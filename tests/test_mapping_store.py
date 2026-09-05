@@ -2008,5 +2008,307 @@ class MappingStoreInjectiveKeyV2Tests(unittest.TestCase):
                 )
 
 
+class MappingStoreAuthoritativeLoadTests(unittest.TestCase):
+    SYSTEM_ID = "synthetic-system-a"
+    ENCLOSURE_ID = "synthetic-enclosure-a"
+    SLOT = 7
+
+    def make_store(self, root: str) -> MappingStore:
+        return MappingStore(Path(root) / "mappings.json")
+
+    def mapping(self, serial: str = "OLD") -> ManualMapping:
+        return ManualMapping(
+            system_id=self.SYSTEM_ID,
+            enclosure_id=self.ENCLOSURE_ID,
+            slot=self.SLOT,
+            serial=serial,
+        )
+
+    def write_valid_document(self, store: MappingStore, version: int) -> bytes:
+        mapping = self.mapping()
+        key = (
+            store._slot_key(self.SYSTEM_ID, self.ENCLOSURE_ID, self.SLOT)
+            if version == 1
+            else store._encode_v2_key(self.SYSTEM_ID, self.ENCLOSURE_ID, self.SLOT)
+        )
+        payload = {
+            "version": version,
+            "updated_at": "2026-09-05T00:00:00+00:00",
+            "slot_mappings": {key: mapping.model_dump(mode="json")},
+        }
+        raw = json.dumps(payload, sort_keys=True).encode("utf-8")
+        store.file_path.write_bytes(raw)
+        return raw
+
+    @staticmethod
+    def temp_paths(store: MappingStore) -> set[Path]:
+        return set(store.file_path.parent.glob(f"{store.file_path.name}.*.tmp"))
+
+    def mutation(self, store: MappingStore, operation: str) -> object:
+        incoming = [self.mapping("NEW")]
+        if operation == "save":
+            return store.save_mapping(incoming[0])
+        if operation == "clear":
+            return store.clear_mapping(
+                self.SYSTEM_ID,
+                self.ENCLOSURE_ID,
+                self.SLOT,
+            )
+        if operation == "replace":
+            return store.replace_mappings(
+                self.SYSTEM_ID,
+                self.ENCLOSURE_ID,
+                incoming,
+            )
+        if operation == "import":
+            return store.apply_mapping_import(
+                self.SYSTEM_ID,
+                self.ENCLOSURE_ID,
+                incoming,
+                expected_revision="0" * 64,
+                import_digest="1" * 64,
+            )
+        raise AssertionError(f"unknown mutation {operation}")
+
+    def authority_surface(self, store: MappingStore, operation: str) -> object:
+        if operation in {"save", "clear", "replace", "import"}:
+            return self.mutation(store, operation)
+        if operation == "scope_revision":
+            return store.scope_revision(self.SYSTEM_ID, self.ENCLOSURE_ID)
+        if operation == "save_revision":
+            return store.save_revision(
+                self.SYSTEM_ID,
+                self.ENCLOSURE_ID,
+                self.SLOT,
+            )
+        if operation == "clear_revision":
+            return store.clear_revision(
+                self.SYSTEM_ID,
+                self.ENCLOSURE_ID,
+                self.SLOT,
+            )
+        if operation == "save_revisions":
+            return store.save_revisions(
+                self.SYSTEM_ID,
+                [(self.ENCLOSURE_ID, self.SLOT)],
+            )
+        if operation == "clear_revisions":
+            return store.clear_revisions(
+                self.SYSTEM_ID,
+                [(self.ENCLOSURE_ID, self.SLOT)],
+            )
+        if operation == "preview":
+            return store.preview_replace_mappings(
+                self.SYSTEM_ID,
+                self.ENCLOSURE_ID,
+                [self.mapping("NEW")],
+            )
+        raise AssertionError(f"unknown authority surface {operation}")
+
+    def test_initial_source_read_errors_fail_closed_for_every_authority_surface(self) -> None:
+        original_read_bytes = Path.read_bytes
+        original_replace = os.replace
+        operations = (
+            "save",
+            "clear",
+            "replace",
+            "import",
+            "scope_revision",
+            "save_revision",
+            "clear_revision",
+            "save_revisions",
+            "clear_revisions",
+            "preview",
+        )
+        failures = (OSError("synthetic read failure"), PermissionError("synthetic denied"))
+        for version in (1, 2):
+            for failure in failures:
+                for operation in operations:
+                    with (
+                        self.subTest(
+                            version=version,
+                            failure=type(failure).__name__,
+                            operation=operation,
+                        ),
+                        tempfile.TemporaryDirectory() as temp_dir,
+                    ):
+                        store = self.make_store(temp_dir)
+                        before = self.write_valid_document(store, version)
+                        before_temps = self.temp_paths(store)
+                        target_reads = 0
+
+                        def fail_initial_target_read(path: Path) -> bytes:
+                            nonlocal target_reads
+                            if path == store.file_path:
+                                target_reads += 1
+                                if target_reads == 1:
+                                    raise failure
+                            return original_read_bytes(path)
+
+                        with (
+                            patch.object(Path, "read_bytes", fail_initial_target_read),
+                            patch.object(
+                                store,
+                                "_create_temp_file",
+                                wraps=store._create_temp_file,
+                            ) as create_temp,
+                            patch.object(
+                                store,
+                                "_replace_temp_file",
+                                wraps=store._replace_temp_file,
+                            ) as replace_temp,
+                            patch.object(
+                                mapping_store_module.os,
+                                "replace",
+                                wraps=original_replace,
+                            ) as replace_path,
+                            self.assertRaises(type(failure)),
+                        ):
+                            self.authority_surface(store, operation)
+
+                        create_temp.assert_not_called()
+                        replace_temp.assert_not_called()
+                        replace_path.assert_not_called()
+                        self.assertEqual(original_read_bytes(store.file_path), before)
+                        self.assertEqual(self.temp_paths(store), before_temps)
+                        restarted = self.make_store(temp_dir)
+                        self.assertEqual(
+                            [item.serial for item in restarted.list_mappings()],
+                            ["OLD"],
+                        )
+
+    def test_malformed_documents_fail_closed_on_mutations_and_token_issuers(self) -> None:
+        original_replace = os.replace
+        model = self.mapping().model_dump(mode="json")
+        model_json = json.dumps(model, separators=(",", ":"))
+        duplicate_model_json = model_json.replace(
+            f'"slot":{self.SLOT}',
+            f'"slot":{self.SLOT},"slot":{self.SLOT}',
+            1,
+        )
+        v2_key = MappingStore._encode_v2_key(
+            self.SYSTEM_ID,
+            self.ENCLOSURE_ID,
+            self.SLOT,
+        )
+        malformed = {
+            "invalid_utf8": b"\xff",
+            "truncated_json": b'{"version":2',
+            "non_object_root": b"[]",
+            "missing_slot_mappings": b'{"version":2}',
+            "non_object_slot_mappings": b'{"version":2,"slot_mappings":[]}',
+            "unsupported_version": b'{"version":3,"slot_mappings":{}}',
+            "boolean_version": b'{"version":true,"slot_mappings":{}}',
+            "invalid_v2_key": (
+                '{"version":2,"slot_mappings":{"not-v2":' + model_json + "}}"
+            ).encode("utf-8"),
+            "invalid_v2_model": (
+                '{"version":2,"slot_mappings":'
+                + json.dumps({v2_key: {**model, "slot": True}}, separators=(",", ":"))
+                + "}"
+            ).encode("utf-8"),
+            "duplicate_root_key": (
+                '{"version":2,"version":2,"slot_mappings":{}}'
+            ).encode("utf-8"),
+            "duplicate_mapping_key": (
+                '{"version":2,"slot_mappings":{'
+                + json.dumps(v2_key)
+                + ":"
+                + model_json
+                + ","
+                + json.dumps(v2_key)
+                + ":"
+                + model_json
+                + "}}"
+            ).encode("utf-8"),
+            "duplicate_mapping_entry_key": (
+                '{"version":2,"slot_mappings":{'
+                + json.dumps(v2_key)
+                + ":"
+                + duplicate_model_json
+                + "}}"
+            ).encode("utf-8"),
+        }
+        operations = (
+            "save",
+            "clear",
+            "replace",
+            "import",
+            "scope_revision",
+            "save_revision",
+            "clear_revision",
+            "save_revisions",
+            "clear_revisions",
+            "preview",
+        )
+        for case, raw in malformed.items():
+            for operation in operations:
+                with (
+                    self.subTest(case=case, operation=operation),
+                    tempfile.TemporaryDirectory() as temp_dir,
+                ):
+                    store = self.make_store(temp_dir)
+                    store.file_path.write_bytes(raw)
+                    before_temps = self.temp_paths(store)
+                    with (
+                        patch.object(
+                            store,
+                            "_create_temp_file",
+                            wraps=store._create_temp_file,
+                        ) as create_temp,
+                        patch.object(
+                            store,
+                            "_replace_temp_file",
+                            wraps=store._replace_temp_file,
+                        ) as replace_temp,
+                        patch.object(
+                            mapping_store_module.os,
+                            "replace",
+                            wraps=original_replace,
+                        ) as replace_path,
+                        self.assertRaises(MappingScopeConflict),
+                    ):
+                        self.authority_surface(store, operation)
+
+                    create_temp.assert_not_called()
+                    replace_temp.assert_not_called()
+                    replace_path.assert_not_called()
+                    self.assertEqual(store.file_path.read_bytes(), raw)
+                    self.assertEqual(self.temp_paths(store), before_temps)
+
+    def test_missing_target_is_empty_v2_state_and_accepts_first_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+            self.assertFalse(store.file_path.exists())
+
+            revision = store.save_revision(
+                self.SYSTEM_ID,
+                self.ENCLOSURE_ID,
+                self.SLOT,
+            )
+            store.save_mapping(self.mapping("FIRST"), expected_revision=revision)
+
+            payload = json.loads(store.file_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["version"], 2)
+            self.assertEqual(
+                [item.serial for item in store.list_mappings()],
+                ["FIRST"],
+            )
+
+    def test_load_all_preserves_historical_malformed_v1_tolerance_without_writing(self) -> None:
+        malformed_v1_documents = (
+            b'{"version":1,"slot_mappings":{"legacy:7":{"slot":true}}}',
+            b'{"version":1,"slot_mappings":',
+        )
+        for raw in malformed_v1_documents:
+            with self.subTest(raw=raw), tempfile.TemporaryDirectory() as temp_dir:
+                store = self.make_store(temp_dir)
+                store.file_path.write_bytes(raw)
+
+                self.assertEqual(store.load_all(), {})
+                self.assertEqual(store.file_path.read_bytes(), raw)
+                self.assertEqual(self.temp_paths(store), set())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -222,22 +222,49 @@ class MappingStore:
         except ValidationError:
             raise MappingScopeConflict() from None
 
+    @staticmethod
+    def _reject_duplicate_object_keys(
+        pairs: list[tuple[str, Any]],
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise MappingScopeConflict()
+            result[key] = value
+        return result
+
     def _read_document(
         self,
         *,
+        strict: bool = True,
         tolerate_invalid_models: bool = False,
     ) -> tuple[int, dict[str, ManualMapping]]:
-        if not self.file_path.exists():
-            return 2, {}
+        """Read once; authoritative callers fail closed, legacy display may degrade."""
         try:
             raw = self.file_path.read_bytes()
-            payload = json.loads(raw.decode("utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
+        except FileNotFoundError:
+            return 2, {}
+        except OSError:
+            if strict:
+                raise
+            return 1, {}
+        try:
+            payload = json.loads(
+                raw.decode("utf-8"),
+                object_pairs_hook=self._reject_duplicate_object_keys,
+            )
+        except (UnicodeError, json.JSONDecodeError):
+            if strict:
+                raise MappingScopeConflict() from None
             return 1, {}
         if not isinstance(payload, dict):
+            if strict:
+                raise MappingScopeConflict()
             return 1, {}
-        raw_mappings = payload.get("slot_mappings", {})
+        raw_mappings = payload.get("slot_mappings")
         if not isinstance(raw_mappings, dict):
+            if strict:
+                raise MappingScopeConflict()
             return 1, {}
         version = payload.get("version", 1)
         if isinstance(version, bool) or version not in (1, 2):
@@ -475,7 +502,11 @@ class MappingStore:
         return self._classify_entries(2 if True in prefixes else 1, entries)
 
     def load_all(self) -> dict[str, ManualMapping]:
-        version, entries = self._read_document(tolerate_invalid_models=True)
+        """Load for historical read-only display, tolerating corrupt v1-era stores."""
+        version, entries = self._read_document(
+            strict=False,
+            tolerate_invalid_models=True,
+        )
         if version == 2:
             self._classify_entries(version, entries)
         return entries
