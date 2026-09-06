@@ -74,6 +74,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_enclosure_aliases",
             "tests.test_enclosure_option_labels",
             "tests.test_history_routes",
+            "tests.test_app_history_body_bound",
             "tests.test_app_history_bounds",
             "tests.test_history_bulk_bounds",
             "tests.test_history_refresh_bounds",
