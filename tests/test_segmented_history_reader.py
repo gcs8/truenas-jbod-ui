@@ -901,6 +901,334 @@ class SegmentedHistoryReaderCliTests(unittest.TestCase):
             self.assertEqual(samples[0]["value_min"], 30.0)
             self.assertEqual(samples[0]["value_max"], 36.0)
 
+    def test_scope_history_limit_merges_hot_and_sealed_partial_rollup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            hot_path = root / "hot.sqlite3"
+            segment_path = root / "segment-0001.sqlite3"
+            self._create_database(hot_path, [])
+            self._create_database(segment_path, [])
+            insert_sql = """
+                INSERT INTO metric_rollups (
+                    bucket_start, bucket_seconds, system_id, enclosure_key, slot, slot_label,
+                    metric_name, sample_count, value_sum, value_min, value_max, last_value,
+                    last_observed_at
+                ) VALUES (?, 3600, 'system-1', 'enclosure-1', 1, 'slot-1',
+                          'temperature', ?, ?, ?, ?, ?, ?)
+            """
+            with sqlite3.connect(hot_path) as connection:
+                connection.execute(
+                    insert_sql,
+                    (
+                        "2025-01-01T10:00:00+00:00",
+                        2,
+                        70.0,
+                        34.0,
+                        36.0,
+                        36.0,
+                        "2025-01-01T10:50:00+00:00",
+                    ),
+                )
+            with sqlite3.connect(segment_path) as connection:
+                connection.execute(
+                    insert_sql,
+                    (
+                        "2025-01-01T10:00:00+00:00",
+                        2,
+                        62.0,
+                        30.0,
+                        32.0,
+                        32.0,
+                        "2025-01-01T10:30:00+00:00",
+                    ),
+                )
+
+            with freeze_operation_bounds_now(datetime(2025, 12, 31, tzinfo=timezone.utc)):
+                samples = SegmentedHistoryReader(
+                    hot_path=hot_path,
+                    segment_paths=[segment_path],
+                ).list_scope_history(
+                    "system-1",
+                    "enclosure-1",
+                    slots=[1],
+                    event_limit=0,
+                    metric_limits={"temperature": 1},
+                    since="2025-01-01T00:00:00+00:00",
+                )[1]["metrics"]["temperature"]
+
+            self.assertEqual(len(samples), 1)
+            self.assertEqual(
+                (
+                    samples[0]["value"],
+                    samples[0]["sample_count"],
+                    samples[0]["value_min"],
+                    samples[0]["value_max"],
+                ),
+                (33.0, 4, 30.0, 36.0),
+            )
+
+    def test_scope_history_completes_every_selected_rollup_identity_without_admitting_more(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            hot_path = root / "hot.sqlite3"
+            segment_path = root / "segment-0002.sqlite3"
+            older_segment_path = root / "segment-0001.sqlite3"
+            self._create_database(hot_path, [])
+            self._create_database(segment_path, [])
+            self._create_database(older_segment_path, [])
+            for path, bucket_start, value_sum in (
+                (hot_path, "2025-01-01T12:00:00+00:00", 70.0),
+                (hot_path, "2025-01-01T11:00:00+00:00", 50.0),
+                (segment_path, "2025-01-01T12:00:00+00:00", 62.0),
+                (segment_path, "2025-01-01T11:00:00+00:00", 46.0),
+                (segment_path, "2025-01-01T10:00:00+00:00", 42.0),
+                (older_segment_path, "2025-01-01T09:00:00+00:00", 40.0),
+                (older_segment_path, "2025-01-01T08:00:00+00:00", 38.0),
+            ):
+                self._insert_rollup(path, bucket_start=bucket_start, value_sum=value_sum)
+            reader = SegmentedHistoryReader(
+                hot_path=hot_path,
+                segment_paths=[older_segment_path, segment_path],
+            )
+            materialized_rollups = 0
+            materializing_queries: list[str] = []
+            original_query_connection = reader._query_connection
+
+            @contextmanager
+            def counted_query_connection(path: Path):
+                nonlocal materialized_rollups
+                with original_query_connection(path) as connection:
+                    class CountingCursor:
+                        def __init__(self, cursor, query: str) -> None:
+                            self._cursor = cursor
+                            self._query = query
+
+                        def fetchall(self):
+                            nonlocal materialized_rollups
+                            rows = self._cursor.fetchall()
+                            if "FROM metric_rollups" in self._query:
+                                materialized_rollups += len(rows)
+                                materializing_queries.append(self._query)
+                            return rows
+
+                        def __getattr__(self, name: str):
+                            return getattr(self._cursor, name)
+
+                    class CountingConnection:
+                        def execute(self, query, parameters=()):
+                            return CountingCursor(connection.execute(query, parameters), query)
+
+                    yield CountingConnection()
+
+            with freeze_operation_bounds_now(datetime(2025, 12, 31, tzinfo=timezone.utc)):
+                with patch.object(
+                    reader,
+                    "_query_connection",
+                    side_effect=counted_query_connection,
+                ):
+                    samples = reader.list_scope_history(
+                        "system-1",
+                        "enclosure-1",
+                        slots=[1],
+                        event_limit=0,
+                        metric_limits={"temperature": 2},
+                        since="2025-01-01T00:00:00+00:00",
+                    )[1]["metrics"]["temperature"]
+
+            self.assertEqual(
+                [
+                    (sample["observed_at"], sample["value"], sample["sample_count"])
+                    for sample in samples
+                ],
+                [
+                    ("2025-01-01T12:00:00+00:00", 33.0, 4),
+                    ("2025-01-01T11:00:00+00:00", 24.0, 4),
+                ],
+            )
+            self.assertEqual(materialized_rollups, 4)
+            self.assertTrue(materializing_queries)
+            self.assertTrue(
+                all(
+                    "new_row_number <= remaining" in query or "LIMIT ?" in query
+                    for query in materializing_queries
+                )
+            )
+
+    def test_scope_history_does_not_merge_or_admit_a_different_rollup_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            hot_path = root / "hot.sqlite3"
+            segment_path = root / "segment-0001.sqlite3"
+            self._create_database(hot_path, [])
+            self._create_database(segment_path, [])
+            self._insert_rollup(
+                hot_path,
+                bucket_start="2025-01-01T10:00:00+00:00",
+                value_sum=70.0,
+                disk_identity_key="disk-a",
+            )
+            self._insert_rollup(
+                segment_path,
+                bucket_start="2025-01-01T10:00:00+00:00",
+                value_sum=62.0,
+                disk_identity_key="disk-a",
+            )
+            self._insert_rollup(
+                segment_path,
+                bucket_start="2025-01-01T10:00:00+00:00",
+                value_sum=200.0,
+                disk_identity_key="disk-b",
+            )
+
+            with freeze_operation_bounds_now(datetime(2025, 12, 31, tzinfo=timezone.utc)):
+                samples = SegmentedHistoryReader(
+                    hot_path=hot_path,
+                    segment_paths=[segment_path],
+                ).list_scope_history(
+                    "system-1",
+                    "enclosure-1",
+                    slots=[1],
+                    event_limit=0,
+                    metric_limits={"temperature": 1},
+                    since="2025-01-01T00:00:00+00:00",
+                )[1]["metrics"]["temperature"]
+
+            self.assertEqual(len(samples), 1)
+            self.assertEqual(samples[0]["disk_identity_key"], "disk-a")
+            self.assertEqual(samples[0]["value"], 33.0)
+            self.assertEqual(samples[0]["sample_count"], 4)
+
+    def test_scope_history_completes_rollup_with_partial_remaining_quota(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            hot_path = root / "hot.sqlite3"
+            segment_path = root / "segment-0001.sqlite3"
+            self._create_database(
+                hot_path,
+                [],
+                [(1, "2025-01-01T12:30:00+00:00", 40)],
+            )
+            self._create_database(segment_path, [])
+            self._insert_rollup(
+                hot_path,
+                bucket_start="2025-01-01T11:00:00+00:00",
+                value_sum=70.0,
+            )
+            self._insert_rollup(
+                segment_path,
+                bucket_start="2025-01-01T11:00:00+00:00",
+                value_sum=62.0,
+            )
+            self._insert_rollup(
+                segment_path,
+                bucket_start="2025-01-01T10:00:00+00:00",
+                value_sum=40.0,
+            )
+
+            with freeze_operation_bounds_now(datetime(2025, 12, 31, tzinfo=timezone.utc)):
+                samples = SegmentedHistoryReader(
+                    hot_path=hot_path,
+                    segment_paths=[segment_path],
+                ).list_scope_history(
+                    "system-1",
+                    "enclosure-1",
+                    slots=[1],
+                    event_limit=0,
+                    metric_limits={"temperature": 2},
+                    since="2025-01-01T00:00:00+00:00",
+                )[1]["metrics"]["temperature"]
+
+            self.assertEqual([sample["value"] for sample in samples], [40, 33.0])
+            self.assertEqual(samples[1]["sample_count"], 4)
+
+    def test_scope_history_zero_rollup_quota_preserves_raw_precedence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            hot_path = root / "hot.sqlite3"
+            segment_path = root / "segment-0001.sqlite3"
+            self._create_database(
+                hot_path,
+                [],
+                [(1, "2025-01-01T12:30:00+00:00", 40)],
+            )
+            self._create_database(segment_path, [])
+            self._insert_rollup(
+                hot_path,
+                bucket_start="2025-01-01T11:00:00+00:00",
+                value_sum=70.0,
+            )
+            self._insert_rollup(
+                segment_path,
+                bucket_start="2025-01-01T11:00:00+00:00",
+                value_sum=62.0,
+            )
+
+            with freeze_operation_bounds_now(datetime(2025, 12, 31, tzinfo=timezone.utc)):
+                samples = SegmentedHistoryReader(
+                    hot_path=hot_path,
+                    segment_paths=[segment_path],
+                ).list_scope_history(
+                    "system-1",
+                    "enclosure-1",
+                    slots=[1],
+                    event_limit=0,
+                    metric_limits={"temperature": 1},
+                    since="2025-01-01T00:00:00+00:00",
+                )[1]["metrics"]["temperature"]
+
+            self.assertEqual([(sample["value"], sample.get("rollup_seconds")) for sample in samples], [(40, None)])
+
+    def test_scope_history_merges_hourly_and_daily_fragments_in_precedence_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            hot_path = root / "hot.sqlite3"
+            segment_path = root / "segment-0001.sqlite3"
+            self._create_database(
+                hot_path,
+                [],
+                [(1, "2025-01-03T12:30:00+00:00", 40)],
+            )
+            self._create_database(segment_path, [])
+            for path, bucket_start, bucket_seconds, value_sum in (
+                (hot_path, "2025-01-03T11:00:00+00:00", 3600, 70.0),
+                (segment_path, "2025-01-03T11:00:00+00:00", 3600, 62.0),
+                (hot_path, "2025-01-02T00:00:00+00:00", 86400, 50.0),
+                (segment_path, "2025-01-02T00:00:00+00:00", 86400, 46.0),
+                (segment_path, "2025-01-01T00:00:00+00:00", 86400, 40.0),
+            ):
+                self._insert_rollup(
+                    path,
+                    bucket_start=bucket_start,
+                    bucket_seconds=bucket_seconds,
+                    value_sum=value_sum,
+                )
+
+            with freeze_operation_bounds_now(datetime(2025, 12, 31, tzinfo=timezone.utc)):
+                samples = SegmentedHistoryReader(
+                    hot_path=hot_path,
+                    segment_paths=[segment_path],
+                ).list_scope_history(
+                    "system-1",
+                    "enclosure-1",
+                    slots=[1],
+                    event_limit=0,
+                    metric_limits={"temperature": 3},
+                    since="2025-01-01T00:00:00+00:00",
+                )[1]["metrics"]["temperature"]
+
+            self.assertEqual(
+                [
+                    (sample["observed_at"], sample["value"], sample.get("rollup_seconds"))
+                    for sample in samples
+                ],
+                [
+                    ("2025-01-03T12:30:00+00:00", 40, None),
+                    ("2025-01-03T11:00:00+00:00", 33.0, 3600),
+                    ("2025-01-02T00:00:00+00:00", 24.0, 86400),
+                ],
+            )
+            self.assertEqual([sample.get("sample_count") for sample in samples], [None, 4, 4])
+
     def test_catalog_loader_refuses_a_dangling_pending_migration_marker(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -1461,6 +1789,41 @@ class SegmentedHistoryReaderCliTests(unittest.TestCase):
     def _assert_no_sqlite_sidecars(self, path: Path) -> None:
         for suffix in ("-wal", "-shm", "-journal"):
             self.assertFalse(Path(f"{path}{suffix}").exists(), f"{path.name}{suffix} exists")
+
+    @staticmethod
+    def _insert_rollup(
+        path: Path,
+        *,
+        bucket_start: str,
+        value_sum: float,
+        bucket_seconds: int = 3600,
+        disk_identity_key: str = "",
+    ) -> None:
+        average = value_sum / 2
+        last_observed_at = (
+            datetime.fromisoformat(bucket_start) + timedelta(seconds=bucket_seconds // 2)
+        ).isoformat()
+        with sqlite3.connect(path) as connection:
+            connection.execute(
+                """
+                INSERT INTO metric_rollups (
+                    bucket_start, bucket_seconds, system_id, enclosure_key, slot, slot_label,
+                    metric_name, sample_count, value_sum, value_min, value_max, last_value,
+                    last_observed_at, disk_identity_key
+                ) VALUES (?, ?, 'system-1', 'enclosure-1', 1, 'slot-1',
+                          'temperature', 2, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    bucket_start,
+                    bucket_seconds,
+                    value_sum,
+                    average - 1,
+                    average + 1,
+                    average + 1,
+                    last_observed_at,
+                    disk_identity_key,
+                ),
+            )
 
     @staticmethod
     def _create_database(
