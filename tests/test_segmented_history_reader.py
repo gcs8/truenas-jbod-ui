@@ -1018,6 +1018,9 @@ class SegmentedHistoryReaderCliTests(unittest.TestCase):
                         def execute(self, query, parameters=()):
                             return CountingCursor(connection.execute(query, parameters), query)
 
+                        def __getattr__(self, name: str):
+                            return getattr(connection, name)
+
                     yield CountingConnection()
 
             with freeze_operation_bounds_now(datetime(2025, 12, 31, tzinfo=timezone.utc)):
@@ -1228,6 +1231,174 @@ class SegmentedHistoryReaderCliTests(unittest.TestCase):
                 ],
             )
             self.assertEqual([sample.get("sample_count") for sample in samples], [None, 4, 4])
+
+    def test_scope_history_retained_keys_do_not_exceed_sqlite_variable_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            hot_path = root / "hot.sqlite3"
+            segment_path = root / "segment-0001.sqlite3"
+            self._create_database(hot_path, [])
+            self._create_database(segment_path, [])
+            retained_rows = [
+                (
+                    slot,
+                    f"2025-01-01T{hour:02d}:00:00+00:00",
+                    float(slot * 100 + hour),
+                    f"disk-{slot}",
+                )
+                for slot in (1, 2)
+                for hour in (10, 11)
+            ]
+            self._insert_scope_rollups(hot_path, retained_rows)
+            self._insert_scope_rollups(segment_path, [retained_rows[-1]])
+            reader = SegmentedHistoryReader(
+                hot_path=hot_path,
+                segment_paths=[segment_path],
+            )
+            statements: list[str] = []
+            original_query_connection = reader._query_connection
+
+            @contextmanager
+            def limited_query_connection(path: Path):
+                with original_query_connection(path) as connection:
+                    connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 20)
+
+                    class ObservedConnection:
+                        def execute(self, query, parameters=()):
+                            statements.append(query)
+                            return connection.execute(query, parameters)
+
+                        def __getattr__(self, name: str):
+                            return getattr(connection, name)
+
+                    yield ObservedConnection()
+
+            with freeze_operation_bounds_now(datetime(2025, 12, 31, tzinfo=timezone.utc)):
+                with patch.object(
+                    reader,
+                    "_query_connection",
+                    side_effect=limited_query_connection,
+                ):
+                    histories = reader.list_scope_history(
+                        "system-1",
+                        "enclosure-1",
+                        slots=[1, 2],
+                        event_limit=0,
+                        metric_limits={"temperature": 2},
+                        since="2025-01-01T00:00:00+00:00",
+                    )
+
+            self.assertEqual(
+                [len(histories[slot]["metrics"]["temperature"]) for slot in (1, 2)],
+                [2, 2],
+            )
+            self.assertEqual(
+                histories[2]["metrics"]["temperature"][0]["sample_count"],
+                4,
+            )
+            rollup_statements = [query for query in statements if "candidates AS (" in query]
+            self.assertEqual(len(rollup_statements), 2)
+            self.assertEqual([query.count("?") for query in rollup_statements], [15, 15])
+
+    def test_scope_history_high_cardinality_retained_keys_stay_bounded(self) -> None:
+        slot_count = 114
+        metric_limit = 96
+        with sqlite3.connect(":memory:") as connection:
+            runtime_variable_limit = connection.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER)
+        self.assertEqual(runtime_variable_limit, 32_766)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            hot_path = root / "hot.sqlite3"
+            segment_path = root / "segment-0001.sqlite3"
+            self._create_database(hot_path, [])
+            self._create_database(segment_path, [])
+            retained_rows = [
+                (
+                    slot,
+                    (
+                        datetime(2025, 1, 1, tzinfo=timezone.utc)
+                        + timedelta(hours=index)
+                    ).isoformat(),
+                    float(slot * 1_000 + index),
+                    f"disk-{slot}",
+                )
+                for slot in range(slot_count)
+                for index in range(metric_limit)
+            ]
+            self._insert_scope_rollups(hot_path, retained_rows)
+            fragment = retained_rows[-1]
+            self._insert_scope_rollups(segment_path, [fragment])
+            reader = SegmentedHistoryReader(
+                hot_path=hot_path,
+                segment_paths=[segment_path],
+            )
+            query_count = 0
+            materialized_rollups = 0
+            rollup_placeholder_counts: list[int] = []
+            original_query_connection = reader._query_connection
+
+            @contextmanager
+            def observed_query_connection(path: Path):
+                nonlocal query_count, materialized_rollups
+                query_count += 1
+                with original_query_connection(path) as connection:
+                    class ObservedCursor:
+                        def __init__(self, cursor, query: str) -> None:
+                            self._cursor = cursor
+                            self._query = query
+
+                        def fetchall(self):
+                            nonlocal materialized_rollups
+                            rows = self._cursor.fetchall()
+                            if "candidates AS (" in self._query:
+                                materialized_rollups += len(rows)
+                            return rows
+
+                        def __getattr__(self, name: str):
+                            return getattr(self._cursor, name)
+
+                    class ObservedConnection:
+                        def execute(self, query, parameters=()):
+                            if "candidates AS (" in query:
+                                rollup_placeholder_counts.append(query.count("?"))
+                            return ObservedCursor(connection.execute(query, parameters), query)
+
+                        def __getattr__(self, name: str):
+                            return getattr(connection, name)
+
+                    yield ObservedConnection()
+
+            with freeze_operation_bounds_now(datetime(2025, 12, 31, tzinfo=timezone.utc)):
+                with patch.object(
+                    reader,
+                    "_query_connection",
+                    side_effect=observed_query_connection,
+                ):
+                    histories = reader.list_scope_history(
+                        "system-1",
+                        "enclosure-1",
+                        slots=list(range(slot_count)),
+                        event_limit=0,
+                        metric_limits={"temperature": metric_limit},
+                        since="2025-01-01T00:00:00+00:00",
+                    )
+
+            self.assertEqual(len(histories), slot_count)
+            self.assertEqual(
+                sum(len(history["metrics"]["temperature"]) for history in histories.values()),
+                slot_count * metric_limit,
+            )
+            merged_fragment = histories[slot_count - 1]["metrics"]["temperature"][0]
+            self.assertEqual(merged_fragment["sample_count"], 4)
+            self.assertEqual(query_count, 4)
+            self.assertEqual(materialized_rollups, slot_count * metric_limit + 1)
+            self.assertEqual(len(rollup_placeholder_counts), 2)
+            self.assertEqual(
+                rollup_placeholder_counts,
+                [5 * slot_count + 5, 5 * slot_count + 5],
+            )
+            self.assertLess(max(rollup_placeholder_counts), runtime_variable_limit)
 
     def test_catalog_loader_refuses_a_dangling_pending_migration_marker(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -1823,6 +1994,39 @@ class SegmentedHistoryReaderCliTests(unittest.TestCase):
                     last_observed_at,
                     disk_identity_key,
                 ),
+            )
+
+    @staticmethod
+    def _insert_scope_rollups(
+        path: Path,
+        rows: list[tuple[int, str, float, str]],
+    ) -> None:
+        with sqlite3.connect(path) as connection:
+            connection.executemany(
+                """
+                INSERT INTO metric_rollups (
+                    bucket_start, bucket_seconds, system_id, enclosure_key, slot,
+                    slot_label, metric_name, sample_count, value_sum, value_min,
+                    value_max, last_value, last_observed_at, disk_identity_key
+                ) VALUES (?, 3600, 'system-1', 'enclosure-1', ?, ?, 'temperature',
+                          2, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        bucket_start,
+                        slot,
+                        f"slot-{slot}",
+                        value_sum,
+                        value_sum / 2 - 1,
+                        value_sum / 2 + 1,
+                        value_sum / 2 + 1,
+                        (
+                            datetime.fromisoformat(bucket_start) + timedelta(minutes=30)
+                        ).isoformat(),
+                        disk_identity_key,
+                    )
+                    for slot, bucket_start, value_sum, disk_identity_key in rows
+                ],
             )
 
     @staticmethod

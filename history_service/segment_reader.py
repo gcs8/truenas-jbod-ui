@@ -1312,35 +1312,34 @@ class SegmentedHistoryReader:
                     if since:
                         rollup_where.append("julianday(bucket_start) >= julianday(?)")
                         rollup_parameters.append(since)
-                    retained_cte = ""
                     retained_expression = "0"
-                    retained_parameters: list[Any] = []
+                    retained_key_set = set(retained_keys)
                     if retained_keys:
-                        retained_values = ", ".join("(?, ?, ?)" for _ in retained_keys)
-                        retained_parameters = [
-                            value for retained_key in retained_keys for value in retained_key
-                        ]
-                        retained_cte = f"""
-                            retained_keys(
-                                slot_number, retained_bucket_start,
-                                retained_disk_identity_key
-                            ) AS (VALUES {retained_values}),
-                        """
                         retained_expression = """
-                            EXISTS (
-                                SELECT 1 FROM retained_keys
-                                WHERE retained_keys.slot_number = metric_rollups.slot
-                                  AND retained_keys.retained_bucket_start =
-                                      metric_rollups.bucket_start
-                                  AND retained_keys.retained_disk_identity_key =
-                                      COALESCE(metric_rollups.disk_identity_key, '')
+                            _history_retained_rollup_key(
+                                metric_rollups.slot,
+                                metric_rollups.bucket_start,
+                                COALESCE(metric_rollups.disk_identity_key, '')
                             )
                         """
                     with self._query_connection(path) as connection:
+                        if retained_keys:
+                            connection.create_function(
+                                "_history_retained_rollup_key",
+                                3,
+                                lambda slot_number, bucket_start, disk_identity_key: int(
+                                    (
+                                        int(slot_number),
+                                        str(bucket_start),
+                                        str(disk_identity_key or ""),
+                                    )
+                                    in retained_key_set
+                                ),
+                                deterministic=True,
+                            )
                         rows = connection.execute(
                             f"""
-                            WITH {retained_cte}
-                            quotas(slot_number, remaining, boundary, inclusive) AS (
+                            WITH quotas(slot_number, remaining, boundary, inclusive) AS (
                                 VALUES {quota_values}
                             ),
                             candidates AS (
@@ -1393,7 +1392,6 @@ class SegmentedHistoryReader:
                             WHERE retained = 1 OR new_row_number <= remaining
                             """,
                             [
-                                *retained_parameters,
                                 *quota_parameters,
                                 *rollup_parameters,
                             ],
