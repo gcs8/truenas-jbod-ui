@@ -12383,6 +12383,46 @@ class InventoryServiceSnapshotStateBoundsTests(unittest.IsolatedAsyncioTestCase)
             self.assertNotIn("expired", service._snapshot_state_keys())
             self.assertEqual(service._snapshot_state_keys(), {"fresh"})
 
+    async def test_physical_invalidation_preserves_canonical_admission_for_immediate_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            selected_id = "enc-a::dell-md1280-drawer-top-42"
+            sibling_id = "enc-b"
+            options = [
+                EnclosureOption(id=selected_id, label="Shelf A top"),
+                EnclosureOption(id=sibling_id, label="Shelf B"),
+            ]
+            cached = InventorySnapshot(
+                slots=[],
+                refresh_interval_seconds=30,
+                selected_system_id="bounded",
+                selected_system_platform="core",
+                selected_enclosure_id=selected_id,
+                enclosures=options,
+            )
+            refreshed = cached.model_copy(deep=True)
+            service._canonical_enclosure_options = {option.id: option for option in options}
+            service._canonical_default_enclosure_id = selected_id
+            service._cache[selected_id] = cached
+            service._cache_until[selected_id] = datetime.now(timezone.utc) + timedelta(minutes=5)
+            service._build_snapshot = AsyncMock(return_value=refreshed)
+
+            service.invalidate_physical_enclosure_snapshot_cache(
+                reason="test.physical",
+                enclosure_id=selected_id,
+            )
+            result = await service.get_snapshot(
+                force_refresh=True,
+                selected_enclosure_id=selected_id,
+            )
+
+            self.assertIs(result, refreshed)
+            service._build_snapshot.assert_awaited_once_with(
+                selected_enclosure_id=selected_id,
+                force_source_refresh=True,
+            )
+            self.assertEqual(set(service._canonical_enclosure_options or {}), {selected_id, sibling_id})
+
     async def test_physical_invalidation_cleans_coordinated_drawer_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = self._service(temp_dir)
@@ -12421,9 +12461,9 @@ class InventoryServiceSnapshotStateBoundsTests(unittest.IsolatedAsyncioTestCase)
                 service._snapshot_refresh_tasks,
                 service._snapshot_activity,
                 service._snapshot_lru,
-                service._canonical_enclosure_options,
             ):
                 self.assertFalse(any(key.startswith("enc-a") for key in state))
+            self.assertEqual(set(service._canonical_enclosure_options or {}), set(keys))
             self.assertIn("enc-b", service._cache)
 
     async def test_physical_invalidation_fences_a_blocked_cold_discovery(self) -> None:
