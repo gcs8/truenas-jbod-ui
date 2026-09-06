@@ -149,6 +149,8 @@ them before starting the new images.
 
 ### Security
 
+- Reset skipped-scope topology confirmation state, bounded anonymous bulk
+  history reads, and capped persistent host-prep staging (#381)
 - Hardened inventory, mapping, history, SAS diagnostics, and snapshot export
   boundaries across the reviewed security backlog (#378).
 - Excluded internal endpoint, filesystem-path, and collection-stage metadata
