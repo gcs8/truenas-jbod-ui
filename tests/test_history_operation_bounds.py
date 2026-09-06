@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 from history_service.operation_bounds import (
     MAX_EVENT_ROWS,
@@ -14,11 +15,18 @@ from history_service.operation_bounds import (
     HistoryBudgetExceeded,
     HistoryRequestShapeError,
     build_history_read_plan,
+    validate_store_scope_request,
 )
 
 
 NOW = datetime(2030, 1, 2, 12, 0, tzinfo=timezone.utc)
 SINCE = (NOW - timedelta(hours=24)).isoformat()
+
+
+class FrozenDateTime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return NOW if tz is None else NOW.astimezone(tz)
 
 
 class HistoryOperationBoundsTests(unittest.TestCase):
@@ -33,6 +41,15 @@ class HistoryOperationBoundsTests(unittest.TestCase):
         }
         arguments.update(overrides)
         return build_history_read_plan(**arguments)
+
+    def _validate_store(self, *, since):
+        with patch("history_service.operation_bounds.datetime", FrozenDateTime):
+            validate_store_scope_request(
+                slots=[0],
+                event_limit=0,
+                metric_limits={"temperature_c": 1},
+                since=since,
+            )
 
     def test_contract_constants_are_server_owned(self) -> None:
         self.assertEqual(MAX_SCOPES, 32)
@@ -101,6 +118,40 @@ class HistoryOperationBoundsTests(unittest.TestCase):
             self._plan(since=(NOW - timedelta(hours=MAX_HISTORY_HOURS)).isoformat()).window_hours,
             MAX_HISTORY_HOURS,
         )
+
+    def test_store_window_preflight_accepts_inclusive_boundaries_and_utc_offsets(self) -> None:
+        valid_since_values = (
+            NOW - timedelta(hours=1),
+            NOW - timedelta(hours=1, seconds=1),
+            NOW - timedelta(hours=MAX_HISTORY_HOURS) + timedelta(seconds=1),
+            NOW - timedelta(hours=MAX_HISTORY_HOURS),
+        )
+        for since in valid_since_values:
+            for offset in (timezone.utc, timezone(timedelta(hours=-5)), timezone(timedelta(hours=9))):
+                with self.subTest(since=since, offset=offset):
+                    self._validate_store(since=since.astimezone(offset).isoformat())
+
+    def test_store_window_preflight_rejects_future_and_outside_boundaries_directly(self) -> None:
+        invalid_since_values = (
+            NOW + timedelta(seconds=1),
+            NOW - timedelta(hours=1) + timedelta(seconds=1),
+            NOW - timedelta(hours=MAX_HISTORY_HOURS, seconds=1),
+        )
+        for since in invalid_since_values:
+            with self.subTest(since=since), self.assertRaisesRegex(
+                HistoryRequestShapeError,
+                f"since must bound history to between 1 and {MAX_HISTORY_HOURS} hours",
+            ):
+                self._validate_store(since=since.isoformat())
+
+    def test_store_window_preflight_rejects_naive_and_invalid_timestamps_directly(self) -> None:
+        invalid_since_values = (
+            (NOW - timedelta(hours=1)).replace(tzinfo=None).isoformat(),
+            "not-a-timestamp",
+        )
+        for since in invalid_since_values:
+            with self.subTest(since=since), self.assertRaises(HistoryRequestShapeError):
+                self._validate_store(since=since)
 
     def test_metric_and_event_ranges_are_strict(self) -> None:
         for metric_limit in (0, 97, True):

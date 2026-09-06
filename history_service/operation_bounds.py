@@ -244,14 +244,7 @@ def validate_store_scope_request(
             maximum=INTERNAL_HISTORY_METRIC_MAX_LIMITS[metric],
         )
         total_metric_rows += normalized_limit
-    if not isinstance(since, str) or not since.strip():
-        raise HistoryRequestShapeError("since is required for bulk history reads.")
-    try:
-        parsed_since = datetime.fromisoformat(since.strip().replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise HistoryRequestShapeError("since must be a valid timezone-aware timestamp.") from exc
-    if parsed_since.tzinfo is None or parsed_since.utcoffset() is None:
-        raise HistoryRequestShapeError("since must be timezone-aware.")
+    _normalize_since(since, now=datetime.now(timezone.utc))
     event_rows = len(normalized_slots) * normalized_event_limit
     if event_rows > MAX_EVENT_ROWS:
         raise HistoryBudgetExceeded("event_rows", event_rows, MAX_EVENT_ROWS)

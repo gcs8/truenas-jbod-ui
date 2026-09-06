@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 from contextlib import asynccontextmanager
 from functools import lru_cache
@@ -99,21 +100,83 @@ def _history_error_response(exc: Exception) -> JSONResponse:
     return JSONResponse({"detail": "History request shape is invalid."}, status_code=422)
 
 
+def _json_string_size(value: str) -> int:
+    size = 2
+    for character in value:
+        codepoint = ord(character)
+        if character in {'"', "\\"} or character in "\b\f\n\r\t":
+            size += 2
+        elif codepoint <= 0x1F:
+            size += 6
+        else:
+            size += len(character.encode("utf-8"))
+    return size
+
+
+def _json_key_text(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if value is None:
+        return "null"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("Out of range float values are not JSON compliant")
+        return repr(value)
+    raise TypeError("History response JSON object keys must be strings or scalar values.")
+
+
+def _json_value_size(value: object) -> int:
+    if value is None:
+        return 4
+    if value is True:
+        return 4
+    if value is False:
+        return 5
+    if isinstance(value, str):
+        return _json_string_size(value)
+    if isinstance(value, int):
+        return len(str(value))
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("Out of range float values are not JSON compliant")
+        return len(repr(value))
+    if isinstance(value, (list, tuple)):
+        return 2 + max(0, len(value) - 1) + sum(_json_value_size(item) for item in value)
+    if isinstance(value, dict):
+        size = 2 + max(0, len(value) - 1)
+        for key, item in value.items():
+            size += _json_string_size(_json_key_text(key)) + 1 + _json_value_size(item)
+        return size
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def _set_exact_response_size(payload: dict[str, object]) -> int:
+    budget = payload.get("budget")
+    if not isinstance(budget, dict):
+        return _json_value_size(payload)
+    budget["response_bytes"] = 0
+    size_without_response_byte_digits = _json_value_size(payload) - 1
+    digit_count = len(str(size_without_response_byte_digits + 1))
+    response_bytes = size_without_response_byte_digits + digit_count
+    if len(str(response_bytes)) != digit_count:
+        response_bytes = size_without_response_byte_digits + len(str(response_bytes))
+    budget["response_bytes"] = response_bytes
+    return response_bytes
+
+
 def bounded_history_json_response(
     payload: dict[str, object],
     *,
     max_bytes: int = MAX_RESPONSE_BYTES,
 ) -> JSONResponse:
-    budget = payload.get("budget")
-    if isinstance(budget, dict):
-        for _ in range(4):
-            response = JSONResponse(payload)
-            current = budget.get("response_bytes")
-            budget["response_bytes"] = len(response.body)
-            if current == len(response.body):
-                break
-    response = JSONResponse(payload)
-    if len(response.body) > max_bytes:
+    response_bytes = _set_exact_response_size(payload)
+    if response_bytes > max_bytes:
         return JSONResponse(
             {
                 "detail": "History response exceeds serialized byte limit.",
@@ -121,6 +184,9 @@ def bounded_history_json_response(
             },
             status_code=413,
         )
+    response = JSONResponse(payload)
+    if len(response.body) != response_bytes:
+        raise RuntimeError("History response byte accounting mismatch.")
     return response
 
 

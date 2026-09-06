@@ -79,8 +79,8 @@ class HistoryBackendClient:
 
         try:
             payload = await self._fetch_json("/healthz")
-        except Exception as exc:  # noqa: BLE001 - surface optional-backend errors as degraded status.
-            logger.warning("History backend status request failed: %s", exc)
+        except Exception:  # noqa: BLE001 - surface optional-backend errors as degraded status.
+            logger.warning("History backend status request failed.")
             return {
                 "configured": True,
                 "available": False,
@@ -124,8 +124,8 @@ class HistoryBackendClient:
 
         try:
             return await self._fetch_slot_history(slot, system_id, enclosure_id, window_hours=window_hours)
-        except Exception as exc:  # noqa: BLE001 - optional backend should degrade gracefully.
-            logger.warning("History backend slot history request failed: %s", exc)
+        except Exception:  # noqa: BLE001 - optional backend should degrade gracefully.
+            logger.warning("History backend slot history request failed.")
             return self._failed_slot_payload(slot, system_id, enclosure_id)
 
     async def _fetch_slot_history(
@@ -192,15 +192,14 @@ class HistoryBackendClient:
                     return self._failed_slot_payload(slot, system_id, enclosure_id)
                 try:
                     return await self._fetch_slot_history(slot, system_id, enclosure_id, window_hours=window_hours)
-                except HistoryBackendUnavailableError as exc:
+                except HistoryBackendUnavailableError:
                     if not unreachable.is_set():
                         logger.warning(
-                            "History backend unreachable during per-slot fallback; skipping remaining slots: %s",
-                            exc,
+                            "History backend unreachable during per-slot fallback; skipping remaining slots."
                         )
                     unreachable.set()
-                except Exception as exc:  # noqa: BLE001 - optional backend should degrade gracefully.
-                    logger.warning("History backend slot history request failed: %s", exc)
+                except Exception:  # noqa: BLE001 - optional backend should degrade gracefully.
+                    logger.warning("History backend slot history request failed.")
                 return self._failed_slot_payload(slot, system_id, enclosure_id)
 
         results = await asyncio.gather(*(fetch_one(slot) for slot in unique_slots))
@@ -246,8 +245,8 @@ class HistoryBackendClient:
                 raise
             except HistoryBackendResponseError:
                 raise
-            except (HistoryBackendUnavailableError, OSError) as exc:
-                logger.warning("History backend multi-scope request failed: %s", exc)
+            except (HistoryBackendUnavailableError, OSError):
+                logger.warning("History backend multi-scope request failed.")
                 available = False
                 detail = HISTORY_BACKEND_FAILURE_DETAIL
         return {
@@ -331,8 +330,8 @@ class HistoryBackendClient:
                 raise HistoryBackendResponseError(0, "History backend returned a malformed histories payload.")
         except (HistoryBudgetExceeded, HistoryRequestShapeError) as exc:
             raise ValueError(str(exc)) from exc
-        except HistoryBackendUnavailableError as exc:
-            logger.warning("History backend scope history request failed: %s", exc)
+        except HistoryBackendUnavailableError:
+            logger.warning("History backend scope history request failed.")
             return {
                 slot: self._failed_slot_payload(slot, system_id, enclosure_id)
                 for slot in dict.fromkeys(slots)

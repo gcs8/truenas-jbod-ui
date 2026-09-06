@@ -34,7 +34,19 @@ from history_service.config import HistorySettings, get_history_settings
 from history_service.domain import MetricSample, SlotStateRecord, build_slot_events, isoformat_utc
 from history_service.migration_lock import history_lock_path, history_write_lock
 from history_service.segment_catalog import MIGRATION_PENDING_MARKER, activation_pending_path
+from history_service.segment_reader import SegmentedHistoryReader
 from history_service.store import DISK_IDENTITY_BACKFILL_USER_VERSION, HistoryStore, SlotStateUpdate
+
+
+@contextmanager
+def freeze_operation_bounds_now(now: datetime):
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.replace(tzinfo=None) if tz is None else now.astimezone(tz)
+
+    with patch("history_service.operation_bounds.datetime", FrozenDateTime):
+        yield
 
 
 class HistoryDomainTests(unittest.TestCase):
@@ -2712,6 +2724,211 @@ class HistoryStoreTests(unittest.TestCase):
         )
 
     @staticmethod
+    def _insert_scope_rollups(
+        store: HistoryStore,
+        *,
+        slot: int,
+        metric_name: str,
+        bucket_seconds: int,
+        count: int = 12,
+    ) -> None:
+        connection = sqlite3.connect(store.file_path)
+        try:
+            month = 1 if bucket_seconds == 3600 else 12
+            year = 2026 if bucket_seconds == 3600 else 2025
+            connection.executemany(
+                """
+                INSERT INTO metric_rollups (
+                    bucket_start, bucket_seconds, system_id, system_label,
+                    enclosure_key, enclosure_id, enclosure_label, slot,
+                    slot_label, metric_name, sample_count, value_sum,
+                    value_min, value_max, last_value, last_observed_at,
+                    disk_identity_key
+                ) VALUES (?, ?, 'archive-core', 'Archive CORE', 'enc-a',
+                          'enc-a', 'Front Shelf', ?, ?, ?, 1, ?, ?, ?, ?, ?, '')
+                """,
+                [
+                    (
+                        f"{year:04d}-{month:02d}-{day:02d}T00:00:00+00:00",
+                        bucket_seconds,
+                        slot,
+                        f"{slot:02d}",
+                        metric_name,
+                        float(day),
+                        float(day),
+                        float(day),
+                        float(day),
+                        f"{year:04d}-{month:02d}-{day:02d}T00:59:00+00:00",
+                    )
+                    for day in range(1, count + 1)
+                ],
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def _scope_materialization_fixture(
+        self,
+        raw_counts: dict[tuple[int, str], int],
+    ) -> HistoryStore:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        store = HistoryStore(str(Path(temp_dir.name) / "history.db"))
+        samples = []
+        for (slot, metric_name), count in raw_counts.items():
+            samples.extend(
+                replace(
+                    self._metric_sample(
+                        f"2026-02-{day:02d}T12:00:00+00:00",
+                        day,
+                        slot=slot,
+                    ),
+                    metric_name=metric_name,
+                )
+                for day in range(1, count + 1)
+            )
+            for bucket_seconds in (3600, 86400):
+                self._insert_scope_rollups(
+                    store,
+                    slot=slot,
+                    metric_name=metric_name,
+                    bucket_seconds=bucket_seconds,
+                )
+        store.insert_metric_samples(samples)
+        return store
+
+    @staticmethod
+    def _counting_connection(connection, materialized: dict[str, int]):
+        class CountingCursor:
+            def __init__(self, cursor, query: str) -> None:
+                self._cursor = cursor
+                self._query = query
+
+            def fetchall(self):
+                rows = self._cursor.fetchall()
+                if "FROM metric_samples" in self._query:
+                    materialized["raw"] = materialized.get("raw", 0) + len(rows)
+                if "FROM metric_rollups" in self._query:
+                    materialized["rollup"] = materialized.get("rollup", 0) + len(rows)
+                return rows
+
+            def __getattr__(self, name: str):
+                return getattr(self._cursor, name)
+
+        class CountingConnection:
+            def execute(self, query, parameters=()):
+                return CountingCursor(connection.execute(query, parameters), query)
+
+            def close(self) -> None:
+                connection.close()
+
+            def __getattr__(self, name: str):
+                return getattr(connection, name)
+
+        return CountingConnection()
+
+    def _read_scope_with_materialization_count(
+        self,
+        store: HistoryStore,
+        *,
+        segmented: bool,
+        slots: list[int],
+        metric_limits: dict[str, int],
+    ) -> tuple[dict[int, dict[str, Any]], dict[str, int]]:
+        materialized: dict[str, int] = {}
+        fixture_now = datetime(2025, 12, 31, tzinfo=timezone.utc)
+        arguments = {
+            "slots": slots,
+            "event_limit": 0,
+            "metric_limits": metric_limits,
+            "since": "2025-01-01T00:00:00+00:00",
+        }
+        if not segmented:
+            original_connect = store._connect
+
+            def counted_connect():
+                return self._counting_connection(original_connect(), materialized)
+
+            with freeze_operation_bounds_now(fixture_now):
+                with patch.object(store, "_connect", side_effect=counted_connect):
+                    payload = store.list_scope_history("archive-core", "enc-a", **arguments)
+            return payload, materialized
+
+        reader = SegmentedHistoryReader(hot_path=store.file_path)
+        original_query_connection = reader._query_connection
+
+        @contextmanager
+        def counted_query_connection(path: Path):
+            with original_query_connection(path) as connection:
+                yield self._counting_connection(connection, materialized)
+
+        with freeze_operation_bounds_now(fixture_now):
+            with patch.object(reader, "_query_connection", side_effect=counted_query_connection):
+                payload = reader.list_scope_history("archive-core", "enc-a", **arguments)
+        return payload, materialized
+
+    def test_scope_bulk_materializes_only_one_rollup_after_nine_raw_rows(self) -> None:
+        for segmented in (False, True):
+            with self.subTest(segmented=segmented):
+                store = self._scope_materialization_fixture({(5, "temperature_c"): 9})
+                payload, materialized = self._read_scope_with_materialization_count(
+                    store,
+                    segmented=segmented,
+                    slots=[5],
+                    metric_limits={"temperature_c": 10},
+                )
+
+                samples = payload[5]["metrics"]["temperature_c"]
+                self.assertEqual(materialized, {"raw": 9, "rollup": 1})
+                self.assertEqual(len(samples), 10)
+                self.assertNotIn("rollup_seconds", samples[8])
+                self.assertEqual(samples[9]["rollup_seconds"], 3600)
+
+    def test_scope_bulk_uses_each_slot_metric_remaining_quota(self) -> None:
+        raw_counts = {
+            (5, "temperature_c"): 9,
+            (5, "bytes_read"): 10,
+            (6, "temperature_c"): 7,
+            (6, "bytes_read"): 8,
+        }
+        for segmented in (False, True):
+            with self.subTest(segmented=segmented):
+                store = self._scope_materialization_fixture(raw_counts)
+                payload, materialized = self._read_scope_with_materialization_count(
+                    store,
+                    segmented=segmented,
+                    slots=[5, 6],
+                    metric_limits={"temperature_c": 10, "bytes_read": 10},
+                )
+
+                self.assertEqual(materialized, {"raw": 34, "rollup": 6})
+                for slot in (5, 6):
+                    for metric_name in ("temperature_c", "bytes_read"):
+                        samples = payload[slot]["metrics"][metric_name]
+                        raw_count = raw_counts[(slot, metric_name)]
+                        self.assertEqual(len(samples), 10)
+                        self.assertTrue(
+                            all("rollup_seconds" not in item for item in samples[:raw_count])
+                        )
+                        self.assertTrue(
+                            all(item["rollup_seconds"] == 3600 for item in samples[raw_count:])
+                        )
+
+    def test_scope_bulk_skips_rollup_queries_when_no_quota_remains(self) -> None:
+        for segmented in (False, True):
+            with self.subTest(segmented=segmented):
+                store = self._scope_materialization_fixture({(5, "temperature_c"): 10})
+                payload, materialized = self._read_scope_with_materialization_count(
+                    store,
+                    segmented=segmented,
+                    slots=[5],
+                    metric_limits={"temperature_c": 10},
+                )
+
+                self.assertEqual(materialized, {"raw": 10})
+                self.assertEqual(len(payload[5]["metrics"]["temperature_c"]), 10)
+
+    @staticmethod
     def _insert_event_rows(store: HistoryStore, observed_times: list[str]) -> None:
         connection = sqlite3.connect(store.file_path)
         try:
@@ -2938,14 +3155,15 @@ class HistoryStoreTests(unittest.TestCase):
             "archive-core", "enc-a", 5,
             metric_name="temperature_c", limit=10,
         )
-        scope = store.list_scope_history(
-            "archive-core",
-            "enc-a",
-            slots=[5],
-            event_limit=0,
-            metric_limits={"temperature_c": 10},
-            since="2025-09-05T00:00:00+00:00",
-        )
+        with freeze_operation_bounds_now(datetime(2026, 7, 1, tzinfo=timezone.utc)):
+            scope = store.list_scope_history(
+                "archive-core",
+                "enc-a",
+                slots=[5],
+                event_limit=0,
+                metric_limits={"temperature_c": 10},
+                since="2025-09-05T00:00:00+00:00",
+            )
 
         self.assertEqual([sample["value"] for sample in samples], [30.0])
         self.assertEqual(
@@ -3128,15 +3346,16 @@ class HistoryStoreTests(unittest.TestCase):
                     return original_connect()
 
                 started = time.perf_counter()
-                with patch.object(store, "_connect", counting_connect):
-                    before = store.list_scope_history(
-                        "archive-core",
-                        "enc-a",
-                        slots=list(range(slot_count)),
-                        event_limit=0,
-                        metric_limits={"temperature_c": 4},
-                        since="2022-01-01T00:00:00+00:00",
-                    )
+                with freeze_operation_bounds_now(datetime(2022, 12, 31, tzinfo=timezone.utc)):
+                    with patch.object(store, "_connect", counting_connect):
+                        before = store.list_scope_history(
+                            "archive-core",
+                            "enc-a",
+                            slots=list(range(slot_count)),
+                            event_limit=0,
+                            metric_limits={"temperature_c": 4},
+                            since="2022-01-01T00:00:00+00:00",
+                        )
                 pre_query_seconds = time.perf_counter() - started
                 self.assertEqual(connect_calls, 1)
 
@@ -3153,15 +3372,16 @@ class HistoryStoreTests(unittest.TestCase):
                 maintenance_seconds = time.perf_counter() - maintenance_started
                 connect_calls = 0
                 started = time.perf_counter()
-                with patch.object(store, "_connect", counting_connect):
-                    after = store.list_scope_history(
-                        "archive-core",
-                        "enc-a",
-                        slots=list(range(slot_count)),
-                        event_limit=0,
-                        metric_limits={"temperature_c": 4},
-                        since="2022-01-01T00:00:00+00:00",
-                    )
+                with freeze_operation_bounds_now(datetime(2022, 12, 31, tzinfo=timezone.utc)):
+                    with patch.object(store, "_connect", counting_connect):
+                        after = store.list_scope_history(
+                            "archive-core",
+                            "enc-a",
+                            slots=list(range(slot_count)),
+                            event_limit=0,
+                            metric_limits={"temperature_c": 4},
+                            since="2022-01-01T00:00:00+00:00",
+                        )
                 post_query_seconds = time.perf_counter() - started
 
                 self.assertEqual(summary["metric_samples_removed"], slot_count)

@@ -134,11 +134,46 @@ class HistoryBulkRouteBoundsTests(unittest.TestCase):
 
     def test_exact_serialized_response_overflow_returns_small_413(self) -> None:
         payload = {"histories": {"0": {"events": [], "metrics": {"temperature_c": ["x" * 1000]}}}}
-        response = history_main.bounded_history_json_response(payload, max_bytes=100)
+        with patch.object(history_main, "JSONResponse", wraps=history_main.JSONResponse) as response_type:
+            response = history_main.bounded_history_json_response(payload, max_bytes=100)
         self.assertEqual(response.status_code, 413)
+        self.assertEqual(response_type.call_count, 1)
         self.assertLess(len(response.body), 500)
         self.assertNotIn(b"xxxxxxxx", response.body)
         self.assertIn(str(MAX_RESPONSE_BYTES).encode(), response.body)
+
+    def test_response_budget_is_exact_with_one_serialization_across_digit_boundaries(self) -> None:
+        cases = ((57, 99), (58, 101), (956, 999), (957, 1001))
+
+        for value_length, expected_bytes in cases:
+            with self.subTest(expected_bytes=expected_bytes):
+                payload = {
+                    "data": "x" * value_length,
+                    "budget": {"response_bytes": 0},
+                }
+                with patch.object(
+                    history_main,
+                    "JSONResponse",
+                    wraps=history_main.JSONResponse,
+                ) as response_type:
+                    response = history_main.bounded_history_json_response(payload)
+
+                document = json.loads(response.body)
+                self.assertEqual(response_type.call_count, 1)
+                self.assertEqual(len(response.body), expected_bytes)
+                self.assertEqual(document["budget"]["response_bytes"], expected_bytes)
+
+    def test_response_budget_counts_real_history_keys_and_escaped_text_exactly(self) -> None:
+        payload = {
+            "scopes": [{"histories": {5: {"label": "temp\néra"}}}],
+            "budget": {"response_bytes": 0},
+        }
+
+        response = history_main.bounded_history_json_response(payload)
+
+        document = json.loads(response.body)
+        self.assertEqual(document["budget"]["response_bytes"], len(response.body))
+        self.assertEqual(document["scopes"][0]["histories"]["5"]["label"], "temp\néra")
 
     def test_store_rejects_unbounded_scope_work_before_opening_sqlite(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

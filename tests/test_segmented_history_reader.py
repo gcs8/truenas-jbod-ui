@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,17 @@ from unittest.mock import patch
 from history_service import segment_reader
 from history_service.segment_reader import MAX_HISTORY_QUERY_LIMIT, SegmentedHistoryReader
 from history_service.store import SCHEMA, HistoryStore
+
+
+@contextmanager
+def freeze_operation_bounds_now(now: datetime):
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.replace(tzinfo=None) if tz is None else now.astimezone(tz)
+
+    with patch("history_service.operation_bounds.datetime", FrozenDateTime):
+        yield
 
 
 class SegmentedHistoryReaderCliTests(unittest.TestCase):
@@ -192,20 +204,21 @@ class SegmentedHistoryReaderCliTests(unittest.TestCase):
                 [2, 1],
             )
             self.assertEqual(store.counts()["event_count"], 2)
-            self.assertEqual(
-                [
-                    sample["id"]
-                    for sample in store.list_scope_history(
-                        "system-1",
-                        "enclosure-1",
-                        slots=[1],
-                        event_limit=10,
-                        metric_limits={"temperature": 10},
-                        since="2025-01-01T00:00:00+00:00",
-                    )[1]["metrics"]["temperature"]
-                ],
-                [2, 1],
-            )
+            with freeze_operation_bounds_now(datetime(2025, 12, 31, tzinfo=timezone.utc)):
+                self.assertEqual(
+                    [
+                        sample["id"]
+                        for sample in store.list_scope_history(
+                            "system-1",
+                            "enclosure-1",
+                            slots=[1],
+                            event_limit=10,
+                            metric_limits={"temperature": 10},
+                            since="2025-01-01T00:00:00+00:00",
+                        )[1]["metrics"]["temperature"]
+                    ],
+                    [2, 1],
+                )
             store._segment_reader_cache = None
             store._segment_reader_identity = None
             with patch.object(
@@ -325,15 +338,20 @@ class SegmentedHistoryReaderCliTests(unittest.TestCase):
                 hot_path=hot_path,
                 segment_paths=[segment_path],
             )
-            with patch.object(reader, "_query_connection", wraps=reader._query_connection) as query_connection:
-                histories = reader.list_scope_history(
-                    "system-1",
-                    "enclosure-1",
-                    slots=[1, 2],
-                    event_limit=10,
-                    metric_limits={"temperature": 10},
-                    since="2025-01-01T00:00:00+00:00",
-                )
+            with freeze_operation_bounds_now(datetime(2025, 12, 31, tzinfo=timezone.utc)):
+                with patch.object(
+                    reader,
+                    "_query_connection",
+                    wraps=reader._query_connection,
+                ) as query_connection:
+                    histories = reader.list_scope_history(
+                        "system-1",
+                        "enclosure-1",
+                        slots=[1, 2],
+                        event_limit=10,
+                        metric_limits={"temperature": 10},
+                        since="2025-01-01T00:00:00+00:00",
+                    )
 
             self.assertEqual([event["id"] for event in histories[1]["events"]], [3, 1])
             self.assertEqual([event["id"] for event in histories[2]["events"]], [4, 2])
@@ -864,14 +882,15 @@ class SegmentedHistoryReaderCliTests(unittest.TestCase):
                 metric_name="temperature",
                 limit=10,
             )
-            batched_samples = reader.list_scope_history(
-                "system-1",
-                "enclosure-1",
-                slots=[1],
-                event_limit=0,
-                metric_limits={"temperature": 10},
-                since="2025-01-01T00:00:00+00:00",
-            )[1]["metrics"]["temperature"]
+            with freeze_operation_bounds_now(datetime(2025, 12, 31, tzinfo=timezone.utc)):
+                batched_samples = reader.list_scope_history(
+                    "system-1",
+                    "enclosure-1",
+                    slots=[1],
+                    event_limit=0,
+                    metric_limits={"temperature": 10},
+                    since="2025-01-01T00:00:00+00:00",
+                )[1]["metrics"]["temperature"]
 
             self.assertEqual(len(batched_samples), 1)
             self.assertEqual(batched_samples[0]["value"], 33.0)

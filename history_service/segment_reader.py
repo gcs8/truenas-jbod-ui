@@ -1123,6 +1123,9 @@ class SegmentedHistoryReader:
         rollups_by_metric_interval_slot: dict[str, dict[int, dict[int, list[dict[str, Any]]]]] = {
             metric_name: {3600: {}, 86400: {}} for metric_name in metric_limits
         }
+        rollup_paths_by_metric_interval: dict[str, dict[int, list[Path]]] = {
+            metric_name: {3600: [], 86400: []} for metric_name in metric_limits
+        }
         for path in (self.hot_path, *reversed(self._selected_segment_paths(since=since))):
             with self._query_connection(path) as connection:
                 if not requested_slots:
@@ -1161,26 +1164,41 @@ class SegmentedHistoryReader:
                         if len(retained_events) < event_limit:
                             retained_events.append(item)
                 for metric_name, limit in metric_limits.items():
+                    raw_quotas = [
+                        (slot, limit - len(raw_by_metric_slot[metric_name].get(slot, [])))
+                        for slot in discovered_slots
+                        if len(raw_by_metric_slot[metric_name].get(slot, [])) < limit
+                    ]
+                    if not raw_quotas:
+                        continue
+                    quota_values = ", ".join("(?, ?)" for _ in raw_quotas)
+                    quota_parameters = [value for quota in raw_quotas for value in quota]
                     metric_where = [*where_clauses, "metric_name = ?"]
-                    metric_parameters = [*parameters, metric_name]
+                    metric_parameters = [*quota_parameters, *parameters, metric_name]
                     if since:
                         metric_where.append("julianday(observed_at) >= julianday(?)")
                         metric_parameters.append(since)
                     rows = connection.execute(
                         f"""
+                        WITH quotas(slot_number, remaining) AS (
+                            VALUES {quota_values}
+                        )
                         SELECT * FROM (
-                            SELECT *, ROW_NUMBER() OVER (
-                                PARTITION BY slot, metric_name
-                                ORDER BY julianday(observed_at) DESC, id DESC
-                            ) AS row_number
+                            SELECT metric_samples.*, quotas.remaining,
+                                   ROW_NUMBER() OVER (
+                                       PARTITION BY slot, metric_name
+                                       ORDER BY julianday(observed_at) DESC, id DESC
+                                   ) AS row_number
                             FROM metric_samples
+                            JOIN quotas ON quotas.slot_number = metric_samples.slot
                             WHERE {' AND '.join(metric_where)}
-                        ) WHERE row_number <= ?
+                        ) WHERE row_number <= remaining
                         """,
-                        [*metric_parameters, limit],
+                        metric_parameters,
                     ).fetchall()
                     for row in rows:
                         item = dict(row)
+                        item.pop("remaining", None)
                         item.pop("row_number", None)
                         item["value"] = (
                             item["value_integer"]
@@ -1188,17 +1206,95 @@ class SegmentedHistoryReader:
                             else item["value_real"]
                         )
                         slot = int(item["slot"])
-                        retained_raw = raw_by_metric_slot[metric_name].setdefault(slot, [])
-                        if len(retained_raw) < limit:
-                            retained_raw.append(item)
+                        raw_by_metric_slot[metric_name].setdefault(slot, []).append(item)
                     for bucket_seconds in (3600, 86400):
                         rollup_where = [*where_clauses, "metric_name = ?", "bucket_seconds = ?"]
                         rollup_parameters: list[Any] = [*parameters, metric_name, bucket_seconds]
                         if since:
                             rollup_where.append("julianday(bucket_start) >= julianday(?)")
                             rollup_parameters.append(since)
+                        if connection.execute(
+                            f"""
+                            SELECT EXISTS(
+                                SELECT 1 FROM metric_rollups
+                                WHERE {' AND '.join(rollup_where)}
+                                LIMIT 1
+                            )
+                            """,
+                            rollup_parameters,
+                        ).fetchone()[0]:
+                            rollup_paths_by_metric_interval[metric_name][bucket_seconds].append(path)
+            event_quotas_filled = event_limit == 0 or all(
+                len(events_by_slot.get(slot, [])) >= event_limit for slot in slot_numbers
+            )
+            metric_quotas_filled = all(
+                all(
+                    len(raw_by_metric_slot[metric_name].get(slot, []))
+                    + sum(
+                        len(rollups_by_metric_interval_slot[metric_name][interval].get(slot, []))
+                        for interval in (3600, 86400)
+                    ) >= limit
+                    for metric_name, limit in metric_limits.items()
+                )
+                for slot in slot_numbers
+            )
+            if event_quotas_filled and metric_quotas_filled:
+                break
+
+        for metric_name, limit in metric_limits.items():
+            interval_rollups = rollups_by_metric_interval_slot[metric_name]
+            for bucket_seconds in (3600, 86400):
+                for path in rollup_paths_by_metric_interval[metric_name][bucket_seconds]:
+                    quotas: list[tuple[int, int, str | None, int]] = []
+                    for slot in discovered_slots:
+                        raw = raw_by_metric_slot[metric_name].get(slot, [])
+                        retained_count = len(raw) + sum(
+                            len(interval_rollups[interval].get(slot, []))
+                            for interval in (3600, 86400)
+                        )
+                        remaining = limit - retained_count
+                        if remaining <= 0:
+                            continue
+                        current_interval = interval_rollups[bucket_seconds].get(slot, [])
+                        prior = current_interval or (
+                            interval_rollups[3600].get(slot, [])
+                            if bucket_seconds == 86400
+                            else []
+                        ) or raw
+                        before = str(prior[-1]["observed_at"]) if prior else None
+                        if before and bucket_seconds == 86400 and interval_rollups[3600].get(slot):
+                            before = _utc_day_start(before)
+                        quotas.append((slot, remaining, before, int(bool(current_interval))))
+                    if not quotas:
+                        break
+
+                    quota_values = ", ".join("(?, ?, ?, ?)" for _ in quotas)
+                    quota_parameters = [value for quota in quotas for value in quota]
+                    rollup_where = [
+                        *where_clauses,
+                        "metric_name = ?",
+                        "bucket_seconds = ?",
+                        "(quotas.boundary IS NULL"
+                        " OR julianday(bucket_start) < julianday(quotas.boundary)"
+                        " OR (quotas.inclusive = 1"
+                        "     AND julianday(bucket_start) = julianday(quotas.boundary)))",
+                    ]
+                    rollup_parameters: list[Any] = [
+                        *quota_parameters,
+                        *parameters,
+                        metric_name,
+                        bucket_seconds,
+                    ]
+                    if since:
+                        rollup_where.append("julianday(bucket_start) >= julianday(?)")
+                        rollup_parameters.append(since)
+                    rows = []
+                    with self._query_connection(path) as connection:
                         rows = connection.execute(
                             f"""
+                            WITH quotas(slot_number, remaining, boundary, inclusive) AS (
+                                VALUES {quota_values}
+                            )
                             SELECT * FROM (
                                 SELECT
                                     NULL AS id,
@@ -1220,46 +1316,25 @@ class SegmentedHistoryReader:
                                     value_sum AS _value_sum,
                                     last_value AS _last_value,
                                     last_observed_at AS _last_observed_at,
+                                    quotas.remaining AS remaining,
                                     ROW_NUMBER() OVER (
                                         PARTITION BY slot, metric_name
                                         ORDER BY julianday(bucket_start) DESC
                                     ) AS row_number
                                 FROM metric_rollups
+                                JOIN quotas ON quotas.slot_number = metric_rollups.slot
                                 WHERE {' AND '.join(rollup_where)}
-                            ) WHERE row_number <= ?
+                            ) WHERE row_number <= remaining
                             """,
-                            [*rollup_parameters, limit],
+                            rollup_parameters,
                         ).fetchall()
-                        for row in rows:
-                            item = dict(row)
-                            item.pop("row_number", None)
-                            item["value"] = item["value_real"]
-                            slot = int(item["slot"])
-                            retained_rollups = rollups_by_metric_interval_slot[metric_name][bucket_seconds].setdefault(
-                                slot, []
-                            )
-                            already_retained = len(raw_by_metric_slot[metric_name].get(slot, [])) + sum(
-                                len(rollups_by_metric_interval_slot[metric_name][interval].get(slot, []))
-                                for interval in (3600, 86400)
-                            )
-                            if already_retained < limit:
-                                retained_rollups.append(item)
-            event_quotas_filled = event_limit == 0 or all(
-                len(events_by_slot.get(slot, [])) >= event_limit for slot in slot_numbers
-            )
-            metric_quotas_filled = all(
-                all(
-                    len(raw_by_metric_slot[metric_name].get(slot, []))
-                    + sum(
-                        len(rollups_by_metric_interval_slot[metric_name][interval].get(slot, []))
-                        for interval in (3600, 86400)
-                    ) >= limit
-                    for metric_name, limit in metric_limits.items()
-                )
-                for slot in slot_numbers
-            )
-            if event_quotas_filled and metric_quotas_filled:
-                break
+                    for row in rows:
+                        item = dict(row)
+                        item.pop("remaining", None)
+                        item.pop("row_number", None)
+                        item["value"] = item["value_real"]
+                        slot = int(item["slot"])
+                        interval_rollups[bucket_seconds].setdefault(slot, []).append(item)
         payload_by_slot: dict[int, dict[str, Any]] = {}
         for slot in sorted(discovered_slots):
             events = sorted(

@@ -18,6 +18,21 @@ from app.services.history_backend import (
 
 
 class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
+    LEAKING_EXCEPTION_TEXT = (
+        "raw transport failure token=secret password=secret "
+        "url=https://history.invalid/private payload={'credential': 'secret'} path=/srv/private/history.db"
+    )
+
+    def assert_single_safe_warning(self, captured: Any, expected: str) -> None:
+        self.assertEqual(
+            captured.output,
+            [f"WARNING:app.services.history_backend:{expected}"],
+        )
+        rendered = "\n".join(captured.output)
+        self.assertNotIn("token=secret", rendered)
+        self.assertNotIn("password=secret", rendered)
+        self.assertNotIn(self.LEAKING_EXCEPTION_TEXT, rendered)
+
     def test_request_bytes_sync_propagates_current_server_request_id(self) -> None:
         client = HistoryBackendClient(
             HistoryConfig(service_url="http://history-backend:8001", timeout_seconds=10)
@@ -166,6 +181,127 @@ class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["detail"], "History backend request failed; see application logs.")
         self.assertNotIn("secret", str(payload))
         self.assertNotIn("Traceback", str(payload))
+
+    async def test_get_status_warning_omits_backend_exception_details(self) -> None:
+        client = HistoryBackendClient(
+            HistoryConfig(service_url="http://history-backend:8001", timeout_seconds=10)
+        )
+        error = RuntimeError(self.LEAKING_EXCEPTION_TEXT)
+
+        with (
+            patch.object(client, "_fetch_json", AsyncMock(side_effect=error)),
+            self.assertLogs("app.services.history_backend", level="WARNING") as captured,
+        ):
+            payload = await client.get_status()
+
+        self.assertFalse(payload["available"])
+        self.assertEqual(payload["detail"], HISTORY_BACKEND_FAILURE_DETAIL)
+        self.assert_single_safe_warning(captured, "History backend status request failed.")
+
+    async def test_get_slot_history_warning_omits_backend_exception_details(self) -> None:
+        client = HistoryBackendClient(
+            HistoryConfig(service_url="http://history-backend:8001", timeout_seconds=10)
+        )
+        error = RuntimeError(self.LEAKING_EXCEPTION_TEXT)
+
+        with (
+            patch.object(client, "_fetch_json", AsyncMock(side_effect=error)),
+            self.assertLogs("app.services.history_backend", level="WARNING") as captured,
+        ):
+            payload = await client.get_slot_history(5, "archive-core", "front", window_hours=24)
+
+        self.assertFalse(payload["available"])
+        self.assertEqual(payload["detail"], HISTORY_BACKEND_FAILURE_DETAIL)
+        self.assert_single_safe_warning(captured, "History backend slot history request failed.")
+
+    async def test_per_slot_fallback_unreachable_warning_omits_backend_exception_details(self) -> None:
+        client = HistoryBackendClient(
+            HistoryConfig(service_url="http://history-backend:8001", timeout_seconds=10)
+        )
+        error = HistoryBackendUnavailableError(self.LEAKING_EXCEPTION_TEXT)
+
+        with (
+            patch.object(client, "_fetch_slot_history", AsyncMock(side_effect=error)),
+            self.assertLogs("app.services.history_backend", level="WARNING") as captured,
+        ):
+            payload = await client._fallback_scope_history(
+                [5],
+                "archive-core",
+                "front",
+                window_hours=24,
+            )
+
+        self.assertFalse(payload[5]["available"])
+        self.assertEqual(payload[5]["detail"], HISTORY_BACKEND_FAILURE_DETAIL)
+        self.assert_single_safe_warning(
+            captured,
+            "History backend unreachable during per-slot fallback; skipping remaining slots.",
+        )
+
+    async def test_per_slot_fallback_response_warning_omits_backend_exception_details(self) -> None:
+        client = HistoryBackendClient(
+            HistoryConfig(service_url="http://history-backend:8001", timeout_seconds=10)
+        )
+        error = HistoryBackendResponseError(503, self.LEAKING_EXCEPTION_TEXT)
+
+        with (
+            patch.object(client, "_fetch_slot_history", AsyncMock(side_effect=error)),
+            self.assertLogs("app.services.history_backend", level="WARNING") as captured,
+        ):
+            payload = await client._fallback_scope_history(
+                [5],
+                "archive-core",
+                "front",
+                window_hours=24,
+            )
+
+        self.assertFalse(payload[5]["available"])
+        self.assertEqual(payload[5]["detail"], HISTORY_BACKEND_FAILURE_DETAIL)
+        self.assert_single_safe_warning(captured, "History backend slot history request failed.")
+
+    async def test_multi_scope_warning_omits_backend_exception_details(self) -> None:
+        client = HistoryBackendClient(
+            HistoryConfig(service_url="http://history-backend:8001", timeout_seconds=10)
+        )
+        error = HistoryBackendUnavailableError(self.LEAKING_EXCEPTION_TEXT)
+
+        with (
+            patch.object(client, "_send_json", AsyncMock(side_effect=error)),
+            self.assertLogs("app.services.history_backend", level="WARNING") as captured,
+        ):
+            payload = await client.get_scopes_history(
+                scopes=[{"system_id": "archive-core", "enclosure_id": "front", "slots": [5]}],
+                since="2026-04-15T23:10:00+00:00",
+                metrics=["temperature_c"],
+                event_limit=12,
+                metric_limit=60,
+            )
+
+        self.assertFalse(payload["available"])
+        self.assertEqual(payload["detail"], HISTORY_BACKEND_FAILURE_DETAIL)
+        self.assert_single_safe_warning(captured, "History backend multi-scope request failed.")
+
+    async def test_get_scope_history_warning_omits_backend_exception_details(self) -> None:
+        client = HistoryBackendClient(
+            HistoryConfig(service_url="http://history-backend:8001", timeout_seconds=10)
+        )
+        error = HistoryBackendUnavailableError(self.LEAKING_EXCEPTION_TEXT)
+
+        with (
+            patch.object(client, "get_scopes_history", AsyncMock(side_effect=error)),
+            patch.object(client, "_build_since_isoformat", return_value="2026-04-15T23:10:00+00:00"),
+            self.assertLogs("app.services.history_backend", level="WARNING") as captured,
+        ):
+            payload = await client.get_scope_history(
+                system_id="archive-core",
+                enclosure_id="front",
+                slots=[5],
+                window_hours=24,
+            )
+
+        self.assertFalse(payload[5]["available"])
+        self.assertEqual(payload[5]["detail"], HISTORY_BACKEND_FAILURE_DETAIL)
+        self.assert_single_safe_warning(captured, "History backend scope history request failed.")
 
     async def test_get_slot_history_shapes_metric_and_event_payloads(self) -> None:
         client = HistoryBackendClient(
