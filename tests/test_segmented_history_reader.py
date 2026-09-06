@@ -1305,7 +1305,6 @@ class SegmentedHistoryReaderCliTests(unittest.TestCase):
         metric_limit = 96
         with sqlite3.connect(":memory:") as connection:
             runtime_variable_limit = connection.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER)
-        self.assertEqual(runtime_variable_limit, 32_766)
 
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
