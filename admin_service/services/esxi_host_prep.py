@@ -26,6 +26,7 @@ MAX_METADATA_BYTES = 16 * 1024
 DEFAULT_MAX_STAGED_PACKAGES = 8
 DEFAULT_MAX_STAGED_BYTES = 2 * 1024 * 1024 * 1024
 STAGING_QUOTA_ERROR = "ESXi host-prep staging capacity is unavailable."
+STAGING_UPLOAD_WORKSPACE_PREFIX = "truenas-jbod-ui-host-prep-upload-"
 ALLOWED_UPLOAD_EXTENSIONS: dict[str, str] = {
     ".zip": "component_bundle",
     ".vib": "vib",
@@ -43,6 +44,16 @@ class _OwnedStagedPackage:
     metadata_identity: tuple[int, int]
     package_identity: tuple[int, int]
     size_bytes: int
+
+
+@dataclass(frozen=True)
+class HostPrepStageReservation:
+    token: str
+    max_bytes: int
+
+    @property
+    def workspace_prefix(self) -> str:
+        return f"{STAGING_UPLOAD_WORKSPACE_PREFIX}{self.token}-"
 
 
 class HostPrepStagingQuotaError(ValueError):
@@ -410,7 +421,48 @@ class ESXiHostPrepService:
         packages.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
         return packages
 
+    @contextmanager
+    def reserve_stage_upload(
+        self,
+        declared_bytes: int | None,
+    ) -> Iterator[HostPrepStageReservation]:
+        if declared_bytes is None:
+            reserved_bytes = MAX_UPLOAD_BYTES
+        elif type(declared_bytes) is not int or not 0 <= declared_bytes <= MAX_UPLOAD_BYTES:
+            raise ValueError(
+                f"declared_bytes must be between 0 and {MAX_UPLOAD_BYTES}."
+            )
+        else:
+            reserved_bytes = declared_bytes
+
+        token = uuid.uuid4().hex
+        with self._activity_lock:
+            staged_count, staged_bytes = self._scan_staged_usage_locked()
+            reserved_count = len(self._pending_stage_reservations)
+            pending_bytes = sum(self._pending_stage_reservations.values())
+            if (
+                staged_count + reserved_count + 1 > self.max_staged_packages
+                or staged_bytes + pending_bytes + reserved_bytes > self.max_staged_bytes
+            ):
+                raise HostPrepStagingQuotaError(STAGING_QUOTA_ERROR)
+            self._pending_stage_reservations[token] = reserved_bytes
+        reservation = HostPrepStageReservation(token=token, max_bytes=reserved_bytes)
+        try:
+            yield reservation
+        finally:
+            with self._activity_lock:
+                self._pending_stage_reservations.pop(token, None)
+
     def stage_package(self, filename: str, content: bytes) -> dict[str, Any]:
+        with self.reserve_stage_upload(len(content)) as reservation:
+            return self.stage_reserved_package(reservation, filename, content)
+
+    def stage_reserved_package(
+        self,
+        reservation: HostPrepStageReservation,
+        filename: str,
+        content: bytes,
+    ) -> dict[str, Any]:
         safe_filename = self._sanitize_filename(filename)
         if not content:
             raise ValueError("The uploaded ESXi package was empty.")
@@ -424,20 +476,27 @@ class ESXiHostPrepService:
         if install_mode is None:
             raise ValueError("Only ESXi .zip offline bundles and .vib packages are supported here.")
 
-        token = uuid.uuid4().hex
+        token = reservation.token
+        with self._activity_lock:
+            reserved_bytes = self._pending_stage_reservations.get(token)
+            if (
+                reserved_bytes is None
+                or reserved_bytes != reservation.max_bytes
+                or len(content) > reserved_bytes
+            ):
+                raise HostPrepStagingQuotaError(STAGING_QUOTA_ERROR)
+            staged_count, staged_bytes = self._scan_staged_usage_locked()
+            if (
+                staged_count + len(self._pending_stage_reservations)
+                > self.max_staged_packages
+                or staged_bytes + sum(self._pending_stage_reservations.values())
+                > self.max_staged_bytes
+            ):
+                raise HostPrepStagingQuotaError(STAGING_QUOTA_ERROR)
+
         package_dir = self.staging_root / token
         package_path = package_dir / safe_filename
         metadata_path = package_dir / "meta.json"
-        with self._activity_lock:
-            staged_count, staged_bytes = self._scan_staged_usage_locked()
-            reserved_count = len(self._pending_stage_reservations)
-            reserved_bytes = sum(self._pending_stage_reservations.values())
-            if (
-                staged_count + reserved_count + 1 > self.max_staged_packages
-                or staged_bytes + reserved_bytes + len(content) > self.max_staged_bytes
-            ):
-                raise HostPrepStagingQuotaError(STAGING_QUOTA_ERROR)
-            self._pending_stage_reservations[token] = len(content)
         try:
             package_dir.mkdir(parents=False, exist_ok=False)
             package_path.write_bytes(content)
@@ -457,9 +516,19 @@ class ESXiHostPrepService:
         except BaseException:
             self._cleanup_failed_stage(package_dir, package_path, metadata_path)
             raise
-        finally:
-            with self._activity_lock:
-                self._pending_stage_reservations.pop(token, None)
+
+    def _entry_has_pending_stage_reservation(self, entry_name: str) -> bool:
+        if entry_name in self._pending_stage_reservations:
+            return True
+        if not entry_name.startswith(STAGING_UPLOAD_WORKSPACE_PREFIX):
+            return False
+        remainder = entry_name[len(STAGING_UPLOAD_WORKSPACE_PREFIX) :]
+        token, separator, _suffix = remainder.partition("-")
+        return (
+            bool(separator)
+            and PACKAGE_TOKEN_PATTERN.fullmatch(token) is not None
+            and token in self._pending_stage_reservations
+        )
 
     def _scan_staged_usage_locked(self) -> tuple[int, int]:
         root_fd: int | None = None
@@ -486,7 +555,7 @@ class ESXiHostPrepService:
                 for index, entry in enumerate(entries):
                     if index >= MAX_ACCOUNTING_ENTRIES:
                         raise HostPrepStagingQuotaError(STAGING_QUOTA_ERROR)
-                    if entry.name in self._pending_stage_reservations:
+                    if self._entry_has_pending_stage_reservation(entry.name):
                         continue
                     try:
                         package = self._load_owned_package_for_cleanup(

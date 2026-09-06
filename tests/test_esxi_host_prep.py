@@ -514,6 +514,49 @@ class ESXiHostPrepServiceTests(unittest.TestCase):
             ):
                 service.stage_package("third.vib", b"x")
 
+    def test_stage_reservation_rejects_excess_before_spool_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = ESXiHostPrepService(
+                temp_dir,
+                max_staged_packages=1,
+                max_staged_bytes=7,
+                probe_factory=FakeProbe,
+            )
+
+            with service.reserve_stage_upload(7) as reservation:
+                self.assertEqual(reservation.max_bytes, 7)
+                with self.assertRaisesRegex(
+                    ValueError,
+                    r"^ESXi host-prep staging capacity is unavailable\.$",
+                ):
+                    with service.reserve_stage_upload(1):
+                        self.fail("A second reservation must not be admitted")
+
+    def test_pending_upload_workspace_is_charged_by_its_reservation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = ESXiHostPrepService(
+                temp_dir,
+                max_staged_packages=2,
+                max_staged_bytes=7,
+                probe_factory=FakeProbe,
+            )
+
+            with service.reserve_stage_upload(3) as first:
+                workspace = Path(
+                    tempfile.mkdtemp(prefix=first.workspace_prefix, dir=temp_dir)
+                )
+                (workspace / "bundle.archive").write_bytes(b"one")
+                with service.reserve_stage_upload(4) as second:
+                    staged = service.stage_reserved_package(
+                        second,
+                        "second.vib",
+                        b"four",
+                    )
+                (workspace / "bundle.archive").unlink()
+                workspace.rmdir()
+
+            self.assertEqual(staged["size_bytes"], 4)
+
     def test_concurrent_stage_admission_reserves_before_writing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = ESXiHostPrepService(

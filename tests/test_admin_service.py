@@ -10,6 +10,7 @@ import tempfile
 import threading
 import urllib.error
 import unittest
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -3415,11 +3416,19 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         )
         request.body = AsyncMock(side_effect=AssertionError("request.body() must not be used"))
         host_prep_service = MagicMock()
-        host_prep_service.stage_package.return_value = {
+        reservation = SimpleNamespace(
+            token="a" * 32,
+            max_bytes=len(b"storcli-bytes"),
+            workspace_prefix="truenas-jbod-ui-host-prep-upload-" + ("a" * 32) + "-",
+        )
+        host_prep_service.reserve_stage_upload.return_value = nullcontext(reservation)
+        host_prep_service.stage_reserved_package.return_value = {
             "token": "storcli-1",
             "filename": "BCM-vmware-storcli64.zip",
         }
-        host_prep_service.list_staged_packages.return_value = [host_prep_service.stage_package.return_value]
+        host_prep_service.list_staged_packages.return_value = [
+            host_prep_service.stage_reserved_package.return_value
+        ]
 
         with tempfile.TemporaryDirectory() as temp_dir:
             workspace = Path(temp_dir) / "host-prep-upload"
@@ -3437,23 +3446,26 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertEqual(payload["packages"][0]["filename"], "BCM-vmware-storcli64.zip")
         self.assertEqual(receive_probe.call_count, 2)
         request.body.assert_not_called()
-        host_prep_service.stage_package.assert_called_once_with("BCM-vmware-storcli64.zip", b"storcli-bytes")
+        host_prep_service.reserve_stage_upload.assert_called_once_with(len(b"storcli-bytes"))
+        host_prep_service.stage_reserved_package.assert_called_once_with(
+            reservation,
+            "BCM-vmware-storcli64.zip",
+            b"storcli-bytes",
+        )
 
     def test_esxi_host_prep_upload_removes_its_spool_before_quota_accounting(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/esxi-host-prep/upload")
         request, _ = make_streaming_request([b"payload"], content_length=7)
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            workspace = Path(temp_dir) / "truenas-jbod-ui-admin-import-synthetic"
-            workspace.mkdir()
             host_prep_service = ESXiHostPrepService(
                 temp_dir,
                 max_staged_packages=1,
                 max_staged_bytes=7,
             )
-            with (
-                patch("admin_service.main.tempfile.mkdtemp", return_value=str(workspace)),
-                patch("admin_service.main.get_esxi_host_prep_service", return_value=host_prep_service),
+            with patch(
+                "admin_service.main.get_esxi_host_prep_service",
+                return_value=host_prep_service,
             ):
                 response = asyncio.run(
                     route.endpoint(request=request, filename="vendor.vib")
@@ -3462,7 +3474,10 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             payload = json.loads(response.body.decode("utf-8"))
             self.assertEqual(response.status_code, 200)
             self.assertEqual(payload["package"]["size_bytes"], 7)
-            self.assertFalse(workspace.exists())
+            self.assertEqual(
+                [path.name for path in Path(temp_dir).iterdir()],
+                [payload["package"]["token"]],
+            )
 
     def test_esxi_host_prep_upload_rejects_declared_oversize_without_reading_stream(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/esxi-host-prep/upload")
@@ -3496,7 +3511,13 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         route = next(route for route in admin_app.routes if route.path == "/api/admin/esxi-host-prep/upload")
         request, _ = make_streaming_request([b"payload"], content_length=7)
         host_prep_service = MagicMock()
-        host_prep_service.stage_package.side_effect = HostPrepStagingQuotaError(
+        reservation = SimpleNamespace(
+            token="b" * 32,
+            max_bytes=7,
+            workspace_prefix="truenas-jbod-ui-host-prep-upload-" + ("b" * 32) + "-",
+        )
+        host_prep_service.reserve_stage_upload.return_value = nullcontext(reservation)
+        host_prep_service.stage_reserved_package.side_effect = HostPrepStagingQuotaError(
             "private staging path and quota values"
         )
 
@@ -3517,6 +3538,53 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             "ESXi host-prep staging capacity is unavailable.",
         )
         self.assertNotIn("private", str(raised.exception.detail))
+
+    def test_esxi_host_prep_upload_rejects_full_quota_before_reading_stream(self) -> None:
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/esxi-host-prep/upload")
+        request, receive_probe = make_streaming_request([b"x"], content_length=1)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            host_prep_service = ESXiHostPrepService(
+                temp_dir,
+                max_staged_packages=1,
+                max_staged_bytes=7,
+            )
+            host_prep_service.stage_package("existing.vib", b"payload")
+            with (
+                patch("admin_service.main.get_esxi_host_prep_service", return_value=host_prep_service),
+                self.assertRaises(HTTPException) as raised,
+            ):
+                asyncio.run(route.endpoint(request=request, filename="blocked.vib"))
+
+        self.assertEqual(raised.exception.status_code, 507)
+        self.assertEqual(
+            raised.exception.detail,
+            "ESXi host-prep staging capacity is unavailable.",
+        )
+        receive_probe.assert_not_called()
+
+    def test_esxi_host_prep_chunked_upload_reserves_full_request_limit(self) -> None:
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/esxi-host-prep/upload")
+        request, receive_probe = make_streaming_request([b"x"])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            host_prep_service = ESXiHostPrepService(
+                temp_dir,
+                max_staged_packages=1,
+                max_staged_bytes=7,
+            )
+            with (
+                patch("admin_service.main.get_esxi_host_prep_service", return_value=host_prep_service),
+                self.assertRaises(HTTPException) as raised,
+            ):
+                asyncio.run(route.endpoint(request=request, filename="blocked.vib"))
+
+        self.assertEqual(raised.exception.status_code, 507)
+        self.assertEqual(
+            raised.exception.detail,
+            "ESXi host-prep staging capacity is unavailable.",
+        )
+        receive_probe.assert_not_called()
 
     def test_esxi_host_prep_install_route_returns_install_status_payload(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/esxi-host-prep/install")
