@@ -251,6 +251,8 @@ them before starting the new images.
 
 ### Fixed
 
+- Fixed scoped enclosure refreshes, exact history boundaries, aggregate export
+  batching, and bounded JSON-only history proxy parsing (#379).
 - Mapped SATA bays through the Linux enclosure driver when shared AES addresses
   cannot distinguish the slots (#121).
 - Preserved legacy chassis slot widths when rendering older saved layouts
