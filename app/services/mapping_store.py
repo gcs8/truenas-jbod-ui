@@ -91,6 +91,12 @@ class _ClassifiedStore:
     mappings: dict[Identity, ManualMapping]
 
 
+@dataclass(frozen=True)
+class _TempFileIdentity:
+    device: int
+    inode: int
+
+
 class _VersionedEntries(dict[str, ManualMapping]):
     __slots__ = ("__store_version",)
 
@@ -1250,7 +1256,24 @@ class MappingStore:
         self._classify_entries(2, entries)
         return data
 
-    def _create_temp_file(self) -> tuple[Path, int]:
+    @staticmethod
+    def _unlink_owned_temp_file(
+        temp_path: Path,
+        identity: _TempFileIdentity,
+    ) -> None:
+        try:
+            current = os.lstat(temp_path)
+            if (
+                not stat.S_ISREG(current.st_mode)
+                or current.st_dev != identity.device
+                or current.st_ino != identity.inode
+            ):
+                return
+            temp_path.unlink()
+        except OSError:
+            pass
+
+    def _create_temp_file(self) -> tuple[Path, int, _TempFileIdentity]:
         for _attempt in range(128):
             temp_path = self.file_path.parent / (
                 f"{self.file_path.name}.{secrets.token_hex(16)}.tmp"
@@ -1264,34 +1287,38 @@ class MappingStore:
             except FileExistsError:
                 continue
             temp_stat: os.stat_result | None = None
+            temp_identity: _TempFileIdentity | None = None
             try:
                 os.fchmod(descriptor, 0o600)
                 temp_stat = os.fstat(descriptor)
+                if not stat.S_ISREG(temp_stat.st_mode):
+                    raise OSError("Mapping temporary path is not a regular file.")
+                temp_identity = _TempFileIdentity(
+                    device=temp_stat.st_dev,
+                    inode=temp_stat.st_ino,
+                )
                 if stat.S_IMODE(temp_stat.st_mode) != 0o600:
                     raise OSError("Mapping temporary file mode is not 0600.")
             except Exception:
                 if temp_stat is None:
                     try:
                         temp_stat = os.fstat(descriptor)
+                        if stat.S_ISREG(temp_stat.st_mode):
+                            temp_identity = _TempFileIdentity(
+                                device=temp_stat.st_dev,
+                                inode=temp_stat.st_ino,
+                            )
                     except OSError:
                         pass
                 try:
                     os.close(descriptor)
                 except OSError:
                     pass
-                if temp_stat is not None:
-                    try:
-                        current = os.lstat(temp_path)
-                        if (
-                            stat.S_ISREG(current.st_mode)
-                            and current.st_dev == temp_stat.st_dev
-                            and current.st_ino == temp_stat.st_ino
-                        ):
-                            temp_path.unlink()
-                    except FileNotFoundError:
-                        pass
+                if temp_identity is not None:
+                    self._unlink_owned_temp_file(temp_path, temp_identity)
                 raise
-            return temp_path, descriptor
+            assert temp_identity is not None
+            return temp_path, descriptor, temp_identity
         raise FileExistsError("Could not allocate a unique mapping temporary file.")
 
     @staticmethod
@@ -1355,9 +1382,10 @@ class MappingStore:
         data = self._serialize_v2(mappings)
         temp_path: Path | None = None
         descriptor: int | None = None
+        temp_identity: _TempFileIdentity | None = None
         replaced = False
         try:
-            temp_path, descriptor = self._create_temp_file()
+            temp_path, descriptor, temp_identity = self._create_temp_file()
             self._write_temp_file(descriptor, data)
             os.close(descriptor)
             descriptor = None
@@ -1371,11 +1399,12 @@ class MappingStore:
                     os.close(descriptor)
                 except OSError:
                     pass
-            if not replaced and temp_path is not None:
-                try:
-                    temp_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
+            if (
+                not replaced
+                and temp_path is not None
+                and temp_identity is not None
+            ):
+                self._unlink_owned_temp_file(temp_path, temp_identity)
             if replaced:
                 raise MappingDurabilityError() from exc
             raise

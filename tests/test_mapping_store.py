@@ -4,7 +4,9 @@ import json
 import os
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 from app.models.domain import ManualMapping
@@ -2988,6 +2990,587 @@ class MappingStoreAuthoritativeLoadTests(unittest.TestCase):
                 store.load_all()
             self.assertEqual(store.file_path.read_bytes(), raw)
             self.assertEqual(self.temp_paths(store), set())
+
+
+class MappingStoreIdentityBoundTempCleanupTests(unittest.TestCase):
+    def make_store(self, root: str) -> MappingStore:
+        return MappingStore(str(Path(root) / "mappings.json"))
+
+    @staticmethod
+    def old_mapping() -> ManualMapping:
+        return ManualMapping(
+            system_id="system-a",
+            enclosure_id="enc-a",
+            slot=1,
+            serial="OLD",
+        )
+
+    @staticmethod
+    def new_mapping() -> ManualMapping:
+        return ManualMapping(
+            system_id="system-b",
+            enclosure_id="enc-b",
+            slot=2,
+            serial="NEW",
+        )
+
+    def seed_target(self, store: MappingStore) -> bytes:
+        mapping = self.old_mapping()
+        payload = {
+            "version": 1,
+            "updated_at": "2026-09-05T00:00:00+00:00",
+            "slot_mappings": {
+                "system-a:enc-a:1": mapping.model_dump(mode="json"),
+            },
+        }
+        raw = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+        store.file_path.write_bytes(raw)
+        return raw
+
+    def assert_target_unchanged(
+        self,
+        store: MappingStore,
+        target_exists: bool,
+        old: bytes | None,
+    ) -> None:
+        if target_exists:
+            self.assertEqual(store.file_path.read_bytes(), old)
+        else:
+            self.assertFalse(store.file_path.exists())
+
+    def test_pre_replace_cleanup_never_removes_swapped_pathnames(self) -> None:
+        failure_points = (
+            "_write_temp_file",
+            "_write_temp_bytes",
+            "_flush_temp_file",
+            "_fsync_temp_file",
+            "descriptor_close",
+        )
+        replacement_kinds = ("regular", "symlink", "directory", "missing")
+        original_close = os.close
+
+        for target_exists in (False, True):
+            for replacement_kind in replacement_kinds:
+                for failure_point in failure_points:
+                    with (
+                        self.subTest(
+                            target_exists=target_exists,
+                            replacement_kind=replacement_kind,
+                            failure_point=failure_point,
+                        ),
+                        tempfile.TemporaryDirectory() as temp_dir,
+                    ):
+                        store = self.make_store(temp_dir)
+                        old = self.seed_target(store) if target_exists else None
+                        original_create = store._create_temp_file
+                        created_path: Path | None = None
+                        created_descriptor: int | None = None
+                        symlink_target: Path | None = None
+
+                        def create_then_swap() -> Any:
+                            nonlocal created_path, created_descriptor, symlink_target
+                            result = original_create()
+                            created_path = result[0]
+                            created_descriptor = result[1]
+                            created_path.unlink()
+                            if replacement_kind == "regular":
+                                created_path.write_bytes(b"unrelated replacement")
+                            elif replacement_kind == "symlink":
+                                symlink_target = created_path.with_name(
+                                    "unrelated-evidence"
+                                )
+                                symlink_target.write_bytes(b"unrelated symlink target")
+                                created_path.symlink_to(symlink_target)
+                            elif replacement_kind == "directory":
+                                created_path.mkdir()
+                                (created_path / "evidence").write_bytes(
+                                    b"unrelated directory"
+                                )
+                            return result
+
+                        def close_then_fail(descriptor: int) -> None:
+                            if descriptor != created_descriptor:
+                                original_close(descriptor)
+                                return
+                            original_close(descriptor)
+                            raise OSError("synthetic descriptor close failure")
+
+                        with ExitStack() as stack:
+                            stack.enter_context(
+                                patch.object(
+                                    store,
+                                    "_create_temp_file",
+                                    side_effect=create_then_swap,
+                                )
+                            )
+                            replace_temp = stack.enter_context(
+                                patch.object(
+                                    store,
+                                    "_replace_temp_file",
+                                    wraps=store._replace_temp_file,
+                                )
+                            )
+                            if failure_point == "descriptor_close":
+                                stack.enter_context(
+                                    patch.object(
+                                        mapping_store_module.os,
+                                        "close",
+                                        close_then_fail,
+                                    )
+                                )
+                            else:
+                                stack.enter_context(
+                                    patch.object(
+                                        store,
+                                        failure_point,
+                                        side_effect=OSError(
+                                            f"synthetic {failure_point} failure"
+                                        ),
+                                    )
+                                )
+                            with self.assertRaises(OSError):
+                                store.save_mapping(self.new_mapping())
+
+                        replace_temp.assert_not_called()
+                        assert created_path is not None
+                        assert created_descriptor is not None
+                        with self.assertRaises(OSError):
+                            os.fstat(created_descriptor)
+                        if replacement_kind == "regular":
+                            self.assertEqual(
+                                created_path.read_bytes(), b"unrelated replacement"
+                            )
+                        elif replacement_kind == "symlink":
+                            self.assertTrue(created_path.is_symlink())
+                            self.assertEqual(
+                                created_path.read_bytes(), b"unrelated symlink target"
+                            )
+                            assert symlink_target is not None
+                            self.assertEqual(
+                                symlink_target.read_bytes(), b"unrelated symlink target"
+                            )
+                        elif replacement_kind == "directory":
+                            self.assertTrue(created_path.is_dir())
+                            self.assertEqual(
+                                (created_path / "evidence").read_bytes(),
+                                b"unrelated directory",
+                            )
+                        else:
+                            self.assertFalse(created_path.exists())
+                        self.assert_target_unchanged(
+                            store, target_exists=target_exists, old=old
+                        )
+
+    def test_pre_replace_cleanup_removes_the_exact_owned_temp_inode(self) -> None:
+        failure_points = (
+            "_write_temp_file",
+            "_write_temp_bytes",
+            "_flush_temp_file",
+            "_fsync_temp_file",
+            "descriptor_close",
+        )
+        original_close = os.close
+
+        for failure_point in failure_points:
+            with (
+                self.subTest(failure_point=failure_point),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                store = self.make_store(temp_dir)
+                original_create = store._create_temp_file
+                created_path: Path | None = None
+                created_descriptor: int | None = None
+
+                def track_create() -> Any:
+                    nonlocal created_path, created_descriptor
+                    result = original_create()
+                    created_path = result[0]
+                    created_descriptor = result[1]
+                    return result
+
+                def close_then_fail(descriptor: int) -> None:
+                    if descriptor != created_descriptor:
+                        original_close(descriptor)
+                        return
+                    original_close(descriptor)
+                    raise OSError("synthetic descriptor close failure")
+
+                with ExitStack() as stack:
+                    stack.enter_context(
+                        patch.object(
+                            store, "_create_temp_file", side_effect=track_create
+                        )
+                    )
+                    replace_temp = stack.enter_context(
+                        patch.object(
+                            store,
+                            "_replace_temp_file",
+                            wraps=store._replace_temp_file,
+                        )
+                    )
+                    if failure_point == "descriptor_close":
+                        stack.enter_context(
+                            patch.object(
+                                mapping_store_module.os,
+                                "close",
+                                close_then_fail,
+                            )
+                        )
+                    else:
+                        stack.enter_context(
+                            patch.object(
+                                store,
+                                failure_point,
+                                side_effect=OSError(
+                                    f"synthetic {failure_point} failure"
+                                ),
+                            )
+                        )
+                    with self.assertRaises(OSError):
+                        store.save_mapping(self.new_mapping())
+
+                replace_temp.assert_not_called()
+                assert created_path is not None
+                assert created_descriptor is not None
+                self.assertFalse(created_path.exists())
+                with self.assertRaises(OSError):
+                    os.fstat(created_descriptor)
+
+    def test_cleanup_does_not_search_for_a_renamed_owned_temp(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+            original_create = store._create_temp_file
+            original_path: Path | None = None
+            evidence_path = store.file_path.with_name("renamed-operation-evidence")
+            descriptor: int | None = None
+
+            def create_then_rename() -> Any:
+                nonlocal original_path, descriptor
+                result = original_create()
+                original_path = result[0]
+                descriptor = result[1]
+                original_path.rename(evidence_path)
+                return result
+
+            with (
+                patch.object(
+                    store, "_create_temp_file", side_effect=create_then_rename
+                ),
+                patch.object(
+                    store,
+                    "_write_temp_file",
+                    side_effect=OSError("synthetic write failure"),
+                ),
+                patch.object(
+                    store,
+                    "_replace_temp_file",
+                    wraps=store._replace_temp_file,
+                ) as replace_temp,
+                self.assertRaises(OSError),
+            ):
+                store.save_mapping(self.new_mapping())
+
+            replace_temp.assert_not_called()
+            assert original_path is not None
+            assert descriptor is not None
+            self.assertFalse(original_path.exists())
+            self.assertTrue(evidence_path.is_file())
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+
+    def test_cleanup_may_unlink_a_recreated_hardlink_to_the_exact_owned_inode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+            original_create = store._create_temp_file
+            original_path: Path | None = None
+            evidence_path = store.file_path.with_name("hardlinked-operation-evidence")
+
+            def create_then_relink() -> Any:
+                nonlocal original_path
+                result = original_create()
+                original_path = result[0]
+                original_path.rename(evidence_path)
+                os.link(evidence_path, original_path)
+                return result
+
+            with (
+                patch.object(
+                    store, "_create_temp_file", side_effect=create_then_relink
+                ),
+                patch.object(
+                    store,
+                    "_write_temp_file",
+                    side_effect=OSError("synthetic write failure"),
+                ),
+                self.assertRaises(OSError),
+            ):
+                store.save_mapping(self.new_mapping())
+
+            assert original_path is not None
+            self.assertFalse(original_path.exists())
+            self.assertTrue(evidence_path.is_file())
+
+    def test_cleanup_lstat_failures_and_identity_mismatches_preserve_path(self) -> None:
+        original_lstat = os.lstat
+        cases = (
+            ("missing", FileNotFoundError("synthetic lstat missing")),
+            ("denied", PermissionError("synthetic lstat denied")),
+            ("error", OSError("synthetic lstat failure")),
+            ("wrong_type", None),
+            ("wrong_device", None),
+            ("wrong_inode", None),
+        )
+        for case, lstat_failure in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temp_dir:
+                store = self.make_store(temp_dir)
+                original_create = store._create_temp_file
+                created_path: Path | None = None
+                cleanup_armed = False
+
+                def track_create() -> Any:
+                    nonlocal created_path, cleanup_armed
+                    result = original_create()
+                    created_path = result[0]
+                    cleanup_armed = True
+                    return result
+
+                def injected_lstat(path: Path) -> os.stat_result:
+                    if cleanup_armed and Path(path) == created_path:
+                        if lstat_failure is not None:
+                            raise lstat_failure
+                        result = original_lstat(path)
+                        values = list(result)
+                        if case == "wrong_type":
+                            values[0] = (
+                                (int(values[0]) & 0o7777)
+                                | mapping_store_module.stat.S_IFLNK
+                            )
+                        elif case == "wrong_device":
+                            values[2] += 1
+                        else:
+                            values[1] += 1
+                        return os.stat_result(values)
+                    return original_lstat(path)
+
+                original_failure = OSError("synthetic write failure")
+                with (
+                    patch.object(
+                        store, "_create_temp_file", side_effect=track_create
+                    ),
+                    patch.object(
+                        store, "_write_temp_file", side_effect=original_failure
+                    ),
+                    patch.object(mapping_store_module.os, "lstat", injected_lstat),
+                    self.assertRaises(OSError) as raised,
+                ):
+                    store.save_mapping(self.new_mapping())
+
+                self.assertIs(raised.exception, original_failure)
+                assert created_path is not None
+                self.assertTrue(created_path.exists())
+
+    def test_cleanup_identity_allows_permission_mode_change_on_owned_inode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+            original_create = store._create_temp_file
+            created_path: Path | None = None
+
+            def create_then_chmod() -> Any:
+                nonlocal created_path
+                result = original_create()
+                created_path = result[0]
+                created_path.chmod(0o400)
+                return result
+
+            with (
+                patch.object(
+                    store, "_create_temp_file", side_effect=create_then_chmod
+                ),
+                patch.object(
+                    store,
+                    "_write_temp_file",
+                    side_effect=OSError("synthetic write failure"),
+                ),
+                self.assertRaises(OSError),
+            ):
+                store.save_mapping(self.new_mapping())
+
+            assert created_path is not None
+            self.assertFalse(created_path.exists())
+
+    def test_cleanup_unlink_errors_preserve_original_failure_and_temp_evidence(
+        self,
+    ) -> None:
+        original_unlink = Path.unlink
+        for cleanup_failure in (
+            FileNotFoundError("synthetic unlink missing"),
+            PermissionError("synthetic unlink denied"),
+            OSError("synthetic unlink failure"),
+        ):
+            with (
+                self.subTest(cleanup_failure=type(cleanup_failure).__name__),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                store = self.make_store(temp_dir)
+                original_create = store._create_temp_file
+                created_path: Path | None = None
+
+                def track_create() -> Any:
+                    nonlocal created_path
+                    result = original_create()
+                    created_path = result[0]
+                    return result
+
+                def fail_owned_unlink(
+                    path: Path, missing_ok: bool = False
+                ) -> None:
+                    if Path(path) == created_path:
+                        raise cleanup_failure
+                    original_unlink(path, missing_ok=missing_ok)
+
+                original_failure = OSError("synthetic write failure")
+                with (
+                    patch.object(
+                        store, "_create_temp_file", side_effect=track_create
+                    ),
+                    patch.object(
+                        store, "_write_temp_file", side_effect=original_failure
+                    ),
+                    patch.object(Path, "unlink", fail_owned_unlink),
+                    self.assertRaises(OSError) as raised,
+                ):
+                    store.save_mapping(self.new_mapping())
+
+                self.assertIs(raised.exception, original_failure)
+                assert created_path is not None
+                self.assertTrue(created_path.exists())
+
+    def test_fchmod_failure_cleanup_preserves_a_swapped_unrelated_inode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+            swapped_path: Path | None = None
+            descriptor: int | None = None
+
+            def swap_then_fail_fchmod(temp_descriptor: int, mode: int) -> None:
+                nonlocal swapped_path, descriptor
+                descriptor = temp_descriptor
+                paths = list(
+                    store.file_path.parent.glob(f"{store.file_path.name}.*.tmp")
+                )
+                self.assertEqual(len(paths), 1)
+                swapped_path = paths[0]
+                swapped_path.unlink()
+                swapped_path.write_bytes(b"unrelated replacement")
+                raise OSError("synthetic fchmod failure")
+
+            with (
+                patch.object(
+                    mapping_store_module.os,
+                    "fchmod",
+                    swap_then_fail_fchmod,
+                ),
+                patch.object(
+                    store,
+                    "_replace_temp_file",
+                    wraps=store._replace_temp_file,
+                ) as replace_temp,
+                self.assertRaises(OSError),
+            ):
+                store.save_mapping(self.new_mapping())
+
+            replace_temp.assert_not_called()
+            assert swapped_path is not None
+            assert descriptor is not None
+            self.assertEqual(swapped_path.read_bytes(), b"unrelated replacement")
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+
+    def test_fstat_mode_proof_failure_cleans_only_with_recovered_identity(
+        self,
+    ) -> None:
+        original_fstat = os.fstat
+        for scenario in ("unavailable", "recovered", "wrong_type"):
+            with (
+                self.subTest(scenario=scenario),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                store = self.make_store(temp_dir)
+                descriptor: int | None = None
+                calls = 0
+
+                def injected_fstat(temp_descriptor: int) -> os.stat_result:
+                    nonlocal descriptor, calls
+                    descriptor = temp_descriptor
+                    calls += 1
+                    if scenario == "unavailable" or (
+                        scenario == "recovered" and calls == 1
+                    ):
+                        raise OSError("synthetic fstat failure")
+                    result = original_fstat(temp_descriptor)
+                    if scenario == "wrong_type":
+                        values = list(result)
+                        values[0] = (
+                            (int(values[0]) & 0o7777)
+                            | mapping_store_module.stat.S_IFLNK
+                        )
+                        return os.stat_result(values)
+                    return result
+
+                with (
+                    patch.object(mapping_store_module.os, "fstat", injected_fstat),
+                    patch.object(
+                        store,
+                        "_replace_temp_file",
+                        wraps=store._replace_temp_file,
+                    ) as replace_temp,
+                    self.assertRaises(OSError),
+                ):
+                    store.save_mapping(self.new_mapping())
+
+                replace_temp.assert_not_called()
+                remaining = list(
+                    store.file_path.parent.glob(f"{store.file_path.name}.*.tmp")
+                )
+                self.assertEqual(len(remaining), 0 if scenario == "recovered" else 1)
+                assert descriptor is not None
+                with self.assertRaises(OSError):
+                    os.fstat(descriptor)
+
+    def test_post_replace_failures_never_attempt_temp_cleanup(self) -> None:
+        for failure_point in (
+            "_fsync_parent_directory",
+            "_validate_published_bytes",
+        ):
+            with (
+                self.subTest(failure_point=failure_point),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                store = self.make_store(temp_dir)
+                self.seed_target(store)
+                with (
+                    patch.object(
+                        store,
+                        failure_point,
+                        side_effect=OSError(f"synthetic {failure_point} failure"),
+                    ),
+                    patch.object(
+                        Path,
+                        "unlink",
+                        side_effect=AssertionError(
+                            "post-replace cleanup was attempted"
+                        ),
+                    ) as unlink,
+                    self.assertRaises(mapping_store_module.MappingDurabilityError),
+                ):
+                    store.save_mapping(self.new_mapping())
+
+                unlink.assert_not_called()
+                payload = json.loads(store.file_path.read_text(encoding="utf-8"))
+                self.assertEqual(payload["version"], 2)
+                self.assertEqual(
+                    {mapping.serial for mapping in store.load_all().values()},
+                    {"OLD", "NEW"},
+                )
 
 
 if __name__ == "__main__":
