@@ -47,6 +47,21 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
         content["runtime"] = await build_runtime_payload(runtime_service)
         return JSONResponse(content)
 
+    async def run_retained_thread_worker(function: Any, *args: Any) -> Any:
+        operation = asyncio.create_task(asyncio.to_thread(function, *args))
+        try:
+            await asyncio.wait((operation,))
+        except asyncio.CancelledError as cancellation:
+            while not operation.done():
+                try:
+                    await asyncio.wait((operation,))
+                except asyncio.CancelledError:
+                    continue
+            if not operation.cancelled():
+                operation.exception()
+            raise cancellation
+        return operation.result()
+
     @router.get("/", response_class=HTMLResponse)
     async def index(request: Request) -> HTMLResponse:
         bootstrap = await build_admin_state_payload(request)
@@ -309,10 +324,10 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
                             status_code=400,
                             detail="ESXi host-prep upload request body was empty.",
                         )
-                    content = await asyncio.to_thread(upload_path.read_bytes)
+                    content = await run_retained_thread_worker(upload_path.read_bytes)
                     upload_path.unlink()
                     upload_path.parent.rmdir()
-                    package = await asyncio.to_thread(
+                    package = await run_retained_thread_worker(
                         service.stage_reserved_package,
                         reservation,
                         filename,

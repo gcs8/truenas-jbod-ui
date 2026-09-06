@@ -3479,6 +3479,129 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
                 [payload["package"]["token"]],
             )
 
+    def test_esxi_host_prep_upload_cancellation_retains_reservation_until_spool_read_finishes(
+        self,
+    ) -> None:
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/esxi-host-prep/upload")
+
+        async def exercise() -> None:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                service = ESXiHostPrepService(
+                    temp_dir,
+                    max_staged_packages=1,
+                    max_staged_bytes=7,
+                )
+                request, _ = make_streaming_request([b"payload"], content_length=7)
+                read_entered = threading.Event()
+                read_release = threading.Event()
+                read_finished = threading.Event()
+
+                def blocking_read(path: Path) -> bytes:
+                    try:
+                        with path.open("rb") as source:
+                            read_entered.set()
+                            if not read_release.wait(timeout=5):
+                                raise AssertionError("Timed out waiting to release spool read")
+                            return source.read()
+                    finally:
+                        read_finished.set()
+
+                with (
+                    patch("admin_service.main.get_esxi_host_prep_service", return_value=service),
+                    patch.object(Path, "read_bytes", blocking_read),
+                ):
+                    task = asyncio.create_task(
+                        route.endpoint(request=request, filename="vendor.vib")
+                    )
+                    self.assertTrue(await asyncio.to_thread(read_entered.wait, 5))
+                    for _ in range(2):
+                        task.cancel()
+                        event_loop_turn = asyncio.Event()
+                        asyncio.get_running_loop().call_soon(event_loop_turn.set)
+                        await event_loop_turn.wait()
+                    try:
+                        with service.reserve_stage_upload(7):
+                            acquired_while_read_running = True
+                    except HostPrepStagingQuotaError:
+                        acquired_while_read_running = False
+                    finally:
+                        read_release.set()
+
+                    with self.assertRaises(asyncio.CancelledError):
+                        await task
+                    self.assertTrue(await asyncio.to_thread(read_finished.wait, 5))
+
+                self.assertFalse(acquired_while_read_running)
+
+        asyncio.run(exercise())
+
+    def test_esxi_host_prep_upload_cancellation_retains_reservation_until_stage_finishes(
+        self,
+    ) -> None:
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/esxi-host-prep/upload")
+
+        async def exercise() -> None:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                service = ESXiHostPrepService(
+                    temp_dir,
+                    max_staged_packages=1,
+                    max_staged_bytes=7,
+                )
+                request, _ = make_streaming_request([b"payload"], content_length=7)
+                stage_entered = threading.Event()
+                stage_release = threading.Event()
+                stage_worker_finished = threading.Event()
+                real_mkdir = Path.mkdir
+                real_stage_reserved_package = service.stage_reserved_package
+
+                def blocking_package_mkdir(path: Path, *args: Any, **kwargs: Any) -> None:
+                    if path.parent == service.staging_root and len(path.name) == 32:
+                        stage_entered.set()
+                        if not stage_release.wait(timeout=5):
+                            raise AssertionError("Timed out waiting to release staged package")
+                    real_mkdir(path, *args, **kwargs)
+
+                def tracked_stage_reserved_package(*args: Any, **kwargs: Any) -> dict[str, Any]:
+                    try:
+                        return real_stage_reserved_package(*args, **kwargs)
+                    finally:
+                        stage_worker_finished.set()
+
+                with (
+                    patch("admin_service.main.get_esxi_host_prep_service", return_value=service),
+                    patch.object(Path, "mkdir", blocking_package_mkdir),
+                    patch.object(
+                        service,
+                        "stage_reserved_package",
+                        tracked_stage_reserved_package,
+                    ),
+                ):
+                    task = asyncio.create_task(
+                        route.endpoint(request=request, filename="vendor.vib")
+                    )
+                    self.assertTrue(await asyncio.to_thread(stage_entered.wait, 5))
+                    for _ in range(2):
+                        task.cancel()
+                        event_loop_turn = asyncio.Event()
+                        asyncio.get_running_loop().call_soon(event_loop_turn.set)
+                        await event_loop_turn.wait()
+                    try:
+                        with service.reserve_stage_upload(7):
+                            acquired_while_stage_running = True
+                    except HostPrepStagingQuotaError:
+                        acquired_while_stage_running = False
+                    finally:
+                        stage_release.set()
+
+                    with self.assertRaises(asyncio.CancelledError):
+                        await task
+                    self.assertTrue(await asyncio.to_thread(stage_worker_finished.wait, 5))
+
+                self.assertFalse(acquired_while_stage_running)
+                self.assertEqual(len(service.list_staged_packages()), 1)
+
+        asyncio.run(exercise())
+
     def test_esxi_host_prep_upload_rejects_declared_oversize_without_reading_stream(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/esxi-host-prep/upload")
         request, receive_probe = make_streaming_request(
