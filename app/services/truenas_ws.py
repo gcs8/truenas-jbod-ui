@@ -18,12 +18,55 @@ from app.services.tls_context import build_tls_client_context, resolve_tls_serve
 
 logger = logging.getLogger(__name__)
 
+# Inventory layouts and operator-configured enclosure profiles support at most
+# 4096 slots. Accepting more API disk rows cannot represent a supported layout
+# and would let appliance-controlled cardinality drive model allocation.
+MAX_DISK_INVENTORY_ROWS = 4096
+_DISK_IDENTITY_KEYS = (
+    "name",
+    "devname",
+    "device",
+    "disk",
+    "identifier",
+    "serial",
+    "serial_lunid",
+    "lunid",
+    "multipath_name",
+    "multipath_member",
+    "zfs_guid",
+)
+
 
 class TrueNASAPIError(RuntimeError):
     pass
 
 
 MethodCaller = Callable[[str, list[Any]], Awaitable[Any]]
+
+
+def normalize_disk_inventory_rows(value: Any, *, source: str = "disk inventory") -> list[dict[str, Any]]:
+    if isinstance(value, list):
+        if len(value) > MAX_DISK_INVENTORY_ROWS:
+            raise TrueNASAPIError(
+                f"{source} returned {len(value)} rows; the supported maximum is {MAX_DISK_INVENTORY_ROWS}."
+            )
+        rows = value
+    elif isinstance(value, dict):
+        rows = [value]
+    else:
+        return []
+
+    return [
+        row
+        for row in rows
+        if isinstance(row, dict)
+        and any(
+            not isinstance(value := row.get(key), bool)
+            and isinstance(value, (str, int))
+            and bool(str(value).strip())
+            for key in _DISK_IDENTITY_KEYS
+        )
+    ]
 
 
 class _MiddlewareCallDispatcher:
@@ -234,10 +277,11 @@ class TrueNASWebsocketClient:
 
     async def _fetch_disks(self, call_method: MethodCaller) -> list[dict[str, Any]]:
         try:
-            query_disks = self._ensure_list(await call_method("disk.query", [[], {"extra": {"pools": True}}]))
+            query_payload = await call_method("disk.query", [[], {"extra": {"pools": True}}])
         except TrueNASAPIError:
             logger.warning("disk.query with extra.pools failed; retrying without extra options.")
-            query_disks = self._ensure_list(await call_method("disk.query", [[]]))
+            query_payload = await call_method("disk.query", [[]])
+        query_disks = normalize_disk_inventory_rows(query_payload, source="disk.query")
 
         if self.config.platform != "scale":
             return query_disks
@@ -305,11 +349,15 @@ class TrueNASWebsocketClient:
             for bucket in ("used", "unused"):
                 rows = payload.get(bucket)
                 if isinstance(rows, list):
-                    combined.extend(item for item in rows if isinstance(item, dict))
-            return combined
-        if isinstance(payload, list):
-            return [item for item in payload if isinstance(item, dict)]
-        return []
+                    if len(combined) + len(rows) > MAX_DISK_INVENTORY_ROWS:
+                        raise TrueNASAPIError(
+                            "disk.details returned more than "
+                            f"{MAX_DISK_INVENTORY_ROWS} rows; the supported maximum is "
+                            f"{MAX_DISK_INVENTORY_ROWS}."
+                        )
+                    combined.extend(rows)
+            payload = combined
+        return normalize_disk_inventory_rows(payload, source="disk.details")
 
     @staticmethod
     def _disk_lookup_keys(disk: dict[str, Any]) -> set[str]:

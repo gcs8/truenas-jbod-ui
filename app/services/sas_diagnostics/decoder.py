@@ -187,6 +187,15 @@ def bound_diagnostic_value(value: Any) -> Any:
     return value
 
 
+def _mpr_target_sort_key(value: Any) -> tuple[int, int, str]:
+    if value is None:
+        return (2, 0, "")
+    text = str(value)
+    if text.isascii() and text.isdigit():
+        return (0, int(text), text)
+    return (1, 0, text)
+
+
 def record_mpr_event_summary(summary: dict[str, Any], event: dict[str, Any], record: dict[str, Any]) -> None:
     summary["event_count"] += 1
     if record.get("severity") == "error":
@@ -254,7 +263,7 @@ def finalize_mpr_event_summary(summary: dict[str, Any]) -> dict[str, Any]:
         "sense_count": summary["sense_count"],
         "ioc_terminated_count": summary["ioc_terminated_count"],
         "devices": sorted(summary["devices"]),
-        "targets": sorted(summary["targets"], key=lambda value: int(value) if str(value).isdigit() else str(value)),
+        "targets": sorted(summary["targets"], key=_mpr_target_sort_key),
         "loginfo_counts": dict(summary["loginfo_counts"]),
         "sense_counts": dict(summary["sense_counts"]),
         "cam_status_counts": dict(summary["cam_status_counts"]),
@@ -428,7 +437,7 @@ def _top_mpr_findings(summary: dict[str, Any]) -> list[dict[str, Any]]:
                 "affected": {
                     "controllers": sorted(finding["controllers"]),
                     "devices": sorted(finding["devices"]),
-                    "targets": sorted(finding["targets"], key=lambda value: int(value) if str(value).isdigit() else str(value)),
+                    "targets": sorted(finding["targets"], key=_mpr_target_sort_key),
                 },
                 "loginfo": finding.get("loginfo"),
                 "asc": finding.get("asc"),
@@ -453,7 +462,7 @@ def _mpr_operator_summary(summary: dict[str, Any], primary_fault: dict[str, Any]
     if not summary.get("event_count"):
         return None
     devices = sorted(summary["devices"])
-    targets = sorted(summary["targets"], key=lambda value: int(value) if str(value).isdigit() else str(value))
+    targets = sorted(summary["targets"], key=_mpr_target_sort_key)
     scope = ""
     if devices:
         scope = f" on {', '.join(devices[:4])}"

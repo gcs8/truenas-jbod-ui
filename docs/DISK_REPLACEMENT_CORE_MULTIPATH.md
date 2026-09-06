@@ -30,9 +30,9 @@ view of which disks exist and how their paths group.
   `docs/SSH_READ_ONLY_SETUP.md` include them):
   - CORE: `/usr/local/bin/midclt call disk.multipath_sync`,
     `/usr/local/bin/midclt call disk.sync_all`,
-    `/usr/local/bin/midclt call core.get_jobs *`
+    `/usr/local/bin/midclt ^call core\.get_jobs \[\[\"id\"\,\"=\"\,[0-9]+\]\]$`
   - SCALE: `/usr/bin/midclt call disk.sync_all`,
-    `/usr/bin/midclt call core.get_jobs *`
+    `/usr/bin/midclt ^call core\.get_jobs \[\[\"id\"\,\"=\"\,[0-9]+\]\]$`
 - The app runs with `ADMIN_AUTH_MODE=basic` and a configured public origin, the
   same gate the identify LED controls use. In network mode the controls are
   disabled with a reason.

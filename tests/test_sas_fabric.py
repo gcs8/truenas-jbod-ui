@@ -25,6 +25,9 @@ from app.services.sas_diagnostics.decoder import (
     MAX_DIAGNOSTIC_NUMERIC_TOKEN_LENGTH,
     MAX_DIAGNOSTIC_TEXT_LENGTH,
     bound_diagnostic_value,
+    finalize_mpr_event_summary,
+    new_mpr_event_summary,
+    record_mpr_event_summary,
 )
 from app.services.sas_diagnostics import lsi_loginfo as lsi_loginfo_module
 from app.services.sas_diagnostics import scsi as scsi_module
@@ -921,6 +924,35 @@ Jun  7 10:39:05 truenas mpr0: Controller reported scsi ioc terminated tgt 12 SMI
                 self.assertEqual(controller["targets"], [bounded_target])
                 self.assertEqual(record["target"], bounded_target)
                 self.assertIn(f"mpr0:{bounded_target}", events["by_controller_target"])
+
+    def test_mpr_summary_orders_mixed_bounded_targets_without_losing_scope(self) -> None:
+        bounded_target = f"{'9' * (MAX_DIAGNOSTIC_NUMERIC_TOKEN_LENGTH - 3)}..."
+        summary = new_mpr_event_summary()
+
+        for sequence, target in enumerate(("10", bounded_target, "2", "10", None)):
+            event = {
+                "controller": "mpr0",
+                "target": target,
+                "event_type": "ioc_terminated",
+                "severity": "error",
+            }
+            record = {
+                **event,
+                "event_id": f"event-{sequence}",
+                "family": "sas_transport",
+                "fingerprint": "shared-finding",
+                "label": "Shared SAS fault",
+            }
+            record_mpr_event_summary(summary, event, record)
+
+        finalized = finalize_mpr_event_summary(summary)
+
+        expected_targets = ["2", "10", bounded_target]
+        self.assertEqual(finalized["targets"], expected_targets)
+        self.assertEqual(finalized["top_findings"][0]["affected"]["targets"], expected_targets)
+        self.assertIn(f"on target 2, 10, {bounded_target}", finalized["operator_summary"])
+        self.assertEqual(finalized["event_count"], 5)
+        self.assertEqual(finalized["top_findings"][0]["count"], 5)
 
     def test_aggregated_finding_severity_is_monotonic_across_event_order(self) -> None:
         info_event = "(da2:mpr0:0:10:0): SCSI sense: NO SENSE asc:7f,7e (Unknown hardware fault)"

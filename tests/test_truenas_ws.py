@@ -11,6 +11,63 @@ from app.services.truenas_ws import _MiddlewareCallDispatcher, TrueNASAPIError, 
 
 
 class TrueNASWebsocketClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_disk_query_accepts_the_maximum_supported_inventory(self) -> None:
+        client = TrueNASWebsocketClient(TrueNASConfig(api_key="token", platform="core"))
+        disks = [{"name": f"da{index}"} for index in range(4096)]
+
+        result = await client._fetch_disks(AsyncMock(return_value=disks))
+
+        self.assertEqual(result, disks)
+
+    async def test_disk_query_rejects_inventory_above_the_supported_maximum(self) -> None:
+        client = TrueNASWebsocketClient(TrueNASConfig(api_key="token", platform="core"))
+        disks = [{"name": f"da{index}"} for index in range(4097)]
+
+        call_method = AsyncMock(return_value=disks)
+
+        with self.assertRaisesRegex(TrueNASAPIError, "4096"):
+            await client._fetch_disks(call_method)
+
+        call_method.assert_awaited_once_with("disk.query", [[], {"extra": {"pools": True}}])
+
+    async def test_disk_query_discards_malformed_and_identity_free_rows(self) -> None:
+        client = TrueNASWebsocketClient(TrueNASConfig(api_key="token", platform="core"))
+        disk = {"name": "da0", "model": "Synthetic disk"}
+        call_method = AsyncMock(return_value=[None, "not-a-disk", {}, {"model": "metadata only"}, disk])
+
+        result = await client._fetch_disks(call_method)
+
+        self.assertEqual(result, [disk])
+
+    async def test_scale_disk_details_preserve_bounded_query_order(self) -> None:
+        client = TrueNASWebsocketClient(TrueNASConfig(api_key="token", platform="scale"))
+        call_method = AsyncMock(
+            side_effect=[
+                [{"name": "sdb", "status": "ONLINE"}, {"name": "sda", "status": "ONLINE"}],
+                {"used": [{"name": "sda", "model": "A"}], "unused": [{"name": "sdb", "model": "B"}]},
+            ]
+        )
+
+        result = await client._fetch_disks(call_method)
+
+        self.assertEqual([disk["name"] for disk in result], ["sdb", "sda"])
+        self.assertEqual([disk["model"] for disk in result], ["B", "A"])
+
+    async def test_scale_disk_details_reject_combined_inventory_above_the_supported_maximum(self) -> None:
+        client = TrueNASWebsocketClient(TrueNASConfig(api_key="token", platform="scale"))
+        call_method = AsyncMock(
+            side_effect=[
+                [{"name": "sda"}],
+                {
+                    "used": [{"name": f"used{index}"} for index in range(2048)],
+                    "unused": [{"name": f"unused{index}"} for index in range(2049)],
+                },
+            ]
+        )
+
+        with self.assertRaisesRegex(TrueNASAPIError, "4096"):
+            await client._fetch_disks(call_method)
+
     async def test_enclosure_query_failure_is_not_reported_as_an_empty_success(self) -> None:
         client = TrueNASWebsocketClient(TrueNASConfig(api_key="token"))
         primary_error = TrueNASAPIError("enclosure.query failed: EPERM")

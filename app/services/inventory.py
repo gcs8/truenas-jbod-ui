@@ -121,7 +121,12 @@ from app.services.parsers import (
 from app.services.ssh_probe import SSHCommandResult, SSHProbe, redact_ssh_command
 from app.services.slot_detail_store import SlotDetailCacheEntry, SlotDetailStore
 from app.services.supermicro_bmc import BMCInventory, SupermicroBMCService
-from app.services.truenas_ws import TrueNASAPIError, TrueNASRawData, TrueNASWebsocketClient
+from app.services.truenas_ws import (
+    TrueNASAPIError,
+    TrueNASRawData,
+    TrueNASWebsocketClient,
+    normalize_disk_inventory_rows,
+)
 
 SmartCacheKey = tuple[str, str, str, int, tuple[str, ...]]
 SmartCacheGenerationToken = tuple[int, int]
@@ -10710,6 +10715,7 @@ class InventoryService:
         disk_temperatures: dict[str, int],
         smart_tests: dict[str, dict[str, Any]],
     ) -> list[DiskRecord]:
+        disks = normalize_disk_inventory_rows(disks)
         records: list[DiskRecord] = []
         linux_block_index = self._index_linux_blockdevices(ssh_data)
         linux_scsi_index = self._index_linux_scsi_devices(ssh_data)
