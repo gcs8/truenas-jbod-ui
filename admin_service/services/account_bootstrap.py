@@ -54,14 +54,14 @@ LINUX_SG_SES_SUDO_COMMANDS = (
     "/usr/bin/sg_ses ^--dev-slot-num=[0-9]+ --clear=ident /dev/sg[0-9]+$",
 )
 SMARTCTL_SUDO_COMMANDS = (
-    "/usr/sbin/smartctl -x -j *",
-    "/usr/sbin/smartctl -x *",
-    "/usr/sbin/smartctl -d * -x -j *",
-    "/usr/sbin/smartctl -d * -x *",
-    "/usr/local/sbin/smartctl -x -j *",
-    "/usr/local/sbin/smartctl -x *",
-    "/usr/local/sbin/smartctl -d * -x -j *",
-    "/usr/local/sbin/smartctl -d * -x *",
+    "/usr/sbin/smartctl ^-x -j /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$",
+    "/usr/sbin/smartctl ^-x /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$",
+    r"/usr/sbin/smartctl ^-d [A-Za-z0-9][A-Za-z0-9_:+./-]*(\,[A-Za-z0-9][A-Za-z0-9_:+./-]*)* -x -j /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$",
+    r"/usr/sbin/smartctl ^-d [A-Za-z0-9][A-Za-z0-9_:+./-]*(\,[A-Za-z0-9][A-Za-z0-9_:+./-]*)* -x /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$",
+    "/usr/local/sbin/smartctl ^-x -j /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$",
+    "/usr/local/sbin/smartctl ^-x /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$",
+    r"/usr/local/sbin/smartctl ^-d [A-Za-z0-9][A-Za-z0-9_:+./-]*(\,[A-Za-z0-9][A-Za-z0-9_:+./-]*)* -x -j /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$",
+    r"/usr/local/sbin/smartctl ^-d [A-Za-z0-9][A-Za-z0-9_:+./-]*(\,[A-Za-z0-9][A-Za-z0-9_:+./-]*)* -x /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$",
 )
 LINUX_NVME_SUDO_COMMANDS = (
     "/usr/sbin/nvme smart-log -o json /dev/nvme*",

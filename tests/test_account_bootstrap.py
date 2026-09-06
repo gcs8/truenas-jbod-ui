@@ -269,7 +269,10 @@ class ServiceAccountBootstrapServiceTests(unittest.TestCase):
             "/usr/bin/sg_ses ^--dev-slot-num=[0-9]+ --clear=ident /dev/sg[0-9]+$",
             content,
         )
-        self.assertIn("/usr/sbin/smartctl -x -j *", content)
+        self.assertIn(
+            "/usr/sbin/smartctl ^-x -j /dev/[A-Za-z0-9_:+-]",
+            content,
+        )
         self.assertNotIn("sudo -n", content)
 
     def test_saved_sudo_commands_for_system_returns_only_saved_sudo_lines(self) -> None:
@@ -586,18 +589,41 @@ class BootstrapSudoGrantContractTests(unittest.IsolatedAsyncioTestCase):
                     )
 
     def test_smartctl_grants_only_allow_inventory_read_shapes(self) -> None:
-        allowed_argument_shapes = {
-            ("-x", "-j", "*"),
-            ("-x", "*"),
-            ("-d", "*", "-x", "-j", "*"),
-            ("-d", "*", "-x", "*"),
-        }
         for platform in self.platforms:
             with self.subTest(platform=platform):
                 for grant in SUDO_COMMANDS_BY_PLATFORM[platform]:
                     tokens = shlex.split(grant)
                     if Path(tokens[0]).name == "smartctl":
-                        self.assertIn(tuple(tokens[1:]), allowed_argument_shapes)
+                        arguments = grant.split(maxsplit=1)[1]
+                        self.assertTrue(arguments.startswith("^"), grant)
+                        self.assertTrue(arguments.endswith("$"), grant)
+
+    def test_smartctl_grants_reject_mutating_and_trailing_options(self) -> None:
+        legitimate = (
+            "/usr/sbin/smartctl -x -j /dev/sda",
+            "/usr/sbin/smartctl -x /dev/disk/by-id/scsi-synthetic.01",
+            "/usr/sbin/smartctl -d scsi -x -j /dev/boot",
+            "/usr/local/sbin/smartctl -d megaraid,12 -x /dev/da0",
+        )
+        rejected = (
+            "/usr/sbin/smartctl -x -j /dev/sda --smart=off",
+            "/usr/sbin/smartctl -x /dev/sda --set=wcache,off",
+            "/usr/sbin/smartctl -d scsi -x -j /dev/boot --offlineauto=off",
+            "/usr/local/sbin/smartctl -d megaraid,12 -x /dev/da0 --saveauto=off",
+            "/usr/sbin/smartctl -x -j /dev/../etc/shadow",
+        )
+        grants = tuple(
+            grant
+            for platform in self.platforms
+            for grant in SUDO_COMMANDS_BY_PLATFORM[platform]
+            if Path(shlex.split(grant)[0]).name == "smartctl"
+        )
+        for command in legitimate:
+            with self.subTest(command=command):
+                self.assertTrue(any(sudoers_grant_matches(grant, command) for grant in grants))
+        for command in rejected:
+            with self.subTest(command=command):
+                self.assertFalse(any(sudoers_grant_matches(grant, command) for grant in grants))
 
     def test_quantastor_bootstrap_does_not_grant_unbounded_root_cli_access(self) -> None:
         self.assertFalse(

@@ -270,8 +270,13 @@ midclt call user.update USER_ID '{"sudo":true,"sudo_nopasswd":true,"sudo_command
 If you want the full current web UI feature set on this CORE box, use this
 combined allow-list:
 
+The anchored command regexes require sudo 1.9.10 or newer. The bootstrap runs
+`visudo -cf` before installation when `visudo` is available. On an older host,
+enumerate the exact SMART device commands instead of replacing the regex with a
+wildcard.
+
 ```bash
-midclt call user.update USER_ID '{"sudo":true,"sudo_nopasswd":true,"sudo_commands":["/usr/sbin/sesutil map","/usr/sbin/sesutil show","/sbin/camcontrol devlist -v","/usr/sbin/sesutil locate -u /dev/ses* * on","/usr/sbin/sesutil locate -u /dev/ses* * off","/usr/local/sbin/smartctl -x -j *","/usr/local/sbin/smartctl -x *","/usr/sbin/mprutil show adapter","/usr/sbin/mprutil show adapters","/usr/sbin/mprutil show all","/usr/sbin/mprutil show devices","/usr/sbin/mprutil show enclosures","/usr/sbin/mprutil show expanders","/usr/sbin/mprutil show iocfacts","/usr/sbin/mprutil -u * show adapter","/usr/sbin/mprutil -u * show all","/usr/sbin/mprutil -u * show devices","/usr/sbin/mprutil -u * show enclosures","/usr/sbin/mprutil -u * show expanders","/usr/sbin/mprutil -u * show iocfacts","/usr/local/sbin/dmidecode -t slot","/usr/bin/tail -n 4000 /var/log/messages","/usr/local/bin/midclt call disk.multipath_sync","/usr/local/bin/midclt call disk.sync_all","/usr/local/bin/midclt ^call core\\.get_jobs \\[\\[\\\"id\\\"\\,\\\"=\\\"\\,[0-9]+\\]\\]$"]}'
+midclt call user.update USER_ID '{"sudo":true,"sudo_nopasswd":true,"sudo_commands":["/usr/sbin/sesutil map","/usr/sbin/sesutil show","/sbin/camcontrol devlist -v","/usr/sbin/sesutil locate -u /dev/ses* * on","/usr/sbin/sesutil locate -u /dev/ses* * off","/usr/local/sbin/smartctl ^-x -j /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$","/usr/local/sbin/smartctl ^-x /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$","/usr/sbin/mprutil show adapter","/usr/sbin/mprutil show adapters","/usr/sbin/mprutil show all","/usr/sbin/mprutil show devices","/usr/sbin/mprutil show enclosures","/usr/sbin/mprutil show expanders","/usr/sbin/mprutil show iocfacts","/usr/sbin/mprutil -u * show adapter","/usr/sbin/mprutil -u * show all","/usr/sbin/mprutil -u * show devices","/usr/sbin/mprutil -u * show enclosures","/usr/sbin/mprutil -u * show expanders","/usr/sbin/mprutil -u * show iocfacts","/usr/local/sbin/dmidecode -t slot","/usr/bin/tail -n 4000 /var/log/messages","/usr/local/bin/midclt call disk.multipath_sync","/usr/local/bin/midclt call disk.sync_all","/usr/local/bin/midclt ^call core\\.get_jobs \\[\\[\\\"id\\\"\\,\\\"=\\\"\\,[0-9]+\\]\\]$"]}'
 ```
 
 That enables:
@@ -625,8 +630,11 @@ through SSH.
 
 The `gpu-server` Ubuntu `mdadm` / NVMe test host currently uses:
 
+These anchored command regexes require sudo 1.9.10 or newer. Use exact
+per-device commands on an older host.
+
 ```bash
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x -j /dev/nvme*n*
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl ^-x -j /dev/nvme[0-9]+n[0-9]+$
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/nvme smart-log -o json /dev/nvme*
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/nvme id-ctrl -o json /dev/nvme*
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/nvme id-ns -o json /dev/nvme*
@@ -691,10 +699,10 @@ jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses ^-p ec /dev/sg[0-9]+$
 jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses ^--join --filter /dev/sg[0-9]+$
 jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses ^--dev-slot-num=[0-9]+ --set=ident /dev/sg[0-9]+$
 jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses ^--dev-slot-num=[0-9]+ --clear=ident /dev/sg[0-9]+$
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x -j /dev/sd*
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x /dev/sd*
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x -j /dev/disk/by-id/scsi-*
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x /dev/disk/by-id/scsi-*
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl ^-x -j /dev/sd[a-z]+$
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl ^-x /dev/sd[a-z]+$
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl ^-x -j /dev/disk/by-id/scsi-[A-Za-z0-9_.:+-]+$
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl ^-x /dev/disk/by-id/scsi-[A-Za-z0-9_.:+-]+$
 ```
 
 One node on that cluster currently exposes the real SES device, while the peer

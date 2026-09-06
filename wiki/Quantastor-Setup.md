@@ -185,13 +185,16 @@ SSH user can run `smartctl` and `sg_ses` without a password.
 
 SMART:
 
+The anchored command regexes require sudo 1.9.10 or newer. On an older node,
+enumerate exact device commands instead of using argument wildcards.
+
 ```bash
 sudo tee /etc/sudoers.d/jbodmap-smartctl >/dev/null <<'EOF'
 Defaults:jbodmap !requiretty
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x -j /dev/sd*
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x /dev/sd*
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x -j /dev/disk/by-id/scsi-*
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x /dev/disk/by-id/scsi-*
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl ^-x -j /dev/sd[a-z]+$
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl ^-x /dev/sd[a-z]+$
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl ^-x -j /dev/disk/by-id/scsi-[A-Za-z0-9_.:+-]+$
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl ^-x /dev/disk/by-id/scsi-[A-Za-z0-9_.:+-]+$
 EOF
 
 sudo chmod 440 /etc/sudoers.d/jbodmap-smartctl

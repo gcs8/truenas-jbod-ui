@@ -184,12 +184,15 @@ jbodmap ALL=(root) NOPASSWD: /usr/bin/tail -n 4000 /var/log/messages
 
 SCALE example:
 
+Anchored command regexes require sudo 1.9.10 or newer. Use exact per-device
+commands on older hosts, not argument wildcards.
+
 ```text
 jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses ^-p aes /dev/sg[0-9]+$
 jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses ^-p ec /dev/sg[0-9]+$
 jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses ^--dev-slot-num=[0-9]+ --set=ident /dev/sg[0-9]+$
 jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses ^--dev-slot-num=[0-9]+ --clear=ident /dev/sg[0-9]+$
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x -j /dev/*
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl ^-x -j /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$
 ```
 
 Generic Linux NVMe example:
@@ -197,7 +200,7 @@ Generic Linux NVMe example:
 ```text
 jbodmap ALL=(root) NOPASSWD: /usr/bin/lsblk -OJ
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/mdadm --detail --scan
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x -j /dev/nvme*
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl ^-x -j /dev/nvme[0-9]+n[0-9]+$
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/nvme smart-log -o json /dev/nvme*
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/nvme id-ctrl -o json /dev/nvme*
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/nvme id-ns -o json /dev/nvme*
