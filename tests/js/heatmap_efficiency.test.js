@@ -63,6 +63,15 @@ test("timeline rate lookup uses logarithmic reads of prepared samples", () => {
   assert.doesNotMatch(rateSource, /\.forEach\(/);
 });
 
+test("history heatmaps always request metric-only bounded playback", () => {
+  const source = functionSource("heatmapHistoryScopeRequest");
+  assert.match(source, /params\.set\("event_limit", "0"\)/);
+  assert.match(source, /params\.set\("metric_limit", "24"\)/);
+  assert.match(source, /params\.set\("window_hours", String\(boundedWindowHours\)\)/);
+  assert.match(source, /8760/);
+  assert.doesNotMatch(source, /metrics.*temperature_c.*bytes_read.*bytes_written/s);
+});
+
 test("attention score context provides constant-time view comparisons", () => {
   const entries = [
     { id: "a", temperature: 10, write: 10 },

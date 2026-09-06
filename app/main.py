@@ -13,14 +13,16 @@ import urllib.request
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Collection
+from typing import Any, Collection, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel, ConfigDict
 
 from admin_service.config import get_admin_settings
 from app import __version__
@@ -55,10 +57,19 @@ from app.models.domain import (
 from app.metrics import install_metrics
 from app.perf import add_perf_metadata, install_perf_timing_middleware, perf_stage
 from app.script_json import register_script_json_filters
-from app.services.history_backend import HistoryBackendClient
-from app.services.inventory import DiskInventorySyncBusy
+from app.services.history_backend import HistoryBackendClient, HistoryBackendPolicyError
+from app.services.inventory import (
+    DiskInventorySyncBusy,
+    SnapshotStateBusyError,
+    UnknownEnclosureError,
+)
 from app.services.inventory_registry import InventoryRegistry, SystemNotConfiguredError
-from app.services.mapping_store import MappingImportDigestMismatch, MappingRevisionConflict
+from app.services.mapping_store import (
+    MappingDurabilityError,
+    MappingImportDigestMismatch,
+    MappingRevisionConflict,
+    MappingScopeConflict,
+)
 from app.services.profile_registry import build_profile_reference_warnings
 from app.services.release_status import ReleaseStatusService
 from app.services.snapshot_export import (
@@ -67,6 +78,12 @@ from app.services.snapshot_export import (
     collect_configured_hostnames,
 )
 from app.services.truenas_ws import TrueNASAPIError
+from history_service.operation_bounds import (
+    ALLOWED_HISTORY_METRICS,
+    HistoryBudgetExceeded,
+    HistoryRequestShapeError,
+    build_history_read_plan,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
@@ -76,6 +93,30 @@ logger = logging.getLogger(__name__)
 INVALID_MAPPING_BUNDLE_DETAIL = "Mapping bundle is invalid."
 
 
+class HistoryRefreshProxyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["fast", "full"]
+
+
+class HistoryScopeProxyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    system_id: str
+    enclosure_id: str | None = None
+    slots: list[int]
+
+
+class HistoryScopesProxyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scopes: list[HistoryScopeProxyRequest]
+    metrics: list[str]
+    since: str
+    event_limit: int
+    metric_limit: int
+
+
 async def system_not_configured_exception_handler(
     _: Request,
     exc: Exception,
@@ -83,6 +124,52 @@ async def system_not_configured_exception_handler(
     return JSONResponse(
         {"ok": False, "detail": str(exc)},
         status_code=404,
+    )
+
+
+async def unknown_enclosure_exception_handler(
+    _: Request,
+    exc: Exception,
+) -> JSONResponse:
+    return JSONResponse({"ok": False, "detail": str(exc)}, status_code=404)
+
+
+async def snapshot_state_busy_exception_handler(
+    _: Request,
+    exc: Exception,
+) -> JSONResponse:
+    return JSONResponse(
+        {"ok": False, "detail": str(exc)},
+        status_code=503,
+        headers={"Retry-After": "1"},
+    )
+
+
+async def mapping_scope_conflict_exception_handler(
+    _: Request,
+    _exc: Exception,
+) -> JSONResponse:
+    return JSONResponse(
+        {
+            "ok": False,
+            "error": "mapping_scope_conflict",
+            "detail": MappingScopeConflict.public_detail,
+        },
+        status_code=409,
+    )
+
+
+async def mapping_durability_exception_handler(
+    _: Request,
+    _exc: Exception,
+) -> JSONResponse:
+    return JSONResponse(
+        {
+            "ok": False,
+            "error": "mapping_durability_indeterminate",
+            "detail": MappingDurabilityError.public_detail,
+        },
+        status_code=503,
     )
 
 
@@ -500,6 +587,22 @@ def create_app() -> FastAPI:
         SystemNotConfiguredError,
         system_not_configured_exception_handler,
     )
+    app.add_exception_handler(
+        UnknownEnclosureError,
+        unknown_enclosure_exception_handler,
+    )
+    app.add_exception_handler(
+        SnapshotStateBusyError,
+        snapshot_state_busy_exception_handler,
+    )
+    app.add_exception_handler(
+        MappingScopeConflict,
+        mapping_scope_conflict_exception_handler,
+    )
+    app.add_exception_handler(
+        MappingDurabilityError,
+        mapping_durability_exception_handler,
+    )
 
     @app.exception_handler(HTTPException)
     async def http_exception_handler(_: Request, exc: HTTPException) -> JSONResponse:
@@ -629,6 +732,14 @@ async def resolve_layout_slots(
             selected_enclosure_id=selected_enclosure_id,
             allow_stale_cache=True,
         )
+    except UnknownEnclosureError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except SnapshotStateBusyError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=str(exc),
+            headers={"Retry-After": "1"},
+        ) from exc
     except Exception as exc:  # noqa: BLE001 - expose a stable route error, not source details
         logger.debug("Slot bounds: selected enclosure snapshot unavailable (%s)", exc)
         raise HTTPException(
@@ -638,7 +749,7 @@ async def resolve_layout_slots(
     if selected_enclosure_id and snapshot.selected_enclosure_id != selected_enclosure_id:
         raise HTTPException(
             status_code=404,
-            detail=f"Enclosure {selected_enclosure_id!r} is not available for this system.",
+            detail="Requested enclosure is not available for this system.",
         )
     layout_slots = snapshot_layout_slots(snapshot)
     if not layout_slots:

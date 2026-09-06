@@ -135,7 +135,10 @@ class HistoryCollector:
         self.background_backoff_until: datetime | None = None
         self.last_smart_failure_evidence_disks: int = 0
         self.last_max_temperature_celsius: float | None = None
+        self.last_smart_failure_evidence_at: str | None = None
+        self.last_temperature_evidence_at: str | None = None
         self.last_smart_evidence_at: str | None = None
+        self._scope_enumeration_complete = True
         self.next_collection_at: datetime | None = None
         self._pending_topology_changes: dict[
             tuple[str, str, int],
@@ -247,9 +250,12 @@ class HistoryCollector:
             )
         )
         smart_evidence_expected: set[str] = set()
-        smart_evidence_observed: set[str] = set()
+        smart_failure_health_observed: set[str] = set()
+        smart_temperature_observed: set[str] = set()
         smart_failure_evidence: set[str] = set()
         smart_temperatures: dict[str, float] = {}
+        trusted_smart_scope_observed = False
+        smart_scope_unavailable = False
         force_inventory = self._should_force_inventory_for_collection(
             collect_fast=collect_fast,
             collect_slow=collect_slow,
@@ -261,7 +267,9 @@ class HistoryCollector:
         enumerate_kwargs: dict[str, bool] = {"force_inventory": force_inventory}
         if cached_root_only and not force_inventory:
             enumerate_kwargs["cached_root_only"] = True
+        self._scope_enumeration_complete = True
         scopes = await self._enumerate_scopes(**enumerate_kwargs)
+        smart_scope_unavailable = not self._scope_enumeration_complete
         self._raise_if_stopping()
         self._record_collection_stage(
             "enumerate.scopes",
@@ -277,6 +285,8 @@ class HistoryCollector:
             scope_label = self._scope_activity_label(scope)
             self._set_collection_activity(f"recording {scope_label} ({scope_index}/{len(scopes)})")
             if not self._should_record_scope_snapshot(scope.snapshot):
+                self._clear_pending_topology_changes_for_scope(scope.system_id, scope.enclosure_id)
+                smart_scope_unavailable = True
                 logger.warning(
                     "Skipping history capture for %s%s because the inventory snapshot is degraded or untrusted.",
                     scope.system_id,
@@ -292,6 +302,7 @@ class HistoryCollector:
                     scope_index=scope_index,
                 )
                 continue
+            trusted_smart_scope_observed = True
             slot_records = [
                 SlotStateRecord.from_snapshot_slot(scope.snapshot, slot_payload)
                 for slot_payload in scope.snapshot.get("slots", [])
@@ -361,15 +372,16 @@ class HistoryCollector:
                 if not isinstance(summary, dict):
                     continue
                 evidence_key = self._smart_evidence_disk_key(record)
-                if self._smart_summary_has_alert_evidence(summary):
-                    smart_evidence_observed.add(evidence_key)
+                if self._smart_summary_has_failure_health_evidence(summary):
+                    smart_failure_health_observed.add(evidence_key)
                     if self._smart_summary_indicates_failure(summary):
                         smart_failure_evidence.add(evidence_key)
-                    temperature = self._smart_summary_temperature(summary)
-                    if temperature is not None:
-                        previous_temperature = smart_temperatures.get(evidence_key)
-                        if previous_temperature is None or temperature > previous_temperature:
-                            smart_temperatures[evidence_key] = temperature
+                temperature = self._smart_summary_temperature(summary)
+                if temperature is not None:
+                    smart_temperature_observed.add(evidence_key)
+                    previous_temperature = smart_temperatures.get(evidence_key)
+                    if previous_temperature is None or temperature > previous_temperature:
+                        smart_temperatures[evidence_key] = temperature
                 if collect_fast:
                     metric_samples.extend(
                         self._build_metric_samples(record, summary, observed_at, FAST_METRIC_FIELDS)
@@ -393,12 +405,24 @@ class HistoryCollector:
                     sample_count=len(metric_samples),
                 )
 
-        if (collect_fast or collect_slow) and smart_evidence_expected.issubset(smart_evidence_observed):
-            self.last_smart_failure_evidence_disks = len(smart_failure_evidence)
-            self.last_max_temperature_celsius = (
-                max(smart_temperatures.values()) if smart_temperatures else None
-            )
-            self.last_smart_evidence_at = observed_at
+        if (
+            (collect_fast or collect_slow)
+            and trusted_smart_scope_observed
+            and not smart_scope_unavailable
+        ):
+            if smart_evidence_expected.issubset(smart_failure_health_observed):
+                self.last_smart_failure_evidence_disks = len(smart_failure_evidence)
+                self.last_smart_failure_evidence_at = observed_at
+            if smart_evidence_expected.issubset(smart_temperature_observed):
+                self.last_max_temperature_celsius = (
+                    max(smart_temperatures.values()) if smart_temperatures else None
+                )
+                self.last_temperature_evidence_at = observed_at
+            if self.last_smart_failure_evidence_at and self.last_temperature_evidence_at:
+                self.last_smart_evidence_at = min(
+                    self.last_smart_failure_evidence_at,
+                    self.last_temperature_evidence_at,
+                )
 
         backup_succeeded = False
         retention_backup_at: datetime | None = None
@@ -496,6 +520,8 @@ class HistoryCollector:
             "last_slow_metrics_at": self.last_slow_metrics_at,
             "last_smart_failure_evidence_disks": self.last_smart_failure_evidence_disks,
             "last_max_temperature_celsius": self.last_max_temperature_celsius,
+            "last_smart_failure_evidence_at": self.last_smart_failure_evidence_at,
+            "last_temperature_evidence_at": self.last_temperature_evidence_at,
             "last_smart_evidence_at": self.last_smart_evidence_at,
             "last_success_at": self.last_success_at,
             "last_backup_at": self.last_backup_at,
@@ -924,18 +950,32 @@ class HistoryCollector:
         # One read per scope and one write transaction per pass instead of three
         # connection open/PRAGMA/commit cycles per slot.
         previous_by_scope: dict[tuple[str, str], dict[int, SlotStateRecord]] = {}
-        updates: list[SlotStateUpdate] = []
+        previous_records: list[SlotStateRecord | None] = []
         for record in slot_records:
             scope_key = (record.system_id, record.enclosure_key)
             if scope_key not in previous_by_scope:
                 previous_by_scope[scope_key] = self.store.get_slot_states(record.system_id, record.enclosure_id)
-            previous = previous_by_scope[scope_key].get(record.slot)
+            previous_records.append(previous_by_scope[scope_key].get(record.slot))
+
+        degraded_pairs = [
+            (previous, record)
+            for previous, record in zip(previous_records, slot_records, strict=True)
+            if previous is not None and self._is_topology_degradation(previous, record)
+        ]
+        mass_topology_degradation = self._is_mass_topology_degradation(len(degraded_pairs), len(slot_records))
+        if mass_topology_degradation:
+            for _previous, record in degraded_pairs:
+                self._pending_topology_changes.pop(self._slot_state_key(record), None)
+
+        updates: list[SlotStateUpdate] = []
+        for previous, record in zip(previous_records, slot_records, strict=True):
             if self._should_backfill_extended_state(previous, record):
                 updates.append(SlotStateUpdate(record=record, observed_at=observed_at))
                 continue
             record, topology_degraded, topology_pending = self._prepare_slot_record_for_history(
                 previous,
                 record,
+                suppress_topology_degradation=mass_topology_degradation,
             )
             if topology_degraded:
                 suppressed_topology_degradations += 1
@@ -945,7 +985,7 @@ class HistoryCollector:
             updates.append(SlotStateUpdate(record=record, observed_at=observed_at, events=list(events)))
         self.store.record_slot_updates(updates)
         if suppressed_topology_degradations:
-            if self._is_mass_topology_degradation(suppressed_topology_degradations, len(slot_records)):
+            if mass_topology_degradation:
                 logger.warning(
                     "Suppressed mass topology-detail degradation for %s/%s slots; keeping last trusted topology until the source stabilizes.",
                     suppressed_topology_degradations,
@@ -967,12 +1007,14 @@ class HistoryCollector:
         self,
         previous: SlotStateRecord | None,
         current: SlotStateRecord,
+        *,
+        suppress_topology_degradation: bool = False,
     ) -> tuple[SlotStateRecord, bool, bool]:
         if previous is None:
             return current, False, False
         key = self._slot_state_key(current)
-        if self._is_topology_degradation(previous, current):
-            self._pending_topology_changes.pop(key, None)
+        topology_degraded = self._is_topology_degradation(previous, current)
+        if topology_degraded and suppress_topology_degradation:
             return self._with_previous_topology(previous, current), True, False
         if not self._topology_changed(previous, current):
             self._pending_topology_changes.pop(key, None)
@@ -986,13 +1028,19 @@ class HistoryCollector:
         pending_count = pending_count + 1 if pending_signature == signature else 1
         if pending_count < TOPOLOGY_CHANGE_CONFIRMATION_COUNT:
             self._pending_topology_changes[key] = (signature, pending_count)
-            return self._with_previous_topology(previous, current), False, True
+            return self._with_previous_topology(previous, current), topology_degraded, True
         self._pending_topology_changes.pop(key, None)
         return current, False, False
 
     @staticmethod
     def _slot_state_key(record: SlotStateRecord) -> tuple[str, str, int]:
         return (record.system_id, record.enclosure_id or "", record.slot)
+
+    def _clear_pending_topology_changes_for_scope(self, system_id: str, enclosure_id: str | None) -> None:
+        scope_key = (system_id, enclosure_id or "")
+        for key in tuple(self._pending_topology_changes):
+            if key[:2] == scope_key:
+                self._pending_topology_changes.pop(key, None)
 
     @staticmethod
     def _topology_signature(record: SlotStateRecord) -> tuple[str | None, str | None, str | None]:
@@ -1104,9 +1152,20 @@ class HistoryCollector:
 
     @staticmethod
     def _smart_summary_has_alert_evidence(summary: dict[str, Any]) -> bool:
-        return any(
-            summary.get(field_name) is not None
-            for field_name in ("smart_health_status", "predictive_errors", "temperature_c")
+        return (
+            HistoryCollector._smart_summary_has_failure_health_evidence(summary)
+            or HistoryCollector._smart_summary_temperature(summary) is not None
+        )
+
+    @staticmethod
+    def _smart_summary_has_failure_health_evidence(summary: dict[str, Any]) -> bool:
+        if normalize_text(summary.get("smart_health_status")):
+            return True
+        predictive_errors = summary.get("predictive_errors")
+        return (
+            isinstance(predictive_errors, int | float)
+            and not isinstance(predictive_errors, bool)
+            and math.isfinite(float(predictive_errors))
         )
 
     @staticmethod
@@ -1183,6 +1242,7 @@ class HistoryCollector:
         force_inventory: bool = True,
         cached_root_only: bool = False,
     ) -> list[ScopeSnapshot]:
+        self._scope_enumeration_complete = True
         root_started = time.perf_counter()
         root_snapshot = await self._fetch_inventory(force=force_inventory)
         self._record_collection_stage(
@@ -1249,6 +1309,7 @@ class HistoryCollector:
             try:
                 system_snapshot = await self._fetch_inventory(system_id=system_id, force=force_inventory)
             except Exception as exc:  # noqa: BLE001 - keep broad saved-fleet sweeps moving.
+                self._scope_enumeration_complete = False
                 logger.warning("Skipping history scope enumeration for %s: %s", system_id, exc)
                 self._record_collection_stage(
                     "inventory.system_failed",
@@ -1311,6 +1372,7 @@ class HistoryCollector:
                             force=force_inventory,
                         )
                     except Exception as exc:  # noqa: BLE001 - preserve the rest of the full-fleet pass.
+                        self._scope_enumeration_complete = False
                         logger.warning(
                             "Skipping history scope enumeration for %s enclosure %s: %s",
                             system_id,
@@ -1371,6 +1433,7 @@ class HistoryCollector:
                 force_inventory=force_inventory,
             )
         except Exception as exc:  # noqa: BLE001 - storage views should not kill the whole sweep.
+            self._scope_enumeration_complete = False
             logger.warning("Skipping history storage-view enumeration for %s: %s", system_id, exc)
             self._record_collection_stage(
                 "storage_views.failed",

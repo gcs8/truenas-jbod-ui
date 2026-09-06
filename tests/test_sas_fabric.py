@@ -22,6 +22,7 @@ from app.services.inventory import InventoryService
 from app.services.parsers import canonicalize_ssh_command
 from app.services.sas_diagnostics.decoder import (
     MAX_DIAGNOSTIC_COLLECTION_ITEMS,
+    MAX_DIAGNOSTIC_NUMERIC_TOKEN_LENGTH,
     MAX_DIAGNOSTIC_TEXT_LENGTH,
     bound_diagnostic_value,
 )
@@ -889,6 +890,83 @@ Jun  7 10:39:05 truenas mpr0: Controller reported scsi ioc terminated tgt 12 SMI
         self.assertEqual(cam_error["source_attribution"]["url"], "https://man.freebsd.org/cgi/man.cgi?apropos=0&manpath=freebsd&query=intro&sektion=2")
         self.assertEqual(da1["operation_counts"]["WRITE(10)"], 1)
         self.assertEqual(events["by_controller"]["mpr0"]["loginfo_counts"]["31120302"], 1)
+
+    def test_oversized_cam_numeric_code_is_not_converted_and_keeps_bounded_evidence(self) -> None:
+        oversized_code = "9" * 5_000
+        events = parse_mpr_dmesg_events(
+            f"(da1:mpr0:0:9:0): Error {oversized_code}, Retries exhausted"
+        )
+
+        record = events["by_device"]["da1"]["event_table"]["rows"][0]
+
+        self.assertEqual(record["family"], "cam_error")
+        self.assertNotIn("cam_error_code", record)
+        self.assertLessEqual(len(record["cam_error_code_raw"]), MAX_DIAGNOSTIC_TEXT_LENGTH)
+        self.assertTrue(record["cam_error_code_raw"].endswith("..."))
+        self.assertIn("too long to decode", record["decoder_note"])
+
+    def test_oversized_cam_target_tokens_are_not_converted_and_keep_bounded_evidence(self) -> None:
+        oversized_target = "9" * 5_000
+        bounded_target = f"{'9' * (MAX_DIAGNOSTIC_NUMERIC_TOKEN_LENGTH - 3)}..."
+
+        for line in (
+            f"(da1:mpr0:0:{oversized_target}:0): Retrying command",
+            f"mpr0: Controller reported scsi ioc terminated tgt {oversized_target} SMID 1 loginfo 31120302",
+        ):
+            with self.subTest(source=line[:20]):
+                events = parse_mpr_dmesg_events(line)
+                controller = events["by_controller"]["mpr0"]
+                record = controller["event_table"]["rows"][0]
+
+                self.assertEqual(controller["targets"], [bounded_target])
+                self.assertEqual(record["target"], bounded_target)
+                self.assertIn(f"mpr0:{bounded_target}", events["by_controller_target"])
+
+    def test_aggregated_finding_severity_is_monotonic_across_event_order(self) -> None:
+        info_event = "(da2:mpr0:0:10:0): SCSI sense: NO SENSE asc:7f,7e (Unknown hardware fault)"
+        error_event = "(da2:mpr0:0:10:0): SCSI sense: HARDWARE ERROR asc:7f,7e (Unknown hardware fault)"
+
+        for rows in ((info_event, error_event), (error_event, info_event)):
+            with self.subTest(first=rows[0].split("SCSI sense: ", 1)[1].split(" asc:", 1)[0]):
+                events = parse_mpr_dmesg_events("\n".join(rows))
+                finding = events["by_controller"]["mpr0"]["top_findings"][0]
+
+                self.assertEqual(finding["count"], 2)
+                self.assertEqual(finding["severity"], "error")
+
+    def test_unknown_hardware_error_sense_keeps_parser_error_severity(self) -> None:
+        events = parse_mpr_dmesg_events(
+            "(da2:mpr0:0:10:0): SCSI sense: HARDWARE ERROR asc:7f,7e (Unknown hardware fault)"
+        )
+
+        record = events["by_device"]["da2"]["event_table"]["rows"][0]
+
+        self.assertEqual(record["family"], "scsi_sense")
+        self.assertEqual(record["severity"], "error")
+
+    def test_medium_format_sense_is_an_error(self) -> None:
+        events = parse_mpr_dmesg_events(
+            "(da3:mpr0:0:11:0): SCSI sense: MEDIUM ERROR asc:31,0 (Medium format corrupted)"
+        )
+
+        record = events["by_device"]["da3"]["event_table"]["rows"][0]
+
+        self.assertEqual(record["family"], "medium_format")
+        self.assertEqual(record["severity"], "error")
+
+    def test_error_count_matches_final_sense_severities(self) -> None:
+        events = parse_mpr_dmesg_events(
+            "\n".join((
+                "(da2:mpr0:0:10:0): SCSI sense: HARDWARE ERROR asc:7f,7e (Unknown hardware fault)",
+                "(da3:mpr0:0:11:0): SCSI sense: MEDIUM ERROR asc:31,0 (Medium format corrupted)",
+                "(da4:mpr0:0:12:0): SCSI sense: RECOVERED ERROR asc:18,5 (Recovered data, recommend reassignment)",
+            ))
+        )
+        controller = events["by_controller"]["mpr0"]
+        severities = [row["severity"] for row in controller["event_table"]["rows"]]
+
+        self.assertEqual(severities, ["error", "error", "warning"])
+        self.assertEqual(controller["error_count"], severities.count("error"))
 
     def test_archive_core_bad_cable_fixture_builds_normalized_event_table(self) -> None:
         events = parse_mpr_dmesg_events(ARCHIVE_CORE_BAD_CABLE_DMESG)

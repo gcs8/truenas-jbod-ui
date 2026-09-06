@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import ipaddress
 import os
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
+
+from app.http_auth import configured_origin_identity
+from app.secret_files import load_secret_environment_value
 
 
 def _history_runtime_root() -> Path:
@@ -25,6 +29,8 @@ def _default_history_long_term_backup_dir() -> str:
 
 
 class HistorySettings(BaseModel):
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     app_name: str = "TrueNAS JBOD History Service"
     host: str = "0.0.0.0"
     port: int = 8001
@@ -62,6 +68,24 @@ class HistorySettings(BaseModel):
     retention_interval_seconds: int = Field(default=3600, ge=1)
     retention_batch_size: int = Field(default=5000, ge=1)
     retention_max_batches_per_run: int = Field(default=20, ge=1)
+    published_bind_address: str = "127.0.0.1"
+    public_origin: str | None = None
+    refresh_auth_mode: Literal["network", "token"] = "network"
+    refresh_token: SecretStr | None = None
+    full_refresh_cooldown_seconds: int = Field(default=900, ge=0, le=86400)
+
+    @field_validator("refresh_token", mode="before")
+    @classmethod
+    def normalize_refresh_token(cls, value: Any) -> Any:
+        if value is None or (isinstance(value, str) and not value):
+            return None
+        return value
+
+    @field_validator("public_origin", mode="before")
+    @classmethod
+    def normalize_public_origin(cls, value: Any) -> str | None:
+        normalized = str(value or "").strip()
+        return normalized or None
 
     @field_validator("segment_catalog_path", "scheduled_backup_status_file", mode="before")
     @classmethod
@@ -92,6 +116,21 @@ class HistorySettings(BaseModel):
             or (self.sqlite_path != default_sqlite_path and self.long_term_backup_dir == default_long_term_backup_dir)
         ):
             self.long_term_backup_dir = str(Path(self.backup_dir) / "long-term")
+
+        bind_address = self.published_bind_address.strip().lower()
+        try:
+            loopback = bind_address == "localhost" or ipaddress.ip_address(bind_address).is_loopback
+        except ValueError:
+            loopback = False
+        token = self.refresh_token.get_secret_value() if self.refresh_token is not None else ""
+        if not loopback and self.refresh_auth_mode != "token":
+            raise ValueError("Non-loopback history exposure requires refresh token mode.")
+        if self.refresh_auth_mode == "token" and not token:
+            raise ValueError("History refresh token mode requires a non-empty token.")
+        if not loopback and configured_origin_identity(self.public_origin) is None:
+            raise ValueError("Non-loopback history exposure requires a valid HISTORY_PUBLIC_ORIGIN.")
+        if self.public_origin is not None and configured_origin_identity(self.public_origin) is None:
+            raise ValueError("HISTORY_PUBLIC_ORIGIN must be an absolute HTTP(S) origin.")
 
         return self
 
@@ -133,6 +172,10 @@ ENV_OVERRIDES: dict[str, str] = {
     "HISTORY_RETENTION_INTERVAL_SECONDS": "retention_interval_seconds",
     "HISTORY_RETENTION_BATCH_SIZE": "retention_batch_size",
     "HISTORY_RETENTION_MAX_BATCHES_PER_RUN": "retention_max_batches_per_run",
+    "HISTORY_PUBLISHED_BIND_ADDRESS": "published_bind_address",
+    "HISTORY_PUBLIC_ORIGIN": "public_origin",
+    "HISTORY_REFRESH_AUTH_MODE": "refresh_auth_mode",
+    "HISTORY_FULL_REFRESH_COOLDOWN_SECONDS": "full_refresh_cooldown_seconds",
 }
 
 PERMISSION_MODE_ENV_VARS = frozenset({"HISTORY_SHARED_DIR_MODE", "HISTORY_SHARED_FILE_MODE"})
@@ -169,6 +212,10 @@ def get_history_settings() -> HistorySettings:
         payload[field_name] = (
             _parse_permission_mode(raw_value) if env_name in PERMISSION_MODE_ENV_VARS else _parse_scalar(raw_value)
         )
+
+    refresh_token = load_secret_environment_value("HISTORY_REFRESH_TOKEN")
+    if refresh_token is not None:
+        payload["refresh_token"] = refresh_token
 
     settings = HistorySettings.model_validate(payload)
     Path(settings.sqlite_path).parent.mkdir(parents=True, exist_ok=True)

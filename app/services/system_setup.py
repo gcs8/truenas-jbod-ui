@@ -21,6 +21,13 @@ from app.config import (
     normalize_text,
 )
 from app.models.domain import SystemSetupRequest
+from app.services.credential_authority import (
+    api_credential_authority,
+    bmc_credential_authority,
+    same_credential_authorities,
+    same_credential_authority,
+    ssh_credential_authorities,
+)
 from app.services.sas_fabric import (
     CORE_DMIDECODE_SLOT_COMMAND,
     CORE_MPR_DMESG_EVENTS_COMMAND,
@@ -292,6 +299,108 @@ class SystemSetupService:
             if existing_index is not None:
                 existing_system = SystemConfig.model_validate(raw_systems[existing_index])
 
+            tls_ca_bundle_path = (
+                payload.tls_ca_bundle_path
+                if payload.tls_ca_bundle_path is not None
+                else (existing_system.truenas.tls_ca_bundle_path if existing_system is not None else None)
+            )
+            tls_server_name = (
+                payload.tls_server_name
+                if payload.tls_server_name is not None
+                else (existing_system.truenas.tls_server_name if existing_system is not None else None)
+            )
+            ssh_host = payload.ssh_host or payload.truenas_host
+            ssh_extra_hosts = (
+                list(existing_system.ssh.extra_hosts)
+                if existing_system is not None
+                else list(payload.ssh_extra_hosts)
+            )
+            ssh_ha_hosts = [node.host for node in payload.ha_nodes]
+
+            preserving_api_secret = any(
+                incoming == PRESERVE_SECRET_SENTINEL
+                for incoming in (payload.api_key, payload.api_password)
+            )
+            if preserving_api_secret:
+                saved_authority = (
+                    api_credential_authority(
+                        platform=existing_system.truenas.platform,
+                        host=existing_system.truenas.host,
+                        username=existing_system.truenas.api_user,
+                        verify_tls=existing_system.truenas.verify_ssl,
+                        tls_ca_bundle_path=existing_system.truenas.tls_ca_bundle_path,
+                        tls_server_name=existing_system.truenas.tls_server_name,
+                    )
+                    if existing_system is not None
+                    else None
+                )
+                requested_authority = api_credential_authority(
+                    platform=payload.platform,
+                    host=payload.truenas_host,
+                    username=payload.api_user,
+                    verify_tls=payload.verify_ssl,
+                    tls_ca_bundle_path=tls_ca_bundle_path,
+                    tls_server_name=tls_server_name,
+                )
+                if not same_credential_authority(requested_authority, saved_authority):
+                    raise ValueError(
+                        "A saved secret can only be reused with its saved connection settings."
+                    )
+
+            preserving_ssh_secret = any(
+                incoming == PRESERVE_SECRET_SENTINEL
+                for incoming in (payload.ssh_password, payload.ssh_sudo_password)
+            )
+            if preserving_ssh_secret:
+                saved_authorities = (
+                    ssh_credential_authorities(
+                        platform=existing_system.truenas.platform,
+                        hosts=[
+                            existing_system.ssh.host,
+                            *existing_system.ssh.extra_hosts,
+                            *(node.host for node in existing_system.ssh.ha_nodes),
+                        ],
+                        port=existing_system.ssh.port,
+                        username=existing_system.ssh.user,
+                        strict_host_key_checking=existing_system.ssh.strict_host_key_checking,
+                    )
+                    if existing_system is not None
+                    else frozenset()
+                )
+                requested_authorities = ssh_credential_authorities(
+                    platform=payload.platform,
+                    hosts=[ssh_host, *ssh_extra_hosts, *ssh_ha_hosts],
+                    port=payload.ssh_port,
+                    username=payload.ssh_user,
+                    strict_host_key_checking=payload.ssh_strict_host_key_checking,
+                )
+                if not same_credential_authorities(requested_authorities, saved_authorities):
+                    raise ValueError(
+                        "A saved secret can only be reused with its saved connection settings."
+                    )
+
+            if payload.bmc_password == PRESERVE_SECRET_SENTINEL:
+                saved_authority = (
+                    bmc_credential_authority(
+                        platform=existing_system.truenas.platform,
+                        host=existing_system.bmc.host,
+                        username=existing_system.bmc.username,
+                        verify_tls=existing_system.bmc.verify_ssl,
+                    )
+                    if existing_system is not None
+                    else None
+                )
+                requested_authority = bmc_credential_authority(
+                    platform=payload.platform,
+                    host=payload.bmc_host,
+                    username=payload.bmc_username,
+                    verify_tls=payload.bmc_verify_ssl,
+                )
+                if not same_credential_authority(requested_authority, saved_authority):
+                    raise ValueError(
+                        "A saved secret can only be reused with its saved connection settings."
+                    )
+
             def resolve_secret(incoming: str | None, existing: str | None = None) -> str:
                 return resolve_preserved_secret(incoming, existing)
 
@@ -323,7 +432,6 @@ class SystemSetupService:
                     or existing_ssh_commands
                     or default_ssh_commands_for_platform(payload.platform)
                 )
-            ssh_host = payload.ssh_host or payload.truenas_host
             if payload.storage_views is None and existing_system is not None:
                 storage_views = list(existing_system.storage_views)
             else:
@@ -380,16 +488,8 @@ class SystemSetupService:
                     ),
                     platform=payload.platform,
                     verify_ssl=payload.verify_ssl,
-                    tls_ca_bundle_path=(
-                        payload.tls_ca_bundle_path
-                        if payload.tls_ca_bundle_path is not None
-                        else (existing_system.truenas.tls_ca_bundle_path if existing_system is not None else None)
-                    ),
-                    tls_server_name=(
-                        payload.tls_server_name
-                        if payload.tls_server_name is not None
-                        else (existing_system.truenas.tls_server_name if existing_system is not None else None)
-                    ),
+                    tls_ca_bundle_path=tls_ca_bundle_path,
+                    tls_server_name=tls_server_name,
                     timeout_seconds=(
                         existing_system.truenas.timeout_seconds
                         if existing_system is not None
@@ -400,11 +500,7 @@ class SystemSetupService:
                 ssh=SSHConfig(
                     enabled=ssh_enabled,
                     host=ssh_host or "",
-                    extra_hosts=(
-                        list(existing_system.ssh.extra_hosts)
-                        if existing_system is not None
-                        else list(payload.ssh_extra_hosts)
-                    ),
+                    extra_hosts=ssh_extra_hosts,
                     ha_enabled=bool(payload.ha_enabled),
                     ha_nodes=[
                         HANodeConfig(

@@ -88,8 +88,6 @@
       ? `${collector.collection_kind || "background"} for ${formatDuration(collector.collection_elapsed_seconds)}: ${collector.collection_activity || "working"}`
       : "not running";
     setText("status-current-collection", currentCollection);
-    setText("status-source-base-url", statusValue(collector.source_base_url, "unknown"));
-    setText("status-sqlite-path", statusValue(collector.sqlite_path, "unknown"));
     setText("status-last-inventory-at", statusValue(collector.last_inventory_at));
     setText("status-last-fast-metrics-at", statusValue(collector.last_fast_metrics_at));
     setText("status-last-slow-metrics-at", statusValue(collector.last_slow_metrics_at));
@@ -210,8 +208,10 @@
         : "Running fast history refresh...";
     }
     try {
-      const response = await fetch(`/api/history/refresh?mode=${encodeURIComponent(mode)}`, {
+      const response = await fetch("/api/history/refresh", {
         method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode }),
       });
       const body = await response.text();
       let payload = {};

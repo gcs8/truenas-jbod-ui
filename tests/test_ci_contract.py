@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -318,6 +319,27 @@ class CIWorkflowContractTests(unittest.TestCase):
             label_step["run"],
             r"\*\)\s+echo \"Unknown conventional type.*\n\s+exit 0\n\s+;;",
         )
+
+    def test_pr_label_workflow_uses_rest_without_graphql_pr_commands(self) -> None:
+        workflow = yaml.safe_load(self.read(WORKFLOW_DIR / "pr-labels.yml"))
+        label_step = workflow["jobs"]["label"]["steps"][0]
+        script = label_step["run"]
+
+        self.assertNotIn("gh pr ", script)
+        self.assertIn('gh api "repos/$GH_REPO/issues/$PR_NUMBER/labels?per_page=100"', script)
+        self.assertIn('gh api --method POST "repos/$GH_REPO/issues/$PR_NUMBER/labels"', script)
+        self.assertIn(
+            'gh api --method DELETE "repos/$GH_REPO/issues/$PR_NUMBER/labels/$label"',
+            script,
+        )
+
+    def test_pr_label_workflow_uses_a_bash_safe_conventional_title_pattern(self) -> None:
+        workflow = yaml.safe_load(self.read(WORKFLOW_DIR / "pr-labels.yml"))
+        script = workflow["jobs"]["label"]["steps"][0]["run"]
+
+        self.assertIn("conventional_pattern=", script)
+        self.assertIn('[[ "$title" =~ $conventional_pattern ]]', script)
+        subprocess.run(["bash", "-n"], input=script, text=True, check=True)
 
     def test_release_checklist_collects_bounded_branch_metadata_and_keeps_wiki_publication_owner_gated(self) -> None:
         checklist = self.read(ROOT / "docs" / "RELEASE_CHECKLIST.md")

@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
@@ -390,6 +390,7 @@ class BootstrapSudoGrantContractTests(unittest.IsolatedAsyncioTestCase):
     async def collect_sudo_commands(self, platform: Platform) -> set[str]:
         recorded: list[str] = []
         host = f"{platform}-host.invalid"
+        smartctl_success = False
 
         async def record_many(commands, host=None, **_kwargs):
             command_list = list(commands)
@@ -397,10 +398,18 @@ class BootstrapSudoGrantContractTests(unittest.IsolatedAsyncioTestCase):
             return [
                 SSHCommandResult(
                     command=command,
-                    ok="smartctl" not in command,
-                    stdout="",
-                    stderr="command not found" if "smartctl" in command else "",
-                    exit_code=127 if "smartctl" in command else 0,
+                    ok="smartctl" not in command or smartctl_success,
+                    stdout=(
+                        '{"device":{"protocol":"SCSI"},"smart_status":{"passed":true}}'
+                        if smartctl_success and "smartctl" in command and " -j " in command
+                        else ""
+                    ),
+                    stderr=(
+                        "command not found"
+                        if "smartctl" in command and not smartctl_success
+                        else ""
+                    ),
+                    exit_code=127 if "smartctl" in command and not smartctl_success else 0,
                 )
                 for command in command_list
             ]
@@ -450,11 +459,18 @@ class BootstrapSudoGrantContractTests(unittest.IsolatedAsyncioTestCase):
             if platform == "linux":
                 await service._fetch_smart_summary_over_ssh(["nvme0n1"])
             await service._fetch_smart_summary_over_ssh(["sda"])
-            await service._fetch_smart_summary_over_ssh(
-                ["sda"],
-                hosts=[host] if platform == "quantastor" else None,
-                device_type=LINUX_BOOT_MEDIA_SMARTCTL_DEVICE_TYPE,
-            )
+            smartctl_success = True
+            for smartctl_binary in smartctl_binaries:
+                with patch.object(
+                    service,
+                    "_smartctl_binary_candidates",
+                    return_value=(smartctl_binary,),
+                ):
+                    await service._fetch_smart_summary_over_ssh(
+                        ["sda"],
+                        hosts=[host] if platform == "quantastor" else None,
+                        device_type=LINUX_BOOT_MEDIA_SMARTCTL_DEVICE_TYPE,
+                    )
 
             # Identify control uses sesutil on CORE and sg_ses elsewhere.
             ses_device = "/dev/ses3" if platform == "core" else "/dev/sg3"

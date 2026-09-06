@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from app.config import SSHConfig, Settings, SystemConfig, TrueNASConfig
 from app.models.domain import EnclosureOption, InventorySnapshot, SasFabricAlias
+from app.services import inventory
 from app.services.inventory import (
     InventoryService,
     disambiguate_enclosure_option_labels,
@@ -78,6 +79,25 @@ class DisambiguateEnclosureOptionLabelsTests(unittest.TestCase):
         ]
         labels = [option.label for option in disambiguate_enclosure_option_labels(options)]
         self.assertEqual(labels, ["Front 24 Bay [a1234]", "Front 24 Bay [b1234]"])
+
+    def test_long_common_suffixes_use_bounded_normalized_identifiers(self) -> None:
+        common_suffix = "a" * 20_000
+        options = [
+            _option(f"first-{common_suffix}", "Synthetic Shelf"),
+            _option(f"second-{common_suffix}", "Synthetic Shelf"),
+        ]
+
+        labels = [option.label for option in disambiguate_enclosure_option_labels(options)]
+
+        self.assertEqual(len(set(labels)), 2)
+        self.assertTrue(all(label.startswith("Synthetic Shelf [") for label in labels))
+        self.assertTrue(
+            all(
+                len(label.removeprefix("Synthetic Shelf [").removesuffix("]"))
+                <= inventory.MAX_NORMALIZED_ENCLOSURE_IDENTIFIER_LENGTH
+                for label in labels
+            )
+        )
 
     def test_pass_is_idempotent_and_keeps_ids_and_order(self) -> None:
         options = [
@@ -298,18 +318,20 @@ class EnclosureAliasOptionLabelTests(unittest.TestCase):
                 SasFabricAliasStore(Path(temp_dir) / "sas_fabric_aliases.json"),
             )
             future = datetime.now(timezone.utc) + timedelta(minutes=5)
+            drawer_top = "enc-a::dell-md1280-drawer-top-42"
+            drawer_bottom = "enc-a::dell-md1280-drawer-bottom-42"
 
             def seed_cache() -> None:
-                for key in ("__default__", "enc-a", "enc-a::drawer-top", "enc-other"):
+                for key in ("__default__", "enc-a", drawer_top, "enc-other"):
                     service._cache[key] = InventorySnapshot(slots=[], refresh_interval_seconds=30)
                     service._cache_until[key] = future
 
             seed_cache()
             service.save_sas_fabric_alias(
-                object_id="enc-a::drawer-top",
+                object_id=drawer_top,
                 object_kind="enclosure",
                 label="Archive East",
-                selected_enclosure_id="enc-a::drawer-top",
+                selected_enclosure_id=drawer_top,
                 scope="system",
             )
             self.assertEqual(set(service._cache), {"enc-other"})
@@ -317,10 +339,10 @@ class EnclosureAliasOptionLabelTests(unittest.TestCase):
 
             seed_cache()
             service.save_sas_fabric_alias(
-                object_id="enc-a::drawer-bottom",
+                object_id=drawer_bottom,
                 object_kind="enclosure",
                 label="",
-                selected_enclosure_id="enc-a::drawer-bottom",
+                selected_enclosure_id=drawer_bottom,
                 scope="system",
             )
             self.assertEqual(set(service._cache), {"enc-other"})

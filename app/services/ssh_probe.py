@@ -16,6 +16,10 @@ from app.config import SSHConfig
 
 logger = logging.getLogger(__name__)
 
+# Bound each command's combined stdout/stderr before it can enter synchronous
+# parser paths. Four MiB still covers the largest supported SES page.
+MAX_SSH_OUTPUT_BYTES = 4 * 1024 * 1024
+
 SENSITIVE_OPTION_NAMES = {
     "--api-key",
     "--apikey",
@@ -442,8 +446,21 @@ class SSHProbe:
                 stdin.channel.shutdown_write()
             else:
                 stdin.close()
-            output = stdout.read().decode("utf-8", errors="replace")
-            error = stderr.read().decode("utf-8", errors="replace")
+            output_bytes = stdout.read(MAX_SSH_OUTPUT_BYTES + 1)
+            if len(output_bytes) > MAX_SSH_OUTPUT_BYTES:
+                return self._failure_result(
+                    command,
+                    f"SSH command output exceeded the {MAX_SSH_OUTPUT_BYTES}-byte limit.",
+                )
+            remaining_bytes = MAX_SSH_OUTPUT_BYTES - len(output_bytes)
+            error_bytes = stderr.read(remaining_bytes + 1)
+            if len(error_bytes) > remaining_bytes:
+                return self._failure_result(
+                    command,
+                    f"SSH command output exceeded the {MAX_SSH_OUTPUT_BYTES}-byte limit.",
+                )
+            output = output_bytes.decode("utf-8", errors="replace")
+            error = error_bytes.decode("utf-8", errors="replace")
             exit_code = stdout.channel.recv_exit_status()
             ok = exit_code == 0
             if not ok:

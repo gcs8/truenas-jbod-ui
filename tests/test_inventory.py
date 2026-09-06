@@ -52,7 +52,7 @@ from app.services.inventory import (
     parse_size_to_bytes,
     resolve_persistent_id,
 )
-from app.services.mapping_store import MappingStore
+from app.services.mapping_store import MappingRevisionConflict, MappingStore
 from app.services.parsers import (
     LinuxScsiDevice,
     ParsedSSHData,
@@ -362,8 +362,14 @@ class InventoryHelpersTests(unittest.TestCase):
         )
         self.assertTrue(
             service._legacy_mapping_fallback_allowed([
-                EnclosureOption(id="enc-a::drawer-a", label="Drawer A"),
-                EnclosureOption(id="enc-a::drawer-b", label="Drawer B"),
+                EnclosureOption(
+                    id="enc-a::dell-md1280-drawer-top-42",
+                    label="Drawer A",
+                ),
+                EnclosureOption(
+                    id="enc-a::dell-md1280-drawer-bottom-42",
+                    label="Drawer B",
+                ),
             ])
         )
         self.assertFalse(service._legacy_mapping_fallback_allowed([]))
@@ -571,14 +577,14 @@ class InventoryHelpersTests(unittest.TestCase):
             })
             enclosures = [
                 EnclosureOption(
-                    id="enc-a::drawer-a",
+                    id="enc-a::dell-md1280-drawer-top-42",
                     label="Drawer A",
                     rows=2,
                     columns=4,
                     slot_count=8,
                 ),
                 EnclosureOption(
-                    id="enc-a::drawer-b",
+                    id="enc-a::dell-md1280-drawer-bottom-42",
                     label="Drawer B",
                     rows=2,
                     columns=4,
@@ -590,14 +596,17 @@ class InventoryHelpersTests(unittest.TestCase):
             warnings: list[str] = []
             frame = service._resolve_layout_frame(
                 enclosures,
-                "enc-a::drawer-b",
+                "enc-a::dell-md1280-drawer-bottom-42",
                 warnings,
                 require_profile=False,
             )
 
             self.assertIsInstance(frame, inventory_module._LayoutFrame)
             self.assertFalse(frame.allow_legacy_mapping_fallback)
-            self.assertEqual(frame.selected_meta["id"], "enc-a::drawer-b")
+            self.assertEqual(
+                frame.selected_meta["id"],
+                "enc-a::dell-md1280-drawer-bottom-42",
+            )
             self.assertEqual(len(warnings), 1)
             self.assertIn("1 manual mapping ", warnings[0])
             self.assertNotIn("2 manual", warnings[0])
@@ -615,7 +624,7 @@ class InventoryHelpersTests(unittest.TestCase):
             ]
             enclosures = [
                 EnclosureOption(
-                    id="enc-a::bottom",
+                    id="enc-a::dell-md1280-drawer-bottom-42",
                     label="Bottom drawer",
                     rows=3,
                     columns=14,
@@ -628,7 +637,7 @@ class InventoryHelpersTests(unittest.TestCase):
             warnings: list[str] = []
             frame = service._resolve_layout_frame(
                 enclosures,
-                "enc-a::bottom",
+                "enc-a::dell-md1280-drawer-bottom-42",
                 warnings,
                 require_profile=False,
             )
@@ -2419,6 +2428,9 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             settings = Settings()
             system = SystemConfig(id="linux-host", truenas=TrueNASConfig(platform="linux"))
             service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            service._canonical_enclosure_options = {
+                "enc-a": EnclosureOption(id="enc-a", label="Shelf A")
+            }
             source_bundle = InventorySourceBundle(
                 raw_data=TrueNASRawData(
                     enclosures=[],
@@ -2451,6 +2463,10 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             settings = Settings()
             system = SystemConfig(id="linux-host", truenas=TrueNASConfig(platform="linux"))
             service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            service._canonical_enclosure_options = {
+                f"enc-{index}": EnclosureOption(id=f"enc-{index}", label=f"Shelf {index}")
+                for index in range(65)
+            }
             source_bundle = InventorySourceBundle(
                 raw_data=TrueNASRawData(
                     enclosures=[],
@@ -3961,6 +3977,7 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             12,
             selected_enclosure_id="enc-a",
             allow_stale_cache=True,
+            bypass_negative_cache=False,
         )
 
     def test_get_storage_view_slot_smart_summary_builds_synthetic_slot_for_inventory_bound_view(self) -> None:
@@ -4029,6 +4046,10 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
 
         self.assertIs(summary, expected_summary)
         synthetic_slot = service._get_slot_smart_summary_for_slot_view.await_args.args[0]
+        self.assertEqual(
+            service._get_slot_smart_summary_for_slot_view.await_args.kwargs,
+            {"allow_stale_cache": True, "bypass_negative_cache": False},
+        )
         self.assertEqual(synthetic_slot.enclosure_id, "storage-view:boot-doms")
         self.assertEqual(synthetic_slot.enclosure_label, "Boot SATADOMs")
         self.assertEqual(synthetic_slot.device_name, "ada0")
@@ -5979,9 +6000,198 @@ class InventoryBmcCorrelationTests(unittest.TestCase):
                 ],
             )
 
-            index = service._build_bmc_serial_disk_index(bmc_inventory)
+            platform_disks = service._build_disk_records(
+                [{"name": "da0", "serial": "SERIAL-1"}],
+                ParsedSSHData(),
+                {},
+                {},
+            )
+            index = service._build_bmc_serial_disk_index(bmc_inventory, platform_disks)
 
             self.assertNotIn("serial-1", index)
+
+    def test_bmc_serial_match_is_consumed_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = build_inventory_service(
+                Settings(),
+                SystemConfig(id="core-1", truenas=TrueNASConfig(platform="core")),
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            platform_disks = service._build_disk_records(
+                [{"name": "da0", "serial": "SERIAL-1"}],
+                ParsedSSHData(),
+                {},
+                {},
+            )
+            bmc_inventory = BMCInventory(
+                drives=[BMCDriveRecord(controller_id=0, physical_index=0, slot_number=1, serial="SERIAL-1")]
+            )
+            index = service._build_bmc_serial_disk_index(bmc_inventory, platform_disks)
+
+            self.assertIsNotNone(service._match_bmc_disk_by_serial(platform_disks[0], index))
+            self.assertIsNone(service._match_bmc_disk_by_serial(platform_disks[0], index))
+
+    def _assert_ambiguous_platform_serials_do_not_gain_bmc_coordinates(
+        self,
+        platform: str,
+        *,
+        conflicting: bool,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system_id = "example-qs-ha" if platform == "quantastor" else f"{platform}-1"
+            service = build_inventory_service(
+                settings,
+                SystemConfig(id=system_id, truenas=TrueNASConfig(platform=platform)),
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            bmc_inventory = BMCInventory(
+                drives=[
+                    BMCDriveRecord(
+                        controller_id=7,
+                        physical_index=11,
+                        slot_number=13,
+                        serial="SERIAL-1",
+                    )
+                ],
+            )
+
+            if platform == "quantastor":
+                disks = [
+                    {
+                        "id": "pdisk-1",
+                        "storageSystemId": "node-a",
+                        "devicePath": "/dev/sda",
+                        "serialNumber": "SERIAL-1",
+                        "serial": "SERIAL-OTHER" if conflicting else "SERIAL-1",
+                        "healthStatus": "ONLINE",
+                        "slot": "01",
+                    }
+                ]
+                if not conflicting:
+                    disks.append(
+                        {
+                            "id": "pdisk-2",
+                            "storageSystemId": "node-a",
+                            "devicePath": "/dev/sdb",
+                            "serialNumber": " serial-1 ",
+                            "healthStatus": "ONLINE",
+                            "slot": "02",
+                        }
+                    )
+                raw_data = TrueNASRawData(
+                    enclosures=[],
+                    systems=[{"id": "node-a", "name": "Example QS"}],
+                    disks=disks,
+                    pools=[],
+                    disk_temperatures={},
+                    smart_test_results=[],
+                )
+                ssh_data = ParsedSSHData()
+                correlate_kwargs = {"quantastor_ses_data": ParsedSSHData()}
+            else:
+                disks = [
+                    {
+                        "name": "da0" if platform == "core" else "sda",
+                        "serial": "SERIAL-1",
+                        "serialNumber": "SERIAL-OTHER" if conflicting else "SERIAL-1",
+                        "status": "ONLINE",
+                    }
+                ]
+                if not conflicting:
+                    disks.append(
+                        {
+                            "name": "da1" if platform == "core" else "sdb",
+                            "serial": " serial-1 ",
+                            "status": "ONLINE",
+                        }
+                    )
+                if platform == "core":
+                    for index, disk in enumerate(disks, start=1):
+                        disk["enclosure"] = {"id": "enc-1", "slot": index}
+                    raw_data = TrueNASRawData(
+                        enclosures=[
+                            {
+                                "id": "enc-1",
+                                "label": "Core Front",
+                                "elements": [
+                                    {"slot": index, "dev": f"/dev/{disk['name']}", "status": "OK"}
+                                    for index, disk in enumerate(disks, start=1)
+                                ],
+                            }
+                        ],
+                        disks=disks,
+                        pools=[],
+                        disk_temperatures={},
+                        smart_test_results=[],
+                    )
+                    ssh_data = ParsedSSHData()
+                else:
+                    raw_data = TrueNASRawData(
+                        enclosures=[],
+                        disks=disks,
+                        pools=[],
+                        disk_temperatures={},
+                        smart_test_results=[],
+                    )
+                    ssh_data = ParsedSSHData(
+                        ses_enclosures=[
+                            SESMapEnclosure(
+                                ses_device="/dev/sg27",
+                                enclosure_id="scale-ses",
+                                enclosure_label="Scale SES",
+                                slots={
+                                    index: SESMapSlot(
+                                        slot_number=index,
+                                        element_id=index,
+                                        device_names=[disk["name"]],
+                                        status="OK",
+                                        present=True,
+                                    )
+                                    for index, disk in enumerate(disks)
+                                },
+                            )
+                        ]
+                    )
+                correlate_kwargs = {}
+
+            slot_views, *_rest = service._correlate(
+                raw_data,
+                ssh_data,
+                [],
+                bmc_inventory=bmc_inventory,
+                **correlate_kwargs,
+            )
+            correlated_slots = [slot for slot in slot_views if slot.serial]
+
+            self.assertEqual(len(correlated_slots), 1 if conflicting else 2)
+            for slot in correlated_slots:
+                self.assertNotEqual(slot.led_backend, "supermicro_bmc")
+                self.assertNotIn("bmc_match_source", slot.raw_status)
+                self.assertNotIn("bmc_controller_id", slot.raw_status)
+                self.assertNotIn("bmc_physical_index", slot.raw_status)
+
+    def test_core_duplicate_platform_serials_do_not_gain_bmc_coordinates(self) -> None:
+        self._assert_ambiguous_platform_serials_do_not_gain_bmc_coordinates("core", conflicting=False)
+
+    def test_core_conflicting_platform_serials_do_not_gain_bmc_coordinates(self) -> None:
+        self._assert_ambiguous_platform_serials_do_not_gain_bmc_coordinates("core", conflicting=True)
+
+    def test_scale_duplicate_platform_serials_do_not_gain_bmc_coordinates(self) -> None:
+        self._assert_ambiguous_platform_serials_do_not_gain_bmc_coordinates("scale", conflicting=False)
+
+    def test_scale_conflicting_platform_serials_do_not_gain_bmc_coordinates(self) -> None:
+        self._assert_ambiguous_platform_serials_do_not_gain_bmc_coordinates("scale", conflicting=True)
+
+    def test_quantastor_duplicate_platform_serials_do_not_gain_bmc_coordinates(self) -> None:
+        self._assert_ambiguous_platform_serials_do_not_gain_bmc_coordinates("quantastor", conflicting=False)
+
+    def test_quantastor_conflicting_platform_serials_do_not_gain_bmc_coordinates(self) -> None:
+        self._assert_ambiguous_platform_serials_do_not_gain_bmc_coordinates("quantastor", conflicting=True)
 
     def test_core_slot_is_augmented_by_matching_bmc_serial(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -6257,6 +6467,1240 @@ class InventoryBmcCorrelationTests(unittest.TestCase):
 
 
 class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _smart_budget_slots(count: int, *, enclosure_id: str = "enc-budget") -> list[SlotView]:
+        return [
+            SlotView(
+                slot=index,
+                slot_label=f"{index:02d}",
+                row_index=0,
+                column_index=index,
+                enclosure_id=enclosure_id,
+                device_name=f"sd{index}",
+                transport_protocol="SAS",
+            )
+            for index in range(count)
+        ]
+
+    async def test_inventory_service_owns_one_server_smart_budget_with_floor(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            settings.app.smart_batch_max_concurrency = 0
+            system = SystemConfig(
+                id="single-budget-linux",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+
+            self.assertEqual(service._smart_operation_limit, 1)
+            self.assertIsInstance(service._smart_operation_semaphore, asyncio.Semaphore)
+            self.assertFalse(hasattr(service, "_background_smart_refresh_semaphore"))
+
+    async def test_positive_and_negative_cache_hits_skip_server_smart_budget(self) -> None:
+        class ForbiddenSemaphore:
+            async def __aenter__(self):
+                raise AssertionError("cache hits must not acquire the SMART work budget")
+
+            async def __aexit__(self, *_args):
+                return False
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="cache-hit-budget-linux",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            slot = self._smart_budget_slots(1, enclosure_id="enc-cache-hit")[0]
+            cache_key = service._smart_cache_key(slot)
+            positive = SmartSummaryView(available=True, power_on_hours=1)
+            service._smart_cache[cache_key] = positive
+            service._smart_cache_until[cache_key] = datetime.now(timezone.utc) + timedelta(minutes=1)
+            service._smart_operation_semaphore = ForbiddenSemaphore()  # type: ignore[assignment]
+
+            positive_result = await service._get_slot_smart_summary_for_slot_view(slot)
+            service._smart_cache.clear()
+            service._smart_cache_until.clear()
+            negative = SmartSummaryView(available=False, message="synthetic unavailable")
+            service._smart_negative_cache[cache_key] = (
+                negative,
+                datetime.now(timezone.utc) + timedelta(seconds=15),
+            )
+            negative_result = await service._get_slot_smart_summary_for_slot_view(slot)
+
+            self.assertIs(positive_result, positive)
+            self.assertIs(negative_result, negative)
+
+    async def test_get_slot_smart_summaries_caps_client_hint_at_server_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            settings.app.smart_batch_max_concurrency = 2
+            system = SystemConfig(
+                id="budget-linux",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            slots = self._smart_budget_slots(4)
+            service.get_snapshot = AsyncMock(
+                return_value=InventorySnapshot(slots=slots, refresh_interval_seconds=30)
+            )
+            release = asyncio.Event()
+            server_capacity_reached = asyncio.Event()
+            active = 0
+            peak = 0
+
+            async def fetch_summary(*_args, **_kwargs):
+                nonlocal active, peak
+                active += 1
+                peak = max(peak, active)
+                if active >= 2:
+                    server_capacity_reached.set()
+                try:
+                    await release.wait()
+                    return SmartSummaryView(available=True, power_on_hours=1), None
+                finally:
+                    active -= 1
+
+            service._fetch_smart_summary_over_ssh = AsyncMock(side_effect=fetch_summary)
+            request = asyncio.create_task(
+                service.get_slot_smart_summaries([0, 1, 2, 3], max_concurrency=128)
+            )
+            try:
+                await server_capacity_reached.wait()
+                for _ in range(4):
+                    await asyncio.sleep(0)
+                self.assertEqual(peak, 2)
+            finally:
+                release.set()
+                await request
+
+    async def test_get_slot_smart_summaries_allows_client_hint_to_lower_server_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            settings.app.smart_batch_max_concurrency = 4
+            system = SystemConfig(
+                id="hint-linux",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            slots = self._smart_budget_slots(4)
+            service.get_snapshot = AsyncMock(
+                return_value=InventorySnapshot(slots=slots, refresh_interval_seconds=30)
+            )
+            release = asyncio.Event()
+            hint_capacity_reached = asyncio.Event()
+            active = 0
+            peak = 0
+
+            async def fetch_summary(*_args, **_kwargs):
+                nonlocal active, peak
+                active += 1
+                peak = max(peak, active)
+                if active >= 2:
+                    hint_capacity_reached.set()
+                try:
+                    await release.wait()
+                    return SmartSummaryView(available=True, power_on_hours=1), None
+                finally:
+                    active -= 1
+
+            service._fetch_smart_summary_over_ssh = AsyncMock(side_effect=fetch_summary)
+            request = asyncio.create_task(
+                service.get_slot_smart_summaries([0, 1, 2, 3], max_concurrency=2)
+            )
+            try:
+                await hint_capacity_reached.wait()
+                for _ in range(4):
+                    await asyncio.sleep(0)
+                self.assertEqual(peak, 2)
+            finally:
+                release.set()
+                await request
+
+    async def test_concurrent_smart_requests_share_one_system_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            settings.app.smart_batch_max_concurrency = 2
+            system = SystemConfig(
+                id="shared-budget-linux",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            slots = self._smart_budget_slots(5)
+            service.get_snapshot = AsyncMock(
+                return_value=InventorySnapshot(slots=slots, refresh_interval_seconds=30)
+            )
+            release = asyncio.Event()
+            capacity_reached = asyncio.Event()
+            active = 0
+            peak = 0
+
+            async def fetch_summary(*_args, **_kwargs):
+                nonlocal active, peak
+                active += 1
+                peak = max(peak, active)
+                if active >= 2:
+                    capacity_reached.set()
+                try:
+                    await release.wait()
+                    return SmartSummaryView(available=True, power_on_hours=1), None
+                finally:
+                    active -= 1
+
+            service._fetch_smart_summary_over_ssh = AsyncMock(side_effect=fetch_summary)
+            requests = [
+                asyncio.create_task(service.get_slot_smart_summaries([0, 1], max_concurrency=8)),
+                asyncio.create_task(service.get_slot_smart_summaries([2, 3], max_concurrency=8)),
+                asyncio.create_task(service.get_slot_smart_summary(4)),
+            ]
+            try:
+                await capacity_reached.wait()
+                for _ in range(6):
+                    await asyncio.sleep(0)
+                self.assertEqual(peak, 2)
+            finally:
+                release.set()
+                await asyncio.gather(*requests)
+
+    async def test_background_and_foreground_smart_work_share_one_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            settings.app.smart_batch_max_concurrency = 1
+            system = SystemConfig(
+                id="background-budget-linux",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            stale_slot, cold_slot = self._smart_budget_slots(2)
+            stale_key = service._smart_cache_key(stale_slot)
+            service._smart_cache[stale_key] = SmartSummaryView(available=True, power_on_hours=1)
+            service._smart_cache_until[stale_key] = datetime.now(timezone.utc) - timedelta(seconds=1)
+            service.get_snapshot = AsyncMock(
+                return_value=InventorySnapshot(
+                    slots=[stale_slot, cold_slot],
+                    refresh_interval_seconds=30,
+                )
+            )
+            release = asyncio.Event()
+            first_started = asyncio.Event()
+            active = 0
+            peak = 0
+
+            async def fetch_summary(*_args, **_kwargs):
+                nonlocal active, peak
+                active += 1
+                peak = max(peak, active)
+                first_started.set()
+                try:
+                    await release.wait()
+                    return SmartSummaryView(available=True, power_on_hours=2), None
+                finally:
+                    active -= 1
+
+            service._fetch_smart_summary_over_ssh = AsyncMock(side_effect=fetch_summary)
+            await service.get_slot_smart_summary(0, allow_stale_cache=True)
+            foreground = asyncio.create_task(service.get_slot_smart_summary(1))
+            try:
+                await first_started.wait()
+                for _ in range(6):
+                    await asyncio.sleep(0)
+                self.assertEqual(peak, 1)
+            finally:
+                release.set()
+                await foreground
+                await asyncio.gather(*service._smart_refresh_tasks.values())
+
+    async def test_stale_background_and_foreground_same_key_share_one_live_task(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="background-flight-linux",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            slot = self._smart_budget_slots(1, enclosure_id="enc-background-flight")[0]
+            cache_key = service._smart_cache_key(slot)
+            stale = SmartSummaryView(available=True, power_on_hours=1)
+            service._smart_cache[cache_key] = stale
+            service._smart_cache_until[cache_key] = datetime.now(timezone.utc) - timedelta(seconds=1)
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def load_summary(*_args, **_kwargs):
+                started.set()
+                await release.wait()
+                return SmartSummaryView(available=True, power_on_hours=2)
+
+            service._load_uncached_smart_summary = AsyncMock(side_effect=load_summary)
+            stale_result = await service._get_slot_smart_summary_for_slot_view(
+                slot,
+                allow_stale_cache=True,
+            )
+            await started.wait()
+            foreground = asyncio.create_task(
+                service._get_slot_smart_summary_for_slot_view(slot)
+            )
+            for _ in range(3):
+                await asyncio.sleep(0)
+            release.set()
+            foreground_result = await foreground
+            await asyncio.gather(*service._smart_refresh_tasks.values())
+
+            self.assertIs(stale_result, stale)
+            self.assertEqual(foreground_result.power_on_hours, 2)
+            self.assertEqual(service._load_uncached_smart_summary.await_count, 1)
+
+    async def test_concurrent_cold_slot_and_batch_misses_share_one_live_task(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="single-flight-linux",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            slot = self._smart_budget_slots(1, enclosure_id="enc-flight")[0]
+            snapshot = InventorySnapshot(slots=[slot], refresh_interval_seconds=30)
+            service.get_snapshot = AsyncMock(return_value=snapshot)
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def load_summary(*_args, **_kwargs):
+                started.set()
+                await release.wait()
+                return SmartSummaryView(available=True, power_on_hours=700)
+
+            service._load_uncached_smart_summary = AsyncMock(side_effect=load_summary)
+            direct = asyncio.create_task(service.get_slot_smart_summary(0))
+            batch = asyncio.create_task(service.get_slot_smart_summaries([0]))
+            try:
+                await started.wait()
+                for _ in range(4):
+                    await asyncio.sleep(0)
+            finally:
+                release.set()
+            direct_result, batch_result = await asyncio.gather(direct, batch)
+
+            self.assertEqual(service._load_uncached_smart_summary.await_count, 1)
+            self.assertEqual(direct_result, batch_result[0].summary)
+
+    async def test_single_flight_is_keyed_by_full_smart_cache_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            settings.app.smart_batch_max_concurrency = 2
+            system = SystemConfig(
+                id="keyed-flight-linux",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            first = self._smart_budget_slots(1, enclosure_id="enc-keyed")[0]
+            second = first.model_copy(update={"device_name": "different-device"})
+            both_started = asyncio.Event()
+            release = asyncio.Event()
+            started = 0
+
+            async def load_summary(_slot, *, candidates, **_kwargs):
+                nonlocal started
+                started += 1
+                if started == 2:
+                    both_started.set()
+                await release.wait()
+                return SmartSummaryView(
+                    available=True,
+                    power_on_hours=1 if candidates == ["sd0"] else 2,
+                )
+
+            service._load_uncached_smart_summary = AsyncMock(side_effect=load_summary)
+            requests = [
+                asyncio.create_task(service._get_slot_smart_summary_for_slot_view(first)),
+                asyncio.create_task(service._get_slot_smart_summary_for_slot_view(second)),
+            ]
+            try:
+                await both_started.wait()
+            finally:
+                release.set()
+            results = await asyncio.gather(*requests)
+
+            self.assertEqual(service._load_uncached_smart_summary.await_count, 2)
+            self.assertEqual([result.power_on_hours for result in results], [1, 2])
+
+    async def test_cancelled_waiter_does_not_cancel_shared_smart_work(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="cancelled-flight-linux",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            slot = self._smart_budget_slots(1, enclosure_id="enc-cancel")[0]
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def load_summary(*_args, **_kwargs):
+                started.set()
+                await release.wait()
+                return SmartSummaryView(available=True, power_on_hours=900)
+
+            service._load_uncached_smart_summary = AsyncMock(side_effect=load_summary)
+            cancelled_waiter = asyncio.create_task(
+                service._get_slot_smart_summary_for_slot_view(slot)
+            )
+            surviving_waiter = asyncio.create_task(
+                service._get_slot_smart_summary_for_slot_view(slot)
+            )
+            await started.wait()
+            for _ in range(4):
+                await asyncio.sleep(0)
+            cancelled_waiter.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await cancelled_waiter
+            release.set()
+
+            result = await surviving_waiter
+
+            self.assertEqual(result.power_on_hours, 900)
+            self.assertEqual(service._load_uncached_smart_summary.await_count, 1)
+            self.assertEqual(service._smart_load_tasks, {})
+
+    async def test_invalidation_during_foreground_flight_fences_successful_cache_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="fenced-flight-linux",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            slot = self._smart_budget_slots(1, enclosure_id="enc-fenced")[0]
+            started = asyncio.Event()
+            release = asyncio.Event()
+            attempts = 0
+
+            async def fetch_summary(*_args, **_kwargs):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    started.set()
+                    await release.wait()
+                return SmartSummaryView(available=True, power_on_hours=attempts), None
+
+            service._fetch_smart_summary_over_ssh = AsyncMock(side_effect=fetch_summary)
+            request = asyncio.create_task(
+                service._get_slot_smart_summary_for_slot_view(slot)
+            )
+            await started.wait()
+            service.invalidate_snapshot_cache(
+                reason="test.foreground_fence",
+                cache_keys=["enc-fenced"],
+            )
+            release.set()
+
+            first = await request
+            second = await service._get_slot_smart_summary_for_slot_view(slot)
+
+            self.assertEqual(first.power_on_hours, 1)
+            self.assertEqual(second.power_on_hours, 2)
+            self.assertEqual(attempts, 2)
+
+    async def test_concurrent_unavailable_cold_misses_single_flight_and_negative_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="negative-flight-linux",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            slot = self._smart_budget_slots(1, enclosure_id="enc-negative")[0]
+            started = asyncio.Event()
+            release = asyncio.Event()
+            attempts = 0
+
+            async def fetch_summary(*_args, **_kwargs):
+                nonlocal attempts
+                attempts += 1
+                started.set()
+                await release.wait()
+                return None, "synthetic unavailable"
+
+            service._fetch_smart_summary_over_ssh = AsyncMock(side_effect=fetch_summary)
+            requests = [
+                asyncio.create_task(service._get_slot_smart_summary_for_slot_view(slot))
+                for _ in range(3)
+            ]
+            await started.wait()
+            for _ in range(4):
+                await asyncio.sleep(0)
+            release.set()
+            results = await asyncio.gather(*requests)
+            cached = await service._get_slot_smart_summary_for_slot_view(slot)
+
+            self.assertTrue(all(result.available is False for result in results))
+            self.assertFalse(cached.available)
+            self.assertEqual(attempts, 1)
+
+    async def test_unavailable_summary_is_reused_only_until_negative_ttl(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="negative-ttl-linux",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            slot = self._smart_budget_slots(1, enclosure_id="enc-ttl")[0]
+            current = datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc)
+            attempts = 0
+
+            async def fetch_summary(*_args, **_kwargs):
+                nonlocal attempts
+                attempts += 1
+                return None, "synthetic unavailable"
+
+            service._fetch_smart_summary_over_ssh = AsyncMock(side_effect=fetch_summary)
+            with patch.object(inventory_module, "utcnow", side_effect=lambda: current):
+                await service._get_slot_smart_summary_for_slot_view(slot)
+                await service._get_slot_smart_summary_for_slot_view(slot)
+                self.assertEqual(attempts, 1)
+                current += timedelta(seconds=15)
+                await service._get_slot_smart_summary_for_slot_view(slot)
+
+            self.assertEqual(attempts, 2)
+
+    async def test_fresh_read_bypasses_negative_cache_but_still_single_flights(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="negative-bypass-linux",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            slot = self._smart_budget_slots(1, enclosure_id="enc-bypass")[0]
+            attempts = 0
+            release = asyncio.Event()
+            retry_started = asyncio.Event()
+
+            async def fetch_summary(*_args, **_kwargs):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 2:
+                    retry_started.set()
+                    await release.wait()
+                return None, "synthetic unavailable"
+
+            service._fetch_smart_summary_over_ssh = AsyncMock(side_effect=fetch_summary)
+            await service._get_slot_smart_summary_for_slot_view(slot)
+            requests = [
+                asyncio.create_task(
+                    service._get_slot_smart_summary_for_slot_view(
+                        slot,
+                        bypass_negative_cache=True,
+                    )
+                )
+                for _ in range(3)
+            ]
+            try:
+                for _ in range(2):
+                    await asyncio.sleep(0)
+                if any(request.done() for request in requests):
+                    await asyncio.gather(*requests)
+                await retry_started.wait()
+                for _ in range(4):
+                    await asyncio.sleep(0)
+                self.assertEqual(attempts, 2)
+            finally:
+                release.set()
+            await asyncio.gather(*requests)
+
+    async def test_success_replaces_negative_entry_and_uses_normal_positive_ttl(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="negative-replaced-linux",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            slot = self._smart_budget_slots(1, enclosure_id="enc-replaced")[0]
+            attempts = 0
+
+            async def fetch_summary(*_args, **_kwargs):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    return None, "synthetic unavailable"
+                return SmartSummaryView(available=True, power_on_hours=55), None
+
+            service._fetch_smart_summary_over_ssh = AsyncMock(side_effect=fetch_summary)
+            first = await service._get_slot_smart_summary_for_slot_view(slot)
+            second = await service._get_slot_smart_summary_for_slot_view(
+                slot,
+                bypass_negative_cache=True,
+            )
+            third = await service._get_slot_smart_summary_for_slot_view(slot)
+
+            self.assertFalse(first.available)
+            self.assertEqual(second.power_on_hours, 55)
+            self.assertEqual(third.power_on_hours, 55)
+            self.assertEqual(attempts, 2)
+            self.assertNotIn(service._smart_cache_key(slot), service._smart_negative_cache)
+
+    async def test_negative_smart_cache_is_bounded_by_oldest_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="negative-bounded-linux",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            slots = self._smart_budget_slots(3, enclosure_id="enc-bounded")
+            service._fetch_smart_summary_over_ssh = AsyncMock(
+                return_value=(None, "synthetic unavailable")
+            )
+
+            with patch.object(inventory_module, "SMART_NEGATIVE_CACHE_MAX_ENTRIES", 2):
+                for slot in slots:
+                    await service._get_slot_smart_summary_for_slot_view(slot)
+
+            self.assertEqual(len(service._smart_negative_cache), 2)
+            self.assertNotIn(service._smart_cache_key(slots[0]), service._smart_negative_cache)
+            self.assertIn(service._smart_cache_key(slots[1]), service._smart_negative_cache)
+            self.assertIn(service._smart_cache_key(slots[2]), service._smart_negative_cache)
+
+    async def test_unavailable_summary_is_not_stored_as_positive_or_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="negative-not-persisted-esxi",
+                truenas=TrueNASConfig(platform="esxi"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            slot = SlotView(
+                slot=0,
+                slot_label="00",
+                row_index=0,
+                column_index=0,
+                enclosure_id="enc-negative",
+                device_name="naa.synthetic",
+            )
+            service._build_esxi_slot_smart_summary = AsyncMock(
+                return_value=SmartSummaryView(available=False, message="synthetic unavailable")
+            )
+
+            summary = await service._get_slot_smart_summary_for_slot_view(slot)
+
+            cache_key = service._smart_cache_key(slot)
+            self.assertFalse(summary.available)
+            self.assertNotIn(cache_key, service._smart_cache)
+            self.assertIn(cache_key, service._smart_negative_cache)
+            store = service.slot_detail_store
+            self.assertIsNotNone(store)
+            assert store is not None
+            self.assertTrue(all(not entry.smart_fields for entry in store.load_all().values()))
+
+    async def test_scoped_invalidation_removes_matching_negative_entries_and_fences_inflight_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            settings.app.smart_batch_max_concurrency = 2
+            system = SystemConfig(
+                id="negative-invalidation-linux",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            selected = self._smart_budget_slots(1, enclosure_id="enc-selected")[0]
+            other = self._smart_budget_slots(1, enclosure_id="enc-other")[0]
+            other = other.model_copy(update={"device_name": "other-device"})
+            attempts: dict[str, int] = {}
+            retry_started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def fetch_summary(candidates, **_kwargs):
+                candidate = candidates[0]
+                attempts[candidate] = attempts.get(candidate, 0) + 1
+                if candidate == "sd0" and attempts[candidate] == 2:
+                    retry_started.set()
+                    await release.wait()
+                return None, "synthetic unavailable"
+
+            service._fetch_smart_summary_over_ssh = AsyncMock(side_effect=fetch_summary)
+            await service._get_slot_smart_summary_for_slot_view(selected)
+            await service._get_slot_smart_summary_for_slot_view(other)
+            inflight = asyncio.create_task(
+                service._get_slot_smart_summary_for_slot_view(
+                    selected,
+                    bypass_negative_cache=True,
+                )
+            )
+            for _ in range(2):
+                await asyncio.sleep(0)
+            if inflight.done():
+                await inflight
+            await retry_started.wait()
+            service.invalidate_snapshot_cache(
+                reason="test.negative_fence",
+                cache_keys=["enc-selected"],
+            )
+            release.set()
+            await inflight
+
+            await service._get_slot_smart_summary_for_slot_view(other)
+            await service._get_slot_smart_summary_for_slot_view(selected)
+
+            self.assertEqual(attempts["other-device"], 1)
+            self.assertEqual(attempts["sd0"], 3)
+
+    async def test_transport_specific_smart_enrichment_command_matrix(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="transport-matrix",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            complete_common = {
+                "available": True,
+                "power_on_hours": 10,
+                "rotation_rate_rpm": 7200,
+                "form_factor": "2.5 inches",
+                "read_cache_enabled": True,
+                "writeback_cache_enabled": True,
+            }
+            cases = [
+                (
+                    "ATA",
+                    SmartSummaryView(
+                        **complete_common,
+                        transport_protocol="ATA",
+                        protocol_version="SATA 3.3",
+                        negotiated_link_rate="6 Gb/s",
+                        bytes_read=1,
+                        bytes_written=2,
+                        read_commands=3,
+                        write_commands=4,
+                    ),
+                    (),
+                ),
+                (
+                    "ATA",
+                    SmartSummaryView(available=True, transport_protocol="ATA"),
+                    ("smartctl-text", "smartctl-json"),
+                ),
+                (
+                    "ATA",
+                    SmartSummaryView(
+                        available=True,
+                        transport_protocol="ATA",
+                        protocol_version="SATA 3.3",
+                        negotiated_link_rate="6 Gb/s",
+                        rotation_rate_rpm=7200,
+                        form_factor="2.5 inches",
+                        read_cache_enabled=True,
+                        writeback_cache_enabled=True,
+                        bytes_read=1,
+                        bytes_written=2,
+                        read_commands=3,
+                        write_commands=4,
+                    ),
+                    ("smartctl-json",),
+                ),
+                (
+                    "SAS",
+                    SmartSummaryView(
+                        **complete_common,
+                        transport_protocol="SAS",
+                        logical_unit_id="0x1",
+                        sas_address="0x2",
+                        attached_sas_address="0x3",
+                        negotiated_link_rate="12 Gbps",
+                    ),
+                    (),
+                ),
+                (
+                    "SAS",
+                    SmartSummaryView(**complete_common, transport_protocol="SAS"),
+                    ("smartctl-text",),
+                ),
+                (
+                    "SAS",
+                    SmartSummaryView(
+                        available=True,
+                        transport_protocol="SAS",
+                        rotation_rate_rpm=7200,
+                        form_factor="2.5 inches",
+                        read_cache_enabled=True,
+                        writeback_cache_enabled=True,
+                        logical_unit_id="0x1",
+                        sas_address="0x2",
+                        attached_sas_address="0x3",
+                        negotiated_link_rate="12 Gbps",
+                    ),
+                    ("smartctl-json",),
+                ),
+                (
+                    "NVMe",
+                    SmartSummaryView(
+                        available=True,
+                        transport_protocol="NVMe",
+                        temperature_c=30,
+                        power_on_hours=10,
+                        available_spare_percent=100,
+                        available_spare_threshold_percent=10,
+                        endurance_used_percent=1,
+                        bytes_read=1,
+                        bytes_written=2,
+                        media_errors=0,
+                        unsafe_shutdowns=0,
+                        firmware_version="1.0",
+                        protocol_version="NVMe 2.0",
+                        warning_temperature_c=70,
+                        critical_temperature_c=80,
+                        namespace_eui64="0x1",
+                        namespace_nguid="0x2",
+                    ),
+                    (),
+                ),
+                (
+                    "NVMe",
+                    SmartSummaryView(available=True, transport_protocol="NVMe"),
+                    ("nvme-smart-log", "nvme-id-ctrl", "nvme-id-ns"),
+                ),
+                (
+                    "unknown",
+                    SmartSummaryView(available=True),
+                    ("smartctl-text",),
+                ),
+            ]
+
+            for expected_transport, summary, expected_groups in cases:
+                with self.subTest(transport=expected_transport, groups=expected_groups):
+                    slot = SlotView(
+                        slot=0,
+                        slot_label="00",
+                        row_index=0,
+                        column_index=0,
+                    )
+                    transport, groups = service._smart_enrichment_plan(
+                        summary,
+                        slot,
+                        ["device0"],
+                    )
+                    self.assertEqual(transport, expected_transport)
+                    self.assertEqual(groups, expected_groups)
+
+    async def test_core_nvme_json_does_not_fetch_text_or_ssh_for_missing_sas_fields(self) -> None:
+        class DummyTrueNASClient:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, tuple[str, ...]]] = []
+
+            async def fetch_disk_smartctl(self, disk_name: str, args: list[str] | None = None):
+                self.calls.append((disk_name, tuple(args or [])))
+                if args != ["-a", "-j"]:
+                    raise AssertionError("complete NVMe JSON must not request text enrichment")
+                return json.dumps(
+                    {
+                        "device": {"protocol": "NVMe"},
+                        "smart_status": {"passed": True},
+                        "temperature": {"current": 31},
+                        "power_on_time": {"hours": 120},
+                        "rotation_rate": 0,
+                        "firmware_version": "1.0",
+                        "nvme_version": {"string": "NVMe 2.0"},
+                        "nvme_smart_health_information_log": {
+                            "available_spare": 100,
+                            "available_spare_threshold": 10,
+                            "percentage_used": 1,
+                            "data_units_read": 2,
+                            "data_units_written": 3,
+                            "media_errors": 0,
+                            "unsafe_shutdowns": 0,
+                        },
+                        "nvme_namespaces": [{"eui64": "".join(("00112233", "44556677"))}],
+                    }
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="core-nvme",
+                truenas=TrueNASConfig(platform="core"),
+                ssh=SSHConfig(enabled=True),
+            )
+            client = DummyTrueNASClient()
+            service = build_inventory_service(settings, system, client, AsyncMock(), temp_dir)
+            slot = SlotView(
+                slot=0,
+                slot_label="00",
+                row_index=0,
+                column_index=0,
+                device_name="nvme0n1",
+                transport_protocol="NVMe",
+            )
+            service._fetch_smart_summary_over_ssh = AsyncMock()
+
+            summary = await service._get_slot_smart_summary_for_slot_view(slot)
+
+            self.assertTrue(summary.available)
+            self.assertEqual(summary.transport_protocol, "NVMe")
+            self.assertEqual(client.calls, [("nvme0n1", ("-a", "-j"))])
+            service._fetch_smart_summary_over_ssh.assert_not_awaited()
+
+    async def test_complete_core_ata_json_skips_ssh_json_while_sparse_ata_triggers_it(self) -> None:
+        class DummyTrueNASClient:
+            async def fetch_disk_smartctl(self, disk_name: str, args: list[str] | None = None):
+                if args == ["-x"]:
+                    return (
+                        "SMART overall-health self-assessment test result: PASSED\n"
+                        "Read Cache is: Enabled\n"
+                        "Writeback Cache is: Enabled\n"
+                        "SATA Version is: SATA 3.3 (current: 6 Gb/s)\n"
+                    )
+                if disk_name == "complete-ata":
+                    return json.dumps(
+                        {
+                            "device": {"protocol": "ATA"},
+                            "smart_status": {"passed": True},
+                            "power_on_time": {"hours": 10},
+                            "rotation_rate": 7200,
+                            "form_factor": {"name": "2.5 inches"},
+                            "sata_version": {"string": "SATA 3.3"},
+                            "interface_speed": {"current": {"string": "6 Gb/s"}},
+                            "read_lookahead": {"enabled": True},
+                            "write_cache": {"enabled": True},
+                            "ata_device_statistics": {
+                                "pages": [
+                                    {
+                                        "table": [
+                                            {"name": "Logical Sectors Read", "value": 2},
+                                            {"name": "Logical Sectors Written", "value": 3},
+                                            {"name": "Number of Read Commands", "value": 4},
+                                            {"name": "Number of Write Commands", "value": 5},
+                                        ]
+                                    }
+                                ]
+                            },
+                        }
+                    )
+                return json.dumps({"device": {"protocol": "ATA"}, "smart_status": {"passed": True}})
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="core-ata-staging",
+                truenas=TrueNASConfig(platform="core"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                DummyTrueNASClient(),
+                AsyncMock(),
+                temp_dir,
+            )
+            complete = SlotView(
+                slot=0,
+                slot_label="00",
+                row_index=0,
+                column_index=0,
+                enclosure_id="enc-ata",
+                device_name="complete-ata",
+                transport_protocol="ATA",
+            )
+            sparse = complete.model_copy(update={"slot": 1, "device_name": "sparse-ata"})
+            service._fetch_smart_summary_over_ssh = AsyncMock(
+                return_value=(SmartSummaryView(available=True, transport_protocol="ATA"), None)
+            )
+
+            await service._get_slot_smart_summary_for_slot_view(complete)
+            await service._get_slot_smart_summary_for_slot_view(sparse)
+
+            service._fetch_smart_summary_over_ssh.assert_awaited_once()
+            self.assertEqual(
+                service._fetch_smart_summary_over_ssh.await_args.args[0],
+                ["sparse-ata"],
+            )
+
+    async def test_smart_summary_over_ssh_stages_primary_json_before_sas_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="staged-sas",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            observed_batches: list[list[str]] = []
+
+            async def run_planned(planner, *, initial_commands, host=None):
+                self.assertIsNone(host)
+                initial = list(initial_commands)
+                observed_batches.append(initial)
+                self.assertEqual(len(initial), 1)
+                results = [
+                    SSHCommandResult(
+                        command=initial[0],
+                        ok=True,
+                        stdout=json.dumps(
+                            {
+                                "device": {"protocol": "SAS"},
+                                "smart_status": {"passed": True},
+                                "power_on_time": {"hours": 10},
+                            }
+                        ),
+                        exit_code=0,
+                    )
+                ]
+                followups = list(planner(results))
+                observed_batches.append(followups)
+                self.assertEqual(len(followups), 1)
+                results.append(
+                    SSHCommandResult(
+                        command=followups[0],
+                        ok=True,
+                        stdout=(
+                            "Transport protocol: SAS\n"
+                            "SAS address = 0x1\n"
+                            "attached SAS address = 0x2\n"
+                            "negotiated logical link rate: 12 Gbps\n"
+                        ),
+                        exit_code=0,
+                    )
+                )
+                return results
+
+            service._run_ssh_planned_commands = AsyncMock(side_effect=run_planned)
+            service._run_ssh_commands = AsyncMock(
+                side_effect=AssertionError("eager SMART command batches are forbidden")
+            )
+
+            summary, error = await service._fetch_smart_summary_over_ssh(["sda"])
+
+            self.assertIsNone(error)
+            self.assertIsNotNone(summary)
+            assert summary is not None
+            self.assertEqual(summary.transport_protocol, "SAS")
+            self.assertEqual(len(observed_batches), 2)
+            self.assertIn("-x -j /dev/sda", observed_batches[0][0])
+            self.assertIn("-x /dev/sda", observed_batches[1][0])
+
+    async def test_linux_nvme_staging_requests_only_missing_command_groups(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="staged-nvme",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            followup_commands: list[str] = []
+
+            async def run_planned(planner, *, initial_commands, host=None):
+                initial = list(initial_commands)
+                results = [
+                    SSHCommandResult(
+                        command=initial[0],
+                        ok=True,
+                        stdout=json.dumps(
+                            {
+                                "device": {"protocol": "NVMe"},
+                                "temperature": {"current": 30},
+                                "power_on_time": {"hours": 100},
+                                "nvme_smart_health_information_log": {
+                                    "available_spare": 100,
+                                    "available_spare_threshold": 10,
+                                    "percentage_used": 1,
+                                    "data_units_read": 2,
+                                    "data_units_written": 3,
+                                    "media_errors": 0,
+                                    "unsafe_shutdowns": 0,
+                                },
+                            }
+                        ),
+                        exit_code=0,
+                    )
+                ]
+                followup_commands.extend(planner(results))
+                results.extend(
+                    SSHCommandResult(command=command, ok=True, stdout="{}", exit_code=0)
+                    for command in followup_commands
+                )
+                return results
+
+            service._run_ssh_planned_commands = AsyncMock(side_effect=run_planned)
+            service._run_ssh_commands = AsyncMock(
+                side_effect=AssertionError("eager SMART command batches are forbidden")
+            )
+
+            summary, error = await service._fetch_smart_summary_over_ssh(["nvme0n1"])
+
+            self.assertIsNone(error)
+            self.assertIsNotNone(summary)
+            self.assertEqual(len(followup_commands), 2)
+            self.assertTrue(any(" id-ctrl " in command for command in followup_commands))
+            self.assertTrue(any(" id-ns " in command for command in followup_commands))
+            self.assertFalse(any(" smart-log " in command for command in followup_commands))
+            self.assertFalse(any("smartctl" in command and " -j " not in command for command in followup_commands))
+
+    async def test_mixed_transport_concurrent_requests_bound_and_coalesce_remote_work(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            settings.app.smart_batch_max_concurrency = 2
+            system = SystemConfig(
+                id="mixed-transport-linux",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            sas_slot = SlotView(
+                slot=0,
+                slot_label="00",
+                row_index=0,
+                column_index=0,
+                enclosure_id="enc-mixed",
+                device_name="sas0",
+                transport_protocol="SAS",
+            )
+            nvme_slot = SlotView(
+                slot=1,
+                slot_label="01",
+                row_index=0,
+                column_index=1,
+                enclosure_id="enc-mixed",
+                device_name="nvme0n1",
+                transport_protocol="NVMe",
+            )
+            service.get_snapshot = AsyncMock(
+                return_value=InventorySnapshot(
+                    slots=[sas_slot, nvme_slot],
+                    refresh_interval_seconds=30,
+                )
+            )
+            release = asyncio.Event()
+            both_started = asyncio.Event()
+            active = 0
+            peak = 0
+            primary_counts: dict[str, int] = {}
+            followups_by_device: dict[str, list[str]] = {}
+
+            async def run_planned(planner, *, initial_commands, host=None):
+                nonlocal active, peak
+                initial = list(initial_commands)
+                command = initial[0]
+                device = "nvme" if "/dev/nvme0n1" in command else "sas"
+                primary_counts[device] = primary_counts.get(device, 0) + 1
+                active += 1
+                peak = max(peak, active)
+                if len(primary_counts) == 2:
+                    both_started.set()
+                try:
+                    await release.wait()
+                    payload = (
+                        {
+                            "device": {"protocol": "NVMe"},
+                            "smart_status": {"passed": True},
+                        }
+                        if device == "nvme"
+                        else {
+                            "device": {"protocol": "SAS"},
+                            "smart_status": {"passed": True},
+                        }
+                    )
+                    results = [
+                        SSHCommandResult(
+                            command=command,
+                            ok=True,
+                            stdout=json.dumps(payload),
+                            exit_code=0,
+                        )
+                    ]
+                    followups = list(planner(results))
+                    followups_by_device[device] = followups
+                    results.extend(
+                        SSHCommandResult(command=item, ok=True, stdout="{}", exit_code=0)
+                        for item in followups
+                    )
+                    return results
+                finally:
+                    active -= 1
+
+            service._run_ssh_planned_commands = AsyncMock(side_effect=run_planned)
+            first = asyncio.create_task(
+                service.get_slot_smart_summaries([0, 1, 0, 99], max_concurrency=8)
+            )
+            second = asyncio.create_task(
+                service.get_slot_smart_summaries([1, 0], max_concurrency=8)
+            )
+            try:
+                await both_started.wait()
+                for _ in range(4):
+                    await asyncio.sleep(0)
+                self.assertEqual(peak, 2)
+            finally:
+                release.set()
+            first_result, second_result = await asyncio.gather(first, second)
+
+            self.assertEqual([item.slot for item in first_result], [0, 1])
+            self.assertEqual([item.slot for item in second_result], [1, 0])
+            self.assertEqual(primary_counts, {"sas": 1, "nvme": 1})
+            self.assertTrue(followups_by_device["sas"])
+            self.assertTrue(all("nvme " not in command for command in followups_by_device["sas"]))
+            self.assertTrue(followups_by_device["nvme"])
+            self.assertTrue(all("nvme " in command for command in followups_by_device["nvme"]))
+            self.assertTrue(all("smartctl" not in command for command in followups_by_device["nvme"]))
+
+    async def test_real_ssh_smart_request_uses_one_planned_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="planned-session-linux",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True, host="192.0.2.50", user="operator"),
+            )
+            probe = SSHProbe(system.ssh)
+            service = build_inventory_service(settings, system, AsyncMock(), probe, temp_dir)
+
+            async def run_planned(planner, *, initial_commands):
+                initial = list(initial_commands)
+                results = [
+                    SSHCommandResult(
+                        command=initial[0],
+                        ok=True,
+                        stdout=json.dumps(
+                            {
+                                "device": {"protocol": "SAS"},
+                                "smart_status": {"passed": True},
+                            }
+                        ),
+                        exit_code=0,
+                    )
+                ]
+                results.extend(
+                    SSHCommandResult(command=command, ok=True, stdout="", exit_code=0)
+                    for command in planner(results)
+                )
+                return results
+
+            probe.run_planned_commands = AsyncMock(side_effect=run_planned)  # type: ignore[method-assign]
+
+            summary, error = await service._fetch_smart_summary_over_ssh(["sda"])
+
+            self.assertIsNone(error)
+            self.assertIsNotNone(summary)
+            probe.run_planned_commands.assert_awaited_once()
+
     async def test_degraded_smart_cache_uses_default_snapshot_scope_when_enclosure_is_omitted(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()
@@ -6389,13 +7833,125 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertIsNone(returned)
 
+    async def test_run_ssh_commands_rejects_unapproved_caller_destination_before_transport(self) -> None:
+        observed_transport_hosts: list[str] = []
+
+        async def record_transport(probe: SSHProbe, commands, *, stdin_data=None):
+            observed_transport_hosts.append(probe.config.host)
+            return [
+                SSHCommandResult(command=command, ok=True, stdout="synthetic", exit_code=0)
+                for command in commands
+            ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="synthetic-quantastor",
+                truenas=TrueNASConfig(platform="quantastor"),
+                ssh=SSHConfig(
+                    enabled=True,
+                    host="approved-node.example.test",
+                    user="synthetic-operator",
+                    password="SYNTHETIC-SAVED-SSH-PASSWORD-362",
+                ),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                SSHProbe(system.ssh),
+                temp_dir,
+            )
+
+            with patch.object(SSHProbe, "run_commands", new=record_transport):
+                results = await service._run_ssh_commands(
+                    ["synthetic-read-only-command"],
+                    "replacement-node.example.test",
+                )
+
+        self.assertEqual(observed_transport_hosts, [])
+        self.assertEqual(len(results), 1)
+        self.assertFalse(results[0].ok)
+        self.assertIn("not an operator-approved destination", results[0].stderr)
+
+    async def test_quantastor_cli_does_not_send_credentials_to_appliance_discovered_host(self) -> None:
+        observed_transport_hosts: list[str] = []
+
+        async def record_transport(probe: SSHProbe, commands, *, stdin_data=None):
+            observed_transport_hosts.append(probe.config.host)
+            return [
+                SSHCommandResult(command=command, ok=True, stdout="synthetic", exit_code=0)
+                for command in commands
+            ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="synthetic-quantastor",
+                truenas=TrueNASConfig(
+                    host="https://saved-api.example.test",
+                    platform="quantastor",
+                    api_user="synthetic-api-operator",
+                    api_password="SYNTHETIC-SAVED-API-PASSWORD-362",
+                ),
+                ssh=SSHConfig(
+                    enabled=True,
+                    host="saved-api.example.test",
+                    ha_enabled=True,
+                    user="synthetic-ssh-operator",
+                    password="SYNTHETIC-SAVED-SSH-PASSWORD-362",
+                ),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                SSHProbe(system.ssh),
+                temp_dir,
+            )
+            raw_data = TrueNASRawData(
+                enclosures=[],
+                systems=[
+                    {
+                        "id": "node-from-appliance",
+                        "name": "Synthetic appliance node",
+                        "mainIpAddress": "replacement-node.example.test",
+                        "storageSystemClusterId": "synthetic-cluster",
+                    }
+                ],
+                disks=[],
+                pools=[],
+                pool_devices=[],
+                ha_groups=[],
+                hw_disks=[],
+                hw_enclosures=[
+                    {"id": "synthetic-enclosure", "storageSystemId": "node-from-appliance"}
+                ],
+                disk_temperatures={},
+                smart_test_results=[],
+            )
+
+            with patch.object(SSHProbe, "run_commands", new=record_transport):
+                _overlay, failures = await service._fetch_quantastor_cli_overlay(raw_data)
+
+        self.assertEqual(observed_transport_hosts, [])
+        self.assertTrue(failures)
+        self.assertTrue(
+            all("not an operator-approved destination" in failure for failure in failures)
+        )
+
     async def test_ssh_batches_for_different_hosts_are_not_globally_serialized(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()
             system = SystemConfig(
                 id="multi-host",
                 truenas=TrueNASConfig(platform="quantastor"),
-                ssh=SSHConfig(enabled=True, host="192.0.2.10", user="operator"),
+                ssh=SSHConfig(
+                    enabled=True,
+                    host="192.0.2.10",
+                    extra_hosts=["192.0.2.11"],
+                    user="operator",
+                ),
             )
             service = build_inventory_service(
                 settings,
@@ -6514,11 +8070,11 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertIsNone(error)
             self.assertIsNotNone(summary)
-            self.assertEqual(service._run_ssh_commands.await_count, 1)
-            combined_batch = service._run_ssh_commands.await_args
-            self.assertIsNotNone(combined_batch)
-            assert combined_batch is not None
-            self.assertEqual(len(combined_batch.args[0]), 5)
+            self.assertEqual(service._run_ssh_commands.await_count, 2)
+            staged_batches = [call.args[0] for call in service._run_ssh_commands.await_args_list]
+            self.assertEqual(len(staged_batches[0]), 1)
+            self.assertEqual(len(staged_batches[1]), 3)
+            self.assertTrue(all("nvme " in command for command in staged_batches[1]))
 
     async def test_esxi_host_smart_candidates_share_one_command_batch(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -7092,11 +8648,11 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
             expiry = datetime.now(timezone.utc) + timedelta(seconds=30)
             matching_keys = {
                 "enc-a",
-                "enc-a::dell-md1280-top-drawer",
-                "enc-a::dell-md1280-bottom-drawer",
+                "enc-a::dell-md1280-drawer-top-42",
+                "enc-a::dell-md1280-drawer-bottom-42",
                 "__default__",
             }
-            unrelated_key = "enc-b::dell-md1280-top-drawer"
+            unrelated_key = "enc-b::dell-md1280-drawer-top-42"
             for cache_key in matching_keys | {unrelated_key}:
                 service._cache[cache_key] = snapshot
                 service._cache_until[cache_key] = expiry
@@ -7112,7 +8668,7 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
 
             service.invalidate_physical_enclosure_snapshot_cache(
                 reason="test.physical.scope",
-                enclosure_id="enc-a::dell-md1280-top-drawer",
+                enclosure_id="enc-a::dell-md1280-drawer-top-42",
             )
 
             self.assertEqual(set(service._cache), {unrelated_key})
@@ -8456,7 +10012,12 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
 
-            async def fetch_summary(slot_view: SlotView, *, allow_stale_cache: bool = False) -> SmartSummaryView:
+            async def fetch_summary(
+                slot_view: SlotView,
+                *,
+                allow_stale_cache: bool = False,
+                bypass_negative_cache: bool = False,
+            ) -> SmartSummaryView:
                 return SmartSummaryView(available=True, power_on_hours=100 + slot_view.slot)
 
             service._get_slot_smart_summary_for_slot_view = AsyncMock(side_effect=fetch_summary)
@@ -8501,7 +10062,12 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
             active_calls = 0
             peak_calls = 0
 
-            async def fetch_summary(slot_view: SlotView, *, allow_stale_cache: bool = False) -> SmartSummaryView:
+            async def fetch_summary(
+                slot_view: SlotView,
+                *,
+                allow_stale_cache: bool = False,
+                bypass_negative_cache: bool = False,
+            ) -> SmartSummaryView:
                 nonlocal active_calls, peak_calls
                 active_calls += 1
                 peak_calls = max(peak_calls, active_calls)
@@ -9091,7 +10657,13 @@ Enclosure Status diagnostic page:
                 id="quantastor-lab",
                 label="Quantastor Lab",
                 truenas=TrueNASConfig(platform="quantastor"),
-                ssh=SSHConfig(enabled=True, host="10.0.0.10", user="jbodmap", commands=[]),
+                ssh=SSHConfig(
+                    enabled=True,
+                    host="10.0.0.10",
+                    extra_hosts=[f"10.0.0.{20}"],
+                    user="jbodmap",
+                    commands=[],
+                ),
             )
             service = build_inventory_service(
                 settings,
@@ -9103,32 +10675,28 @@ Enclosure Status diagnostic page:
 
             async def run_commands(commands: list[str], host: str | None = None) -> list[SSHCommandResult]:
                 self.assertEqual(host, "10.0.0.20")
-                self.assertEqual(len(commands), 2)
-                json_command, text_command = commands
                 return [
                     SSHCommandResult(
-                        command=json_command,
+                        command=command,
                         ok=True,
                         stdout=(
-                            '{'
-                            '"power_on_time":{"hours":47003},'
-                            '"rotation_rate":0,'
-                            '"smart_status":{"passed":true}'
-                            '}'
+                            (
+                                '{'
+                                '"power_on_time":{"hours":47003},'
+                                '"rotation_rate":0,'
+                                '"smart_status":{"passed":true}'
+                                '}'
+                            )
+                            if " -j " in command
+                            else (
+                                "Read Cache is:        Enabled\n"
+                                "Writeback Cache is:   Enabled\n"
+                            )
                         ),
                         stderr="",
                         exit_code=0,
-                    ),
-                    SSHCommandResult(
-                        command=text_command,
-                        ok=True,
-                        stdout=(
-                            "Read Cache is:        Enabled\n"
-                            "Writeback Cache is:   Enabled\n"
-                        ),
-                        stderr="",
-                        exit_code=0,
-                    ),
+                    )
+                    for command in commands
                 ]
 
             service._run_ssh_commands = AsyncMock(side_effect=run_commands)
@@ -9142,10 +10710,10 @@ Enclosure Status diagnostic page:
             self.assertEqual(summary.power_on_hours, 47003)
             self.assertTrue(summary.read_cache_enabled)
             self.assertTrue(summary.writeback_cache_enabled)
-            service._run_ssh_commands.assert_awaited_once()
-            batched_commands = service._run_ssh_commands.await_args.args[0]
-            self.assertIn("-x -j /dev/sdb", batched_commands[0])
-            self.assertIn("-x /dev/sdb", batched_commands[1])
+            self.assertEqual(service._run_ssh_commands.await_count, 2)
+            staged_batches = [call.args[0] for call in service._run_ssh_commands.await_args_list]
+            self.assertIn("-x -j /dev/sdb", staged_batches[0][0])
+            self.assertIn("-x /dev/sdb", staged_batches[1][0])
 
     async def test_real_ssh_probe_command_batches_are_serialized_per_inventory_service(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -9816,9 +11384,8 @@ Enclosure Status diagnostic page:
                     ("ada0", ("-x",)),
                 ],
             )
-            self.assertEqual(len(service.ssh_probe.commands), 2)
+            self.assertEqual(len(service.ssh_probe.commands), 1)
             self.assertIn("/usr/local/sbin/smartctl -x -j /dev/ada0", service.ssh_probe.commands[0])
-            self.assertIn("/usr/local/sbin/smartctl -x /dev/ada0", service.ssh_probe.commands[1])
 
     async def test_core_smart_summary_falls_back_to_ssh_when_api_smartctl_fails(self) -> None:
         class DummyTrueNASClient:
@@ -10644,6 +12211,547 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
                 self.assertEqual(len(store.load_all()), slot_count)
 
 
+class InventoryServiceSnapshotStateBoundsTests(unittest.IsolatedAsyncioTestCase):
+    def _service(self, temp_dir: str) -> InventoryService:
+        return build_inventory_service(
+            Settings(),
+            SystemConfig(id="bounded", truenas=TrueNASConfig(platform="core")),
+            AsyncMock(),
+            AsyncMock(),
+            temp_dir,
+        )
+
+    @staticmethod
+    def _snapshot(selected: str | None = "enc-a") -> InventorySnapshot:
+        return InventorySnapshot(
+            slots=[],
+            refresh_interval_seconds=30,
+            selected_system_id="bounded",
+            selected_system_platform="core",
+            selected_enclosure_id=selected,
+            enclosures=[
+                EnclosureOption(id="enc-a", label="Shelf A"),
+                EnclosureOption(id="enc-b", label="Shelf B"),
+                EnclosureOption(id="enc-a:drawer-top", label="Shelf A top"),
+                EnclosureOption(id="view:flash", label="Flash view", kind="virtual"),
+            ],
+        )
+
+    async def test_unknown_ids_fail_before_request_keyed_state_or_build(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            service._build_snapshot = AsyncMock(return_value=self._snapshot())
+
+            for index in range(80):
+                raw_id = f"untrusted-{index}-" + ("x" * index)
+                with self.assertRaisesRegex(Exception, "Requested enclosure is not available"):
+                    await service.get_snapshot(selected_enclosure_id=raw_id)
+                self.assertNotIn(raw_id, service._cache)
+                self.assertNotIn(raw_id, service._cache_until)
+                self.assertNotIn(raw_id, service._snapshot_locks)
+                self.assertNotIn(raw_id, service._snapshot_refresh_tasks)
+
+            self.assertEqual(
+                [call.kwargs["selected_enclosure_id"] for call in service._build_snapshot.await_args_list],
+                [None],
+            )
+
+    async def test_none_and_exact_default_coalesce_while_aliases_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            default_snapshot = self._snapshot()
+            service._build_snapshot = AsyncMock(return_value=default_snapshot)
+
+            omitted, explicit = await asyncio.gather(
+                service.get_snapshot(),
+                service.get_snapshot(selected_enclosure_id="enc-a"),
+            )
+
+            self.assertIs(omitted, default_snapshot)
+            self.assertIs(explicit, default_snapshot)
+            self.assertEqual(set(service._cache), {"enc-a"})
+            self.assertNotIn("__default__", service._cache)
+            self.assertEqual(service._build_snapshot.await_count, 1)
+            for alias in ("Shelf A", "enc", "ENC-A", "drawer-top", "enc-a:drawer"):
+                with self.assertRaisesRegex(Exception, "Requested enclosure is not available"):
+                    await service.get_snapshot(selected_enclosure_id=alias)
+
+    async def test_perf_metadata_uses_only_canonical_snapshot_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            service._build_snapshot = AsyncMock(return_value=self._snapshot())
+            raw_id = "caller-" + ("x" * 512)
+
+            with patch("app.services.inventory.add_perf_metadata") as metadata:
+                await service.get_snapshot()
+                await service.get_snapshot(selected_enclosure_id="enc-a")
+                with self.assertRaisesRegex(Exception, "Requested enclosure is not available"):
+                    await service.get_snapshot(selected_enclosure_id=raw_id)
+
+            cache_keys = [
+                call.kwargs["snapshot_cache_key"]
+                for call in metadata.call_args_list
+                if "snapshot_cache_key" in call.kwargs
+            ]
+            self.assertTrue(cache_keys)
+            self.assertEqual(set(cache_keys), {"enc-a"})
+            self.assertNotIn(raw_id, repr(metadata.call_args_list))
+
+    async def test_exact_physical_drawer_and_virtual_ids_remain_distinct(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+
+            async def build_snapshot(
+                selected_enclosure_id: str | None = None,
+                *,
+                force_source_refresh: bool = False,
+            ) -> InventorySnapshot:
+                return self._snapshot(selected_enclosure_id or "enc-a")
+
+            service._build_snapshot = AsyncMock(side_effect=build_snapshot)
+            requested = ("enc-a", "enc-b", "enc-a:drawer-top", "view:flash")
+            returned = [
+                await service.get_snapshot(selected_enclosure_id=key)
+                for key in requested
+            ]
+
+            self.assertEqual([snapshot.selected_enclosure_id for snapshot in returned], list(requested))
+            self.assertEqual(set(service._cache), set(requested))
+            self.assertEqual(set(service._cache_until), set(requested))
+
+    async def test_inactive_snapshot_state_uses_deterministic_lru_eviction(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            option_ids = [f"enc-{index}" for index in range(65)]
+            options = [EnclosureOption(id=item, label=item) for item in option_ids]
+
+            async def build_snapshot(
+                selected_enclosure_id: str | None = None,
+                *,
+                force_source_refresh: bool = False,
+            ) -> InventorySnapshot:
+                selected = selected_enclosure_id or option_ids[0]
+                return InventorySnapshot(
+                    slots=[],
+                    refresh_interval_seconds=30,
+                    selected_system_id="bounded",
+                    selected_system_platform="core",
+                    selected_enclosure_id=selected,
+                    enclosures=options,
+                )
+
+            service._build_snapshot = AsyncMock(side_effect=build_snapshot)
+            for enclosure_id in option_ids[:64]:
+                await service.get_snapshot(selected_enclosure_id=enclosure_id)
+            await service.get_snapshot(selected_enclosure_id="enc-0")
+            await service.get_snapshot(selected_enclosure_id="enc-64")
+
+            state_keys = (
+                set(service._cache)
+                | set(service._cache_until)
+                | set(service._snapshot_locks)
+                | set(service._snapshot_refresh_tasks)
+            )
+            self.assertLessEqual(len(state_keys), 64)
+            self.assertIn("enc-0", state_keys)
+            self.assertNotIn("enc-1", state_keys)
+            self.assertEqual(set(service._cache), set(service._cache_until))
+
+    async def test_new_admission_prunes_expired_payload_expiry_lock_and_lru(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            service._canonical_enclosure_options = {
+                "expired": EnclosureOption(id="expired", label="Expired"),
+                "fresh": EnclosureOption(id="fresh", label="Fresh"),
+            }
+            service._admit_snapshot_key("expired")
+            service._cache["expired"] = self._snapshot("expired")
+            service._cache_until["expired"] = datetime.now(timezone.utc) - timedelta(seconds=1)
+            service._get_snapshot_lock("expired")
+            service._build_snapshot = AsyncMock(
+                return_value=InventorySnapshot(
+                    slots=[],
+                    refresh_interval_seconds=30,
+                    selected_system_platform="core",
+                    selected_enclosure_id="fresh",
+                    enclosures=list(service._canonical_enclosure_options.values()),
+                )
+            )
+
+            await service.get_snapshot(selected_enclosure_id="fresh")
+
+            self.assertNotIn("expired", service._snapshot_state_keys())
+            self.assertEqual(service._snapshot_state_keys(), {"fresh"})
+
+    async def test_physical_invalidation_cleans_coordinated_drawer_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            keys = (
+                "enc-a",
+                "enc-a::dell-md1280-drawer-top-42",
+                "enc-a::dell-md1280-drawer-bottom-42",
+                "enc-b",
+            )
+            fresh_until = datetime.now(timezone.utc) + timedelta(minutes=5)
+            for key in keys:
+                service._admit_snapshot_key(key)
+                service._cache[key] = self._snapshot("enc-a" if key.startswith("enc-a") else "enc-b")
+                service._cache_until[key] = fresh_until
+                service._get_snapshot_lock(key)
+            sleeper = asyncio.create_task(asyncio.sleep(60))
+            service._snapshot_refresh_tasks[
+                "enc-a::dell-md1280-drawer-top-42"
+            ] = sleeper
+            service._canonical_enclosure_options = {
+                key: EnclosureOption(id=key, label=key) for key in keys
+            }
+
+            service.invalidate_physical_enclosure_snapshot_cache(
+                reason="test.physical",
+                enclosure_id="enc-a",
+            )
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+
+            self.assertTrue(sleeper.cancelled())
+            for state in (
+                service._cache,
+                service._cache_until,
+                service._snapshot_locks,
+                service._snapshot_refresh_tasks,
+                service._snapshot_activity,
+                service._snapshot_lru,
+                service._canonical_enclosure_options,
+            ):
+                self.assertFalse(any(key.startswith("enc-a") for key in state))
+            self.assertIn("enc-b", service._cache)
+
+    async def test_physical_invalidation_fences_a_blocked_cold_discovery(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            started = asyncio.Event()
+            release = asyncio.Event()
+            old_snapshot = InventorySnapshot(
+                slots=[],
+                refresh_interval_seconds=30,
+                selected_system_platform="core",
+                selected_enclosure_id="enc-a",
+                enclosures=[
+                    EnclosureOption(id="enc-a", label="Shelf A"),
+                    EnclosureOption(id="enc-b", label="Shelf B"),
+                ],
+            )
+            new_snapshot = InventorySnapshot(
+                slots=[],
+                refresh_interval_seconds=30,
+                selected_system_platform="core",
+                selected_enclosure_id="enc-b",
+                enclosures=[EnclosureOption(id="enc-b", label="Shelf B")],
+            )
+
+            async def discover(
+                selected_enclosure_id: str | None = None,
+                *,
+                force_source_refresh: bool = False,
+            ) -> InventorySnapshot:
+                if not started.is_set():
+                    started.set()
+                    await release.wait()
+                    return old_snapshot
+                return new_snapshot
+
+            service._build_snapshot = AsyncMock(side_effect=discover)
+            request = asyncio.create_task(service.get_snapshot(selected_enclosure_id="enc-a"))
+            await started.wait()
+            generation = service._snapshot_topology_generation
+            service.invalidate_physical_enclosure_snapshot_cache(
+                reason="test.physical.discovery",
+                enclosure_id="enc-a",
+            )
+            release.set()
+
+            with self.assertRaisesRegex(Exception, "Requested enclosure is not available"):
+                await request
+            self.assertGreater(service._snapshot_topology_generation, generation)
+            self.assertEqual(set(service._canonical_enclosure_options or {}), {"enc-b"})
+            self.assertNotIn("enc-a", service._snapshot_state_keys())
+            self.assertEqual(service._build_snapshot.await_count, 2)
+
+    async def test_full_invalidation_fences_a_blocked_foreground_build(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            service._canonical_enclosure_options = {
+                "enc-a": EnclosureOption(id="enc-a", label="Shelf A"),
+                "enc-b": EnclosureOption(id="enc-b", label="Shelf B"),
+            }
+            started = asyncio.Event()
+            release = asyncio.Event()
+            stale_snapshot = InventorySnapshot(
+                slots=[],
+                refresh_interval_seconds=30,
+                selected_system_platform="core",
+                selected_enclosure_id="enc-a",
+                enclosures=list(service._canonical_enclosure_options.values()),
+            )
+
+            async def build_snapshot(
+                selected_enclosure_id: str | None = None,
+                *,
+                force_source_refresh: bool = False,
+            ) -> InventorySnapshot:
+                started.set()
+                await release.wait()
+                return stale_snapshot
+
+            service._build_snapshot = AsyncMock(side_effect=build_snapshot)
+            request = asyncio.create_task(
+                service.get_snapshot(force_refresh=True, selected_enclosure_id="enc-a")
+            )
+            await started.wait()
+            service.invalidate_snapshot_cache(reason="test.full.foreground")
+            release.set()
+
+            with self.assertRaises(inventory_module.SnapshotStateBusyError):
+                await request
+            self.assertIsNone(service._canonical_enclosure_options)
+            self.assertNotIn("enc-a", service._snapshot_state_keys())
+
+    async def test_source_invalidation_fences_an_older_discovery_result(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            started = asyncio.Event()
+            release = asyncio.Event()
+            old_snapshot = InventorySnapshot(
+                slots=[],
+                refresh_interval_seconds=30,
+                selected_system_platform="core",
+                selected_enclosure_id="old",
+                enclosures=[EnclosureOption(id="old", label="Old")],
+            )
+            new_snapshot = InventorySnapshot(
+                slots=[],
+                refresh_interval_seconds=30,
+                selected_system_platform="core",
+                selected_enclosure_id="new",
+                enclosures=[EnclosureOption(id="new", label="New")],
+            )
+
+            async def discover(
+                selected_enclosure_id: str | None = None,
+                *,
+                force_source_refresh: bool = False,
+            ) -> InventorySnapshot:
+                if not started.is_set():
+                    started.set()
+                    await release.wait()
+                    return old_snapshot
+                return new_snapshot
+
+            service._build_snapshot = AsyncMock(side_effect=discover)
+            request = asyncio.create_task(service.get_snapshot(selected_enclosure_id="old"))
+            await started.wait()
+            service.invalidate_snapshot_cache(reason="test.source", invalidate_source_bundle=True)
+            release.set()
+
+            with self.assertRaisesRegex(Exception, "Requested enclosure is not available"):
+                await request
+            self.assertEqual(set(service._canonical_enclosure_options or {}), {"new"})
+            self.assertNotIn("old", service._snapshot_state_keys())
+
+    async def test_trusted_refresh_replaces_the_canonical_option_index(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            initial = self._snapshot()
+            refreshed = InventorySnapshot(
+                slots=[],
+                refresh_interval_seconds=30,
+                selected_system_platform="core",
+                selected_enclosure_id="enc-a",
+                enclosures=[
+                    EnclosureOption(id="enc-a", label="Shelf A"),
+                    EnclosureOption(id="enc-c", label="Shelf C"),
+                ],
+            )
+            selected_c = refreshed.model_copy(update={"selected_enclosure_id": "enc-c"})
+            service._build_snapshot = AsyncMock(side_effect=[initial, refreshed, selected_c])
+
+            await service.get_snapshot()
+            await service.get_snapshot(force_refresh=True)
+            returned = await service.get_snapshot(selected_enclosure_id="enc-c")
+
+            self.assertIs(returned, selected_c)
+            self.assertEqual(set(service._canonical_enclosure_options or {}), {"enc-a", "enc-c"})
+            with self.assertRaisesRegex(Exception, "Requested enclosure is not available"):
+                await service.get_snapshot(selected_enclosure_id="enc-b")
+
+    async def test_parsed_ssh_cache_never_retains_a_none_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            bundle = InventorySourceBundle(
+                raw_data=TrueNASRawData(
+                    enclosures=[],
+                    disks=[],
+                    pools=[],
+                    disk_temperatures={},
+                    smart_test_results=[],
+                ),
+                ssh_outputs={},
+                ssh_collected=True,
+                warnings=[],
+                sources={},
+                scale_ses_data=ParsedSSHData(),
+                quantastor_ses_data=ParsedSSHData(),
+            )
+
+            service._parsed_ssh_data_for_enclosure(bundle, None)
+
+            self.assertNotIn(None, bundle.parsed_ssh_data_by_enclosure)
+            self.assertTrue(all(key is not None for key in bundle.parsed_ssh_data_by_enclosure))
+
+    async def test_parsed_ssh_cache_does_not_retain_an_unknown_secondary_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            service._canonical_enclosure_options = {
+                "enc-a": EnclosureOption(id="enc-a", label="Shelf A")
+            }
+            valid = ParsedSSHData(warnings=["valid canonical cached data"])
+            retained = {"enc-a": valid}
+            retained.update(
+                {
+                    f"legacy-{index}": ParsedSSHData()
+                    for index in range(inventory_module.PARSED_SSH_BUNDLE_CACHE_MAX_ENTRIES - 1)
+                }
+            )
+            bundle = InventorySourceBundle(
+                raw_data=TrueNASRawData(
+                    enclosures=[],
+                    disks=[],
+                    pools=[],
+                    disk_temperatures={},
+                    smart_test_results=[],
+                ),
+                ssh_outputs={},
+                ssh_collected=True,
+                warnings=[],
+                sources={},
+                scale_ses_data=ParsedSSHData(),
+                quantastor_ses_data=ParsedSSHData(),
+                parsed_ssh_data_by_enclosure=retained,
+            )
+
+            parsed = service._parsed_ssh_data_for_enclosure(bundle, "unknown-secondary-key")
+
+            self.assertIsInstance(parsed, ParsedSSHData)
+            self.assertIs(bundle.parsed_ssh_data_by_enclosure["enc-a"], valid)
+            self.assertNotIn("unknown-secondary-key", bundle.parsed_ssh_data_by_enclosure)
+
+    async def test_parsed_ssh_cache_prunes_removed_topology_before_canonical_admission(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            current_ids = [
+                f"enc-{index}"
+                for index in range(inventory_module.PARSED_SSH_BUNDLE_CACHE_MAX_ENTRIES)
+            ]
+            service._canonical_enclosure_options = {
+                "old-removed": EnclosureOption(id="old-removed", label="Old shelf"),
+                **{
+                    key: EnclosureOption(id=key, label=key)
+                    for key in current_ids[:-1]
+                },
+            }
+            retained = {
+                key: ParsedSSHData(warnings=[f"cached {key}"])
+                for key in current_ids[:-1]
+            }
+            retained["old-removed"] = ParsedSSHData(warnings=["stale removed shelf"])
+            bundle = InventorySourceBundle(
+                raw_data=TrueNASRawData(
+                    enclosures=[],
+                    disks=[],
+                    pools=[],
+                    disk_temperatures={},
+                    smart_test_results=[],
+                ),
+                ssh_outputs={},
+                ssh_collected=True,
+                warnings=[],
+                sources={},
+                scale_ses_data=ParsedSSHData(),
+                quantastor_ses_data=ParsedSSHData(),
+                parsed_ssh_data_by_enclosure=retained,
+            )
+            service._replace_canonical_options_from_trusted_snapshot(
+                InventorySnapshot(
+                    slots=[],
+                    refresh_interval_seconds=30,
+                    selected_enclosure_id="enc-0",
+                    enclosures=[
+                        EnclosureOption(id=key, label=key)
+                        for key in current_ids
+                    ],
+                )
+            )
+
+            service._parsed_ssh_data_for_enclosure(bundle, current_ids[-1])
+
+            retained_keys = set(bundle.parsed_ssh_data_by_enclosure)
+            self.assertNotIn("old-removed", retained_keys)
+            self.assertIn("enc-0", retained_keys)
+            self.assertEqual(retained_keys, set(current_ids))
+            self.assertLessEqual(
+                len(retained_keys),
+                inventory_module.PARSED_SSH_BUNDLE_CACHE_MAX_ENTRIES,
+            )
+
+    async def test_all_active_capacity_fails_closed_without_transient_overflow(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            option_ids = [f"active-{index}" for index in range(inventory_module.SNAPSHOT_STATE_MAX_ENTRIES + 1)]
+            service._canonical_enclosure_options = {
+                key: EnclosureOption(id=key, label=key) for key in option_ids
+            }
+            for key in option_ids[:-1]:
+                service._admit_snapshot_key(key)
+                service._snapshot_activity[key] = 1
+            service._build_snapshot = AsyncMock()
+
+            with self.assertRaisesRegex(Exception, "Snapshot state capacity is temporarily busy"):
+                await service.get_snapshot(selected_enclosure_id=option_ids[-1])
+
+            self.assertEqual(
+                len(service._snapshot_state_keys()),
+                inventory_module.SNAPSHOT_STATE_MAX_ENTRIES,
+            )
+            service._build_snapshot.assert_not_awaited()
+
+    async def test_cancelled_build_leaves_no_orphan_coordination_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            service._canonical_enclosure_options = {
+                "enc-a": EnclosureOption(id="enc-a", label="Shelf A")
+            }
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def build_snapshot(
+                selected_enclosure_id: str | None = None,
+                *,
+                force_source_refresh: bool = False,
+            ) -> InventorySnapshot:
+                started.set()
+                await release.wait()
+                return self._snapshot()
+
+            service._build_snapshot = AsyncMock(side_effect=build_snapshot)
+            request = asyncio.create_task(service.get_snapshot(selected_enclosure_id="enc-a"))
+            await started.wait()
+            request.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await request
+
+            self.assertNotIn("enc-a", service._snapshot_state_keys())
+
+
 class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def _empty_source_bundle(*, warning: str | None = None) -> InventorySourceBundle:
@@ -10900,6 +13008,7 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
                 selected_system_id=system.id,
                 selected_system_platform="quantastor",
                 selected_enclosure_id="node-a",
+                enclosures=[EnclosureOption(id="node-a", label="Node A")],
                 platform_context={"topology_complete": True},
             )
             incomplete_snapshot = InventorySnapshot(
@@ -10984,7 +13093,10 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertIs(returned, stale_snapshot)
             await asyncio.sleep(0.05)
-            self.assertEqual(service._cache["__default__"].slots[0].device_name, "da1")
+            self.assertEqual(
+                service._cache[inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY].slots[0].device_name,
+                "da1",
+            )
 
     async def test_background_stale_snapshot_refresh_recollects_sources_without_invalidating_sg_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -11026,9 +13138,12 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
 
             first = await service.get_snapshot(allow_stale_cache=True)
             await asyncio.wait_for(collect_started.wait(), timeout=0.1)
-            background_task = service._snapshot_refresh_tasks["__default__"]
+            background_task = service._snapshot_refresh_tasks[inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY]
             second = await service.get_snapshot(allow_stale_cache=True)
-            self.assertIs(service._snapshot_refresh_tasks["__default__"], background_task)
+            self.assertIs(
+                service._snapshot_refresh_tasks[inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY],
+                background_task,
+            )
             release_collect.set()
             await asyncio.wait_for(background_task, timeout=0.1)
 
@@ -11072,7 +13187,7 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             )
             service._build_snapshot = AsyncMock(wraps=service._build_snapshot)
 
-            await service._background_snapshot_refresh("__default__", None)
+            await service._background_snapshot_refresh(inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY)
             await asyncio.sleep(0)
 
             service._build_snapshot.assert_not_awaited()
@@ -11102,6 +13217,10 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
                     selected_system_id=system.id,
                     selected_system_platform="scale",
                     selected_enclosure_id=enclosure_id,
+                    enclosures=[
+                        EnclosureOption(id="enc-a", label="Shelf A"),
+                        EnclosureOption(id="enc-b", label="Shelf B"),
+                    ],
                 )
 
             stale_snapshots = {
@@ -11168,14 +13287,20 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             stale_snapshot = InventorySnapshot(
                 slots=[SlotView(slot=0, slot_label="00", row_index=0, column_index=0, device_name="da0")],
                 refresh_interval_seconds=30,
+                selected_enclosure_id="enc-a",
+                enclosures=[EnclosureOption(id="enc-a", label="A"), EnclosureOption(id="enc-b", label="B")],
             )
             fresh_snapshot = InventorySnapshot(
                 slots=[SlotView(slot=1, slot_label="01", row_index=0, column_index=1, device_name="da1")],
                 refresh_interval_seconds=30,
+                selected_enclosure_id="enc-a",
+                enclosures=[EnclosureOption(id="enc-a", label="A"), EnclosureOption(id="enc-b", label="B")],
             )
             other_snapshot = InventorySnapshot(
                 slots=[SlotView(slot=2, slot_label="02", row_index=0, column_index=2, device_name="da2")],
                 refresh_interval_seconds=30,
+                selected_enclosure_id="enc-b",
+                enclosures=[EnclosureOption(id="enc-a", label="A"), EnclosureOption(id="enc-b", label="B")],
             )
             service._cache["enc-a"] = stale_snapshot
             service._cache_until["enc-a"] = datetime.now(timezone.utc) - timedelta(seconds=1)
@@ -11495,6 +13620,7 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
                 selected_system_id=system.id,
                 selected_system_platform="quantastor",
                 selected_enclosure_id="node-a",
+                enclosures=[EnclosureOption(id="node-a", label="Node A")],
                 platform_context={"topology_complete": True},
             )
             incomplete_snapshot = InventorySnapshot(
@@ -11553,6 +13679,26 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
                 AsyncMock(),
                 temp_dir,
             )
+
+            async def build_snapshot(
+                selected_enclosure_id: str | None = None,
+                *,
+                force_source_refresh: bool = False,
+            ) -> InventorySnapshot:
+                await service._get_inventory_source_bundle(force_refresh=force_source_refresh)
+                selected = selected_enclosure_id or "enc-a"
+                return InventorySnapshot(
+                    slots=[],
+                    refresh_interval_seconds=30,
+                    selected_system_platform="core",
+                    selected_enclosure_id=selected,
+                    enclosures=[
+                        EnclosureOption(id="enc-a", label="Shelf A"),
+                        EnclosureOption(id="enc-b", label="Shelf B"),
+                    ],
+                )
+
+            service._build_snapshot = AsyncMock(side_effect=build_snapshot)
 
             await service.get_snapshot(force_refresh=True, selected_enclosure_id="enc-a")
             await service.get_snapshot(selected_enclosure_id="enc-b")
@@ -12254,6 +14400,127 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertTrue(cleared)
             self.assertIsNone(service.mapping_store.get_mapping(system.id, None, 0))
+
+    async def test_drawer_mapping_mutations_and_bundles_share_physical_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="synthetic-system-a",
+                truenas=TrueNASConfig(platform="scale"),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            physical_id = "synthetic-shelf-a"
+            top_id = f"{physical_id}::dell-md1280-drawer-top-42"
+            bottom_id = f"{physical_id}::dell-md1280-drawer-bottom-42"
+
+            def snapshot_for(view_id: str | None) -> InventorySnapshot:
+                return InventorySnapshot(
+                    slots=[
+                        SlotView(
+                            slot=7,
+                            slot_label="08",
+                            row_index=0,
+                            column_index=7,
+                            enclosure_id=physical_id,
+                        )
+                    ],
+                    refresh_interval_seconds=30,
+                    selected_system_id=system.id,
+                    selected_enclosure_id=view_id,
+                    enclosures=[
+                        EnclosureOption(id=top_id, label="Top"),
+                        EnclosureOption(id=bottom_id, label="Bottom"),
+                        EnclosureOption(id=physical_id, label="Full"),
+                    ],
+                )
+
+            service.get_snapshot = AsyncMock(
+                side_effect=lambda selected_enclosure_id=None, **_kwargs: snapshot_for(
+                    selected_enclosure_id
+                )
+            )
+            first_revision = service.mapping_store.save_revision(system.id, top_id, 7)
+            saved = await service.save_mapping(
+                7,
+                {"serial": "FIRST"},
+                selected_enclosure_id=top_id,
+                expected_revision=first_revision,
+                invalidate_snapshot=False,
+            )
+            self.assertEqual(saved.enclosure_id, physical_id)
+
+            stale_save = service.mapping_store.save_revision(system.id, top_id, 7)
+            stale_clear = service.mapping_store.clear_revision(system.id, top_id, 7)
+            updated = await service.save_mapping(
+                7,
+                {"serial": "SECOND"},
+                selected_enclosure_id=bottom_id,
+                expected_revision=service.mapping_store.save_revision(system.id, bottom_id, 7),
+                invalidate_snapshot=False,
+            )
+            self.assertEqual(updated.enclosure_id, physical_id)
+            with self.assertRaises(MappingRevisionConflict):
+                await service.save_mapping(
+                    7,
+                    {"serial": "STALE"},
+                    selected_enclosure_id=top_id,
+                    expected_revision=stale_save,
+                    invalidate_snapshot=False,
+                )
+            with self.assertRaises(MappingRevisionConflict):
+                await service.clear_mapping(
+                    7,
+                    selected_enclosure_id=top_id,
+                    expected_revision=stale_clear,
+                    invalidate_snapshot=False,
+                )
+            current = service.mapping_store.get_mapping(system.id, physical_id, 7)
+            self.assertIsNotNone(current)
+            assert current is not None
+            self.assertEqual(current.serial, "SECOND")
+
+            exported = await service.export_mapping_bundle(selected_enclosure_id=bottom_id)
+            self.assertEqual(exported.enclosure_id, physical_id)
+            self.assertEqual({item.enclosure_id for item in exported.mappings}, {physical_id})
+            imported_bundle = exported.model_copy(
+                update={
+                    "mappings": [
+                        exported.mappings[0].model_copy(update={"serial": "IMPORTED"})
+                    ]
+                }
+            )
+            preview = await service.preview_mapping_bundle(
+                imported_bundle,
+                selected_enclosure_id=top_id,
+            )
+            self.assertEqual(preview["enclosure_id"], physical_id)
+            self.assertEqual(preview["updates"][0]["enclosure_id"], physical_id)
+            result = await service.import_mapping_bundle(
+                imported_bundle,
+                selected_enclosure_id=bottom_id,
+                expected_revision=preview["revision"],
+                import_digest=preview["import_digest"],
+                invalidate_snapshot=False,
+            )
+            self.assertEqual(result["imported"], 1)
+            final_export = await service.export_mapping_bundle(selected_enclosure_id=top_id)
+            self.assertEqual(final_export.enclosure_id, physical_id)
+            self.assertEqual(final_export.mappings[0].serial, "IMPORTED")
+
+            clear_revision = service.mapping_store.clear_revision(system.id, bottom_id, 7)
+            self.assertTrue(await service.clear_mapping(
+                7,
+                selected_enclosure_id=top_id,
+                expected_revision=clear_revision,
+                invalidate_snapshot=False,
+            ))
+            self.assertIsNone(service.mapping_store.get_mapping(system.id, physical_id, 7))
 
 
 class InventoryServiceLedTests(unittest.IsolatedAsyncioTestCase):

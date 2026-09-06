@@ -24,6 +24,31 @@ The history sidecar is optional, but it is a normal supported runtime service,
 not a dev-only helper. If it is unavailable, the live app keeps working and
 snapshot exports still work, but they omit historical samples and events.
 
+## Request And Refresh Boundaries
+
+Bulk history reads require an explicit window from 1 hour through 1 year. The
+service accepts only the six documented history metrics and owns aggregate
+ceilings of 32 scopes, 347 scope-slot targets, 4,096 event rows, 36,000 total
+projected rows, a 64 KiB multi-scope request, and a 24 MiB serialized response.
+Heat-map playback requests events at zero, only the one or two selected metrics,
+and at most 24 samples per metric. The single-slot drawer keeps its separately
+bounded behavior. An unavailable optional sidecar still degrades to unavailable
+history rather than breaking inventory views or exports.
+
+The published history port remains loopback-only by default. If you intentionally
+publish it on a non-loopback address, set `HISTORY_REFRESH_AUTH_MODE=token`,
+configure the exact `HISTORY_PUBLIC_ORIGIN`, and provide
+`HISTORY_REFRESH_TOKEN_FILE` through the secrets overlay (or a privately
+protected `HISTORY_REFRESH_TOKEN`). Direct refresh requests use a strict JSON
+body such as `{"mode":"full"}` and an `Authorization: Bearer ...` header. Never
+put that token in a browser URL or page. Browser operators should use the
+Basic-authenticated main-UI refresh proxy instead.
+
+Full refresh admission has a 900-second server-owned cooldown by default.
+Concurrent refreshes return `409`; a full refresh inside the cooldown returns
+`429` with `Retry-After`. Failed full-refresh attempts also start the cooldown,
+and a process restart resets this in-memory timestamp.
+
 ## Start The Optional History Sidecar
 
 Use the same folder you created in [[Quick Start|Quick-Start]], where

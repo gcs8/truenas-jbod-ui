@@ -8,6 +8,8 @@ from types import ModuleType
 from typing import Any
 
 from app.route_compat import MainModuleAPIRouter
+from app.services.history_backend import HISTORY_BACKEND_DEGRADED_DETAIL
+from app.services.history_status import project_public_collector_status
 
 
 def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
@@ -38,6 +40,16 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
                 "error": "mapping_revision_conflict",
                 "detail": MappingRevisionConflict.public_detail,
                 "current_revision": exc.current_revision,
+            },
+        )
+
+    def mapping_scope_conflict_response() -> JSONResponse:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "ok": False,
+                "error": "mapping_scope_conflict",
+                "detail": MappingScopeConflict.public_detail,
             },
         )
 
@@ -354,6 +366,8 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             )
         except MappingRevisionConflict as exc:
             return mapping_revision_conflict_response(exc)
+        except MappingScopeConflict:
+            return mapping_scope_conflict_response()
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -410,6 +424,8 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             )
         except MappingRevisionConflict as exc:
             return mapping_revision_conflict_response(exc)
+        except MappingScopeConflict:
+            return mapping_scope_conflict_response()
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         if cleared:
@@ -442,6 +458,8 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
                 payload,
                 selected_enclosure_id=enclosure_id,
             )
+        except MappingScopeConflict:
+            return mapping_scope_conflict_response()
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except ValueError:
@@ -469,6 +487,8 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             )
         except MappingRevisionConflict as exc:
             return mapping_revision_conflict_response(exc)
+        except MappingScopeConflict:
+            return mapping_scope_conflict_response()
         except MappingImportDigestMismatch as exc:
             return JSONResponse(
                 status_code=409,
@@ -526,6 +546,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
                     slot,
                     selected_enclosure_id=enclosure_id,
                     allow_stale_cache=not fresh,
+                    bypass_negative_cache=fresh,
                 )
             return SmartSummaryView.model_validate(summary).model_copy(
                 update={"layout_bounds": layout_bounds}
@@ -553,6 +574,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
                 slot_index,
                 selected_enclosure_id=enclosure_id,
                 allow_stale_cache=not fresh,
+                bypass_negative_cache=fresh,
             )
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -641,6 +663,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
                     selected_enclosure_id=enclosure_id,
                     max_concurrency=payload.max_concurrency,
                     allow_stale_cache=not fresh,
+                    bypass_negative_cache=fresh,
                 )
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -649,7 +672,48 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
     @router.get("/api/history/status")
     async def get_history_status() -> JSONResponse:
         history_backend = get_history_backend()
-        return JSONResponse(await history_backend.get_status())
+        payload = await history_backend.get_status()
+        return JSONResponse(
+            {
+                **payload,
+                "collector": project_public_collector_status(
+                    payload.get("collector"),
+                    last_error_detail=HISTORY_BACKEND_DEGRADED_DETAIL,
+                ),
+            }
+        )
+
+    @router.post(
+        "/api/history/refresh",
+        dependencies=[Depends(require_read_ui_mutation_authorization)],
+    )
+    async def refresh_history_proxy(payload: HistoryRefreshProxyRequest) -> JSONResponse:
+        history_backend = get_history_backend()
+        try:
+            result = await history_backend.refresh(payload.mode)
+        except HistoryBackendPolicyError as exc:
+            raise HTTPException(status_code=exc.status_code, detail="History refresh was rejected by policy.") from exc
+        return JSONResponse(result)
+
+    @router.post("/api/history/scopes/bundle")
+    async def get_history_scopes_bundle(payload: HistoryScopesProxyRequest) -> JSONResponse:
+        history_backend = get_history_backend()
+        try:
+            result = await history_backend.get_scopes_history(
+                scopes=[scope.model_dump() for scope in payload.scopes],
+                metrics=payload.metrics,
+                since=payload.since,
+                event_limit=payload.event_limit,
+                metric_limit=payload.metric_limit,
+            )
+        except HistoryBackendPolicyError as exc:
+            raise HTTPException(status_code=exc.status_code, detail="History request was rejected by policy.") from exc
+        except (HistoryRequestShapeError, HistoryBudgetExceeded, ValueError) as exc:
+            raise HTTPException(
+                status_code=413 if isinstance(exc, HistoryBudgetExceeded) else 422,
+                detail=str(exc),
+            ) from exc
+        return JSONResponse(result)
 
     @router.get("/api/slots/{slot}/history")
     async def get_slot_history(
@@ -685,31 +749,40 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
         slots: list[int] | None = Query(default=None),
         window_hours: int | None = None,
         metrics: list[str] | None = Query(default=None),
-        event_limit: int = Query(default=12, ge=0, le=1000),
+        event_limit: int = Query(default=12),
+        metric_limit: int = 60,
     ) -> JSONResponse:
         requested_slots = [int(slot) for slot in (slots or [])]
-        if len(requested_slots) > SMART_BATCH_MAX_SLOTS:
-            raise HTTPException(
-                status_code=422,
-                detail=f"At most {SMART_BATCH_MAX_SLOTS} history slots may be requested.",
-            )
-        for slot in requested_slots:
-            if slot < 0:
-                check_slot_bounds(slot, ())
-            if slot > SMART_BATCH_MAX_SLOTS:
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"History slot values must not exceed {SMART_BATCH_MAX_SLOTS}.",
-                )
-        normalized_slots = sorted(set(requested_slots))
+        if len(requested_slots) > 347:
+            raise HTTPException(status_code=413, detail="History request exceeds target_count limit (347).")
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
-        layout_bounds = "verified"
-        if normalized_slots:
-            layout_slots, layout_bounds = await resolve_read_layout_slots(service, enclosure_id)
-            for slot in normalized_slots:
-                if layout_slots is not None:
-                    check_slot_bounds(slot, layout_slots)
+        if not requested_slots or not isinstance(window_hours, int) or not 1 <= window_hours <= 8760:
+            raise HTTPException(status_code=422, detail="Bounded history slots and window_hours are required.")
+        selected_metrics = metrics or list(ALLOWED_HISTORY_METRICS)
+        since = (datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat()
+        try:
+            build_history_read_plan(
+                scopes=[{
+                    "system_id": service.system.id,
+                    "enclosure_id": enclosure_id,
+                    "slots": requested_slots,
+                }],
+                metrics=selected_metrics,
+                since=since,
+                event_limit=event_limit,
+                metric_limit=metric_limit,
+            )
+        except (HistoryRequestShapeError, HistoryBudgetExceeded) as exc:
+            raise HTTPException(
+                status_code=413 if isinstance(exc, HistoryBudgetExceeded) else 422,
+                detail=str(exc),
+            ) from exc
+        normalized_slots = sorted(set(requested_slots))
+        layout_slots, layout_bounds = await resolve_read_layout_slots(service, enclosure_id)
+        for slot in normalized_slots:
+            if layout_slots is not None:
+                check_slot_bounds(slot, layout_slots)
         add_perf_metadata(
             system_id=service.system.id,
             platform=service.system.truenas.platform,
@@ -723,8 +796,9 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             enclosure_id=enclosure_id,
             slots=normalized_slots,
             window_hours=window_hours,
-            metrics=metrics,
+            metrics=selected_metrics,
             event_limit=event_limit,
+            metric_limit=metric_limit,
         )
         return JSONResponse(
             {
@@ -743,8 +817,11 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
         enclosure_id: str | None = None,
         window_hours: int | None = None,
         metrics: list[str] | None = Query(default=None),
-        event_limit: int = Query(default=12, ge=0, le=1000),
+        event_limit: int = Query(default=12),
+        metric_limit: int = 60,
     ) -> JSONResponse:
+        if not isinstance(window_hours, int) or not 1 <= window_hours <= 8760:
+            raise HTTPException(status_code=422, detail="A bounded window_hours is required.")
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
         try:
@@ -780,19 +857,37 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             slot_count=len(runtime_view.slots),
             history_window_hours=window_hours,
         )
+        selected_metrics = metrics or list(ALLOWED_HISTORY_METRICS)
+        scopes = [
+            {
+                "system_id": service.system.id,
+                "enclosure_id": history_enclosure_id,
+                "slots": sorted(history_slots),
+            }
+            for history_enclosure_id, history_slots in slots_by_enclosure.items()
+        ]
         history_backend = get_history_backend()
+        payload = await history_backend.get_scopes_history(
+            scopes=scopes,
+            since=(datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat(),
+            metrics=selected_metrics,
+            event_limit=event_limit,
+            metric_limit=metric_limit,
+        )
         histories_by_display_slot: dict[str, dict[str, Any]] = {}
-        for history_enclosure_id, history_slots in slots_by_enclosure.items():
-            scope_payload = await history_backend.get_scope_history(
-                system_id=service.system.id,
-                enclosure_id=history_enclosure_id,
-                slots=sorted(history_slots),
-                window_hours=window_hours,
-                metrics=metrics,
-                event_limit=event_limit,
-            )
-            for history_slot, history_payload in scope_payload.items():
-                for display_slot in display_slot_by_target.get((history_enclosure_id, int(history_slot)), []):
+        for scope_payload in payload.get("scopes", []):
+            if not isinstance(scope_payload, dict):
+                continue
+            history_enclosure_id = scope_payload.get("enclosure_id")
+            histories = scope_payload.get("histories")
+            if not isinstance(histories, dict):
+                continue
+            for history_slot, history_payload in histories.items():
+                if not isinstance(history_payload, dict):
+                    continue
+                for display_slot in display_slot_by_target.get(
+                    (history_enclosure_id, int(history_slot)), []
+                ):
                     histories_by_display_slot[str(display_slot)] = history_payload
 
         return JSONResponse(

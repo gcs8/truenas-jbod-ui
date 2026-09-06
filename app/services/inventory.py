@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import ipaddress
 import json
 import logging
 import re
 import shlex
 import time
-from collections import Counter
+from collections import Counter, OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -53,7 +54,11 @@ from app.metrics import (
     observe_smart_summary_request,
 )
 from app.perf import add_perf_metadata, perf_stage
-from app.services.mapping_store import MappingStore
+from app.services.credential_authority import (
+    credential_authorities_are_approved,
+    ssh_credential_authorities,
+)
+from app.services.mapping_store import MappingStore, resolve_physical_mapping_scope
 from app.services.profile_registry import (
     ENCLOSURE_SUB_VIEW_PROFILE_IDS,
     ESXI_AOC_SLG4_2H8M2_PROFILE_ID,
@@ -128,6 +133,8 @@ CacheValueT = TypeVar("CacheValueT")
 # horizon are evicted to keep the cache bounded.
 SMART_CACHE_STALE_RETENTION_TTL_MULTIPLIER = 12
 SMART_CACHE_STALE_RETENTION_FLOOR_SECONDS = 3600
+SMART_NEGATIVE_CACHE_TTL_SECONDS = 15
+SMART_NEGATIVE_CACHE_MAX_ENTRIES = 1024
 VIRTUAL_MAPPING_UNAVAILABLE_REASON = (
     "Mapping import is unavailable because this system disk inventory has no identified "
     "physical enclosure or stable physical slot identities."
@@ -323,6 +330,8 @@ SMART_SUMMARY_VALUE_FIELDS = tuple(
 OPTIONAL_SSH_BATCH_FAILURE_BACKOFF_SECONDS = 30
 PARSED_SSH_BUNDLE_CACHE_MAX_ENTRIES = 64
 QUANTASTOR_ENCLOSURE_OPTIONS_MAX_ENTRIES = 64
+SNAPSHOT_STATE_MAX_ENTRIES = 64
+SNAPSHOT_NO_ENCLOSURE_KEY = "__service_no_enclosure__"
 SSH_CONNECTION_FAILURE_MARKERS = (
     "error reading ssh protocol banner",
     "no existing session",
@@ -384,6 +393,35 @@ def _slot_grid_position(
 
 
 ENCLOSURE_OPTION_ID_TAIL_MIN_LENGTH = 4
+# Appliance-provided identifiers are normalized to this small fixed ceiling
+# before selector-label disambiguation. Long values retain a stable digest so
+# distinct identifiers cannot collapse merely because their visible tails match.
+MAX_NORMALIZED_ENCLOSURE_IDENTIFIER_LENGTH = 128
+
+
+def _normalize_enclosure_identifier(value: Any) -> str:
+    identifier = str(value).strip()
+    if len(identifier) <= MAX_NORMALIZED_ENCLOSURE_IDENTIFIER_LENGTH:
+        return identifier
+    digest = hashlib.sha256(identifier.encode("utf-8")).hexdigest()[:16]
+    tail_length = MAX_NORMALIZED_ENCLOSURE_IDENTIFIER_LENGTH - len(digest) - 1
+    return f"{identifier[-tail_length:]}~{digest}"
+
+
+def _distinguishing_tail_length(identifiers: set[str]) -> int:
+    """Return one suffix length that distinguishes all bounded identifiers."""
+    if len(identifiers) < 2:
+        return ENCLOSURE_OPTION_ID_TAIL_MIN_LENGTH
+    reversed_ids = sorted(identifier[::-1] for identifier in identifiers)
+    common = 0
+    for left, right in zip(reversed_ids, reversed_ids[1:]):
+        shared = 0
+        for left_char, right_char in zip(left, right):
+            if left_char != right_char:
+                break
+            shared += 1
+        common = max(common, shared)
+    return max(ENCLOSURE_OPTION_ID_TAIL_MIN_LENGTH, common + 1)
 
 
 def disambiguate_enclosure_option_labels(options: list[EnclosureOption]) -> list[EnclosureOption]:
@@ -399,14 +437,18 @@ def disambiguate_enclosure_option_labels(options: list[EnclosureOption]) -> list
     """
     if len(options) < 2:
         return options
-    base_ids = [str(option.id).split("::", 1)[0] for option in options]
+    base_ids = [
+        _normalize_enclosure_identifier(str(option.id).split("::", 1)[0])
+        for option in options
+    ]
     label_counts = Counter(option.label for option in options)
     if all(count == 1 for count in label_counts.values()):
         return options
-    tail_length = ENCLOSURE_OPTION_ID_TAIL_MIN_LENGTH
-    longest = max(len(base_id) for base_id in base_ids)
-    while tail_length < longest and len({base_id[-tail_length:] for base_id in set(base_ids)}) < len(set(base_ids)):
-        tail_length += 1
+    distinct_base_ids = set(base_ids)
+    tail_length = min(
+        _distinguishing_tail_length(distinct_base_ids),
+        max(len(base_id) for base_id in distinct_base_ids),
+    )
     resolved: list[EnclosureOption] = []
     for option, base_id in zip(options, base_ids):
         if label_counts[option.label] > 1 and not option.alias:
@@ -689,6 +731,20 @@ class CacheResult(Generic[CacheValueT]):
     cache_state: CacheState
 
 
+class UnknownEnclosureError(Exception):
+    """Raised when a request does not name a discovered enclosure option."""
+
+    def __init__(self) -> None:
+        super().__init__("Requested enclosure is not available for this system.")
+
+
+class SnapshotStateBusyError(Exception):
+    """Raised when every bounded snapshot-state entry is active."""
+
+    def __init__(self) -> None:
+        super().__init__("Snapshot state capacity is temporarily busy; retry later.")
+
+
 @dataclass(slots=True)
 class InventorySourceBundle:
     raw_data: TrueNASRawData
@@ -700,7 +756,7 @@ class InventorySourceBundle:
     quantastor_ses_data: ParsedSSHData
     ssh_failure_details: list[dict[str, Any]] = field(default_factory=list)
     bmc_inventory: BMCInventory | None = None
-    parsed_ssh_data_by_enclosure: dict[str | None, ParsedSSHData] = field(default_factory=dict)
+    parsed_ssh_data_by_enclosure: dict[str, ParsedSSHData] = field(default_factory=dict)
 
 
 class InventoryService:
@@ -729,11 +785,25 @@ class InventoryService:
         self._cache_until: dict[str, datetime] = {}
         self._smart_cache: dict[SmartCacheKey, SmartSummaryView] = {}
         self._smart_cache_until: dict[SmartCacheKey, datetime] = {}
+        self._smart_negative_cache: OrderedDict[
+            SmartCacheKey,
+            tuple[SmartSummaryView, datetime],
+        ] = OrderedDict()
         self._smart_cache_global_generation = 0
         self._smart_cache_enclosure_generations: dict[str, int] = {}
+        self._smart_load_tasks: dict[SmartCacheKey, asyncio.Task[SmartSummaryView]] = {}
+        self._smart_operation_limit = max(1, self.settings.app.smart_batch_max_concurrency)
+        self._smart_operation_semaphore = asyncio.Semaphore(self._smart_operation_limit)
         self._source_bundle: InventorySourceBundle | None = None
         self._source_bundle_until: datetime = datetime.min.replace(tzinfo=timezone.utc)
         self._snapshot_locks: dict[str, asyncio.Lock] = {}
+        self._snapshot_activity: dict[str, int] = {}
+        self._snapshot_lru: OrderedDict[str, None] = OrderedDict()
+        self._snapshot_invalidated: set[str] = set()
+        self._snapshot_discovery_lock = asyncio.Lock()
+        self._canonical_enclosure_options: dict[str, EnclosureOption] | None = None
+        self._canonical_default_enclosure_id: str | None = None
+        self._snapshot_topology_generation = 0
         self._source_bundle_lock = asyncio.Lock()
         self._ssh_session_locks: dict[str, asyncio.Lock] = {}
         self._disk_inventory_sync_lock = asyncio.Lock()
@@ -745,9 +815,6 @@ class InventoryService:
         self._snapshot_refresh_tasks: dict[str, asyncio.Task[None]] = {}
         self._source_bundle_refresh_task: asyncio.Task[bool] | None = None
         self._smart_refresh_tasks: dict[SmartCacheKey, asyncio.Task[None]] = {}
-        self._background_smart_refresh_semaphore = asyncio.Semaphore(
-            max(1, self.settings.app.smart_batch_max_concurrency)
-        )
         self._scale_preferred_ses_host: str | None = None
         self._quantastor_preferred_ses_host: str | None = None
         self._sg_ses_device_cache: dict[str, tuple[list[str], datetime]] = {}
@@ -843,66 +910,284 @@ class InventoryService:
         allow_stale_cache: bool = False,
         force_source_refresh: bool | None = None,
     ) -> CacheResult[InventorySnapshot]:
-        cache_key = selected_enclosure_id or "__default__"
         refresh_sources = force_refresh if force_source_refresh is None else force_source_refresh
+        cache_key, discovered_snapshot = await self._resolve_snapshot_cache_key(
+            selected_enclosure_id,
+            force_source_refresh=bool(refresh_sources),
+        )
+        topology_generation = self._snapshot_topology_generation
+        self._admit_snapshot_key(cache_key)
+        if discovered_snapshot is not None:
+            if cache_key != SNAPSHOT_NO_ENCLOSURE_KEY and discovered_snapshot.selected_enclosure_id != cache_key:
+                raise UnknownEnclosureError()
+            self._cache[cache_key] = discovered_snapshot
+            self._cache_until[cache_key] = utcnow() + timedelta(
+                seconds=max(0, int(self.settings.app.snapshot_cache_ttl_seconds))
+            )
+            self._touch_snapshot_key(cache_key)
+            cache_state: CacheState = "forced-refresh" if force_refresh else "miss"
+            add_perf_metadata(snapshot_cache=cache_state, snapshot_cache_key=cache_key)
+            self._observe_inventory_cache_metrics()
+            self._observe_inventory_snapshot_request(cache_state)
+            return CacheResult(discovered_snapshot, cache_state)
         cached = self._cache.get(cache_key)
         cache_until = self._cache_until.get(cache_key, datetime.min.replace(tzinfo=timezone.utc))
         now = utcnow()
         if not force_refresh and cached and now < cache_until:
+            self._touch_snapshot_key(cache_key)
             add_perf_metadata(snapshot_cache="hit", snapshot_cache_key=cache_key)
             self._observe_inventory_snapshot_request("hit")
             return CacheResult(cached, "hit")
         if not force_refresh and allow_stale_cache and cached:
+            self._touch_snapshot_key(cache_key)
             add_perf_metadata(snapshot_cache="stale-hit", snapshot_cache_key=cache_key)
             self._observe_inventory_snapshot_request("stale-hit")
-            self._schedule_background_snapshot_refresh(cache_key, selected_enclosure_id)
+            self._schedule_background_snapshot_refresh(cache_key)
             return CacheResult(cached, "stale-hit")
 
-        async with self._get_snapshot_lock(cache_key):
-            cached = self._cache.get(cache_key)
-            cache_until = self._cache_until.get(cache_key, datetime.min.replace(tzinfo=timezone.utc))
-            now = utcnow()
-            if not force_refresh and cached and now < cache_until:
-                add_perf_metadata(snapshot_cache="hit-after-wait", snapshot_cache_key=cache_key)
-                self._observe_inventory_snapshot_request("hit-after-wait")
-                return CacheResult(cached, "hit-after-wait")
+        self._snapshot_activity[cache_key] = self._snapshot_activity.get(cache_key, 0) + 1
+        try:
+            async with self._get_snapshot_lock(cache_key):
+                if (
+                    topology_generation != self._snapshot_topology_generation
+                    and cache_key in self._snapshot_invalidated
+                ):
+                    raise SnapshotStateBusyError()
+                cached = self._cache.get(cache_key)
+                cache_until = self._cache_until.get(cache_key, datetime.min.replace(tzinfo=timezone.utc))
+                now = utcnow()
+                if not force_refresh and cached and now < cache_until:
+                    self._touch_snapshot_key(cache_key)
+                    add_perf_metadata(snapshot_cache="hit-after-wait", snapshot_cache_key=cache_key)
+                    self._observe_inventory_snapshot_request("hit-after-wait")
+                    return CacheResult(cached, "hit-after-wait")
 
-            refresh_trigger: CacheState = "forced-refresh" if force_refresh else "miss"
-            add_perf_metadata(
-                snapshot_cache=refresh_trigger,
-                snapshot_cache_key=cache_key,
-                system_id=self.system.id,
-                platform=self.system.truenas.platform,
-            )
-            build_started = time.perf_counter()
-            with perf_stage("inventory.build_snapshot", system_id=self.system.id, enclosure_id=selected_enclosure_id):
-                snapshot = await self._build_snapshot(
-                    selected_enclosure_id=selected_enclosure_id,
-                    force_source_refresh=refresh_sources,
+                refresh_trigger: CacheState = "forced-refresh" if force_refresh else "miss"
+                add_perf_metadata(
+                    snapshot_cache=refresh_trigger,
+                    snapshot_cache_key=cache_key,
+                    system_id=self.system.id,
+                    platform=self.system.truenas.platform,
                 )
-            self._observe_inventory_snapshot_build(
-                trigger=refresh_trigger,
-                snapshot=snapshot,
-                duration_seconds=time.perf_counter() - build_started,
-            )
-            if not self._snapshot_has_trusted_topology(snapshot):
-                add_perf_metadata(snapshot_topology="untrusted", snapshot_cache_key=cache_key)
-                if cached and self._snapshot_has_trusted_topology(cached):
-                    self._observe_inventory_snapshot_request("trusted-fallback")
-                    logger.warning(
-                        "Preserving previously trusted snapshot for %s because the refreshed topology is incomplete.",
-                        cache_key,
+                build_started = time.perf_counter()
+                with perf_stage("inventory.build_snapshot", system_id=self.system.id, enclosure_id=cache_key):
+                    snapshot = await self._build_snapshot(
+                        selected_enclosure_id=None if cache_key == SNAPSHOT_NO_ENCLOSURE_KEY else cache_key,
+                        force_source_refresh=refresh_sources,
                     )
-                    return CacheResult(cached, "trusted-fallback")
+                topology_changed = topology_generation != self._snapshot_topology_generation
+                if topology_changed and cache_key in self._snapshot_invalidated:
+                    raise SnapshotStateBusyError()
+                self._observe_inventory_snapshot_build(
+                    trigger=refresh_trigger,
+                    snapshot=snapshot,
+                    duration_seconds=time.perf_counter() - build_started,
+                )
+                if not self._snapshot_has_trusted_topology(snapshot):
+                    add_perf_metadata(snapshot_topology="untrusted", snapshot_cache_key=cache_key)
+                    if cached and self._snapshot_has_trusted_topology(cached):
+                        self._observe_inventory_snapshot_request("trusted-fallback")
+                        logger.warning(
+                            "Preserving previously trusted snapshot for %s because the refreshed topology is incomplete.",
+                            cache_key,
+                        )
+                        return CacheResult(cached, "trusted-fallback")
+                    self._observe_inventory_snapshot_request(refresh_trigger)
+                    return CacheResult(snapshot, refresh_trigger)
+                if cache_key != SNAPSHOT_NO_ENCLOSURE_KEY and snapshot.selected_enclosure_id != cache_key:
+                    if self._canonical_enclosure_options is not None:
+                        self._canonical_enclosure_options.pop(cache_key, None)
+                    self._snapshot_invalidated.add(cache_key)
+                    raise UnknownEnclosureError()
+                if not topology_changed:
+                    self._replace_canonical_options_from_trusted_snapshot(snapshot)
+                self._cache[cache_key] = snapshot
+                self._cache_until[cache_key] = utcnow() + timedelta(
+                    seconds=max(0, int(self.settings.app.snapshot_cache_ttl_seconds))
+                )
+                self._touch_snapshot_key(cache_key)
+                self._observe_inventory_cache_metrics()
                 self._observe_inventory_snapshot_request(refresh_trigger)
                 return CacheResult(snapshot, refresh_trigger)
-            self._cache[cache_key] = snapshot
-            self._cache_until[cache_key] = utcnow() + timedelta(
-                seconds=max(0, int(self.settings.app.snapshot_cache_ttl_seconds))
+        finally:
+            remaining = self._snapshot_activity.get(cache_key, 1) - 1
+            if remaining:
+                self._snapshot_activity[cache_key] = remaining
+            else:
+                self._snapshot_activity.pop(cache_key, None)
+                if cache_key in self._snapshot_invalidated or cache_key not in self._cache:
+                    self._remove_snapshot_state_key(cache_key)
+
+    def _snapshot_state_keys(self) -> set[str]:
+        return (
+            set(self._cache)
+            | set(self._cache_until)
+            | set(self._snapshot_locks)
+            | set(self._snapshot_refresh_tasks)
+            | set(self._snapshot_activity)
+            | set(self._snapshot_lru)
+        )
+
+    def _snapshot_key_is_active(self, cache_key: str) -> bool:
+        task = self._snapshot_refresh_tasks.get(cache_key)
+        return bool(self._snapshot_activity.get(cache_key) or (task is not None and not task.done()))
+
+    def _touch_snapshot_key(self, cache_key: str) -> None:
+        self._snapshot_lru[cache_key] = None
+        self._snapshot_lru.move_to_end(cache_key)
+
+    def _remove_snapshot_state_key(self, cache_key: str, *, cancel_task: bool = False) -> bool:
+        if self._snapshot_activity.get(cache_key):
+            self._cache.pop(cache_key, None)
+            self._cache_until.pop(cache_key, None)
+            self._snapshot_invalidated.add(cache_key)
+            return False
+        task = self._snapshot_refresh_tasks.get(cache_key)
+        if task is not None and not task.done():
+            if not cancel_task:
+                return False
+            self._cache.pop(cache_key, None)
+            self._cache_until.pop(cache_key, None)
+            task.cancel()
+            self._snapshot_invalidated.add(cache_key)
+
+            def _finish_invalidation(completed: asyncio.Task[None], *, key: str = cache_key) -> None:
+                if self._snapshot_refresh_tasks.get(key) is completed:
+                    self._snapshot_refresh_tasks.pop(key, None)
+                self._remove_snapshot_state_key(key)
+
+            task.add_done_callback(_finish_invalidation)
+            return False
+        self._cache.pop(cache_key, None)
+        self._cache_until.pop(cache_key, None)
+        self._snapshot_locks.pop(cache_key, None)
+        self._snapshot_refresh_tasks.pop(cache_key, None)
+        self._snapshot_activity.pop(cache_key, None)
+        self._snapshot_lru.pop(cache_key, None)
+        self._snapshot_invalidated.discard(cache_key)
+        return True
+
+    def _admit_snapshot_key(self, cache_key: str) -> None:
+        if cache_key in self._snapshot_state_keys():
+            if not self._snapshot_key_is_active(cache_key):
+                self._snapshot_invalidated.discard(cache_key)
+            self._touch_snapshot_key(cache_key)
+            return
+        now = utcnow()
+        for candidate in tuple(self._snapshot_lru):
+            if self._snapshot_key_is_active(candidate):
+                continue
+            if self._cache_until.get(candidate, datetime.min.replace(tzinfo=timezone.utc)) <= now:
+                self._remove_snapshot_state_key(candidate)
+        while len(self._snapshot_state_keys()) >= SNAPSHOT_STATE_MAX_ENTRIES:
+            victim = next(
+                (candidate for candidate in self._snapshot_lru if not self._snapshot_key_is_active(candidate)),
+                None,
             )
-            self._observe_inventory_cache_metrics()
-            self._observe_inventory_snapshot_request(refresh_trigger)
-            return CacheResult(snapshot, refresh_trigger)
+            if victim is None:
+                raise SnapshotStateBusyError()
+            self._remove_snapshot_state_key(victim)
+        self._touch_snapshot_key(cache_key)
+
+    async def _resolve_snapshot_cache_key(
+        self,
+        selected_enclosure_id: str | None,
+        *,
+        force_source_refresh: bool,
+    ) -> tuple[str, InventorySnapshot | None]:
+        self._migrate_legacy_default_snapshot()
+        self._learn_canonical_options_from_cache()
+        options = self._canonical_enclosure_options
+        discovered_snapshot: InventorySnapshot | None = None
+        if options is None:
+            async with self._snapshot_discovery_lock:
+                options = self._canonical_enclosure_options
+                while options is None:
+                    generation = self._snapshot_topology_generation
+                    candidate = await self._build_snapshot(
+                        selected_enclosure_id=None,
+                        force_source_refresh=force_source_refresh,
+                    )
+                    if generation != self._snapshot_topology_generation:
+                        continue
+                    discovered_snapshot = candidate
+                    trusted_topology = self._snapshot_has_trusted_topology(discovered_snapshot)
+                    options = {option.id: option for option in discovered_snapshot.enclosures}
+                    if not options and not trusted_topology:
+                        raise SnapshotStateBusyError()
+                    self._canonical_enclosure_options = options
+                    self._canonical_default_enclosure_id = (
+                        discovered_snapshot.selected_enclosure_id
+                        if discovered_snapshot.selected_enclosure_id in options
+                        else next(iter(options), None)
+                    )
+                    if not trusted_topology:
+                        discovered_snapshot = None
+        if selected_enclosure_id is None:
+            return self._canonical_default_enclosure_id or SNAPSHOT_NO_ENCLOSURE_KEY, discovered_snapshot
+        if selected_enclosure_id not in options:
+            raise UnknownEnclosureError()
+        return selected_enclosure_id, (
+            discovered_snapshot
+            if discovered_snapshot is not None
+            and discovered_snapshot.selected_enclosure_id == selected_enclosure_id
+            else None
+        )
+
+    def _migrate_legacy_default_snapshot(self) -> None:
+        legacy_key = "__default__"
+        if legacy_key not in self._cache:
+            return
+        snapshot = self._cache.pop(legacy_key)
+        target_key = snapshot.selected_enclosure_id or SNAPSHOT_NO_ENCLOSURE_KEY
+        self._cache[target_key] = snapshot
+        if legacy_key in self._cache_until:
+            self._cache_until[target_key] = self._cache_until.pop(legacy_key)
+        self._snapshot_locks.pop(legacy_key, None)
+        self._snapshot_lru.pop(legacy_key, None)
+        self._touch_snapshot_key(target_key)
+        if target_key == SNAPSHOT_NO_ENCLOSURE_KEY and self._canonical_enclosure_options is None:
+            self._canonical_enclosure_options = {}
+            self._canonical_default_enclosure_id = None
+
+    def _learn_canonical_options_from_cache(self) -> None:
+        if self._canonical_enclosure_options is not None:
+            return
+        trusted_snapshots = [
+            snapshot
+            for snapshot in self._cache.values()
+            if snapshot.enclosures and self._snapshot_has_trusted_topology(snapshot)
+        ]
+        if not trusted_snapshots:
+            return
+        options = {
+            option.id: option
+            for snapshot in trusted_snapshots
+            for option in snapshot.enclosures
+        }
+        self._canonical_enclosure_options = options
+        self._canonical_default_enclosure_id = next(
+            (
+                snapshot.selected_enclosure_id
+                for snapshot in trusted_snapshots
+                if snapshot.selected_enclosure_id in options
+            ),
+            next(iter(options), None),
+        )
+
+    def _replace_canonical_options_from_trusted_snapshot(self, snapshot: InventorySnapshot) -> None:
+        options = {option.id: option for option in snapshot.enclosures}
+        if not options and snapshot.selected_enclosure_id is not None:
+            return
+        removed_keys = set(self._canonical_enclosure_options or {}) - set(options)
+        self._canonical_enclosure_options = options
+        self._canonical_default_enclosure_id = (
+            snapshot.selected_enclosure_id
+            if snapshot.selected_enclosure_id in options
+            else next(iter(options), None)
+        )
+        for key in removed_keys:
+            self._remove_snapshot_state_key(key, cancel_task=True)
 
     async def get_sas_fabric_snapshot(
         self,
@@ -969,7 +1254,7 @@ class InventoryService:
         if kind_name == "enclosure":
             if object_text.startswith("virtual-system:"):
                 raise ValueError("Friendly enclosure names are available only for identified physical enclosures.")
-            object_text = self._base_enclosure_id(object_text) or object_text
+            object_text = resolve_physical_mapping_scope(object_text) or object_text
             enclosure_id = None
         else:
             enclosure_id = (
@@ -1107,6 +1392,7 @@ class InventoryService:
         selected_enclosure_id: str | None = None,
         *,
         allow_stale_cache: bool = False,
+        bypass_negative_cache: bool = False,
     ) -> SmartSummaryView:
         runtime = await self.get_storage_view_runtime(
             force_refresh=False,
@@ -1124,12 +1410,14 @@ class InventoryService:
                 runtime_slot.snapshot_slot,
                 selected_enclosure_id=selected_enclosure_id or runtime_view.backing_enclosure_id,
                 allow_stale_cache=allow_stale_cache,
+                bypass_negative_cache=bypass_negative_cache,
             )
 
         synthetic_slot = self._build_slot_view_from_storage_view_runtime_slot(runtime_view, runtime_slot)
         return await self._get_slot_smart_summary_for_slot_view(
             synthetic_slot,
             allow_stale_cache=allow_stale_cache,
+            bypass_negative_cache=bypass_negative_cache,
         )
 
     async def resolve_storage_view_slot_history_target(
@@ -1656,19 +1944,31 @@ class InventoryService:
         invalidate_source_bundle: bool = False,
     ) -> None:
         if cache_keys is None:
-            self._cache.clear()
-            self._cache_until.clear()
+            snapshot_keys_to_remove = self._snapshot_state_keys()
+            self._canonical_enclosure_options = None
+            self._canonical_default_enclosure_id = None
+            self._snapshot_topology_generation += 1
             self._smart_cache_global_generation += 1
             smart_keys_to_remove = (
                 set(self._smart_cache)
                 | set(self._smart_cache_until)
+                | set(self._smart_negative_cache)
                 | set(self._smart_refresh_tasks)
+                | set(self._smart_load_tasks)
             )
         else:
-            normalized_keys = {key or "__default__" for key in cache_keys}
-            for key in normalized_keys:
-                self._cache.pop(key, None)
-                self._cache_until.pop(key, None)
+            self._snapshot_topology_generation += 1
+            requested_keys = tuple(cache_keys)
+            normalized_keys = {
+                key
+                if key is not None
+                else self._canonical_default_enclosure_id or SNAPSHOT_NO_ENCLOSURE_KEY
+                for key in requested_keys
+            }
+            if any(key is None for key in requested_keys):
+                normalized_keys.add("__default__")
+            snapshot_keys_to_remove = set(normalized_keys)
+            for key in snapshot_keys_to_remove:
                 self._smart_cache_enclosure_generations[key] = (
                     self._smart_cache_enclosure_generations.get(key, 0) + 1
                 )
@@ -1677,11 +1977,26 @@ class InventoryService:
                 for key in (
                     set(self._smart_cache)
                     | set(self._smart_cache_until)
+                    | set(self._smart_negative_cache)
                     | set(self._smart_refresh_tasks)
+                    | set(self._smart_load_tasks)
                 )
                 if key[2] in normalized_keys
             }
+            if self._canonical_enclosure_options is not None:
+                for key in snapshot_keys_to_remove:
+                    self._canonical_enclosure_options.pop(key, None)
+                if self._canonical_default_enclosure_id in snapshot_keys_to_remove:
+                    self._canonical_default_enclosure_id = next(
+                        iter(self._canonical_enclosure_options),
+                        None,
+                    )
+        for key in snapshot_keys_to_remove:
+            self._remove_snapshot_state_key(key, cancel_task=True)
         self._remove_smart_cache_keys(smart_keys_to_remove)
+        for smart_key in smart_keys_to_remove:
+            self._smart_negative_cache.pop(smart_key, None)
+            self._smart_load_tasks.pop(smart_key, None)
         for smart_key in smart_keys_to_remove:
             task = self._smart_refresh_tasks.pop(smart_key, None)
             if task is not None and not task.done():
@@ -1702,21 +2017,24 @@ class InventoryService:
         if not enclosure_id:
             cache_keys: set[str | None] = {None}
         else:
-            base_enclosure_id = self._base_enclosure_id(enclosure_id)
+            base_enclosure_id = resolve_physical_mapping_scope(enclosure_id)
             known_enclosure_keys = (
-                set(self._cache)
-                | set(self._cache_until)
+                self._snapshot_state_keys()
                 | set(self._smart_cache_enclosure_generations)
+                | set(self._canonical_enclosure_options or {})
                 | {key[2] for key in self._smart_cache}
                 | {key[2] for key in self._smart_cache_until}
+                | {key[2] for key in self._smart_negative_cache}
                 | {key[2] for key in self._smart_refresh_tasks}
+                | {key[2] for key in self._smart_load_tasks}
             )
             cache_keys = {
                 key
                 for key in known_enclosure_keys
-                if key != "__default__" and self._base_enclosure_id(key) == base_enclosure_id
+                if key != SNAPSHOT_NO_ENCLOSURE_KEY
+                and resolve_physical_mapping_scope(key) == base_enclosure_id
             }
-            cache_keys.update({base_enclosure_id, enclosure_id, None})
+            cache_keys.update({base_enclosure_id, enclosure_id, "__default__"})
         self.invalidate_snapshot_cache(
             reason=reason,
             cache_keys=cache_keys,
@@ -1727,6 +2045,8 @@ class InventoryService:
         preferred_keys: list[str] = []
         if selected_enclosure_id:
             preferred_keys.append(selected_enclosure_id)
+        else:
+            preferred_keys.append(self._canonical_default_enclosure_id or SNAPSHOT_NO_ENCLOSURE_KEY)
         preferred_keys.append("__default__")
         for key in preferred_keys:
             snapshot = self._cache.get(key)
@@ -2592,17 +2912,19 @@ class InventoryService:
             bmc_inventory=bmc_inventory,
         )
 
-    def _schedule_background_snapshot_refresh(self, cache_key: str, selected_enclosure_id: str | None) -> None:
+    def _schedule_background_snapshot_refresh(self, cache_key: str) -> None:
         existing = self._snapshot_refresh_tasks.get(cache_key)
         if existing is not None and not existing.done():
             return
 
-        task = asyncio.create_task(self._background_snapshot_refresh(cache_key, selected_enclosure_id))
+        task = asyncio.create_task(self._background_snapshot_refresh(cache_key))
         self._snapshot_refresh_tasks[cache_key] = task
 
         def _cleanup(completed: asyncio.Task[None], *, key: str = cache_key) -> None:
             if self._snapshot_refresh_tasks.get(key) is completed:
                 self._snapshot_refresh_tasks.pop(key, None)
+            if key in self._snapshot_invalidated or key not in self._cache:
+                self._remove_snapshot_state_key(key)
             if completed.cancelled():
                 return
             exc = completed.exception()
@@ -2611,14 +2933,14 @@ class InventoryService:
 
         task.add_done_callback(_cleanup)
 
-    async def _background_snapshot_refresh(self, cache_key: str, selected_enclosure_id: str | None) -> None:
+    async def _background_snapshot_refresh(self, cache_key: str) -> None:
         try:
             source_refresh_succeeded = await asyncio.shield(self._schedule_background_source_bundle_refresh())
             if not source_refresh_succeeded:
                 return
             await self._get_snapshot_result(
                 force_refresh=True,
-                selected_enclosure_id=selected_enclosure_id,
+                selected_enclosure_id=None if cache_key == SNAPSHOT_NO_ENCLOSURE_KEY else cache_key,
                 force_source_refresh=False,
             )
         except Exception:  # noqa: BLE001 - background refreshes should stay best-effort.
@@ -2671,12 +2993,11 @@ class InventoryService:
         generation_token: SmartCacheGenerationToken,
     ) -> None:
         try:
-            async with self._background_smart_refresh_semaphore:
-                await self._get_slot_smart_summary_for_slot_view(
-                    slot_view,
-                    allow_stale_cache=False,
-                    expected_generation=generation_token,
-                )
+            await self._get_slot_smart_summary_for_slot_view(
+                slot_view,
+                allow_stale_cache=False,
+                expected_generation=generation_token,
+            )
         except Exception:  # noqa: BLE001 - background refreshes should stay best-effort.
             logger.exception("Background SMART refresh failed for %s", cache_key)
 
@@ -3132,7 +3453,9 @@ class InventoryService:
                 slot_view.mapping_reason
                 or "Manual mapping is unavailable because this disk has no stable physical location."
             )
-        enclosure_id = slot_view.enclosure_id if slot_view else None
+        enclosure_id = resolve_physical_mapping_scope(
+            slot_view.enclosure_id if slot_view else selected_enclosure_id
+        )
         mapping = ManualMapping(
             system_id=self.system.id,
             slot=slot,
@@ -3162,7 +3485,9 @@ class InventoryService:
                 slot_view.mapping_reason
                 or "Manual mapping is unavailable because this disk has no stable physical location."
             )
-        enclosure_id = slot_view.enclosure_id if slot_view else None
+        enclosure_id = resolve_physical_mapping_scope(
+            slot_view.enclosure_id if slot_view else selected_enclosure_id
+        )
         cleared = self.mapping_store.clear_mapping(
             self.system.id,
             enclosure_id,
@@ -3298,6 +3623,7 @@ class InventoryService:
         selected_enclosure_id: str | None = None,
         *,
         allow_stale_cache: bool = False,
+        bypass_negative_cache: bool = False,
     ) -> SmartSummaryView:
         with perf_stage("smart.summary.total", slot=slot, platform=self.system.truenas.platform):
             snapshot = await self.get_snapshot(
@@ -3310,6 +3636,7 @@ class InventoryService:
             return await self._get_slot_smart_summary_for_slot_view(
                 slot_view,
                 allow_stale_cache=allow_stale_cache,
+                bypass_negative_cache=bypass_negative_cache,
             )
 
     def _smart_cache_expiry(self) -> datetime:
@@ -3358,7 +3685,8 @@ class InventoryService:
         # a batch destroy every other slot's stale-serve entry and force
         # foreground refetches across the grid.  Evicting past the horizon also
         # bounds how old a stale-served summary can get.
-        eviction_horizon = utcnow() - self._smart_cache_stale_retention()
+        now = utcnow()
+        eviction_horizon = now - self._smart_cache_stale_retention()
         expired_keys = {
             cache_key
             for cache_key in set(self._smart_cache) | set(self._smart_cache_until)
@@ -3367,6 +3695,9 @@ class InventoryService:
         }
         if self._remove_smart_cache_keys(expired_keys):
             self._observe_inventory_cache_metrics()
+        for cache_key, (_summary, expires_at) in tuple(self._smart_negative_cache.items()):
+            if expires_at <= now:
+                self._smart_negative_cache.pop(cache_key, None)
 
     def _store_smart_summary_cache(
         self,
@@ -3377,6 +3708,8 @@ class InventoryService:
         expected_generation: SmartCacheGenerationToken | None = None,
     ) -> bool:
         cache_key = self._smart_cache_key(slot_view)
+        if summary.available is False:
+            return False
         if (
             expected_generation is not None
             and self._smart_cache_generation_token(cache_key) != expected_generation
@@ -3385,6 +3718,28 @@ class InventoryService:
         self._evict_expired_smart_cache_entries()
         self._smart_cache[cache_key] = summary
         self._smart_cache_until[cache_key] = expires_at or self._smart_cache_expiry()
+        self._smart_negative_cache.pop(cache_key, None)
+        return True
+
+    def _store_negative_smart_summary(
+        self,
+        cache_key: SmartCacheKey,
+        summary: SmartSummaryView,
+        *,
+        expected_generation: SmartCacheGenerationToken,
+    ) -> bool:
+        if summary.available is not False:
+            return False
+        if self._smart_cache_generation_token(cache_key) != expected_generation:
+            return False
+        self._evict_expired_smart_cache_entries()
+        self._smart_negative_cache.pop(cache_key, None)
+        self._smart_negative_cache[cache_key] = (
+            summary,
+            utcnow() + timedelta(seconds=SMART_NEGATIVE_CACHE_TTL_SECONDS),
+        )
+        while len(self._smart_negative_cache) > SMART_NEGATIVE_CACHE_MAX_ENTRIES:
+            self._smart_negative_cache.popitem(last=False)
         return True
 
     async def _get_slot_smart_summary_for_slot_view(
@@ -3392,6 +3747,7 @@ class InventoryService:
         slot_view: SlotView,
         *,
         allow_stale_cache: bool = False,
+        bypass_negative_cache: bool = False,
         expected_generation: SmartCacheGenerationToken | None = None,
     ) -> SmartSummaryView:
         cache_key = self._smart_cache_key(slot_view)
@@ -3408,14 +3764,86 @@ class InventoryService:
             self._observe_smart_summary_request("stale-hit")
             self._schedule_background_smart_refresh(cache_key, slot_view)
             return cached
+        if not bypass_negative_cache:
+            negative_entry = self._smart_negative_cache.get(cache_key)
+            if negative_entry is not None:
+                self._smart_negative_cache.move_to_end(cache_key)
+                add_perf_metadata(smart_cache="negative-hit")
+                self._observe_smart_summary_request("negative-hit")
+                return negative_entry[0]
 
+        task = self._smart_load_tasks.get(cache_key)
+        if task is None:
+            generation_token = expected_generation or self._smart_cache_generation_token(cache_key)
+            task = asyncio.create_task(
+                self._run_smart_loader(
+                    slot_view,
+                    cache_key=cache_key,
+                    candidates=candidates,
+                    generation_token=generation_token,
+                    allow_stale_cache=allow_stale_cache,
+                )
+            )
+            self._smart_load_tasks[cache_key] = task
+            task.add_done_callback(
+                lambda completed, key=cache_key: self._cleanup_smart_load_task(key, completed)
+            )
+        return await asyncio.shield(task)
+
+    def _cleanup_smart_load_task(
+        self,
+        cache_key: SmartCacheKey,
+        completed: asyncio.Task[SmartSummaryView],
+    ) -> None:
+        if self._smart_load_tasks.get(cache_key) is completed:
+            self._smart_load_tasks.pop(cache_key, None)
+        if completed.cancelled():
+            return
+        completed.exception()
+
+    async def _run_smart_loader(
+        self,
+        slot_view: SlotView,
+        *,
+        cache_key: SmartCacheKey,
+        candidates: list[str],
+        generation_token: SmartCacheGenerationToken,
+        allow_stale_cache: bool,
+    ) -> SmartSummaryView:
+        async with self._smart_operation_semaphore:
+            summary = await self._load_uncached_smart_summary(
+                slot_view,
+                cache_key=cache_key,
+                candidates=candidates,
+                generation_token=generation_token,
+                allow_stale_cache=allow_stale_cache,
+            )
+        if summary.available is False:
+            self._store_negative_smart_summary(
+                cache_key,
+                summary,
+                expected_generation=generation_token,
+            )
+        elif self._smart_cache_generation_token(cache_key) == generation_token:
+            self._smart_negative_cache.pop(cache_key, None)
+        return summary
+
+    async def _load_uncached_smart_summary(
+        self,
+        slot_view: SlotView,
+        *,
+        cache_key: SmartCacheKey,
+        candidates: list[str],
+        generation_token: SmartCacheGenerationToken,
+        allow_stale_cache: bool,
+    ) -> SmartSummaryView:
         smartctl_device_type = self._smart_candidate_device_type(slot_view)
         if self.system.truenas.platform == "esxi":
             summary = await self._build_esxi_slot_smart_summary(slot_view)
             if self._store_smart_summary_cache(
                 slot_view,
                 summary,
-                expected_generation=expected_generation,
+                expected_generation=generation_token,
             ):
                 self._persist_slot_detail_cache(slot_view, smart_summary=summary)
                 self._observe_inventory_cache_metrics()
@@ -3423,11 +3851,16 @@ class InventoryService:
             return summary
         if self.system.truenas.platform == "quantastor":
             summary = self._merge_smart_summary(slot_view, self._build_quantastor_smart_summary(slot_view))
-            if self.system.ssh.enabled and candidates and self._summary_needs_ssh_enrichment(summary):
+            if (
+                self.system.ssh.enabled
+                and candidates
+                and self._summary_needs_ssh_enrichment(summary, slot_view, candidates)
+            ):
                 ssh_summary, _ssh_error = await self._fetch_smart_summary_over_ssh(
                     candidates,
                     hosts=self._build_quantastor_preferred_hosts(slot_view),
                     device_type=smartctl_device_type,
+                    slot_view=slot_view,
                 )
                 if ssh_summary is not None:
                     summary = self._merge_missing_smart_fields(
@@ -3437,7 +3870,7 @@ class InventoryService:
             if self._store_smart_summary_cache(
                 slot_view,
                 summary,
-                expected_generation=expected_generation,
+                expected_generation=generation_token,
             ):
                 self._persist_slot_detail_cache(slot_view, smart_summary=summary)
                 self._observe_inventory_cache_metrics()
@@ -3460,7 +3893,7 @@ class InventoryService:
                 slot_view,
                 persisted,
                 expires_at=utcnow(),
-                expected_generation=expected_generation,
+                expected_generation=generation_token,
             ):
                 self._schedule_background_smart_refresh(cache_key, slot_view)
                 self._observe_inventory_cache_metrics()
@@ -3472,13 +3905,14 @@ class InventoryService:
             summary, error_message = await self._fetch_smart_summary_over_ssh(
                 candidates,
                 device_type=smartctl_device_type,
+                slot_view=slot_view,
             )
             if summary is not None:
                 summary = self._merge_smart_summary(slot_view, summary)
                 if self._store_smart_summary_cache(
                     slot_view,
                     summary,
-                    expected_generation=expected_generation,
+                    expected_generation=generation_token,
                 ):
                     self._persist_slot_detail_cache(slot_view, smart_summary=summary)
                     self._observe_inventory_cache_metrics()
@@ -3517,7 +3951,8 @@ class InventoryService:
             break
 
         if api_summary is not None:
-            if api_candidate and self._summary_needs_ssh_enrichment(api_summary):
+            transport, groups = self._smart_enrichment_plan(api_summary, slot_view, candidates)
+            if api_candidate and "smartctl-text" in groups:
                 try:
                     with perf_stage("smart.api.fetch_text_enrichment", candidate=api_candidate):
                         enrichment_payload = await self.truenas_client.fetch_disk_smartctl(api_candidate, ["-x"])
@@ -3530,21 +3965,24 @@ class InventoryService:
                             parse_smartctl_text_enrichment(enrichment_payload)
                         ),
                     )
-            if self._summary_prefers_core_ssh_json(api_summary):
+            if self._summary_prefers_core_ssh_json(api_summary, slot_view, candidates):
                 ssh_summary, _ssh_error = await self._fetch_smart_summary_over_ssh(
                     candidates,
                     device_type=smartctl_device_type,
+                    slot_view=slot_view,
                 )
                 if ssh_summary is not None:
                     api_summary = self._merge_missing_smart_fields(
                         self._merge_smart_summary(slot_view, ssh_summary),
                         api_summary,
                     )
+            if api_summary.transport_protocol is None and transport != "unknown":
+                api_summary.transport_protocol = transport
 
             if self._store_smart_summary_cache(
                 slot_view,
                 api_summary,
-                expected_generation=expected_generation,
+                expected_generation=generation_token,
             ):
                 self._persist_slot_detail_cache(slot_view, smart_summary=api_summary)
                 self._observe_inventory_cache_metrics()
@@ -3555,13 +3993,14 @@ class InventoryService:
             ssh_summary, ssh_error = await self._fetch_smart_summary_over_ssh(
                 candidates,
                 device_type=smartctl_device_type,
+                slot_view=slot_view,
             )
             if ssh_summary is not None:
                 ssh_summary = self._merge_smart_summary(slot_view, ssh_summary)
                 if self._store_smart_summary_cache(
                     slot_view,
                     ssh_summary,
-                    expected_generation=expected_generation,
+                    expected_generation=generation_token,
                 ):
                     self._persist_slot_detail_cache(slot_view, smart_summary=ssh_summary)
                     self._observe_inventory_cache_metrics()
@@ -3585,6 +4024,7 @@ class InventoryService:
         max_concurrency: int | None = None,
         *,
         allow_stale_cache: bool = False,
+        bypass_negative_cache: bool = False,
     ) -> list[SmartBatchItem]:
         with perf_stage("smart.batch.total", requested_slot_count=len(slots)):
             snapshot = await self.get_snapshot(
@@ -3603,7 +4043,9 @@ class InventoryService:
             if not ordered_slots:
                 return []
 
-            effective_concurrency = max_concurrency or self.settings.app.smart_batch_max_concurrency
+            effective_concurrency = self._smart_operation_limit
+            if max_concurrency is not None:
+                effective_concurrency = min(effective_concurrency, max(1, max_concurrency))
             semaphore = asyncio.Semaphore(max(1, effective_concurrency))
 
             async def load_summary(slot: int) -> SmartBatchItem:
@@ -3612,6 +4054,7 @@ class InventoryService:
                         summary = await self._get_slot_smart_summary_for_slot_view(
                             slot_lookup[slot],
                             allow_stale_cache=allow_stale_cache,
+                            bypass_negative_cache=bypass_negative_cache,
                         )
                     except TrueNASAPIError as exc:
                         summary = self._fallback_smart_summary(slot_lookup.get(slot), str(exc))
@@ -3624,6 +4067,7 @@ class InventoryService:
         candidates: list[str],
         hosts: list[str] | None = None,
         device_type: str | None = None,
+        slot_view: SlotView | None = None,
     ) -> tuple[SmartSummaryView | None, str | None]:
         if not self.system.ssh.enabled:
             return None, (
@@ -3631,92 +4075,171 @@ class InventoryService:
                 "and SSH fallback is disabled."
             )
 
-        last_error: str | None = None
         host_candidates = [normalize_text(host) for host in (hosts or []) if normalize_text(host)]
         if not host_candidates:
             host_candidates = [None]
+        attempts: list[
+            tuple[
+                str,
+                str,
+                str,
+                str,
+                tuple[tuple[str, Any], ...],
+            ]
+        ] = []
+        for candidate in candidates:
+            device_path = candidate if candidate.startswith("/dev/") else f"/dev/{candidate}"
+            for smartctl_binary in self._smartctl_binary_candidates():
+                command_parts = ["sudo", "-n", smartctl_binary]
+                if device_type:
+                    command_parts.extend(["-d", device_type])
+                command_parts.extend(["-x", "-j", device_path])
+                json_command = shlex.join(command_parts)
+                text_command_parts = ["sudo", "-n", smartctl_binary]
+                if device_type:
+                    text_command_parts.extend(["-d", device_type])
+                text_command_parts.extend(["-x", device_path])
+                attempts.append(
+                    (
+                        candidate,
+                        device_path,
+                        json_command,
+                        shlex.join(text_command_parts),
+                        self._linux_nvme_enrichment_command_parsers(device_path),
+                    )
+                )
 
-        with perf_stage("smart.ssh.fetch", candidate_count=len(candidates), host_count=len(host_candidates)):
+        if not attempts:
+            return None, None
+
+        def parse_primary(result: SSHCommandResult | None) -> SmartSummaryView | None:
+            if result is None or not result.stdout.strip():
+                return None
+            candidate_summary = SmartSummaryView.model_validate(
+                parse_smartctl_summary(result.stdout)
+            )
+            # smartctl commonly returns advisory non-zero exit codes even when
+            # the JSON payload is intact and contains useful SMART data.
+            if (
+                candidate_summary.available
+                or candidate_summary.message != "SMART JSON parsing failed."
+            ):
+                return candidate_summary
+            return None
+
+        def command_groups(
+            summary: SmartSummaryView,
+            attempt: tuple[str, str, str, str, tuple[tuple[str, Any], ...]],
+        ) -> list[str]:
+            candidate, _device_path, _json_command, text_command, nvme_parsers = attempt
+            transport, groups = self._smart_enrichment_plan(
+                summary,
+                slot_view,
+                [candidate],
+            )
+            commands: list[str] = []
+            if "smartctl-text" in groups:
+                commands.append(text_command)
+            nvme_groups = ("nvme-smart-log", "nvme-id-ctrl", "nvme-id-ns")
+            for group, command_parser in zip(nvme_groups, nvme_parsers, strict=False):
+                if group in groups:
+                    commands.append(command_parser[0])
+            return commands
+
+        last_error: str | None = None
+        with perf_stage(
+            "smart.ssh.fetch",
+            candidate_count=len(candidates),
+            host_count=len(host_candidates),
+        ):
             for target_host in host_candidates:
-                for candidate in candidates:
-                    device_path = candidate if candidate.startswith("/dev/") else f"/dev/{candidate}"
-                    for smartctl_binary in self._smartctl_binary_candidates():
-                        command_parts = ["sudo", "-n", smartctl_binary]
-                        if device_type:
-                            command_parts.extend(["-d", device_type])
-                        command_parts.extend(["-x", "-j", device_path])
-                        command = shlex.join(command_parts)
-                        text_command_parts = ["sudo", "-n", smartctl_binary]
-                        if device_type:
-                            text_command_parts.extend(["-d", device_type])
-                        text_command_parts.extend(["-x", device_path])
-                        text_command = shlex.join(text_command_parts)
-                        nvme_command_parsers = self._linux_nvme_enrichment_command_parsers(device_path)
-                        command_results = {
-                            result.command: result
-                            for result in await self._run_ssh_commands(
-                                [
-                                    command,
-                                    text_command,
-                                    *(nvme_command for nvme_command, _parser in nvme_command_parsers),
-                                ],
-                                target_host,
-                            )
-                        }
-                        result = command_results.get(
-                            command,
-                            SSHCommandResult(
-                                command=command,
-                                ok=False,
-                                stderr="SSH command result missing.",
-                                exit_code=255,
+                def planner(results: list[SSHCommandResult]) -> list[str]:
+                    result_by_command = {result.command: result for result in results}
+                    skipped_candidate: str | None = None
+                    for attempt in attempts:
+                        candidate, _device_path, json_command, _text_command, _nvme_parsers = attempt
+                        if candidate == skipped_candidate:
+                            continue
+                        result = result_by_command.get(json_command)
+                        if result is None:
+                            return [json_command]
+                        summary = parse_primary(result)
+                        if summary is not None:
+                            return [
+                                command
+                                for command in command_groups(summary, attempt)
+                                if command not in result_by_command
+                            ]
+                        detail = result.stderr.strip() or result.stdout.strip()
+                        if "command not found" not in detail.lower():
+                            skipped_candidate = candidate
+                    return []
+
+                planned_results = await self._run_ssh_planned_commands(
+                    planner,
+                    initial_commands=[attempts[0][2]],
+                    host=target_host,
+                )
+                result_by_command = {
+                    result.command: result
+                    for result in planned_results
+                }
+                skipped_candidate: str | None = None
+                for attempt in attempts:
+                    candidate, device_path, json_command, text_command, nvme_parsers = attempt
+                    if candidate == skipped_candidate:
+                        continue
+                    result = result_by_command.get(json_command)
+                    if result is None:
+                        continue
+                    summary = parse_primary(result)
+                    if summary is None:
+                        detail = (
+                            result.stderr.strip()
+                            or result.stdout.strip()
+                            or "Unknown SSH smartctl error."
+                        )
+                        detail = self._describe_smartctl_ssh_failure(detail, device_path)
+                        last_error = (
+                            f"{target_host}:{device_path}: {detail}"
+                            if target_host
+                            else f"{device_path}: {detail}"
+                        )
+                        if "command not found" not in detail.lower():
+                            skipped_candidate = candidate
+                        continue
+
+                    transport, _groups = self._smart_enrichment_plan(
+                        summary,
+                        slot_view,
+                        [candidate],
+                    )
+                    text_result = result_by_command.get(text_command)
+                    if text_result is not None and text_result.stdout.strip():
+                        summary = self._merge_missing_smart_fields(
+                            summary,
+                            SmartSummaryView.model_validate(
+                                parse_smartctl_text_enrichment(text_result.stdout)
                             ),
                         )
-                        summary = None
-                        if result.stdout.strip():
-                            parsed = parse_smartctl_summary(result.stdout)
-                            candidate_summary = SmartSummaryView.model_validate(parsed)
-                            # smartctl commonly returns advisory non-zero exit codes even when the
-                            # JSON payload is intact and contains useful SMART data.
-                            if candidate_summary.available or candidate_summary.message != "SMART JSON parsing failed.":
-                                summary = candidate_summary
-                        if summary is None:
-                            detail = result.stderr.strip() or result.stdout.strip() or "Unknown SSH smartctl error."
-                            detail = self._describe_smartctl_ssh_failure(detail, device_path)
-                            last_error = (
-                                f"{target_host}:{device_path}: {detail}"
-                                if target_host
-                                else f"{device_path}: {detail}"
-                            )
-                            if "command not found" in detail.lower():
-                                continue
-                            break
-
-                        text_result = command_results.get(text_command)
-                        if text_result is not None and text_result.stdout.strip():
-                            summary = self._merge_missing_smart_fields(
-                                summary,
-                                SmartSummaryView.model_validate(
-                                    parse_smartctl_text_enrichment(text_result.stdout)
-                                ),
-                            )
-                        if self.system.truenas.platform == "linux":
-                            nvme_summary = self._parse_linux_nvme_enrichment_results(
-                                nvme_command_parsers,
-                                command_results,
-                            )
-                            if nvme_summary is not None:
-                                summary = self._merge_missing_smart_fields(summary, nvme_summary)
-                        if summary.available or summary.message != "SMART JSON parsing failed.":
-                            if self.system.truenas.platform == "quantastor" and target_host:
-                                self._quantastor_preferred_ses_host = target_host
-                            return summary, None
-                        last_error = (
-                            f"{target_host}:{device_path}: {summary.message or 'SMART JSON parsing failed.'}"
-                            if target_host
-                            else f"{device_path}: {summary.message or 'SMART JSON parsing failed.'}"
-                        )
-                        break
+                    nvme_summary = self._parse_linux_nvme_enrichment_results(
+                        nvme_parsers,
+                        result_by_command,
+                    )
+                    if nvme_summary is not None:
+                        summary = self._merge_missing_smart_fields(summary, nvme_summary)
+                    if summary.transport_protocol is None and transport != "unknown":
+                        summary.transport_protocol = transport
+                    if summary.available or summary.message != "SMART JSON parsing failed.":
+                        if self.system.truenas.platform == "quantastor" and target_host:
+                            self._quantastor_preferred_ses_host = target_host
+                        return summary, None
+                    last_error = (
+                        f"{target_host}:{device_path}: {summary.message or 'SMART JSON parsing failed.'}"
+                        if target_host
+                        else f"{device_path}: {summary.message or 'SMART JSON parsing failed.'}"
+                    )
+                    skipped_candidate = candidate
 
         return None, last_error
 
@@ -3790,16 +4313,17 @@ class InventoryService:
         return summary
 
     async def export_mapping_bundle(self, selected_enclosure_id: str | None = None) -> MappingBundle:
-        mappings = self.mapping_store.list_mappings(self.system.id, selected_enclosure_id)
+        mapping_enclosure_id = resolve_physical_mapping_scope(selected_enclosure_id)
+        mappings = self.mapping_store.list_mappings(self.system.id, mapping_enclosure_id)
         preview = self.mapping_store.preview_replace_mappings(
             self.system.id,
-            selected_enclosure_id,
+            mapping_enclosure_id,
             mappings,
         )
         return MappingBundle(
             app_version=__version__,
             system_id=self.system.id,
-            enclosure_id=selected_enclosure_id,
+            enclosure_id=mapping_enclosure_id,
             revision=preview["revision"],
             mappings=mappings,
         )
@@ -3810,8 +4334,11 @@ class InventoryService:
         selected_enclosure_id: str | None,
     ) -> list[ManualMapping]:
         rewritten: list[ManualMapping] = []
+        mapping_enclosure_id = resolve_physical_mapping_scope(selected_enclosure_id)
         for mapping in bundle.mappings:
-            target_enclosure_id = selected_enclosure_id or mapping.enclosure_id
+            target_enclosure_id = mapping_enclosure_id or resolve_physical_mapping_scope(
+                mapping.enclosure_id
+            )
             rewritten.append(
                 mapping.model_copy(
                     update={
@@ -3844,16 +4371,17 @@ class InventoryService:
         selected_enclosure_id: str | None = None,
     ) -> dict[str, Any]:
         self._require_physical_mapping_scope(selected_enclosure_id, bundle)
+        mapping_enclosure_id = resolve_physical_mapping_scope(selected_enclosure_id)
         rewritten = self._rewrite_mapping_bundle(bundle, selected_enclosure_id)
         preview = self.mapping_store.preview_replace_mappings(
             self.system.id,
-            selected_enclosure_id,
+            mapping_enclosure_id,
             rewritten,
         )
         return {
             **preview,
             "system_id": self.system.id,
-            "enclosure_id": selected_enclosure_id,
+            "enclosure_id": mapping_enclosure_id,
         }
 
     async def import_mapping_bundle(
@@ -3866,10 +4394,11 @@ class InventoryService:
         invalidate_snapshot: bool = True,
     ) -> dict[str, Any]:
         self._require_physical_mapping_scope(selected_enclosure_id, bundle)
+        mapping_enclosure_id = resolve_physical_mapping_scope(selected_enclosure_id)
         rewritten = self._rewrite_mapping_bundle(bundle, selected_enclosure_id)
         result = self.mapping_store.apply_mapping_import(
             self.system.id,
-            selected_enclosure_id,
+            mapping_enclosure_id,
             rewritten,
             expected_revision=expected_revision,
             import_digest=import_digest,
@@ -4089,7 +4618,10 @@ class InventoryService:
         )
 
     def _attach_mapping_revisions(self, slots: list[SlotView]) -> list[SlotView]:
-        targets = list({(slot.enclosure_id, slot.slot) for slot in slots})
+        targets = list({
+            (resolve_physical_mapping_scope(slot.enclosure_id), slot.slot)
+            for slot in slots
+        })
         save_revisions = self.mapping_store.save_revisions(self.system.id, targets)
         clear_revisions = self.mapping_store.clear_revisions(
             self.system.id,
@@ -4098,8 +4630,12 @@ class InventoryService:
         return [
             slot.model_copy(
                 update={
-                    "mapping_revision": save_revisions[(slot.enclosure_id, slot.slot)],
-                    "mapping_clear_revision": clear_revisions[(slot.enclosure_id, slot.slot)],
+                    "mapping_revision": save_revisions[
+                        (resolve_physical_mapping_scope(slot.enclosure_id), slot.slot)
+                    ],
+                    "mapping_clear_revision": clear_revisions[
+                        (resolve_physical_mapping_scope(slot.enclosure_id), slot.slot)
+                    ],
                 }
             )
             for slot in slots
@@ -4450,7 +4986,7 @@ class InventoryService:
                 warnings,
                 # Drawer sub-views resolve mappings against the base shelf id,
                 # so the probe has to use the same key the correlator uses.
-                self._base_enclosure_id(resolved_meta.get("id")),
+                resolve_physical_mapping_scope(resolved_meta.get("id")),
                 slot_positions,
                 loaded_mappings,
                 no_identified_physical_enclosure=not available_enclosures,
@@ -4551,7 +5087,7 @@ class InventoryService:
             disk_records,
             self.system.truenas.platform,
         )
-        bmc_disks_by_serial = self._build_bmc_serial_disk_index(bmc_inventory)
+        bmc_disks_by_serial = self._build_bmc_serial_disk_index(bmc_inventory, disk_records)
         loaded_mappings = frame.loaded_mappings
 
         slot_views: list[SlotView] = []
@@ -4718,7 +5254,30 @@ class InventoryService:
         source_bundle: InventorySourceBundle,
         selected_enclosure_id: str | None,
     ) -> ParsedSSHData:
-        cache_key = normalize_text(selected_enclosure_id)
+        cache_key = selected_enclosure_id
+        if cache_key is None:
+            return parse_ssh_outputs(
+                source_bundle.ssh_outputs,
+                self.settings.layout.slot_count,
+                self.system.truenas.enclosure_filter,
+                selected_enclosure_id=None,
+            )
+        retain_parsed = (
+            self._canonical_enclosure_options is not None
+            and cache_key in self._canonical_enclosure_options
+        )
+        if not retain_parsed:
+            return parse_ssh_outputs(
+                source_bundle.ssh_outputs,
+                self.settings.layout.slot_count,
+                self.system.truenas.enclosure_filter,
+                selected_enclosure_id=cache_key,
+            )
+        for stale_key in (
+            set(source_bundle.parsed_ssh_data_by_enclosure)
+            - set(self._canonical_enclosure_options or {})
+        ):
+            source_bundle.parsed_ssh_data_by_enclosure.pop(stale_key, None)
         cached = source_bundle.parsed_ssh_data_by_enclosure.get(cache_key)
         if cached is not None:
             return cached
@@ -5365,7 +5924,7 @@ class InventoryService:
             ssh_data.ses_enclosures,
             candidate_slot_bound,
             self.system.truenas.enclosure_filter,
-            self._base_enclosure_id(selected_option.id),
+            resolve_physical_mapping_scope(selected_option.id),
         )
         for warning in ssh_meta.get("warnings") or []:
             warning_text = normalize_text(warning)
@@ -5376,7 +5935,7 @@ class InventoryService:
             self.system.truenas.enclosure_filter,
             candidate_slot_bound,
             self.settings.layout.api_slot_number_base,
-            self._base_enclosure_id(selected_option.id),
+            resolve_physical_mapping_scope(selected_option.id),
         )
         selected_meta = self._merge_enclosure_meta(self._enclosure_option_meta(selected_option), api_selected_meta)
         selected_meta = self._merge_enclosure_meta(selected_meta, ssh_meta)
@@ -5400,9 +5959,9 @@ class InventoryService:
             disk_records,
             self.system.truenas.platform,
         )
-        bmc_disks_by_serial = self._build_bmc_serial_disk_index(bmc_inventory)
+        bmc_disks_by_serial = self._build_bmc_serial_disk_index(bmc_inventory, disk_records)
 
-        mapping_enclosure_id = self._base_enclosure_id(selected_option.id)
+        mapping_enclosure_id = resolve_physical_mapping_scope(selected_option.id)
         is_sub_view = mapping_enclosure_id != selected_option.id
         # Synthetic drawer sub-views render only their own layout slots. Normal
         # profiles retain the existing range behavior so sparse custom layouts
@@ -5447,11 +6006,12 @@ class InventoryService:
             bmc_disk = self._match_bmc_disk_by_serial(disk, bmc_disks_by_serial)
             if bmc_disk is not None:
                 self._apply_bmc_serial_match_to_raw_slot_status(candidate, bmc_disk, disk)
+            mapping_meta = {**selected_meta, "id": mapping_enclosure_id}
             slot_view = self._build_slot_view(
                 slot=slot,
                 row_index=row_index,
                 column_index=column_index,
-                enclosure_meta=selected_meta,
+                enclosure_meta=mapping_meta,
                 raw_slot_status=candidate,
                 disk=disk,
                 mapping=mapping,
@@ -5529,7 +6089,7 @@ class InventoryService:
         disks_by_sas = index_disks_by_sas(
             (disk, *self._disk_sas_alias_tiers(disk)) for disk in disk_records
         )
-        bmc_disks_by_serial = self._build_bmc_serial_disk_index(bmc_inventory)
+        bmc_disks_by_serial = self._build_bmc_serial_disk_index(bmc_inventory, disk_records)
 
         api_topology_members = self._build_quantastor_topology_members(raw_data, disk_records)
         selected_meta = frame.selected_meta
@@ -8745,31 +9305,42 @@ class InventoryService:
             keys.update(normalize_lookup_keys(str(value) if value is not None else None))
         return keys
 
-    def _build_bmc_serial_disk_index(self, bmc_inventory: BMCInventory | None) -> dict[str, DiskRecord]:
+    def _build_bmc_serial_disk_index(
+        self,
+        bmc_inventory: BMCInventory | None,
+        platform_disks: Iterable[DiskRecord],
+    ) -> dict[str, DiskRecord]:
+        bmc_disks = self._build_bmc_disk_records(bmc_inventory)
+        bmc_serial_counts: Counter[str] = Counter()
+        platform_serial_counts: Counter[str] = Counter()
+
+        for disk in bmc_disks:
+            bmc_serial_counts.update(self._disk_record_serial_identity_keys(disk))
+        for disk in platform_disks:
+            platform_serial_counts.update(self._disk_record_serial_identity_keys(disk))
+
         index: dict[str, DiskRecord] = {}
-        ambiguous_keys: set[str] = set()
-        for disk in self._build_bmc_disk_records(bmc_inventory):
-            for key in self._disk_record_serial_identity_keys(disk):
-                if key in ambiguous_keys:
-                    continue
-                existing = index.get(key)
-                if existing is not None:
-                    ambiguous_keys.add(key)
-                    index.pop(key, None)
-                    continue
-                index[key] = disk
-        return {key: disk for key, disk in index.items() if key not in ambiguous_keys}
+        for disk in bmc_disks:
+            serial_keys = self._disk_record_serial_identity_keys(disk)
+            if len(serial_keys) != 1:
+                continue
+            serial_key = next(iter(serial_keys))
+            if bmc_serial_counts[serial_key] != 1:
+                continue
+            if platform_serial_counts[serial_key] != 1:
+                continue
+            index[serial_key] = disk
+        return index
 
     def _match_bmc_disk_by_serial(
         self,
         disk: DiskRecord | None,
         bmc_disks_by_serial: dict[str, DiskRecord],
     ) -> DiskRecord | None:
-        for key in self._disk_record_serial_identity_keys(disk):
-            matched = bmc_disks_by_serial.get(key)
-            if matched is not None:
-                return matched
-        return None
+        serial_keys = self._disk_record_serial_identity_keys(disk)
+        if len(serial_keys) != 1:
+            return None
+        return bmc_disks_by_serial.pop(next(iter(serial_keys)), None)
 
     @staticmethod
     def _build_bmc_platform_context(bmc_inventory: BMCInventory) -> dict[str, Any]:
@@ -9048,7 +9619,7 @@ class InventoryService:
                 continue
             # Multi-drawer chassis expose one selectable view per drawer in
             # addition to the whole-shelf view; the suffixed option id keeps
-            # selector state distinct while _base_enclosure_id maps it back
+            # selector state distinct while the mapping-scope resolver maps it back
             # to the real SES enclosure for candidates and manual mappings.
             for sub_profile_id in ENCLOSURE_SUB_VIEW_PROFILE_IDS.get(option.profile_id or "", []):
                 sub_profile = self.profile_registry.get(sub_profile_id)
@@ -9140,12 +9711,6 @@ class InventoryService:
             "mapping to scope it."
         )
 
-    @staticmethod
-    def _base_enclosure_id(option_id: str | None) -> str | None:
-        if not option_id:
-            return option_id
-        return option_id.split("::", 1)[0]
-
     def _legacy_mapping_fallback_allowed(
         self,
         available_enclosures: list[EnclosureOption],
@@ -9154,7 +9719,7 @@ class InventoryService:
             base_id
             for option in available_enclosures
             if option.kind == "physical"
-            and (base_id := self._base_enclosure_id(option.id))
+            and (base_id := resolve_physical_mapping_scope(option.id))
         }
         has_only_physical_options = all(
             option.kind == "physical" for option in available_enclosures
@@ -11241,6 +11806,8 @@ class InventoryService:
             raise TrueNASAPIError("SSH LED action failed: " + detail)
 
     async def _run_ssh_command(self, command: str, host: str | None = None) -> Any:
+        if not self._ssh_destination_authority_approved(host):
+            return self._ssh_authority_failure_results([command])[0]
         if isinstance(self.ssh_probe, SSHProbe):
             async with self._ssh_session_lock_for_host(host):
                 target_host = normalize_text(host)
@@ -11251,6 +11818,42 @@ class InventoryService:
                 return await probe.run_command(command)
 
         return await self.ssh_probe.run_command(command)
+
+    def _ssh_destination_authority_approved(self, host: str | None = None) -> bool:
+        if host is None:
+            return True
+        target_host = normalize_text(host)
+        candidate = ssh_credential_authorities(
+            platform=self.system.truenas.platform,
+            hosts=[target_host],
+            port=self.system.ssh.port,
+            username=self.system.ssh.user,
+            strict_host_key_checking=self.system.ssh.strict_host_key_checking,
+        )
+        approved = ssh_credential_authorities(
+            platform=self.system.truenas.platform,
+            hosts=[
+                self.system.ssh.host,
+                *self.system.ssh.extra_hosts,
+                *(node.host for node in self.system.ssh.ha_nodes),
+            ],
+            port=self.system.ssh.port,
+            username=self.system.ssh.user,
+            strict_host_key_checking=self.system.ssh.strict_host_key_checking,
+        )
+        return credential_authorities_are_approved(candidate, approved)
+
+    @staticmethod
+    def _ssh_authority_failure_results(commands: Iterable[str]) -> list[SSHCommandResult]:
+        return [
+            SSHCommandResult(
+                command=command,
+                ok=False,
+                stderr="SSH target is not an operator-approved destination for this credential authority.",
+                exit_code=255,
+            )
+            for command in commands
+        ]
 
     def _optional_ssh_backoff_key(self, host: str | None = None) -> str:
         return normalize_text(host) or normalize_text(self.system.ssh.host) or "__default__"
@@ -11360,6 +11963,8 @@ class InventoryService:
         initial_list = list(initial_commands)
         if not initial_list:
             return []
+        if not self._ssh_destination_authority_approved(host):
+            return self._ssh_authority_failure_results(initial_list)
 
         backoff_results = self._optional_ssh_backoff_failure_results(initial_list, host)
         if backoff_results is not None:
@@ -11408,6 +12013,8 @@ class InventoryService:
         command_list = list(commands)
         if not command_list:
             return []
+        if not self._ssh_destination_authority_approved(host):
+            return self._ssh_authority_failure_results(command_list)
 
         backoff_results = self._optional_ssh_backoff_failure_results(command_list, host)
         if backoff_results is not None:
@@ -11730,29 +12337,158 @@ class InventoryService:
         return summary
 
     @staticmethod
-    def _summary_needs_ssh_enrichment(summary: SmartSummaryView) -> bool:
-        return any(
-            value is None
-            for value in (
-                summary.power_on_hours,
-                summary.rotation_rate_rpm,
-                summary.form_factor,
-                summary.read_cache_enabled,
-                summary.writeback_cache_enabled,
-                summary.transport_protocol,
-                summary.sas_address,
-                summary.attached_sas_address,
-                summary.negotiated_link_rate,
-            )
-        )
+    def _normalize_smart_transport_value(value: str | None) -> str | None:
+        normalized = (normalize_text(value) or "").upper()
+        if "NVME" in normalized:
+            return "NVMe"
+        if "SAS" in normalized or "SCSI" in normalized:
+            return "SAS"
+        if "SATA" in normalized or normalized == "ATA" or normalized.startswith("ATA "):
+            return "ATA"
+        return None
 
-    def _summary_prefers_core_ssh_json(self, summary: SmartSummaryView) -> bool:
+    def _normalized_smart_transport(
+        self,
+        summary: SmartSummaryView,
+        slot_view: SlotView | None,
+        candidates: Iterable[str],
+    ) -> str:
+        for value in (
+            summary.transport_protocol,
+            summary.protocol_version,
+            slot_view.transport_protocol if slot_view is not None else None,
+            slot_view.smart_device_type if slot_view is not None else None,
+        ):
+            transport = self._normalize_smart_transport_value(value)
+            if transport is not None:
+                return transport
+
+        evidence = " ".join(str(candidate).lower() for candidate in candidates)
+        device_name = normalize_text(slot_view.device_name) if slot_view is not None else None
+        if device_name:
+            evidence = f"{device_name.lower()} {evidence}"
+        if "nvme" in evidence:
+            return "NVMe"
+        if "disk/by-id/ata-" in evidence or any(
+            token.startswith("ada") for token in evidence.replace("/dev/", "").split()
+        ):
+            return "ATA"
+        if "disk/by-id/scsi-" in evidence or "multipath/" in evidence:
+            return "SAS"
+        return "unknown"
+
+    def _smart_enrichment_plan(
+        self,
+        summary: SmartSummaryView,
+        slot_view: SlotView | None,
+        candidates: Iterable[str],
+    ) -> tuple[str, tuple[str, ...]]:
+        transport = self._normalized_smart_transport(summary, slot_view, candidates)
+        groups: list[str] = []
+        if transport == "ATA":
+            if any(
+                getattr(summary, field_name) is None
+                for field_name in (
+                    "read_cache_enabled",
+                    "writeback_cache_enabled",
+                    "protocol_version",
+                    "negotiated_link_rate",
+                )
+            ):
+                groups.append("smartctl-text")
+            if any(
+                getattr(summary, field_name) is None
+                for field_name in (
+                    "power_on_hours",
+                    "rotation_rate_rpm",
+                    "form_factor",
+                    "bytes_read",
+                    "bytes_written",
+                    "read_commands",
+                    "write_commands",
+                )
+            ):
+                groups.append("smartctl-json")
+        elif transport == "SAS":
+            if any(
+                getattr(summary, field_name) is None
+                for field_name in (
+                    "read_cache_enabled",
+                    "writeback_cache_enabled",
+                    "logical_unit_id",
+                    "sas_address",
+                    "attached_sas_address",
+                    "negotiated_link_rate",
+                )
+            ):
+                groups.append("smartctl-text")
+            if any(
+                getattr(summary, field_name) is None
+                for field_name in (
+                    "power_on_hours",
+                    "rotation_rate_rpm",
+                    "form_factor",
+                )
+            ):
+                groups.append("smartctl-json")
+        elif transport == "NVMe":
+            if any(
+                getattr(summary, field_name) is None
+                for field_name in (
+                    "temperature_c",
+                    "power_on_hours",
+                    "available_spare_percent",
+                    "available_spare_threshold_percent",
+                    "endurance_used_percent",
+                    "bytes_read",
+                    "bytes_written",
+                    "media_errors",
+                    "unsafe_shutdowns",
+                )
+            ):
+                groups.append("nvme-smart-log")
+            if any(
+                getattr(summary, field_name) is None
+                for field_name in (
+                    "firmware_version",
+                    "protocol_version",
+                    "warning_temperature_c",
+                    "critical_temperature_c",
+                )
+            ):
+                groups.append("nvme-id-ctrl")
+            if summary.namespace_eui64 is None or summary.namespace_nguid is None:
+                groups.append("nvme-id-ns")
+        elif any(
+            getattr(summary, field_name) is None
+            for field_name in (
+                "transport_protocol",
+                "read_cache_enabled",
+                "writeback_cache_enabled",
+            )
+        ):
+            groups.append("smartctl-text")
+        return transport, tuple(groups)
+
+    def _summary_needs_ssh_enrichment(
+        self,
+        summary: SmartSummaryView,
+        slot_view: SlotView | None = None,
+        candidates: Iterable[str] = (),
+    ) -> bool:
+        _transport, groups = self._smart_enrichment_plan(summary, slot_view, candidates)
+        return bool(groups)
+
+    def _summary_prefers_core_ssh_json(
+        self,
+        summary: SmartSummaryView,
+        slot_view: SlotView | None = None,
+        candidates: Iterable[str] = (),
+    ) -> bool:
         if self.system.truenas.platform != "core" or not self.system.ssh.enabled:
             return False
-
-        transport = (summary.transport_protocol or "").strip().upper()
-        protocol_version = (summary.protocol_version or "").strip().upper()
-        return transport == "ATA" or protocol_version.startswith("SATA")
+        transport, groups = self._smart_enrichment_plan(summary, slot_view, candidates)
+        return transport == "ATA" and "smartctl-json" in groups
 
     @staticmethod
     def _merge_missing_smart_fields(

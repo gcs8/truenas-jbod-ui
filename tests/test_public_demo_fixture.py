@@ -280,6 +280,10 @@ class PublicDemoBuildScriptTests(unittest.TestCase):
             self.assertIn('"identify_active": true', first_html)
             self.assertNotIn('src="/static/app.js"', first_html)
             self.assertNotIn('href="/static/style.css"', first_html)
+            self.assertIn('const trustedBase = new URL("/", window.location.origin);', first_html)
+            self.assertIn("new URLSearchParams(target.search)", first_html)
+            self.assertIn("buildScopedUrl(url, queryParams)", first_html)
+            self.assertNotIn("`${url}?${params.toString()}`", first_html)
             self.assertNotIn("history/history.db", first_html)
 
     def test_build_script_help_marks_generation_as_local_history_path(self) -> None:

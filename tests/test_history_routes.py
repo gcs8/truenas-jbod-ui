@@ -15,6 +15,50 @@ class SlotHistoryRouteTests(unittest.TestCase):
     def _route(self, path: str):
         return next(route for route in app_main.app.routes if getattr(route, "path", None) == path)
 
+    def test_history_status_route_reprojects_backend_result(self) -> None:
+        route = self._route("/api/history/status")
+        backend_payload = {
+            "configured": True,
+            "available": True,
+            "detail": None,
+            "counts": {"tracked_slots": 12},
+            "scopes": [{"system_id": "synthetic-system"}],
+            "collector": {
+                "collector_running": True,
+                "last_success_at": "2026-09-06T10:00:00+00:00",
+                "last_completed_at": "2026-09-06T09:59:00+00:00",
+                "last_error": "status-leak-ZXQ9 raw backend failure",
+                "source_base_url": "https://collector.status-leak-ZXQ9.example.test",
+                "sqlite_path": "/synthetic/private/status-leak-ZXQ9/history.db",
+                "collection_stage_timings": [{"error": "status-leak-ZXQ9"}],
+                "future_internal_metadata": "status-leak-ZXQ9",
+            },
+        }
+        history_backend = Mock()
+        history_backend.get_status = AsyncMock(return_value=backend_payload)
+
+        with patch.object(app_main, "get_history_backend", return_value=history_backend):
+            response = asyncio.run(route.endpoint())
+
+        payload = json.loads(response.body)
+        self.assertEqual(
+            payload,
+            {
+                "configured": True,
+                "available": True,
+                "detail": None,
+                "counts": {"tracked_slots": 12},
+                "scopes": [{"system_id": "synthetic-system"}],
+                "collector": {
+                    "collector_running": True,
+                    "last_success_at": "2026-09-06T10:00:00+00:00",
+                    "last_completed_at": "2026-09-06T09:59:00+00:00",
+                    "last_error": "History backend is degraded; see history service logs.",
+                },
+            },
+        )
+        self.assertNotIn("status-leak-ZXQ9", response.body.decode())
+
     def test_slot_history_resolves_the_default_system_when_system_id_is_omitted(self) -> None:
         route = self._route("/api/slots/{slot}/history")
         service = Mock()

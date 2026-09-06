@@ -10,7 +10,7 @@ import time
 import zipfile
 from collections import Counter, OrderedDict
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from ipaddress import ip_address
 from math import ceil
 from pathlib import Path
@@ -1491,12 +1491,22 @@ class SnapshotExportService:
                     for slot in snapshot.slots
                 }
 
-        scope_history = await self.history_backend.get_scope_history(
-            system_id=system_id,
-            enclosure_id=enclosure_id,
-            slots=slot_numbers,
-            window_hours=history_window_hours,
-        )
+        scope_arguments: dict[str, Any] = {
+            "system_id": system_id,
+            "enclosure_id": enclosure_id,
+            "slots": slot_numbers,
+            "window_hours": history_window_hours if isinstance(history_window_hours, int) else 8760,
+        }
+        if hasattr(self.history_backend, "get_scopes_history"):
+            scope_arguments.update(
+                metrics=[
+                    "temperature_c", "bytes_read", "bytes_written",
+                    "annualized_bytes_read", "annualized_bytes_written", "power_on_hours",
+                ],
+                event_limit=11,
+                metric_limit=15,
+            )
+        scope_history = await self.history_backend.get_scope_history(**scope_arguments)
         payload = {
             self._build_history_cache_key(system_id, enclosure_id, slot_number): scope_history.get(
                 slot_number,
@@ -1519,6 +1529,40 @@ class SnapshotExportService:
         *,
         history_window_hours: int | None,
     ) -> dict[str, dict[str, Any]]:
+        if hasattr(self.history_backend, "get_scopes_history") and snapshots_by_enclosure:
+            window_hours = history_window_hours if isinstance(history_window_hours, int) else 8760
+            window_hours = max(1, min(8760, window_hours))
+            scopes = [
+                {
+                    "system_id": snapshot.selected_system_id or "",
+                    "enclosure_id": snapshot.selected_enclosure_id,
+                    "slots": [slot.slot for slot in snapshot.slots],
+                }
+                for snapshot in snapshots_by_enclosure.values()
+                if snapshot.slots
+            ]
+            if not scopes:
+                return {}
+            response = await self.history_backend.get_scopes_history(
+                scopes=scopes,
+                since=(datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat(),
+                metrics=[
+                    "temperature_c", "bytes_read", "bytes_written",
+                    "annualized_bytes_read", "annualized_bytes_written", "power_on_hours",
+                ],
+                event_limit=11,
+                metric_limit=15,
+            )
+            payload: dict[str, dict[str, Any]] = {}
+            for scope_payload in response.get("scopes", []):
+                if not isinstance(scope_payload, dict) or not isinstance(scope_payload.get("histories"), dict):
+                    continue
+                for slot, history in scope_payload["histories"].items():
+                    if isinstance(history, dict):
+                        payload[self._build_history_cache_key(
+                            scope_payload.get("system_id"), scope_payload.get("enclosure_id"), int(slot)
+                        )] = history
+            return payload
         payload: dict[str, dict[str, Any]] = {}
         for snapshot in snapshots_by_enclosure.values():
             payload.update(
@@ -1584,6 +1628,50 @@ class SnapshotExportService:
                 return payload
 
         payload: dict[str, dict[str, Any]] = {}
+        all_slots_by_enclosure: dict[str | None, set[int]] = {}
+        all_display_targets: dict[tuple[str | None, int], list[int]] = {}
+        for runtime_view in storage_view_runtime.views:
+            for runtime_slot in runtime_view.slots:
+                history_slot, history_enclosure_id = self._storage_view_history_target(
+                    runtime_view,
+                    runtime_slot,
+                    fallback_enclosure_id=snapshot.selected_enclosure_id,
+                )
+                all_slots_by_enclosure.setdefault(history_enclosure_id, set()).add(history_slot)
+                all_display_targets.setdefault((history_enclosure_id, history_slot), []).append(runtime_slot.slot_index)
+        if hasattr(self.history_backend, "get_scopes_history") and all_slots_by_enclosure:
+            window_hours = history_window_hours if isinstance(history_window_hours, int) else 8760
+            window_hours = max(1, min(8760, window_hours))
+            response = await self.history_backend.get_scopes_history(
+                scopes=[
+                    {
+                        "system_id": system_id or "",
+                        "enclosure_id": history_enclosure_id,
+                        "slots": sorted(history_slots),
+                    }
+                    for history_enclosure_id, history_slots in all_slots_by_enclosure.items()
+                ],
+                since=(datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat(),
+                metrics=[
+                    "temperature_c", "bytes_read", "bytes_written",
+                    "annualized_bytes_read", "annualized_bytes_written", "power_on_hours",
+                ],
+                event_limit=11,
+                metric_limit=15,
+            )
+            for scope_payload in response.get("scopes", []):
+                if not isinstance(scope_payload, dict) or not isinstance(scope_payload.get("histories"), dict):
+                    continue
+                history_enclosure_id = scope_payload.get("enclosure_id")
+                for history_slot, history_payload in scope_payload["histories"].items():
+                    if not isinstance(history_payload, dict):
+                        continue
+                    slot_number = int(history_slot)
+                    for display_slot in all_display_targets.get((history_enclosure_id, slot_number), []):
+                        cache_slot = display_slot if str(history_enclosure_id).startswith("storage-view:") else slot_number
+                        payload[self._build_history_cache_key(system_id, history_enclosure_id, cache_slot)] = history_payload
+            self._store_cached_value(self._history_cache, history_cache_key, payload)
+            return payload
         for runtime_view in storage_view_runtime.views:
             display_slot_by_target: dict[tuple[str | None, int], list[int]] = {}
             slots_by_enclosure: dict[str | None, set[int]] = {}

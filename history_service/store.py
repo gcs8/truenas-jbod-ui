@@ -18,6 +18,7 @@ from typing import Any, Callable, Iterable, Iterator
 
 from history_service.domain import MetricSample, SlotEvent, SlotStateRecord
 from history_service.migration_lock import history_write_lock
+from history_service.operation_bounds import validate_store_scope_request
 from history_service.segment_catalog import (
     MIGRATION_PENDING_MARKER,
     activation_pending_path,
@@ -2106,69 +2107,67 @@ class HistoryStore:
         limit: int,
         since: str | None,
     ) -> None:
-        if limit <= 0:
-            return
-        rollups_by_interval: dict[int, dict[int, list[dict[str, Any]]]] = {}
         for bucket_seconds in (3600, 86400):
+            quotas: list[tuple[int, int, str | None]] = []
+            for slot, payload in payload_by_slot.items():
+                samples = payload.setdefault("metrics", {}).setdefault(metric_name, [])
+                remaining = limit - len(samples)
+                if remaining <= 0:
+                    continue
+                before = str(samples[-1]["observed_at"]) if samples else None
+                boundary = (
+                    f"{before[:10]}T00:00:00+00:00"
+                    if before and bucket_seconds == 86400 and any(
+                        item.get("rollup_seconds") == 3600 for item in samples
+                    )
+                    else before
+                )
+                quotas.append((slot, remaining, boundary))
+            if not quotas:
+                continue
+
+            quota_values = ", ".join("(?, ?, ?)" for _ in quotas)
+            quota_parameters = [value for quota in quotas for value in quota]
             rollup_where = [
                 *where_clauses,
                 "metric_name = ?",
                 "bucket_seconds = ?",
+                "(quotas.boundary IS NULL OR CASE"
+                f" WHEN metric_name IN ({_ROLLUP_COUNTER_METRICS_SQL})"
+                " THEN last_observed_at ELSE bucket_start END < quotas.boundary)",
             ]
-            rollup_parameters = [*parameters, metric_name, bucket_seconds]
+            rollup_parameters = [*quota_parameters, *parameters, metric_name, bucket_seconds]
             if since is not None:
                 rollup_where.append("bucket_start >= ?")
                 rollup_parameters.append(since)
-            rollup_parameters.append(limit)
             rows = connection.execute(
                 f"""
+                WITH quotas(slot_number, remaining, boundary) AS (
+                    VALUES {quota_values}
+                )
                 SELECT *
                 FROM (
                     SELECT
 {_indent_sql(ROLLUP_TO_SAMPLE_PROJECTION, 4)},
+                        quotas.remaining AS remaining,
                         ROW_NUMBER() OVER (
                             PARTITION BY slot, metric_name
                             ORDER BY bucket_start DESC
                         ) AS row_number
                     FROM metric_rollups
+                    JOIN quotas ON quotas.slot_number = metric_rollups.slot
                     WHERE {' AND '.join(rollup_where)}
                 )
-                WHERE row_number <= ?
+                WHERE row_number <= remaining
                 ORDER BY slot, observed_at DESC
                 """,
                 rollup_parameters,
             ).fetchall()
-            by_slot: dict[int, list[dict[str, Any]]] = {}
             for item in cls._metric_rows_to_payload(rows):
+                item.pop("remaining", None)
                 item.pop("row_number", None)
-                by_slot.setdefault(int(item["slot"]), []).append(item)
-            rollups_by_interval[bucket_seconds] = by_slot
-
-        for slot, payload in payload_by_slot.items():
-            samples = payload.setdefault("metrics", {}).setdefault(metric_name, [])
-            before = str(samples[-1]["observed_at"]) if samples else None
-            hourly_rollup_added = False
-            for bucket_seconds in (3600, 86400):
-                if len(samples) >= limit:
-                    break
-                boundary = None
-                if before:
-                    boundary = (
-                        f"{before[:10]}T00:00:00+00:00"
-                        if bucket_seconds == 86400 and hourly_rollup_added
-                        else before
-                    )
-                candidates = rollups_by_interval[bucket_seconds].get(slot, [])
-                additions = [
-                    item
-                    for item in candidates
-                    if boundary is None or str(item["observed_at"]) < boundary
-                ][: max(0, limit - len(samples))]
-                samples.extend(additions)
-                if additions:
-                    if bucket_seconds == 3600:
-                        hourly_rollup_added = True
-                    before = str(additions[-1]["observed_at"])
+                slot = int(item["slot"])
+                payload_by_slot[slot]["metrics"][metric_name].append(item)
 
     @staticmethod
     def _empty_slot_history_payload(metric_names: Iterable[str]) -> dict[str, Any]:
@@ -2189,6 +2188,12 @@ class HistoryStore:
         metric_limits: dict[str, int] | None = None,
         since: str | None = None,
     ) -> dict[int, dict[str, Any]]:
+        validate_store_scope_request(
+            slots=slots,
+            event_limit=event_limit,
+            metric_limits=metric_limits,
+            since=since,
+        )
         segmented_reader = self._segmented_reader()
         if segmented_reader is not None:
             return segmented_reader.list_scope_history(

@@ -1326,6 +1326,46 @@ ses0:
 
         self.assertEqual(slot.device_names, ["da5", "da29"])
 
+    def test_repeated_device_name_records_keep_bounded_incremental_state(self) -> None:
+        records = "\n".join(
+            f"""  Element {element}, Type: Array Device Slot
+    Status: OK
+    Description: Slot00
+    Device Names: da{element}"""
+            for element in range(256)
+        )
+
+        slot = parse_sesutil_map(f"ses0:\n{records}")[0].slots[0]
+
+        self.assertEqual(len(slot.device_names), parsers.MAX_SES_DEVICE_NAMES_PER_SLOT)
+        self.assertEqual(len(slot._device_name_keys), parsers.MAX_SES_DEVICE_NAMES_PER_SLOT)
+        self.assertEqual(slot._device_name_keys, set(slot.device_names))
+
+    def test_ses_element_count_is_rejected_before_parsing(self) -> None:
+        records = "\n".join(
+            f"  Element {element}, Type: Array Device Slot"
+            for element in range(parsers.MAX_SES_ELEMENTS + 1)
+        )
+
+        self.assertEqual(parse_sesutil_map(f"ses0:\n{records}"), [])
+
+    def test_many_unique_unmapped_elements_are_indexed_by_stable_key(self) -> None:
+        element_count = 512
+        records = "\n".join(
+            f"""  Element {element}, Type: Array Device Slot
+    Description: Mystery{element}"""
+            for element in range(element_count)
+        )
+
+        enclosure = parse_sesutil_map(f"ses0:\n{records}")[0]
+
+        self.assertEqual(len(enclosure.unmapped_slots), element_count)
+        self.assertEqual(len(enclosure._unmapped_slot_index), element_count)
+        self.assertEqual(
+            set(enclosure._unmapped_slot_index),
+            {("/dev/ses0", element) for element in range(element_count)},
+        )
+
     def test_parse_sg_ses_aes_duplicate_slot_keeps_first_nonempty_path_details(self) -> None:
         output = """
   ExampleCo  DualPathShelf  0001
@@ -1921,6 +1961,24 @@ Slot 01  da0  Example Disk  SYNTH0001  OK
 
         self.assertIsNone(slot.element_id)
         self.assertEqual(slot.control_targets, [])
+
+    def test_parse_sesutil_show_rejects_overlength_device_names_at_ingestion(self) -> None:
+        overlength_name = "x" * (parsers.MAX_SES_DEVICE_NAME_LENGTH + 1)
+        output = f"""
+ses2:  <ExampleCo OneBasedShelf 0001>; ID: synthetic-id
+Desc  Device  Model  Serial  Status
+Slot 00  {overlength_name}  -  -  OK
+""".strip()
+
+        direct_slot = parse_sesutil_show_enclosures(output)[0].slots[0]
+        aggregate_slot = parse_ssh_outputs(
+            {"sesutil show": output},
+            slot_count=1,
+            enclosure_filter=None,
+        ).ses_enclosures[0].slots[0]
+
+        self.assertEqual(direct_slot.device_names, [])
+        self.assertEqual(aggregate_slot.device_names, [])
 
     def test_core_map_show_mismatch_keeps_only_authentic_map_element_target(self) -> None:
         ses_map = """
@@ -2804,6 +2862,30 @@ Additional element status diagnostic page:
         self.assertNotIn("sg1", mapping)
         # Only sg nodes join back to sg_ses evidence.
         self.assertNotIn("ses0", mapping)
+
+    def test_parse_enclosure_sysfs_map_bounds_names_during_accumulation(self) -> None:
+        overlength_name = "x" * (parsers.MAX_SES_DEVICE_NAME_LENGTH + 1)
+        higher_names = " ".join(f"disk{index}" for index in range(17, 7, -1))
+        lower_names = " ".join(f"disk{index}" for index in range(7, -1, -1))
+        output = "\n".join(
+            [
+                f"13:0:0:0|sg84 |0|0|{higher_names}",
+                f"13:0:0:0|sg84 |0|0|{overlength_name} {lower_names}",
+            ]
+        )
+
+        mapping = parse_enclosure_sysfs_map(output)
+
+        self.assertEqual(
+            mapping["sg84"][0],
+            [f"disk{index}" for index in range(parsers.MAX_SES_DEVICE_NAMES_PER_SLOT)],
+        )
+        self.assertTrue(
+            all(
+                len(name) <= parsers.MAX_SES_DEVICE_NAME_LENGTH
+                for name in mapping["sg84"][0]
+            )
+        )
 
     def test_parse_ssh_outputs_disables_shared_aes_addresses_and_uses_sysfs_slots(self) -> None:
         sysfs_output = "\n".join(

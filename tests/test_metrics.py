@@ -35,8 +35,8 @@ from app.request_context import (
     request_id_headers,
     validate_request_id,
 )
-from app.models.domain import InventorySnapshot, SlotView, SmartSummaryView
-from app.services.inventory import InventoryService
+from app.models.domain import EnclosureOption, InventorySnapshot, SlotView, SmartSummaryView
+from app.services.inventory import InventoryService, SNAPSHOT_STATE_MAX_ENTRIES
 from app.services.mapping_store import MappingStore
 from app.services.profile_registry import ProfileRegistry
 from app.services.slot_detail_store import SlotDetailStore
@@ -837,6 +837,40 @@ class InventoryMetricsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('cache_state="hit"', metrics_text)
         self.assertIn("truenas_jbod_ui_inventory_snapshot_cache_entries", metrics_text)
 
+    async def test_snapshot_cache_metric_never_exceeds_coordinated_bound(self) -> None:
+        app = FastAPI()
+        system_id = "metrics-bounded-snapshot"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.dict("os.environ", {"METRICS_ENABLED": "true", "METRICS_PATH": "/metrics"}, clear=False):
+                install_metrics(app, service_name="test-metrics-bounded-snapshot", version="0.0.0-test")
+                service = build_inventory_service(temp_dir=temp_dir, system_id=system_id)
+                option_ids = [f"enc-{index}" for index in range(SNAPSHOT_STATE_MAX_ENTRIES + 8)]
+                service._canonical_enclosure_options = {
+                    key: EnclosureOption(id=key, label=key) for key in option_ids
+                }
+                for key in option_ids:
+                    service._admit_snapshot_key(key)
+                    service._cache[key] = InventorySnapshot(
+                        slots=[],
+                        refresh_interval_seconds=30,
+                        selected_system_id=system_id,
+                        selected_system_platform="core",
+                        selected_enclosure_id=key,
+                        enclosures=[service._canonical_enclosure_options[key]],
+                    )
+                    service._cache_until[key] = datetime.now(timezone.utc) + timedelta(minutes=5)
+                service._observe_inventory_cache_metrics()
+
+        metrics_text = response_body(await invoke_asgi(app, "/metrics"))
+        gauge_line = next(
+            line
+            for line in metrics_text.splitlines()
+            if line.startswith("truenas_jbod_ui_inventory_snapshot_cache_entries{")
+            and f'system_id="{system_id}"' in line
+        )
+        self.assertTrue(gauge_line.endswith(f" {float(SNAPSHOT_STATE_MAX_ENTRIES)}"), gauge_line)
+        self.assertLessEqual(len(service._snapshot_state_keys()), SNAPSHOT_STATE_MAX_ENTRIES)
+
     async def test_inventory_metrics_publish_source_bundle_states(self) -> None:
         class DummyTrueNASClient:
             async def fetch_all(self) -> TrueNASRawData:
@@ -896,6 +930,35 @@ class InventoryMetricsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("truenas_jbod_ui_smart_summary_requests_total", metrics_text)
         self.assertIn('system_id="metrics-smart-system"', metrics_text)
         self.assertIn('cache_state="hit"', metrics_text)
+
+    async def test_inventory_metrics_distinguish_negative_hits_from_positive_cache_entries(self) -> None:
+        app = FastAPI()
+        system_id = "metrics-smart-negative"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.dict("os.environ", {"METRICS_ENABLED": "true", "METRICS_PATH": "/metrics"}, clear=False):
+                install_metrics(app, service_name="test-metrics-scrape-smart-negative", version="0.0.0-test")
+                service = build_inventory_service(temp_dir=temp_dir, system_id=system_id)
+                slot_view = SlotView(
+                    slot=8,
+                    slot_label="08",
+                    row_index=0,
+                    column_index=8,
+                    enclosure_id="enc-negative",
+                )
+
+                first = await service._get_slot_smart_summary_for_slot_view(slot_view)
+                second = await service._get_slot_smart_summary_for_slot_view(slot_view)
+
+        self.assertFalse(first.available)
+        self.assertFalse(second.available)
+        metrics_messages = await invoke_asgi(app, "/metrics")
+        metrics_text = response_body(metrics_messages)
+        self.assertIn('cache_state="negative-hit"', metrics_text)
+        self.assertIn(
+            "# HELP truenas_jbod_ui_smart_summary_cache_entries "
+            "Current in-memory positive SMART summary cache entries for this system service.",
+            metrics_text,
+        )
 
     async def test_smart_cache_retention_eviction_updates_entry_gauge_before_cache_hit_returns(self) -> None:
         app = FastAPI()

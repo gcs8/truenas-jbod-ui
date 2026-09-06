@@ -47,7 +47,8 @@ jobs:
           done
 
           declare -a want=()
-          if [[ "$title" =~ ^([a-z]+)(\(([^)]*)\))?(!)?: ]]; then
+          conventional_pattern='^([a-z]+)(\(([^)]*)\))?(!)?:'
+          if [[ "$title" =~ $conventional_pattern ]]; then
             type="${BASH_REMATCH[1]}"
             scope="${BASH_REMATCH[3]:-}"
             bang="${BASH_REMATCH[4]:-}"
@@ -76,7 +77,15 @@ jobs:
             exit 0
           fi
 
-          mapfile -t current < <(gh pr view "$PR_NUMBER" --json labels --jq '.labels[].name')
+          current_output="$(
+            gh api "repos/$GH_REPO/issues/$PR_NUMBER/labels?per_page=100" \
+              --paginate \
+              --jq '.[].name'
+          )"
+          current=()
+          if [[ -n "$current_output" ]]; then
+            mapfile -t current <<<"$current_output"
+          fi
 
           contains() {
             local needle="$1"; shift
@@ -87,21 +96,38 @@ jobs:
             return 1
           }
 
-          add_args=()
-          remove_args=()
           for label in "${want[@]}"; do
             if ! contains "$label" "${current[@]}"; then
-              add_args+=(--add-label "$label")
+              gh api --method POST "repos/$GH_REPO/issues/$PR_NUMBER/labels" \
+                --raw-field "labels[]=$label" >/dev/null
             fi
           done
           for label in "${type_labels[@]}"; do
             if contains "$label" "${current[@]}" && ! contains "$label" "${want[@]}"; then
-              remove_args+=(--remove-label "$label")
+              gh api --method DELETE "repos/$GH_REPO/issues/$PR_NUMBER/labels/$label" \
+                >/dev/null
             fi
           done
-          if [[ ${#add_args[@]} -eq 0 && ${#remove_args[@]} -eq 0 ]]; then
-            echo "Labels already match title: ${want[*]}"
-            exit 0
+
+          final_output="$(
+            gh api "repos/$GH_REPO/issues/$PR_NUMBER/labels?per_page=100" \
+              --paginate \
+              --jq '.[].name'
+          )"
+          final=()
+          if [[ -n "$final_output" ]]; then
+            mapfile -t final <<<"$final_output"
           fi
-          gh pr edit "$PR_NUMBER" "${add_args[@]}" "${remove_args[@]}"
+          for label in "${want[@]}"; do
+            contains "$label" "${final[@]}" || {
+              echo "Required label was not applied: $label" >&2
+              exit 1
+            }
+          done
+          for label in "${type_labels[@]}"; do
+            if contains "$label" "${final[@]}" && ! contains "$label" "${want[@]}"; then
+              echo "Obsolete type label remains: $label" >&2
+              exit 1
+            fi
+          done
           echo "Applied: ${want[*]}"

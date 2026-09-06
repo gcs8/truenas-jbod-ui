@@ -1999,18 +1999,20 @@
     return list(diagnostics?.recent_events);
   }
 
-  function diagnosticTableKey(diagnostics) {
+  function diagnosticTableKey(diagnostics, scopeLabel = "", panelInstanceIdentity = "") {
     const rows = diagnosticEventRows(diagnostics);
     const first = rows[0]?.event_id || rows[0]?.id || "first";
     const last = rows[rows.length - 1]?.event_id || rows[rows.length - 1]?.id || "last";
     const scope = [
-      list(diagnostics?.devices).join("-"),
-      list(diagnostics?.targets).join("-"),
+      scopeLabel,
+      panelInstanceIdentity,
+      list(diagnostics?.devices),
+      list(diagnostics?.targets),
       diagnostics?.event_count,
       first,
       last,
-    ].filter(Boolean).join("-");
-    return classToken(scope || "diagnostic-events");
+    ];
+    return `diagnostic-${encodeURIComponent(JSON.stringify(scope))}`;
   }
 
   function diagnosticTableState(key) {
@@ -2276,7 +2278,7 @@
     `;
   }
 
-  function diagnosticTablePresentation(diagnostics, tableState) {
+  function diagnosticTablePresentation(diagnostics, tableState, key = diagnosticTableKey(diagnostics)) {
     const eventRows = diagnosticEventRows(diagnostics);
     const table = diagnostics.event_table || {};
     const pageSize = Math.max(1, Math.min(Number(table.page_size || 25), 100));
@@ -2287,7 +2289,7 @@
     const pageStartIndex = (tableState.page - 1) * pageSize;
     const tableRows = filteredRows.slice(pageStartIndex, pageStartIndex + pageSize);
     return {
-      key: diagnosticTableKey(diagnostics),
+      key,
       page: tableState.page,
       pageCount,
       pageSize,
@@ -2320,13 +2322,12 @@
       : '<tr><td colspan="7">No events match the current filter.</td></tr>';
   }
 
-  function refreshDiagnosticTable(key) {
+  function refreshDiagnosticTable(key, details) {
     const diagnostics = state.diagnosticPayloads[key];
-    const details = document.querySelector(`[data-fabric-diagnostic-table-key="${key}"]`);
     if (!diagnostics || !details) {
       return false;
     }
-    const presentation = diagnosticTablePresentation(diagnostics, diagnosticTableState(key));
+    const presentation = diagnosticTablePresentation(diagnostics, diagnosticTableState(key), key);
     const status = details.querySelector("[data-fabric-diagnostic-status]");
     const pagination = details.querySelector("[data-fabric-diagnostic-pagination]");
     const body = details.querySelector("tbody");
@@ -2339,14 +2340,14 @@
     return true;
   }
 
-  function renderDiagnosticEvidencePanel(diagnostics, scopeLabel = "") {
+  function renderDiagnosticEvidencePanel(diagnostics, scopeLabel = "", panelInstanceIdentity = "") {
     if (!diagnostics || typeof diagnostics !== "object" || !Number(diagnostics.event_count || 0)) {
       return "";
     }
     const table = diagnostics.event_table || {};
-    const tableKey = diagnosticTableKey(diagnostics);
+    const tableKey = diagnosticTableKey(diagnostics, scopeLabel, panelInstanceIdentity);
     const tableState = diagnosticTableState(tableKey);
-    const presentation = diagnosticTablePresentation(diagnostics, tableState);
+    const presentation = diagnosticTablePresentation(diagnostics, tableState, tableKey);
     const eventRows = presentation.eventRows;
     const events = eventRows.slice(-5).reverse();
     const sampleCount = Number(table.sample_count || eventRows.length || 0);
@@ -2624,7 +2625,7 @@
       stateName,
       mprDevice?.member_device_name || seed.device_name,
     ].filter(Boolean).join(" ");
-    return renderDiagnosticEvidencePanel(diagnostics, scopeLabel);
+    return renderDiagnosticEvidencePanel(diagnostics, scopeLabel, seed.expanderNode?.id || "");
   }
 
   function renderDiskPathBranch(seed, trace, fabric, slotNumber, options = {}) {
@@ -3831,7 +3832,7 @@
         tableState.page = Math.max(1, Number(action) || 1);
       }
       tableState.open = true;
-      refreshDiagnosticTable(key);
+      refreshDiagnosticTable(key, diagnosticPageButton.closest("[data-fabric-diagnostic-table-key]"));
       return;
     }
     const expandButton = target.closest("[data-fabric-expand-slots]");
@@ -3913,7 +3914,7 @@
     tableState.filter = target.value || "";
     tableState.page = 1;
     tableState.open = true;
-    refreshDiagnosticTable(key);
+    refreshDiagnosticTable(key, target.closest("[data-fabric-diagnostic-table-key]"));
   });
 
   document.addEventListener("change", (event) => {
@@ -3935,7 +3936,7 @@
     }
     tableState.page = 1;
     tableState.open = true;
-    refreshDiagnosticTable(key);
+    refreshDiagnosticTable(key, target.closest("[data-fabric-diagnostic-table-key]"));
   });
 
   document.addEventListener("toggle", (event) => {

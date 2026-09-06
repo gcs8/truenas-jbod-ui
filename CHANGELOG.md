@@ -149,6 +149,13 @@ them before starting the new images.
 
 ### Security
 
+- Hardened inventory, mapping, history, SAS diagnostics, and snapshot export
+  boundaries across the reviewed security backlog (#378).
+- Excluded internal endpoint, filesystem-path, and collection-stage metadata
+  from public history collector status responses (#373).
+- Required explicit bearer authorization, trusted-origin validation, atomic
+  admission, and a server-owned cooldown for exposed history refreshes; bulk
+  history reads now enforce aggregate work and serialized-byte ceilings (#371).
 - Routed the admin bootstrap payload through the shared script-safe JSON
   boundary (#151).
 - Bounded ESXi host-prep uploads through the private file-backed request limiter

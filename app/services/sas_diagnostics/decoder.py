@@ -6,6 +6,7 @@ from typing import Any
 
 from app.services.sas_diagnostics.common import (
     FAULT_FAMILY_LABELS,
+    FAULT_FAMILY_SEVERITIES,
     fault_family_likely_layer,
     fault_family_priority,
     fault_family_severity,
@@ -22,6 +23,7 @@ from app.services.sas_diagnostics.scsi import (
 DEFAULT_EVENT_TABLE_PAGE_SIZE = 25
 MAX_DIAGNOSTIC_TEXT_LENGTH = 384
 MAX_DIAGNOSTIC_COLLECTION_ITEMS = 64
+MAX_DIAGNOSTIC_NUMERIC_TOKEN_LENGTH = 32
 
 FREEBSD_ERRNO_SOURCE = {
     "name": "FreeBSD intro(2) errno list",
@@ -143,6 +145,7 @@ def make_decoded_event_record(event: dict[str, Any], *, event_id: str, sequence:
         "scsi_status",
         "scsi_status_code",
         "cam_error_code",
+        "cam_error_code_raw",
         "cam_retry_state",
         "errno_name",
         "errno_label",
@@ -152,7 +155,7 @@ def make_decoded_event_record(event: dict[str, Any], *, event_id: str, sequence:
             record[key] = decoded.get(key)
     if not record.get("label"):
         record["label"] = event.get("reason") or event.get("message") or "Kernel event"
-    if record.get("event_type") == "scsi_sense" and record.get("family"):
+    if record.get("event_type") == "scsi_sense" and record.get("family") in FAULT_FAMILY_SEVERITIES:
         record["severity"] = fault_family_severity(str(record["family"]))
     if not record.get("likely_layer") and record.get("family"):
         record["likely_layer"] = fault_family_likely_layer(str(record["family"]))
@@ -299,6 +302,9 @@ def _record_finding(summary: dict[str, Any], record: dict[str, Any]) -> None:
             "last_event_id": record.get("event_id"),
         },
     )
+    record_severity = record.get("severity") or fault_family_severity(str(record.get("family") or ""))
+    if severity_rank(record_severity) < severity_rank(finding.get("severity")):
+        finding["severity"] = record_severity
     finding["count"] += 1
     finding["last_event_id"] = record.get("event_id")
     for key in ("controllers", "devices", "targets"):
@@ -342,7 +348,21 @@ def _decode_cam_error_event(message: str) -> dict[str, Any]:
             "likely_layer": "FreeBSD CAM transport layer",
             "description": "The FreeBSD CAM layer reported a command error.",
         }
-    code = int(match.group("code"))
+    code_token = match.group("code")
+    if len(code_token) > MAX_DIAGNOSTIC_NUMERIC_TOKEN_LENGTH:
+        return {
+            "label": "CAM error: numeric code too long to decode",
+            "family": "cam_error",
+            "likely_layer": "FreeBSD CAM transport layer",
+            "description": "The FreeBSD CAM layer reported a command error with an oversized numeric code.",
+            "cam_error_code_raw": f"{code_token[: MAX_DIAGNOSTIC_NUMERIC_TOKEN_LENGTH - 3]}...",
+            "cam_retry_state": bound_diagnostic_value(match.group("state").strip()),
+            "decode_confidence": "unconfirmed",
+            "decode_source": "freebsd_cam_errno",
+            "source_attribution": dict(FREEBSD_ERRNO_SOURCE),
+            "decoder_note": "CAM numeric error code was too long to decode safely; bounded raw evidence was retained.",
+        }
+    code = int(code_token)
     state = match.group("state").strip()
     errno_name, errno_label = FREEBSD_ERRNO_LABELS.get(code, (None, None))
     label_head = f"CAM {errno_name}" if errno_name else f"CAM error {code}"

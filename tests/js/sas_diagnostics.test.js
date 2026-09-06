@@ -152,19 +152,12 @@ test("diagnostic filtering updates table subregions without replacing the input"
       }[selector] || null;
     },
   };
-  const document = {
-    querySelector(selector) {
-      assert.match(selector, /data-fabric-diagnostic-table-key/);
-      return details;
-    },
-  };
   const state = {
     diagnosticPayloads: { table_a: { event_count: 2 } },
     diagnosticTables: { table_a: { filter: "timeout", page: 1 } },
   };
   const { refreshDiagnosticTable } = loadFunctions(["refreshDiagnosticTable"], {
     state,
-    document,
     diagnosticTableState: () => state.diagnosticTables.table_a,
     diagnosticTablePresentation: () => ({ tableRows: [{ id: "event-a" }] }),
     renderDiagnosticTableStatus: () => "new status",
@@ -172,7 +165,7 @@ test("diagnostic filtering updates table subregions without replacing the input"
     renderDiagnosticTableRows: () => "new rows",
   });
 
-  assert.equal(refreshDiagnosticTable("table_a"), true);
+  assert.equal(refreshDiagnosticTable("table_a", details), true);
   assert.equal(status.innerHTML, "new status");
   assert.equal(pagination.innerHTML, "new pages");
   assert.equal(body.innerHTML, "new rows");
@@ -180,6 +173,126 @@ test("diagnostic filtering updates table subregions without replacing the input"
 
   const source = fs.readFileSync(path.join(ROOT, "app/static/sas_fabric_view.js"), "utf8");
   const inputHandler = source.slice(source.indexOf('document.addEventListener("input"'), source.indexOf('document.addEventListener("change"'));
-  assert.match(inputHandler, /refreshDiagnosticTable\(key\)/);
+  assert.match(inputHandler, /refreshDiagnosticTable\(key, target\.closest\("\[data-fabric-diagnostic-table-key\]"\)\)/);
   assert.doesNotMatch(inputHandler, /\brender\(\)/);
+});
+
+test("diagnostic table identity preserves colliding content and panel scopes", () => {
+  const { diagnosticTableKey, diagnosticEventRows, list } = loadFunctions([
+    "diagnosticTableKey",
+    "diagnosticEventRows",
+    "classToken",
+    "list",
+  ]);
+  const colonScope = {
+    devices: ["da:1"],
+    targets: ["10"],
+    event_count: 1,
+    event_table: { rows: [{ event_id: "event:1" }] },
+  };
+  const dashScope = {
+    devices: ["da-1"],
+    targets: ["10"],
+    event_count: 1,
+    event_table: { rows: [{ event_id: "event-1" }] },
+  };
+
+  assert.notEqual(diagnosticTableKey(colonScope, "mpr:0"), diagnosticTableKey(dashScope, "mpr-0"));
+  assert.notEqual(diagnosticTableKey(colonScope, "path:a"), diagnosticTableKey(colonScope, "path-b"));
+});
+
+test("simultaneously filtered diagnostic panels refresh only their own DOM", () => {
+  function panel(name) {
+    const regions = {
+      "[data-fabric-diagnostic-status]": { innerHTML: `${name}-old-status` },
+      "[data-fabric-diagnostic-pagination]": { innerHTML: `${name}-old-pages` },
+      "tbody": { innerHTML: `${name}-old-rows` },
+    };
+    return {
+      regions,
+      querySelector(selector) {
+        return regions[selector] || null;
+      },
+    };
+  }
+  const firstPanel = panel("first");
+  const secondPanel = panel("second");
+  const state = {
+    diagnosticPayloads: {
+      first_key: { event_count: 1 },
+      second_key: { event_count: 1 },
+    },
+    diagnosticTables: {
+      first_key: { filter: "timeout", page: 1 },
+      second_key: { filter: "medium", page: 1 },
+    },
+  };
+  const { refreshDiagnosticTable } = loadFunctions(["refreshDiagnosticTable"], {
+    state,
+    document: {
+      querySelector() {
+        throw new Error("refresh must not query the global document");
+      },
+    },
+    diagnosticTableState: (key) => state.diagnosticTables[key],
+    diagnosticTablePresentation: (_diagnostics, tableState, key) => ({ key, filter: tableState.filter }),
+    renderDiagnosticTableStatus: ({ key, filter }) => `${key}:${filter}:status`,
+    renderDiagnosticTablePagination: ({ key, filter }) => `${key}:${filter}:pages`,
+    renderDiagnosticTableRows: ({ key, filter }) => `${key}:${filter}:rows`,
+  });
+
+  assert.equal(refreshDiagnosticTable("first_key", firstPanel), true);
+  assert.equal(refreshDiagnosticTable("second_key", secondPanel), true);
+  assert.equal(firstPanel.regions.tbody.innerHTML, "first_key:timeout:rows");
+  assert.equal(secondPanel.regions.tbody.innerHTML, "second_key:medium:rows");
+  assert.equal(firstPanel.regions["[data-fabric-diagnostic-status]"].innerHTML, "first_key:timeout:status");
+  assert.equal(secondPanel.regions["[data-fabric-diagnostic-status]"].innerHTML, "second_key:medium:status");
+});
+
+test("fallback expander panels with identical diagnostics keep distinct table state", () => {
+  const state = { diagnosticTables: {} };
+  const diagnostics = {
+    devices: [],
+    targets: ["10"],
+    event_count: 1,
+    event_table: { rows: [{ event_id: "event-1" }] },
+  };
+  const controllerNode = { metrics: { kernel_diagnostics: diagnostics } };
+  const trace = { node_ids: [], metrics: {} };
+  const fabric = { nodes: [] };
+  const { diskPathBranchEvidence, diagnosticTableKey, diagnosticTableState, diagnosticEventRows, list } = loadFunctions([
+    "diskPathBranchEvidence",
+    "diagnosticTableKey",
+    "diagnosticTableState",
+    "diagnosticEventRows",
+    "list",
+  ], {
+    state,
+    nodeMap: () => new Map(),
+    branchMprDevice: () => null,
+    controllerNameFromId: () => null,
+    firstTraceNode: () => null,
+    renderDiagnosticEvidencePanel: (panelDiagnostics, scopeLabel, panelIdentity) => ({
+      diagnostics: panelDiagnostics,
+      scopeLabel,
+      panelIdentity,
+    }),
+  });
+  const first = diskPathBranchEvidence({
+    controller: "mpr0",
+    state: "reported",
+    controllerNode,
+    expanderNode: { id: "expander:first" },
+  }, trace, fabric);
+  const second = diskPathBranchEvidence({
+    controller: "mpr0",
+    state: "reported",
+    controllerNode,
+    expanderNode: { id: "expander:second" },
+  }, trace, fabric);
+  const firstKey = diagnosticTableKey(first.diagnostics, first.scopeLabel, first.panelIdentity);
+  const secondKey = diagnosticTableKey(second.diagnostics, second.scopeLabel, second.panelIdentity);
+
+  assert.notEqual(firstKey, secondKey);
+  assert.notEqual(diagnosticTableState(firstKey), diagnosticTableState(secondKey));
 });

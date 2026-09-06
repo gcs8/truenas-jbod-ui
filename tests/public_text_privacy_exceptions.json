@@ -711,7 +711,7 @@
   "tests/test_system_backup.py": {
     "findings": {
       "internal_hostname": {
-        "sha256:018fdf69639e1ed1eb3d11a726b467615371e847aa590a74af06d2ca1fcf5c17": 25
+        "sha256:3edeb7346ff1d407431e57c25bd8b5252ef8328d4edd32e75b53a64c997086ff": 25
       },
       "local_windows_drive_path": {
         "sha256:72d1da1cfc961bc4d5ff3e9f983bd667555607f98a33e14e6e771a4445ccc49f": 4

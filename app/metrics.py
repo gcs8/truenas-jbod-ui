@@ -264,7 +264,7 @@ INVENTORY_SNAPSHOT_CACHE_ENTRIES = Gauge(
 )
 SMART_SUMMARY_CACHE_ENTRIES = Gauge(
     "smart_summary_cache_entries",
-    "Current in-memory SMART summary cache entries for this system service.",
+    "Current in-memory positive SMART summary cache entries for this system service.",
     labelnames=("service", "system_id", "platform"),
     namespace=METRICS_NAMESPACE,
 )

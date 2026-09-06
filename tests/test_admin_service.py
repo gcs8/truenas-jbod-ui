@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import secrets
 import shlex
 import stat
 import tempfile
@@ -3655,6 +3656,260 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertEqual(api_config.api_password, MARKER_ALPHA)
         self.assertEqual(discovery_payload.ssh_password, MARKER_BRAVO)
         self.assertEqual(discovery_payload.ssh_timeout_seconds, 45)
+
+    def test_quantastor_discovery_rejects_preserved_ssh_password_for_caller_supplied_ha_destination(self) -> None:
+        route = next(
+            route
+            for route in admin_app.routes
+            if route.path == "/api/admin/system-setup/quantastor-nodes"
+        )
+        settings = Settings(
+            systems=[
+                SystemConfig(
+                    id="saved-quantastor",
+                    truenas=TrueNASConfig(
+                        host="https://saved-api.example.test",
+                        platform="quantastor",
+                        api_user="saved-api-operator",
+                        api_password="SYNTHETIC-SAVED-API-PASSWORD-362",
+                    ),
+                    ssh=SSHConfig(
+                        enabled=True,
+                        host="saved-node-a.example.test",
+                        ha_enabled=True,
+                        ha_nodes=[
+                            {"system_id": "node-a", "host": "saved-node-a.example.test"},
+                        ],
+                        user="saved-ssh-operator",
+                        password="SYNTHETIC-SAVED-SSH-PASSWORD-362",
+                    ),
+                )
+            ]
+        )
+        client = MagicMock()
+        client.fetch_all = AsyncMock(return_value=SimpleNamespace())
+        enrich = AsyncMock(return_value={"attempted": False, "ok": True})
+
+        with patch("admin_service.main.reload_app_settings", return_value=settings):
+            with patch("admin_service.main.QuantastorRESTClient", return_value=client) as client_factory:
+                with patch("admin_service.main.serialize_quantastor_nodes", return_value=[]):
+                    with patch("admin_service.main.enrich_quantastor_nodes_from_ssh", enrich):
+                        with self.assertRaises(HTTPException) as captured:
+                            asyncio.run(
+                                route.endpoint(
+                                    QuantastorNodeDiscoveryRequest(
+                                        system_id="saved-quantastor",
+                                        truenas_host="https://saved-api.example.test",
+                                        api_user="saved-api-operator",
+                                        api_password="SYNTHETIC-FRESH-API-PASSWORD-362",
+                                        ssh_enabled=True,
+                                        ssh_host="saved-node-a.example.test",
+                                        ssh_user="saved-ssh-operator",
+                                        ssh_password=PRESERVE_SECRET_SENTINEL,
+                                        ha_nodes=[
+                                            {
+                                                "system_id": "node-b",
+                                                "host": "replacement-node-b.example.test",
+                                            }
+                                        ],
+                                    )
+                                )
+                            )
+
+        self.assertEqual(captured.exception.status_code, 400)
+        client_factory.assert_not_called()
+        enrich.assert_not_awaited()
+
+    def test_quantastor_discovery_rejects_preserved_api_password_for_replacement_ssh_sink(self) -> None:
+        route = next(
+            route
+            for route in admin_app.routes
+            if route.path == "/api/admin/system-setup/quantastor-nodes"
+        )
+        saved_api_password = "SYNTHETIC-SAVED-API-PASSWORD-CROSS-SINK-362"
+        fresh_ssh_password = "SYNTHETIC-FRESH-SSH-PASSWORD-CROSS-SINK-362"
+        transport_events: list[str] = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.yaml"
+            original_config = b"systems: []\n"
+            config_path.write_bytes(original_config)
+            settings = Settings(
+                config_file=str(config_path),
+                systems=[
+                    SystemConfig(
+                        id="saved-quantastor",
+                        truenas=TrueNASConfig(
+                            host="https://saved-api.example.test",
+                            platform="quantastor",
+                            api_user="saved-api-operator",
+                            api_password=saved_api_password,
+                        ),
+                        ssh=SSHConfig(
+                            enabled=True,
+                            host="saved-node-a.example.test",
+                            ha_enabled=True,
+                            ha_nodes=[
+                                {
+                                    "system_id": "node-a",
+                                    "host": "saved-node-a.example.test",
+                                }
+                            ],
+                            user="saved-ssh-operator",
+                            password="SYNTHETIC-SAVED-SSH-PASSWORD-CROSS-SINK-362",
+                        ),
+                    )
+                ],
+            )
+            raw_data = TrueNASRawData(
+                enclosures=[],
+                systems=[
+                    {
+                        "id": "node-a",
+                        "name": "Synthetic node A",
+                        "storageSystemClusterId": "synthetic-cluster",
+                    },
+                    {
+                        "id": "node-b",
+                        "name": "Synthetic node B",
+                        "storageSystemClusterId": "synthetic-cluster",
+                    },
+                ],
+                disks=[],
+                pools=[],
+                pool_devices=[],
+                ha_groups=[],
+                hw_disks=[],
+                hw_enclosures=[
+                    {"id": "synthetic-enclosure-a", "storageSystemId": "node-a"},
+                    {"id": "synthetic-enclosure-b", "storageSystemId": "node-b"},
+                ],
+                disk_temperatures={},
+                smart_test_results=[],
+            )
+
+            class SyntheticQuantastorClient:
+                def __init__(self, _config: TrueNASConfig) -> None:
+                    pass
+
+                async def fetch_all(self) -> TrueNASRawData:
+                    transport_events.append("rest")
+                    return raw_data
+
+            async def record_ssh_transport(_probe, _commands, *, stdin_data=None):
+                transport_events.append("ssh-with-stdin" if stdin_data else "ssh-without-stdin")
+                return []
+
+            persisted = MagicMock()
+            captured: HTTPException | None = None
+            with patch("admin_service.main.reload_app_settings", return_value=settings):
+                with patch("admin_service.main.QuantastorRESTClient", SyntheticQuantastorClient):
+                    with patch("admin_service.main.SSHProbe.run_commands", new=record_ssh_transport):
+                        with patch("admin_service.main.SystemSetupService.save_system", persisted):
+                            try:
+                                asyncio.run(
+                                    route.endpoint(
+                                        QuantastorNodeDiscoveryRequest(
+                                            system_id="saved-quantastor",
+                                            truenas_host="https://saved-api.example.test",
+                                            api_user="saved-api-operator",
+                                            api_password=PRESERVE_SECRET_SENTINEL,
+                                            ssh_enabled=True,
+                                            ssh_host="replacement-node-b.example.test",
+                                            ssh_user="saved-ssh-operator",
+                                            ssh_password=fresh_ssh_password,
+                                            ha_nodes=[
+                                                {
+                                                    "system_id": "node-b",
+                                                    "host": "replacement-node-b.example.test",
+                                                }
+                                            ],
+                                        )
+                                    )
+                                )
+                            except HTTPException as exc:
+                                captured = exc
+
+            self.assertEqual(transport_events, [])
+            persisted.assert_not_called()
+            self.assertEqual(config_path.read_bytes(), original_config)
+
+        self.assertIsNotNone(captured)
+        assert captured is not None
+        self.assertEqual(captured.status_code, 400)
+        detail = str(captured.detail)
+        self.assertIn("saved connection settings", detail)
+        self.assertNotIn(saved_api_password, detail)
+        self.assertNotIn(fresh_ssh_password, detail)
+
+    def test_quantastor_discovery_never_logs_preserved_credentials_from_ssh_exception(self) -> None:
+        route = next(
+            route for route in admin_app.routes
+            if route.path == "/api/admin/system-setup/quantastor-nodes"
+        )
+        secret = secrets.token_hex(32)
+        saved_host = "saved-node.example.test"
+        settings = Settings(systems=[SystemConfig(
+            id="saved-quantastor",
+            truenas=TrueNASConfig(
+                host="https://saved-api.example.test", platform="quantastor",
+                api_user="operator", api_password=secret,
+            ),
+            ssh=SSHConfig(
+                enabled=True, host=saved_host, user="operator",
+                password="synthetic-ssh-password",
+            ),
+        )])
+        raw_data = TrueNASRawData(
+            enclosures=[], disks=[], pools=[], disk_temperatures={}, smart_test_results=[],
+            systems=[{"id": "node-a", "name": "Synthetic node"}],
+        )
+        transport_hosts: list[str] = []
+        encoded_inputs: list[str] = []
+
+        async def fail_transport(probe, commands, *, stdin_data=None):
+            transport_hosts.append(probe.config.host)
+            self.assertTrue(isinstance(stdin_data, str), "Expected credential-bearing SSH stdin")
+            decoded = base64.b64decode(stdin_data.strip(), validate=True).decode("utf-8")
+            # Boolean assertions keep random credentials out of failure diagnostics.
+            self.assertTrue(secret in decoded, "Saved API credential did not reach approved SSH stdin")
+            self.assertFalse(secret in repr(commands), "Credential entered command arguments")
+            encoded_inputs.append(stdin_data.strip())
+            raise RuntimeError(f"Synthetic transport failure: {decoded}; input={stdin_data}")
+
+        client = MagicMock()
+        client.fetch_all = AsyncMock(return_value=raw_data)
+        with (
+            patch("admin_service.main.reload_app_settings", return_value=settings),
+            patch("admin_service.main.QuantastorRESTClient", return_value=client),
+            patch("admin_service.main.SSHProbe.run_commands", new=fail_transport),
+            self.assertLogs(level="WARNING") as captured,
+        ):
+            response = asyncio.run(route.endpoint(QuantastorNodeDiscoveryRequest(
+                system_id="saved-quantastor", truenas_host="https://saved-api.example.test",
+                api_user="operator", api_password=PRESERVE_SECRET_SENTINEL,
+                ssh_enabled=True, ssh_host=saved_host, ssh_user="operator",
+                ssh_password=PRESERVE_SECRET_SENTINEL,
+            )))
+
+        self.assertEqual(transport_hosts, [saved_host])
+        # Enrichment catches transport assertions too; prove the fake reached its intended failure.
+        self.assertEqual(len(encoded_inputs), 1)
+        client.fetch_all.assert_awaited_once()
+        result = json.loads(response.body)
+        self.assertTrue(result["host_discovery"]["attempted"])
+        self.assertFalse(result["host_discovery"]["ok"])
+        self.assertEqual(len(captured.records), 1)
+        log_text = repr([record.__dict__ for record in captured.records]) + repr(captured.output)
+        for sensitive in (secret, *encoded_inputs):
+            self.assertFalse(sensitive in log_text, "Credential-bearing transport data leaked into warning logs")
+            self.assertFalse(sensitive in response.body.decode(), "Credential-bearing data leaked into response")
+        record = captured.records[0]
+        self.assertEqual(record.getMessage(), "Quantastor HA node host discovery failed; SSH interface discovery unavailable")
+        self.assertEqual(record.discovery_stage, "ssh_interface_discovery")
+        self.assertEqual(record.levelname, "WARNING")
+        self.assertIsNone(record.exc_info)
+        self.assertIsNone(record.exc_text)
 
     def test_quantastor_discovery_rejects_saved_secrets_for_different_endpoint(self) -> None:
         route = next(

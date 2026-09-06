@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi.routing import APIRoute
 
@@ -18,6 +18,7 @@ import tests.admin_test_env  # noqa: F401  (must precede admin_service.main)
 from admin_service import main as admin_main
 from app import main as app_main
 from app.models.domain import SystemBackupExportRequest
+from app.services.inventory import SnapshotStateBusyError, UnknownEnclosureError
 
 
 APP_ROUTE_MATRIX = [
@@ -45,6 +46,8 @@ APP_ROUTE_MATRIX = [
     ("/api/storage-views/{view_id}/slots/{slot_index}/history", ("GET",), "get_storage_view_slot_history", "starlette.responses.JSONResponse", None),
     ("/api/slots/smart-batch", ("POST",), "get_slot_smart_summaries", "starlette.responses.JSONResponse", "app.models.domain.SmartBatchResponse"),
     ("/api/history/status", ("GET",), "get_history_status", "starlette.responses.JSONResponse", None),
+    ("/api/history/refresh", ("POST",), "refresh_history_proxy", "starlette.responses.JSONResponse", None),
+    ("/api/history/scopes/bundle", ("POST",), "get_history_scopes_bundle", "starlette.responses.JSONResponse", None),
     ("/api/slots/{slot}/history", ("GET",), "get_slot_history", "starlette.responses.JSONResponse", None),
     ("/api/history/scope", ("GET",), "get_history_scope", "starlette.responses.JSONResponse", None),
     ("/api/storage-views/{view_id}/history", ("GET",), "get_storage_view_history", "starlette.responses.JSONResponse", None),
@@ -133,6 +136,77 @@ def _create_app_node(module) -> ast.FunctionDef:
 class RouteContractTests(unittest.TestCase):
     def test_main_route_matrix_is_frozen(self) -> None:
         self.assertEqual(_route_matrix(app_main.create_app()), APP_ROUTE_MATRIX)
+
+    def test_inventory_route_maps_unknown_enclosure_to_bounded_404(self) -> None:
+        service = MagicMock()
+        service.get_snapshot = AsyncMock(side_effect=UnknownEnclosureError())
+        registry = MagicMock()
+        registry.get_service.return_value = service
+        application = app_main.create_app()
+        messages: list[dict[str, object]] = []
+
+        async def invoke() -> None:
+            request_sent = False
+
+            async def receive() -> dict[str, object]:
+                nonlocal request_sent
+                if not request_sent:
+                    request_sent = True
+                    return {"type": "http.request", "body": b"", "more_body": False}
+                return {"type": "http.disconnect"}
+
+            async def send(message: dict[str, object]) -> None:
+                messages.append(message)
+
+            await application(
+                {
+                    "type": "http",
+                    "asgi": {"version": "3.0"},
+                    "http_version": "1.1",
+                    "method": "GET",
+                    "scheme": "http",
+                    "path": "/api/inventory",
+                    "raw_path": b"/api/inventory",
+                    "query_string": b"enclosure_id=caller-controlled-value",
+                    "headers": [],
+                    "client": ("127.0.0.1", 1),
+                    "server": ("test", 80),
+                    "root_path": "",
+                },
+                receive,
+                send,
+            )
+
+        with patch.object(app_main, "get_inventory_registry", return_value=registry):
+            asyncio.run(invoke())
+
+        start = next(message for message in messages if message["type"] == "http.response.start")
+        body = b"".join(
+            message.get("body", b"")
+            for message in messages
+            if message["type"] == "http.response.body"
+        )
+        self.assertEqual(start["status"], 404)
+        self.assertEqual(
+            json.loads(body),
+            {"ok": False, "detail": "Requested enclosure is not available for this system."},
+        )
+        self.assertNotIn(b"caller-controlled-value", body)
+
+    def test_snapshot_capacity_error_maps_to_retryable_503(self) -> None:
+        response = asyncio.run(
+            app_main.snapshot_state_busy_exception_handler(
+                MagicMock(),
+                SnapshotStateBusyError(),
+            )
+        )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.headers["retry-after"], "1")
+        self.assertEqual(
+            json.loads(response.body),
+            {"ok": False, "detail": "Snapshot state capacity is temporarily busy; retry later."},
+        )
 
     def test_admin_route_matrix_is_frozen(self) -> None:
         self.assertEqual(_route_matrix(admin_main.create_app()), ADMIN_ROUTE_MATRIX)

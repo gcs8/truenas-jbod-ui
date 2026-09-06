@@ -21,15 +21,33 @@ from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 from starlette.requests import Request
 
 from app.request_context import request_context
+from app.services.history_status import PUBLIC_COLLECTOR_STATUS_FIELDS
 from history_service import main as history_main
 from history_service import migration_lock
 from history_service import store as history_store
-from history_service.collector import HistoryCollectionStopping, HistoryCollector, ScopeSnapshot
+from history_service.collector import (
+    TOPOLOGY_CHANGE_CONFIRMATION_COUNT,
+    HistoryCollectionStopping,
+    HistoryCollector,
+    ScopeSnapshot,
+)
 from history_service.config import HistorySettings, get_history_settings
 from history_service.domain import MetricSample, SlotStateRecord, build_slot_events, isoformat_utc
 from history_service.migration_lock import history_lock_path, history_write_lock
 from history_service.segment_catalog import MIGRATION_PENDING_MARKER, activation_pending_path
+from history_service.segment_reader import SegmentedHistoryReader
 from history_service.store import DISK_IDENTITY_BACKFILL_USER_VERSION, HistoryStore, SlotStateUpdate
+
+
+@contextmanager
+def freeze_operation_bounds_now(now: datetime):
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.replace(tzinfo=None) if tz is None else now.astimezone(tz)
+
+    with patch("history_service.operation_bounds.datetime", FrozenDateTime):
+        yield
 
 
 class HistoryDomainTests(unittest.TestCase):
@@ -394,6 +412,11 @@ class HistoryConfigTests(unittest.TestCase):
 
 
 class HistoryDashboardRouteTests(unittest.TestCase):
+    def setUp(self) -> None:
+        history_main.refresh_admission = history_main.ManualRefreshAdmission(
+            cooldown_seconds=history_main.settings.full_refresh_cooldown_seconds
+        )
+
     @staticmethod
     def _request(*, root_path: str = "") -> Request:
         return Request(
@@ -411,6 +434,34 @@ class HistoryDashboardRouteTests(unittest.TestCase):
                 "server": ("testserver", 80),
                 "app": history_main.app,
             }
+        )
+
+    @staticmethod
+    def _refresh_request(mode: str) -> Request:
+        body = json.dumps({"mode": mode}).encode("utf-8")
+        sent = False
+
+        async def receive():
+            nonlocal sent
+            if sent:
+                return {"type": "http.request", "body": b"", "more_body": False}
+            sent = True
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        return Request(
+            {
+                "type": "http",
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/api/history/refresh",
+                "raw_path": b"/api/history/refresh",
+                "query_string": b"",
+                "headers": [(b"content-type", b"application/json")],
+                "client": ("127.0.0.1", 12345),
+                "server": ("testserver", 80),
+            },
+            receive,
         )
 
     @staticmethod
@@ -442,6 +493,69 @@ class HistoryDashboardRouteTests(unittest.TestCase):
                 )
             )
         return response.body.decode("utf-8")
+
+    @staticmethod
+    def _leaking_collector_status() -> dict[str, object]:
+        return {
+            "collector_running": True,
+            "collection_running": False,
+            "last_success_at": "2026-09-06T10:00:00+00:00",
+            "last_completed_at": "2026-09-06T09:59:00+00:00",
+            "last_error": None,
+            "source_base_url": "https://collector.status-leak-ZXQ9.example.test",
+            "sqlite_path": "/synthetic/private/status-leak-ZXQ9/history.db",
+            "collection_stage_timings": [
+                {"stage": "internal", "error": "status-leak-ZXQ9"}
+            ],
+            "future_internal_metadata": "status-leak-ZXQ9",
+        }
+
+    def test_history_public_routes_drop_distinctive_collector_metadata(self) -> None:
+        status = self._leaking_collector_status()
+        expected = {
+            key: status[key]
+            for key in (
+                "collector_running",
+                "collection_running",
+                "last_success_at",
+                "last_completed_at",
+                "last_error",
+            )
+        }
+        patches = (
+            patch.object(history_main.collector, "status", return_value=status),
+            patch.object(history_main.store, "estimated_counts", return_value={"tracked_slots": 0}),
+            patch.object(history_main.store, "list_scopes", return_value=[]),
+            patch.object(history_main.store, "database_size_bytes", return_value=4096),
+        )
+        with patches[0], patches[1], patches[2], patches[3]:
+            dashboard = asyncio.run(
+                next(route for route in history_main.app.routes if route.path == "/").endpoint(
+                    request=self._request(),
+                    exact_counts=False,
+                )
+            )
+            health = asyncio.run(history_main.healthz())
+            overview = asyncio.run(history_main.overview(exact_counts=False))
+
+        dashboard_bytes = dashboard.body
+        match = re.search(
+            rb'<script id="history-dashboard-bootstrap" type="application/json">\s*(.*?)\s*</script>',
+            dashboard_bytes,
+            flags=re.DOTALL,
+        )
+        self.assertIsNotNone(match)
+        self.assertEqual(json.loads(match.group(1)), expected)
+        health_payload = json.loads(health.body)
+        self.assertEqual(health_payload["collector"], expected)
+        self.assertEqual(
+            set(health_payload),
+            {"status", "collector", "database_size_bytes", *expected},
+        )
+        self.assertEqual(overview["collector"], expected)
+        for serialized in (dashboard_bytes, health.body, json.dumps(overview).encode()):
+            self.assertNotIn(b"status-leak-ZXQ9", serialized)
+        self.assertEqual(set(expected), set(PUBLIC_COLLECTOR_STATUS_FIELDS) & set(status))
 
     def test_dashboard_uses_template_and_gated_static_assets(self) -> None:
         service_dir = Path(history_main.__file__).resolve().parent
@@ -486,7 +600,8 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         self.assertIn('id="history-refresh-full"', markup)
         self.assertIn('src="http://testserver/static/dashboard.js"', markup)
         self.assertIn('href="http://testserver/static/dashboard.css"', markup)
-        self.assertIn("/api/history/refresh?mode=", script_source)
+        self.assertIn('fetch("/api/history/refresh"', script_source)
+        self.assertIn('body: JSON.stringify({ mode })', script_source)
         self.assertIn("const body = await response.text();", script_source)
         self.assertIn("JSON.parse(body)", script_source)
         self.assertIn("Next background pass", markup)
@@ -509,6 +624,23 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         self.assertIn('id="status-current-collection"', markup)
         self.assertIn('id="collector-state-value"', markup)
         self.assertIn('id="tracked-scopes-body"', markup)
+
+    def test_dashboard_hides_direct_refresh_controls_in_token_mode(self) -> None:
+        token_settings = HistorySettings(
+            refresh_auth_mode="token",
+            refresh_token="synthetic-token",
+            public_origin="https://history.example.test",
+        )
+        with patch.object(history_main, "settings", token_settings):
+            markup = self._render_dashboard(
+                {"collector_running": True},
+                {"tracked_slots": 0, "event_count": 0, "metric_sample_count": 0},
+                [],
+            )
+        self.assertNotIn('id="history-refresh-fast"', markup)
+        self.assertNotIn('id="history-refresh-full"', markup)
+        self.assertNotIn("synthetic-token", markup)
+        self.assertIn("authenticated main UI", markup)
 
     def test_dashboard_omits_release_link_for_non_http_urls(self) -> None:
         markup = self._render_dashboard(
@@ -576,8 +708,8 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         hostile_text = "</script><script>alert('&')</script>" + chr(0x2028) + chr(0x2029)
         status = {
             "collector_running": True,
-            "source_base_url": hostile_text,
             "collection_activity": hostile_text,
+            "future_internal_metadata": "status-leak-ZXQ9",
         }
         counts = {
             "tracked_slots": 1,
@@ -610,8 +742,12 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         self.assertNotIn(chr(0x2029), bootstrap_text)
         self.assertEqual(
             json.loads(bootstrap_text),
-            status,
+            {
+                "collector_running": True,
+                "collection_activity": hostile_text,
+            },
         )
+        self.assertNotIn("status-leak-ZXQ9", markup)
         self.assertNotIn(hostile_text, markup)
         self.assertIn("&lt;/script&gt;&lt;script&gt;alert", markup)
 
@@ -641,6 +777,51 @@ class HistoryDashboardRouteTests(unittest.TestCase):
 
         self.assertTrue(payload["counts_exact"])
 
+    def test_history_refresh_responses_keep_allowlist_on_success_and_conflict(self) -> None:
+        route = next(route for route in history_main.app.routes if route.path == "/api/history/refresh")
+        status = self._leaking_collector_status()
+        expected = {
+            key: status[key]
+            for key in (
+                "collector_running",
+                "collection_running",
+                "last_success_at",
+                "last_completed_at",
+                "last_error",
+            )
+        }
+
+        with (
+            patch.object(type(history_main.collector), "collection_running", new_callable=PropertyMock, return_value=False),
+            patch.object(history_main.collector, "run_once", new_callable=AsyncMock),
+            patch.object(history_main.collector, "status", return_value=status),
+            patch.object(history_main.store, "estimated_counts", return_value={"tracked_slots": 0}),
+            patch.object(history_main.store, "list_scopes", return_value=[]),
+            patch.object(history_main.store, "database_size_bytes", return_value=4096),
+        ):
+            success = asyncio.run(route.endpoint(request=self._refresh_request("fast")))
+
+        self.assertEqual(success["collector"], expected)
+        self.assertNotIn("status-leak-ZXQ9", json.dumps(success))
+
+        with (
+            patch.object(type(history_main.collector), "collection_running", new_callable=PropertyMock, return_value=True),
+            patch.object(history_main.collector, "status", return_value=status),
+        ):
+            conflict = asyncio.run(route.endpoint(request=self._refresh_request("full")))
+
+        self.assertEqual(conflict.status_code, 409)
+        conflict_payload = json.loads(conflict.body)
+        self.assertEqual(
+            conflict_payload,
+            {
+                "ok": False,
+                "mode": "full",
+                "detail": "History collection already running.",
+            },
+        )
+        self.assertNotIn("status-leak-ZXQ9", conflict.body.decode())
+
     def test_history_refresh_endpoint_forces_fast_collection(self) -> None:
         route = next(route for route in history_main.app.routes if route.path == "/api/history/refresh")
 
@@ -650,7 +831,7 @@ class HistoryDashboardRouteTests(unittest.TestCase):
             patch.object(history_main.store, "estimated_counts", return_value={"tracked_slots": 0}),
             patch.object(history_main.store, "list_scopes", return_value=[]),
         ):
-            payload = asyncio.run(route.endpoint(mode="fast"))
+            payload = asyncio.run(route.endpoint(request=self._refresh_request("fast")))
 
         run_once.assert_awaited_once_with(
             force_fast=True,
@@ -671,7 +852,7 @@ class HistoryDashboardRouteTests(unittest.TestCase):
             patch.object(history_main.store, "estimated_counts", return_value={"tracked_slots": 0}),
             patch.object(history_main.store, "list_scopes", return_value=[]),
         ):
-            payload = asyncio.run(route.endpoint(mode="full"))
+            payload = asyncio.run(route.endpoint(request=self._refresh_request("full")))
 
         run_once.assert_awaited_once_with(
             force_fast=True,
@@ -698,13 +879,17 @@ class HistoryDashboardRouteTests(unittest.TestCase):
                 return_value={
                     "collector_running": True,
                     "last_error": "POST http://enclosure-ui:8000/api/slots/smart-batch timed out after 45s",
+                    "source_base_url": "https://collector.status-leak-ZXQ9.example.test",
+                    "sqlite_path": "/synthetic/private/status-leak-ZXQ9/history.db",
+                    "collection_stage_timings": [{"error": "status-leak-ZXQ9"}],
+                    "future_internal_metadata": "status-leak-ZXQ9",
                 },
             ),
             patch.object(history_main.store, "estimated_counts", return_value={"tracked_slots": 0}),
             patch.object(history_main.store, "list_scopes", return_value=[]),
             patch.object(history_main.logger, "exception"),
         ):
-            response = asyncio.run(route.endpoint(mode="full"))
+            response = asyncio.run(route.endpoint(request=self._refresh_request("full")))
 
         run_once.assert_awaited_once_with(
             force_fast=True,
@@ -717,7 +902,15 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["mode"], "full")
         self.assertEqual(payload["detail"], "History full refresh failed; see service logs.")
+        self.assertEqual(
+            payload["collector"],
+            {
+                "collector_running": True,
+                "last_error": "History full refresh failed; see service logs.",
+            },
+        )
         self.assertNotIn("timed out after 45s", json.dumps(payload))
+        self.assertNotIn("status-leak-ZXQ9", json.dumps(payload))
         self.assertFalse(payload["counts_exact"])
 
     def test_history_refresh_endpoint_reports_existing_collection_as_conflict(self) -> None:
@@ -734,7 +927,7 @@ class HistoryDashboardRouteTests(unittest.TestCase):
             patch.object(history_main.store, "estimated_counts", return_value={"tracked_slots": 0}),
             patch.object(history_main.store, "list_scopes", return_value=[]),
         ):
-            response = asyncio.run(route.endpoint(mode="full"))
+            response = asyncio.run(route.endpoint(request=self._refresh_request("full")))
 
         run_once.assert_not_awaited()
         self.assertEqual(response.status_code, 409)
@@ -795,8 +988,9 @@ class HistoryDashboardRouteTests(unittest.TestCase):
                     "enclosure_id": "front",
                     "slots": [5],
                     "metrics": ["temperature_c"],
-                    "since": None,
+                    "since": (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(),
                     "event_limit": 12,
+                    "metric_limit": 60,
                 },
             ),
         )
@@ -2655,6 +2849,211 @@ class HistoryStoreTests(unittest.TestCase):
         )
 
     @staticmethod
+    def _insert_scope_rollups(
+        store: HistoryStore,
+        *,
+        slot: int,
+        metric_name: str,
+        bucket_seconds: int,
+        count: int = 12,
+    ) -> None:
+        connection = sqlite3.connect(store.file_path)
+        try:
+            month = 1 if bucket_seconds == 3600 else 12
+            year = 2026 if bucket_seconds == 3600 else 2025
+            connection.executemany(
+                """
+                INSERT INTO metric_rollups (
+                    bucket_start, bucket_seconds, system_id, system_label,
+                    enclosure_key, enclosure_id, enclosure_label, slot,
+                    slot_label, metric_name, sample_count, value_sum,
+                    value_min, value_max, last_value, last_observed_at,
+                    disk_identity_key
+                ) VALUES (?, ?, 'archive-core', 'Archive CORE', 'enc-a',
+                          'enc-a', 'Front Shelf', ?, ?, ?, 1, ?, ?, ?, ?, ?, '')
+                """,
+                [
+                    (
+                        f"{year:04d}-{month:02d}-{day:02d}T00:00:00+00:00",
+                        bucket_seconds,
+                        slot,
+                        f"{slot:02d}",
+                        metric_name,
+                        float(day),
+                        float(day),
+                        float(day),
+                        float(day),
+                        f"{year:04d}-{month:02d}-{day:02d}T00:59:00+00:00",
+                    )
+                    for day in range(1, count + 1)
+                ],
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def _scope_materialization_fixture(
+        self,
+        raw_counts: dict[tuple[int, str], int],
+    ) -> HistoryStore:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        store = HistoryStore(str(Path(temp_dir.name) / "history.db"))
+        samples = []
+        for (slot, metric_name), count in raw_counts.items():
+            samples.extend(
+                replace(
+                    self._metric_sample(
+                        f"2026-02-{day:02d}T12:00:00+00:00",
+                        day,
+                        slot=slot,
+                    ),
+                    metric_name=metric_name,
+                )
+                for day in range(1, count + 1)
+            )
+            for bucket_seconds in (3600, 86400):
+                self._insert_scope_rollups(
+                    store,
+                    slot=slot,
+                    metric_name=metric_name,
+                    bucket_seconds=bucket_seconds,
+                )
+        store.insert_metric_samples(samples)
+        return store
+
+    @staticmethod
+    def _counting_connection(connection, materialized: dict[str, int]):
+        class CountingCursor:
+            def __init__(self, cursor, query: str) -> None:
+                self._cursor = cursor
+                self._query = query
+
+            def fetchall(self):
+                rows = self._cursor.fetchall()
+                if "FROM metric_samples" in self._query:
+                    materialized["raw"] = materialized.get("raw", 0) + len(rows)
+                if "FROM metric_rollups" in self._query:
+                    materialized["rollup"] = materialized.get("rollup", 0) + len(rows)
+                return rows
+
+            def __getattr__(self, name: str):
+                return getattr(self._cursor, name)
+
+        class CountingConnection:
+            def execute(self, query, parameters=()):
+                return CountingCursor(connection.execute(query, parameters), query)
+
+            def close(self) -> None:
+                connection.close()
+
+            def __getattr__(self, name: str):
+                return getattr(connection, name)
+
+        return CountingConnection()
+
+    def _read_scope_with_materialization_count(
+        self,
+        store: HistoryStore,
+        *,
+        segmented: bool,
+        slots: list[int],
+        metric_limits: dict[str, int],
+    ) -> tuple[dict[int, dict[str, Any]], dict[str, int]]:
+        materialized: dict[str, int] = {}
+        fixture_now = datetime(2025, 12, 31, tzinfo=timezone.utc)
+        arguments = {
+            "slots": slots,
+            "event_limit": 0,
+            "metric_limits": metric_limits,
+            "since": "2025-01-01T00:00:00+00:00",
+        }
+        if not segmented:
+            original_connect = store._connect
+
+            def counted_connect():
+                return self._counting_connection(original_connect(), materialized)
+
+            with freeze_operation_bounds_now(fixture_now):
+                with patch.object(store, "_connect", side_effect=counted_connect):
+                    payload = store.list_scope_history("archive-core", "enc-a", **arguments)
+            return payload, materialized
+
+        reader = SegmentedHistoryReader(hot_path=store.file_path)
+        original_query_connection = reader._query_connection
+
+        @contextmanager
+        def counted_query_connection(path: Path):
+            with original_query_connection(path) as connection:
+                yield self._counting_connection(connection, materialized)
+
+        with freeze_operation_bounds_now(fixture_now):
+            with patch.object(reader, "_query_connection", side_effect=counted_query_connection):
+                payload = reader.list_scope_history("archive-core", "enc-a", **arguments)
+        return payload, materialized
+
+    def test_scope_bulk_materializes_only_one_rollup_after_nine_raw_rows(self) -> None:
+        for segmented in (False, True):
+            with self.subTest(segmented=segmented):
+                store = self._scope_materialization_fixture({(5, "temperature_c"): 9})
+                payload, materialized = self._read_scope_with_materialization_count(
+                    store,
+                    segmented=segmented,
+                    slots=[5],
+                    metric_limits={"temperature_c": 10},
+                )
+
+                samples = payload[5]["metrics"]["temperature_c"]
+                self.assertEqual(materialized, {"raw": 9, "rollup": 1})
+                self.assertEqual(len(samples), 10)
+                self.assertNotIn("rollup_seconds", samples[8])
+                self.assertEqual(samples[9]["rollup_seconds"], 3600)
+
+    def test_scope_bulk_uses_each_slot_metric_remaining_quota(self) -> None:
+        raw_counts = {
+            (5, "temperature_c"): 9,
+            (5, "bytes_read"): 10,
+            (6, "temperature_c"): 7,
+            (6, "bytes_read"): 8,
+        }
+        for segmented in (False, True):
+            with self.subTest(segmented=segmented):
+                store = self._scope_materialization_fixture(raw_counts)
+                payload, materialized = self._read_scope_with_materialization_count(
+                    store,
+                    segmented=segmented,
+                    slots=[5, 6],
+                    metric_limits={"temperature_c": 10, "bytes_read": 10},
+                )
+
+                self.assertEqual(materialized, {"raw": 34, "rollup": 6})
+                for slot in (5, 6):
+                    for metric_name in ("temperature_c", "bytes_read"):
+                        samples = payload[slot]["metrics"][metric_name]
+                        raw_count = raw_counts[(slot, metric_name)]
+                        self.assertEqual(len(samples), 10)
+                        self.assertTrue(
+                            all("rollup_seconds" not in item for item in samples[:raw_count])
+                        )
+                        self.assertTrue(
+                            all(item["rollup_seconds"] == 3600 for item in samples[raw_count:])
+                        )
+
+    def test_scope_bulk_skips_rollup_queries_when_no_quota_remains(self) -> None:
+        for segmented in (False, True):
+            with self.subTest(segmented=segmented):
+                store = self._scope_materialization_fixture({(5, "temperature_c"): 10})
+                payload, materialized = self._read_scope_with_materialization_count(
+                    store,
+                    segmented=segmented,
+                    slots=[5],
+                    metric_limits={"temperature_c": 10},
+                )
+
+                self.assertEqual(materialized, {"raw": 10})
+                self.assertEqual(len(payload[5]["metrics"]["temperature_c"]), 10)
+
+    @staticmethod
     def _insert_event_rows(store: HistoryStore, observed_times: list[str]) -> None:
         connection = sqlite3.connect(store.file_path)
         try:
@@ -2861,7 +3260,7 @@ class HistoryStoreTests(unittest.TestCase):
             [30, 20.0],
         )
 
-    def test_all_history_queries_include_retained_rollups_without_since(self) -> None:
+    def test_single_history_query_allows_all_time_while_bulk_requires_since(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         store = HistoryStore(str(temp_dir / "history.db"))
         store.insert_metric_samples(
@@ -2881,13 +3280,15 @@ class HistoryStoreTests(unittest.TestCase):
             "archive-core", "enc-a", 5,
             metric_name="temperature_c", limit=10,
         )
-        scope = store.list_scope_history(
-            "archive-core",
-            "enc-a",
-            slots=[5],
-            event_limit=0,
-            metric_limits={"temperature_c": 10},
-        )
+        with freeze_operation_bounds_now(datetime(2026, 7, 1, tzinfo=timezone.utc)):
+            scope = store.list_scope_history(
+                "archive-core",
+                "enc-a",
+                slots=[5],
+                event_limit=0,
+                metric_limits={"temperature_c": 10},
+                since="2025-09-05T00:00:00+00:00",
+            )
 
         self.assertEqual([sample["value"] for sample in samples], [30.0])
         self.assertEqual(
@@ -3070,15 +3471,16 @@ class HistoryStoreTests(unittest.TestCase):
                     return original_connect()
 
                 started = time.perf_counter()
-                with patch.object(store, "_connect", counting_connect):
-                    before = store.list_scope_history(
-                        "archive-core",
-                        "enc-a",
-                        slots=list(range(slot_count)),
-                        event_limit=0,
-                        metric_limits={"temperature_c": 4},
-                        since="2022-01-01T00:00:00+00:00",
-                    )
+                with freeze_operation_bounds_now(datetime(2022, 12, 31, tzinfo=timezone.utc)):
+                    with patch.object(store, "_connect", counting_connect):
+                        before = store.list_scope_history(
+                            "archive-core",
+                            "enc-a",
+                            slots=list(range(slot_count)),
+                            event_limit=0,
+                            metric_limits={"temperature_c": 4},
+                            since="2022-01-01T00:00:00+00:00",
+                        )
                 pre_query_seconds = time.perf_counter() - started
                 self.assertEqual(connect_calls, 1)
 
@@ -3095,15 +3497,16 @@ class HistoryStoreTests(unittest.TestCase):
                 maintenance_seconds = time.perf_counter() - maintenance_started
                 connect_calls = 0
                 started = time.perf_counter()
-                with patch.object(store, "_connect", counting_connect):
-                    after = store.list_scope_history(
-                        "archive-core",
-                        "enc-a",
-                        slots=list(range(slot_count)),
-                        event_limit=0,
-                        metric_limits={"temperature_c": 4},
-                        since="2022-01-01T00:00:00+00:00",
-                    )
+                with freeze_operation_bounds_now(datetime(2022, 12, 31, tzinfo=timezone.utc)):
+                    with patch.object(store, "_connect", counting_connect):
+                        after = store.list_scope_history(
+                            "archive-core",
+                            "enc-a",
+                            slots=list(range(slot_count)),
+                            event_limit=0,
+                            metric_limits={"temperature_c": 4},
+                            since="2022-01-01T00:00:00+00:00",
+                        )
                 post_query_seconds = time.perf_counter() - started
 
                 self.assertEqual(summary["metric_samples_removed"], slot_count)
@@ -3522,6 +3925,7 @@ class HistoryStoreTests(unittest.TestCase):
             slots=[5],
             event_limit=0,
             metric_limits={"bytes_written": 10},
+            since="2026-04-16T00:00:00+00:00",
         )
 
         self.assertEqual(payload[5]["events"], [])
@@ -5216,6 +5620,89 @@ class HistoryStoreTests(unittest.TestCase):
 
 class HistoryCollectorTests(unittest.TestCase):
     @staticmethod
+    def _topology_history_fixture(
+        *,
+        system_id: str = "archive-core",
+        enclosure_id: str = "enc-a",
+        slot: int = 30,
+    ) -> tuple[HistoryStore, HistoryCollector, SlotStateRecord]:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        collector = HistoryCollector(
+            HistorySettings(
+                sqlite_path=str(temp_dir / "history.db"),
+                backup_dir=str(temp_dir / "backups"),
+                startup_grace_seconds=0,
+            ),
+            store,
+        )
+        baseline = SlotStateRecord(
+            system_id=system_id,
+            system_label="Archive CORE",
+            enclosure_key=enclosure_id,
+            enclosure_id=enclosure_id,
+            enclosure_label="Front Shelf",
+            slot=slot,
+            slot_label=f"{slot:02d}",
+            present=True,
+            state="healthy",
+            identify_active=False,
+            device_name=f"multipath/disk{slot}",
+            serial=f"SERIAL-{slot}",
+            model="WDC WUH721818AL5204",
+            gptid=f"gptid/{slot}",
+            pool_name="The-Repository",
+            vdev_name="raidz2-2",
+            health="ONLINE",
+            topology_label="The-Repository > raidz2-2 > data",
+            logical_unit_id=f"0x5000cca27c7f{slot:04d}",
+            disk_identity_key=f"disk:{slot}",
+        )
+        return store, collector, baseline
+
+    @staticmethod
+    def _topology_scope(record: SlotStateRecord, snapshot: dict[str, Any]) -> ScopeSnapshot:
+        return ScopeSnapshot(
+            system_id=record.system_id,
+            system_label=record.system_label,
+            enclosure_id=record.enclosure_id,
+            enclosure_label=record.enclosure_label,
+            snapshot=snapshot,
+        )
+
+    @staticmethod
+    def _topology_snapshot(record: SlotStateRecord, **overrides: Any) -> dict[str, Any]:
+        slot_payload = {
+            "slot": record.slot,
+            "slot_label": record.slot_label,
+            "enclosure_id": record.enclosure_id,
+            "enclosure_label": record.enclosure_label,
+            "present": record.present,
+            "state": record.state,
+            "identify_active": record.identify_active,
+            "device_name": record.device_name,
+            "serial": record.serial,
+            "model": record.model,
+            "gptid": record.gptid,
+            "pool_name": record.pool_name,
+            "vdev_name": record.vdev_name,
+            "health": record.health,
+            "topology_label": record.topology_label,
+            "logical_unit_id": record.logical_unit_id,
+            "disk_identity_key": record.disk_identity_key,
+        }
+        slot_payload.update(overrides.pop("slot_overrides", {}))
+        snapshot = {
+            "selected_system_id": record.system_id,
+            "selected_system_label": record.system_label,
+            "selected_system_platform": "core",
+            "sources": {"api": {"enabled": True, "ok": True}},
+            "slots": [slot_payload],
+        }
+        snapshot.update(overrides)
+        return snapshot
+
+    @staticmethod
     def _scheduled_backup_status(
         *,
         success_at: datetime,
@@ -6050,10 +6537,281 @@ class HistoryCollectorTests(unittest.TestCase):
         loaded = store.get_slot_state("archive-core", "enc-a", 30)
 
         self.assertEqual(events, [])
+        self.assertEqual(
+            collector._pending_topology_changes.get(("archive-core", "enc-a", 30)),
+            (("The-Repository", None, "The-Repository > data"), 1),
+        )
         self.assertIsNotNone(loaded)
         assert loaded is not None
         self.assertEqual(loaded.vdev_name, "raidz2-2")
         self.assertEqual(loaded.topology_label, "The-Repository > raidz2-2 > data")
+
+    def test_record_slot_changes_confirms_repeated_topology_degradation_at_threshold(self) -> None:
+        store, collector, baseline = self._topology_history_fixture()
+        degraded = replace(
+            baseline,
+            vdev_name=None,
+            topology_label="The-Repository > data",
+        )
+        first_observed_at = "2026-06-12T09:54:00+00:00"
+        confirming_observed_at = "2026-06-12T09:59:00+00:00"
+
+        self.assertEqual(TOPOLOGY_CHANGE_CONFIRMATION_COUNT, 2)
+        store.upsert_slot_state(baseline, "2026-06-12T09:50:00+00:00")
+        collector._record_slot_changes([degraded], first_observed_at)
+
+        self.assertEqual(store.list_slot_events(baseline.system_id, baseline.enclosure_id, baseline.slot), [])
+        self.assertEqual(
+            collector._pending_topology_changes.get(collector._slot_state_key(baseline)),
+            (collector._topology_signature(degraded), 1),
+        )
+        after_first = store.get_slot_state(baseline.system_id, baseline.enclosure_id, baseline.slot)
+        self.assertIsNotNone(after_first)
+        assert after_first is not None
+        self.assertEqual(after_first.vdev_name, baseline.vdev_name)
+        self.assertEqual(after_first.topology_label, baseline.topology_label)
+
+        collector._record_slot_changes([degraded], confirming_observed_at)
+
+        events = store.list_slot_events(baseline.system_id, baseline.enclosure_id, baseline.slot)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event_type"], "slot_topology_changed")
+        self.assertEqual(events[0]["observed_at"], confirming_observed_at)
+        self.assertEqual(events[0]["previous_value"], baseline.topology_label)
+        self.assertEqual(events[0]["current_value"], degraded.topology_label)
+        self.assertEqual(
+            json.loads(events[0]["details_json"]),
+            {
+                "topology_label": {
+                    "label": "Topology",
+                    "previous": baseline.topology_label,
+                    "current": degraded.topology_label,
+                },
+                "vdev_name": {
+                    "label": "Vdev",
+                    "previous": baseline.vdev_name,
+                    "current": None,
+                },
+            },
+        )
+        accepted = store.get_slot_state(baseline.system_id, baseline.enclosure_id, baseline.slot)
+        self.assertIsNotNone(accepted)
+        assert accepted is not None
+        self.assertIsNone(accepted.vdev_name)
+        self.assertEqual(accepted.topology_label, degraded.topology_label)
+        self.assertNotIn(collector._slot_state_key(baseline), collector._pending_topology_changes)
+
+        collector._record_slot_changes([degraded], "2026-06-12T10:04:00+00:00")
+
+        self.assertEqual(len(store.list_slot_events(baseline.system_id, baseline.enclosure_id, baseline.slot)), 1)
+
+    def test_record_slot_changes_clears_pending_degradation_on_transient_recovery(self) -> None:
+        store, collector, baseline = self._topology_history_fixture()
+        degraded = replace(baseline, vdev_name=None, topology_label="The-Repository > data")
+        key = collector._slot_state_key(baseline)
+        store.upsert_slot_state(baseline, "2026-06-12T09:50:00+00:00")
+
+        collector._record_slot_changes([degraded], "2026-06-12T09:54:00+00:00")
+        self.assertEqual(collector._pending_topology_changes.get(key), (collector._topology_signature(degraded), 1))
+
+        collector._record_slot_changes([baseline], "2026-06-12T09:59:00+00:00")
+
+        self.assertNotIn(key, collector._pending_topology_changes)
+        self.assertEqual(store.list_slot_events(baseline.system_id, baseline.enclosure_id, baseline.slot), [])
+        recovered = store.get_slot_state(baseline.system_id, baseline.enclosure_id, baseline.slot)
+        self.assertIsNotNone(recovered)
+        assert recovered is not None
+        self.assertEqual(recovered.vdev_name, baseline.vdev_name)
+        self.assertEqual(recovered.topology_label, baseline.topology_label)
+
+    def test_record_slot_changes_replaces_pending_degradation_on_alternating_signatures(self) -> None:
+        store, collector, baseline = self._topology_history_fixture()
+        degraded_a = replace(baseline, vdev_name=None, topology_label="The-Repository > data")
+        degraded_b = replace(baseline, vdev_name=None, topology_label="The-Repository > unknown")
+        key = collector._slot_state_key(baseline)
+        store.upsert_slot_state(baseline, "2026-06-12T09:50:00+00:00")
+
+        for index, candidate in enumerate((degraded_a, degraded_b, degraded_a, degraded_b), start=1):
+            collector._record_slot_changes([candidate], f"2026-06-12T10:{index:02d}:00+00:00")
+            self.assertEqual(
+                collector._pending_topology_changes.get(key),
+                (collector._topology_signature(candidate), 1),
+            )
+
+        self.assertEqual(store.list_slot_events(baseline.system_id, baseline.enclosure_id, baseline.slot), [])
+        loaded = store.get_slot_state(baseline.system_id, baseline.enclosure_id, baseline.slot)
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        self.assertEqual(loaded.vdev_name, baseline.vdev_name)
+        self.assertEqual(loaded.topology_label, baseline.topology_label)
+
+    def test_record_slot_changes_discards_pending_degradation_on_disk_identity_change(self) -> None:
+        store, collector, baseline = self._topology_history_fixture()
+        degraded_a = replace(baseline, vdev_name=None, topology_label="The-Repository > data")
+        replacement = replace(
+            baseline,
+            device_name="multipath/replacement30",
+            serial="REPLACEMENT-30",
+            gptid="gptid/replacement-30",
+            logical_unit_id="replacement-lun-30",
+            disk_identity_key="disk:replacement-30",
+        )
+        degraded_replacement = replace(
+            replacement,
+            vdev_name=None,
+            topology_label="The-Repository > data",
+        )
+        key = collector._slot_state_key(baseline)
+        store.upsert_slot_state(baseline, "2026-06-12T09:50:00+00:00")
+
+        collector._record_slot_changes([degraded_a], "2026-06-12T09:54:00+00:00")
+        self.assertEqual(collector._pending_topology_changes.get(key), (collector._topology_signature(degraded_a), 1))
+
+        collector._record_slot_changes([replacement], "2026-06-12T09:59:00+00:00")
+
+        self.assertNotIn(key, collector._pending_topology_changes)
+        identity_events = store.list_slot_events(baseline.system_id, baseline.enclosure_id, baseline.slot)
+        self.assertEqual([event["event_type"] for event in identity_events], ["slot_identity_changed"])
+        loaded = store.get_slot_state(baseline.system_id, baseline.enclosure_id, baseline.slot)
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        self.assertEqual(loaded.disk_identity_key, replacement.disk_identity_key)
+
+        collector._record_slot_changes([degraded_replacement], "2026-06-12T10:04:00+00:00")
+
+        self.assertEqual(
+            collector._pending_topology_changes.get(key),
+            (collector._topology_signature(degraded_replacement), 1),
+        )
+        self.assertEqual(len(store.list_slot_events(baseline.system_id, baseline.enclosure_id, baseline.slot)), 1)
+
+    def test_record_slot_changes_never_confirms_mass_topology_degradation(self) -> None:
+        store, collector, template = self._topology_history_fixture(slot=0)
+        baselines = [
+            replace(
+                template,
+                slot=slot,
+                slot_label=f"{slot:02d}",
+                device_name=f"multipath/disk{slot}",
+                serial=f"SERIAL-{slot}",
+                gptid=f"gptid/{slot}",
+                logical_unit_id=f"0x5000cca27c7f{slot:04d}",
+                disk_identity_key=f"disk:{slot}",
+            )
+            for slot in range(4)
+        ]
+        degraded = [
+            replace(record, vdev_name=None, topology_label="The-Repository > data") for record in baselines
+        ]
+        for record in baselines:
+            store.upsert_slot_state(record, "2026-06-12T09:50:00+00:00")
+
+        collector._record_slot_changes([degraded[0]], "2026-06-12T09:54:00+00:00")
+        self.assertEqual(
+            collector._pending_topology_changes.get(collector._slot_state_key(degraded[0])),
+            (collector._topology_signature(degraded[0]), 1),
+        )
+
+        for pass_number in range(TOPOLOGY_CHANGE_CONFIRMATION_COUNT + 1):
+            collector._record_slot_changes(degraded, f"2026-06-12T10:{pass_number:02d}:00+00:00")
+            for record in degraded:
+                self.assertNotIn(collector._slot_state_key(record), collector._pending_topology_changes)
+
+        for baseline in baselines:
+            self.assertEqual(store.list_slot_events(baseline.system_id, baseline.enclosure_id, baseline.slot), [])
+            loaded = store.get_slot_state(baseline.system_id, baseline.enclosure_id, baseline.slot)
+            self.assertIsNotNone(loaded)
+            assert loaded is not None
+            self.assertEqual(loaded.vdev_name, baseline.vdev_name)
+            self.assertEqual(loaded.topology_label, baseline.topology_label)
+
+    def test_run_once_failed_source_breaks_pending_degradation_confirmation(self) -> None:
+        store, collector, baseline = self._topology_history_fixture()
+        degraded = replace(baseline, vdev_name=None, topology_label="The-Repository > data")
+        _, _, unrelated = self._topology_history_fixture(system_id="other-system", enclosure_id="enc-b", slot=8)
+        unrelated_degraded = replace(unrelated, vdev_name=None, topology_label="The-Repository > data")
+        key = collector._slot_state_key(baseline)
+        unrelated_key = collector._slot_state_key(unrelated)
+        store.upsert_slot_state(baseline, "2026-06-12T09:50:00+00:00")
+        store.upsert_slot_state(unrelated, "2026-06-12T09:50:00+00:00")
+        collector._record_slot_changes([degraded], "2026-06-12T09:54:00+00:00")
+        collector._record_slot_changes([unrelated_degraded], "2026-06-12T09:54:00+00:00")
+        self.assertEqual(collector._pending_topology_changes.get(key), (collector._topology_signature(degraded), 1))
+        self.assertEqual(
+            collector._pending_topology_changes.get(unrelated_key),
+            (collector._topology_signature(unrelated_degraded), 1),
+        )
+        rejected = self._topology_snapshot(
+            degraded,
+            sources={"api": {"enabled": True, "ok": False}},
+        )
+        collector._enumerate_scopes = AsyncMock(  # type: ignore[method-assign]
+            return_value=[self._topology_scope(baseline, rejected)]
+        )
+
+        with patch.object(store, "record_slot_updates", wraps=store.record_slot_updates) as record_updates:
+            asyncio.run(collector.run_once())
+
+        record_updates.assert_not_called()
+        self.assertNotIn(key, collector._pending_topology_changes)
+        self.assertEqual(
+            collector._pending_topology_changes.get(unrelated_key),
+            (collector._topology_signature(unrelated_degraded), 1),
+        )
+        self.assertEqual(store.list_slot_events(baseline.system_id, baseline.enclosure_id, baseline.slot), [])
+        loaded = store.get_slot_state(baseline.system_id, baseline.enclosure_id, baseline.slot)
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        self.assertEqual(loaded.topology_label, baseline.topology_label)
+
+        collector._record_slot_changes([degraded], "2026-06-12T10:04:00+00:00")
+
+        self.assertEqual(collector._pending_topology_changes.get(key), (collector._topology_signature(degraded), 1))
+        self.assertEqual(store.list_slot_events(baseline.system_id, baseline.enclosure_id, baseline.slot), [])
+
+    def test_run_once_incomplete_quantastor_topology_breaks_pending_degradation_confirmation(self) -> None:
+        store, collector, baseline = self._topology_history_fixture(
+            system_id="qs-cryostorage",
+            enclosure_id="node-a",
+            slot=0,
+        )
+        baseline = replace(
+            baseline,
+            system_label="QS CryoStorage",
+            enclosure_label="QSOSN-Right",
+            pool_name="HA-Pool-R10",
+            vdev_name="mirror-0",
+            topology_label="HA-Pool-R10 > mirror-0 > data",
+        )
+        degraded = replace(baseline, vdev_name="disk", topology_label="HA-Pool-R10 > disk")
+        key = collector._slot_state_key(baseline)
+        store.upsert_slot_state(baseline, "2026-06-12T09:50:00+00:00")
+        collector._record_slot_changes([degraded], "2026-06-12T09:54:00+00:00")
+        self.assertEqual(collector._pending_topology_changes.get(key), (collector._topology_signature(degraded), 1))
+        incomplete = self._topology_snapshot(
+            degraded,
+            selected_system_platform="quantastor",
+            platform_context={"topology_complete": False},
+        )
+        collector._enumerate_scopes = AsyncMock(  # type: ignore[method-assign]
+            return_value=[self._topology_scope(baseline, incomplete)]
+        )
+
+        with patch.object(store, "record_slot_updates", wraps=store.record_slot_updates) as record_updates:
+            asyncio.run(collector.run_once())
+
+        record_updates.assert_not_called()
+        self.assertNotIn(key, collector._pending_topology_changes)
+        self.assertEqual(store.list_slot_events(baseline.system_id, baseline.enclosure_id, baseline.slot), [])
+        loaded = store.get_slot_state(baseline.system_id, baseline.enclosure_id, baseline.slot)
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        self.assertEqual(loaded.topology_label, baseline.topology_label)
+
+        collector._record_slot_changes([degraded], "2026-06-12T10:04:00+00:00")
+
+        self.assertEqual(collector._pending_topology_changes.get(key), (collector._topology_signature(degraded), 1))
+        self.assertEqual(store.list_slot_events(baseline.system_id, baseline.enclosure_id, baseline.slot), [])
 
     def test_record_slot_changes_confirms_real_topology_change_before_event(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
@@ -6495,105 +7253,422 @@ class HistoryCollectorTests(unittest.TestCase):
             )
         )
 
-    def test_run_once_publishes_deduplicated_complete_smart_alert_evidence(self) -> None:
+    @staticmethod
+    def _smart_alert_scope(slots: list[dict[str, object]]) -> ScopeSnapshot:
+        return ScopeSnapshot(
+            system_id="test-system",
+            system_label="Test system",
+            enclosure_id="enc-a",
+            enclosure_label="Test shelf",
+            snapshot={
+                "selected_system_id": "test-system",
+                "selected_enclosure_id": "enc-a",
+                "slots": slots,
+            },
+        )
+
+    def _smart_alert_collector(self, slots: list[dict[str, object]]) -> HistoryCollector:
         temp_dir = Path(tempfile.mkdtemp())
         store = HistoryStore(str(temp_dir / "history.db"))
         store.create_backup = MagicMock(return_value=None)  # type: ignore[method-assign]
-        settings = HistorySettings(
-            sqlite_path=str(temp_dir / "history.db"),
-            backup_dir=str(temp_dir / "backups"),
-            poll_interval_seconds=300,
-            failure_backoff_max_seconds=900,
-            startup_grace_seconds=0,
+        collector = HistoryCollector(
+            HistorySettings(
+                sqlite_path=str(temp_dir / "history.db"),
+                backup_dir=str(temp_dir / "backups"),
+                poll_interval_seconds=300,
+                failure_backoff_max_seconds=900,
+                startup_grace_seconds=0,
+            ),
+            store,
         )
-        collector = HistoryCollector(settings, store)
-        live_slots = [
-            {
-                "slot": 0,
-                "present": True,
-                "serial": "DISK-A",
-                "logical_unit_id": "0x5000cca000000001",
-                "device_name": "da0",
-                "state": "healthy",
-            },
-            {
-                "slot": 1,
-                "present": True,
-                "serial": "DISK-B",
-                "gptid": "gptid/disk-b",
-                "persistent_id_label": "GPTID",
-                "device_name": "da1",
-                "state": "healthy",
-            },
+        collector._enumerate_scopes = AsyncMock(  # type: ignore[method-assign]
+            return_value=[self._smart_alert_scope(slots)]
+        )
+        return collector
+
+    def _run_smart_alert_pass(
+        self,
+        collector: HistoryCollector,
+        summaries: dict[int, dict[str, object]],
+        observed_at: datetime,
+    ) -> dict[str, Any]:
+        collector._fetch_smart_summaries = AsyncMock(return_value=summaries)  # type: ignore[method-assign]
+        with patch("history_service.collector.utcnow", return_value=observed_at):
+            asyncio.run(collector.run_once(force_fast=True, include_due_intervals=False))
+        return collector.status()
+
+    def test_temperature_only_complete_pass_preserves_failure_evidence(self) -> None:
+        slots = [{"slot": 0, "present": True, "serial": "DISK-A", "state": "healthy"}]
+        collector = self._smart_alert_collector(slots)
+        first_at = datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc)
+        second_at = first_at + timedelta(minutes=5)
+
+        initial = self._run_smart_alert_pass(
+            collector,
+            {0: {"available": True, "smart_health_status": "FAILED", "temperature_c": 61}},
+            first_at,
+        )
+        updated = self._run_smart_alert_pass(
+            collector,
+            {0: {"available": True, "temperature_c": 42}},
+            second_at,
+        )
+
+        self.assertEqual(initial["last_smart_failure_evidence_disks"], 1)
+        self.assertEqual(updated["last_smart_failure_evidence_disks"], 1)
+        self.assertEqual(updated["last_max_temperature_celsius"], 42)
+        self.assertEqual(updated["last_smart_failure_evidence_at"], isoformat_utc(first_at))
+        self.assertEqual(updated["last_temperature_evidence_at"], isoformat_utc(second_at))
+
+    def test_health_only_complete_pass_preserves_temperature_evidence(self) -> None:
+        slots = [{"slot": 0, "present": True, "serial": "DISK-A", "state": "healthy"}]
+        collector = self._smart_alert_collector(slots)
+        first_at = datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc)
+        second_at = first_at + timedelta(minutes=5)
+
+        self._run_smart_alert_pass(
+            collector,
+            {0: {"available": True, "smart_health_status": "FAILED", "temperature_c": 61}},
+            first_at,
+        )
+        updated = self._run_smart_alert_pass(
+            collector,
+            {0: {"available": True, "smart_health_status": "PASSED"}},
+            second_at,
+        )
+
+        self.assertEqual(updated["last_smart_failure_evidence_disks"], 0)
+        self.assertEqual(updated["last_max_temperature_celsius"], 61)
+        self.assertEqual(updated["last_smart_failure_evidence_at"], isoformat_utc(second_at))
+        self.assertEqual(updated["last_temperature_evidence_at"], isoformat_utc(first_at))
+
+    def test_partial_health_pass_recovers_only_after_every_disk_has_health_evidence(self) -> None:
+        slots = [
+            {"slot": 0, "present": True, "serial": "DISK-A", "state": "healthy"},
+            {"slot": 1, "present": True, "serial": "DISK-B", "state": "healthy"},
         ]
-        duplicate_view_slot = {
+        collector = self._smart_alert_collector(slots)
+        first_at = datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc)
+        self._run_smart_alert_pass(
+            collector,
+            {
+                0: {"available": True, "smart_health_status": "FAILED", "temperature_c": 50},
+                1: {"available": True, "smart_health_status": "PASSED", "temperature_c": 40},
+            },
+            first_at,
+        )
+
+        partial = self._run_smart_alert_pass(
+            collector,
+            {
+                0: {"available": True, "smart_health_status": "PASSED", "temperature_c": 35},
+                1: {"available": False, "temperature_c": 34},
+            },
+            first_at + timedelta(minutes=5),
+        )
+        recovered = self._run_smart_alert_pass(
+            collector,
+            {
+                0: {"available": True, "smart_health_status": "PASSED"},
+                1: {"available": True, "predictive_errors": 0},
+            },
+            first_at + timedelta(minutes=10),
+        )
+
+        self.assertEqual(partial["last_smart_failure_evidence_disks"], 1)
+        self.assertEqual(partial["last_max_temperature_celsius"], 35)
+        self.assertEqual(recovered["last_smart_failure_evidence_disks"], 0)
+        self.assertEqual(recovered["last_max_temperature_celsius"], 35)
+
+    def test_partial_temperature_pass_recovers_only_after_every_disk_has_temperature(self) -> None:
+        slots = [
+            {"slot": 0, "present": True, "serial": "DISK-A", "state": "healthy"},
+            {"slot": 1, "present": True, "serial": "DISK-B", "state": "healthy"},
+        ]
+        collector = self._smart_alert_collector(slots)
+        first_at = datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc)
+        self._run_smart_alert_pass(
+            collector,
+            {
+                0: {"available": True, "smart_health_status": "PASSED", "temperature_c": 61},
+                1: {"available": True, "smart_health_status": "PASSED", "temperature_c": 45},
+            },
+            first_at,
+        )
+
+        partial = self._run_smart_alert_pass(
+            collector,
+            {
+                0: {"available": True, "smart_health_status": "FAILED", "temperature_c": 36},
+                1: {"available": True, "smart_health_status": "PASSED"},
+            },
+            first_at + timedelta(minutes=5),
+        )
+        recovered = self._run_smart_alert_pass(
+            collector,
+            {
+                0: {"available": True, "temperature_c": 36},
+                1: {"available": True, "temperature_c": 40},
+            },
+            first_at + timedelta(minutes=10),
+        )
+
+        self.assertEqual(partial["last_smart_failure_evidence_disks"], 1)
+        self.assertEqual(partial["last_max_temperature_celsius"], 61)
+        self.assertEqual(recovered["last_smart_failure_evidence_disks"], 1)
+        self.assertEqual(recovered["last_max_temperature_celsius"], 40)
+
+    def test_mixed_sources_complete_each_alert_class_for_the_same_disk(self) -> None:
+        live_slot = {
+            "slot": 0,
+            "present": True,
+            "serial": "DISK-A",
+            "logical_unit_id": "0x5000cca000000001",
+            "state": "healthy",
+        }
+        view_slot = {
             "slot": 7,
             "present": True,
             "serial": "DISK-A",
             "logical_unit_id": "0x5000cca000000001",
-            "device_name": "view-da0",
             "state": "matched",
         }
+        collector = self._smart_alert_collector([live_slot])
         collector._enumerate_scopes = AsyncMock(  # type: ignore[method-assign]
             return_value=[
+                self._smart_alert_scope([live_slot]),
                 ScopeSnapshot(
-                    system_id="archive-core",
-                    system_label="Archive CORE",
-                    enclosure_id="enc-a",
-                    enclosure_label="Front Shelf",
-                    snapshot={
-                        "selected_system_id": "archive-core",
-                        "selected_enclosure_id": "enc-a",
-                        "slots": live_slots,
-                    },
-                ),
-                ScopeSnapshot(
-                    system_id="archive-core",
-                    system_label="Archive CORE",
+                    system_id="test-system",
+                    system_label="Test system",
                     enclosure_id="storage-view:critical",
                     enclosure_label="Critical disks",
                     snapshot={
-                        "selected_system_id": "archive-core",
+                        "selected_system_id": "test-system",
                         "selected_enclosure_id": "storage-view:critical",
-                        "slots": [duplicate_view_slot],
+                        "slots": [view_slot],
                     },
                 ),
             ]
         )
         collector._fetch_smart_summaries = AsyncMock(  # type: ignore[method-assign]
             side_effect=[
-                {
-                    0: {"available": True, "temperature_c": 61, "smart_health_status": "FAILED"},
-                    1: {"available": True, "temperature_c": 44, "predictive_errors": 2},
-                },
-                {7: {"available": True, "temperature_c": 60, "smart_health_status": "FAILED"}},
+                {0: {"available": True, "smart_health_status": "FAILED"}},
+                {7: {"available": True, "temperature_c": 62}},
             ]
         )
 
-        asyncio.run(collector.run_once(force_fast=True, include_due_intervals=False))
+        with patch(
+            "history_service.collector.utcnow",
+            return_value=datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc),
+        ):
+            asyncio.run(collector.run_once(force_fast=True, include_due_intervals=False))
 
         status = collector.status()
-        self.assertEqual(status["poll_interval_seconds"], 300)
-        self.assertEqual(status["failure_backoff_max_seconds"], 900)
-        self.assertEqual(status["last_smart_failure_evidence_disks"], 2)
-        self.assertEqual(status["last_max_temperature_celsius"], 61)
-        self.assertIsNotNone(status["last_smart_evidence_at"])
+        self.assertEqual(status["last_smart_failure_evidence_disks"], 1)
+        self.assertEqual(status["last_max_temperature_celsius"], 62)
+        self.assertEqual(
+            status["last_smart_failure_evidence_at"],
+            status["last_temperature_evidence_at"],
+        )
 
+    def test_failure_evidence_clears_after_failed_disk_disappears(self) -> None:
+        initial_slots = [
+            {"slot": 0, "present": True, "serial": "DISK-A", "state": "healthy"},
+            {"slot": 1, "present": True, "serial": "DISK-B", "state": "fault"},
+        ]
+        collector = self._smart_alert_collector(initial_slots)
+        first_at = datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc)
+        self._run_smart_alert_pass(
+            collector,
+            {
+                0: {"available": True, "smart_health_status": "PASSED", "temperature_c": 35},
+                1: {"available": True, "smart_health_status": "FAILED", "temperature_c": 45},
+            },
+            first_at,
+        )
+        collector._enumerate_scopes = AsyncMock(  # type: ignore[method-assign]
+            return_value=[self._smart_alert_scope([initial_slots[0]])]
+        )
+
+        updated = self._run_smart_alert_pass(
+            collector,
+            {0: {"available": True, "smart_health_status": "PASSED"}},
+            first_at + timedelta(minutes=5),
+        )
+
+        self.assertEqual(updated["last_smart_failure_evidence_disks"], 0)
+        self.assertEqual(updated["last_max_temperature_celsius"], 45)
+
+    def test_max_temperature_drops_after_hottest_disk_disappears(self) -> None:
+        initial_slots = [
+            {"slot": 0, "present": True, "serial": "DISK-A", "state": "healthy"},
+            {"slot": 1, "present": True, "serial": "DISK-B", "state": "healthy"},
+        ]
+        collector = self._smart_alert_collector(initial_slots)
+        first_at = datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc)
+        self._run_smart_alert_pass(
+            collector,
+            {
+                0: {"available": True, "smart_health_status": "FAILED", "temperature_c": 35},
+                1: {"available": True, "smart_health_status": "PASSED", "temperature_c": 61},
+            },
+            first_at,
+        )
+        collector._enumerate_scopes = AsyncMock(  # type: ignore[method-assign]
+            return_value=[self._smart_alert_scope([initial_slots[0]])]
+        )
+
+        updated = self._run_smart_alert_pass(
+            collector,
+            {0: {"available": True, "temperature_c": 37}},
+            first_at + timedelta(minutes=5),
+        )
+
+        self.assertEqual(updated["last_smart_failure_evidence_disks"], 1)
+        self.assertEqual(updated["last_max_temperature_celsius"], 37)
+
+    def test_untrusted_inventory_pass_preserves_both_alert_classes(self) -> None:
+        slots = [{"slot": 0, "present": True, "serial": "DISK-A", "state": "fault"}]
+        collector = self._smart_alert_collector(slots)
+        first_at = datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc)
+        initial = self._run_smart_alert_pass(
+            collector,
+            {0: {"available": True, "smart_health_status": "FAILED", "temperature_c": 61}},
+            first_at,
+        )
+        degraded_scope = self._smart_alert_scope([])
+        degraded_scope.snapshot["sources"] = {"api": {"enabled": True, "ok": False}}
+        collector._enumerate_scopes = AsyncMock(  # type: ignore[method-assign]
+            return_value=[self._smart_alert_scope([]), degraded_scope]
+        )
+
+        updated = self._run_smart_alert_pass(
+            collector,
+            {},
+            first_at + timedelta(minutes=5),
+        )
+
+        self.assertEqual(updated["last_smart_failure_evidence_disks"], 1)
+        self.assertEqual(updated["last_max_temperature_celsius"], 61)
+        self.assertEqual(updated["last_smart_evidence_at"], initial["last_smart_evidence_at"])
+
+    def _assert_enumeration_failure_preserves_smart_evidence(
+        self,
+        failure_kind: str,
+        expected_stage: str,
+    ) -> None:
+        survivor_scope = ScopeSnapshot(
+            system_id="archive-core",
+            system_label="Archive CORE",
+            enclosure_id="enc-a",
+            enclosure_label="Front Shelf",
+            snapshot={
+                "selected_system_id": "archive-core",
+                "selected_system_label": "Archive CORE",
+                "selected_enclosure_id": "enc-a",
+                "selected_enclosure_label": "Front Shelf",
+                "slots": [{"slot": 0, "present": True, "serial": "HEALTHY-DISK", "state": "healthy"}],
+            },
+        )
+        unavailable_scope = ScopeSnapshot(
+            system_id="slow-system" if failure_kind == "system" else "archive-core",
+            system_label="Slow System" if failure_kind == "system" else "Archive CORE",
+            enclosure_id="storage-view:critical" if failure_kind == "storage-view" else "enc-b",
+            enclosure_label="Critical Disks" if failure_kind == "storage-view" else "Rear Shelf",
+            snapshot={
+                "selected_system_id": "slow-system" if failure_kind == "system" else "archive-core",
+                "selected_enclosure_id": "storage-view:critical" if failure_kind == "storage-view" else "enc-b",
+                "storage_view_id": "critical" if failure_kind == "storage-view" else None,
+                "slots": [{"slot": 1, "present": True, "serial": "FAILED-DISK", "state": "fault"}],
+            },
+        )
+        collector = self._smart_alert_collector([])
+        collector._enumerate_scopes = AsyncMock(  # type: ignore[method-assign]
+            return_value=[survivor_scope, unavailable_scope]
+        )
         collector._fetch_smart_summaries = AsyncMock(  # type: ignore[method-assign]
             side_effect=[
-                {
-                    0: {"available": True, "power_on_hours": 100},
-                    1: {"available": True, "power_on_hours": 200},
-                },
-                {7: {"available": True, "power_on_hours": 100}},
+                {0: {"available": True, "smart_health_status": "PASSED", "temperature_c": 35}},
+                {1: {"available": True, "smart_health_status": "FAILED", "temperature_c": 61}},
             ]
         )
-        asyncio.run(collector.run_once(force_fast=True, include_due_intervals=False))
+        first_at = datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc)
+        with patch("history_service.collector.utcnow", return_value=first_at):
+            asyncio.run(collector.run_once(force_fast=True, include_due_intervals=False))
+        initial = collector.status()
 
-        partial_status = collector.status()
-        self.assertEqual(partial_status["last_smart_failure_evidence_disks"], 2)
-        self.assertEqual(partial_status["last_max_temperature_celsius"], 61)
-        self.assertEqual(partial_status["last_smart_evidence_at"], status["last_smart_evidence_at"])
+        root_snapshot = {
+            "systems": (
+                [
+                    {"id": "slow-system", "label": "Slow System"},
+                    {"id": "archive-core", "label": "Archive CORE"},
+                ]
+                if failure_kind == "system"
+                else [{"id": "archive-core", "label": "Archive CORE"}]
+            ),
+            "selected_system_id": "archive-core",
+            "selected_system_label": "Archive CORE",
+        }
+        survivor_snapshot = {
+            **survivor_scope.snapshot,
+            "enclosures": (
+                [{"id": "enc-a", "label": "Front Shelf"}, {"id": "enc-b", "label": "Rear Shelf"}]
+                if failure_kind == "enclosure"
+                else [{"id": "enc-a", "label": "Front Shelf"}]
+            ),
+        }
+
+        async def fetch_inventory(
+            system_id: str | None = None,
+            enclosure_id: str | None = None,
+            *,
+            force: bool = True,
+        ) -> dict[str, object]:
+            if system_id is None:
+                return root_snapshot
+            if failure_kind == "system" and system_id == "slow-system":
+                raise RuntimeError("saved system unavailable")
+            if failure_kind == "enclosure" and enclosure_id == "enc-b":
+                raise RuntimeError("enclosure unavailable")
+            return survivor_snapshot
+
+        collector._enumerate_scopes = collector.__class__._enumerate_scopes.__get__(collector)  # type: ignore[method-assign]
+        collector._fetch_inventory = fetch_inventory  # type: ignore[method-assign]
+        collector._enumerate_storage_view_scopes = AsyncMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError("storage views unavailable")
+            if failure_kind == "storage-view"
+            else None,
+            return_value=[],
+        )
+        collector._fetch_smart_summaries = AsyncMock(  # type: ignore[method-assign]
+            return_value={0: {"available": True, "smart_health_status": "PASSED", "temperature_c": 35}}
+        )
+
+        with patch(
+            "history_service.collector.utcnow",
+            return_value=first_at + timedelta(minutes=5),
+        ):
+            asyncio.run(collector.run_once(force_fast=True, include_due_intervals=False))
+        updated = collector.status()
+
+        self.assertIn(expected_stage, [entry["stage"] for entry in updated["collection_stage_timings"]])
+        for field in (
+            "last_smart_failure_evidence_disks",
+            "last_max_temperature_celsius",
+            "last_smart_failure_evidence_at",
+            "last_temperature_evidence_at",
+            "last_smart_evidence_at",
+        ):
+            self.assertEqual(updated[field], initial[field], field)
+
+    def test_system_enumeration_failure_preserves_smart_evidence(self) -> None:
+        self._assert_enumeration_failure_preserves_smart_evidence("system", "inventory.system_failed")
+
+    def test_enclosure_enumeration_failure_preserves_smart_evidence(self) -> None:
+        self._assert_enumeration_failure_preserves_smart_evidence("enclosure", "inventory.enclosure_failed")
+
+    def test_storage_view_enumeration_failure_preserves_smart_evidence(self) -> None:
+        self._assert_enumeration_failure_preserves_smart_evidence("storage-view", "storage_views.failed")
 
     def test_run_once_skips_recent_history_backup_during_slow_collection(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())

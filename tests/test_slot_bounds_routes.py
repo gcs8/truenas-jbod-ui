@@ -4,9 +4,10 @@ import asyncio
 import json
 import tempfile
 import unittest
+from collections import OrderedDict
 from datetime import timedelta
 from pathlib import Path
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, call, patch
 
 from fastapi import HTTPException
 from pydantic import ValidationError
@@ -21,7 +22,7 @@ from app.models.domain import (
     SmartSummaryView,
     utcnow,
 )
-from app.services.inventory import InventoryService
+from app.services.inventory import InventoryService, UnknownEnclosureError
 from app.services.profile_registry import dell_md1280_bottom_drawer_slot_layout
 from app.services.slot_detail_store import SlotDetailCacheEntry, SlotDetailStore
 
@@ -72,6 +73,7 @@ def _service_with_cached_smart(
     service.slot_detail_store = None
     service._smart_cache = {}
     service._smart_cache_until = {}
+    service._smart_negative_cache = OrderedDict()
     service._smart_cache_global_generation = 0
     service._smart_cache_enclosure_generations = {}
     service._observe_inventory_cache_metrics = Mock()
@@ -154,6 +156,17 @@ class SlotBoundsFollowSelectedEnclosureTests(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 503)
         self.assertEqual(raised.exception.detail, "Unable to resolve selected enclosure layout.")
 
+    def test_unknown_enclosure_keeps_slot_bound_route_404(self) -> None:
+        service = _service(layout_slot_count=12)
+        service.get_snapshot.side_effect = UnknownEnclosureError()
+
+        with self.assertRaises(HTTPException) as raised:
+            asyncio.run(app_main.ensure_slot_bounds(4, service, "caller-controlled-value"))
+
+        self.assertEqual(raised.exception.status_code, 404)
+        self.assertEqual(raised.exception.detail, "Requested enclosure is not available for this system.")
+        self.assertNotIn("caller-controlled-value", raised.exception.detail)
+
     def test_scoped_bounds_reject_a_snapshot_for_a_different_enclosure(self) -> None:
         service = _service(layout_slot_count=84)
         service.get_snapshot.return_value.selected_enclosure_id = "other-shelf"
@@ -162,7 +175,7 @@ class SlotBoundsFollowSelectedEnclosureTests(unittest.TestCase):
             asyncio.run(app_main.ensure_slot_bounds(40, service, "small-shelf"))
 
         self.assertEqual(raised.exception.status_code, 404)
-        self.assertEqual(raised.exception.detail, "Enclosure 'small-shelf' is not available for this system.")
+        self.assertEqual(raised.exception.detail, "Requested enclosure is not available for this system.")
 
     def test_smart_route_reaches_the_service_for_an_md1280_upper_bay(self) -> None:
         route = _route("/api/slots/{slot}/smart", "GET")
@@ -195,6 +208,7 @@ class SlotBoundsFollowSelectedEnclosureTests(unittest.TestCase):
             78,
             selected_enclosure_id="50050cc11ac013fc",
             allow_stale_cache=True,
+            bypass_negative_cache=False,
         )
         self.assertEqual(raised.exception.status_code, 404)
 
@@ -432,11 +446,11 @@ class DegradedReadSlotBoundsTests(unittest.TestCase):
                     )
                 )
 
-        self.assertEqual(raised.exception.status_code, 422)
+        self.assertEqual(raised.exception.status_code, 413)
         self.registry.get_service.assert_not_called()
         history_backend.get_scope_history.assert_not_awaited()
 
-    def test_history_scope_rejects_oversized_slot_value_before_degraded_fallback(self) -> None:
+    def test_history_scope_allows_sparse_high_slot_value_during_degraded_fallback(self) -> None:
         route = _route("/api/history/scope", "GET")
         history_backend = Mock()
         history_backend.configured = True
@@ -446,21 +460,21 @@ class DegradedReadSlotBoundsTests(unittest.TestCase):
             patch.object(app_main, "get_inventory_registry", return_value=self.registry),
             patch.object(app_main, "get_history_backend", return_value=history_backend),
         ):
-            with self.assertRaises(HTTPException) as raised:
-                asyncio.run(
-                    route.endpoint(
-                        system_id="system-a",
-                        enclosure_id="enc-a",
-                        slots=[SMART_BATCH_MAX_SLOTS + 1],
-                        window_hours=24,
-                        metrics=None,
-                        event_limit=12,
-                    )
+            response = asyncio.run(
+                route.endpoint(
+                    system_id="system-a",
+                    enclosure_id="enc-a",
+                    slots=[SMART_BATCH_MAX_SLOTS + 1],
+                    window_hours=24,
+                    metrics=["temperature_c"],
+                    event_limit=0,
+                    metric_limit=24,
                 )
+            )
 
-        self.assertEqual(raised.exception.status_code, 422)
-        self.registry.get_service.assert_not_called()
-        history_backend.get_scope_history.assert_not_awaited()
+        self.assertEqual(response.status_code, 200)
+        self.registry.get_service.assert_called_once_with("system-a")
+        history_backend.get_scope_history.assert_awaited_once()
 
     def test_cached_smart_read_continues_when_layout_is_unavailable(self) -> None:
         route = _route("/api/slots/{slot}/smart", "GET")
@@ -543,6 +557,141 @@ class DegradedReadSlotBoundsTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.status_code, 503)
         self.service.get_slot_smart_summary.assert_not_awaited()
+
+    def test_physical_smart_route_maps_fresh_to_negative_cache_bypass(self) -> None:
+        route = _route("/api/slots/{slot}/smart", "GET")
+        slot = SlotView(slot=0, slot_label="00", row_index=0, column_index=0)
+        service = _service(layout_slot_count=1, selected_enclosure_id="enc", slots=[slot])
+        service.get_slot_smart_summary = AsyncMock(return_value=SmartSummaryView(available=True))
+        registry = Mock()
+        registry.get_service.return_value = service
+
+        with (
+            patch.object(app_main, "get_inventory_registry", return_value=registry),
+            patch.object(app_main, "add_perf_metadata"),
+        ):
+            asyncio.run(route.endpoint(slot=0, system_id="system-a", enclosure_id="enc", fresh=False))
+            asyncio.run(route.endpoint(slot=0, system_id="system-a", enclosure_id="enc", fresh=True))
+
+        self.assertEqual(
+            service.get_slot_smart_summary.await_args_list,
+            [
+                call(
+                    0,
+                    selected_enclosure_id="enc",
+                    allow_stale_cache=True,
+                    bypass_negative_cache=False,
+                ),
+                call(
+                    0,
+                    selected_enclosure_id="enc",
+                    allow_stale_cache=False,
+                    bypass_negative_cache=True,
+                ),
+            ],
+        )
+
+    def test_storage_view_smart_route_maps_fresh_to_negative_cache_bypass(self) -> None:
+        route = _route("/api/storage-views/{view_id}/slots/{slot_index}/smart", "GET")
+        service = _service(layout_slot_count=1)
+        service.get_storage_view_slot_smart_summary = AsyncMock(
+            return_value=SmartSummaryView(available=True)
+        )
+
+        registry = Mock()
+        registry.get_service.return_value = service
+        with (
+            patch.object(app_main, "get_inventory_registry", return_value=registry),
+            patch.object(app_main, "add_perf_metadata"),
+        ):
+            asyncio.run(
+                route.endpoint(
+                    view_id="view-a",
+                    slot_index=2,
+                    system_id="system-a",
+                    enclosure_id="enc",
+                    fresh=False,
+                )
+            )
+            asyncio.run(
+                route.endpoint(
+                    view_id="view-a",
+                    slot_index=2,
+                    system_id="system-a",
+                    enclosure_id="enc",
+                    fresh=True,
+                )
+            )
+
+        self.assertEqual(
+            service.get_storage_view_slot_smart_summary.await_args_list,
+            [
+                call(
+                    "view-a",
+                    2,
+                    selected_enclosure_id="enc",
+                    allow_stale_cache=True,
+                    bypass_negative_cache=False,
+                ),
+                call(
+                    "view-a",
+                    2,
+                    selected_enclosure_id="enc",
+                    allow_stale_cache=False,
+                    bypass_negative_cache=True,
+                ),
+            ],
+        )
+
+    def test_smart_batch_route_maps_fresh_to_negative_cache_bypass(self) -> None:
+        route = _route("/api/slots/smart-batch", "POST")
+        slot = SlotView(slot=0, slot_label="00", row_index=0, column_index=0)
+        service = _service(layout_slot_count=1, selected_enclosure_id="enc", slots=[slot])
+        service.get_slot_smart_summaries = AsyncMock(return_value=[])
+        registry = Mock()
+        registry.get_service.return_value = service
+        payload = Mock(slots=[0], max_concurrency=3)
+
+        with (
+            patch.object(app_main, "get_inventory_registry", return_value=registry),
+            patch.object(app_main, "add_perf_metadata"),
+        ):
+            asyncio.run(
+                route.endpoint(
+                    payload=payload,
+                    system_id="system-a",
+                    enclosure_id="enc",
+                    fresh=False,
+                )
+            )
+            asyncio.run(
+                route.endpoint(
+                    payload=payload,
+                    system_id="system-a",
+                    enclosure_id="enc",
+                    fresh=True,
+                )
+            )
+
+        self.assertEqual(
+            service.get_slot_smart_summaries.await_args_list,
+            [
+                call(
+                    [0],
+                    selected_enclosure_id="enc",
+                    max_concurrency=3,
+                    allow_stale_cache=True,
+                    bypass_negative_cache=False,
+                ),
+                call(
+                    [0],
+                    selected_enclosure_id="enc",
+                    max_concurrency=3,
+                    allow_stale_cache=False,
+                    bypass_negative_cache=True,
+                ),
+            ],
+        )
 
     def test_cached_smart_batch_continues_when_layout_is_unavailable(self) -> None:
         route = _route("/api/slots/smart-batch", "POST")
