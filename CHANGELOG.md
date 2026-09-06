@@ -149,6 +149,8 @@ them before starting the new images.
 
 ### Security
 
+- Hardened inventory, mapping, history, SAS diagnostics, and snapshot export
+  boundaries across the reviewed security backlog (#378).
 - Excluded internal endpoint, filesystem-path, and collection-stage metadata
   from public history collector status responses (#373).
 - Required explicit bearer authorization, trusted-origin validation, atomic
