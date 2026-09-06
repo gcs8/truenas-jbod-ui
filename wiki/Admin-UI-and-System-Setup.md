@@ -210,6 +210,10 @@ Important guardrails:
 - on startup, the admin service prunes service-owned staging artifacts stale for 24 hours
   by default; change `ADMIN_HOST_PREP_STALE_TTL_SECONDS` to choose a different
   retention window, or set it to `0` to disable automatic pruning
+- aggregate admission defaults to at most 8 retained packages and 2 GiB across
+  restarts; tune `ADMIN_HOST_PREP_MAX_PACKAGES` and `ADMIN_HOST_PREP_MAX_BYTES`
+  for the Docker host, and remove unsafe/unaccountable entries manually rather
+  than expecting the service to delete them to make room
 - this path is for one-time host prep / remediation, not ongoing RAID control
 - if a host only needs BMC-backed inventory, you can still use the `ipmi`
   platform and skip ESXi SSH entirely

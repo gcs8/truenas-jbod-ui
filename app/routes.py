@@ -12,12 +12,27 @@ from typing import Any
 from pydantic import ValidationError
 
 from app.route_compat import MainModuleAPIRouter
-from app.services.history_backend import HISTORY_BACKEND_DEGRADED_DETAIL
+from app.services.history_backend import (
+    HISTORY_BACKEND_DEGRADED_DETAIL,
+    HistoryBackendBusyError,
+)
 from app.services.history_status import project_public_collector_status
+from history_service.operation_bounds import (
+    HISTORY_READ_BUSY_DETAIL,
+    HISTORY_READ_RETRY_AFTER_SECONDS,
+)
 from history_service.refresh_auth import read_limited_request_body
 
 
 MAX_HISTORY_SCOPES_REQUEST_BYTES = 64 * 1024
+
+
+def _history_read_busy_response() -> JSONResponse:
+    return JSONResponse(
+        {"detail": HISTORY_READ_BUSY_DETAIL},
+        status_code=503,
+        headers={"Retry-After": str(HISTORY_READ_RETRY_AFTER_SECONDS)},
+    )
 
 
 def _is_json_media_type(content_type: str | None) -> bool:
@@ -761,6 +776,8 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
                 event_limit=payload.event_limit,
                 metric_limit=payload.metric_limit,
             )
+        except HistoryBackendBusyError:
+            return _history_read_busy_response()
         except HistoryBackendPolicyError as exc:
             raise HTTPException(status_code=exc.status_code, detail="History request was rejected by policy.") from exc
         except (HistoryRequestShapeError, HistoryBudgetExceeded, ValueError) as exc:
@@ -846,15 +863,18 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             history_window_hours=window_hours,
         )
         history_backend = get_history_backend()
-        payload = await history_backend.get_scope_history(
-            system_id=service.system.id,
-            enclosure_id=enclosure_id,
-            slots=normalized_slots,
-            window_hours=window_hours,
-            metrics=selected_metrics,
-            event_limit=event_limit,
-            metric_limit=metric_limit,
-        )
+        try:
+            payload = await history_backend.get_scope_history(
+                system_id=service.system.id,
+                enclosure_id=enclosure_id,
+                slots=normalized_slots,
+                window_hours=window_hours,
+                metrics=selected_metrics,
+                event_limit=event_limit,
+                metric_limit=metric_limit,
+            )
+        except HistoryBackendBusyError:
+            return _history_read_busy_response()
         return JSONResponse(
             {
                 "configured": history_backend.configured,
@@ -922,13 +942,16 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             for history_enclosure_id, history_slots in slots_by_enclosure.items()
         ]
         history_backend = get_history_backend()
-        payload = await history_backend.get_scopes_history(
-            scopes=scopes,
-            since=(datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat(),
-            metrics=selected_metrics,
-            event_limit=event_limit,
-            metric_limit=metric_limit,
-        )
+        try:
+            payload = await history_backend.get_scopes_history(
+                scopes=scopes,
+                since=(datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat(),
+                metrics=selected_metrics,
+                event_limit=event_limit,
+                metric_limit=metric_limit,
+            )
+        except HistoryBackendBusyError:
+            return _history_read_busy_response()
         histories_by_display_slot: dict[str, dict[str, Any]] = {}
         for scope_payload in payload.get("scopes", []):
             if not isinstance(scope_payload, dict):

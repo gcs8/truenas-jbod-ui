@@ -47,6 +47,21 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
         content["runtime"] = await build_runtime_payload(runtime_service)
         return JSONResponse(content)
 
+    async def run_retained_thread_worker(function: Any, *args: Any) -> Any:
+        operation = asyncio.create_task(asyncio.to_thread(function, *args))
+        try:
+            await asyncio.wait((operation,))
+        except asyncio.CancelledError as cancellation:
+            while not operation.done():
+                try:
+                    await asyncio.wait((operation,))
+                except asyncio.CancelledError:
+                    continue
+            if not operation.cancelled():
+                operation.exception()
+            raise cancellation
+        return operation.result()
+
     @router.get("/", response_class=HTMLResponse)
     async def index(request: Request) -> HTMLResponse:
         bootstrap = await build_admin_state_payload(request)
@@ -288,30 +303,53 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
         request: Request,
         filename: str = Query(..., min_length=1),
     ) -> JSONResponse:
-        upload_path = await stream_limited_request_body_to_file(
+        declared_bytes = limited_request_content_length(
             request,
             max_bytes=MAX_ESXI_HOST_PREP_UPLOAD_BYTES,
             body_description="ESXi host-prep upload",
         )
+        service = get_esxi_host_prep_service()
         try:
-            if upload_path.stat().st_size == 0:
-                raise HTTPException(status_code=400, detail="ESXi host-prep upload request body was empty.")
-            content = await asyncio.to_thread(upload_path.read_bytes)
-            service = get_esxi_host_prep_service()
-            try:
-                package = await asyncio.to_thread(service.stage_package, filename, content)
-            except ValueError as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-            return JSONResponse(
-                {
-                    "ok": True,
-                    "package": package,
-                    "packages": await asyncio.to_thread(service.list_staged_packages),
-                }
-            )
-        finally:
-            upload_path.unlink(missing_ok=True)
-            upload_path.parent.rmdir()
+            with service.reserve_stage_upload(declared_bytes) as reservation:
+                upload_path = await stream_limited_request_body_to_file(
+                    request,
+                    max_bytes=reservation.max_bytes,
+                    body_description="ESXi host-prep upload",
+                    workspace_parent=service.staging_root,
+                    workspace_prefix=reservation.workspace_prefix,
+                )
+                try:
+                    if upload_path.stat().st_size == 0:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="ESXi host-prep upload request body was empty.",
+                        )
+                    content = await run_retained_thread_worker(upload_path.read_bytes)
+                    upload_path.unlink()
+                    upload_path.parent.rmdir()
+                    package = await run_retained_thread_worker(
+                        service.stage_reserved_package,
+                        reservation,
+                        filename,
+                        content,
+                    )
+                    return JSONResponse(
+                        {
+                            "ok": True,
+                            "package": package,
+                            "packages": await asyncio.to_thread(service.list_staged_packages),
+                        }
+                    )
+                finally:
+                    upload_path.unlink(missing_ok=True)
+                    try:
+                        upload_path.parent.rmdir()
+                    except FileNotFoundError:
+                        pass
+        except HostPrepStagingQuotaError as exc:
+            raise HTTPException(status_code=507, detail=STAGING_QUOTA_ERROR) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @router.post("/api/admin/esxi-host-prep/install")
     async def install_esxi_host_prep_package(payload: ESXiHostPrepInstallRequest) -> JSONResponse:

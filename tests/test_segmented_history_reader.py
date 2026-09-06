@@ -367,6 +367,32 @@ class SegmentedHistoryReaderCliTests(unittest.TestCase):
             self.assertEqual(histories[2]["latest_values"], {"temperature": 44})
             self.assertEqual(query_connection.call_count, 2)
 
+    def test_segmented_scope_history_excludes_events_before_since(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            hot_path = root / "hot.sqlite3"
+            segment_path = root / "segment-0001.sqlite3"
+            now = datetime.now(timezone.utc)
+            recent = (now - timedelta(hours=1)).isoformat()
+            old = (now - timedelta(hours=25)).isoformat()
+            self._create_database(hot_path, [(2, recent)], [])
+            self._create_database(segment_path, [(1, old)], [])
+            reader = SegmentedHistoryReader(
+                hot_path=hot_path,
+                segment_paths=[segment_path],
+            )
+
+            histories = reader.list_scope_history(
+                "system-1",
+                "enclosure-1",
+                slots=[1],
+                event_limit=2,
+                metric_limits={"temperature": 1},
+                since=(now - timedelta(hours=24)).isoformat(),
+            )
+
+            self.assertEqual([event["id"] for event in histories[1]["events"]], [2])
+
     def test_scope_history_stops_opening_older_segments_when_all_quotas_fill(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

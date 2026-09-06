@@ -149,6 +149,8 @@ them before starting the new images.
 
 ### Security
 
+- Reset skipped-scope topology confirmation state, bounded anonymous bulk
+  history reads, and capped persistent host-prep staging (#381)
 - Restricted generated storage-discovery sudo grants, rejected malformed or
   oversized TrueNAS inventory responses, normalized SAS target identifiers,
   and documented least-privilege setup requirements (#380).

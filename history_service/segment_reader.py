@@ -1115,7 +1115,6 @@ class SegmentedHistoryReader:
             placeholders = ", ".join("?" for _ in slot_numbers)
             where_clauses.append(f"slot IN ({placeholders})")
             parameters.extend(slot_numbers)
-        scope_where = " AND ".join(where_clauses)
         events_by_slot: dict[int, list[dict[str, Any]]] = {}
         raw_by_metric_slot: dict[str, dict[int, list[dict[str, Any]]]] = {
             metric_name: {} for metric_name in metric_limits
@@ -1144,6 +1143,11 @@ class SegmentedHistoryReader:
                     ).fetchall()
                     discovered_slots.update(int(row[0]) for row in rows)
                 if event_limit > 0:
+                    event_where = [*where_clauses]
+                    event_parameters = [*parameters]
+                    if since:
+                        event_where.append("julianday(observed_at) >= julianday(?)")
+                        event_parameters.append(since)
                     rows = connection.execute(
                         f"""
                         SELECT * FROM (
@@ -1151,10 +1155,10 @@ class SegmentedHistoryReader:
                                 PARTITION BY slot
                                 ORDER BY julianday(observed_at) DESC, id DESC
                             ) AS row_number
-                            FROM slot_events WHERE {scope_where}
+                            FROM slot_events WHERE {' AND '.join(event_where)}
                         ) WHERE row_number <= ?
                         """,
-                        [*parameters, event_limit],
+                        [*event_parameters, event_limit],
                     ).fetchall()
                     for row in rows:
                         item = dict(row)

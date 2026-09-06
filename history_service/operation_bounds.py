@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from types import MappingProxyType
@@ -32,6 +33,9 @@ HISTORY_WINDOW_TRANSIT_TOLERANCE_SECONDS = 1
 MAX_REQUEST_BYTES = 65536
 MAX_RESPONSE_BYTES = 25165824
 MAX_METRIC_LIMIT = 96
+MAX_CONCURRENT_BULK_HISTORY_READS = 4
+HISTORY_READ_BUSY_DETAIL = "History read capacity is temporarily busy; retry later."
+HISTORY_READ_RETRY_AFTER_SECONDS = 1
 
 
 class HistoryRequestShapeError(ValueError):
@@ -46,6 +50,32 @@ class HistoryBudgetExceeded(ValueError):
         self.value = value
         self.limit = limit
         super().__init__(f"History request exceeds {limit_name} limit ({limit}).")
+
+
+class HistoryReadBusy(RuntimeError):
+    """The shared anonymous bulk-history read boundary is full."""
+
+
+class BulkHistoryReadAdmission:
+    def __init__(self, *, max_concurrency: int = MAX_CONCURRENT_BULK_HISTORY_READS) -> None:
+        if type(max_concurrency) is not int or max_concurrency < 1:
+            raise ValueError("Bulk history read concurrency must be a positive integer.")
+        self.max_concurrency = max_concurrency
+        self._state_lock = threading.Lock()
+        self._in_flight = 0
+
+    def try_acquire(self) -> bool:
+        with self._state_lock:
+            if self._in_flight >= self.max_concurrency:
+                return False
+            self._in_flight += 1
+            return True
+
+    def release(self) -> None:
+        with self._state_lock:
+            if self._in_flight < 1:
+                raise RuntimeError("Bulk history read admission release is unbalanced.")
+            self._in_flight -= 1
 
 
 @dataclass(frozen=True)

@@ -65,6 +65,33 @@ class AdminSettingsHostPrepTempDirTests(unittest.TestCase):
 
         self.assertEqual(settings.host_prep_stale_ttl_seconds, 0)
 
+    def test_host_prep_aggregate_quota_defaults_are_bounded(self) -> None:
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("admin_service.config.Path.mkdir"),
+        ):
+            settings = get_admin_settings()
+
+        self.assertEqual(settings.host_prep_max_packages, 8)
+        self.assertEqual(settings.host_prep_max_bytes, 2 * 1024 * 1024 * 1024)
+
+    def test_host_prep_aggregate_quota_accepts_explicit_positive_limits(self) -> None:
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "ADMIN_HOST_PREP_MAX_PACKAGES": "3",
+                    "ADMIN_HOST_PREP_MAX_BYTES": "1073741824",
+                },
+                clear=True,
+            ),
+            patch("admin_service.config.Path.mkdir"),
+        ):
+            settings = get_admin_settings()
+
+        self.assertEqual(settings.host_prep_max_packages, 3)
+        self.assertEqual(settings.host_prep_max_bytes, 1073741824)
+
 
 if __name__ == "__main__":
     unittest.main()

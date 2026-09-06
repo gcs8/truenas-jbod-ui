@@ -1,19 +1,35 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import unittest
+import urllib.error
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, Mock, patch
 
 from app.config import HistoryConfig
 from app.services.history_backend import (
     HistoryBackendClient,
+    HistoryBackendBusyError,
     HistoryBackendPolicyError,
     HistoryBackendResponseError,
 )
 
 
 class HistoryBackendBoundsTests(unittest.IsolatedAsyncioTestCase):
+    def test_http_503_maps_to_dedicated_busy_error(self) -> None:
+        client = HistoryBackendClient(HistoryConfig(service_url="http://history-backend:8001"))
+        error = urllib.error.HTTPError(
+            "http://history-backend:8001/api/history/scopes/bundle",
+            503,
+            "busy",
+            {},
+            io.BytesIO(b"busy"),
+        )
+        with patch("app.services.history_backend.urllib.request.urlopen", side_effect=error):
+            with self.assertRaises(HistoryBackendBusyError):
+                client._request_bytes_sync("/api/history/scopes/bundle")
+
     async def test_multi_scope_uses_one_strict_json_request_with_internal_bearer(self) -> None:
         client = HistoryBackendClient(
             HistoryConfig(

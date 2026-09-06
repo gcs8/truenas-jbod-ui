@@ -27,7 +27,11 @@ from admin_service.services.account_bootstrap import (
     ServiceAccountBootstrapService,
     saved_sudo_commands_for_system,
 )
-from admin_service.services.esxi_host_prep import ESXiHostPrepService
+from admin_service.services.esxi_host_prep import (
+    ESXiHostPrepService,
+    HostPrepStagingQuotaError,
+    STAGING_QUOTA_ERROR,
+)
 from admin_service.services.esxi_host_prep import MAX_UPLOAD_BYTES as MAX_ESXI_HOST_PREP_UPLOAD_BYTES
 from admin_service.services.maintenance import AdminMaintenanceService
 from admin_service.services.runtime_control import DockerRuntimeError, DockerRuntimeService
@@ -212,25 +216,48 @@ def validate_admin_export_policy(
     )
 
 
+def limited_request_content_length(
+    request: Request,
+    *,
+    max_bytes: int = MAX_FILE_BACKED_BACKUP_ARCHIVE_BYTES,
+    body_description: str = "Backup import",
+) -> int | None:
+    too_large_detail = f"{body_description} request body is too large."
+    raw_content_length = request.headers.get("content-length")
+    if raw_content_length is None:
+        return None
+    try:
+        content_length = int(raw_content_length)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Content-Length must be an integer.") from exc
+    if content_length < 0:
+        raise HTTPException(status_code=400, detail="Content-Length must not be negative.")
+    if content_length > max_bytes:
+        raise HTTPException(status_code=413, detail=too_large_detail)
+    return content_length
+
+
 async def stream_limited_request_body_to_file(
     request: Request,
     *,
     max_bytes: int = MAX_FILE_BACKED_BACKUP_ARCHIVE_BYTES,
     body_description: str = "Backup import",
+    workspace_parent: Path | None = None,
+    workspace_prefix: str = "truenas-jbod-ui-admin-import-",
 ) -> Path:
+    limited_request_content_length(
+        request,
+        max_bytes=max_bytes,
+        body_description=body_description,
+    )
     too_large_detail = f"{body_description} request body is too large."
-    raw_content_length = request.headers.get("content-length")
-    if raw_content_length is not None:
-        try:
-            content_length = int(raw_content_length)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail="Content-Length must be an integer.") from exc
-        if content_length < 0:
-            raise HTTPException(status_code=400, detail="Content-Length must not be negative.")
-        if content_length > max_bytes:
-            raise HTTPException(status_code=413, detail=too_large_detail)
 
-    workspace = Path(tempfile.mkdtemp(prefix="truenas-jbod-ui-admin-import-"))
+    workspace = Path(
+        tempfile.mkdtemp(
+            prefix=workspace_prefix,
+            dir=str(workspace_parent) if workspace_parent is not None else None,
+        )
+    )
     archive_path = workspace / "bundle.archive"
     descriptor: int | None = None
     try:
@@ -339,6 +366,8 @@ def get_esxi_host_prep_service() -> ESXiHostPrepService:
     return ESXiHostPrepService(
         admin_settings.host_prep_temp_dir,
         stale_ttl_seconds=admin_settings.host_prep_stale_ttl_seconds,
+        max_staged_packages=admin_settings.host_prep_max_packages,
+        max_staged_bytes=admin_settings.host_prep_max_bytes,
     )
 
 

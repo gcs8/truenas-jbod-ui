@@ -25,9 +25,14 @@ from app.services.release_status import ReleaseStatusService
 from history_service.collector import HistoryCollectionAlreadyRunning, HistoryCollector
 from history_service.config import HistorySettings, get_history_settings
 from history_service.operation_bounds import (
+    HISTORY_READ_BUSY_DETAIL,
+    HISTORY_READ_RETRY_AFTER_SECONDS,
+    MAX_CONCURRENT_BULK_HISTORY_READS,
     MAX_REQUEST_BYTES,
     MAX_RESPONSE_BYTES,
+    BulkHistoryReadAdmission,
     HistoryBudgetExceeded,
+    HistoryReadBusy,
     HistoryReadPlan,
     HistoryRequestShapeError,
     build_history_read_plan,
@@ -69,6 +74,10 @@ logger = logging.getLogger(__name__)
 refresh_admission = ManualRefreshAdmission(
     cooldown_seconds=settings.full_refresh_cooldown_seconds,
 )
+bulk_history_read_admission = BulkHistoryReadAdmission(
+    max_concurrency=MAX_CONCURRENT_BULK_HISTORY_READS,
+)
+bulk_history_read_operations: set[asyncio.Task[tuple[list[dict[str, object]], int]]] = set()
 HISTORY_COLLECTOR_ERROR_DETAIL = "History collector error; see service logs."
 SLOT_HISTORY_METRIC_LIMITS: dict[str, int] = {
     "temperature_c": 96,
@@ -215,6 +224,42 @@ async def _execute_history_plan(plan: HistoryReadPlan) -> tuple[list[dict[str, o
             }
         )
     return scope_payloads, returned_rows
+
+
+async def _execute_admitted_history_plan(
+    plan: HistoryReadPlan,
+) -> tuple[list[dict[str, object]], int]:
+    admission = bulk_history_read_admission
+    if not admission.try_acquire():
+        raise HistoryReadBusy(HISTORY_READ_BUSY_DETAIL)
+
+    async def execute_and_release() -> tuple[list[dict[str, object]], int]:
+        try:
+            return await _execute_history_plan(plan)
+        finally:
+            admission.release()
+
+    operation = asyncio.create_task(execute_and_release())
+    bulk_history_read_operations.add(operation)
+    operation.add_done_callback(_finish_bulk_history_operation)
+    await asyncio.wait((operation,))
+    return operation.result()
+
+
+def _finish_bulk_history_operation(
+    operation: asyncio.Task[tuple[list[dict[str, object]], int]],
+) -> None:
+    bulk_history_read_operations.discard(operation)
+    if not operation.cancelled():
+        operation.exception()
+
+
+def _history_read_busy_response() -> JSONResponse:
+    return JSONResponse(
+        {"detail": HISTORY_READ_BUSY_DETAIL},
+        status_code=503,
+        headers={"Retry-After": str(HISTORY_READ_RETRY_AFTER_SECONDS)},
+    )
 
 
 def public_collector_status(
@@ -491,7 +536,9 @@ async def scope_slot_history(
             event_limit=event_limit,
             metric_limit=metric_limit,
         )
-        scope_payloads, returned_rows = await _execute_history_plan(plan)
+        scope_payloads, returned_rows = await _execute_admitted_history_plan(plan)
+    except HistoryReadBusy:
+        return _history_read_busy_response()
     except (HistoryRequestShapeError, HistoryBudgetExceeded) as exc:
         raise HTTPException(
             status_code=413 if isinstance(exc, HistoryBudgetExceeded) else 422,
@@ -547,7 +594,9 @@ async def scopes_history_bundle(request: Request) -> JSONResponse:
             event_limit=document["event_limit"],
             metric_limit=document["metric_limit"],
         )
-        scope_payloads, returned_rows = await _execute_history_plan(plan)
+        scope_payloads, returned_rows = await _execute_admitted_history_plan(plan)
+    except HistoryReadBusy:
+        return _history_read_busy_response()
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         if isinstance(exc, HistoryBudgetExceeded):
             return _history_error_response(exc)
