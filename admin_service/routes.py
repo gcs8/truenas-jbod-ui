@@ -297,9 +297,13 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
             if upload_path.stat().st_size == 0:
                 raise HTTPException(status_code=400, detail="ESXi host-prep upload request body was empty.")
             content = await asyncio.to_thread(upload_path.read_bytes)
+            upload_path.unlink()
+            upload_path.parent.rmdir()
             service = get_esxi_host_prep_service()
             try:
                 package = await asyncio.to_thread(service.stage_package, filename, content)
+            except HostPrepStagingQuotaError as exc:
+                raise HTTPException(status_code=507, detail=STAGING_QUOTA_ERROR) from exc
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             return JSONResponse(
@@ -311,7 +315,10 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
             )
         finally:
             upload_path.unlink(missing_ok=True)
-            upload_path.parent.rmdir()
+            try:
+                upload_path.parent.rmdir()
+            except FileNotFoundError:
+                pass
 
     @router.post("/api/admin/esxi-host-prep/install")
     async def install_esxi_host_prep_package(payload: ESXiHostPrepInstallRequest) -> JSONResponse:

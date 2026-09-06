@@ -567,6 +567,14 @@ class ContainerResourceContractTests(unittest.TestCase):
                     admin["environment"].get("ADMIN_HOST_PREP_STALE_TTL_SECONDS"),
                     "${ADMIN_HOST_PREP_STALE_TTL_SECONDS:-86400}",
                 )
+                self.assertEqual(
+                    admin["environment"].get("ADMIN_HOST_PREP_MAX_PACKAGES"),
+                    "${ADMIN_HOST_PREP_MAX_PACKAGES:-8}",
+                )
+                self.assertEqual(
+                    admin["environment"].get("ADMIN_HOST_PREP_MAX_BYTES"),
+                    "${ADMIN_HOST_PREP_MAX_BYTES:-2147483648}",
+                )
                 self.assertIn("host-prep-staging", compose.get("volumes", {}))
                 self.assertIn("host-prep-staging:/app/host-prep", admin["volumes"])
 
@@ -615,6 +623,8 @@ class ContainerResourceContractTests(unittest.TestCase):
             env_example,
         )
         self.assertIn("ADMIN_HOST_PREP_STALE_TTL_SECONDS=86400", env_example)
+        self.assertIn("ADMIN_HOST_PREP_MAX_PACKAGES=8", env_example)
+        self.assertIn("ADMIN_HOST_PREP_MAX_BYTES=2147483648", env_example)
         self.assertRegex(
             env_example,
             r"(?i)disk-backed[^\n]*host-prep|host-prep[^\n]*disk-backed",
@@ -631,6 +641,8 @@ class ContainerResourceContractTests(unittest.TestCase):
         self.assertIn("`ADMIN_HOST_PREP_STALE_TTL_SECONDS`", admin_guide)
         self.assertRegex(admin_guide, r"(?i)startup[^\n]*stale[^\n]*24 hours")
         self.assertRegex(admin_guide, r"(?i)set[^\n]*`0`[^\n]*disable")
+        self.assertIn("`ADMIN_HOST_PREP_MAX_PACKAGES`", admin_guide)
+        self.assertIn("`ADMIN_HOST_PREP_MAX_BYTES`", admin_guide)
 
     def test_default_nonroot_migration_is_documented_before_start(self) -> None:
         env_example = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")

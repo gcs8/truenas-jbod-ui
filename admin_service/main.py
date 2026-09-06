@@ -27,7 +27,11 @@ from admin_service.services.account_bootstrap import (
     ServiceAccountBootstrapService,
     saved_sudo_commands_for_system,
 )
-from admin_service.services.esxi_host_prep import ESXiHostPrepService
+from admin_service.services.esxi_host_prep import (
+    ESXiHostPrepService,
+    HostPrepStagingQuotaError,
+    STAGING_QUOTA_ERROR,
+)
 from admin_service.services.esxi_host_prep import MAX_UPLOAD_BYTES as MAX_ESXI_HOST_PREP_UPLOAD_BYTES
 from admin_service.services.maintenance import AdminMaintenanceService
 from admin_service.services.runtime_control import DockerRuntimeError, DockerRuntimeService
@@ -339,6 +343,8 @@ def get_esxi_host_prep_service() -> ESXiHostPrepService:
     return ESXiHostPrepService(
         admin_settings.host_prep_temp_dir,
         stale_ttl_seconds=admin_settings.host_prep_stale_ttl_seconds,
+        max_staged_packages=admin_settings.host_prep_max_packages,
+        max_staged_bytes=admin_settings.host_prep_max_bytes,
     )
 
 

@@ -21,7 +21,11 @@ from app.services.ssh_probe import SSHCommandResult, SSHProbe
 
 MAX_UPLOAD_BYTES = 512 * 1024 * 1024
 MAX_PRUNE_ENTRIES = 1000
+MAX_ACCOUNTING_ENTRIES = 1000
 MAX_METADATA_BYTES = 16 * 1024
+DEFAULT_MAX_STAGED_PACKAGES = 8
+DEFAULT_MAX_STAGED_BYTES = 2 * 1024 * 1024 * 1024
+STAGING_QUOTA_ERROR = "ESXi host-prep staging capacity is unavailable."
 ALLOWED_UPLOAD_EXTENSIONS: dict[str, str] = {
     ".zip": "component_bundle",
     ".vib": "vib",
@@ -38,6 +42,11 @@ class _OwnedStagedPackage:
     directory_identity: tuple[int, int]
     metadata_identity: tuple[int, int]
     package_identity: tuple[int, int]
+    size_bytes: int
+
+
+class HostPrepStagingQuotaError(ValueError):
+    pass
 
 
 def utcnow() -> datetime:
@@ -50,15 +59,33 @@ class ESXiHostPrepService:
         staging_root: str,
         *,
         stale_ttl_seconds: int = 24 * 60 * 60,
+        max_staged_packages: int = DEFAULT_MAX_STAGED_PACKAGES,
+        max_staged_bytes: int = DEFAULT_MAX_STAGED_BYTES,
         probe_factory: Callable[[SSHConfig], SSHProbe] = SSHProbe,
     ) -> None:
+        if not 1 <= max_staged_packages <= MAX_ACCOUNTING_ENTRIES:
+            raise ValueError(
+                f"max_staged_packages must be between 1 and {MAX_ACCOUNTING_ENTRIES}."
+            )
+        if max_staged_bytes < 1:
+            raise ValueError("max_staged_bytes must be at least 1.")
         self._service_uid = os.geteuid()
         self.staging_root = Path(staging_root)
         self.staging_root.mkdir(parents=True, exist_ok=True)
         self.stale_ttl_seconds = stale_ttl_seconds
+        self.max_staged_packages = max_staged_packages
+        self.max_staged_bytes = max_staged_bytes
         self.probe_factory = probe_factory
         self._activity_lock = threading.RLock()
         self._active_tokens: dict[str, int] = {}
+        self._pending_stage_reservations: dict[str, int] = {}
+        self._staged_package_count = 0
+        self._staged_bytes = 0
+        try:
+            self._staged_package_count, self._staged_bytes = self._scan_staged_usage_locked()
+        except HostPrepStagingQuotaError:
+            # Admission rescans and remains closed until every entry is safely accountable.
+            pass
 
     def prune_stale_packages(self, *, now: datetime | None = None) -> dict[str, int | bool]:
         summary: dict[str, int | bool] = {
@@ -258,11 +285,16 @@ class ESXiHostPrepService:
                 directory_identity=directory_identity,
                 metadata_identity=metadata_identity,
                 package_identity=(package_lstat.st_dev, package_lstat.st_ino),
+                size_bytes=package_lstat.st_size,
             )
         finally:
             os.close(package_fd)
 
     def _remove_completed_package(self, token: str) -> str:
+        with self._activity_lock:
+            return self._remove_completed_package_locked(token)
+
+    def _remove_completed_package_locked(self, token: str) -> str:
         root_fd: int | None = None
         try:
             root_lstat = self.staging_root.lstat()
@@ -394,19 +426,118 @@ class ESXiHostPrepService:
 
         token = uuid.uuid4().hex
         package_dir = self.staging_root / token
-        package_dir.mkdir(parents=True, exist_ok=False)
         package_path = package_dir / safe_filename
-        package_path.write_bytes(content)
-        metadata = {
-            "token": token,
-            "filename": safe_filename,
-            "extension": extension,
-            "install_mode": install_mode,
-            "size_bytes": len(content),
-            "created_at": utcnow().isoformat(),
-        }
-        (package_dir / "meta.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-        return self._load_package(package_dir) or metadata
+        metadata_path = package_dir / "meta.json"
+        with self._activity_lock:
+            staged_count, staged_bytes = self._scan_staged_usage_locked()
+            reserved_count = len(self._pending_stage_reservations)
+            reserved_bytes = sum(self._pending_stage_reservations.values())
+            if (
+                staged_count + reserved_count + 1 > self.max_staged_packages
+                or staged_bytes + reserved_bytes + len(content) > self.max_staged_bytes
+            ):
+                raise HostPrepStagingQuotaError(STAGING_QUOTA_ERROR)
+            self._pending_stage_reservations[token] = len(content)
+        try:
+            package_dir.mkdir(parents=False, exist_ok=False)
+            package_path.write_bytes(content)
+            metadata = {
+                "token": token,
+                "filename": safe_filename,
+                "extension": extension,
+                "install_mode": install_mode,
+                "size_bytes": len(content),
+                "created_at": utcnow().isoformat(),
+            }
+            metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+            loaded_package = self._load_package(package_dir)
+            if loaded_package is None:
+                raise OSError("The staged package could not be verified after writing.")
+            return loaded_package
+        except BaseException:
+            self._cleanup_failed_stage(package_dir, package_path, metadata_path)
+            raise
+        finally:
+            with self._activity_lock:
+                self._pending_stage_reservations.pop(token, None)
+
+    def _scan_staged_usage_locked(self) -> tuple[int, int]:
+        root_fd: int | None = None
+        try:
+            root_lstat = self.staging_root.lstat()
+            if not stat.S_ISDIR(root_lstat.st_mode):
+                raise HostPrepStagingQuotaError(STAGING_QUOTA_ERROR)
+            root_fd = os.open(
+                self.staging_root,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            root_fstat = os.fstat(root_fd)
+            if (root_fstat.st_dev, root_fstat.st_ino) != (
+                root_lstat.st_dev,
+                root_lstat.st_ino,
+            ):
+                raise HostPrepStagingQuotaError(STAGING_QUOTA_ERROR)
+            package_count = 0
+            staged_bytes = 0
+            with os.scandir(root_fd) as entries:
+                for index, entry in enumerate(entries):
+                    if index >= MAX_ACCOUNTING_ENTRIES:
+                        raise HostPrepStagingQuotaError(STAGING_QUOTA_ERROR)
+                    if entry.name in self._pending_stage_reservations:
+                        continue
+                    try:
+                        package = self._load_owned_package_for_cleanup(
+                            root_fd,
+                            root_fstat,
+                            entry.name,
+                        )
+                    except OSError as exc:
+                        raise HostPrepStagingQuotaError(STAGING_QUOTA_ERROR) from exc
+                    if package is None:
+                        raise HostPrepStagingQuotaError(STAGING_QUOTA_ERROR)
+                    package_count += 1
+                    staged_bytes += package.size_bytes
+            self._staged_package_count = package_count
+            self._staged_bytes = staged_bytes
+            return package_count, staged_bytes
+        except HostPrepStagingQuotaError:
+            raise
+        except OSError as exc:
+            raise HostPrepStagingQuotaError(STAGING_QUOTA_ERROR) from exc
+        finally:
+            if root_fd is not None:
+                os.close(root_fd)
+
+    def _cleanup_failed_stage(
+        self,
+        package_dir: Path,
+        package_path: Path,
+        metadata_path: Path,
+    ) -> None:
+        for path in (metadata_path, package_path):
+            try:
+                path_stat = path.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return
+            if (
+                not stat.S_ISREG(path_stat.st_mode)
+                or path_stat.st_uid != self._service_uid
+                or path_stat.st_nlink != 1
+            ):
+                return
+            try:
+                path.unlink()
+            except OSError:
+                return
+        try:
+            package_dir.rmdir()
+        except OSError:
+            return
 
     def install_package(
         self,

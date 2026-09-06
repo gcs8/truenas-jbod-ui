@@ -478,6 +478,211 @@ class ESXiHostPrepServiceTests(unittest.TestCase):
             self.assertEqual(len(packages), 1)
             self.assertEqual(packages[0]["token"], staged["token"])
 
+    def test_stage_package_accepts_exact_package_count_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = ESXiHostPrepService(
+                temp_dir,
+                max_staged_packages=2,
+                max_staged_bytes=100,
+                probe_factory=FakeProbe,
+            )
+
+            service.stage_package("first.vib", b"one")
+            service.stage_package("second.vib", b"two")
+
+            with self.assertRaisesRegex(
+                ValueError,
+                r"^ESXi host-prep staging capacity is unavailable\.$",
+            ):
+                service.stage_package("third.vib", b"three")
+
+    def test_stage_package_accepts_exact_aggregate_byte_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = ESXiHostPrepService(
+                temp_dir,
+                max_staged_packages=3,
+                max_staged_bytes=7,
+                probe_factory=FakeProbe,
+            )
+
+            service.stage_package("first.vib", b"one")
+            service.stage_package("second.vib", b"four")
+
+            with self.assertRaisesRegex(
+                ValueError,
+                r"^ESXi host-prep staging capacity is unavailable\.$",
+            ):
+                service.stage_package("third.vib", b"x")
+
+    def test_concurrent_stage_admission_reserves_before_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = ESXiHostPrepService(
+                temp_dir,
+                max_staged_packages=1,
+                max_staged_bytes=7,
+                probe_factory=FakeProbe,
+            )
+            write_entered = threading.Event()
+            write_release = threading.Event()
+            first_errors: list[BaseException] = []
+            real_write_bytes = Path.write_bytes
+
+            def blocking_write(path: Path, content: bytes) -> int:
+                write_entered.set()
+                if not write_release.wait(timeout=5):
+                    raise AssertionError("Timed out waiting to release staged write")
+                return real_write_bytes(path, content)
+
+            def stage_first() -> None:
+                try:
+                    service.stage_package("first.vib", b"payload")
+                except BaseException as exc:
+                    first_errors.append(exc)
+
+            with patch.object(Path, "write_bytes", blocking_write):
+                first_thread = threading.Thread(target=stage_first)
+                first_thread.start()
+                self.assertTrue(write_entered.wait(timeout=5))
+                try:
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        r"^ESXi host-prep staging capacity is unavailable\.$",
+                    ):
+                        service.stage_package("second.vib", b"payload")
+                finally:
+                    write_release.set()
+                    first_thread.join(timeout=5)
+
+            self.assertFalse(first_thread.is_alive())
+            self.assertEqual(first_errors, [])
+            self.assertEqual(len(service.list_staged_packages()), 1)
+
+    def test_restart_accounts_for_existing_owned_staged_packages(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            first_service = ESXiHostPrepService(
+                temp_dir,
+                max_staged_packages=1,
+                max_staged_bytes=7,
+                probe_factory=FakeProbe,
+            )
+            first_service.stage_package("first.vib", b"payload")
+
+            restarted_service = ESXiHostPrepService(
+                temp_dir,
+                max_staged_packages=1,
+                max_staged_bytes=7,
+                probe_factory=FakeProbe,
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                r"^ESXi host-prep staging capacity is unavailable\.$",
+            ):
+                restarted_service.stage_package("second.vib", b"payload")
+
+    def test_failed_stage_write_releases_reservation_and_removes_partial_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = ESXiHostPrepService(
+                temp_dir,
+                max_staged_packages=1,
+                max_staged_bytes=7,
+                probe_factory=FakeProbe,
+            )
+
+            def partial_write(path: Path, content: bytes) -> int:
+                with path.open("wb") as output:
+                    output.write(content[:3])
+                raise OSError("synthetic write failure")
+
+            with patch.object(Path, "write_bytes", partial_write):
+                with self.assertRaisesRegex(OSError, "synthetic write failure"):
+                    service.stage_package("failed.vib", b"payload")
+
+            self.assertEqual(list(Path(temp_dir).iterdir()), [])
+            staged = service.stage_package("retry.vib", b"payload")
+            self.assertEqual(staged["size_bytes"], 7)
+
+    def test_prune_releases_aggregate_capacity(self) -> None:
+        now = datetime(2030, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = ESXiHostPrepService(
+                temp_dir,
+                stale_ttl_seconds=3600,
+                max_staged_packages=1,
+                max_staged_bytes=7,
+                probe_factory=FakeProbe,
+            )
+            staged = service.stage_package("stale.vib", b"payload")
+            self._set_created_at(staged, now - timedelta(seconds=3600))
+
+            self.assertEqual(service.prune_stale_packages(now=now)["removed"], 1)
+            replacement = service.stage_package("fresh.vib", b"payload")
+
+            self.assertEqual(replacement["size_bytes"], 7)
+
+    def test_install_cleanup_releases_aggregate_capacity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = ESXiHostPrepService(
+                temp_dir,
+                max_staged_packages=1,
+                max_staged_bytes=7,
+                probe_factory=FakeProbe,
+            )
+            staged = service.stage_package("installed.vib", b"payload")
+            payload = ESXiHostPrepInstallRequest(
+                host="192.0.2.48",
+                user="root",
+                password="synthetic",
+                upload_token=str(staged["token"]),
+            )
+
+            with patch.object(service, "_install_package", return_value={"ok": True}):
+                service.install_package(payload)
+            replacement = service.stage_package("fresh.vib", b"payload")
+
+            self.assertEqual(replacement["size_bytes"], 7)
+
+    def test_unaccountable_entry_fails_closed_without_deleting_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            unaccountable = Path(temp_dir) / "operator-note.txt"
+            unaccountable.write_text("preserve me", encoding="utf-8")
+            service = ESXiHostPrepService(
+                temp_dir,
+                max_staged_packages=2,
+                max_staged_bytes=100,
+                probe_factory=FakeProbe,
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                r"^ESXi host-prep staging capacity is unavailable\.$",
+            ):
+                service.stage_package("blocked.vib", b"payload")
+
+            self.assertEqual(unaccountable.read_text(encoding="utf-8"), "preserve me")
+
+    def test_symlink_entry_fails_closed_without_following_or_deleting_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir, tempfile.TemporaryDirectory() as external_dir:
+            external_file = Path(external_dir) / "outside.vib"
+            external_file.write_bytes(b"outside")
+            staged_link = Path(temp_dir) / ("a" * 32)
+            staged_link.symlink_to(external_file)
+            service = ESXiHostPrepService(
+                temp_dir,
+                max_staged_packages=2,
+                max_staged_bytes=100,
+                probe_factory=FakeProbe,
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                r"^ESXi host-prep staging capacity is unavailable\.$",
+            ):
+                service.stage_package("blocked.vib", b"payload")
+
+            self.assertTrue(staged_link.is_symlink())
+            self.assertEqual(external_file.read_bytes(), b"outside")
+
     def test_install_package_uses_component_apply_for_zip_and_reports_zero_visible_controller(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = ESXiHostPrepService(temp_dir, probe_factory=FakeProbe)
