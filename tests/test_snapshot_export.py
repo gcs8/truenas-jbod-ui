@@ -1646,6 +1646,15 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("archive-core|storage-view:boot-doms|0", rendered.history_cache)
 
     async def test_six_sixty_slot_enclosures_batch_history_for_estimate_and_export(self) -> None:
+        class ControlledDateTime(datetime):
+            current = datetime(2030, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+
+            @classmethod
+            def now(cls, tz=None):
+                if tz is None:
+                    return cls.current.replace(tzinfo=None)
+                return cls.current.astimezone(tz)
+
         enclosure_options = [
             EnclosureOption(
                 id=f"enc-{enclosure_index}",
@@ -1687,6 +1696,7 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
             snapshots[enclosure.id] = candidate
 
         sent_documents: list[dict[str, Any]] = []
+        dispatch_times: list[datetime] = []
         history_backend = HistoryBackendClient(
             HistoryConfig(service_url="http://synthetic-history.invalid", timeout_seconds=10)
         )
@@ -1709,6 +1719,9 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
                 MAX_REQUEST_BYTES,
             )
             sent_documents.append(document)
+            dispatch_times.append(ControlledDateTime.current)
+            if len(sent_documents) == 1:
+                ControlledDateTime.current += timedelta(seconds=2)
             return {
                 "configured": True,
                 "available": True,
@@ -1748,14 +1761,18 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
             "snapshot": snapshots["enc-0"],
             "live_enclosure_snapshots": snapshots,
             "selected_slot": 0,
-            "history_window_hours": 24,
+            "history_window_hours": 8760,
             "history_panel_open": True,
             "io_chart_mode": "total",
             "packaging": "auto",
         }
 
-        estimate = await exporter.estimate_enclosure_snapshot_export(**common_args)
-        artifact = await exporter.build_enclosure_snapshot_export(**common_args)
+        with patch("app.services.snapshot_export.datetime", ControlledDateTime), patch(
+            "history_service.operation_bounds.datetime",
+            ControlledDateTime,
+        ):
+            estimate = await exporter.estimate_enclosure_snapshot_export(**common_args)
+            artifact = await exporter.build_enclosure_snapshot_export(**common_args)
         rendered = next(iter(EXPORT_RENDER_CACHE.values())).value
 
         self.assertTrue(estimate["ok"])
@@ -1765,7 +1782,51 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
             sum(len(scope["slots"]) for document in sent_documents for scope in document["scopes"]),
             360,
         )
+        self.assertEqual(
+            [
+                dispatch_time - datetime.fromisoformat(document["since"])
+                for dispatch_time, document in zip(dispatch_times, sent_documents, strict=True)
+            ],
+            [timedelta(hours=8760)] * len(sent_documents),
+        )
         self.assertEqual(len(rendered.history_cache), 360)
+
+        sent_documents.clear()
+        dispatch_times.clear()
+        ControlledDateTime.current = datetime(2030, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+        with patch("app.services.snapshot_export.datetime", ControlledDateTime), patch(
+            "history_service.operation_bounds.datetime",
+            ControlledDateTime,
+        ):
+            await exporter._get_batched_scopes_history(
+                scopes=[
+                    {
+                        "system_id": snapshot.selected_system_id or "",
+                        "enclosure_id": snapshot.selected_enclosure_id,
+                        "slots": [slot.slot for slot in snapshot.slots],
+                    }
+                    for snapshot in snapshots.values()
+                ],
+                window_hours=24,
+                metrics=[
+                    "temperature_c",
+                    "bytes_read",
+                    "bytes_written",
+                    "annualized_bytes_read",
+                    "annualized_bytes_written",
+                    "power_on_hours",
+                ],
+                event_limit=11,
+                metric_limit=15,
+            )
+        self.assertGreater(len(sent_documents), 1)
+        self.assertEqual(
+            [
+                dispatch_time - datetime.fromisoformat(document["since"])
+                for dispatch_time, document in zip(dispatch_times, sent_documents, strict=True)
+            ],
+            [timedelta(hours=24)] * len(sent_documents),
+        )
 
     async def test_storage_view_export_redaction_covers_view_payloads(self) -> None:
         snapshot = build_snapshot()

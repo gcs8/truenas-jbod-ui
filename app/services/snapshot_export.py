@@ -1551,7 +1551,7 @@ class SnapshotExportService:
                 return {}
             scope_payloads = await self._get_batched_scopes_history(
                 scopes=scopes,
-                since=(datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat(),
+                window_hours=window_hours,
                 metrics=[
                     "temperature_c", "bytes_read", "bytes_written",
                     "annualized_bytes_read", "annualized_bytes_written", "power_on_hours",
@@ -1657,7 +1657,7 @@ class SnapshotExportService:
                     }
                     for history_enclosure_id, history_slots in all_slots_by_enclosure.items()
                 ],
-                since=(datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat(),
+                window_hours=window_hours,
                 metrics=[
                     "temperature_c", "bytes_read", "bytes_written",
                     "annualized_bytes_read", "annualized_bytes_written", "power_on_hours",
@@ -1719,7 +1719,7 @@ class SnapshotExportService:
         self,
         *,
         scopes: list[dict[str, Any]],
-        since: str,
+        window_hours: int,
         metrics: list[str],
         event_limit: int,
         metric_limit: int,
@@ -1727,14 +1727,14 @@ class SnapshotExportService:
         scope_payloads: list[dict[str, Any]] = []
         for batch in self._history_scope_batches(
             scopes=scopes,
-            since=since,
+            window_hours=window_hours,
             metrics=metrics,
             event_limit=event_limit,
             metric_limit=metric_limit,
         ):
             response = await self.history_backend.get_scopes_history(
                 scopes=batch,
-                since=since,
+                since=self._history_since_for_window(window_hours),
                 metrics=metrics,
                 event_limit=event_limit,
                 metric_limit=metric_limit,
@@ -1752,7 +1752,7 @@ class SnapshotExportService:
     def _history_scope_batches(
         *,
         scopes: list[dict[str, Any]],
-        since: str,
+        window_hours: int,
         metrics: list[str],
         event_limit: int,
         metric_limit: int,
@@ -1765,7 +1765,7 @@ class SnapshotExportService:
             plan = build_history_read_plan(
                 scopes=candidate,
                 metrics=metrics,
-                since=since,
+                since=SnapshotExportService._history_since_for_window(window_hours),
                 event_limit=event_limit,
                 metric_limit=metric_limit,
             )
@@ -1796,7 +1796,7 @@ class SnapshotExportService:
             identity_plan = build_history_read_plan(
                 scopes=[{**source_scope, "slots": [source_slots[0]]}],
                 metrics=metrics,
-                since=since,
+                since=SnapshotExportService._history_since_for_window(window_hours),
                 event_limit=event_limit,
                 metric_limit=metric_limit,
             )
@@ -1831,6 +1831,10 @@ class SnapshotExportService:
         if current:
             batches.append(current)
         return batches
+
+    @staticmethod
+    def _history_since_for_window(window_hours: int) -> str:
+        return (datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat()
 
     @staticmethod
     def _storage_view_history_target(runtime_view: Any, runtime_slot: Any, *, fallback_enclosure_id: str | None) -> tuple[int, str | None]:
