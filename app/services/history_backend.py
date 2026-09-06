@@ -55,6 +55,13 @@ class HistoryBackendResponseError(HistoryBackendError):
         super().__init__(message)
 
 
+class HistoryBackendBusyError(HistoryBackendResponseError):
+    """The history service rejected bulk work at its shared read boundary."""
+
+    def __init__(self) -> None:
+        super().__init__(503)
+
+
 class HistoryBackendPolicyError(HistoryBackendResponseError):
     """The backend rejected a request under its public authorization or budget policy."""
 
@@ -497,6 +504,8 @@ class HistoryBackendClient:
             with urllib.request.urlopen(request, timeout=self.config.timeout_seconds) as response:
                 return response.read(), dict(response.headers.items())
         except urllib.error.HTTPError as exc:
+            if exc.code == 503:
+                raise HistoryBackendBusyError() from exc
             if exc.code in {401, 403, 413, 422, 429}:
                 raise HistoryBackendPolicyError(exc.code) from exc
             raise HistoryBackendResponseError(exc.code) from exc

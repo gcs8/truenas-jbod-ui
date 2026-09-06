@@ -2238,6 +2238,11 @@ class HistoryStore:
                 )
 
             if event_limit > 0:
+                event_where_clauses = [*where_clauses]
+                event_parameters = [*parameters]
+                if since:
+                    event_where_clauses.append("julianday(observed_at) >= julianday(?)")
+                    event_parameters.append(since)
                 event_rows = connection.execute(
                     f"""
                     SELECT *
@@ -2249,12 +2254,12 @@ class HistoryStore:
                                 ORDER BY observed_at DESC, id DESC
                             ) AS row_number
                         FROM slot_events
-                        WHERE {scope_where}
+                        WHERE {' AND '.join(event_where_clauses)}
                     )
                     WHERE row_number <= ?
                     ORDER BY slot, observed_at DESC, id DESC
                     """,
-                    [*parameters, event_limit],
+                    [*event_parameters, event_limit],
                 ).fetchall()
                 for row in event_rows:
                     item = dict(row)
