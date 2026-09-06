@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import secrets
+import stat
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -258,13 +259,13 @@ class MappingStore:
     ) -> tuple[int, dict[str, ManualMapping]]:
         """Read once; authoritative callers fail closed, legacy display may degrade."""
         try:
-            raw = self.file_path.read_bytes()
-        except FileNotFoundError:
-            return 2, {}
+            raw = self._read_source_bytes()
         except OSError:
             if strict:
                 raise
             return 1, {}
+        if raw is None:
+            return 2, {}
         try:
             payload = json.loads(
                 raw.decode("utf-8"),
@@ -299,6 +300,36 @@ class MappingStore:
                     return version, {}
                 raise
         return version, entries
+
+    def _read_source_bytes(self) -> bytes | None:
+        try:
+            observed = os.lstat(self.file_path)
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISREG(observed.st_mode):
+            raise OSError("Configured mapping source is not a regular file.")
+
+        flags = os.O_RDONLY
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(self.file_path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_dev != observed.st_dev
+                or opened.st_ino != observed.st_ino
+            ):
+                raise OSError("Configured mapping source identity changed during open.")
+            chunks: list[bytes] = []
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            return b"".join(chunks)
+        finally:
+            os.close(descriptor)
 
     def _classify_v1(self, key: str, mapping: ManualMapping) -> tuple[Identity, ManualMapping]:
         canonical = self._canonical_mapping(mapping)
@@ -1232,6 +1263,34 @@ class MappingStore:
                 )
             except FileExistsError:
                 continue
+            temp_stat: os.stat_result | None = None
+            try:
+                os.fchmod(descriptor, 0o600)
+                temp_stat = os.fstat(descriptor)
+                if stat.S_IMODE(temp_stat.st_mode) != 0o600:
+                    raise OSError("Mapping temporary file mode is not 0600.")
+            except Exception:
+                if temp_stat is None:
+                    try:
+                        temp_stat = os.fstat(descriptor)
+                    except OSError:
+                        pass
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+                if temp_stat is not None:
+                    try:
+                        current = os.lstat(temp_path)
+                        if (
+                            stat.S_ISREG(current.st_mode)
+                            and current.st_dev == temp_stat.st_dev
+                            and current.st_ino == temp_stat.st_ino
+                        ):
+                            temp_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                raise
             return temp_path, descriptor
         raise FileExistsError("Could not allocate a unique mapping temporary file.")
 

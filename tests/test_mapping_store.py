@@ -2426,6 +2426,7 @@ class MappingStoreAuthoritativeLoadTests(unittest.TestCase):
 
     def test_initial_source_read_errors_fail_closed_for_every_authority_surface(self) -> None:
         original_read_bytes = Path.read_bytes
+        original_lstat = os.lstat
         original_replace = os.replace
         operations = (
             "save",
@@ -2454,18 +2455,17 @@ class MappingStoreAuthoritativeLoadTests(unittest.TestCase):
                         store = self.make_store(temp_dir)
                         before = self.write_valid_document(store, version)
                         before_temps = self.temp_paths(store)
-                        target_reads = 0
-
-                        def fail_initial_target_read(path: Path) -> bytes:
-                            nonlocal target_reads
-                            if path == store.file_path:
-                                target_reads += 1
-                                if target_reads == 1:
-                                    raise failure
-                            return original_read_bytes(path)
+                        def fail_initial_target_observation(path: Path) -> os.stat_result:
+                            if Path(path) == store.file_path:
+                                raise failure
+                            return original_lstat(path)
 
                         with (
-                            patch.object(Path, "read_bytes", fail_initial_target_read),
+                            patch.object(
+                                mapping_store_module.os,
+                                "lstat",
+                                fail_initial_target_observation,
+                            ),
                             patch.object(
                                 store,
                                 "_create_temp_file",
@@ -2613,6 +2613,335 @@ class MappingStoreAuthoritativeLoadTests(unittest.TestCase):
                 [item.serial for item in store.list_mappings()],
                 ["FIRST"],
             )
+
+    def test_existing_target_open_and_read_losses_fail_every_authority_surface(self) -> None:
+        operations = (
+            "save",
+            "clear",
+            "replace",
+            "import",
+            "scope_revision",
+            "save_revision",
+            "clear_revision",
+            "save_revisions",
+            "clear_revisions",
+            "preview",
+        )
+        failures = (
+            ("open_missing", FileNotFoundError),
+            ("open_denied", PermissionError),
+            ("open_error", OSError),
+            ("read_missing", FileNotFoundError),
+            ("read_denied", PermissionError),
+            ("read_error", OSError),
+        )
+        original_open = os.open
+        original_read = os.read
+        for version in (1, 2):
+            for failure_name, failure_type in failures:
+                for operation in operations:
+                    with (
+                        self.subTest(
+                            version=version,
+                            failure=failure_name,
+                            operation=operation,
+                        ),
+                        tempfile.TemporaryDirectory() as temp_dir,
+                    ):
+                        store = self.make_store(temp_dir)
+                        before = self.write_valid_document(store, version)
+                        source_descriptor: int | None = None
+                        import_preview = None
+                        if operation == "import":
+                            import_preview = store.preview_replace_mappings(
+                                self.SYSTEM_ID,
+                                self.ENCLOSURE_ID,
+                                [self.mapping("NEW")],
+                            )
+
+                        def guarded_open(path: Path, flags: int, mode: int = 0o777) -> int:
+                            nonlocal source_descriptor
+                            if Path(path) == store.file_path and not flags & os.O_CREAT:
+                                if failure_name.startswith("open_"):
+                                    raise failure_type("synthetic source open loss")
+                                source_descriptor = original_open(path, flags, mode)
+                                return source_descriptor
+                            return original_open(path, flags, mode)
+
+                        def guarded_read(descriptor: int, size: int) -> bytes:
+                            if descriptor == source_descriptor:
+                                raise failure_type("synthetic source read loss")
+                            return original_read(descriptor, size)
+
+                        with (
+                            patch.object(mapping_store_module.os, "open", guarded_open),
+                            patch.object(mapping_store_module.os, "read", guarded_read),
+                            patch.object(
+                                store,
+                                "_create_temp_file",
+                                wraps=store._create_temp_file,
+                            ) as create_temp,
+                            patch.object(
+                                store,
+                                "_replace_temp_file",
+                                wraps=store._replace_temp_file,
+                            ) as replace_temp,
+                            self.assertRaises(failure_type),
+                        ):
+                            if operation == "import":
+                                assert import_preview is not None
+                                store.apply_mapping_import(
+                                    self.SYSTEM_ID,
+                                    self.ENCLOSURE_ID,
+                                    [self.mapping("NEW")],
+                                    expected_revision=import_preview["revision"],
+                                    import_digest=import_preview["import_digest"],
+                                )
+                            else:
+                                self.authority_surface(store, operation)
+
+                        create_temp.assert_not_called()
+                        replace_temp.assert_not_called()
+                        self.assertEqual(store.file_path.read_bytes(), before)
+                        self.assertEqual(self.temp_paths(store), set())
+                        if source_descriptor is not None:
+                            with self.assertRaises(OSError):
+                                os.fstat(source_descriptor)
+
+    def test_target_swap_between_observation_and_open_fails_before_mutation(self) -> None:
+        original_open = os.open
+        original_replace = os.replace
+        for version in (1, 2):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as temp_dir:
+                store = self.make_store(temp_dir)
+                self.write_valid_document(store, version)
+                replacement = store.file_path.with_name("replacement.json")
+                replacement_bytes = self.write_valid_document(
+                    MappingStore(replacement),
+                    version,
+                ).replace(b"OLD", b"NEW")
+                replacement.write_bytes(replacement_bytes)
+                swapped = False
+
+                def swap_then_open(path: Path, flags: int, mode: int = 0o777) -> int:
+                    nonlocal swapped
+                    if Path(path) == store.file_path and not flags & os.O_CREAT and not swapped:
+                        swapped = True
+                        original_replace(replacement, store.file_path)
+                    return original_open(path, flags, mode)
+
+                with (
+                    patch.object(mapping_store_module.os, "open", swap_then_open),
+                    patch.object(
+                        store,
+                        "_create_temp_file",
+                        wraps=store._create_temp_file,
+                    ) as create_temp,
+                    patch.object(
+                        store,
+                        "_replace_temp_file",
+                        wraps=store._replace_temp_file,
+                    ) as replace_temp,
+                    self.assertRaises(OSError),
+                ):
+                    store.save_mapping(self.mapping("CALLER"))
+
+                self.assertTrue(swapped)
+                create_temp.assert_not_called()
+                replace_temp.assert_not_called()
+                self.assertEqual(store.file_path.read_bytes(), replacement_bytes)
+                self.assertEqual(self.temp_paths(store), set())
+
+    def test_opened_descriptor_identity_mismatch_fails_before_mutation(self) -> None:
+        original_open = os.open
+        original_fstat = os.fstat
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+            before = self.write_valid_document(store, 1)
+            source_descriptor: int | None = None
+
+            def track_open(path: Path, flags: int, mode: int = 0o777) -> int:
+                nonlocal source_descriptor
+                descriptor = original_open(path, flags, mode)
+                if Path(path) == store.file_path and not flags & os.O_CREAT:
+                    source_descriptor = descriptor
+                return descriptor
+
+            def mismatched_fstat(descriptor: int) -> os.stat_result:
+                result = original_fstat(descriptor)
+                if descriptor != source_descriptor:
+                    return result
+                values = list(result)
+                values[1] += 1
+                return os.stat_result(values)
+
+            with (
+                patch.object(mapping_store_module.os, "open", track_open),
+                patch.object(mapping_store_module.os, "fstat", mismatched_fstat),
+                patch.object(
+                    store,
+                    "_create_temp_file",
+                    wraps=store._create_temp_file,
+                ) as create_temp,
+                patch.object(
+                    store,
+                    "_replace_temp_file",
+                    wraps=store._replace_temp_file,
+                ) as replace_temp,
+                self.assertRaises(OSError),
+            ):
+                store.save_mapping(self.mapping("NEW"))
+
+            create_temp.assert_not_called()
+            replace_temp.assert_not_called()
+            self.assertEqual(store.file_path.read_bytes(), before)
+            self.assertEqual(self.temp_paths(store), set())
+            assert source_descriptor is not None
+            with self.assertRaises(OSError):
+                os.fstat(source_descriptor)
+
+    def test_configured_source_rejects_symlinks_and_non_regular_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            real_store = MappingStore(root / "real.json")
+            real_bytes = self.write_valid_document(real_store, 1)
+            symlink_store = MappingStore(root / "symlink.json")
+            symlink_store.file_path.symlink_to(real_store.file_path)
+
+            with (
+                patch.object(
+                    symlink_store,
+                    "_create_temp_file",
+                    wraps=symlink_store._create_temp_file,
+                ) as create_temp,
+                self.assertRaises(OSError),
+            ):
+                symlink_store.save_mapping(self.mapping("NEW"))
+
+            create_temp.assert_not_called()
+            self.assertTrue(symlink_store.file_path.is_symlink())
+            self.assertEqual(real_store.file_path.read_bytes(), real_bytes)
+            self.assertEqual(self.temp_paths(symlink_store), set())
+
+            directory_store = MappingStore(root / "configured-directory")
+            directory_store.file_path.mkdir()
+            with self.assertRaises(OSError):
+                directory_store.save_revision(
+                    self.SYSTEM_ID,
+                    self.ENCLOSURE_ID,
+                    self.SLOT,
+                )
+
+    def test_saves_publish_exact_owner_only_mode_under_every_umask(self) -> None:
+        original_replace = os.replace
+        for requested_umask in (0o000, 0o077, 0o777):
+            with (
+                self.subTest(umask=oct(requested_umask)),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                store = self.make_store(temp_dir)
+                provisional_modes: list[int] = []
+
+                def inspect_then_replace(source: Path, target: Path) -> None:
+                    provisional_modes.append(os.stat(source).st_mode & 0o777)
+                    original_replace(source, target)
+
+                previous_umask = os.umask(requested_umask)
+                try:
+                    with patch.object(mapping_store_module.os, "replace", inspect_then_replace):
+                        try:
+                            store.save_mapping(self.mapping("FIRST"))
+                        except Exception as exc:
+                            self.fail(
+                                f"save failed under umask {oct(requested_umask)}: "
+                                f"{type(exc).__name__}"
+                            )
+                finally:
+                    os.umask(previous_umask)
+
+                self.assertEqual(provisional_modes, [0o600])
+                self.assertEqual(os.stat(store.file_path).st_mode & 0o777, 0o600)
+                resolved = store.get_mapping(
+                    self.SYSTEM_ID,
+                    self.ENCLOSURE_ID,
+                    self.SLOT,
+                )
+                self.assertIsNotNone(resolved)
+                assert resolved is not None
+                self.assertEqual(resolved.serial, "FIRST")
+
+    def test_fchmod_failure_closes_and_unlinks_temp_without_replacement(self) -> None:
+        for target_exists in (False, True):
+            with (
+                self.subTest(target_exists=target_exists),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                store = self.make_store(temp_dir)
+                before = self.write_valid_document(store, 1) if target_exists else None
+                temp_descriptor: int | None = None
+
+                def fail_fchmod(descriptor: int, mode: int) -> None:
+                    nonlocal temp_descriptor
+                    temp_descriptor = descriptor
+                    raise OSError("synthetic fchmod failure")
+
+                with (
+                    patch.object(mapping_store_module.os, "fchmod", fail_fchmod),
+                    patch.object(
+                        store,
+                        "_replace_temp_file",
+                        wraps=store._replace_temp_file,
+                    ) as replace_temp,
+                    self.assertRaises(OSError),
+                ):
+                    store.save_mapping(self.mapping("NEW"))
+
+                replace_temp.assert_not_called()
+                self.assertEqual(self.temp_paths(store), set())
+                if before is None:
+                    self.assertFalse(store.file_path.exists())
+                else:
+                    self.assertEqual(store.file_path.read_bytes(), before)
+                assert temp_descriptor is not None
+                with self.assertRaises(OSError):
+                    os.fstat(temp_descriptor)
+
+    def test_wrong_post_fchmod_mode_closes_and_unlinks_temp_without_replacement(self) -> None:
+        original_fchmod = os.fchmod
+        for target_exists in (False, True):
+            with (
+                self.subTest(target_exists=target_exists),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                store = self.make_store(temp_dir)
+                before = self.write_valid_document(store, 1) if target_exists else None
+                temp_descriptor: int | None = None
+
+                def leave_wrong_mode(descriptor: int, mode: int) -> None:
+                    nonlocal temp_descriptor
+                    temp_descriptor = descriptor
+                    original_fchmod(descriptor, 0o400)
+
+                with (
+                    patch.object(mapping_store_module.os, "fchmod", leave_wrong_mode),
+                    patch.object(
+                        store,
+                        "_replace_temp_file",
+                        wraps=store._replace_temp_file,
+                    ) as replace_temp,
+                    self.assertRaises(OSError),
+                ):
+                    store.save_mapping(self.mapping("NEW"))
+
+                replace_temp.assert_not_called()
+                self.assertEqual(self.temp_paths(store), set())
+                if before is None:
+                    self.assertFalse(store.file_path.exists())
+                else:
+                    self.assertEqual(store.file_path.read_bytes(), before)
+                assert temp_descriptor is not None
+                with self.assertRaises(OSError):
+                    os.fstat(temp_descriptor)
 
     def test_load_all_rejects_explicit_non_v1_versions_before_shape_tolerance(self) -> None:
         malformed_documents = (
