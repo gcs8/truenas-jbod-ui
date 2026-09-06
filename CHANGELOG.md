@@ -149,6 +149,9 @@ them before starting the new images.
 
 ### Security
 
+- Restricted generated storage-discovery sudo grants, rejected malformed or
+  oversized TrueNAS inventory responses, normalized SAS target identifiers,
+  and documented least-privilege setup requirements (#380).
 - Hardened inventory, mapping, history, SAS diagnostics, and snapshot export
   boundaries across the reviewed security backlog (#378).
 - Excluded internal endpoint, filesystem-path, and collection-stage metadata
