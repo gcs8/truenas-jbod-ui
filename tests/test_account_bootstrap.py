@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import re
 import shlex
 import stat
 import tempfile
@@ -257,12 +258,21 @@ class ServiceAccountBootstrapServiceTests(unittest.TestCase):
         )
 
         self.assertNotIn("/usr/sbin/zpool status -gP", content)
-        self.assertIn("/usr/bin/sg_ses -p aes /dev/sg*", content)
-        self.assertIn("/usr/bin/sg_ses -p ec /dev/sg*", content)
-        self.assertIn("/usr/bin/sg_ses --join --filter /dev/sg*", content)
-        self.assertIn("/usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg*", content)
-        self.assertIn("/usr/bin/sg_ses --dev-slot-num=* --clear=ident /dev/sg*", content)
-        self.assertIn("/usr/sbin/smartctl -x -j *", content)
+        self.assertIn("/usr/bin/sg_ses ^-p aes /dev/sg[0-9]+$", content)
+        self.assertIn("/usr/bin/sg_ses ^-p ec /dev/sg[0-9]+$", content)
+        self.assertIn("/usr/bin/sg_ses ^--join --filter /dev/sg[0-9]+$", content)
+        self.assertIn(
+            "/usr/bin/sg_ses ^--dev-slot-num=[0-9]+ --set=ident /dev/sg[0-9]+$",
+            content,
+        )
+        self.assertIn(
+            "/usr/bin/sg_ses ^--dev-slot-num=[0-9]+ --clear=ident /dev/sg[0-9]+$",
+            content,
+        )
+        self.assertIn(
+            "/usr/sbin/smartctl ^-x -j /dev/[A-Za-z0-9_:+-]",
+            content,
+        )
         self.assertNotIn("sudo -n", content)
 
     def test_saved_sudo_commands_for_system_returns_only_saved_sudo_lines(self) -> None:
@@ -322,19 +332,20 @@ class ServiceAccountBootstrapServiceTests(unittest.TestCase):
 def sudoers_grant_matches(grant: str, command: str) -> bool:
     """Model how sudoers matches a granted command spec against a real command.
 
-    Wildcards are matched per argument, the way sudo compares an invoked command
-    against a `Cmnd_Spec`, so `smartctl -x -j *` does not silently cover
-    `smartctl -d scsi -x -j /dev/sda`.
+    Sudo joins argv with spaces before matching the argument portion of a
+    ``Cmnd_Spec``. Globs can therefore cross argument boundaries; anchored
+    regular expressions cannot.
     """
 
     grant_tokens = shlex.split(grant)
     command_tokens = shlex.split(command)
-    if len(grant_tokens) != len(command_tokens):
+    if not grant_tokens or not command_tokens or grant_tokens[0] != command_tokens[0]:
         return False
-    return all(
-        fnmatch.fnmatchcase(command_token, grant_token)
-        for grant_token, command_token in zip(grant_tokens, command_tokens)
-    )
+    grant_arguments = grant.split(maxsplit=1)[1] if len(grant_tokens) > 1 else ""
+    command_arguments = " ".join(command_tokens[1:])
+    if grant_arguments.startswith("^") and grant_arguments.endswith("$"):
+        return re.fullmatch(grant_arguments, command_arguments) is not None
+    return fnmatch.fnmatchcase(command_arguments, grant_arguments)
 
 
 def strip_sudo_prefix(command: str) -> str | None:
@@ -552,19 +563,67 @@ class BootstrapSudoGrantContractTests(unittest.IsolatedAsyncioTestCase):
                     f"{platform} supplemental sudo grants do not cover: " + ", ".join(ungranted),
                 )
 
+    def test_sg_ses_grants_reject_options_after_the_device_argument(self) -> None:
+        injected = (
+            "/usr/bin/sg_ses -p aes /dev/sg3 "
+            "--control --data=synthetic-nonsecret-payload"
+        )
+        legitimate = (
+            "/usr/bin/sg_ses -p aes /dev/sg3",
+            "/usr/bin/sg_ses -p ec /dev/sg4095",
+            "/usr/bin/sg_ses --join --filter /dev/sg12",
+            "/usr/bin/sg_ses --dev-slot-num=7 --set=ident /dev/sg12",
+            "/usr/bin/sg_ses --dev-slot-num=7 --clear=ident /dev/sg12",
+        )
+        for platform in ("scale", "linux", "quantastor"):
+            with self.subTest(platform=platform):
+                grants = SUDO_COMMANDS_BY_PLATFORM[platform]
+                self.assertFalse(
+                    any(sudoers_grant_matches(grant, injected) for grant in grants),
+                    f"{platform} grants admitted trailing sg_ses control options",
+                )
+                for command in legitimate:
+                    self.assertTrue(
+                        any(sudoers_grant_matches(grant, command) for grant in grants),
+                        f"{platform} grants did not cover {command}",
+                    )
+
     def test_smartctl_grants_only_allow_inventory_read_shapes(self) -> None:
-        allowed_argument_shapes = {
-            ("-x", "-j", "*"),
-            ("-x", "*"),
-            ("-d", "*", "-x", "-j", "*"),
-            ("-d", "*", "-x", "*"),
-        }
         for platform in self.platforms:
             with self.subTest(platform=platform):
                 for grant in SUDO_COMMANDS_BY_PLATFORM[platform]:
                     tokens = shlex.split(grant)
                     if Path(tokens[0]).name == "smartctl":
-                        self.assertIn(tuple(tokens[1:]), allowed_argument_shapes)
+                        arguments = grant.split(maxsplit=1)[1]
+                        self.assertTrue(arguments.startswith("^"), grant)
+                        self.assertTrue(arguments.endswith("$"), grant)
+
+    def test_smartctl_grants_reject_mutating_and_trailing_options(self) -> None:
+        legitimate = (
+            "/usr/sbin/smartctl -x -j /dev/sda",
+            "/usr/sbin/smartctl -x /dev/disk/by-id/scsi-synthetic.01",
+            "/usr/sbin/smartctl -d scsi -x -j /dev/boot",
+            "/usr/local/sbin/smartctl -d megaraid,12 -x /dev/da0",
+        )
+        rejected = (
+            "/usr/sbin/smartctl -x -j /dev/sda --smart=off",
+            "/usr/sbin/smartctl -x /dev/sda --set=wcache,off",
+            "/usr/sbin/smartctl -d scsi -x -j /dev/boot --offlineauto=off",
+            "/usr/local/sbin/smartctl -d megaraid,12 -x /dev/da0 --saveauto=off",
+            "/usr/sbin/smartctl -x -j /dev/../etc/shadow",
+        )
+        grants = tuple(
+            grant
+            for platform in self.platforms
+            for grant in SUDO_COMMANDS_BY_PLATFORM[platform]
+            if Path(shlex.split(grant)[0]).name == "smartctl"
+        )
+        for command in legitimate:
+            with self.subTest(command=command):
+                self.assertTrue(any(sudoers_grant_matches(grant, command) for grant in grants))
+        for command in rejected:
+            with self.subTest(command=command):
+                self.assertFalse(any(sudoers_grant_matches(grant, command) for grant in grants))
 
     def test_quantastor_bootstrap_does_not_grant_unbounded_root_cli_access(self) -> None:
         self.assertFalse(

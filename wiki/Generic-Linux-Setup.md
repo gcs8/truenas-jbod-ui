@@ -52,13 +52,16 @@ sudo chmod 600 /home/jbodmap/.ssh/authorized_keys
 
 ## 3. Minimal Generic Linux Sudo
 
+The anchored command regexes below require sudo 1.9.10 or newer. On an older
+host, enumerate exact device commands. Do not substitute argument wildcards.
+
 ```bash
 sudo tee /etc/sudoers.d/jbodmap-storage > /dev/null <<'EOF'
 Defaults:jbodmap !requiretty
 jbodmap ALL=(root) NOPASSWD: /usr/bin/lsblk -OJ
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/mdadm --detail --scan
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x -j /dev/sd*
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x -j /dev/nvme*
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl ^-x -j /dev/sd[a-z]+$
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl ^-x -j /dev/nvme[0-9]+n[0-9]+$
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/nvme smart-log -o json /dev/nvme*
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/nvme id-ctrl -o json /dev/nvme*
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/nvme id-ns -o json /dev/nvme*

@@ -270,8 +270,14 @@ midclt call user.update USER_ID '{"sudo":true,"sudo_nopasswd":true,"sudo_command
 If you want the full current web UI feature set on this CORE box, use this
 combined allow-list:
 
+The anchored command regexes require sudo 1.9.10 or newer. On CORE, the
+bootstrap saves this list through `midclt user.update`; it does
+not run `visudo -cf` first. Confirm the installed sudo version before using
+regex entries. On an older host, enumerate the exact SMART device commands
+instead of replacing the regex with a wildcard.
+
 ```bash
-midclt call user.update USER_ID '{"sudo":true,"sudo_nopasswd":true,"sudo_commands":["/usr/sbin/sesutil map","/usr/sbin/sesutil show","/sbin/camcontrol devlist -v","/usr/sbin/sesutil locate -u /dev/ses* * on","/usr/sbin/sesutil locate -u /dev/ses* * off","/usr/local/sbin/smartctl -x -j *","/usr/local/sbin/smartctl -x *","/usr/sbin/mprutil show adapter","/usr/sbin/mprutil show adapters","/usr/sbin/mprutil show all","/usr/sbin/mprutil show devices","/usr/sbin/mprutil show enclosures","/usr/sbin/mprutil show expanders","/usr/sbin/mprutil show iocfacts","/usr/sbin/mprutil -u * show adapter","/usr/sbin/mprutil -u * show all","/usr/sbin/mprutil -u * show devices","/usr/sbin/mprutil -u * show enclosures","/usr/sbin/mprutil -u * show expanders","/usr/sbin/mprutil -u * show iocfacts","/usr/local/sbin/dmidecode -t slot","/usr/bin/tail -n 4000 /var/log/messages","/usr/local/bin/midclt call disk.multipath_sync","/usr/local/bin/midclt call disk.sync_all","/usr/local/bin/midclt call core.get_jobs *"]}'
+midclt call user.update USER_ID '{"sudo":true,"sudo_nopasswd":true,"sudo_commands":["/usr/sbin/sesutil map","/usr/sbin/sesutil show","/sbin/camcontrol devlist -v","/usr/sbin/sesutil locate -u /dev/ses* * on","/usr/sbin/sesutil locate -u /dev/ses* * off","/usr/local/sbin/smartctl ^-x -j /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$","/usr/local/sbin/smartctl ^-x /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$","/usr/sbin/mprutil show adapter","/usr/sbin/mprutil show adapters","/usr/sbin/mprutil show all","/usr/sbin/mprutil show devices","/usr/sbin/mprutil show enclosures","/usr/sbin/mprutil show expanders","/usr/sbin/mprutil show iocfacts","/usr/sbin/mprutil -u * show adapter","/usr/sbin/mprutil -u * show all","/usr/sbin/mprutil -u * show devices","/usr/sbin/mprutil -u * show enclosures","/usr/sbin/mprutil -u * show expanders","/usr/sbin/mprutil -u * show iocfacts","/usr/local/sbin/dmidecode -t slot","/usr/bin/tail -n 4000 /var/log/messages","/usr/local/bin/midclt call disk.multipath_sync","/usr/local/bin/midclt call disk.sync_all","/usr/local/bin/midclt ^call core\\.get_jobs \\[\\[\\\"id\\\"\\,\\\"=\\\"\\,[0-9]+\\]\\]$"]}'
 ```
 
 That enables:
@@ -566,16 +572,16 @@ sudo -n /usr/bin/sg_ses --dev-slot-num=0 --set=ident /dev/sg37
 sudo -n /usr/bin/sg_ses --dev-slot-num=0 --clear=ident /dev/sg37
 ```
 
-If your SCALE build accepts wildcard command arguments in sudo rules, a
-narrower exact-command shape would look like:
+If your SCALE build accepts anchored regular-expression arguments in sudo
+rules, a bounded command shape would look like:
 
 ```bash
-midclt call user.update USER_ID '{"sudo":true,"sudo_nopasswd":false,"sudo_commands":["/usr/bin/sg_ses -p aes /dev/sg26","/usr/bin/sg_ses -p aes /dev/sg37","/usr/bin/sg_ses -p ec /dev/sg26","/usr/bin/sg_ses -p ec /dev/sg37","/usr/bin/sg_ses --join --filter /dev/sg26","/usr/bin/sg_ses --join --filter /dev/sg37","/usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg26","/usr/bin/sg_ses --dev-slot-num=* --clear=ident /dev/sg26","/usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg37","/usr/bin/sg_ses --dev-slot-num=* --clear=ident /dev/sg37","/usr/bin/midclt call disk.sync_all","/usr/bin/midclt call core.get_jobs *"]}'
+midclt call user.update USER_ID '{"sudo":true,"sudo_nopasswd":false,"sudo_commands":["/usr/bin/sg_ses ^-p aes /dev/sg[0-9]+$","/usr/bin/sg_ses ^-p ec /dev/sg[0-9]+$","/usr/bin/sg_ses ^--join --filter /dev/sg[0-9]+$","/usr/bin/sg_ses ^--dev-slot-num=[0-9]+ --set=ident /dev/sg[0-9]+$","/usr/bin/sg_ses ^--dev-slot-num=[0-9]+ --clear=ident /dev/sg[0-9]+$","/usr/bin/midclt call disk.sync_all","/usr/bin/midclt ^call core\\.get_jobs \\[\\[\\\"id\\\"\\,\\\"=\\\"\\,[0-9]+\\]\\]$"]}'
 ```
 
-The tested web UI path on this box was broader: add `/usr/bin/sg_ses` to both
-`Allowed sudo commands` and `Allowed Sudo Commands (No Password)`. That works,
-but it grants a wider surface area than the exact-command list above.
+Do not grant the bare `/usr/bin/sg_ses` executable or use a trailing `/dev/sg*`
+argument glob. Sudo globs can consume spaces and trailing options; keep the
+anchored argument regexes above or enumerate exact device commands.
 
 The two `/usr/bin/midclt` entries are only needed if you want the **Full disk
 sync** action from the enclosure header on SCALE; see "Disk Inventory Sync
@@ -625,8 +631,11 @@ through SSH.
 
 The `gpu-server` Ubuntu `mdadm` / NVMe test host currently uses:
 
+These anchored command regexes require sudo 1.9.10 or newer. Use exact
+per-device commands on an older host.
+
 ```bash
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x -j /dev/nvme*n*
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl ^-x -j /dev/nvme[0-9]+n[0-9]+$
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/nvme smart-log -o json /dev/nvme*
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/nvme id-ctrl -o json /dev/nvme*
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/nvme id-ns -o json /dev/nvme*
@@ -651,14 +660,14 @@ TrueNAS middleware to re-read its disk table over the same SSH channel used for
 bootstrap seeds them for CORE and SCALE:
 
 ```text
-# CORE
+# CORE (the backslashes are part of the sudo command specification)
 /usr/local/bin/midclt call disk.multipath_sync
 /usr/local/bin/midclt call disk.sync_all
-/usr/local/bin/midclt call core.get_jobs *
+/usr/local/bin/midclt ^call core\.get_jobs \[\[\"id\"\,\"=\"\,[0-9]+\]\]$
 
 # SCALE
 /usr/bin/midclt call disk.sync_all
-/usr/bin/midclt call core.get_jobs *
+/usr/bin/midclt ^call core\.get_jobs \[\[\"id\"\,\"=\"\,[0-9]+\]\]$
 ```
 
 - `disk.multipath_sync` is CORE only. It rebuilds the middleware multipath
@@ -666,8 +675,8 @@ bootstrap seeds them for CORE and SCALE:
 - `disk.sync_all` re-reads every disk into the middleware inventory as a job.
   The app then polls `core.get_jobs '[["id","=",<job id>]]'` until the job is
   terminal or `APP_DISK_INVENTORY_SYNC_TIMEOUT_SECONDS` (default 180) passes.
-  The `*` in the `core.get_jobs` grant only admits that filter argument; no
-  other `midclt` method is granted.
+  The anchored argument regex admits only that numeric-ID filter and no trailing
+  arguments; no other `midclt` method is granted.
 - Neither call touches pools or data. The runbook is
   `docs/DISK_REPLACEMENT_CORE_MULTIPATH.md`.
 
@@ -682,19 +691,19 @@ controller path. The working LED path is currently:
 - SSH `smartctl` for verified per-disk SMART detail
 - SSH `sg_ses` for live SES slot state and identify LED control
 
-The tested wildcard sudoers entries for `jbodmap` were:
+The bounded sudoers entries for `jbodmap` are:
 
 ```bash
 Defaults:jbodmap !requiretty
-jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses -p aes /dev/sg*
-jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses -p ec /dev/sg*
-jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses --join --filter /dev/sg*
-jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg*
-jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses --dev-slot-num=* --clear=ident /dev/sg*
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x -j /dev/sd*
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x /dev/sd*
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x -j /dev/disk/by-id/scsi-*
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x /dev/disk/by-id/scsi-*
+jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses ^-p aes /dev/sg[0-9]+$
+jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses ^-p ec /dev/sg[0-9]+$
+jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses ^--join --filter /dev/sg[0-9]+$
+jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses ^--dev-slot-num=[0-9]+ --set=ident /dev/sg[0-9]+$
+jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses ^--dev-slot-num=[0-9]+ --clear=ident /dev/sg[0-9]+$
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl ^-x -j /dev/sd[a-z]+$
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl ^-x /dev/sd[a-z]+$
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl ^-x -j /dev/disk/by-id/scsi-[A-Za-z0-9_.:+-]+$
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl ^-x /dev/disk/by-id/scsi-[A-Za-z0-9_.:+-]+$
 ```
 
 One node on that cluster currently exposes the real SES device, while the peer

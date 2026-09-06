@@ -529,6 +529,47 @@ class InventoryHelpersTests(unittest.TestCase):
             self.assertEqual(snapshot.layout_rows, [[0, 1]])
             self.assertEqual(snapshot.layout_slot_count, 2)
 
+    def test_identity_free_rows_do_not_consume_virtual_inventory_slots(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(id="system-a", truenas=TrueNASConfig(platform="core"))
+            settings = Settings(systems=[system])
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            raw_data = TrueNASRawData(
+                enclosures=[],
+                disks=[
+                    {},
+                    {"model": "metadata only", "status": "ONLINE"},
+                    {"name": "da0", "model": "Synthetic disk", "status": "ONLINE"},
+                ],
+                pools=[],
+                disk_temperatures={},
+                smart_test_results=[],
+            )
+
+            slots, enclosures, _selected_meta, rows, slot_count, columns = service._correlate(
+                raw_data,
+                ParsedSSHData(),
+                [],
+            )
+
+            self.assertEqual([slot.device_name for slot in slots], ["da0"])
+            self.assertEqual(enclosures[0].slot_count, 1)
+            self.assertEqual(rows, [[0]])
+            self.assertEqual((slot_count, columns), (1, 1))
+
+    def test_disk_record_normalization_rejects_raw_inventory_above_the_supported_maximum(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(id="system-a", truenas=TrueNASConfig(platform="core"))
+            settings = Settings(systems=[system])
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            disks = [{"name": f"da{index}"} for index in range(4097)]
+
+            with patch("app.services.inventory.DiskRecord", wraps=DiskRecord) as disk_record:
+                with self.assertRaisesRegex(TrueNASAPIError, "4096"):
+                    service._build_disk_records(disks, ParsedSSHData(), {}, {})
+
+            disk_record.assert_not_called()
+
     def test_multi_enclosure_snapshot_warns_once_about_unapplied_legacy_mappings(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = self._legacy_fallback_service(temp_dir, [SystemConfig(id="system-a")])
