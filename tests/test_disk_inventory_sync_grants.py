@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import re
 import shlex
 import tempfile
 import unittest
@@ -35,12 +36,13 @@ from app.services.ssh_probe import SSHCommandResult
 def sudoers_grant_matches(grant: str, command: str) -> bool:
     grant_tokens = shlex.split(grant)
     command_tokens = shlex.split(command)
-    if len(grant_tokens) != len(command_tokens):
+    if not grant_tokens or not command_tokens or grant_tokens[0] != command_tokens[0]:
         return False
-    return all(
-        fnmatch.fnmatchcase(command_token, grant_token)
-        for grant_token, command_token in zip(grant_tokens, command_tokens)
-    )
+    grant_arguments = grant.split(maxsplit=1)[1] if len(grant_tokens) > 1 else ""
+    command_arguments = " ".join(command_tokens[1:])
+    if grant_arguments.startswith("^") and grant_arguments.endswith("$"):
+        return re.fullmatch(grant_arguments, command_arguments) is not None
+    return fnmatch.fnmatchcase(command_arguments, grant_arguments)
 
 
 def strip_sudo_prefix(command: str) -> str | None:
@@ -158,11 +160,13 @@ class DiskInventorySyncSudoGrantContractTests(unittest.IsolatedAsyncioTestCase):
     def test_grants_are_exact_argument_entries(self) -> None:
         for grant in (*CORE_MIDCLT_DISK_SYNC_SUDO_COMMANDS, *SCALE_MIDCLT_DISK_SYNC_SUDO_COMMANDS):
             tokens = shlex.split(grant)
-            self.assertEqual(tokens[1], "call", grant)
-            self.assertIn(tokens[2], {"disk.multipath_sync", "disk.sync_all", "core.get_jobs"}, grant)
-            if tokens[2] == "core.get_jobs":
-                self.assertEqual(tokens[3:], ["*"], grant)
+            if tokens[1].startswith("^call"):
+                self.assertIn(r"^call core\.get_jobs", grant)
+                self.assertTrue(grant.endswith("$"), grant)
+                self.assertNotIn(" *", grant)
             else:
+                self.assertEqual(tokens[1], "call", grant)
+                self.assertIn(tokens[2], {"disk.multipath_sync", "disk.sync_all"}, grant)
                 self.assertEqual(len(tokens), 3, f"{grant} must not accept extra arguments")
         # A wildcard that would admit other midclt methods must never appear.
         for grants in SUDO_COMMANDS_BY_PLATFORM.values():
@@ -170,6 +174,19 @@ class DiskInventorySyncSudoGrantContractTests(unittest.IsolatedAsyncioTestCase):
                 if "midclt" in grant:
                     self.assertNotIn("call *", grant)
                     self.assertFalse(grant.endswith("midclt *"), grant)
+
+    def test_job_poll_grants_reject_arbitrary_filters_and_trailing_arguments(self) -> None:
+        for grants, midclt in (
+            (CORE_MIDCLT_DISK_SYNC_SUDO_COMMANDS, "/usr/local/bin/midclt"),
+            (SCALE_MIDCLT_DISK_SYNC_SUDO_COMMANDS, "/usr/bin/midclt"),
+        ):
+            with self.subTest(midclt=midclt):
+                expected = f'{midclt} call core.get_jobs \'[["id","=",268071]]\''
+                arbitrary_filter = f'{midclt} call core.get_jobs \'[["method","=","pool.export"]]\''
+                trailing_argument = expected + " synthetic-extra-argument"
+                self.assertTrue(any(sudoers_grant_matches(grant, expected) for grant in grants))
+                self.assertFalse(any(sudoers_grant_matches(grant, arbitrary_filter) for grant in grants))
+                self.assertFalse(any(sudoers_grant_matches(grant, trailing_argument) for grant in grants))
 
     def test_sudoers_files_render_the_midclt_grants(self) -> None:
         core = ServiceAccountBootstrapService._build_sudoers_content("jbodmap", "core")

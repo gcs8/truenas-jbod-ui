@@ -185,10 +185,10 @@ jbodmap ALL=(root) NOPASSWD: /usr/bin/tail -n 4000 /var/log/messages
 SCALE example:
 
 ```text
-jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses -p aes /dev/sg*
-jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses -p ec /dev/sg*
-jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg*
-jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses --dev-slot-num=* --clear=ident /dev/sg*
+jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses ^-p aes /dev/sg[0-9]+$
+jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses ^-p ec /dev/sg[0-9]+$
+jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses ^--dev-slot-num=[0-9]+ --set=ident /dev/sg[0-9]+$
+jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses ^--dev-slot-num=[0-9]+ --clear=ident /dev/sg[0-9]+$
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x -j /dev/*
 ```
 

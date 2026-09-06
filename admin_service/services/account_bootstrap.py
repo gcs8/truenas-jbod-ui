@@ -11,7 +11,7 @@ from cryptography.hazmat.primitives import serialization
 from app.config import Settings, SSHConfig, _derive_runtime_layout_paths, normalize_text
 from app.models.domain import SystemSetupBootstrapRequest
 from app.services.ssh_key_manager import SSHKeyManager
-from app.services.ssh_probe import SSHProbe
+from app.services.ssh_probe import SSHProbe, redact_ssh_command
 
 
 PUBLIC_KEY_PREFIXES = ("ssh-ed25519 ", "ssh-rsa ", "ecdsa-", "sk-ssh-")
@@ -47,11 +47,11 @@ CORE_MESSAGES_SUDO_COMMANDS = (
 # devices. They never appear in an operator's saved command list, so the bootstrap
 # has to grant them in both the seeded and the supplemental flow (#332, #335).
 LINUX_SG_SES_SUDO_COMMANDS = (
-    "/usr/bin/sg_ses -p aes /dev/sg*",
-    "/usr/bin/sg_ses -p ec /dev/sg*",
-    "/usr/bin/sg_ses --join --filter /dev/sg*",
-    "/usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg*",
-    "/usr/bin/sg_ses --dev-slot-num=* --clear=ident /dev/sg*",
+    "/usr/bin/sg_ses ^-p aes /dev/sg[0-9]+$",
+    "/usr/bin/sg_ses ^-p ec /dev/sg[0-9]+$",
+    "/usr/bin/sg_ses ^--join --filter /dev/sg[0-9]+$",
+    "/usr/bin/sg_ses ^--dev-slot-num=[0-9]+ --set=ident /dev/sg[0-9]+$",
+    "/usr/bin/sg_ses ^--dev-slot-num=[0-9]+ --clear=ident /dev/sg[0-9]+$",
 )
 SMARTCTL_SUDO_COMMANDS = (
     "/usr/sbin/smartctl -x -j *",
@@ -79,16 +79,16 @@ CORE_MPRUTIL_SHOW_COMMANDS = {
 }
 CORE_MPRUTIL_UNIT_SHOW_COMMANDS = CORE_MPRUTIL_SHOW_COMMANDS - {"adapters"}
 # TrueNAS middleware calls behind the main UI's disk inventory sync action (#357).
-# Exact-argument entries: the app never runs any other midclt method, and the
-# core.get_jobs wildcard only admits the job filter argument the poll loop builds.
+# Anchored argument regexes admit only the numeric-ID filter built by the poll
+# loop; sudo globs can otherwise consume whitespace and additional arguments.
 CORE_MIDCLT_DISK_SYNC_SUDO_COMMANDS = (
     "/usr/local/bin/midclt call disk.multipath_sync",
     "/usr/local/bin/midclt call disk.sync_all",
-    "/usr/local/bin/midclt call core.get_jobs *",
+    r'/usr/local/bin/midclt ^call core\.get_jobs \[\[\"id\"\,\"=\"\,[0-9]+\]\]$',
 )
 SCALE_MIDCLT_DISK_SYNC_SUDO_COMMANDS = (
     "/usr/bin/midclt call disk.sync_all",
-    "/usr/bin/midclt call core.get_jobs *",
+    r'/usr/bin/midclt ^call core\.get_jobs \[\[\"id\"\,\"=\"\,[0-9]+\]\]$',
 )
 SUDO_COMMANDS_BY_PLATFORM: dict[str, tuple[str, ...]] = {
     "core": (
@@ -104,11 +104,7 @@ SUDO_COMMANDS_BY_PLATFORM: dict[str, tuple[str, ...]] = {
         *CORE_MIDCLT_DISK_SYNC_SUDO_COMMANDS,
     ),
     "scale": (
-        "/usr/bin/sg_ses -p aes /dev/sg*",
-        "/usr/bin/sg_ses -p ec /dev/sg*",
-        "/usr/bin/sg_ses --join --filter /dev/sg*",
-        "/usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg*",
-        "/usr/bin/sg_ses --dev-slot-num=* --clear=ident /dev/sg*",
+        *LINUX_SG_SES_SUDO_COMMANDS,
         *SMARTCTL_SUDO_COMMANDS,
         *SCALE_MIDCLT_DISK_SYNC_SUDO_COMMANDS,
     ),
@@ -119,11 +115,7 @@ SUDO_COMMANDS_BY_PLATFORM: dict[str, tuple[str, ...]] = {
         *LINUX_NVME_SUDO_COMMANDS,
     ),
     "quantastor": (
-        "/usr/bin/sg_ses -p aes /dev/sg*",
-        "/usr/bin/sg_ses -p ec /dev/sg*",
-        "/usr/bin/sg_ses --join --filter /dev/sg*",
-        "/usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg*",
-        "/usr/bin/sg_ses --dev-slot-num=* --clear=ident /dev/sg*",
+        *LINUX_SG_SES_SUDO_COMMANDS,
         *SMARTCTL_SUDO_COMMANDS,
     ),
     "esxi": (),
@@ -139,8 +131,8 @@ SUPPLEMENTAL_SUDO_COMMANDS_BY_PLATFORM: dict[str, tuple[str, ...]] = {
         *CORE_MIDCLT_DISK_SYNC_SUDO_COMMANDS,
     ),
     "scale": (
-        "/usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg*",
-        "/usr/bin/sg_ses --dev-slot-num=* --clear=ident /dev/sg*",
+        LINUX_SG_SES_SUDO_COMMANDS[3],
+        LINUX_SG_SES_SUDO_COMMANDS[4],
         *SMARTCTL_SUDO_COMMANDS,
         *SCALE_MIDCLT_DISK_SYNC_SUDO_COMMANDS,
     ),
@@ -150,8 +142,8 @@ SUPPLEMENTAL_SUDO_COMMANDS_BY_PLATFORM: dict[str, tuple[str, ...]] = {
         *LINUX_NVME_SUDO_COMMANDS,
     ),
     "quantastor": (
-        "/usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg*",
-        "/usr/bin/sg_ses --dev-slot-num=* --clear=ident /dev/sg*",
+        LINUX_SG_SES_SUDO_COMMANDS[3],
+        LINUX_SG_SES_SUDO_COMMANDS[4],
         *SMARTCTL_SUDO_COMMANDS,
     ),
     "esxi": (),
@@ -453,6 +445,10 @@ class ServiceAccountBootstrapService:
                 ),
                 "content": "# Sudo rules disabled for this bootstrap run.\n",
             }
+        if any(cls._sudo_command_contains_credentials(command) for command in requested_commands or ()):
+            raise ValueError(
+                "Sudoers preview cannot display commands with credential-shaped arguments."
+            )
         if platform == "core":
             return {
                 "enabled": True,
@@ -575,7 +571,10 @@ class ServiceAccountBootstrapService:
         executable_name = Path(executable).name.lower()
 
         if executable_name == "sg_ses":
-            target_device = next((arg for arg in reversed(args) if arg.startswith("/dev/sg")), None)
+            target_device = next(
+                (arg for arg in reversed(args) if re.fullmatch(r"/dev/sg[0-9]+", arg)),
+                None,
+            )
             page_name = None
             for index, arg in enumerate(args):
                 if arg == "-p" and index + 1 < len(args):
@@ -587,13 +586,13 @@ class ServiceAccountBootstrapService:
                     page_name = arg.lower()
                     break
             if target_device and page_name:
-                return f"{executable} -p {page_name} /dev/sg*"
+                return f"{executable} ^-p {page_name} /dev/sg[0-9]+$"
             if target_device and "--join" in args and "--filter" in args:
-                return f"{executable} --join --filter /dev/sg*"
+                return f"{executable} ^--join --filter /dev/sg[0-9]+$"
             if target_device and any(arg == "--set=ident" for arg in args):
-                return f"{executable} --dev-slot-num=* --set=ident /dev/sg*"
+                return f"{executable} ^--dev-slot-num=[0-9]+ --set=ident /dev/sg[0-9]+$"
             if target_device and any(arg == "--clear=ident" for arg in args):
-                return f"{executable} --dev-slot-num=* --clear=ident /dev/sg*"
+                return f"{executable} ^--dev-slot-num=[0-9]+ --clear=ident /dev/sg[0-9]+$"
 
         if executable_name == "sesutil" and len(args) >= 5 and args[:2] == ["locate", "-u"]:
             state = args[-1].lower()
@@ -623,6 +622,15 @@ class ServiceAccountBootstrapService:
                 return f"{executable} -n 4000 /var/log/messages"
 
         return shlex.join([executable, *args])
+
+    @staticmethod
+    def _sudo_command_contains_credentials(command: str) -> bool:
+        raw_command = str(command or "")
+        redacted_command = redact_ssh_command(raw_command)
+        try:
+            return shlex.split(redacted_command) != shlex.split(raw_command)
+        except ValueError:
+            return redacted_command != raw_command
 
     @staticmethod
     def _dedupe_commands(commands: tuple[str, ...] | list[str]) -> tuple[str, ...]:

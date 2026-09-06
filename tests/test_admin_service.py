@@ -3083,9 +3083,9 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertEqual(payload["filename"], "truenas-jbod-ui-jbodmap")
         self.assertIn("/usr/local/etc/sudoers.d/truenas-jbod-ui-jbodmap", payload["path_candidates"])
         self.assertIn("Cmnd_Alias JBODMAP_SCALE_CMDS", payload["content"])
-        self.assertIn("/usr/bin/sg_ses -p aes /dev/sg*", payload["content"])
-        self.assertIn("/usr/bin/sg_ses -p ec /dev/sg*", payload["content"])
-        self.assertIn("/usr/bin/sg_ses --join --filter /dev/sg*", payload["content"])
+        self.assertIn("/usr/bin/sg_ses ^-p aes /dev/sg[0-9]+$", payload["content"])
+        self.assertIn("/usr/bin/sg_ses ^-p ec /dev/sg[0-9]+$", payload["content"])
+        self.assertIn("/usr/bin/sg_ses ^--join --filter /dev/sg[0-9]+$", payload["content"])
         self.assertNotIn("/usr/sbin/zpool status -gP", payload["content"])
 
     def test_sudoers_preview_route_includes_core_mprutil_topology_rules(self) -> None:
@@ -3211,6 +3211,43 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertNotIn("/usr/sbin/zpool status -gP", payload["content"])
         # The platform default set must not replace the operator's saved list.
         self.assertNotIn("/usr/bin/sg_ses -p aes /dev/sg*", payload["content"])
+
+    def test_sudoers_preview_route_rejects_credential_shaped_saved_commands(self) -> None:
+        marker = "synthetic-preview-credential-marker"
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/system-setup/sudoers-preview")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings(
+                config_file=str(Path(temp_dir) / "config" / "config.yaml"),
+                systems=[
+                    SystemConfig(
+                        id="saved-scale",
+                        truenas=TrueNASConfig(host="https://saved.example.test", platform="scale"),
+                        ssh=SSHConfig(
+                            enabled=True,
+                            host="saved.example.test",
+                            user="jbodmap",
+                            commands=[f"sudo -n /usr/bin/synthetic-tool --token {marker}"],
+                        ),
+                    )
+                ],
+            )
+            with patch("admin_service.main.reload_app_settings", return_value=settings):
+                with self.assertRaises(HTTPException) as context:
+                    asyncio.run(
+                        route.endpoint(
+                            SystemSetupSudoPreviewRequest(
+                                platform="scale",
+                                service_user="jbodmap",
+                                install_sudo_rules=True,
+                                sudo_commands=[],
+                                ssh_commands_source_system_id="saved-scale",
+                            )
+                        )
+                    )
+
+        self.assertEqual(context.exception.status_code, 400)
+        self.assertNotIn(marker, str(context.exception.detail))
+        self.assertIn("credential-shaped", str(context.exception.detail))
 
     def test_sudoers_preview_route_rejects_an_unknown_saved_command_source(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/system-setup/sudoers-preview")
