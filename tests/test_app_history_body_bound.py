@@ -19,6 +19,7 @@ class MainHistoryScopesBodyBoundTests(unittest.IsolatedAsyncioTestCase):
         chunks: list[bytes],
         *,
         content_length: int | None = None,
+        content_type: bytes | None = b"application/json",
     ) -> tuple[int, dict[str, object], int]:
         messages = deque(
             {
@@ -41,7 +42,9 @@ class MainHistoryScopesBodyBoundTests(unittest.IsolatedAsyncioTestCase):
         async def send(message: dict[str, object]) -> None:
             response_messages.append(message)
 
-        headers = [(b"content-type", b"application/json")]
+        headers: list[tuple[bytes, bytes]] = []
+        if content_type is not None:
+            headers.append((b"content-type", content_type))
         if content_length is not None:
             headers.append((b"content-length", str(content_length).encode("ascii")))
         scope = {
@@ -177,6 +180,86 @@ class MainHistoryScopesBodyBoundTests(unittest.IsolatedAsyncioTestCase):
             event_limit=request_document["event_limit"],
             metric_limit=request_document["metric_limit"],
         )
+
+    async def test_non_json_media_types_are_rejected_before_receive_or_backend_work(self) -> None:
+        body = json.dumps(
+            {
+                "scopes": [
+                    {
+                        "system_id": "synthetic",
+                        "enclosure_id": "front",
+                        "slots": [0],
+                    }
+                ],
+                "metrics": ["temperature_c"],
+                "since": "2026-01-01T00:00:00+00:00",
+                "event_limit": 0,
+                "metric_limit": 24,
+            }
+        ).encode("utf-8")
+
+        for content_type in (b"text/plain", b"application/octet-stream", None):
+            backend = AsyncMock()
+            backend.get_scopes_history.return_value = {"ok": True}
+            with self.subTest(content_type=content_type), patch.object(
+                app_main,
+                "get_history_backend",
+                return_value=backend,
+            ):
+                status, payload, receive_calls = await self._post(
+                    [body],
+                    content_length=len(body),
+                    content_type=content_type,
+                )
+
+            self.assertEqual(status, 415)
+            self.assertEqual(
+                payload,
+                {
+                    "ok": False,
+                    "detail": "History request Content-Type must be application/json or application/*+json.",
+                },
+            )
+            self.assertEqual(receive_calls, 0)
+            backend.get_scopes_history.assert_not_awaited()
+
+    async def test_json_compatible_media_types_reach_backend(self) -> None:
+        request_document = {
+            "scopes": [
+                {
+                    "system_id": "synthetic",
+                    "enclosure_id": "front",
+                    "slots": [0],
+                }
+            ],
+            "metrics": ["temperature_c"],
+            "since": "2026-01-01T00:00:00+00:00",
+            "event_limit": 0,
+            "metric_limit": 24,
+        }
+        body = json.dumps(request_document).encode("utf-8")
+
+        for content_type in (
+            b"application/json; charset=utf-8",
+            b"application/vnd.truenas.history+json",
+        ):
+            backend = AsyncMock()
+            backend.get_scopes_history.return_value = {"ok": True}
+            with self.subTest(content_type=content_type), patch.object(
+                app_main,
+                "get_history_backend",
+                return_value=backend,
+            ):
+                status, payload, receive_calls = await self._post(
+                    [body],
+                    content_length=len(body),
+                    content_type=content_type,
+                )
+
+            self.assertEqual(status, 200)
+            self.assertEqual(payload, {"ok": True})
+            self.assertEqual(receive_calls, 1)
+            backend.get_scopes_history.assert_awaited_once()
 
     async def test_openapi_retains_the_history_scopes_request_contract(self) -> None:
         request_schema = app_main.app.openapi()["paths"]["/api/history/scopes/bundle"]["post"]["requestBody"][

@@ -4,6 +4,7 @@ from __future__ import annotations
 # pyright: reportUndefinedVariable=false
 # ruff: noqa: F821
 
+import email.message
 import json
 from types import ModuleType
 from typing import Any
@@ -17,6 +18,17 @@ from history_service.refresh_auth import read_limited_request_body
 
 
 MAX_HISTORY_SCOPES_REQUEST_BYTES = 64 * 1024
+
+
+def _is_json_media_type(content_type: str | None) -> bool:
+    if not content_type:
+        return False
+    message = email.message.Message()
+    message["content-type"] = content_type
+    if message.get_content_maintype() != "application":
+        return False
+    subtype = message.get_content_subtype()
+    return subtype == "json" or subtype.endswith("+json")
 
 
 def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
@@ -722,6 +734,11 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
         },
     )
     async def get_history_scopes_bundle(request: Request) -> JSONResponse:
+        if not _is_json_media_type(request.headers.get("content-type")):
+            raise HTTPException(
+                status_code=415,
+                detail="History request Content-Type must be application/json or application/*+json.",
+            )
         body = await read_limited_request_body(
             request,
             limit=MAX_HISTORY_SCOPES_REQUEST_BYTES,
