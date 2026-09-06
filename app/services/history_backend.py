@@ -14,6 +14,7 @@ from typing import Any
 from app.config import HistoryConfig
 from app.models.domain import utcnow
 from app.request_context import request_id_headers
+from app.services.history_status import project_public_collector_status
 from history_service.operation_bounds import (
     ALLOWED_HISTORY_METRICS,
     HistoryBudgetExceeded,
@@ -89,8 +90,11 @@ class HistoryBackendClient:
                 "collector": {},
                 "scopes": [],
             }
-        collector = dict(payload.get("collector", {})) if isinstance(payload.get("collector"), dict) else {}
-        if payload.get("status") == "degraded" or collector.get("last_error"):
+        collector = project_public_collector_status(
+            payload.get("collector"),
+            last_error_detail=HISTORY_BACKEND_DEGRADED_DETAIL,
+        )
+        if payload.get("status") == "degraded" and not collector.get("last_error"):
             collector["last_error"] = HISTORY_BACKEND_DEGRADED_DETAIL
         return {
             "configured": True,

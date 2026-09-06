@@ -88,8 +88,6 @@
       ? `${collector.collection_kind || "background"} for ${formatDuration(collector.collection_elapsed_seconds)}: ${collector.collection_activity || "working"}`
       : "not running";
     setText("status-current-collection", currentCollection);
-    setText("status-source-base-url", statusValue(collector.source_base_url, "unknown"));
-    setText("status-sqlite-path", statusValue(collector.sqlite_path, "unknown"));
     setText("status-last-inventory-at", statusValue(collector.last_inventory_at));
     setText("status-last-fast-metrics-at", statusValue(collector.last_fast_metrics_at));
     setText("status-last-slow-metrics-at", statusValue(collector.last_slow_metrics_at));

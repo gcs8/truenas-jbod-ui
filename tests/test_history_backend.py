@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import unittest
 import urllib.error
 from typing import Any
@@ -10,10 +11,43 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from app.config import ENV_OVERRIDES, HistoryConfig
 from app.request_context import request_context
 from app.services.history_backend import (
+    HISTORY_BACKEND_DEGRADED_DETAIL,
     HISTORY_BACKEND_FAILURE_DETAIL,
     HistoryBackendClient,
     HistoryBackendResponseError,
     HistoryBackendUnavailableError,
+)
+from app.services.history_status import (
+    PUBLIC_COLLECTOR_STATUS_FIELDS,
+    project_public_collector_status,
+)
+
+
+EXPECTED_PUBLIC_COLLECTOR_STATUS_FIELDS = (
+    "collector_running",
+    "collection_running",
+    "collection_kind",
+    "collection_activity",
+    "collection_elapsed_seconds",
+    "last_collection_inventory_forced",
+    "last_collection_duration_seconds",
+    "last_background_overrun_seconds",
+    "background_consecutive_failures",
+    "background_backoff_until",
+    "background_backoff_seconds_remaining",
+    "next_collection_at",
+    "last_inventory_at",
+    "last_fast_metrics_at",
+    "last_slow_metrics_at",
+    "last_success_at",
+    "last_completed_at",
+    "last_backup_at",
+    "last_retention_at",
+    "last_retention_duration_seconds",
+    "last_retention_rows_removed",
+    "last_retention_has_more",
+    "last_retention_error",
+    "last_error",
 )
 
 
@@ -22,6 +56,64 @@ class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
         "raw transport failure token=secret password=secret "
         "url=https://history.invalid/private payload={'credential': 'secret'} path=/srv/private/history.db"
     )
+
+    def test_public_collector_status_uses_exact_allowlist(self) -> None:
+        status: dict[str, Any] = {
+            field: f"approved-{index}"
+            for index, field in enumerate(EXPECTED_PUBLIC_COLLECTOR_STATUS_FIELDS)
+        }
+        status.update(
+            {
+                "last_error": None,
+                "future_internal_metadata": "status-leak-ZXQ9",
+                "source_base_url": "https://collector.status-leak-ZXQ9.example.test",
+                "sqlite_path": "/synthetic/private/status-leak-ZXQ9/history.db",
+                "collection_stage_timings": [
+                    {"stage": "internal", "error": "status-leak-ZXQ9"}
+                ],
+                "poll_interval_seconds": "status-leak-ZXQ9",
+                "failure_backoff_max_seconds": "status-leak-ZXQ9",
+                "last_scope_count": "status-leak-ZXQ9",
+                "last_smart_failure_evidence_disks": "status-leak-ZXQ9",
+                "last_max_temperature_celsius": "status-leak-ZXQ9",
+                "last_retention_metric_samples_removed": "status-leak-ZXQ9",
+            }
+        )
+
+        projected = project_public_collector_status(
+            status,
+            last_error_detail="Stable public collector detail.",
+        )
+
+        self.assertEqual(PUBLIC_COLLECTOR_STATUS_FIELDS, EXPECTED_PUBLIC_COLLECTOR_STATUS_FIELDS)
+        self.assertEqual(
+            projected,
+            {field: status[field] for field in EXPECTED_PUBLIC_COLLECTOR_STATUS_FIELDS},
+        )
+        self.assertNotIn("status-leak-ZXQ9", json.dumps(projected))
+
+    def test_public_collector_status_replaces_raw_last_error(self) -> None:
+        projected = project_public_collector_status(
+            {"collector_running": True, "last_error": "status-leak-ZXQ9"},
+            last_error_detail="Stable public collector detail.",
+        )
+
+        self.assertEqual(
+            projected,
+            {"collector_running": True, "last_error": "Stable public collector detail."},
+        )
+        self.assertNotIn("status-leak-ZXQ9", json.dumps(projected))
+
+    def test_public_collector_status_rejects_non_mapping_input(self) -> None:
+        for malformed in ([{"collector_running": True}], "status-leak-ZXQ9", None):
+            with self.subTest(malformed=malformed):
+                self.assertEqual(
+                    project_public_collector_status(
+                        malformed,
+                        last_error_detail="Stable public collector detail.",
+                    ),
+                    {},
+                )
 
     def assert_single_safe_warning(self, captured: Any, expected: str) -> None:
         self.assertEqual(
@@ -95,6 +187,85 @@ class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["counts"], {})
         self.assertEqual(payload["collector"], {})
         self.assertEqual(payload["scopes"], [])
+
+    async def test_get_status_uses_explicit_public_collector_allowlist(self) -> None:
+        client = HistoryBackendClient(
+            HistoryConfig(service_url="https://history.example.test", timeout_seconds=10)
+        )
+        collector: dict[str, Any] = {
+            "collector_running": True,
+            "last_success_at": "2026-09-06T10:00:00+00:00",
+            "last_completed_at": "2026-09-06T09:59:00+00:00",
+            "source_base_url": "https://collector.status-leak-ZXQ9.example.test",
+            "sqlite_path": "/synthetic/private/status-leak-ZXQ9/history.db",
+            "collection_stage_timings": [{"error": "status-leak-ZXQ9"}],
+            "future_internal_metadata": "status-leak-ZXQ9",
+        }
+
+        with patch.object(
+            client,
+            "_fetch_json",
+            AsyncMock(return_value={"status": "ok", "collector": collector}),
+        ):
+            payload = await client.get_status()
+
+        self.assertEqual(
+            payload["collector"],
+            {
+                "collector_running": True,
+                "last_success_at": "2026-09-06T10:00:00+00:00",
+                "last_completed_at": "2026-09-06T09:59:00+00:00",
+            },
+        )
+        self.assertNotIn("status-leak-ZXQ9", json.dumps(payload))
+
+    async def test_get_status_degraded_without_collector_error_adds_only_stable_error(self) -> None:
+        client = HistoryBackendClient(
+            HistoryConfig(service_url="https://history.example.test", timeout_seconds=10)
+        )
+
+        with patch.object(
+            client,
+            "_fetch_json",
+            AsyncMock(
+                return_value={
+                    "status": "degraded",
+                    "collector": {
+                        "last_success_at": "2026-09-06T10:00:00+00:00",
+                        "future_internal_metadata": "status-leak-ZXQ9",
+                    },
+                }
+            ),
+        ):
+            payload = await client.get_status()
+
+        self.assertEqual(payload["detail"], HISTORY_BACKEND_DEGRADED_DETAIL)
+        self.assertEqual(
+            payload["collector"],
+            {
+                "last_success_at": "2026-09-06T10:00:00+00:00",
+                "last_error": HISTORY_BACKEND_DEGRADED_DETAIL,
+            },
+        )
+        self.assertNotIn("status-leak-ZXQ9", json.dumps(payload))
+
+    async def test_get_status_malformed_collector_fails_closed(self) -> None:
+        client = HistoryBackendClient(
+            HistoryConfig(service_url="https://history.example.test", timeout_seconds=10)
+        )
+
+        for malformed in ([{"collector_running": True}], "status-leak-ZXQ9", None):
+            with (
+                self.subTest(malformed=malformed),
+                patch.object(
+                    client,
+                    "_fetch_json",
+                    AsyncMock(return_value={"status": "ok", "collector": malformed}),
+                ),
+            ):
+                payload = await client.get_status()
+                self.assertEqual(payload["collector"], {})
+                self.assertNotIn("status-leak-ZXQ9", json.dumps(payload))
 
     async def test_get_status_returns_available_payload_when_backend_responds(self) -> None:
         client = HistoryBackendClient(

@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 from starlette.requests import Request
 
 from app.request_context import request_context
+from app.services.history_status import PUBLIC_COLLECTOR_STATUS_FIELDS
 from history_service import main as history_main
 from history_service import migration_lock
 from history_service import store as history_store
@@ -493,6 +494,69 @@ class HistoryDashboardRouteTests(unittest.TestCase):
             )
         return response.body.decode("utf-8")
 
+    @staticmethod
+    def _leaking_collector_status() -> dict[str, object]:
+        return {
+            "collector_running": True,
+            "collection_running": False,
+            "last_success_at": "2026-09-06T10:00:00+00:00",
+            "last_completed_at": "2026-09-06T09:59:00+00:00",
+            "last_error": None,
+            "source_base_url": "https://collector.status-leak-ZXQ9.example.test",
+            "sqlite_path": "/synthetic/private/status-leak-ZXQ9/history.db",
+            "collection_stage_timings": [
+                {"stage": "internal", "error": "status-leak-ZXQ9"}
+            ],
+            "future_internal_metadata": "status-leak-ZXQ9",
+        }
+
+    def test_history_public_routes_drop_distinctive_collector_metadata(self) -> None:
+        status = self._leaking_collector_status()
+        expected = {
+            key: status[key]
+            for key in (
+                "collector_running",
+                "collection_running",
+                "last_success_at",
+                "last_completed_at",
+                "last_error",
+            )
+        }
+        patches = (
+            patch.object(history_main.collector, "status", return_value=status),
+            patch.object(history_main.store, "estimated_counts", return_value={"tracked_slots": 0}),
+            patch.object(history_main.store, "list_scopes", return_value=[]),
+            patch.object(history_main.store, "database_size_bytes", return_value=4096),
+        )
+        with patches[0], patches[1], patches[2], patches[3]:
+            dashboard = asyncio.run(
+                next(route for route in history_main.app.routes if route.path == "/").endpoint(
+                    request=self._request(),
+                    exact_counts=False,
+                )
+            )
+            health = asyncio.run(history_main.healthz())
+            overview = asyncio.run(history_main.overview(exact_counts=False))
+
+        dashboard_bytes = dashboard.body
+        match = re.search(
+            rb'<script id="history-dashboard-bootstrap" type="application/json">\s*(.*?)\s*</script>',
+            dashboard_bytes,
+            flags=re.DOTALL,
+        )
+        self.assertIsNotNone(match)
+        self.assertEqual(json.loads(match.group(1)), expected)
+        health_payload = json.loads(health.body)
+        self.assertEqual(health_payload["collector"], expected)
+        self.assertEqual(
+            set(health_payload),
+            {"status", "collector", "database_size_bytes", *expected},
+        )
+        self.assertEqual(overview["collector"], expected)
+        for serialized in (dashboard_bytes, health.body, json.dumps(overview).encode()):
+            self.assertNotIn(b"status-leak-ZXQ9", serialized)
+        self.assertEqual(set(expected), set(PUBLIC_COLLECTOR_STATUS_FIELDS) & set(status))
+
     def test_dashboard_uses_template_and_gated_static_assets(self) -> None:
         service_dir = Path(history_main.__file__).resolve().parent
         template_path = service_dir / "templates" / "dashboard.html"
@@ -644,8 +708,8 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         hostile_text = "</script><script>alert('&')</script>" + chr(0x2028) + chr(0x2029)
         status = {
             "collector_running": True,
-            "source_base_url": hostile_text,
             "collection_activity": hostile_text,
+            "future_internal_metadata": "status-leak-ZXQ9",
         }
         counts = {
             "tracked_slots": 1,
@@ -678,8 +742,12 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         self.assertNotIn(chr(0x2029), bootstrap_text)
         self.assertEqual(
             json.loads(bootstrap_text),
-            status,
+            {
+                "collector_running": True,
+                "collection_activity": hostile_text,
+            },
         )
+        self.assertNotIn("status-leak-ZXQ9", markup)
         self.assertNotIn(hostile_text, markup)
         self.assertIn("&lt;/script&gt;&lt;script&gt;alert", markup)
 
@@ -708,6 +776,51 @@ class HistoryDashboardRouteTests(unittest.TestCase):
             payload = asyncio.run(history_main.overview(exact_counts=False))
 
         self.assertTrue(payload["counts_exact"])
+
+    def test_history_refresh_responses_keep_allowlist_on_success_and_conflict(self) -> None:
+        route = next(route for route in history_main.app.routes if route.path == "/api/history/refresh")
+        status = self._leaking_collector_status()
+        expected = {
+            key: status[key]
+            for key in (
+                "collector_running",
+                "collection_running",
+                "last_success_at",
+                "last_completed_at",
+                "last_error",
+            )
+        }
+
+        with (
+            patch.object(type(history_main.collector), "collection_running", new_callable=PropertyMock, return_value=False),
+            patch.object(history_main.collector, "run_once", new_callable=AsyncMock),
+            patch.object(history_main.collector, "status", return_value=status),
+            patch.object(history_main.store, "estimated_counts", return_value={"tracked_slots": 0}),
+            patch.object(history_main.store, "list_scopes", return_value=[]),
+            patch.object(history_main.store, "database_size_bytes", return_value=4096),
+        ):
+            success = asyncio.run(route.endpoint(request=self._refresh_request("fast")))
+
+        self.assertEqual(success["collector"], expected)
+        self.assertNotIn("status-leak-ZXQ9", json.dumps(success))
+
+        with (
+            patch.object(type(history_main.collector), "collection_running", new_callable=PropertyMock, return_value=True),
+            patch.object(history_main.collector, "status", return_value=status),
+        ):
+            conflict = asyncio.run(route.endpoint(request=self._refresh_request("full")))
+
+        self.assertEqual(conflict.status_code, 409)
+        conflict_payload = json.loads(conflict.body)
+        self.assertEqual(
+            conflict_payload,
+            {
+                "ok": False,
+                "mode": "full",
+                "detail": "History collection already running.",
+            },
+        )
+        self.assertNotIn("status-leak-ZXQ9", conflict.body.decode())
 
     def test_history_refresh_endpoint_forces_fast_collection(self) -> None:
         route = next(route for route in history_main.app.routes if route.path == "/api/history/refresh")
@@ -766,6 +879,10 @@ class HistoryDashboardRouteTests(unittest.TestCase):
                 return_value={
                     "collector_running": True,
                     "last_error": "POST http://enclosure-ui:8000/api/slots/smart-batch timed out after 45s",
+                    "source_base_url": "https://collector.status-leak-ZXQ9.example.test",
+                    "sqlite_path": "/synthetic/private/status-leak-ZXQ9/history.db",
+                    "collection_stage_timings": [{"error": "status-leak-ZXQ9"}],
+                    "future_internal_metadata": "status-leak-ZXQ9",
                 },
             ),
             patch.object(history_main.store, "estimated_counts", return_value={"tracked_slots": 0}),
@@ -785,7 +902,15 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["mode"], "full")
         self.assertEqual(payload["detail"], "History full refresh failed; see service logs.")
+        self.assertEqual(
+            payload["collector"],
+            {
+                "collector_running": True,
+                "last_error": "History full refresh failed; see service logs.",
+            },
+        )
         self.assertNotIn("timed out after 45s", json.dumps(payload))
+        self.assertNotIn("status-leak-ZXQ9", json.dumps(payload))
         self.assertFalse(payload["counts_exact"])
 
     def test_history_refresh_endpoint_reports_existing_collection_as_conflict(self) -> None:

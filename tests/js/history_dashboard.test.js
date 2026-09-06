@@ -8,6 +8,8 @@ const vm = require("node:vm");
 
 const SCRIPT_PATH = path.resolve(__dirname, "../../history_service/static/dashboard.js");
 const SOURCE = fs.existsSync(SCRIPT_PATH) ? fs.readFileSync(SCRIPT_PATH, "utf8") : "";
+const TEMPLATE_PATH = path.resolve(__dirname, "../../history_service/templates/dashboard.html");
+const TEMPLATE_SOURCE = fs.existsSync(TEMPLATE_PATH) ? fs.readFileSync(TEMPLATE_PATH, "utf8") : "";
 
 function functionSource(name) {
   const patterns = [`async function ${name}(`, `function ${name}(`];
@@ -97,7 +99,7 @@ test("dashboard formatters preserve count, byte, duration, and status labels", (
 });
 
 test("dashboard reads the script-safe JSON bootstrap block", () => {
-  const payload = { collector: { source_base_url: "</script>" }, counts: { tracked_slots: 1 } };
+  const payload = { collector: { collection_activity: "</script>" }, counts: { tracked_slots: 1 } };
   const { readInitialOverview } = loadFunctions(["readInitialOverview"], {
     document: {
       getElementById(id) {
@@ -108,6 +110,25 @@ test("dashboard reads the script-safe JSON bootstrap block", () => {
   });
 
   assert.deepEqual(readInitialOverview(), payload);
+});
+
+test("dashboard omits collector locations while retaining approved status updates", () => {
+  const publicSources = `${TEMPLATE_SOURCE}\n${SOURCE}`;
+  for (const forbidden of [
+    "status-source-base-url",
+    "status-sqlite-path",
+    ".source_base_url",
+    ".sqlite_path",
+  ]) {
+    assert.ok(!publicSources.includes(forbidden), `${forbidden} must not remain in dashboard sources`);
+  }
+  assert.match(SOURCE, /collector\.last_inventory_at/);
+  assert.match(SOURCE, /collector\.last_fast_metrics_at/);
+  assert.match(SOURCE, /collector\.last_slow_metrics_at/);
+  assert.match(SOURCE, /collector\.last_error/);
+  assert.match(TEMPLATE_SOURCE, /status-last-inventory-at/);
+  assert.match(TEMPLATE_SOURCE, /status-last-error/);
+  assert.match(TEMPLATE_SOURCE, /db-size-value/);
 });
 
 test("dashboard does not repaint the server-rendered overview during bootstrap", () => {

@@ -8,6 +8,8 @@ from types import ModuleType
 from typing import Any
 
 from app.route_compat import MainModuleAPIRouter
+from app.services.history_backend import HISTORY_BACKEND_DEGRADED_DETAIL
+from app.services.history_status import project_public_collector_status
 
 
 def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
@@ -670,7 +672,16 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
     @router.get("/api/history/status")
     async def get_history_status() -> JSONResponse:
         history_backend = get_history_backend()
-        return JSONResponse(await history_backend.get_status())
+        payload = await history_backend.get_status()
+        return JSONResponse(
+            {
+                **payload,
+                "collector": project_public_collector_status(
+                    payload.get("collector"),
+                    last_error_detail=HISTORY_BACKEND_DEGRADED_DETAIL,
+                ),
+            }
+        )
 
     @router.post(
         "/api/history/refresh",

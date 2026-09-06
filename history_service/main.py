@@ -20,6 +20,7 @@ from app import __version__
 from app.logging_config import configure_service_logging
 from app.metrics import install_metrics
 from app.script_json import register_script_json_filters
+from app.services.history_status import project_public_collector_status
 from app.services.release_status import ReleaseStatusService
 from history_service.collector import HistoryCollectionAlreadyRunning, HistoryCollector
 from history_service.config import HistorySettings, get_history_settings
@@ -217,14 +218,14 @@ async def _execute_history_plan(plan: HistoryReadPlan) -> tuple[list[dict[str, o
 
 
 def public_collector_status(
-    status: dict[str, object],
+    status: object,
     *,
     last_error_detail: str = HISTORY_COLLECTOR_ERROR_DETAIL,
 ) -> dict[str, object]:
-    payload = dict(status)
-    if payload.get("last_error"):
-        payload["last_error"] = last_error_detail
-    return payload
+    return project_public_collector_status(
+        status,
+        last_error_detail=last_error_detail,
+    )
 
 
 def safe_http_url(value: object) -> str:

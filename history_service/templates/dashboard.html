@@ -66,8 +66,6 @@
         <h2>Collector Status</h2>
         <p>
           Current collection: <code id="status-current-collection">{{ current_collection_label }}</code><br>
-          Source: <code id="status-source-base-url">{{ status.get('source_base_url') or 'unknown' }}</code><br>
-          Database: <code id="status-sqlite-path">{{ status.get('sqlite_path') or 'unknown' }}</code><br>
           Last inventory pass: <code id="status-last-inventory-at">{{ status.get('last_inventory_at') or 'never' }}</code><br>
           Last fast metrics pass: <code id="status-last-fast-metrics-at">{{ status.get('last_fast_metrics_at') or 'never' }}</code><br>
           Last slow metrics pass: <code id="status-last-slow-metrics-at">{{ status.get('last_slow_metrics_at') or 'never' }}</code><br>

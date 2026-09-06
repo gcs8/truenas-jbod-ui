@@ -149,6 +149,8 @@ them before starting the new images.
 
 ### Security
 
+- Excluded internal endpoint, filesystem-path, and collection-stage metadata
+  from public history collector status responses (#373).
 - Required explicit bearer authorization, trusted-origin validation, atomic
   admission, and a server-owned cooldown for exposed history refreshes; bulk
   history reads now enforce aggregate work and serialized-byte ceilings (#371).

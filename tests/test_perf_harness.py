@@ -295,6 +295,19 @@ class HistoryPerfHarnessTests(unittest.TestCase):
         self.assertEqual(totals["collector.smart.batch"], 41.5)
         self.assertNotIn("collector.bad", totals)
 
+    def test_collector_stage_totals_accepts_public_payload_without_stage_timings(self) -> None:
+        payload = {
+            "collector": {
+                "collector_running": True,
+                "last_success_at": "2026-09-06T10:00:00+00:00",
+            }
+        }
+
+        self.assertEqual(
+            run_history_perf_harness.collector_stage_totals_from_payload(payload),
+            {},
+        )
+
     def test_history_markdown_includes_collector_and_database_snapshot(self) -> None:
         payload = {
             "run_id": "history-1",
