@@ -368,11 +368,118 @@ class HistoryReadAdmissionTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.to_thread(finished.wait)
             self.assertFalse(acquired_while_thread_running)
 
+            for _ in range(100):
+                acquired_after_finish = admission.try_acquire()
+                if acquired_after_finish:
+                    admission.release()
+                    break
+                await asyncio.sleep(0)
+            else:
+                self.fail("Admission was not released after the SQLite worker finished")
+
         with (
             patch.object(history_main, "bulk_history_read_admission", admission),
             patch.object(history_main, "_execute_history_plan", AsyncMock(return_value=([], 0))),
         ):
             self.assertEqual(await history_main._execute_admitted_history_plan(plan), ([], 0))
+
+    async def test_repeated_cancellation_retains_admission_until_worker_finishes(self) -> None:
+        admission = history_main.BulkHistoryReadAdmission(max_concurrency=1)
+        plan = history_main.build_history_read_plan(
+            scopes=[{"system_id": "synthetic", "enclosure_id": "front", "slots": [0]}],
+            metrics=["temperature_c"],
+            since=SINCE,
+            event_limit=0,
+            metric_limit=1,
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+
+        def blocked_store(*_args, **_kwargs):
+            entered.set()
+            release.wait()
+            finished.set()
+            return {}
+
+        with (
+            patch.object(history_main, "bulk_history_read_admission", admission),
+            patch.object(history_main, "store", Mock(list_scope_history=blocked_store)),
+        ):
+            task = asyncio.create_task(history_main._execute_admitted_history_plan(plan))
+            await asyncio.to_thread(entered.wait)
+            try:
+                task.cancel()
+                await asyncio.sleep(0)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+
+                acquired_while_thread_running = admission.try_acquire()
+                if acquired_while_thread_running:
+                    admission.release()
+                self.assertFalse(acquired_while_thread_running)
+            finally:
+                release.set()
+                await asyncio.to_thread(finished.wait)
+
+            for _ in range(100):
+                acquired_after_finish = admission.try_acquire()
+                if acquired_after_finish:
+                    admission.release()
+                    break
+                await asyncio.sleep(0)
+            else:
+                self.fail("Admission was not released after the SQLite worker finished")
+
+
+    async def test_canceled_caller_consumes_late_worker_exception(self) -> None:
+        admission = history_main.BulkHistoryReadAdmission(max_concurrency=1)
+        plan = history_main.build_history_read_plan(
+            scopes=[{"system_id": "synthetic", "enclosure_id": "front", "slots": [0]}],
+            metrics=["temperature_c"],
+            since=SINCE,
+            event_limit=0,
+            metric_limit=1,
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        loop_errors: list[dict[str, object]] = []
+
+        def failing_store(*_args, **_kwargs):
+            entered.set()
+            release.wait()
+            finished.set()
+            raise RuntimeError("synthetic late worker failure")
+
+        loop = asyncio.get_running_loop()
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+        try:
+            with (
+                patch.object(history_main, "bulk_history_read_admission", admission),
+                patch.object(history_main, "store", Mock(list_scope_history=failing_store)),
+            ):
+                task = asyncio.create_task(history_main._execute_admitted_history_plan(plan))
+                await asyncio.to_thread(entered.wait)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                release.set()
+                await asyncio.to_thread(finished.wait)
+                for _ in range(100):
+                    if not history_main.bulk_history_read_operations:
+                        break
+                    await asyncio.sleep(0)
+                else:
+                    self.fail("Failed bulk-history operation remained retained")
+                await asyncio.sleep(0)
+        finally:
+            release.set()
+            loop.set_exception_handler(previous_handler)
+
+        self.assertEqual(loop_errors, [])
 
 
 if __name__ == "__main__":

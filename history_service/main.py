@@ -77,6 +77,7 @@ refresh_admission = ManualRefreshAdmission(
 bulk_history_read_admission = BulkHistoryReadAdmission(
     max_concurrency=MAX_CONCURRENT_BULK_HISTORY_READS,
 )
+bulk_history_read_operations: set[asyncio.Task[tuple[list[dict[str, object]], int]]] = set()
 HISTORY_COLLECTOR_ERROR_DETAIL = "History collector error; see service logs."
 SLOT_HISTORY_METRIC_LIMITS: dict[str, int] = {
     "temperature_c": 96,
@@ -231,17 +232,25 @@ async def _execute_admitted_history_plan(
     admission = bulk_history_read_admission
     if not admission.try_acquire():
         raise HistoryReadBusy(HISTORY_READ_BUSY_DETAIL)
-    operation = asyncio.create_task(_execute_history_plan(plan))
-    try:
-        return await asyncio.shield(operation)
-    except asyncio.CancelledError:
+
+    async def execute_and_release() -> tuple[list[dict[str, object]], int]:
         try:
-            await asyncio.shield(operation)
-        except BaseException:
-            pass
-        raise
-    finally:
-        admission.release()
+            return await _execute_history_plan(plan)
+        finally:
+            admission.release()
+
+    operation = asyncio.create_task(execute_and_release())
+    bulk_history_read_operations.add(operation)
+    operation.add_done_callback(_finish_bulk_history_operation)
+    return await asyncio.shield(operation)
+
+
+def _finish_bulk_history_operation(
+    operation: asyncio.Task[tuple[list[dict[str, object]], int]],
+) -> None:
+    bulk_history_read_operations.discard(operation)
+    if not operation.cancelled():
+        operation.exception()
 
 
 def _history_read_busy_response() -> JSONResponse:
