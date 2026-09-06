@@ -456,10 +456,40 @@ class HistoryReadAdmissionTests(unittest.IsolatedAsyncioTestCase):
         loop = asyncio.get_running_loop()
         previous_handler = loop.get_exception_handler()
         loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+
+        def python314_shield(
+            operation: asyncio.Future[tuple[list[dict[str, object]], int]],
+        ) -> asyncio.Future[tuple[list[dict[str, object]], int]]:
+            outer: asyncio.Future[tuple[list[dict[str, object]], int]] = loop.create_future()
+
+            def finish(inner: asyncio.Future[tuple[list[dict[str, object]], int]]) -> None:
+                if outer.cancelled():
+                    if not inner.cancelled() and inner.exception() is not None:
+                        loop.call_exception_handler(
+                            {
+                                "message": "Future exception was never retrieved",
+                                "exception": inner.exception(),
+                                "future": inner,
+                            }
+                        )
+                    return
+                if inner.cancelled():
+                    outer.cancel()
+                    return
+                exception = inner.exception()
+                if exception is None:
+                    outer.set_result(inner.result())
+                else:
+                    outer.set_exception(exception)
+
+            operation.add_done_callback(finish)
+            return outer
+
         try:
             with (
                 patch.object(history_main, "bulk_history_read_admission", admission),
                 patch.object(history_main, "store", Mock(list_scope_history=failing_store)),
+                patch.object(history_main.asyncio, "shield", side_effect=python314_shield),
             ):
                 task = asyncio.create_task(history_main._execute_admitted_history_plan(plan))
                 await asyncio.to_thread(entered.wait)

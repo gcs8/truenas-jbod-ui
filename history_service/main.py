@@ -242,7 +242,8 @@ async def _execute_admitted_history_plan(
     operation = asyncio.create_task(execute_and_release())
     bulk_history_read_operations.add(operation)
     operation.add_done_callback(_finish_bulk_history_operation)
-    return await asyncio.shield(operation)
+    await asyncio.wait((operation,))
+    return operation.result()
 
 
 def _finish_bulk_history_operation(
