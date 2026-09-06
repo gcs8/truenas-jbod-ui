@@ -6769,6 +6769,126 @@ class HistoryCollectorTests(unittest.TestCase):
         self.assertEqual(collector._pending_topology_changes.get(key), (collector._topology_signature(degraded), 1))
         self.assertEqual(store.list_slot_events(baseline.system_id, baseline.enclosure_id, baseline.slot), [])
 
+    def _assert_omitted_scope_breaks_pending_topology_confirmation(self, failure_kind: str) -> None:
+        failed_system_id = "slow-system" if failure_kind == "system" else "archive-core"
+        failed_enclosure_id = {
+            "system": "enc-b",
+            "enclosure": "enc-b",
+            "storage-view": "storage-view:critical",
+        }[failure_kind]
+        store, collector, baseline = self._topology_history_fixture(
+            system_id=failed_system_id,
+            enclosure_id=failed_enclosure_id,
+            slot=1,
+        )
+        unaffected = replace(
+            baseline,
+            system_id="unaffected-system",
+            system_label="Unaffected System",
+            enclosure_key="enc-z",
+            enclosure_id="enc-z",
+            enclosure_label="Unaffected Shelf",
+            slot=9,
+            slot_label="09",
+            device_name="multipath/disk9",
+            serial="SERIAL-9",
+            gptid="gptid/9",
+            logical_unit_id="sanitized-lun-9",
+            disk_identity_key="disk:9",
+        )
+        degraded = replace(baseline, vdev_name=None, topology_label="The-Repository > data")
+        unaffected_degraded = replace(unaffected, vdev_name=None, topology_label="The-Repository > data")
+        failed_key = collector._slot_state_key(baseline)
+        unaffected_key = collector._slot_state_key(unaffected)
+        store.upsert_slot_state(baseline, "2026-09-06T09:50:00+00:00")
+        store.upsert_slot_state(unaffected, "2026-09-06T09:50:00+00:00")
+        collector._record_slot_changes([degraded], "2026-09-06T09:54:00+00:00")
+        collector._record_slot_changes([unaffected_degraded], "2026-09-06T09:54:00+00:00")
+
+        root_snapshot = {
+            "systems": (
+                [
+                    {"id": "slow-system", "label": "Slow System"},
+                    {"id": "archive-core", "label": "Archive CORE"},
+                ]
+                if failure_kind == "system"
+                else [{"id": "archive-core", "label": "Archive CORE"}]
+            ),
+            "selected_system_id": "archive-core",
+            "selected_system_label": "Archive CORE",
+        }
+        survivor = replace(
+            baseline,
+            system_id="archive-core",
+            system_label="Archive CORE",
+            enclosure_key="enc-a",
+            enclosure_id="enc-a",
+            enclosure_label="Front Shelf",
+            slot=0,
+            slot_label="00",
+            device_name="multipath/disk0",
+            serial="SERIAL-0",
+            gptid="gptid/0",
+            logical_unit_id="sanitized-lun-0",
+            disk_identity_key="disk:0",
+        )
+        survivor_snapshot = {
+            **self._topology_snapshot(survivor),
+            "selected_enclosure_id": "enc-a",
+            "selected_enclosure_label": "Front Shelf",
+            "enclosures": (
+                [{"id": "enc-a", "label": "Front Shelf"}, {"id": "enc-b", "label": "Rear Shelf"}]
+                if failure_kind == "enclosure"
+                else [{"id": "enc-a", "label": "Front Shelf"}]
+            ),
+        }
+
+        async def fetch_inventory(
+            system_id: str | None = None,
+            enclosure_id: str | None = None,
+            *,
+            force: bool = True,
+        ) -> dict[str, object]:
+            if system_id is None:
+                return root_snapshot
+            if failure_kind == "system" and system_id == "slow-system":
+                raise RuntimeError("saved system unavailable")
+            if failure_kind == "enclosure" and enclosure_id == "enc-b":
+                raise RuntimeError("enclosure unavailable")
+            return survivor_snapshot
+
+        collector._fetch_inventory = fetch_inventory  # type: ignore[method-assign]
+        collector._enumerate_storage_view_scopes = AsyncMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError("storage views unavailable")
+            if failure_kind == "storage-view"
+            else None,
+            return_value=[],
+        )
+
+        asyncio.run(collector.run_once(include_due_intervals=False))
+
+        self.assertFalse(collector._scope_enumeration_complete)
+        self.assertNotIn(failed_key, collector._pending_topology_changes)
+        self.assertEqual(
+            collector._pending_topology_changes.get(unaffected_key),
+            (collector._topology_signature(unaffected_degraded), 1),
+        )
+        self.assertEqual(store.list_slot_events(baseline.system_id, baseline.enclosure_id, baseline.slot), [])
+        persisted = store.get_slot_state(baseline.system_id, baseline.enclosure_id, baseline.slot)
+        self.assertIsNotNone(persisted)
+        assert persisted is not None
+        self.assertEqual(persisted.vdev_name, baseline.vdev_name)
+        self.assertEqual(persisted.topology_label, baseline.topology_label)
+
+    def test_run_once_system_omission_breaks_pending_topology_confirmation(self) -> None:
+        self._assert_omitted_scope_breaks_pending_topology_confirmation("system")
+
+    def test_run_once_enclosure_omission_breaks_pending_topology_confirmation(self) -> None:
+        self._assert_omitted_scope_breaks_pending_topology_confirmation("enclosure")
+
+    def test_run_once_storage_view_omission_breaks_pending_topology_confirmation(self) -> None:
+        self._assert_omitted_scope_breaks_pending_topology_confirmation("storage-view")
+
     def test_run_once_incomplete_quantastor_topology_breaks_pending_degradation_confirmation(self) -> None:
         store, collector, baseline = self._topology_history_fixture(
             system_id="qs-cryostorage",

@@ -1042,6 +1042,16 @@ class HistoryCollector:
             if key[:2] == scope_key:
                 self._pending_topology_changes.pop(key, None)
 
+    def _clear_pending_topology_changes_for_system(self, system_id: str) -> None:
+        for key in tuple(self._pending_topology_changes):
+            if key[0] == system_id:
+                self._pending_topology_changes.pop(key, None)
+
+    def _clear_pending_topology_changes_for_storage_views(self, system_id: str) -> None:
+        for key in tuple(self._pending_topology_changes):
+            if key[0] == system_id and key[1].startswith(STORAGE_VIEW_SCOPE_PREFIX):
+                self._pending_topology_changes.pop(key, None)
+
     @staticmethod
     def _topology_signature(record: SlotStateRecord) -> tuple[str | None, str | None, str | None]:
         return (record.pool_name, record.vdev_name, record.topology_label)
@@ -1310,6 +1320,7 @@ class HistoryCollector:
                 system_snapshot = await self._fetch_inventory(system_id=system_id, force=force_inventory)
             except Exception as exc:  # noqa: BLE001 - keep broad saved-fleet sweeps moving.
                 self._scope_enumeration_complete = False
+                self._clear_pending_topology_changes_for_system(system_id)
                 logger.warning("Skipping history scope enumeration for %s: %s", system_id, exc)
                 self._record_collection_stage(
                     "inventory.system_failed",
@@ -1373,6 +1384,7 @@ class HistoryCollector:
                         )
                     except Exception as exc:  # noqa: BLE001 - preserve the rest of the full-fleet pass.
                         self._scope_enumeration_complete = False
+                        self._clear_pending_topology_changes_for_scope(system_id, enclosure_id)
                         logger.warning(
                             "Skipping history scope enumeration for %s enclosure %s: %s",
                             system_id,
@@ -1434,6 +1446,7 @@ class HistoryCollector:
             )
         except Exception as exc:  # noqa: BLE001 - storage views should not kill the whole sweep.
             self._scope_enumeration_complete = False
+            self._clear_pending_topology_changes_for_storage_views(system_id)
             logger.warning("Skipping history storage-view enumeration for %s: %s", system_id, exc)
             self._record_collection_stage(
                 "storage_views.failed",
