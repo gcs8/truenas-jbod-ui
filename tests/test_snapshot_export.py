@@ -14,7 +14,7 @@ from unittest.mock import MagicMock, patch
 from starlette.datastructures import URLPath
 from starlette.requests import Request
 
-from app.config import BMCConfig, HANodeConfig, SSHConfig, Settings, SystemConfig, TrueNASConfig, get_settings
+from app.config import BMCConfig, HANodeConfig, HistoryConfig, SSHConfig, Settings, SystemConfig, TrueNASConfig, get_settings
 from app.main import templates
 from app.models.domain import (
     EnclosureOption,
@@ -29,6 +29,7 @@ from app.models.domain import (
     StorageViewRuntimeView,
     SystemOption,
 )
+from app.services.history_backend import HistoryBackendClient
 from app.services.snapshot_export import (
     EXPORT_HISTORY_CACHE,
     EXPORT_RENDER_CACHE,
@@ -36,6 +37,14 @@ from app.services.snapshot_export import (
     SnapshotExportService,
     SnapshotRedactor,
     collect_configured_hostnames,
+)
+from history_service.operation_bounds import (
+    MAX_EVENT_ROWS,
+    MAX_REQUEST_BYTES,
+    MAX_RETURNED_ROWS,
+    MAX_SCOPES,
+    MAX_TARGETS,
+    build_history_read_plan,
 )
 
 
@@ -1635,6 +1644,128 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("archive-core|front|0", rendered.history_cache)
         self.assertIn("archive-core|rear|0", rendered.history_cache)
         self.assertIn("archive-core|storage-view:boot-doms|0", rendered.history_cache)
+
+    async def test_six_sixty_slot_enclosures_batch_history_for_estimate_and_export(self) -> None:
+        enclosure_options = [
+            EnclosureOption(
+                id=f"enc-{enclosure_index}",
+                label=f"Enclosure {enclosure_index}",
+                rows=5,
+                columns=12,
+                slot_count=60,
+                slot_layout=[list(range(row * 12, (row + 1) * 12)) for row in range(5)],
+            )
+            for enclosure_index in range(6)
+        ]
+        snapshots: dict[str, InventorySnapshot] = {}
+        for enclosure_index, enclosure in enumerate(enclosure_options):
+            candidate = build_snapshot().model_copy(deep=True)
+            candidate.selected_enclosure_id = enclosure.id
+            candidate.selected_enclosure_label = enclosure.label
+            candidate.enclosures = enclosure_options
+            candidate.slots = [
+                candidate.slots[0].model_copy(
+                    update={
+                        "slot": slot_number,
+                        "slot_label": f"{slot_number:02d}",
+                        "row_index": slot_number // 12,
+                        "column_index": slot_number % 12,
+                        "enclosure_id": enclosure.id,
+                        "enclosure_label": enclosure.label,
+                        "device_name": f"disk-{enclosure_index}-{slot_number}",
+                        "serial": f"SYNTHETIC{enclosure_index:02d}{slot_number:04d}",
+                    }
+                )
+                for slot_number in range(60)
+            ]
+            candidate.layout_rows = [list(range(row * 12, (row + 1) * 12)) for row in range(5)]
+            candidate.layout_slot_count = 60
+            candidate.layout_columns = 12
+            candidate.summary.disk_count = 60
+            candidate.summary.mapped_slot_count = 60
+            candidate.summary.enclosure_count = 6
+            snapshots[enclosure.id] = candidate
+
+        sent_documents: list[dict[str, Any]] = []
+        history_backend = HistoryBackendClient(
+            HistoryConfig(service_url="http://synthetic-history.invalid", timeout_seconds=10)
+        )
+
+        async def send_json(path: str, document: dict[str, Any]) -> dict[str, Any]:
+            self.assertEqual(path, "/api/history/scopes/bundle")
+            plan = build_history_read_plan(
+                scopes=document["scopes"],
+                metrics=document["metrics"],
+                since=document["since"],
+                event_limit=document["event_limit"],
+                metric_limit=document["metric_limit"],
+            )
+            self.assertLessEqual(plan.scope_count, MAX_SCOPES)
+            self.assertLessEqual(plan.target_count, MAX_TARGETS)
+            self.assertLessEqual(plan.projected_event_rows, MAX_EVENT_ROWS)
+            self.assertLessEqual(plan.projected_rows, MAX_RETURNED_ROWS)
+            self.assertLessEqual(
+                len(json.dumps(document, separators=(",", ":"), ensure_ascii=False).encode("utf-8")),
+                MAX_REQUEST_BYTES,
+            )
+            sent_documents.append(document)
+            return {
+                "configured": True,
+                "available": True,
+                "detail": None,
+                "scopes": [
+                    {
+                        "system_id": scope["system_id"],
+                        "enclosure_id": scope["enclosure_id"],
+                        "histories": {
+                            str(slot): {
+                                "configured": True,
+                                "available": True,
+                                "detail": None,
+                                "slot": slot,
+                                "system_id": scope["system_id"],
+                                "enclosure_id": scope["enclosure_id"],
+                                "metrics": {},
+                                "events": [],
+                                "sample_counts": {},
+                                "latest_values": {},
+                            }
+                            for slot in scope["slots"]
+                        },
+                    }
+                    for scope in document["scopes"]
+                ],
+            }
+
+        async def get_status() -> dict[str, Any]:
+            return {"configured": True, "available": True, "detail": None}
+
+        history_backend._send_json = send_json  # type: ignore[method-assign]
+        history_backend.get_status = get_status  # type: ignore[method-assign]
+        exporter = SnapshotExportService(Settings(), history_backend, templates)
+        common_args = {
+            "request": build_request(),
+            "snapshot": snapshots["enc-0"],
+            "live_enclosure_snapshots": snapshots,
+            "selected_slot": 0,
+            "history_window_hours": 24,
+            "history_panel_open": True,
+            "io_chart_mode": "total",
+            "packaging": "auto",
+        }
+
+        estimate = await exporter.estimate_enclosure_snapshot_export(**common_args)
+        artifact = await exporter.build_enclosure_snapshot_export(**common_args)
+        rendered = next(iter(EXPORT_RENDER_CACHE.values())).value
+
+        self.assertTrue(estimate["ok"])
+        self.assertGreater(artifact.size_bytes, 0)
+        self.assertGreater(len(sent_documents), 1)
+        self.assertEqual(
+            sum(len(scope["slots"]) for document in sent_documents for scope in document["scopes"]),
+            360,
+        )
+        self.assertEqual(len(rendered.history_cache), 360)
 
     async def test_storage_view_export_redaction_covers_view_payloads(self) -> None:
         snapshot = build_snapshot()

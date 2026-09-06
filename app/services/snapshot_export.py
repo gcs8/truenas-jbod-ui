@@ -31,6 +31,12 @@ from app.metrics import (
 from app.models.domain import InventorySnapshot, StorageViewRuntimePayload
 from app.perf import add_perf_metadata, perf_stage
 from app.services.history_backend import HistoryBackendClient
+from history_service.operation_bounds import (
+    MAX_REQUEST_BYTES,
+    HistoryBudgetExceeded,
+    HistoryRequestShapeError,
+    build_history_read_plan,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -1543,7 +1549,7 @@ class SnapshotExportService:
             ]
             if not scopes:
                 return {}
-            response = await self.history_backend.get_scopes_history(
+            scope_payloads = await self._get_batched_scopes_history(
                 scopes=scopes,
                 since=(datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat(),
                 metrics=[
@@ -1554,7 +1560,7 @@ class SnapshotExportService:
                 metric_limit=15,
             )
             payload: dict[str, dict[str, Any]] = {}
-            for scope_payload in response.get("scopes", []):
+            for scope_payload in scope_payloads:
                 if not isinstance(scope_payload, dict) or not isinstance(scope_payload.get("histories"), dict):
                     continue
                 for slot, history in scope_payload["histories"].items():
@@ -1642,7 +1648,7 @@ class SnapshotExportService:
         if hasattr(self.history_backend, "get_scopes_history") and all_slots_by_enclosure:
             window_hours = history_window_hours if isinstance(history_window_hours, int) else 8760
             window_hours = max(1, min(8760, window_hours))
-            response = await self.history_backend.get_scopes_history(
+            scope_payloads = await self._get_batched_scopes_history(
                 scopes=[
                     {
                         "system_id": system_id or "",
@@ -1659,7 +1665,7 @@ class SnapshotExportService:
                 event_limit=11,
                 metric_limit=15,
             )
-            for scope_payload in response.get("scopes", []):
+            for scope_payload in scope_payloads:
                 if not isinstance(scope_payload, dict) or not isinstance(scope_payload.get("histories"), dict):
                     continue
                 history_enclosure_id = scope_payload.get("enclosure_id")
@@ -1708,6 +1714,123 @@ class SnapshotExportService:
         self._store_cached_value(self._history_cache, history_cache_key, payload)
         add_perf_metadata(snapshot_export_history_cache_entries=len(self._history_cache))
         return payload
+
+    async def _get_batched_scopes_history(
+        self,
+        *,
+        scopes: list[dict[str, Any]],
+        since: str,
+        metrics: list[str],
+        event_limit: int,
+        metric_limit: int,
+    ) -> list[dict[str, Any]]:
+        scope_payloads: list[dict[str, Any]] = []
+        for batch in self._history_scope_batches(
+            scopes=scopes,
+            since=since,
+            metrics=metrics,
+            event_limit=event_limit,
+            metric_limit=metric_limit,
+        ):
+            response = await self.history_backend.get_scopes_history(
+                scopes=batch,
+                since=since,
+                metrics=metrics,
+                event_limit=event_limit,
+                metric_limit=metric_limit,
+            )
+            response_scopes = response.get("scopes", [])
+            if isinstance(response_scopes, list):
+                scope_payloads.extend(
+                    scope_payload
+                    for scope_payload in response_scopes
+                    if isinstance(scope_payload, dict)
+                )
+        return scope_payloads
+
+    @staticmethod
+    def _history_scope_batches(
+        *,
+        scopes: list[dict[str, Any]],
+        since: str,
+        metrics: list[str],
+        event_limit: int,
+        metric_limit: int,
+    ) -> list[list[dict[str, Any]]]:
+        batches: list[list[dict[str, Any]]] = []
+        current: list[dict[str, Any]] = []
+        seen_scope_identities: set[tuple[str, str | None]] = set()
+
+        def validate(candidate: list[dict[str, Any]]) -> None:
+            plan = build_history_read_plan(
+                scopes=candidate,
+                metrics=metrics,
+                since=since,
+                event_limit=event_limit,
+                metric_limit=metric_limit,
+            )
+            document = {
+                "scopes": [
+                    {
+                        "system_id": scope.system_id,
+                        "enclosure_id": scope.enclosure_id,
+                        "slots": list(scope.slots),
+                    }
+                    for scope in plan.scopes
+                ],
+                "metrics": list(plan.metrics),
+                "since": plan.since,
+                "event_limit": plan.event_limit,
+                "metric_limit": plan.metric_limit,
+            }
+            request_bytes = len(json.dumps(document, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+            if request_bytes > MAX_REQUEST_BYTES:
+                raise HistoryBudgetExceeded("request_bytes", request_bytes, MAX_REQUEST_BYTES)
+
+        for source_scope in scopes:
+            source_slots = source_scope.get("slots")
+            if not isinstance(source_slots, list) or not source_slots:
+                validate([source_scope])
+                raise AssertionError("History scope validation unexpectedly accepted missing slots.")
+
+            identity_plan = build_history_read_plan(
+                scopes=[{**source_scope, "slots": [source_slots[0]]}],
+                metrics=metrics,
+                since=since,
+                event_limit=event_limit,
+                metric_limit=metric_limit,
+            )
+            identity_scope = identity_plan.scopes[0]
+            identity = (identity_scope.system_id, identity_scope.enclosure_id)
+            if identity in seen_scope_identities:
+                raise HistoryRequestShapeError("Duplicate history scope identities are not allowed.")
+            seen_scope_identities.add(identity)
+
+            for slot in source_slots:
+                candidate = [
+                    {**scope, "slots": list(scope["slots"])}
+                    for scope in current
+                ]
+                if candidate and candidate[-1]["system_id"] == source_scope["system_id"] and candidate[-1].get(
+                    "enclosure_id"
+                ) == source_scope.get("enclosure_id"):
+                    candidate[-1]["slots"].append(slot)
+                else:
+                    candidate.append({**source_scope, "slots": [slot]})
+                try:
+                    validate(candidate)
+                except HistoryBudgetExceeded:
+                    if not current:
+                        raise
+                    batches.append(current)
+                    current = [{**source_scope, "slots": [slot]}]
+                    validate(current)
+                else:
+                    current = candidate
+
+        if current:
+            batches.append(current)
+        return batches
 
     @staticmethod
     def _storage_view_history_target(runtime_view: Any, runtime_slot: Any, *, fallback_enclosure_id: str | None) -> tuple[int, str | None]:
