@@ -4,12 +4,31 @@ from __future__ import annotations
 # pyright: reportUndefinedVariable=false
 # ruff: noqa: F821
 
+import email.message
+import json
 from types import ModuleType
 from typing import Any
+
+from pydantic import ValidationError
 
 from app.route_compat import MainModuleAPIRouter
 from app.services.history_backend import HISTORY_BACKEND_DEGRADED_DETAIL
 from app.services.history_status import project_public_collector_status
+from history_service.refresh_auth import read_limited_request_body
+
+
+MAX_HISTORY_SCOPES_REQUEST_BYTES = 64 * 1024
+
+
+def _is_json_media_type(content_type: str | None) -> bool:
+    if not content_type:
+        return False
+    message = email.message.Message()
+    message["content-type"] = content_type
+    if message.get_content_maintype() != "application":
+        return False
+    subtype = message.get_content_subtype()
+    return subtype == "json" or subtype.endswith("+json")
 
 
 def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
@@ -695,8 +714,44 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             raise HTTPException(status_code=exc.status_code, detail="History refresh was rejected by policy.") from exc
         return JSONResponse(result)
 
-    @router.post("/api/history/scopes/bundle")
-    async def get_history_scopes_bundle(payload: HistoryScopesProxyRequest) -> JSONResponse:
+    history_scopes_request_schema = HistoryScopesProxyRequest.model_json_schema()
+    history_scopes_request_schema["properties"]["scopes"]["items"] = (
+        HistoryScopeProxyRequest.model_json_schema()
+    )
+    history_scopes_request_schema.pop("$defs", None)
+
+    @router.post(
+        "/api/history/scopes/bundle",
+        openapi_extra={
+            "requestBody": {
+                "required": True,
+                "content": {
+                    "application/json": {
+                        "schema": history_scopes_request_schema,
+                    }
+                },
+            }
+        },
+    )
+    async def get_history_scopes_bundle(request: Request) -> JSONResponse:
+        if not _is_json_media_type(request.headers.get("content-type")):
+            raise HTTPException(
+                status_code=415,
+                detail="History request Content-Type must be application/json or application/*+json.",
+            )
+        body = await read_limited_request_body(
+            request,
+            limit=MAX_HISTORY_SCOPES_REQUEST_BYTES,
+            detail=f"History request exceeds {MAX_HISTORY_SCOPES_REQUEST_BYTES} bytes.",
+        )
+        try:
+            document = json.loads(body)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=422, detail="History request must be valid JSON.") from exc
+        try:
+            payload = HistoryScopesProxyRequest.model_validate(document)
+        except ValidationError as exc:
+            raise HTTPException(status_code=422, detail="History request body is invalid.") from exc
         history_backend = get_history_backend()
         try:
             result = await history_backend.get_scopes_history(

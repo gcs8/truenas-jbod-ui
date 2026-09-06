@@ -1983,14 +1983,6 @@ class InventoryService:
                 )
                 if key[2] in normalized_keys
             }
-            if self._canonical_enclosure_options is not None:
-                for key in snapshot_keys_to_remove:
-                    self._canonical_enclosure_options.pop(key, None)
-                if self._canonical_default_enclosure_id in snapshot_keys_to_remove:
-                    self._canonical_default_enclosure_id = next(
-                        iter(self._canonical_enclosure_options),
-                        None,
-                    )
         for key in snapshot_keys_to_remove:
             self._remove_snapshot_state_key(key, cancel_task=True)
         self._remove_smart_cache_keys(smart_keys_to_remove)

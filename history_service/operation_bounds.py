@@ -28,6 +28,7 @@ MAX_METRICS = len(ALLOWED_HISTORY_METRICS)
 MAX_EVENT_ROWS = 4096
 MAX_RETURNED_ROWS = 36000
 MAX_HISTORY_HOURS = 8760
+HISTORY_WINDOW_TRANSIT_TOLERANCE_SECONDS = 1
 MAX_REQUEST_BYTES = 65536
 MAX_RESPONSE_BYTES = 25165824
 MAX_METRIC_LIMIT = 96
@@ -109,9 +110,10 @@ def _normalize_since(value: object, *, now: datetime) -> tuple[str, int]:
     if current.tzinfo is None or current.utcoffset() is None:
         current = current.replace(tzinfo=timezone.utc)
     elapsed_seconds = (current.astimezone(timezone.utc) - parsed.astimezone(timezone.utc)).total_seconds()
-    if elapsed_seconds < 3600 or elapsed_seconds > MAX_HISTORY_HOURS * 3600:
+    maximum_elapsed_seconds = MAX_HISTORY_HOURS * 3600 + HISTORY_WINDOW_TRANSIT_TOLERANCE_SECONDS
+    if elapsed_seconds < 3600 or elapsed_seconds > maximum_elapsed_seconds:
         raise HistoryRequestShapeError(f"since must bound history to between 1 and {MAX_HISTORY_HOURS} hours.")
-    return parsed.astimezone(timezone.utc).isoformat(), int(elapsed_seconds // 3600)
+    return parsed.astimezone(timezone.utc).isoformat(), min(int(elapsed_seconds // 3600), MAX_HISTORY_HOURS)
 
 
 def _normalize_scope(raw_scope: object) -> tuple[HistoryScope, int]:

@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 from history_service.operation_bounds import (
+    HISTORY_WINDOW_TRANSIT_TOLERANCE_SECONDS,
     MAX_EVENT_ROWS,
     MAX_HISTORY_HOURS,
     MAX_REQUEST_BYTES,
@@ -24,9 +25,11 @@ SINCE = (NOW - timedelta(hours=24)).isoformat()
 
 
 class FrozenDateTime(datetime):
+    current = NOW
+
     @classmethod
     def now(cls, tz=None):
-        return NOW if tz is None else NOW.astimezone(tz)
+        return cls.current if tz is None else cls.current.astimezone(tz)
 
 
 class HistoryOperationBoundsTests(unittest.TestCase):
@@ -42,8 +45,11 @@ class HistoryOperationBoundsTests(unittest.TestCase):
         arguments.update(overrides)
         return build_history_read_plan(**arguments)
 
-    def _validate_store(self, *, since):
-        with patch("history_service.operation_bounds.datetime", FrozenDateTime):
+    def _validate_store(self, *, since, now=NOW):
+        with (
+            patch.object(FrozenDateTime, "current", now),
+            patch("history_service.operation_bounds.datetime", FrozenDateTime),
+        ):
             validate_store_scope_request(
                 slots=[0],
                 event_limit=0,
@@ -52,6 +58,7 @@ class HistoryOperationBoundsTests(unittest.TestCase):
             )
 
     def test_contract_constants_are_server_owned(self) -> None:
+        self.assertEqual(HISTORY_WINDOW_TRANSIT_TOLERANCE_SECONDS, 1)
         self.assertEqual(MAX_SCOPES, 32)
         self.assertEqual(MAX_TARGETS, 347)
         self.assertEqual(MAX_EVENT_ROWS, 4096)
@@ -109,7 +116,14 @@ class HistoryOperationBoundsTests(unittest.TestCase):
             "2030-01-02T11:00:00",
             (NOW + timedelta(seconds=1)).isoformat(),
             (NOW - timedelta(minutes=59)).isoformat(),
-            (NOW - timedelta(hours=MAX_HISTORY_HOURS, seconds=1)).isoformat(),
+            (
+                NOW
+                - timedelta(
+                    hours=MAX_HISTORY_HOURS,
+                    seconds=HISTORY_WINDOW_TRANSIT_TOLERANCE_SECONDS,
+                    microseconds=1,
+                )
+            ).isoformat(),
         ):
             with self.subTest(since=since), self.assertRaises(HistoryRequestShapeError):
                 self._plan(since=since)
@@ -131,11 +145,41 @@ class HistoryOperationBoundsTests(unittest.TestCase):
                 with self.subTest(since=since, offset=offset):
                     self._validate_store(since=since.astimezone(offset).isoformat())
 
+    def test_exact_maximum_window_survives_small_generation_to_store_transit(self) -> None:
+        generated_at = NOW
+        plan_validated_at = generated_at + timedelta(milliseconds=100)
+        store_revalidated_at = generated_at + timedelta(milliseconds=200)
+        since = generated_at - timedelta(hours=MAX_HISTORY_HOURS)
+
+        plan = self._plan(since=since.isoformat(), now=plan_validated_at)
+
+        self.assertEqual(plan.window_hours, MAX_HISTORY_HOURS)
+        self._validate_store(since=plan.since, now=store_revalidated_at)
+
+    def test_store_window_preflight_rejects_time_clearly_older_than_transit_tolerance(self) -> None:
+        generated_at = NOW
+        validated_at = generated_at + timedelta(
+            seconds=HISTORY_WINDOW_TRANSIT_TOLERANCE_SECONDS,
+            microseconds=1,
+        )
+        since = generated_at - timedelta(hours=MAX_HISTORY_HOURS)
+
+        with self.assertRaisesRegex(
+            HistoryRequestShapeError,
+            f"since must bound history to between 1 and {MAX_HISTORY_HOURS} hours",
+        ):
+            self._validate_store(since=since.isoformat(), now=validated_at)
+
     def test_store_window_preflight_rejects_future_and_outside_boundaries_directly(self) -> None:
         invalid_since_values = (
             NOW + timedelta(seconds=1),
             NOW - timedelta(hours=1) + timedelta(seconds=1),
-            NOW - timedelta(hours=MAX_HISTORY_HOURS, seconds=1),
+            NOW
+            - timedelta(
+                hours=MAX_HISTORY_HOURS,
+                seconds=HISTORY_WINDOW_TRANSIT_TOLERANCE_SECONDS,
+                microseconds=1,
+            ),
         )
         for since in invalid_since_values:
             with self.subTest(since=since), self.assertRaisesRegex(
