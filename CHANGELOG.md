@@ -398,6 +398,8 @@ them before starting the new images.
 - Retained trusted disk and topology data when an enclosure query fails (#354).
 - Backfilled CORE multipath association from unambiguous `gmultipath` consumers
   while rejecting conflicting ZFS GUID folds (#356).
+- Staged fresh schema-v2 segment directories and files with shared read modes
+  before activation while preserving existing target modes (#389).
 
 ### Performance
 
