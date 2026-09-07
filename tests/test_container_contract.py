@@ -136,6 +136,27 @@ class ContainerResourceContractTests(unittest.TestCase):
         self.assertRegex(quantastor_guide, r"(?i)preload[^.]+every HA node")
         self.assertIn("strict_host_key_checking: true", quantastor_guide)
 
+    def test_strict_host_key_docs_preserve_existing_targets_before_install(self) -> None:
+        ssh_guide = (REPO_ROOT / "wiki/SSH-Setup-and-Sudo.md").read_text(encoding="utf-8")
+
+        ordered_steps = (
+            'known_hosts_scan="$(mktemp)"',
+            'known_hosts_merged="$(mktemp)"',
+            'ssh-keyscan -H "$ssh_host" > "$known_hosts_scan"',
+            'ssh-keygen -lf "$known_hosts_scan"',
+            'sudo cat data/known_hosts > "$known_hosts_merged"',
+            'cat "$known_hosts_scan" >> "$known_hosts_merged"',
+            'sudo install -o "$app_uid" -g "$app_gid" -m 0660 "$known_hosts_merged" data/known_hosts',
+        )
+        positions = [ssh_guide.index(step) for step in ordered_steps]
+
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn("if sudo test -f data/known_hosts; then", ssh_guide)
+        self.assertNotRegex(
+            ssh_guide,
+            r'install[^\n]+"\$known_hosts_scan"[^\n]+data/known_hosts',
+        )
+
     def test_nonroot_ssh_docs_use_the_configured_identity_and_exact_target_host(self) -> None:
         ssh_guide = (REPO_ROOT / "wiki/SSH-Setup-and-Sudo.md").read_text(encoding="utf-8")
         troubleshooting = (REPO_ROOT / "wiki/Troubleshooting.md").read_text(encoding="utf-8")

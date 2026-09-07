@@ -45,19 +45,25 @@ same values in this shell first:
 app_uid="${APP_UID:-10001}"
 app_gid="${APP_GID:-10001}"
 ssh_host="storage-host.example.test"
-known_hosts_tmp="$(mktemp)"
-trap 'rm -f "$known_hosts_tmp"' EXIT
-ssh-keyscan -H "$ssh_host" > "$known_hosts_tmp"
-ssh-keygen -lf "$known_hosts_tmp"
+known_hosts_scan="$(mktemp)"
+known_hosts_merged="$(mktemp)"
+trap 'rm -f "$known_hosts_scan" "$known_hosts_merged"' EXIT
+ssh-keyscan -H "$ssh_host" > "$known_hosts_scan"
+ssh-keygen -lf "$known_hosts_scan"
 # Compare the fingerprint out of band before installing the file.
-sudo install -o "$app_uid" -g "$app_gid" -m 0660 "$known_hosts_tmp" data/known_hosts
-rm -f "$known_hosts_tmp"
+if sudo test -f data/known_hosts; then
+  sudo cat data/known_hosts > "$known_hosts_merged"
+fi
+cat "$known_hosts_scan" >> "$known_hosts_merged"
+sudo install -o "$app_uid" -g "$app_gid" -m 0660 "$known_hosts_merged" data/known_hosts
+rm -f "$known_hosts_scan" "$known_hosts_merged"
 trap - EXIT
 ```
 
-Repeat the scan for every configured host and HA node, appending verified keys
-to the temporary file before installation. Do not use a root-owned `0600` file;
-the non-root UI process cannot read it.
+Repeat the block for every configured host and HA node. Each run copies the
+existing pinned keys into the merged temporary file before appending the newly
+verified scan. Do not use a root-owned `0600` file; the non-root UI process
+cannot read it.
 
 In app config:
 
