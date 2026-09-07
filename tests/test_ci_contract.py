@@ -291,12 +291,9 @@ class CIWorkflowContractTests(unittest.TestCase):
             "$slot_focus_artifact = [System.IO.Path]::GetTempFileName()",
             powershell,
         )
-        self.assertIn('$env:PUBLIC_DEMO_LOCAL_HISTORY = "1"', powershell)
+        self.assertNotIn("PUBLIC_DEMO_LOCAL_HISTORY", powershell)
         self.assertIn("finally {", powershell)
-        self.assertIn(
-            "Remove-Item Env:PUBLIC_DEMO_LOCAL_HISTORY -ErrorAction SilentlyContinue",
-            powershell,
-        )
+
         self.assertIn(
             "Remove-Item Env:PUBLIC_DEMO_ARTIFACT -ErrorAction SilentlyContinue",
             powershell,
@@ -309,7 +306,6 @@ class CIWorkflowContractTests(unittest.TestCase):
             """    } finally {
         Remove-Item Env:PUBLIC_DEMO_ARTIFACT -ErrorAction SilentlyContinue
         Remove-Item Env:SLOT_FOCUS_ARTIFACT -ErrorAction SilentlyContinue
-        Remove-Item Env:PUBLIC_DEMO_LOCAL_HISTORY -ErrorAction SilentlyContinue
     }""",
             powershell,
         )
@@ -328,7 +324,6 @@ class CIWorkflowContractTests(unittest.TestCase):
         cleanup = """    } finally {
         Remove-Item Env:PUBLIC_DEMO_ARTIFACT -ErrorAction SilentlyContinue
         Remove-Item Env:SLOT_FOCUS_ARTIFACT -ErrorAction SilentlyContinue
-        Remove-Item Env:PUBLIC_DEMO_LOCAL_HISTORY -ErrorAction SilentlyContinue
     }"""
         mutated = checklist.replace(cleanup, "", 1) + f"\n```powershell\n{cleanup}\n```\n"
         case = CIWorkflowContractTests(
