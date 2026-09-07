@@ -26,6 +26,7 @@
   --sans: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
   --history-write: #69c3ff;
   --history-read: #7cd4a8;
+  background: var(--bg);
 }
 
 * {

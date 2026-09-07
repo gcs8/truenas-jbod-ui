@@ -573,7 +573,7 @@
   }
 
   function selectorLabelForEnclosureOption(enclosure) {
-    const kind = state.snapshotMode ? "Snapshot Enclosure" : "Live Enclosure";
+    const kind = state.snapshotMode ? "Snapshot" : "Live Enclosure";
     return `${kind} · ${enclosure?.label || enclosure?.id || "Unknown enclosure"}`;
   }
 
@@ -2219,7 +2219,9 @@
     }
     if (!fabric) {
       sasFabricInspectorTitle.textContent = "Fabric Inspector";
-      sasFabricInspectorBody.innerHTML = "Open topology to load the current Storage Fabric.";
+      sasFabricInspectorBody.innerHTML = state.snapshotMode
+        ? "No Storage Fabric payload is included in this snapshot."
+        : "Open topology to load the current Storage Fabric.";
       return;
     }
     const trace = selectedSasFabricTrace();
@@ -2275,7 +2277,7 @@
     if (sasFabricStatus) {
       if (state.snapshotMode) {
         sasFabricStatus.className = "warning-item muted compact";
-        sasFabricStatus.textContent = "Offline snapshots do not include live Storage Fabric refresh yet.";
+        sasFabricStatus.textContent = "This offline snapshot does not include Storage Fabric data or live refresh capability.";
       } else if (state.sasFabric.error) {
         sasFabricStatus.className = "warning-item compact";
         sasFabricStatus.textContent = `Storage Fabric load failed: ${state.sasFabric.error}`;
@@ -8258,9 +8260,11 @@
 
     const multipath = slot.multipath;
     if (!multipath) {
-      multipathContext.innerHTML = currentPlatform() === "linux"
-        ? '<div class="warning-item muted">This slot is not currently presented through a multipath stack.</div>'
-        : '<div class="warning-item muted">This slot is not currently presented through gmultipath.</div>';
+      const stack = currentPlatform() === "linux" ? "a multipath stack" : "gmultipath";
+      const message = state.snapshotMode
+        ? `This slot was not presented through ${stack} at capture.`
+        : `This slot is not currently presented through ${stack}.`;
+      multipathContext.innerHTML = `<div class="warning-item muted">${escapeHtml(message)}</div>`;
       return;
     }
 
