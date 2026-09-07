@@ -24,7 +24,10 @@ Use the same folder you created in [[Quick Start|Quick-Start]], where
 `compose.yaml` and `.env` live.
 
 Before starting the sidecar, read the
-[Admin trust boundary](../docs/ADMIN_TRUST_BOUNDARY.md). The default network
+[Admin trust boundary](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/ADMIN_TRUST_BOUNDARY.md).
+Set `ADMIN_PUBLIC_ORIGIN` to the exact scheme, host, and port shown in the
+browser for the admin UI. The current-main admin service refuses to start when
+the value is missing or malformed. The default network
 mode has no application login and treats every client that can reach port
 `8082` as a trusted operator. The mounted Docker socket gives the sidecar
 host-level container authority. Restrict network reachability to trusted
@@ -58,7 +61,7 @@ Then open:
 http://your-docker-host:8082
 ```
 
-By default the admin sidecar:
+With the shipped Compose file, the admin sidecar:
 
 - listens on port `8082`
 - auto-stops after `3600` seconds unless you change
@@ -66,9 +69,9 @@ By default the admin sidecar:
 - stays separate from the main UI so the read path can remain standalone if
   you do not want the extra write-capable maintenance surface up all the time
 
-`ADMIN_AUTO_STOP_SECONDS=0` disables auto-stop. A positive integer is the
+The application default is `0`, which disables auto-stop. A positive integer is the
 number of seconds before shutdown; negative or malformed values are rejected.
-The published Compose files explicitly default to `3600`. If you change this
+The published Compose files explicitly set the Compose default to `3600`. If you change this
 environment value, recreate the admin container so the process receives it:
 
 ```bash
@@ -162,6 +165,11 @@ Use the SSH section when you want to:
 - point at an existing key under `config/ssh`
 - generate a fresh Ed25519 keypair
 - review the recommended runtime command list for the target host
+
+Saved SSH commands are hidden when an existing system is loaded. The editor
+shows placeholders rather than returning the command text to the browser. The
+server resolves the saved list only when generating the bootstrap permission
+preview or applying the one-time setup action.
 
 This is especially useful on CORE and SCALE systems where the app can stay
 read-only in the main UI but still use richer SSH detail, LED control, and

@@ -50,26 +50,17 @@ sudo chown jbodmap:jbodmap /home/jbodmap/.ssh/authorized_keys
 sudo chmod 600 /home/jbodmap/.ssh/authorized_keys
 ```
 
-## 3. Minimal Generic Linux Sudo
+## 3. Bounded Generic Linux sudo
 
-The anchored command regexes below require sudo 1.9.10 or newer. On an older
-host, enumerate exact device commands. Do not substitute argument wildcards.
+Use the complete generated Linux policy in
+[[SSH Setup and Sudo|SSH-Setup-and-Sudo]]. It matches the one-time bootstrap and includes
+`sg_ses -p aes`, `sg_ses -p ec`, `sg_ses --join --filter`, identify on/off,
+all current bounded `smartctl` forms, `mdadm`, and the three NVMe probes.
 
-```bash
-sudo tee /etc/sudoers.d/jbodmap-storage > /dev/null <<'EOF'
-Defaults:jbodmap !requiretty
-jbodmap ALL=(root) NOPASSWD: /usr/bin/lsblk -OJ
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/mdadm --detail --scan
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl ^-x -j /dev/sd[a-z]+$
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl ^-x -j /dev/nvme[0-9]+n[0-9]+$
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/nvme smart-log -o json /dev/nvme*
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/nvme id-ctrl -o json /dev/nvme*
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/nvme id-ns -o json /dev/nvme*
-EOF
-
-sudo chmod 440 /etc/sudoers.d/jbodmap-storage
-sudo visudo -cf /etc/sudoers.d/jbodmap-storage
-```
+The anchored command regexes require sudo 1.9.10 or newer. On an older host,
+enumerate exact per-device commands. Do not substitute argument wildcards.
+Save the generated block as one mode-`0440` file and pass it through
+`visudo -cf` before installation.
 
 ## 4. Example Generic Linux System Config
 
@@ -88,7 +79,6 @@ systems:
       host: gpu-server.example.local
       user: jbodmap
       key_path: /run/ssh/id_truenas
-      known_hosts_path: /app/data/known_hosts
       strict_host_key_checking: true
       commands:
         - /usr/bin/lsblk -OJ
@@ -115,7 +105,6 @@ systems:
       user: root
       key_path: ""
       password: "REPLACE_ME"
-      known_hosts_path: /app/data/known_hosts
       strict_host_key_checking: true
       commands:
         - /bin/lsblk -OJ

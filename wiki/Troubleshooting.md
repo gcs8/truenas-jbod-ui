@@ -90,6 +90,43 @@ Fix it by:
 
 Do not broaden sudo more than needed.
 
+## Main-UI Writes Return 403
+
+`Read UI mutations require ADMIN_AUTH_MODE=basic.` means the deployment is in
+the current-main network mode. Reads stay anonymous, but mapping, alias, import,
+locator, and LED writes are disabled. Set `ADMIN_AUTH_MODE=basic`, configure the
+shared credentials and exact `APP_PUBLIC_ORIGIN`, recreate the services, then
+use the in-page sign-in. Each page and tab starts signed out.
+
+## Admin Mutations Return 403
+
+`Cross-origin admin mutation rejected.` means the browser origin does not match
+`ADMIN_PUBLIC_ORIGIN`. Set it to the exact scheme, host, and port shown in the
+browser, with no path, then recreate the admin container. Current main refuses
+to start if this setting is empty or malformed.
+
+## Full Backup Returns 400
+
+`Plaintext backup export is disabled.` means an unsanitized export was requested
+without encryption. Enable encryption. Set
+`ADMIN_ALLOW_PLAINTEXT_BACKUP_EXPORT=true` only for an intentional trusted-local
+workflow; the override does not make the archive safe to share.
+
+## A Non-Root Container Gets Permission Denied
+
+If current-main UI or history startup reports `permission denied`, stop the
+stack and run the bounded ownership helper from the matching source checkout:
+
+```bash
+sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001
+sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001 --apply
+```
+
+Run the dry check first. Do not use recursive `chmod 777`, and do not run this
+current-main migration against the release-matched v0.22.2 Compose/image pair.
+If SSH then fails to load `known_hosts`, verify that `data/known_hosts` is owned
+by `10001:10001` and uses mode `0660`.
+
 ## SCALE Shows A Generic Runtime Profile
 
 That usually means:

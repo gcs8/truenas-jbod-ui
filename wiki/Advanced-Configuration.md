@@ -36,7 +36,6 @@ systems:
       host: archive-core.example.local
       user: jbodmap
       key_path: /run/ssh/id_truenas
-      known_hosts_path: /app/data/known_hosts
       strict_host_key_checking: true
       commands:
         - /sbin/glabel status
@@ -60,7 +59,6 @@ systems:
       host: offsite-scale.example.local
       user: jbodmap
       key_path: /run/ssh/id_truenas
-      known_hosts_path: /app/data/known_hosts
       strict_host_key_checking: true
       commands:
         - /usr/sbin/zpool status -gP
