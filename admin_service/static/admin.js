@@ -5869,22 +5869,61 @@
       elements.backupImportButton.disabled = true;
     }
     if (elements.backupImportResult) {
-      elements.backupImportResult.textContent = `Importing ${file.name}...`;
+      elements.backupImportResult.textContent = `Inspecting ${file.name} before import...`;
     }
     try {
       const stopServices = Boolean(elements.backupImportStopToggle?.checked);
       const restartServices = Boolean(elements.backupImportRestartToggle?.checked);
+      const archiveBytes = await file.arrayBuffer();
+      const secretHeaders = passphrase !== null
+        ? { "X-Backup-Passphrase-Base64": encodeUtf8Base64(passphrase) }
+        : {};
+      const inspectionResponse = await fetch("/api/admin/backup/inspect", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/octet-stream",
+          ...secretHeaders,
+        },
+        body: archiveBytes,
+      });
+      const inspection = await readJsonResponse(inspectionResponse);
+      if (!inspectionResponse.ok || inspection?.ok === false) {
+        throw new Error(
+          describeApiError(inspection?.detail) ||
+          `Inspection failed with ${inspectionResponse.status}`
+        );
+      }
+      if (
+        !["encrypted", "plaintext"].includes(inspection?.encryption_mode) ||
+        !inspection?.inspection_receipt
+      ) {
+        throw new Error("Inspection did not return an observed encryption mode and receipt.");
+      }
+      const aggregateSummary = JSON.stringify(inspection.aggregate_counts || {});
+      const confirmed = window.confirm(
+        `Inspect ${file.name} before import.\n\n` +
+        `Observed encryption mode: ${inspection.encryption_mode}.\n` +
+        `Selected groups: ${(inspection.selected_groups || []).join(", ") || "none"}.\n` +
+        `Aggregate counts: ${aggregateSummary}.\n\n` +
+        "Import this exact inspected archive?"
+      );
+      if (!confirmed) {
+        return;
+      }
+      if (elements.backupImportResult) {
+        elements.backupImportResult.textContent = `Importing inspected ${file.name}...`;
+      }
       const response = await fetch(
         `/api/admin/backup/import?stop_services=${String(stopServices)}&restart_services=${String(restartServices)}`,
         {
           method: "POST",
           headers: {
             "Content-Type": "application/octet-stream",
-            ...(passphrase !== null
-              ? { "X-Backup-Passphrase-Base64": encodeUtf8Base64(passphrase) }
-              : {}),
+            ...secretHeaders,
+            "X-Backup-Expected-Encryption": inspection.encryption_mode,
+            "X-Backup-Inspection-Receipt": inspection.inspection_receipt,
           },
-          body: await file.arrayBuffer(),
+          body: archiveBytes,
         }
       );
       const payload = await readJsonResponse(response);

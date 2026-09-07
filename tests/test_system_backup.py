@@ -1692,6 +1692,10 @@ class SystemBackupServiceTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "concatenated gzip"):
             self.backup_service.import_bundle(concatenated)
+        archive_path = self.temp_dir / "concatenated.tar.gz"
+        archive_path.write_bytes(concatenated)
+        with self.assertRaisesRegex(ValueError, "concatenated gzip"):
+            self.backup_service.import_bundle_from_file(archive_path)
 
     def test_tar_gzip_applies_ratio_cap_during_decompression(self) -> None:
         observed_max_lengths: list[int] = []
@@ -1740,6 +1744,94 @@ class SystemBackupServiceTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "concatenated zstd"):
             self.backup_service.import_bundle(concatenated)
+        archive_path = self.temp_dir / "concatenated.tar.zst"
+        archive_path.write_bytes(concatenated)
+        with self.assertRaisesRegex(ValueError, "concatenated zstd"):
+            self.backup_service.import_bundle_from_file(archive_path)
+
+    def test_file_backed_zstd_ratio_rejection_stays_below_eight_mib_python_heap(self) -> None:
+        if system_backup_module.zstd is None:
+            self.skipTest("zstandard is not installed")
+        archive_path = self.temp_dir / "high-ratio.tar.zst"
+        output_path = self.temp_dir / "high-ratio.tar"
+        archive_path.write_bytes(
+            system_backup_module.zstd.ZstdCompressor(level=19).compress(
+                b"0" * (32 * 1024 * 1024)
+            )
+        )
+
+        tracemalloc.start()
+        try:
+            with self.assertRaisesRegex(ValueError, "compression ratio"):
+                self.backup_service._decompress_tar_archive_to_file(
+                    archive_path,
+                    output_path,
+                    "tar.zst",
+                )
+            _, peak_bytes = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+            output_path.unlink(missing_ok=True)
+
+        self.assertLess(peak_bytes, 8 * 1024 * 1024)
+
+    def test_7z_listing_rejects_duplicate_member_metadata_keys(self) -> None:
+        output = "\n".join(
+            [
+                "Path = bundle.7z",
+                "Type = 7z",
+                "",
+                "Path = manifest.json",
+                "Size = 10",
+                "Encrypted = +",
+                "Encrypted = -",
+            ]
+        )
+
+        with self.assertRaisesRegex(ValueError, "duplicate metadata"):
+            self.backup_service._seven_zip_listed_entries(
+                output,
+                Path("bundle.7z"),
+            )
+
+    def test_7z_encryption_provenance_requires_every_regular_member(self) -> None:
+        entries = [
+            {"Path": "manifest.json", "Size": "10", "Encrypted": "+"},
+            {"Path": "config/config.yaml", "Size": "20"},
+        ]
+
+        with self.assertRaisesRegex(ValueError, "encryption metadata is missing"):
+            self.backup_service._seven_zip_encryption_mode(entries)
+
+    def test_7z_encryption_provenance_rejects_malformed_member_metadata(self) -> None:
+        entries = [
+            {"Path": "manifest.json", "Size": "10", "Encrypted": "yes"},
+        ]
+
+        with self.assertRaisesRegex(ValueError, "encryption metadata is malformed"):
+            self.backup_service._seven_zip_encryption_mode(entries)
+
+    def test_7z_encryption_provenance_rejects_mixed_regular_members(self) -> None:
+        entries = [
+            {"Path": "manifest.json", "Size": "10", "Encrypted": "+"},
+            {"Path": "config/config.yaml", "Size": "20", "Encrypted": "-"},
+        ]
+
+        with self.assertRaisesRegex(ValueError, "mixes encrypted and plaintext"):
+            self.backup_service._seven_zip_encryption_mode(entries)
+
+    def test_7z_encryption_provenance_reports_uniform_regular_members(self) -> None:
+        encrypted = [
+            {"Path": "config", "Folder": "+", "Attributes": "D"},
+            {"Path": "manifest.json", "Size": "10", "Encrypted": "+"},
+            {"Path": "config/config.yaml", "Size": "20", "Encrypted": "+"},
+        ]
+        plaintext = [
+            {"Path": "manifest.json", "Size": "10", "Encrypted": "-"},
+        ]
+
+        self.assertTrue(self.backup_service._seven_zip_encryption_mode(encrypted))
+        self.assertFalse(self.backup_service._seven_zip_encryption_mode(plaintext))
 
     def test_7z_limits_count_and_ratio_from_listing_before_extraction(self) -> None:
         entries = [
@@ -2244,6 +2336,113 @@ sys.stdout.flush()
             MAX_FILE_BACKED_ARCHIVE_EXPANDED_BYTES,
             production_history_bytes + 1024 * 1024 * 1024,
         )
+
+    def test_export_construction_counts_manifest_at_non_history_limit_boundary(self) -> None:
+        manifest = {
+            "format": BUNDLE_FORMAT,
+            "groups": [],
+            "files": [
+                {
+                    "key": CONFIG_FILE_KEY,
+                    "group_key": CONFIG_FILE_KEY,
+                    "archive_path": "config/config.yaml",
+                    "size_bytes": 7,
+                }
+            ],
+        }
+
+        self.backup_service._validate_export_manifest_non_history_aggregate(
+            manifest,
+            manifest_size=3,
+            limit=10,
+        )
+        with self.assertRaisesRegex(ValueError, "non-history members exceed"):
+            self.backup_service._validate_export_manifest_non_history_aggregate(
+                manifest,
+                manifest_size=4,
+                limit=10,
+            )
+
+    def test_export_construction_applies_non_history_aggregate_limit_to_7z(self) -> None:
+        members = [
+            BundleMember(
+                key=HISTORY_DB_KEY,
+                group_key=HISTORY_DB_KEY,
+                archive_path="history/history.sqlite3",
+                source_path=None,
+                present=True,
+                content=b"h" * 50,
+            ),
+            BundleMember(
+                key=CONFIG_FILE_KEY,
+                group_key=CONFIG_FILE_KEY,
+                archive_path="config/config.yaml",
+                source_path=None,
+                present=True,
+                content=b"c" * 6,
+            ),
+        ]
+
+        with self.assertRaisesRegex(ValueError, "non-history members exceed"):
+            self.backup_service._collect_file_specs(
+                members,
+                member_limit=100,
+                expanded_limit=100,
+                large_member_group_keys=frozenset({HISTORY_DB_KEY}),
+                non_history_expanded_limit=5,
+            )
+
+    def test_7z_export_verification_applies_manifest_aware_non_history_limit(self) -> None:
+        archive_path = self.temp_dir / "aggregate-parity.7z"
+        archive_path.write_bytes(SEVEN_ZIP_SIGNATURE + b"synthetic")
+        manifest = {
+            "schema_version": BUNDLE_SCHEMA_VERSION,
+            "format": BUNDLE_FORMAT,
+            "groups": [],
+            "files": [
+                {
+                    "key": CONFIG_FILE_KEY,
+                    "group_key": CONFIG_FILE_KEY,
+                    "archive_path": "config/config.yaml",
+                    "size_bytes": 6,
+                    "sha256": "a" * 64,
+                }
+            ],
+        }
+        listing = subprocess.CompletedProcess(
+            ["7z", "l"],
+            0,
+            stdout="\n".join(
+                [
+                    f"Path = {archive_path.name}",
+                    "Type = 7z",
+                    "",
+                    "Path = manifest.json",
+                    "Size = 1",
+                    "Packed Size = 1",
+                    "Encrypted = -",
+                    "",
+                    "Path = config/config.yaml",
+                    "Size = 6",
+                    "Packed Size = 6",
+                    "Encrypted = -",
+                ]
+            ),
+            stderr="",
+        )
+
+        with (
+            patch.object(self.backup_service, "_run_7z_command", return_value=listing),
+            patch("history_service.system_backup.MAX_ARCHIVE_EXPANDED_BYTES", 5),
+            self.assertRaisesRegex(ValueError, "non-history members exceed"),
+        ):
+            self.backup_service._validate_export_archive(
+                archive_path,
+                "7z",
+                expanded_archive_size=None,
+                passphrase=None,
+                manifest=manifest,
+            )
 
     def test_file_backed_limit_is_only_available_to_history_manifest_member(self) -> None:
         member = {
@@ -2934,6 +3133,46 @@ sys.stdout.flush()
                         self.assertEqual(counts["tracked_slots"], 1)
                         self.assertEqual(counts["metric_sample_count"], 1)
 
+    def test_expected_encryption_contract_rejects_plaintext_substitution(self) -> None:
+        artifact = self.backup_service.export_bundle_to_file(
+            packaging="zip",
+            included_paths=[MAPPING_FILE_KEY],
+        )
+        try:
+            with self.assertRaisesRegex(ValueError, "expected encrypted"):
+                self.backup_service.inspect_bundle_file(
+                    artifact.path,
+                    expected_encrypted=True,
+                )
+            with self.assertRaisesRegex(ValueError, "expected encrypted"):
+                self.backup_service.import_bundle_from_file(
+                    artifact.path,
+                    expected_encrypted=True,
+                )
+        finally:
+            artifact.cleanup()
+
+    def test_expected_encryption_contract_rejects_encrypted_substitution(self) -> None:
+        with patch.object(
+            self.backup_service,
+            "_run_7z_command",
+            side_effect=self._fake_7z_command,
+        ):
+            artifact = self.backup_service.export_bundle_to_file(
+                encrypt=True,
+                passphrase="synthetic expected mode passphrase",
+                included_paths=[MAPPING_FILE_KEY],
+            )
+            try:
+                with self.assertRaisesRegex(ValueError, "expected plaintext"):
+                    self.backup_service.inspect_bundle_file(
+                        artifact.path,
+                        passphrase="synthetic expected mode passphrase",
+                        expected_encrypted=False,
+                    )
+            finally:
+                artifact.cleanup()
+
     def test_file_inspection_validates_without_activation_and_returns_aggregate_only(self) -> None:
         with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
             get_settings.cache_clear()
@@ -3077,26 +3316,35 @@ sys.stdout.flush()
             {"manifest.json": b"{}"},
             "correct passphrase",
         )
+        workspace = self.temp_dir / "seven-zip-cleanup-failure"
 
-        with (
-            patch.object(
-                self.backup_service,
-                "_run_7z_command",
-                side_effect=self._fake_7z_command,
-            ),
-            patch(
-                "history_service.system_backup.shutil.rmtree",
-                side_effect=OSError("synthetic cleanup failure"),
-            ),
-        ):
-            with self.assertRaisesRegex(RuntimeError, "workspace cleanup failed"):
-                self.backup_service.import_bundle(
-                    archive,
-                    passphrase="wrong passphrase",
-                )
+        try:
+            with (
+                patch(
+                    "history_service.system_backup.tempfile.mkdtemp",
+                    return_value=str(workspace),
+                ),
+                patch.object(
+                    self.backup_service,
+                    "_run_7z_command",
+                    side_effect=self._fake_7z_command,
+                ),
+                patch(
+                    "history_service.system_backup.shutil.rmtree",
+                    side_effect=OSError("synthetic cleanup failure"),
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "workspace cleanup failed"):
+                    self.backup_service.import_bundle(
+                        archive,
+                        passphrase="wrong passphrase",
+                    )
+        finally:
+            shutil.rmtree(workspace, ignore_errors=True)
 
     def test_7z_import_workspace_cleanup_failure_precedes_activation(self) -> None:
         passphrase = "cleanup ordering passphrase"
+        workspace = self.temp_dir / "seven-zip-import-cleanup-failure"
         with (
             patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False),
             patch.object(
@@ -3112,19 +3360,28 @@ sys.stdout.flush()
                 packaging="7z",
                 included_paths=[HISTORY_DB_KEY],
             )
-            with (
-                patch.object(
-                    self.backup_service,
-                    "_cleanup_extracted_archive",
-                    side_effect=RuntimeError("Backup bundle extraction workspace cleanup failed."),
-                ),
-                patch.object(self.backup_service, "_activate_import_bundle") as activate,
-            ):
-                with self.assertRaisesRegex(RuntimeError, "workspace cleanup failed"):
-                    self.backup_service.import_bundle(
-                        artifact.content,
-                        passphrase=passphrase,
-                    )
+            try:
+                with (
+                    patch(
+                        "history_service.system_backup.tempfile.mkdtemp",
+                        return_value=str(workspace),
+                    ),
+                    patch.object(
+                        self.backup_service,
+                        "_cleanup_extracted_archive",
+                        side_effect=RuntimeError(
+                            "Backup bundle extraction workspace cleanup failed."
+                        ),
+                    ),
+                    patch.object(self.backup_service, "_activate_import_bundle") as activate,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "workspace cleanup failed"):
+                        self.backup_service.import_bundle(
+                            artifact.content,
+                            passphrase=passphrase,
+                        )
+            finally:
+                shutil.rmtree(workspace, ignore_errors=True)
 
         activate.assert_not_called()
 
@@ -3236,6 +3493,118 @@ sys.stdout.flush()
             self.assertTrue(artifact.path.is_file())
         finally:
             artifact.cleanup()
+
+    def test_file_import_stages_zip_and_tar_members_as_files(self) -> None:
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            for packaging in ("zip", "tar.gz", "tar.zst"):
+                with self.subTest(packaging=packaging):
+                    artifact = self.backup_service.export_bundle_to_file(
+                        packaging=packaging,
+                        included_paths=[MAPPING_FILE_KEY],
+                    )
+                    cleanup_root = None
+                    try:
+                        _manifest, extracted, _packaging, metadata = (
+                            self.backup_service._read_archive_file(artifact.path)
+                        )
+                        cleanup_root = metadata.get("_cleanup_root")
+                        self.assertTrue(extracted)
+                        self.assertTrue(all(isinstance(value, Path) for value in extracted.values()))
+                    finally:
+                        self.backup_service._cleanup_extracted_archive(cleanup_root)
+                        artifact.cleanup()
+
+    def test_sixteen_mib_file_import_stays_below_eight_mib_python_heap(self) -> None:
+        with sqlite3.connect(self.history_db_path) as connection:
+            connection.execute("CREATE TABLE qa_synthetic_filler (payload BLOB NOT NULL)")
+            connection.execute(
+                "INSERT INTO qa_synthetic_filler(payload) VALUES (randomblob(?))",
+                (16 * 1024 * 1024,),
+            )
+            connection.commit()
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            artifact = self.backup_service.export_bundle_to_file(
+                packaging="zip",
+                included_paths=[HISTORY_DB_KEY],
+            )
+            try:
+                tracemalloc.start()
+                result = self.backup_service.import_bundle_from_file(artifact.path)
+                _, peak_bytes = tracemalloc.get_traced_memory()
+                tracemalloc.stop()
+            finally:
+                artifact.cleanup()
+
+        self.assertTrue(result["restored_history_database"])
+        self.assertLess(peak_bytes, 8 * 1024 * 1024)
+
+    def test_outer_file_import_workspace_cleanup_failure_is_surfaced(self) -> None:
+        archive_path = self.temp_dir / "synthetic.7z"
+        archive_path.write_bytes(SEVEN_ZIP_SIGNATURE)
+        workspace = self.temp_dir / "outer-import-workspace"
+
+        with (
+            patch("history_service.system_backup.tempfile.mkdtemp", return_value=str(workspace)),
+            patch.object(
+                self.backup_service,
+                "_read_7z_archive",
+                side_effect=ValueError("synthetic parse failure"),
+            ),
+            patch(
+                "history_service.system_backup.shutil.rmtree",
+                side_effect=OSError("synthetic cleanup failure"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "workspace cleanup failed"),
+        ):
+            self.backup_service._read_archive_file(archive_path)
+
+    def test_file_import_rejection_cleans_file_backed_workspace(self) -> None:
+        before = set(Path(tempfile.gettempdir()).glob("truenas-jbod-ui-file-import-*"))
+        archive_path = self.temp_dir / "corrupted.zip"
+        archive_path.write_bytes(b"PK-corrupted")
+
+        with self.assertRaisesRegex(ValueError, "ZIP archive"):
+            self.backup_service.import_bundle_from_file(archive_path)
+
+        after = set(Path(tempfile.gettempdir()).glob("truenas-jbod-ui-file-import-*"))
+        self.assertEqual(after, before)
+
+    def test_file_backed_aes_decryption_heap_is_flat_from_two_to_thirty_two_mib(self) -> None:
+        peaks: list[int] = []
+        for size_mib in (2, 32):
+            source_path = self.temp_dir / f"aes-source-{size_mib}.bin"
+            encrypted_path = self.temp_dir / f"aes-encrypted-{size_mib}.bin"
+            decrypted_path = self.temp_dir / f"aes-decrypted-{size_mib}.bin"
+            with source_path.open("wb") as output:
+                remaining = size_mib * 1024 * 1024
+                while remaining:
+                    chunk = os.urandom(min(1024 * 1024, remaining))
+                    output.write(chunk)
+                    remaining -= len(chunk)
+            self.backup_service._encrypt_scheduled_archive(
+                source_path,
+                encrypted_path,
+                "synthetic flat allocation passphrase",
+            )
+
+            tracemalloc.start()
+            self.backup_service._decrypt_scheduled_archive_to_file(
+                encrypted_path,
+                decrypted_path,
+                "synthetic flat allocation passphrase",
+            )
+            _, peak_bytes = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+            peaks.append(peak_bytes)
+            self.assertEqual(
+                self.backup_service._extracted_member_sha256(source_path),
+                self.backup_service._extracted_member_sha256(decrypted_path),
+            )
+
+        self.assertLess(max(peaks), 4 * 1024 * 1024)
+        self.assertLess(abs(peaks[1] - peaks[0]), 1024 * 1024)
 
     def test_file_export_peak_python_memory_is_not_archive_sized(self) -> None:
         large_snapshot = self.temp_dir / "large-history.sqlite3"

@@ -265,6 +265,9 @@ them before starting the new images.
 
 - Made TrueNAS-rendered poll grants match only numeric job IDs and let CORE
   multipath sync use the configured disk-sync timeout (#390).
+- Bound backup import to inspected encryption provenance and a single-use server
+  receipt, aligned non-history limits, streamed restore members, and recovered
+  the complete observed pre-maintenance service state within 1 GiB (#368).
 - Correlated sparse physical profiles by explicit slot IDs across all six
   platform paths without inventing gap slots (#382).
 - Fixed scoped enclosure refreshes, exact history boundaries, aggregate export

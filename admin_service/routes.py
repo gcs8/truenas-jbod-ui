@@ -47,8 +47,12 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
         content["runtime"] = await build_runtime_payload(runtime_service)
         return JSONResponse(content)
 
-    async def run_retained_thread_worker(function: Any, *args: Any) -> Any:
-        operation = asyncio.create_task(asyncio.to_thread(function, *args))
+    async def run_retained_thread_worker(
+        function: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        operation = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
         try:
             await asyncio.wait((operation,))
         except asyncio.CancelledError as cancellation:
@@ -61,6 +65,17 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
                 operation.exception()
             raise cancellation
         return operation.result()
+
+    def expected_backup_encryption_mode(request: Request) -> str:
+        mode = request.headers.get("X-Backup-Expected-Encryption", "")
+        if mode not in {"encrypted", "plaintext"}:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "X-Backup-Expected-Encryption must be exactly encrypted or plaintext."
+                ),
+            )
+        return mode
 
     @router.get("/", response_class=HTMLResponse)
     async def index(request: Request) -> HTMLResponse:
@@ -224,15 +239,33 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             if passphrase is None:
                 passphrase = request.headers.get("X-Backup-Passphrase") or None
-            try:
-                result = await asyncio.to_thread(
-                    get_backup_service().inspect_bundle_file,
+            def inspect_and_issue_receipt() -> tuple[dict[str, Any], dict[str, Any]]:
+                result = get_backup_service().inspect_bundle_file(
                     archive_path,
                     passphrase=passphrase,
                 )
+                mode = "encrypted" if result.get("encrypted") is True else "plaintext"
+                issued = get_backup_receipt_store().issue(
+                    archive_path,
+                    observed_encryption_mode=mode,
+                )
+                return result, issued
+
+            try:
+                result, issued = await run_retained_thread_worker(
+                    inspect_and_issue_receipt,
+                )
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
-            return JSONResponse(result)
+            encryption_mode = "encrypted" if result.get("encrypted") is True else "plaintext"
+            return JSONResponse(
+                {
+                    **result,
+                    "encryption_mode": encryption_mode,
+                    "inspection_receipt": issued["receipt"],
+                    "inspection_receipt_expires_at": issued["expires_at"],
+                }
+            )
         finally:
             archive_path.unlink(missing_ok=True)
             archive_path.parent.rmdir()
@@ -256,14 +289,32 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             if passphrase is None:
                 passphrase = request.headers.get("X-Backup-Passphrase") or None
+            expected_mode = expected_backup_encryption_mode(request)
+            receipt = request.headers.get("X-Backup-Inspection-Receipt", "")
+            if not receipt:
+                raise HTTPException(
+                    status_code=400,
+                    detail="X-Backup-Inspection-Receipt is required before import.",
+                )
             maintenance_service = get_maintenance_service()
-            try:
-                result, maintenance = await asyncio.to_thread(
-                    maintenance_service.import_bundle_from_file,
+
+            def admitted_import() -> Any:
+                get_backup_receipt_store().consume(
+                    receipt,
+                    archive_path,
+                    expected_encryption_mode=expected_mode,
+                )
+                return maintenance_service.import_bundle_from_file(
                     archive_path,
                     passphrase=passphrase,
+                    expected_encrypted=expected_mode == "encrypted",
                     stop_services=stop_services,
                     restart_services=restart_services,
+                )
+
+            try:
+                result, maintenance = await run_retained_thread_worker(
+                    admitted_import,
                 )
             except (ValueError, DockerRuntimeError) as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc

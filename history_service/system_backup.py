@@ -4,6 +4,7 @@ import gzip
 import hashlib
 import io
 import json
+import mmap
 import os
 import re
 import select
@@ -256,6 +257,7 @@ MAX_ARCHIVE_METADATA_BYTES = 8 * 1024 * 1024
 MAX_MANIFEST_BYTES = 4 * 1024 * 1024
 MAX_7Z_COMMAND_OUTPUT_BYTES = 8 * 1024 * 1024
 ARCHIVE_READ_CHUNK_BYTES = 1024 * 1024
+ZSTD_BOUNDED_INPUT_BYTES = 32
 
 ExtractedMember = bytes | Path
 
@@ -1744,6 +1746,7 @@ class SystemBackupService:
                 normalized_packaging,
                 expanded_archive_size=expanded_archive_size,
                 passphrase=passphrase if encrypt else None,
+                manifest=manifest,
             )
             return FileBackupArtifact(
                 filename=filename,
@@ -2009,11 +2012,28 @@ class SystemBackupService:
             "history": history_counts,
         }
 
+    @staticmethod
+    def _enforce_expected_encryption(
+        archive_meta: dict[str, Any],
+        expected_encrypted: bool | None,
+    ) -> None:
+        if expected_encrypted is None:
+            return
+        observed_encrypted = archive_meta.get("encrypted") is True
+        if observed_encrypted == expected_encrypted:
+            return
+        expected_label = "encrypted" if expected_encrypted else "plaintext"
+        observed_label = "encrypted" if observed_encrypted else "plaintext"
+        raise ValueError(
+            f"Backup import expected {expected_label} content but inspected {observed_label} content."
+        )
+
     def inspect_bundle_file(
         self,
         archive_path: str | Path,
         *,
         passphrase: str | None = None,
+        expected_encrypted: bool | None = None,
     ) -> dict[str, Any]:
         manifest, extracted, detected_packaging, archive_meta = self._read_archive_file(
             Path(archive_path),
@@ -2021,6 +2041,7 @@ class SystemBackupService:
         )
         cleanup_root = archive_meta.pop("_cleanup_root", None)
         try:
+            self._enforce_expected_encryption(archive_meta, expected_encrypted)
             group_entries = self._manifest_group_entries(manifest)
             selected_groups = [
                 key
@@ -2333,6 +2354,7 @@ class SystemBackupService:
                 normalized_packaging,
                 expanded_archive_size=expanded_archive_size,
                 passphrase=passphrase if encrypt else None,
+                manifest=manifest,
             )
             return FileBackupArtifact(
                 filename=filename,
@@ -2364,13 +2386,20 @@ class SystemBackupService:
             label="activation journal",
         )
 
-    def import_bundle(self, content: bytes, *, passphrase: str | None = None) -> dict[str, Any]:
+    def import_bundle(
+        self,
+        content: bytes,
+        *,
+        passphrase: str | None = None,
+        expected_encrypted: bool | None = None,
+    ) -> dict[str, Any]:
         if len(content) > MAX_BACKUP_ARCHIVE_BYTES:
             raise ValueError(
                 f"Backup bundle archive exceeds the {MAX_BACKUP_ARCHIVE_BYTES}-byte input limit."
             )
         return self._import_parsed_bundle(
-            self._read_archive(content, passphrase=passphrase)
+            self._read_archive(content, passphrase=passphrase),
+            expected_encrypted=expected_encrypted,
         )
 
     def import_bundle_from_file(
@@ -2378,9 +2407,11 @@ class SystemBackupService:
         archive_path: str | Path,
         *,
         passphrase: str | None = None,
+        expected_encrypted: bool | None = None,
     ) -> dict[str, Any]:
         return self._import_parsed_bundle(
-            self._read_archive_file(Path(archive_path), passphrase=passphrase)
+            self._read_archive_file(Path(archive_path), passphrase=passphrase),
+            expected_encrypted=expected_encrypted,
         )
 
     def _import_parsed_bundle(
@@ -2391,10 +2422,13 @@ class SystemBackupService:
             ArchivePackaging,
             dict[str, Any],
         ],
+        *,
+        expected_encrypted: bool | None = None,
     ) -> dict[str, Any]:
         manifest, extracted, detected_packaging, archive_meta = parsed
         cleanup_root = archive_meta.pop("_cleanup_root", None)
         try:
+            self._enforce_expected_encryption(archive_meta, expected_encrypted)
             group_entries = self._manifest_group_entries(manifest)
             self._validate_manifest_member_metadata(manifest, extracted)
             self._preflight_selected_group_members(manifest, group_entries, extracted)
@@ -3817,11 +3851,13 @@ class SystemBackupService:
         member_limit: int = MAX_ARCHIVE_MEMBER_BYTES,
         expanded_limit: int = MAX_ARCHIVE_EXPANDED_BYTES,
         large_member_group_keys: frozenset[str] = frozenset(),
+        non_history_expanded_limit: int = MAX_ARCHIVE_EXPANDED_BYTES,
     ) -> list[dict[str, Any]]:
         if len(bundle_members) + 1 > MAX_ARCHIVE_MEMBER_COUNT:
             raise ValueError("Backup bundle archive contains too many members.")
         manifest_files: list[dict[str, Any]] = []
         expanded_total = 0
+        non_history_total = 0
         for member in bundle_members:
             size_bytes, digest = cls._bundle_member_size_and_digest(member)
             effective_member_limit = (
@@ -3834,6 +3870,12 @@ class SystemBackupService:
             expanded_total += size_bytes
             if expanded_total > expanded_limit:
                 raise ValueError("Backup bundle archive expanded data exceeds its byte limit.")
+            if member.group_key not in large_member_group_keys:
+                non_history_total += size_bytes
+                if non_history_total > non_history_expanded_limit:
+                    raise ValueError(
+                        "Backup bundle non-history members exceed the expanded byte limit."
+                    )
             manifest_files.append(
                 {
                     "key": member.key,
@@ -3855,6 +3897,37 @@ class SystemBackupService:
             )
         return MAX_ARCHIVE_MEMBER_BYTES, MAX_ARCHIVE_EXPANDED_BYTES
 
+    @classmethod
+    def _validate_export_manifest_non_history_aggregate(
+        cls,
+        manifest: dict[str, Any],
+        *,
+        manifest_size: int,
+        limit: int = MAX_ARCHIVE_EXPANDED_BYTES,
+    ) -> None:
+        non_history_total = manifest_size
+        for entry in manifest.get("files", []):
+            if not isinstance(entry, dict):
+                continue
+            archive_path = str(entry.get("archive_path") or "")
+            is_history_member = cls._is_declared_history_manifest_member(
+                manifest,
+                key=str(entry.get("key") or ""),
+                group_key=str(entry.get("group_key") or ""),
+                archive_path=archive_path,
+            )
+            if (
+                manifest.get("format") == DEBUG_BUNDLE_FORMAT
+                and entry.get("group_key") == HISTORY_DB_KEY
+            ):
+                is_history_member = True
+            if not is_history_member:
+                non_history_total += int(entry.get("size_bytes") or 0)
+            if non_history_total > limit:
+                raise ValueError(
+                    "Backup bundle non-history members exceed the expanded byte limit."
+                )
+
     def _validate_export_archive(
         self,
         archive_path: Path,
@@ -3862,6 +3935,7 @@ class SystemBackupService:
         *,
         expanded_archive_size: int | None,
         passphrase: str | None,
+        manifest: dict[str, Any],
     ) -> None:
         archive_size = archive_path.stat().st_size
         archive_limit = (
@@ -3916,12 +3990,16 @@ class SystemBackupService:
                 list_result.stdout,
                 archive_path,
             )
+            encrypted = self._seven_zip_encryption_mode(listed_entries)
+            if encrypted != bool(passphrase):
+                raise ValueError("Portable 7z backup export encryption provenance is inconsistent.")
             self._validate_7z_listed_entries(
                 listed_entries,
                 archive_size=archive_size,
                 member_limit=MAX_FILE_BACKED_ARCHIVE_MEMBER_BYTES,
                 expanded_limit=MAX_FILE_BACKED_ARCHIVE_EXPANDED_BYTES,
             )
+            self._validate_7z_listing_against_manifest(listed_entries, manifest)
             return
         raise ValueError(f"Unsupported backup packaging '{packaging}'.")
 
@@ -3972,6 +4050,10 @@ class SystemBackupService:
             raise ValueError("A passphrase is required when encryption is enabled.")
         output_path.parent.mkdir(parents=True, exist_ok=True)
         manifest_bytes = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8")
+        self._validate_export_manifest_non_history_aggregate(
+            manifest,
+            manifest_size=len(manifest_bytes),
+        )
         if packaging == "zip":
             with zipfile.ZipFile(
                 output_path,
@@ -4229,43 +4311,197 @@ class SystemBackupService:
                 or metadata.st_size > MAX_FILE_BACKED_BACKUP_ARCHIVE_BYTES
             ):
                 raise ValueError("Backup bundle archive exceeds its size or type limits.")
-            prefix = os.pread(descriptor, len(SEVEN_ZIP_SIGNATURE), 0)
-            if prefix.startswith(SEVEN_ZIP_SIGNATURE):
-                workspace = Path(tempfile.mkdtemp(prefix="truenas-jbod-ui-file-import-"))
-                private_archive = workspace / "bundle.7z"
-                try:
-                    with os.fdopen(os.dup(descriptor), "rb", closefd=True) as source, private_archive.open(
-                        "xb"
-                    ) as destination:
-                        source.seek(0)
-                        shutil.copyfileobj(source, destination, length=ARCHIVE_READ_CHUNK_BYTES)
-                        destination.flush()
-                        os.fsync(destination.fileno())
-                    private_archive.chmod(0o600)
-                    return self._read_7z_archive(
-                        archive_path=private_archive,
-                        passphrase=passphrase,
-                        workspace=workspace,
-                    )
-                except Exception:
-                    shutil.rmtree(workspace, ignore_errors=True)
-                    raise
-            if metadata.st_size > MAX_BACKUP_ARCHIVE_BYTES:
-                raise ValueError(
-                    "Large file-backed backup imports require portable 7z packaging."
+            workspace = Path(tempfile.mkdtemp(prefix="truenas-jbod-ui-file-import-"))
+            workspace.mkdir(mode=0o700, exist_ok=True)
+            private_archive = workspace / "bundle.archive"
+            try:
+                with os.fdopen(os.dup(descriptor), "rb", closefd=True) as source, private_archive.open(
+                    "xb"
+                ) as destination:
+                    source.seek(0)
+                    shutil.copyfileobj(source, destination, length=ARCHIVE_READ_CHUNK_BYTES)
+                    destination.flush()
+                    os.fsync(destination.fileno())
+                private_archive.chmod(0o600)
+                prefix = os.pread(
+                    descriptor,
+                    max(len(ENCRYPTED_BACKUP_MAGIC), len(SEVEN_ZIP_SIGNATURE)),
+                    0,
                 )
-            os.lseek(descriptor, 0, os.SEEK_SET)
-            chunks: list[bytes] = []
-            remaining = metadata.st_size
-            while remaining:
-                chunk = os.read(descriptor, min(ARCHIVE_READ_CHUNK_BYTES, remaining))
-                if not chunk:
-                    raise ValueError("Backup bundle archive is truncated.")
-                chunks.append(chunk)
-                remaining -= len(chunk)
-            return self._read_archive(b"".join(chunks), passphrase=passphrase)
+                encrypted_outer = prefix.startswith(ENCRYPTED_BACKUP_MAGIC)
+                if encrypted_outer:
+                    decrypted_archive = workspace / "bundle.decrypted"
+                    self._decrypt_scheduled_archive_to_file(
+                        private_archive,
+                        decrypted_archive,
+                        passphrase,
+                    )
+                    private_archive = decrypted_archive
+                parsed = self._read_plain_archive_file(
+                    private_archive,
+                    workspace=workspace,
+                    passphrase=passphrase if not encrypted_outer else None,
+                )
+                manifest, extracted, packaging, archive_meta = parsed
+                if encrypted_outer:
+                    archive_meta.update(
+                        {
+                            "encrypted": True,
+                            "encryption": "aes-256-gcm-scrypt",
+                        }
+                    )
+                return manifest, extracted, packaging, archive_meta
+            except Exception:
+                try:
+                    if workspace.exists():
+                        shutil.rmtree(workspace)
+                except Exception as cleanup_error:
+                    raise RuntimeError(
+                        "Backup bundle outer workspace cleanup failed."
+                    ) from cleanup_error
+                raise
         finally:
             os.close(descriptor)
+
+    @classmethod
+    def _decrypt_scheduled_archive_to_file(
+        cls,
+        source_path: Path,
+        output_path: Path,
+        passphrase: str | None,
+    ) -> None:
+        header_size = (
+            len(ENCRYPTED_BACKUP_MAGIC)
+            + ENCRYPTED_BACKUP_SALT_BYTES
+            + ENCRYPTED_BACKUP_NONCE_BYTES
+        )
+        source_size = source_path.stat(follow_symlinks=False).st_size
+        if source_size < header_size + ENCRYPTED_BACKUP_TAG_BYTES:
+            raise ValueError("Scheduled backup archive is corrupted.")
+        if not passphrase:
+            raise ValueError("A passphrase is required for this encrypted backup bundle.")
+        with source_path.open("rb", buffering=0) as source:
+            header = source.read(header_size)
+            if not header.startswith(ENCRYPTED_BACKUP_MAGIC) or len(header) != header_size:
+                raise ValueError("Scheduled backup archive is corrupted.")
+            salt_start = len(ENCRYPTED_BACKUP_MAGIC)
+            nonce_start = salt_start + ENCRYPTED_BACKUP_SALT_BYTES
+            salt = header[salt_start:nonce_start]
+            nonce = header[nonce_start:]
+            source.seek(source_size - ENCRYPTED_BACKUP_TAG_BYTES)
+            tag = source.read(ENCRYPTED_BACKUP_TAG_BYTES)
+            key = cls._scheduled_backup_key(passphrase, salt)
+            decryptor = Cipher(algorithms.AES(key), modes.GCM(nonce, tag)).decryptor()
+            decryptor.authenticate_additional_data(header)
+            source.seek(header_size)
+            remaining = source_size - header_size - ENCRYPTED_BACKUP_TAG_BYTES
+            try:
+                with output_path.open("xb") as output:
+                    while remaining:
+                        chunk = source.read(min(ARCHIVE_READ_CHUNK_BYTES, remaining))
+                        if not chunk:
+                            raise ValueError("Scheduled backup archive is corrupted.")
+                        remaining -= len(chunk)
+                        output.write(decryptor.update(chunk))
+                    output.write(decryptor.finalize())
+                    output.flush()
+                    os.fsync(output.fileno())
+            except InvalidTag as exc:
+                output_path.unlink(missing_ok=True)
+                raise ValueError("Scheduled backup archive could not be decrypted.") from exc
+        output_path.chmod(0o600)
+
+    def _read_plain_archive_file(
+        self,
+        archive_path: Path,
+        *,
+        workspace: Path,
+        passphrase: str | None,
+    ) -> tuple[dict[str, Any], dict[str, ExtractedMember], ArchivePackaging, dict[str, Any]]:
+        archive_size = archive_path.stat(follow_symlinks=False).st_size
+        with archive_path.open("rb", buffering=0) as source:
+            prefix = source.read(8)
+        packaging = self._detect_archive_packaging(prefix)
+        if packaging is None:
+            raise ValueError("Backup bundle archive format is not supported.")
+        if packaging == "7z":
+            return self._read_7z_archive(
+                archive_path=archive_path,
+                passphrase=passphrase,
+                workspace=workspace,
+            )
+        if archive_size > MAX_BACKUP_ARCHIVE_BYTES:
+            raise ValueError(
+                f"Backup bundle archive exceeds the {MAX_BACKUP_ARCHIVE_BYTES}-byte input limit."
+            )
+        extract_dir = workspace / "extract"
+        extract_dir.mkdir(mode=0o700)
+        if packaging == "zip":
+            try:
+                with archive_path.open("rb") as raw_archive:
+                    with mmap.mmap(raw_archive.fileno(), 0, access=mmap.ACCESS_READ) as mapped:
+                        self._preflight_zip_archive(mapped)
+                with zipfile.ZipFile(archive_path, mode="r") as archive:
+                    members = archive.infolist()
+                    self._validate_zip_members(members)
+                    physical_paths = [member.filename for member in members if not member.is_dir()]
+                    self._validate_unique_physical_archive_paths(physical_paths)
+                    try:
+                        manifest_member = archive.getinfo("manifest.json")
+                    except KeyError as exc:
+                        raise ValueError("Backup bundle is missing manifest.json.") from exc
+                    if manifest_member.file_size > MAX_MANIFEST_BYTES:
+                        raise ValueError("Backup bundle manifest exceeds its size limit.")
+                    with archive.open(manifest_member) as manifest_source:
+                        manifest = self._load_manifest(
+                            self._read_bounded_stream(manifest_source, MAX_MANIFEST_BYTES)
+                        )
+                    self._validate_manifest_before_extraction(manifest)
+                    self._validate_restore_schema_support(manifest)
+                    self._validate_supported_physical_archive_paths(physical_paths, manifest)
+                    extracted = self._extract_manifest_zip_members_to_directory(
+                        archive,
+                        manifest,
+                        extract_dir,
+                    )
+            except zipfile.BadZipFile as exc:
+                raise ValueError("Backup bundle ZIP archive is corrupted.") from exc
+            return manifest, extracted, packaging, {
+                "encrypted": False,
+                "_cleanup_root": workspace,
+            }
+
+        tar_path = workspace / "bundle.tar"
+        self._decompress_tar_archive_to_file(archive_path, tar_path, packaging)
+        with tar_path.open("rb") as raw_tar:
+            with mmap.mmap(raw_tar.fileno(), 0, access=mmap.ACCESS_READ) as mapped:
+                preflight_tar_paths = self._preflight_tar_archive(mapped)
+        try:
+            with tarfile.open(tar_path, mode="r:") as archive:
+                members = self._read_bounded_tar_members(archive)
+                physical_paths = [member.name for member in members if member.isfile()]
+                if physical_paths != preflight_tar_paths:
+                    raise ValueError(
+                        "Backup bundle TAR members do not match its physical headers."
+                    )
+                self._validate_unique_physical_archive_paths(physical_paths)
+                manifest = self._load_manifest(
+                    self._read_tar_member_bounded(archive, "manifest.json", MAX_MANIFEST_BYTES)
+                )
+                self._validate_manifest_before_extraction(manifest)
+                self._validate_restore_schema_support(manifest)
+                self._validate_supported_physical_archive_paths(physical_paths, manifest)
+                extracted = self._extract_manifest_tar_members_to_directory(
+                    archive,
+                    manifest,
+                    extract_dir,
+                )
+        except tarfile.TarError as exc:
+            raise ValueError("Backup bundle TAR archive is corrupted.") from exc
+        return manifest, extracted, packaging, {
+            "encrypted": False,
+            "_cleanup_root": workspace,
+        }
 
     def _read_7z_archive(
         self,
@@ -4327,7 +4563,7 @@ class SystemBackupService:
             self._validate_unique_physical_archive_paths(
                 listed_paths
             )
-            encrypted = "Encrypted = +" in list_result.stdout or "7zAES" in list_result.stdout
+            encrypted = self._seven_zip_encryption_mode(listed_entries)
 
             manifest_entries = [
                 entry
@@ -4632,7 +4868,7 @@ class SystemBackupService:
             extra_cursor += extra_length
 
     @classmethod
-    def _preflight_zip_archive(cls, archive_bytes: bytes) -> None:
+    def _preflight_zip_archive(cls, archive_bytes: Any) -> None:
         eocd_signature = b"PK\x05\x06"
         search_start = max(0, len(archive_bytes) - (65535 + 22))
         candidates: list[tuple[int, tuple[Any, ...]]] = []
@@ -4814,7 +5050,7 @@ class SystemBackupService:
         return cls._normalize_archive_member_path(attributes["path"])
 
     @classmethod
-    def _preflight_tar_archive(cls, tar_bytes: bytes) -> list[str]:
+    def _preflight_tar_archive(cls, tar_bytes: Any) -> list[str]:
         if not tar_bytes or len(tar_bytes) % 512:
             raise ValueError("Backup bundle TAR archive framing is invalid.")
         paths: list[str] = []
@@ -5016,7 +5252,16 @@ class SystemBackupService:
                 group_key=str(manifest_entry.get("group_key") or "").strip(),
                 archive_path=archive_path,
             )
-            if manifest_entry.get("group_key") == HISTORY_DB_KEY and not is_history_member:
+            if (
+                manifest.get("format") == DEBUG_BUNDLE_FORMAT
+                and manifest_entry.get("group_key") == HISTORY_DB_KEY
+            ):
+                is_history_member = True
+            if (
+                manifest.get("format") == BUNDLE_FORMAT
+                and manifest_entry.get("group_key") == HISTORY_DB_KEY
+                and not is_history_member
+            ):
                 raise ValueError(
                     "Backup bundle history member does not match its declared backup group."
                 )
@@ -5044,6 +5289,24 @@ class SystemBackupService:
             raise ValueError(
                 "Backup bundle non-history members exceed the expanded byte limit."
             )
+
+    @classmethod
+    def _seven_zip_encryption_mode(cls, entries: list[dict[str, str]]) -> bool:
+        observed: set[bool] = set()
+        for entry in entries:
+            if cls._is_7z_directory_entry(entry):
+                continue
+            if "Encrypted" not in entry:
+                raise ValueError("Backup bundle 7z member encryption metadata is missing.")
+            raw_mode = entry["Encrypted"].strip()
+            if raw_mode not in {"+", "-"}:
+                raise ValueError("Backup bundle 7z member encryption metadata is malformed.")
+            observed.add(raw_mode == "+")
+        if len(observed) > 1:
+            raise ValueError("Backup bundle 7z archive mixes encrypted and plaintext members.")
+        if not observed:
+            raise ValueError("Backup bundle 7z archive contains no regular members.")
+        return observed.pop()
 
     @staticmethod
     def _is_7z_directory_entry(entry: dict[str, str]) -> bool:
@@ -5090,6 +5353,93 @@ class SystemBackupService:
             raise ValueError("Backup bundle 7z extracted members do not match its listing.")
         if not expected_directories.issubset(actual_directories):
             raise ValueError("Backup bundle 7z extracted directories do not match its listing.")
+
+    @staticmethod
+    def _read_bounded_stream(source: Any, limit: int) -> bytes:
+        chunks: list[bytes] = []
+        total = 0
+        while chunk := source.read(min(ARCHIVE_READ_CHUNK_BYTES, limit - total + 1)):
+            total += len(chunk)
+            if total > limit:
+                raise ValueError("Backup bundle archive member exceeds its expanded byte limit.")
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    @classmethod
+    def _stage_archive_stream(
+        cls,
+        source: Any,
+        target_path: Path,
+        *,
+        expected_size: int,
+    ) -> Path:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        total = 0
+        with target_path.open("xb") as output:
+            while chunk := source.read(ARCHIVE_READ_CHUNK_BYTES):
+                total += len(chunk)
+                if total > expected_size:
+                    raise ValueError("Backup bundle archive member exceeds its declared size.")
+                output.write(chunk)
+            if total != expected_size:
+                raise ValueError("Backup bundle archive member is truncated.")
+            output.flush()
+            os.fsync(output.fileno())
+        target_path.chmod(0o600)
+        return target_path
+
+    def _extract_manifest_zip_members_to_directory(
+        self,
+        archive: zipfile.ZipFile,
+        manifest: dict[str, Any],
+        extract_dir: Path,
+    ) -> dict[str, ExtractedMember]:
+        extracted: dict[str, ExtractedMember] = {}
+        for entry in self._manifest_file_entries(manifest):
+            try:
+                member = archive.getinfo(entry["archive_path"])
+            except KeyError as exc:
+                raise ValueError(f"Backup bundle is missing {entry['archive_path']}.") from exc
+            target_path = self._safe_child_path(
+                extract_dir,
+                Path(entry["archive_path"]),
+                entry["archive_path"],
+            )
+            with archive.open(member) as source:
+                extracted[entry["key"]] = self._stage_archive_stream(
+                    source,
+                    target_path,
+                    expected_size=member.file_size,
+                )
+        return extracted
+
+    def _extract_manifest_tar_members_to_directory(
+        self,
+        archive: tarfile.TarFile,
+        manifest: dict[str, Any],
+        extract_dir: Path,
+    ) -> dict[str, ExtractedMember]:
+        extracted: dict[str, ExtractedMember] = {}
+        for entry in self._manifest_file_entries(manifest):
+            try:
+                member = archive.getmember(entry["archive_path"])
+            except KeyError as exc:
+                raise ValueError(f"Backup bundle is missing {entry['archive_path']}.") from exc
+            source = archive.extractfile(member)
+            if source is None:
+                raise ValueError(f"Backup bundle member {entry['archive_path']} could not be read.")
+            target_path = self._safe_child_path(
+                extract_dir,
+                Path(entry["archive_path"]),
+                entry["archive_path"],
+            )
+            with source:
+                extracted[entry["key"]] = self._stage_archive_stream(
+                    source,
+                    target_path,
+                    expected_size=member.size,
+                )
+        return extracted
 
     def _extract_manifest_zip_members(
         self,
@@ -5174,6 +5524,8 @@ class SystemBackupService:
             if " = " not in line:
                 continue
             key, value = line.split(" = ", 1)
+            if key in current:
+                raise ValueError("Backup bundle 7z listing contains duplicate metadata keys.")
             current[key] = value
         if current:
             entries.append(current)
@@ -5382,6 +5734,25 @@ class SystemBackupService:
         info.size = len(content)
         archive.addfile(info, io.BytesIO(content))
 
+    @classmethod
+    def _read_tar_member_bounded(
+        cls,
+        archive: tarfile.TarFile,
+        archive_path: str,
+        limit: int,
+    ) -> bytes:
+        try:
+            member = archive.getmember(archive_path)
+        except KeyError as exc:
+            raise ValueError(f"Backup bundle is missing {archive_path}.") from exc
+        if member.size > limit:
+            raise ValueError("Backup bundle manifest exceeds its size limit.")
+        extracted = archive.extractfile(member)
+        if extracted is None:
+            raise ValueError(f"Backup bundle member {archive_path} could not be read.")
+        with extracted:
+            return cls._read_bounded_stream(extracted, limit)
+
     @staticmethod
     def _read_tar_member(archive: tarfile.TarFile, archive_path: str) -> bytes:
         try:
@@ -5470,6 +5841,89 @@ class SystemBackupService:
         if len(content) != declared_size:
             raise ValueError("Backup bundle tar.zst archive size does not match its frame metadata.")
         return content
+
+    @classmethod
+    def _decompress_tar_archive_to_file(
+        cls,
+        archive_path: Path,
+        output_path: Path,
+        packaging: ArchivePackaging,
+    ) -> None:
+        archive_size = archive_path.stat(follow_symlinks=False).st_size
+        output_limit = min(
+            MAX_ARCHIVE_EXPANDED_BYTES,
+            MAX_ARCHIVE_COMPRESSION_RATIO * max(archive_size, 1),
+        )
+
+        def write_checked(output: Any, chunk: bytes, total: int) -> int:
+            next_total = total + len(chunk)
+            if next_total > output_limit:
+                if output_limit < MAX_ARCHIVE_EXPANDED_BYTES:
+                    raise ValueError("Backup bundle archive compression ratio exceeds its limit.")
+                raise ValueError("Backup bundle archive expanded data exceeds its byte limit.")
+            output.write(chunk)
+            return next_total
+
+        total = 0
+        try:
+            with archive_path.open("rb", buffering=0) as source, output_path.open("xb") as output:
+                if packaging == "tar.gz":
+                    decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                    reached_eof = False
+                    while compressed := source.read(ARCHIVE_READ_CHUNK_BYTES):
+                        pending = compressed
+                        while True:
+                            chunk = decompressor.decompress(pending, ARCHIVE_READ_CHUNK_BYTES)
+                            total = write_checked(output, chunk, total)
+                            pending = decompressor.unconsumed_tail
+                            if decompressor.eof:
+                                if decompressor.unused_data or source.read(1):
+                                    raise ValueError(
+                                        "Backup bundle tar.gz archive contains concatenated gzip data."
+                                    )
+                                reached_eof = True
+                                break
+                            if pending:
+                                continue
+                            if len(chunk) == ARCHIVE_READ_CHUNK_BYTES:
+                                pending = b""
+                                continue
+                            break
+                        if reached_eof:
+                            break
+                    if not reached_eof:
+                        raise ValueError("Backup bundle tar.gz archive is corrupted.")
+                    total = write_checked(output, decompressor.flush(), total)
+                elif packaging == "tar.zst":
+                    if zstd is None:
+                        raise ValueError(
+                            "tar.zst import requires the optional 'zstandard' dependency."
+                        )
+                    decompressor = zstd.ZstdDecompressor().decompressobj(
+                        read_across_frames=False
+                    )
+                    reached_eof = False
+                    while compressed := source.read(ZSTD_BOUNDED_INPUT_BYTES):
+                        chunk = decompressor.decompress(compressed)
+                        total = write_checked(output, chunk, total)
+                        if decompressor.eof:
+                            if decompressor.unused_data or source.read(1):
+                                raise ValueError(
+                                    "Backup bundle tar.zst archive contains concatenated zstd data."
+                                )
+                            reached_eof = True
+                            break
+                    if not reached_eof:
+                        raise ValueError("Backup bundle tar.zst archive is corrupted.")
+                    total = write_checked(output, decompressor.flush(), total)
+                else:
+                    raise ValueError(f"Unsupported tar archive packaging '{packaging}'.")
+                output.flush()
+                os.fsync(output.fileno())
+        except (zlib.error, zstd.ZstdError if zstd is not None else zlib.error) as exc:
+            output_path.unlink(missing_ok=True)
+            raise ValueError(f"Backup bundle {packaging} archive is corrupted.") from exc
+        output_path.chmod(0o600)
 
     @classmethod
     def _decompress_tar_archive(

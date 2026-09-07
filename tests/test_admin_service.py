@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import secrets
 import shlex
@@ -25,6 +26,7 @@ from app import __version__
 # Must precede admin_service.main, which builds its app at import time.
 from tests.admin_test_env import ADMIN_TEST_PUBLIC_ORIGIN
 from admin_service.config import AdminSettings
+from admin_service.services.backup_receipts import BackupInspectionReceiptStore
 from admin_service.services.account_bootstrap import ServiceAccountBootstrapService
 from admin_service.services.esxi_host_prep import (
     ESXiHostPrepService,
@@ -137,6 +139,146 @@ def make_streaming_request(
         receive,
     )
     return request, receive_probe
+
+
+class BackupInspectionReceiptTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.archive = Path(self.temp_dir.name) / "backup.archive"
+        self.archive.write_bytes(b"synthetic archive bytes")
+        self.store = BackupInspectionReceiptStore(
+            signing_key=b"k" * 32,
+            ttl_seconds=30,
+            nonce_factory=lambda: bytes.fromhex("12" * 16),
+        )
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    @staticmethod
+    def _forge_receipt(receipt: str, **replacements: object) -> str:
+        encoded_payload, encoded_signature = receipt.split(".", 1)
+        padded = encoded_payload + "=" * (-len(encoded_payload) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+        payload.update(replacements)
+        forged_payload = base64.urlsafe_b64encode(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).rstrip(b"=").decode("ascii")
+        return f"{forged_payload}.{encoded_signature}"
+
+    def test_receipt_binds_server_digest_mode_times_and_nonce(self) -> None:
+        issued = self.store.issue(
+            self.archive,
+            observed_encryption_mode="encrypted",
+            now=100,
+        )
+        encoded_payload = issued["receipt"].split(".", 1)[0]
+        padded = encoded_payload + "=" * (-len(encoded_payload) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+
+        self.assertEqual(payload["archive_sha256"], hashlib.sha256(self.archive.read_bytes()).hexdigest())
+        self.assertEqual(payload["encryption_mode"], "encrypted")
+        self.assertEqual(payload["issued_at"], 100)
+        self.assertEqual(payload["expires_at"], 130)
+        self.assertEqual(payload["nonce"], "12" * 16)
+
+    def test_forged_digest_or_mode_is_rejected_without_consuming_receipt(self) -> None:
+        for replacement in (
+            {"archive_sha256": "0" * 64},
+            {"encryption_mode": "plaintext"},
+        ):
+            with self.subTest(replacement=replacement):
+                store = BackupInspectionReceiptStore(
+                    signing_key=b"k" * 32,
+                    ttl_seconds=30,
+                    nonce_factory=lambda: bytes.fromhex("34" * 16),
+                )
+                issued = store.issue(
+                    self.archive,
+                    observed_encryption_mode="encrypted",
+                    now=100,
+                )
+                forged = self._forge_receipt(issued["receipt"], **replacement)
+                with self.assertRaisesRegex(ValueError, "invalid"):
+                    store.consume(
+                        forged,
+                        self.archive,
+                        expected_encryption_mode="encrypted",
+                        now=101,
+                    )
+                store.consume(
+                    issued["receipt"],
+                    self.archive,
+                    expected_encryption_mode="encrypted",
+                    now=101,
+                )
+
+    def test_archive_swap_after_inspection_is_rejected_without_consuming_receipt(self) -> None:
+        original = self.archive.read_bytes()
+        issued = self.store.issue(
+            self.archive,
+            observed_encryption_mode="encrypted",
+            now=100,
+        )
+        self.archive.write_bytes(b"substituted archive bytes")
+
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            self.store.consume(
+                issued["receipt"],
+                self.archive,
+                expected_encryption_mode="encrypted",
+                now=101,
+            )
+
+        self.archive.write_bytes(original)
+        self.store.consume(
+            issued["receipt"],
+            self.archive,
+            expected_encryption_mode="encrypted",
+            now=102,
+        )
+
+    def test_expired_receipt_is_rejected(self) -> None:
+        issued = self.store.issue(
+            self.archive,
+            observed_encryption_mode="plaintext",
+            now=100,
+        )
+
+        with self.assertRaisesRegex(ValueError, "expired"):
+            self.store.consume(
+                issued["receipt"],
+                self.archive,
+                expected_encryption_mode="plaintext",
+                now=131,
+            )
+
+    def test_receipt_is_consumed_once_at_successful_import_admission(self) -> None:
+        issued = self.store.issue(
+            self.archive,
+            observed_encryption_mode="encrypted",
+            now=100,
+        )
+        with self.assertRaisesRegex(ValueError, "encryption mode"):
+            self.store.consume(
+                issued["receipt"],
+                self.archive,
+                expected_encryption_mode="plaintext",
+                now=101,
+            )
+        self.store.consume(
+            issued["receipt"],
+            self.archive,
+            expected_encryption_mode="encrypted",
+            now=102,
+        )
+        with self.assertRaisesRegex(ValueError, "already used"):
+            self.store.consume(
+                issued["receipt"],
+                self.archive,
+                expected_encryption_mode="encrypted",
+                now=103,
+            )
 
 
 class BackupImportRequestLimitTests(unittest.TestCase):
@@ -443,6 +585,12 @@ class MainAppBoundaryTests(unittest.TestCase):
 
     def test_admin_backup_import_streams_file_and_cleans_workspace(self) -> None:
         request, _receive_probe = make_streaming_request([b"archive-", b"bytes"])
+        request.scope["headers"].extend(
+            [
+                (b"x-backup-expected-encryption", b"plaintext"),
+                (b"x-backup-inspection-receipt", b"server-receipt"),
+            ]
+        )
         maintenance = SimpleNamespace(
             stopped_containers=[],
             restarted_containers=[],
@@ -470,9 +618,11 @@ class MainAppBoundaryTests(unittest.TestCase):
         route = next(route for route in admin_app.routes if route.path == "/api/admin/backup/import")
         runtime_service = MagicMock()
         runtime_service.managed_containers = {}
+        receipt_store = MagicMock()
 
         with (
             patch("admin_service.main.get_maintenance_service", return_value=service),
+            patch("admin_service.main.get_backup_receipt_store", return_value=receipt_store),
             patch("admin_service.main.observe_backup_operation") as observe_operation,
             patch(
                 "admin_service.main.reload_app_settings",
@@ -501,6 +651,11 @@ class MainAppBoundaryTests(unittest.TestCase):
         self.assertFalse(archive_path.exists())
         self.assertFalse(archive_path.parent.exists())
         service.import_bundle_from_file.assert_called_once()
+        receipt_store.consume.assert_called_once_with(
+            "server-receipt",
+            archive_path,
+            expected_encryption_mode="plaintext",
+        )
         service.import_bundle.assert_not_called()
         observed_metric = observe_operation.call_args.kwargs
         self.assertEqual(observed_metric["operation"], "import")
@@ -530,6 +685,11 @@ class MainAppBoundaryTests(unittest.TestCase):
                 "history": {"event_count": 42},
             },
         }
+        receipt_store = MagicMock()
+        receipt_store.issue.return_value = {
+            "receipt": "server-receipt",
+            "expires_at": 123456,
+        }
         route = next(
             route for route in admin_app.routes
             if route.path == "/api/admin/backup/inspect"
@@ -537,12 +697,21 @@ class MainAppBoundaryTests(unittest.TestCase):
 
         with (
             patch("admin_service.main.get_backup_service", return_value=service),
+            patch("admin_service.main.get_backup_receipt_store", return_value=receipt_store),
             patch("admin_service.main.observe_backup_operation") as observe_operation,
         ):
             response = asyncio.run(route.endpoint(request))
 
         payload = json.loads(response.body)
-        self.assertEqual(payload, service.inspect_bundle_file.return_value)
+        self.assertEqual(
+            payload,
+            {
+                **service.inspect_bundle_file.return_value,
+                "encryption_mode": "encrypted",
+                "inspection_receipt": "server-receipt",
+                "inspection_receipt_expires_at": 123456,
+            },
+        )
         inspected_path = service.inspect_bundle_file.call_args.args[0]
         self.assertFalse(inspected_path.exists())
         self.assertFalse(inspected_path.parent.exists())
@@ -550,10 +719,60 @@ class MainAppBoundaryTests(unittest.TestCase):
             service.inspect_bundle_file.call_args.kwargs,
             {"passphrase": "synthetic passphrase"},
         )
+        receipt_store.issue.assert_called_once_with(
+            inspected_path,
+            observed_encryption_mode="encrypted",
+        )
         observed_metric = observe_operation.call_args.kwargs
         self.assertEqual(observed_metric["operation"], "inspect")
         self.assertEqual(observed_metric["outcome"], "success")
         self.assertGreaterEqual(observed_metric["duration_seconds"], 0)
+
+    def test_admin_backup_inspection_cancellation_drains_worker_before_workspace_cleanup(self) -> None:
+        request, _receive_probe = make_streaming_request([b"archive-bytes"])
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+        worker_finished = threading.Event()
+        observed_path: list[Path] = []
+        service = MagicMock()
+
+        def inspect_from_file(path: Path, **_kwargs: object) -> dict[str, object]:
+            observed_path.append(path)
+            worker_started.set()
+            release_worker.wait(5)
+            self.assertTrue(path.exists())
+            worker_finished.set()
+            return {"ok": True, "encrypted": False}
+
+        service.inspect_bundle_file.side_effect = inspect_from_file
+        receipt_store = MagicMock()
+        receipt_store.issue.return_value = {"receipt": "receipt", "expires_at": 123}
+        route = next(
+            route for route in admin_app.routes if route.path == "/api/admin/backup/inspect"
+        )
+
+        async def exercise() -> None:
+            with (
+                patch("admin_service.main.get_backup_service", return_value=service),
+                patch("admin_service.main.get_backup_receipt_store", return_value=receipt_store),
+            ):
+                task = asyncio.create_task(route.endpoint(request))
+                self.assertTrue(await asyncio.to_thread(worker_started.wait, 5))
+                for _ in range(2):
+                    task.cancel()
+                    turn = asyncio.Event()
+                    asyncio.get_running_loop().call_soon(turn.set)
+                    await turn.wait()
+                    self.assertFalse(worker_finished.is_set())
+                    self.assertTrue(observed_path[0].exists())
+                release_worker.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+
+        asyncio.run(exercise())
+        self.assertTrue(worker_finished.is_set())
+        self.assertFalse(observed_path[0].exists())
+        self.assertFalse(observed_path[0].parent.exists())
 
     def test_admin_backup_import_rejection_records_only_bounded_outcome(self) -> None:
         request, _receive_probe = make_streaming_request([])
@@ -609,6 +828,12 @@ class MainAppBoundaryTests(unittest.TestCase):
 
     def test_admin_backup_import_without_stops_keeps_impacted_services_needing_restart(self) -> None:
         request, _receive_probe = make_streaming_request([b"archive-bytes"])
+        request.scope["headers"].extend(
+            [
+                (b"x-backup-expected-encryption", b"plaintext"),
+                (b"x-backup-inspection-receipt", b"server-receipt"),
+            ]
+        )
         maintenance = SimpleNamespace(
             stopped_containers=[],
             restarted_containers=[],
@@ -638,6 +863,7 @@ class MainAppBoundaryTests(unittest.TestCase):
                 "admin_service.main.get_maintenance_service",
                 return_value=maintenance_service,
             ),
+            patch("admin_service.main.get_backup_receipt_store", return_value=MagicMock()),
             patch(
                 "admin_service.main.reload_app_settings",
                 return_value=SimpleNamespace(default_system_id=None),
@@ -661,6 +887,69 @@ class MainAppBoundaryTests(unittest.TestCase):
             )
 
         self.assertEqual(runtime_service.pending_restart_keys, {"ui", "history"})
+
+    def test_admin_backup_import_cancellation_drains_worker_before_workspace_cleanup(self) -> None:
+        request, _receive_probe = make_streaming_request([b"archive-bytes"])
+        request.scope["headers"].extend(
+            [
+                (b"x-backup-expected-encryption", b"plaintext"),
+                (b"x-backup-inspection-receipt", b"server-receipt"),
+            ]
+        )
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+        worker_finished = threading.Event()
+        observed_path: list[Path] = []
+        service = MagicMock()
+
+        def import_from_file(path: Path, **_kwargs: object) -> object:
+            observed_path.append(path)
+            worker_started.set()
+            release_worker.wait(5)
+            self.assertTrue(path.exists())
+            worker_finished.set()
+            return (
+                {"ok": True, "systems": [], "restored_paths": []},
+                SimpleNamespace(
+                    stopped_containers=[],
+                    restarted_containers=[],
+                    restart_failures={},
+                ),
+            )
+
+        service.import_bundle_from_file.side_effect = import_from_file
+        route = next(
+            route for route in admin_app.routes if route.path == "/api/admin/backup/import"
+        )
+
+        async def exercise() -> None:
+            with (
+                patch("admin_service.main.get_maintenance_service", return_value=service),
+                patch("admin_service.main.get_backup_receipt_store", return_value=MagicMock()),
+            ):
+                task = asyncio.create_task(
+                    route.endpoint(
+                        request,
+                        stop_services=True,
+                        restart_services=True,
+                    )
+                )
+                self.assertTrue(await asyncio.to_thread(worker_started.wait, 5))
+                for _ in range(2):
+                    task.cancel()
+                    turn = asyncio.Event()
+                    asyncio.get_running_loop().call_soon(turn.set)
+                    await turn.wait()
+                    self.assertFalse(worker_finished.is_set())
+                    self.assertTrue(observed_path[0].exists())
+                release_worker.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+
+        asyncio.run(exercise())
+        self.assertTrue(worker_finished.is_set())
+        self.assertFalse(observed_path[0].exists())
+        self.assertFalse(observed_path[0].parent.exists())
 
     def test_admin_backup_export_cleans_workspace_when_response_setup_fails(self) -> None:
         workspace = Path(tempfile.mkdtemp(prefix="admin-export-setup-failure-"))

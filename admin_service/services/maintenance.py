@@ -81,7 +81,12 @@ class AdminMaintenanceService:
 
     # ------------------------------------------------------------------ helpers
 
-    def _stop_targets(self, *, restart_on_failure: bool) -> list[str]:
+    def _stop_targets(
+        self,
+        initially_running: list[str],
+        *,
+        restart_on_failure: bool,
+    ) -> list[str]:
         """Stop every running clean-backup target, failing closed.
 
         If any stop fails, no further stops are attempted, the containers that were
@@ -90,15 +95,25 @@ class AdminMaintenanceService:
         """
 
         stopped: list[str] = []
-        for key in self.runtime_service.running_container_keys(self.clean_backup_targets):
+        for key in initially_running:
             try:
                 self.runtime_service.stop_container(key)
             except DockerRuntimeError as exc:
                 logger.warning("Failed to stop container %s for maintenance: %s", key, exc)
                 restarted: list[str] = []
                 restart_failures: dict[str, str] = {}
+                try:
+                    still_running = set(
+                        self.runtime_service.running_container_keys(initially_running)
+                    )
+                except DockerRuntimeError:
+                    still_running = set()
+                stopped = [item for item in initially_running if item not in still_running]
                 if restart_on_failure:
-                    restarted, restart_failures = self._start_targets(stopped)
+                    restarted, restart_failures = self._restore_initial_running(
+                        initially_running,
+                        stopped,
+                    )
                 detail = f"Failed to stop container '{key}' before maintenance: {exc}"
                 if stopped:
                     detail += f" Already stopped: {', '.join(stopped)}."
@@ -117,19 +132,41 @@ class AdminMaintenanceService:
             stopped.append(key)
         return stopped
 
-    def _start_targets(self, keys: list[str]) -> tuple[list[str], dict[str, str]]:
-        """Start every container in ``keys``; keep going past failures and report them."""
+    def _restore_initial_running(
+        self,
+        initially_running: list[str],
+        stopped: list[str],
+    ) -> tuple[list[str], dict[str, str]]:
+        """Best-effort restore, then report only the final observed running state."""
 
-        restarted: list[str] = []
-        failures: dict[str, str] = {}
-        for key in keys:
+        start_errors: dict[str, str] = {}
+        try:
+            currently_running = set(
+                self.runtime_service.running_container_keys(initially_running)
+            )
+        except DockerRuntimeError:
+            currently_running = set()
+        for key in initially_running:
+            if key in currently_running:
+                continue
             try:
                 self.runtime_service.start_container(key)
             except DockerRuntimeError as exc:
                 logger.warning("Failed to restart container %s after maintenance: %s", key, exc)
-                failures[key] = str(exc)
-                continue
-            restarted.append(key)
+                start_errors[key] = str(exc)
+        try:
+            final_running = set(
+                self.runtime_service.running_container_keys(initially_running)
+            )
+        except DockerRuntimeError as exc:
+            final_running = set()
+            start_errors = {key: str(exc) for key in initially_running}
+        restarted = [key for key in stopped if key in final_running]
+        failures = {
+            key: start_errors.get(key, "not observed running after restart")
+            for key in initially_running
+            if key not in final_running
+        }
         return restarted, failures
 
     def _run_with_quiesced_services(
@@ -142,13 +179,23 @@ class AdminMaintenanceService:
         stopped_containers: list[str] = []
         restarted_containers: list[str] = []
         restart_failures: dict[str, str] = {}
+        initially_running: list[str] = []
         if stop_services:
-            stopped_containers = self._stop_targets(restart_on_failure=restart_services)
+            initially_running = self.runtime_service.running_container_keys(
+                self.clean_backup_targets
+            )
+            stopped_containers = self._stop_targets(
+                initially_running,
+                restart_on_failure=restart_services,
+            )
         try:
             result = operation(stopped_containers)
         except Exception as operation_error:
             if stop_services and restart_services:
-                restarted_containers, restart_failures = self._start_targets(stopped_containers)
+                restarted_containers, restart_failures = self._restore_initial_running(
+                    initially_running,
+                    stopped_containers,
+                )
             if restart_failures:
                 raise MaintenanceOperationError(
                     operation_error,
@@ -158,7 +205,10 @@ class AdminMaintenanceService:
                 ) from operation_error
             raise
         if stop_services and restart_services:
-            restarted_containers, restart_failures = self._start_targets(stopped_containers)
+            restarted_containers, restart_failures = self._restore_initial_running(
+                initially_running,
+                stopped_containers,
+            )
         return result, MaintenanceOutcome(stopped_containers, restarted_containers, restart_failures)
 
     # --------------------------------------------------------------- operations
@@ -241,13 +291,21 @@ class AdminMaintenanceService:
         archive_path: Path,
         *,
         passphrase: str | None = None,
+        expected_encrypted: bool | None = None,
         stop_services: bool = False,
         restart_services: bool = True,
     ) -> tuple[dict[str, Any], MaintenanceOutcome]:
+        self.backup_service.inspect_bundle_file(
+            archive_path,
+            passphrase=passphrase,
+            expected_encrypted=expected_encrypted,
+        )
+
         def operation(_stopped: list[str]) -> dict[str, Any]:
             return self.backup_service.import_bundle_from_file(
                 archive_path,
                 passphrase=passphrase,
+                expected_encrypted=expected_encrypted,
             )
 
         return self._run_with_quiesced_services(

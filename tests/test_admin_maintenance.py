@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import http.client
 import unittest
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -93,6 +94,86 @@ def build_service(runtime: FakeRuntimeService, backup: FakeBackupService) -> Adm
 
 
 class MaintenanceQuiesceTests(unittest.TestCase):
+    def test_file_import_preflights_before_stopping_services(self) -> None:
+        events: list[str] = []
+        runtime = FakeRuntimeService(["ui", "history"])
+        original_stop = runtime.stop_container
+
+        def stop_container(key: str) -> None:
+            events.append(f"stop:{key}")
+            original_stop(key)
+
+        runtime.stop_container = stop_container  # type: ignore[method-assign]
+        backup = FakeBackupService()
+        backup.inspect_bundle_file = lambda *_args, **_kwargs: events.append("preflight")  # type: ignore[attr-defined]
+        backup.import_bundle_from_file = lambda *_args, **_kwargs: (  # type: ignore[attr-defined]
+            events.append("import") or {"ok": True}
+        )
+
+        build_service(runtime, backup).import_bundle_from_file(
+            Path("synthetic.archive"),
+            stop_services=True,
+        )
+
+        self.assertLess(events.index("preflight"), events.index("stop:ui"))
+        self.assertLess(events.index("stop:history"), events.index("import"))
+
+    def test_stop_error_after_effect_recovers_complete_initial_running_state(self) -> None:
+        class EffectThenErrorRuntime(FakeRuntimeService):
+            def stop_container(self, key: str) -> None:
+                super().stop_container(key)
+                if key == "ui":
+                    raise DockerRuntimeError("response lost after stop")
+
+        runtime = EffectThenErrorRuntime(["ui", "history"])
+        backup = FakeBackupService()
+        backup.inspect_bundle_file = lambda *_args, **_kwargs: {"ok": True}  # type: ignore[attr-defined]
+
+        with self.assertRaises(MaintenanceStopError) as raised:
+            build_service(runtime, backup).import_bundle_from_file(
+                Path("synthetic.archive"),
+                stop_services=True,
+            )
+
+        self.assertEqual(sorted(runtime.running), ["history", "ui"])
+        self.assertEqual(raised.exception.stopped_containers, ["ui"])
+        self.assertEqual(raised.exception.restarted_containers, ["ui"])
+        self.assertEqual(raised.exception.restart_failures, {})
+
+    def test_start_success_without_observed_running_state_is_not_restart_success(self) -> None:
+        class UnobservedStartRuntime(FakeRuntimeService):
+            def start_container(self, key: str) -> None:
+                self.calls.append(("start", key))
+
+        runtime = UnobservedStartRuntime(["ui", "history"])
+        backup = FakeBackupService()
+
+        _result, outcome = build_service(runtime, backup).import_bundle(
+            b"bundle",
+            stop_services=True,
+        )
+
+        self.assertEqual(outcome.restarted_containers, [])
+        self.assertEqual(set(outcome.restart_failures), {"ui", "history"})
+
+    def test_start_error_after_effect_is_reconciled_as_observed_restart_success(self) -> None:
+        class EffectThenErrorRuntime(FakeRuntimeService):
+            def start_container(self, key: str) -> None:
+                super().start_container(key)
+                raise DockerRuntimeError("response lost after start")
+
+        runtime = EffectThenErrorRuntime(["ui", "history"])
+        backup = FakeBackupService()
+
+        _result, outcome = build_service(runtime, backup).import_bundle(
+            b"bundle",
+            stop_services=True,
+        )
+
+        self.assertEqual(outcome.restarted_containers, ["ui", "history"])
+        self.assertEqual(outcome.restart_failures, {})
+        self.assertEqual(sorted(runtime.running), ["history", "ui"])
+
     def test_happy_path_stops_operates_and_restarts_every_target(self) -> None:
         runtime = FakeRuntimeService(["ui", "history", "admin"])
         backup = FakeBackupService()

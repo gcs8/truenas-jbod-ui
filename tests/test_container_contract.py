@@ -32,7 +32,7 @@ EXPECTED_COMPOSE_SECRETS = {
 EXPECTED_MEMORY_LIMITS = {
     "enclosure-ui": "${APP_MEM_LIMIT:-1g}",
     "enclosure-history": "${HISTORY_MEM_LIMIT:-1g}",
-    "enclosure-admin": "${ADMIN_MEM_LIMIT:-3g}",
+    "enclosure-admin": "${ADMIN_MEM_LIMIT:-1g}",
     "enclosure-backup": "${BACKUP_MEM_LIMIT:-3g}",
 }
 EXPECTED_HISTORY_PERMISSION_ENV = {
@@ -1240,8 +1240,15 @@ class ContainerResourceContractTests(unittest.TestCase):
 
         self.assertIn("APP_MEM_LIMIT=1g", example_lines)
         self.assertIn("HISTORY_MEM_LIMIT=1g", example_lines)
-        self.assertIn("ADMIN_MEM_LIMIT=3g", example_lines)
+        self.assertIn("ADMIN_MEM_LIMIT=1g", example_lines)
         self.assertIn("BACKUP_MEM_LIMIT=3g", example_lines)
+
+        backup_guide = (
+            REPO_ROOT / "wiki/Backup-Restore-and-Debug-Bundles.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("1 GiB admin container", backup_guide)
+        self.assertIn("2 GiB non-history expanded archive limit", backup_guide)
+        self.assertIn("1 MiB", backup_guide)
 
     def test_history_permission_repair_is_explicit_and_documented(self) -> None:
         for compose_name in COMPOSE_FILES:

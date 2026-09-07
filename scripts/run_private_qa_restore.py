@@ -41,6 +41,9 @@ INSPECTION_FIELDS = {
     "app_version",
     "exported_at",
     "encrypted",
+    "encryption_mode",
+    "inspection_receipt",
+    "inspection_receipt_expires_at",
     "packaging",
     "selected_groups",
     "present_groups",
@@ -176,6 +179,18 @@ def validate_inspection_payload(payload: object) -> dict[str, Any]:
         raise QaRestoreError("backup inspection did not report success")
     if payload.get("encrypted") is not True:
         raise QaRestoreError("private QA requires an encrypted FULL backup")
+    if payload.get("encryption_mode") != "encrypted":
+        raise QaRestoreError("private QA inspection encryption mode was not encrypted")
+    if not isinstance(payload.get("inspection_receipt"), str) or not payload[
+        "inspection_receipt"
+    ]:
+        raise QaRestoreError("private QA inspection receipt was missing")
+    if (
+        isinstance(payload.get("inspection_receipt_expires_at"), bool)
+        or not isinstance(payload.get("inspection_receipt_expires_at"), int)
+        or payload["inspection_receipt_expires_at"] <= 0
+    ):
+        raise QaRestoreError("private QA inspection receipt expiry was invalid")
     aggregate = payload.get("aggregate_counts")
     if not isinstance(aggregate, dict) or set(aggregate) != AGGREGATE_FIELDS:
         raise QaRestoreError("inspection aggregate count fields are invalid")
@@ -366,6 +381,8 @@ def post_archive(
     passphrase: str,
     username: str,
     password: str,
+    *,
+    extra_headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=1800)
     try:
@@ -378,6 +395,14 @@ def post_archive(
             "X-Backup-Passphrase-Base64",
             base64.b64encode(passphrase.encode("utf-8")).decode("ascii"),
         )
+        allowed_extra_headers = {
+            "X-Backup-Expected-Encryption",
+            "X-Backup-Inspection-Receipt",
+        }
+        if set(extra_headers or {}) - allowed_extra_headers:
+            raise QaRestoreError("archive request contained an unsupported extra header")
+        for key, value in (extra_headers or {}).items():
+            connection.putheader(key, value)
         connection.endheaders()
         with archive.open("rb", buffering=0) as source:
             while chunk := source.read(1024 * 1024):
@@ -1626,6 +1651,10 @@ def main() -> int:
             passphrase,
             username,
             password,
+            extra_headers={
+                "X-Backup-Expected-Encryption": inspection["encryption_mode"],
+                "X-Backup-Inspection-Receipt": inspection["inspection_receipt"],
+            },
         )
         import_summary = _safe_import_summary(
             imported,
