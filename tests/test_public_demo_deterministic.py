@@ -246,9 +246,8 @@ class DeterministicPublicDemoContractTests(unittest.TestCase):
                 "scripts/check_public_demo_artifact.py",
             }
         )
-        for event_name in ("pull_request", "push"):
-            with self.subTest(event_name=event_name):
-                self.assertEqual(workflow_paths_for_event(workflow, event_name), expected_paths)
+        self.assertEqual(workflow_paths_for_event(workflow, "pull_request"), expected_paths)
+        self.assertEqual(workflow_paths_for_event(workflow, "push"), {"public-demo/**"})
 
     def test_pages_deploy_requires_manual_dispatch(self) -> None:
         workflow = (ROOT / ".github/workflows/publish-public-demo.yml").read_text(encoding="utf-8")
