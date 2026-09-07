@@ -16,6 +16,7 @@ from history_service import segment_migration
 from history_service.config import HistorySettings
 from history_service.segment_catalog import activation_pending_path
 from history_service.segment_rotation import recover_pending_rotation
+from history_service.segmented_restore import record_tree as record_restore_tree
 from history_service.store import SCHEMA, HistoryStore
 from history_service.system_backup import (
     HISTORY_DB_KEY,
@@ -40,6 +41,336 @@ class SegmentedRestoreRecoveryTests(unittest.TestCase):
             - self._import_roots_before
         ):
             shutil.rmtree(import_root, ignore_errors=True)
+
+    def test_schema_v2_restore_uses_shared_modes_for_a_fresh_segment_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source, source_segments = self._create_generation(
+                root / "source",
+                "candidate",
+            )
+            target_root = root / "target"
+            target_root.mkdir()
+            target = target_root / "history.db"
+            target_segments = target_root / "segments"
+            expected_gid = target_root.stat().st_gid
+            source_service = self._service(source, source_segments)
+            target_service = self._service(target, target_segments)
+            artifact = source_service.export_bundle_to_file(
+                packaging="zip",
+                included_paths=[HISTORY_DB_KEY],
+            )
+
+            try:
+                result = target_service.import_bundle_from_file(artifact.path)
+
+                self.assertEqual(result["schema_version"], 2)
+                self.assertEqual(stat.S_IMODE(target_segments.stat().st_mode), 0o750)
+                for path in (
+                    target_segments / "catalog.json",
+                    target_segments / "segment-0001.sqlite3",
+                ):
+                    self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o640)
+                    self.assertEqual(path.stat().st_gid, expected_gid)
+                self.assertEqual(target_segments.stat().st_gid, expected_gid)
+            finally:
+                artifact.cleanup()
+
+    def test_schema_v2_restore_preserves_existing_modes_and_shares_a_missing_member(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source, source_segments = self._create_generation(
+                root / "source",
+                "candidate",
+            )
+            target, target_segments = self._create_generation(
+                root / "target",
+                "prior",
+            )
+            target_catalog = target_segments / "catalog.json"
+            target_segment = target_segments / "segment-0001.sqlite3"
+            target_segments.chmod(0o710)
+            target_catalog.chmod(0o620)
+            target_segment.unlink()
+            source_service = self._service(source, source_segments)
+            target_service = self._service(target, target_segments)
+            artifact = source_service.export_bundle_to_file(
+                packaging="zip",
+                included_paths=[HISTORY_DB_KEY],
+            )
+
+            try:
+                result = target_service.import_bundle_from_file(artifact.path)
+
+                self.assertEqual(result["schema_version"], 2)
+                self.assertEqual(stat.S_IMODE(target_segments.stat().st_mode), 0o710)
+                self.assertEqual(stat.S_IMODE(target_catalog.stat().st_mode), 0o620)
+                self.assertEqual(stat.S_IMODE(target_segment.stat().st_mode), 0o640)
+            finally:
+                artifact.cleanup()
+
+    def test_schema_v2_marker_authenticates_one_final_shared_mode_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source, source_segments = self._create_generation(
+                root / "source",
+                "candidate",
+            )
+            target_root = root / "target"
+            target_root.mkdir()
+            target = target_root / "history.db"
+            target_segments = target_root / "segments"
+            source_service = self._service(source, source_segments)
+            target_service = self._service(target, target_segments)
+            artifact = source_service.export_bundle_to_file(
+                packaging="zip",
+                included_paths=[HISTORY_DB_KEY],
+            )
+            inspected = False
+
+            def inspect_before_marker(_store: HistoryStore, payload: dict[str, Any]):
+                nonlocal inspected
+                staged_segments = target_root / payload["segments"]["staged_name"]
+                candidate = payload["segments"]["candidate"]
+                self.assertEqual(candidate, record_restore_tree(staged_segments))
+                self.assertEqual(candidate["mode"], 0o750)
+                self.assertTrue(candidate["files"])
+                self.assertTrue(all(item["mode"] == 0o640 for item in candidate["files"]))
+                self.assertNotIn("candidate_final", payload)
+                self.assertNotIn("candidate_final", payload["segments"])
+                inspected = True
+                raise SimulatedRestoreCrash("before-marker-publication")
+
+            try:
+                with patch.object(
+                    SystemBackupService,
+                    "_create_segmented_activation_marker",
+                    side_effect=inspect_before_marker,
+                ):
+                    with self.assertRaises(SimulatedRestoreCrash):
+                        target_service.import_bundle_from_file(artifact.path)
+
+                self.assertTrue(inspected)
+                self.assertFalse(activation_pending_path(target).exists())
+            finally:
+                artifact.cleanup()
+
+    def test_schema_v2_catalog_mutation_after_marker_preserves_authenticated_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source, source_segments = self._create_generation(
+                root / "source",
+                "candidate",
+            )
+            target, target_segments = self._create_generation(
+                root / "target",
+                "prior",
+            )
+            prior_events = self._event_types(target)
+            target_catalog = target_segments / "catalog.json"
+            target_catalog.unlink()
+            source_service = self._service(source, source_segments)
+            target_service = self._service(target, target_segments)
+            artifact = source_service.export_bundle_to_file(
+                packaging="zip",
+                included_paths=[HISTORY_DB_KEY],
+            )
+            original_create_marker = SystemBackupService._create_segmented_activation_marker
+            original_path_chmod = Path.chmod
+            original_os_chmod = os.chmod
+            original_os_fchmod = os.fchmod
+            marker_published = False
+            staged_segments: Path | None = None
+            mutation_identity: tuple[int, int, int, int] | None = None
+            post_marker_mode_changes: list[str] = []
+
+            def is_candidate_path(value: str | bytes | os.PathLike[str] | int) -> bool:
+                if isinstance(value, int):
+                    return False
+                path = Path(os.fsdecode(value))
+                roots = [target_segments]
+                if staged_segments is not None:
+                    roots.append(staged_segments)
+                return any(
+                    path == candidate_root or candidate_root in path.parents
+                    for candidate_root in roots
+                )
+
+            def checked_path_chmod(path: Path, mode: int, *, follow_symlinks: bool = True):
+                if marker_published and is_candidate_path(path):
+                    post_marker_mode_changes.append(f"Path.chmod:{path}")
+                return original_path_chmod(path, mode, follow_symlinks=follow_symlinks)
+
+            def checked_os_chmod(
+                path: str | bytes | int,
+                mode: int,
+                *,
+                dir_fd: int | None = None,
+                follow_symlinks: bool = True,
+            ):
+                if marker_published and is_candidate_path(path):
+                    post_marker_mode_changes.append(f"os.chmod:{path}")
+                return original_os_chmod(
+                    path,
+                    mode,
+                    dir_fd=dir_fd,
+                    follow_symlinks=follow_symlinks,
+                )
+
+            def checked_os_fchmod(descriptor: int, mode: int):
+                if marker_published:
+                    try:
+                        descriptor_path = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+                    except OSError:
+                        descriptor_path = None
+                    if descriptor_path is not None and is_candidate_path(descriptor_path):
+                        post_marker_mode_changes.append(f"os.fchmod:{descriptor_path}")
+                return original_os_fchmod(descriptor, mode)
+
+            def mutate_catalog_after_marker(store: HistoryStore, payload: dict[str, Any]):
+                nonlocal marker_published, mutation_identity, staged_segments
+                original_create_marker(store, payload)
+                marker_published = True
+                candidate_segments = target.parent / payload["segments"]["staged_name"]
+                staged_segments = candidate_segments
+                staged_catalog = candidate_segments / "catalog.json"
+                before = staged_catalog.stat(follow_symlinks=False)
+                with staged_catalog.open("r+b", buffering=0) as stream:
+                    first_byte = stream.read(1)
+                    stream.seek(0)
+                    stream.write(b"[" if first_byte != b"[" else b"{")
+                    os.fsync(stream.fileno())
+                after = staged_catalog.stat(follow_symlinks=False)
+                mutation_identity = (
+                    before.st_ino,
+                    after.st_ino,
+                    before.st_size,
+                    after.st_size,
+                )
+                raise SimulatedRestoreCrash("catalog-mutated-after-marker")
+
+            previous_umask = os.umask(0o077)
+            try:
+                with (
+                    patch.object(Path, "chmod", autospec=True, side_effect=checked_path_chmod),
+                    patch("history_service.system_backup.os.chmod", side_effect=checked_os_chmod),
+                    patch("history_service.system_backup.os.fchmod", side_effect=checked_os_fchmod),
+                    patch.object(
+                        SystemBackupService,
+                        "_create_segmented_activation_marker",
+                        side_effect=mutate_catalog_after_marker,
+                    ),
+                    patch.object(
+                        _ImportActivationTransaction,
+                        "__exit__",
+                        return_value=False,
+                    ),
+                ):
+                    with self.assertRaises(SimulatedRestoreCrash):
+                        target_service.import_bundle_from_file(artifact.path)
+                    with self.assertRaisesRegex(ValueError, "restore|integrity|divergent"):
+                        recover_pending_rotation(
+                            source=target,
+                            segments_directory=target_segments,
+                            apply=True,
+                        )
+            finally:
+                os.umask(previous_umask)
+                artifact.cleanup()
+
+            self.assertIsNotNone(staged_segments)
+            assert staged_segments is not None
+            self.assertIsNotNone(mutation_identity)
+            assert mutation_identity is not None
+            self.assertEqual(mutation_identity[0], mutation_identity[1])
+            self.assertEqual(mutation_identity[2], mutation_identity[3])
+            self.assertEqual(self._event_types(target), prior_events)
+            self.assertFalse(target_catalog.exists())
+            self.assertTrue(staged_segments.is_dir())
+            self.assertEqual(stat.S_IMODE(staged_segments.stat().st_mode), 0o750)
+            self.assertEqual(
+                stat.S_IMODE((staged_segments / "catalog.json").stat().st_mode),
+                0o640,
+            )
+            marker_path = activation_pending_path(target)
+            self.assertTrue(marker_path.is_file())
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            self.assertTrue((target.parent / marker["hot"]["staged_name"]).is_file())
+            self.assertEqual(post_marker_mode_changes, [])
+
+    def test_schema_v2_missing_target_recovers_after_activation_before_marker_removal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source, source_segments = self._create_generation(
+                root / "source",
+                "candidate",
+            )
+            target_root = root / "target"
+            target_root.mkdir()
+            target = target_root / "history.db"
+            target_segments = target_root / "segments"
+            source_service = self._service(source, source_segments)
+            target_service = self._service(target, target_segments)
+            artifact = source_service.export_bundle_to_file(
+                packaging="zip",
+                included_paths=[HISTORY_DB_KEY],
+            )
+            try:
+                with patch.object(
+                    SystemBackupService,
+                    "_remove_segmented_activation_marker",
+                    side_effect=SimulatedRestoreCrash("after-activation-before-marker-removal"),
+                ):
+                    with self.assertRaises(SimulatedRestoreCrash):
+                        target_service.import_bundle_from_file(artifact.path)
+
+                marker_path = activation_pending_path(target)
+                self.assertTrue(marker_path.is_file())
+                marker = json.loads(marker_path.read_text(encoding="utf-8"))
+                candidate_hot_sha256 = marker["hot"]["candidate"]["sha256"]
+                candidate_catalog_sha256 = next(
+                    item["sha256"]
+                    for item in marker["segments"]["candidate"]["files"]
+                    if item["path"] == "catalog.json"
+                )
+                generation_id = marker["generation_id"]
+                result = recover_pending_rotation(
+                    source=target,
+                    segments_directory=target_segments,
+                    apply=True,
+                )
+
+                self.assertEqual(result["recovery_state"], "candidate-finalized")
+                self.assertEqual(self._sha256(target), candidate_hot_sha256)
+                self.assertEqual(
+                    self._sha256(target_segments / "catalog.json"),
+                    candidate_catalog_sha256,
+                )
+                self.assertEqual(
+                    record_restore_tree(target_segments),
+                    marker["segments"]["candidate"],
+                )
+                self.assertEqual(
+                    json.loads(
+                        (target_segments / "catalog.json").read_text(encoding="utf-8")
+                    )["generation_id"],
+                    generation_id,
+                )
+                self.assertEqual(stat.S_IMODE(target_segments.stat().st_mode), 0o750)
+                self.assertEqual(
+                    stat.S_IMODE((target_segments / "catalog.json").stat().st_mode),
+                    0o640,
+                )
+                self.assertEqual(
+                    stat.S_IMODE((target_segments / "segment-0001.sqlite3").stat().st_mode),
+                    0o640,
+                )
+                self.assertFalse(activation_pending_path(target).exists())
+                for section in (marker["hot"], marker["segments"]):
+                    self.assertFalse((target_root / section["staged_name"]).exists())
+                    self.assertFalse((target_root / section["previous_name"]).exists())
+            finally:
+                artifact.cleanup()
 
     def test_public_restore_refuses_candidate_mutation_after_marker_publication(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
