@@ -79,16 +79,17 @@ CORE_MPRUTIL_SHOW_COMMANDS = {
 }
 CORE_MPRUTIL_UNIT_SHOW_COMMANDS = CORE_MPRUTIL_SHOW_COMMANDS - {"adapters"}
 # TrueNAS middleware calls behind the main UI's disk inventory sync action (#357).
-# Anchored argument regexes admit only the numeric-ID filter built by the poll
-# loop; sudo globs can otherwise consume whitespace and additional arguments.
+# Backslash-free anchored POSIX EREs survive TrueNAS sudoers rendering and admit
+# only the numeric-ID filter built by the poll loop. Sudo globs can otherwise
+# consume whitespace and additional arguments.
 CORE_MIDCLT_DISK_SYNC_SUDO_COMMANDS = (
     "/usr/local/bin/midclt call disk.multipath_sync",
     "/usr/local/bin/midclt call disk.sync_all",
-    r'/usr/local/bin/midclt ^call core\.get_jobs \[\[\"id\"\,\"=\"\,[0-9]+\]\]$',
+    r'/usr/local/bin/midclt ^call core[.]get_jobs [[][[]"id","=",[0-9]+[]][]]$',
 )
 SCALE_MIDCLT_DISK_SYNC_SUDO_COMMANDS = (
     "/usr/bin/midclt call disk.sync_all",
-    r'/usr/bin/midclt ^call core\.get_jobs \[\[\"id\"\,\"=\"\,[0-9]+\]\]$',
+    r'/usr/bin/midclt ^call core[.]get_jobs [[][[]"id","=",[0-9]+[]][]]$',
 )
 SUDO_COMMANDS_BY_PLATFORM: dict[str, tuple[str, ...]] = {
     "core": (

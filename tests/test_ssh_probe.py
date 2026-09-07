@@ -313,6 +313,44 @@ class SSHProbeTests(unittest.TestCase):
         ssh_client.close.assert_called_once_with()
 
     @patch("app.services.ssh_probe.paramiko.SSHClient")
+    def test_run_command_sync_can_extend_only_the_remote_command_timeout(
+        self,
+        ssh_client_cls: MagicMock,
+    ) -> None:
+        ssh_client = MagicMock()
+        ssh_client.__enter__.return_value = ssh_client
+        ssh_client_cls.return_value = ssh_client
+        stdout = MagicMock()
+        stdout.read.return_value = b"null\n"
+        stdout.channel.recv_exit_status.return_value = 0
+        stderr = MagicMock()
+        stderr.read.return_value = b""
+        ssh_client.exec_command.return_value = MagicMock(), stdout, stderr
+        probe = SSHProbe(
+            SSHConfig(
+                enabled=True,
+                host="archive-core.example.test",
+                user="jbodmap",
+                timeout_seconds=15,
+                strict_host_key_checking=False,
+            )
+        )
+
+        result = probe._run_command_sync(
+            "sudo -n /usr/local/bin/midclt call disk.multipath_sync",
+            timeout_seconds=180,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(ssh_client.connect.call_args.kwargs["timeout"], 15)
+        self.assertEqual(ssh_client.connect.call_args.kwargs["banner_timeout"], 15)
+        self.assertEqual(ssh_client.connect.call_args.kwargs["auth_timeout"], 15)
+        ssh_client.exec_command.assert_called_once_with(
+            "sudo -n /usr/local/bin/midclt call disk.multipath_sync",
+            timeout=180,
+        )
+
+    @patch("app.services.ssh_probe.paramiko.SSHClient")
     def test_run_commands_sync_returns_failure_results_for_each_command_when_connection_setup_fails(
         self,
         ssh_client_cls: MagicMock,

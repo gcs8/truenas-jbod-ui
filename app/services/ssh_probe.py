@@ -186,7 +186,12 @@ class SSHProbe:
             return []
         return await asyncio.to_thread(self._run_planned_commands_sync, planner, initial_commands)
 
-    async def run_command(self, command: str) -> SSHCommandResult:
+    async def run_command(
+        self,
+        command: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> SSHCommandResult:
         if not self.config.enabled:
             return SSHCommandResult(
                 command=command,
@@ -194,9 +199,18 @@ class SSHProbe:
                 stderr="SSH fallback is disabled.",
                 exit_code=1,
             )
-        return await asyncio.to_thread(self._run_command_sync, command)
+        return await asyncio.to_thread(
+            self._run_command_sync,
+            command,
+            timeout_seconds=timeout_seconds,
+        )
 
-    def run_command_sync(self, command: str) -> SSHCommandResult:
+    def run_command_sync(
+        self,
+        command: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> SSHCommandResult:
         if not self.config.enabled:
             return SSHCommandResult(
                 command=command,
@@ -204,7 +218,7 @@ class SSHProbe:
                 stderr="SSH fallback is disabled.",
                 exit_code=1,
             )
-        return self._run_command_sync(command)
+        return self._run_command_sync(command, timeout_seconds=timeout_seconds)
 
     def _run_commands_sync(
         self,
@@ -326,10 +340,19 @@ class SSHProbe:
         )
         return results
 
-    def _run_command_sync(self, command: str) -> SSHCommandResult:
+    def _run_command_sync(
+        self,
+        command: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> SSHCommandResult:
         try:
             with self._client() as client:
-                return self._run_single_command(client, command)
+                return self._run_single_command(
+                    client,
+                    command,
+                    timeout_seconds=timeout_seconds,
+                )
         except Exception as exc:
             logger.warning(
                 "SSH command failed to start for %s@%s: %s",
@@ -428,6 +451,7 @@ class SSHProbe:
         command: str,
         *,
         stdin_data: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> SSHCommandResult:
         safe_command = redact_ssh_command(command)
         logger.debug("Running SSH command: %s", safe_command)
@@ -438,7 +462,8 @@ class SSHProbe:
                 "SSH command input cannot be combined with sudo password input.",
             )
         try:
-            stdin, stdout, stderr = client.exec_command(effective_command, timeout=self.config.timeout_seconds)
+            command_timeout = self.config.timeout_seconds if timeout_seconds is None else timeout_seconds
+            stdin, stdout, stderr = client.exec_command(effective_command, timeout=command_timeout)
             command_input = f"{sudo_password}\n" if sudo_password else stdin_data
             if command_input is not None:
                 stdin.write(command_input)

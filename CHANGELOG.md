@@ -264,6 +264,8 @@ them before starting the new images.
 
 ### Fixed
 
+- Made TrueNAS-rendered poll grants match only numeric job IDs and let CORE
+  multipath sync use the configured disk-sync timeout (#390).
 - Correlated sparse physical profiles by explicit slot IDs across all six
   platform paths without inventing gap slots (#382).
 - Fixed scoped enclosure refreshes, exact history boundaries, aggregate export
