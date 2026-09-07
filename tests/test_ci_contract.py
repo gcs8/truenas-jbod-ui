@@ -270,6 +270,23 @@ class CIWorkflowContractTests(unittest.TestCase):
         self.assertIn("PUBLIC_DEMO_URL:", publish)
         self.assertIn("--grep \"published public demo\"", publish)
 
+    def test_public_demo_source_revision_jobs_checkout_full_history(self) -> None:
+        expected_jobs = {
+            CI_WORKFLOW: ("python-source", "public-demo-artifact"),
+            PUBLISH_PUBLIC_DEMO_WORKFLOW: ("verify",),
+        }
+
+        for workflow_path, job_names in expected_jobs.items():
+            workflow = yaml.safe_load(self.read(workflow_path))
+            for job_name in job_names:
+                with self.subTest(workflow=workflow_path.name, job=job_name):
+                    checkout = next(
+                        step
+                        for step in workflow["jobs"][job_name]["steps"]
+                        if str(step.get("uses", "")).startswith("actions/checkout@")
+                    )
+                    self.assertEqual(checkout.get("with", {}).get("fetch-depth"), 0)
+
     def test_release_checklist_public_demo_commands_supply_both_required_artifacts(self) -> None:
         checklist = self.read(ROOT / "docs" / "RELEASE_CHECKLIST.md")
         public_demo_commands = [
