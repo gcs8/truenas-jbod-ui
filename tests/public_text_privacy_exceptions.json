@@ -79,14 +79,7 @@
     },
     "reason": "Reviewed source literal or validation pattern; exact detector counts are pinned."
   },
-  "app/services/public_demo_fixture.py": {
-    "findings": {
-      "sas_wwn_identifier": {
-        "sha256:7b89c41ea9648df787ca2ce4f52648372f0fb3b1e58a0c72394e585c11c2cb22": 1
-      }
-    },
-    "reason": "Reviewed source literal or validation pattern; exact detector counts are pinned."
-  },
+
   "app/static/sas_fabric_view.js": {
     "findings": {
       "internal_hostname": {
@@ -307,12 +300,9 @@
     "findings": {
       "compact_lab_host_id": {
         "sha256:53a13e21199cb549462704b9d319d0eef5ff654df15691a558e71f213f73b0aa": 3
-      },
-      "sas_wwn_identifier": {
-        "sha256:d6aeb1462173590f2a894f4cc5b68868ae5cfcbcb50dd09c9e469039c98e5d24": 683
       }
     },
-    "reason": "Generated sanitized demo; the dedicated artifact privacy checker also applies."
+    "reason": "Generated synthetic demo; three image-data substrings match the compact-host detector, and the dedicated artifact checker also applies."
   },
   "qa/fixtures/admin-cleanroom-config.yaml": {
     "findings": {
@@ -631,14 +621,6 @@
     "findings": {
       "rfc1918_ipv4": {
         "sha256:c68326e1093cc4427ce971259cb6da0f0dfe7a1c08c6779a23cf508097f4d0aa": 3
-      }
-    },
-    "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
-  },
-  "tests/test_public_demo_fixture.py": {
-    "findings": {
-      "sas_wwn_identifier": {
-        "sha256:3b83745e02f361c09757b5666c6f2bf194e5fec71c55bee53b4fbe7a884b07a6": 4
       }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."

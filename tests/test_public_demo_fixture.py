@@ -1,37 +1,32 @@
 from __future__ import annotations
 
-import argparse
-import asyncio
-import contextlib
 import hashlib
-import io
+import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 import unittest
-from unittest import mock
 
+from pydantic import ValidationError
+
+from app import __version__
 from app.services.public_demo_fixture import (
+    PUBLIC_DEMO_ENCLOSURE_ID,
+    PUBLIC_DEMO_FIXTURE_PATH,
     PUBLIC_DEMO_GENERATED_AT,
-    PUBLIC_DEMO_HISTORY_WINDOW_HOURS,
+    PUBLIC_DEMO_SYSTEM_ID,
+    PublicDemoFixture,
     build_public_demo_html,
     build_public_demo_snapshot_bundle,
+    load_public_demo_fixture,
 )
-from app.services.snapshot_export import (
-    EXPORT_HISTORY_CACHE,
-    EXPORT_RENDER_CACHE,
-    EXPORT_ZIP_CACHE,
-)
+from app.services.snapshot_export import EXPORT_HISTORY_CACHE, EXPORT_RENDER_CACHE, EXPORT_ZIP_CACHE
 
 
 ROOT = Path(__file__).resolve().parents[1]
-LOCAL_HISTORY_ENV = "PUBLIC_DEMO_LOCAL_HISTORY"
-LOCAL_HISTORY_DB = ROOT / "history" / "history.db"
-LOCAL_HISTORY_SKIP_REASON = (
-    f"requires {LOCAL_HISTORY_ENV}=1 and local ignored history/history.db release input"
-)
 
 
 def clear_export_caches() -> None:
@@ -40,148 +35,99 @@ def clear_export_caches() -> None:
     EXPORT_ZIP_CACHE.clear()
 
 
-class PublicDemoArtifactTests(unittest.TestCase):
-    def _write_minimal_demo_artifact(self, demo_dir: Path, *, padding: str = "") -> None:
-        demo_dir.mkdir(parents=True, exist_ok=True)
-        marker_html = "\n".join(
-            (
-                "Frozen Sanitized Snapshot",
-                "Artifact app v0.0.0-test",
-                "Capture time",
-                "Live-derived CORE 60-bay sample",
-                "Scrambled IDs",
-                "4x NVMe Carrier Card",
-                "Boot SATADOMs",
-                "mirror-8",
-                padding,
-            )
-        )
-        (demo_dir / "index.html").write_text(marker_html, encoding="utf-8")
-        (demo_dir / ".nojekyll").write_text("", encoding="utf-8")
+def run_checker(demo_dir: Path, *extra: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "scripts/check_public_demo_artifact.py", str(demo_dir), *extra],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
 
-    def test_checked_in_public_demo_artifact_is_publishable(self) -> None:
-        result = subprocess.run(
-            [sys.executable, "scripts/check_public_demo_artifact.py", "public-demo"],
-            cwd=ROOT,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
+
+class PublicDemoArtifactTests(unittest.TestCase):
+    def copy_artifact(self, target: Path) -> Path:
+        target.mkdir(parents=True)
+        shutil.copy2(ROOT / "public-demo/index.html", target / "index.html")
+        shutil.copy2(ROOT / "public-demo/.nojekyll", target / ".nojekyll")
+        return target / "index.html"
+
+    def test_checked_in_artifact_is_publishable_and_reports_sizes(self) -> None:
+        result = run_checker(ROOT / "public-demo")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Public demo artifact is publishable", result.stdout)
-
-    def test_checked_in_public_demo_artifact_reports_raw_and_gzip_sizes(self) -> None:
-        result = subprocess.run(
-            [sys.executable, "scripts/check_public_demo_artifact.py", "public-demo"],
-            cwd=ROOT,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-
-        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("raw=", result.stdout)
         self.assertIn("gzip=", result.stdout)
 
-    def test_public_demo_without_storage_fabric_route_action_is_publishable(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            demo_dir = Path(temp_dir) / "public-demo"
-            self._write_minimal_demo_artifact(demo_dir)
-
-            result = subprocess.run(
-                [sys.executable, "scripts/check_public_demo_artifact.py", str(demo_dir)],
-                cwd=ROOT,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-
-    def test_public_demo_storage_fabric_route_action_is_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            demo_dir = Path(temp_dir) / "public-demo"
-            self._write_minimal_demo_artifact(demo_dir)
-            with (demo_dir / "index.html").open("a", encoding="utf-8") as artifact:
-                artifact.write('\n<a id="sas-fabric-view-link" href="#sas-fabric-panel">Storage Fabric</a>\n')
-
-            result = subprocess.run(
-                [sys.executable, "scripts/check_public_demo_artifact.py", str(demo_dir)],
-                cwd=ROOT,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("snapshot Storage Fabric route action", result.stderr)
-
-    def test_checked_in_public_demo_artifact_enforces_raw_size_budget(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            demo_dir = Path(temp_dir) / "public-demo"
-            self._write_minimal_demo_artifact(demo_dir, padding="x" * 128)
-
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    "scripts/check_public_demo_artifact.py",
-                    str(demo_dir),
-                    "--max-raw-bytes",
-                    "64",
-                ],
-                cwd=ROOT,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("raw size", result.stderr)
-        self.assertIn("exceeds budget", result.stderr)
-
-    def test_checked_in_public_demo_artifact_enforces_gzip_size_budget(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            demo_dir = Path(temp_dir) / "public-demo"
-            self._write_minimal_demo_artifact(demo_dir, padding="x" * 128)
-
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    "scripts/check_public_demo_artifact.py",
-                    str(demo_dir),
-                    "--max-gzip-bytes",
-                    "16",
-                ],
-                cwd=ROOT,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("gzip size", result.stderr)
-        self.assertIn("exceeds budget", result.stderr)
-
-    def test_checked_in_public_demo_artifact_has_operator_markers(self) -> None:
-        artifact_path = ROOT / "public-demo" / "index.html"
-        self.assertTrue(artifact_path.exists(), f"missing checked-in artifact: {artifact_path}")
-        html = artifact_path.read_text(encoding="utf-8")
+    def test_checked_in_artifact_has_synthetic_operator_markers(self) -> None:
+        html = (ROOT / "public-demo/index.html").read_text(encoding="utf-8")
 
         for marker in (
             "Frozen Sanitized Snapshot",
-            "Artifact app v0.21.0-dev",
-            "Capture time",
+            f"Artifact app v{__version__}",
             PUBLIC_DEMO_GENERATED_AT.isoformat(),
-            "Live-derived CORE 60-bay sample",
-            "Scrambled IDs",
-            "4x NVMe Carrier Card",
-            "Boot SATADOMs",
+            "Synthetic IDs",
+            "Demo Storage Host",
+            "Demo 60-Bay Top Loader",
+            "Demo Boot Modules",
+            "Demo 4x NVMe Carrier",
             "mirror-8",
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, html)
+        self.assertNotIn("Live-derived", html)
+        self.assertNotIn("history/history.db", html)
         self.assertNotIn('id="sas-fabric-view-link"', html)
+
+    def test_artifact_version_mismatch_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            demo_dir = Path(temp_dir) / "public-demo"
+            artifact = self.copy_artifact(demo_dir)
+            artifact.write_text(
+                artifact.read_text(encoding="utf-8").replace(
+                    f"Artifact app v{__version__}",
+                    "Artifact app v0.0.0-stale",
+                ),
+                encoding="utf-8",
+            )
+            result = run_checker(demo_dir)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"does not match source {__version__}", result.stderr)
+
+    def test_missing_source_manifest_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            demo_dir = Path(temp_dir) / "public-demo"
+            artifact = self.copy_artifact(demo_dir)
+            artifact.write_text(artifact.read_text(encoding="utf-8").split("\n", 1)[1], encoding="utf-8")
+            result = run_checker(demo_dir)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing public demo source parity manifest", result.stderr)
+
+    def test_forbidden_route_action_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            demo_dir = Path(temp_dir) / "public-demo"
+            artifact = self.copy_artifact(demo_dir)
+            with artifact.open("a", encoding="utf-8") as handle:
+                handle.write('\n<a id="sas-fabric-view-link">Storage Fabric</a>\n')
+            result = run_checker(demo_dir)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("snapshot Storage Fabric route action", result.stderr)
+
+    def test_raw_and_gzip_budgets_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            demo_dir = Path(temp_dir) / "public-demo"
+            self.copy_artifact(demo_dir)
+            raw = run_checker(demo_dir, "--max-raw-bytes", "64")
+            gzip = run_checker(demo_dir, "--max-gzip-bytes", "64")
+
+        self.assertNotEqual(raw.returncode, 0)
+        self.assertIn("raw size", raw.stderr)
+        self.assertNotEqual(gzip.returncode, 0)
+        self.assertIn("gzip size", gzip.stderr)
 
 
 class PublicDemoBuildScriptTests(unittest.TestCase):
@@ -321,7 +267,92 @@ print("synthetic-win32-import: PASS")
             self.assertNotIn("`${url}?${params.toString()}`", first_html)
             self.assertNotIn("history/history.db", first_html)
 
-    def test_build_script_help_marks_generation_as_local_history_path(self) -> None:
+
+class PublicDemoFixtureTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        clear_export_caches()
+
+    def test_checked_in_fixture_is_complete_synthetic_schema(self) -> None:
+        fixture = load_public_demo_fixture(PUBLIC_DEMO_FIXTURE_PATH)
+
+        self.assertEqual(fixture.schema_version, 1)
+        self.assertEqual(fixture.provenance, "synthetic")
+        self.assertEqual(fixture.history_window_hours, 168)
+        self.assertEqual(len(fixture.slots), 60)
+        self.assertEqual([slot.slot for slot in fixture.slots], list(range(60)))
+        self.assertEqual({view.id for view in fixture.storage_views}, {"boot-doms", "nvme-carrier-x4"})
+
+    def test_fixture_rejects_a_storage_view_missing_a_template_slot(self) -> None:
+        payload = json.loads(PUBLIC_DEMO_FIXTURE_PATH.read_text(encoding="utf-8"))
+        payload["storage_views"][0]["slots"].pop()
+
+        with self.assertRaisesRegex(
+            ValidationError,
+            r"storage view boot-doms must declare exactly template slots 0, 1",
+        ):
+            PublicDemoFixture.model_validate(payload)
+
+    def test_snapshot_bundle_maps_synthetic_fixture(self) -> None:
+        bundle = build_public_demo_snapshot_bundle()
+        snapshot = bundle.primary_snapshot
+        slots = {slot.slot: slot for slot in snapshot.slots}
+
+        self.assertEqual(snapshot.selected_system_id, PUBLIC_DEMO_SYSTEM_ID)
+        self.assertEqual(snapshot.selected_enclosure_id, PUBLIC_DEMO_ENCLOSURE_ID)
+        self.assertEqual(snapshot.selected_profile.face_style, "top-loader")
+        self.assertEqual(snapshot.layout_slot_count, 60)
+        self.assertEqual(slots[12].state.value, "empty")
+        self.assertEqual(slots[57].model, "Demo Flash SSD 4TB")
+        self.assertEqual(slots[57].serial, "DEMO-SN-CORE-0057")
+        self.assertEqual(slots[57].vdev_name, "mirror-8")
+        self.assertEqual(bundle.smart_summary_cache["57"]["temperature_c"], 30)
+
+        boot = next(view for view in bundle.storage_view_runtime.views if view.id == "boot-doms")
+        nvme = next(view for view in bundle.storage_view_runtime.views if view.id == "nvme-carrier-x4")
+        self.assertEqual([slot.slot_label for slot in boot.slots], ["DOM-A", "DOM-B"])
+        self.assertEqual(nvme.slot_layout, [[3], [2], [1], [0]])
+        self.assertEqual([slot.slot_label for slot in nvme.slots], ["M2-1", "M2-2", "M2-3", "M2-4"])
+        self.assertEqual(nvme.slots[0].model, "Demo NVMe Flash 2TB")
+
+    async def test_public_demo_html_is_deterministic_and_self_contained(self) -> None:
+        first = await build_public_demo_html()
+        clear_export_caches()
+        second = await build_public_demo_html()
+
+        self.assertEqual(first, second)
+        self.assertEqual(hashlib.sha256(first.encode()).hexdigest(), hashlib.sha256(second.encode()).hexdigest())
+        self.assertIn("Synthetic IDs", first)
+        self.assertIn('"history_window_hours": 168', first)
+        self.assertIn("Demo 4x NVMe Carrier", first)
+        self.assertNotIn('src="/static/app.js"', first)
+        self.assertNotIn('href="/static/style.css"', first)
+        self.assertIn("data:image/png;base64", first)
+        self.assertNotIn("history/history.db", first)
+
+    def test_build_script_writes_and_checks_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "index.html"
+            build = subprocess.run(
+                [sys.executable, "scripts/build_public_demo.py", "--output", str(output)],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            check = subprocess.run(
+                [sys.executable, "scripts/build_public_demo.py", "--output", str(output), "--check"],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(build.returncode, 0, build.stderr)
+        self.assertIn("deterministic synthetic", build.stdout)
+        self.assertEqual(check.returncode, 0, check.stderr)
+        self.assertIn("artifact is current", check.stdout)
+
+    def test_build_script_help_documents_clean_source_input(self) -> None:
         result = subprocess.run(
             [sys.executable, "scripts/build_public_demo.py", "--help"],
             cwd=ROOT,
@@ -331,194 +362,9 @@ print("synthetic-win32-import: PASS")
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("local ignored history/history.db", result.stdout)
-
-    def test_build_script_reports_local_history_errors_without_traceback(self) -> None:
-        from scripts import build_public_demo as build_script
-
-        async_build = mock.AsyncMock(
-            side_effect=RuntimeError(
-                "Public demo release generation requires local ignored history/history.db."
-            )
-        )
-        with tempfile.TemporaryDirectory() as temp_dir:
-            args = argparse.Namespace(output=Path(temp_dir) / "index.html", check=False)
-            stderr = io.StringIO()
-            stdout = io.StringIO()
-            with (
-                mock.patch.object(build_script, "build_public_demo_html", new=async_build),
-                mock.patch.object(build_script, "parse_args", return_value=args),
-                contextlib.redirect_stderr(stderr),
-                contextlib.redirect_stdout(stdout),
-            ):
-                result = asyncio.run(build_script.run())
-
-        self.assertEqual(result, 1)
-        self.assertIn("history/history.db", stderr.getvalue())
-        self.assertIn("Clean CI validates", stderr.getvalue())
-        self.assertNotIn("Traceback", stderr.getvalue())
+        self.assertIn("checked-in synthetic fixture", result.stdout)
+        self.assertIn("uses no config, history database", result.stdout)
 
 
-@unittest.skipUnless(os.environ.get(LOCAL_HISTORY_ENV) == "1", LOCAL_HISTORY_SKIP_REASON)
-class PublicDemoFixtureTests(unittest.IsolatedAsyncioTestCase):
-    def setUp(self) -> None:
-        if not LOCAL_HISTORY_DB.exists():
-            self.fail(
-                f"{LOCAL_HISTORY_ENV}=1 but local ignored release input is missing: "
-                f"{LOCAL_HISTORY_DB.relative_to(ROOT)}"
-            )
-        clear_export_caches()
-
-    async def test_public_demo_html_is_deterministic(self) -> None:
-        first_html = await build_public_demo_html()
-        clear_export_caches()
-        second_html = await build_public_demo_html()
-
-        self.assertEqual(first_html, second_html)
-        self.assertEqual(
-            hashlib.sha256(first_html.encode("utf-8")).hexdigest(),
-            hashlib.sha256(second_html.encode("utf-8")).hexdigest(),
-        )
-        self.assertIn(PUBLIC_DEMO_GENERATED_AT.isoformat(), first_html)
-        self.assertIn("TN Core", first_html)
-        self.assertIn("Supermicro CSE-946", first_html)
-        self.assertIn("WDC WUH721818AL5204", first_html)
-        self.assertIn("SAMSUNG MZILT3T8HALS/007", first_html)
-        self.assertIn("4x NVMe Carrier Card", first_html)
-        self.assertIn("Samsung SSD 970 EVO 2TB", first_html)
-        self.assertIn("Scrambled IDs", first_html)
-        self.assertIn('"history_window_hours": 168', first_html)
-        self.assertIn("initialSelectedSlot: null", first_html)
-        self.assertEqual(PUBLIC_DEMO_HISTORY_WINDOW_HOURS, 168)
-        self.assertIn("preloadedSnapshotsByEnclosure", first_html)
-        self.assertIn("preloadedStorageViewSmartSummaries", first_html)
-        self.assertIn("Frozen Sanitized Snapshot", first_html)
-        self.assertIn("Artifact app v", first_html)
-        self.assertIn("Capture time", first_html)
-        self.assertNotIn('id="sas-fabric-view-link"', first_html)
-        self.assertNotIn('src="/static/app.js"', first_html)
-        self.assertNotIn('href="/static/style.css"', first_html)
-        self.assertNotIn("/static/images/hyper-m2-gen3-card.png", first_html)
-        self.assertIn("data:image/png;base64", first_html)
-
-    async def test_public_demo_html_omits_real_fixture_identifiers(self) -> None:
-        html = await build_public_demo_html()
-        forbidden_values = [
-            "Archive CORE",
-            "Offsite SCALE",
-            "QSOSN",
-            "ABC123456",
-            "SATADOM123456",
-            "REAR123456",
-            "S464NB0K900412E",
-            "PHKM8522005N200E",
-            "SMC0515D93717D7B1810",
-            "500304801f715f3f",
-            "500304801f5a003f",
-            "5000c500c2a7f220",
-            "500304801f5a00bf",
-            "10.13.",
-            "192.168.",
-            "BEGIN OPENSSH",
-        ]
-
-        for value in forbidden_values:
-            with self.subTest(value=value):
-                self.assertNotIn(value, html)
-
-    def test_fixture_uses_core_top_loader_with_stable_scrambled_ids(self) -> None:
-        bundle = build_public_demo_snapshot_bundle()
-
-        snapshot = bundle.primary_snapshot
-        self.assertEqual(snapshot.selected_system_label, "TN Core")
-        self.assertEqual(snapshot.selected_profile.face_style, "top-loader")
-        self.assertEqual(snapshot.layout_slot_count, 60)
-        self.assertEqual(set(bundle.live_enclosure_snapshots), {"tn-core-cse-946-top-loader"})
-        self.assertEqual(
-            {view.id for view in bundle.storage_view_runtime.views},
-            {"boot-doms", "nvme-carrier-x4"},
-        )
-        slots = {slot.slot: slot for slot in snapshot.slots}
-        expected_empty_slots = {12, 13, 14, 27, 28, 29, 44, 45, 46, 47, 48, 49, 50}
-        for slot_number in expected_empty_slots:
-            with self.subTest(slot=slot_number, expectation="empty"):
-                self.assertTrue(slots[slot_number].present)
-                self.assertEqual(slots[slot_number].state.value, "empty")
-
-        expected_vdevs = {
-            "raidz2-0": (0, 1, 2, 3, 4, 5),
-            "raidz2-1": (15, 16, 17, 18, 19, 20),
-            "raidz2-2": (30, 31, 32, 33, 34, 35),
-            "raidz2-3": (6, 7, 8, 9, 10, 11),
-            "raidz2-4": (21, 22, 23, 24, 25, 26),
-            "raidz2-5": (36, 37, 38, 39, 40, 41),
-            "raidz2-6": (51, 52, 53, 54, 55, 56),
-        }
-        for vdev_name, slot_numbers in expected_vdevs.items():
-            for slot_number in slot_numbers:
-                with self.subTest(slot=slot_number, vdev=vdev_name):
-                    self.assertTrue(slots[slot_number].present)
-                    self.assertEqual(slots[slot_number].pool_name, "The-Repository")
-                    self.assertEqual(slots[slot_number].vdev_name, vdev_name)
-                    self.assertEqual(slots[slot_number].vdev_class, "data")
-
-        self.assertEqual(slots[42].pool_name, "The-Repository")
-        self.assertEqual(slots[42].vdev_name, "spares")
-        self.assertEqual(slots[42].vdev_class, "spare")
-        self.assertIsNone(slots[43].pool_name)
-        self.assertIsNone(slots[43].vdev_name)
-        self.assertIn("OK", slots[43].health or "")
-        for slot_number in (57, 58, 59):
-            with self.subTest(slot=slot_number, vdev="mirror-8"):
-                self.assertEqual(slots[slot_number].model, "SAMSUNG MZILT3T8HALS/007")
-                self.assertEqual(slots[slot_number].vdev_name, "mirror-8")
-                self.assertEqual(slots[slot_number].vdev_class, "special")
-
-        slot_57 = next(slot for slot in snapshot.slots if slot.slot == 57)
-        self.assertEqual(slot_57.model, "SAMSUNG MZILT3T8HALS/007")
-        self.assertEqual(slot_57.serial, "DEMO-SN-CORE-0057")
-        self.assertEqual(bundle.smart_summary_cache["57"]["serial_number"], slot_57.serial)
-        self.assertEqual(bundle.smart_summary_cache["57"]["temperature_c"], 32)
-        nvme_view = next(view for view in bundle.storage_view_runtime.views if view.id == "nvme-carrier-x4")
-        self.assertEqual(nvme_view.label, "4x NVMe Carrier Card")
-        self.assertEqual(nvme_view.slot_layout, [[3], [2], [1], [0]])
-        self.assertEqual([slot.slot_label for slot in nvme_view.slots], ["M2-1", "M2-2", "M2-3", "M2-4"])
-        self.assertEqual(nvme_view.slots[0].model, "Samsung SSD 970 EVO 2TB")
-        self.assertEqual(nvme_view.slots[0].serial, "DEMO-SN-NVME-0000")
-        boot_view = next(view for view in bundle.storage_view_runtime.views if view.id == "boot-doms")
-        self.assertEqual(boot_view.label, "Boot SATADOMs")
-        self.assertEqual([slot.slot_label for slot in boot_view.slots], ["DOM-A", "DOM-B"])
-        self.assertEqual(boot_view.slots[0].model, "SuperMicro SSD")
-        self.assertIn("tn-core-cse-946-top-loader", bundle.live_enclosure_smart_summary_cache)
-        self.assertIn("boot-doms", bundle.storage_view_smart_summary_cache)
-        self.assertIn("nvme-carrier-x4", bundle.storage_view_smart_summary_cache)
-
-    def test_build_script_writes_and_checks_artifact(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            output_path = Path(temp_dir) / "index.html"
-            build_result = subprocess.run(
-                [sys.executable, "scripts/build_public_demo.py", "--output", str(output_path)],
-                cwd=ROOT,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-            self.assertEqual(build_result.returncode, 0, build_result.stderr)
-            self.assertIn("Built public demo artifact", build_result.stdout)
-            self.assertIn("TN Core", output_path.read_text(encoding="utf-8"))
-
-            check_result = subprocess.run(
-                [
-                    sys.executable,
-                    "scripts/build_public_demo.py",
-                    "--output",
-                    str(output_path),
-                    "--check",
-                ],
-                cwd=ROOT,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-            self.assertEqual(check_result.returncode, 0, check_result.stderr)
-            self.assertIn("Public demo artifact is current", check_result.stdout)
+if __name__ == "__main__":
+    unittest.main()

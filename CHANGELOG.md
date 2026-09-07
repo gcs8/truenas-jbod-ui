@@ -259,6 +259,8 @@ them before starting the new images.
 - Merged SES element and additional-element evidence by enclosure element
   identity, normalized `eiioe` indexes, and kept multi-enclosure ordering stable
   (#265).
+- Rebuilt the public demo from a deterministic synthetic fixture and separated
+  verification from manual Pages publication (#386).
 
 ### Fixed
 
@@ -399,6 +401,13 @@ them before starting the new images.
 - Retained trusted disk and topology data when an enclosure query fails (#354).
 - Backfilled CORE multipath association from unambiguous `gmultipath` consumers
   while rejecting conflicting ZFS GUID folds (#356).
+- Staged fresh schema-v2 segment directories and files with shared read modes
+  before activation while preserving existing target modes (#389).
+
+### Performance
+
+- Bounded process-wide snapshot export rendering, compression, pending keys,
+  and retained intermediate bytes with cancellation-safe admission (#361).
 
 ### Docs
 

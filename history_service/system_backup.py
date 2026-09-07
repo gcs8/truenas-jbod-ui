@@ -59,6 +59,7 @@ from history_service.segment_catalog import (
 )
 from history_service.migration_lock import history_write_lock
 from history_service.segment_reader import SegmentedHistoryReader
+from history_service.segment_sealer import SEGMENT_DIRECTORY_MODE, SEGMENT_FILE_MODE
 from history_service.segmented_restore import (
     file_matches as restore_file_matches,
     record_file as record_restore_file,
@@ -631,7 +632,7 @@ class _ImportActivationTransaction:
         )
         self._apply_owner(staged_dir, root_owner)
         staged_dir.chmod(
-            self._existing_mode(existing_directory, directory=True)
+            self._segmented_staging_mode(target_dir, directory=True)
             or self._MISSING_DIRECTORY_MODE
         )
         seen: set[Path] = set()
@@ -664,7 +665,10 @@ class _ImportActivationTransaction:
                     )
                 self._apply_owner(staged_parent, parent_owner)
                 staged_parent.chmod(
-                    self._existing_mode(existing_parent, directory=True)
+                    self._segmented_staging_mode(
+                        target_dir / current_relative,
+                        directory=True,
+                    )
                     or self._MISSING_DIRECTORY_MODE
                 )
             shutil.copyfile(self._staged_member(member_key), staged_target)
@@ -681,7 +685,10 @@ class _ImportActivationTransaction:
                 )
             self._apply_owner(staged_target, target_owner)
             staged_target.chmod(
-                self._existing_mode(existing_target, directory=False)
+                self._segmented_staging_mode(
+                    target_dir / relative_path,
+                    directory=False,
+                )
                 or self._MISSING_FILE_MODE
             )
         self._fsync_tree(staged_dir)
@@ -1235,6 +1242,15 @@ class _ImportActivationTransaction:
         if not directory and not path.is_file():
             return None
         return path.stat(follow_symlinks=False).st_mode & 0o7777
+
+    @classmethod
+    def _segmented_staging_mode(cls, path: Path | None, *, directory: bool) -> int | None:
+        existing_mode = cls._existing_mode(path, directory=directory)
+        if existing_mode is not None:
+            return existing_mode
+        if path is not None and cls._target_path_kind(path) == "missing":
+            return SEGMENT_DIRECTORY_MODE if directory else SEGMENT_FILE_MODE
+        return None
 
     @staticmethod
     def _existing_owner(path: Path | None, *, directory: bool) -> tuple[int, int] | None:
