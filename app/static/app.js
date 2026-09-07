@@ -573,7 +573,8 @@
   }
 
   function selectorLabelForEnclosureOption(enclosure) {
-    return `Live Enclosure · ${enclosure?.label || enclosure?.id || "Unknown enclosure"}`;
+    const kind = state.snapshotMode ? "Snapshot Enclosure" : "Live Enclosure";
+    return `${kind} · ${enclosure?.label || enclosure?.id || "Unknown enclosure"}`;
   }
 
   function isSavedChassisView(view) {
@@ -7902,7 +7903,14 @@
   }
 
   function renderMappingImportControl() {
-    const reason = mappingImportUnavailableReason();
+    const snapshotModeActive = typeof state !== "undefined" && Boolean(state.snapshotMode);
+    const reason = snapshotModeActive
+      ? "Mapping backup actions are disabled in an offline snapshot export."
+      : mappingImportUnavailableReason();
+    if (typeof exportMappingsButton !== "undefined" && exportMappingsButton) {
+      exportMappingsButton.disabled = snapshotModeActive;
+      exportMappingsButton.title = snapshotModeActive ? reason : "";
+    }
     if (importMappingsButton) {
       importMappingsButton.disabled = Boolean(reason);
       importMappingsButton.title = reason || "";
@@ -7946,11 +7954,14 @@
       showQuantastorContext ? kvRowIfMeaningful("I/O Fence On", formatQuantastorContextValue(slot, "fence_owner_label")) : "",
       showQuantastorContext ? kvRowIfMeaningful("Visible On", formatVisibleOnValue(slot)) : "",
       showQuantastorContext ? kvRowIfMeaningful("SES Host", formatSesHostValue(slot)) : "",
-      kvRow("Health", slot.health),
+      kvRow(state.snapshotMode ? "Health at capture" : "Health", slot.health),
       kvRow("Temp", formatTemperatureValue(slot, smartEntry)),
       kvRowIfMeaningful("Warning Temp", formatWarningTemperatureValue(smartEntry)),
       kvRowIfMeaningful("Critical Temp", formatCriticalTemperatureValue(smartEntry)),
-      kvRowIfMeaningful("SMART Status", formatSmartHealthStatusValue(smartEntry)),
+      kvRowIfMeaningful(
+        state.snapshotMode ? "SMART Status at capture" : "SMART Status",
+        formatSmartHealthStatusValue(smartEntry),
+      ),
       kvRow("Last SMART Test", formatLastSmartTestValue(slot, smartEntry)),
       kvRow("Power On", formatPowerOnValue(smartEntry)),
       kvRowIfMeaningful("Power Cycles", formatPowerCycleValue(smartEntry)),
@@ -8081,11 +8092,14 @@
         kvRowIfMeaningful("Namespace EUI64", formatNamespaceEui64Value(storageViewSlot, smartEntry), true),
         kvRowIfMeaningful("Namespace NGUID", formatNamespaceNguidValue(smartEntry), true),
         kvRowIfMeaningful("Pool", storageViewSlot.pool_name),
-        kvRowIfMeaningful("Health", storageViewSlot.health),
+        kvRowIfMeaningful(state.snapshotMode ? "Health at capture" : "Health", storageViewSlot.health),
         kvRow("Temp", formatTemperatureValue(storageViewSlot, smartEntry)),
         kvRowIfMeaningful("Warning Temp", formatWarningTemperatureValue(smartEntry)),
         kvRowIfMeaningful("Critical Temp", formatCriticalTemperatureValue(smartEntry)),
-        kvRow("SMART Status", formatSmartHealthStatusValue(smartEntry)),
+        kvRow(
+          state.snapshotMode ? "SMART Status at capture" : "SMART Status",
+          formatSmartHealthStatusValue(smartEntry),
+        ),
         kvRow("Last SMART Test", formatLastSmartTestValue(storageViewSlot, smartEntry)),
         kvRow("Power On", formatPowerOnValue(smartEntry)),
         kvRowIfMeaningful("Power Cycles", formatPowerCycleValue(smartEntry)),
@@ -8491,17 +8505,26 @@
       }
     }
 
-    apiStatusChip.className = `status-chip ${api.ok ? "ok" : "error"}`;
-    apiStatusChip.textContent = api.ok ? "API OK" : "API ERR";
+    if (state.snapshotMode) {
+      apiStatusChip.className = "status-chip snapshot";
+      apiStatusChip.textContent = api.ok ? "API AT CAPTURE" : "API ERROR AT CAPTURE";
+      apiStatusChip.title = "Recorded source state. No API is connected to this artifact.";
+      sshStatusChip.className = "status-chip snapshot";
+      sshStatusChip.textContent = !ssh.enabled ? "SSH OFF AT CAPTURE" : "SSH AT CAPTURE";
+      sshStatusChip.title = "Recorded source state. No SSH session is connected to this artifact.";
+    } else {
+      apiStatusChip.className = `status-chip ${api.ok ? "ok" : "error"}`;
+      apiStatusChip.textContent = api.ok ? "API OK" : "API ERR";
 
-    let sshClass = "ok";
-    if (!ssh.enabled) {
-      sshClass = "partial";
-    } else if (!ssh.ok) {
-      sshClass = "error";
+      let sshClass = "ok";
+      if (!ssh.enabled) {
+        sshClass = "partial";
+      } else if (!ssh.ok) {
+        sshClass = "error";
+      }
+      sshStatusChip.className = `status-chip ${sshClass}`;
+      sshStatusChip.textContent = !ssh.enabled ? "SSH OFF" : ssh.ok ? "SSH OK" : "SSH ERR";
     }
-    sshStatusChip.className = `status-chip ${sshClass}`;
-    sshStatusChip.textContent = !ssh.enabled ? "SSH OFF" : ssh.ok ? "SSH OK" : "SSH ERR";
 
     if (historyStatusChip) {
       if (!state.history.configured) {
@@ -8511,7 +8534,10 @@
       } else {
         let historyClass = "partial";
         let historyText = "HIST ...";
-        if (state.history.available) {
+        if (state.snapshotMode) {
+          historyClass = "snapshot";
+          historyText = state.history.available ? "HIST PRELOADED" : "HIST OMITTED";
+        } else if (state.history.available) {
           historyClass = "ok";
           historyText = "HIST OK";
         } else if (state.history.checked && !state.history.loading) {
