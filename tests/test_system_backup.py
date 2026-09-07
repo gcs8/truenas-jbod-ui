@@ -27,6 +27,7 @@ from app.config import PathConfig, Settings, get_settings
 from app.models.domain import (
     DebugBundleExportRequest,
     DemoSystemRequest,
+    ManualMapping,
     SystemBackupExportRequest,
     SystemSetupBootstrapRequest,
     SystemSetupRequest,
@@ -2803,7 +2804,22 @@ sys.stdout.flush()
 
     def test_file_backed_large_mapping_preflight_stays_below_eight_mib_heap(self) -> None:
         member_path = self.temp_dir / "large-valid-mapping.json"
-        padding_bytes = 16 * 1024 * 1024
+        payload_bytes = 16_777_353
+        mapping_entries = 106_862
+        entry_value = b'{"slot":0}'
+        fixed_bytes = (
+            len(b'{"padding":"')
+            + len(b'","slot_mappings":{')
+            + len(b'}}')
+            + sum(
+                len(f'"{index:06d}":'.encode("ascii"))
+                + len(entry_value)
+                + (1 if index else 0)
+                for index in range(mapping_entries)
+            )
+        )
+        padding_bytes = payload_bytes - fixed_bytes
+        self.assertGreaterEqual(padding_bytes, 0)
         with member_path.open("wb") as output:
             output.write(b'{"padding":"')
             remaining = padding_bytes
@@ -2812,40 +2828,193 @@ sys.stdout.flush()
                 written = min(remaining, len(chunk))
                 output.write(chunk[:written])
                 remaining -= written
-            output.write(b'","slot_mappings":{}}')
-        manifest = {
-            "groups": [
-                {
-                    "key": MAPPING_FILE_KEY,
-                    "selected": True,
-                    "present": True,
-                    "restore_mode": "file",
-                }
-            ],
-            "files": [
-                {
-                    "key": MAPPING_FILE_KEY,
-                    "group_key": MAPPING_FILE_KEY,
-                    "archive_path": str(
-                        BACKUP_GROUP_METADATA[MAPPING_FILE_KEY]["archive_root"]
-                    ),
-                }
-            ],
-        }
-        groups = self.backup_service._manifest_group_entries(manifest)
+            output.write(b'","slot_mappings":{')
+            for index in range(mapping_entries):
+                if index:
+                    output.write(b",")
+                output.write(f'"{index:06d}":'.encode("ascii"))
+                output.write(entry_value)
+            output.write(b'}}')
+        self.assertEqual(member_path.stat().st_size, payload_bytes)
 
         tracemalloc.start()
         try:
-            self.backup_service._preflight_import_members(
-                manifest,
-                groups,
-                {MAPPING_FILE_KEY: member_path},
+            accepted_entries = self.backup_service._validate_streaming_json_member(
+                member_path,
+                "slot_mappings",
+                ManualMapping,
             )
             _, peak_bytes = tracemalloc.get_traced_memory()
         finally:
             tracemalloc.stop()
 
+        self.assertEqual(accepted_entries, mapping_entries)
         self.assertLess(peak_bytes, 8 * 1024 * 1024)
+
+    def test_file_backed_json_rejects_duplicate_mapping_key_across_read_chunks(self) -> None:
+        member_path = self.temp_dir / "cross-chunk-duplicate-mapping.json"
+        with member_path.open("w", encoding="utf-8") as output:
+            output.write('{"slot_mappings":{"same":{"slot":0}')
+            for index in range(4_000):
+                output.write(f',"distinct-{index:04d}":{{"slot":0}}')
+            output.write(',"same":{"slot":1}}}')
+
+        with self.assertRaisesRegex(ValueError, "duplicate object key"):
+            self.backup_service._validate_streaming_json_member(
+                member_path,
+                "slot_mappings",
+                ManualMapping,
+            )
+
+    def test_file_backed_json_rejects_duplicate_key_inside_mapping_entry(self) -> None:
+        member_path = self.temp_dir / "nested-duplicate-mapping.json"
+        member_path.write_text(
+            '{"slot_mappings":{"first":{"slot":0,"slot":1}}}',
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "duplicate object key"):
+            self.backup_service._validate_streaming_json_member(
+                member_path,
+                "slot_mappings",
+                ManualMapping,
+            )
+
+    def test_file_backed_json_duplicate_tracker_cleans_workspace_after_rejection(self) -> None:
+        member_path = self.temp_dir / "cleanup-duplicate-mapping.json"
+        member_path.write_text(
+            '{"slot_mappings":{"same":{"slot":0},"same":{"slot":1}}}',
+            encoding="utf-8",
+        )
+        real_mkdtemp = tempfile.mkdtemp
+        tracker_roots: list[Path] = []
+
+        def allocate_tracker_workspace(
+            suffix: str | None = None,
+            prefix: str | None = None,
+            dir: str | os.PathLike[str] | None = None,
+        ) -> str:
+            self.assertIsNone(dir)
+            path = Path(real_mkdtemp(suffix=suffix, prefix=prefix, dir=self.temp_dir))
+            tracker_roots.append(path)
+            return str(path)
+
+        with patch.object(
+            system_backup_module.tempfile,
+            "mkdtemp",
+            side_effect=allocate_tracker_workspace,
+        ):
+            with self.assertRaisesRegex(ValueError, "duplicate object key"):
+                self.backup_service._validate_streaming_json_member(
+                    member_path,
+                    "slot_mappings",
+                    ManualMapping,
+                )
+
+        self.assertEqual(len(tracker_roots), 1)
+        self.assertFalse(tracker_roots[0].exists())
+
+    def test_file_backed_json_duplicate_tracker_uses_private_files_and_cleans_success(self) -> None:
+        member_path = self.temp_dir / "valid-mapping.json"
+        member_path.write_text(
+            '{"slot_mappings":{"first":{"slot":0},"second":{"slot":1}}}',
+            encoding="utf-8",
+        )
+        real_mkdtemp = tempfile.mkdtemp
+        tracker_roots: list[Path] = []
+
+        def allocate_tracker_workspace(
+            suffix: str | None = None,
+            prefix: str | None = None,
+            dir: str | os.PathLike[str] | None = None,
+        ) -> str:
+            self.assertIsNone(dir)
+            path = Path(real_mkdtemp(suffix=suffix, prefix=prefix, dir=self.temp_dir))
+            tracker_roots.append(path)
+            return str(path)
+
+        class InspectingManualMapping:
+            @classmethod
+            def model_validate(cls, value: object) -> object:
+                tracker_root = tracker_roots[0]
+                self.assertEqual(tracker_root.stat().st_mode & 0o777, 0o700)
+                database_path = tracker_root / "keys.sqlite3"
+                self.assertEqual(database_path.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(
+                    sorted(path.name for path in tracker_root.iterdir()),
+                    ["keys.sqlite3"],
+                )
+                return ManualMapping.model_validate(value)
+
+        with patch.object(
+            system_backup_module.tempfile,
+            "mkdtemp",
+            side_effect=allocate_tracker_workspace,
+        ):
+            accepted_entries = self.backup_service._validate_streaming_json_member(
+                member_path,
+                "slot_mappings",
+                InspectingManualMapping,
+            )
+
+        self.assertEqual(accepted_entries, 2)
+        self.assertEqual(len(tracker_roots), 1)
+        self.assertFalse(tracker_roots[0].exists())
+
+    def test_file_backed_json_duplicate_tracker_cleans_workspace_after_cancellation(self) -> None:
+        member_path = self.temp_dir / "cancelled-mapping.json"
+        member_path.write_text(
+            '{"slot_mappings":{"first":{"slot":0}}}',
+            encoding="utf-8",
+        )
+        real_mkdtemp = tempfile.mkdtemp
+        tracker_roots: list[Path] = []
+
+        def allocate_tracker_workspace(
+            suffix: str | None = None,
+            prefix: str | None = None,
+            dir: str | os.PathLike[str] | None = None,
+        ) -> str:
+            self.assertIsNone(dir)
+            path = Path(real_mkdtemp(suffix=suffix, prefix=prefix, dir=self.temp_dir))
+            tracker_roots.append(path)
+            return str(path)
+
+        class CancelledMapping:
+            @classmethod
+            def model_validate(cls, value: object) -> object:
+                raise KeyboardInterrupt("synthetic cancellation")
+
+        with patch.object(
+            system_backup_module.tempfile,
+            "mkdtemp",
+            side_effect=allocate_tracker_workspace,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                self.backup_service._validate_streaming_json_member(
+                    member_path,
+                    "slot_mappings",
+                    CancelledMapping,
+                )
+
+        self.assertEqual(len(tracker_roots), 1)
+        self.assertFalse(tracker_roots[0].exists())
+
+    def test_file_backed_json_allows_equal_field_names_in_separate_objects(self) -> None:
+        member_path = self.temp_dir / "object-scoped-keys.json"
+        member_path.write_text(
+            '{"slot_mappings":{"first":{"slot":0},"second":{"slot":1}}}',
+            encoding="utf-8",
+        )
+
+        self.assertEqual(
+            self.backup_service._validate_streaming_json_member(
+                member_path,
+                "slot_mappings",
+                ManualMapping,
+            ),
+            2,
+        )
 
     def test_file_backed_json_preflight_rejects_duplicate_mapping_keys(self) -> None:
         member_path = self.temp_dir / "duplicate-mapping.json"

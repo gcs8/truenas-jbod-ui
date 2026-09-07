@@ -266,8 +266,113 @@ MAX_STRUCTURED_YAML_MEMBER_BYTES = 2 * 1024 * 1024
 
 JSON_STREAM_CHUNK_CHARS = 64 * 1024
 MAX_JSON_KEY_CHARS = 64 * 1024
+JSON_DUPLICATE_CACHE_KIB = 512
 
 ExtractedMember = bytes | Path
+
+
+class _DiskBackedDuplicateKeyTracker:
+    """Track object-scoped JSON keys without retaining payload keys in Python."""
+
+    __slots__ = ("connection", "cursor", "next_scope", "root")
+
+    def __init__(self) -> None:
+        self.root: Path | None = None
+        self.connection: sqlite3.Connection | None = None
+        self.cursor: sqlite3.Cursor | None = None
+        self.next_scope = 0
+
+    def __enter__(self) -> "_DiskBackedDuplicateKeyTracker":
+        try:
+            self.root = Path(tempfile.mkdtemp(prefix="truenas-jbod-ui-json-keys-"))
+            self.root.chmod(0o700)
+            database_path = self.root / "keys.sqlite3"
+            descriptor = os.open(
+                database_path,
+                os.O_RDWR
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            try:
+                os.fchmod(descriptor, 0o600)
+            finally:
+                os.close(descriptor)
+            self.connection = sqlite3.connect(database_path)
+            self.connection.execute("PRAGMA journal_mode = OFF")
+            self.connection.execute("PRAGMA synchronous = OFF")
+            self.connection.execute("PRAGMA temp_store = FILE")
+            self.connection.execute(f"PRAGMA cache_size = -{JSON_DUPLICATE_CACHE_KIB}")
+            self.connection.execute("PRAGMA mmap_size = 0")
+            self.connection.execute("PRAGMA locking_mode = EXCLUSIVE")
+            self.connection.execute(
+                "CREATE TABLE keys (scope INTEGER NOT NULL, value TEXT NOT NULL, "
+                "PRIMARY KEY (scope, value)) WITHOUT ROWID"
+            )
+            self.cursor = self.connection.cursor()
+            return self
+        except Exception:
+            self.close()
+            raise ValueError("JSON duplicate-key validation could not be initialized.") from None
+
+    def new_scope(self) -> int:
+        scope = self.next_scope
+        self.next_scope += 1
+        return scope
+
+    def add(self, scope: int, key: str) -> None:
+        if self.cursor is None:
+            raise ValueError("JSON duplicate-key validation is unavailable.")
+        try:
+            self.cursor.execute(
+                "INSERT INTO keys (scope, value) VALUES (?, ?)",
+                (scope, key),
+            )
+        except sqlite3.IntegrityError:
+            raise ValueError("JSON payload contains a duplicate object key.") from None
+        except sqlite3.Error:
+            raise ValueError("JSON duplicate-key validation failed.") from None
+
+    def close(self) -> None:
+        cleanup_failed = False
+        if self.cursor is not None:
+            try:
+                self.cursor.close()
+            except sqlite3.Error:
+                cleanup_failed = True
+            self.cursor = None
+        if self.connection is not None:
+            try:
+                self.connection.close()
+            except sqlite3.Error:
+                cleanup_failed = True
+            self.connection = None
+        root = self.root
+        self.root = None
+        self.next_scope = 0
+        if root is not None:
+            try:
+                shutil.rmtree(root)
+            except OSError:
+                cleanup_failed = True
+        if cleanup_failed:
+            raise RuntimeError("JSON duplicate-key tracker cleanup failed.")
+
+    def __exit__(
+        self,
+        exc_type: Any,
+        exc: BaseException | None,
+        traceback: Any,
+    ) -> Literal[False]:
+        try:
+            self.close()
+        except RuntimeError as cleanup_error:
+            if exc is None:
+                raise
+            exc.add_note(str(cleanup_error))
+        return False
 
 
 class _StreamingJSONReader:
@@ -278,6 +383,17 @@ class _StreamingJSONReader:
         self.buffer = ""
         self.position = 0
         self.eof = False
+        self.duplicate_keys: _DiskBackedDuplicateKeyTracker | None = None
+
+    def _new_object_scope(self) -> int:
+        if self.duplicate_keys is None:
+            raise ValueError("JSON duplicate-key validation is unavailable.")
+        return self.duplicate_keys.new_scope()
+
+    def _record_object_key(self, scope: int, key: str) -> None:
+        if self.duplicate_keys is None:
+            raise ValueError("JSON duplicate-key validation is unavailable.")
+        self.duplicate_keys.add(scope, key)
 
     def _fill(self) -> bool:
         if self.position < len(self.buffer):
@@ -355,7 +471,7 @@ class _StreamingJSONReader:
         if token == "{":
             self.take()
             result: dict[str, Any] | None = {} if materialize else None
-            seen: set[str] = set()
+            scope = self._new_object_scope()
             self.whitespace()
             if self.peek() == "}":
                 self.take()
@@ -363,9 +479,7 @@ class _StreamingJSONReader:
             while True:
                 key = self.string()
                 assert isinstance(key, str)
-                if key in seen:
-                    raise ValueError("JSON payload contains a duplicate object key.")
-                seen.add(key)
+                self._record_object_key(scope, key)
                 self.expect(":")
                 item = self.value(materialize=materialize, depth=depth + 1)
                 if result is not None:
@@ -404,8 +518,21 @@ class _StreamingJSONReader:
         return decoded if materialize else None
 
     def validate_mapping_entries(self, target_key: str, model: Any) -> int:
+        result = 0
+        try:
+            with _DiskBackedDuplicateKeyTracker() as duplicate_keys:
+                self.duplicate_keys = duplicate_keys
+                result = self._validate_mapping_entries(target_key, model)
+        finally:
+            self.duplicate_keys = None
+            self.buffer = ""
+            self.position = 0
+            self.eof = True
+        return result
+
+    def _validate_mapping_entries(self, target_key: str, model: Any) -> int:
         self.expect("{")
-        seen_root: set[str] = set()
+        root_scope = self._new_object_scope()
         count = 0
         self.whitespace()
         if self.peek() == "}":
@@ -414,9 +541,7 @@ class _StreamingJSONReader:
             while True:
                 key = self.string()
                 assert isinstance(key, str)
-                if key in seen_root:
-                    raise ValueError("JSON payload contains a duplicate object key.")
-                seen_root.add(key)
+                self._record_object_key(root_scope, key)
                 self.expect(":")
                 if key == target_key:
                     count = self._validate_entry_object(model)
@@ -435,7 +560,7 @@ class _StreamingJSONReader:
 
     def _validate_entry_object(self, model: Any) -> int:
         self.expect("{")
-        seen: set[str] = set()
+        scope = self._new_object_scope()
         count = 0
         self.whitespace()
         if self.peek() == "}":
@@ -444,9 +569,7 @@ class _StreamingJSONReader:
         while True:
             key = self.string()
             assert isinstance(key, str)
-            if key in seen:
-                raise ValueError("JSON payload contains a duplicate object key.")
-            seen.add(key)
+            self._record_object_key(scope, key)
             self.expect(":")
             model.model_validate(self.value(materialize=True, depth=2))
             count += 1
