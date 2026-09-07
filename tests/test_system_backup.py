@@ -2801,6 +2801,226 @@ sys.stdout.flush()
                 {"member": member_path},
             )
 
+    def test_file_backed_large_mapping_preflight_stays_below_eight_mib_heap(self) -> None:
+        member_path = self.temp_dir / "large-valid-mapping.json"
+        padding_bytes = 16 * 1024 * 1024
+        with member_path.open("wb") as output:
+            output.write(b'{"padding":"')
+            remaining = padding_bytes
+            chunk = b"x" * (1024 * 1024)
+            while remaining:
+                written = min(remaining, len(chunk))
+                output.write(chunk[:written])
+                remaining -= written
+            output.write(b'","slot_mappings":{}}')
+        manifest = {
+            "groups": [
+                {
+                    "key": MAPPING_FILE_KEY,
+                    "selected": True,
+                    "present": True,
+                    "restore_mode": "file",
+                }
+            ],
+            "files": [
+                {
+                    "key": MAPPING_FILE_KEY,
+                    "group_key": MAPPING_FILE_KEY,
+                    "archive_path": str(
+                        BACKUP_GROUP_METADATA[MAPPING_FILE_KEY]["archive_root"]
+                    ),
+                }
+            ],
+        }
+        groups = self.backup_service._manifest_group_entries(manifest)
+
+        tracemalloc.start()
+        try:
+            self.backup_service._preflight_import_members(
+                manifest,
+                groups,
+                {MAPPING_FILE_KEY: member_path},
+            )
+            _, peak_bytes = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        self.assertLess(peak_bytes, 8 * 1024 * 1024)
+
+    def test_file_backed_json_preflight_rejects_duplicate_mapping_keys(self) -> None:
+        member_path = self.temp_dir / "duplicate-mapping.json"
+        mapping = {
+            "system_id": "synthetic",
+            "enclosure_id": "enclosure",
+            "slot": 0,
+            "serial": "SERIAL-A",
+            "updated_at": "2030-01-02T03:04:05+00:00",
+            "source": "manual",
+        }
+        encoded = json.dumps(mapping, separators=(",", ":"))
+        member_path.write_text(
+            f'{{"slot_mappings":{{"same":{encoded},"same":{encoded}}}}}',
+            encoding="utf-8",
+        )
+        manifest = {
+            "groups": [
+                {
+                    "key": MAPPING_FILE_KEY,
+                    "selected": True,
+                    "present": True,
+                    "restore_mode": "file",
+                }
+            ],
+            "files": [
+                {
+                    "key": MAPPING_FILE_KEY,
+                    "group_key": MAPPING_FILE_KEY,
+                    "archive_path": str(
+                        BACKUP_GROUP_METADATA[MAPPING_FILE_KEY]["archive_root"]
+                    ),
+                }
+            ],
+        }
+
+        with self.assertRaisesRegex(ValueError, "selected mapping_file member is invalid"):
+            self.backup_service._preflight_import_members(
+                manifest,
+                self.backup_service._manifest_group_entries(manifest),
+                {MAPPING_FILE_KEY: member_path},
+            )
+
+    def test_structured_yaml_member_bound_is_export_import_symmetric(self) -> None:
+        content = b" " * (2 * 1024 * 1024) + b"{}"
+        member = BundleMember(
+            key=CONFIG_FILE_KEY,
+            group_key=CONFIG_FILE_KEY,
+            archive_path=str(BACKUP_GROUP_METADATA[CONFIG_FILE_KEY]["archive_root"]),
+            source_path="synthetic",
+            present=True,
+            content=content,
+        )
+        with self.assertRaisesRegex(ValueError, "Structured YAML member"):
+            self.backup_service._collect_file_specs([member])
+
+        member_path = self.temp_dir / "large-config.yaml"
+        member_path.write_bytes(content)
+        manifest = {
+            "groups": [
+                {
+                    "key": CONFIG_FILE_KEY,
+                    "selected": True,
+                    "present": True,
+                    "restore_mode": "file",
+                }
+            ],
+            "files": [
+                {
+                    "key": CONFIG_FILE_KEY,
+                    "group_key": CONFIG_FILE_KEY,
+                    "archive_path": str(
+                        BACKUP_GROUP_METADATA[CONFIG_FILE_KEY]["archive_root"]
+                    ),
+                }
+            ],
+        }
+        with self.assertRaisesRegex(ValueError, "selected config_file member is invalid"):
+            self.backup_service._preflight_import_members(
+                manifest,
+                self.backup_service._manifest_group_entries(manifest),
+                {CONFIG_FILE_KEY: member_path},
+            )
+
+    def test_primary_parse_error_survives_outer_workspace_cleanup_failure(self) -> None:
+        archive_path = self.temp_dir / "invalid.archive"
+        archive_path.write_bytes(b"not an archive")
+        real_rmtree = shutil.rmtree
+
+        def fail_import_workspace_cleanup(path: object, *args: object, **kwargs: object) -> None:
+            if "truenas-jbod-ui-file-import-" in str(path):
+                raise OSError("synthetic cleanup failure")
+            real_rmtree(path, *args, **kwargs)
+
+        with (
+            patch(
+                "history_service.system_backup.shutil.rmtree",
+                side_effect=fail_import_workspace_cleanup,
+            ),
+            self.assertRaises(RuntimeError) as raised,
+        ):
+            self.backup_service.import_bundle_from_file(archive_path)
+
+        self.assertIn("format is not supported", str(raised.exception))
+        self.assertIn("cleanup", str(raised.exception).lower())
+        self.assertNotIn(str(archive_path), str(raised.exception))
+
+    def test_primary_preflight_error_survives_extracted_workspace_cleanup_failure(self) -> None:
+        cleanup_root = self.temp_dir / "synthetic-extracted-workspace"
+        cleanup_root.mkdir()
+        parsed = (
+            {},
+            {},
+            "zip",
+            {"encrypted": False, "_cleanup_root": cleanup_root},
+        )
+
+        with (
+            patch.object(
+                self.backup_service,
+                "_cleanup_extracted_archive",
+                side_effect=RuntimeError("Backup bundle extraction workspace cleanup failed."),
+            ),
+            self.assertRaises(RuntimeError) as raised,
+        ):
+            self.backup_service._import_parsed_bundle(
+                parsed,
+                expected_encrypted=True,
+            )
+
+        self.assertIn("expected encrypted content", str(raised.exception))
+        self.assertIn("cleanup", str(raised.exception).lower())
+        self.assertNotIn(str(cleanup_root), str(raised.exception))
+
+    def test_inspection_siblings_preserve_primary_when_extracted_cleanup_fails(self) -> None:
+        cleanup_root = self.temp_dir / "synthetic-inspection-workspace"
+        cleanup_root.mkdir()
+        cases = (
+            (
+                lambda: self.backup_service.inspect_bundle_file(
+                    Path("synthetic.archive"),
+                    expected_encrypted=True,
+                ),
+                "expected encrypted content",
+            ),
+            (
+                lambda: self.backup_service.preflight_scheduled_bundle_file(
+                    Path("synthetic.archive"),
+                    passphrase="synthetic",
+                    expected_groups=[],
+                ),
+                "encryption could not be verified",
+            ),
+        )
+
+        for operation, primary_message in cases:
+            with self.subTest(primary_message=primary_message), patch.object(
+                self.backup_service,
+                "_read_archive_file",
+                side_effect=lambda *_args, **_kwargs: (
+                    {},
+                    {},
+                    "zip",
+                    {"encrypted": False, "_cleanup_root": cleanup_root},
+                ),
+            ), patch.object(
+                self.backup_service,
+                "_cleanup_extracted_archive",
+                side_effect=RuntimeError("Backup bundle extraction workspace cleanup failed."),
+            ), self.assertRaises(RuntimeError) as raised:
+                operation()
+            self.assertIn(primary_message, str(raised.exception))
+            self.assertIn("cleanup", str(raised.exception).lower())
+            self.assertNotIn(str(cleanup_root), str(raised.exception))
+
     def test_activation_stages_file_backed_member_without_byte_materialization(self) -> None:
         source_path = self.temp_dir / "file-backed-member.bin"
         source_path.write_bytes(b"file-backed")

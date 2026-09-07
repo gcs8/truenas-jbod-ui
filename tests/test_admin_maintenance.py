@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import http.client
+import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
@@ -94,6 +95,50 @@ def build_service(runtime: FakeRuntimeService, backup: FakeBackupService) -> Adm
 
 
 class MaintenanceQuiesceTests(unittest.TestCase):
+    def test_file_import_activates_the_exact_snapshot_that_preflight_parsed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            archive_path = Path(temporary_directory) / "synthetic.archive"
+            archive_path.write_bytes(b"inspected-a")
+            observed: dict[str, object] = {}
+            runtime = FakeRuntimeService(["ui", "history"])
+            original_stop = runtime.stop_container
+
+            def stop_container(key: str) -> None:
+                if key == "ui":
+                    preflight_path = observed["preflight_path"]
+                    assert isinstance(preflight_path, Path)
+                    replacement = preflight_path.with_suffix(".replacement")
+                    try:
+                        replacement.write_bytes(b"uninspected-b")
+                        replacement.replace(preflight_path)
+                    except OSError:
+                        observed["replacement_rejected"] = True
+                        replacement.unlink(missing_ok=True)
+                original_stop(key)
+
+            def inspect(path: Path, **_kwargs: object) -> bytes:
+                observed["preflight_path"] = Path(path)
+                content = Path(path).read_bytes()
+                observed["preflight"] = content
+                return content
+
+            runtime.stop_container = stop_container  # type: ignore[method-assign]
+            backup = FakeBackupService()
+            backup.inspect_bundle_file = inspect  # type: ignore[attr-defined]
+            backup.import_bundle_from_file = lambda path, **_kwargs: (  # type: ignore[attr-defined]
+                observed.setdefault("activated", Path(path).read_bytes()) or {"ok": True}
+            )
+
+            build_service(runtime, backup).import_bundle_from_file(
+                archive_path,
+                stop_services=True,
+                restart_services=False,
+            )
+
+            self.assertEqual(observed["preflight"], b"inspected-a")
+            self.assertEqual(observed["activated"], b"inspected-a")
+            self.assertIs(observed.get("replacement_rejected"), True)
+
     def test_file_import_preflights_before_stopping_services(self) -> None:
         events: list[str] = []
         runtime = FakeRuntimeService(["ui", "history"])
@@ -110,10 +155,13 @@ class MaintenanceQuiesceTests(unittest.TestCase):
             events.append("import") or {"ok": True}
         )
 
-        build_service(runtime, backup).import_bundle_from_file(
-            Path("synthetic.archive"),
-            stop_services=True,
-        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            archive_path = Path(temporary_directory) / "synthetic.archive"
+            archive_path.write_bytes(b"synthetic")
+            build_service(runtime, backup).import_bundle_from_file(
+                archive_path,
+                stop_services=True,
+            )
 
         self.assertLess(events.index("preflight"), events.index("stop:ui"))
         self.assertLess(events.index("stop:history"), events.index("import"))
@@ -129,11 +177,14 @@ class MaintenanceQuiesceTests(unittest.TestCase):
         backup = FakeBackupService()
         backup.inspect_bundle_file = lambda *_args, **_kwargs: {"ok": True}  # type: ignore[attr-defined]
 
-        with self.assertRaises(MaintenanceStopError) as raised:
-            build_service(runtime, backup).import_bundle_from_file(
-                Path("synthetic.archive"),
-                stop_services=True,
-            )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            archive_path = Path(temporary_directory) / "synthetic.archive"
+            archive_path.write_bytes(b"synthetic")
+            with self.assertRaises(MaintenanceStopError) as raised:
+                build_service(runtime, backup).import_bundle_from_file(
+                    archive_path,
+                    stop_services=True,
+                )
 
         self.assertEqual(sorted(runtime.running), ["history", "ui"])
         self.assertEqual(raised.exception.stopped_containers, ["ui"])
@@ -173,6 +224,59 @@ class MaintenanceQuiesceTests(unittest.TestCase):
         self.assertEqual(outcome.restarted_containers, ["ui", "history"])
         self.assertEqual(outcome.restart_failures, {})
         self.assertEqual(sorted(runtime.running), ["history", "ui"])
+
+    def test_stop_error_before_effect_after_observation_failure_reports_no_false_transitions(self) -> None:
+        class AmbiguousRuntime(FakeRuntimeService):
+            def __init__(self) -> None:
+                super().__init__(["ui", "history"])
+                self.observation_calls = 0
+
+            def stop_container(self, key: str) -> None:
+                self.calls.append(("stop", key))
+                raise DockerRuntimeError("stop response unavailable")
+
+            def running_container_keys(self, keys=None) -> list[str]:
+                self.observation_calls += 1
+                if self.observation_calls == 2:
+                    raise DockerRuntimeError("observation unavailable")
+                return super().running_container_keys(keys)
+
+            def start_container(self, key: str) -> None:
+                self.calls.append(("start", key))
+                if key not in self.running:
+                    self.running.append(key)
+
+        runtime = AmbiguousRuntime()
+
+        with self.assertRaises(MaintenanceStopError) as raised:
+            build_service(runtime, FakeBackupService()).import_bundle(
+                b"bundle",
+                stop_services=True,
+            )
+
+        self.assertEqual(raised.exception.stopped_containers, [])
+        self.assertEqual(raised.exception.restarted_containers, [])
+        self.assertEqual(raised.exception.restart_failures, {})
+        self.assertEqual(raised.exception.final_running_containers, ["ui", "history"])
+        self.assertEqual(runtime.calls, [("stop", "ui")])
+
+    def test_partial_recovery_reports_only_confirmed_restart_and_final_state(self) -> None:
+        runtime = FakeRuntimeService(
+            ["ui", "history"],
+            stop_failures={"history": "stop failed before effect"},
+            start_failures={"ui": "start failed"},
+        )
+
+        with self.assertRaises(MaintenanceStopError) as raised:
+            build_service(runtime, FakeBackupService()).import_bundle(
+                b"bundle",
+                stop_services=True,
+            )
+
+        self.assertEqual(raised.exception.stopped_containers, ["ui"])
+        self.assertEqual(raised.exception.restarted_containers, [])
+        self.assertEqual(raised.exception.restart_failures, {"ui": "start failed"})
+        self.assertEqual(raised.exception.final_running_containers, ["history"])
 
     def test_happy_path_stops_operates_and_restarts_every_target(self) -> None:
         runtime = FakeRuntimeService(["ui", "history", "admin"])

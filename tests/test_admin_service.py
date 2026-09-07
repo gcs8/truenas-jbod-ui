@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 from fastapi import HTTPException
 from fastapi import Request
@@ -603,6 +603,9 @@ class MainAppBoundaryTests(unittest.TestCase):
             observed["path"] = path
             observed["content"] = path.read_bytes()
             observed["mode"] = stat.S_IMODE(path.stat().st_mode)
+            admission = kwargs.get("admission_callback")
+            assert callable(admission)
+            admission(hashlib.sha256(observed["content"]).hexdigest(), "plaintext")
             return (
                 {
                     "ok": True,
@@ -651,16 +654,83 @@ class MainAppBoundaryTests(unittest.TestCase):
         self.assertFalse(archive_path.exists())
         self.assertFalse(archive_path.parent.exists())
         service.import_bundle_from_file.assert_called_once()
-        receipt_store.consume.assert_called_once_with(
+        receipt_store.consume_digest.assert_called_once_with(
             "server-receipt",
-            archive_path,
+            hashlib.sha256(b"archive-bytes").hexdigest(),
             expected_encryption_mode="plaintext",
         )
+        receipt_store.consume.assert_not_called()
         service.import_bundle.assert_not_called()
         observed_metric = observe_operation.call_args.kwargs
         self.assertEqual(observed_metric["operation"], "import")
         self.assertEqual(observed_metric["outcome"], "success")
         self.assertGreaterEqual(observed_metric["duration_seconds"], 0)
+
+    def test_admin_backup_import_consumes_receipt_after_preflight_before_stop(self) -> None:
+        request, _receive_probe = make_streaming_request([b"archive-bytes"])
+        request.scope["headers"].extend(
+            [
+                (b"x-backup-expected-encryption", b"plaintext"),
+                (b"x-backup-inspection-receipt", b"server-receipt"),
+            ]
+        )
+        events: list[str] = []
+        maintenance = SimpleNamespace(
+            stopped_containers=[],
+            restarted_containers=[],
+            restart_failures={},
+            final_running_containers=[],
+        )
+        service = MagicMock()
+
+        def import_from_file(path: Path, **kwargs: object) -> tuple[dict[str, object], object]:
+            events.append("preflight")
+            admission = kwargs.get("admission_callback")
+            if callable(admission):
+                admission(hashlib.sha256(Path(path).read_bytes()).hexdigest(), "plaintext")
+            events.append("stop")
+            return (
+                {
+                    "ok": True,
+                    "systems": [],
+                    "restored_paths": [],
+                    "preserved_absent_groups": [],
+                },
+                maintenance,
+            )
+
+        service.import_bundle_from_file.side_effect = import_from_file
+        receipt_store = MagicMock()
+        receipt_store.consume_digest.side_effect = lambda *_args, **_kwargs: events.append(
+            "consume"
+        )
+        receipt_store.consume.side_effect = lambda *_args, **_kwargs: events.append("consume")
+        runtime_service = MagicMock()
+        runtime_service.managed_containers = {}
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/backup/import")
+
+        with (
+            patch("admin_service.main.get_maintenance_service", return_value=service),
+            patch("admin_service.main.get_backup_receipt_store", return_value=receipt_store),
+            patch("admin_service.main.observe_backup_operation"),
+            patch(
+                "admin_service.main.reload_app_settings",
+                return_value=SimpleNamespace(default_system_id=None),
+            ),
+            patch("admin_service.main.get_runtime_service", return_value=runtime_service),
+            patch("admin_service.main.build_runtime_payload", new=AsyncMock(return_value={})),
+            patch("admin_service.main.serialize_systems", return_value=[]),
+        ):
+            response = asyncio.run(
+                route.endpoint(
+                    request,
+                    stop_services=True,
+                    restart_services=False,
+                )
+            )
+
+        self.assertEqual(events, ["preflight", "consume", "stop"])
+        self.assertEqual(json.loads(response.body)["final_running_containers"], [])
 
     def test_admin_backup_inspection_streams_file_and_returns_only_sanitized_metadata(self) -> None:
         request, _receive_probe = make_streaming_request([b"archive-bytes"])
@@ -685,8 +755,16 @@ class MainAppBoundaryTests(unittest.TestCase):
                 "history": {"event_count": 42},
             },
         }
+
+        def inspect_with_identity(path: Path, **kwargs: object) -> dict[str, object]:
+            callback = kwargs.get("identity_callback")
+            assert callable(callback)
+            callback(hashlib.sha256(path.read_bytes()).hexdigest(), "encrypted")
+            return service.inspect_bundle_file.return_value
+
+        service.inspect_bundle_file.side_effect = inspect_with_identity
         receipt_store = MagicMock()
-        receipt_store.issue.return_value = {
+        receipt_store.issue_digest.return_value = {
             "receipt": "server-receipt",
             "expires_at": 123456,
         }
@@ -717,12 +795,16 @@ class MainAppBoundaryTests(unittest.TestCase):
         self.assertFalse(inspected_path.parent.exists())
         self.assertEqual(
             service.inspect_bundle_file.call_args.kwargs,
-            {"passphrase": "synthetic passphrase"},
+            {
+                "passphrase": "synthetic passphrase",
+                "identity_callback": ANY,
+            },
         )
-        receipt_store.issue.assert_called_once_with(
-            inspected_path,
+        receipt_store.issue_digest.assert_called_once_with(
+            hashlib.sha256(b"archive-bytes").hexdigest(),
             observed_encryption_mode="encrypted",
         )
+        receipt_store.issue.assert_not_called()
         observed_metric = observe_operation.call_args.kwargs
         self.assertEqual(observed_metric["operation"], "inspect")
         self.assertEqual(observed_metric["outcome"], "success")
@@ -736,17 +818,20 @@ class MainAppBoundaryTests(unittest.TestCase):
         observed_path: list[Path] = []
         service = MagicMock()
 
-        def inspect_from_file(path: Path, **_kwargs: object) -> dict[str, object]:
+        def inspect_from_file(path: Path, **kwargs: object) -> dict[str, object]:
             observed_path.append(path)
             worker_started.set()
             release_worker.wait(5)
             self.assertTrue(path.exists())
+            callback = kwargs.get("identity_callback")
+            assert callable(callback)
+            callback(hashlib.sha256(path.read_bytes()).hexdigest(), "plaintext")
             worker_finished.set()
             return {"ok": True, "encrypted": False}
 
         service.inspect_bundle_file.side_effect = inspect_from_file
         receipt_store = MagicMock()
-        receipt_store.issue.return_value = {"receipt": "receipt", "expires_at": 123}
+        receipt_store.issue_digest.return_value = {"receipt": "receipt", "expires_at": 123}
         route = next(
             route for route in admin_app.routes if route.path == "/api/admin/backup/inspect"
         )

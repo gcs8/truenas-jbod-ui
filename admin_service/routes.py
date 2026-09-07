@@ -240,15 +240,23 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
             if passphrase is None:
                 passphrase = request.headers.get("X-Backup-Passphrase") or None
             def inspect_and_issue_receipt() -> tuple[dict[str, Any], dict[str, Any]]:
+                issued: dict[str, Any] = {}
+
+                def issue_for_identity(archive_digest: str, mode: str) -> None:
+                    issued.update(
+                        get_backup_receipt_store().issue_digest(
+                            archive_digest,
+                            observed_encryption_mode=mode,
+                        )
+                    )
+
                 result = get_backup_service().inspect_bundle_file(
                     archive_path,
                     passphrase=passphrase,
+                    identity_callback=issue_for_identity,
                 )
-                mode = "encrypted" if result.get("encrypted") is True else "plaintext"
-                issued = get_backup_receipt_store().issue(
-                    archive_path,
-                    observed_encryption_mode=mode,
-                )
+                if not issued:
+                    raise RuntimeError("Backup inspection identity was not bound.")
                 return result, issued
 
             try:
@@ -299,17 +307,24 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
             maintenance_service = get_maintenance_service()
 
             def admitted_import() -> Any:
-                get_backup_receipt_store().consume(
-                    receipt,
-                    archive_path,
-                    expected_encryption_mode=expected_mode,
-                )
+                def consume_admission(archive_digest: str, observed_mode: str) -> None:
+                    if observed_mode != expected_mode:
+                        raise ValueError(
+                            "Backup inspection receipt encryption mode does not match the import mode."
+                        )
+                    get_backup_receipt_store().consume_digest(
+                        receipt,
+                        archive_digest,
+                        expected_encryption_mode=expected_mode,
+                    )
+
                 return maintenance_service.import_bundle_from_file(
                     archive_path,
                     passphrase=passphrase,
                     expected_encrypted=expected_mode == "encrypted",
                     stop_services=stop_services,
                     restart_services=restart_services,
+                    admission_callback=consume_admission,
                 )
 
             try:
@@ -342,6 +357,11 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
                     "stopped_containers": maintenance.stopped_containers,
                     "restarted_containers": maintenance.restarted_containers,
                     "restart_failures": dict(maintenance.restart_failures),
+                    "final_running_containers": getattr(
+                        maintenance,
+                        "final_running_containers",
+                        [],
+                    ),
                     "runtime": await build_runtime_payload(runtime_service),
                 }
             )

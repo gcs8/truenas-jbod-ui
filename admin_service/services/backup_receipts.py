@@ -72,10 +72,24 @@ class BackupInspectionReceiptStore:
         observed_encryption_mode: str,
         now: int | None = None,
     ) -> dict[str, int | str]:
+        return self.issue_digest(
+            _archive_sha256(archive_path),
+            observed_encryption_mode=observed_encryption_mode,
+            now=now,
+        )
+
+    def issue_digest(
+        self,
+        archive_digest: str,
+        *,
+        observed_encryption_mode: str,
+        now: int | None = None,
+    ) -> dict[str, int | str]:
         mode = self._validate_mode(observed_encryption_mode)
+        if not re.fullmatch(r"[0-9a-f]{64}", archive_digest):
+            raise ValueError("Backup archive identity is invalid.")
         issued_at = int(time.time() if now is None else now)
         expires_at = issued_at + self._ttl_seconds
-        archive_digest = _archive_sha256(archive_path)
         with self._lock:
             self._prune_expired_locked(issued_at)
             for _ in range(8):
@@ -120,7 +134,24 @@ class BackupInspectionReceiptStore:
         expected_encryption_mode: str,
         now: int | None = None,
     ) -> None:
+        self.consume_digest(
+            receipt,
+            _archive_sha256(archive_path),
+            expected_encryption_mode=expected_encryption_mode,
+            now=now,
+        )
+
+    def consume_digest(
+        self,
+        receipt: str,
+        archive_digest: str,
+        *,
+        expected_encryption_mode: str,
+        now: int | None = None,
+    ) -> None:
         expected_mode = self._validate_mode(expected_encryption_mode)
+        if not re.fullmatch(r"[0-9a-f]{64}", archive_digest):
+            raise ValueError("Backup archive identity is invalid.")
         current_time = int(time.time() if now is None else now)
         try:
             encoded_payload, encoded_signature = receipt.split(".", 1)
@@ -147,7 +178,7 @@ class BackupInspectionReceiptStore:
         }:
             raise ValueError("Backup inspection receipt is invalid.")
         version = payload["version"]
-        archive_digest = payload["archive_sha256"]
+        receipt_digest = payload["archive_sha256"]
         mode = payload["encryption_mode"]
         issued_at = payload["issued_at"]
         expires_at = payload["expires_at"]
@@ -155,8 +186,8 @@ class BackupInspectionReceiptStore:
         if (
             type(version) is not int
             or version != RECEIPT_VERSION
-            or not isinstance(archive_digest, str)
-            or not re.fullmatch(r"[0-9a-f]{64}", archive_digest)
+            or not isinstance(receipt_digest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", receipt_digest)
             or mode not in _VALID_MODES
             or type(issued_at) is not int
             or type(expires_at) is not int
@@ -169,10 +200,10 @@ class BackupInspectionReceiptStore:
             raise ValueError("Backup inspection receipt has expired.")
         if mode != expected_mode:
             raise ValueError("Backup inspection receipt encryption mode does not match the import mode.")
-        if _archive_sha256(archive_path) != archive_digest:
+        if archive_digest != receipt_digest:
             raise ValueError("Backup archive does not match its inspection receipt.")
 
-        expected_record = (archive_digest, mode, issued_at, expires_at)
+        expected_record = (receipt_digest, mode, issued_at, expires_at)
         with self._lock:
             record = self._issued.get(nonce)
             if record is None or record[:4] != expected_record:

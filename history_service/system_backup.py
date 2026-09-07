@@ -220,6 +220,10 @@ SENSITIVE_GROUP_KEYS: set[str] = {
     for key, item in BACKUP_GROUP_METADATA.items()
     if bool(item["sensitive"])
 }
+STRUCTURED_YAML_GROUP_KEYS = frozenset(
+    {CONFIG_FILE_KEY, RUNTIME_OVERRIDES_FILE_KEY, PROFILE_FILE_KEY}
+)
+
 
 ArchivePackaging = Literal["tar.zst", "zip", "tar.gz", "7z"]
 SUPPORTED_ARCHIVE_PACKAGING: tuple[ArchivePackaging, ...] = ("tar.zst", "zip", "tar.gz", "7z")
@@ -258,8 +262,200 @@ MAX_MANIFEST_BYTES = 4 * 1024 * 1024
 MAX_7Z_COMMAND_OUTPUT_BYTES = 8 * 1024 * 1024
 ARCHIVE_READ_CHUNK_BYTES = 1024 * 1024
 ZSTD_BOUNDED_INPUT_BYTES = 32
+MAX_STRUCTURED_YAML_MEMBER_BYTES = 2 * 1024 * 1024
+
+JSON_STREAM_CHUNK_CHARS = 64 * 1024
+MAX_JSON_KEY_CHARS = 64 * 1024
 
 ExtractedMember = bytes | Path
+
+
+class _StreamingJSONReader:
+    """Small bounded-buffer JSON reader used for file-backed mapping members."""
+
+    def __init__(self, source: Any) -> None:
+        self.source = source
+        self.buffer = ""
+        self.position = 0
+        self.eof = False
+
+    def _fill(self) -> bool:
+        if self.position < len(self.buffer):
+            return True
+        if self.eof:
+            return False
+        self.buffer = self.source.read(JSON_STREAM_CHUNK_CHARS)
+        self.position = 0
+        if not self.buffer:
+            self.eof = True
+            return False
+        return True
+
+    def peek(self) -> str:
+        return self.buffer[self.position] if self._fill() else ""
+
+    def take(self) -> str:
+        character = self.peek()
+        if character:
+            self.position += 1
+        return character
+
+    def whitespace(self) -> None:
+        while self.peek() in {" ", "\t", "\r", "\n"}:
+            self.position += 1
+
+    def expect(self, expected: str) -> None:
+        self.whitespace()
+        if self.take() != expected:
+            raise ValueError("JSON payload is malformed.")
+
+    def string(self, *, materialize: bool = True) -> str | None:
+        self.whitespace()
+        if self.take() != '"':
+            raise ValueError("JSON payload is malformed.")
+        encoded = ['"'] if materialize else None
+        encoded_chars = 1
+        while True:
+            character = self.take()
+            if not character or ord(character) < 0x20:
+                raise ValueError("JSON payload is malformed.")
+            if encoded is not None:
+                encoded.append(character)
+                encoded_chars += 1
+                if encoded_chars > MAX_JSON_KEY_CHARS:
+                    raise ValueError("JSON scalar exceeds its validation limit.")
+            if character == '"':
+                break
+            if character != "\\":
+                continue
+            escaped = self.take()
+            if escaped not in {'"', "\\", "/", "b", "f", "n", "r", "t", "u"}:
+                raise ValueError("JSON payload is malformed.")
+            if encoded is not None:
+                encoded.append(escaped)
+                encoded_chars += 1
+            if escaped == "u":
+                digits = "".join(self.take() for _ in range(4))
+                if len(digits) != 4 or any(char not in "0123456789abcdefABCDEF" for char in digits):
+                    raise ValueError("JSON payload is malformed.")
+                if encoded is not None:
+                    encoded.append(digits)
+                    encoded_chars += 4
+        if encoded is None:
+            return None
+        return json.loads("".join(encoded))
+
+    def value(self, *, materialize: bool, depth: int = 0) -> Any:
+        if depth > 64:
+            raise ValueError("JSON payload nesting exceeds its validation limit.")
+        self.whitespace()
+        token = self.peek()
+        if token == '"':
+            return self.string(materialize=materialize)
+        if token == "{":
+            self.take()
+            result: dict[str, Any] | None = {} if materialize else None
+            seen: set[str] = set()
+            self.whitespace()
+            if self.peek() == "}":
+                self.take()
+                return result
+            while True:
+                key = self.string()
+                assert isinstance(key, str)
+                if key in seen:
+                    raise ValueError("JSON payload contains a duplicate object key.")
+                seen.add(key)
+                self.expect(":")
+                item = self.value(materialize=materialize, depth=depth + 1)
+                if result is not None:
+                    result[key] = item
+                self.whitespace()
+                separator = self.take()
+                if separator == "}":
+                    return result
+                if separator != ",":
+                    raise ValueError("JSON payload is malformed.")
+        if token == "[":
+            self.take()
+            result_list: list[Any] | None = [] if materialize else None
+            self.whitespace()
+            if self.peek() == "]":
+                self.take()
+                return result_list
+            while True:
+                item = self.value(materialize=materialize, depth=depth + 1)
+                if result_list is not None:
+                    result_list.append(item)
+                self.whitespace()
+                separator = self.take()
+                if separator == "]":
+                    return result_list
+                if separator != ",":
+                    raise ValueError("JSON payload is malformed.")
+        scalar = ""
+        while self.peek() and self.peek() not in {" ", "\t", "\r", "\n", ",", "]", "}"}:
+            scalar += self.take()
+            if len(scalar) > 1024:
+                raise ValueError("JSON scalar exceeds its validation limit.")
+        if not scalar:
+            raise ValueError("JSON payload is malformed.")
+        decoded = json.loads(scalar)
+        return decoded if materialize else None
+
+    def validate_mapping_entries(self, target_key: str, model: Any) -> int:
+        self.expect("{")
+        seen_root: set[str] = set()
+        count = 0
+        self.whitespace()
+        if self.peek() == "}":
+            self.take()
+        else:
+            while True:
+                key = self.string()
+                assert isinstance(key, str)
+                if key in seen_root:
+                    raise ValueError("JSON payload contains a duplicate object key.")
+                seen_root.add(key)
+                self.expect(":")
+                if key == target_key:
+                    count = self._validate_entry_object(model)
+                else:
+                    self.value(materialize=False, depth=1)
+                self.whitespace()
+                separator = self.take()
+                if separator == "}":
+                    break
+                if separator != ",":
+                    raise ValueError("JSON payload is malformed.")
+        self.whitespace()
+        if self.peek():
+            raise ValueError("JSON payload has trailing content.")
+        return count
+
+    def _validate_entry_object(self, model: Any) -> int:
+        self.expect("{")
+        seen: set[str] = set()
+        count = 0
+        self.whitespace()
+        if self.peek() == "}":
+            self.take()
+            return 0
+        while True:
+            key = self.string()
+            assert isinstance(key, str)
+            if key in seen:
+                raise ValueError("JSON payload contains a duplicate object key.")
+            seen.add(key)
+            self.expect(":")
+            model.model_validate(self.value(materialize=True, depth=2))
+            count += 1
+            self.whitespace()
+            separator = self.take()
+            if separator == "}":
+                return count
+            if separator != ",":
+                raise ValueError("JSON payload is malformed.")
 
 
 @dataclass(slots=True)
@@ -1821,7 +2017,7 @@ class SystemBackupService:
         extracted: dict[str, ExtractedMember],
         group_entries: dict[str, dict[str, Any]],
         group_key: str,
-    ) -> bytes | None:
+    ) -> ExtractedMember | None:
         group = group_entries.get(group_key)
         if (
             not self._manifest_group_selected(group)
@@ -1831,7 +2027,7 @@ class SystemBackupService:
         member = self._first_group_member(manifest, group_key)
         if member is None:
             return None
-        return self._extracted_member_bytes(extracted[member["key"]])
+        return extracted[member["key"]]
 
     @staticmethod
     def _inspection_history_member_counts(
@@ -1914,15 +2110,19 @@ class SystemBackupService:
         if config_content is not None:
             merged_config = _deep_merge(
                 Settings().model_dump(),
-                self._load_yaml_mapping(config_content),
+                self._load_yaml_mapping(self._extracted_member_bytes(config_content)),
             )
             if runtime_overrides_content is not None:
                 merged_config = _deep_merge(
                     merged_config,
-                    self._load_yaml_mapping(runtime_overrides_content),
+                    self._load_yaml_mapping(
+                        self._extracted_member_bytes(runtime_overrides_content)
+                    ),
                 )
             if profiles_content is not None:
-                profile_payload = yaml.safe_load(profiles_content.decode("utf-8")) or {}
+                profile_payload = yaml.safe_load(
+                    self._extracted_member_bytes(profiles_content).decode("utf-8")
+                ) or {}
                 inspected_profiles = (
                     profile_payload
                     if isinstance(profile_payload, list)
@@ -1944,7 +2144,9 @@ class SystemBackupService:
 
         profile_count: int | None = None
         if profiles_content is not None:
-            profile_payload = yaml.safe_load(profiles_content.decode("utf-8")) or {}
+            profile_payload = yaml.safe_load(
+                self._extracted_member_bytes(profiles_content).decode("utf-8")
+            ) or {}
             profiles = (
                 profile_payload
                 if isinstance(profile_payload, list)
@@ -1954,9 +2156,15 @@ class SystemBackupService:
             )
             profile_count = len(profiles) if isinstance(profiles, list) else 0
 
-        def json_entry_count(content: bytes | None, key: str) -> int | None:
+        def json_entry_count(
+            content: ExtractedMember | None,
+            key: str,
+            model: Any,
+        ) -> int | None:
             if content is None:
                 return None
+            if isinstance(content, Path):
+                return self._validate_streaming_json_member(content, key, model)
             entries = self._load_json_mapping(content).get(key)
             return len(entries) if isinstance(entries, dict) else 0
 
@@ -2003,9 +2211,17 @@ class SystemBackupService:
             "systems": system_count,
             "profiles": profile_count,
             "storage_views": storage_view_count,
-            "mappings": json_entry_count(mapping_content, "slot_mappings"),
-            "sas_fabric_aliases": json_entry_count(alias_content, "sas_fabric_aliases"),
-            "slot_details": json_entry_count(slot_detail_content, "slot_details"),
+            "mappings": json_entry_count(mapping_content, "slot_mappings", ManualMapping),
+            "sas_fabric_aliases": json_entry_count(
+                alias_content,
+                "sas_fabric_aliases",
+                SasFabricAlias,
+            ),
+            "slot_details": json_entry_count(
+                slot_detail_content,
+                "slot_details",
+                SlotDetailCacheEntry,
+            ),
             "ssh_keys": directory_member_count(SSH_KEYS_KEY),
             "tls_files": directory_member_count(TLS_TRUST_KEY),
             "known_hosts": directory_member_count(KNOWN_HOSTS_KEY),
@@ -2034,12 +2250,15 @@ class SystemBackupService:
         *,
         passphrase: str | None = None,
         expected_encrypted: bool | None = None,
+        identity_callback: Callable[[str, str], None] | None = None,
     ) -> dict[str, Any]:
         manifest, extracted, detected_packaging, archive_meta = self._read_archive_file(
             Path(archive_path),
             passphrase=passphrase,
         )
         cleanup_root = archive_meta.pop("_cleanup_root", None)
+        archive_digest = archive_meta.pop("_archive_sha256", None)
+        primary_error: Exception | None = None
         try:
             self._enforce_expected_encryption(archive_meta, expected_encrypted)
             group_entries = self._manifest_group_entries(manifest)
@@ -2061,7 +2280,7 @@ class SystemBackupService:
             self._validate_manifest_member_metadata(manifest, extracted)
             self._preflight_selected_group_members(manifest, group_entries, extracted)
             self._preflight_import_members(manifest, group_entries, extracted)
-            return {
+            result = {
                 "ok": True,
                 "schema_version": manifest.get("schema_version"),
                 "app_version": manifest.get("app_version"),
@@ -2082,8 +2301,62 @@ class SystemBackupService:
                     group_entries,
                 ),
             }
+            if identity_callback is not None:
+                if not isinstance(archive_digest, str):
+                    raise RuntimeError("Backup archive identity is unavailable.")
+                observed_mode = (
+                    "encrypted" if archive_meta.get("encrypted") is True else "plaintext"
+                )
+                identity_callback(archive_digest, observed_mode)
+            return result
+        except Exception as exc:
+            primary_error = exc
+            raise
         finally:
-            self._cleanup_extracted_archive(cleanup_root)
+            self._cleanup_extracted_archive_after(cleanup_root, primary_error)
+
+    def preflight_import_bundle_file(
+        self,
+        archive_path: str | Path,
+        *,
+        passphrase: str | None = None,
+        expected_encrypted: bool | None = None,
+        identity_callback: Callable[[str, str], None] | None = None,
+    ) -> None:
+        manifest, extracted, _packaging, archive_meta = self._read_archive_file(
+            Path(archive_path),
+            passphrase=passphrase,
+        )
+        cleanup_root = archive_meta.pop("_cleanup_root", None)
+        archive_digest = archive_meta.pop("_archive_sha256", None)
+        primary_error: Exception | None = None
+        try:
+            self._enforce_expected_encryption(archive_meta, expected_encrypted)
+            group_entries = self._manifest_group_entries(manifest)
+            self._validate_manifest_member_metadata(manifest, extracted)
+            self._preflight_selected_group_members(manifest, group_entries, extracted)
+            self._preflight_import_members(manifest, group_entries, extracted)
+            self._build_restore_destination_graph(manifest, group_entries, extracted)
+            self._prepare_segmented_history_import(manifest, extracted)
+            if identity_callback is not None:
+                if not isinstance(archive_digest, str):
+                    raise RuntimeError("Backup archive identity is unavailable.")
+                observed_mode = (
+                    "encrypted" if archive_meta.get("encrypted") is True else "plaintext"
+                )
+                identity_callback(archive_digest, observed_mode)
+        except Exception as exc:
+            primary_error = exc
+            raise
+        finally:
+            try:
+                self._cleanup_extracted_archive(cleanup_root)
+            except Exception as cleanup_error:
+                if primary_error is not None:
+                    raise RuntimeError(
+                        f"{primary_error} Backup bundle extraction workspace cleanup failed too."
+                    ) from primary_error
+                raise cleanup_error
 
     def preflight_scheduled_bundle_file(
         self,
@@ -2097,6 +2370,7 @@ class SystemBackupService:
             passphrase=passphrase,
         )
         cleanup_root = archive_meta.pop("_cleanup_root", None)
+        primary_error: Exception | None = None
         try:
             if not archive_meta.get("encrypted"):
                 raise ValueError("Scheduled backup encryption could not be verified.")
@@ -2121,8 +2395,11 @@ class SystemBackupService:
                 "selected_groups": selected_groups,
                 "absent_groups": absent_groups,
             }
+        except Exception as exc:
+            primary_error = exc
+            raise
         finally:
-            self._cleanup_extracted_archive(cleanup_root)
+            self._cleanup_extracted_archive_after(cleanup_root, primary_error)
 
     @staticmethod
     def _scheduled_backup_key(passphrase: str, salt: bytes) -> bytes:
@@ -2427,6 +2704,7 @@ class SystemBackupService:
     ) -> dict[str, Any]:
         manifest, extracted, detected_packaging, archive_meta = parsed
         cleanup_root = archive_meta.pop("_cleanup_root", None)
+        primary_error: Exception | None = None
         try:
             self._enforce_expected_encryption(archive_meta, expected_encrypted)
             group_entries = self._manifest_group_entries(manifest)
@@ -2510,8 +2788,18 @@ class SystemBackupService:
             except Exception:
                 get_settings.cache_clear()
                 raise
+        except Exception as exc:
+            primary_error = exc
+            raise
         finally:
-            self._cleanup_extracted_archive(cleanup_root)
+            try:
+                self._cleanup_extracted_archive(cleanup_root)
+            except Exception as cleanup_error:
+                if primary_error is not None:
+                    raise RuntimeError(
+                        f"{primary_error} Backup bundle extraction workspace cleanup failed too."
+                    ) from primary_error
+                raise cleanup_error
 
     def _build_restore_destination_graph(
         self,
@@ -2957,6 +3245,20 @@ class SystemBackupService:
                     "Backup bundle extraction workspace cleanup failed."
                 ) from exc
 
+    def _cleanup_extracted_archive_after(
+        self,
+        cleanup_root: Any,
+        primary_error: Exception | None,
+    ) -> None:
+        try:
+            self._cleanup_extracted_archive(cleanup_root)
+        except Exception as cleanup_error:
+            if primary_error is not None:
+                raise RuntimeError(
+                    f"{primary_error} Backup bundle extraction workspace cleanup failed too."
+                ) from primary_error
+            raise cleanup_error
+
     def _preflight_import_members(
         self,
         manifest: dict[str, Any],
@@ -2988,7 +3290,31 @@ class SystemBackupService:
                 content = extracted_members[member_key]
                 if group_key == HISTORY_DB_KEY:
                     self._validate_history_member(content)
+                elif isinstance(content, Path) and group_key == MAPPING_FILE_KEY:
+                    self._validate_streaming_json_member(
+                        content,
+                        "slot_mappings",
+                        ManualMapping,
+                    )
+                elif isinstance(content, Path) and group_key == SAS_FABRIC_ALIAS_FILE_KEY:
+                    self._validate_streaming_json_member(
+                        content,
+                        "sas_fabric_aliases",
+                        SasFabricAlias,
+                    )
+                elif isinstance(content, Path) and group_key == SLOT_DETAIL_FILE_KEY:
+                    self._validate_streaming_json_member(
+                        content,
+                        "slot_details",
+                        SlotDetailCacheEntry,
+                    )
                 else:
+                    if (
+                        group_key in STRUCTURED_YAML_GROUP_KEYS
+                        and self._extracted_member_size(content)
+                        > MAX_STRUCTURED_YAML_MEMBER_BYTES
+                    ):
+                        raise ValueError("Structured YAML member exceeds its size limit.")
                     validator(self._extracted_member_bytes(content))
             except (UnicodeError, yaml.YAMLError, json.JSONDecodeError, sqlite3.Error, TypeError, ValueError) as exc:
                 raise ValueError(
@@ -3106,6 +3432,15 @@ class SystemBackupService:
             while chunk := source.read(ARCHIVE_READ_CHUNK_BYTES):
                 digest.update(chunk)
         return digest.hexdigest()
+
+    @staticmethod
+    def _validate_streaming_json_member(
+        content: Path,
+        target_key: str,
+        model: Any,
+    ) -> int:
+        with content.open("r", encoding="utf-8", buffering=JSON_STREAM_CHUNK_CHARS) as source:
+            return _StreamingJSONReader(source).validate_mapping_entries(target_key, model)
 
     @staticmethod
     def _load_yaml_mapping(content: bytes) -> dict[str, Any]:
@@ -3867,6 +4202,12 @@ class SystemBackupService:
             )
             if size_bytes > effective_member_limit:
                 raise ValueError("Backup bundle archive member exceeds its expanded byte limit.")
+            if (
+                member.group_key in STRUCTURED_YAML_GROUP_KEYS
+                and PurePosixPath(member.archive_path).suffix in {".yaml", ".yml"}
+                and size_bytes > MAX_STRUCTURED_YAML_MEMBER_BYTES
+            ):
+                raise ValueError("Structured YAML member exceeds its size limit.")
             expanded_total += size_bytes
             if expanded_total > expanded_limit:
                 raise ValueError("Backup bundle archive expanded data exceeds its byte limit.")
@@ -4315,11 +4656,20 @@ class SystemBackupService:
             workspace.mkdir(mode=0o700, exist_ok=True)
             private_archive = workspace / "bundle.archive"
             try:
+                archive_digest = hashlib.sha256()
+                copied_bytes = 0
                 with os.fdopen(os.dup(descriptor), "rb", closefd=True) as source, private_archive.open(
                     "xb"
                 ) as destination:
                     source.seek(0)
-                    shutil.copyfileobj(source, destination, length=ARCHIVE_READ_CHUNK_BYTES)
+                    while chunk := source.read(ARCHIVE_READ_CHUNK_BYTES):
+                        copied_bytes += len(chunk)
+                        if copied_bytes > metadata.st_size:
+                            raise ValueError("Backup bundle archive changed while being staged.")
+                        archive_digest.update(chunk)
+                        destination.write(chunk)
+                    if copied_bytes != metadata.st_size:
+                        raise ValueError("Backup bundle archive changed while being staged.")
                     destination.flush()
                     os.fsync(destination.fileno())
                 private_archive.chmod(0o600)
@@ -4350,15 +4700,16 @@ class SystemBackupService:
                             "encryption": "aes-256-gcm-scrypt",
                         }
                     )
+                archive_meta["_archive_sha256"] = archive_digest.hexdigest()
                 return manifest, extracted, packaging, archive_meta
-            except Exception:
+            except Exception as primary_error:
                 try:
                     if workspace.exists():
                         shutil.rmtree(workspace)
-                except Exception as cleanup_error:
+                except Exception:
                     raise RuntimeError(
-                        "Backup bundle outer workspace cleanup failed."
-                    ) from cleanup_error
+                        f"{primary_error} Backup bundle outer workspace cleanup failed too."
+                    ) from primary_error
                 raise
         finally:
             os.close(descriptor)
