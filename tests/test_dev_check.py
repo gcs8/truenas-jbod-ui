@@ -231,6 +231,23 @@ class DevCheckPlanTests(unittest.TestCase):
             posix_exclusion.modules,
         )
 
+    def test_bash_ci_contract_has_a_named_windows_tooling_exclusion(self) -> None:
+        bash_exclusions = [
+            exclusion
+            for exclusion in dev_check.WINDOWS_EXCLUSIONS
+            if exclusion.category == "Bash syntax tooling"
+        ]
+        self.assertEqual(len(bash_exclusions), 1)
+        bash_exclusion = bash_exclusions[0]
+        self.assertNotIn(
+            "tests.test_bash_ci_contract",
+            dev_check.WINDOWS_PORTABLE_TEST_MODULES,
+        )
+        self.assertEqual(
+            bash_exclusion.modules,
+            ("tests.test_bash_ci_contract",),
+        )
+
     def test_every_tracked_test_is_classified_for_windows(self) -> None:
         discovered = {
             f"tests.{path.stem}"

@@ -139,6 +139,14 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_process_secrets",
         ),
     ),
+    WindowsExclusion(
+        category="Bash syntax tooling",
+        reason=(
+            "this suite invokes bash -n and Windows may expose only the WSL launcher "
+            "without an installed Bash runtime"
+        ),
+        modules=("tests.test_bash_ci_contract",),
+    ),
 )
 
 
