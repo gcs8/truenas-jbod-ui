@@ -276,26 +276,34 @@ class CIWorkflowContractTests(unittest.TestCase):
 
     def test_release_checklist_browser_fixture_cleanup_is_unique_and_failure_safe(self) -> None:
         checklist = self.read(ROOT / "docs" / "RELEASE_CHECKLIST.md")
+        release_start = checklist.index("- if the release changes public-demo behavior or data")
+        release_end = checklist.index("## Config And Examples", release_start)
+        release_section = checklist[release_start:release_end]
+        powershell_marker = "    ```powershell\n"
+        self.assertEqual(release_section.count(powershell_marker), 1)
+        powershell_start = release_section.index(powershell_marker) + len(powershell_marker)
+        powershell_end = release_section.index("\n    ```", powershell_start)
+        powershell = release_section[powershell_start:powershell_end]
 
         self.assertIn("trap 'rm -f -- \"$slot_focus_artifact\"' EXIT", checklist)
         self.assertIn("trap - EXIT", checklist)
         self.assertIn(
             "$slot_focus_artifact = [System.IO.Path]::GetTempFileName()",
-            checklist,
+            powershell,
         )
-        self.assertIn('$env:PUBLIC_DEMO_LOCAL_HISTORY = "1"', checklist)
-        self.assertIn("finally {", checklist)
+        self.assertIn('$env:PUBLIC_DEMO_LOCAL_HISTORY = "1"', powershell)
+        self.assertIn("finally {", powershell)
         self.assertIn(
             "Remove-Item Env:PUBLIC_DEMO_LOCAL_HISTORY -ErrorAction SilentlyContinue",
-            checklist,
+            powershell,
         )
         self.assertIn(
             "Remove-Item Env:PUBLIC_DEMO_ARTIFACT -ErrorAction SilentlyContinue",
-            checklist,
+            powershell,
         )
         self.assertIn(
             "Remove-Item Env:SLOT_FOCUS_ARTIFACT -ErrorAction SilentlyContinue",
-            checklist,
+            powershell,
         )
         self.assertIn(
             """    } finally {
@@ -303,14 +311,33 @@ class CIWorkflowContractTests(unittest.TestCase):
         Remove-Item Env:SLOT_FOCUS_ARTIFACT -ErrorAction SilentlyContinue
         Remove-Item Env:PUBLIC_DEMO_LOCAL_HISTORY -ErrorAction SilentlyContinue
     }""",
-            checklist,
+            powershell,
         )
         self.assertIn(
             "Remove-Item -LiteralPath $slot_focus_artifact -ErrorAction SilentlyContinue",
-            checklist,
+            powershell,
         )
-        self.assertNotIn("set PUBLIC_DEMO_LOCAL_HISTORY=1", checklist)
-        self.assertNotIn(r"%TEMP%\truenas-jbod-ui-slot-focus.html", checklist)
+        self.assertNotIn("set PUBLIC_DEMO_LOCAL_HISTORY=1", powershell)
+        self.assertNotIn(r"%TEMP%\truenas-jbod-ui-slot-focus.html", powershell)
+
+    def test_release_cleanup_contract_rejects_a_block_relocated_outside_the_sequence(
+        self,
+    ) -> None:
+        checklist_path = ROOT / "docs" / "RELEASE_CHECKLIST.md"
+        checklist = self.read(checklist_path)
+        cleanup = """    } finally {
+        Remove-Item Env:PUBLIC_DEMO_ARTIFACT -ErrorAction SilentlyContinue
+        Remove-Item Env:SLOT_FOCUS_ARTIFACT -ErrorAction SilentlyContinue
+        Remove-Item Env:PUBLIC_DEMO_LOCAL_HISTORY -ErrorAction SilentlyContinue
+    }"""
+        mutated = checklist.replace(cleanup, "", 1) + f"\n```powershell\n{cleanup}\n```\n"
+        case = CIWorkflowContractTests(
+            "test_release_checklist_browser_fixture_cleanup_is_unique_and_failure_safe"
+        )
+        case.read = lambda _path: mutated  # type: ignore[method-assign]
+
+        with self.assertRaises(AssertionError):
+            case.test_release_checklist_browser_fixture_cleanup_is_unique_and_failure_safe()
 
     def test_dependabot_keeps_immutable_actions_maintained(self) -> None:
         config = yaml.safe_load(self.read(ROOT / ".github" / "dependabot.yml"))
