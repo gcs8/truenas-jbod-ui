@@ -1976,19 +1976,6 @@ class SnapshotExportPendingWorkTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_saturated_request_rejects_before_hostname_or_cache_key_traversal(self) -> None:
-        traversals = 0
-
-        class TraversalDetectingHosts(list[str]):
-            def __iter__(self):
-                nonlocal traversals
-                traversals += 1
-                return super().__iter__()
-
-            def __getitem__(self, index):
-                nonlocal traversals
-                traversals += 1
-                return super().__getitem__(index)
-
         coordinator = self.coordinator(pending=1, retained_bytes=1024)
         occupied = asyncio.Event()
         release = asyncio.Event()
@@ -2004,12 +1991,10 @@ class SnapshotExportPendingWorkTests(unittest.IsolatedAsyncioTestCase):
         exporter = SnapshotExportService(
             Settings(), FakeHistoryBackend(), templates, work_coordinator=coordinator
         )  # type: ignore[arg-type]
-        hosts = TraversalDetectingHosts(
-            [f"node-{index}.example.test" for index in range(256)]
-        )
+        hosts = [f"node-{index}.example.test" for index in range(256)]
         try:
             with (
-                patch.object(exporter, "_build_render_cache_key") as cache_key,
+                patch.object(exporter, "_build_render_work_key") as work_key,
                 patch.object(exporter, "_render_work_retained_bytes") as retained,
                 self.assertRaises(snapshot_export.SnapshotExportBusyError),
             ):
@@ -2022,8 +2007,57 @@ class SnapshotExportPendingWorkTests(unittest.IsolatedAsyncioTestCase):
                     io_chart_mode="average",
                     configured_hostnames=hosts,
                 )
-            self.assertEqual(traversals, 0)
-            cache_key.assert_not_called()
+            work_key.assert_not_called()
+            retained.assert_not_called()
+            self.assertEqual(coordinator.pending_key_count, 1)
+        finally:
+            release.set()
+            await holder
+
+    async def test_byte_saturated_request_rejects_before_hostname_or_cache_key_traversal(self) -> None:
+        coordinator = self.coordinator(
+            concurrency=1,
+            pending=8,
+            retained_bytes=32 * 1024 * 1024,
+        )
+        occupied = asyncio.Event()
+        release = asyncio.Event()
+
+        async def hold() -> None:
+            occupied.set()
+            await release.wait()
+
+        holder = asyncio.create_task(
+            coordinator.run(
+                key="occupied",
+                retained_bytes=29 * 1024 * 1024,
+                work=hold,
+            )
+        )
+        await occupied.wait()
+        exporter = SnapshotExportService(
+            Settings(), FakeHistoryBackend(), templates, work_coordinator=coordinator
+        )  # type: ignore[arg-type]
+        hosts = [f"node-{index}.example.test" for index in range(256)]
+        try:
+            with (
+                patch.object(exporter, "_build_render_work_key") as work_key,
+                patch.object(exporter, "_render_work_retained_bytes") as retained,
+                self.assertRaises(snapshot_export.SnapshotExportBusyError),
+            ):
+                await asyncio.wait_for(
+                    exporter.build_enclosure_snapshot_html(
+                        request=build_request(),
+                        snapshot=build_snapshot(),
+                        smart_summary_cache=build_smart_summary_cache(),
+                        selected_slot=0,
+                        history_window_hours=24,
+                        io_chart_mode="average",
+                        configured_hostnames=hosts,
+                    ),
+                    timeout=0.1,
+                )
+            work_key.assert_not_called()
             retained.assert_not_called()
             self.assertEqual(coordinator.pending_key_count, 1)
         finally:

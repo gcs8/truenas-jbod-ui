@@ -46,6 +46,7 @@ DEFAULT_EXPORT_SIZE_LIMIT_BYTES = 24 * 1024 * 1024
 DEFAULT_EXPORT_WORK_CONCURRENCY = 2
 DEFAULT_EXPORT_PENDING_KEYS = 8
 DEFAULT_EXPORT_PENDING_BYTES = 32 * 1024 * 1024
+DEFAULT_EXPORT_RENDER_RESERVATION_BYTES = DEFAULT_EXPORT_PENDING_BYTES // DEFAULT_EXPORT_PENDING_KEYS
 EXPORT_MAX_CONFIGURED_HOSTNAMES = 256
 EXPORT_MAX_CONFIGURED_HOSTNAME_CHARS = 1024
 OFFLINE_IMAGE_ASSETS = {
@@ -192,10 +193,11 @@ class SnapshotExportWorkCoordinator:
         self._loop = loop
         self._semaphore = asyncio.Semaphore(self.max_concurrency)
 
-    def _has_initial_capacity(self) -> bool:
+    def _has_initial_capacity(self, retained_bytes: int = 0) -> bool:
         return (
             len(self._pending) < self.max_pending_keys
-            and self._retained_bytes < self.max_retained_bytes
+            and retained_bytes <= self.max_retained_bytes
+            and self._retained_bytes + retained_bytes <= self.max_retained_bytes
         )
 
     async def run(
@@ -215,30 +217,41 @@ class SnapshotExportWorkCoordinator:
         self,
         *,
         key_factory: Callable[[], Hashable],
+        reservation_bytes: int,
         retained_bytes: int | Callable[[], int],
         work: Callable[[], Awaitable[Any]],
     ) -> Any:
         self._bind_running_loop()
-        if not self._has_initial_capacity():
+        reservation_bytes = max(0, int(reservation_bytes))
+        if not self._has_initial_capacity(reservation_bytes):
             raise SnapshotExportBusyError()
-        # Reserve a distinct-key slot before any source traversal, render
-        # fingerprinting, or retained-byte estimation. There is no await between
-        # this reservation and publication of the canonical key.
+        # Reserve both a distinct-key slot and its maximum retained bytes before
+        # any source traversal, fingerprinting, or retained-byte estimation.
+        # There is no await between this reservation and publication of the
+        # canonical key.
         self._reservation_sequence += 1
         reservation_key = ("render-key-reservation", self._reservation_sequence)
-        reservation = SnapshotExportPendingWork(retained_bytes=0)
+        reservation = SnapshotExportPendingWork(retained_bytes=reservation_bytes)
         self._pending[reservation_key] = reservation
+        self._retained_bytes += reservation_bytes
+
+        def release_reservation() -> None:
+            if self._pending.pop(reservation_key, None) is reservation:
+                self._retained_bytes -= reservation_bytes
+
         try:
             key = key_factory()
             pending = self._pending.get(key)
             if pending is not None:
-                self._pending.pop(reservation_key, None)
+                release_reservation()
                 return await self._wait(pending)
-            resolved_bytes = self._resolve_retained_bytes(retained_bytes)
-            self._pending.pop(reservation_key, None)
-            pending = self._start_pending(key, resolved_bytes, work)
+            resolved_bytes = retained_bytes() if callable(retained_bytes) else retained_bytes
+            if max(0, int(resolved_bytes)) > reservation_bytes:
+                raise SnapshotExportBusyError()
+            release_reservation()
+            pending = self._start_pending(key, reservation_bytes, work)
         except BaseException:
-            self._pending.pop(reservation_key, None)
+            release_reservation()
             raise
         return await self._wait(pending)
 
@@ -1079,6 +1092,7 @@ class SnapshotExportService:
                     identifier_policy_label=identifier_policy_label,
                     identifier_policy_note=identifier_policy_note,
                 ),
+                reservation_bytes=DEFAULT_EXPORT_RENDER_RESERVATION_BYTES,
                 retained_bytes=lambda: self._render_work_retained_bytes(
                     snapshot=snapshot,
                     smart_summary_cache=smart_summary_cache,
