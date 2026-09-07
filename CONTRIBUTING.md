@@ -203,8 +203,8 @@ python scripts/dev_check.py --safe
 
 It runs the applicable Python suite, compileall, bounded Ruff, every maintained
 JavaScript source and `qa/*.spec.js` syntax check, diff hygiene, JavaScript unit
-tests, and Prometheus rule validation when `promtool` is available. The final
-named summary reports every gate as
+tests, the checked-in performance baseline check, and Prometheus rule validation
+when `promtool` is available. The final named summary reports every gate as
 `PASS`, `FAIL`, or `SKIP`; a missing `promtool` is an explicit `SKIP` with a
 reason rather than silent success.
 
@@ -240,9 +240,10 @@ python scripts/build_perf_baseline.py --check
 promtool check rules prometheus/rules/truenas-jbod-ui-alerts-v1.yml
 ```
 
-The exact source-gate set shared with CI is declared and fail-closed against
-`.github/workflows/ci.yml`. `--full` runs the same safe, local, no-live-data
-source gates plus the checked-in public-demo artifact check. Set
+The exact source-gate set, including the performance baseline, is shared with CI
+and declared fail-closed against `.github/workflows/ci.yml`. `--full` runs the
+same safe, local, no-live-data source gates plus the checked-in public-demo
+artifact check. Set
 `PROMTOOL_BINARY` to an installed executable when it is not on `PATH`.
 
 Install dev-only validation tools before running the wrapper or coverage command

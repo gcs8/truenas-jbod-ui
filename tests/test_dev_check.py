@@ -61,6 +61,7 @@ class DevCheckPlanTests(unittest.TestCase):
         )
         self.assertIn(("git", "diff", "--check"), argv)
         self.assertIn(("npm", "run", "test:unit"), argv)
+        self.assertIn(("python", "scripts/build_perf_baseline.py", "--check"), argv)
         self.assertNotIn(("python", "scripts/check_public_demo_artifact.py", "public-demo"), argv)
         self.assertEqual(
             [skip for skip in plan.skips if skip.name == "Prometheus alert rules"][0].reason,
@@ -94,6 +95,27 @@ class DevCheckPlanTests(unittest.TestCase):
             {("python3", "scripts/check_public_demo_artifact.py", "public-demo")},
         )
         self.assertFalse(any(skip.name.startswith("Windows exclusion:") for skip in full.skips))
+
+    def test_performance_baseline_is_a_shared_portable_ci_source_gate(self) -> None:
+        for mode, platform in (("safe", "linux"), ("full", "win32")):
+            with self.subTest(mode=mode, platform=platform):
+                plan = dev_check.build_plan(
+                    mode,
+                    platform=platform,
+                    root=ROOT,
+                    python_executable="python",
+                    environment={},
+                    find_executable=lambda _name: None,
+                )
+                checks = [check for check in plan.checks if check.name == "Performance baseline"]
+                self.assertEqual(len(checks), 1)
+                self.assertEqual(
+                    checks[0].argv,
+                    ("python", "scripts/build_perf_baseline.py", "--check"),
+                )
+                self.assertEqual(checks[0].ci_gate, "performance-baseline")
+
+        self.assertIn("performance-baseline", dev_check.read_ci_source_gate_contract(ROOT))
 
     def test_javascript_syntax_plan_covers_fixed_assets_and_all_qa_specs_dynamically(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:

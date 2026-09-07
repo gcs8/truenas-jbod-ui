@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
 from history_service.domain import MetricSample, SlotEvent, SlotStateRecord
-from history_service.migration_lock import history_write_lock
 from history_service.operation_bounds import validate_store_scope_request
 from history_service.segment_catalog import (
     MIGRATION_PENDING_MARKER,
@@ -45,6 +44,12 @@ PRIVATE_REPLACEMENT_DIR_PREFIX = ".history-replacement-"
 DISK_IDENTITY_BACKFILL_USER_VERSION = 1
 SEGMENTED_RETENTION_STATE_NAME = "segmented_retention"
 SEGMENTED_RETENTION_STATES = frozenset({"ready", "claimed", "consumed"})
+
+
+def history_write_lock(file_path: Path, *, blocking: bool):
+    from history_service.migration_lock import history_write_lock as posix_history_write_lock
+
+    return posix_history_write_lock(file_path, blocking=blocking)
 
 
 @dataclass(slots=True)

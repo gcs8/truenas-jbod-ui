@@ -152,6 +152,9 @@ jobs:
       - name: Compile Python source
         run: python -m compileall app admin_service history_service scripts tests
 
+      # Both full-discovery matrix branches run tests.test_perf_budgets,
+      # including the checked-in baseline command contract.
+      # dev-check-source-gate: performance-baseline
       # dev-check-source-gate: python-unittest
       - name: Run deterministic unittest suite
         if: matrix.python-version != '3.12'

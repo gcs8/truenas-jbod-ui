@@ -26,6 +26,7 @@ CI_SOURCE_GATES = frozenset(
         "diff-hygiene",
         "javascript-syntax",
         "javascript-unit-tests",
+        "performance-baseline",
         "prometheus-rules",
         "python-compileall",
         "python-unittest",
@@ -385,6 +386,11 @@ def build_plan(
                 find_executable=find_executable,
                 platform=platform,
                 ci_gate="javascript-unit-tests",
+            ),
+            Check(
+                "Performance baseline",
+                (python_executable, "scripts/build_perf_baseline.py", "--check"),
+                ci_gate="performance-baseline",
             ),
         )
     )
