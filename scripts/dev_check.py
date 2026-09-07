@@ -117,6 +117,7 @@ WINDOWS_PORTABLE_TEST_MODULES = (
     "tests.test_profiles",
     "tests.test_prometheus_alert_rules",
     "tests.test_public_doc_privacy",
+    "tests.test_public_demo_deterministic",
     "tests.test_public_demo_fixture",
     "tests.test_quantastor_api",
     "tests.test_release_changelog_coverage",

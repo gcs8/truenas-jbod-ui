@@ -478,16 +478,32 @@ python scripts/validate_release_wrap.py "$version" \
   publication `Pass` always requires the live comparison and exact receipt.
 - add the completed checklist evidence table to the release wrap before the
   tag is cut
-- if the release changes public-demo behavior or data, regenerate and verify
-  the checked-in artifact from a release-maintainer checkout with ignored local
-  `history/history.db` input:
-  - run the complete sequence in PowerShell with failure-safe environment and
-    temporary-file cleanup:
+- if the release changes public-demo behavior or data, review the synthetic
+  fixture at `tests/fixtures/public_demo/public_demo.json`, then regenerate and
+  verify the checked-in artifact from a clean checkout:
+  - on POSIX, use failure-safe temporary-file and environment cleanup:
+
+    ```bash
+    slot_focus_artifact="$(mktemp "${TMPDIR:-/tmp}/truenas-jbod-ui-slot-focus-XXXXXX.html")"
+    cleanup_public_demo_check() {
+      rm -f -- "$slot_focus_artifact"
+      unset PUBLIC_DEMO_ARTIFACT SLOT_FOCUS_ARTIFACT
+    }
+    trap cleanup_public_demo_check EXIT
+    python -m unittest tests.test_public_demo_fixture tests.test_public_demo_deterministic -v
+    python scripts/build_public_demo.py --output public-demo/index.html
+    python scripts/build_public_demo.py --output public-demo/index.html --check
+    python scripts/check_public_demo_artifact.py public-demo
+    python scripts/build_current_source_browser_fixture.py --output "$slot_focus_artifact"
+    PUBLIC_DEMO_ARTIFACT=public-demo/index.html SLOT_FOCUS_ARTIFACT="$slot_focus_artifact" npx playwright test qa/public-demo.spec.js
+    cleanup_public_demo_check
+    trap - EXIT
+    ```
+  - on PowerShell, preserve the same failure-safe boundary:
 
     ```powershell
-    $env:PUBLIC_DEMO_LOCAL_HISTORY = "1"
     try {
-        & .\.venv\Scripts\python.exe -m unittest tests.test_public_demo_fixture -v
+        & .\.venv\Scripts\python.exe -m unittest tests.test_public_demo_fixture tests.test_public_demo_deterministic -v
         & .\.venv\Scripts\python.exe scripts/build_public_demo.py --output public-demo\index.html
         & .\.venv\Scripts\python.exe scripts/build_public_demo.py --output public-demo\index.html --check
         & .\.venv\Scripts\python.exe scripts/check_public_demo_artifact.py public-demo
@@ -501,12 +517,16 @@ python scripts/validate_release_wrap.py "$version" \
     } finally {
         Remove-Item Env:PUBLIC_DEMO_ARTIFACT -ErrorAction SilentlyContinue
         Remove-Item Env:SLOT_FOCUS_ARTIFACT -ErrorAction SilentlyContinue
-        Remove-Item Env:PUBLIC_DEMO_LOCAL_HISTORY -ErrorAction SilentlyContinue
     }
     ```
-  - record the changed files, artifact publishability/privacy result, and
-    browser result in `Docs/wiki/public-demo gate` before tagging; record the
-    Pages workflow run and URL later in `Docs/wiki/public-demo publication`
+  - record fixture provenance, fixture and artifact hashes, declared-input
+    mutation results, privacy scan, and browser result in
+    `Docs/wiki/public-demo gate` before tagging
+  - keep exact fixture-byte approval and Pages publication separate; pushes to
+    `main` only verify the checked-in directory
+  - publish only through a separately approved `workflow_dispatch` run, then
+    record that workflow plus public readback in
+    `Docs/wiki/public-demo publication`
 
 ## Config And Examples
 

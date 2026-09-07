@@ -9,6 +9,7 @@ import re
 import time
 import zipfile
 from collections import Counter, OrderedDict
+from collections.abc import Awaitable, Callable, Hashable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from ipaddress import ip_address
@@ -42,6 +43,12 @@ from history_service.operation_bounds import (
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = BASE_DIR / "static"
 DEFAULT_EXPORT_SIZE_LIMIT_BYTES = 24 * 1024 * 1024
+DEFAULT_EXPORT_WORK_CONCURRENCY = 2
+DEFAULT_EXPORT_PENDING_KEYS = 8
+DEFAULT_EXPORT_PENDING_BYTES = 32 * 1024 * 1024
+DEFAULT_EXPORT_RENDER_RESERVATION_BYTES = DEFAULT_EXPORT_PENDING_BYTES // DEFAULT_EXPORT_PENDING_KEYS
+EXPORT_MAX_CONFIGURED_HOSTNAMES = 256
+EXPORT_MAX_CONFIGURED_HOSTNAME_CHARS = 1024
 OFFLINE_IMAGE_ASSETS = {
     "images/aoc-slg4-2h8m2.jpg": "image/jpeg",
     "images/hyper-m2-gen3-card.png": "image/png",
@@ -119,10 +126,221 @@ class SnapshotExportCacheEntry:
     value: Any
 
 
+@dataclass(slots=True)
+class SnapshotExportPendingWork:
+    retained_bytes: int
+    task: asyncio.Task[Any] | None = None
+    waiters: int = 0
+    started: bool = False
+
+
+class SnapshotExportBusyError(RuntimeError):
+    public_detail = "Snapshot export capacity is busy; retry shortly."
+
+    def __init__(self) -> None:
+        super().__init__(self.public_detail)
+
+
+class SnapshotExportWorkCoordinator:
+    """Process-wide single-flight admission for render and ZIP work."""
+
+    def __init__(
+        self,
+        *,
+        max_concurrency: int,
+        max_pending_keys: int,
+        max_retained_bytes: int,
+    ) -> None:
+        self.max_concurrency = max(1, int(max_concurrency))
+        self.max_pending_keys = max(1, int(max_pending_keys))
+        self.max_retained_bytes = max(1, int(max_retained_bytes))
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._semaphore = asyncio.Semaphore(self.max_concurrency)
+        self._pending: dict[Hashable, SnapshotExportPendingWork] = {}
+        self._active_count = 0
+        self._retained_bytes = 0
+        self._reservation_sequence = 0
+
+    @property
+    def pending_key_count(self) -> int:
+        return len(self._pending)
+
+    @property
+    def retained_bytes(self) -> int:
+        return self._retained_bytes
+
+    @property
+    def active_count(self) -> int:
+        return self._active_count
+
+    @property
+    def queued_count(self) -> int:
+        return sum(
+            1
+            for pending in self._pending.values()
+            if not pending.started and pending.task is not None and not pending.task.done()
+        )
+
+    def has_pending(self, key: Hashable) -> bool:
+        return key in self._pending
+
+    def _bind_running_loop(self) -> None:
+        loop = asyncio.get_running_loop()
+        if self._loop is loop:
+            return
+        if self._pending:
+            raise SnapshotExportBusyError()
+        self._loop = loop
+        self._semaphore = asyncio.Semaphore(self.max_concurrency)
+
+    def _has_initial_capacity(self, retained_bytes: int = 0) -> bool:
+        return (
+            len(self._pending) < self.max_pending_keys
+            and retained_bytes <= self.max_retained_bytes
+            and self._retained_bytes + retained_bytes <= self.max_retained_bytes
+        )
+
+    async def run(
+        self,
+        *,
+        key: Hashable,
+        retained_bytes: int | Callable[[], int],
+        work: Callable[[], Awaitable[Any]],
+    ) -> Any:
+        self._bind_running_loop()
+        pending = self._pending.get(key)
+        if pending is None:
+            pending = self._admit(key, retained_bytes, work)
+        return await self._wait(pending)
+
+    async def run_deferred(
+        self,
+        *,
+        key_factory: Callable[[], Hashable],
+        reservation_bytes: int,
+        retained_bytes: int | Callable[[], int],
+        work: Callable[[], Awaitable[Any]],
+    ) -> Any:
+        self._bind_running_loop()
+        reservation_bytes = max(0, int(reservation_bytes))
+        if not self._has_initial_capacity(reservation_bytes):
+            raise SnapshotExportBusyError()
+        # Reserve both a distinct-key slot and provisional retained bytes before
+        # any source traversal, fingerprinting, or retained-byte estimation.
+        # There is no await between this reservation and publication of the
+        # canonical key.
+        self._reservation_sequence += 1
+        reservation_key = ("render-key-reservation", self._reservation_sequence)
+        reservation = SnapshotExportPendingWork(retained_bytes=reservation_bytes)
+        self._pending[reservation_key] = reservation
+        self._retained_bytes += reservation_bytes
+
+        def release_reservation() -> None:
+            if self._pending.pop(reservation_key, None) is reservation:
+                self._retained_bytes -= reservation_bytes
+
+        try:
+            key = key_factory()
+            pending = self._pending.get(key)
+            if pending is not None:
+                release_reservation()
+                return await self._wait(pending)
+            resolved_bytes = retained_bytes() if callable(retained_bytes) else retained_bytes
+            resolved_bytes = max(0, int(resolved_bytes))
+            retained_without_reservation = self._retained_bytes - reservation_bytes
+            if (
+                resolved_bytes > self.max_retained_bytes
+                or retained_without_reservation + resolved_bytes > self.max_retained_bytes
+            ):
+                raise SnapshotExportBusyError()
+            release_reservation()
+            pending = self._start_pending(key, resolved_bytes, work)
+        except BaseException:
+            release_reservation()
+            raise
+        return await self._wait(pending)
+
+    def _admit(
+        self,
+        key: Hashable,
+        retained_bytes: int | Callable[[], int],
+        work: Callable[[], Awaitable[Any]],
+    ) -> SnapshotExportPendingWork:
+        if not self._has_initial_capacity():
+            raise SnapshotExportBusyError()
+        resolved_bytes = self._resolve_retained_bytes(retained_bytes)
+        return self._start_pending(key, resolved_bytes, work)
+
+    def _resolve_retained_bytes(self, retained_bytes: int | Callable[[], int]) -> int:
+        resolved_bytes = retained_bytes() if callable(retained_bytes) else retained_bytes
+        resolved_bytes = max(0, int(resolved_bytes))
+        if (
+            resolved_bytes > self.max_retained_bytes
+            or self._retained_bytes + resolved_bytes > self.max_retained_bytes
+        ):
+            raise SnapshotExportBusyError()
+        return resolved_bytes
+
+    def _start_pending(
+        self,
+        key: Hashable,
+        resolved_bytes: int,
+        work: Callable[[], Awaitable[Any]],
+    ) -> SnapshotExportPendingWork:
+        pending = SnapshotExportPendingWork(retained_bytes=resolved_bytes)
+        task = asyncio.create_task(self._run_work(pending, work))
+        pending.task = task
+        self._pending[key] = pending
+        self._retained_bytes += resolved_bytes
+
+        def cleanup(completed: asyncio.Task[Any]) -> None:
+            if self._pending.get(key) is pending:
+                self._pending.pop(key, None)
+                self._retained_bytes -= pending.retained_bytes
+            if not completed.cancelled():
+                completed.exception()
+
+        task.add_done_callback(cleanup)
+        return pending
+
+    async def _wait(self, pending: SnapshotExportPendingWork) -> Any:
+        task = pending.task
+        if task is None:
+            raise RuntimeError("Snapshot export work was admitted without a task.")
+        pending.waiters += 1
+        try:
+            # wait() does not forward caller cancellation into executor-backed
+            # work, so admission remains owned by the retained task until done.
+            await asyncio.wait((task,))
+            return task.result()
+        finally:
+            pending.waiters -= 1
+            if pending.waiters == 0 and not pending.started and not task.done():
+                task.cancel()
+
+    async def _run_work(
+        self,
+        pending: SnapshotExportPendingWork,
+        work: Callable[[], Awaitable[Any]],
+    ) -> Any:
+        async with self._semaphore:
+            pending.started = True
+            self._active_count += 1
+            try:
+                return await work()
+            finally:
+                self._active_count -= 1
+
+
 EXPORT_HISTORY_CACHE: OrderedDict[str, SnapshotExportCacheEntry] = OrderedDict()
 EXPORT_RENDER_CACHE: OrderedDict[str, SnapshotExportCacheEntry] = OrderedDict()
 EXPORT_ZIP_CACHE: OrderedDict[str, SnapshotExportCacheEntry] = OrderedDict()
 EXPORT_CACHE_ACCESS_SEQUENCE = 0
+EXPORT_WORK_COORDINATOR = SnapshotExportWorkCoordinator(
+    max_concurrency=DEFAULT_EXPORT_WORK_CONCURRENCY,
+    max_pending_keys=DEFAULT_EXPORT_PENDING_KEYS,
+    max_retained_bytes=DEFAULT_EXPORT_PENDING_BYTES,
+)
 
 
 def _next_export_cache_access_sequence() -> int:
@@ -626,6 +844,7 @@ class SnapshotExportService:
         *,
         size_limit_bytes: int = DEFAULT_EXPORT_SIZE_LIMIT_BYTES,
         metrics_service_name: str = "enclosure-ui",
+        work_coordinator: SnapshotExportWorkCoordinator | None = None,
     ) -> None:
         self.settings = settings
         self.history_backend = history_backend
@@ -635,7 +854,7 @@ class SnapshotExportService:
         self._history_cache = EXPORT_HISTORY_CACHE
         self._render_cache = EXPORT_RENDER_CACHE
         self._zip_cache = EXPORT_ZIP_CACHE
-        self._zip_build_tasks: dict[str, asyncio.Task[bytes]] = {}
+        self._work_coordinator = work_coordinator or EXPORT_WORK_COORDINATOR
 
     async def build_enclosure_snapshot_export(
         self,
@@ -856,7 +1075,60 @@ class SnapshotExportService:
         generated_at: datetime | None = None,
         identifier_policy_label: str | None = None,
         identifier_policy_note: str | None = None,
+        _coordinated: bool = False,
     ) -> RenderedSnapshotExport:
+        if not _coordinated:
+            return await self._work_coordinator.run_deferred(
+                key_factory=lambda: self._build_render_work_key(
+                    snapshot=snapshot,
+                    smart_summary_cache=smart_summary_cache,
+                    live_enclosure_snapshots=live_enclosure_snapshots,
+                    live_enclosure_smart_summary_cache=live_enclosure_smart_summary_cache,
+                    storage_view_runtime=storage_view_runtime,
+                    storage_view_smart_summary_cache=storage_view_smart_summary_cache,
+                    selected_slot=selected_slot,
+                    selected_storage_view_id=selected_storage_view_id,
+                    history_window_hours=history_window_hours,
+                    history_panel_open=history_panel_open,
+                    io_chart_mode=io_chart_mode,
+                    redact_sensitive=redact_sensitive,
+                    configured_hostnames=configured_hostnames,
+                    generated_at=generated_at,
+                    identifier_policy_label=identifier_policy_label,
+                    identifier_policy_note=identifier_policy_note,
+                ),
+                reservation_bytes=DEFAULT_EXPORT_RENDER_RESERVATION_BYTES,
+                retained_bytes=lambda: self._render_work_retained_bytes(
+                    snapshot=snapshot,
+                    smart_summary_cache=smart_summary_cache,
+                    live_enclosure_snapshots=live_enclosure_snapshots,
+                    live_enclosure_smart_summary_cache=live_enclosure_smart_summary_cache,
+                    storage_view_runtime=storage_view_runtime,
+                    storage_view_smart_summary_cache=storage_view_smart_summary_cache,
+                    configured_hostnames=configured_hostnames,
+                ),
+                work=lambda: self.build_enclosure_snapshot_html(
+                    request=request,
+                    snapshot=snapshot,
+                    smart_summary_cache=smart_summary_cache,
+                    live_enclosure_snapshots=live_enclosure_snapshots,
+                    live_enclosure_smart_summary_cache=live_enclosure_smart_summary_cache,
+                    storage_view_runtime=storage_view_runtime,
+                    storage_view_smart_summary_cache=storage_view_smart_summary_cache,
+                    selected_slot=selected_slot,
+                    selected_storage_view_id=selected_storage_view_id,
+                    history_window_hours=history_window_hours,
+                    history_panel_open=history_panel_open,
+                    io_chart_mode=io_chart_mode,
+                    redact_sensitive=redact_sensitive,
+                    configured_hostnames=configured_hostnames,
+                    requested_packaging=requested_packaging,
+                    generated_at=generated_at,
+                    identifier_policy_label=identifier_policy_label,
+                    identifier_policy_note=identifier_policy_note,
+                    _coordinated=True,
+                ),
+            )
         normalized_storage_view_id, normalized_slot = self._normalize_initial_selection(
             snapshot,
             storage_view_runtime,
@@ -1877,35 +2149,27 @@ class SnapshotExportService:
             )
             return cached_zip
 
-        task = self._zip_build_tasks.get(cache_key)
-        if task is None:
-            add_perf_metadata(
-                snapshot_export_zip_cache="miss",
-                snapshot_export_zip_cache_entries=len(self._zip_cache),
-            )
-            task = asyncio.create_task(
-                self._build_and_cache_zip_archive(
-                    cache_key,
-                    rendered.filename,
-                    html_content,
-                )
-            )
-            self._zip_build_tasks[cache_key] = task
-
-            def cleanup(completed: asyncio.Task[bytes], *, key: str = cache_key) -> None:
-                if self._zip_build_tasks.get(key) is completed:
-                    self._zip_build_tasks.pop(key, None)
-                if not completed.cancelled():
-                    completed.exception()
-
-            task.add_done_callback(cleanup)
-        else:
+        work_key = f"zip:{cache_key}"
+        if self._work_coordinator.has_pending(work_key):
             self._observe_cache_request(self._zip_cache, "pending-hit")
             add_perf_metadata(
                 snapshot_export_zip_cache="pending-hit",
                 snapshot_export_zip_cache_entries=len(self._zip_cache),
             )
-        return await asyncio.shield(task)
+        else:
+            add_perf_metadata(
+                snapshot_export_zip_cache="miss",
+                snapshot_export_zip_cache_entries=len(self._zip_cache),
+            )
+        return await self._work_coordinator.run(
+            key=work_key,
+            retained_bytes=len(html_content),
+            work=lambda: self._build_and_cache_zip_archive(
+                cache_key,
+                rendered.filename,
+                html_content,
+            ),
+        )
 
     async def _build_and_cache_zip_archive(
         self,
@@ -1955,6 +2219,97 @@ class SnapshotExportService:
                 ensure_ascii=False,
                 default=str,
             ).encode("utf-8")
+        )
+
+    @classmethod
+    def _render_work_retained_bytes(
+        cls,
+        *,
+        snapshot: InventorySnapshot,
+        smart_summary_cache: dict[str, dict[str, Any]] | None,
+        live_enclosure_snapshots: dict[str, InventorySnapshot] | None,
+        live_enclosure_smart_summary_cache: dict[str, dict[str, dict[str, Any]]] | None,
+        storage_view_runtime: StorageViewRuntimePayload | None,
+        storage_view_smart_summary_cache: dict[str, dict[str, dict[str, Any]]] | None,
+        configured_hostnames: list[str] | None,
+    ) -> int:
+        retained_bytes = cls._compact_json_size_bytes(snapshot.model_dump(mode="json"))
+        retained_bytes += cls._compact_json_size_bytes(smart_summary_cache or {})
+        for candidate in (live_enclosure_snapshots or {}).values():
+            retained_bytes += cls._compact_json_size_bytes(candidate.model_dump(mode="json"))
+        retained_bytes += cls._compact_json_size_bytes(live_enclosure_smart_summary_cache or {})
+        if storage_view_runtime is not None:
+            retained_bytes += cls._compact_json_size_bytes(storage_view_runtime.model_dump(mode="json"))
+        retained_bytes += cls._compact_json_size_bytes(storage_view_smart_summary_cache or {})
+        retained_bytes += cls._compact_json_size_bytes(configured_hostnames or [])
+        return retained_bytes
+
+    @staticmethod
+    def _validate_configured_hostnames(configured_hostnames: list[str] | None) -> None:
+        if configured_hostnames is None:
+            return
+        if type(configured_hostnames) is not list or len(configured_hostnames) > EXPORT_MAX_CONFIGURED_HOSTNAMES:
+            raise SnapshotExportBusyError()
+        if any(
+            type(hostname) is not str or len(hostname) > EXPORT_MAX_CONFIGURED_HOSTNAME_CHARS
+            for hostname in configured_hostnames
+        ):
+            raise SnapshotExportBusyError()
+
+    def _build_render_work_key(
+        self,
+        *,
+        snapshot: InventorySnapshot,
+        smart_summary_cache: dict[str, dict[str, Any]] | None,
+        live_enclosure_snapshots: dict[str, InventorySnapshot] | None,
+        live_enclosure_smart_summary_cache: dict[str, dict[str, dict[str, Any]]] | None,
+        storage_view_runtime: StorageViewRuntimePayload | None,
+        storage_view_smart_summary_cache: dict[str, dict[str, dict[str, Any]]] | None,
+        selected_slot: int | None,
+        selected_storage_view_id: str | None,
+        history_window_hours: int | None,
+        history_panel_open: bool,
+        io_chart_mode: str,
+        redact_sensitive: bool,
+        configured_hostnames: list[str] | None,
+        generated_at: datetime | None,
+        identifier_policy_label: str | None,
+        identifier_policy_note: str | None,
+    ) -> str:
+        self._validate_configured_hostnames(configured_hostnames)
+        normalized_storage_view_id, normalized_slot = self._normalize_initial_selection(
+            snapshot,
+            storage_view_runtime,
+            selected_storage_view_id,
+            selected_slot,
+        )
+        normalized_live_snapshots = self._normalize_live_enclosure_snapshots(
+            snapshot,
+            live_enclosure_snapshots,
+        )
+        normalized_live_smart = self._normalize_live_enclosure_smart_summary_cache(
+            snapshot=snapshot,
+            smart_summary_cache=smart_summary_cache,
+            live_enclosure_snapshots=normalized_live_snapshots,
+            live_enclosure_smart_summary_cache=live_enclosure_smart_summary_cache,
+        )
+        return self._build_render_cache_key(
+            snapshot=snapshot,
+            smart_summary_cache=smart_summary_cache,
+            live_enclosure_snapshots=normalized_live_snapshots,
+            live_enclosure_smart_summary_cache=normalized_live_smart,
+            storage_view_runtime=storage_view_runtime,
+            storage_view_smart_summary_cache=storage_view_smart_summary_cache,
+            selected_slot=normalized_slot,
+            selected_storage_view_id=normalized_storage_view_id,
+            history_window_hours=self._normalize_history_window_hours(history_window_hours),
+            history_panel_open=history_panel_open,
+            io_chart_mode="average" if io_chart_mode == "average" else "total",
+            redact_sensitive=redact_sensitive,
+            configured_hostnames=configured_hostnames,
+            generated_at=generated_at,
+            identifier_policy_label=identifier_policy_label,
+            identifier_policy_note=identifier_policy_note,
         )
 
     @classmethod
@@ -2426,14 +2781,14 @@ class SnapshotExportService:
         return selected_slot if selected_slot in valid_slots else None
 
     @staticmethod
-    def _normalize_history_window_hours(history_window_hours: int | None) -> int | None:
+    def _normalize_history_window_hours(history_window_hours: int | None) -> int:
         if history_window_hours is None:
-            return None
+            return 24 * 365
         try:
             numeric_value = int(history_window_hours)
         except (TypeError, ValueError):
             return 24
-        return numeric_value if numeric_value > 0 else None
+        return max(1, min(numeric_value, 24 * 365))
 
     @staticmethod
     def _build_history_cache_key(system_id: str | None, enclosure_id: str | None, slot_number: int) -> str:
