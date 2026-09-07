@@ -162,6 +162,11 @@ QUANTASTOR_OPTIONAL_SSH_BACKOFF_WARNING_REGEX = re.compile(
     r"Skipping optional SSH command batch after a recent connection startup failure; "
     r"retry after (?P<retry_at>\S+)"
 )
+_CORE_GMULTIPATH_BACKFILL_WARNING = (
+    "TrueNAS API disk inventory omitted multipath metadata, so this snapshot used gmultipath list to "
+    "backfill multipath attribution. Use the live TrueNAS disk inventory controls in the enclosure header to "
+    "sync the multipath table."
+)
 
 
 def _structural_enclosure_topology(value: Any) -> Any:
@@ -5060,6 +5065,7 @@ class InventoryService:
             ssh_data,
             raw_data.disk_temperatures,
             parse_smart_test_results(raw_data.smart_test_results),
+            warnings=warnings,
         )
         if not available_enclosures and disk_records:
             return self._build_system_disk_virtual_enclosure(
@@ -10748,6 +10754,8 @@ class InventoryService:
         ssh_data: ParsedSSHData,
         disk_temperatures: dict[str, int],
         smart_tests: dict[str, dict[str, Any]],
+        *,
+        warnings: list[str] | None = None,
     ) -> list[DiskRecord]:
         disks = normalize_disk_inventory_rows(disks)
         records: list[DiskRecord] = []
@@ -10762,6 +10770,7 @@ class InventoryService:
             str,
             tuple[int, MultipathInfo, list[tuple[DiskRecord, bool]]],
         ] = {}
+        gmultipath_backfill_fired = False
         for disk in disks:
             device_name = normalize_device_name(
                 disk.get("devname") or disk.get("name") or disk.get("device") or disk.get("disk")
@@ -10796,6 +10805,7 @@ class InventoryService:
                     device_name,
                 )
                 if parsed_multipath is not None:
+                    gmultipath_backfill_fired = True
                     geom_key = parsed_multipath.name.lower()
                     multipath_name = parsed_multipath.name
                     multipath_member = next(
@@ -10997,6 +11007,12 @@ class InventoryService:
                     group_records,
                     parsed_multipath,
                 )
+        if (
+            gmultipath_backfill_fired
+            and warnings is not None
+            and _CORE_GMULTIPATH_BACKFILL_WARNING not in warnings
+        ):
+            warnings.append(_CORE_GMULTIPATH_BACKFILL_WARNING)
         return records
 
     @staticmethod

@@ -5031,6 +5031,86 @@ ses2:
             enclosure_filter=None,
         )
 
+    def test_snapshot_warning_tracks_only_gmultipath_backfill(self) -> None:
+        warning = (
+            "TrueNAS API disk inventory omitted multipath metadata, so this snapshot used gmultipath list to "
+            "backfill multipath attribution. Use the live TrueNAS disk inventory controls in the enclosure header to "
+            "sync the multipath table."
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._build_core_multipath_service(temp_dir)
+
+            def source_bundle(disks: list[dict[str, object]]) -> InventorySourceBundle:
+                return InventorySourceBundle(
+                    raw_data=TrueNASRawData(
+                        enclosures=[],
+                        disks=disks,
+                        pools=[],
+                        disk_temperatures={},
+                        smart_test_results=[],
+                    ),
+                    ssh_outputs={
+                        "gmultipath list": self.CORE_GMULTIPATH_LIST_FIXTURE,
+                        "glabel status": self.CORE_GLABEL_STATUS_FIXTURE,
+                        "camcontrol devlist -v": self.CORE_CAMCONTROL_DEVLIST_FIXTURE,
+                        "zpool status -gP": self.CORE_ZPOOL_STATUS_GP_FIXTURE,
+                        "sesutil map": self.CORE_SESUTIL_MAP_FIXTURE,
+                    },
+                    ssh_collected=True,
+                    warnings=[],
+                    sources={
+                        "api": SourceStatus(enabled=True, ok=True),
+                        "ssh": SourceStatus(enabled=True, ok=True),
+                    },
+                    scale_ses_data=ParsedSSHData(),
+                    quantastor_ses_data=ParsedSSHData(),
+                )
+
+            passive_member = dict(
+                self.CORE_UNSYNCED_MULTIPATH_API_DISK,
+                name="da69",
+                devname="da69",
+            )
+            service._get_inventory_source_bundle = AsyncMock(
+                return_value=source_bundle(
+                    [dict(self.CORE_UNSYNCED_MULTIPATH_API_DISK), passive_member]
+                )
+            )
+            backfilled_snapshot = asyncio.run(service._build_snapshot())
+
+            matching_warnings = [
+                item for item in backfilled_snapshot.warnings if item == warning
+            ]
+            self.assertEqual(matching_warnings, [warning])
+            snapshot_warning = matching_warnings[0]
+            self.assertLessEqual(len(snapshot_warning.encode("utf-8")), 256)
+            self.assertIn("TrueNAS API", snapshot_warning)
+            self.assertIn("gmultipath list", snapshot_warning)
+            self.assertIn("live TrueNAS disk inventory controls", snapshot_warning)
+            for identifier in (
+                "archive-core",
+                "SYNTH0000000049",
+                "SYNTH0000000050",
+                "disk49",
+                "disk50",
+                "da84",
+                "da69",
+                "da70",
+                "da31",
+            ):
+                with self.subTest(identifier=identifier):
+                    self.assertNotIn(identifier, snapshot_warning)
+
+            service._get_inventory_source_bundle = AsyncMock(
+                return_value=source_bundle(
+                    [dict(self.CORE_API_NAMED_MULTIPATH_API_DISK)]
+                )
+            )
+            api_named_snapshot = asyncio.run(service._build_snapshot())
+
+            self.assertNotIn(warning, api_named_snapshot.warnings)
+
     def test_build_disk_records_backfills_multipath_from_gmultipath_consumers(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = self._build_core_multipath_service(temp_dir)

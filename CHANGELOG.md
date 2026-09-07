@@ -201,6 +201,9 @@ them before starting the new images.
   `disk.sync_all` on CORE and SCALE) to the enclosure header behind the main-UI
   write gate, with exact-argument sudo grants and a CORE multipath disk
   replacement runbook (#357).
+- Added one bounded snapshot warning when CORE multipath attribution is
+  backfilled from `gmultipath list`, directing operators to the existing disk
+  inventory controls without exposing device identifiers (#385).
 - Added guarded disk inventory synchronization controls for supported TrueNAS
   systems, including immutable target confirmation and convergence polling
   (#359).
