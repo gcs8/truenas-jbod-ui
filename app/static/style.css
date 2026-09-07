@@ -3753,6 +3753,11 @@ button.fabric-trace-crumb:hover {
   transition: transform 0.16s ease, box-shadow 0.16s ease, border-color 0.16s ease;
 }
 
+.slot-tile:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 3px;
+}
+
 .slot-tile.heatmap-active {
   border-color: rgba(var(--heatmap-rgb), var(--heatmap-border-alpha, 0.62));
   background:
