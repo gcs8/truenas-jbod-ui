@@ -15,6 +15,15 @@ WINDOWS_NPM_SHIM = r"C:\Program Files\nodejs\npm.cmd"
 
 
 class DevCheckPlanTests(unittest.TestCase):
+    @staticmethod
+    def _copy_ci_contract(root: Path) -> None:
+        workflow = root / ".github" / "workflows" / "ci.yml"
+        workflow.parent.mkdir(parents=True)
+        workflow.write_text(
+            (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+
     def test_posix_safe_plan_matches_source_level_ci_commands(self) -> None:
         plan = dev_check.build_plan(
             "safe",
@@ -53,13 +62,22 @@ class DevCheckPlanTests(unittest.TestCase):
         self.assertIn(("git", "diff", "--check"), argv)
         self.assertIn(("npm", "run", "test:unit"), argv)
         self.assertIn(("python", "scripts/build_perf_baseline.py", "--check"), argv)
+        self.assertNotIn(("python", "scripts/check_public_demo_artifact.py", "public-demo"), argv)
         self.assertEqual(
             [skip for skip in plan.skips if skip.name == "Prometheus alert rules"][0].reason,
             "promtool is not available; install it or set PROMTOOL_BINARY to run this gate",
         )
 
-    def test_full_plan_uses_full_discovery_on_posix(self) -> None:
-        plan = dev_check.build_plan(
+    def test_full_plan_is_strictly_broader_than_safe_on_posix(self) -> None:
+        safe = dev_check.build_plan(
+            "safe",
+            platform="darwin",
+            root=ROOT,
+            python_executable="python3",
+            environment={},
+            find_executable=lambda _name: None,
+        )
+        full = dev_check.build_plan(
             "full",
             platform="darwin",
             root=ROOT,
@@ -68,15 +86,41 @@ class DevCheckPlanTests(unittest.TestCase):
             find_executable=lambda _name: None,
         )
 
+        safe_commands = {check.argv for check in safe.checks}
+        full_commands = {check.argv for check in full.checks}
+
+        self.assertLess(safe_commands, full_commands)
         self.assertEqual(
-            plan.checks[0].argv,
-            ("python3", "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py", "-v"),
+            full_commands - safe_commands,
+            {("python3", "scripts/check_public_demo_artifact.py", "public-demo")},
         )
-        self.assertFalse(any(skip.name.startswith("Windows exclusion:") for skip in plan.skips))
+        self.assertFalse(any(skip.name.startswith("Windows exclusion:") for skip in full.skips))
+
+    def test_performance_baseline_is_a_shared_portable_ci_source_gate(self) -> None:
+        for mode, platform in (("safe", "linux"), ("full", "win32")):
+            with self.subTest(mode=mode, platform=platform):
+                plan = dev_check.build_plan(
+                    mode,
+                    platform=platform,
+                    root=ROOT,
+                    python_executable="python",
+                    environment={},
+                    find_executable=lambda _name: None,
+                )
+                checks = [check for check in plan.checks if check.name == "Performance baseline"]
+                self.assertEqual(len(checks), 1)
+                self.assertEqual(
+                    checks[0].argv,
+                    ("python", "scripts/build_perf_baseline.py", "--check"),
+                )
+                self.assertEqual(checks[0].ci_gate, "performance-baseline")
+
+        self.assertIn("performance-baseline", dev_check.read_ci_source_gate_contract(ROOT))
 
     def test_javascript_syntax_plan_covers_fixed_assets_and_all_qa_specs_dynamically(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)
+            self._copy_ci_contract(root)
             (root / "qa").mkdir()
             for relative in ("qa/z-last.spec.js", "qa/a-first.spec.js"):
                 (root / relative).write_text("// fixture\n", encoding="utf-8")
@@ -106,6 +150,7 @@ class DevCheckPlanTests(unittest.TestCase):
     def test_missing_qa_specs_is_a_planning_failure(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)
+            self._copy_ci_contract(root)
             (root / "qa").mkdir()
 
             with self.assertRaisesRegex(dev_check.PlanError, r"No QA spec files found under qa/\*\.spec\.js"):
@@ -169,6 +214,40 @@ class DevCheckPlanTests(unittest.TestCase):
                 self.assertIn(module, rendered)
         self.assertIn("tests.test_esxi_host_prep", rendered)
 
+    def test_mapping_store_suite_is_classified_as_posix_filesystem_semantics(
+        self,
+    ) -> None:
+        posix_exclusion = next(
+            exclusion
+            for exclusion in dev_check.WINDOWS_EXCLUSIONS
+            if exclusion.category == "POSIX filesystem and identity semantics"
+        )
+        self.assertNotIn(
+            "tests.test_mapping_store",
+            dev_check.WINDOWS_PORTABLE_TEST_MODULES,
+        )
+        self.assertIn(
+            "tests.test_mapping_store",
+            posix_exclusion.modules,
+        )
+
+    def test_bash_ci_contract_has_a_named_windows_tooling_exclusion(self) -> None:
+        bash_exclusions = [
+            exclusion
+            for exclusion in dev_check.WINDOWS_EXCLUSIONS
+            if exclusion.category == "Bash syntax tooling"
+        ]
+        self.assertEqual(len(bash_exclusions), 1)
+        bash_exclusion = bash_exclusions[0]
+        self.assertNotIn(
+            "tests.test_bash_ci_contract",
+            dev_check.WINDOWS_PORTABLE_TEST_MODULES,
+        )
+        self.assertEqual(
+            bash_exclusion.modules,
+            ("tests.test_bash_ci_contract",),
+        )
+
     def test_every_tracked_test_is_classified_for_windows(self) -> None:
         discovered = {
             f"tests.{path.stem}"
@@ -186,6 +265,7 @@ class DevCheckPlanTests(unittest.TestCase):
     def test_windows_plan_fails_closed_when_test_classification_drifts(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)
+            self._copy_ci_contract(root)
             (root / "qa").mkdir()
             (root / "qa/smoke.spec.js").write_text("// fixture\n", encoding="utf-8")
             (root / "tests").mkdir()
@@ -201,8 +281,7 @@ class DevCheckPlanTests(unittest.TestCase):
                     find_executable=lambda _name: None,
                 )
 
-    def test_wrapper_commands_remain_in_parity_with_ci_source_gates(self) -> None:
-        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    def test_wrapper_gate_set_exactly_matches_ci_source_gate_contract(self) -> None:
         plan = dev_check.build_plan(
             "safe",
             platform="linux",
@@ -212,42 +291,172 @@ class DevCheckPlanTests(unittest.TestCase):
             find_executable=lambda name: name,
         )
 
-        command_lines = {" ".join(check.argv) for check in plan.checks}
-        expected_ci_commands = {
-            'python -m unittest discover -s tests -p test_*.py -v',
-            "python -m compileall app admin_service history_service scripts tests",
-            "python -m ruff check app admin_service history_service scripts tests --select E4,E7,E9,F",
-            "git diff --check",
-            "npm run test:unit",
-            "promtool check rules prometheus/rules/truenas-jbod-ui-alerts-v1.yml",
-        }
-        self.assertTrue(expected_ci_commands <= command_lines)
-        workflow_equivalents = {
-            "python -m ruff check app admin_service history_service scripts tests --select E4,E7,E9,F": (
-                "ruff check app admin_service history_service scripts tests --select E4,E7,E9,F"
+        self.assertEqual(
+            dev_check.planned_ci_source_gates(plan),
+            dev_check.read_ci_source_gate_contract(ROOT),
+        )
+        self.assertEqual(
+            dev_check.planned_ci_source_gates(plan),
+            dev_check.CI_SOURCE_GATES,
+        )
+
+    def test_ci_source_gate_contract_fails_closed_on_addition_or_removal(self) -> None:
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        marker = "# dev-check-source-gate: python-unittest"
+        self.assertIn(marker, workflow)
+
+        for mutated in (
+            workflow.replace(marker, "", 1),
+            workflow + "\n# dev-check-source-gate: unexpected-new-gate\n",
+        ):
+            with self.subTest(mutation=mutated[-80:]), tempfile.TemporaryDirectory() as raw_root:
+                root = Path(raw_root)
+                (root / ".github/workflows").mkdir(parents=True)
+                (root / ".github/workflows/ci.yml").write_text(mutated, encoding="utf-8")
+
+                with self.assertRaisesRegex(dev_check.PlanError, "CI source gate contract drift"):
+                    dev_check.validate_ci_source_gate_contract(root)
+
+    def test_ci_source_gate_contract_rejects_duplicate_marker_occurrence(self) -> None:
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        marker = "# dev-check-source-gate: diff-hygiene"
+        mutated = f"{workflow}\n{marker}\n"
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            (root / ".github/workflows").mkdir(parents=True)
+            (root / ".github/workflows/ci.yml").write_text(mutated, encoding="utf-8")
+
+            with self.assertRaisesRegex(dev_check.PlanError, "CI source gate marker is duplicated"):
+                dev_check.validate_ci_source_gate_contract(root)
+
+    def test_ci_source_gate_contract_rejects_marker_detached_from_executable_step(self) -> None:
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        marker = "# dev-check-source-gate: diff-hygiene"
+        indented_marker = f"      {marker}"
+        self.assertEqual(workflow.count(indented_marker), 1)
+        workflow_without_marker = workflow.replace(f"{indented_marker}\n", "", 1)
+        mutated = f"{marker}\n{workflow_without_marker}"
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            (root / ".github/workflows").mkdir(parents=True)
+            (root / ".github/workflows/ci.yml").write_text(mutated, encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                dev_check.PlanError,
+                "CI source gate marker is not attached to an executable workflow step",
+            ):
+                dev_check.validate_ci_source_gate_contract(root)
+
+    def test_ci_source_gate_contract_rejects_marker_on_the_wrong_executable_step(self) -> None:
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        marker = "      # dev-check-source-gate: diff-hygiene"
+        unrelated_step = "      - name: Confirm checkout stayed clean"
+        self.assertEqual(workflow.count(marker), 1)
+        self.assertEqual(workflow.count(unrelated_step), 1)
+        without_marker = workflow.replace(f"{marker}\n", "", 1)
+        mutated = without_marker.replace(
+            unrelated_step,
+            f"{marker}\n{unrelated_step}",
+            1,
+        )
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            (root / ".github/workflows").mkdir(parents=True)
+            (root / ".github/workflows/ci.yml").write_text(mutated, encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                dev_check.PlanError,
+                "CI source gate marker guards the wrong workflow step",
+            ):
+                dev_check.validate_ci_source_gate_contract(root)
+
+    def test_ci_source_gate_contract_rejects_command_drift_for_every_gate(self) -> None:
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        mutations = {
+            "diff-hygiene": (
+                'git diff --check "${PR_BASE_SHA}...HEAD"',
+                'git diff --stat "${PR_BASE_SHA}...HEAD"',
+            ),
+            "prometheus-rules": (
+                "promtool check rules prometheus/rules/truenas-jbod-ui-alerts-v1.yml",
+                "promtool check rules prometheus/rules/*.yml",
+            ),
+            "python-compileall": (
+                "python -m compileall app admin_service history_service scripts tests",
+                "python -m compileall app",
+            ),
+            "performance-baseline/python-unittest": (
+                'python -m unittest discover -s tests -p "test_*.py" -v',
+                "python -m unittest tests.test_perf_budgets -v",
+            ),
+            "bounded-ruff": (
+                "ruff check app admin_service history_service scripts tests --select E4,E7,E9,F",
+                "ruff check app --select E4",
+            ),
+            "javascript-syntax": (
+                "node --check history_service/static/dashboard.js",
+                "node --check app/static/app.js",
+            ),
+            "javascript-unit-tests": (
+                "npm run test:unit",
+                "npm test",
             ),
         }
-        for command in expected_ci_commands - {'python -m unittest discover -s tests -p test_*.py -v'}:
-            command = workflow_equivalents.get(command, command)
-            self.assertIn(command, workflow)
-        self.assertIn('python -m unittest discover -s tests -p "test_*.py" -v', workflow)
-        for path in dev_check.FIXED_JAVASCRIPT_PATHS:
-            self.assertIn(f"node --check {path}", workflow)
-        self.assertIn("specs=(qa/*.spec.js)", workflow)
-        planned_qa_specs = {
-            check.argv[-1]
-            for check in plan.checks
-            if check.argv[:2] == ("node", "--check") and check.argv[-1].startswith("qa/")
-        }
-        discovered_qa_specs = {
-            path.relative_to(ROOT).as_posix()
-            for path in (ROOT / "qa").glob("*.spec.js")
-        }
-        self.assertEqual(planned_qa_specs, discovered_qa_specs)
-        self.assertIn(
-            "python scripts/build_perf_baseline.py --check",
-            (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8"),
+
+        for gate, (original, replacement) in mutations.items():
+            with self.subTest(gate=gate), tempfile.TemporaryDirectory() as raw_root:
+                self.assertEqual(workflow.count(original), 1)
+                root = Path(raw_root)
+                (root / ".github/workflows").mkdir(parents=True)
+                (root / ".github/workflows/ci.yml").write_text(
+                    workflow.replace(original, replacement, 1),
+                    encoding="utf-8",
+                )
+
+                with self.assertRaisesRegex(
+                    dev_check.PlanError,
+                    "CI source gate command drift",
+                ):
+                    dev_check.validate_ci_source_gate_contract(root)
+
+        self.assertEqual(
+            frozenset(dev_check.CI_SOURCE_GATE_WORKFLOW_COMMANDS),
+            dev_check.CI_SOURCE_GATES,
         )
+
+    def test_planned_source_gate_contract_rejects_local_command_drift(self) -> None:
+        plan = dev_check.build_plan(
+            "safe",
+            platform="linux",
+            root=ROOT,
+            python_executable="python",
+            environment={"PROMTOOL_BINARY": "promtool"},
+            find_executable=lambda name: name,
+        )
+        mutated_checks = tuple(
+            dev_check.Check(
+                check.name,
+                ("python", "-m", "ruff", "check", "app", "--select", "E4"),
+                missing_tool=check.missing_tool,
+                ci_gate=check.ci_gate,
+            )
+            if check.ci_gate == "bounded-ruff"
+            else check
+            for check in plan.checks
+        )
+
+        with self.assertRaisesRegex(
+            dev_check.PlanError,
+            "Local source gate command drift: bounded-ruff",
+        ):
+            dev_check.validate_planned_ci_source_gate_commands(
+                dev_check.Plan(mutated_checks, plan.skips),
+                root=ROOT,
+                platform="linux",
+            )
 
     def test_contributing_names_wrapper_as_tier_one_authority_on_posix_and_windows(self) -> None:
         contributing = (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")

@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import json
 import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import patch
 
 from app.config import Settings
@@ -28,9 +30,11 @@ from app.services.snapshot_export import (
     SnapshotExportService,
 )
 from history_service.domain import MetricSample, SlotEvent, SlotStateRecord
-from history_service.store import HistoryStore, SlotStateUpdate
 from starlette.datastructures import URLPath
 from starlette.requests import Request
+
+if TYPE_CHECKING:
+    from history_service.store import HistoryStore
 
 
 MODELED_SLOT_COUNTS = (60, 347)
@@ -352,6 +356,8 @@ def build_modeled_scope_history(slot_count: int) -> dict[int, dict[str, Any]]:
 
 
 def populate_modeled_history_store(store: HistoryStore, slot_count: int) -> None:
+    from history_service.store import SlotStateUpdate
+
     snapshot = build_modeled_inventory_snapshot(slot_count)
     snapshot_payload = snapshot.model_dump(mode="json")
     histories = build_modeled_scope_history(slot_count)
@@ -385,6 +391,18 @@ def populate_modeled_history_store(store: HistoryStore, slot_count: int) -> None
 
     store.record_slot_updates(updates)
     store.insert_metric_samples(samples)
+
+
+@contextmanager
+def _modeled_history_store(path: Path) -> Iterator[HistoryStore]:
+    from history_service import store as history_store_module
+
+    with patch.object(
+        history_store_module,
+        "history_write_lock",
+        side_effect=lambda *_args, **_kwargs: nullcontext(),
+    ):
+        yield history_store_module.HistoryStore(str(path))
 
 
 class ModeledHistoryBackend:
@@ -498,8 +516,9 @@ def measure_modeled_perf_case(slot_count: int) -> dict[str, Any]:
     enclosure_id = snapshot.selected_enclosure_id
     inventory_response_bytes = len(_compact_json_bytes(snapshot.model_dump(mode="json")))
 
-    with tempfile.TemporaryDirectory(prefix="modeled-perf-history-") as temp_dir:
-        store = HistoryStore(str(Path(temp_dir) / "history.db"))
+    with tempfile.TemporaryDirectory(prefix="modeled-perf-history-") as temp_dir, _modeled_history_store(
+        Path(temp_dir) / "history.db"
+    ) as store:
         populate_modeled_history_store(store, slot_count)
         connection_count = 0
         select_statements: list[str] = []

@@ -211,6 +211,9 @@ them before starting the new images.
 
 ### Changed
 
+- Split local validation into distinct portable safe and full modes, retained
+  the performance baseline and exact CI source-gate parity, and corrected
+  Windows browser commands (#384).
 - Expanded the private QA restore matrix and its sanitized deployment evidence
   checks without publishing private runtime details (#247).
 - Retained fresh disk, pool, temperature, and SMART payloads when TrueNAS
@@ -256,6 +259,8 @@ them before starting the new images.
 
 ### Fixed
 
+- Correlated sparse physical profiles by explicit slot IDs across all six
+  platform paths without inventing gap slots (#382).
 - Fixed scoped enclosure refreshes, exact history boundaries, aggregate export
   batching, and bounded JSON-only history proxy parsing (#379).
 - Mapped SATA bays through the Linux enclosure driver when shared AES addresses
