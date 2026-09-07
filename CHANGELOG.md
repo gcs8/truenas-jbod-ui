@@ -256,6 +256,8 @@ them before starting the new images.
 
 ### Fixed
 
+- Correlated sparse physical profiles by explicit slot IDs across all six
+  platform paths without inventing gap slots (#382).
 - Fixed scoped enclosure refreshes, exact history boundaries, aggregate export
   batching, and bounded JSON-only history proxy parsing (#379).
 - Mapped SATA bays through the Linux enclosure driver when shared AES addresses
