@@ -43,6 +43,57 @@ CI_SOURCE_GATE_STEPS: Mapping[str, str] = {
     "python-compileall": "Compile Python source",
     "python-unittest": "Run deterministic unittest suite",
 }
+CI_SOURCE_GATE_WORKFLOW_COMMANDS: Mapping[str, str] = {
+    "bounded-ruff": (
+        "ruff check app admin_service history_service scripts tests --select E4,E7,E9,F"
+    ),
+    "diff-hygiene": "\n".join(
+        (
+            "set -euo pipefail",
+            'if [ "${GITHUB_EVENT_NAME}" = "pull_request" ] && [ -n "${PR_BASE_SHA:-}" ]; then',
+            'git diff --check "${PR_BASE_SHA}...HEAD"',
+            'elif [ -n "${BEFORE_SHA:-}" ] && [ "${BEFORE_SHA}" != '
+            '"0000000000000000000000000000000000000000" ] && git cat-file -e '
+            '"${BEFORE_SHA}^{commit}" 2>/dev/null; then',
+            'git diff --check "${BEFORE_SHA}..HEAD"',
+            "elif git rev-parse --verify HEAD^ >/dev/null 2>&1; then",
+            'git diff --check "HEAD^..HEAD"',
+            "else",
+            "git diff --check",
+            "fi",
+        )
+    ),
+    "javascript-syntax": "\n".join(
+        (
+            "set -euo pipefail",
+            "shopt -s nullglob",
+            "node --check app/static/app.js",
+            "node --check app/static/sas_fabric_view.js",
+            "node --check admin_service/static/admin.js",
+            "node --check history_service/static/dashboard.js",
+            "specs=(qa/*.spec.js)",
+            "if [ ${#specs[@]} -eq 0 ]; then",
+            'echo "No QA spec files found under qa/*.spec.js"',
+            "exit 1",
+            "fi",
+            'for spec in "${specs[@]}"; do',
+            'node --check "$spec"',
+            "done",
+        )
+    ),
+    "javascript-unit-tests": "npm run test:unit",
+    "performance-baseline": 'python -m unittest discover -s tests -p "test_*.py" -v',
+    "prometheus-rules": "\n".join(
+        (
+            "promtool check rules prometheus/rules/truenas-jbod-ui-alerts-v1.yml",
+            "python -m unittest tests.test_prometheus_alert_rules -v",
+        )
+    ),
+    "python-compileall": (
+        "python -m compileall app admin_service history_service scripts tests"
+    ),
+    "python-unittest": 'python -m unittest discover -s tests -p "test_*.py" -v',
+}
 CI_SOURCE_GATE_MARKER = re.compile(
     r"^(?P<indent> *)# dev-check-source-gate: (?P<gate>[a-z0-9-]+)\s*$",
     re.MULTILINE,
@@ -259,11 +310,15 @@ def _tool_check(
     return Check(name, (resolved, *args), ci_gate=ci_gate)
 
 
-def _ci_source_gate_marker_step_name(
+def _normalize_ci_source_gate_command(lines: Sequence[str]) -> str:
+    return "\n".join(line.strip() for line in lines if line.strip())
+
+
+def _ci_source_gate_marker_step(
     lines: Sequence[str],
     marker_index: int,
     indent: str,
-) -> str | None:
+) -> tuple[str, str] | None:
     for line in reversed(lines[:marker_index]):
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
@@ -294,17 +349,34 @@ def _ci_source_gate_marker_step_name(
         return None
 
     run_prefix = f"{indent}  run"
-    for line in lines[step_index + 1 :]:
+    for run_index, line in enumerate(lines[step_index + 1 :], start=step_index + 1):
         stripped = line.strip()
         if stripped and not stripped.startswith("#"):
             line_indent = line[: len(line) - len(line.lstrip(" "))]
             if len(line_indent) <= len(indent):
                 break
-        if line.startswith(run_prefix) and re.match(
-            rf"^{re.escape(indent)}  run\s*:",
+        run_match = re.match(
+            rf"^{re.escape(indent)}  run\s*:\s*(?P<command>.*?)\s*$",
             line,
-        ):
-            return step_name_match.group("name")
+        )
+        if not line.startswith(run_prefix) or run_match is None:
+            continue
+
+        command = run_match.group("command")
+        if command in {"|", "|-"}:
+            block_lines = []
+            run_indent = len(indent) + 2
+            for block_line in lines[run_index + 1 :]:
+                block_stripped = block_line.strip()
+                block_indent = len(block_line) - len(block_line.lstrip(" "))
+                if block_stripped and block_indent <= run_indent:
+                    break
+                block_lines.append(block_line)
+            command = _normalize_ci_source_gate_command(block_lines)
+        elif command.startswith(">") or not command:
+            return None
+
+        return step_name_match.group("name"), command
     return None
 
 
@@ -343,25 +415,35 @@ def validate_ci_source_gate_contract(root: Path) -> None:
             f"(added={','.join(added) or '-'}; removed={','.join(removed) or '-'})"
         )
 
+    if (
+        frozenset(CI_SOURCE_GATE_STEPS) != CI_SOURCE_GATES
+        or frozenset(CI_SOURCE_GATE_WORKFLOW_COMMANDS) != CI_SOURCE_GATES
+    ):
+        raise PlanError("CI source gate validator contract drift")
+
     lines = workflow.splitlines()
     for match in matches:
         marker_index = workflow.count("\n", 0, match.start())
-        step_name = _ci_source_gate_marker_step_name(
+        step = _ci_source_gate_marker_step(
             lines,
             marker_index,
             match.group("indent"),
         )
-        if step_name is None:
+        if step is None:
             raise PlanError(
                 "CI source gate marker is not attached to an executable workflow step: "
                 f"{match.group('gate')}"
             )
-        expected_step_name = CI_SOURCE_GATE_STEPS[match.group("gate")]
+        step_name, command = step
+        gate = match.group("gate")
+        expected_step_name = CI_SOURCE_GATE_STEPS[gate]
         if step_name != expected_step_name:
             raise PlanError(
                 "CI source gate marker guards the wrong workflow step: "
-                f"{match.group('gate')}"
+                f"{gate}"
             )
+        if command != CI_SOURCE_GATE_WORKFLOW_COMMANDS[gate]:
+            raise PlanError(f"CI source gate command drift: {gate}")
 
 
 def planned_ci_source_gates(plan: Plan) -> frozenset[str]:
@@ -370,6 +452,69 @@ def planned_ci_source_gates(plan: Plan) -> frozenset[str]:
         for item in (*plan.checks, *plan.skips)
         if (gate := item.ci_gate) is not None
     )
+
+
+def _planned_ci_source_gate_commands(
+    plan: Plan,
+) -> Mapping[str, tuple[tuple[str, ...], ...]]:
+    commands: dict[str, list[tuple[str, ...]]] = {}
+    for check in plan.checks:
+        if check.ci_gate is not None:
+            commands.setdefault(check.ci_gate, []).append(check.argv[1:])
+    for skip in plan.skips:
+        if skip.ci_gate is not None:
+            commands.setdefault(skip.ci_gate, []).append(("<skip>",))
+    return {gate: tuple(sorted(argvs)) for gate, argvs in commands.items()}
+
+
+def validate_planned_ci_source_gate_commands(
+    plan: Plan,
+    *,
+    root: Path,
+    platform: str,
+) -> None:
+    python_unittest = (
+        ("-m", "unittest", "-v", *WINDOWS_PORTABLE_TEST_MODULES)
+        if platform.startswith("win")
+        else ("-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py", "-v")
+    )
+    expected: dict[str, tuple[tuple[str, ...], ...]] = {
+        "bounded-ruff": (
+            (
+                "-m",
+                "ruff",
+                "check",
+                "app",
+                "admin_service",
+                "history_service",
+                "scripts",
+                "tests",
+                "--select",
+                "E4,E7,E9,F",
+            ),
+        ),
+        "diff-hygiene": (("diff", "--check"),),
+        "javascript-syntax": tuple(
+            sorted(("--check", path) for path in (*FIXED_JAVASCRIPT_PATHS, *_qa_spec_paths(root)))
+        ),
+        "javascript-unit-tests": (("run", "test:unit"),),
+        "performance-baseline": (("scripts/build_perf_baseline.py", "--check"),),
+        "prometheus-rules": (
+            ("check", "rules", "prometheus/rules/truenas-jbod-ui-alerts-v1.yml"),
+        ),
+        "python-compileall": (
+            ("-m", "compileall", "app", "admin_service", "history_service", "scripts", "tests"),
+        ),
+        "python-unittest": (python_unittest,),
+    }
+    actual = _planned_ci_source_gate_commands(plan)
+    for gate in sorted(CI_SOURCE_GATES):
+        commands = actual.get(gate)
+        allowed = (expected[gate],)
+        if gate == "prometheus-rules":
+            allowed += ((("<skip>",),),)
+        if commands not in allowed:
+            raise PlanError(f"Local source gate command drift: {gate}")
 
 
 def _qa_spec_paths(root: Path) -> tuple[str, ...]:
@@ -530,6 +675,11 @@ def build_plan(
     plan = Plan(tuple(checks), tuple(skips))
     if planned_ci_source_gates(plan) != CI_SOURCE_GATES:
         raise PlanError("planned source gates do not exactly match the CI source gate contract")
+    validate_planned_ci_source_gate_commands(
+        plan,
+        root=root,
+        platform=platform,
+    )
     return plan
 
 

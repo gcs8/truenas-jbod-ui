@@ -499,6 +499,8 @@ python scripts/validate_release_wrap.py "$version" \
             Remove-Item -LiteralPath $slot_focus_artifact -ErrorAction SilentlyContinue
         }
     } finally {
+        Remove-Item Env:PUBLIC_DEMO_ARTIFACT -ErrorAction SilentlyContinue
+        Remove-Item Env:SLOT_FOCUS_ARTIFACT -ErrorAction SilentlyContinue
         Remove-Item Env:PUBLIC_DEMO_LOCAL_HISTORY -ErrorAction SilentlyContinue
     }
     ```

@@ -290,6 +290,22 @@ class CIWorkflowContractTests(unittest.TestCase):
             checklist,
         )
         self.assertIn(
+            "Remove-Item Env:PUBLIC_DEMO_ARTIFACT -ErrorAction SilentlyContinue",
+            checklist,
+        )
+        self.assertIn(
+            "Remove-Item Env:SLOT_FOCUS_ARTIFACT -ErrorAction SilentlyContinue",
+            checklist,
+        )
+        self.assertIn(
+            """    } finally {
+        Remove-Item Env:PUBLIC_DEMO_ARTIFACT -ErrorAction SilentlyContinue
+        Remove-Item Env:SLOT_FOCUS_ARTIFACT -ErrorAction SilentlyContinue
+        Remove-Item Env:PUBLIC_DEMO_LOCAL_HISTORY -ErrorAction SilentlyContinue
+    }""",
+            checklist,
+        )
+        self.assertIn(
             "Remove-Item -LiteralPath $slot_focus_artifact -ErrorAction SilentlyContinue",
             checklist,
         )

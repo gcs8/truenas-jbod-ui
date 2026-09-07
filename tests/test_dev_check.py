@@ -373,6 +373,91 @@ class DevCheckPlanTests(unittest.TestCase):
             ):
                 dev_check.validate_ci_source_gate_contract(root)
 
+    def test_ci_source_gate_contract_rejects_command_drift_for_every_gate(self) -> None:
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        mutations = {
+            "diff-hygiene": (
+                'git diff --check "${PR_BASE_SHA}...HEAD"',
+                'git diff --stat "${PR_BASE_SHA}...HEAD"',
+            ),
+            "prometheus-rules": (
+                "promtool check rules prometheus/rules/truenas-jbod-ui-alerts-v1.yml",
+                "promtool check rules prometheus/rules/*.yml",
+            ),
+            "python-compileall": (
+                "python -m compileall app admin_service history_service scripts tests",
+                "python -m compileall app",
+            ),
+            "performance-baseline/python-unittest": (
+                'python -m unittest discover -s tests -p "test_*.py" -v',
+                "python -m unittest tests.test_perf_budgets -v",
+            ),
+            "bounded-ruff": (
+                "ruff check app admin_service history_service scripts tests --select E4,E7,E9,F",
+                "ruff check app --select E4",
+            ),
+            "javascript-syntax": (
+                "node --check history_service/static/dashboard.js",
+                "node --check app/static/app.js",
+            ),
+            "javascript-unit-tests": (
+                "npm run test:unit",
+                "npm test",
+            ),
+        }
+
+        for gate, (original, replacement) in mutations.items():
+            with self.subTest(gate=gate), tempfile.TemporaryDirectory() as raw_root:
+                self.assertEqual(workflow.count(original), 1)
+                root = Path(raw_root)
+                (root / ".github/workflows").mkdir(parents=True)
+                (root / ".github/workflows/ci.yml").write_text(
+                    workflow.replace(original, replacement, 1),
+                    encoding="utf-8",
+                )
+
+                with self.assertRaisesRegex(
+                    dev_check.PlanError,
+                    "CI source gate command drift",
+                ):
+                    dev_check.validate_ci_source_gate_contract(root)
+
+        self.assertEqual(
+            frozenset(dev_check.CI_SOURCE_GATE_WORKFLOW_COMMANDS),
+            dev_check.CI_SOURCE_GATES,
+        )
+
+    def test_planned_source_gate_contract_rejects_local_command_drift(self) -> None:
+        plan = dev_check.build_plan(
+            "safe",
+            platform="linux",
+            root=ROOT,
+            python_executable="python",
+            environment={"PROMTOOL_BINARY": "promtool"},
+            find_executable=lambda name: name,
+        )
+        mutated_checks = tuple(
+            dev_check.Check(
+                check.name,
+                ("python", "-m", "ruff", "check", "app", "--select", "E4"),
+                missing_tool=check.missing_tool,
+                ci_gate=check.ci_gate,
+            )
+            if check.ci_gate == "bounded-ruff"
+            else check
+            for check in plan.checks
+        )
+
+        with self.assertRaisesRegex(
+            dev_check.PlanError,
+            "Local source gate command drift: bounded-ruff",
+        ):
+            dev_check.validate_planned_ci_source_gate_commands(
+                dev_check.Plan(mutated_checks, plan.skips),
+                root=ROOT,
+                platform="linux",
+            )
+
     def test_contributing_names_wrapper_as_tier_one_authority_on_posix_and_windows(self) -> None:
         contributing = (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
 
