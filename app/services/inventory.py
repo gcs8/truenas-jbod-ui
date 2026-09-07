@@ -164,7 +164,7 @@ QUANTASTOR_OPTIONAL_SSH_BACKOFF_WARNING_REGEX = re.compile(
 )
 _CORE_GMULTIPATH_BACKFILL_WARNING = (
     "TrueNAS API disk inventory omitted multipath metadata, so this snapshot used gmultipath list to "
-    "backfill multipath attribution. Use the TrueNAS disk inventory controls in the enclosure header to "
+    "backfill multipath attribution. Use the live TrueNAS disk inventory controls in the enclosure header to "
     "sync the multipath table."
 )
 

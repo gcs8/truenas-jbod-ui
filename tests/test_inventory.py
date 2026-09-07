@@ -5034,7 +5034,7 @@ ses2:
     def test_snapshot_warning_tracks_only_gmultipath_backfill(self) -> None:
         warning = (
             "TrueNAS API disk inventory omitted multipath metadata, so this snapshot used gmultipath list to "
-            "backfill multipath attribution. Use the TrueNAS disk inventory controls in the enclosure header to "
+            "backfill multipath attribution. Use the live TrueNAS disk inventory controls in the enclosure header to "
             "sync the multipath table."
         )
 
@@ -5087,7 +5087,7 @@ ses2:
             self.assertLessEqual(len(snapshot_warning.encode("utf-8")), 256)
             self.assertIn("TrueNAS API", snapshot_warning)
             self.assertIn("gmultipath list", snapshot_warning)
-            self.assertIn("TrueNAS disk inventory controls", snapshot_warning)
+            self.assertIn("live TrueNAS disk inventory controls", snapshot_warning)
             for identifier in (
                 "archive-core",
                 "SYNTH0000000049",
