@@ -317,6 +317,62 @@ class DevCheckPlanTests(unittest.TestCase):
                 with self.assertRaisesRegex(dev_check.PlanError, "CI source gate contract drift"):
                     dev_check.validate_ci_source_gate_contract(root)
 
+    def test_ci_source_gate_contract_rejects_duplicate_marker_occurrence(self) -> None:
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        marker = "# dev-check-source-gate: diff-hygiene"
+        mutated = f"{workflow}\n{marker}\n"
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            (root / ".github/workflows").mkdir(parents=True)
+            (root / ".github/workflows/ci.yml").write_text(mutated, encoding="utf-8")
+
+            with self.assertRaisesRegex(dev_check.PlanError, "CI source gate marker is duplicated"):
+                dev_check.validate_ci_source_gate_contract(root)
+
+    def test_ci_source_gate_contract_rejects_marker_detached_from_executable_step(self) -> None:
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        marker = "# dev-check-source-gate: diff-hygiene"
+        indented_marker = f"      {marker}"
+        self.assertEqual(workflow.count(indented_marker), 1)
+        workflow_without_marker = workflow.replace(f"{indented_marker}\n", "", 1)
+        mutated = f"{marker}\n{workflow_without_marker}"
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            (root / ".github/workflows").mkdir(parents=True)
+            (root / ".github/workflows/ci.yml").write_text(mutated, encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                dev_check.PlanError,
+                "CI source gate marker is not attached to an executable workflow step",
+            ):
+                dev_check.validate_ci_source_gate_contract(root)
+
+    def test_ci_source_gate_contract_rejects_marker_on_the_wrong_executable_step(self) -> None:
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        marker = "      # dev-check-source-gate: diff-hygiene"
+        unrelated_step = "      - name: Confirm checkout stayed clean"
+        self.assertEqual(workflow.count(marker), 1)
+        self.assertEqual(workflow.count(unrelated_step), 1)
+        without_marker = workflow.replace(f"{marker}\n", "", 1)
+        mutated = without_marker.replace(
+            unrelated_step,
+            f"{marker}\n{unrelated_step}",
+            1,
+        )
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            (root / ".github/workflows").mkdir(parents=True)
+            (root / ".github/workflows/ci.yml").write_text(mutated, encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                dev_check.PlanError,
+                "CI source gate marker guards the wrong workflow step",
+            ):
+                dev_check.validate_ci_source_gate_contract(root)
+
     def test_contributing_names_wrapper_as_tier_one_authority_on_posix_and_windows(self) -> None:
         contributing = (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
 

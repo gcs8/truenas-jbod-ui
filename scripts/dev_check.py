@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import os
 import re
 import shutil
@@ -32,8 +33,18 @@ CI_SOURCE_GATES = frozenset(
         "python-unittest",
     }
 )
+CI_SOURCE_GATE_STEPS: Mapping[str, str] = {
+    "bounded-ruff": "Run bounded Ruff rules",
+    "diff-hygiene": "Check patch whitespace",
+    "javascript-syntax": "Check JavaScript syntax",
+    "javascript-unit-tests": "Run deterministic JavaScript unit tests",
+    "performance-baseline": "Run deterministic unittest suite",
+    "prometheus-rules": "Validate starter Prometheus alert rules",
+    "python-compileall": "Compile Python source",
+    "python-unittest": "Run deterministic unittest suite",
+}
 CI_SOURCE_GATE_MARKER = re.compile(
-    r"^\s*# dev-check-source-gate: (?P<gate>[a-z0-9-]+)\s*$",
+    r"^(?P<indent> *)# dev-check-source-gate: (?P<gate>[a-z0-9-]+)\s*$",
     re.MULTILINE,
 )
 WINDOWS_PORTABLE_TEST_MODULES = (
@@ -248,20 +259,82 @@ def _tool_check(
     return Check(name, (resolved, *args), ci_gate=ci_gate)
 
 
-def read_ci_source_gate_contract(root: Path) -> frozenset[str]:
+def _ci_source_gate_marker_step_name(
+    lines: Sequence[str],
+    marker_index: int,
+    indent: str,
+) -> str | None:
+    for line in reversed(lines[:marker_index]):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        line_indent = line[: len(line) - len(line.lstrip(" "))]
+        if len(line_indent) < len(indent):
+            if stripped != "steps:":
+                return None
+            break
+    else:
+        return None
+
+    step_index = marker_index + 1
+    while step_index < len(lines):
+        next_marker = CI_SOURCE_GATE_MARKER.fullmatch(lines[step_index])
+        if next_marker is None or next_marker.group("indent") != indent:
+            break
+        step_index += 1
+    if step_index >= len(lines):
+        return None
+
+    step_line = lines[step_index]
+    step_name_match = re.match(
+        rf"^{re.escape(indent)}- name:\s*(?P<name>.+?)\s*$",
+        step_line,
+    )
+    if step_name_match is None:
+        return None
+
+    run_prefix = f"{indent}  run"
+    for line in lines[step_index + 1 :]:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            line_indent = line[: len(line) - len(line.lstrip(" "))]
+            if len(line_indent) <= len(indent):
+                break
+        if line.startswith(run_prefix) and re.match(
+            rf"^{re.escape(indent)}  run\s*:",
+            line,
+        ):
+            return step_name_match.group("name")
+    return None
+
+
+def _read_ci_source_gate_matches(root: Path) -> tuple[str, tuple[re.Match[str], ...]]:
     workflow_path = root / ".github" / "workflows" / "ci.yml"
     try:
         workflow = workflow_path.read_text(encoding="utf-8")
     except OSError as exc:
         raise PlanError(f"Cannot read CI source gate contract: {workflow_path}") from exc
-    gates = frozenset(match.group("gate") for match in CI_SOURCE_GATE_MARKER.finditer(workflow))
-    if not gates:
+    matches = tuple(CI_SOURCE_GATE_MARKER.finditer(workflow))
+    if not matches:
         raise PlanError("CI source gate contract is missing")
-    return gates
+    duplicate_gates = sorted(
+        gate
+        for gate, count in Counter(match.group("gate") for match in matches).items()
+        if count > 1
+    )
+    if duplicate_gates:
+        raise PlanError(f"CI source gate marker is duplicated: {','.join(duplicate_gates)}")
+    return workflow, matches
+
+
+def read_ci_source_gate_contract(root: Path) -> frozenset[str]:
+    _, matches = _read_ci_source_gate_matches(root)
+    return frozenset(match.group("gate") for match in matches)
 
 
 def validate_ci_source_gate_contract(root: Path) -> None:
-    declared = read_ci_source_gate_contract(root)
+    workflow, matches = _read_ci_source_gate_matches(root)
+    declared = frozenset(match.group("gate") for match in matches)
     if declared != CI_SOURCE_GATES:
         added = sorted(declared - CI_SOURCE_GATES)
         removed = sorted(CI_SOURCE_GATES - declared)
@@ -269,6 +342,26 @@ def validate_ci_source_gate_contract(root: Path) -> None:
             "CI source gate contract drift "
             f"(added={','.join(added) or '-'}; removed={','.join(removed) or '-'})"
         )
+
+    lines = workflow.splitlines()
+    for match in matches:
+        marker_index = workflow.count("\n", 0, match.start())
+        step_name = _ci_source_gate_marker_step_name(
+            lines,
+            marker_index,
+            match.group("indent"),
+        )
+        if step_name is None:
+            raise PlanError(
+                "CI source gate marker is not attached to an executable workflow step: "
+                f"{match.group('gate')}"
+            )
+        expected_step_name = CI_SOURCE_GATE_STEPS[match.group("gate")]
+        if step_name != expected_step_name:
+            raise PlanError(
+                "CI source gate marker guards the wrong workflow step: "
+                f"{match.group('gate')}"
+            )
 
 
 def planned_ci_source_gates(plan: Plan) -> frozenset[str]:
