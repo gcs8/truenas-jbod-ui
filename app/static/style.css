@@ -26,7 +26,7 @@
   --sans: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
   --history-write: #69c3ff;
   --history-read: #7cd4a8;
-  background: var(--bg);
+  background: #090d12;
 }
 
 * {
@@ -188,6 +188,10 @@ textarea {
 
 .meta-select-card {
   gap: 8px;
+}
+
+.system-select-card {
+  flex: 1 1 14rem;
 }
 
 .enclosure-select-card {
