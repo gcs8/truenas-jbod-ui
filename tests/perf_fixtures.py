@@ -5,7 +5,7 @@ import json
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import patch
 
 from app.config import Settings
@@ -28,9 +28,11 @@ from app.services.snapshot_export import (
     SnapshotExportService,
 )
 from history_service.domain import MetricSample, SlotEvent, SlotStateRecord
-from history_service.store import HistoryStore, SlotStateUpdate
 from starlette.datastructures import URLPath
 from starlette.requests import Request
+
+if TYPE_CHECKING:
+    from history_service.store import HistoryStore
 
 
 MODELED_SLOT_COUNTS = (60, 347)
@@ -352,6 +354,8 @@ def build_modeled_scope_history(slot_count: int) -> dict[int, dict[str, Any]]:
 
 
 def populate_modeled_history_store(store: HistoryStore, slot_count: int) -> None:
+    from history_service.store import SlotStateUpdate
+
     snapshot = build_modeled_inventory_snapshot(slot_count)
     snapshot_payload = snapshot.model_dump(mode="json")
     histories = build_modeled_scope_history(slot_count)
@@ -492,6 +496,8 @@ def _route_scope_payload(
 
 
 def measure_modeled_perf_case(slot_count: int) -> dict[str, Any]:
+    from history_service.store import HistoryStore
+
     _validate_slot_count(slot_count)
     snapshot = build_modeled_inventory_snapshot(slot_count)
     system_id = snapshot.selected_system_id or ""

@@ -163,7 +163,11 @@ python scripts/validate_release_wrap.py "$version" \
   - `for spec in qa/*.spec.js; do node --check "$spec"; done`
 - run the browser smoke suites. Live-appliance specs require explicit opt-in;
   a bare `npx playwright test` is not a portable release command:
-  - `npx playwright test qa/public-demo.spec.js qa/offline-snapshot.spec.js`
+  - POSIX: `slot_focus_artifact="$(mktemp "${TMPDIR:-/tmp}/truenas-jbod-ui-slot-focus-XXXXXX.html")"`
+  - POSIX: `python scripts/build_current_source_browser_fixture.py --output "$slot_focus_artifact"`
+  - POSIX: `PUBLIC_DEMO_ARTIFACT=public-demo/index.html SLOT_FOCUS_ARTIFACT="$slot_focus_artifact" npx playwright test qa/public-demo.spec.js`
+  - POSIX: `rm -f "$slot_focus_artifact"`
+  - `npx playwright test qa/offline-snapshot.spec.js`
   - `PLAYWRIGHT_ADMIN_BASE_URL=http://127.0.0.1:8082 npx playwright test qa/admin-operations.spec.js`
   - `PLAYWRIGHT_LIVE_APPLIANCE_QA=1 npx playwright test qa/ui-switching.spec.js qa/esxi-smoke.spec.js`
     (only against an intentionally configured live stack)
@@ -480,8 +484,9 @@ python scripts/validate_release_wrap.py "$version" \
   - `.\.venv\Scripts\python.exe scripts\build_public_demo.py --output public-demo\index.html`
   - `.\.venv\Scripts\python.exe scripts\build_public_demo.py --output public-demo\index.html --check`
   - `.\.venv\Scripts\python.exe scripts\check_public_demo_artifact.py public-demo`
-  - `set PUBLIC_DEMO_ARTIFACT=public-demo/index.html`
-  - `npx playwright test qa/public-demo.spec.js`
+  - `.\.venv\Scripts\python.exe scripts/build_current_source_browser_fixture.py --output "%TEMP%\truenas-jbod-ui-slot-focus.html"`
+  - `set "PUBLIC_DEMO_ARTIFACT=public-demo/index.html" && set "SLOT_FOCUS_ARTIFACT=%TEMP%\truenas-jbod-ui-slot-focus.html" && npx playwright test qa/public-demo.spec.js`
+  - `del "%TEMP%\truenas-jbod-ui-slot-focus.html"`
   - record the changed files, artifact publishability/privacy result, and
     browser result in `Docs/wiki/public-demo gate` before tagging; record the
     Pages workflow run and URL later in `Docs/wiki/public-demo publication`

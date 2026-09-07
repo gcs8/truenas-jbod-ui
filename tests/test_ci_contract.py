@@ -257,6 +257,24 @@ class CIWorkflowContractTests(unittest.TestCase):
                 self.assertIn('rm -rf "$fixture_root"', workflow_text)
                 self.assertIn("git status --short", workflow_text)
 
+    def test_release_checklist_public_demo_commands_supply_both_required_artifacts(self) -> None:
+        checklist = self.read(ROOT / "docs" / "RELEASE_CHECKLIST.md")
+        public_demo_commands = [
+            line
+            for line in checklist.splitlines()
+            if "npx playwright test" in line and "qa/public-demo.spec.js" in line
+        ]
+
+        self.assertGreaterEqual(len(public_demo_commands), 2)
+        for command in public_demo_commands:
+            with self.subTest(command=command):
+                self.assertIn("PUBLIC_DEMO_ARTIFACT", command)
+                self.assertIn("SLOT_FOCUS_ARTIFACT", command)
+        self.assertGreaterEqual(
+            checklist.count("scripts/build_current_source_browser_fixture.py --output"),
+            len(public_demo_commands),
+        )
+
     def test_dependabot_keeps_immutable_actions_maintained(self) -> None:
         config = yaml.safe_load(self.read(ROOT / ".github" / "dependabot.yml"))
         actions_entries = [

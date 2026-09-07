@@ -50,6 +50,36 @@ def compact_json_bytes(value: object) -> bytes:
 
 
 class ModeledPerfFixtureTests(unittest.TestCase):
+    def test_perf_baseline_script_imports_under_synthetic_win32_without_fcntl(self) -> None:
+        probe = """
+import asyncio
+import builtins
+import runpy
+import sys
+
+script = sys.argv[1]
+real_import = builtins.__import__
+
+def portable_import(name, *args, **kwargs):
+    if name == "fcntl":
+        raise ModuleNotFoundError("synthetic Windows has no fcntl")
+    return real_import(name, *args, **kwargs)
+
+builtins.__import__ = portable_import
+runpy.run_path(script, run_name="synthetic_windows_import_probe")
+print("synthetic-win32-import: PASS")
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", probe, str(ROOT / "scripts/build_perf_baseline.py")],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("synthetic-win32-import: PASS", result.stdout)
+
     @staticmethod
     def _comparison_payload() -> dict[str, object]:
         return {

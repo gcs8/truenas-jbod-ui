@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -18,6 +19,21 @@ FIXED_JAVASCRIPT_PATHS = (
     "app/static/sas_fabric_view.js",
     "admin_service/static/admin.js",
     "history_service/static/dashboard.js",
+)
+CI_SOURCE_GATES = frozenset(
+    {
+        "bounded-ruff",
+        "diff-hygiene",
+        "javascript-syntax",
+        "javascript-unit-tests",
+        "prometheus-rules",
+        "python-compileall",
+        "python-unittest",
+    }
+)
+CI_SOURCE_GATE_MARKER = re.compile(
+    r"^\s*# dev-check-source-gate: (?P<gate>[a-z0-9-]+)\s*$",
+    re.MULTILINE,
 )
 WINDOWS_PORTABLE_TEST_MODULES = (
     "tests.test_admin_command_state",
@@ -39,6 +55,7 @@ WINDOWS_PORTABLE_TEST_MODULES = (
     "tests.test_profiles",
     "tests.test_prometheus_alert_rules",
     "tests.test_public_doc_privacy",
+    "tests.test_public_demo_fixture",
     "tests.test_quantastor_api",
     "tests.test_release_changelog_coverage",
     "tests.test_release_status",
@@ -86,7 +103,6 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_perf",
             "tests.test_perf_budgets",
             "tests.test_platform_parity_fixtures",
-            "tests.test_public_demo_fixture",
             "tests.test_read_ui_auth",
             "tests.test_route_contracts",
             "tests.test_sas_fabric",
@@ -130,12 +146,14 @@ class Check:
     name: str
     argv: tuple[str, ...]
     missing_tool: str | None = None
+    ci_gate: str | None = None
 
 
 @dataclass(frozen=True)
 class Skip:
     name: str
     reason: str
+    ci_gate: str | None = None
 
 
 @dataclass(frozen=True)
@@ -213,11 +231,43 @@ def _tool_check(
     *,
     find_executable: ExecutableFinder,
     platform: str,
+    ci_gate: str | None = None,
 ) -> Check:
     resolved = _resolve_tool(tool, find_executable, platform)
     if resolved is None:
-        return Check(name, (tool, *args), missing_tool=tool)
-    return Check(name, (resolved, *args))
+        return Check(name, (tool, *args), missing_tool=tool, ci_gate=ci_gate)
+    return Check(name, (resolved, *args), ci_gate=ci_gate)
+
+
+def read_ci_source_gate_contract(root: Path) -> frozenset[str]:
+    workflow_path = root / ".github" / "workflows" / "ci.yml"
+    try:
+        workflow = workflow_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise PlanError(f"Cannot read CI source gate contract: {workflow_path}") from exc
+    gates = frozenset(match.group("gate") for match in CI_SOURCE_GATE_MARKER.finditer(workflow))
+    if not gates:
+        raise PlanError("CI source gate contract is missing")
+    return gates
+
+
+def validate_ci_source_gate_contract(root: Path) -> None:
+    declared = read_ci_source_gate_contract(root)
+    if declared != CI_SOURCE_GATES:
+        added = sorted(declared - CI_SOURCE_GATES)
+        removed = sorted(CI_SOURCE_GATES - declared)
+        raise PlanError(
+            "CI source gate contract drift "
+            f"(added={','.join(added) or '-'}; removed={','.join(removed) or '-'})"
+        )
+
+
+def planned_ci_source_gates(plan: Plan) -> frozenset[str]:
+    return frozenset(
+        gate
+        for item in (*plan.checks, *plan.skips)
+        if (gate := item.ci_gate) is not None
+    )
 
 
 def _qa_spec_paths(root: Path) -> tuple[str, ...]:
@@ -241,6 +291,7 @@ def build_plan(
 ) -> Plan:
     if mode not in {"safe", "full"}:
         raise PlanError(f"Unsupported validation mode: {mode}")
+    validate_ci_source_gate_contract(root)
 
     if find_executable is None:
         find_executable = shutil.which
@@ -248,6 +299,12 @@ def build_plan(
     skips: list[Skip] = []
     if platform.startswith("win"):
         python_check, windows_skips = _windows_test_check(root, python_executable)
+        python_check = Check(
+            python_check.name,
+            python_check.argv,
+            missing_tool=python_check.missing_tool,
+            ci_gate="python-unittest",
+        )
         skips.extend(windows_skips)
     else:
         python_check = Check(
@@ -263,6 +320,7 @@ def build_plan(
                 "test_*.py",
                 "-v",
             ),
+            ci_gate="python-unittest",
         )
 
     checks = [
@@ -279,6 +337,7 @@ def build_plan(
                 "scripts",
                 "tests",
             ),
+            ci_gate="python-compileall",
         ),
         Check(
             "Bounded Ruff",
@@ -295,6 +354,7 @@ def build_plan(
                 "--select",
                 "E4,E7,E9,F",
             ),
+            ci_gate="bounded-ruff",
         ),
     ]
     checks.extend(
@@ -304,6 +364,7 @@ def build_plan(
             ("--check", path),
             find_executable=find_executable,
             platform=platform,
+            ci_gate="javascript-syntax",
         )
         for path in (*FIXED_JAVASCRIPT_PATHS, *_qa_spec_paths(root))
     )
@@ -315,6 +376,7 @@ def build_plan(
                 ("diff", "--check"),
                 find_executable=find_executable,
                 platform=platform,
+                ci_gate="diff-hygiene",
             ),
             _tool_check(
                 "JavaScript unit tests",
@@ -322,13 +384,17 @@ def build_plan(
                 ("run", "test:unit"),
                 find_executable=find_executable,
                 platform=platform,
-            ),
-            Check(
-                "Performance baseline",
-                (python_executable, "scripts/build_perf_baseline.py", "--check"),
+                ci_gate="javascript-unit-tests",
             ),
         )
     )
+    if mode == "full":
+        checks.append(
+            Check(
+                "Checked-in public demo artifact",
+                (python_executable, "scripts/check_public_demo_artifact.py", "public-demo"),
+            )
+        )
 
     requested_promtool = environment.get("PROMTOOL_BINARY", "promtool")
     promtool = _resolve_tool(requested_promtool, find_executable, platform)
@@ -337,6 +403,7 @@ def build_plan(
             Skip(
                 "Prometheus alert rules",
                 "promtool is not available; install it or set PROMTOOL_BINARY to run this gate",
+                ci_gate="prometheus-rules",
             )
         )
     else:
@@ -349,10 +416,14 @@ def build_plan(
                     "rules",
                     "prometheus/rules/truenas-jbod-ui-alerts-v1.yml",
                 ),
+                ci_gate="prometheus-rules",
             )
         )
 
-    return Plan(tuple(checks), tuple(skips))
+    plan = Plan(tuple(checks), tuple(skips))
+    if planned_ci_source_gates(plan) != CI_SOURCE_GATES:
+        raise PlanError("planned source gates do not exactly match the CI source gate contract")
+    return plan
 
 
 def run_plan(
