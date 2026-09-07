@@ -11,9 +11,11 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+from pydantic import ValidationError
 from starlette.datastructures import URLPath
 from starlette.requests import Request
 
+import app.services.snapshot_export as snapshot_export
 from app.config import BMCConfig, HANodeConfig, HistoryConfig, SSHConfig, Settings, SystemConfig, TrueNASConfig, get_settings
 from app.main import templates
 from app.models.domain import (
@@ -1197,7 +1199,7 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(build_calls, 1)
         self.assertIs(first_result, second_result)
         self.assertEqual(len(exporter._zip_cache), 1)
-        self.assertEqual(exporter._zip_build_tasks, {})
+        self.assertEqual(exporter._work_coordinator.pending_key_count, 0)
 
     async def test_concurrent_oversized_zip_requests_share_build_without_retaining_bytes(self) -> None:
         settings = self.cache_settings(max_bytes=1)
@@ -1236,7 +1238,7 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(first_result, second_result)
         self.assertEqual(build_calls, 1)
         self.assertEqual(len(exporter._zip_cache), 0)
-        self.assertEqual(exporter._zip_build_tasks, {})
+        self.assertEqual(exporter._work_coordinator.pending_key_count, 0)
 
     async def test_estimate_allows_snapshot_to_keep_smart_details_and_oversize_override(self) -> None:
         snapshot = build_snapshot()
@@ -1953,6 +1955,402 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("archive-core|rear|0", rendered.history_cache)
         self.assertIn("archive-core|storage-view:boot-doms|0", rendered.history_cache)
 
+
+class SnapshotExportPendingWorkTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        EXPORT_HISTORY_CACHE.clear()
+        EXPORT_RENDER_CACHE.clear()
+        EXPORT_ZIP_CACHE.clear()
+
+    @staticmethod
+    def coordinator(
+        *,
+        concurrency: int = 1,
+        pending: int = 2,
+        retained_bytes: int = 8 * 1024 * 1024,
+    ) -> Any:
+        return snapshot_export.SnapshotExportWorkCoordinator(
+            max_concurrency=concurrency,
+            max_pending_keys=pending,
+            max_retained_bytes=retained_bytes,
+        )
+
+    async def test_saturated_request_rejects_before_hostname_or_cache_key_traversal(self) -> None:
+        coordinator = self.coordinator(pending=1, retained_bytes=1024)
+        occupied = asyncio.Event()
+        release = asyncio.Event()
+
+        async def hold() -> None:
+            occupied.set()
+            await release.wait()
+
+        holder = asyncio.create_task(
+            coordinator.run(key="occupied", retained_bytes=1, work=hold)
+        )
+        await occupied.wait()
+        exporter = SnapshotExportService(
+            Settings(), FakeHistoryBackend(), templates, work_coordinator=coordinator
+        )  # type: ignore[arg-type]
+        hosts = [f"node-{index}.example.test" for index in range(256)]
+        try:
+            with (
+                patch.object(exporter, "_build_render_work_key") as work_key,
+                patch.object(exporter, "_render_work_retained_bytes") as retained,
+                self.assertRaises(snapshot_export.SnapshotExportBusyError),
+            ):
+                await exporter.build_enclosure_snapshot_html(
+                    request=build_request(),
+                    snapshot=build_snapshot(),
+                    smart_summary_cache=build_smart_summary_cache(),
+                    selected_slot=0,
+                    history_window_hours=24,
+                    io_chart_mode="average",
+                    configured_hostnames=hosts,
+                )
+            work_key.assert_not_called()
+            retained.assert_not_called()
+            self.assertEqual(coordinator.pending_key_count, 1)
+        finally:
+            release.set()
+            await holder
+
+    async def test_byte_saturated_request_rejects_before_hostname_or_cache_key_traversal(self) -> None:
+        coordinator = self.coordinator(
+            concurrency=1,
+            pending=8,
+            retained_bytes=32 * 1024 * 1024,
+        )
+        occupied = asyncio.Event()
+        release = asyncio.Event()
+
+        async def hold() -> None:
+            occupied.set()
+            await release.wait()
+
+        holder = asyncio.create_task(
+            coordinator.run(
+                key="occupied",
+                retained_bytes=29 * 1024 * 1024,
+                work=hold,
+            )
+        )
+        await occupied.wait()
+        exporter = SnapshotExportService(
+            Settings(), FakeHistoryBackend(), templates, work_coordinator=coordinator
+        )  # type: ignore[arg-type]
+        hosts = [f"node-{index}.example.test" for index in range(256)]
+        try:
+            with (
+                patch.object(exporter, "_build_render_work_key") as work_key,
+                patch.object(exporter, "_render_work_retained_bytes") as retained,
+                self.assertRaises(snapshot_export.SnapshotExportBusyError),
+            ):
+                await asyncio.wait_for(
+                    exporter.build_enclosure_snapshot_html(
+                        request=build_request(),
+                        snapshot=build_snapshot(),
+                        smart_summary_cache=build_smart_summary_cache(),
+                        selected_slot=0,
+                        history_window_hours=24,
+                        io_chart_mode="average",
+                        configured_hostnames=hosts,
+                    ),
+                    timeout=0.1,
+                )
+            work_key.assert_not_called()
+            retained.assert_not_called()
+            self.assertEqual(coordinator.pending_key_count, 1)
+        finally:
+            release.set()
+            await holder
+
+    async def test_process_wide_active_and_queued_ceiling_spans_service_instances(self) -> None:
+        coordinator = self.coordinator(concurrency=1, pending=2)
+        first_started = threading.Event()
+        second_started = threading.Event()
+        release_first = threading.Event()
+        release_second = threading.Event()
+        render_calls = 0
+
+        def controlled_render(_request: Request, _template: Any, _context: dict[str, Any]) -> str:
+            nonlocal render_calls
+            render_calls += 1
+            if render_calls == 1:
+                first_started.set()
+                release_first.wait(timeout=2)
+            else:
+                second_started.set()
+                release_second.wait(timeout=2)
+            return f"<html>render {render_calls}</html>"
+
+        with patch.object(snapshot_export, "EXPORT_WORK_COORDINATOR", coordinator):
+            first_exporter = SnapshotExportService(Settings(), FakeHistoryBackend(), templates)  # type: ignore[arg-type]
+            second_exporter = SnapshotExportService(Settings(), FakeHistoryBackend(), templates)  # type: ignore[arg-type]
+        self.assertIs(first_exporter._work_coordinator, second_exporter._work_coordinator)
+        first_exporter._render_template_with_assets = controlled_render  # type: ignore[method-assign]
+        second_exporter._render_template_with_assets = controlled_render  # type: ignore[method-assign]
+        common = {
+            "request": build_request(),
+            "snapshot": build_snapshot(),
+            "smart_summary_cache": build_smart_summary_cache(),
+            "selected_slot": 0,
+            "history_window_hours": 24,
+            "io_chart_mode": "total",
+        }
+        first = asyncio.create_task(
+            first_exporter.build_enclosure_snapshot_html(**common, history_panel_open=False)
+        )
+        self.assertTrue(await asyncio.to_thread(first_started.wait, 1))
+        second = asyncio.create_task(
+            second_exporter.build_enclosure_snapshot_html(**common, history_panel_open=True)
+        )
+        await asyncio.sleep(0)
+        self.assertEqual(coordinator.active_count, 1)
+        self.assertEqual(coordinator.queued_count, 1)
+        self.assertEqual(coordinator.pending_key_count, 2)
+        third_args = {**common, "io_chart_mode": "average"}
+        with self.assertRaises(snapshot_export.SnapshotExportBusyError):
+            await second_exporter.build_enclosure_snapshot_html(
+                **third_args,
+                history_panel_open=False,
+            )
+        self.assertEqual(render_calls, 1)
+        release_first.set()
+        self.assertTrue(await asyncio.to_thread(second_started.wait, 1))
+        release_second.set()
+        await asyncio.gather(first, second)
+        self.assertEqual(coordinator.pending_key_count, 0)
+
+    async def test_equal_nonidentical_requests_single_flight_without_second_slot(self) -> None:
+        coordinator = self.coordinator(concurrency=1, pending=2)
+        exporter = SnapshotExportService(
+            Settings(), FakeHistoryBackend(), templates, work_coordinator=coordinator
+        )  # type: ignore[arg-type]
+        started = threading.Event()
+        release = threading.Event()
+        render_calls = 0
+
+        def controlled_render(_request: Request, _template: Any, _context: dict[str, Any]) -> str:
+            nonlocal render_calls
+            render_calls += 1
+            started.set()
+            release.wait(timeout=2)
+            return "<html>one semantic render</html>"
+
+        exporter._render_template_with_assets = controlled_render  # type: ignore[method-assign]
+        first_snapshot = build_snapshot()
+        second_snapshot = first_snapshot.model_copy(deep=True)
+        first_cache = build_smart_summary_cache()
+        second_cache = json.loads(json.dumps(first_cache))
+        first = asyncio.create_task(
+            exporter.build_enclosure_snapshot_html(
+                request=build_request(),
+                snapshot=first_snapshot,
+                smart_summary_cache=first_cache,
+                selected_slot=0,
+                selected_storage_view_id="".join(("boot", "-", "doms")),
+                history_window_hours=24,
+                io_chart_mode="total",
+                configured_hostnames=["node-a.example.test"],
+            )
+        )
+        self.assertTrue(await asyncio.to_thread(started.wait, 1))
+        second = asyncio.create_task(
+            exporter.build_enclosure_snapshot_html(
+                request=build_request(),
+                snapshot=second_snapshot,
+                smart_summary_cache=second_cache,
+                selected_slot=0,
+                selected_storage_view_id="boot-doms".encode().decode(),
+                history_window_hours=24,
+                io_chart_mode="to" + "tal",
+                configured_hostnames=list(["node-a.example.test"]),
+            )
+        )
+        await asyncio.sleep(0)
+        self.assertEqual(coordinator.pending_key_count, 1)
+        self.assertGreater(coordinator.retained_bytes, 0)
+        self.assertEqual(render_calls, 1)
+        release.set()
+        first_result, second_result = await asyncio.gather(first, second)
+        self.assertIs(first_result, second_result)
+        self.assertEqual(render_calls, 1)
+        self.assertEqual(coordinator.pending_key_count, 0)
+        self.assertEqual(coordinator.retained_bytes, 0)
+
+    async def test_pending_tasks_and_retained_intermediate_bytes_are_bounded(self) -> None:
+        coordinator = self.coordinator(concurrency=1, pending=3, retained_bytes=10)
+        release = asyncio.Event()
+
+        async def hold() -> bytes:
+            await release.wait()
+            return b"done"
+
+        first = asyncio.create_task(
+            coordinator.run(key="first", retained_bytes=6, work=hold)
+        )
+        await asyncio.sleep(0)
+        with self.assertRaises(snapshot_export.SnapshotExportBusyError):
+            await coordinator.run(key="second", retained_bytes=5, work=hold)
+        self.assertEqual(coordinator.pending_key_count, 1)
+        self.assertEqual(coordinator.retained_bytes, 6)
+        release.set()
+        await first
+        self.assertEqual(coordinator.pending_key_count, 0)
+        self.assertEqual(coordinator.retained_bytes, 0)
+
+    async def test_queued_cancellation_removes_work_before_it_runs(self) -> None:
+        coordinator = self.coordinator(concurrency=1, pending=2, retained_bytes=10)
+        active_started = asyncio.Event()
+        release = asyncio.Event()
+        queued_ran = False
+
+        async def active_work() -> None:
+            active_started.set()
+            await release.wait()
+
+        async def queued_work() -> None:
+            nonlocal queued_ran
+            queued_ran = True
+
+        active = asyncio.create_task(
+            coordinator.run(key="active", retained_bytes=3, work=active_work)
+        )
+        await active_started.wait()
+        queued = asyncio.create_task(
+            coordinator.run(key="queued", retained_bytes=4, work=queued_work)
+        )
+        await asyncio.sleep(0)
+        self.assertEqual(coordinator.queued_count, 1)
+        queued.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await queued
+        await asyncio.sleep(0)
+        self.assertFalse(queued_ran)
+        self.assertEqual(coordinator.pending_key_count, 1)
+        self.assertEqual(coordinator.retained_bytes, 3)
+        release.set()
+        await active
+
+    async def test_repeated_running_cancellation_retains_admission_until_executor_finishes(self) -> None:
+        coordinator = self.coordinator(concurrency=1, pending=1, retained_bytes=10)
+        entered = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+
+        def worker() -> str:
+            entered.set()
+            release.wait(timeout=2)
+            finished.set()
+            return "done"
+
+        async def work() -> str:
+            return await asyncio.to_thread(worker)
+
+        caller = asyncio.create_task(
+            coordinator.run(key="running", retained_bytes=7, work=work)
+        )
+        self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+        caller.cancel()
+        await asyncio.sleep(0)
+        caller.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await caller
+        self.assertEqual(coordinator.pending_key_count, 1)
+        self.assertEqual(coordinator.active_count, 1)
+        self.assertEqual(coordinator.retained_bytes, 7)
+        with self.assertRaises(snapshot_export.SnapshotExportBusyError):
+            await coordinator.run(key="replacement", retained_bytes=1, work=work)
+        release.set()
+        self.assertTrue(await asyncio.to_thread(finished.wait, 1))
+        for _ in range(100):
+            if coordinator.pending_key_count == 0:
+                break
+            await asyncio.sleep(0)
+        self.assertEqual(coordinator.pending_key_count, 0)
+        self.assertEqual(coordinator.active_count, 0)
+
+    async def test_cancelled_caller_consumes_late_executor_exception(self) -> None:
+        coordinator = self.coordinator(concurrency=1, pending=1, retained_bytes=10)
+        entered = threading.Event()
+        release = threading.Event()
+        loop_errors: list[dict[str, Any]] = []
+
+        def worker() -> None:
+            entered.set()
+            release.wait(timeout=2)
+            raise RuntimeError("synthetic late export failure")
+
+        async def work() -> None:
+            await asyncio.to_thread(worker)
+
+        loop = asyncio.get_running_loop()
+        prior_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+        try:
+            caller = asyncio.create_task(
+                coordinator.run(key="late-failure", retained_bytes=1, work=work)
+            )
+            self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+            operation = next(iter(coordinator._pending.values())).task
+            self.assertIsNotNone(operation)
+            caller.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await caller
+            release.set()
+            for _ in range(100):
+                if coordinator.pending_key_count == 0:
+                    break
+                await asyncio.sleep(0)
+            await asyncio.sleep(0)
+        finally:
+            release.set()
+            loop.set_exception_handler(prior_handler)
+        self.assertEqual(coordinator.pending_key_count, 0)
+        self.assertEqual(loop_errors, [])
+        assert operation is not None
+        self.assertFalse(operation._log_traceback)
+
+    def test_request_caps_every_field_used_by_export_identity(self) -> None:
+        payload = SnapshotExportRequest(
+            selected_slot=65535,
+            selected_storage_view_id="v" * 256,
+            history_window_hours=None,
+            io_chart_mode="average",
+            enclosure_ids=[f"enclosure-{index}" for index in range(128)],
+            storage_view_ids=[f"view-{index}" for index in range(128)],
+        )
+        self.assertEqual(payload.history_window_hours, 24 * 365)
+        self.assertEqual(len(payload.enclosure_ids), 128)
+        self.assertEqual(len(payload.storage_view_ids), 128)
+        self.assertEqual(
+            SnapshotExportRequest(enclosure_ids=["x" * 300]).enclosure_ids,
+            ["x" * 256],
+        )
+        invalid_payloads = (
+            {"selected_slot": -1},
+            {"selected_slot": 65536},
+            {"selected_storage_view_id": "v" * 257},
+            {"history_window_hours": 0},
+            {"history_window_hours": 8761},
+            {"io_chart_mode": "unbounded"},
+            {"enclosure_ids": [str(index) for index in range(129)]},
+            {"storage_view_ids": [str(index) for index in range(129)]},
+        )
+        for invalid in invalid_payloads:
+            with self.subTest(field=next(iter(invalid))):
+                with self.assertRaises(ValidationError):
+                    SnapshotExportRequest(**invalid)
+
+    def test_service_defensively_caps_history_window_used_by_cache_keys(self) -> None:
+        self.assertEqual(
+            SnapshotExportService._normalize_history_window_hours(None),
+            24 * 365,
+        )
+        self.assertEqual(
+            SnapshotExportService._normalize_history_window_hours(10**12),
+            24 * 365,
+        )
 
 
 class SnapshotRedactorIdentifierKeyTests(unittest.TestCase):

@@ -1,7 +1,5 @@
 const { test, expect } = require("@playwright/test");
-const { spawnSync } = require("child_process");
 const fs = require("fs");
-const os = require("os");
 const path = require("path");
 const { pathToFileURL } = require("url");
 
@@ -17,28 +15,11 @@ function resolveArtifactPath(requestedPath) {
   return artifactPath;
 }
 
-function buildPublicDemoFromLocalHistory() {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "jbod-public-demo-"));
-  const outputPath = path.join(tempDir, "index.html");
-  const python = process.env.PYTHON || (process.platform === "win32" ? "python" : "python3");
-  const result = spawnSync(python, ["scripts/build_public_demo.py", "--output", outputPath], {
-    cwd: repoRoot,
-    encoding: "utf8",
-  });
-  if (result.status !== 0) {
-    throw new Error(`Public demo generation failed:\n${result.stdout}\n${result.stderr}`);
-  }
-  return outputPath;
-}
-
 function resolvePublicDemoArtifact() {
   if (process.env.PUBLIC_DEMO_ARTIFACT) {
     return resolveArtifactPath(process.env.PUBLIC_DEMO_ARTIFACT);
   }
 
-  if (process.env.PUBLIC_DEMO_BUILD_FROM_HISTORY === "1") {
-    return buildPublicDemoFromLocalHistory();
-  }
 
   const checkedInArtifact = path.join(repoRoot, "public-demo", "index.html");
   if (fs.existsSync(checkedInArtifact)) {
@@ -47,8 +28,7 @@ function resolvePublicDemoArtifact() {
 
   throw new Error(
     "No checked-in public-demo/index.html artifact found. Set PUBLIC_DEMO_ARTIFACT "
-      + "to an existing artifact, or set PUBLIC_DEMO_BUILD_FROM_HISTORY=1 on a "
-      + "release-maintainer checkout with local ignored history/history.db."
+      + "to an existing deterministic synthetic artifact."
   );
 }
 
@@ -62,9 +42,15 @@ function resolveSlotFocusArtifact() {
 test("public demo static artifact is explorable without a live backend", async ({ page }) => {
   const demoPath = resolvePublicDemoArtifact();
   const consoleErrors = [];
+  const outboundRequests = [];
   page.on("console", (message) => {
     if (message.type() === "error") {
       consoleErrors.push(message.text());
+    }
+  });
+  page.on("request", (request) => {
+    if (!/^(?:file|data|blob):/.test(request.url())) {
+      outboundRequests.push(request.url());
     }
   });
 
@@ -76,7 +62,7 @@ test("public demo static artifact is explorable without a live backend", async (
   await expect(page.locator(".snapshot-banner-meta")).toContainText("Capture time");
   await expect(page.locator(".snapshot-banner-facts")).toContainText("60 visible bays");
   await expect(page.locator(".snapshot-banner-facts")).toContainText("2 saved/virtual views");
-  await expect(page.locator(".snapshot-banner-meta")).toContainText("Scrambled IDs");
+  await expect(page.locator(".snapshot-banner-meta")).toContainText("Synthetic IDs");
   await expect(page.locator(".snapshot-banner-meta")).toContainText("7d");
   await expect(page.locator("#system-setup-button")).toHaveCount(0);
   await expect(page.locator("#export-snapshot-button")).toHaveCount(0);
@@ -95,7 +81,7 @@ test("public demo static artifact is explorable without a live backend", async (
   await expect(page.locator("#slot-grid .slot-tile.selected")).toHaveCount(0);
   await expect(page.locator("#detail-empty")).toContainText("Select a slot tile");
   await page.locator('#slot-grid .slot-tile[data-slot="57"]').click();
-  await expect(page.locator("#detail-kv-grid")).toContainText("SAMSUNG MZILT3T8HALS/007");
+  await expect(page.locator("#detail-kv-grid")).toContainText("Demo Flash SSD 4TB");
   await expect(page.locator("#detail-kv-grid")).toContainText("DEMO-SN-CORE-0057");
   await expect(page.locator("#detail-kv-grid")).toContainText("mirror-8");
   await page.locator("#history-toggle-button").click();
@@ -115,20 +101,21 @@ test("public demo static artifact is explorable without a live backend", async (
   await page.locator("#heatmap-toggle-button").click();
 
   await selector.selectOption("view:boot-doms");
-  await expect(page.locator("#enclosure-panel-title")).toContainText("Boot SATADOMs");
+  await expect(page.locator("#enclosure-panel-title")).toContainText("Demo Boot Modules");
   await page.locator('#slot-grid .slot-tile[data-slot="0"]').click();
-  await expect(page.locator("#detail-kv-grid")).toContainText("SuperMicro SSD");
-  await expect(page.locator("#detail-kv-grid")).toContainText("48 C");
+  await expect(page.locator("#detail-kv-grid")).toContainText("Demo Boot Flash 128GB");
+  await expect(page.locator("#detail-kv-grid")).toContainText("34 C");
   await selector.selectOption("view:nvme-carrier-x4");
-  await expect(page.locator("#enclosure-panel-title")).toContainText("4x NVMe Carrier Card");
+  await expect(page.locator("#enclosure-panel-title")).toContainText("Demo 4x NVMe Carrier");
   await page.locator('#slot-grid .slot-tile[data-slot="0"]').click();
-  await expect(page.locator("#detail-kv-grid")).toContainText("Samsung SSD 970 EVO 2TB");
+  await expect(page.locator("#detail-kv-grid")).toContainText("Demo NVMe Flash 2TB");
   await expect(page.locator("#detail-kv-grid")).toContainText("DEMO-SN-NVME-0000");
   await page.locator("#heatmap-toggle-button").click();
   await expect(page.locator('#slot-grid .slot-tile[data-slot="0"] .slot-heatmap-value')).toBeVisible();
 
   await expect(page.locator("#refresh-button")).toBeDisabled();
   expect(consoleErrors).toEqual([]);
+  expect(outboundRequests).toEqual([]);
 });
 
 test("current-source heat-map overlays win the face and empty-bay cascade", async ({ page }) => {

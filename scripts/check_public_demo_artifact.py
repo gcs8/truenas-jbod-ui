@@ -7,87 +7,88 @@ import re
 import sys
 
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from scripts.public_demo_source_parity import check_source_parity_manifest  # noqa: E402
+
+
 DEFAULT_DEMO_DIR = Path("public-demo")
 DEFAULT_MAX_RAW_BYTES = 8 * 1024 * 1024
 DEFAULT_MAX_GZIP_BYTES = 1_835_008
-
 PRIVATE_IPV4_PATTERN = re.compile(
-    r"(?<![0-9])"
-    r"(?:10|192\.168|172\.(?:1[6-9]|2[0-9]|3[01]))"
+    r"(?<![0-9])(?:10|192\.168|172\.(?:1[6-9]|2[0-9]|3[01]))"
     r"\.(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])"
-    r"\.(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])"
-    r"(?![0-9])"
+    r"\.(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])(?![0-9])"
 )
-
 SENSITIVE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("private IPv4 address", PRIVATE_IPV4_PATTERN),
-    ("API key environment name", re.compile(r"\b(?:TRUENAS_API_KEY|API_KEY|SECRET_KEY)\b")),
+    (
+        "non-empty credential value",
+        re.compile(r'(?i)"(?:api_key|api_password|password|secret|token)"\s*:\s*"(?!")'),
+    ),
     ("private key block", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
     ("OpenSSH key material", re.compile(r"\bOPENSSH PRIVATE KEY\b")),
-    ("known live disk serial", re.compile(r"\b(?:S464NB0K900412E|PHKM8522005N200E|SMC0515D93717D7B1810)\b")),
-    ("known live SAS/NAA identifier", re.compile(r"\b500304801f(?:5a00bf|715f3f|5a003f)\b", re.IGNORECASE)),
+    ("non-demo serial", re.compile(r"(?i)\bserial(?:_number)?[\"']?\s*[:=]\s*[\"'](?!DEMO-|null)[^\"']+")),
 )
-
 REQUIRED_MARKERS: tuple[str, ...] = (
     "Frozen Sanitized Snapshot",
     "Artifact app v",
     "Capture time",
-    "Live-derived CORE 60-bay sample",
-    "Scrambled IDs",
-    "4x NVMe Carrier Card",
-    "Boot SATADOMs",
+    "Synthetic IDs",
+    "Demo 60-Bay Top Loader",
+    "Demo 4x NVMe Carrier",
+    "Demo Boot Modules",
     "mirror-8",
 )
-
 FORBIDDEN_MARKERS: tuple[tuple[str, str], ...] = (
     ("snapshot Storage Fabric route action", 'id="sas-fabric-view-link"'),
+    ("live-derived provenance claim", "Live-derived"),
+    ("local history dependency", "history/history.db"),
 )
+ARTIFACT_VERSION_PATTERN = re.compile(r"\bArtifact app v(?P<version>[0-9A-Za-z][0-9A-Za-z.+-]*)\b")
+SOURCE_VERSION_PATTERN = re.compile(
+    r'^__version__\s*=\s*["\'](?P<version>[0-9A-Za-z][0-9A-Za-z.+-]*)["\']\s*$',
+    re.MULTILINE,
+)
+
+
+def read_source_version(source_root: Path) -> str:
+    version_path = source_root / "app" / "__init__.py"
+    try:
+        source = version_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"unable to read source version: {version_path}") from exc
+    match = SOURCE_VERSION_PATTERN.search(source)
+    if match is None:
+        raise ValueError(f"unable to parse source version: {version_path}")
+    return match.group("version")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Check that the checked-in public demo artifact is publishable.",
-    )
+    parser = argparse.ArgumentParser(description="Check that the deterministic checked-in public demo is publishable.")
+    parser.add_argument("demo_dir", nargs="?", type=Path, default=DEFAULT_DEMO_DIR)
+    parser.add_argument("--max-raw-bytes", type=int, default=DEFAULT_MAX_RAW_BYTES)
+    parser.add_argument("--max-gzip-bytes", type=int, default=DEFAULT_MAX_GZIP_BYTES)
     parser.add_argument(
-        "demo_dir",
-        nargs="?",
+        "--source-root",
         type=Path,
-        default=DEFAULT_DEMO_DIR,
-        help="Directory containing the static public demo files.",
-    )
-    parser.add_argument(
-        "--max-raw-bytes",
-        type=int,
-        default=DEFAULT_MAX_RAW_BYTES,
-        help=(
-            "Maximum allowed raw index.html size in bytes. "
-            f"Defaults to {DEFAULT_MAX_RAW_BYTES}; pass 0 to disable."
-        ),
-    )
-    parser.add_argument(
-        "--max-gzip-bytes",
-        type=int,
-        default=DEFAULT_MAX_GZIP_BYTES,
-        help=(
-            "Maximum allowed gzip-9 index.html size in bytes. "
-            f"Defaults to {DEFAULT_MAX_GZIP_BYTES}; pass 0 to disable."
-        ),
+        default=ROOT,
+        help="Repository root containing the centrally declared source graph.",
     )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    demo_dir = args.demo_dir
-    index_path = demo_dir / "index.html"
-    nojekyll_path = demo_dir / ".nojekyll"
-
+    index_path = args.demo_dir / "index.html"
+    nojekyll_path = args.demo_dir / ".nojekyll"
     errors: list[str] = []
     if not index_path.exists():
         errors.append(f"missing {index_path}")
     if not nojekyll_path.exists():
         errors.append(f"missing {nojekyll_path}")
-
     if errors:
         for error in errors:
             print(error, file=sys.stderr)
@@ -96,40 +97,44 @@ def main() -> int:
     raw_bytes = index_path.read_bytes()
     raw_size = len(raw_bytes)
     gzip_size = len(gzip.compress(raw_bytes, compresslevel=9, mtime=0))
-
     if args.max_raw_bytes > 0 and raw_size > args.max_raw_bytes:
-        errors.append(
-            f"public demo artifact raw size {raw_size} exceeds budget {args.max_raw_bytes}"
-        )
+        errors.append(f"public demo artifact raw size {raw_size} exceeds budget {args.max_raw_bytes}")
     if args.max_gzip_bytes > 0 and gzip_size > args.max_gzip_bytes:
-        errors.append(
-            f"public demo artifact gzip size {gzip_size} exceeds budget {args.max_gzip_bytes}"
-        )
+        errors.append(f"public demo artifact gzip size {gzip_size} exceeds budget {args.max_gzip_bytes}")
 
-    html = raw_bytes.decode("utf-8")
-    for marker in REQUIRED_MARKERS:
-        if marker not in html:
-            errors.append(f"missing required marker: {marker}")
-
-    for label, marker in FORBIDDEN_MARKERS:
-        if marker in html:
-            errors.append(f"found forbidden {label}")
-
-    for label, pattern in SENSITIVE_PATTERNS:
-        match = pattern.search(html)
-        if match:
-            excerpt = match.group(0)
-            errors.append(f"found {label}: {excerpt}")
+    try:
+        html = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        errors.append("public demo artifact is not valid UTF-8")
+        html = ""
+    if html:
+        errors.extend(check_source_parity_manifest(html, source_root=args.source_root))
+        try:
+            source_version = read_source_version(args.source_root)
+        except ValueError as exc:
+            errors.append(str(exc))
+            source_version = None
+        for marker in REQUIRED_MARKERS:
+            if marker not in html:
+                errors.append(f"missing required marker: {marker}")
+        versions = {match.group("version") for match in ARTIFACT_VERSION_PATTERN.finditer(html)}
+        if not versions:
+            errors.append("missing parseable artifact app version")
+        for artifact_version in sorted(versions):
+            if source_version is not None and artifact_version != source_version:
+                errors.append(f"artifact app version {artifact_version} does not match source {source_version}")
+        for label, marker in FORBIDDEN_MARKERS:
+            if marker in html:
+                errors.append(f"found forbidden {label}")
+        for label, pattern in SENSITIVE_PATTERNS:
+            if match := pattern.search(html):
+                errors.append(f"found {label}: {match.group(0)[:80]}")
 
     if errors:
         for error in errors:
             print(error, file=sys.stderr)
         return 1
-
-    print(
-        "Public demo artifact is publishable: "
-        f"{index_path} (raw={raw_size} bytes, gzip={gzip_size} bytes)"
-    )
+    print(f"Public demo artifact is publishable: {index_path} (raw={raw_size} bytes, gzip={gzip_size} bytes)")
     return 0
 
 
