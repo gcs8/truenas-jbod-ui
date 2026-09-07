@@ -637,17 +637,19 @@ def _history_payload(
             "power_on_hours": source.power_on_hours or 0,
             "bytes_read": source.bytes_read or 0,
             "bytes_written": source.bytes_written or 0,
+            "annualized_bytes_read": (source.bytes_read or 0) * 4,
+            "annualized_bytes_written": (source.bytes_written or 0) * 4,
         }
         for metric_name, base in bases.items():
             samples: list[dict[str, Any]] = []
             for index, offset in enumerate(offsets):
                 value = base
                 if metric_name == "temperature_c":
-                    value = base + (-1, 0, 1, 0)[index % 4]
+                    value = base if offset == 0 else base + (-1, 0, 1, 0)[index % 4]
                 elif metric_name == "power_on_hours":
                     value = max(0, base - offset)
-                else:
-                    value = max(0, base - (offset * (index + 1) * 1_000_000))
+                elif metric_name in {"bytes_read", "bytes_written"}:
+                    value = max(0, base - (offset * 1_000_000))
                 samples.append(
                     {
                         "observed_at": (fixture.generated_at - timedelta(hours=offset)).isoformat(),

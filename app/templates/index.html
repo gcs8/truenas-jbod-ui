@@ -77,7 +77,7 @@
         <span class="snapshot-banner-fact">{{ snapshot_export_meta.storage_view_count }} saved/virtual views</span>
         {% endif %}
         <span class="snapshot-banner-fact">{{ snapshot_export_meta.metric_sample_count or 0 }} metric samples</span>
-        <span class="snapshot-banner-fact">{{ snapshot_export_meta.smart_summary_count or 0 }} SMART summaries</span>
+        <span class="snapshot-banner-fact">{{ snapshot_export_meta.smart_summary_count or 0 }} slot/view SMART summaries</span>
         <span class="snapshot-banner-fact">{{ snapshot_export_meta.event_count or 0 }} event{% if (snapshot_export_meta.event_count or 0) != 1 %}s{% endif %}</span>
         <span class="snapshot-banner-fact">Downsampling {{ snapshot_export_meta.downsampling_label or "None" }}</span>
       </div>
