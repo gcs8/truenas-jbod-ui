@@ -253,6 +253,8 @@ them before starting the new images.
 - Merged SES element and additional-element evidence by enclosure element
   identity, normalized `eiioe` indexes, and kept multi-enclosure ordering stable
   (#265).
+- Rebuilt the public demo from a deterministic synthetic fixture and separated
+  verification from manual Pages publication (#350).
 
 ### Fixed
 

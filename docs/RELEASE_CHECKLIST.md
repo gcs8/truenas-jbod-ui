@@ -483,9 +483,10 @@ python scripts/validate_release_wrap.py "$version" \
   - record fixture provenance, fixture and artifact hashes, declared-input
     mutation results, privacy scan, and browser result in
     `Docs/wiki/public-demo gate` before tagging
-  - keep exact fixture-byte approval and Pages publication separate; a push to
-    `main` that changes `public-demo/**` deploys the checked-in directory, and
-    the workflow run plus public readback belong later in
+  - keep exact fixture-byte approval and Pages publication separate; pushes to
+    `main` only verify the checked-in directory
+  - publish only through a separately approved `workflow_dispatch` run, then
+    record that workflow plus public readback in
     `Docs/wiki/public-demo publication`
 
 ## Config And Examples

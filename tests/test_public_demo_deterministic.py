@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import importlib
 import json
 import os
@@ -18,14 +19,22 @@ from app import __version__
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_PATH = Path("tests/fixtures/public_demo/public_demo.json")
+LOCAL_PYTHON_PACKAGES = {"admin_service", "app", "history_service", "scripts"}
 EXPECTED_INPUT_PATHS = {
     FIXTURE_PATH,
     Path("app/__init__.py"),
     Path("app/config.py"),
+    Path("app/logging_config.py"),
     Path("app/main.py"),
+    Path("app/metrics.py"),
     Path("app/models/domain.py"),
+    Path("app/perf.py"),
+    Path("app/request_context.py"),
     Path("app/script_json.py"),
+    Path("app/secret_files.py"),
     Path("app/slot_layout.py"),
+    Path("app/services/history_backend.py"),
+    Path("app/services/history_status.py"),
     Path("app/services/profile_registry.py"),
     Path("app/services/public_demo_fixture.py"),
     Path("app/services/snapshot_export.py"),
@@ -38,6 +47,8 @@ EXPECTED_INPUT_PATHS = {
     Path("app/static/style.css"),
     Path("app/templates/base.html"),
     Path("app/templates/index.html"),
+    Path("history_service/operation_bounds.py"),
+    Path("history_service/scheduled_backup.py"),
     Path("app/static/images/aoc-slg4-2h8m2.jpg"),
     Path("app/static/images/hyper-m2-gen3-card.png"),
     Path("app/static/images/satadom-ml-3ie3-v2.png"),
@@ -55,6 +66,69 @@ def run_checker(demo_dir: Path, *, source_root: Path | None = None) -> subproces
         capture_output=True,
         check=False,
     )
+
+
+def recursive_local_python_inputs(entrypoint: Path) -> set[Path]:
+    def resolve_module(module_name: str) -> Path | None:
+        module_path = ROOT.joinpath(*module_name.split("."))
+        for candidate in (module_path.with_suffix(".py"), module_path / "__init__.py"):
+            if candidate.is_file():
+                return candidate
+        return None
+
+    def module_name(path: Path) -> str:
+        parts = list(path.relative_to(ROOT).with_suffix("").parts)
+        if parts[-1] == "__init__":
+            parts.pop()
+        return ".".join(parts)
+
+    pending = [ROOT / entrypoint]
+    discovered: set[Path] = set()
+    while pending:
+        source_path = pending.pop()
+        relative_path = source_path.relative_to(ROOT)
+        if relative_path in discovered:
+            continue
+        discovered.add(relative_path)
+        current_module = module_name(source_path)
+        package = current_module if source_path.name == "__init__.py" else current_module.rsplit(".", 1)[0]
+        parsed = ast.parse(source_path.read_text(encoding="utf-8"), filename=relative_path.as_posix())
+        candidates: list[str] = []
+        for node in ast.walk(parsed):
+            if isinstance(node, ast.Import):
+                candidates.extend(alias.name for alias in node.names)
+                continue
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            base = node.module or ""
+            if node.level:
+                package_parts = package.split(".") if package else []
+                keep = max(0, len(package_parts) - (node.level - 1))
+                base = ".".join(package_parts[:keep] + ([base] if base else []))
+            if base:
+                candidates.append(base)
+                candidates.extend(f"{base}.{alias.name}" for alias in node.names if alias.name != "*")
+        for candidate in candidates:
+            if candidate.split(".", 1)[0] not in LOCAL_PYTHON_PACKAGES:
+                continue
+            resolved = resolve_module(candidate)
+            if resolved is not None:
+                pending.append(resolved)
+    return discovered
+
+
+def workflow_paths_for_event(workflow: str, event_name: str) -> set[str]:
+    lines = workflow.splitlines()
+    event_header = f"  {event_name}:"
+    start = lines.index(event_header)
+    paths_start = next(index for index in range(start + 1, len(lines)) if lines[index] == "    paths:")
+    paths: set[str] = set()
+    for line in lines[paths_start + 1 :]:
+        if line.startswith("  ") and not line.startswith("      "):
+            break
+        if line.startswith('      - "') and line.endswith('"'):
+            paths.add(line.removeprefix('      - "').removesuffix('"'))
+    return paths
 
 
 class DeterministicPublicDemoContractTests(unittest.TestCase):
@@ -121,6 +195,13 @@ class DeterministicPublicDemoContractTests(unittest.TestCase):
         self.assertEqual(len(actual), len(set(actual)))
         self.assertEqual(actual, tuple(sorted(actual, key=lambda path: path.as_posix())))
 
+    def test_shared_input_graph_covers_recursive_local_python_imports(self) -> None:
+        module = importlib.import_module("scripts.public_demo_inputs")
+        declared = set(module.PUBLIC_DEMO_INPUT_PATHS)
+        imported = recursive_local_python_inputs(Path("scripts/build_public_demo.py"))
+
+        self.assertEqual(imported - declared, set())
+
     def test_every_declared_input_mutation_invalidates_checked_artifact(self) -> None:
         module = importlib.import_module("scripts.public_demo_inputs")
         input_paths = tuple(module.PUBLIC_DEMO_INPUT_PATHS)
@@ -155,9 +236,25 @@ class DeterministicPublicDemoContractTests(unittest.TestCase):
         module = importlib.import_module("scripts.public_demo_inputs")
         workflow = (ROOT / ".github/workflows/publish-public-demo.yml").read_text(encoding="utf-8")
 
-        for relative_path in module.PUBLIC_DEMO_INPUT_PATHS:
-            with self.subTest(path=relative_path.as_posix()):
-                self.assertIn(f'- "{relative_path.as_posix()}"', workflow)
+        expected_paths = {path.as_posix() for path in module.PUBLIC_DEMO_INPUT_PATHS}
+        expected_paths.update(
+            {
+                ".github/workflows/publish-public-demo.yml",
+                "public-demo/**",
+                "qa/public-demo.spec.js",
+                "scripts/build_current_source_browser_fixture.py",
+                "scripts/check_public_demo_artifact.py",
+            }
+        )
+        for event_name in ("pull_request", "push"):
+            with self.subTest(event_name=event_name):
+                self.assertEqual(workflow_paths_for_event(workflow, event_name), expected_paths)
+
+    def test_pages_deploy_requires_manual_dispatch(self) -> None:
+        workflow = (ROOT / ".github/workflows/publish-public-demo.yml").read_text(encoding="utf-8")
+
+        self.assertNotIn("if: github.event_name != 'pull_request'", workflow)
+        self.assertEqual(workflow.count("if: github.event_name == 'workflow_dispatch'"), 3)
 
     def test_docs_define_deterministic_regeneration_and_publication_boundaries(self) -> None:
         public_readme = (ROOT / "public-demo/README.md").read_text(encoding="utf-8")
@@ -168,9 +265,11 @@ class DeterministicPublicDemoContractTests(unittest.TestCase):
         for document in (public_readme, contributor_rails, release_checklist):
             self.assertIn("tests/fixtures/public_demo/public_demo.json", document)
             self.assertIn("python scripts/build_public_demo.py --output public-demo/index.html", document)
+            self.assertIn("workflow_dispatch", document)
         self.assertIn("does not publish", public_readme)
+        self.assertIn("do not deploy", public_readme)
         self.assertIn("public-demo/**", pull_request_template)
-        self.assertIn("deploys GitHub Pages", pull_request_template)
+        self.assertIn("do not deploy GitHub Pages", pull_request_template)
 
     def test_fixture_is_schema_bounded_and_rejects_unknown_fields(self) -> None:
         fixture_module = importlib.import_module("app.services.public_demo_fixture")

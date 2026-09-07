@@ -483,10 +483,10 @@ python scripts/check_public_demo_artifact.py public-demo
 PUBLIC_DEMO_ARTIFACT=public-demo/index.html npx playwright test qa/public-demo.spec.js
 ```
 
-A local build does not publish. Pull requests run verification only. A push to
-`main` that changes `public-demo/**` triggers the Pages deployment workflow, so
-commit, push, merge, exact-byte approval, publication, and readback must be
-recorded as separate gates.
+A local build does not publish. Pull requests and pushes to `main` run
+verification only and do not deploy. An owner-approved `workflow_dispatch` run
+publishes the reviewed `public-demo/**` bytes. Commit, push, merge, exact-byte
+approval, publication, and public readback remain separate gates.
 
 ## Live Data Cautions
 

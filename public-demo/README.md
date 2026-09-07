@@ -28,12 +28,12 @@ embedded JavaScript and CSS, privacy rules, removed-code rules, and size limits.
 Change fixture data in the checked-in JSON, not in generated HTML. Do not edit
 `public-demo/index.html` by hand.
 
-Running the builder locally does not publish anything. A pull request runs the
-verification job without deployment. A push to `main` that changes
-`public-demo/**` starts `.github/workflows/publish-public-demo.yml` and deploys
-that exact checked-in directory to GitHub Pages. Commit, push, merge, Pages
-publication, and public readback remain separate approval and verification
-gates.
+Running the builder locally does not publish anything. Pull requests and pushes
+to `main` run the verification job but do not deploy. Publishing the exact
+checked-in directory to GitHub Pages requires a separately approved
+`workflow_dispatch` run of `.github/workflows/publish-public-demo.yml`. Commit,
+push, merge, Pages publication, and public readback remain separate approval and
+verification gates.
 
 Local-history conversion is not part of normal generation. If maintainers add a
 future conversion tool, it must require explicit opt-in, write the bounded
