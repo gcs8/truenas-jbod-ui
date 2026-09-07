@@ -399,6 +399,8 @@ them before starting the new images.
 
 ### Docs
 
+- Replaced deployment and operations guides with current `v0.22.2` container,
+  authentication, backup, history, and platform procedures (#383).
 - Aligned contributor and release guidance with the current CI gates, task
   authority, and release-wrap steps (#160).
 - Added a public hardware-report issue template and the sanitized fixture-intake

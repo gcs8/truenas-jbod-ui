@@ -43,6 +43,27 @@ SEGMENTED_HISTORY_CLI_PATHS = (
     "scripts/query_segmented_history.py",
     "scripts/seal_history_segment.py",
 )
+PUBLIC_DOCUMENT_PATHS = (
+    "README.md",
+    *tuple(
+        sorted(
+            str(path.relative_to(REPO_ROOT))
+            for path in (REPO_ROOT / "wiki").glob("*.md")
+        )
+    ),
+)
+
+
+def generated_policy_block(document: str, platform: str) -> str:
+    match = re.search(
+        rf"(?ms)^<!-- generated-bootstrap-policy:{re.escape(platform)}:start -->\n"
+        rf"```text\n(.*?)\n```\n"
+        rf"<!-- generated-bootstrap-policy:{re.escape(platform)}:end -->$",
+        document,
+    )
+    if match is None:
+        return ""
+    return match.group(1)
 
 
 def writable_volume_targets(service: dict[str, Any]) -> set[str]:
@@ -58,6 +79,256 @@ def writable_volume_targets(service: dict[str, Any]) -> set[str]:
 
 
 class ContainerResourceContractTests(unittest.TestCase):
+    def test_public_docs_remove_obsolete_ssh_config_and_unsafe_permission_examples(self) -> None:
+        docs = "\n".join(
+            (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+            for relative_path in PUBLIC_DOCUMENT_PATHS
+        )
+
+        self.assertNotIn("known_hosts_path:", docs)
+        self.assertNotRegex(docs, r"strict_host_key_checking:\s*false")
+        self.assertNotIn("/usr/bin/qs *", docs)
+        self.assertNotRegex(docs, r"(?m)smartctl\s+\*$")
+        self.assertNotRegex(docs, r"(?m)sg_ses\s+\*$")
+        self.assertNotRegex(
+            docs,
+            r"install(?:[^\n]|\\\n)*-m 0600(?:[^\n]|\\\n)*known_hosts",
+        )
+
+    def test_ssh_guide_embeds_exact_current_bootstrap_policy_previews(self) -> None:
+        from admin_service.services.account_bootstrap import ServiceAccountBootstrapService
+
+        guide = (REPO_ROOT / "wiki/SSH-Setup-and-Sudo.md").read_text(encoding="utf-8")
+        for platform in ("core", "scale", "linux", "quantastor"):
+            with self.subTest(platform=platform):
+                expected = str(
+                    ServiceAccountBootstrapService.build_sudoers_preview(
+                        "jbodmap",
+                        platform,
+                    )["content"]
+                ).rstrip("\n")
+                self.assertEqual(generated_policy_block(guide, platform), expected)
+
+        self.assertIn("sudo 1.9.10 or newer", guide)
+        self.assertRegex(guide, r"(?i)older hosts?[^.]+exact per-device")
+
+    def test_platform_guides_use_the_canonical_generated_bootstrap_policy(self) -> None:
+        for relative_path in (
+            "wiki/TrueNAS-CORE-Setup.md",
+            "wiki/TrueNAS-SCALE-Setup.md",
+            "wiki/Generic-Linux-Setup.md",
+            "wiki/Quantastor-Setup.md",
+        ):
+            guide = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+            with self.subTest(guide=relative_path):
+                self.assertIn("[[SSH Setup and Sudo|SSH-Setup-and-Sudo]]", guide)
+                self.assertNotIn("jbodmap ALL=(root) NOPASSWD:", guide)
+                self.assertNotIn("midclt call user.update USER_ID", guide)
+
+    def test_strict_host_key_docs_preload_every_target_with_nonroot_readable_ownership(self) -> None:
+        ssh_guide = (REPO_ROOT / "wiki/SSH-Setup-and-Sudo.md").read_text(encoding="utf-8")
+        quantastor_guide = (REPO_ROOT / "wiki/Quantastor-Setup.md").read_text(encoding="utf-8")
+
+        self.assertIn("derived from the runtime layout", ssh_guide)
+        self.assertIn("`/app/data/known_hosts`", ssh_guide)
+        self.assertIn('-o "$app_uid" -g "$app_gid" -m 0660', ssh_guide)
+        self.assertRegex(ssh_guide, r"(?i)strict[^.]+preload")
+        self.assertRegex(quantastor_guide, r"(?i)preload[^.]+every HA node")
+        self.assertIn("strict_host_key_checking: true", quantastor_guide)
+
+    def test_strict_host_key_docs_preserve_existing_targets_before_install(self) -> None:
+        ssh_guide = (REPO_ROOT / "wiki/SSH-Setup-and-Sudo.md").read_text(encoding="utf-8")
+
+        ordered_steps = (
+            'known_hosts_scan="$(mktemp)"',
+            'known_hosts_merged="$(mktemp)"',
+            'ssh-keyscan -H "$ssh_host" > "$known_hosts_scan"',
+            'ssh-keygen -lf "$known_hosts_scan"',
+            'sudo cat data/known_hosts > "$known_hosts_merged"',
+            'cat "$known_hosts_scan" >> "$known_hosts_merged"',
+            'sudo install -o "$app_uid" -g "$app_gid" -m 0660 "$known_hosts_merged" data/known_hosts',
+        )
+        positions = [ssh_guide.index(step) for step in ordered_steps]
+
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn("if sudo test -f data/known_hosts; then", ssh_guide)
+        self.assertNotRegex(
+            ssh_guide,
+            r'install[^\n]+"\$known_hosts_scan"[^\n]+data/known_hosts',
+        )
+
+    def test_nonroot_ssh_docs_use_the_configured_identity_and_exact_target_host(self) -> None:
+        ssh_guide = (REPO_ROOT / "wiki/SSH-Setup-and-Sudo.md").read_text(encoding="utf-8")
+        troubleshooting = (REPO_ROOT / "wiki/Troubleshooting.md").read_text(encoding="utf-8")
+
+        for guide in (ssh_guide, troubleshooting):
+            self.assertIn('app_uid="${APP_UID:-10001}"', guide)
+            self.assertIn('app_gid="${APP_GID:-10001}"', guide)
+
+        self.assertIn('ssh_host="storage-host.example.test"', ssh_guide)
+        self.assertIn('ssh-keyscan -H "$ssh_host"', ssh_guide)
+        self.assertIn("host: storage-host.example.test", ssh_guide)
+        self.assertNotIn(".local", ssh_guide)
+        self.assertIn('-o "$app_uid" -g "$app_gid" -m 0660', ssh_guide)
+        self.assertNotIn("-o 10001 -g 10001", ssh_guide)
+        self.assertIn('--uid "$app_uid" --gid "$app_gid"', troubleshooting)
+        self.assertNotIn("--uid 10001 --gid 10001", troubleshooting)
+        self.assertNotIn("owned by `10001:10001`", troubleshooting)
+
+    def test_published_install_guides_pair_v0222_compose_and_image(self) -> None:
+        for relative_path in (
+            "README.md",
+            "wiki/Quick-Start.md",
+            "wiki/Docker-and-GHCR-Deployment.md",
+        ):
+            guide = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+            with self.subTest(guide=relative_path):
+                self.assertIn(
+                    "https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/v0.22.2/docker-compose.yml",
+                    guide,
+                )
+                self.assertIn("ghcr.io/gcs8/truenas-jbod-ui:v0.22.2", guide)
+                self.assertRegex(guide, r"(?i)current `main`[^.]+source build")
+
+        docs = "\n".join(
+            (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+            for relative_path in PUBLIC_DOCUMENT_PATHS
+        )
+        self.assertNotIn("v0.22.3", docs)
+        self.assertNotRegex(docs, r"JBOD_UI_IMAGE=[^\n]*v0\.18\.0")
+
+    def test_admin_guides_match_current_origin_startup_and_read_ui_write_policy(self) -> None:
+        for relative_path in (
+            "README.md",
+            "wiki/Quick-Start.md",
+            "wiki/Docker-and-GHCR-Deployment.md",
+            "wiki/Admin-UI-and-System-Setup.md",
+        ):
+            guide = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+            with self.subTest(guide=relative_path):
+                self.assertIn("ADMIN_PUBLIC_ORIGIN", guide)
+                self.assertRegex(guide, r"(?i)refuses to start")
+
+        for relative_path in (
+            "README.md",
+            "wiki/Quick-Start.md",
+            "wiki/Docker-and-GHCR-Deployment.md",
+        ):
+            guide = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+            with self.subTest(guide=relative_path):
+                self.assertIn("ADMIN_AUTH_MODE=network", guide)
+                self.assertIn("ADMIN_AUTH_MODE=basic", guide)
+                self.assertRegex(guide, r"(?i)write controls disabled")
+                self.assertRegex(guide, r"(?i)starts?[^.]+signed out")
+
+    def test_admin_guides_distinguish_application_and_compose_auto_stop_defaults(self) -> None:
+        for relative_path in (
+            "wiki/Admin-UI-and-System-Setup.md",
+            "wiki/Docker-and-GHCR-Deployment.md",
+            "wiki/Backup-Restore-and-Debug-Bundles.md",
+        ):
+            guide = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+            with self.subTest(guide=relative_path):
+                self.assertRegex(guide, r"(?i)application default[^.]+`0`")
+                self.assertRegex(guide, r"(?i)compose[^.]+`3600`")
+
+    def test_backup_docs_match_plaintext_and_scheduled_archive_contracts(self) -> None:
+        guide = (REPO_ROOT / "wiki/Backup-Restore-and-Debug-Bundles.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertRegex(guide, r"(?i)full backup exports?[^.]+encrypted by default")
+        self.assertIn("ADMIN_ALLOW_PLAINTEXT_BACKUP_EXPORT=true", guide)
+        self.assertRegex(guide, r"(?i)includes? `history_db`[^.]+`.7z`")
+        self.assertRegex(guide, r"(?i)without `history_db`[^.]+`.tar.zst.enc`")
+        self.assertNotIn("It publishes `.tar.zst.enc` bundles.", guide)
+
+    def test_segmented_recovery_docs_are_version_gated_and_fail_closed(self) -> None:
+        export_guide = (REPO_ROOT / "wiki/History-and-Snapshot-Export.md").read_text(
+            encoding="utf-8"
+        )
+        maintenance_guide = (
+            REPO_ROOT / "wiki/History-Maintenance-and-Recovery.md"
+        ).read_text(encoding="utf-8")
+
+        for script_path in SEGMENTED_HISTORY_CLI_PATHS:
+            self.assertIn(f"`/app/{script_path}`", export_guide)
+        self.assertRegex(export_guide, r"(?i)v0\.22\.2[^.]+does not contain")
+        self.assertRegex(export_guide, r"(?i)current `main`[^.]+source-build image")
+        self.assertRegex(maintenance_guide, r"(?i)segmented history[^.]+fail closed")
+        self.assertNotIn("qs-cryostorage", maintenance_guide)
+
+    def test_snapshot_redaction_docs_state_alias_mask_and_review_boundaries(self) -> None:
+        guide = (REPO_ROOT / "wiki/History-and-Snapshot-Export.md").read_text(
+            encoding="utf-8"
+        )
+
+        for expected in (
+            "system and enclosure names and IDs",
+            "serial",
+            "WWN",
+            "SAS",
+            "IPv4",
+            "canonical, uncompressed IPv6",
+            "compressed IPv6",
+            "model",
+            "firmware",
+        ):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, guide)
+
+    def test_profile_docs_cover_current_layout_fields_and_values(self) -> None:
+        guide = (REPO_ROOT / "wiki/Profiles-and-Custom-Layouts.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("slot_number_base", guide)
+        for value in (
+            "generic",
+            "top-loader",
+            "drawer",
+            "front-drive",
+            "rear-drive",
+            "unifi-drive",
+            "nvme-carrier",
+        ):
+            with self.subTest(face_style=value):
+                self.assertIn(f"`{value}`", guide)
+        self.assertRegex(guide, r"(?i)sparse[^.]+`null`|`null`[^.]+sparse")
+        self.assertNotIn("later-work schema", guide)
+
+    def test_wiki_links_architecture_screenshots_and_publish_commands_are_current(self) -> None:
+        wiki_docs = {
+            path.name: path.read_text(encoding="utf-8")
+            for path in (REPO_ROOT / "wiki").glob("*.md")
+        }
+        combined = "\n".join(wiki_docs.values())
+
+        self.assertNotIn("../docs/", combined)
+        self.assertIn(
+            "https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/ADMIN_TRUST_BOUNDARY.md",
+            combined,
+        )
+        architecture = wiki_docs["Architecture-and-Services.md"]
+        self.assertNotIn("Admin --> Logs", architecture)
+        for path in ("./backups", "./backup-status", "./config/backup-secrets"):
+            self.assertIn(path, architecture)
+        self.assertIn("historical v0.18", (REPO_ROOT / "README.md").read_text(encoding="utf-8"))
+        self.assertIn("historical v0.18", wiki_docs["Visual-Tour.md"])
+        self.assertIn("capture_visual_tour_screenshots.py", wiki_docs["Publishing-the-Wiki.md"])
+
+    def test_troubleshooting_covers_current_auth_export_and_nonroot_failures(self) -> None:
+        guide = (REPO_ROOT / "wiki/Troubleshooting.md").read_text(encoding="utf-8")
+        for expected in (
+            "Read UI mutations require ADMIN_AUTH_MODE=basic.",
+            "Cross-origin admin mutation rejected.",
+            "Plaintext backup export is disabled.",
+            "permission denied",
+            "prepare_nonroot_bind_mounts.py",
+        ):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, guide)
+
     def test_documented_segmented_history_cli_sources_exist(self) -> None:
         runbook = (REPO_ROOT / "docs/SEGMENTED_HISTORY_V2.md").read_text(encoding="utf-8")
         documented_paths = set(
@@ -654,7 +925,10 @@ class ContainerResourceContractTests(unittest.TestCase):
 
         self.assertIn("default non-root UI and history services", env_example)
         self.assertIn("Default non-root runtime", deployment_guide)
-        self.assertRegex(deployment_guide, r"before\s+the first v0\.22\.3 start")
+        self.assertRegex(
+            deployment_guide,
+            r"(?i)current `main` source build[^.]+ownership helper",
+        )
         self.assertIn("prepare_nonroot_bind_mounts.py", readme)
         self.assertIn("prepare_nonroot_bind_mounts.py", quick_start)
         self.assertIn("--apply", quick_start)
@@ -774,7 +1048,12 @@ class ContainerResourceContractTests(unittest.TestCase):
         ):
             guide = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
             with self.subTest(guide=relative_path):
-                self.assertIn("../docs/ADMIN_TRUST_BOUNDARY.md", guide)
+                self.assertIn(
+                    "https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/ADMIN_TRUST_BOUNDARY.md",
+                    guide,
+                )
+                self.assertIn("ADMIN_PUBLIC_ORIGIN", guide)
+                self.assertRegex(guide, r"(?i)refuses to start")
                 self.assertIn("trusted operator", guide)
                 self.assertIn("Docker socket", guide)
                 self.assertIn("Auto-stop limits exposure; it is not authentication", guide)

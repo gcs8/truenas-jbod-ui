@@ -32,16 +32,12 @@ cd /docker-local/truenas-jbod-ui
 mkdir -p config/ssh data history/backups/long-term logs
 ```
 
-## 2. Download the Compose file and ownership helper
+## 2. Download the v0.22.2 Compose file
 
 ```bash
-mkdir -p scripts
 curl -fsSL \
   -o compose.yaml \
-  https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/main/docker-compose.yml
-curl -fsSL \
-  -o scripts/prepare_nonroot_bind_mounts.py \
-  https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/main/scripts/prepare_nonroot_bind_mounts.py
+  https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/v0.22.2/docker-compose.yml
 ```
 
 That Compose file runs the public image from:
@@ -59,7 +55,7 @@ For a simple single-system TrueNAS CORE install:
 ```bash
 cat > .env <<'EOF'
 APP_PORT=8080
-JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:latest
+JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.22.2
 
 TRUENAS_HOST=https://truenas.example.local
 TRUENAS_API_KEY=replace_me
@@ -81,18 +77,17 @@ Edit the values before starting:
 Start with CORE or SCALE here. Less common adapters are covered on their
 platform-specific setup pages so this first-run path stays focused.
 
-## 4. Prepare, pull, and start
+## 4. Pull and start
 
 ```bash
-sudo python scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001
-sudo python scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001 --apply
 docker compose pull
 docker compose up -d
 ```
 
-The dry run must pass before `--apply`. The base Compose file runs UI and
-history as `10001:10001`, so these ownership steps are required for a fresh
-install and before the first v0.22.3 start of an older root-owned deployment.
+This published path pairs the v0.22.2 Compose file with the v0.22.2 image. Do
+not download Compose from current `main` while running the stable v0.22.2
+image. The current `main` non-root layout has different ownership requirements
+and belongs to the source build below.
 
 Open:
 
@@ -114,7 +109,7 @@ Expected shape:
 
 ## Updates
 
-If you use `latest`, updates are the normal Compose flow:
+For the v0.22.2 pair, updates are the normal Compose flow:
 
 ```bash
 cd /docker-local/truenas-jbod-ui
@@ -122,13 +117,10 @@ docker compose pull
 docker compose up -d
 ```
 
-When crossing from v0.22.2 or older to v0.22.3, stop the stack and run the
-ownership helper's dry run and `--apply` commands above before recreating it.
-
 If you pin a version, edit `JBOD_UI_IMAGE` in `.env` first:
 
 ```dotenv
-JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.18.0
+JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.22.2
 ```
 
 Then run:
@@ -164,11 +156,26 @@ The admin UI is optional. Turn it on when you want guided setup, storage-view
 editing, backups/restores, runtime controls, or the profile builder.
 
 Before starting it, read the
-[Admin trust boundary](../docs/ADMIN_TRUST_BOUNDARY.md). The default network
+[Admin trust boundary](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/ADMIN_TRUST_BOUNDARY.md).
+On current `main`, set `ADMIN_PUBLIC_ORIGIN` to the exact scheme, host, and port
+shown in the browser for the admin UI. The admin service refuses to start when
+that value is missing or malformed. The default network
 mode has no application login and treats every client that can reach port
 `8082` as a trusted operator. The mounted Docker socket gives the sidecar
 host-level container authority. Restrict network reachability to trusted
 operators. Auto-stop limits exposure; it is not authentication.
+
+Current `main` also ships the read-UI write policy. In
+`ADMIN_AUTH_MODE=network`, reads remain available but the write controls disabled
+by policy include mapping, alias, import, locator, and LED changes. Set
+`ADMIN_AUTH_MODE=basic`, shared credentials, and the exact `APP_PUBLIC_ORIGIN`
+to enable them. Each live page starts signed out. Sign in on that page before a
+write; credentials stay in page memory and clear on reload or sign-out.
+
+Those startup, disabled-control, and in-page sign-in behaviors are current-main
+behavior. The v0.22.2 image used by the published path above predates them, so
+keep that release restricted to trusted networks rather than relying on those
+controls.
 
 ```bash
 docker compose --profile admin pull
@@ -206,7 +213,7 @@ When you are ready, use the setup page for your platform:
 - [[TrueNAS SCALE Setup|TrueNAS-SCALE-Setup]]
 - [[Generic Linux Setup|Generic-Linux-Setup]]
 
-## Advanced: Source Builds
+## Advanced: Current-main source builds
 
 Clone the repo only if you are developing, testing branch changes, or
 intentionally building the image yourself.
@@ -216,8 +223,8 @@ git clone https://github.com/gcs8/truenas-jbod-ui.git
 cd truenas-jbod-ui
 cp .env.example .env
 cp config/config.example.yaml config/config.yaml
-sudo python scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001
-sudo python scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001 --apply
+sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001
+sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001 --apply
 ```
 
 Edit `.env` before the first start; values in `.env` override matching YAML settings.

@@ -18,6 +18,9 @@ Public demo:
 
 ## Screenshots
 
+These are historical v0.18 screenshots. They remain useful for orientation,
+but they do not show every current-main control or policy.
+
 ### Archive CORE
 
 ![Archive CORE overview](docs/images/screenshots/core-overview-v0.18.0.png)
@@ -73,19 +76,25 @@ Public demo:
 ```bash
 mkdir -p /docker-local/truenas-jbod-ui/{config/ssh,data,history/backups/long-term,logs}
 cd /docker-local/truenas-jbod-ui
-curl -fsSL -o compose.yaml https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/main/docker-compose.yml
-mkdir -p scripts
-curl -fsSL -o scripts/prepare_nonroot_bind_mounts.py https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/main/scripts/prepare_nonroot_bind_mounts.py
-sudo python scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001
-sudo python scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001 --apply
+curl -fsSL -o compose.yaml https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/v0.22.2/docker-compose.yml
 # create .env with your TRUENAS_HOST / TRUENAS_API_KEY first
+printf '%s\n' 'JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.22.2' >> .env
 docker compose pull
 docker compose up -d
 ```
 
+The Compose file and image above are both from v0.22.2. Do not mix a Compose
+file from current `main` with that stable image. Use the source build below when
+you need current-main behavior.
+
 Optional services from the published image:
 
-Before starting the admin profile, read the
+The authentication behavior below describes the current `main` source build and
+the next release, not v0.22.2. The v0.22.2 image predates the startup origin
+requirement and read-UI disabled-write policy. Keep that stable release on a
+trusted network.
+
+Before starting the current-main admin profile, read the
 [Admin Trust Boundary](docs/ADMIN_TRUST_BOUNDARY.md). Its default network mode
 assumes every client that can reach port `8082` is a trusted operator. Set
 `ADMIN_PUBLIC_ORIGIN` in `.env` to the exact origin your browser shows for the
@@ -123,15 +132,15 @@ Open:
 
 ### Build from source
 
-Use this only for development or branch testing.
+Use this current `main` source build only for development or branch testing.
 
 ```bash
 git clone https://github.com/gcs8/truenas-jbod-ui.git
 cd truenas-jbod-ui
 cp .env.example .env
 cp config/config.example.yaml config/config.yaml
-sudo python scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001
-sudo python scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001 --apply
+sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001
+sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001 --apply
 ```
 
 Edit `.env` before the first start; values in `.env` override matching YAML settings.

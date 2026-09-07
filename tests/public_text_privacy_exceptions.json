@@ -795,14 +795,7 @@
     },
     "reason": "Reviewed operator-documentation example; exact detector counts are pinned."
   },
-  "wiki/SSH-Setup-and-Sudo.md": {
-    "findings": {
-      "internal_hostname": {
-        "sha256:9571ab60f5bbef2ef59f1953417ebb2f5c779a8d1af796172833fbdf07dbceb7": 4
-      }
-    },
-    "reason": "Reviewed operator-documentation example; exact detector counts are pinned."
-  },
+
   "wiki/Troubleshooting.md": {
     "findings": {
       "sas_wwn_identifier": {

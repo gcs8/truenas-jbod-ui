@@ -56,7 +56,7 @@ runtime service rather than a dev-only helper.
 3. In SSH enrichment:
    - enable SSH if you want `qs`, `smartctl`, or `sg_ses` detail
    - turn on the Quantastor HA cluster checkbox
-   - use `Load Nodes from Quantastor API` to populate the node ids, labels, and
+   - use `Load Nodes From Quantastor API` to populate the node ids, labels, and
      any API-advertised node hostnames/IPs
    - keep the shared API or grid-management VIP out of SSH targeting
    - the app auto-adds HA node SSH candidates from API `hostname`, main IP,
@@ -106,8 +106,7 @@ like this:
     port: 22
     user: jbodmap
     key_path: /run/ssh/id_jbodmap
-    known_hosts_path: /app/data/known_hosts
-    strict_host_key_checking: false
+    strict_host_key_checking: true
     timeout_seconds: 15
     commands: []
   storage_views:
@@ -156,6 +155,12 @@ Notes:
 - `ssh.commands` usually stays blank for Quantastor unless you have a custom
   reason to override the platform-owned defaults
 - `binding.target_system_id` is what pins a storage view to one HA node
+- strict checking does not learn keys on first connection; preload and verify
+  every HA node in the shared derived `known_hosts` file before enabling SSH
+
+Use the ownership-safe preload procedure in [[SSH Setup and
+Sudo|SSH-Setup-and-Sudo]]. Keep `strict_host_key_checking: true`; do not bypass
+pinning to bootstrap a node.
 
 ## Prepare The SSH User
 
@@ -178,43 +183,19 @@ Expected shape:
 - `which qs` returns `/usr/bin/qs`
 - `~/.qs.cnf` exists for local CLI auth
 
-## Add The Useful `sudoers` Rules
+## Add the bounded sudo policy
 
-The app does not need blanket root, but Quantastor is much more useful when the
-SSH user can run `smartctl` and `sg_ses` without a password.
+Use the complete generated QuantaStor policy in [[SSH Setup and
+Sudo|SSH-Setup-and-Sudo]]. It matches the current one-time bootstrap. The
+policy includes `sg_ses -p aes`, `sg_ses -p ec`, `sg_ses --join --filter`,
+identify on/off, and all current bounded `smartctl` forms. It does not grant
+`qs` as root because the application runs its read-only `qs` inventory commands
+directly as the service account.
 
-SMART:
-
-The anchored command regexes require sudo 1.9.10 or newer. On an older node,
-enumerate exact device commands instead of using argument wildcards.
-
-```bash
-sudo tee /etc/sudoers.d/jbodmap-smartctl >/dev/null <<'EOF'
-Defaults:jbodmap !requiretty
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl ^-x -j /dev/sd[a-z]+$
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl ^-x /dev/sd[a-z]+$
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl ^-x -j /dev/disk/by-id/scsi-[A-Za-z0-9_.:+-]+$
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl ^-x /dev/disk/by-id/scsi-[A-Za-z0-9_.:+-]+$
-EOF
-
-sudo chmod 440 /etc/sudoers.d/jbodmap-smartctl
-sudo visudo -cf /etc/sudoers.d/jbodmap-smartctl
-```
-
-SES and identify LEDs:
-
-```bash
-sudo tee /etc/sudoers.d/jbodmap-sg_ses >/dev/null <<'EOF'
-Defaults:jbodmap !requiretty
-jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses ^-p aes /dev/sg[0-9]+$
-jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses ^-p ec /dev/sg[0-9]+$
-jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses ^--dev-slot-num=[0-9]+ --set=ident /dev/sg[0-9]+$
-jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses ^--dev-slot-num=[0-9]+ --clear=ident /dev/sg[0-9]+$
-EOF
-
-sudo chmod 440 /etc/sudoers.d/jbodmap-sg_ses
-sudo visudo -cf /etc/sudoers.d/jbodmap-sg_ses
-```
+The anchored command regexes require sudo 1.9.10 or newer. On older nodes,
+enumerate exact per-device commands rather than using argument wildcards. Save
+the generated policy as one mode-`0440` file and run `visudo -cf` before
+installing it.
 
 ## Sanity-Check The Node Capabilities
 

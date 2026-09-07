@@ -29,7 +29,8 @@ Open the admin sidecar on `:8082` for these workflows.
 
 Use a full backup when you may want to restore the app state later.
 
-The default plaintext scope covers core state:
+Full Backup exports are encrypted by default. Core state can be selected without
+the locked secret-material paths:
 
 - `config/config.yaml`
 - `config/profiles.yaml`
@@ -43,7 +44,11 @@ trust roots:
 - imported TLS trust bundles
 - shared `known_hosts`
 
-Selecting any locked path forces encrypted portable `.7z` export. That keeps
+Selecting any locked path forces encrypted portable `.7z` export. An
+unencrypted export containing unsanitized state is rejected unless the operator
+explicitly sets `ADMIN_ALLOW_PLAINTEXT_BACKUP_EXPORT=true` for a trusted local
+deployment. That override does not make the resulting archive safe to share.
+This keeps
 secret material out of plaintext bundles while still letting the admin import
 path restore those same selected files later.
 
@@ -55,11 +60,14 @@ contain carriage returns or line feeds because the 7z prompt is line-oriented.
 ## Optional scheduled state backups
 
 Scheduled backups use a separate one-shot container. The container has no
-published port, network, or Docker socket. A host timer starts it, so the
-privileged admin sidecar keeps its default one-hour auto-stop boundary.
-New scheduled archives use encrypted portable `.7z` and file-backed validation,
-including segmented history. Existing `.tar.zst.enc` scheduled archives remain
-recognized for retention and bounded compatibility restore.
+published port, network, or Docker socket. A host timer starts it. The admin
+application default is `0`, while the shipped Compose files set the Compose
+default to `3600` seconds for the separately launched admin sidecar.
+
+The archive suffix depends on the selected groups. A scheduled backup that
+includes `history_db` uses encrypted portable `.7z`, including segmented
+history. A scheduled backup without `history_db` uses the native encrypted
+`.tar.zst.enc` envelope. Retention and bounded restore accept both formats.
 
 Create a private passphrase file under `config/backup-secrets` and make it
 readable only by its owner. The Compose files mount that directory read-only at
@@ -134,10 +142,10 @@ The runner creates private `0600` files in the destination, verifies the copied
 archive through the normal restore preflight, publishes without overwriting an
 existing name, publishes shared-read-only `0640` status under the prepared
 `2750` directory, and prunes only files matching its owned filename contract. It
-publishes `.tar.zst.enc` bundles. The inner archive is the validated system
-backup format. The outer envelope uses AES-256-GCM with a per-file salt and
-nonce. Import the file through the normal admin restore path and supply the same
-passphrase.
+uses `.7z` when `history_db` is selected. Without `history_db`, the inner archive
+is the validated system backup format and the `.tar.zst.enc` outer envelope uses
+AES-256-GCM with a per-file salt and nonce. Import either file through the normal
+admin restore path and supply the same passphrase.
 
 The repository includes `deploy/systemd/truenas-jbod-system-backup.service` and
 `.timer`. They assume the Compose project is installed at
@@ -192,11 +200,12 @@ archive headroom for the hot file plus all selected segments. Each 7z create,
 verify, list, or extract operation remains bounded to 10 minutes. Archive
 creation uses normal compression with one worker thread.
 
-The native scheduled `.tar.zst.enc` path supports schema 2 and uses the same
-staged restore contract. Schema 2 restore requires the target to configure
+The `.tar.zst.enc` path is used only when `history_db` is not selected. A
+segmented `history_db` backup uses `.7z` schema 2 and the same staged restore
+contract. Schema 2 restore requires the target to configure
 `HISTORY_SEGMENT_CATALOG_PATH`.
 
-See [Segmented history v2](../docs/SEGMENTED_HISTORY_V2.md) for migration,
+See [Segmented history v2](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/SEGMENTED_HISTORY_V2.md) for migration,
 recovery, rollback, catalog, and release-gate details.
 
 ## Restore Pattern
@@ -236,8 +245,10 @@ disabled so private keys and trust material do not accidentally ride along.
 for the current enclosure or storage view.
 
 That is useful when you want someone to inspect a physical slot map without
-connecting to the live app. It is not a restore path and does not carry the full
-local stack state.
+connecting to the live app. Its `Redact sensitive IDs` option applies bounded
+aliases and masks; it leaves some operational text and hardware fields intact,
+so review the file before sharing it. It is not a restore path and does not carry
+the full local stack state.
 
 See [[History and Snapshot Export|History-and-Snapshot-Export]].
 
