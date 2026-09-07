@@ -118,14 +118,17 @@ If current-main UI or history startup reports `permission denied`, stop the
 stack and run the bounded ownership helper from the matching source checkout:
 
 ```bash
-sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001
-sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001 --apply
+app_uid="${APP_UID:-10001}"
+app_gid="${APP_GID:-10001}"
+sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid "$app_uid" --gid "$app_gid"
+sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid "$app_uid" --gid "$app_gid" --apply
 ```
 
-Run the dry check first. Do not use recursive `chmod 777`, and do not run this
-current-main migration against the release-matched v0.22.2 Compose/image pair.
-If SSH then fails to load `known_hosts`, verify that `data/known_hosts` is owned
-by `10001:10001` and uses mode `0660`.
+Run the dry check first. If `.env` overrides `APP_UID` or `APP_GID`, export the
+same values before running the block. Do not use recursive `chmod 777`, and do
+not run this current-main migration against the release-matched v0.22.2
+Compose/image pair. If SSH then fails to load `known_hosts`, verify that
+`data/known_hosts` is owned by the configured app UID/GID and uses mode `0660`.
 
 ## SCALE Shows A Generic Runtime Profile
 

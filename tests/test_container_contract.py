@@ -131,10 +131,28 @@ class ContainerResourceContractTests(unittest.TestCase):
 
         self.assertIn("derived from the runtime layout", ssh_guide)
         self.assertIn("`/app/data/known_hosts`", ssh_guide)
-        self.assertIn("-o 10001 -g 10001 -m 0660", ssh_guide)
+        self.assertIn('-o "$app_uid" -g "$app_gid" -m 0660', ssh_guide)
         self.assertRegex(ssh_guide, r"(?i)strict[^.]+preload")
         self.assertRegex(quantastor_guide, r"(?i)preload[^.]+every HA node")
         self.assertIn("strict_host_key_checking: true", quantastor_guide)
+
+    def test_nonroot_ssh_docs_use_the_configured_identity_and_exact_target_host(self) -> None:
+        ssh_guide = (REPO_ROOT / "wiki/SSH-Setup-and-Sudo.md").read_text(encoding="utf-8")
+        troubleshooting = (REPO_ROOT / "wiki/Troubleshooting.md").read_text(encoding="utf-8")
+
+        for guide in (ssh_guide, troubleshooting):
+            self.assertIn('app_uid="${APP_UID:-10001}"', guide)
+            self.assertIn('app_gid="${APP_GID:-10001}"', guide)
+
+        self.assertIn('ssh_host="storage-host.example.test"', ssh_guide)
+        self.assertIn('ssh-keyscan -H "$ssh_host"', ssh_guide)
+        self.assertIn("host: storage-host.example.test", ssh_guide)
+        self.assertNotIn(".local", ssh_guide)
+        self.assertIn('-o "$app_uid" -g "$app_gid" -m 0660', ssh_guide)
+        self.assertNotIn("-o 10001 -g 10001", ssh_guide)
+        self.assertIn('--uid "$app_uid" --gid "$app_gid"', troubleshooting)
+        self.assertNotIn("--uid 10001 --gid 10001", troubleshooting)
+        self.assertNotIn("owned by `10001:10001`", troubleshooting)
 
     def test_published_install_guides_pair_v0222_compose_and_image(self) -> None:
         for relative_path in (

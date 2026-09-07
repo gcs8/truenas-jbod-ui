@@ -37,15 +37,20 @@ container layout the derived file is `/app/data/known_hosts`.
 Strict checking rejects an unknown key, so preload and verify every SSH target
 before enabling the system. Get each fingerprint through a trusted channel, then
 compare it with the scan before installation. This example preserves the
-current non-root service ownership and group readability:
+configured non-root service ownership and group readability. Run it from the
+deployment directory. If `.env` overrides `APP_UID` or `APP_GID`, export the
+same values in this shell first:
 
 ```bash
+app_uid="${APP_UID:-10001}"
+app_gid="${APP_GID:-10001}"
+ssh_host="storage-host.example.test"
 known_hosts_tmp="$(mktemp)"
 trap 'rm -f "$known_hosts_tmp"' EXIT
-ssh-keyscan -H storage-host.example.test > "$known_hosts_tmp"
+ssh-keyscan -H "$ssh_host" > "$known_hosts_tmp"
 ssh-keygen -lf "$known_hosts_tmp"
 # Compare the fingerprint out of band before installing the file.
-sudo install -o 10001 -g 10001 -m 0660 "$known_hosts_tmp" data/known_hosts
+sudo install -o "$app_uid" -g "$app_gid" -m 0660 "$known_hosts_tmp" data/known_hosts
 rm -f "$known_hosts_tmp"
 trap - EXIT
 ```
@@ -59,7 +64,7 @@ In app config:
 ```yaml
 ssh:
   enabled: true
-  host: storage-host.example.local
+  host: storage-host.example.test
   port: 22
   user: jbodmap
   key_path: /run/ssh/id_truenas
@@ -71,7 +76,7 @@ If the appliance only supports password SSH, set `ssh.password` and leave
 `key_path` empty or unset. Strict host-key checking still needs the verified
 preload above.
 
-For example, a CORE config may use host: `truenas-core-a.example.local`. Verify
+For example, a CORE config may use host: `truenas-core-a.example.test`. Verify
 and preload the key for the actual host name in your own config.
 
 For ESXi specifically, password-only auth is a normal supported case:
