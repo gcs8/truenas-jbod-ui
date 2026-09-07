@@ -3309,6 +3309,7 @@ class InventoryService:
                 await self._run_disk_inventory_sync_command(
                     [midclt, "call", "disk.multipath_sync"],
                     failure_prefix="TrueNAS could not rebuild its multipath table",
+                    timeout_seconds=max(1, int(self.settings.app.disk_inventory_sync_timeout_seconds)),
                 )
                 result = DiskInventorySyncResult(
                     mode=mode,
@@ -3329,9 +3330,15 @@ class InventoryService:
     def _disk_inventory_sync_elapsed(self, started: float) -> float:
         return round(max(0.0, float(self._disk_inventory_sync_clock() - started)), 1)
 
-    async def _run_disk_inventory_sync_command(self, argv: list[str], *, failure_prefix: str) -> Any:
+    async def _run_disk_inventory_sync_command(
+        self,
+        argv: list[str],
+        *,
+        failure_prefix: str,
+        timeout_seconds: float | None = None,
+    ) -> Any:
         command = shlex.join(["sudo", "-n", *argv])
-        result = await self._run_ssh_command(command)
+        result = await self._run_ssh_command(command, timeout_seconds=timeout_seconds)
         if not result.ok:
             detail = (
                 _bounded_middleware_text(result.stderr)
@@ -11853,19 +11860,28 @@ class InventoryService:
             detail = result.stderr.strip() or result.stdout.strip() or "Unknown UniFi SSH LED error."
             raise TrueNASAPIError("SSH LED action failed: " + detail)
 
-    async def _run_ssh_command(self, command: str, host: str | None = None) -> Any:
+    async def _run_ssh_command(
+        self, command: str, host: str | None = None, *, timeout_seconds: float | None = None
+    ) -> Any:
         if not self._ssh_destination_authority_approved(host):
             return self._ssh_authority_failure_results([command])[0]
-        if isinstance(self.ssh_probe, SSHProbe):
+        ssh_probe: Any = self.ssh_probe
+        if isinstance(ssh_probe, SSHProbe):
             async with self._ssh_session_lock_for_host(host):
                 target_host = normalize_text(host)
                 if not target_host or target_host == normalize_text(self.system.ssh.host):
-                    return await self.ssh_probe.run_command(command)
+                    if timeout_seconds is None:
+                        return await ssh_probe.run_command(command)
+                    return await ssh_probe.run_command(command, timeout_seconds=timeout_seconds)
 
                 probe = SSHProbe(self.system.ssh.model_copy(update={"host": target_host}))
-                return await probe.run_command(command)
+                if timeout_seconds is None:
+                    return await probe.run_command(command)
+                return await probe.run_command(command, timeout_seconds=timeout_seconds)
 
-        return await self.ssh_probe.run_command(command)
+        if timeout_seconds is None:
+            return await ssh_probe.run_command(command)
+        return await ssh_probe.run_command(command, timeout_seconds=timeout_seconds)
 
     def _ssh_destination_authority_approved(self, host: str | None = None) -> bool:
         if host is None:

@@ -17,7 +17,7 @@ uses for `sesutil`:
 
 | Control | Middleware call | What it does | Platforms |
 | --- | --- | --- | --- |
-| Sync multipath table | `disk.multipath_sync` | Rebuilds the middleware multipath table from the kernel's `gmultipath` geoms. Synchronous. | CORE only |
+| Sync multipath table | `disk.multipath_sync` | Rebuilds the middleware multipath table from the kernel's `gmultipath` geoms. Synchronous; uses the configured disk-sync timeout. | CORE only |
 | Full disk sync | `disk.sync_all` | Re-reads every disk into the middleware inventory. Runs as a job; the app polls `core.get_jobs` until it finishes (180 s default timeout). | CORE and SCALE |
 
 Neither call touches pools, vdevs, or data. They only refresh the middleware's
@@ -30,9 +30,9 @@ view of which disks exist and how their paths group.
   `docs/SSH_READ_ONLY_SETUP.md` include them):
   - CORE: `/usr/local/bin/midclt call disk.multipath_sync`,
     `/usr/local/bin/midclt call disk.sync_all`,
-    `/usr/local/bin/midclt ^call core\.get_jobs \[\[\"id\"\,\"=\"\,[0-9]+\]\]$`
+    `/usr/local/bin/midclt ^call core[.]get_jobs [[][[]"id","=",[0-9]+[]][]]$`
   - SCALE: `/usr/bin/midclt call disk.sync_all`,
-    `/usr/bin/midclt ^call core\.get_jobs \[\[\"id\"\,\"=\"\,[0-9]+\]\]$`
+    `/usr/bin/midclt ^call core[.]get_jobs [[][[]"id","=",[0-9]+[]][]]$`
 - The app runs with `ADMIN_AUTH_MODE=basic` and a configured public origin, the
   same gate the identify LED controls use. In network mode the controls are
   disabled with a reason.

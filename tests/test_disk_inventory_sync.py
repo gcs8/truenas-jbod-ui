@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import HTTPException
@@ -40,9 +41,16 @@ class RecordingSSHRunner:
     def __init__(self, responses: list[SSHCommandResult | Exception]) -> None:
         self.responses = list(responses)
         self.commands: list[str] = []
+        self.timeouts: list[float | None] = []
 
-    async def __call__(self, command: str, host: str | None = None) -> SSHCommandResult:
+    async def __call__(
+        self,
+        command: str,
+        *_args: Any,
+        **kwargs: Any,
+    ) -> SSHCommandResult:
         self.commands.append(command)
+        self.timeouts.append(kwargs.get("timeout_seconds"))
         if not self.responses:
             raise AssertionError(f"unexpected extra SSH command: {command}")
         response = self.responses.pop(0)
@@ -129,6 +137,7 @@ class DiskInventorySyncServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.state, "SUCCESS")
         self.assertIsNone(result.job_id)
         self.assertFalse(result.timed_out)
+        self.assertEqual(runner.timeouts, [180])
         self.assertIn("Refresh to see the updated bays", result.message)
         self.assertEqual(service._cache, {}, "a successful sync must drop the cached inventory")
 
@@ -147,6 +156,16 @@ class DiskInventorySyncServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(len(message), 500)
         self.assertTrue(message.endswith("..."), message)
         self.assertNotEqual(service._cache, {}, "a failed sync must not drop the cached inventory")
+
+    async def test_multipath_mode_clamps_the_configured_sync_timeout_to_one_second(self) -> None:
+        service = self.build_service(platform="core", timeout_seconds=0)
+        runner = RecordingSSHRunner([ok("null\n")])
+        service._run_ssh_command = runner
+
+        result = await service.sync_disk_inventory(DiskInventorySyncMode.multipath)
+
+        self.assertEqual(result.state, "SUCCESS")
+        self.assertEqual(runner.timeouts, [1])
 
     async def test_full_mode_parses_the_job_id_and_polls_until_success(self) -> None:
         service = self.build_service(platform="scale")
@@ -338,7 +357,11 @@ class DiskInventorySyncServiceTests(unittest.IsolatedAsyncioTestCase):
         release = asyncio.Event()
         commands: list[str] = []
 
-        async def blocking_runner(command: str, host: str | None = None) -> SSHCommandResult:
+        async def blocking_runner(
+            command: str,
+            *_args: Any,
+            **_kwargs: Any,
+        ) -> SSHCommandResult:
             commands.append(command)
             await release.wait()
             return ok("null")

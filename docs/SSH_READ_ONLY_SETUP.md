@@ -660,23 +660,27 @@ TrueNAS middleware to re-read its disk table over the same SSH channel used for
 bootstrap seeds them for CORE and SCALE:
 
 ```text
-# CORE (the backslashes are part of the sudo command specification)
+# CORE (the bracket classes avoid TrueNAS escaping the POSIX regex backslashes)
 /usr/local/bin/midclt call disk.multipath_sync
 /usr/local/bin/midclt call disk.sync_all
-/usr/local/bin/midclt ^call core\.get_jobs \[\[\"id\"\,\"=\"\,[0-9]+\]\]$
+/usr/local/bin/midclt ^call core[.]get_jobs [[][[]"id","=",[0-9]+[]][]]$
 
 # SCALE
 /usr/bin/midclt call disk.sync_all
-/usr/bin/midclt ^call core\.get_jobs \[\[\"id\"\,\"=\"\,[0-9]+\]\]$
+/usr/bin/midclt ^call core[.]get_jobs [[][[]"id","=",[0-9]+[]][]]$
 ```
 
 - `disk.multipath_sync` is CORE only. It rebuilds the middleware multipath
-  table from the kernel's `gmultipath` geoms and returns immediately.
+  table from the kernel's `gmultipath` geoms and returns when that rebuild
+  finishes. The app bounds that command with
+  `APP_DISK_INVENTORY_SYNC_TIMEOUT_SECONDS` rather than the shorter generic SSH
+  command timeout.
 - `disk.sync_all` re-reads every disk into the middleware inventory as a job.
   The app then polls `core.get_jobs '[["id","=",<job id>]]'` until the job is
   terminal or `APP_DISK_INVENTORY_SYNC_TIMEOUT_SECONDS` (default 180) passes.
-  The anchored argument regex admits only that numeric-ID filter and no trailing
-  arguments; no other `midclt` method is granted.
+  The backslash-free anchored argument regex survives TrueNAS sudoers rendering
+  and admits only that numeric-ID filter with no trailing arguments. No other
+  `midclt` method is granted.
 - Neither call touches pools or data. The runbook is
   `docs/DISK_REPLACEMENT_CORE_MULTIPATH.md`.
 

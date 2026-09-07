@@ -16,6 +16,7 @@ import shlex
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock
 
 from admin_service.services.account_bootstrap import (
@@ -41,7 +42,8 @@ def sudoers_grant_matches(grant: str, command: str) -> bool:
     grant_arguments = grant.split(maxsplit=1)[1] if len(grant_tokens) > 1 else ""
     command_arguments = " ".join(command_tokens[1:])
     if grant_arguments.startswith("^") and grant_arguments.endswith("$"):
-        return re.fullmatch(grant_arguments, command_arguments) is not None
+        python_pattern = grant_arguments.replace("[[]", r"\[").replace("[]]", r"\]")
+        return re.fullmatch(python_pattern, command_arguments) is not None
     return fnmatch.fnmatchcase(command_arguments, grant_arguments)
 
 
@@ -84,7 +86,11 @@ class DiskInventorySyncSudoGrantContractTests(unittest.IsolatedAsyncioTestCase):
         recorded: list[str] = []
         job_id = 268071
 
-        async def record(command: str, host: str | None = None) -> SSHCommandResult:
+        async def record(
+            command: str,
+            *_args: Any,
+            **_kwargs: Any,
+        ) -> SSHCommandResult:
             recorded.append(command)
             stdout = ""
             if command.endswith("call disk.sync_all"):
@@ -161,9 +167,10 @@ class DiskInventorySyncSudoGrantContractTests(unittest.IsolatedAsyncioTestCase):
         for grant in (*CORE_MIDCLT_DISK_SYNC_SUDO_COMMANDS, *SCALE_MIDCLT_DISK_SYNC_SUDO_COMMANDS):
             tokens = shlex.split(grant)
             if tokens[1].startswith("^call"):
-                self.assertIn(r"^call core\.get_jobs", grant)
+                self.assertIn('^call core[.]get_jobs [[][[]"id","=",[0-9]+[]][]]', grant)
                 self.assertTrue(grant.endswith("$"), grant)
                 self.assertNotIn(" *", grant)
+                self.assertNotIn("\\", grant, "TrueNAS doubles backslashes when rendering sudoers")
             else:
                 self.assertEqual(tokens[1], "call", grant)
                 self.assertIn(tokens[2], {"disk.multipath_sync", "disk.sync_all"}, grant)
