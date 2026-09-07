@@ -240,9 +240,11 @@ python scripts/build_perf_baseline.py --check
 promtool check rules prometheus/rules/truenas-jbod-ui-alerts-v1.yml
 ```
 
-The source commands shared with CI are contract-tested against
-`.github/workflows/ci.yml`; the performance baseline is an additional Tier 1
-gate. Set `PROMTOOL_BINARY` to an installed executable when it is not on `PATH`.
+The exact source-gate set, including the performance baseline, is shared with CI
+and declared fail-closed against `.github/workflows/ci.yml`. `--full` runs the
+same safe, local, no-live-data source gates plus the checked-in public-demo
+artifact check. Set
+`PROMTOOL_BINARY` to an installed executable when it is not on `PATH`.
 
 Install dev-only validation tools before running the wrapper or coverage command
 in a fresh environment:

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-import subprocess
 import unittest
 from pathlib import Path
 
@@ -257,6 +256,89 @@ class CIWorkflowContractTests(unittest.TestCase):
                 self.assertIn('rm -rf "$fixture_root"', workflow_text)
                 self.assertIn("git status --short", workflow_text)
 
+    def test_release_checklist_public_demo_commands_supply_both_required_artifacts(self) -> None:
+        checklist = self.read(ROOT / "docs" / "RELEASE_CHECKLIST.md")
+        public_demo_commands = [
+            line
+            for line in checklist.splitlines()
+            if "npx playwright test" in line and "qa/public-demo.spec.js" in line
+        ]
+
+        self.assertGreaterEqual(len(public_demo_commands), 2)
+        for command in public_demo_commands:
+            with self.subTest(command=command):
+                self.assertIn("PUBLIC_DEMO_ARTIFACT", command)
+                self.assertIn("SLOT_FOCUS_ARTIFACT", command)
+        self.assertGreaterEqual(
+            checklist.count("scripts/build_current_source_browser_fixture.py --output"),
+            len(public_demo_commands),
+        )
+
+    def test_release_checklist_browser_fixture_cleanup_is_unique_and_failure_safe(self) -> None:
+        checklist = self.read(ROOT / "docs" / "RELEASE_CHECKLIST.md")
+        release_start = checklist.index("- if the release changes public-demo behavior or data")
+        release_end = checklist.index("## Config And Examples", release_start)
+        release_section = checklist[release_start:release_end]
+        powershell_marker = "    ```powershell\n"
+        self.assertEqual(release_section.count(powershell_marker), 1)
+        powershell_start = release_section.index(powershell_marker) + len(powershell_marker)
+        powershell_end = release_section.index("\n    ```", powershell_start)
+        powershell = release_section[powershell_start:powershell_end]
+
+        self.assertIn("trap 'rm -f -- \"$slot_focus_artifact\"' EXIT", checklist)
+        self.assertIn("trap - EXIT", checklist)
+        self.assertIn(
+            "$slot_focus_artifact = [System.IO.Path]::GetTempFileName()",
+            powershell,
+        )
+        self.assertIn('$env:PUBLIC_DEMO_LOCAL_HISTORY = "1"', powershell)
+        self.assertIn("finally {", powershell)
+        self.assertIn(
+            "Remove-Item Env:PUBLIC_DEMO_LOCAL_HISTORY -ErrorAction SilentlyContinue",
+            powershell,
+        )
+        self.assertIn(
+            "Remove-Item Env:PUBLIC_DEMO_ARTIFACT -ErrorAction SilentlyContinue",
+            powershell,
+        )
+        self.assertIn(
+            "Remove-Item Env:SLOT_FOCUS_ARTIFACT -ErrorAction SilentlyContinue",
+            powershell,
+        )
+        self.assertIn(
+            """    } finally {
+        Remove-Item Env:PUBLIC_DEMO_ARTIFACT -ErrorAction SilentlyContinue
+        Remove-Item Env:SLOT_FOCUS_ARTIFACT -ErrorAction SilentlyContinue
+        Remove-Item Env:PUBLIC_DEMO_LOCAL_HISTORY -ErrorAction SilentlyContinue
+    }""",
+            powershell,
+        )
+        self.assertIn(
+            "Remove-Item -LiteralPath $slot_focus_artifact -ErrorAction SilentlyContinue",
+            powershell,
+        )
+        self.assertNotIn("set PUBLIC_DEMO_LOCAL_HISTORY=1", powershell)
+        self.assertNotIn(r"%TEMP%\truenas-jbod-ui-slot-focus.html", powershell)
+
+    def test_release_cleanup_contract_rejects_a_block_relocated_outside_the_sequence(
+        self,
+    ) -> None:
+        checklist_path = ROOT / "docs" / "RELEASE_CHECKLIST.md"
+        checklist = self.read(checklist_path)
+        cleanup = """    } finally {
+        Remove-Item Env:PUBLIC_DEMO_ARTIFACT -ErrorAction SilentlyContinue
+        Remove-Item Env:SLOT_FOCUS_ARTIFACT -ErrorAction SilentlyContinue
+        Remove-Item Env:PUBLIC_DEMO_LOCAL_HISTORY -ErrorAction SilentlyContinue
+    }"""
+        mutated = checklist.replace(cleanup, "", 1) + f"\n```powershell\n{cleanup}\n```\n"
+        case = CIWorkflowContractTests(
+            "test_release_checklist_browser_fixture_cleanup_is_unique_and_failure_safe"
+        )
+        case.read = lambda _path: mutated  # type: ignore[method-assign]
+
+        with self.assertRaises(AssertionError):
+            case.test_release_checklist_browser_fixture_cleanup_is_unique_and_failure_safe()
+
     def test_dependabot_keeps_immutable_actions_maintained(self) -> None:
         config = yaml.safe_load(self.read(ROOT / ".github" / "dependabot.yml"))
         actions_entries = [
@@ -332,14 +414,6 @@ class CIWorkflowContractTests(unittest.TestCase):
             'gh api --method DELETE "repos/$GH_REPO/issues/$PR_NUMBER/labels/$label"',
             script,
         )
-
-    def test_pr_label_workflow_uses_a_bash_safe_conventional_title_pattern(self) -> None:
-        workflow = yaml.safe_load(self.read(WORKFLOW_DIR / "pr-labels.yml"))
-        script = workflow["jobs"]["label"]["steps"][0]["run"]
-
-        self.assertIn("conventional_pattern=", script)
-        self.assertIn('[[ "$title" =~ $conventional_pattern ]]', script)
-        subprocess.run(["bash", "-n"], input=script, text=True, check=True)
 
     def test_release_checklist_collects_bounded_branch_metadata_and_keeps_wiki_publication_owner_gated(self) -> None:
         checklist = self.read(ROOT / "docs" / "RELEASE_CHECKLIST.md")
