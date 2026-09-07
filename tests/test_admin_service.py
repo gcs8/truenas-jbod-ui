@@ -55,6 +55,7 @@ from app.config import (
 )
 from app.main import app as main_app
 from app.main import resolve_admin_launch_url
+from app.main import snapshot_state_busy_exception_handler
 from app.main import _clear_snapshot_export_source_cache_for_tests
 from app.models.domain import ESXiHostPrepInstallRequest
 from app.models.domain import EnclosureOption
@@ -69,7 +70,7 @@ from app.models.domain import SystemBackupExportRequest
 from app.request_context import request_context
 from app.services.profile_registry import UNIFI_UNVR_FRONT_4_PROFILE_ID
 from app.services.ssh_probe import SSHCommandResult
-from app.services.snapshot_export import PackagedSnapshotExport
+from app.services.snapshot_export import PackagedSnapshotExport, SnapshotExportBusyError
 from app.services.system_setup import PRESERVE_SECRET_SENTINEL
 from history_service.config import HistorySettings
 from history_service.main import app as history_app
@@ -826,6 +827,12 @@ class MainAppBoundaryTests(unittest.TestCase):
             joined = json.dumps(payload)
             self.assertNotIn("Traceback", joined)
             self.assertNotIn("topsecret", joined)
+
+    def test_snapshot_export_busy_uses_the_retryable_busy_handler(self) -> None:
+        self.assertIs(
+            main_app.exception_handlers.get(SnapshotExportBusyError),
+            snapshot_state_busy_exception_handler,
+        )
 
     def test_main_app_exposes_storage_view_runtime_route(self) -> None:
         paths = {route.path for route in main_app.routes}

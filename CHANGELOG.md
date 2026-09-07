@@ -394,6 +394,11 @@ them before starting the new images.
 - Backfilled CORE multipath association from unambiguous `gmultipath` consumers
   while rejecting conflicting ZFS GUID folds (#356).
 
+### Performance
+
+- Bounded process-wide snapshot export rendering, compression, pending keys,
+  and retained intermediate bytes with cancellation-safe admission (#361).
+
 ### Docs
 
 - Aligned contributor and release guidance with the current CI gates, task

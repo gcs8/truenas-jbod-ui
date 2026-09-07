@@ -73,6 +73,7 @@ from app.services.mapping_store import (
 from app.services.profile_registry import build_profile_reference_warnings
 from app.services.release_status import ReleaseStatusService
 from app.services.snapshot_export import (
+    SnapshotExportBusyError,
     SnapshotExportService,
     SnapshotExportTooLargeError,
     collect_configured_hostnames,
@@ -593,6 +594,10 @@ def create_app() -> FastAPI:
     )
     app.add_exception_handler(
         SnapshotStateBusyError,
+        snapshot_state_busy_exception_handler,
+    )
+    app.add_exception_handler(
+        SnapshotExportBusyError,
         snapshot_state_busy_exception_handler,
     )
     app.add_exception_handler(
