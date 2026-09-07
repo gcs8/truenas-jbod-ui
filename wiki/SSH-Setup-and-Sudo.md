@@ -23,44 +23,81 @@ sidecar's `Password Only / No Key` mode instead of forcing a fake key path.
 - public key auth
 - command-limited sudo
 
-## Good Default SSH Material
+## Good default SSH material
 
 On the Docker host:
 
 - private key in `./config/ssh/id_truenas`
 - pinned host keys in `./data/known_hosts` by default
 
+The known-hosts location is derived from the runtime layout. Do not add
+`known_hosts_path` to YAML; configured values are discarded. Inside the default
+container layout the derived file is `/app/data/known_hosts`.
+
+Strict checking rejects an unknown key, so preload and verify every SSH target
+before enabling the system. Get each fingerprint through a trusted channel, then
+compare it with the scan before installation. This example preserves the
+configured non-root service ownership and group readability. Run it from the
+deployment directory. If `.env` overrides `APP_UID` or `APP_GID`, export the
+same values in this shell first:
+
+```bash
+app_uid="${APP_UID:-10001}"
+app_gid="${APP_GID:-10001}"
+ssh_host="storage-host.example.test"
+known_hosts_scan="$(mktemp)"
+known_hosts_merged="$(mktemp)"
+trap 'rm -f "$known_hosts_scan" "$known_hosts_merged"' EXIT
+ssh-keyscan -H "$ssh_host" > "$known_hosts_scan"
+ssh-keygen -lf "$known_hosts_scan"
+# Compare the fingerprint out of band before installing the file.
+if sudo test -f data/known_hosts; then
+  sudo cat data/known_hosts > "$known_hosts_merged"
+fi
+cat "$known_hosts_scan" >> "$known_hosts_merged"
+sudo install -o "$app_uid" -g "$app_gid" -m 0660 "$known_hosts_merged" data/known_hosts
+rm -f "$known_hosts_scan" "$known_hosts_merged"
+trap - EXIT
+```
+
+Repeat the block for every configured host and HA node. Each run copies the
+existing pinned keys into the merged temporary file before appending the newly
+verified scan. Do not use a root-owned `0600` file; the non-root UI process
+cannot read it.
+
 In app config:
 
 ```yaml
 ssh:
   enabled: true
-  host: storage-host.example.local
+  host: storage-host.example.test
   port: 22
   user: jbodmap
   key_path: /run/ssh/id_truenas
   password: ""
-  known_hosts_path: /app/data/known_hosts
   strict_host_key_checking: true
 ```
 
 If the appliance only supports password SSH, set `ssh.password` and leave
-`key_path` empty or unset.
+`key_path` empty or unset. Strict host-key checking still needs the verified
+preload above.
+
+For example, a CORE config may use host: `truenas-core-a.example.test`. Verify
+and preload the key for the actual host name in your own config.
 
 For ESXi specifically, password-only auth is a normal supported case:
 
 ```yaml
 ssh:
   enabled: true
-  host: truenas-core-a.example.local
+  host: esxi-host.example.test
   user: root
   key_path: ""
   password: "your-esxi-root-password"
 ```
 
-With that default, the first successful SSH connection pins the observed host
-key into `/app/data/known_hosts`, and later connections must match it unless
-you intentionally clear the saved entry.
+Later connections must match the preloaded key. A key mismatch fails closed;
+verify the host before replacing its entry.
 
 ## CORE Command Ideas
 
@@ -155,56 +192,106 @@ If you do not want to touch the host OS at all, the current Supermicro FatTwin
 path can also run as `ipmi` / BMC-only inventory and skip ESXi SSH entirely,
 with ESXi added later only as optional enrichment.
 
-## Example Narrow Sudoers Entries
+## Generated bootstrap permission previews
 
-CORE example:
+The admin sidecar's Sudoers Preview is the canonical copy/paste source. The
+blocks below are generated from the same current-main policy used by the one-time
+bootstrap. Do not split them into partial SMART and SES files or add command
+wildcards. Linux-like policies must pass `visudo -cf` before installation.
 
+Anchored command regexes require sudo 1.9.10 or newer. On older hosts, enumerate
+exact per-device commands instead of replacing an argument regex with `*`.
+TrueNAS CORE stores its list through middleware, so review the generated
+`midclt` payload and the installed sudo version there rather than running
+`visudo` against it.
+
+### TrueNAS CORE
+
+<!-- generated-bootstrap-policy:core:start -->
 ```text
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/sesutil map
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/sesutil show
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/sesutil locate -u /dev/ses* * on
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/sesutil locate -u /dev/ses* * off
-jbodmap ALL=(root) NOPASSWD: /sbin/camcontrol devlist -v
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/mprutil show adapter
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/mprutil show adapters
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/mprutil show all
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/mprutil show devices
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/mprutil show enclosures
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/mprutil show expanders
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/mprutil show iocfacts
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/mprutil -u * show adapter
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/mprutil -u * show all
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/mprutil -u * show devices
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/mprutil -u * show enclosures
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/mprutil -u * show expanders
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/mprutil -u * show iocfacts
-jbodmap ALL=(root) NOPASSWD: /usr/local/sbin/dmidecode -t slot
-jbodmap ALL=(root) NOPASSWD: /usr/bin/tail -n 4000 /var/log/messages
+midclt call user.update USER_ID '{"sudo":true,"sudo_nopasswd":true,"sudo_commands":["/usr/sbin/sesutil map","/usr/sbin/sesutil show","/usr/sbin/sesutil locate -u /dev/ses* * on","/usr/sbin/sesutil locate -u /dev/ses* * off","/sbin/camcontrol devlist -v","/usr/sbin/smartctl ^-x -j /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$","/usr/sbin/smartctl ^-x /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$","/usr/sbin/smartctl ^-d [A-Za-z0-9][A-Za-z0-9_:+./-]*(\\,[A-Za-z0-9][A-Za-z0-9_:+./-]*)* -x -j /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$","/usr/sbin/smartctl ^-d [A-Za-z0-9][A-Za-z0-9_:+./-]*(\\,[A-Za-z0-9][A-Za-z0-9_:+./-]*)* -x /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$","/usr/local/sbin/smartctl ^-x -j /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$","/usr/local/sbin/smartctl ^-x /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$","/usr/local/sbin/smartctl ^-d [A-Za-z0-9][A-Za-z0-9_:+./-]*(\\,[A-Za-z0-9][A-Za-z0-9_:+./-]*)* -x -j /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$","/usr/local/sbin/smartctl ^-d [A-Za-z0-9][A-Za-z0-9_:+./-]*(\\,[A-Za-z0-9][A-Za-z0-9_:+./-]*)* -x /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$","/usr/sbin/mprutil show adapter","/usr/sbin/mprutil show adapters","/usr/sbin/mprutil show all","/usr/sbin/mprutil show devices","/usr/sbin/mprutil show enclosures","/usr/sbin/mprutil show expanders","/usr/sbin/mprutil show iocfacts","/usr/sbin/mprutil -u * show adapter","/usr/sbin/mprutil -u * show all","/usr/sbin/mprutil -u * show devices","/usr/sbin/mprutil -u * show enclosures","/usr/sbin/mprutil -u * show expanders","/usr/sbin/mprutil -u * show iocfacts","/usr/local/sbin/dmidecode -t slot","/usr/bin/tail -n 4000 /var/log/messages","/usr/local/bin/midclt call disk.multipath_sync","/usr/local/bin/midclt call disk.sync_all","/usr/local/bin/midclt ^call core\\.get_jobs \\[\\[\\\"id\\\"\\,\\\"=\\\"\\,[0-9]+\\]\\]$"]}'
 ```
+<!-- generated-bootstrap-policy:core:end -->
 
-SCALE example:
+### TrueNAS SCALE
 
-Anchored command regexes require sudo 1.9.10 or newer. Use exact per-device
-commands on older hosts, not argument wildcards.
-
+<!-- generated-bootstrap-policy:scale:start -->
 ```text
-jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses ^-p aes /dev/sg[0-9]+$
-jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses ^-p ec /dev/sg[0-9]+$
-jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses ^--dev-slot-num=[0-9]+ --set=ident /dev/sg[0-9]+$
-jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses ^--dev-slot-num=[0-9]+ --clear=ident /dev/sg[0-9]+$
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl ^-x -j /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$
+# Managed by truenas-jbod-ui admin bootstrap for jbodmap
+Defaults:jbodmap !requiretty
+Cmnd_Alias JBODMAP_SCALE_CMDS = /usr/bin/sg_ses ^-p aes /dev/sg[0-9]+$, \
+  /usr/bin/sg_ses ^-p ec /dev/sg[0-9]+$, \
+  /usr/bin/sg_ses ^--join --filter /dev/sg[0-9]+$, \
+  /usr/bin/sg_ses ^--dev-slot-num=[0-9]+ --set=ident /dev/sg[0-9]+$, \
+  /usr/bin/sg_ses ^--dev-slot-num=[0-9]+ --clear=ident /dev/sg[0-9]+$, \
+  /usr/sbin/smartctl ^-x -j /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$, \
+  /usr/sbin/smartctl ^-x /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$, \
+  /usr/sbin/smartctl ^-d [A-Za-z0-9][A-Za-z0-9_:+./-]*(\,[A-Za-z0-9][A-Za-z0-9_:+./-]*)* -x -j /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$, \
+  /usr/sbin/smartctl ^-d [A-Za-z0-9][A-Za-z0-9_:+./-]*(\,[A-Za-z0-9][A-Za-z0-9_:+./-]*)* -x /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$, \
+  /usr/local/sbin/smartctl ^-x -j /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$, \
+  /usr/local/sbin/smartctl ^-x /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$, \
+  /usr/local/sbin/smartctl ^-d [A-Za-z0-9][A-Za-z0-9_:+./-]*(\,[A-Za-z0-9][A-Za-z0-9_:+./-]*)* -x -j /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$, \
+  /usr/local/sbin/smartctl ^-d [A-Za-z0-9][A-Za-z0-9_:+./-]*(\,[A-Za-z0-9][A-Za-z0-9_:+./-]*)* -x /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$, \
+  /usr/bin/midclt call disk.sync_all, \
+  /usr/bin/midclt ^call core\.get_jobs \[\[\"id\"\,\"=\"\,[0-9]+\]\]$
+jbodmap ALL=(root) NOPASSWD: JBODMAP_SCALE_CMDS
 ```
+<!-- generated-bootstrap-policy:scale:end -->
 
-Generic Linux NVMe example:
+### Generic Linux
 
+<!-- generated-bootstrap-policy:linux:start -->
 ```text
-jbodmap ALL=(root) NOPASSWD: /usr/bin/lsblk -OJ
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/mdadm --detail --scan
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl ^-x -j /dev/nvme[0-9]+n[0-9]+$
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/nvme smart-log -o json /dev/nvme*
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/nvme id-ctrl -o json /dev/nvme*
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/nvme id-ns -o json /dev/nvme*
+# Managed by truenas-jbod-ui admin bootstrap for jbodmap
+Defaults:jbodmap !requiretty
+Cmnd_Alias JBODMAP_LINUX_CMDS = /usr/sbin/mdadm --detail --scan, \
+  /usr/bin/sg_ses ^-p aes /dev/sg[0-9]+$, \
+  /usr/bin/sg_ses ^-p ec /dev/sg[0-9]+$, \
+  /usr/bin/sg_ses ^--join --filter /dev/sg[0-9]+$, \
+  /usr/bin/sg_ses ^--dev-slot-num=[0-9]+ --set=ident /dev/sg[0-9]+$, \
+  /usr/bin/sg_ses ^--dev-slot-num=[0-9]+ --clear=ident /dev/sg[0-9]+$, \
+  /usr/sbin/smartctl ^-x -j /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$, \
+  /usr/sbin/smartctl ^-x /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$, \
+  /usr/sbin/smartctl ^-d [A-Za-z0-9][A-Za-z0-9_:+./-]*(\,[A-Za-z0-9][A-Za-z0-9_:+./-]*)* -x -j /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$, \
+  /usr/sbin/smartctl ^-d [A-Za-z0-9][A-Za-z0-9_:+./-]*(\,[A-Za-z0-9][A-Za-z0-9_:+./-]*)* -x /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$, \
+  /usr/local/sbin/smartctl ^-x -j /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$, \
+  /usr/local/sbin/smartctl ^-x /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$, \
+  /usr/local/sbin/smartctl ^-d [A-Za-z0-9][A-Za-z0-9_:+./-]*(\,[A-Za-z0-9][A-Za-z0-9_:+./-]*)* -x -j /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$, \
+  /usr/local/sbin/smartctl ^-d [A-Za-z0-9][A-Za-z0-9_:+./-]*(\,[A-Za-z0-9][A-Za-z0-9_:+./-]*)* -x /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$, \
+  /usr/sbin/nvme smart-log -o json /dev/nvme*, \
+  /usr/sbin/nvme id-ctrl -o json /dev/nvme*, \
+  /usr/sbin/nvme id-ns -o json /dev/nvme*
+jbodmap ALL=(root) NOPASSWD: JBODMAP_LINUX_CMDS
 ```
+<!-- generated-bootstrap-policy:linux:end -->
+
+### QuantaStor
+
+<!-- generated-bootstrap-policy:quantastor:start -->
+```text
+# Managed by truenas-jbod-ui admin bootstrap for jbodmap
+Defaults:jbodmap !requiretty
+Cmnd_Alias JBODMAP_QUANTASTOR_CMDS = /usr/bin/sg_ses ^-p aes /dev/sg[0-9]+$, \
+  /usr/bin/sg_ses ^-p ec /dev/sg[0-9]+$, \
+  /usr/bin/sg_ses ^--join --filter /dev/sg[0-9]+$, \
+  /usr/bin/sg_ses ^--dev-slot-num=[0-9]+ --set=ident /dev/sg[0-9]+$, \
+  /usr/bin/sg_ses ^--dev-slot-num=[0-9]+ --clear=ident /dev/sg[0-9]+$, \
+  /usr/sbin/smartctl ^-x -j /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$, \
+  /usr/sbin/smartctl ^-x /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$, \
+  /usr/sbin/smartctl ^-d [A-Za-z0-9][A-Za-z0-9_:+./-]*(\,[A-Za-z0-9][A-Za-z0-9_:+./-]*)* -x -j /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$, \
+  /usr/sbin/smartctl ^-d [A-Za-z0-9][A-Za-z0-9_:+./-]*(\,[A-Za-z0-9][A-Za-z0-9_:+./-]*)* -x /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$, \
+  /usr/local/sbin/smartctl ^-x -j /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$, \
+  /usr/local/sbin/smartctl ^-x /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$, \
+  /usr/local/sbin/smartctl ^-d [A-Za-z0-9][A-Za-z0-9_:+./-]*(\,[A-Za-z0-9][A-Za-z0-9_:+./-]*)* -x -j /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$, \
+  /usr/local/sbin/smartctl ^-d [A-Za-z0-9][A-Za-z0-9_:+./-]*(\,[A-Za-z0-9][A-Za-z0-9_:+./-]*)* -x /dev/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*(/[A-Za-z0-9_:+-][A-Za-z0-9_.:+-]*){0,2}$
+jbodmap ALL=(root) NOPASSWD: JBODMAP_QUANTASTOR_CMDS
+```
+<!-- generated-bootstrap-policy:quantastor:end -->
+
+For SCALE, Linux, and QuantaStor, save the matching block as one file with
+mode `0440`, then run `sudo visudo -cf /etc/sudoers.d/<file>` before moving it
+into service. The generated QuantaStor policy contains no `qs` root grant; its
+read-only `qs` commands run as the service account with local CLI credentials.
 
 ## When To Widen Permissions
 

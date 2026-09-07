@@ -46,7 +46,7 @@ flowchart LR
     Admin --> HistDB
     UI --> Logs
     History --> Logs
-    Admin --> Logs
+
     Pages -. no live backend .-> Browser
 ```
 
@@ -70,8 +70,11 @@ Keep these beside the checkout or deployment bundle:
 | --- | --- |
 | `./config` | saved systems, profiles, runtime overrides, optional SSH material |
 | `./config/ssh` | SSH keys if you let the app manage or reuse them |
+| `./config/backup-secrets` | private passphrase files for the one-shot backup service |
 | `./data` | slot mappings, detail cache, known host records |
 | `./history` | history sidecar SQLite DB and backups |
+| `./backups` | private scheduled backup archives |
+| `./backup-status` | shared read-only scheduled backup status |
 | `./logs` | local app logs when configured |
 
 The published image does not remove the need for local config and persistent

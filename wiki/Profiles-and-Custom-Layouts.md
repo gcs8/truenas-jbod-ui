@@ -88,8 +88,8 @@ Hand-editing `profiles.yaml` is still useful when:
 
 - you want to keep the file under your own version control
 - you need fields the current builder does not expose yet
-- you are experimenting with sparse/gapped layouts or other later-work schema
-  details
+- you are defining a sparse or gapped `slot_layout`, using `null` for a visual
+  cell that has no bay
 
 ## Example Custom Profile
 
@@ -105,6 +105,7 @@ profiles:
     latch_edge: right
     rows: 2
     columns: 4
+    slot_number_base: 0
     slot_layout:
       - [4, 5, 6, 7]
       - [0, 1, 2, 3]
@@ -125,6 +126,16 @@ profiles:
 - `slot_layout`
 - `row_groups`
 - `slot_hints`
+- `slot_number_base`
+
+`slot_number_base` changes the displayed bay-label base for this profile. Use
+`0` for zero-based labels or `1` for chassis silk-screen labels that start at
+one. If omitted, the profile inherits the global layout value.
+
+Current built-in `face_style` values are `generic`, `top-loader`, `drawer`,
+`front-drive`, `rear-drive`, `unifi-drive`, and `nvme-carrier`. These values
+select existing visual treatments; custom strings fall back to the generic
+shape rather than adding a new renderer.
 
 ## Slot Ordering In Builder Mode
 

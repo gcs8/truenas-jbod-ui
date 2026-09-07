@@ -11,7 +11,7 @@ different jobs and should not be treated as interchangeable.
 | --- | --- | --- | --- | --- |
 | Public demo site | yes, static Pages workflow | no | no | let visitors explore scrubbed sample data in a static browser page |
 | Demo Builder Seed | yes | yes | synthetic config only | create a local fake system/profile/views for builder testing |
-| Export Snapshot | yes | no after export | yes, but frozen/redacted by export settings | share one offline enclosure or storage-view HTML artifact |
+| Export Snapshot | yes | no after export | yes; `Redact sensitive IDs` applies the bounded alias/mask rules documented in the history guide | share one offline enclosure or storage-view HTML artifact |
 | Debug Bundle | yes | no after export | yes, optionally scrubbed | send support evidence for inspection |
 | Full Backup | yes | yes for restore | yes | restore or migrate app state |
 

@@ -78,10 +78,11 @@ $env:SCREENSHOT_TAG='vX.Y.Z'
 .\.venv\Scripts\python.exe scripts\capture_readme_screenshots.py
 .\.venv\Scripts\python.exe scripts\capture_history_export_screenshots.py
 .\.venv\Scripts\python.exe scripts\capture_release_workflow_screenshots.py
+.\.venv\Scripts\python.exe scripts\capture_visual_tour_screenshots.py
 ```
 
 This refreshes the repository screenshots under `docs/images/screenshots/` and
 the wiki copies under `wiki/images/`.
 
 For the full release flow, use
-[`docs/RELEASE_CHECKLIST.md`](../docs/RELEASE_CHECKLIST.md).
+[`docs/RELEASE_CHECKLIST.md`](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/RELEASE_CHECKLIST.md).
