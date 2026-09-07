@@ -211,6 +211,9 @@ them before starting the new images.
 
 ### Changed
 
+- Split local validation into distinct portable safe and full modes, retained
+  the performance baseline and exact CI source-gate parity, and corrected
+  Windows browser commands (#384).
 - Expanded the private QA restore matrix and its sanitized deployment evidence
   checks without publishing private runtime details (#247).
 - Retained fresh disk, pool, temperature, and SMART payloads when TrueNAS
