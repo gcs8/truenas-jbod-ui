@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.config import (
     BMCConfig,
+    EnclosureProfileConfig,
     HANodeConfig,
     SSHConfig,
     Settings,
@@ -15336,7 +15337,7 @@ class ReviewRegressionTests(unittest.TestCase):
             self.assertEqual(columns, 0)
             self.assertEqual((slots[0].row_index, slots[0].column_index), (0, 0))
 
-    def test_scale_linux_normal_profile_keeps_slots_missing_from_sparse_layout(self) -> None:
+    def test_scale_linux_normal_profile_renders_only_explicit_layout_slots(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()
             system = SystemConfig(id="sparse-scale", truenas=TrueNASConfig(platform="scale"))
@@ -15372,13 +15373,267 @@ class ReviewRegressionTests(unittest.TestCase):
                 selected_enclosure_id="enc-a",
             )
 
-            self.assertEqual([slot.slot for slot in slots], [0, 1, 2])
+            self.assertEqual([slot.slot for slot in slots], [0, 2])
             self.assertEqual(slot_count, 3)
             service.mapping_store.load_all.assert_called_once_with()
-            self.assertEqual(service.mapping_store.get_mapping.call_count, slot_count)
+            self.assertEqual(service.mapping_store.get_mapping.call_count, len(slots))
             self.assertTrue(
                 all(call.kwargs["loaded_entries"] is loaded_mappings for call in service.mapping_store.get_mapping.call_args_list)
             )
+
+    def test_gapped_profile_renders_actual_slot_ids_on_all_physical_correlation_paths(self) -> None:
+        layout = [list(range(0, 12)), list(range(20, 32))]
+        expected_ids = [slot for row in layout for slot in row]
+        profile = EnclosureProfileConfig(
+            id="gapped-24",
+            label="Gapped 24",
+            rows=2,
+            columns=12,
+            slot_layout=layout,
+        )
+
+        def empty_raw(**extra) -> TrueNASRawData:
+            return TrueNASRawData(
+                enclosures=[],
+                disks=[],
+                pools=[],
+                disk_temperatures={},
+                smart_test_results=[],
+                **extra,
+            )
+
+        def correlate_core(service: InventoryService):
+            return service._correlate(empty_raw(), ParsedSSHData(), [])
+
+        def correlate_linux(service: InventoryService):
+            return service._correlate_linux_host(ParsedSSHData(), [], None)
+
+        def correlate_esxi(service: InventoryService):
+            return service._correlate_esxi_host(ParsedSSHData(), [], None)
+
+        def correlate_bmc(service: InventoryService):
+            return service._correlate_bmc_host([], None, BMCInventory(system_model="SYNTH-CHASSIS"))
+
+        def correlate_scale_linux(service: InventoryService):
+            option = EnclosureOption(
+                id="enc-a",
+                label="Gapped shelf",
+                profile_id=profile.id,
+                rows=2,
+                columns=12,
+                slot_count=24,
+                slot_layout=[list(row) for row in layout],
+            )
+            service._build_scale_linux_enclosure_options = MagicMock(return_value=[option])
+            return service._correlate_scale_linux(empty_raw(), ParsedSSHData(), [], "enc-a")
+
+        def correlate_quantastor(service: InventoryService):
+            return service._correlate_quantastor(
+                empty_raw(systems=[{"id": "qs-node-a", "name": "Node A"}]),
+                [],
+                None,
+                ParsedSSHData(),
+            )
+
+        paths = (
+            ("core-scale-fallback", "core", correlate_core),
+            ("linux", "linux", correlate_linux),
+            ("esxi", "esxi", correlate_esxi),
+            ("bmc-ipmi", "ipmi", correlate_bmc),
+            ("scale-linux", "scale", correlate_scale_linux),
+            ("quantastor", "quantastor", correlate_quantastor),
+        )
+        for path_name, platform, correlate in paths:
+            with self.subTest(path=path_name), tempfile.TemporaryDirectory() as temp_dir:
+                settings = Settings(profiles=[profile])
+                system = SystemConfig(
+                    id=f"{platform}-gapped",
+                    default_profile_id=profile.id,
+                    truenas=TrueNASConfig(platform=platform),
+                )
+                service = build_inventory_service(settings, system, MagicMock(), MagicMock(), temp_dir)
+
+                slots, _enclosures, _meta, rows, slot_count, columns = correlate(service)
+
+                self.assertEqual(rows, layout)
+                self.assertEqual((slot_count, columns), (24, 12))
+                self.assertEqual([slot.slot for slot in slots], expected_ids)
+                positions = {slot.slot: (slot.row_index, slot.column_index) for slot in slots}
+                self.assertEqual(positions[11], (0, 11))
+                self.assertEqual(positions[20], (1, 0))
+                self.assertEqual(positions[31], (1, 11))
+
+    def test_gapped_bmc_profile_maps_discovered_slots_by_rendered_ordinal(self) -> None:
+        profile = EnclosureProfileConfig(
+            id="gapped-bmc",
+            label="Gapped BMC",
+            rows=1,
+            columns=2,
+            slot_layout=[[0, 20]],
+        )
+        inventory = BMCInventory(
+            system_model="SYNTH-CHASSIS",
+            drives=[
+                BMCDriveRecord(
+                    controller_id=0,
+                    physical_index=0,
+                    slot_number=100,
+                    serial="SERIAL-FIRST",
+                    health="ONLINE",
+                ),
+                BMCDriveRecord(
+                    controller_id=0,
+                    physical_index=1,
+                    slot_number=101,
+                    serial="SERIAL-SECOND",
+                    health="ONLINE",
+                ),
+            ],
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings(profiles=[profile])
+            system = SystemConfig(
+                id="gapped-bmc",
+                default_profile_id=profile.id,
+                truenas=TrueNASConfig(platform="ipmi"),
+            )
+            service = build_inventory_service(settings, system, MagicMock(), MagicMock(), temp_dir)
+
+            slots, *_rest = service._correlate_bmc_host([], None, inventory)
+
+        self.assertEqual([slot.slot for slot in slots], [0, 20])
+        self.assertEqual([slot.serial for slot in slots], ["SERIAL-FIRST", "SERIAL-SECOND"])
+
+    def test_gapped_profiles_keep_high_id_api_and_ses_source_evidence(self) -> None:
+        layout = [list(range(0, 12)), list(range(20, 32))]
+        profile = EnclosureProfileConfig(
+            id="gapped-evidence",
+            label="Gapped evidence",
+            rows=2,
+            columns=12,
+            slot_layout=layout,
+        )
+
+        def raw_data(**extra) -> TrueNASRawData:
+            values = {
+                "enclosures": [],
+                "disks": [],
+                "pools": [],
+                "disk_temperatures": {},
+                "smart_test_results": [],
+            }
+            values.update(extra)
+            return TrueNASRawData(**values)
+
+        ses_enclosure = SESMapEnclosure(
+            ses_device="/dev/sg20",
+            enclosure_id="enc-a",
+            profile_id=profile.id,
+            slots={
+                0: SESMapSlot(
+                    slot_number=0,
+                    element_id=0,
+                    ses_device="/dev/sg20",
+                    description="First SES bay",
+                    present=False,
+                ),
+                31: SESMapSlot(
+                    slot_number=31,
+                    element_id=31,
+                    ses_device="/dev/sg20",
+                    description="High SES bay",
+                    device_names=["sdz"],
+                    present=True,
+                )
+            },
+        )
+        ses_data = ParsedSSHData(ses_enclosures=[ses_enclosure])
+
+        cases: list[tuple[str, str, list[SlotView]]] = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings(profiles=[profile])
+            settings.layout.api_slot_number_base = 0
+            system = SystemConfig(
+                id="core-api-gapped",
+                default_profile_id=profile.id,
+                truenas=TrueNASConfig(platform="core"),
+            )
+            service = build_inventory_service(settings, system, MagicMock(), MagicMock(), temp_dir)
+            slots, *_rest = service._correlate(
+                raw_data(
+                    enclosures=[{
+                        "id": "enc-a",
+                        "elements": [{
+                            "slot": 31,
+                            "dev": "sdz",
+                            "status": "OK",
+                            "descriptor": "High API bay",
+                        }],
+                    }]
+                ),
+                ParsedSSHData(),
+                [],
+                "enc-a",
+            )
+            cases.append(("core-api", "High API bay", slots))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings(profiles=[profile])
+            system = SystemConfig(
+                id="core-ses-gapped",
+                default_profile_id=profile.id,
+                truenas=TrueNASConfig(platform="core"),
+            )
+            service = build_inventory_service(settings, system, MagicMock(), MagicMock(), temp_dir)
+            slots, *_rest = service._correlate(raw_data(), ses_data, [], "enc-a")
+            cases.append(("core-ses", "High SES bay", slots))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings(profiles=[profile])
+            system = SystemConfig(
+                id="scale-ses-gapped",
+                default_profile_id=profile.id,
+                truenas=TrueNASConfig(platform="scale"),
+            )
+            service = build_inventory_service(settings, system, MagicMock(), MagicMock(), temp_dir)
+            option = EnclosureOption(
+                id="enc-a",
+                label="Gapped shelf",
+                profile_id=profile.id,
+                rows=2,
+                columns=12,
+                slot_count=24,
+                slot_layout=[list(row) for row in layout],
+            )
+            service._build_scale_linux_enclosure_options = MagicMock(return_value=[option])
+            slots, *_rest = service._correlate_scale_linux(raw_data(), ses_data, [], "enc-a")
+            cases.append(("scale-linux-ses", "High SES bay", slots))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings(profiles=[profile])
+            system = SystemConfig(
+                id="quantastor-ses-gapped",
+                default_profile_id=profile.id,
+                truenas=TrueNASConfig(platform="quantastor"),
+            )
+            service = build_inventory_service(settings, system, MagicMock(), MagicMock(), temp_dir)
+            slots, *_rest = service._correlate_quantastor(
+                raw_data(
+                    systems=[{"id": "node-a", "name": "Node A"}],
+                    hw_enclosures=[{"id": "enc-a", "storageSystemId": "node-a"}],
+                ),
+                [],
+                "node-a",
+                ses_data,
+            )
+            cases.append(("quantastor-ses", "High SES bay", slots))
+
+        for source, descriptor, slots in cases:
+            with self.subTest(source=source):
+                self.assertIn(31, [slot.slot for slot in slots])
+                slot = next(slot for slot in slots if slot.slot == 31)
+                self.assertTrue(slot.present)
+                self.assertEqual(slot.raw_status["descriptor"], descriptor)
 
     def test_scale_linux_does_not_overlay_first_api_enclosure_on_selected_ses_enclosure(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

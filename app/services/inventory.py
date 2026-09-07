@@ -678,6 +678,16 @@ class _LayoutFrame:
     allow_legacy_mapping_fallback: bool
     loaded_mappings: dict[str, ManualMapping]
 
+    def actual_slot_ids(self) -> list[int]:
+        """Return rendered physical slot ids in ascending order."""
+        if self.slot_positions:
+            return sorted(self.slot_positions)
+        return list(range(self.layout_slot_count))
+
+    def exclusive_slot_bound(self) -> int:
+        """Return the exclusive upper bound for bounded source candidates."""
+        return max(self.actual_slot_ids(), default=-1) + 1
+
     def result(
         self,
         slot_views: list[SlotView],
@@ -5028,7 +5038,7 @@ class InventoryService:
             return self._correlate_scale_linux(raw_data, ssh_data, warnings, selected_enclosure_id, bmc_inventory)
 
         slot_count = self.settings.layout.slot_count
-        api_candidates, api_selected_meta = extract_enclosure_slot_candidates(
+        _api_candidates, api_selected_meta = extract_enclosure_slot_candidates(
             raw_data.enclosures,
             self.system.truenas.enclosure_filter,
             slot_count,
@@ -5044,16 +5054,6 @@ class InventoryService:
         )
         if selected_option is not None:
             selected_meta.update(self._enclosure_option_meta(selected_option))
-        api_enclosure_ids = {
-            enclosure_id
-            for enclosure_id in (
-                normalize_text(candidate.get("enclosure_id")) for candidate in api_candidates.values()
-            )
-            if enclosure_id
-        }
-        if api_selected_meta.get("id"):
-            api_enclosure_ids.add(api_selected_meta["id"])
-        slot_candidates = merge_slot_candidate_maps(ssh_data.ses_slot_candidates, api_candidates)
         api_topology_members = parse_pool_query_topology(raw_data.pools)
         disk_records = self._build_disk_records(
             raw_data.disks,
@@ -5080,6 +5080,47 @@ class InventoryService:
             return frame
         allow_legacy_mapping_fallback = frame.allow_legacy_mapping_fallback
 
+        candidate_slot_bound = frame.exclusive_slot_bound()
+        physical_enclosure_id = resolve_physical_mapping_scope(
+            frame.selected_option.id if frame.selected_option is not None else selected_enclosure_id
+        )
+        api_candidates, api_selected_meta = extract_enclosure_slot_candidates(
+            raw_data.enclosures,
+            self.system.truenas.enclosure_filter,
+            candidate_slot_bound,
+            self.settings.layout.api_slot_number_base,
+            physical_enclosure_id,
+        )
+        if ssh_data.ses_enclosures:
+            rebuilt_ses_candidates, _ses_meta = build_slot_candidates_from_ses_enclosures(
+                ssh_data.ses_enclosures,
+                candidate_slot_bound,
+                self.system.truenas.enclosure_filter,
+                physical_enclosure_id,
+            )
+            existing_selected_candidates = {
+                slot: candidate
+                for slot, candidate in ssh_data.ses_slot_candidates.items()
+                if slot in rebuilt_ses_candidates
+            }
+            ses_candidates = merge_slot_candidate_maps(
+                rebuilt_ses_candidates,
+                existing_selected_candidates,
+            )
+        else:
+            ses_candidates = ssh_data.ses_slot_candidates
+        api_enclosure_ids = {
+            enclosure_id
+            for enclosure_id in (
+                normalize_text(candidate.get("enclosure_id")) for candidate in api_candidates.values()
+            )
+            if enclosure_id
+        }
+        api_selected_enclosure_id = normalize_text(api_selected_meta.get("id"))
+        if api_selected_enclosure_id:
+            api_enclosure_ids.add(api_selected_enclosure_id)
+        slot_candidates = merge_slot_candidate_maps(ses_candidates, api_candidates)
+
         disks_by_key, disks_by_slot, disks_by_sas = _index_disk_records(
             disk_records,
             self.system.truenas.platform,
@@ -5089,7 +5130,7 @@ class InventoryService:
 
         slot_views: list[SlotView] = []
 
-        for slot in range(frame.layout_slot_count):
+        for slot in frame.actual_slot_ids():
             row_index, column_index = _slot_grid_position(
                 slot,
                 frame.slot_positions,
@@ -5507,7 +5548,7 @@ class InventoryService:
                 "GPIO state changes are visible, but operator-visible bay validation is still pending."
             )
 
-        for slot in range(frame.layout_slot_count):
+        for slot in frame.actual_slot_ids():
             row_index, column_index = _slot_grid_position(
                 slot,
                 frame.slot_positions,
@@ -5659,7 +5700,7 @@ class InventoryService:
         }
         loaded_mappings = frame.loaded_mappings
         slot_views: list[SlotView] = []
-        for slot in range(frame.layout_slot_count):
+        for slot in frame.actual_slot_ids():
             row_index, column_index = _slot_grid_position(
                 slot,
                 frame.slot_positions,
@@ -5825,15 +5866,15 @@ class InventoryService:
         empty_ssh = ParsedSSHData()
         loaded_mappings = frame.loaded_mappings
         slot_views: list[SlotView] = []
-        for slot in range(frame.layout_slot_count):
+        for ordinal, slot in enumerate(frame.actual_slot_ids()):
             row_index, column_index = _slot_grid_position(
                 slot,
                 frame.slot_positions,
                 frame.layout_columns,
             )
             mapped_bmc_slot = bmc_slot_hints.get(slot)
-            if mapped_bmc_slot is None and slot < len(discovered_slot_numbers):
-                mapped_bmc_slot = discovered_slot_numbers[slot]
+            if mapped_bmc_slot is None and ordinal < len(discovered_slot_numbers):
+                mapped_bmc_slot = discovered_slot_numbers[ordinal]
             slot_hint = f"bmc-slot:{mapped_bmc_slot}" if isinstance(mapped_bmc_slot, int) else None
             raw_slot_status: dict[str, Any] = {
                 "device_names": [slot_hint] if slot_hint else [],
@@ -5916,7 +5957,7 @@ class InventoryService:
         # not zero-based) renders fewer bays than its highest bay id, so bound
         # the builders by the highest rendered id while the visible count
         # keeps feeding the option label and layout_slot_count (issue #274).
-        candidate_slot_bound = max(frame.slot_positions) + 1 if frame.slot_positions else slot_count
+        candidate_slot_bound = frame.exclusive_slot_bound()
         ssh_candidates, ssh_meta = build_slot_candidates_from_ses_enclosures(
             ssh_data.ses_enclosures,
             candidate_slot_bound,
@@ -5960,14 +6001,7 @@ class InventoryService:
 
         mapping_enclosure_id = resolve_physical_mapping_scope(selected_option.id)
         is_sub_view = mapping_enclosure_id != selected_option.id
-        # Synthetic drawer sub-views render only their own layout slots. Normal
-        # profiles retain the existing range behavior so sparse custom layouts
-        # do not silently remove bays from inventory.
-        slots_to_render = (
-            sorted(frame.slot_positions)
-            if is_sub_view and frame.slot_positions
-            else list(range(slot_count))
-        )
+        slots_to_render = frame.actual_slot_ids()
         if is_sub_view:
             slot_count = len(slots_to_render)
         loaded_mappings = frame.loaded_mappings
@@ -6096,14 +6130,14 @@ class InventoryService:
             raw_data,
             selected_system_id,
             quantastor_ses_data,
-            frame.layout_slot_count,
+            frame.exclusive_slot_bound(),
             selected_profile.id,
             selected_hw_enclosure_id,
         )
         loaded_mappings = frame.loaded_mappings
         slot_views: list[SlotView] = []
 
-        for slot in range(frame.layout_slot_count):
+        for slot in frame.actual_slot_ids():
             row_index, column_index = _slot_grid_position(
                 slot,
                 frame.slot_positions,
