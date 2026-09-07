@@ -18,8 +18,6 @@ from app.request_context import (
     request_context,
     validate_request_id,
 )
-from history_service.scheduled_backup import read_scheduled_backup_status
-
 METRICS_NAMESPACE = "truenas_jbod_ui"
 DEFAULT_METRICS_PATH = "/metrics"
 HTTP_DURATION_BUCKETS = (
@@ -581,6 +579,10 @@ class ScheduledBackupStatusCollector:
         raw_path = str(os.getenv("SCHEDULED_BACKUP_STATUS_FILE", "")).strip()
         if not raw_path:
             return None
+        # Source-only fixture tooling is supported on Windows even though the
+        # configured scheduled-backup runtime still requires POSIX flock.
+        from history_service.scheduled_backup import read_scheduled_backup_status
+
         return read_scheduled_backup_status(raw_path)
 
     def collect(self):

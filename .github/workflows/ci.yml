@@ -28,6 +28,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # dev-check-source-gate: diff-hygiene
       - name: Check patch whitespace
         env:
           BEFORE_SHA: ${{ github.event.before }}
@@ -141,14 +142,20 @@ jobs:
           chmod 0755 "$install_dir/promtool"
           printf '%s\n' "$install_dir" >> "$GITHUB_PATH"
 
+      # dev-check-source-gate: prometheus-rules
       - name: Validate starter Prometheus alert rules
         run: |
           promtool check rules prometheus/rules/truenas-jbod-ui-alerts-v1.yml
           python -m unittest tests.test_prometheus_alert_rules -v
 
+      # dev-check-source-gate: python-compileall
       - name: Compile Python source
         run: python -m compileall app admin_service history_service scripts tests
 
+      # Both full-discovery matrix branches run tests.test_perf_budgets,
+      # including the checked-in baseline command contract.
+      # dev-check-source-gate: performance-baseline
+      # dev-check-source-gate: python-unittest
       - name: Run deterministic unittest suite
         if: matrix.python-version != '3.12'
         run: python -m unittest discover -s tests -p "test_*.py" -v
@@ -191,6 +198,7 @@ jobs:
           python -m pip install -r requirements-dev.txt
           python -m pip check
 
+      # dev-check-source-gate: bounded-ruff
       - name: Run bounded Ruff rules
         run: ruff check app admin_service history_service scripts tests --select E4,E7,E9,F
 
@@ -213,6 +221,7 @@ jobs:
       - name: Install locked Node dependencies without lifecycle scripts
         run: npm ci --ignore-scripts
 
+      # dev-check-source-gate: javascript-syntax
       - name: Check JavaScript syntax
         run: |
           set -euo pipefail
@@ -230,6 +239,7 @@ jobs:
             node --check "$spec"
           done
 
+      # dev-check-source-gate: javascript-unit-tests
       - name: Run deterministic JavaScript unit tests
         run: npm run test:unit
 

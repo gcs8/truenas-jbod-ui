@@ -163,7 +163,13 @@ python scripts/validate_release_wrap.py "$version" \
   - `for spec in qa/*.spec.js; do node --check "$spec"; done`
 - run the browser smoke suites. Live-appliance specs require explicit opt-in;
   a bare `npx playwright test` is not a portable release command:
-  - `npx playwright test qa/public-demo.spec.js qa/offline-snapshot.spec.js`
+  - POSIX: `slot_focus_artifact="$(mktemp "${TMPDIR:-/tmp}/truenas-jbod-ui-slot-focus-XXXXXX.html")"`
+  - POSIX: `trap 'rm -f -- "$slot_focus_artifact"' EXIT`
+  - POSIX: `python scripts/build_current_source_browser_fixture.py --output "$slot_focus_artifact"`
+  - POSIX: `PUBLIC_DEMO_ARTIFACT=public-demo/index.html SLOT_FOCUS_ARTIFACT="$slot_focus_artifact" npx playwright test qa/public-demo.spec.js`
+  - POSIX: `rm -f -- "$slot_focus_artifact"`
+  - POSIX: `trap - EXIT`
+  - `npx playwright test qa/offline-snapshot.spec.js`
   - `PLAYWRIGHT_ADMIN_BASE_URL=http://127.0.0.1:8082 npx playwright test qa/admin-operations.spec.js`
   - `PLAYWRIGHT_LIVE_APPLIANCE_QA=1 npx playwright test qa/ui-switching.spec.js qa/esxi-smoke.spec.js`
     (only against an intentionally configured live stack)
@@ -475,13 +481,29 @@ python scripts/validate_release_wrap.py "$version" \
 - if the release changes public-demo behavior or data, regenerate and verify
   the checked-in artifact from a release-maintainer checkout with ignored local
   `history/history.db` input:
-  - `set PUBLIC_DEMO_LOCAL_HISTORY=1`
-  - `.\.venv\Scripts\python.exe -m unittest tests.test_public_demo_fixture -v`
-  - `.\.venv\Scripts\python.exe scripts\build_public_demo.py --output public-demo\index.html`
-  - `.\.venv\Scripts\python.exe scripts\build_public_demo.py --output public-demo\index.html --check`
-  - `.\.venv\Scripts\python.exe scripts\check_public_demo_artifact.py public-demo`
-  - `set PUBLIC_DEMO_ARTIFACT=public-demo/index.html`
-  - `npx playwright test qa/public-demo.spec.js`
+  - run the complete sequence in PowerShell with failure-safe environment and
+    temporary-file cleanup:
+
+    ```powershell
+    $env:PUBLIC_DEMO_LOCAL_HISTORY = "1"
+    try {
+        & .\.venv\Scripts\python.exe -m unittest tests.test_public_demo_fixture -v
+        & .\.venv\Scripts\python.exe scripts/build_public_demo.py --output public-demo\index.html
+        & .\.venv\Scripts\python.exe scripts/build_public_demo.py --output public-demo\index.html --check
+        & .\.venv\Scripts\python.exe scripts/check_public_demo_artifact.py public-demo
+        $slot_focus_artifact = [System.IO.Path]::GetTempFileName()
+        try {
+            & .\.venv\Scripts\python.exe scripts/build_current_source_browser_fixture.py --output $slot_focus_artifact
+            $env:PUBLIC_DEMO_ARTIFACT = "public-demo/index.html"; $env:SLOT_FOCUS_ARTIFACT = $slot_focus_artifact; npx playwright test qa/public-demo.spec.js
+        } finally {
+            Remove-Item -LiteralPath $slot_focus_artifact -ErrorAction SilentlyContinue
+        }
+    } finally {
+        Remove-Item Env:PUBLIC_DEMO_ARTIFACT -ErrorAction SilentlyContinue
+        Remove-Item Env:SLOT_FOCUS_ARTIFACT -ErrorAction SilentlyContinue
+        Remove-Item Env:PUBLIC_DEMO_LOCAL_HISTORY -ErrorAction SilentlyContinue
+    }
+    ```
   - record the changed files, artifact publishability/privacy result, and
     browser result in `Docs/wiki/public-demo gate` before tagging; record the
     Pages workflow run and URL later in `Docs/wiki/public-demo publication`

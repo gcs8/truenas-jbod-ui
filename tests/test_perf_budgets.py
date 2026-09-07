@@ -50,6 +50,80 @@ def compact_json_bytes(value: object) -> bytes:
 
 
 class ModeledPerfFixtureTests(unittest.TestCase):
+    def test_perf_baseline_check_executes_under_synthetic_win32_without_fcntl(self) -> None:
+        probe = """
+import asyncio
+import builtins
+import runpy
+import sys
+
+script = sys.argv[1]
+real_import = builtins.__import__
+
+def portable_import(name, *args, **kwargs):
+    if name == "fcntl":
+        raise ModuleNotFoundError("synthetic Windows has no fcntl")
+    return real_import(name, *args, **kwargs)
+
+builtins.__import__ = portable_import
+sys.argv = [script, "--check"]
+try:
+    runpy.run_path(script, run_name="__main__")
+except SystemExit as exc:
+    if exc.code not in (None, 0):
+        raise
+print("synthetic-win32-import: PASS")
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", probe, str(ROOT / "scripts/build_perf_baseline.py")],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("synthetic-win32-import: PASS", result.stdout)
+
+    def test_real_history_store_still_requires_posix_locking_after_portable_import(self) -> None:
+        probe = """
+import builtins
+from pathlib import Path
+import sys
+import tempfile
+
+real_import = builtins.__import__
+
+def portable_import(name, *args, **kwargs):
+    if name == "fcntl":
+        raise ModuleNotFoundError("synthetic Windows has no fcntl")
+    return real_import(name, *args, **kwargs)
+
+builtins.__import__ = portable_import
+from history_service.store import HistoryStore
+print("history-store-import: PASS")
+with tempfile.TemporaryDirectory() as temp_dir:
+    try:
+        HistoryStore(str(Path(temp_dir) / "history.db"))
+    except RuntimeError as exc:
+        if str(exc) != "Segmented history migration locking requires POSIX flock support.":
+            raise
+    else:
+        raise AssertionError("production HistoryStore unexpectedly ran without POSIX locking")
+print("history-store-posix-lock: PASS")
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("history-store-import: PASS", result.stdout)
+        self.assertIn("history-store-posix-lock: PASS", result.stdout)
+
     @staticmethod
     def _comparison_payload() -> dict[str, object]:
         return {
