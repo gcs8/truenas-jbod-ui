@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from pathlib import Path
+import subprocess
 import sys
 
 
@@ -14,7 +15,10 @@ from app.services.public_demo_fixture import (  # noqa: E402
     PUBLIC_DEMO_GENERATED_AT,
     build_public_demo_html,
 )
-from scripts.public_demo_source_parity import add_source_parity_manifest  # noqa: E402
+from scripts.public_demo_source_parity import (  # noqa: E402
+    add_source_parity_manifest,
+    parse_manifest,
+)
 
 
 DEFAULT_OUTPUT = ROOT / "public-demo" / "index.html"
@@ -41,7 +45,34 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Verify that the output already equals a fresh deterministic build.",
     )
+    parser.add_argument(
+        "--source-revision",
+        help="Full Git commit for the declared demo inputs. Defaults to the current Git HEAD.",
+    )
     return parser.parse_args()
+
+
+def resolve_source_revision(
+    explicit_revision: str | None,
+    *,
+    checked_output: Path | None = None,
+) -> str:
+    if explicit_revision is not None:
+        return explicit_revision
+    if checked_output is not None and checked_output.is_file():
+        manifest, _artifact_html, errors = parse_manifest(checked_output.read_text(encoding="utf-8"))
+        recorded = manifest.get("source_revision")
+        if not errors and isinstance(recorded, str):
+            return recorded
+    result = subprocess.run(
+        ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise ValueError("source revision is required outside a Git checkout")
+    return result.stdout.strip()
 
 
 async def run() -> int:
@@ -49,7 +80,14 @@ async def run() -> int:
     output_path = args.output if args.output.is_absolute() else ROOT / args.output
     try:
         html = normalize_artifact_html(await build_public_demo_html())
-        html = add_source_parity_manifest(html, source_root=ROOT)
+        html = add_source_parity_manifest(
+            html,
+            source_root=ROOT,
+            source_revision=resolve_source_revision(
+                args.source_revision,
+                checked_output=output_path if args.check else None,
+            ),
+        )
     except (RuntimeError, ValueError) as exc:
         print(f"Public demo generation failed: {exc}", file=sys.stderr)
         return 1
