@@ -3244,6 +3244,10 @@ button.fabric-trace-crumb:hover {
   .slot-tile.state-unmapped::after { border-style: dashed; }
 }
 
+.slot-scroll-hint {
+  display: none;
+}
+
 .enclosure-face {
   flex: 0 0 auto;
   display: flex;
@@ -6085,6 +6089,13 @@ button.fabric-trace-crumb:hover {
 
   .summary-strip {
     grid-template-columns: 1fr 1fr;
+  }
+
+  .slot-scroll-hint {
+    display: block;
+    margin: 0 0 10px;
+    color: var(--muted);
+    font-size: 0.86rem;
   }
 
   .fabric-lane-board,
