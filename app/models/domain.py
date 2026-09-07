@@ -502,18 +502,23 @@ class MappingImportConfirmation(BaseModel):
 
 
 class SnapshotExportRequest(BaseModel):
-    selected_slot: int | None = None
-    selected_storage_view_id: str | None = None
-    history_window_hours: int | None = 24
+    selected_slot: int | None = Field(default=None, ge=0, le=65535)
+    selected_storage_view_id: str | None = Field(default=None, max_length=256)
+    history_window_hours: int = Field(default=24, ge=1, le=24 * 365)
     history_panel_open: bool = False
-    io_chart_mode: str = "total"
+    io_chart_mode: Literal["total", "average"] = "total"
     redact_sensitive: bool = False
     packaging: Literal["auto", "html", "zip"] = "auto"
     allow_oversize: bool = False
     include_live_enclosures: bool = False
-    enclosure_ids: list[str] = Field(default_factory=list)
+    enclosure_ids: list[str] = Field(default_factory=list, max_length=128)
     include_storage_views: bool = False
-    storage_view_ids: list[str] = Field(default_factory=list)
+    storage_view_ids: list[str] = Field(default_factory=list, max_length=128)
+
+    @field_validator("history_window_hours", mode="before")
+    @classmethod
+    def bound_all_history_window(cls, value: Any) -> Any:
+        return 24 * 365 if value is None else value
 
     @field_validator("selected_storage_view_id")
     @classmethod
