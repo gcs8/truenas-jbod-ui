@@ -182,8 +182,23 @@ class PublicDemoFixture(FixtureModel):
         if {view.id for view in self.storage_views} != {"boot-doms", "nvme-carrier-x4"}:
             raise ValueError("public demo fixture must declare both synthetic storage views")
         for view in self.storage_views:
-            if len({slot.slot_index for slot in view.slots}) != len(view.slots):
+            slot_indices = {slot.slot_index for slot in view.slots}
+            if len(slot_indices) != len(view.slots):
                 raise ValueError(f"storage view {view.id} has duplicate slot indices")
+            template = get_storage_view_template(view.template_id)
+            if template is None:
+                raise ValueError(f"storage view {view.id} references an unknown template")
+            template_slot_indices = {
+                slot_index
+                for row in template.slot_layout
+                for slot_index in row
+                if slot_index is not None
+            }
+            if slot_indices != template_slot_indices:
+                expected = ", ".join(str(slot_index) for slot_index in sorted(template_slot_indices))
+                raise ValueError(
+                    f"storage view {view.id} must declare exactly template slots {expected}"
+                )
         return self
 
 

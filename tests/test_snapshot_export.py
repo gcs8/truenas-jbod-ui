@@ -1975,6 +1975,40 @@ class SnapshotExportPendingWorkTests(unittest.IsolatedAsyncioTestCase):
             max_retained_bytes=retained_bytes,
         )
 
+    async def test_deferred_admission_charges_measured_bytes_above_reservation(self) -> None:
+        coordinator = self.coordinator(pending=8, retained_bytes=32)
+        retained_during_work: list[int] = []
+
+        async def work() -> str:
+            retained_during_work.append(coordinator.retained_bytes)
+            return "done"
+
+        result = await coordinator.run_deferred(
+            key_factory=lambda: "large-render",
+            reservation_bytes=4,
+            retained_bytes=24,
+            work=work,
+        )
+
+        self.assertEqual(result, "done")
+        self.assertEqual(retained_during_work, [24])
+        self.assertEqual(coordinator.pending_key_count, 0)
+        self.assertEqual(coordinator.retained_bytes, 0)
+
+    async def test_deferred_admission_releases_reservation_when_measured_bytes_exceed_cap(self) -> None:
+        coordinator = self.coordinator(pending=8, retained_bytes=10)
+
+        with self.assertRaises(snapshot_export.SnapshotExportBusyError):
+            await coordinator.run_deferred(
+                key_factory=lambda: "oversized-render",
+                reservation_bytes=4,
+                retained_bytes=11,
+                work=lambda: asyncio.sleep(0),
+            )
+
+        self.assertEqual(coordinator.pending_key_count, 0)
+        self.assertEqual(coordinator.retained_bytes, 0)
+
     async def test_saturated_request_rejects_before_hostname_or_cache_key_traversal(self) -> None:
         coordinator = self.coordinator(pending=1, retained_bytes=1024)
         occupied = asyncio.Event()

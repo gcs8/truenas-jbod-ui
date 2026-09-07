@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -9,12 +10,15 @@ import tempfile
 from pathlib import Path
 import unittest
 
+from pydantic import ValidationError
+
 from app import __version__
 from app.services.public_demo_fixture import (
     PUBLIC_DEMO_ENCLOSURE_ID,
     PUBLIC_DEMO_FIXTURE_PATH,
     PUBLIC_DEMO_GENERATED_AT,
     PUBLIC_DEMO_SYSTEM_ID,
+    PublicDemoFixture,
     build_public_demo_html,
     build_public_demo_snapshot_bundle,
     load_public_demo_fixture,
@@ -277,6 +281,16 @@ class PublicDemoFixtureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(fixture.slots), 60)
         self.assertEqual([slot.slot for slot in fixture.slots], list(range(60)))
         self.assertEqual({view.id for view in fixture.storage_views}, {"boot-doms", "nvme-carrier-x4"})
+
+    def test_fixture_rejects_a_storage_view_missing_a_template_slot(self) -> None:
+        payload = json.loads(PUBLIC_DEMO_FIXTURE_PATH.read_text(encoding="utf-8"))
+        payload["storage_views"][0]["slots"].pop()
+
+        with self.assertRaisesRegex(
+            ValidationError,
+            r"storage view boot-doms must declare exactly template slots 0, 1",
+        ):
+            PublicDemoFixture.model_validate(payload)
 
     def test_snapshot_bundle_maps_synthetic_fixture(self) -> None:
         bundle = build_public_demo_snapshot_bundle()

@@ -225,7 +225,7 @@ class SnapshotExportWorkCoordinator:
         reservation_bytes = max(0, int(reservation_bytes))
         if not self._has_initial_capacity(reservation_bytes):
             raise SnapshotExportBusyError()
-        # Reserve both a distinct-key slot and its maximum retained bytes before
+        # Reserve both a distinct-key slot and provisional retained bytes before
         # any source traversal, fingerprinting, or retained-byte estimation.
         # There is no await between this reservation and publication of the
         # canonical key.
@@ -246,10 +246,15 @@ class SnapshotExportWorkCoordinator:
                 release_reservation()
                 return await self._wait(pending)
             resolved_bytes = retained_bytes() if callable(retained_bytes) else retained_bytes
-            if max(0, int(resolved_bytes)) > reservation_bytes:
+            resolved_bytes = max(0, int(resolved_bytes))
+            retained_without_reservation = self._retained_bytes - reservation_bytes
+            if (
+                resolved_bytes > self.max_retained_bytes
+                or retained_without_reservation + resolved_bytes > self.max_retained_bytes
+            ):
                 raise SnapshotExportBusyError()
             release_reservation()
-            pending = self._start_pending(key, reservation_bytes, work)
+            pending = self._start_pending(key, resolved_bytes, work)
         except BaseException:
             release_reservation()
             raise
