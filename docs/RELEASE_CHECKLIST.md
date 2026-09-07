@@ -472,19 +472,21 @@ python scripts/validate_release_wrap.py "$version" \
   publication `Pass` always requires the live comparison and exact receipt.
 - add the completed checklist evidence table to the release wrap before the
   tag is cut
-- if the release changes public-demo behavior or data, regenerate and verify
-  the checked-in artifact from a release-maintainer checkout with ignored local
-  `history/history.db` input:
-  - `set PUBLIC_DEMO_LOCAL_HISTORY=1`
-  - `.\.venv\Scripts\python.exe -m unittest tests.test_public_demo_fixture -v`
-  - `.\.venv\Scripts\python.exe scripts\build_public_demo.py --output public-demo\index.html`
-  - `.\.venv\Scripts\python.exe scripts\build_public_demo.py --output public-demo\index.html --check`
-  - `.\.venv\Scripts\python.exe scripts\check_public_demo_artifact.py public-demo`
-  - `set PUBLIC_DEMO_ARTIFACT=public-demo/index.html`
-  - `npx playwright test qa/public-demo.spec.js`
-  - record the changed files, artifact publishability/privacy result, and
-    browser result in `Docs/wiki/public-demo gate` before tagging; record the
-    Pages workflow run and URL later in `Docs/wiki/public-demo publication`
+- if the release changes public-demo behavior or data, review the synthetic
+  fixture at `tests/fixtures/public_demo/public_demo.json`, then regenerate and
+  verify the checked-in artifact from a clean checkout:
+  - `python -m unittest tests.test_public_demo_fixture tests.test_public_demo_deterministic -v`
+  - `python scripts/build_public_demo.py --output public-demo/index.html`
+  - `python scripts/build_public_demo.py --output public-demo/index.html --check`
+  - `python scripts/check_public_demo_artifact.py public-demo`
+  - `PUBLIC_DEMO_ARTIFACT=public-demo/index.html npx playwright test qa/public-demo.spec.js`
+  - record fixture provenance, fixture and artifact hashes, declared-input
+    mutation results, privacy scan, and browser result in
+    `Docs/wiki/public-demo gate` before tagging
+  - keep exact fixture-byte approval and Pages publication separate; a push to
+    `main` that changes `public-demo/**` deploys the checked-in directory, and
+    the workflow run plus public readback belong later in
+    `Docs/wiki/public-demo publication`
 
 ## Config And Examples
 

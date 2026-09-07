@@ -1,64 +1,41 @@
-# Public Demo Artifact
+# Public demo artifact
 
-This folder holds the generated static demo entry point for GitHub Pages or any
-plain static host. The checked-in demo is built from live-derived TN Core sample
-data through the same offline snapshot exporter used by the app, with critical
-disk identifiers scrambled consistently across the artifact.
+This directory contains the generated static demo served by GitHub Pages. The
+demo uses only the schema-validated fixture at
+`tests/fixtures/public_demo/public_demo.json`. Every system, enclosure, disk,
+identifier, metric, and event in that fixture was invented for this repository.
+The normal build never reads operator config, local history, caches, logs, or a
+live system.
 
 Published site:
 
 - https://gcs8.github.io/truenas-jbod-ui/
 
-The local history database is release input, not a repository fixture. Clean
-checkouts and CI validate the checked-in `public-demo/index.html` artifact; they
-do not rebuild it from ignored `history/history.db`.
+## Regenerate and verify
 
-## Clean checkout / CI checks
+A clean checkout can reproduce the artifact:
 
-Check that the committed artifact is safe to publish with:
-
-```powershell
-python scripts/check_public_demo_artifact.py public-demo
-```
-
-Smoke-test the checked-in static artifact with:
-
-```powershell
-$env:PUBLIC_DEMO_ARTIFACT = "public-demo/index.html"
-npx playwright test qa/public-demo.spec.js
-```
-
-## Release-maintainer regeneration
-
-Regenerating the demo requires a trusted local checkout with ignored
-`history/history.db` release input. Do not copy that database into the repo.
-
-Run the local-data generation tests explicitly:
-
-```powershell
-$env:PUBLIC_DEMO_LOCAL_HISTORY = "1"
-python -m unittest tests.test_public_demo_fixture -v
-```
-
-Build or freshness-check the checked-in artifact with:
-
-```powershell
+```bash
 python scripts/build_public_demo.py --output public-demo/index.html
 python scripts/build_public_demo.py --output public-demo/index.html --check
 python scripts/check_public_demo_artifact.py public-demo
+PUBLIC_DEMO_ARTIFACT=public-demo/index.html npx playwright test qa/public-demo.spec.js
 ```
 
-To smoke-test a temporary artifact generated from local history, opt in
-explicitly:
+The builder records SHA-256 fingerprints for the complete semantic input graph
+in the artifact. The checker verifies those fingerprints, the source version,
+embedded JavaScript and CSS, privacy rules, removed-code rules, and size limits.
+Change fixture data in the checked-in JSON, not in generated HTML. Do not edit
+`public-demo/index.html` by hand.
 
-```powershell
-$env:PUBLIC_DEMO_BUILD_FROM_HISTORY = "1"
-npx playwright test qa/public-demo.spec.js
-```
+Running the builder locally does not publish anything. A pull request runs the
+verification job without deployment. A push to `main` that changes
+`public-demo/**` starts `.github/workflows/publish-public-demo.yml` and deploys
+that exact checked-in directory to GitHub Pages. Commit, push, merge, Pages
+publication, and public readback remain separate approval and verification
+gates.
 
-The GitHub Pages workflow deploys this directory as-is. GitHub-hosted runners
-smoke-test the checked-in `public-demo/index.html` file rather than rebuilding
-from live data. A release or `main` publication therefore preserves the exact
-committed capture time and artifact app version. Regeneration is an explicit
-maintainer step that requires trusted local ignored history input, followed by
-review of the artifact diff, publishability check, and browser smoke test.
+Local-history conversion is not part of normal generation. If maintainers add a
+future conversion tool, it must require explicit opt-in, write the bounded
+public fixture, and stop before artifact regeneration or publication so the
+fixture bytes can be reviewed first.

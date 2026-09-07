@@ -4,7 +4,7 @@
 {% set profile = snapshot.selected_profile %}
 {% set release_status_payload = release_status if release_status is defined and release_status else {} %}
 {% set release_note = release_status_payload.summary if release_status_payload and release_status_payload.summary else "Checking releases..." %}
-{% set snapshot_is_sanitized = snapshot_mode and (snapshot_export_meta.redaction == "partial" or snapshot_export_meta.redaction_label == "Scrambled IDs") %}
+{% set snapshot_is_sanitized = snapshot_mode and (snapshot_export_meta.redaction == "partial" or snapshot_export_meta.redaction_label in ["Scrambled IDs", "Synthetic IDs"]) %}
 <div class="app-shell">
   <header class="topbar">
     <div>
@@ -62,7 +62,7 @@
   <section class="panel snapshot-banner">
     <div class="snapshot-banner-copy">
       <div class="snapshot-banner-badge">{% if snapshot_is_sanitized %}Frozen Sanitized Snapshot{% else %}Frozen Offline Artifact{% endif %}</div>
-      <p class="eyebrow">{% if snapshot_export_meta.redaction_label == "Scrambled IDs" %}Public Demo Artifact{% else %}Offline Snapshot{% endif %}</p>
+      <p class="eyebrow">{% if snapshot_export_meta.redaction_label in ["Scrambled IDs", "Synthetic IDs"] %}Public Demo Artifact{% else %}Offline Snapshot{% endif %}</p>
       <h2>Explorable Enclosure Snapshot</h2>
       <p class="subtle">
         {% if snapshot_is_sanitized %}Frozen, sanitized point-in-time snapshot. This is not live data. You can search, click slots, and inspect preloaded history offline.{% else %}Frozen point-in-time enclosure snapshot. Live actions are disabled, but you can still search, click slots, and inspect preloaded history offline.{% endif %}

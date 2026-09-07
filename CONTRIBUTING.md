@@ -451,47 +451,42 @@ Additional notes by area:
 
 ## Public Demo And Fixture Policy
 
-Public-demo output should look realistic enough to represent the product well,
-but tests must be deterministic and clean-checkout safe.
+The checked-in public demo is reproducible from synthetic public repository
+state. Its normal input is the schema-validated fixture at
+`tests/fixtures/public_demo/public_demo.json`.
 
 Rules:
 
-1. Do not depend on a developer's local `history/history.db` for normal unit
-   tests.
-2. Do not assume hidden local 60-bay or production-like history data exists in
-   CI or a clean checkout.
-3. If a test needs representative data, add a deterministic sanitized fixture.
-4. If a test truly needs local/live data, mark it as integration/local-data and
-   skip by default unless an explicit environment variable enables it.
-5. Generated public-demo artifacts should be produced by scripts, not manual
+1. Every fixture value must be invented, deterministic, and public-safe. Do not
+   derive fixture bytes from local history, config, profiles, caches, logs, live
+   systems, or private issue/archive material.
+2. Normal generation must ignore operator config and ambient local data. A clean
+   checkout rebuilds the same bytes with:
+   `python scripts/build_public_demo.py --output public-demo/index.html`.
+3. Generated public-demo artifacts are produced by the builder, never by manual
    edits.
+4. The builder and checker share one centrally declared semantic input graph.
+   Any declared input change must make the old artifact fail closed.
+5. Any future local-history conversion must be an explicit maintainer-only tool
+   that writes the bounded public fixture. Fixture review, artifact regeneration,
+   and publication remain separate later steps.
 6. Public-demo output must not contain real hostnames, private IPs, serials,
-   WWNs/SAS addresses, keys, configured system names, or secrets.
+   WWNs/SAS addresses, keys, configured system names, credentials, or secrets.
 
-When public-demo behavior or data changes, separate clean artifact validation
-from local-data release regeneration.
-
-Clean checkout / CI validation uses the checked-in artifact only:
+Regenerate and verify from a clean checkout:
 
 ```bash
-python scripts/check_public_demo_artifact.py public-demo
-PUBLIC_DEMO_ARTIFACT=public-demo/index.html npx playwright test qa/public-demo.spec.js
-```
-
-Release-maintainer regeneration requires ignored local `history/history.db`
-input and must be explicit:
-
-```bash
-PUBLIC_DEMO_LOCAL_HISTORY=1 python -m unittest tests.test_public_demo_fixture -v
+python -m unittest tests.test_public_demo_fixture tests.test_public_demo_deterministic -v
 python scripts/build_public_demo.py --output public-demo/index.html
 python scripts/build_public_demo.py --output public-demo/index.html --check
 python scripts/check_public_demo_artifact.py public-demo
 PUBLIC_DEMO_ARTIFACT=public-demo/index.html npx playwright test qa/public-demo.spec.js
 ```
 
-Use `PUBLIC_DEMO_BUILD_FROM_HISTORY=1` only when the Playwright public-demo
-smoke should build a temporary artifact from local ignored history data.
-On Windows shells, adapt environment variable syntax as needed.
+A local build does not publish. Pull requests run verification only. A push to
+`main` that changes `public-demo/**` triggers the Pages deployment workflow, so
+commit, push, merge, exact-byte approval, publication, and readback must be
+recorded as separate gates.
 
 ## Live Data Cautions
 

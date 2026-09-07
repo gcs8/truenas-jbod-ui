@@ -86,6 +86,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_perf",
             "tests.test_perf_budgets",
             "tests.test_platform_parity_fixtures",
+            "tests.test_public_demo_deterministic",
             "tests.test_public_demo_fixture",
             "tests.test_read_ui_auth",
             "tests.test_route_contracts",
