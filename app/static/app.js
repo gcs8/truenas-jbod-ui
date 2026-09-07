@@ -2302,7 +2302,9 @@
     }
     if (sasFabricLanes) {
       if (!fabric) {
-        sasFabricLanes.innerHTML = '<div class="warning-item muted compact">No Storage Fabric payload has been loaded yet.</div>';
+        sasFabricLanes.innerHTML = state.snapshotMode
+          ? '<div class="warning-item muted compact">No Storage Fabric payload is included in this snapshot.</div>'
+          : '<div class="warning-item muted compact">No Storage Fabric payload has been loaded yet.</div>';
       } else if (fabric.available === false) {
         sasFabricLanes.innerHTML = '<div class="warning-item muted compact">No Storage Fabric map is available for this platform yet.</div>';
       } else {
