@@ -68,7 +68,7 @@ The final release-wrap validation pass confirmed:
 - local Windows broad Python suite: `234` passing tests
 - Linux dev target host-side broad Python suite: `234` passing tests
 - local Windows browser QA: `9` passing / `1` skipped
-- Linux dev target browser QA against `http://10.13.37.138:8080`: `10` passing
+- Linux dev target browser QA against `http://192.0.2.138:8080`: `10` passing
 - local Windows perf harness (`release-candidate-0.12.0-local-windows`):
   - `inventory_force` avg `8315.8 ms`
   - `snapshot_export_estimate` avg `13988.8 ms`

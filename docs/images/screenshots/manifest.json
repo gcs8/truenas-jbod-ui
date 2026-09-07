@@ -1,0 +1,35 @@
+{
+  "images": {
+    "public-demo-overview.png": {
+      "bytes": 1124849,
+      "dimensions": [
+        1920,
+        4104
+      ],
+      "pixel_review": "PASS",
+      "sha256": "9fda4e2b4c7e9ebba39a8b99eb4042e208b43173915944bd6b2cb3398aba7699"
+    },
+    "public-demo-history.png": {
+      "bytes": 1255167,
+      "dimensions": [
+        1920,
+        4860
+      ],
+      "pixel_review": "PASS",
+      "sha256": "d9f1a65ed38dc1b02b52bd23bd7f18554d878a6dc097cac8cfca2fd19fdad224"
+    },
+    "public-demo-mobile.png": {
+      "bytes": 595793,
+      "dimensions": [
+        390,
+        4821
+      ],
+      "pixel_review": "PASS",
+      "sha256": "d26fbe7952fca0d29bf9e3a3a7506eded59169e66e68eabd3caa1904060f9a6e"
+    }
+  },
+  "provenance": "synthetic-public-demo",
+  "schema_version": 1,
+  "source_artifact_sha256": "457220520f57564b29494aa3dbe5f4447fa4b22407c9b481eb3dd178addda06d",
+  "source_revision": "843df7d9d1f7ccb2d12aad08532ed4eba716b919"
+}

@@ -79,7 +79,6 @@
     },
     "reason": "Reviewed source literal or validation pattern; exact detector counts are pinned."
   },
-
   "app/static/sas_fabric_view.js": {
     "findings": {
       "internal_hostname": {
@@ -117,86 +116,6 @@
       }
     },
     "reason": "Reviewed public documentation example; exact detector counts are pinned."
-  },
-  "docs/RELEASE_NOTES_0.12.0.md": {
-    "findings": {
-      "rfc1918_ipv4": {
-        "sha256:2317060e1568573e65166f383b510ba0c5fa127c1c193bae67fa5ac0f5b55be2": 1
-      }
-    },
-    "reason": "Historical public release evidence; exact detector counts are pinned."
-  },
-  "docs/RELEASE_NOTES_0.17.0.md": {
-    "findings": {
-      "rfc1918_ipv4": {
-        "sha256:0a9e6688d9a7d985c0b78e850bf40593facd313ed5f6e89d3a329c7dae1072b7": 2
-      }
-    },
-    "reason": "Historical public release evidence; exact detector counts are pinned."
-  },
-  "docs/RELEASE_NOTES_0.20.1.md": {
-    "findings": {
-      "sas_wwn_identifier": {
-        "sha256:47dcffccecc527984675bb4c11ad47a4492c2b315fd108446e022b9d1aaea755": 1
-      }
-    },
-    "reason": "Historical public release evidence; exact detector counts are pinned."
-  },
-  "docs/RELEASE_WRAP_0.17.0.md": {
-    "findings": {
-      "rfc1918_ipv4": {
-        "sha256:2317060e1568573e65166f383b510ba0c5fa127c1c193bae67fa5ac0f5b55be2": 1
-      }
-    },
-    "reason": "Historical public release evidence; exact detector counts are pinned."
-  },
-  "docs/RELEASE_WRAP_0.20.0.md": {
-    "findings": {
-      "rfc1918_ipv4": {
-        "sha256:2317060e1568573e65166f383b510ba0c5fa127c1c193bae67fa5ac0f5b55be2": 1
-      }
-    },
-    "reason": "Historical public release evidence; exact detector counts are pinned."
-  },
-  "docs/RELEASE_WRAP_0.20.2.md": {
-    "findings": {
-      "rfc1918_ipv4": {
-        "sha256:f32214e7bedc2dcbe43f12e491af15a300266943fbd46a6de7f7ed30f4ea422c": 2
-      }
-    },
-    "reason": "Historical public release evidence; exact detector counts are pinned."
-  },
-  "docs/RELEASE_WRAP_0.21.0.md": {
-    "findings": {
-      "rfc1918_ipv4": {
-        "sha256:44b9b52abf75a0602230602f090b13d575092acb7c72493ccb263883c0b127e7": 11
-      }
-    },
-    "reason": "Historical public release evidence; exact detector counts are pinned."
-  },
-  "docs/RELEASE_WRAP_0.21.1.md": {
-    "findings": {
-      "rfc1918_ipv4": {
-        "sha256:60edeb3ba73ae3fa4363b372a1cbfe74dee8d98a7d73003fd05242b93d0fef61": 3
-      }
-    },
-    "reason": "Historical public release evidence; exact detector counts are pinned."
-  },
-  "docs/RELEASE_WRAP_0.21.2.md": {
-    "findings": {
-      "rfc1918_ipv4": {
-        "sha256:551c00040b924f8811eae1441c56becd1f63adb09c7804873bcfbdbb3bc7a86d": 9
-      }
-    },
-    "reason": "Historical public release evidence; exact detector counts are pinned."
-  },
-  "docs/RELEASE_WRAP_0.22.0.md": {
-    "findings": {
-      "compact_lab_host_id": {
-        "sha256:2aad1662600d1dadc9b7eecccdaa1e4f6a9ecb82a47fa4442b3e9ba8142ecaa2": 1
-      }
-    },
-    "reason": "Historical public release evidence; exact detector counts are pinned."
   },
   "docs/SAS_DIAGNOSTIC_DECODER_SOURCES.md": {
     "findings": {
@@ -312,30 +231,7 @@
     },
     "reason": "Deterministic clean-room QA fixture; exact detector counts are pinned."
   },
-  "scripts/capture_readme_screenshots.py": {
-    "findings": {
-      "sas_wwn_identifier": {
-        "sha256:14d804e199a8dc6ef9135c3ba57ebdb1b09863e54f376dfcaf76f489e7da40e7": 3
-      }
-    },
-    "reason": "Reviewed source literal for sanitized capture or QA tooling."
-  },
-  "scripts/capture_release_workflow_screenshots.py": {
-    "findings": {
-      "sas_wwn_identifier": {
-        "sha256:1db7e953a8d3c1f608849c82baea4a3dd644eddda8fcfb6549a9309fdc6ce3af": 1
-      }
-    },
-    "reason": "Reviewed source literal for sanitized capture or QA tooling."
-  },
-  "scripts/capture_visual_tour_screenshots.py": {
-    "findings": {
-      "sas_wwn_identifier": {
-        "sha256:d668a8016f0fedbc2b575fd354893af98db8f827928584dedf3439b8ac719581": 2
-      }
-    },
-    "reason": "Reviewed source literal for sanitized capture or QA tooling."
-  },
+
   "scripts/run_private_qa_restore.py": {
     "findings": {
       "sas_wwn_identifier": {
@@ -753,26 +649,11 @@
     },
     "reason": "Reviewed operator-documentation example; exact detector counts are pinned."
   },
-  "wiki/Operations-Logging-and-Metrics.md": {
-    "findings": {
-      "internal_hostname": {
-        "sha256:b0fb2f1da71ca3e8b4d5897c2f4b596761970e25bddf3ba8a47d67e28917e96f": 1
-      }
-    },
-    "reason": "Reviewed operator-documentation example; exact detector counts are pinned."
-  },
+
   "wiki/Profiles-and-Custom-Layouts.md": {
     "findings": {
       "sas_wwn_identifier": {
         "sha256:6d8288a378ab08c9df50235706954b3b087e49ba26f33e480a0c8270f1742716": 2
-      }
-    },
-    "reason": "Reviewed operator-documentation example; exact detector counts are pinned."
-  },
-  "wiki/Quick-Start.md": {
-    "findings": {
-      "internal_hostname": {
-        "sha256:e40435f697458ad404e9301264359a6d8bebab0e64e4d679fd25601ae62a95bc": 1
       }
     },
     "reason": "Reviewed operator-documentation example; exact detector counts are pinned."

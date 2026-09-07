@@ -117,6 +117,17 @@ class PublicDemoArtifactTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("snapshot Storage Fabric route action", result.stderr)
 
+    def test_external_or_missing_local_resource_reference_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            demo_dir = Path(temp_dir) / "public-demo"
+            artifact = self.copy_artifact(demo_dir)
+            with artifact.open("a", encoding="utf-8") as handle:
+                handle.write('\n<script src="missing-local-asset.js"></script>\n')
+            result = run_checker(demo_dir)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("external or local resource reference", result.stderr)
+
     def test_raw_and_gzip_budgets_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             demo_dir = Path(temp_dir) / "public-demo"

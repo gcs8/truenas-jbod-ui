@@ -443,5 +443,7 @@ test("template and stylesheet expose an accessible inline alias editor", () => {
   assert.notEqual(mobileBoundary, -1);
   assert.match(STYLES.slice(0, mobileBoundary), /\.enclosure-alias-editor-row\s*\{[^}]*flex-wrap:\s*wrap;/s);
   assert.match(TEMPLATE, /class="meta-card meta-select-card enclosure-select-card"/);
-  assert.match(STYLES, /\.enclosure-select-card\s*\{[^}]*flex:\s*1 1 18rem;/s);
+  assert.match(TEMPLATE, /class="meta-card meta-select-card system-select-card"/);
+  assert.match(STYLES, /\.system-select-card\s*\{[^}]*flex:\s*1 1 14rem;/s);
+  assert.match(STYLES, /\.enclosure-select-card\s*\{[^}]*flex:\s*1 1 24rem;/s);
 });

@@ -22,7 +22,7 @@ Validated against `docs/RELEASE_CHECKLIST.md`.
 | Docker build and health gates | yes | local image `truenas-jbod-ui:v0.21.1-hotfix-local` built from the hotfix source; temporary UI container returned `/livez status=ok version=0.21.1` and `/healthz status=ok` | Pass |  |
 | Optional-sidecar runtime matrix | yes | temporary local `0.21.1` stack booted UI/history/admin sidecars on `127.0.0.1:19180/19181/19182`; UI/history/admin `/livez` returned `status=ok version=0.21.1`; history/admin `/healthz` returned `status=ok`; `/api/history/status` returned JSON | Pass |  |
 | Full Playwright/browser gates | yes | no browser/UI code changed in `v0.21.1`; `v0.21.0` full restored Linux QA Playwright gate remains the UI/layout evidence, and the hotfix local image served `/` HTML successfully (`159640` bytes) | Pass |  |
-| Feature-specific live API/UI gates | yes | `.138` source stack rebuilt from hotfix source and served `http://10.13.37.138:8080/livez` as `status=ok version=0.21.1`; history sidecar cleaned and refreshed with `0` same-day `slot_identity_changed`/`slot_topology_changed` rows after the presence-flap regression fix | Pass |  |
+| Feature-specific live API/UI gates | yes | `.138` source stack rebuilt from hotfix source and served `http://192.0.2.138:8080/livez` as `status=ok version=0.21.1`; history sidecar cleaned and refreshed with `0` same-day `slot_identity_changed`/`slot_topology_changed` rows after the presence-flap regression fix | Pass |  |
 | Local release perf harnesses | yes | inherited from `v0.21.0` release wrap because this patch changes only event grouping for present/absent transitions and does not affect inventory/API rendering paths; local Docker health/sniff was rerun for `0.21.1` | Pass |  |
 | Linux QA restore gate | yes | inherited `v0.21.0` corrected full-data Linux QA restore/provenance gate; `v0.21.1` additionally rebuilt the long-running `.138` source stack from hotfix source and preserved `347` tracked slots while cleaning only the 8 post-`v0.21.0` identity/topology rows | Pass |  |
 | Restored Linux QA perf harnesses | yes | inherited `v0.21.0` restored Linux QA perf evidence; `v0.21.1` is a narrow history event-filter patch with no perf-sensitive path change | Pass |  |
@@ -40,8 +40,8 @@ Validated against `docs/RELEASE_CHECKLIST.md`.
 - GHCR workflow: `https://github.com/gcs8/truenas-jbod-ui/actions/runs/27434127617`
 - GHCR digest: `sha256:28e38a92dd77b9526cf2367bf151b44fafa85a82e425434fdbdc95c56a6ac6d1`
 - Verified tags: `ghcr.io/gcs8/truenas-jbod-ui:v0.21.1`, `ghcr.io/gcs8/truenas-jbod-ui:0.21.1`, and `ghcr.io/gcs8/truenas-jbod-ui:latest` all converged to the digest above
-- Published source deployment: `10.13.37.138:8080/8081/8082`, all containers pinned to the digest above, `347` tracked slots, `18,243` events, `1,381,523` metric samples, `0` same-day identity/topology rows after refresh
-- Published QA deployment: `10.13.37.138:18080/18081/18082`, all containers pinned to the digest above, `347` tracked slots, `17,841` events, `1,372,400` metric samples, `0` same-day identity/topology rows after refresh
+- Published source deployment: `192.0.2.138:8080/8081/8082`, all containers pinned to the digest above, `347` tracked slots, `18,243` events, `1,381,523` metric samples, `0` same-day identity/topology rows after refresh
+- Published QA deployment: `192.0.2.138:18080/18081/18082`, all containers pinned to the digest above, `347` tracked slots, `17,841` events, `1,372,400` metric samples, `0` same-day identity/topology rows after refresh
 - Issue closed: `https://github.com/gcs8/truenas-jbod-ui/issues/6` closed as completed at `2026-06-12T18:21:42Z`
 - Supersedes: `v0.21.0` for deployment; `v0.21.0` remains published for audit history and should not be used as the final candidate
 - Source cleanup backup: `/srv/truenas-jbod-ui/history/manual-cleanup-backups/source-history-pre-presence-flap-cleanup-20260612T175900Z.sqlite3`

@@ -29,7 +29,6 @@ Validated target so far:
 
 Here is an example Quantastor HA SATADOM view in the main UI:
 
-![Quantastor HA SATADOM storage view](images/quantastor-satadoms-right-v0.18.0.png)
 
 ## Recommended Admin Flow
 

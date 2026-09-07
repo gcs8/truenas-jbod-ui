@@ -463,8 +463,8 @@ Rules:
    derive fixture bytes from local history, config, profiles, caches, logs, live
    systems, or private issue/archive material.
 2. Normal generation must ignore operator config and ambient local data. A clean
-   checkout rebuilds the same bytes with:
-   `python scripts/build_public_demo.py --output public-demo/index.html`.
+   checkout rebuilds the same bytes when the recorded source revision is passed
+   to `python scripts/build_public_demo.py --output public-demo/index.html --source-revision <full-source-commit>`.
 3. Generated public-demo artifacts are produced by the builder, never by manual
    edits.
 4. The builder and checker share one centrally declared semantic input graph.
@@ -479,10 +479,16 @@ Regenerate and verify from a clean checkout:
 
 ```bash
 python -m unittest tests.test_public_demo_fixture tests.test_public_demo_deterministic -v
-python scripts/build_public_demo.py --output public-demo/index.html
+SOURCE_COMMIT="$(git rev-parse HEAD)"
+python scripts/build_public_demo.py --output public-demo/index.html --source-revision "$SOURCE_COMMIT"
 python scripts/build_public_demo.py --output public-demo/index.html --check
 python scripts/check_public_demo_artifact.py public-demo
-PUBLIC_DEMO_ARTIFACT=public-demo/index.html npx playwright test qa/public-demo.spec.js
+python scripts/check_public_docs.py
+python scripts/check_public_screenshots.py
+slot_focus_artifact="$(mktemp "${TMPDIR:-/tmp}/truenas-jbod-ui-slot-focus-XXXXXX.html")"
+trap 'rm -f -- "$slot_focus_artifact"' EXIT
+python scripts/build_current_source_browser_fixture.py --output "$slot_focus_artifact"
+PUBLIC_DEMO_ARTIFACT=public-demo/index.html SLOT_FOCUS_ARTIFACT="$slot_focus_artifact" npx playwright test qa/public-demo.spec.js
 ```
 
 A local build does not publish. Pull requests and pushes to `main` run

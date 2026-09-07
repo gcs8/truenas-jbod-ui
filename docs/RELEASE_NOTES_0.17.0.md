@@ -93,11 +93,11 @@ Current RC validation on `codex/v0.17.0-kickoff-2026-04-27-post-0.16.0`:
   exported a mutated backup, and re-imported it successfully
 - Linux disposable restore QA stack repeated the same restore/mutation/
   failure-mode/export/re-import drill against `codex-dev-test-target`
-- public Linux UI/history/admin on `10.13.37.138:8080/8081/8082` reported
+- public Linux UI/history/admin on `192.0.2.138:8080/8081/8082` reported
   `0.17.0-dev` during RC after the VM reboot and stack refresh
 - after the late export-source-cache fix, the public Linux stack was rebuilt
   again, `qa/ui-switching.spec.js` passed `13` tests with `1` data skip against
-  `10.13.37.138:8080`, and an Archive CORE 60-bay estimate followed by forced
+  `192.0.2.138:8080`, and an Archive CORE 60-bay estimate followed by forced
   ZIP download confirmed the download reused staged inputs instead of
   reloading snapshot/SMART data
 - random populated-disk LED identify checks passed on all `7` LED-capable

@@ -13,7 +13,6 @@ The short version:
 
 Open the admin sidecar on `:8082` for these workflows.
 
-![Admin maintenance bundle and history tools](images/admin-maintenance-v0.18.0.png)
 
 ## Tool Picker
 

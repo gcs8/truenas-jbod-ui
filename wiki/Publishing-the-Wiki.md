@@ -68,21 +68,21 @@ manual even when the release gate reports drift.
 
 ## Refresh screenshots before a release-oriented publish
 
-If the release changed operator-facing flows, regenerate the tracked screenshot
-set before copying `wiki/images/` into the GitHub wiki repository.
+Screenshots come only from the checked synthetic public-demo artifact. Do not
+capture a live app, local config, private history database, or admin page for a
+public release.
 
-From the repository root in PowerShell, use the release tag being prepared:
-
-```powershell
-$env:SCREENSHOT_TAG='vX.Y.Z'
-.\.venv\Scripts\python.exe scripts\capture_readme_screenshots.py
-.\.venv\Scripts\python.exe scripts\capture_history_export_screenshots.py
-.\.venv\Scripts\python.exe scripts\capture_release_workflow_screenshots.py
-.\.venv\Scripts\python.exe scripts\capture_visual_tour_screenshots.py
+```bash
+node scripts/capture_public_demo_screenshots.js
+python3 scripts/check_public_demo_artifact.py public-demo
+python3 scripts/check_public_screenshots.py
 ```
 
-This refreshes the repository screenshots under `docs/images/screenshots/` and
-the wiki copies under `wiki/images/`.
+The capture script writes matching files under `docs/images/screenshots/` and
+`wiki/images/`. It leaves the manifest's pixel review at `PENDING`. Inspect each
+exact PNG, bind the decision to its SHA-256, then change only those three review
+fields to `PASS`. Run both checkers again before copying `wiki/images/` into the
+external Wiki repository.
 
 For the full release flow, use
 [`docs/RELEASE_CHECKLIST.md`](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/RELEASE_CHECKLIST.md).

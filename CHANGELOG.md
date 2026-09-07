@@ -413,6 +413,9 @@ them before starting the new images.
 
 ### Docs
 
+- Replaced live-derived public screenshots with fixture-only images, added
+  source/build identity and Pages readback gates, and reconciled the README and
+  Wiki documentation set (#391).
 - Replaced deployment and operations guides with current `v0.22.2` container,
   authentication, backup, history, and platform procedures (#383).
 - Aligned contributor and release guidance with the current CI gates, task

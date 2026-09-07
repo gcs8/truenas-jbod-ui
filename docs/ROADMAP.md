@@ -463,10 +463,11 @@ Current notes:
 
 Current status:
 
-- first static path shipped in `v0.19.0`: the repo carries a
-  live-derived, scrubbed TN Core public-demo artifact, a GitHub Pages workflow
-  for publishing `public-demo/`, static artifact checks, and Playwright smoke
-  coverage; runtime demo/import mode remains later work
+- first static path shipped in `v0.19.0`; current `main` now carries a
+  schema-validated synthetic public-demo fixture, exact source/build identity,
+  fixture-only screenshots, a manual GitHub Pages workflow, exact-byte
+  publication readback, and Playwright browser gates; runtime demo/import mode
+  remains later work
 
 ## Longer-Term Ideas
 

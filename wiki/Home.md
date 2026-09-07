@@ -63,7 +63,6 @@ The app runs off-box in Docker. For the normal homelab path, it talks to
 TrueNAS CORE or SCALE, maps the storage host into a physical bay view, and lets
 you inspect disks without logging into the NAS every time.
 
-![60-bay TrueNAS CORE enclosure view](images/archive-core-60-bay-v0.18.0.png)
 
 The main UI is read-oriented and runs on `:8080`. Optional sidecars can add:
 
@@ -122,8 +121,8 @@ scheduled-backup-gated hot retention, and the immutable deployment staging fix.
 See the [GitHub release](https://github.com/gcs8/truenas-jbod-ui/releases/tag/v0.22.2).
 
 The public demo from `0.19.0` remains a static GitHub Pages sample data
-experience, not a hosted copy of the live Docker app. Open
-https://gcs8.github.io/truenas-jbod-ui/.
+experience, not a hosted copy of the live Docker app. The current artifact uses
+only the checked synthetic fixture. [Open the public demo](https://gcs8.github.io/truenas-jbod-ui/).
 
 For older release-by-release detail, use the project changelog and GitHub
 releases instead of treating the wiki home page as release notes.
@@ -137,15 +136,10 @@ If you learn better by seeing the flow first, start here:
 - [[Heat Map Mode|Heat-Map-Mode]]
 - [[Public Demo Site|Public-Demo-Site]]
 
-Those pages show:
-
-- the live history drawer on a populated slot
-- heat-map overlays for the physical bay layout
-- the export snapshot dialog with live size estimates
-- the frozen offline snapshot HTML after export
-- the static public demo boundary and published demo link
-- the maintenance/recovery follow-up lives on
-  [[History Maintenance and Recovery|History-Maintenance-and-Recovery]]
+The Visual Tour uses only current fixture screenshots from the public demo. The
+other pages explain the live history, heat-map, export, and maintenance paths in
+text. Use [[History Maintenance and Recovery|History-Maintenance-and-Recovery]]
+for cleanup and adoption procedures.
 
 ## Page Map
 

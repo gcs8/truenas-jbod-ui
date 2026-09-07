@@ -352,65 +352,18 @@ python scripts/validate_release_wrap.py "$version" \
 
 ## Screenshots
 
-- decide first whether the release actually needs a screenshot refresh:
-  - if operator-facing layout or workflow visuals changed materially, regenerate
-    the tracked screenshot set
-  - if the release is mostly runtime, guardrail, or metadata polish, it is okay
-    to keep the current screenshot set intentionally and only verify the
-    existing image references still match the shipped workflow story
-- when a refresh is needed, regenerate tracked screenshots:
-  - `python scripts/capture_readme_screenshots.py`
-  - `python scripts/capture_history_export_screenshots.py`
-- verify output in `docs/images/screenshots/`
-- confirm README image references point at the current release filenames
-- if the release changes operator-facing workflows beyond the README overview,
-  capture and stage manual screenshots in `docs/images/screenshots/` before the
-  tag is cut
-- for the current ESXi / BMC carry-over cycle, capture at least:
-  - admin sidecar `Enclosure / Profile Builder` workspace showing:
-    - the profile catalog
-    - the builder controls
-    - the full-width builder preview
-    - either `Slot Ordering` or the `Custom Matrix` layout path
-  - admin sidecar `Setup + Maintenance` view if the grouped setup/runtime
-    workflow is still featured in the README/wiki
-  - main UI selector showing `Live Enclosures`, `Saved Chassis Views`, and
-    `Virtual Storage Views` if that grouped runtime model is still called out
-    in release-facing docs
-  - a saved live-backed chassis view that demonstrates the now-matching
-    live-profile tray geometry if that parity work is still featured
-  - storage-view history open on a populated internal view such as the NVMe
-    carrier or `Boot SATADOMs`
-  - the separate CORE `Front 24 Bay` live enclosure on `archive-core` if the
-    Linux/runtime sanity work is still featured
-  - the Quantastor HA SATADOM runtime view on `QSOSN HA` if the current docs
-    still call out the HA-node model
-  - the ESXi `AOC-SLG4-2H8M2` live carrier view if the current docs call out
-    the first-pass read-only ESXi path
-  - the ESXi FatTwin front-six view if the current docs call out the newer
-    BMC-backed read-only ESXi path
-  - the admin `Host Prep / Vendor Tool Upload` panel if the current docs or
-    wiki tell operators to stage Broadcom StorCLI bundles there
-  - the admin maintenance panel showing orphan purge and history adoption if
-    those maintenance tools remain part of the README/wiki operator story
-  - export snapshot dialog with live size estimate visible if that workflow is
-    still featured in the README/wiki
-- use release-style filenames for those manual captures, for example:
-  - `builder-workspace-v0.15.0.png`
-  - `admin-setup-v0.15.0.png`
-  - `admin-esxi-host-prep-v0.15.0.png`
-  - `admin-maintenance-v0.15.0.png`
-  - `live-vs-storage-views-v0.15.0.png`
-  - `storage-view-history-v0.15.0.png`
-  - `archive-core-front-24-v0.15.0.png`
-  - `quantastor-satadoms-right-v0.15.0.png`
-  - `esxi-overview-v0.15.0.png`
-  - `snapshot-export-dialog-v0.15.0.png`
-- decide whether each new screenshot is:
-  - README-facing and should replace or extend repo image references
-  - wiki-facing only and should still be staged in-repo before wiki publish
-- if the docs mention degraded history behavior, capture one optional
-  history-unavailable state before release as reference material
+- regenerate public screenshots only from the checked synthetic artifact:
+  `node scripts/capture_public_demo_screenshots.js`
+- do not capture a live app, admin page, operator config, local history, or
+  private deployment for the public README or Wiki
+- inspect `public-demo-overview.png`, `public-demo-history.png`, and
+  `public-demo-mobile.png` at their exact manifest hashes
+- after pixel review, set each manifest review field to `PASS` and run:
+  - `python3 scripts/check_public_demo_artifact.py public-demo`
+  - `python3 scripts/check_public_screenshots.py`
+  - `python3 scripts/check_public_docs.py`
+- require the docs and Wiki PNG copies to be byte-identical; remove obsolete
+  images rather than keeping an unreferenced historical gallery
 
 ## Release Notes And Docs
 
@@ -491,9 +444,12 @@ python scripts/validate_release_wrap.py "$version" \
     }
     trap cleanup_public_demo_check EXIT
     python -m unittest tests.test_public_demo_fixture tests.test_public_demo_deterministic -v
-    python scripts/build_public_demo.py --output public-demo/index.html
+    public_demo_source_commit="$(git rev-parse HEAD)"
+    python scripts/build_public_demo.py --output public-demo/index.html --source-revision "$public_demo_source_commit"
     python scripts/build_public_demo.py --output public-demo/index.html --check
     python scripts/check_public_demo_artifact.py public-demo
+    python scripts/check_public_docs.py
+    python scripts/check_public_screenshots.py
     python scripts/build_current_source_browser_fixture.py --output "$slot_focus_artifact"
     PUBLIC_DEMO_ARTIFACT=public-demo/index.html SLOT_FOCUS_ARTIFACT="$slot_focus_artifact" npx playwright test qa/public-demo.spec.js
     cleanup_public_demo_check
@@ -504,9 +460,12 @@ python scripts/validate_release_wrap.py "$version" \
     ```powershell
     try {
         & .\.venv\Scripts\python.exe -m unittest tests.test_public_demo_fixture tests.test_public_demo_deterministic -v
-        & .\.venv\Scripts\python.exe scripts/build_public_demo.py --output public-demo\index.html
+        $public_demo_source_commit = (git rev-parse HEAD).Trim()
+        & .\.venv\Scripts\python.exe scripts/build_public_demo.py --output public-demo\index.html --source-revision $public_demo_source_commit
         & .\.venv\Scripts\python.exe scripts/build_public_demo.py --output public-demo\index.html --check
         & .\.venv\Scripts\python.exe scripts/check_public_demo_artifact.py public-demo
+        & .\.venv\Scripts\python.exe scripts/check_public_docs.py
+        & .\.venv\Scripts\python.exe scripts/check_public_screenshots.py
         $slot_focus_artifact = [System.IO.Path]::GetTempFileName()
         try {
             & .\.venv\Scripts\python.exe scripts/build_current_source_browser_fixture.py --output $slot_focus_artifact
@@ -527,6 +486,28 @@ python scripts/validate_release_wrap.py "$version" \
   - publish only through a separately approved `workflow_dispatch` run, then
     record that workflow plus public readback in
     `Docs/wiki/public-demo publication`
+  - test the known-good republish source before a rollback. This does not publish
+    or change the current worktree:
+
+    ```bash
+    known_good_commit="<full reviewed commit>"
+    rollback_root="$(mktemp -d "${TMPDIR:-/tmp}/truenas-jbod-ui-pages-rollback-XXXXXX")"
+    cleanup_rollback_check() {
+      git worktree remove --force "$rollback_root/repo" 2>/dev/null || true
+      rm -rf -- "$rollback_root"
+    }
+    trap cleanup_rollback_check EXIT
+    git worktree add --detach "$rollback_root/repo" "$known_good_commit"
+    (
+      cd "$rollback_root/repo"
+      python3 scripts/check_public_demo_artifact.py public-demo
+    )
+    cleanup_rollback_check
+    trap - EXIT
+    ```
+  - if rollback is needed, revert through a pull request, merge only after fresh
+    exact-head checks, run the manual Pages workflow at the new `main`, and
+    require its byte-readback and browser jobs to pass
 
 ## Config And Examples
 

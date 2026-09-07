@@ -14,17 +14,18 @@ For installation steps, start with [[Quick Start|Quick-Start]]. For the
 container/service map, use
 [[Architecture and Services|Architecture-and-Services]].
 
-Screenshots on this page are historical v0.18 images. They are retained for
-orientation and have not been refreshed for current-main behavior.
+The three screenshots on this page come from the checked-in synthetic public
+demo. They contain no live host, address, serial, credential, or history data.
+The public screenshot manifest binds their exact bytes to the demo artifact.
 
 ## Main Enclosure View
 
 The primary screen is a physical slot map. The goal is to make the bay location
 obvious first, then expose disk and topology detail when you inspect a slot.
-For CORE, the main example is the 60-bay top-loading shelf because that is the
-representative day-to-day chassis view.
+The demo uses a synthetic 60-bay top-loading shelf so the full layout remains
+easy to inspect without making a hardware-support claim.
 
-![Archive CORE 60-bay live enclosure](images/archive-core-60-bay-v0.18.0.png)
+![Synthetic 60-bay enclosure overview](images/public-demo-overview.png)
 
 ## Runtime Selector
 
@@ -35,15 +36,11 @@ The selector groups runtime targets by what they are:
 - `Virtual Storage Views` are internal or logical disk groups such as boot
   devices or carrier cards.
 
-![Grouped runtime selector on archive-core](images/runtime-selector-groups-v0.18.0.png)
-
 ## Heat Map Mode
 
 Heat map mode keeps the physical enclosure shape and colors each bay by a
 selected numeric metric such as temperature, read/write rate, endurance, or
 attention score.
-
-![Heat map timeline mode on the physical enclosure view](images/heat-map-mode-v0.18.0.png)
 
 The details live in [[Heat Map Mode|Heat-Map-Mode]].
 
@@ -53,7 +50,7 @@ When the optional history sidecar is running, populated slots can open a
 history drawer under the enclosure. Storage views use the same drawer when the
 selected internal disk has a stable identity.
 
-![Live slot history drawer](images/history-drawer-v0.18.0.png)
+![Synthetic slot history panel](images/public-demo-history.png)
 
 The details live in
 [[History and Snapshot Export|History-and-Snapshot-Export]].
@@ -63,8 +60,6 @@ The details live in
 The optional admin sidecar handles guided setup, system config, SSH material,
 runtime controls, profile authoring, backup/restore tools, and maintenance
 flows.
-
-![Admin sidecar grouped setup view](images/admin-setup-v0.18.0.png)
 
 Use [[Admin UI and System Setup|Admin-UI-and-System-Setup]] for launch and
 setup. Use
@@ -76,8 +71,6 @@ backup, restore, debug bundles, and destructive-maintenance guardrails.
 The builder workspace creates reusable custom enclosure profiles without
 hand-editing `profiles.yaml` first.
 
-![Builder workspace with full-width preview](images/builder-workspace-v0.18.0.png)
-
 The details live in
 [[Profiles and Custom Layouts|Profiles-and-Custom-Layouts]].
 
@@ -86,11 +79,7 @@ The details live in
 The main UI can export a self-contained offline HTML artifact for the current
 enclosure or storage view.
 
-![Snapshot export dialog with live estimate](images/snapshot-export-dialog-v0.18.0.png)
-
 The exported file opens away from the live app:
-
-![Frozen offline enclosure snapshot](images/offline-snapshot-v0.18.0.png)
 
 The boundaries between public demo, offline snapshot, debug bundle, and full
 backup are summarized in
@@ -101,10 +90,20 @@ backup are summarized in
 History cleanup and adoption tools live in the admin sidecar because they can
 rewrite local sidecar data.
 
-![Admin maintenance bundle and history tools](images/admin-maintenance-v0.18.0.png)
-
 Use [[History Maintenance and Recovery|History-Maintenance-and-Recovery]] for
 the history-specific cleanup flow.
+
+## Narrow layout
+
+At a phone-sized viewport, the same synthetic enclosure stacks its controls and
+detail panels rather than forcing a page-wide horizontal scroll.
+
+![Synthetic public demo at a narrow viewport](images/public-demo-mobile.png)
+
+The demo intentionally omits the admin sidecar, setup wizard, live refresh,
+mapping changes, locator controls, and target writes. The
+[[Public Demo Site|Public-Demo-Site]] page lists the full inclusion and omission
+contract.
 
 ## Related Pages
 

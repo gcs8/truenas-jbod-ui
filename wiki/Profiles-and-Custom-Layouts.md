@@ -80,7 +80,6 @@ The optional admin sidecar now includes a dedicated
 - generate common slot-ordering patterns
 - save an explicit custom row matrix into `slot_layout`
 
-![Builder workspace previewing a custom profile](images/builder-workspace-v0.18.0.png)
 
 This is the recommended first pass for normal operator changes.
 
