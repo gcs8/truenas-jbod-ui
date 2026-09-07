@@ -214,6 +214,23 @@ class DevCheckPlanTests(unittest.TestCase):
                 self.assertIn(module, rendered)
         self.assertIn("tests.test_esxi_host_prep", rendered)
 
+    def test_mapping_store_suite_is_classified_as_posix_filesystem_semantics(
+        self,
+    ) -> None:
+        posix_exclusion = next(
+            exclusion
+            for exclusion in dev_check.WINDOWS_EXCLUSIONS
+            if exclusion.category == "POSIX filesystem and identity semantics"
+        )
+        self.assertNotIn(
+            "tests.test_mapping_store",
+            dev_check.WINDOWS_PORTABLE_TEST_MODULES,
+        )
+        self.assertIn(
+            "tests.test_mapping_store",
+            posix_exclusion.modules,
+        )
+
     def test_every_tracked_test_is_classified_for_windows(self) -> None:
         discovered = {
             f"tests.{path.stem}"

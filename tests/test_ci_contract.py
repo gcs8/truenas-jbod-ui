@@ -379,7 +379,7 @@ class CIWorkflowContractTests(unittest.TestCase):
 
         self.assertIn("conventional_pattern=", script)
         self.assertIn('[[ "$title" =~ $conventional_pattern ]]', script)
-        subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+        subprocess.run(["bash", "-n"], input=script.encode("utf-8"), check=True)
 
     def test_release_checklist_collects_bounded_branch_metadata_and_keeps_wiki_publication_owner_gated(self) -> None:
         checklist = self.read(ROOT / "docs" / "RELEASE_CHECKLIST.md")

@@ -43,6 +43,7 @@ class WikiDriftVerifierTests(unittest.TestCase):
     def _init_repository(path: Path) -> None:
         path.mkdir()
         subprocess.run(["git", "init", "-q", "-b", "main"], cwd=path, check=True)
+        subprocess.run(["git", "config", "core.autocrlf", "false"], cwd=path, check=True)
         subprocess.run(["git", "config", "user.name", "Wiki Test"], cwd=path, check=True)
         subprocess.run(["git", "config", "user.email", "wiki@example.test"], cwd=path, check=True)
 
