@@ -44,7 +44,6 @@ ssh:
   host: scale.example.local
   user: jbodmap
   key_path: /run/ssh/id_truenas
-  known_hosts_path: /app/data/known_hosts
   strict_host_key_checking: true
   commands:
     - /usr/sbin/zpool status -gP
@@ -66,20 +65,11 @@ expanders whose AES pages report one shared SAS address for every bay.
 
 ## 4. Required SCALE Sudo Access
 
-The important pattern is:
-
-```text
-/usr/bin/sg_ses
-/usr/sbin/smartctl
-```
-
-The app has been validated with narrow rules for:
-
-- `sg_ses -p aes`
-- `sg_ses -p ec`
-- `sg_ses --dev-slot-num=... --set=ident`
-- `sg_ses --dev-slot-num=... --clear=ident`
-- `smartctl -x -j /dev/<disk>`
+Use the complete generated SCALE policy in
+[[SSH Setup and Sudo|SSH-Setup-and-Sudo]]. It matches the current bootstrap and includes bounded
+rules for `sg_ses -p aes`, `sg_ses -p ec`, `sg_ses --join --filter`, identify
+on/off, both supported `smartctl` paths and forms, and the middleware disk-sync
+job poll. Do not build a partial file from only the commands below.
 
 ## 5. Example SCALE Multi-System Config
 
@@ -101,7 +91,6 @@ systems:
       host: scale.example.local
       user: jbodmap
       key_path: /run/ssh/id_truenas
-      known_hosts_path: /app/data/known_hosts
       strict_host_key_checking: true
       commands:
         - /usr/sbin/zpool status -gP

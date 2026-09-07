@@ -40,7 +40,7 @@ publish it on a non-loopback address, set `HISTORY_REFRESH_AUTH_MODE=token`,
 configure the exact `HISTORY_PUBLIC_ORIGIN`, and provide
 `HISTORY_REFRESH_TOKEN_FILE` through the secrets overlay (or a privately
 protected `HISTORY_REFRESH_TOKEN`). Direct refresh requests use a strict JSON
-body such as `{"mode":"full"}` and an `Authorization: Bearer ...` header. Never
+`{"mode":"full"}` and an `Authorization: Bearer ***` header. Never
 put that token in a browser URL or page. Browser operators should use the
 Basic-authenticated main-UI refresh proxy instead.
 
@@ -93,7 +93,19 @@ SQLite `ATTACH`. A query selects at most 32 segments and 5,000 rows; broader
 requests fail rather than silently omitting older history.
 
 Migration, recovery, and rollback commands are documented in
-[Segmented history v2](../docs/SEGMENTED_HISTORY_V2.md).
+[Segmented history v2](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/SEGMENTED_HISTORY_V2.md).
+
+The recovery tools packaged by the current `main` source-build image are:
+
+- `/app/scripts/migrate_segmented_history.py`
+- `/app/scripts/rotate_segmented_history.py`
+- `/app/scripts/query_segmented_history.py`
+- `/app/scripts/seal_history_segment.py`
+
+The v0.22.2 published image does not contain these tools. Do not run the
+commands in the current-main runbook against that older image. Build the
+matching current source and use its dev Compose file until a release that
+contains the tools is published.
 
 ## History Sidecar Dashboard
 
@@ -172,6 +184,24 @@ Things to notice:
 
 If you want a different snapshot history range, change the window in the
 History drawer first, then open the export dialog.
+
+### What Redact sensitive IDs changes
+
+When `Redact sensitive IDs` is on, the exporter gives related
+system and enclosure names and IDs stable aliases such as `host-01` and
+`enc-01`. It masks
+serial values to a short suffix and partially masks WWN, SAS, NAA, UUID, GPTID,
+LUN, transport, NGUID, and EUI-64 identifiers. It also masks IPv4 values while
+keeping the last octet and masks canonical, uncompressed IPv6 values while
+keeping the final groups. Configured hostnames are replaced wherever the
+exporter recognizes them.
+
+The current matcher does not cover every free-form value. In particular,
+compressed IPv6 addresses require manual review. The toggle leaves model,
+firmware, capacity, health, metrics, pool names, and other unclassified text in
+the artifact. Review the exported file before sharing it; the toggle is a
+bounded identifier scrub, not a promise that arbitrary text contains no private
+data.
 
 ## What The Offline Snapshot Looks Like
 

@@ -26,17 +26,12 @@ cd /docker-local/truenas-jbod-ui
 mkdir -p config/ssh data history/backups/long-term logs
 ```
 
-Download the release Compose file and ownership helper from the same source
-revision:
+Download the v0.22.2 Compose file:
 
 ```bash
-mkdir -p scripts
 curl -fsSL \
   -o compose.yaml \
-  https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/main/docker-compose.yml
-curl -fsSL \
-  -o scripts/prepare_nonroot_bind_mounts.py \
-  https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/main/scripts/prepare_nonroot_bind_mounts.py
+  https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/v0.22.2/docker-compose.yml
 ```
 
 Create a minimal `.env` for one TrueNAS system:
@@ -45,7 +40,7 @@ Create a minimal `.env` for one TrueNAS system:
 umask 077
 cat > .env <<'EOF'
 APP_PORT=8080
-JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:latest
+JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.22.2
 
 TRUENAS_HOST=https://truenas.example.local
 TRUENAS_API_KEY=replace_me
@@ -57,14 +52,16 @@ EOF
 chmod 600 .env
 ```
 
-Prepare the bind mounts, then pull and start:
+Pull and start:
 
 ```bash
-sudo python scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001
-sudo python scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001 --apply
 docker compose pull
 docker compose up -d
 ```
+
+This path pairs the v0.22.2 Compose file and image. Do not combine the current
+`main` Compose file with the v0.22.2 image. Use a current `main` source build
+when you need unreleased behavior.
 
 Open:
 
@@ -72,8 +69,9 @@ Open:
 http://your-docker-host:8080
 ```
 
-The default `ADMIN_AUTH_MODE=network` keeps this dashboard readable but disables
-mapping, alias, import, locator, and LED mutations. To enable operator controls,
+On current `main`, the default `ADMIN_AUTH_MODE=network` keeps this dashboard
+readable but renders the write controls disabled for mapping, alias, import,
+locator, and LED mutations. To enable operator controls,
 set shared Basic credentials and the exact main-UI origin:
 
 ```dotenv
@@ -91,9 +89,13 @@ Each live page starts signed out. Use its in-page sign-in before a write. The
 browser holds the credentials only in page memory, sends them only to
 same-origin verification and mutation routes, and clears them on reload or
 sign-out. Separate tabs and the dedicated Storage Fabric page require their own
-sign-in.
+sign-in. These read-UI policy controls are not in the v0.22.2 image.
 
-## Default non-root runtime
+## Default non-root runtime on current main
+
+This section applies to a cloned current `main` source tree and its matching dev
+Compose file. It does not apply to the v0.22.2 published pair above. A
+current `main` source build requires the ownership helper before first start.
 
 The base Compose file uses numeric UID/GID `10001:10001` for the UI and history
 services by default, and mounts the UI's configuration read-only. Every service
@@ -113,8 +115,9 @@ so the non-root UI can use them. The admin container no longer mounts the app
 log directory. The one-shot backup service keeps its separate `1000:1000`
 primary identity and receives only the supplemental app-data group `10001`.
 
-For an existing deployment, stop the stack and run the ownership helper before
-the first v0.22.3 start. Run it once without `--apply` first. It inspects only
+For an existing current-main source deployment, stop the stack and run the
+ownership helper before first non-root start. Run it once without `--apply`
+first. It inspects only
 the `config` directory inode,
 `config/config.yaml`, `config/ssh/**`, `config/tls/**`, `data/**`,
 `history/**`, and `logs/**`. It deliberately leaves
@@ -125,8 +128,8 @@ process descriptor budget:
 
 ```bash
 docker compose down
-sudo python scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001
-sudo python scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001 --apply
+sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001
+sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001 --apply
 ```
 
 Apply opens and inode-checks every selected entry before its first ownership
@@ -137,12 +140,11 @@ its runtime state and lets the backup service read selected app data through
 its supplemental group. Backup passphrases remain under the separate backup
 identity with their existing private modes.
 
-Then start the base Compose file:
+Then build and start from that source tree:
 
 ```bash
-docker compose pull
-docker compose up -d
-docker compose exec enclosure-ui id
+docker compose -f docker-compose.dev.yml up -d --build
+docker compose -f docker-compose.dev.yml exec enclosure-ui id
 ```
 
 `docker-compose.nonroot.yml` remains available so existing immutable-deployment
@@ -238,7 +240,7 @@ That tracks the newest published stable image.
 If you want slower, more deliberate updates, select a release tag first:
 
 ```dotenv
-JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.18.0
+JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.22.2
 ```
 
 Useful tag shapes:
@@ -246,8 +248,8 @@ Useful tag shapes:
 | Tag | Use it when |
 | --- | --- |
 | `latest` | you want the newest stable published image |
-| `v0.18.0` | you want the image currently labeled with that GitHub release |
-| `0.18.0` | you want the same stable release without the `v` prefix |
+| `v0.22.2` | you want the image currently labeled with that GitHub release |
+| `0.22.2` | you want the same stable release without the `v` prefix |
 | `dev` | you are testing the current development image and accept churn |
 
 Every registry tag is a mutable pointer, including `latest`, version tags, and
@@ -298,7 +300,7 @@ set -euo pipefail
 cd /docker-local/truenas-jbod-ui
 release_revision='REPLACE_WITH_40_HEX_SOURCE_REVISION'
 expected_image='REPLACE_WITH_WORKFLOW_IMMUTABLE_IMAGE'
-candidate_tag='ghcr.io/gcs8/truenas-jbod-ui:v0.18.0'
+candidate_tag='ghcr.io/gcs8/truenas-jbod-ui:v0.22.2'
 python3 scripts/update_immutable_deployment.py update . \
   --project-name truenas-jbod-ui \
   --source-revision "$release_revision" \
@@ -479,11 +481,18 @@ Turn on admin when you want guided setup, storage-view editing, backup/restore,
 runtime controls, or the profile builder:
 
 Before starting it, read the
-[Admin trust boundary](../docs/ADMIN_TRUST_BOUNDARY.md). The default network
+[Admin trust boundary](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/ADMIN_TRUST_BOUNDARY.md).
+On current `main`, set `ADMIN_PUBLIC_ORIGIN` to the exact browser origin before
+launch. The admin service refuses to start when it is missing or malformed. The
+default network
 mode has no application login and treats every client that can reach port
 `8082` as a trusted operator. The mounted Docker socket gives the sidecar
 host-level container authority. Restrict network reachability to trusted
 operators. Auto-stop limits exposure; it is not authentication.
+
+The v0.22.2 image predates this startup check. Keep the release-matched v0.22.2
+deployment restricted to trusted operators rather than treating the newer
+origin check as a release feature.
 
 ```bash
 docker compose --profile admin pull
@@ -496,8 +505,10 @@ Open:
 http://your-docker-host:8082
 ```
 
-By default the admin sidecar stops itself after `3600` seconds. Change that in
-`.env` only if you intentionally want a different behavior:
+The application default is `0`, which disables auto-stop. The shipped Compose
+files explicitly set a Compose default of `3600` seconds, so normal Compose
+launches stop the sidecar after one hour. Change that in `.env` only if you
+intend different behavior:
 
 ```dotenv
 ADMIN_AUTO_STOP_SECONDS=3600

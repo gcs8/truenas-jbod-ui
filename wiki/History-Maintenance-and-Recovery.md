@@ -47,6 +47,11 @@ contents do not establish ownership.
 
 ## Delete System Vs Delete + Purge History
 
+While segmented history is active, these system-wide delete, purge, and adopt
+actions fail closed. They do not rewrite immutable segments. Use the version-gated
+segmented recovery tools and publish a complete replacement catalog generation
+instead of applying the hot-only maintenance flow to segmented history.
+
 The `Existing Systems` panel gives you two different delete behaviors:
 
 - `Delete System`
@@ -91,7 +96,7 @@ The current first pass is intentionally whole-system-id based:
 
 This is the right tool for cases like:
 
-- `qs-cryostorage` -> `qsosn-ha`
+- `old-system-id` -> `replacement-system-id`
 - lab rebuilds where the appliance identity changed but the chassis history is
   still worth keeping
 
