@@ -136,6 +136,15 @@ class PublicScreenshotContractTests(unittest.TestCase):
                 " ".join(document.split()),
             )
 
+    def test_wiki_publish_guide_uses_the_desktop_screenshot_count(self) -> None:
+        publishing_guide = (ROOT / "wiki/Publishing-the-Wiki.md").read_text(
+            encoding="utf-8"
+        )
+        normalized = " ".join(publishing_guide.split())
+
+        self.assertIn("those two review fields", normalized)
+        self.assertNotIn("those three review fields", normalized)
+
 
 if __name__ == "__main__":
     unittest.main()

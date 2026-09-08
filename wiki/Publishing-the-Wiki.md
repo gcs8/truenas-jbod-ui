@@ -80,7 +80,7 @@ python3 scripts/check_public_screenshots.py
 
 The capture script writes matching files under `docs/images/screenshots/` and
 `wiki/images/`. It leaves the manifest's pixel review at `PENDING`. Inspect each
-exact PNG, bind the decision to its SHA-256, then change only those three review
+exact PNG, bind the decision to its SHA-256, then change only those two review
 fields to `PASS`. Run both checkers again before copying `wiki/images/` into the
 external Wiki repository.
 
