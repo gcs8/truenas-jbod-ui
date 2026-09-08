@@ -573,7 +573,8 @@
   }
 
   function selectorLabelForEnclosureOption(enclosure) {
-    return `Live Enclosure · ${enclosure?.label || enclosure?.id || "Unknown enclosure"}`;
+    const kind = state.snapshotMode ? "Snapshot" : "Live Enclosure";
+    return `${kind} · ${enclosure?.label || enclosure?.id || "Unknown enclosure"}`;
   }
 
   function isSavedChassisView(view) {
@@ -2218,7 +2219,9 @@
     }
     if (!fabric) {
       sasFabricInspectorTitle.textContent = "Fabric Inspector";
-      sasFabricInspectorBody.innerHTML = "Open topology to load the current Storage Fabric.";
+      sasFabricInspectorBody.innerHTML = state.snapshotMode
+        ? "No Storage Fabric payload is included in this snapshot."
+        : "Open topology to load the current Storage Fabric.";
       return;
     }
     const trace = selectedSasFabricTrace();
@@ -2274,7 +2277,7 @@
     if (sasFabricStatus) {
       if (state.snapshotMode) {
         sasFabricStatus.className = "warning-item muted compact";
-        sasFabricStatus.textContent = "Offline snapshots do not include live Storage Fabric refresh yet.";
+        sasFabricStatus.textContent = "This offline snapshot does not include Storage Fabric data or live refresh capability.";
       } else if (state.sasFabric.error) {
         sasFabricStatus.className = "warning-item compact";
         sasFabricStatus.textContent = `Storage Fabric load failed: ${state.sasFabric.error}`;
@@ -2299,7 +2302,9 @@
     }
     if (sasFabricLanes) {
       if (!fabric) {
-        sasFabricLanes.innerHTML = '<div class="warning-item muted compact">No Storage Fabric payload has been loaded yet.</div>';
+        sasFabricLanes.innerHTML = state.snapshotMode
+          ? '<div class="warning-item muted compact">No Storage Fabric payload is included in this snapshot.</div>'
+          : '<div class="warning-item muted compact">No Storage Fabric payload has been loaded yet.</div>';
       } else if (fabric.available === false) {
         sasFabricLanes.innerHTML = '<div class="warning-item muted compact">No Storage Fabric map is available for this platform yet.</div>';
       } else {
@@ -7902,7 +7907,14 @@
   }
 
   function renderMappingImportControl() {
-    const reason = mappingImportUnavailableReason();
+    const snapshotModeActive = typeof state !== "undefined" && Boolean(state.snapshotMode);
+    const reason = snapshotModeActive
+      ? "Mapping backup actions are disabled in an offline snapshot export."
+      : mappingImportUnavailableReason();
+    if (typeof exportMappingsButton !== "undefined" && exportMappingsButton) {
+      exportMappingsButton.disabled = snapshotModeActive;
+      exportMappingsButton.title = snapshotModeActive ? reason : "";
+    }
     if (importMappingsButton) {
       importMappingsButton.disabled = Boolean(reason);
       importMappingsButton.title = reason || "";
@@ -7946,11 +7958,14 @@
       showQuantastorContext ? kvRowIfMeaningful("I/O Fence On", formatQuantastorContextValue(slot, "fence_owner_label")) : "",
       showQuantastorContext ? kvRowIfMeaningful("Visible On", formatVisibleOnValue(slot)) : "",
       showQuantastorContext ? kvRowIfMeaningful("SES Host", formatSesHostValue(slot)) : "",
-      kvRow("Health", slot.health),
+      kvRow(state.snapshotMode ? "Health at capture" : "Health", slot.health),
       kvRow("Temp", formatTemperatureValue(slot, smartEntry)),
       kvRowIfMeaningful("Warning Temp", formatWarningTemperatureValue(smartEntry)),
       kvRowIfMeaningful("Critical Temp", formatCriticalTemperatureValue(smartEntry)),
-      kvRowIfMeaningful("SMART Status", formatSmartHealthStatusValue(smartEntry)),
+      kvRowIfMeaningful(
+        state.snapshotMode ? "SMART Status at capture" : "SMART Status",
+        formatSmartHealthStatusValue(smartEntry),
+      ),
       kvRow("Last SMART Test", formatLastSmartTestValue(slot, smartEntry)),
       kvRow("Power On", formatPowerOnValue(smartEntry)),
       kvRowIfMeaningful("Power Cycles", formatPowerCycleValue(smartEntry)),
@@ -8081,11 +8096,14 @@
         kvRowIfMeaningful("Namespace EUI64", formatNamespaceEui64Value(storageViewSlot, smartEntry), true),
         kvRowIfMeaningful("Namespace NGUID", formatNamespaceNguidValue(smartEntry), true),
         kvRowIfMeaningful("Pool", storageViewSlot.pool_name),
-        kvRowIfMeaningful("Health", storageViewSlot.health),
+        kvRowIfMeaningful(state.snapshotMode ? "Health at capture" : "Health", storageViewSlot.health),
         kvRow("Temp", formatTemperatureValue(storageViewSlot, smartEntry)),
         kvRowIfMeaningful("Warning Temp", formatWarningTemperatureValue(smartEntry)),
         kvRowIfMeaningful("Critical Temp", formatCriticalTemperatureValue(smartEntry)),
-        kvRow("SMART Status", formatSmartHealthStatusValue(smartEntry)),
+        kvRow(
+          state.snapshotMode ? "SMART Status at capture" : "SMART Status",
+          formatSmartHealthStatusValue(smartEntry),
+        ),
         kvRow("Last SMART Test", formatLastSmartTestValue(storageViewSlot, smartEntry)),
         kvRow("Power On", formatPowerOnValue(smartEntry)),
         kvRowIfMeaningful("Power Cycles", formatPowerCycleValue(smartEntry)),
@@ -8244,9 +8262,11 @@
 
     const multipath = slot.multipath;
     if (!multipath) {
-      multipathContext.innerHTML = currentPlatform() === "linux"
-        ? '<div class="warning-item muted">This slot is not currently presented through a multipath stack.</div>'
-        : '<div class="warning-item muted">This slot is not currently presented through gmultipath.</div>';
+      const stack = currentPlatform() === "linux" ? "a multipath stack" : "gmultipath";
+      const message = state.snapshotMode
+        ? `This slot was not presented through ${stack} at capture.`
+        : `This slot is not currently presented through ${stack}.`;
+      multipathContext.innerHTML = `<div class="warning-item muted">${escapeHtml(message)}</div>`;
       return;
     }
 
@@ -8472,6 +8492,16 @@
       : '<div class="warning-item muted">No warnings.</div>';
   }
 
+  function snapshotSshStatus(ssh) {
+    if (!ssh.enabled) {
+      return { className: "status-chip snapshot", textContent: "SSH OFF AT CAPTURE" };
+    }
+    if (!ssh.ok) {
+      return { className: "status-chip error", textContent: "SSH ERROR AT CAPTURE" };
+    }
+    return { className: "status-chip snapshot", textContent: "SSH AT CAPTURE" };
+  }
+
   function renderStatus() {
     const api = state.snapshot.sources?.api || { ok: false, message: "Unavailable" };
     const ssh = state.snapshot.sources?.ssh || { enabled: false, ok: true, message: "Disabled" };
@@ -8491,17 +8521,27 @@
       }
     }
 
-    apiStatusChip.className = `status-chip ${api.ok ? "ok" : "error"}`;
-    apiStatusChip.textContent = api.ok ? "API OK" : "API ERR";
+    if (state.snapshotMode) {
+      apiStatusChip.className = "status-chip snapshot";
+      apiStatusChip.textContent = api.ok ? "API AT CAPTURE" : "API ERROR AT CAPTURE";
+      apiStatusChip.title = "Recorded source state. No API is connected to this artifact.";
+      const snapshotSsh = snapshotSshStatus(ssh);
+      sshStatusChip.className = snapshotSsh.className;
+      sshStatusChip.textContent = snapshotSsh.textContent;
+      sshStatusChip.title = "Recorded source state. No SSH session is connected to this artifact.";
+    } else {
+      apiStatusChip.className = `status-chip ${api.ok ? "ok" : "error"}`;
+      apiStatusChip.textContent = api.ok ? "API OK" : "API ERR";
 
-    let sshClass = "ok";
-    if (!ssh.enabled) {
-      sshClass = "partial";
-    } else if (!ssh.ok) {
-      sshClass = "error";
+      let sshClass = "ok";
+      if (!ssh.enabled) {
+        sshClass = "partial";
+      } else if (!ssh.ok) {
+        sshClass = "error";
+      }
+      sshStatusChip.className = `status-chip ${sshClass}`;
+      sshStatusChip.textContent = !ssh.enabled ? "SSH OFF" : ssh.ok ? "SSH OK" : "SSH ERR";
     }
-    sshStatusChip.className = `status-chip ${sshClass}`;
-    sshStatusChip.textContent = !ssh.enabled ? "SSH OFF" : ssh.ok ? "SSH OK" : "SSH ERR";
 
     if (historyStatusChip) {
       if (!state.history.configured) {
@@ -8511,7 +8551,10 @@
       } else {
         let historyClass = "partial";
         let historyText = "HIST ...";
-        if (state.history.available) {
+        if (state.snapshotMode) {
+          historyClass = "snapshot";
+          historyText = state.history.available ? "HIST PRELOADED" : "HIST OMITTED";
+        } else if (state.history.available) {
           historyClass = "ok";
           historyText = "HIST OK";
         } else if (state.history.checked && !state.history.loading) {

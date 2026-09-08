@@ -12,33 +12,34 @@ It does not install anything on TrueNAS CORE or SCALE. The app talks to storage
 hosts over their existing API, SSH, or BMC paths and renders what it can from
 there.
 
+## Desktop support contract
+
+This is a desktop operator application. Mobile and tablet layouts are unsupported.
+If a phone or tablet happens to render the page, that is incidental behavior,
+not a supported workflow or compatibility claim.
+
 Public demo:
 
 - [https://gcs8.github.io/truenas-jbod-ui/](https://gcs8.github.io/truenas-jbod-ui/)
 
 ## Screenshots
 
-These are historical v0.18 screenshots. They remain useful for orientation,
-but they do not show every current-main control or policy.
+These images come from the checked-in synthetic public demo. They contain no
+live target data. The [screenshot manifest](docs/images/screenshots/manifest.json)
+binds each PNG to the exact demo artifact and source revision.
 
-### Archive CORE
+### Enclosure overview
 
-![Archive CORE overview](docs/images/screenshots/core-overview-v0.18.0.png)
+![Synthetic 60-bay enclosure overview](docs/images/screenshots/public-demo-overview.png)
 
-### ESXi FatTwin
+### History panel
 
-![ESXi FatTwin overview](docs/images/screenshots/esxi-overview-v0.18.0.png)
+![Synthetic slot history panel](docs/images/screenshots/public-demo-history.png)
 
-### More
-
-- Offsite SCALE: [docs/images/screenshots/scale-overview-v0.18.0.png](docs/images/screenshots/scale-overview-v0.18.0.png)
-- Quantastor HA: [docs/images/screenshots/quantastor-overview-v0.18.0.png](docs/images/screenshots/quantastor-overview-v0.18.0.png)
-- GPU Server Linux: [docs/images/screenshots/gpu-server-overview-v0.18.0.png](docs/images/screenshots/gpu-server-overview-v0.18.0.png)
-- UniFi UNVR: [docs/images/screenshots/unvr-overview-v0.18.0.png](docs/images/screenshots/unvr-overview-v0.18.0.png)
-- UniFi UNVR Pro: [docs/images/screenshots/unvr-pro-overview-v0.18.0.png](docs/images/screenshots/unvr-pro-overview-v0.18.0.png)
-- History drawer: [docs/images/screenshots/history-drawer-v0.18.0.png](docs/images/screenshots/history-drawer-v0.18.0.png)
-- Admin setup: [docs/images/screenshots/admin-setup-v0.18.0.png](docs/images/screenshots/admin-setup-v0.18.0.png)
-- Admin ESXi host prep: [docs/images/screenshots/admin-esxi-host-prep-v0.18.0.png](docs/images/screenshots/admin-esxi-host-prep-v0.18.0.png)
+See the [public demo product brief](docs/PUBLIC_DEMO_PRODUCT_BRIEF.md) for the
+fixture, browser, privacy, and publication contract. The
+[documentation inventory](docs/DOCUMENTATION_INVENTORY.md) records the README
+and Wiki review baseline.
 
 ## Features
 
@@ -74,11 +75,20 @@ but they do not show every current-main control or policy.
 ### Run the published image
 
 ```bash
-mkdir -p /docker-local/truenas-jbod-ui/{config/ssh,data,history/backups/long-term,logs}
+mkdir -p /docker-local/truenas-jbod-ui/{config/ssh,config/tls,data,history/backups/long-term,logs}
 cd /docker-local/truenas-jbod-ui
 curl -fsSL -o compose.yaml https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/v0.22.2/docker-compose.yml
-# create .env with your TRUENAS_HOST / TRUENAS_API_KEY first
-printf '%s\n' 'JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.22.2' >> .env
+# copy your trusted CA certificate before writing .env
+cp /path/to/truenas-ca.pem config/tls/truenas-ca.pem
+# create .env with your target, API key, and CA trust first
+cat > .env <<'EOF'
+JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.22.2
+TRUENAS_HOST=https://truenas.example.test
+TRUENAS_API_KEY=replace-with-your-api-key
+TRUENAS_VERIFY_SSL=true
+TRUENAS_TLS_CA_BUNDLE_PATH=/app/config/tls/truenas-ca.pem
+TRUENAS_TLS_SERVER_NAME=truenas.example.test
+EOF
 docker compose pull
 docker compose up -d
 ```

@@ -4,14 +4,17 @@ import base64
 import hashlib
 import json
 from pathlib import Path
+import re
+import subprocess
 from typing import Any
 
 from scripts.public_demo_inputs import PUBLIC_DEMO_INPUT_PATHS
 
 
-SOURCE_PARITY_SCHEMA = 2
+SOURCE_PARITY_SCHEMA = 3
 SOURCE_PARITY_PREFIX = "<!-- public-demo-source-parity "
 SOURCE_PARITY_SUFFIX = " -->\n"
+SOURCE_REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 OFFLINE_IMAGE_INPUTS: dict[Path, str] = {
     Path("app/static/images/aoc-slg4-2h8m2.jpg"): "image/jpeg",
     Path("app/static/images/hyper-m2-gen3-card.png"): "image/png",
@@ -23,16 +26,30 @@ INLINE_SOURCE_WRAPPERS: dict[Path, tuple[str, str]] = {
 }
 
 
-def add_source_parity_manifest(html: str, *, source_root: Path) -> str:
+def add_source_parity_manifest(
+    html: str,
+    *,
+    source_root: Path,
+    source_revision: str,
+) -> str:
     if html.startswith(SOURCE_PARITY_PREFIX):
         raise ValueError("public demo source parity manifest already exists")
+    source_revision = normalize_source_revision(source_revision)
     digests = source_digests(source_root)
     inline_errors = inline_source_errors(html, source_root)
     if inline_errors:
         raise ValueError("; ".join(inline_errors))
+    build_id = build_identity(digests, source_revision)
+    html = inject_visible_build_identity(
+        html,
+        source_revision=source_revision,
+        build_id=build_id,
+    )
     manifest = {
         "artifact_sha256": sha256_text(html),
+        "build_id": build_id,
         "schema": SOURCE_PARITY_SCHEMA,
+        "source_revision": source_revision,
         "source_output_sha256": source_output_digest(digests, html),
         "sources": digests,
     }
@@ -56,6 +73,11 @@ def check_source_parity_manifest(html: str, *, source_root: Path) -> list[str]:
     elif tuple(sorted(declared_sources)) != tuple(sorted(expected_paths)):
         errors.append("public demo source parity input set mismatch")
 
+    source_revision = manifest.get("source_revision")
+    if not isinstance(source_revision, str) or SOURCE_REVISION_PATTERN.fullmatch(source_revision) is None:
+        errors.append("invalid public demo source revision")
+        source_revision = ""
+
     actual_source_digests: dict[str, str] = {}
     for relative_path in PUBLIC_DEMO_INPUT_PATHS:
         source_key = relative_path.as_posix()
@@ -69,6 +91,14 @@ def check_source_parity_manifest(html: str, *, source_root: Path) -> list[str]:
             errors.append(f"source fingerprint mismatch: {source_key}")
 
     errors.extend(inline_source_errors(artifact_html, source_root))
+    expected_build_id = build_identity(actual_source_digests, source_revision) if source_revision else ""
+    build_id = manifest.get("build_id")
+    if not isinstance(build_id, str) or build_id != expected_build_id:
+        errors.append("public demo build identity mismatch")
+    if source_revision and artifact_html.count(f">{source_revision}<") != 1:
+        errors.append("public demo source revision is not visible exactly once")
+    if expected_build_id and artifact_html.count(f">{expected_build_id}<") != 1:
+        errors.append("public demo build identity is not visible exactly once")
     artifact_digest = manifest.get("artifact_sha256")
     if not isinstance(artifact_digest, str) or artifact_digest != sha256_text(artifact_html):
         errors.append("public demo embedded output fingerprint mismatch")
@@ -79,6 +109,92 @@ def check_source_parity_manifest(html: str, *, source_root: Path) -> list[str]:
     ):
         errors.append("source/output parity fingerprint mismatch")
     return errors
+
+
+def normalize_source_revision(value: str) -> str:
+    revision = value.strip()
+    if SOURCE_REVISION_PATTERN.fullmatch(revision) is None:
+        raise ValueError("source revision must be a full lowercase 40-character Git commit")
+    return revision
+
+
+def build_identity(source_hashes: dict[str, str], source_revision: str) -> str:
+    payload = {
+        "schema": SOURCE_PARITY_SCHEMA,
+        "source_revision": normalize_source_revision(source_revision),
+        "sources": source_hashes,
+    }
+    return sha256_text(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+
+
+def inject_visible_build_identity(html: str, *, source_revision: str, build_id: str) -> str:
+    marker = (
+        '      <div class="summary-card compact">\n'
+        '        <span class="summary-label">Redaction</span>\n'
+        '        <span class="summary-value">Synthetic IDs</span>\n'
+        '        <span class="summary-note">Generated only from schema-validated, deterministic, checked-in synthetic values.</span>\n'
+        "      </div>"
+    )
+    if html.count(marker) != 1:
+        raise ValueError("public demo identity insertion point is missing or ambiguous")
+    identity_cards = (
+        "\n"
+        '      <div class="summary-card compact">\n'
+        '        <span class="summary-label">Source revision</span>\n'
+        f'        <span class="summary-value public-demo-identity">{source_revision}</span>\n'
+        '        <span class="summary-note">exact Git commit for declared demo inputs</span>\n'
+        "      </div>\n"
+        '      <div class="summary-card compact">\n'
+        '        <span class="summary-label">Build ID</span>\n'
+        f'        <span class="summary-value public-demo-identity">{build_id}</span>\n'
+        '        <span class="summary-note">deterministic input-manifest fingerprint</span>\n'
+        "      </div>"
+    )
+    return html.replace(marker, marker + identity_cards, 1)
+
+
+def recorded_source_revision_errors(*, source_root: Path, source_revision: str) -> list[str]:
+    """Check Git ancestry and declared-input stability when Git metadata exists."""
+    try:
+        revision = normalize_source_revision(source_revision)
+    except ValueError as exc:
+        return [str(exc)]
+    git_dir = subprocess.run(
+        ["git", "-C", str(source_root), "rev-parse", "--git-dir"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if git_dir.returncode != 0:
+        return []
+    if subprocess.run(
+        ["git", "-C", str(source_root), "cat-file", "-e", f"{revision}^{{commit}}"],
+        capture_output=True,
+        check=False,
+    ).returncode != 0:
+        return ["recorded public demo source revision is not a local commit"]
+    if subprocess.run(
+        ["git", "-C", str(source_root), "merge-base", "--is-ancestor", revision, "HEAD"],
+        capture_output=True,
+        check=False,
+    ).returncode != 0:
+        return ["recorded public demo source revision is not an ancestor of HEAD"]
+    paths = [path.as_posix() for path in PUBLIC_DEMO_INPUT_PATHS]
+    committed_drift = subprocess.run(
+        ["git", "-C", str(source_root), "diff", "--quiet", f"{revision}..HEAD", "--", *paths],
+        capture_output=True,
+        check=False,
+    ).returncode
+    if committed_drift != 0:
+        return ["declared public demo inputs changed after the recorded source revision"]
+    working_drift = subprocess.run(
+        ["git", "-C", str(source_root), "diff", "--quiet", "HEAD", "--", *paths],
+        capture_output=True,
+        check=False,
+    ).returncode
+    if working_drift != 0:
+        return ["declared public demo inputs have uncommitted changes"]
+    return []
 
 
 def source_digests(source_root: Path) -> dict[str, str]:

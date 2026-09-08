@@ -29,7 +29,7 @@ Use whatever folder you normally keep Compose apps in. The examples below use
 sudo mkdir -p /docker-local/truenas-jbod-ui
 sudo chown "$USER":"$USER" /docker-local/truenas-jbod-ui
 cd /docker-local/truenas-jbod-ui
-mkdir -p config/ssh data history/backups/long-term logs
+mkdir -p config/ssh config/tls data history/backups/long-term logs
 ```
 
 ## 2. Download the v0.22.2 Compose file
@@ -50,17 +50,27 @@ Public pulls do not require `docker login`.
 
 ## 3. Create `.env`
 
-For a simple single-system TrueNAS CORE install:
+Copy the CA certificate that signed the TrueNAS HTTPS certificate. This can be
+your private CA root or the required intermediate chain:
+
+```bash
+cp /path/to/truenas-ca.pem config/tls/truenas-ca.pem
+chmod 0644 config/tls/truenas-ca.pem
+```
+
+Then create `.env` for a single-system TrueNAS CORE install:
 
 ```bash
 cat > .env <<'EOF'
 APP_PORT=8080
 JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.22.2
 
-TRUENAS_HOST=https://truenas.example.local
+TRUENAS_HOST=https://truenas.example.test
 TRUENAS_API_KEY=replace_me
 TRUENAS_PLATFORM=core
-TRUENAS_VERIFY_SSL=false
+TRUENAS_VERIFY_SSL=true
+TRUENAS_TLS_CA_BUNDLE_PATH=/app/config/tls/truenas-ca.pem
+TRUENAS_TLS_SERVER_NAME=truenas.example.test
 
 SSH_ENABLED=false
 EOF
@@ -71,11 +81,22 @@ Edit the values before starting:
 - `TRUENAS_HOST` is the appliance URL, without `/api/v2.0`
 - `TRUENAS_API_KEY` is for TrueNAS CORE/SCALE
 - `TRUENAS_PLATFORM` is usually `core` or `scale` for a first install
-- `TRUENAS_VERIFY_SSL=false` is common for a lab box with a self-signed cert
+- `TRUENAS_VERIFY_SSL=true` keeps certificate validation on
+- `TRUENAS_TLS_CA_BUNDLE_PATH` points to the mounted CA chain
+- `TRUENAS_TLS_SERVER_NAME` is the DNS name on the certificate; omit it only
+  when `TRUENAS_HOST` already uses that name
 - `SSH_ENABLED=false` is fine for the first boot; SSH can be added later
 
 Start with CORE or SCALE here. Less common adapters are covered on their
 platform-specific setup pages so this first-run path stays focused.
+
+### Temporary insecure diagnostic
+
+If certificate validation blocks first-boot diagnosis, you may set
+`TRUENAS_VERIFY_SSL=false` for one short test on an isolated trusted network.
+This disables server identity verification and allows interception. Do not use
+it as the normal configuration. Restore `true`, install the correct CA chain,
+and repeat the health check before putting the app into service.
 
 ## 4. Pull and start
 

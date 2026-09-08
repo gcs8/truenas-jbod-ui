@@ -76,7 +76,7 @@ Current local validation on
   `paths=3`, `traces=63`, `links=467`, and decoded MPR/CAM evidence.
 - Forced Offsite SCALE Storage Fabric returned `fabric_kind=linux_ses`,
   `paths=1`, `traces=25`, `links=99`, and bay identity including
-  `WUH721414AL4204`, `9RKSV2KC`, `12.7 TiB`, `5000cca264d473d4`, HCTL
+  `WUH721414AL4204`, `9RKSV2KC`, `12.7 TiB`, `SANITIZED-WWN`, HCTL
   `1:0:1:0`, and SMART candidate `sdc`.
 - Forced Quantastor Storage Fabric returned `fabric_kind=storage_quantastor`,
   `traces=25`, `links=69`, and source-provenance warning copy.

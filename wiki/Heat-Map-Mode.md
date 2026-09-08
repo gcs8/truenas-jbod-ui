@@ -7,7 +7,6 @@ operator-selected metric, so you can answer the practical question:
 
 > Where is the weirdness physically?
 
-![Heat map timeline mode on the physical enclosure view](images/heat-map-mode-v0.18.0.png)
 
 It does not add disk-control, LED, or admin write behavior.
 

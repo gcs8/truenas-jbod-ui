@@ -38,7 +38,7 @@ Validated against `docs/RELEASE_CHECKLIST.md`.
 
 ## Planned development QA contract
 
-- Target: `h0073` - `Codex-dev-test-target`; the maintainer-only inventory address is intentionally omitted.
+- Target: `demo-host-01` - `Codex-dev-test-target`; the maintainer-only inventory address is intentionally omitted.
 - Fresh isolated directory and Compose project; no reuse of stale containers or receipts.
 - Fresh port range `18280/18281/18282`; unrelated listeners on `18080/18081` remain untouched.
 - Existing approved full-data QA state is copied into a new isolated source directory. A current candidate admin export/import cycle proves the restore path before acceptance.

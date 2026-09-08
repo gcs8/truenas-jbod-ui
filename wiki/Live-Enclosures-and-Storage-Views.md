@@ -7,7 +7,6 @@ This page is the quick mental model for what the selector is showing.
 The current `archive-core` runtime selector shows the live and virtual groups
 that are actually configured today:
 
-![Grouped runtime selector on archive-core](images/runtime-selector-groups-v0.18.0.png)
 
 `archive-core` intentionally does not keep a duplicate saved chassis view by
 default, so the `Saved Chassis Views` runtime group only appears after an
@@ -70,7 +69,6 @@ dividers should therefore match when those surfaces point at the same profile.
 
 Here is the current admin-side grouped picker and profile catalog:
 
-![Admin sidecar grouped Add Storage View flow](images/admin-setup-v0.18.0.png)
 
 ## Profiles Vs Storage Views
 

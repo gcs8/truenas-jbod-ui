@@ -130,10 +130,17 @@ cp docker-compose.override.yml.example docker-compose.override.yml
 Then set the matching keys in `.env`:
 
 ```dotenv
-LOG_SYSLOG_ADDRESS=udp://syslog.example.local:514
+LOG_SYSLOG_ADDRESS=udp://syslog.example.test:514
 LOG_SYSLOG_FORMAT=rfc5424micro
 LOG_SYSLOG_FACILITY=local0
 ```
+
+UDP syslog has no confidentiality, peer authentication, delivery guarantee, or
+tamper protection. Use this example only on a trusted, isolated logging network.
+Across a shared or routed network, send the local container logs through a host
+collector that uses an authenticated and encrypted transport such as mutually
+authenticated TLS. Configure and test the collector's CA, client certificate,
+server name, queue, and retry policy before removing the local log copy.
 
 After that, the normal default path stays the same:
 

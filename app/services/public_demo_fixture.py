@@ -578,6 +578,12 @@ def _storage_runtime_slot(
     )
 
 
+def _annualized_bytes(total_bytes: int | None, power_on_hours: int | None) -> int | None:
+    if not total_bytes or not power_on_hours or power_on_hours <= 0:
+        return None
+    return int(total_bytes * 8760 / power_on_hours)
+
+
 def _smart_summary(source: PublicDemoSlot | PublicDemoStorageSlot) -> SmartSummaryView:
     return SmartSummaryView(
         available=bool(getattr(source, "state", None) != SlotState.empty and getattr(source, "occupied", True)),
@@ -589,8 +595,8 @@ def _smart_summary(source: PublicDemoSlot | PublicDemoStorageSlot) -> SmartSumma
         physical_block_size=4096,
         bytes_read=source.bytes_read,
         bytes_written=source.bytes_written,
-        annualized_bytes_read=(source.bytes_read or 0) * 4,
-        annualized_bytes_written=(source.bytes_written or 0) * 4,
+        annualized_bytes_read=_annualized_bytes(source.bytes_read, source.power_on_hours),
+        annualized_bytes_written=_annualized_bytes(source.bytes_written, source.power_on_hours),
         rotation_rate_rpm=0 if source.model and "Flash" in source.model else 7200,
         form_factor="2.5 inches" if source.model and "Flash" in source.model else "3.5 inches",
         firmware_version="DEMO-1.0",
@@ -637,17 +643,19 @@ def _history_payload(
             "power_on_hours": source.power_on_hours or 0,
             "bytes_read": source.bytes_read or 0,
             "bytes_written": source.bytes_written or 0,
+            "annualized_bytes_read": _annualized_bytes(source.bytes_read, source.power_on_hours) or 0,
+            "annualized_bytes_written": _annualized_bytes(source.bytes_written, source.power_on_hours) or 0,
         }
         for metric_name, base in bases.items():
             samples: list[dict[str, Any]] = []
             for index, offset in enumerate(offsets):
                 value = base
                 if metric_name == "temperature_c":
-                    value = base + (-1, 0, 1, 0)[index % 4]
+                    value = base if offset == 0 else base + (-1, 0, 1, 0)[index % 4]
                 elif metric_name == "power_on_hours":
                     value = max(0, base - offset)
-                else:
-                    value = max(0, base - (offset * (index + 1) * 1_000_000))
+                elif metric_name in {"bytes_read", "bytes_written"}:
+                    value = max(0, base - (offset * 1_000_000))
                 samples.append(
                     {
                         "observed_at": (fixture.generated_at - timedelta(hours=offset)).isoformat(),

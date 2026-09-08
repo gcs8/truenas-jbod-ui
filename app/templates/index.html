@@ -17,7 +17,7 @@
       </p>
     </div>
     <div class="topbar-meta">
-      <div class="meta-card meta-select-card">
+      <div class="meta-card meta-select-card system-select-card">
         <label class="meta-label" for="system-select">System</label>
         <select class="meta-select" id="system-select">
           {% for system in snapshot.systems %}
@@ -42,7 +42,7 @@
         </select>
       </div>
       <div class="meta-card">
-        <span class="meta-label">Last Updated</span>
+        <span class="meta-label">{% if snapshot_mode %}Snapshot time{% else %}Last Updated{% endif %}</span>
         <span class="meta-value" id="last-updated">{{ snapshot.last_updated }}</span>
         <span class="meta-note" id="timezone-label">Browser local time</span>
       </div>
@@ -69,7 +69,7 @@
       </p>
       <div class="snapshot-banner-facts">
         <span class="snapshot-banner-fact">Artifact app v{{ snapshot_export_meta.app_version or "unknown" }}</span>
-        <span class="snapshot-banner-fact">{{ snapshot_export_meta.visible_bay_count or snapshot.layout_slot_count or (snapshot.slots | length) }} visible bays</span>
+        <span class="snapshot-banner-fact">{{ snapshot_export_meta.visible_bay_count or snapshot.layout_slot_count or (snapshot.slots | length) }} bays in artifact</span>
         {% if snapshot_export_meta.enclosure_count and snapshot_export_meta.enclosure_count > 1 %}
         <span class="snapshot-banner-fact">{{ snapshot_export_meta.enclosure_count }} live enclosures</span>
         {% endif %}
@@ -77,8 +77,8 @@
         <span class="snapshot-banner-fact">{{ snapshot_export_meta.storage_view_count }} saved/virtual views</span>
         {% endif %}
         <span class="snapshot-banner-fact">{{ snapshot_export_meta.metric_sample_count or 0 }} metric samples</span>
-        <span class="snapshot-banner-fact">{{ snapshot_export_meta.smart_summary_count or 0 }} SMART summaries</span>
-        <span class="snapshot-banner-fact">{{ snapshot_export_meta.event_count or 0 }} events</span>
+        <span class="snapshot-banner-fact">{{ snapshot_export_meta.smart_summary_count or 0 }} slot/view SMART summaries</span>
+        <span class="snapshot-banner-fact">{{ snapshot_export_meta.event_count or 0 }} event{% if (snapshot_export_meta.event_count or 0) != 1 %}s{% endif %}</span>
         <span class="snapshot-banner-fact">Downsampling {{ snapshot_export_meta.downsampling_label or "None" }}</span>
       </div>
     </div>
@@ -389,6 +389,9 @@
             </div>
           </div>
         </div>
+        <p class="slot-scroll-hint" id="slot-scroll-hint">
+          Swipe or scroll bays horizontally to inspect the full enclosure.
+        </p>
         <div class="enclosure-face">
           <div class="chassis-shell" id="chassis-shell" data-face-style="{{ profile.face_style if profile else 'generic' }}" data-latch-edge="{{ profile.latch_edge if profile else 'bottom' }}">
             <div class="service-zone" aria-hidden="true">

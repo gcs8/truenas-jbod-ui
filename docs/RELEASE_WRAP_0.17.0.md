@@ -53,7 +53,7 @@ Linux dev target:
 
 - VM was rebooted after OOMs and came back healthy
 - long-running public UI/history/admin were rebuilt and reported `0.17.0-dev`
-  during RC on `10.13.37.138:8080`, `:8081`, and `:8082`
+  during RC on `192.0.2.138:8080`, `:8081`, and `:8082`
 - the public stack was rebuilt again after the late export-source-cache fix;
   `qa/ui-switching.spec.js` passed against `:8080`, and direct Archive CORE
   estimate followed by forced ZIP download returned from the staged inputs

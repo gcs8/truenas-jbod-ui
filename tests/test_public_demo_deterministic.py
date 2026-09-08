@@ -153,7 +153,14 @@ class DeterministicPublicDemoContractTests(unittest.TestCase):
                 "PYTHONHASHSEED": "random",
             }
             result = subprocess.run(
-                [sys.executable, "scripts/build_public_demo.py", "--output", str(output)],
+                [
+                    sys.executable,
+                    "scripts/build_public_demo.py",
+                    "--output",
+                    str(output),
+                    "--source-revision",
+                    "0" * 40,
+                ],
                 cwd=materialized,
                 env=env,
                 text=True,
@@ -242,8 +249,17 @@ class DeterministicPublicDemoContractTests(unittest.TestCase):
                 ".github/workflows/publish-public-demo.yml",
                 "public-demo/**",
                 "qa/public-demo.spec.js",
+                "README.md",
+                "docs/DOCUMENTATION_INVENTORY.md",
+                "docs/PUBLIC_DEMO_PRODUCT_BRIEF.md",
+                "docs/PUBLIC_SCREENSHOT_REVIEW.md",
+                "docs/images/screenshots/**",
+                "wiki/**",
                 "scripts/build_current_source_browser_fixture.py",
                 "scripts/check_public_demo_artifact.py",
+                "scripts/check_public_demo_deployment.py",
+                "scripts/check_public_docs.py",
+                "scripts/check_public_screenshots.py",
             }
         )
         self.assertEqual(workflow_paths_for_event(workflow, "pull_request"), expected_paths)
@@ -253,7 +269,7 @@ class DeterministicPublicDemoContractTests(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/publish-public-demo.yml").read_text(encoding="utf-8")
 
         self.assertNotIn("if: github.event_name != 'pull_request'", workflow)
-        self.assertEqual(workflow.count("if: github.event_name == 'workflow_dispatch'"), 3)
+        self.assertEqual(workflow.count("if: github.event_name == 'workflow_dispatch'"), 4)
 
     def test_docs_define_deterministic_regeneration_and_publication_boundaries(self) -> None:
         public_readme = (ROOT / "public-demo/README.md").read_text(encoding="utf-8")
@@ -263,7 +279,8 @@ class DeterministicPublicDemoContractTests(unittest.TestCase):
 
         for document in (public_readme, contributor_rails, release_checklist):
             self.assertIn("tests/fixtures/public_demo/public_demo.json", document)
-            self.assertIn("python scripts/build_public_demo.py --output public-demo/index.html", document)
+            self.assertIn("scripts/build_public_demo.py", document)
+            self.assertIn("--source-revision", document)
             self.assertIn("workflow_dispatch", document)
         self.assertIn("does not publish", public_readme)
         self.assertIn("do not deploy", public_readme)

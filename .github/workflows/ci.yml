@@ -104,6 +104,7 @@ jobs:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Set up Python
@@ -230,6 +231,7 @@ jobs:
           node --check app/static/sas_fabric_view.js
           node --check admin_service/static/admin.js
           node --check history_service/static/dashboard.js
+          node --check scripts/capture_public_demo_screenshots.js
           specs=(qa/*.spec.js)
           if [ ${#specs[@]} -eq 0 ]; then
             echo "No QA spec files found under qa/*.spec.js"
@@ -545,6 +547,7 @@ jobs:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Set up Python
@@ -559,6 +562,11 @@ jobs:
 
       - name: Verify checked-in public demo is publishable
         run: python scripts/check_public_demo_artifact.py public-demo
+
+      - name: Verify current README, Wiki, and screenshots
+        run: |
+          python scripts/check_public_docs.py
+          python scripts/check_public_screenshots.py
 
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7

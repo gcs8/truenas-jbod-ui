@@ -159,8 +159,9 @@ class CIWorkflowContractTests(unittest.TestCase):
                 if match.group("version") is None:
                     uncommented.append(f"{workflow_path.name}: {action}")
 
-        # 28 pre-existing uses plus the changelog-entry job's checkout.
-        self.assertEqual(action_count, 29)
+        # 29 existing uses plus checkout, setup-python, and setup-node in the
+        # owner-gated Pages readback job.
+        self.assertEqual(action_count, 32)
         self.assertEqual(unpinned, [])
         self.assertEqual(uncommented, [])
 
@@ -255,6 +256,52 @@ class CIWorkflowContractTests(unittest.TestCase):
                 self.assertIn("npm ci --ignore-scripts", workflow_text)
                 self.assertIn('rm -rf "$fixture_root"', workflow_text)
                 self.assertIn("git status --short", workflow_text)
+
+    def test_public_demo_pages_request_allowlist_is_probe_specific(self) -> None:
+        spec = self.read(PUBLIC_DEMO_SPEC)
+
+        self.assertIn(
+            'const CHROME_LOCALHOST_DEVTOOLS_PROBE = "/.well-known/appspecific/com.chrome.devtools.json";',
+            spec,
+        )
+        self.assertIn("function isExpectedPagesRequest(requestURL)", spec)
+        self.assertIn("requestPath === CHROME_LOCALHOST_DEVTOOLS_PROBE", spec)
+        self.assertIn("const unexpectedPagesRequests = fixture.requests.filter", spec)
+        self.assertIn("expect(unexpectedPagesRequests).toEqual([])", spec)
+        self.assertNotIn(
+            'fixture.requests.every((request) => request.startsWith("/truenas-jbod-ui/"))',
+            spec,
+        )
+
+    def test_public_docs_screenshots_and_deployment_readback_are_release_gates(self) -> None:
+        ci = self.read(CI_WORKFLOW)
+        publish = self.read(PUBLISH_PUBLIC_DEMO_WORKFLOW)
+
+        for workflow_text in (ci, publish):
+            self.assertIn("python scripts/check_public_docs.py", workflow_text)
+            self.assertIn("python scripts/check_public_screenshots.py", workflow_text)
+        self.assertIn("source_sha: ${{ github.sha }}", publish)
+        self.assertIn("page_url: ${{ steps.deployment.outputs.page_url }}", publish)
+        self.assertIn("scripts/check_public_demo_deployment.py", publish)
+        self.assertIn("PUBLIC_DEMO_URL:", publish)
+        self.assertIn("--grep \"published public demo\"", publish)
+
+    def test_public_demo_source_revision_jobs_checkout_full_history(self) -> None:
+        expected_jobs = {
+            CI_WORKFLOW: ("python-source", "public-demo-artifact"),
+            PUBLISH_PUBLIC_DEMO_WORKFLOW: ("verify",),
+        }
+
+        for workflow_path, job_names in expected_jobs.items():
+            workflow = yaml.safe_load(self.read(workflow_path))
+            for job_name in job_names:
+                with self.subTest(workflow=workflow_path.name, job=job_name):
+                    checkout = next(
+                        step
+                        for step in workflow["jobs"][job_name]["steps"]
+                        if str(step.get("uses", "")).startswith("actions/checkout@")
+                    )
+                    self.assertEqual(checkout.get("with", {}).get("fetch-depth"), 0)
 
     def test_release_checklist_public_demo_commands_supply_both_required_artifacts(self) -> None:
         checklist = self.read(ROOT / "docs" / "RELEASE_CHECKLIST.md")

@@ -18,23 +18,19 @@ different jobs and should not be treated as interchangeable.
 ## Public Demo Site
 
 The public demo is a GitHub Pages-compatible static site. The current source
-tree generates `public-demo/index.html` from live-derived TN Core / Supermicro
-CSE-946-style data through the offline snapshot exporter, and the page clearly
-marks itself as an offline artifact. Critical serial, SAS, NAA, and persistent
-identifiers are scrambled consistently, while make, model, capacity, configured
-storage-view names, SMART summaries, and history samples come from the source
-data. Its pool topology follows the validated CORE 60-bay membership pattern,
-including data `raidz2` groups, the spare bay, special mirror members, matching
-empty bays, the `4x NVMe Carrier Card`, and `Boot SATADOMs`. It opens with no
-bay selected and preserves a 7-day history window.
+tree generates `public-demo/index.html` only from the schema-validated fixture
+at `tests/fixtures/public_demo/public_demo.json`. Every system, bay, disk,
+identifier, metric, event, and storage view in that fixture was invented for the
+repository. The artifact has one synthetic 60-bay enclosure, two synthetic
+saved or virtual views, and a seven-day synthetic history window.
 
-The page labels the committed capture time and artifact app version. GitHub
-Pages deploys that checked-in deterministic artifact unchanged. It does not
-regenerate from live or local history during a release publication.
+The page labels the artifact app version, source revision, and deterministic
+Build ID. GitHub Pages deploys the checked-in artifact unchanged. Publication
+does not read live or local history.
 
 Public demo:
 
-- https://gcs8.github.io/truenas-jbod-ui/
+- [Open the public demo](https://gcs8.github.io/truenas-jbod-ui/)
 
 It must not:
 

@@ -11,7 +11,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.public_demo_source_parity import check_source_parity_manifest  # noqa: E402
+from scripts.public_demo_source_parity import (  # noqa: E402
+    check_source_parity_manifest,
+    parse_manifest,
+    recorded_source_revision_errors,
+)
 
 
 DEFAULT_DEMO_DIR = Path("public-demo")
@@ -37,6 +41,8 @@ REQUIRED_MARKERS: tuple[str, ...] = (
     "Artifact app v",
     "Capture time",
     "Synthetic IDs",
+    "Source revision",
+    "Build ID",
     "Demo 60-Bay Top Loader",
     "Demo 4x NVMe Carrier",
     "Demo Boot Modules",
@@ -48,6 +54,10 @@ FORBIDDEN_MARKERS: tuple[tuple[str, str], ...] = (
     ("local history dependency", "history/history.db"),
 )
 ARTIFACT_VERSION_PATTERN = re.compile(r"\bArtifact app v(?P<version>[0-9A-Za-z][0-9A-Za-z.+-]*)\b")
+RESOURCE_REFERENCE_PATTERN = re.compile(
+    r"<(?:script|img|link|source|video|audio|iframe)\b[^>]*\b(?:src|href|poster)\s*=\s*[\"'](?!data:|#)[^\"']+",
+    re.IGNORECASE,
+)
 SOURCE_VERSION_PATTERN = re.compile(
     r'^__version__\s*=\s*["\'](?P<version>[0-9A-Za-z][0-9A-Za-z.+-]*)["\']\s*$',
     re.MULTILINE,
@@ -109,6 +119,16 @@ def main() -> int:
         html = ""
     if html:
         errors.extend(check_source_parity_manifest(html, source_root=args.source_root))
+        manifest, _artifact_html, manifest_errors = parse_manifest(html)
+        if not manifest_errors:
+            source_revision = manifest.get("source_revision")
+            if isinstance(source_revision, str):
+                errors.extend(
+                    recorded_source_revision_errors(
+                        source_root=args.source_root,
+                        source_revision=source_revision,
+                    )
+                )
         try:
             source_version = read_source_version(args.source_root)
         except ValueError as exc:
@@ -126,6 +146,8 @@ def main() -> int:
         for label, marker in FORBIDDEN_MARKERS:
             if marker in html:
                 errors.append(f"found forbidden {label}")
+        if RESOURCE_REFERENCE_PATTERN.search(html):
+            errors.append("found external or local resource reference")
         for label, pattern in SENSITIVE_PATTERNS:
             if match := pattern.search(html):
                 errors.append(f"found {label}: {match.group(0)[:80]}")

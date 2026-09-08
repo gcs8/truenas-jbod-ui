@@ -261,6 +261,20 @@ class PublicDocPrivacyTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "non-empty reason"):
                 load_reviewed_exceptions(path)
 
+    def test_historical_release_evidence_exceptions_are_retired(self) -> None:
+        retired_reason = "Historical public release evidence; exact detector counts are pinned."
+        matching_paths = [
+            path
+            for path, (reason, _findings) in REVIEWED_FINDING_EXCEPTIONS.items()
+            if reason == retired_reason
+        ]
+
+        self.assertEqual(
+            len(matching_paths),
+            0,
+            msg=f"{len(matching_paths)} historical release evidence exceptions remain",
+        )
+
     def test_privacy_findings_pin_values_instead_of_only_category_counts(self) -> None:
         first = _scan_text("host: 10.23.45.67\n")
         replacement = _scan_text("host: 10.23.45.68\n")

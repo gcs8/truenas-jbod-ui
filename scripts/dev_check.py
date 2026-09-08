@@ -20,6 +20,7 @@ FIXED_JAVASCRIPT_PATHS = (
     "app/static/sas_fabric_view.js",
     "admin_service/static/admin.js",
     "history_service/static/dashboard.js",
+    "scripts/capture_public_demo_screenshots.js",
 )
 CI_SOURCE_GATES = frozenset(
     {
@@ -71,6 +72,7 @@ CI_SOURCE_GATE_WORKFLOW_COMMANDS: Mapping[str, str] = {
             "node --check app/static/sas_fabric_view.js",
             "node --check admin_service/static/admin.js",
             "node --check history_service/static/dashboard.js",
+            "node --check scripts/capture_public_demo_screenshots.js",
             "specs=(qa/*.spec.js)",
             "if [ ${#specs[@]} -eq 0 ]; then",
             'echo "No QA spec files found under qa/*.spec.js"',
@@ -117,8 +119,13 @@ WINDOWS_PORTABLE_TEST_MODULES = (
     "tests.test_profiles",
     "tests.test_prometheus_alert_rules",
     "tests.test_public_doc_privacy",
+    "tests.test_public_demo_deployment",
     "tests.test_public_demo_deterministic",
     "tests.test_public_demo_fixture",
+    "tests.test_public_demo_history_consistency",
+    "tests.test_public_demo_provenance",
+    "tests.test_public_docs_contract",
+    "tests.test_public_screenshots",
     "tests.test_quantastor_api",
     "tests.test_release_changelog_coverage",
     "tests.test_release_status",

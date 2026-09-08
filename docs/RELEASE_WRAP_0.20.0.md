@@ -76,7 +76,7 @@ Current closeout validation before the release cut:
   `data/history-perf/history.jsonl`. `overview_estimated` averaged `110.4 ms`
   with `227` tracked slots and `841858` metric samples.
 - Linux QA Docker restore gate passed on `2026-05-20` using
-  `codex-dev-test-target` (`10.13.37.138`) with an isolated stack under
+  `codex-dev-test-target` (`192.0.2.138`) with an isolated stack under
   `/docker-local/truenas-jbod-ui-qa-0.20.0-20260520-002021` on
   `18080` / `18081` / `18082`.
 - The restore-grade bundle was exported from the local Windows admin API and

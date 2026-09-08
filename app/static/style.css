@@ -26,6 +26,7 @@
   --sans: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
   --history-write: #69c3ff;
   --history-read: #7cd4a8;
+  background: #090d12;
 }
 
 * {
@@ -116,7 +117,7 @@ textarea {
 }
 
 .enclosure-alias-edit-button:focus-visible {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--selected);
   outline-offset: 2px;
 }
 
@@ -189,8 +190,12 @@ textarea {
   gap: 8px;
 }
 
+.system-select-card {
+  flex: 1 1 14rem;
+}
+
 .enclosure-select-card {
-  flex: 1 1 18rem;
+  flex: 1 1 24rem;
 }
 
 .meta-label {
@@ -3244,6 +3249,10 @@ button.fabric-trace-crumb:hover {
   .slot-tile.state-unmapped::after { border-style: dashed; }
 }
 
+.slot-scroll-hint {
+  display: none;
+}
+
 .enclosure-face {
   flex: 0 0 auto;
   display: flex;
@@ -3751,6 +3760,11 @@ button.fabric-trace-crumb:hover {
   text-align: left;
   color: var(--text);
   transition: transform 0.16s ease, box-shadow 0.16s ease, border-color 0.16s ease;
+}
+
+.slot-tile:focus-visible {
+  outline: 3px solid var(--selected);
+  outline-offset: 3px;
 }
 
 .slot-tile.heatmap-active {
@@ -6080,6 +6094,13 @@ button.fabric-trace-crumb:hover {
 
   .summary-strip {
     grid-template-columns: 1fr 1fr;
+  }
+
+  .slot-scroll-hint {
+    display: block;
+    margin: 0 0 10px;
+    color: var(--muted);
+    font-size: 0.86rem;
   }
 
   .fabric-lane-board,

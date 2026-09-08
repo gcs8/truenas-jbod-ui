@@ -8,6 +8,8 @@ const vm = require("node:vm");
 
 const ROOT = path.resolve(__dirname, "../..");
 const APP_SOURCE = fs.readFileSync(path.join(ROOT, "app/static/app.js"), "utf8");
+const BASE_TEMPLATE = fs.readFileSync(path.join(ROOT, "app/templates/base.html"), "utf8");
+const PUBLIC_DEMO = fs.readFileSync(path.join(ROOT, "public-demo/index.html"), "utf8");
 
 function functionSource(name) {
   const patterns = [`async function ${name}(`, `function ${name}(`];
@@ -60,4 +62,28 @@ test("live Storage Fabric link preserves the server-provided root path", () => {
   updateSasFabricViewLink();
 
   assert.equal(sasFabricViewLink.href, "/truenas-jbod-ui/sas-fabric?system_id=demo");
+});
+
+test("snapshot SSH status preserves disabled, success, and captured failure states", () => {
+  const snapshotSshStatus = loadFunction("snapshotSshStatus");
+
+  assert.deepEqual(
+    { ...snapshotSshStatus({ enabled: false, ok: true }) },
+    { className: "status-chip snapshot", textContent: "SSH OFF AT CAPTURE" },
+  );
+  assert.deepEqual(
+    { ...snapshotSshStatus({ enabled: true, ok: true }) },
+    { className: "status-chip snapshot", textContent: "SSH AT CAPTURE" },
+  );
+  assert.deepEqual(
+    { ...snapshotSshStatus({ enabled: true, ok: false }) },
+    { className: "status-chip error", textContent: "SSH ERROR AT CAPTURE" },
+  );
+});
+
+test("main page and checked public demo use an inline favicon", () => {
+  const inlineFavicon = /<link\s+rel="icon"\s+href="data:[^"]*">/;
+
+  assert.match(BASE_TEMPLATE, inlineFavicon);
+  assert.match(PUBLIC_DEMO, inlineFavicon);
 });
