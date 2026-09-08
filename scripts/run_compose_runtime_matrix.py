@@ -572,6 +572,22 @@ def _verify_mapping_cycle(
         or not enclosure_id
     ):
         raise RuntimeError("physical mapping scope is unavailable")
+    inventory_slots = inventory.get("slots")
+    selected_slot = next(
+        (
+            item
+            for item in inventory_slots
+            if isinstance(item, dict) and item.get("slot") == 0
+        ),
+        None,
+    ) if isinstance(inventory_slots, list) else None
+    save_revision = (
+        selected_slot.get("mapping_revision")
+        if isinstance(selected_slot, dict)
+        else None
+    )
+    if not isinstance(save_revision, str) or len(save_revision) != 64:
+        raise RuntimeError("slot save revision is unavailable")
     scope_query = urllib.parse.urlencode(
         (("system_id", system_id), ("enclosure_id", enclosure_id))
     )
@@ -583,7 +599,7 @@ def _verify_mapping_cycle(
 
     save_url = f"{base}/api/slots/0/mapping?{scope_query}"
     payload = {
-        "expected_revision": initial_revision,
+        "expected_revision": save_revision,
         "notes": f"Matrix {variant.name}",
         "clear_identify_after_save": False,
     }

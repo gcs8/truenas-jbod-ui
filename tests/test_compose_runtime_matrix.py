@@ -8,6 +8,7 @@ import os
 import socket
 import tempfile
 import unittest
+import urllib.parse
 from pathlib import Path
 from unittest.mock import Mock, call, patch
 
@@ -310,7 +311,12 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
             request_urls: list[str] = []
             events: list[str] = []
             prefix = ("docker", "compose", "--project-name", "matrix")
-            scope_query = "system_id=synthetic-core&enclosure_id=synthetic-enclosure"
+            system_id = "synthetic core/a+b"
+            enclosure_id = "synthetic enclosure?x=1&y=2"
+            mapping_revision = "c" * 64
+            scope_query = urllib.parse.urlencode(
+                (("system_id", system_id), ("enclosure_id", enclosure_id))
+            )
 
             def require_mapping(url, expected, **kwargs):
                 self.assertEqual(expected, 200)
@@ -318,14 +324,24 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
                 if url.endswith("/api/inventory"):
                     return json.dumps(
                         {
-                            "selected_system_id": "synthetic-core",
-                            "selected_enclosure_id": "synthetic-enclosure",
+                            "selected_system_id": system_id,
+                            "selected_enclosure_id": enclosure_id,
+                            "slots": [
+                                {
+                                    "slot": 0,
+                                    "mapping_revision": mapping_revision,
+                                }
+                            ],
                         }
                     ).encode()
                 if "/api/mappings/export" in url:
                     export_calls.append(kwargs)
                     return json.dumps({"revision": "a" * 64}).encode()
                 if kwargs.get("method") == "POST":
+                    self.assertEqual(
+                        kwargs["payload"]["expected_revision"],
+                        mapping_revision,
+                    )
                     events.append("save")
                     mapping_path.write_text(
                         json.dumps(
@@ -374,35 +390,90 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
             [{"authenticated": True}],
         )
         self.assertEqual(
-            request_urls[:3],
+            request_urls,
             [
                 "http://127.0.0.1:19080/api/inventory",
                 f"http://127.0.0.1:19080/api/mappings/export?{scope_query}",
                 f"http://127.0.0.1:19080/api/slots/0/mapping?{scope_query}",
+                f"http://127.0.0.1:19080/api/slots/0/mapping?{scope_query}"
+                f"&expected_revision={'b' * 64}",
             ],
         )
         self.assertEqual(len(clear_urls), 1)
-        self.assertIn(scope_query, clear_urls[0])
-        self.assertIn("expected_revision=" + "b" * 64, clear_urls[0])
+        for url in request_urls[1:]:
+            query = urllib.parse.parse_qs(
+                urllib.parse.urlsplit(url).query,
+                keep_blank_values=True,
+            )
+            self.assertEqual(query["system_id"], [system_id])
+            self.assertEqual(query["enclosure_id"], [enclosure_id])
+        clear_query = urllib.parse.parse_qs(
+            urllib.parse.urlsplit(clear_urls[0]).query,
+            keep_blank_values=True,
+        )
+        self.assertEqual(
+            clear_query,
+            {
+                "system_id": [system_id],
+                "enclosure_id": [enclosure_id],
+                "expected_revision": ["b" * 64],
+            },
+        )
         self.assertEqual(events, ["save", "restart", "clear"])
 
     def test_mapping_cycle_stops_when_physical_scope_is_unavailable(self) -> None:
         module = self.load_matrix_module()
         ports = module.Ports(19080, 19081, 19082)
         prefix = ("docker", "compose", "--project-name", "matrix")
+        invalid_scopes = (
+            {"selected_enclosure_id": "synthetic-enclosure"},
+            {"selected_system_id": None, "selected_enclosure_id": "synthetic-enclosure"},
+            {"selected_system_id": "", "selected_enclosure_id": "synthetic-enclosure"},
+            {"selected_system_id": 7, "selected_enclosure_id": "synthetic-enclosure"},
+            {"selected_system_id": "synthetic-core"},
+            {"selected_system_id": "synthetic-core", "selected_enclosure_id": None},
+            {"selected_system_id": "synthetic-core", "selected_enclosure_id": ""},
+            {"selected_system_id": "synthetic-core", "selected_enclosure_id": 7},
+        )
+        for inventory in invalid_scopes:
+            with self.subTest(inventory=inventory), tempfile.TemporaryDirectory() as temp_dir:
+                with (
+                    patch.object(
+                        module,
+                        "_require_status",
+                        return_value=json.dumps(inventory).encode(),
+                    ) as require_status,
+                    self.assertRaisesRegex(RuntimeError, "physical mapping scope is unavailable"),
+                ):
+                    module._verify_mapping_cycle(
+                        Path(temp_dir),
+                        module.VARIANTS[0],
+                        ports,
+                        prefix,
+                    )
+                require_status.assert_called_once_with(
+                    "http://127.0.0.1:19080/api/inventory",
+                    200,
+                    authenticated=True,
+                )
+
+    def test_mapping_cycle_stops_when_slot_save_revision_is_unavailable(self) -> None:
+        module = self.load_matrix_module()
+        ports = module.Ports(19080, 19081, 19082)
+        prefix = ("docker", "compose", "--project-name", "matrix")
+        inventory = {
+            "selected_system_id": "synthetic-core",
+            "selected_enclosure_id": "synthetic-enclosure",
+            "slots": [{"slot": 0, "mapping_revision": None}],
+        }
         with tempfile.TemporaryDirectory() as temp_dir:
             with (
                 patch.object(
                     module,
                     "_require_status",
-                    return_value=json.dumps(
-                        {
-                            "selected_system_id": "synthetic-core",
-                            "selected_enclosure_id": None,
-                        }
-                    ).encode(),
+                    return_value=json.dumps(inventory).encode(),
                 ) as require_status,
-                self.assertRaisesRegex(RuntimeError, "physical mapping scope is unavailable"),
+                self.assertRaisesRegex(RuntimeError, "slot save revision is unavailable"),
             ):
                 module._verify_mapping_cycle(
                     Path(temp_dir),
