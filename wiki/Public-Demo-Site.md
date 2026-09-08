@@ -77,8 +77,11 @@ The supported public browser is the current stable Chrome channel on GitHub's
 hosted Ubuntu runner. The Playwright suite also runs with local bundled Chromium
 when Chrome is unavailable. It covers file mode, a Pages-style subpath, reload,
 back and forward navigation, keyboard focus, reduced motion, a 200-percent
-viewport-equivalent layout,
-phone through wide-desktop widths, console errors, and unexpected requests.
+desktop zoom-equivalent layout, 1280- and 1920-pixel desktop widths, console
+errors, and unexpected requests.
+
+Mobile and tablet layouts are unsupported. Incidental rendering on those
+devices is not a public-demo capability or compatibility claim.
 
 Firefox and WebKit are not release gates for this demo.
 

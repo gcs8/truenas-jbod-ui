@@ -12,7 +12,6 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_NAMES = {
     "public-demo-history.png": 1920,
-    "public-demo-mobile.png": 390,
     "public-demo-overview.png": 1920,
 }
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
@@ -178,7 +177,7 @@ def main() -> int:
         for error in errors:
             print(error, file=sys.stderr)
         return 1
-    print("Public screenshots: PASS (3 fixture images, 6 image copies, exact-byte manifest and pixel review)")
+    print("Public screenshots: PASS (2 fixture images, 4 image copies, exact-byte manifest and pixel review)")
     return 0
 
 

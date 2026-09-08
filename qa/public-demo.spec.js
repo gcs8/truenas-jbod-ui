@@ -223,7 +223,7 @@ test("public demo works from a Pages subpath through reload and history navigati
   expect(unexpectedPagesRequests).toEqual([]);
 });
 
-test("public demo responsive and accessibility contract holds at supported viewports", async ({ page }) => {
+test("public demo desktop accessibility contract holds at supported viewports", async ({ page }) => {
   const demoURL = pathToFileURL(resolvePublicDemoArtifact()).href;
   const consoleErrors = [];
   page.on("console", (message) => {
@@ -232,8 +232,6 @@ test("public demo responsive and accessibility contract holds at supported viewp
     }
   });
   for (const viewport of [
-    { width: 390, height: 844 },
-    { width: 768, height: 1024 },
     { width: 1280, height: 720 },
     { width: 1920, height: 1080 },
   ]) {
@@ -242,26 +240,7 @@ test("public demo responsive and accessibility contract holds at supported viewp
     await expect(page.locator("main")).toHaveCount(1);
     await expect(page.locator("h1")).toHaveCount(1);
     await expect(page.locator("#enclosure-select")).toHaveAccessibleName(/enclosure|view/i);
-    if (viewport.width === 390) {
-      const selectedOptionFit = await page.locator("#enclosure-select").evaluate((select) => {
-        const style = getComputedStyle(select);
-        const context = document.createElement("canvas").getContext("2d");
-        context.font = style.font;
-        const textWidth = context.measureText(select.selectedOptions[0]?.text || "").width;
-        const availableWidth = select.clientWidth
-          - parseFloat(style.paddingLeft)
-          - parseFloat(style.paddingRight)
-          - 36;
-        return { availableWidth, textWidth };
-      });
-      expect(selectedOptionFit.textWidth).toBeLessThanOrEqual(selectedOptionFit.availableWidth);
-    }
-    if (viewport.width <= 820) {
-      await expect(page.locator("#slot-scroll-hint")).toBeVisible();
-      await expect(page.locator("#slot-scroll-hint")).toContainText("Swipe or scroll bays horizontally");
-    } else {
-      await expect(page.locator("#slot-scroll-hint")).toBeHidden();
-    }
+    await expect(page.locator("#slot-scroll-hint")).toBeHidden();
     const geometry = await page.evaluate(() => ({
       clientWidth: document.documentElement.clientWidth,
       scrollWidth: document.documentElement.scrollWidth,
@@ -363,7 +342,7 @@ test("public demo responsive and accessibility contract holds at supported viewp
     expect(ratio, `${selector} text contrast`).toBeGreaterThanOrEqual(4.5);
   }
 
-  // A 640 CSS-pixel viewport is the layout width of a 1280-pixel window at 200% browser zoom.
+  // A 640 CSS-pixel viewport is the layout width of a supported 1280-pixel desktop window at 200% browser zoom.
   await page.setViewportSize({ width: 640, height: 720 });
   await page.goto(demoURL, { waitUntil: "load" });
   const zoomGeometry = await page.evaluate(() => ({

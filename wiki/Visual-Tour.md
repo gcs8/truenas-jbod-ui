@@ -14,9 +14,13 @@ For installation steps, start with [[Quick Start|Quick-Start]]. For the
 container/service map, use
 [[Architecture and Services|Architecture-and-Services]].
 
-The three screenshots on this page come from the checked-in synthetic public
+The two screenshots on this page come from the checked-in synthetic public
 demo. They contain no live host, address, serial, credential, or history data.
 The public screenshot manifest binds their exact bytes to the demo artifact.
+
+This is a desktop operator application. Mobile and tablet layouts are
+unsupported. Incidental rendering on those devices is not a compatibility
+claim or documented workflow.
 
 ## Main Enclosure View
 
@@ -92,13 +96,6 @@ rewrite local sidecar data.
 
 Use [[History Maintenance and Recovery|History-Maintenance-and-Recovery]] for
 the history-specific cleanup flow.
-
-## Narrow layout
-
-At a phone-sized viewport, the same synthetic enclosure stacks its controls and
-detail panels rather than forcing a page-wide horizontal scroll.
-
-![Synthetic public demo at a narrow viewport](images/public-demo-mobile.png)
 
 The demo intentionally omits the admin sidecar, setup wizard, live refresh,
 mapping changes, locator controls, and target writes. The

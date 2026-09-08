@@ -12,6 +12,12 @@ It does not install anything on TrueNAS CORE or SCALE. The app talks to storage
 hosts over their existing API, SSH, or BMC paths and renders what it can from
 there.
 
+## Desktop support contract
+
+This is a desktop operator application. Mobile and tablet layouts are unsupported.
+If a phone or tablet happens to render the page, that is incidental behavior,
+not a supported workflow or compatibility claim.
+
 Public demo:
 
 - [https://gcs8.github.io/truenas-jbod-ui/](https://gcs8.github.io/truenas-jbod-ui/)
@@ -29,10 +35,6 @@ binds each PNG to the exact demo artifact and source revision.
 ### History panel
 
 ![Synthetic slot history panel](docs/images/screenshots/public-demo-history.png)
-
-### Narrow layout
-
-![Synthetic public demo at a narrow viewport](docs/images/screenshots/public-demo-mobile.png)
 
 See the [public demo product brief](docs/PUBLIC_DEMO_PRODUCT_BRIEF.md) for the
 fixture, browser, privacy, and publication contract. The

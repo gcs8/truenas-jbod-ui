@@ -317,10 +317,11 @@ class ContainerResourceContractTests(unittest.TestCase):
         for name in (
             "public-demo-overview.png",
             "public-demo-history.png",
-            "public-demo-mobile.png",
         ):
             self.assertIn(name, readme)
             self.assertIn(name, wiki_docs["Visual-Tour.md"])
+        self.assertNotIn("public-demo-mobile.png", readme)
+        self.assertNotIn("public-demo-mobile.png", wiki_docs["Visual-Tour.md"])
         self.assertNotIn("historical v0.18", readme)
         self.assertNotIn("historical v0.18", wiki_docs["Visual-Tour.md"])
         self.assertIn("capture_public_demo_screenshots.js", wiki_docs["Publishing-the-Wiki.md"])

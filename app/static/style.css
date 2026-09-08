@@ -6071,19 +6071,6 @@ button.fabric-trace-crumb:hover {
     align-items: stretch;
   }
 
-  .topbar {
-    padding: 14px;
-  }
-
-  .topbar .meta-card {
-    padding-inline: 10px;
-  }
-
-  .topbar .meta-select {
-    padding-inline: 8px;
-    font-size: 0.8rem;
-  }
-
   .topbar-meta {
     min-width: 0;
   }

@@ -67,6 +67,9 @@ The operator contract must remain stable:
   Quantastor, Linux, ESXi, and BMC/IPMI paths
 - functional parity means a predictable operator experience, not identical
   feature sets on every platform
+- the UI is a desktop operator application; mobile and tablet layouts are
+  unsupported and incidental rendering must not be documented or tested as a
+  product capability
 
 ## Standing Non-Goals For Maintenance Cycles
 

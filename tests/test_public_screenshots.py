@@ -16,11 +16,9 @@ MANIFEST_PATH = DOCS_IMAGE_ROOT / "manifest.json"
 EXPECTED_NAMES = {
     "public-demo-overview.png",
     "public-demo-history.png",
-    "public-demo-mobile.png",
 }
 EXPECTED_WIDTHS = {
     "public-demo-history.png": 1920,
-    "public-demo-mobile.png": 390,
     "public-demo-overview.png": 1920,
 }
 
@@ -72,7 +70,7 @@ class PublicScreenshotContractTests(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("6 image copies", result.stdout)
+        self.assertIn("4 image copies", result.stdout)
         self.assertIn("exact-byte", result.stdout)
 
     def test_pixel_review_record_names_every_exact_image_hash(self) -> None:
@@ -99,6 +97,7 @@ class PublicScreenshotContractTests(unittest.TestCase):
         capture_script = (ROOT / "scripts/capture_public_demo_screenshots.js").read_text(encoding="utf-8")
         self.assertIn("public-demo/index.html", capture_script)
         self.assertIn('timezoneId: "UTC"', capture_script)
+        self.assertNotIn("public-demo-mobile.png", capture_script)
         self.assertNotIn("http://localhost:8080", capture_script)
         self.assertNotIn("system_id", capture_script)
         self.assertNotIn("enclosure_id", capture_script)
@@ -111,6 +110,17 @@ class PublicScreenshotContractTests(unittest.TestCase):
             self.assertIn(name, readme + visual_tour)
         self.assertNotIn("v0.18.0.png", readme)
         self.assertNotIn("v0.18.0.png", visual_tour)
+        self.assertNotIn("public-demo-mobile.png", readme)
+        self.assertNotIn("public-demo-mobile.png", visual_tour)
+
+    def test_desktop_only_product_contract_is_explicit(self) -> None:
+        product_brief = (ROOT / "docs/PUBLIC_DEMO_PRODUCT_BRIEF.md").read_text(
+            encoding="utf-8"
+        )
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+        for document in (product_brief, readme):
+            self.assertIn("Mobile and tablet layouts are unsupported", document)
 
 
 if __name__ == "__main__":

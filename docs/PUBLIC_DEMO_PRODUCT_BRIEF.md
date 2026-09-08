@@ -8,9 +8,11 @@ The demo answers a narrow question: does the physical enclosure view, slot detai
 
 ## Audience
 
-The intended reader runs or evaluates direct-attached storage and wants to see the operator workflow first. The demo is also the public fixture used by maintainers for screenshot, accessibility, responsive-layout, and Pages publication checks.
+The intended reader runs or evaluates direct-attached storage and wants to see the operator workflow first. The demo is also the public fixture used by maintainers for screenshot, accessibility, desktop-layout, and Pages publication checks.
 
 It is not a remote administration console. Do not use it to judge whether a specific chassis, controller, disk, multipath layout, or account policy is supported.
+
+This is a desktop operator application. Mobile and tablet layouts are unsupported. A page that happens to render on a phone or tablet is incidental behavior, not a product capability, compatibility promise, or release gate.
 
 ## Included interactions
 
@@ -50,18 +52,17 @@ The repository uses two commits when generator inputs change. The first commit f
 
 ## Screenshot provenance
 
-`scripts/capture_public_demo_screenshots.js` opens only `public-demo/index.html` through `file://`. It blocks and records non-file requests, uses fixed viewports and reduced motion, and writes three PNGs:
+`scripts/capture_public_demo_screenshots.js` opens only `public-demo/index.html` through `file://`. It blocks and records non-file requests, uses fixed desktop viewports and reduced motion, and writes two PNGs:
 
 - `public-demo-overview.png`
 - `public-demo-history.png`
-- `public-demo-mobile.png`
 
 `docs/images/screenshots/manifest.json` records the source artifact hash, source revision, image dimensions, byte counts, and SHA-256 values. The Wiki copies must be byte-identical. The capture script leaves pixel review at `PENDING`; a reviewer changes it to `PASS` only after inspecting the exact recorded bytes.
 
 [`PUBLIC_SCREENSHOT_REVIEW.md`](PUBLIC_SCREENSHOT_REVIEW.md) records the exact
 hashes and final pixel decision for the checked-in images.
 
-## Supported browser and layout matrix
+## Supported desktop browser and layout matrix
 
 The supported public-demo browser is the current stable Chrome channel used by GitHub's hosted Ubuntu runner. The artifact is also checked with bundled Playwright Chromium during local development when Chrome is unavailable. Firefox and WebKit are not release gates for this static demo.
 
@@ -69,12 +70,10 @@ The browser suite checks these literal viewports:
 
 | Viewport | Purpose |
 |---|---|
-| 390 by 844 | Narrow phone layout and touch-sized controls |
-| 768 by 1024 | Tablet or narrow desktop layout |
 | 1280 by 720 | Short desktop layout |
 | 1920 by 1080 | Standard wide desktop layout |
 
-The same suite checks the 640-CSS-pixel layout equivalent of a 1280-pixel window at 200 percent browser zoom, keyboard focus, accessible names, reduced-motion preference, visible focus, page overflow, same-origin requests, console errors, file mode, and a Pages-style `/truenas-jbod-ui/` subpath. The product makes no promise for obsolete browsers or script-disabled mode.
+The same suite checks the 640-CSS-pixel layout equivalent of a 1280-pixel desktop window at 200 percent browser zoom, keyboard focus, accessible names, reduced-motion preference, visible focus, page overflow, same-origin requests, console errors, file mode, and a Pages-style `/truenas-jbod-ui/` subpath. It does not test or claim phone or tablet support. The product makes no promise for obsolete browsers or script-disabled mode.
 
 The artifact has no local asset or API dependency to fail at runtime. The static
 checker rejects a new `src`, stylesheet, media, or frame reference, and the

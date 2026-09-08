@@ -356,8 +356,8 @@ python scripts/validate_release_wrap.py "$version" \
   `node scripts/capture_public_demo_screenshots.js`
 - do not capture a live app, admin page, operator config, local history, or
   private deployment for the public README or Wiki
-- inspect `public-demo-overview.png`, `public-demo-history.png`, and
-  `public-demo-mobile.png` at their exact manifest hashes
+- inspect `public-demo-overview.png` and `public-demo-history.png` at their
+  exact manifest hashes
 - after pixel review, set each manifest review field to `PASS` and run:
   - `python3 scripts/check_public_demo_artifact.py public-demo`
   - `python3 scripts/check_public_screenshots.py`

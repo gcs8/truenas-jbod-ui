@@ -15,7 +15,6 @@ const wikiRoot = path.join(repoRoot, "wiki", "images");
 const plans = [
   { name: "public-demo-overview.png", viewport: { width: 1920, height: 1080 }, state: "overview" },
   { name: "public-demo-history.png", viewport: { width: 1920, height: 1080 }, state: "history" },
-  { name: "public-demo-mobile.png", viewport: { width: 390, height: 844 }, state: "mobile" },
 ];
 
 function sha256(payload) {
