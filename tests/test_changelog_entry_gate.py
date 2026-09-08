@@ -119,6 +119,23 @@ class ChangelogEntryGateTests(unittest.TestCase):
         self.assertTrue(result.ok, result.messages)
         self.assertIn("v0.2.0", result.messages[0])
 
+    def test_release_candidate_section_accepts_prerelease_and_build_metadata(self) -> None:
+        self._write("app/service.py", "VALUE = 2\n")
+        text = (self.repo / "CHANGELOG.md").read_text(encoding="utf-8")
+        text = text.replace("## Unreleased", "## v1.2.3-rc.1+build.5 - 2026-02-01", 1)
+        text = text.replace(
+            "### Fixed\n\n",
+            "### Fixed\n\n- Prepared the release candidate (#42).\n",
+            1,
+        )
+        self._write("CHANGELOG.md", text)
+        self._commit("chore: prepare release")
+
+        result = self._evaluate()
+
+        self.assertTrue(result.ok, result.messages)
+        self.assertIn("v1.2.3-rc.1+build.5", result.messages[0])
+
     def test_entry_for_a_different_pr_number_fails(self) -> None:
         self._write("app/service.py", "VALUE = 2\n")
         self._add_entry("Fixed", "- Bumped the value (#41).")
@@ -222,6 +239,26 @@ class ChangelogEntryGateTests(unittest.TestCase):
 
 
 class ChangelogEntryParsingTests(unittest.TestCase):
+    def test_release_heading_uses_strict_semver_core_and_identifier_grammar(self) -> None:
+        for valid in (
+            "## v0.0.0",
+            "## v1.2.3-rc.1+build.5",
+            "## v1.2.3-x-y-z+001 - 2026-02-01",
+        ):
+            with self.subTest(valid=valid):
+                self.assertIsNotNone(gate.RELEASE_HEADING.fullmatch(valid))
+
+        for invalid in (
+            "## v01.2.3",
+            "## v1.02.3",
+            "## v1.2.03",
+            "## v1.2.3-01",
+            "## v1.2.3-rc..1",
+            "## v1.2.3+build..5",
+        ):
+            with self.subTest(invalid=invalid):
+                self.assertIsNone(gate.RELEASE_HEADING.fullmatch(invalid))
+
     def test_relevant_path_classification(self) -> None:
         for path in (
             "app/main.py",

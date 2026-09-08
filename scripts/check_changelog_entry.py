@@ -32,7 +32,15 @@ from pathlib import Path
 
 CHANGELOG_PATH = "CHANGELOG.md"
 UNRELEASED_HEADING = "## Unreleased"
-RELEASE_HEADING = re.compile(r"^## v\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?(?: - \d{4}-\d{2}-\d{2})?$")
+SEMVER_CORE = r"(?:0|[1-9]\d*)"
+SEMVER_PRERELEASE_IDENTIFIER = r"(?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
+SEMVER_BUILD_IDENTIFIER = r"[0-9A-Za-z-]+"
+RELEASE_HEADING = re.compile(
+    rf"^## v{SEMVER_CORE}\.{SEMVER_CORE}\.{SEMVER_CORE}"
+    rf"(?:-{SEMVER_PRERELEASE_IDENTIFIER}(?:\.{SEMVER_PRERELEASE_IDENTIFIER})*)?"
+    rf"(?:\+{SEMVER_BUILD_IDENTIFIER}(?:\.{SEMVER_BUILD_IDENTIFIER})*)?"
+    r"(?: - \d{4}-\d{2}-\d{2})?$"
+)
 NO_CHANGELOG_LABEL = "no-changelog"
 # Dependabot pull requests cannot add a changelog line; they still reach the
 # release body under "Dependencies" through .github/release.yml.
