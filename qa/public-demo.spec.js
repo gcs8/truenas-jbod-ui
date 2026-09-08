@@ -5,6 +5,13 @@ const path = require("path");
 const { pathToFileURL } = require("url");
 
 const repoRoot = path.resolve(__dirname, "..");
+const CHROME_LOCALHOST_DEVTOOLS_PROBE = "/.well-known/appspecific/com.chrome.devtools.json";
+
+function isExpectedPagesRequest(requestURL) {
+  const requestPath = new URL(requestURL, "http://127.0.0.1").pathname;
+  return requestPath.startsWith("/truenas-jbod-ui/")
+    || requestPath === CHROME_LOCALHOST_DEVTOOLS_PROBE;
+}
 
 function resolveArtifactPath(requestedPath) {
   const artifactPath = path.isAbsolute(requestedPath)
@@ -178,6 +185,9 @@ test("public demo static artifact is explorable without a live backend", async (
 test("public demo works from a Pages subpath through reload and history navigation", async ({ page }) => {
   const fixture = await startPagesServer(resolvePublicDemoArtifact());
   const failedResponses = [];
+  expect(isExpectedPagesRequest("/truenas-jbod-ui/?review=1")).toBe(true);
+  expect(isExpectedPagesRequest(CHROME_LOCALHOST_DEVTOOLS_PROBE)).toBe(true);
+  expect(isExpectedPagesRequest("/outside-pages-subpath")).toBe(false);
   page.on("response", (response) => {
     if (response.status() >= 400) {
       failedResponses.push(`${response.status()} ${response.url()}`);
@@ -186,6 +196,10 @@ test("public demo works from a Pages subpath through reload and history navigati
   try {
     await page.goto(fixture.baseURL, { waitUntil: "load" });
     await expect(page.locator(".snapshot-banner-badge")).toContainText("Frozen Sanitized Snapshot");
+    const probeResponse = await page.request.get(
+      new URL(CHROME_LOCALHOST_DEVTOOLS_PROBE, fixture.baseURL).href,
+    );
+    expect(probeResponse.status()).toBe(404);
     await page.reload({ waitUntil: "load" });
     await page.goto(`${fixture.baseURL}?review=1`, { waitUntil: "load" });
     await expect(page.locator("#enclosure-panel-title")).toContainText("Demo 60-Bay Top Loader");
@@ -201,7 +215,12 @@ test("public demo works from a Pages subpath through reload and history navigati
   }
   expect(failedResponses).toEqual([]);
   expect(fixture.requests.length).toBeGreaterThanOrEqual(3);
-  expect(fixture.requests.every((request) => request.startsWith("/truenas-jbod-ui/"))).toBe(true);
+  expect(fixture.requests.map((requestURL) => new URL(requestURL, fixture.baseURL).pathname))
+    .toContain(CHROME_LOCALHOST_DEVTOOLS_PROBE);
+  const unexpectedPagesRequests = fixture.requests.filter(
+    (requestURL) => !isExpectedPagesRequest(requestURL),
+  );
+  expect(unexpectedPagesRequests).toEqual([]);
 });
 
 test("public demo responsive and accessibility contract holds at supported viewports", async ({ page }) => {

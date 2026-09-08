@@ -257,6 +257,22 @@ class CIWorkflowContractTests(unittest.TestCase):
                 self.assertIn('rm -rf "$fixture_root"', workflow_text)
                 self.assertIn("git status --short", workflow_text)
 
+    def test_public_demo_pages_request_allowlist_is_probe_specific(self) -> None:
+        spec = self.read(PUBLIC_DEMO_SPEC)
+
+        self.assertIn(
+            'const CHROME_LOCALHOST_DEVTOOLS_PROBE = "/.well-known/appspecific/com.chrome.devtools.json";',
+            spec,
+        )
+        self.assertIn("function isExpectedPagesRequest(requestURL)", spec)
+        self.assertIn("requestPath === CHROME_LOCALHOST_DEVTOOLS_PROBE", spec)
+        self.assertIn("const unexpectedPagesRequests = fixture.requests.filter", spec)
+        self.assertIn("expect(unexpectedPagesRequests).toEqual([])", spec)
+        self.assertNotIn(
+            'fixture.requests.every((request) => request.startsWith("/truenas-jbod-ui/"))',
+            spec,
+        )
+
     def test_public_docs_screenshots_and_deployment_readback_are_release_gates(self) -> None:
         ci = self.read(CI_WORKFLOW)
         publish = self.read(PUBLISH_PUBLIC_DEMO_WORKFLOW)
