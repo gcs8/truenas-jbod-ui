@@ -285,6 +285,7 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
         stop_services: bool = Query(default=True),
         restart_services: bool = Query(default=True),
     ) -> JSONResponse:
+        admission_started_at = int(time.time())
         archive_path = await stream_limited_request_body_to_file(request)
         try:
             if archive_path.stat().st_size == 0:
@@ -316,6 +317,7 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
                         receipt,
                         archive_digest,
                         expected_encryption_mode=expected_mode,
+                        now=admission_started_at,
                     )
 
                 return maintenance_service.import_bundle_from_file(

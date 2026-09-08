@@ -97,31 +97,32 @@ class AdminMaintenanceService:
             descriptor = os.open(archive_path, flags)
         except OSError as exc:
             raise ValueError("Backup bundle archive could not be opened.") from exc
-        workspace = Path(tempfile.mkdtemp(prefix="truenas-jbod-ui-admitted-import-"))
-        snapshot = workspace / "bundle.archive"
         try:
-            metadata = os.fstat(descriptor)
-            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-                raise ValueError("Backup bundle archive exceeds its size or type limits.")
-            copied = 0
-            with os.fdopen(os.dup(descriptor), "rb", closefd=True) as source, snapshot.open(
-                "xb"
-            ) as destination:
-                while chunk := source.read(1024 * 1024):
-                    copied += len(chunk)
-                    if copied > metadata.st_size:
+            workspace = Path(tempfile.mkdtemp(prefix="truenas-jbod-ui-admitted-import-"))
+            snapshot = workspace / "bundle.archive"
+            try:
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                    raise ValueError("Backup bundle archive exceeds its size or type limits.")
+                copied = 0
+                with os.fdopen(os.dup(descriptor), "rb", closefd=True) as source, snapshot.open(
+                    "xb"
+                ) as destination:
+                    while chunk := source.read(1024 * 1024):
+                        copied += len(chunk)
+                        if copied > metadata.st_size:
+                            raise ValueError("Backup bundle archive changed while being staged.")
+                        destination.write(chunk)
+                    if copied != metadata.st_size:
                         raise ValueError("Backup bundle archive changed while being staged.")
-                    destination.write(chunk)
-                if copied != metadata.st_size:
-                    raise ValueError("Backup bundle archive changed while being staged.")
-                destination.flush()
-                os.fsync(destination.fileno())
-            snapshot.chmod(0o400)
-            workspace.chmod(0o500)
-            return snapshot, workspace
-        except Exception:
-            shutil.rmtree(workspace, ignore_errors=True)
-            raise
+                    destination.flush()
+                    os.fsync(destination.fileno())
+                snapshot.chmod(0o400)
+                workspace.chmod(0o500)
+                return snapshot, workspace
+            except Exception:
+                shutil.rmtree(workspace, ignore_errors=True)
+                raise
         finally:
             os.close(descriptor)
 

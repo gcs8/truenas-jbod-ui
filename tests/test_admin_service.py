@@ -584,7 +584,7 @@ class MainAppBoundaryTests(unittest.TestCase):
         self.assertFalse(workspace.exists())
 
     def test_admin_backup_import_streams_file_and_cleans_workspace(self) -> None:
-        request, _receive_probe = make_streaming_request([b"archive-", b"bytes"])
+        request, receive_probe = make_streaming_request([b"archive-", b"bytes"])
         request.scope["headers"].extend(
             [
                 (b"x-backup-expected-encryption", b"plaintext"),
@@ -622,8 +622,14 @@ class MainAppBoundaryTests(unittest.TestCase):
         runtime_service = MagicMock()
         runtime_service.managed_containers = {}
         receipt_store = MagicMock()
+        request_clock = SimpleNamespace(now=100)
+        receive_probe.side_effect = lambda: setattr(request_clock, "now", 1000)
 
         with (
+            patch(
+                "admin_service.main.time.time",
+                side_effect=lambda: request_clock.now,
+            ),
             patch("admin_service.main.get_maintenance_service", return_value=service),
             patch("admin_service.main.get_backup_receipt_store", return_value=receipt_store),
             patch("admin_service.main.observe_backup_operation") as observe_operation,
@@ -658,6 +664,7 @@ class MainAppBoundaryTests(unittest.TestCase):
             "server-receipt",
             hashlib.sha256(b"archive-bytes").hexdigest(),
             expected_encryption_mode="plaintext",
+            now=100,
         )
         receipt_store.consume.assert_not_called()
         service.import_bundle.assert_not_called()

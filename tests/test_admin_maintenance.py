@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import http.client
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -95,6 +96,35 @@ def build_service(runtime: FakeRuntimeService, backup: FakeBackupService) -> Adm
 
 
 class MaintenanceQuiesceTests(unittest.TestCase):
+    def test_archive_snapshot_closes_descriptor_when_workspace_creation_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            archive_path = Path(temporary_directory) / "synthetic.archive"
+            archive_path.write_bytes(b"synthetic")
+            descriptors: list[int] = []
+            real_open = os.open
+
+            def capture_open(path: Path, flags: int) -> int:
+                descriptor = real_open(path, flags)
+                descriptors.append(descriptor)
+                return descriptor
+
+            with (
+                patch(
+                    "admin_service.services.maintenance.os.open",
+                    side_effect=capture_open,
+                ),
+                patch(
+                    "admin_service.services.maintenance.tempfile.mkdtemp",
+                    side_effect=OSError("synthetic workspace failure"),
+                ),
+            ):
+                with self.assertRaisesRegex(OSError, "synthetic workspace failure"):
+                    AdminMaintenanceService._stage_archive_snapshot(archive_path)
+
+            self.assertEqual(len(descriptors), 1)
+            with self.assertRaises(OSError):
+                os.fstat(descriptors[0])
+
     def test_file_import_activates_the_exact_snapshot_that_preflight_parsed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             archive_path = Path(temporary_directory) / "synthetic.archive"
