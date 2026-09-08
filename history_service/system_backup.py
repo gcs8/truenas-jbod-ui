@@ -766,6 +766,56 @@ class _ImportActivationTransaction:
     def rollback_completed(self) -> bool:
         return self._rollback_completed
 
+    @staticmethod
+    def _copy_file_to_descriptor(
+        source_path: Path,
+        descriptor: int,
+        *,
+        owner: tuple[int, int] | None,
+        mode: int,
+    ) -> None:
+        source_metadata = source_path.stat(follow_symlinks=False)
+        if source_path.is_symlink() or not stat.S_ISREG(source_metadata.st_mode):
+            raise ValueError("Backup bundle extracted member is not a regular file.")
+        with (
+            source_path.open("rb") as source_handle,
+            os.fdopen(descriptor, "wb", closefd=False) as target_handle,
+        ):
+            shutil.copyfileobj(source_handle, target_handle)
+            target_handle.flush()
+        if owner is not None:
+            os.fchown(descriptor, owner[0], owner[1])
+        os.fchmod(descriptor, mode)
+        os.fsync(descriptor)
+
+    @classmethod
+    def _copy_file_exclusive(
+        cls,
+        source_path: Path,
+        target_path: Path,
+        *,
+        owner: tuple[int, int] | None,
+        mode: int,
+    ) -> None:
+        descriptor = os.open(
+            target_path,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            mode,
+        )
+        try:
+            cls._copy_file_to_descriptor(
+                source_path,
+                descriptor,
+                owner=owner,
+                mode=mode,
+            )
+        finally:
+            os.close(descriptor)
+
     def activate_file(self, target_path: Path, member_key: str) -> None:
         self._activate_file(target_path, member_key, allow_history=False)
 
@@ -790,12 +840,6 @@ class _ImportActivationTransaction:
         temp_path = Path(temp_name)
         self._sibling_artifacts[temp_path] = "file"
         try:
-            with (
-                staged_path.open("rb") as source_handle,
-                os.fdopen(file_descriptor, "wb", closefd=False) as target_handle,
-            ):
-                shutil.copyfileobj(source_handle, target_handle)
-                target_handle.flush()
             file_owner = self._existing_owner(
                 target_path if entry.kind == "file" else target_path.parent,
                 directory=entry.kind != "file",
@@ -805,10 +849,12 @@ class _ImportActivationTransaction:
                 if entry.kind == "file"
                 else self._MISSING_FILE_MODE
             )
-            if file_owner is not None:
-                os.fchown(file_descriptor, file_owner[0], file_owner[1])
-            os.fchmod(file_descriptor, file_mode)
-            os.fsync(file_descriptor)
+            self._copy_file_to_descriptor(
+                staged_path,
+                file_descriptor,
+                owner=file_owner,
+                mode=file_mode,
+            )
             os.close(file_descriptor)
             file_descriptor = -1
             self._park_original(entry)
@@ -933,18 +979,7 @@ class _ImportActivationTransaction:
         target_path: Path,
         entry: _ImportRollbackEntry,
     ) -> None:
-        descriptor = os.open(
-            staged_path,
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
-            self._MISSING_FILE_MODE,
-        )
-        os.close(descriptor)
         self._sibling_artifacts[staged_path] = "file"
-        shutil.copyfile(source_path, staged_path)
         owner = self._existing_owner(
             target_path if entry.kind == "file" else target_path.parent,
             directory=entry.kind != "file",
@@ -954,9 +989,12 @@ class _ImportActivationTransaction:
             if entry.kind == "file"
             else self._MISSING_FILE_MODE
         )
-        self._apply_owner(staged_path, owner)
-        staged_path.chmod(mode)
-        self._fsync_file(staged_path)
+        self._copy_file_exclusive(
+            source_path,
+            staged_path,
+            owner=owner,
+            mode=mode,
+        )
         self._fsync_directory(staged_path.parent)
 
     def _stage_segmented_directory(
@@ -1015,7 +1053,6 @@ class _ImportActivationTransaction:
                     )
                     or self._MISSING_DIRECTORY_MODE
                 )
-            shutil.copyfile(self._staged_member(member_key), staged_target)
             existing_target = (
                 existing_directory / relative_path
                 if existing_directory is not None
@@ -1027,15 +1064,19 @@ class _ImportActivationTransaction:
                     staged_target.parent,
                     directory=True,
                 )
-            self._apply_owner(staged_target, target_owner)
-            staged_target.chmod(
-                self._segmented_staging_mode(
-                    target_dir / relative_path,
-                    directory=False,
-                )
-                or self._MISSING_FILE_MODE
+            self._copy_file_exclusive(
+                self._staged_member(member_key),
+                staged_target,
+                owner=target_owner,
+                mode=(
+                    self._segmented_staging_mode(
+                        target_dir / relative_path,
+                        directory=False,
+                    )
+                    or self._MISSING_FILE_MODE
+                ),
             )
-        self._fsync_tree(staged_dir)
+        self._fsync_tree(staged_dir, files_already_synced=True)
         self._fsync_directory(staged_dir.parent)
 
     def _activate_prepared_target(
@@ -1195,7 +1236,6 @@ class _ImportActivationTransaction:
                         self._existing_mode(existing_parent, directory=True)
                         or self._MISSING_DIRECTORY_MODE
                     )
-                shutil.copyfile(self._staged_member(member_key), staged_target)
                 existing_target = (
                     existing_directory / relative_path
                     if existing_directory is not None
@@ -1207,12 +1247,16 @@ class _ImportActivationTransaction:
                         staged_target.parent,
                         directory=True,
                     )
-                self._apply_owner(staged_target, target_owner)
-                staged_target.chmod(
-                    self._existing_mode(existing_target, directory=False)
-                    or self._MISSING_FILE_MODE
+                self._copy_file_exclusive(
+                    self._staged_member(member_key),
+                    staged_target,
+                    owner=target_owner,
+                    mode=(
+                        self._existing_mode(existing_target, directory=False)
+                        or self._MISSING_FILE_MODE
+                    ),
                 )
-            self._fsync_tree(staged_dir)
+            self._fsync_tree(staged_dir, files_already_synced=True)
             self._park_original(entry)
             os.replace(staged_dir, target_dir)
             self._sibling_artifacts.pop(staged_dir, None)
@@ -1567,11 +1611,12 @@ class _ImportActivationTransaction:
         if self.root.exists():
             shutil.rmtree(self.root)
 
-    def _fsync_tree(self, root: Path) -> None:
+    def _fsync_tree(self, root: Path, *, files_already_synced: bool = False) -> None:
         paths = list(root.rglob("*"))
-        for path in paths:
-            if path.is_file() and not path.is_symlink():
-                self._fsync_file(path)
+        if not files_already_synced:
+            for path in paths:
+                if path.is_file() and not path.is_symlink():
+                    self._fsync_file(path)
         directories = [path for path in paths if path.is_dir() and not path.is_symlink()]
         for directory in sorted(directories, key=lambda path: len(path.parts), reverse=True):
             self._fsync_directory(directory)
