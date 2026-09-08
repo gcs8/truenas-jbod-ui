@@ -147,12 +147,13 @@ class PublicDocsContractTests(unittest.TestCase):
             "## Fixture strategy",
             "## Source and build identity",
             "## Screenshot provenance",
-            "## Supported browser and layout matrix",
+            "## Supported desktop browser and layout matrix",
             "## Publication and readback",
             "## Revert and republish",
         ):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, brief)
+        self.assertIn("Mobile and tablet layouts are unsupported", brief)
         self.assertIn("git worktree add --detach", checklist)
         self.assertIn("python3 scripts/check_public_demo_artifact.py public-demo", checklist)
         self.assertIn("byte-readback and browser jobs", checklist)
