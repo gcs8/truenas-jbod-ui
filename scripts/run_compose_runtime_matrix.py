@@ -560,13 +560,28 @@ def _verify_mapping_cycle(
 ) -> None:
     base = f"http://127.0.0.1:{ports.ui}"
     same_origin = base
-    export_url = f"{base}/api/mappings/export"
+    inventory = json.loads(
+        _require_status(f"{base}/api/inventory", 200, authenticated=True)
+    )
+    system_id = inventory.get("selected_system_id")
+    enclosure_id = inventory.get("selected_enclosure_id")
+    if (
+        not isinstance(system_id, str)
+        or not system_id
+        or not isinstance(enclosure_id, str)
+        or not enclosure_id
+    ):
+        raise RuntimeError("physical mapping scope is unavailable")
+    scope_query = urllib.parse.urlencode(
+        (("system_id", system_id), ("enclosure_id", enclosure_id))
+    )
+    export_url = f"{base}/api/mappings/export?{scope_query}"
     initial = json.loads(_require_status(export_url, 200, authenticated=True))
     initial_revision = initial.get("revision")
     if not isinstance(initial_revision, str) or len(initial_revision) != 64:
         raise RuntimeError("initial mapping revision is unavailable")
 
-    save_url = f"{base}/api/slots/0/mapping"
+    save_url = f"{base}/api/slots/0/mapping?{scope_query}"
     payload = {
         "expected_revision": initial_revision,
         "notes": f"Matrix {variant.name}",
@@ -621,7 +636,7 @@ def _verify_mapping_cycle(
     if saved_mapping.get("slot") != 0 or saved_mapping.get("notes") != payload["notes"]:
         raise RuntimeError("mapping restart persistence readback failed")
 
-    clear_url = f"{save_url}?{urllib.parse.urlencode({'expected_revision': clear_revision})}"
+    clear_url = f"{save_url}&{urllib.parse.urlencode({'expected_revision': clear_revision})}"
     response = json.loads(
         _require_status(
             clear_url,

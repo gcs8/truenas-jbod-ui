@@ -307,12 +307,22 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
             mapping_path = data / "slot_mappings.json"
             export_calls: list[dict[str, object]] = []
             clear_urls: list[str] = []
+            request_urls: list[str] = []
             events: list[str] = []
             prefix = ("docker", "compose", "--project-name", "matrix")
+            scope_query = "system_id=synthetic-core&enclosure_id=synthetic-enclosure"
 
             def require_mapping(url, expected, **kwargs):
                 self.assertEqual(expected, 200)
-                if url.endswith("/api/mappings/export"):
+                request_urls.append(url)
+                if url.endswith("/api/inventory"):
+                    return json.dumps(
+                        {
+                            "selected_system_id": "synthetic-core",
+                            "selected_enclosure_id": "synthetic-enclosure",
+                        }
+                    ).encode()
+                if "/api/mappings/export" in url:
                     export_calls.append(kwargs)
                     return json.dumps({"revision": "a" * 64}).encode()
                 if kwargs.get("method") == "POST":
@@ -363,9 +373,48 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
             export_calls,
             [{"authenticated": True}],
         )
+        self.assertEqual(
+            request_urls[:3],
+            [
+                "http://127.0.0.1:19080/api/inventory",
+                f"http://127.0.0.1:19080/api/mappings/export?{scope_query}",
+                f"http://127.0.0.1:19080/api/slots/0/mapping?{scope_query}",
+            ],
+        )
         self.assertEqual(len(clear_urls), 1)
+        self.assertIn(scope_query, clear_urls[0])
         self.assertIn("expected_revision=" + "b" * 64, clear_urls[0])
         self.assertEqual(events, ["save", "restart", "clear"])
+
+    def test_mapping_cycle_stops_when_physical_scope_is_unavailable(self) -> None:
+        module = self.load_matrix_module()
+        ports = module.Ports(19080, 19081, 19082)
+        prefix = ("docker", "compose", "--project-name", "matrix")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(
+                    module,
+                    "_require_status",
+                    return_value=json.dumps(
+                        {
+                            "selected_system_id": "synthetic-core",
+                            "selected_enclosure_id": None,
+                        }
+                    ).encode(),
+                ) as require_status,
+                self.assertRaisesRegex(RuntimeError, "physical mapping scope is unavailable"),
+            ):
+                module._verify_mapping_cycle(
+                    Path(temp_dir),
+                    module.VARIANTS[0],
+                    ports,
+                    prefix,
+                )
+        require_status.assert_called_once_with(
+            "http://127.0.0.1:19080/api/inventory",
+            200,
+            authenticated=True,
+        )
 
     def test_matrix_requires_distinct_unprivileged_free_ports(self) -> None:
         module = self.load_matrix_module()
