@@ -4935,7 +4935,7 @@ sys.stdout.flush()
             transaction.commit()
 
         self.assertEqual(target_path.read_bytes(), b"IMPORTED")
-        self.assertEqual(target_path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(target_path.stat().st_mode & 0o777, 0o660)
         self.assertEqual([name for name, _descriptor in events], ["fchown", "fchmod", "fsync"])
         self.assertEqual(len({descriptor for _name, descriptor in events}), 1)
         self.assertEqual(list(self.temp_dir.glob(".missing-target.txt.restore-*")), [])
@@ -4958,7 +4958,7 @@ sys.stdout.flush()
 
         restored = target_dir / "private/key"
         self.assertEqual(restored.read_bytes(), b"IMPORTED")
-        self.assertEqual(restored.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(restored.stat().st_mode & 0o777, 0o660)
         fsync_file.assert_not_called()
 
     def test_segmented_hot_staging_keeps_descriptor_through_metadata_and_fsync(self) -> None:
@@ -4981,7 +4981,7 @@ sys.stdout.flush()
                 )
 
             self.assertEqual(staged_path.read_bytes(), b"HOT")
-            self.assertEqual(staged_path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(staged_path.stat().st_mode & 0o777, 0o660)
             fsync_file.assert_not_called()
         finally:
             transaction._cleanup_sibling_artifacts()
@@ -5222,7 +5222,7 @@ sys.stdout.flush()
             )
         )
 
-    def test_activation_applies_private_modes_to_missing_targets(self) -> None:
+    def test_activation_applies_shared_group_modes_to_missing_targets(self) -> None:
         file_target = self.temp_dir / "missing-file.txt"
         directory_target = self.temp_dir / "missing-directory"
         transaction = _ImportActivationTransaction(
@@ -5237,10 +5237,10 @@ sys.stdout.flush()
             )
             transaction.commit()
 
-        self.assertEqual(file_target.stat().st_mode & 0o777, 0o600)
-        self.assertEqual(directory_target.stat().st_mode & 0o777, 0o700)
-        self.assertEqual((directory_target / "nested").stat().st_mode & 0o777, 0o700)
-        self.assertEqual((directory_target / "nested/id_key").stat().st_mode & 0o777, 0o600)
+        self.assertEqual(file_target.stat().st_mode & 0o777, 0o660)
+        self.assertEqual(directory_target.stat().st_mode & 0o777, 0o770)
+        self.assertEqual((directory_target / "nested").stat().st_mode & 0o777, 0o770)
+        self.assertEqual((directory_target / "nested/id_key").stat().st_mode & 0o777, 0o660)
 
     def test_activation_inherits_parent_ownership_for_missing_targets(self) -> None:
         file_target = self.temp_dir / "missing-owner-file.txt"

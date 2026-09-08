@@ -674,8 +674,8 @@ class _PreparedSegmentedRestore:
 
 
 class _ImportActivationTransaction:
-    _MISSING_FILE_MODE = 0o600
-    _MISSING_DIRECTORY_MODE = 0o700
+    _MISSING_FILE_MODE = 0o660
+    _MISSING_DIRECTORY_MODE = 0o770
 
     def __init__(
         self,
