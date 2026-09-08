@@ -29,17 +29,18 @@ in this mode.
 
 ## Admin browser origin
 
-`ADMIN_PUBLIC_ORIGIN` is optional in the default network mode. Basic mode
-requires it. Set it to the exact origin the browser shows for the admin UI:
-scheme, host, and port, with no path. For example,
+`ADMIN_PUBLIC_ORIGIN` is optional in the default network mode. Without it,
+browser mutations must match the request's own scheme, host, and port. Basic
+mode requires an explicit value. Set it to the exact origin the browser shows
+for the admin UI, with no path. For example,
 `http://jbod-admin.example.test:8082` uses the default port, while
 `https://jbod-admin.example.test` could be served by a reverse proxy.
 
-In Basic mode, browser-initiated admin changes are accepted only when their
-`Origin` or `Referer` header matches this value. The admin service refuses to
-start in Basic mode until the value is a valid origin. A mismatch returns `403
-Cross-origin admin mutation rejected.` Network mode does not apply this origin
-gate.
+Browser-initiated admin changes are accepted only when their `Origin` or
+`Referer` header matches the effective origin. The admin service refuses to
+start in Basic mode until the configured value is valid. A mismatch returns
+`403 Cross-origin admin mutation rejected.` Headerless CLI and automation
+requests remain available.
 
 For the main UI on port `8080`, network mode allows reads and writes without a
 login. Persistent mapping and alias changes, mapping imports, enclosure or drive

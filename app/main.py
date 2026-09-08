@@ -517,6 +517,15 @@ def require_read_ui_basic_credentials(request: Request) -> None:
 def require_read_ui_mutation_authorization(request: Request) -> None:
     auth_settings = request.app.state.operator_auth_settings
     if auth_settings.auth_mode == "network":
+        public_origin = (
+            request.app.state.read_ui_public_origin
+            or f"{request.url.scheme}://{request.url.netloc}"
+        )
+        if not request_origin_allowed(request, public_origin):
+            raise HTTPException(
+                status_code=403,
+                detail="Cross-origin Read UI mutation rejected.",
+            )
         return
     if auth_settings.auth_mode != "basic":
         raise HTTPException(

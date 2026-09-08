@@ -199,7 +199,8 @@ def _basic_auth_matches(authorization: str | None, settings: AdminSettings) -> b
 
 
 def _request_origin_allowed(request: Request, settings: AdminSettings) -> bool:
-    return request_origin_allowed(request, settings.public_origin)
+    public_origin = settings.public_origin or f"{request.url.scheme}://{request.url.netloc}"
+    return request_origin_allowed(request, public_origin)
 
 
 def validate_admin_export_policy(
@@ -492,8 +493,7 @@ def create_app() -> FastAPI:
             admin_metrics_path,
         }
         if (
-            admin_settings.auth_mode == "basic"
-            and request.method.upper() in {"POST", "PUT", "PATCH", "DELETE"}
+            request.method.upper() in {"POST", "PUT", "PATCH", "DELETE"}
             and not _request_origin_allowed(request, admin_settings)
         ):
             return JSONResponse(

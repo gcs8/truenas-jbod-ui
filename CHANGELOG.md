@@ -35,7 +35,8 @@ an entry below.
 ### Highlights
 
 - The main and admin UIs now work without application authentication or public
-  origin settings by default; Basic authentication, exact-origin checks, and
+  origin settings by default. Browser mutations still receive an automatic
+  same-origin check. Basic authentication, explicit public-origin settings, and
   verified private TLS are optional hardening steps (#392, superseding the
   defaults introduced by #245 and #201).
 - Dell MD1280 shelves render with full-chassis and per-drawer profiles built

@@ -92,7 +92,7 @@ def basic_header(username: str, password: str) -> str:
 
 
 class AdminAuthenticationTests(unittest.TestCase):
-    def test_network_mode_is_the_no_auth_default_and_needs_no_origin(self) -> None:
+    def test_network_mode_needs_no_configured_origin_but_rejects_cross_site_browser_mutations(self) -> None:
         settings = AdminSettings()
 
         self.assertEqual(settings.auth_mode, "network")
@@ -104,7 +104,18 @@ class AdminAuthenticationTests(unittest.TestCase):
             app = create_app()
 
         get_status, _headers, _body = asyncio.run(invoke_asgi(app, "/missing"))
-        post_status, _headers, _body = asyncio.run(
+        headerless_post_status, _headers, _body = asyncio.run(
+            invoke_asgi(app, "/missing", method="POST")
+        )
+        same_origin_post_status, _headers, _body = asyncio.run(
+            invoke_asgi(
+                app,
+                "/missing",
+                method="POST",
+                origin="http://admin.example.test",
+            )
+        )
+        cross_site_post_status, _headers, _body = asyncio.run(
             invoke_asgi(
                 app,
                 "/missing",
@@ -113,7 +124,9 @@ class AdminAuthenticationTests(unittest.TestCase):
             )
         )
         self.assertEqual(get_status, 404)
-        self.assertEqual(post_status, 404)
+        self.assertEqual(headerless_post_status, 404)
+        self.assertEqual(same_origin_post_status, 404)
+        self.assertEqual(cross_site_post_status, 403)
 
     def test_clean_backup_targets_rejects_admin_sidecar(self) -> None:
         with self.assertRaisesRegex(ValidationError, "clean_backup_targets"):
@@ -326,6 +339,9 @@ class AdminAuthenticationTests(unittest.TestCase):
 
         status, _headers, _body = asyncio.run(invoke_asgi(app, "/missing"))
         write_status, _headers, _body = asyncio.run(
+            invoke_asgi(app, "/missing", method="POST")
+        )
+        cross_site_write_status, _headers, cross_site_body = asyncio.run(
             invoke_asgi(
                 app,
                 "/missing",
@@ -335,6 +351,11 @@ class AdminAuthenticationTests(unittest.TestCase):
         )
         self.assertEqual(status, 404)
         self.assertEqual(write_status, 404)
+        self.assertEqual(cross_site_write_status, 403)
+        self.assertEqual(
+            cross_site_body,
+            b'{"detail":"Cross-origin admin mutation rejected."}',
+        )
 
     def test_default_admin_app_starts_without_an_origin_or_authentication(self) -> None:
         inherited = dict(os.environ)
@@ -604,6 +625,7 @@ class AdminAuthenticationTests(unittest.TestCase):
         env_example = (root / ".env.example").read_text(encoding="utf-8")
         readme = (root / "README.md").read_text(encoding="utf-8")
         advanced = (root / "wiki" / "Advanced-Configuration.md").read_text(encoding="utf-8")
+        advanced_prose = " ".join(advanced.split())
         security_doc = (root / "docs" / "ADMIN_TRUST_BOUNDARY.md").read_text(encoding="utf-8")
         compose = (root / "docker-compose.yml").read_text(encoding="utf-8")
         admin_template = (root / "admin_service" / "templates" / "index.html").read_text(encoding="utf-8")
@@ -617,11 +639,14 @@ class AdminAuthenticationTests(unittest.TestCase):
             self.assertIn(marker, env_example)
             self.assertIn(marker, compose)
         self.assertIn("The default setup has no login", readme)
-        self.assertIn("available as optional settings", readme)
+        self.assertIn("Browser mutations must come from the same origin automatically", readme)
+        self.assertIn("explicit public-origin settings are optional", readme)
         self.assertIn("ADMIN_AUTH_MODE=basic", advanced)
         self.assertIn("ADMIN_PUBLIC_ORIGIN", advanced)
         self.assertIn("APP_PUBLIC_ORIGIN", advanced)
+        self.assertIn("needs no extra setting", advanced_prose)
         self.assertIn("Anyone who can reach", security_doc)
+        self.assertIn("request's own scheme, host, and port", security_doc)
         self.assertIn("firewall", security_doc.lower())
         self.assertIn("VPN", security_doc)
         self.assertIn("Basic authentication", security_doc)

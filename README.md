@@ -82,8 +82,8 @@ can enable certificate verification by following
 
 The default setup has no login. Anyone who can reach the published port can use
 the controls available in that service. Do not publish the ports directly to
-the Internet. Built-in authentication and stricter browser-origin checks are
-available as optional settings.
+the Internet. Browser mutations must come from the same origin automatically.
+Built-in authentication and explicit public-origin settings are optional.
 
 For a slower walkthrough with health checks and troubleshooting, use the
 [Quick Start guide](wiki/Quick-Start.md).

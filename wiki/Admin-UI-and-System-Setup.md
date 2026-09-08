@@ -55,7 +55,8 @@ The default setup has no login. Anyone who can reach port `8082` can change
 configuration and control the app's containers. The mounted Docker socket gives
 the sidecar host-level container authority. Auto-stop limits exposure; it is not
 authentication. Confirm the page loads, then stop the sidecar or continue with
-the optional hardening below.
+the optional hardening below. Cross-site browser mutations are rejected
+automatically and require no first-run setting.
 
 Read the
 [Admin trust boundary](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/ADMIN_TRUST_BOUNDARY.md)

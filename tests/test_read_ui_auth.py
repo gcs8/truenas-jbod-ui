@@ -182,6 +182,22 @@ class ReadUIAuthorizationTests(unittest.TestCase):
             asyncio.run(invoke_asgi(app, path, method=method))[0]
             for method, path in MUTATION_ROUTES
         ]
+        same_origin_mutation, _headers, _body = asyncio.run(
+            invoke_asgi(
+                app,
+                "/api/system-locator",
+                method="POST",
+                origin="http://ui.example.test",
+            )
+        )
+        cross_site_mutation, _headers, _body = asyncio.run(
+            invoke_asgi(
+                app,
+                "/api/system-locator",
+                method="POST",
+                origin="https://attacker.example",
+            )
+        )
 
         self.assertEqual(read_status, 404)
         self.assertEqual(read_only_post, 200)
@@ -189,6 +205,8 @@ class ReadUIAuthorizationTests(unittest.TestCase):
             all(status not in {401, 403} for status in mutation_statuses),
             mutation_statuses,
         )
+        self.assertNotIn(same_origin_mutation, {401, 403})
+        self.assertEqual(cross_site_mutation, 403)
 
     def test_basic_mode_keeps_reads_anonymous_and_requires_same_origin_for_mutations(self) -> None:
         app = self.make_app(

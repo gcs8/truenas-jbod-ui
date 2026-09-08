@@ -100,10 +100,11 @@ the browser address bar.
 ## Admin mutations return 403
 
 `Cross-origin admin mutation rejected.` means the browser origin does not match
-`ADMIN_PUBLIC_ORIGIN`. Set it to the exact scheme, host, and port shown in the
-browser, with no path, then recreate the admin container. This check applies in
-Basic mode. The admin service refuses to start in Basic mode if the setting is
-empty or malformed.
+the admin address. Without `ADMIN_PUBLIC_ORIGIN`, the service compares it with
+the request's own scheme, host, and port. Reverse-proxy deployments can set
+`ADMIN_PUBLIC_ORIGIN` to the exact public address shown in the browser, with no
+path. Basic mode requires that setting and refuses to start if it is empty or
+malformed.
 
 ## Full backup returns 400
 
