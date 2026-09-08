@@ -4892,6 +4892,47 @@ sys.stdout.flush()
 
         self.assertEqual(list(real_parent.iterdir()), [])
 
+    def test_missing_file_activation_keeps_descriptor_through_owner_mode_and_fsync(self) -> None:
+        target_path = self.temp_dir / "missing-target.txt"
+        transaction = _ImportActivationTransaction({"member": b"IMPORTED"})
+        real_fchown = os.fchown
+        real_fchmod = os.fchmod
+        real_fsync = os.fsync
+        events: list[tuple[str, int]] = []
+
+        def record_fchown(descriptor: int, uid: int, gid: int) -> None:
+            events.append(("fchown", descriptor))
+            real_fchown(descriptor, uid, gid)
+
+        def record_fchmod(descriptor: int, mode: int) -> None:
+            events.append(("fchmod", descriptor))
+            real_fchmod(descriptor, mode)
+
+        def record_fsync(descriptor: int) -> None:
+            if [name for name, _event_descriptor in events] == ["fchown", "fchmod"]:
+                events.append(("fsync", descriptor))
+            real_fsync(descriptor)
+
+        with transaction:
+            with (
+                patch("history_service.system_backup.os.fchown", side_effect=record_fchown),
+                patch("history_service.system_backup.os.fchmod", side_effect=record_fchmod),
+                patch("history_service.system_backup.os.fsync", side_effect=record_fsync),
+                patch.object(
+                    transaction,
+                    "_fsync_file",
+                    side_effect=PermissionError("synthetic path access lost after chown"),
+                ),
+            ):
+                transaction.activate_file(target_path, "member")
+            transaction.commit()
+
+        self.assertEqual(target_path.read_bytes(), b"IMPORTED")
+        self.assertEqual(target_path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual([name for name, _descriptor in events], ["fchown", "fchmod", "fsync"])
+        self.assertEqual(len({descriptor for _name, descriptor in events}), 1)
+        self.assertEqual(list(self.temp_dir.glob(".missing-target.txt.restore-*")), [])
+
     def test_history_rollback_uses_store_snapshot_and_clears_sidecars(self) -> None:
         imported_source_dir = self.temp_dir / "imported-history-source"
         imported_source = self.store.create_backup(imported_source_dir, retention_count=1)
@@ -5075,7 +5116,10 @@ sys.stdout.flush()
             {"file": b"IMPORTED", "key": b"IMPORTED-KEY"}
         )
 
-        with patch("history_service.system_backup.os.chown") as chown:
+        with (
+            patch("history_service.system_backup.os.chown") as chown,
+            patch("history_service.system_backup.os.fchown") as fchown,
+        ):
             with transaction:
                 transaction.activate_file(file_target, "file")
                 transaction.activate_directory(
@@ -5084,7 +5128,9 @@ sys.stdout.flush()
                 )
                 transaction.commit()
 
-        self.assertEqual(len(chown.call_args_list), 4)
+        self.assertEqual(len(chown.call_args_list), 3)
+        fchown.assert_called_once()
+        self.assertEqual(fchown.call_args.args[1:], expected_owner)
         self.assertTrue(
             all(
                 call.args[1:] == expected_owner
@@ -5121,7 +5167,10 @@ sys.stdout.flush()
             {"file": b"IMPORTED", "key": b"IMPORTED-KEY"}
         )
 
-        with patch("history_service.system_backup.os.chown") as chown:
+        with (
+            patch("history_service.system_backup.os.chown") as chown,
+            patch("history_service.system_backup.os.fchown") as fchown,
+        ):
             with transaction:
                 transaction.activate_file(file_target, "file")
                 transaction.activate_directory(
@@ -5130,7 +5179,9 @@ sys.stdout.flush()
                 )
                 transaction.commit()
 
-        self.assertEqual(len(chown.call_args_list), 4)
+        self.assertEqual(len(chown.call_args_list), 3)
+        fchown.assert_called_once()
+        self.assertEqual(fchown.call_args.args[1:], expected_owner)
         self.assertTrue(
             all(
                 call.args[1:] == expected_owner
@@ -5167,12 +5218,17 @@ sys.stdout.flush()
         expected_owner = (self.temp_dir.stat().st_uid, self.temp_dir.stat().st_gid)
         transaction = _ImportActivationTransaction({"file": b"IMPORTED"})
 
-        with patch("history_service.system_backup.os.chown") as chown:
+        with (
+            patch("history_service.system_backup.os.chown") as chown,
+            patch("history_service.system_backup.os.fchown") as fchown,
+        ):
             with transaction:
                 transaction.activate_file(file_target, "file")
                 transaction.commit()
 
-        self.assertEqual(len(chown.call_args_list), 3)
+        self.assertEqual(len(chown.call_args_list), 2)
+        fchown.assert_called_once()
+        self.assertEqual(fchown.call_args.args[1:], expected_owner)
         self.assertTrue(
             all(
                 call.args[1:] == expected_owner

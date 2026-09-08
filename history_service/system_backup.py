@@ -790,8 +790,12 @@ class _ImportActivationTransaction:
         temp_path = Path(temp_name)
         self._sibling_artifacts[temp_path] = "file"
         try:
-            os.close(file_descriptor)
-            shutil.copyfile(staged_path, temp_path)
+            with (
+                staged_path.open("rb") as source_handle,
+                os.fdopen(file_descriptor, "wb", closefd=False) as target_handle,
+            ):
+                shutil.copyfileobj(source_handle, target_handle)
+                target_handle.flush()
             file_owner = self._existing_owner(
                 target_path if entry.kind == "file" else target_path.parent,
                 directory=entry.kind != "file",
@@ -801,15 +805,23 @@ class _ImportActivationTransaction:
                 if entry.kind == "file"
                 else self._MISSING_FILE_MODE
             )
-            self._apply_owner(temp_path, file_owner)
-            temp_path.chmod(file_mode)
-            self._fsync_file(temp_path)
+            if file_owner is not None:
+                os.fchown(file_descriptor, file_owner[0], file_owner[1])
+            os.fchmod(file_descriptor, file_mode)
+            os.fsync(file_descriptor)
+            os.close(file_descriptor)
+            file_descriptor = -1
             self._park_original(entry)
             os.replace(temp_path, target_path)
             self._sibling_artifacts.pop(temp_path, None)
             entry.mutated = True
             self._fsync_directory(target_path.parent)
         finally:
+            if file_descriptor >= 0:
+                try:
+                    os.close(file_descriptor)
+                except OSError:
+                    pass
             self._cleanup_sibling_artifact(temp_path)
 
     def prepare_segmented_history(
