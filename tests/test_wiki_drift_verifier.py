@@ -369,7 +369,7 @@ class WikiDriftVerifierTests(unittest.TestCase):
         self.assertIn("external wiki differs from repository wiki/", completed.stdout)
 
     def test_wiki_publish_guide_keeps_publication_manual_and_documents_verification(self) -> None:
-        guide = (REPOSITORY / "wiki" / "Publishing-the-Wiki.md").read_text(encoding="utf-8")
+        guide = (REPOSITORY / "docs" / "PUBLISHING_THE_WIKI.md").read_text(encoding="utf-8")
 
         self.assertIn("python scripts/verify_wiki_drift.py", guide)
         self.assertIn("--repository-commit", guide)

@@ -618,7 +618,7 @@ class ImmutableDeploymentTests(unittest.TestCase):
             self.assertEqual(len(runtime.commands), command_count)
 
     def test_runbook_uses_transactional_helper_instead_of_sourcing_receipts(self) -> None:
-        runbook = Path("wiki/Docker-and-GHCR-Deployment.md").read_text(encoding="utf-8")
+        runbook = Path("docs/IMMUTABLE_GHCR_DEPLOYMENT.md").read_text(encoding="utf-8")
         self.assertIn("scripts/update_immutable_deployment.py update", runbook)
         self.assertIn("--compose docker-compose.yml=compose.yaml", runbook)
         self.assertIn("--project-name truenas-jbod-ui", runbook)

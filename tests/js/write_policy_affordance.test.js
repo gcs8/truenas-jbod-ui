@@ -196,9 +196,9 @@ test("a missing bootstrap policy means writes stay enabled (snapshot artifacts u
   });
 });
 
-test("network-mode policy disables every write control with the reason and a notice", () => {
+test("a disabled Basic-mode policy disables every write control with the reason and a notice", () => {
   const { fns, state, controls, writePolicyNotice } = buildHarness(undefined);
-  state.writePolicy = fns.normalizeWritePolicy({ enabled: false, mode: "network", reason: NETWORK_REASON });
+  state.writePolicy = fns.normalizeWritePolicy({ enabled: false, mode: "basic", reason: NETWORK_REASON });
 
   fns.renderWritePolicyNotice();
   fns.syncWritePolicyControls();
