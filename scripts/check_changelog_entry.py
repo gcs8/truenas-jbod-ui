@@ -4,9 +4,10 @@ The gate reads the ``base...head`` diff of one pull request with ``git`` only.
 It never talks to the network. A pull request must either carry the
 ``no-changelog`` or ``dependencies`` escape label, or touch an operator-visible
 path and add at least one bullet under
-``## Unreleased`` in one of the allowed ``### `` subsections whose trailing
-parenthetical names the pull request as ``(#N)``. A pull request labelled
-``breaking`` must add that bullet under ``### Breaking changes`` or
+``## Unreleased``, or under the first SemVer release section when Unreleased has
+been cut for a release candidate, in one of the allowed ``### `` subsections
+whose trailing parenthetical names the pull request as ``(#N)``. A pull request
+labelled ``breaking`` must add that bullet under ``### Breaking changes`` or
 ``### Upgrade notes``.
 
 Usage from a checkout that has both refs::
@@ -31,6 +32,7 @@ from pathlib import Path
 
 CHANGELOG_PATH = "CHANGELOG.md"
 UNRELEASED_HEADING = "## Unreleased"
+RELEASE_HEADING = re.compile(r"^## v\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?(?: - \d{4}-\d{2}-\d{2})?$")
 NO_CHANGELOG_LABEL = "no-changelog"
 # Dependabot pull requests cannot add a changelog line; they still reach the
 # release body under "Dependencies" through .github/release.yml.
@@ -159,15 +161,23 @@ def _head_changelog_lines(repo: Path, head: str) -> list[str]:
     return text.splitlines()
 
 
-def unreleased_entries(lines: list[str]) -> list[Entry]:
-    """Return every bullet under ``## Unreleased`` with its subsection.
+def current_entries(lines: list[str]) -> tuple[str, list[Entry]]:
+    """Return bullets from Unreleased or the first versioned release section.
 
     Continuation lines (indented, non-empty) are joined to the bullet so a
     trailing ``(#N)`` may sit on a wrapped line.
     """
 
+    headings = [line.strip() for line in lines if line.startswith("## ")]
+    if UNRELEASED_HEADING in headings:
+        selected_heading = UNRELEASED_HEADING
+    else:
+        selected_heading = next(
+            (heading for heading in headings if RELEASE_HEADING.fullmatch(heading)),
+            UNRELEASED_HEADING,
+        )
     entries: list[Entry] = []
-    in_unreleased = False
+    in_current = False
     subsection = ""
     current_lines: list[str] = []
     current_start = 0
@@ -183,10 +193,10 @@ def unreleased_entries(lines: list[str]) -> list[Entry]:
     for number, raw in enumerate(lines, start=1):
         if raw.startswith("## "):
             flush()
-            in_unreleased = raw.strip() == UNRELEASED_HEADING
+            in_current = raw.strip() == selected_heading
             subsection = ""
             continue
-        if not in_unreleased:
+        if not in_current:
             continue
         if raw.startswith("### "):
             flush()
@@ -202,7 +212,7 @@ def unreleased_entries(lines: list[str]) -> list[Entry]:
             continue
         flush()
     flush()
-    return entries
+    return selected_heading, entries
 
 
 def evaluate(
@@ -232,7 +242,11 @@ def evaluate(
         )
 
     added = added_line_numbers(repo, base, head, CHANGELOG_PATH) if CHANGELOG_PATH in paths else set()
-    entries = unreleased_entries(_head_changelog_lines(repo, head)) if added else []
+    selected_heading, entries = (
+        current_entries(_head_changelog_lines(repo, head))
+        if added
+        else (UNRELEASED_HEADING, [])
+    )
     touched = [
         entry
         for entry in entries
@@ -247,10 +261,10 @@ def evaluate(
             f"CHANGELOG.md needs an entry for #{pr_number}. The diff touches "
             f"operator-visible paths ({', '.join(relevant[:5])}"
             f"{', ...' if len(relevant) > 5 else ''}) but adds no bullet under "
-            f"'{UNRELEASED_HEADING}' that ends with '(#{pr_number})'."
+            f"'{selected_heading}' that ends with '(#{pr_number})'."
         )
         messages.append(
-            "Add one line under '## Unreleased' in one of these subsections: "
+            f"Add one line under '{selected_heading}' in one of these subsections: "
             + ", ".join(f"'### {name}'" for name in ALLOWED_SUBSECTIONS)
             + f". Shape: '- <one sentence in past tense> (#{pr_number})'. "
             "Wrap at about 80 columns; the '(#N)' may sit on the continuation line."
@@ -271,7 +285,8 @@ def evaluate(
 
     subsections = sorted({entry.subsection for entry in touched})
     messages.append(
-        f"CHANGELOG entry for #{pr_number} found under: {', '.join(subsections)}."
+        f"CHANGELOG entry for #{pr_number} found in {selected_heading} under: "
+        f"{', '.join(subsections)}."
     )
     return GateResult(True, messages)
 

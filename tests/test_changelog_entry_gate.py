@@ -102,6 +102,23 @@ class ChangelogEntryGateTests(unittest.TestCase):
         self.assertTrue(result.ok, result.messages)
         self.assertIn("Fixed", result.messages[0])
 
+    def test_release_candidate_section_with_entry_passes_without_unreleased(self) -> None:
+        self._write("app/service.py", "VALUE = 2\n")
+        text = (self.repo / "CHANGELOG.md").read_text(encoding="utf-8")
+        text = text.replace("## Unreleased", "## v0.2.0 - 2026-02-01", 1)
+        text = text.replace(
+            "### Fixed\n\n",
+            "### Fixed\n\n- Prepared the release candidate (#42).\n",
+            1,
+        )
+        self._write("CHANGELOG.md", text)
+        self._commit("chore: prepare release")
+
+        result = self._evaluate()
+
+        self.assertTrue(result.ok, result.messages)
+        self.assertIn("v0.2.0", result.messages[0])
+
     def test_entry_for_a_different_pr_number_fails(self) -> None:
         self._write("app/service.py", "VALUE = 2\n")
         self._add_entry("Fixed", "- Bumped the value (#41).")
