@@ -61,3 +61,20 @@ test("live Storage Fabric link preserves the server-provided root path", () => {
 
   assert.equal(sasFabricViewLink.href, "/truenas-jbod-ui/sas-fabric?system_id=demo");
 });
+
+test("snapshot SSH status preserves disabled, success, and captured failure states", () => {
+  const snapshotSshStatus = loadFunction("snapshotSshStatus");
+
+  assert.deepEqual(
+    { ...snapshotSshStatus({ enabled: false, ok: true }) },
+    { className: "status-chip snapshot", textContent: "SSH OFF AT CAPTURE" },
+  );
+  assert.deepEqual(
+    { ...snapshotSshStatus({ enabled: true, ok: true }) },
+    { className: "status-chip snapshot", textContent: "SSH AT CAPTURE" },
+  );
+  assert.deepEqual(
+    { ...snapshotSshStatus({ enabled: true, ok: false }) },
+    { className: "status-chip error", textContent: "SSH ERROR AT CAPTURE" },
+  );
+});

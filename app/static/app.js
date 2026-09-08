@@ -8492,6 +8492,16 @@
       : '<div class="warning-item muted">No warnings.</div>';
   }
 
+  function snapshotSshStatus(ssh) {
+    if (!ssh.enabled) {
+      return { className: "status-chip snapshot", textContent: "SSH OFF AT CAPTURE" };
+    }
+    if (!ssh.ok) {
+      return { className: "status-chip error", textContent: "SSH ERROR AT CAPTURE" };
+    }
+    return { className: "status-chip snapshot", textContent: "SSH AT CAPTURE" };
+  }
+
   function renderStatus() {
     const api = state.snapshot.sources?.api || { ok: false, message: "Unavailable" };
     const ssh = state.snapshot.sources?.ssh || { enabled: false, ok: true, message: "Disabled" };
@@ -8515,8 +8525,9 @@
       apiStatusChip.className = "status-chip snapshot";
       apiStatusChip.textContent = api.ok ? "API AT CAPTURE" : "API ERROR AT CAPTURE";
       apiStatusChip.title = "Recorded source state. No API is connected to this artifact.";
-      sshStatusChip.className = "status-chip snapshot";
-      sshStatusChip.textContent = !ssh.enabled ? "SSH OFF AT CAPTURE" : "SSH AT CAPTURE";
+      const snapshotSsh = snapshotSshStatus(ssh);
+      sshStatusChip.className = snapshotSsh.className;
+      sshStatusChip.textContent = snapshotSsh.textContent;
       sshStatusChip.title = "Recorded source state. No SSH session is connected to this artifact.";
     } else {
       apiStatusChip.className = `status-chip ${api.ok ? "ok" : "error"}`;
