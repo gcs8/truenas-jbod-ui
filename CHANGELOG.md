@@ -435,6 +435,8 @@ them before starting the new images.
 
 ### Internal
 
+- Rebound the deterministic public demo to the reachable post-squash `main`
+  commit so manual Pages publication can verify its source provenance (#393).
 - Refreshed the pinned Python dependencies after current-`main` CI validation
   (#123).
 - Removed verified-dead Python wrappers while preserving failure and backoff
