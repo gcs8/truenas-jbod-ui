@@ -1,51 +1,21 @@
-# Heat Map Mode
+# Heat map mode
 
-Heat map mode is a read-only visual layer for the main enclosure UI.
+Heat map mode colors the physical bay layout by a selected numeric metric. Use it to compare occupied slots without changing the enclosure layout.
 
-It keeps the normal physical bay layout and colors each tray by an
-operator-selected metric, so you can answer the practical question:
+Heat map mode is read-only. It does not add disk controls, LED actions, or admin write actions.
 
-> Where is the weirdness physically?
+## Open a heat map
 
-
-It does not add disk-control, LED, or admin write behavior.
-
-## When To Use It
-
-Use heat map mode when you want to compare slots at a glance:
-
-- which bays are running warmer than the rest of the view
-- which disks are reading or writing the most in a selected time window
-- which slots have the highest read/write imbalance
-- which disks have the most power-on hours, lifetime writes, or SMART error
-  counters
-- which occupied slots deserve attention according to the explainable
-  `Attention Score`
-
-Identity fields such as serial, GPTID, make, model, pool, vdev, firmware, and
-device name stay in the normal hover/detail surfaces. Heat map mode focuses on
-numeric values that can be compared across the current physical view.
-
-## Basic Controls
-
-In the main UI:
-
-1. Choose the system and enclosure or storage view you want to inspect.
+1. Select a system and an enclosure or storage view.
 2. Click `Heat Map` in the enclosure header.
 3. Choose a `Metric`.
-4. Use `Scale` to adjust color sensitivity without changing the displayed
-   values.
+4. Adjust `Scale` if the colors are too flat or too strong.
 
-The heat overlay sits on the same tray shape as the enclosure renderer. The
-selected metric value appears in the middle of each bay, while the normal
-health, empty, identify, fault, and unknown indicators remain visible.
+The metric value appears in the center of each bay. Health, empty, identify, fault, and unknown indicators remain visible. Empty bays and missing values are neutral or hatched. The renderer does not treat them as zero or include them in the color scale.
 
-Empty bays and missing values render as neutral or hatched. They do not count
-as zero and do not affect the heat-map scale.
+Serial, GPTID, make, model, pool, vdev, firmware, and device name remain in the standard hover and detail views.
 
-## Metrics
-
-The first pass includes:
+## Available metrics
 
 - `Attention Score`
 - `Temperature`
@@ -66,86 +36,50 @@ The first pass includes:
 - `Interface CRC Errors`
 - `Unsafe Shutdowns`
 
-`Attention Score` is an explainable heuristic, not AI or machine learning. It
-adds points for concrete conditions such as SMART health problems, high
-temperature, endurance risk, error counters, missing SMART on occupied slots,
-and unhealthy slot state. Hover a bay to see the short reasons behind the
-score.
+Use temperature metrics to find hot bays, rate metrics to compare recent activity, and lifetime or error metrics to find outliers in the selected view.
 
-## History-Backed Metrics
+`Attention Score` is a rule-based heuristic, not machine learning. It adds points for specific conditions such as SMART health problems, high temperature, endurance risk, error counters, missing SMART data on occupied slots, and unhealthy slot state. Hover over a bay to see the reasons for its score.
 
-Some metrics use the optional history sidecar:
+## Use history-backed metrics
 
-- read rate
-- write rate
-- Annualized Read
-- Annualized Write
-- Read/Write Ratio
+These metrics use the optional history sidecar:
+
+- `Read Rate`
+- `Write Rate`
+- `Annualized Read`
+- `Annualized Write`
+- `Read/Write Ratio`
 - timeline playback for sampled metrics such as temperature
 
-For read/write rate, the UI asks the history sidecar only for the needed raw
-counter metric and disables slot events for that request. That keeps the heat
-map request bounded to the visible bays instead of pulling a full history
-bundle for every slot.
+For rate calculations, the UI requests only the required raw counter metric for visible bays and does not request slot events. If the history sidecar is unavailable, the main UI remains usable and the legend displays `History unavailable` for these metrics.
 
-If the history sidecar is unavailable, the main UI keeps working and the
-heat-map legend shows `History unavailable` for history-backed metrics.
+## Select a time window
 
-## Time Windows
+For a history-backed metric, choose a trailing range with `Window`.
 
-For history-backed metrics, use `Window` to pick the trailing range you want to
-inspect.
+- Use `1h` or `24h` to inspect recent activity.
+- Use `7d` or `30d` to reduce the effect of short bursts.
+- Use `All` for the broadest range available from the sidecar.
 
-Examples:
+The window changes rate calculations and timeline samples. It does not change current lifetime SMART totals.
 
-- use a short window such as `1h` or `24h` to spot recent activity
-- use `7d` or `30d` to smooth out short bursts
-- use `All` when you want the broadest view of available sidecar data
+## Scrub the timeline
 
-The window affects the samples used for rates and timeline playback. It does
-not change lifetime SMART values that are already current-point totals.
+For a metric with history samples, change `Mode` from `Current` to `Timeline`.
 
-## Timeline Scrubbing
+Timeline mode starts at the newest sample in the selected window. Drag the slider to move through recorded samples. After clicking the slider, use the left and right arrow keys to move one sample at a time. Missing samples remain neutral and are not displayed as zero.
 
-For metrics with history samples, switch `Mode` from `Current` to `Timeline`.
+Timeline playback is useful for temperature and `Temperature vs View Avg`. Any metric with a history sample source can provide the same control.
 
-Timeline mode keeps the physical enclosure view and shows one historical sample
-at a time:
+## Adjust the color scale
 
-- it starts on the newest available sample in the selected window
-- dragging the sample slider moves backward or forward through recorded samples
-- after clicking the slider, use the left and right arrow keys for fine
-  one-sample steps
-- missing samples stay neutral instead of becoming fake zeroes
+The `Scale` slider changes how the visible value range maps to the blue, green, yellow, and red colors. It does not change metric values.
 
-This is most useful for temperature and `Temperature vs View Avg`, but any
-metric with a history-sidecar sample source can opt into timeline playback.
+Heat-map preferences reset when the page reloads. Exported offline snapshots do not preserve the selected heat-map mode.
 
-## Scale
+For history setup and snapshot behavior, see [[History and Snapshot Export|History-and-Snapshot-Export]].
 
-The `Scale` slider changes color sensitivity for the current heat map.
-
-It does not change the metric values. It only changes how aggressively the
-visible value range maps into the blue/green/yellow/red color ramp.
-
-Use it when the default color spread is too flat or too dramatic for the
-current view.
-
-## Current Limits
-
-Heat map mode is intentionally a first pass:
-
-- preferences are not persisted yet
-- exported offline snapshots do not preserve the selected heat-map mode yet
-- hourly/daily/weekly rollup tables are deferred until real usage shows the
-  metric-only history reads are not enough
-- future scale modes may add absolute thresholds, historical baselines,
-  neighbor comparisons, or row-aware deviation metrics
-
-For history sidecar setup, storage, and snapshot export behavior, see
-[[History and Snapshot Export|History-and-Snapshot-Export]].
-
-## Related Pages
+## Related pages
 
 - [[Visual Tour|Visual-Tour]]
 - [[History and Snapshot Export|History-and-Snapshot-Export]]

@@ -1,53 +1,35 @@
-# Demo and Offline Workflows
+# Demo and offline workflows
 
-This page keeps the demo-like workflows straight.
+Use the workflow that matches what you need to share or restore. The public demo, snapshot export, debug bundle, and full backup contain different data and are not interchangeable.
 
-Several tools let you look at data away from the normal live path, but they do
-different jobs and should not be treated as interchangeable.
+## Choose a workflow
 
-## Pick The Right Workflow
+| Workflow | Needs Docker? | Uses local data? | Use it for |
+| --- | --- | --- | --- |
+| Public demo site | no | no | Explore synthetic sample data in a static browser page |
+| Demo Builder Seed | yes | synthetic config only | Test the builder, profiles, and saved views locally |
+| Export Snapshot | no after export | yes | Share one offline enclosure or storage-view HTML file |
+| Debug Bundle | no after export | yes, with optional scrubbing | Send selected support evidence for inspection |
+| Full Backup | yes for restore | yes | Restore or migrate application state |
 
-| Workflow | Exists today? | Needs Docker? | Uses real local data? | Purpose |
-| --- | --- | --- | --- | --- |
-| Public demo site | yes, static Pages workflow | no | no | let visitors explore scrubbed sample data in a static browser page |
-| Demo Builder Seed | yes | yes | synthetic config only | create a local fake system/profile/views for builder testing |
-| Export Snapshot | yes | no after export | yes; `Redact sensitive IDs` applies the bounded alias/mask rules documented in the history guide | share one offline enclosure or storage-view HTML artifact |
-| Debug Bundle | yes | no after export | yes, optionally scrubbed | send support evidence for inspection |
-| Full Backup | yes | yes for restore | yes | restore or migrate app state |
+## Open the public demo
 
-## Public Demo Site
+[Open the public demo](https://gcs8.github.io/truenas-jbod-ui/).
 
-The public demo is a GitHub Pages-compatible static site. The current source
-tree generates `public-demo/index.html` only from the schema-validated fixture
-at `tests/fixtures/public_demo/public_demo.json`. Every system, bay, disk,
-identifier, metric, event, and storage view in that fixture was invented for the
-repository. The artifact has one synthetic 60-bay enclosure, two synthetic
-saved or virtual views, and a seven-day synthetic history window.
+The public demo is a static site generated from the synthetic fixture at `tests/fixtures/public_demo/public_demo.json`. It contains one invented 60-bay enclosure, two invented saved or virtual views, and seven days of invented history. It does not read local configuration or history.
 
-The page labels the artifact app version, source revision, and deterministic
-Build ID. GitHub Pages deploys the checked-in artifact unchanged. Publication
-does not read live or local history.
-
-Public demo:
-
-- [Open the public demo](https://gcs8.github.io/truenas-jbod-ui/)
-
-It must not:
+The demo does not:
 
 - connect to a visitor's storage host
 - run the FastAPI backend
-- expose admin maintenance actions
-- contain real serials, hostnames, SSH keys, API keys, TLS trust material, or
-  history databases
+- provide admin maintenance actions
+- contain real serials, hostnames, SSH keys, API keys, TLS trust material, or history databases
 
-See [[Public Demo Site|Public-Demo-Site]].
+See [[Public Demo Site|Public-Demo-Site]] for more detail.
 
-## Demo Builder Seed
+## Add the Demo Builder Seed
 
-The admin sidecar has an `Add Demo Builder System` action for local layout
-testing.
-
-It creates:
+Open the admin sidecar and select `Add Demo Builder System`. The action writes these synthetic entries to the mounted local configuration:
 
 - `demo-builder-lab`
 - `demo-builder-lab-chassis`
@@ -56,57 +38,41 @@ It creates:
 - `Demo Boot Pair`
 - `Demo Manual Group`
 
-That seed is useful when you want to try the builder, saved chassis views, or
-virtual storage-view flow without pointing at a real appliance first.
+Use the seed to test the profile builder, saved chassis views, or virtual storage views without connecting a real appliance. Restart the main UI after saving so the runtime selector reloads the system list.
 
-It still writes to your mounted local config. Restart the main UI after saving
-so the runtime selector reloads the new system list.
+See [[Admin UI and System Setup|Admin-UI-and-System-Setup]] for the setup flow.
 
-Use [[Admin UI and System Setup|Admin-UI-and-System-Setup]] for the button
-location and setup flow.
+## Export an offline snapshot
 
-## Export Snapshot
+Select an enclosure or storage view in the main UI, then choose `Export Snapshot`. The export is one self-contained HTML file. It can include the selected slot and frozen history samples when history is available and selected.
 
-`Export Snapshot` is the main UI's offline viewer path.
-
-It creates one self-contained HTML artifact for the current enclosure or
-storage view. It can include visible slot detail and, when history is available
-and selected, frozen history samples.
-
-Use it when you want to share the current bay map without giving someone access
-to the live app.
+Use this file to share a bay map without granting access to the live application. Review the file before sharing it. `Redact sensitive IDs` applies bounded aliases and masks, but it does not inspect every free-form value.
 
 See [[History and Snapshot Export|History-and-Snapshot-Export]].
 
-## Debug Bundle
+## Create a debug bundle
 
-`Debug Bundle` is for support review.
+Use `Debug Bundle` in the admin sidecar to collect selected configuration, history, logs, and support files. Apply the scrub options that fit the recipient, then inspect the archive before sending it.
 
-It exports selected local state into a normal archive, with scrub toggles for
-obvious secrets and disk identifiers. It is not an HTML viewer and not a
-restore path.
+A debug bundle is not an HTML viewer and cannot be restored. See [[Backup, Restore, and Debug Bundles|Backup-Restore-and-Debug-Bundles]].
 
-See [[Backup, Restore, and Debug Bundles|Backup-Restore-and-Debug-Bundles]].
+## Create a full backup
 
-## Full Backup
+Use `Full Backup` when you need to restore or migrate application state. Full backups are restore-grade archives. Select the encrypted export path whenever the archive includes secret-material paths.
 
-`Full Backup` is for restore and migration.
-
-It is the only workflow in this group that should be treated as a restore-grade
-bundle. If you include secret-material paths, use the encrypted export path.
+Test restore procedures in a disposable stack before changing a long-running deployment. Never use a full backup as public demo data.
 
 See [[Backup, Restore, and Debug Bundles|Backup-Restore-and-Debug-Bundles]].
 
-## Good Rules
+## Sharing rules
 
-- publish only synthetic or thoroughly scrubbed data
-- keep demo/offline pages visibly marked as not live
-- do not use debug bundles as restore artifacts
-- do not use full backups as public demo fixtures
-- test import/restore flows in a disposable stack before touching a long-running
-  deployment
+- Publish only synthetic data or data you have reviewed and scrubbed.
+- Keep exported pages marked as frozen and offline.
+- Do not use debug bundles as restore archives.
+- Do not use full backups as demo fixtures.
+- Review every export before sending it outside the deployment.
 
-## Related Pages
+## Related pages
 
 - [[Public Demo Site|Public-Demo-Site]]
 - [[Visual Tour|Visual-Tour]]

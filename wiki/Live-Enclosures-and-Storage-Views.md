@@ -1,109 +1,76 @@
-# Live Enclosures and Storage Views
+# Live enclosures and storage views
 
-This page is the quick mental model for what the selector is showing.
+The runtime selector groups physical hardware and saved layouts by type. Check the type before treating an entry as a discovered chassis.
 
-## Current Runtime Example
+## Runtime categories
 
-The current `archive-core` runtime selector shows the live and virtual groups
-that are actually configured today:
+### Live Enclosure
 
+A `Live Enclosure` is a chassis or backplane discovered from the host API, SSH SES data, or both. The available evidence depends on the platform and system configuration.
 
-`archive-core` intentionally does not keep a duplicate saved chassis view by
-default, so the `Saved Chassis Views` runtime group only appears after an
-operator deliberately adds one.
+Live enclosures appear automatically when the host exposes them. You do not need to create a storage view to display discovered hardware.
 
-## The Three Runtime Categories
+### Saved Chassis View
 
-- `Live Enclosure`
-  - a real chassis or backplane discovered at runtime from the host API and/or
-    SSH SES data
-  - examples: a CORE `60`-bay shelf, a discovered front `24`-bay enclosure, a
-    rear `12`-bay enclosure on SCALE
-- `Saved Chassis View`
-  - a saved overlay that mirrors a live enclosure through a chosen profile or
-    layout
-  - useful when you want a curated presentation of real bays without replacing
-    the discovered hardware view itself
-- `Virtual Storage View`
-  - a saved internal group that binds real disks into a layout that is not a
-    live SES enclosure
-  - examples: `4x NVMe Carrier Card`, `Boot SATADOMs`
-  - on Quantastor HA installs, a virtual view can also pin a target HA node
-    so left/right SATADOM groups or other internal layouts resolve against the
-    intended shared-SES member cleanly
+A `Saved Chassis View` mirrors a live enclosure through a selected profile or layout. Use one when you want a curated view of discovered bays without replacing the live hardware view.
 
-## What Auto-Populates
+A saved chassis view is an overlay. It is not another physical enclosure.
 
-Live discovered enclosures auto-populate on their own.
+### Virtual Storage View
 
-That means:
+A `Virtual Storage View` binds real disks to a layout that does not represent a live SES enclosure. Use virtual views for internal NVMe carriers, boot devices, SATADOM pairs, and other fixed-disk groups.
 
-- if the host exposes a real enclosure through the API, SSH SES, or both, it
-  should show up as a `Live Enclosure`
-- you do not need to create a saved storage view just to make real hardware
-  appear
+On a Quantastor HA deployment, a virtual view can pin an HA node. Use this setting when an internal layout must resolve against a specific shared-SES member.
 
-## What The Admin Sidecar Saves
+## Create saved and virtual views
 
-The admin sidecar saves config-backed views and bindings.
-
-It is the right place to create:
+Open the admin sidecar and select `Add Storage View`. Use this flow to create:
 
 - a saved chassis layout for a live enclosure
 - an internal NVMe carrier layout
 - a SATADOM or boot-device group
-- a manual internal grouping for odd fixed disks
+- a manual group for fixed internal disks
 
-It does not create new live hardware.
+The admin sidecar saves configuration-backed views and bindings. It does not create or emulate live hardware.
 
-The admin sidecar uses one `Add Storage View` flow for both saved chassis
-layouts and virtual/internal templates. For `ses_enclosure` views, the saved
-view now carries its own `profile_id`, so a `Generic Front 24` or other common
-layout can stay pinned even when the active live enclosure is using a
-different profile.
+For a `ses_enclosure` view, select the profile that should render the saved view. The view keeps its own `profile_id`, so it can remain on a layout such as `Generic Front 24` even when the live enclosure uses a different profile.
 
-The same profile geometry is shared across the live main UI, saved chassis
-views, admin setup preview, profile builder preview, storage-view preview, and
-offline snapshot rendering. Tray rows, latch placement, LED spacing, and row
-dividers should therefore match when those surfaces point at the same profile.
+## Understand profiles and views
 
-Here is the current admin-side grouped picker and profile catalog:
+A profile defines enclosure geometry. It controls tray rows, latch placement, LED spacing, and row dividers.
 
+The same profile geometry is used by:
 
-## Profiles Vs Storage Views
+- the live main UI
+- saved chassis views
+- the admin setup preview
+- the profile builder preview
+- the storage-view preview
+- offline snapshots
 
-Profiles and storage views solve different problems:
+When these screens use the same profile, their geometry should match.
 
-- a `profile` defines how a chassis should look
-- a `live enclosure` decides what hardware was actually discovered
-- a `saved chassis view` lets you mirror discovered hardware through a saved
-  profile-backed layout
-- a `virtual storage view` lets you group disks that do not come from a real
-  enclosure backplane
+The selector entries have separate roles:
 
-## Practical Example
+- a `profile` defines how a chassis is drawn
+- a `live enclosure` represents hardware discovered at runtime
+- a `saved chassis view` presents discovered hardware through a saved profile-backed layout
+- a `virtual storage view` groups disks that are not represented by a live enclosure backplane
 
-For a TrueNAS CORE host with:
+## Example
 
-- one live `60`-bay top-loading shelf
-- one live `24`-bay brain chassis discovered from SSH SES
-- one internal `4x NVMe Carrier Card`
-- one `Boot SATADOMs` pair
+A system can have all of these entries at once:
 
-the selector can legitimately show all four, but they are not the same kind of
-thing:
+- one discovered 60-bay shelf
+- one discovered 24-bay chassis
+- one internal 4-disk NVMe carrier
+- one boot SATADOM pair
 
-- the `60`-bay and `24`-bay entries are `Live Enclosures`
-- the NVMe card and SATADOM pair are `Virtual Storage Views`
+The shelves appear under `Live Enclosures`. The NVMe carrier and SATADOM pair appear under `Virtual Storage Views`. If you add a saved `Front Bays` view for the 24-bay chassis, it appears under `Saved Chassis Views`; it does not represent a second chassis.
 
-If you later add a saved mirrored `Front Bays` or `Primary Chassis` view, that
-becomes a `Saved Chassis View`, not a second physical shelf.
+The `Saved Chassis Views` group appears only when at least one saved view exists.
 
-The separate `Front 24 Bay` live enclosure can still show up as its own runtime
-target on `archive-core`, but the canonical CORE walkthroughs use the 60-bay
-top-loading shelf because that is the main operator view.
-
-## Related Pages
+## Related pages
 
 - [[Visual Tour|Visual-Tour]]
 - [[Architecture and Services|Architecture-and-Services]]

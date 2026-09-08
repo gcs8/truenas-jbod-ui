@@ -1,77 +1,66 @@
-# Backup, Restore, and Debug Bundles
+# Backup, restore, and debug bundles
 
-This page explains the export and recovery tools that live in the optional
-admin sidecar.
+Open the optional admin sidecar on port `8082` to create backups, restore application state, or collect support files.
 
-The short version:
+## Choose the right tool
 
-- use `Full Backup` when you may need to restore or move the local app state
-- use `Debug Bundle` when you want a support artifact for inspection
-- use `Export Snapshot` when you want one offline HTML enclosure view
-- use history purge/adopt tools only after exporting anything you might care
-  about later
-
-Open the admin sidecar on `:8082` for these workflows.
-
-
-## Tool Picker
-
-| Tool | Output | Importable? | Best for |
+| Tool | Output | Importable? | Use it for |
 | --- | --- | --- | --- |
-| `Full Backup` | restore-grade archive | yes | migration, disaster recovery, release-candidate restore drills |
-| `Debug Bundle` | support archive | no | sharing scrubbed config/history/log evidence for review |
-| `Export Snapshot` | self-contained HTML file | no | sharing the current enclosure view offline |
-| `Purge Orphaned Data` | maintenance action | not an export | cleaning deleted/renamed system history |
-| `Adopt Removed System History` | maintenance action | not an export | rehoming old history into a current saved system id |
+| `Full Backup` | restore-grade archive | yes | Migration and disaster recovery |
+| `Debug Bundle` | support archive | no | Sharing selected, scrubbed diagnostic files |
+| `Export Snapshot` | self-contained HTML file | no | Sharing one enclosure or storage view offline |
+| `Purge Orphaned Data` | maintenance action | not an export | Removing history for deleted systems |
+| `Adopt Removed System History` | maintenance action | not an export | Moving orphaned history to a current saved system ID |
 
-## Full Backup Bundles
+Use `Full Backup` if you may need to restore the data. Use `Debug Bundle` only for inspection. Use `Export Snapshot` when the recipient needs an offline bay map rather than application state.
 
-Use a full backup when you may want to restore the app state later.
+## Create a full backup
 
-Full Backup exports are encrypted by default. Core state can be selected without
-the locked secret-material paths:
+Full Backup exports are encrypted by default. Select the state groups needed for the restore:
 
 - `config/config.yaml`
 - `config/profiles.yaml`
 - slot mappings and slot-detail cache JSON
 - the history SQLite database
 
-The secret-material paths are locked because they can contain credentials or
-trust roots:
+These secret-material paths can contain credentials or trust data and remain locked until you choose an encrypted portable `.7z` export:
 
 - `config/ssh`
 - imported TLS trust bundles
 - shared `known_hosts`
 
-Selecting any locked path forces encrypted portable `.7z` export. An
-unencrypted export containing unsanitized state is rejected unless the operator
-explicitly sets `ADMIN_ALLOW_PLAINTEXT_BACKUP_EXPORT=true` for a trusted local
-deployment. That override does not make the resulting archive safe to share.
-This keeps
-secret material out of plaintext bundles while still letting the admin import
-path restore those same selected files later.
+Selecting a locked path forces encrypted `.7z` output. The admin sidecar rejects an unencrypted export of unsanitized state unless `ADMIN_ALLOW_PLAINTEXT_BACKUP_EXPORT=true` is set. That override creates a sensitive plaintext archive. It does not make the archive safe to share.
 
-The admin service supplies the 7z passphrase through a private, bounded terminal
-prompt. It does not place the passphrase in the 7z process arguments or command
-output. Passphrases may include spaces, including trailing spaces, but cannot
-contain carriage returns or line feeds because the 7z prompt is line-oriented.
+The admin service sends the 7z passphrase through a private, bounded terminal prompt. It does not place the passphrase in process arguments or command output. The passphrase may contain spaces, including trailing spaces, but it cannot contain carriage returns or line feeds.
+
+## Restore a backup
+
+For a migration:
+
+1. Export a full backup from the source deployment.
+2. Start the target Docker deployment with separate local directories.
+3. Open the target admin sidecar and import the archive.
+4. Supply the original passphrase for an encrypted archive.
+5. Restart the main UI and any enabled sidecars.
+6. Check `/livez`, the runtime selector, one live enclosure, and one history drawer or dashboard view.
+
+Run the first restore in a disposable stack with separate ports and state directories. Do not test import, restore, purge, adopt, delete, or runtime overrides against a long-running deployment unless you intend to change it.
+
+A hot-only deployment exports backup schema 1. A deployment with `HISTORY_SEGMENT_CATALOG_PATH` exports schema 2. Schema 2 includes the hot database, every immutable segment, and the complete catalog generation. Restore validates every member and stages the hot database and segment directory as one rollback-capable transaction. The target must configure `HISTORY_SEGMENT_CATALOG_PATH` before restoring schema 2.
+
+Each immutable segment is limited to 1.5 GiB. Allow temporary-disk and archive space for the hot database plus every active segment. Each 7z create, verify, list, or extract operation has a 10-minute limit and uses normal compression with one worker thread.
 
 ## Optional scheduled state backups
 
-Scheduled backups use a separate one-shot container. The container has no
-published port, network, or Docker socket. A host timer starts it. The admin
-application default is `0`, while the shipped Compose files set the Compose
-default to `3600` seconds for the separately launched admin sidecar.
+Scheduled backups run in a separate one-shot container with no published port, network, or Docker socket. Start that container from a host timer.
 
-The archive suffix depends on the selected groups. A scheduled backup that
-includes `history_db` uses encrypted portable `.7z`, including segmented
-history. A scheduled backup without `history_db` uses the native encrypted
-`.tar.zst.enc` envelope. Retention and bounded restore accept both formats.
+The admin application default for automatic stop is `0`. The supplied Compose files set the separately launched admin sidecar default to `3600` seconds.
 
-Create a private passphrase file under `config/backup-secrets` and make it
-readable only by its owner. The Compose files mount that directory read-only at
-`/run/backup-secrets`. Do not put the passphrase in `.env`, a command, or a unit
-file.
+A scheduled backup that includes `history_db` uses encrypted `.7z`, including segmented history. A backup without `history_db` uses the native encrypted `.tar.zst.enc` envelope. The restore path accepts both formats.
+
+### Create the passphrase and state directories
+
+Create a private passphrase file under `config/backup-secrets`. Do not put the passphrase in `.env`, a command argument, or a unit file.
 
 ```bash
 BACKUP_UID=$(id -u)
@@ -87,7 +76,11 @@ printf '%s' "$BACKUP_PASSPHRASE" > config/backup-secrets/scheduled-backup-passph
 unset BACKUP_PASSPHRASE
 ```
 
-Set the complete one-shot runner configuration in the ignored local `.env`:
+The Compose files mount `config/backup-secrets` read-only at `/run/backup-secrets`.
+
+### Configure the one-shot runner
+
+Add the complete runner configuration to the ignored local `.env`:
 
 ```dotenv
 BACKUP_UID=1000
@@ -101,56 +94,48 @@ SCHEDULED_BACKUP_PASSPHRASE_FILE=/run/backup-secrets/scheduled-backup-passphrase
 HISTORY_SEGMENTED_BACKUP_MAX_AGE_SECONDS=129600
 ```
 
-Replace `1000` with the numeric values printed by `id -u` and `id -g` above.
-Set `APP_GID` to the numeric app group used by the base Compose file.
-The backup container keeps its host identity and receives `APP_GID` as both an
-explicit validation value and a supplemental group. The setgid `2750` status
-directory makes atomic status replacements inherit that exact group.
-Status files use `0640`, so the non-root UI and history services can read backup
-evidence but cannot alter it. Archives and the passphrase remain private `0600`
-files. Segmented-history publication follows the same least-privilege group
-contract: the segment directory uses exact mode `0750`; segments and `catalog.json` use exact mode `0640`.
-Their owner and group match the hot history database. The non-root app UID owns
-publication; the backup UID reads through its `APP_GID` supplemental group and
-cannot modify those artifacts.
+Replace `1000` with the values from `id -u` and `id -g`. Set `APP_GID` to the numeric application group used by the base Compose file.
 
-Do not run migration, sealing, rotation, or recovery as host root when the hot
-database belongs to the non-root app UID. The publisher refuses an effective UID
-that does not own the hot database, preventing a root-owned replacement from
-making the history service read-only.
+The backup container keeps its host UID and GID and receives `APP_GID` as a supplemental group. The setgid `2750` status directory makes atomic status-file replacements inherit that group. Status files use `0640`. Archives and the passphrase remain private `0600` files.
 
-Deployments that already published a `0600` catalog or segments need one bounded,
-quiesced permission repair before the separate backup UID can read them. Run
-`docker compose down`, then verify that the history root, `history.db`,
-`segments/catalog.json`, and the cataloged `segment-*.sqlite3` files are the
-intended directories and regular files. Set the history root owner to
-`APP_UID:APP_GID` with mode `0770`, and set the writable `history.db` owner and
-group to the same identity with mode `0660`. Set the segment directory to mode
-`0750` and only the active catalog and cataloged segment files to mode `0640`.
-Do not recursively relax rollback snapshots, pending journals, or unrelated
-history files. Restart the history service, run a manual FULL backup, and verify
-its status before allowing retention or rotation.
+The segment directory uses exact mode `0750`; segments and `catalog.json` use exact mode `0640`. Their owner and group match the hot history database.
 
-Run one backup manually before enabling a timer:
+The non-root application UID owns segment publication. The backup UID reads the files through the `APP_GID` supplemental group and cannot modify them.
+
+Do not run migration, sealing, rotation, or recovery as host root when the hot database belongs to the non-root application UID. The publisher rejects a process whose effective UID does not own the hot database. This prevents a root-owned replacement from making the history service read-only.
+
+### Repair old segmented-history permissions
+
+A deployment with a `0600` catalog or segments needs one bounded permission repair before a separate backup UID can read them.
+
+1. Run `docker compose down`.
+2. Verify that the history root, `history.db`, `segments/catalog.json`, and cataloged `segment-*.sqlite3` paths point to the intended directories and regular files.
+3. Set the history root owner to `APP_UID:APP_GID` and mode `0770`.
+4. Set the writable `history.db` owner and group to the same identity and mode `0660`.
+5. Set the segment directory to mode `0750`.
+6. Set only the active catalog and cataloged segment files to mode `0640`.
+7. Restart the history service.
+8. Run a manual full backup and verify its status before allowing retention or rotation.
+
+Do not recursively relax rollback snapshots, pending journals, or unrelated history files.
+
+### Run and verify one backup
+
+Run a backup manually before enabling a timer:
 
 ```bash
 docker compose --profile backup run --rm enclosure-backup
 ```
 
-The runner creates private `0600` files in the destination, verifies the copied
-archive through the normal restore preflight, publishes without overwriting an
-existing name, publishes shared-read-only `0640` status under the prepared
-`2750` directory, and prunes only files matching its owned filename contract. It
-uses `.7z` when `history_db` is selected. Without `history_db`, the inner archive
-is the validated system backup format and the `.tar.zst.enc` outer envelope uses
-AES-256-GCM with a per-file salt and nonce. Import either file through the normal
-admin restore path and supply the same passphrase.
+The runner writes private `0600` archives, validates the archive through restore preflight, avoids overwriting an existing name, writes `0640` status, and prunes only files that match its owned filename pattern.
 
-The repository includes `deploy/systemd/truenas-jbod-system-backup.service` and
-`.timer`. They assume the Compose project is installed at
-`/opt/truenas-jbod-ui`; adjust `WorkingDirectory`, `ConditionPathExists`, and
-`ReadWritePaths` together if it lives elsewhere. Install and enable them only
-after the manual run and restore test succeed:
+When `history_db` is selected, the runner creates `.7z`. Without `history_db`, it creates a validated inner system backup and encrypts the `.tar.zst.enc` envelope with AES-256-GCM, a per-file salt, and a per-file nonce. Import either format through the admin restore path with the same passphrase.
+
+### Enable the systemd timer
+
+The supplied unit files assume the Compose project is in `/opt/truenas-jbod-ui`. If your deployment uses another directory, update `WorkingDirectory`, `ConditionPathExists`, and `ReadWritePaths` together.
+
+After the manual backup and restore test succeed, install and enable the timer:
 
 ```bash
 sudo install -m 0644 deploy/systemd/truenas-jbod-system-backup.service /etc/systemd/system/
@@ -160,110 +145,49 @@ sudo systemctl enable --now truenas-jbod-system-backup.timer
 systemctl list-timers truenas-jbod-system-backup.timer
 ```
 
-The main UI metrics endpoint reads the secret-free durable status file and
-exposes run counts, last success, last failure, age, size, and failure state.
-Metric labels never contain the destination, artifact name, group names, error
-text, or passphrase-file path.
+### Understand backup status and retention
 
-Hot-only history has its own single-SQLite snapshot schedule. Segmented history
-does not use that snapshot because it cannot represent the catalog and immutable
-segments. Its hot-data retention remains blocked until the status file records a
-recent successful encrypted FULL backup that includes `history_db`. The default
-maximum age is 129600 seconds, or 36 hours, which allows the daily timer and its
-random delay to complete. A successful status also requires a positive run
-count, archive size, digest, and owned artifact name. Missing, stale, failed,
-artifact-incomplete, or history-excluding status fails closed without pruning
-hot rows.
+The main UI reads a secret-free status file and exports metrics for run count, last success, last failure, age, size, and failure state. Metric labels omit the destination, artifact name, selected groups, error text, and passphrase-file path.
 
-The one-shot container mounts the whole history directory writable. Do not
-file-bind only `history.db`; segmented locking rejects database-file mount
-points. Size the backup destination and temporary workspace for the hot database
-plus every active segment.
+Hot-only history uses a single-SQLite snapshot schedule. Segmented history cannot use that snapshot because it also needs the catalog and immutable segments.
 
-The base Compose file keeps large temporary workspaces on disk-backed scratch
-inside an existing state mount. `TMPDIR` points history and admin work at
-`/app/history`, and points the one-shot backup worker at `/app/backups`. The
-private `/tmp` tmpfs remains available for small library/runtime files, but FULL
-backup and restore archives do not consume that memory-backed filesystem.
+Segmented hot-data retention runs only when the status file records a recent successful encrypted full backup that includes `history_db`. The default maximum age is `129600` seconds, or 36 hours. A valid status also needs a positive run count, archive size, digest, and owned artifact name. Missing, stale, failed, incomplete, or history-excluding status blocks pruning.
 
-Hot-only deployments export backup schema 1. A deployment configured with
-`HISTORY_SEGMENT_CATALOG_PATH` exports schema 2. Schema 2 includes the hot
-database, every immutable segment, and the complete generation catalog. Import
-validates every member and stages the hot file and segment directory as one
-rollback-capable transaction.
+Mount the whole history directory writable in the one-shot backup container. Do not file-bind only `history.db`; segmented locking rejects database-file mount points. Size the backup destination and temporary workspace for the hot database and every active segment.
 
-Each immutable segment is limited to 1.5 GiB. The current query path selects at
-most 32 segments and returns at most 5,000 rows. A broad request fails instead of
-returning partial history. FULL backup and restore must have temporary-disk and
-archive headroom for the hot file plus all selected segments. Each 7z create,
-verify, list, or extract operation remains bounded to 10 minutes. Archive
-creation uses normal compression with one worker thread.
+The base Compose file uses disk-backed scratch inside existing state mounts for large temporary files. `TMPDIR` points history and admin work to `/app/history`, and backup work to `/app/backups`. The private `/tmp` tmpfs remains for small runtime files, not full backup or restore archives.
 
-The `.tar.zst.enc` path is used only when `history_db` is not selected. A
-segmented `history_db` backup uses `.7z` schema 2 and the same staged restore
-contract. Schema 2 restore requires the target to configure
-`HISTORY_SEGMENT_CATALOG_PATH`.
+See [Segmented history v2](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/SEGMENTED_HISTORY_V2.md) for migration, recovery, rollback, and catalog procedures.
 
-See [Segmented history v2](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/SEGMENTED_HISTORY_V2.md) for migration,
-recovery, rollback, catalog, and release-gate details.
+## Create a debug bundle
 
-## Restore Pattern
+Use `Debug Bundle` to capture selected local state for support inspection. It creates a standard archive and cannot be imported as a backup. Capture can stop and restart the UI and history sidecar.
 
-For real migrations:
+Choose the scrubbing controls before capture:
 
-1. export a full backup from the source stack
-2. start the target Docker stack with separate local folders
-3. import the bundle through the admin sidecar
-4. restart the main UI and sidecars
-5. verify `/livez`, the runtime selector, one live enclosure, and one history
-   drawer or history dashboard view
+- `Scrub obvious secrets` removes recognized secret values and keeps locked secret paths disabled.
+- `Scrub disk identifiers` masks recognized disk identifiers.
 
-For release-candidate or destructive testing, use a disposable QA stack with
-separate ports and separate runtime folders. Do not run import, restore, purge,
-adopt, delete, or runtime override tests against the long-running production
-stack unless you explicitly intend to change it.
+Scrubbing is bounded. Inspect the archive before sharing it. Do not include private keys, trust material, or unreviewed logs unless the recipient needs them and you intend to disclose them.
 
-## Debug Bundles
+## Export an enclosure snapshot
 
-The `Debug Bundle` card is different from full backup.
+`Export Snapshot` in the main UI creates one self-contained HTML file for the selected enclosure or storage view. Its `Redact sensitive IDs` option applies bounded aliases and masks but leaves some operational text and hardware fields intact. Review the file before sharing it.
 
-Use it when you want a frozen support snapshot of local state for offline
-inspection. It:
+A snapshot is not a backup and does not contain the full application state. See [[History and Snapshot Export|History-and-Snapshot-Export]].
 
-- exports a normal archive, not a self-contained HTML viewer
-- is not an importable restore path
-- can stop/restart the UI and history sidecar around capture
-- has separate `Scrub obvious secrets` and `Scrub disk identifiers` toggles
+## Clean up history safely
 
-If `Scrub obvious secrets` stays on, the locked secret-path pills remain
-disabled so private keys and trust material do not accidentally ride along.
+Before purging or adopting history:
 
-## Snapshot Export Is Separate
+1. Export a full backup if the rows may matter later.
+2. Confirm the source and target saved system IDs.
+3. Use previews or the least destructive action available.
+4. Verify the result in the history drawer or dashboard.
 
-`Export Snapshot` in the main UI creates a single self-contained HTML artifact
-for the current enclosure or storage view.
+See [[History Maintenance and Recovery|History-Maintenance-and-Recovery]].
 
-That is useful when you want someone to inspect a physical slot map without
-connecting to the live app. Its `Redact sensitive IDs` option applies bounded
-aliases and masks; it leaves some operational text and hardware fields intact,
-so review the file before sharing it. It is not a restore path and does not carry
-the full local stack state.
-
-See [[History and Snapshot Export|History-and-Snapshot-Export]].
-
-## History Cleanup Safety
-
-Before deleting or adopting history rows:
-
-1. export a full backup if the rows may matter later
-2. confirm the target saved system id
-3. use preview or low-risk cleanup paths first when available
-4. verify the history drawer or history dashboard afterward
-
-The history-specific cleanup guide lives at
-[[History Maintenance and Recovery|History-Maintenance-and-Recovery]].
-
-## Related Pages
+## Related pages
 
 - [[Admin UI and System Setup|Admin-UI-and-System-Setup]]
 - [[History Maintenance and Recovery|History-Maintenance-and-Recovery]]
