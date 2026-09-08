@@ -4987,6 +4987,41 @@ sys.stdout.flush()
             transaction._cleanup_sibling_artifacts()
             transaction._cleanup_root()
 
+    def test_segmented_hot_staging_does_not_claim_an_exclusive_open_race_loser(self) -> None:
+        target_path = self.temp_dir / "missing-hot.sqlite3"
+        staged_path = self.temp_dir / ".missing-hot.sqlite3.restore-synthetic"
+        transaction = _ImportActivationTransaction({"hot": b"HOT"})
+        entry = transaction._record_target(target_path, expected_kind="file")
+        real_copy_file_exclusive = transaction._copy_file_exclusive
+
+        def create_contender_before_exclusive_open(source, destination, *, owner, mode):
+            Path(destination).write_bytes(b"UNOWNED-RACER")
+            return real_copy_file_exclusive(
+                source,
+                destination,
+                owner=owner,
+                mode=mode,
+            )
+
+        try:
+            with patch.object(
+                transaction,
+                "_copy_file_exclusive",
+                side_effect=create_contender_before_exclusive_open,
+            ):
+                with self.assertRaises(FileExistsError):
+                    transaction._stage_segmented_hot(
+                        staged_path,
+                        source_path=transaction._staged_member("hot"),
+                        target_path=target_path,
+                        entry=entry,
+                    )
+
+            self.assertEqual(transaction._cleanup_sibling_artifacts(), [])
+            self.assertEqual(staged_path.read_bytes(), b"UNOWNED-RACER")
+        finally:
+            transaction._cleanup_root()
+
     def test_segmented_directory_staging_does_not_reopen_owned_member_files(self) -> None:
         target_dir = self.temp_dir / "missing-segments"
         staged_dir = self.temp_dir / ".missing-segments.restore-synthetic"

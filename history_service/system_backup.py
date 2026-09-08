@@ -979,7 +979,6 @@ class _ImportActivationTransaction:
         target_path: Path,
         entry: _ImportRollbackEntry,
     ) -> None:
-        self._sibling_artifacts[staged_path] = "file"
         owner = self._existing_owner(
             target_path if entry.kind == "file" else target_path.parent,
             directory=entry.kind != "file",
@@ -995,6 +994,7 @@ class _ImportActivationTransaction:
             owner=owner,
             mode=mode,
         )
+        self._sibling_artifacts[staged_path] = "file"
         self._fsync_directory(staged_path.parent)
 
     def _stage_segmented_directory(
