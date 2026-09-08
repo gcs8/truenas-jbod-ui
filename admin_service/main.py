@@ -11,6 +11,7 @@ import os
 import signal
 import sys
 import tempfile
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache, wraps
@@ -27,6 +28,7 @@ from admin_service.services.account_bootstrap import (
     ServiceAccountBootstrapService,
     saved_sudo_commands_for_system,
 )
+from admin_service.services.backup_receipts import BackupInspectionReceiptStore
 from admin_service.services.esxi_host_prep import (
     ESXiHostPrepService,
     HostPrepStagingQuotaError,
@@ -344,6 +346,11 @@ def resolve_saved_secondary_secret(
 def get_backup_service() -> SystemBackupService:
     history_settings = get_history_settings()
     return SystemBackupService(history_settings, get_history_store())
+
+
+@lru_cache
+def get_backup_receipt_store() -> BackupInspectionReceiptStore:
+    return BackupInspectionReceiptStore()
 
 
 @lru_cache

@@ -47,8 +47,12 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
         content["runtime"] = await build_runtime_payload(runtime_service)
         return JSONResponse(content)
 
-    async def run_retained_thread_worker(function: Any, *args: Any) -> Any:
-        operation = asyncio.create_task(asyncio.to_thread(function, *args))
+    async def run_retained_thread_worker(
+        function: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        operation = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
         try:
             await asyncio.wait((operation,))
         except asyncio.CancelledError as cancellation:
@@ -61,6 +65,17 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
                 operation.exception()
             raise cancellation
         return operation.result()
+
+    def expected_backup_encryption_mode(request: Request) -> str:
+        mode = request.headers.get("X-Backup-Expected-Encryption", "")
+        if mode not in {"encrypted", "plaintext"}:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "X-Backup-Expected-Encryption must be exactly encrypted or plaintext."
+                ),
+            )
+        return mode
 
     @router.get("/", response_class=HTMLResponse)
     async def index(request: Request) -> HTMLResponse:
@@ -224,15 +239,41 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             if passphrase is None:
                 passphrase = request.headers.get("X-Backup-Passphrase") or None
-            try:
-                result = await asyncio.to_thread(
-                    get_backup_service().inspect_bundle_file,
+            def inspect_and_issue_receipt() -> tuple[dict[str, Any], dict[str, Any]]:
+                issued: dict[str, Any] = {}
+
+                def issue_for_identity(archive_digest: str, mode: str) -> None:
+                    issued.update(
+                        get_backup_receipt_store().issue_digest(
+                            archive_digest,
+                            observed_encryption_mode=mode,
+                        )
+                    )
+
+                result = get_backup_service().inspect_bundle_file(
                     archive_path,
                     passphrase=passphrase,
+                    identity_callback=issue_for_identity,
+                )
+                if not issued:
+                    raise RuntimeError("Backup inspection identity was not bound.")
+                return result, issued
+
+            try:
+                result, issued = await run_retained_thread_worker(
+                    inspect_and_issue_receipt,
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
-            return JSONResponse(result)
+            encryption_mode = "encrypted" if result.get("encrypted") is True else "plaintext"
+            return JSONResponse(
+                {
+                    **result,
+                    "encryption_mode": encryption_mode,
+                    "inspection_receipt": issued["receipt"],
+                    "inspection_receipt_expires_at": issued["expires_at"],
+                }
+            )
         finally:
             archive_path.unlink(missing_ok=True)
             archive_path.parent.rmdir()
@@ -244,59 +285,106 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
         stop_services: bool = Query(default=True),
         restart_services: bool = Query(default=True),
     ) -> JSONResponse:
-        archive_path = await stream_limited_request_body_to_file(request)
+        admission_started_at = int(time.time())
+        expected_mode = expected_backup_encryption_mode(request)
+        receipt = request.headers.get("X-Backup-Inspection-Receipt", "")
+        if not receipt:
+            raise HTTPException(
+                status_code=400,
+                detail="X-Backup-Inspection-Receipt is required before import.",
+            )
+        receipt_store = get_backup_receipt_store()
+        admission: str | None = None
         try:
-            if archive_path.stat().st_size == 0:
-                raise HTTPException(status_code=400, detail="Backup import request body was empty.")
             try:
-                passphrase = decode_optional_secret_header(
-                    request.headers.get("X-Backup-Passphrase-Base64")
+                admission = receipt_store.begin_admission(
+                    receipt,
+                    expected_encryption_mode=expected_mode,
+                    now=admission_started_at,
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
-            if passphrase is None:
-                passphrase = request.headers.get("X-Backup-Passphrase") or None
-            maintenance_service = get_maintenance_service()
+            archive_path = await stream_limited_request_body_to_file(request)
             try:
-                result, maintenance = await asyncio.to_thread(
-                    maintenance_service.import_bundle_from_file,
-                    archive_path,
-                    passphrase=passphrase,
-                    stop_services=stop_services,
-                    restart_services=restart_services,
-                )
-            except (ValueError, DockerRuntimeError) as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
+                if archive_path.stat().st_size == 0:
+                    raise HTTPException(status_code=400, detail="Backup import request body was empty.")
+                try:
+                    passphrase = decode_optional_secret_header(
+                        request.headers.get("X-Backup-Passphrase-Base64")
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+                if passphrase is None:
+                    passphrase = request.headers.get("X-Backup-Passphrase") or None
+                maintenance_service = get_maintenance_service()
 
-            settings = reload_app_settings()
-            runtime_service = get_runtime_service()
-            impacted = tuple(
-                key for key in admin_settings.clean_backup_targets
-                if key in runtime_service.managed_containers
-            )
-            restarted = tuple(
-                key for key in maintenance.restarted_containers
-                if key in impacted
-            )
-            await asyncio.to_thread(runtime_service.clear_restart_required, restarted)
-            await asyncio.to_thread(
-                runtime_service.mark_restart_required,
-                tuple(key for key in impacted if key not in restarted),
-            )
-            return JSONResponse(
-                {
-                    **result,
-                    "systems": serialize_systems(settings),
-                    "default_system_id": settings.default_system_id,
-                    "stopped_containers": maintenance.stopped_containers,
-                    "restarted_containers": maintenance.restarted_containers,
-                    "restart_failures": dict(maintenance.restart_failures),
-                    "runtime": await build_runtime_payload(runtime_service),
-                }
-            )
+                def admitted_import() -> Any:
+                    def consume_admission(archive_digest: str, observed_mode: str) -> None:
+                        if observed_mode != expected_mode:
+                            raise ValueError(
+                                "Backup inspection receipt encryption mode does not match the import mode."
+                            )
+                        receipt_store.consume_digest(
+                            receipt,
+                            archive_digest,
+                            expected_encryption_mode=expected_mode,
+                            admission=admission,
+                            now=admission_started_at,
+                        )
+
+                    return maintenance_service.import_bundle_from_file(
+                        archive_path,
+                        passphrase=passphrase,
+                        expected_encrypted=expected_mode == "encrypted",
+                        stop_services=stop_services,
+                        restart_services=restart_services,
+                        admission_callback=consume_admission,
+                    )
+
+                try:
+                    result, maintenance = await run_retained_thread_worker(
+                        admitted_import,
+                    )
+                except (ValueError, DockerRuntimeError) as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+                settings = reload_app_settings()
+                runtime_service = get_runtime_service()
+                impacted = tuple(
+                    key for key in admin_settings.clean_backup_targets
+                    if key in runtime_service.managed_containers
+                )
+                restarted = tuple(
+                    key for key in maintenance.restarted_containers
+                    if key in impacted
+                )
+                await asyncio.to_thread(runtime_service.clear_restart_required, restarted)
+                await asyncio.to_thread(
+                    runtime_service.mark_restart_required,
+                    tuple(key for key in impacted if key not in restarted),
+                )
+                return JSONResponse(
+                    {
+                        **result,
+                        "systems": serialize_systems(settings),
+                        "default_system_id": settings.default_system_id,
+                        "stopped_containers": maintenance.stopped_containers,
+                        "restarted_containers": maintenance.restarted_containers,
+                        "restart_failures": dict(maintenance.restart_failures),
+                        "final_running_containers": getattr(
+                            maintenance,
+                            "final_running_containers",
+                            [],
+                        ),
+                        "runtime": await build_runtime_payload(runtime_service),
+                    }
+                )
+            finally:
+                archive_path.unlink(missing_ok=True)
+                archive_path.parent.rmdir()
         finally:
-            archive_path.unlink(missing_ok=True)
-            archive_path.parent.rmdir()
+            if admission is not None:
+                receipt_store.release_admission(admission)
 
     @router.post("/api/admin/esxi-host-prep/upload")
     async def upload_esxi_host_prep_package(

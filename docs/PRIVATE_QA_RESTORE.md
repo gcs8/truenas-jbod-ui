@@ -112,12 +112,16 @@ The controller performs these phases:
    network metadata, and establish loopback-only host access.
 4. Stream the archive to `/api/admin/backup/inspect`. Inspection validates the
    archive, manifest, member sizes and hashes, candidate config, mapping/profile
-   data, SQLite databases, and segmented history without activating it.
+   data, SQLite databases, and segmented history without activating it. The
+   response includes the observed encryption mode and an expiring server-issued
+   single-use inspection receipt bound to the exact archive bytes.
 5. Keep only the sanitized inspection fields and aggregate counts. The raw
    manifest, systems, identifiers, filenames, and restored paths never enter the
-   receipt.
+   durable QA receipt. Keep the short-lived import receipt only in memory.
 6. Stream the same archive to
-   `/api/admin/backup/import?stop_services=true&restart_services=true`.
+   `/api/admin/backup/import?stop_services=true&restart_services=true`, supplying
+   the observed encryption mode and single-use receipt. The server rehashes the
+   archive and consumes the receipt atomically when import admission succeeds.
 7. Wait for all three services, compare every known archive count with the
    restored stack, exercise allowed pencil edits, clear them, and compare again.
 8. Run `docker compose restart`, wait for health, and compare counts a third

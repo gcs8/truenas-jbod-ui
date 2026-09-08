@@ -160,7 +160,7 @@ services:
       - ./config/ssh:/run/ssh:ro
       - /var/run/docker.sock:/var/run/docker.sock
     restart: "no"
-    mem_limit: ${ADMIN_MEM_LIMIT:-3g}
+    mem_limit: ${ADMIN_MEM_LIMIT:-1g}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/healthz', timeout=4)"]
       interval: 30s

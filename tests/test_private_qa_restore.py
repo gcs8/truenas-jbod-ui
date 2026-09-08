@@ -80,6 +80,9 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
             "app_version": "0.22.3",
             "exported_at": "2030-01-02T03:04:05+00:00",
             "encrypted": True,
+            "encryption_mode": "encrypted",
+            "inspection_receipt": "server-issued-single-use-receipt",
+            "inspection_receipt_expires_at": 1893553500,
             "packaging": "7z",
             "selected_groups": [
                 "config_file",
@@ -607,9 +610,21 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
                     "passphrase",
                     "username",
                     "password",
+                    extra_headers={
+                        "X-Backup-Expected-Encryption": "encrypted",
+                        "X-Backup-Inspection-Receipt": "server-receipt",
+                    },
                 )
         self.assertIn(
             ("Origin", "http://127.0.0.1:28082"),
+            FakeConnection.instance.headers,
+        )
+        self.assertIn(
+            ("X-Backup-Expected-Encryption", "encrypted"),
+            FakeConnection.instance.headers,
+        )
+        self.assertIn(
+            ("X-Backup-Inspection-Receipt", "server-receipt"),
             FakeConnection.instance.headers,
         )
 
@@ -975,6 +990,8 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
             '"internal": True',
             "/api/admin/backup/inspect",
             "/api/admin/backup/import?stop_services=true&restart_services=true",
+            "X-Backup-Expected-Encryption",
+            "X-Backup-Inspection-Receipt",
             "/api/history/overview?exact_counts=true",
             "/api/sas-fabric/aliases",
             "/api/mappings",
@@ -1048,6 +1065,8 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
             "ssh_keys",
             "tls_trust",
             "known_hosts",
+            "single-use inspection receipt",
+            "observed encryption mode",
             "Request correlation gap",
             "scripts/run_private_qa_restore.py",
         ):

@@ -264,9 +264,15 @@ python scripts/validate_release_wrap.py "$version" \
     `APP_BIND_ADDRESS=127.0.0.1`, `APP_PORT=18080`,
     `HISTORY_BIND_ADDRESS=127.0.0.1`, `HISTORY_PORT=18081`,
     `ADMIN_BIND_ADDRESS=127.0.0.1`, and `ADMIN_PORT=18082`
+  - inspect the copied bundle first through
+    `POST http://127.0.0.1:18082/api/admin/backup/inspect`, confirm the returned
+    observed encryption mode and aggregate counts, and retain its short-lived
+    single-use inspection receipt only in memory
   - import the backup through the disposable Linux admin API:
     `POST http://127.0.0.1:18082/api/admin/backup/import?stop_services=true&restart_services=true`
-    with the exported bundle as `application/octet-stream`
+    with the same exported bundle as `application/octet-stream`, the observed
+    mode in `X-Backup-Expected-Encryption`, and the receipt in
+    `X-Backup-Inspection-Receipt`
   - confirm the restored Linux QA stack has the expected systems, profiles,
     storage views, runtime overrides, SAS Fabric aliases, slot-detail cache,
     history DB counts, and healthy UI/history/admin `/livez` and `/healthz`
