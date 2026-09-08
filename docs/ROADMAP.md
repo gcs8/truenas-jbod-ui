@@ -1,10 +1,8 @@
 # Roadmap
 
-This file tracks the current intended release direction after the `v0.22.2`
-maintenance release. `v0.22.2` is the latest published release, published on
-2026-09-01 from source commit
-`6473d05f46d8344146cbbd7d0cdbf44487613a3c`. See the
-[GitHub release](https://github.com/gcs8/truenas-jbod-ui/releases/tag/v0.22.2).
+This file tracks the current intended release direction after the `v0.23.0`
+release. `v0.23.0` is the latest published release, published on 2026-09-08.
+See the [GitHub release](https://github.com/gcs8/truenas-jbod-ui/releases/tag/v0.23.0).
 
 Older milestone notes such as [`docs/V0_2_ROADMAP.md`](./V0_2_ROADMAP.md) are
 kept for history, but this file is the active planning view.

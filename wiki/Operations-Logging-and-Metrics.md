@@ -28,7 +28,7 @@ docker compose up -d
 For a pinned deployment, change `JBOD_UI_IMAGE` in `.env`, then pull and recreate the services:
 
 ```dotenv
-JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.22.2
+JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.23.0
 ```
 
 ```bash

@@ -26,12 +26,12 @@ cd /docker-local/truenas-jbod-ui
 mkdir -p config/ssh data history/backups/long-term logs
 ```
 
-Download the v0.22.2 Compose file:
+Download the v0.23.0 Compose file:
 
 ```bash
 curl -fsSL \
   -o compose.yaml \
-  https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/v0.22.2/docker-compose.yml
+  https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/v0.23.0/docker-compose.yml
 ```
 
 Create a minimal `.env` for one TrueNAS system:
@@ -40,7 +40,7 @@ Create a minimal `.env` for one TrueNAS system:
 umask 077
 cat > .env <<'EOF'
 APP_PORT=8080
-JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.22.2
+JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.23.0
 
 TRUENAS_HOST=https://truenas.example.local
 TRUENAS_API_KEY=replace_me
@@ -59,7 +59,7 @@ docker compose pull
 docker compose up -d
 ```
 
-This path pairs the v0.22.2 Compose file and image. Keep the Compose file and
+This path pairs the v0.23.0 Compose file and image. Keep the Compose file and
 image on the same version.
 
 Open:
@@ -182,7 +182,7 @@ That tracks the newest published stable image.
 If you want slower, more deliberate updates, select a release tag first:
 
 ```dotenv
-JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.22.2
+JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.23.0
 ```
 
 Useful tag shapes:
@@ -190,8 +190,8 @@ Useful tag shapes:
 | Tag | Use it when |
 | --- | --- |
 | `latest` | you want the newest stable published image |
-| `v0.22.2` | you want the image currently labeled with that GitHub release |
-| `0.22.2` | you want the same stable release without the `v` prefix |
+| `v0.23.0` | you want the image currently labeled with that GitHub release |
+| `0.23.0` | you want the same stable release without the `v` prefix |
 | `dev` | you are testing the current development image and accept churn |
 
 Every registry tag is a mutable pointer, including `latest`, version tags, and

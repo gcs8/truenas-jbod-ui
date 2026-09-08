@@ -27,7 +27,7 @@ cd /docker-local/truenas-jbod-ui
 ```bash
 curl -fsSL \
   -o compose.yaml \
-  https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/v0.22.2/docker-compose.yml
+  https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/v0.23.0/docker-compose.yml
 ```
 
 ## 3. Add your TrueNAS connection
@@ -36,7 +36,7 @@ Create `.env` with the URL and API key for your system:
 
 ```bash
 cat > .env <<'EOF'
-JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.22.2
+JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.23.0
 TRUENAS_HOST=https://truenas.example.test
 TRUENAS_API_KEY=replace-with-your-api-key
 TRUENAS_PLATFORM=core

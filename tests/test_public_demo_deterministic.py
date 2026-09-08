@@ -186,13 +186,13 @@ class DeterministicPublicDemoContractTests(unittest.TestCase):
                 shutil.copy2(ROOT / relative_path, target)
             version_file = source_root / "app/__init__.py"
             version_file.write_text(
-                version_file.read_text(encoding="utf-8").replace(__version__, "0.22.3"),
+                version_file.read_text(encoding="utf-8").replace(__version__, "0.23.1"),
                 encoding="utf-8",
             )
             result = run_checker(demo_dir, source_root=source_root)
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("artifact app version 0.22.2 does not match source 0.22.3", result.stderr)
+        self.assertIn("artifact app version 0.23.0 does not match source 0.23.1", result.stderr)
 
     def test_shared_input_graph_is_complete_and_unique(self) -> None:
         module = importlib.import_module("scripts.public_demo_inputs")
@@ -309,6 +309,24 @@ class DeterministicPublicDemoContractTests(unittest.TestCase):
         self.assertNotRegex(fixture_text, r"(?i)\b(?:wwn|naa)\.[0-9a-f]{16,}\b")
         self.assertRegex(fixture_text, re.compile(r'"provenance": "synthetic"'))
         self.assertIn('"id": "demo-system"', fixture_text)
+
+    def test_fixture_models_the_two_production_spares_as_one_synthetic_group(self) -> None:
+        fixture_module = importlib.import_module("app.services.public_demo_fixture")
+        fixture = fixture_module.load_public_demo_fixture(ROOT / FIXTURE_PATH)
+        spare_slots = [slot for slot in fixture.slots if slot.vdev_class == "spare"]
+
+        self.assertEqual([slot.slot for slot in spare_slots], [42, 43])
+        self.assertEqual(
+            {(slot.pool_name, slot.vdev_name, slot.vdev_class) for slot in spare_slots},
+            {("demo-capacity", "spares", "spare")},
+        )
+
+        bundle = fixture_module.build_public_demo_snapshot_bundle(fixture=fixture)
+        rendered_spares = [slot for slot in bundle.primary_snapshot.slots if slot.vdev_class == "spare"]
+        self.assertEqual(
+            {slot.topology_label for slot in rendered_spares},
+            {"demo-capacity > spares > spare"},
+        )
 
     def test_builder_ignores_ambient_operator_configuration(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
