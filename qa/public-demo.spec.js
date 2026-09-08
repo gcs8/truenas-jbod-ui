@@ -113,7 +113,7 @@ test("public demo static artifact is explorable without a live backend", async (
   await expect(page.locator(".snapshot-banner-meta")).toContainText("7d");
   await expect(page.locator("#system-setup-button")).toHaveCount(0);
   await expect(page.locator("#export-snapshot-button")).toHaveCount(0);
-  await expect(selector.locator("option:checked")).toContainText("Snapshot · Demo 60-Bay");
+  await expect(selector.locator("option:checked")).toContainText("Snapshot · Demo 60-Bay Top Loader");
   await expect(page.locator("#api-status-chip")).toHaveText("API AT CAPTURE");
   await expect(page.locator("#ssh-status-chip")).toHaveText("SSH OFF AT CAPTURE");
   await expect(page.locator("#history-status-chip")).toHaveText("HIST PRELOADED");
