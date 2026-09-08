@@ -301,6 +301,40 @@ class ContainerResourceContractTests(unittest.TestCase):
         self.assertRegex(guide, r"(?i)without `history_db`[^.]+`.tar.zst.enc`")
         self.assertNotIn("It publishes `.tar.zst.enc` bundles.", guide)
 
+    def test_backup_docs_keep_restore_sequence_and_limits_in_restore_section(self) -> None:
+        guide = (REPO_ROOT / "wiki/Backup-Restore-and-Debug-Bundles.md").read_text(
+            encoding="utf-8"
+        )
+        restore_match = re.search(
+            r"(?ms)^## Restore a backup\n(.*?)(?=^## )",
+            guide,
+        )
+        scheduled_match = re.search(
+            r"(?ms)^## Optional scheduled state backups\n(.*?)(?=^## )",
+            guide,
+        )
+
+        self.assertIsNotNone(restore_match)
+        self.assertIsNotNone(scheduled_match)
+        assert restore_match is not None
+        assert scheduled_match is not None
+        restore = restore_match.group(1)
+        scheduled = scheduled_match.group(1)
+        self.assertLess(
+            restore.index("Supply the original passphrase"),
+            restore.index("inspects the exact bytes"),
+        )
+        for marker in (
+            "1 GiB admin container",
+            "1 MiB",
+            "2 GiB non-history expanded archive limit",
+            "file-backed",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, restore)
+                self.assertNotIn(marker, scheduled)
+        self.assertIn("Segmented hot-data retention", scheduled)
+
     def test_segmented_recovery_docs_are_version_gated_and_fail_closed(self) -> None:
         export_guide = (REPO_ROOT / "wiki/History-and-Snapshot-Export.md").read_text(
             encoding="utf-8"

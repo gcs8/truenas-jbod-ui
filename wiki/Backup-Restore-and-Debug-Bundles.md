@@ -39,12 +39,12 @@ For a migration:
 
 1. Export a full backup from the source deployment.
 2. Start the target Docker deployment with separate local directories.
-3. Choose the bundle in the target admin sidecar. It inspects the exact bytes
-   and shows the observed encryption mode, selected groups, and aggregate
-   counts.
-4. Confirm that inspection. Import then requires the short-lived, single-use
+3. Choose the bundle in the target admin sidecar.
+   Supply the original passphrase if the archive is encrypted.
+4. Select `Import Backup`. The admin sidecar inspects the exact bytes and shows
+   the observed encryption mode, selected groups, and aggregate counts.
+5. Confirm that inspection. Import then requires the short-lived, single-use
    receipt and rehashes the same bytes before any service stop or restore parse.
-5. Supply the original passphrase for an encrypted archive.
 6. Restart the main UI and any enabled sidecars.
 7. Check `/livez`, the runtime selector, one live enclosure, and one history drawer or dashboard view.
 
@@ -53,6 +53,19 @@ Run the first restore in a disposable stack with separate ports and state direct
 A hot-only deployment exports backup schema 1. A deployment with `HISTORY_SEGMENT_CATALOG_PATH` exports schema 2. Schema 2 includes the hot database, every immutable segment, and the complete catalog generation. Restore validates every member and stages the hot database and segment directory as one rollback-capable transaction. The target must configure `HISTORY_SEGMENT_CATALOG_PATH` before restoring schema 2.
 
 Each immutable segment is limited to 1.5 GiB. Allow temporary-disk and archive space for the hot database plus every active segment. Each 7z create, verify, list, or extract operation has a 10-minute limit and uses normal compression with one worker thread.
+
+The base Compose file keeps large temporary workspaces on disk-backed scratch
+inside an existing state mount. `TMPDIR` points history work at `/app/history`,
+admin work at its dedicated `/app/host-prep` volume, and the one-shot backup
+worker at `/app/backups`. The private `/tmp` tmpfs remains available for small
+library/runtime files, but full backup and restore archives do not consume that
+memory-backed filesystem.
+
+The restore contract is measured for a **1 GiB admin container**. Archive and
+AES-GCM processing use **1 MiB** chunks. The 2 GiB non-history expanded archive limit
+is identical during export construction, export verification, and import. Large ZIP,
+TAR, and decrypted members remain file-backed. Do not raise these limits to
+compensate for memory regressions.
 
 ## Optional scheduled state backups
 
@@ -156,19 +169,6 @@ The main UI reads a secret-free status file and exports metrics for run count, l
 Hot-only history uses a single-SQLite snapshot schedule. Segmented history cannot use that snapshot because it also needs the catalog and immutable segments.
 
 Segmented hot-data retention runs only when the status file records a recent successful encrypted full backup that includes `history_db`. The default maximum age is `129600` seconds, or 36 hours. A valid status also needs a positive run count, archive size, digest, and owned artifact name. Missing, stale, failed, incomplete, or history-excluding status blocks pruning.
-
-The base Compose file keeps large temporary workspaces on disk-backed scratch
-inside an existing state mount. `TMPDIR` points history work at `/app/history`,
-admin work at its dedicated `/app/host-prep` volume, and the one-shot backup
-worker at `/app/backups`. The private `/tmp` tmpfs remains available for small
-library/runtime files, but FULL backup and restore archives do not consume that
-memory-backed filesystem.
-
-The restore contract is measured for a **1 GiB admin container**. Archive and
-AES-GCM processing use **1 MiB** chunks. The 2 GiB non-history expanded archive limit
-is identical during export construction, export verification, and import. Large ZIP,
-TAR, and decrypted members remain file-backed; these limits must not be raised to
-compensate for memory regressions.
 
 Mount the whole history directory writable in the one-shot backup container. Do not file-bind only `history.db`; segmented locking rejects database-file mount points. Size the backup destination and temporary workspace for the hot database and every active segment.
 
