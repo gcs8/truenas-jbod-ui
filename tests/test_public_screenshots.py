@@ -139,8 +139,8 @@ class PublicScreenshotContractTests(unittest.TestCase):
                 " ".join(document.split()),
             )
 
-    def test_wiki_publish_guide_uses_the_desktop_screenshot_count(self) -> None:
-        publishing_guide = (ROOT / "wiki/Publishing-the-Wiki.md").read_text(
+    def test_maintainer_publish_guide_uses_the_desktop_screenshot_count(self) -> None:
+        publishing_guide = (ROOT / "docs/PUBLISHING_THE_WIKI.md").read_text(
             encoding="utf-8"
         )
         normalized = " ".join(publishing_guide.split())

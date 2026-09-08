@@ -1,104 +1,66 @@
-# Visual Tour
+# Visual tour
 
-This page is the quickest way to recognize the main screens before reading the
-deeper setup guides.
+This tour introduces the main screens before you work through setup. For
+installation steps, start with [[Quick Start|Quick-Start]]. You can also open
+the [[Public Demo Site|Public-Demo-Site]] and try these views yourself.
 
-Use it when you want to answer:
+The screenshots use invented sample data. They contain no live host names,
+addresses, serial numbers, credentials, or history records.
 
-- what does the main enclosure UI look like?
-- where do storage views and heat maps show up?
-- what do the optional history and admin sidecars add?
-- what is the difference between a live page and an offline artifact?
+## Enclosure view
 
-For installation steps, start with [[Quick Start|Quick-Start]]. For the
-container/service map, use
-[[Architecture and Services|Architecture-and-Services]].
-
-The two screenshots on this page come from the checked-in synthetic public
-demo. They contain no live host, address, serial, credential, or history data.
-The public screenshot manifest binds their exact bytes to the demo artifact.
-
-## Main Enclosure View
-
-The primary screen is a physical slot map. The goal is to make the bay location
-obvious first, then expose disk and topology detail when you inspect a slot.
-The demo uses a synthetic 60-bay top-loading shelf so the full layout remains
-easy to inspect without making a hardware-support claim.
+The main screen is a physical slot map. It shows bay locations first, then disk
+and topology details when you select a slot. This example uses a synthetic
+60-bay top-loading enclosure.
 
 ![Synthetic 60-bay enclosure overview](images/public-demo-overview.png)
 
-## Runtime Selector
+The runtime selector separates physical `Live Enclosures` from operator-created
+`Saved Chassis Views` and logical `Virtual Storage Views`, such as boot devices
+or carrier cards.
 
-The selector groups runtime targets by what they are:
+## Heat map
 
-- `Live Enclosures` are physical targets discovered from a host.
-- `Saved Chassis Views` are operator-created layout overlays, when configured.
-- `Virtual Storage Views` are internal or logical disk groups such as boot
-  devices or carrier cards.
+Heat map mode keeps the enclosure shape and colors each bay by a selected
+numeric value. Available values include temperature, read and write rate,
+endurance, and attention score. See [[Heat Map Mode|Heat-Map-Mode]] for details.
 
-## Heat Map Mode
+## Slot history
 
-Heat map mode keeps the physical enclosure shape and colors each bay by a
-selected numeric metric such as temperature, read/write rate, endurance, or
-attention score.
-
-The details live in [[Heat Map Mode|Heat-Map-Mode]].
-
-## History Drawer
-
-When the optional history sidecar is running, populated slots can open a
-history drawer under the enclosure. Storage views use the same drawer when the
+When the optional history service is running, a populated slot can open a
+history panel below the enclosure. Storage views use the same panel when the
 selected internal disk has a stable identity.
 
 ![Synthetic slot history panel](images/public-demo-history.png)
 
-The details live in
-[[History and Snapshot Export|History-and-Snapshot-Export]].
+See [[History and Snapshot Export|History-and-Snapshot-Export]] for history
+setup and snapshot export.
 
-## Admin Setup
+## Admin setup and profiles
 
-The optional admin sidecar handles guided setup, system config, SSH material,
-runtime controls, profile authoring, backup/restore tools, and maintenance
-flows.
+The optional admin service provides guided setup, system configuration, runtime
+controls, profile editing, backup and restore tools, and maintenance actions.
+It runs separately from the main enclosure UI.
 
-Use [[Admin UI and System Setup|Admin-UI-and-System-Setup]] for launch and
-setup. Use
-[[Backup, Restore, and Debug Bundles|Backup-Restore-and-Debug-Bundles]] for
-backup, restore, debug bundles, and destructive-maintenance guardrails.
-
-## Profile Builder
-
-The builder workspace creates reusable custom enclosure profiles without
-hand-editing `profiles.yaml` first.
-
-The details live in
+Use [[Admin UI and System Setup|Admin-UI-and-System-Setup]] to get started. For
+custom enclosure layouts, see
 [[Profiles and Custom Layouts|Profiles-and-Custom-Layouts]].
 
-## Snapshot Export
+## Offline snapshots
 
-The main UI can export a self-contained offline HTML artifact for the current
-enclosure or storage view.
+The main UI can export a self-contained HTML snapshot of the current enclosure
+or storage view. The exported file opens without a connection to the live app.
+[[Demo and Offline Workflows|Demo-and-Offline-Workflows]] explains how a public
+demo, an offline snapshot, a debug bundle, and a full backup differ.
 
-The exported file opens away from the live app:
+## Demo limitations
 
-The boundaries between public demo, offline snapshot, debug bundle, and full
-backup are summarized in
-[[Demo and Offline Workflows|Demo-and-Offline-Workflows]].
+The public demo does not include the admin service, setup wizard, live refresh,
+mapping changes, locator controls, or writes to a target. It is meant for
+exploring the enclosure, storage view, heat map, history, and fabric screens
+with safe sample data.
 
-## Maintenance Tools
-
-History cleanup and adoption tools live in the admin sidecar because they can
-rewrite local sidecar data.
-
-Use [[History Maintenance and Recovery|History-Maintenance-and-Recovery]] for
-the history-specific cleanup flow.
-
-The demo intentionally omits the admin sidecar, setup wizard, live refresh,
-mapping changes, locator controls, and target writes. The
-[[Public Demo Site|Public-Demo-Site]] page lists the full inclusion and omission
-contract.
-
-## Related Pages
+## Related pages
 
 - [[Quick Start|Quick-Start]]
 - [[Architecture and Services|Architecture-and-Services]]

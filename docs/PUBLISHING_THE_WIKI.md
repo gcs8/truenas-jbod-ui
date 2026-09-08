@@ -85,4 +85,4 @@ fields to `PASS`. Run both checkers again before copying `wiki/images/` into the
 external Wiki repository.
 
 For the full release flow, use
-[`docs/RELEASE_CHECKLIST.md`](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/RELEASE_CHECKLIST.md).
+[`docs/RELEASE_CHECKLIST.md`](RELEASE_CHECKLIST.md).

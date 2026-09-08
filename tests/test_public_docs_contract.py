@@ -27,7 +27,7 @@ EXPECTED_WIKI_PAGES = {
     "wiki/Operations-Logging-and-Metrics.md",
     "wiki/Profiles-and-Custom-Layouts.md",
     "wiki/Public-Demo-Site.md",
-    "wiki/Publishing-the-Wiki.md",
+
     "wiki/Quantastor-Setup.md",
     "wiki/Quick-Start.md",
     "wiki/SSH-Setup-and-Sudo.md",
@@ -89,13 +89,16 @@ class PublicDocsContractTests(unittest.TestCase):
 
         self.assertEqual(actual, EXPECTED_WIKI_PAGES)
         self.assertTrue((ROOT / "README.md").is_file())
-        self.assertEqual(len(actual) + 1, 25)
+        self.assertEqual(len(actual), 23)
+        self.assertEqual(len(actual) + 1, 24)
+        self.assertFalse((ROOT / "wiki/Publishing-the-Wiki.md").exists())
+        self.assertTrue((ROOT / "docs/PUBLISHING_THE_WIKI.md").is_file())
 
     def test_clean_checkout_docs_checker_passes(self) -> None:
         result = run_checker()
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("25 documents", result.stdout)
+        self.assertIn("24 documents", result.stdout)
         self.assertIn("local links", result.stdout)
         self.assertIn("YAML examples", result.stdout)
         self.assertIn("command paths", result.stdout)
@@ -116,6 +119,7 @@ class PublicDocsContractTests(unittest.TestCase):
                 rows.append(path)
         self.assertEqual(set(rows), expected)
         self.assertEqual(len(rows), len(expected))
+        self.assertIn("`docs/PUBLISHING_THE_WIKI.md`", inventory)
         self.assertIn("c3c819f87211ace3ee5ec82e3be058df7b9b8191", inventory)
         for phrase in ("issue #328", "issue #329", "issue #330", "issue #331", "Fable", "Codex"):
             with self.subTest(phrase=phrase):
@@ -193,6 +197,32 @@ class PublicDocsContractTests(unittest.TestCase):
         self.assertIn("git worktree add --detach", checklist)
         self.assertIn("python3 scripts/check_public_demo_artifact.py public-demo", checklist)
         self.assertIn("byte-readback and browser jobs", checklist)
+
+    def test_public_demo_pages_are_for_visitors(self) -> None:
+        public_demo = (ROOT / "wiki/Public-Demo-Site.md").read_text(encoding="utf-8")
+        visual_tour = (ROOT / "wiki/Visual-Tour.md").read_text(encoding="utf-8")
+        sidebar = (ROOT / "wiki/_Sidebar.md").read_text(encoding="utf-8")
+        publishing_guide = (ROOT / "docs/PUBLISHING_THE_WIKI.md").read_text(encoding="utf-8")
+
+        for page in (public_demo, visual_tour):
+            for maintainer_term in (
+                "manifest",
+                "pixel review",
+                "source revision",
+                "source-revision",
+                "publication",
+                "publish-public-demo.yml",
+                "workflow_dispatch",
+                "contract",
+            ):
+                with self.subTest(page=page.splitlines()[0], maintainer_term=maintainer_term):
+                    self.assertNotIn(maintainer_term, page.lower())
+
+        self.assertNotIn("Publishing-the-Wiki", sidebar)
+        self.assertIn("python scripts/verify_wiki_drift.py", publishing_guide)
+        self.assertIn("complete `images/` tree byte for byte", publishing_guide)
+        self.assertIn("must pass before push", publishing_guide)
+        self.assertIn("public Git URL and the pushed commit", publishing_guide)
 
 
 if __name__ == "__main__":
