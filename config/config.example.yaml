@@ -75,7 +75,7 @@ ssh:
 #       host: https://truenas-core-a.example.local
 #       api_key: ""
 #       platform: core
-#       verify_ssl: true
+#       verify_ssl: false
 #       enclosure_filter: ""
 #     ssh:
 #       enabled: true
@@ -101,7 +101,7 @@ ssh:
 #       host: https://scale.example.local
 #       api_key: ""
 #       platform: scale
-#       verify_ssl: true
+#       verify_ssl: false
 #     ssh:
 #       enabled: true
 #       host: scale.example.local
@@ -135,7 +135,7 @@ ssh:
 #       host: http://gpu-server.example.local
 #       api_key: ""
 #       platform: linux
-#       verify_ssl: true
+#       verify_ssl: false
 #     ssh:
 #       enabled: true
 #       host: gpu-server.example.local
@@ -155,7 +155,7 @@ ssh:
 #       host: https://unvr.example.local
 #       api_key: ""
 #       platform: linux
-#       verify_ssl: true
+#       verify_ssl: false
 #     ssh:
 #       enabled: true
 #       host: unvr.example.local
@@ -177,7 +177,7 @@ ssh:
 #       host: https://unvr-pro.example.local
 #       api_key: ""
 #       platform: linux
-#       verify_ssl: true
+#       verify_ssl: false
 #     ssh:
 #       enabled: true
 #       host: unvr-pro.example.local
@@ -200,7 +200,7 @@ ssh:
 #       api_user: admin
 #       api_password: ""
 #       platform: quantastor
-#       verify_ssl: true
+#       verify_ssl: false
 #     ssh:
 #       enabled: true
 #       # For Quantastor HA, keep the shared API / grid-management VIP in

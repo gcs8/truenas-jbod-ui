@@ -22,7 +22,7 @@ If you recreate the system with the same `system_id`, the old history continues 
 
 `Delete + Purge History` removes the saved configuration entry and deletes matching history rows. Use it only when you want a clean start and no longer need that history.
 
-These delete, purge, and adopt actions fail closed while segmented history is active because they do not rewrite immutable segments. For segmented history, use the version-checked recovery tools in [Segmented history v2](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/SEGMENTED_HISTORY_V2.md) and publish a complete replacement catalog generation.
+Segmented history operations fail closed because these delete, purge, and adopt actions do not rewrite immutable segments. Use the version-checked recovery tools in [Segmented history v2](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/SEGMENTED_HISTORY_V2.md) and publish a complete replacement catalog generation.
 
 ## Purge orphaned data
 

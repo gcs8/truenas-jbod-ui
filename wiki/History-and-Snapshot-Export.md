@@ -141,14 +141,6 @@ This is a bounded identifier scrub, not a complete privacy filter. Compressed IP
 
 See [[Backup, Restore, and Debug Bundles|Backup-Restore-and-Debug-Bundles]] for archive and restore instructions.
 
-## Build the history sidecar from source
-
-Use the published-image commands for normal deployments. In a cloned repository, use this command only for application development or intentional source builds:
-
-```bash
-docker compose -f docker-compose.dev.yml --profile history up -d --build
-```
-
 ## Related pages
 
 - [[Visual Tour|Visual-Tour]]

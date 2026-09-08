@@ -57,5 +57,3 @@ storage layout.
 - [[Operations, Logging, and Metrics|Operations-Logging-and-Metrics]]
 - [[Demo and Offline Workflows|Demo-and-Offline-Workflows]]
 - [[Public Demo Site|Public-Demo-Site]]
-
-Wiki maintainers can use [[Publishing the Wiki|Publishing-the-Wiki]].

@@ -91,8 +91,11 @@ class ContainerResourceContractTests(unittest.TestCase):
         self.assertIn("ADMIN_PUBLIC_ORIGIN=", env_example)
         self.assertIn("APP_PUBLIC_ORIGIN=", env_example)
 
-        config = yaml.safe_load((REPO_ROOT / "config/config.example.yaml").read_text(encoding="utf-8"))
+        config_example = (REPO_ROOT / "config/config.example.yaml").read_text(encoding="utf-8")
+        config = yaml.safe_load(config_example)
         self.assertEqual(config["truenas"]["verify_ssl"], False)
+        self.assertNotIn("#       verify_ssl: true", config_example)
+        self.assertEqual(config_example.count("#       verify_ssl: false"), 6)
 
         for compose_name in COMPOSE_FILES:
             services = yaml.safe_load((REPO_ROOT / compose_name).read_text(encoding="utf-8"))[
@@ -245,7 +248,7 @@ class ContainerResourceContractTests(unittest.TestCase):
         deployment_guide = (REPO_ROOT / "wiki/Docker-and-GHCR-Deployment.md").read_text(
             encoding="utf-8"
         )
-        self.assertRegex(deployment_guide, r"(?i)current `main`[^.]+source build")
+        self.assertNotRegex(deployment_guide, r"(?i)current `main`[^.]+source build")
 
         docs = "\n".join(
             (REPO_ROOT / relative_path).read_text(encoding="utf-8")
@@ -309,7 +312,7 @@ class ContainerResourceContractTests(unittest.TestCase):
         for script_path in SEGMENTED_HISTORY_CLI_PATHS:
             self.assertIn(f"`/app/{script_path}`", export_guide)
         self.assertRegex(export_guide, r"(?i)v0\.22\.2[^.]+does not contain")
-        self.assertRegex(export_guide, r"(?i)current `main`[^.]+source-build image")
+        self.assertNotRegex(export_guide, r"(?i)current `main`[^.]+source-build image")
         self.assertRegex(maintenance_guide, r"(?i)segmented history[^.]+fail closed")
         self.assertNotIn("qs-cryostorage", maintenance_guide)
 
@@ -379,7 +382,10 @@ class ContainerResourceContractTests(unittest.TestCase):
         self.assertNotIn("public-demo-mobile.png", wiki_docs["Visual-Tour.md"])
         self.assertNotIn("historical v0.18", readme)
         self.assertNotIn("historical v0.18", wiki_docs["Visual-Tour.md"])
-        self.assertIn("capture_public_demo_screenshots.js", wiki_docs["Publishing-the-Wiki.md"])
+        publishing_guide = (REPO_ROOT / "docs/PUBLISHING_THE_WIKI.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("capture_public_demo_screenshots.js", publishing_guide)
 
     def test_troubleshooting_covers_current_auth_export_and_nonroot_failures(self) -> None:
         guide = (REPO_ROOT / "wiki/Troubleshooting.md").read_text(encoding="utf-8")
@@ -979,24 +985,24 @@ class ContainerResourceContractTests(unittest.TestCase):
         self.assertIn("`ADMIN_HOST_PREP_MAX_PACKAGES`", admin_guide)
         self.assertIn("`ADMIN_HOST_PREP_MAX_BYTES`", admin_guide)
 
-    def test_default_nonroot_migration_is_documented_before_start(self) -> None:
+    def test_nonroot_migration_stays_in_targeted_troubleshooting(self) -> None:
         env_example = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
         deployment_guide = (
             REPO_ROOT / "wiki/Docker-and-GHCR-Deployment.md"
         ).read_text(encoding="utf-8")
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
         quick_start = (REPO_ROOT / "wiki/Quick-Start.md").read_text(encoding="utf-8")
+        troubleshooting = (REPO_ROOT / "wiki/Troubleshooting.md").read_text(
+            encoding="utf-8"
+        )
 
         self.assertIn("default non-root UI and history services", env_example)
-        self.assertIn("Default non-root runtime", deployment_guide)
-        self.assertRegex(
-            deployment_guide,
-            r"(?i)current `main` source build[^.]+ownership helper",
-        )
         self.assertNotIn("prepare_nonroot_bind_mounts.py", readme)
         self.assertNotIn("prepare_nonroot_bind_mounts.py", quick_start)
-        self.assertIn("prepare_nonroot_bind_mounts.py", deployment_guide)
-        self.assertIn("--apply", deployment_guide)
+        self.assertNotIn("prepare_nonroot_bind_mounts.py", deployment_guide)
+        self.assertIn("prepare_nonroot_bind_mounts.py", troubleshooting)
+        self.assertIn("Run the dry check first", troubleshooting)
+        self.assertIn("--apply", troubleshooting)
         self.assertNotIn("The base Compose file keeps the existing root-compatible", deployment_guide)
 
     def test_nonroot_overlay_preserves_backup_identity_with_app_data_group(self) -> None:
@@ -1085,17 +1091,23 @@ class ContainerResourceContractTests(unittest.TestCase):
         self.assertIn("GitHub and GHCR", quick_start)
         self.assertIn("firewall", quick_start)
 
-    def test_source_build_guides_require_edit_before_start(self) -> None:
-        guide = (REPO_ROOT / "wiki/Docker-and-GHCR-Deployment.md").read_text(
-            encoding="utf-8"
+    def test_reader_guides_do_not_carry_source_build_setup(self) -> None:
+        guides = (
+            REPO_ROOT / "README.md",
+            REPO_ROOT / "wiki/Docker-and-GHCR-Deployment.md",
+            REPO_ROOT / "wiki/History-and-Snapshot-Export.md",
         )
-        self.assertIn("Edit `.env` before the first start", guide)
+        for path in guides:
+            guide = path.read_text(encoding="utf-8")
+            with self.subTest(guide=path.relative_to(REPO_ROOT).as_posix()):
+                self.assertNotIn("docker-compose.dev.yml", guide)
+                self.assertNotRegex(guide, r"(?i)current `main`")
 
-    def test_source_build_guides_explain_env_precedence(self) -> None:
-        guide = (REPO_ROOT / "wiki/Docker-and-GHCR-Deployment.md").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn("values in `.env` override matching YAML settings", guide)
+    def test_contributor_guide_keeps_source_build_commands(self) -> None:
+        guide = (REPO_ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
+        self.assertIn("docker-compose.dev.yml", guide)
+        self.assertIn("--profile history", guide)
+        self.assertIn("--build", guide)
 
     def test_admin_launch_guides_explain_default_access_and_advanced_risk(self) -> None:
         quick_start = (REPO_ROOT / "wiki/Quick-Start.md").read_text(encoding="utf-8")
