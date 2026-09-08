@@ -936,7 +936,7 @@ class SystemSetupRequest(BaseModel):
     api_key: str | None = None
     api_user: str | None = None
     api_password: str | None = None
-    verify_ssl: bool = True
+    verify_ssl: bool = False
     tls_ca_bundle_path: str | None = None
     tls_server_name: str | None = None
     enclosure_filter: str | None = None
@@ -960,7 +960,7 @@ class SystemSetupRequest(BaseModel):
     bmc_host: str | None = None
     bmc_username: str | None = None
     bmc_password: str | None = None
-    bmc_verify_ssl: bool = True
+    bmc_verify_ssl: bool = False
     bmc_timeout_seconds: int = 15
     default_profile_id: str | None = None
     storage_views: list[StorageViewRequest] | None = None
@@ -1139,7 +1139,7 @@ class QuantastorNodeDiscoveryRequest(BaseModel):
     truenas_host: str
     api_user: str
     api_password: str
-    verify_ssl: bool = True
+    verify_ssl: bool = False
     tls_ca_bundle_path: str | None = None
     tls_server_name: str | None = None
     timeout_seconds: int = 15

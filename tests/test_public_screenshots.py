@@ -113,10 +113,11 @@ class PublicScreenshotContractTests(unittest.TestCase):
         self.assertNotIn("public-demo-mobile.png", readme)
         self.assertNotIn("public-demo-mobile.png", visual_tour)
 
-    def test_desktop_only_product_contract_is_explicit(self) -> None:
+    def test_desktop_only_policy_stays_out_of_human_facing_docs(self) -> None:
         product_brief = (ROOT / "docs/PUBLIC_DEMO_PRODUCT_BRIEF.md").read_text(
             encoding="utf-8"
         )
+        contributor_rails = (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         artifact_readme = (ROOT / "public-demo/README.md").read_text(encoding="utf-8")
         visual_tour = (ROOT / "wiki/Visual-Tour.md").read_text(encoding="utf-8")
@@ -124,17 +125,28 @@ class PublicScreenshotContractTests(unittest.TestCase):
             encoding="utf-8"
         )
 
+        self.assertIn("Mobile and tablet layouts are unsupported", product_brief)
+        self.assertIn("mobile and tablet layouts are", contributor_rails)
+
         for document in (
-            product_brief,
             readme,
             artifact_readme,
             visual_tour,
             public_demo_guide,
         ):
-            self.assertIn(
+            self.assertNotIn(
                 "Mobile and tablet layouts are unsupported",
                 " ".join(document.split()),
             )
+
+    def test_maintainer_publish_guide_uses_the_desktop_screenshot_count(self) -> None:
+        publishing_guide = (ROOT / "docs/PUBLISHING_THE_WIKI.md").read_text(
+            encoding="utf-8"
+        )
+        normalized = " ".join(publishing_guide.split())
+
+        self.assertIn("those two review fields", normalized)
+        self.assertNotIn("those three review fields", normalized)
 
 
 if __name__ == "__main__":

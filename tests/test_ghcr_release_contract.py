@@ -7,7 +7,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_PATH = REPO_ROOT / ".github/workflows/publish-ghcr.yml"
-RUNBOOK_PATH = REPO_ROOT / "wiki/Docker-and-GHCR-Deployment.md"
+RUNBOOK_PATH = REPO_ROOT / "docs/IMMUTABLE_GHCR_DEPLOYMENT.md"
 ENV_EXAMPLE_PATH = REPO_ROOT / ".env.example"
 RELEASE_CHECKLIST_PATH = REPO_ROOT / "docs/RELEASE_CHECKLIST.md"
 DEPLOY_HELPER_PATH = REPO_ROOT / "scripts/update_immutable_deployment.py"

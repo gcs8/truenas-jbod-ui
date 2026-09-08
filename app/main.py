@@ -456,31 +456,34 @@ def _clear_snapshot_export_source_cache_for_tests() -> None:
     SNAPSHOT_EXPORT_SOURCE_CACHE.clear()
 
 
-READ_UI_WRITES_DISABLED_NETWORK_MODE_REASON = (
-    "Writes are disabled: this deployment runs the read UI in network auth mode. "
-    "Set ADMIN_AUTH_MODE=basic to enable mapping, LED and alias changes."
-)
 READ_UI_SIGN_IN_REQUIRED_REASON = "Sign in to enable mapping, LED, and alias changes."
+READ_UI_WRITE_POLICY_UNAVAILABLE_REASON = "Write controls are unavailable because the authorization mode is unknown."
 
 
 def build_read_ui_write_policy(auth_settings: Any | None) -> dict[str, object]:
     """Describe whether the main UI's write controls can succeed (#273).
 
-    Mirrors the first check in :func:`require_read_ui_mutation_authorization`: every
-    read-UI mutation is denied with 403 unless ``ADMIN_AUTH_MODE=basic``. Missing auth
-    settings fail closed so the page never advertises writes it cannot perform.
+    Network mode is the no-auth default. Basic mode keeps writes disabled until
+    the operator signs in. Missing or unknown settings fail closed.
     """
 
-    if getattr(auth_settings, "auth_mode", None) == "basic":
+    auth_mode = getattr(auth_settings, "auth_mode", None)
+    if auth_mode == "basic":
         return {
             "enabled": False,
             "mode": "basic",
             "reason": READ_UI_SIGN_IN_REQUIRED_REASON,
         }
+    if auth_mode == "network":
+        return {
+            "enabled": True,
+            "mode": "network",
+            "reason": "",
+        }
     return {
         "enabled": False,
-        "mode": "network",
-        "reason": READ_UI_WRITES_DISABLED_NETWORK_MODE_REASON,
+        "mode": "",
+        "reason": READ_UI_WRITE_POLICY_UNAVAILABLE_REASON,
     }
 
 
@@ -513,10 +516,21 @@ def require_read_ui_basic_credentials(request: Request) -> None:
 
 def require_read_ui_mutation_authorization(request: Request) -> None:
     auth_settings = request.app.state.operator_auth_settings
+    if auth_settings.auth_mode == "network":
+        public_origin = (
+            request.app.state.read_ui_public_origin
+            or f"{request.url.scheme}://{request.url.netloc}"
+        )
+        if not request_origin_allowed(request, public_origin):
+            raise HTTPException(
+                status_code=403,
+                detail="Cross-origin Read UI mutation rejected.",
+            )
+        return
     if auth_settings.auth_mode != "basic":
         raise HTTPException(
             status_code=403,
-            detail="Read UI mutations require ADMIN_AUTH_MODE=basic.",
+            detail="Read UI authorization mode is unavailable.",
         )
     require_read_ui_basic_credentials(request)
     if not request_origin_allowed(request, request.app.state.read_ui_public_origin):

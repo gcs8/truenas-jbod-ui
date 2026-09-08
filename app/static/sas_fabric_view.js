@@ -131,6 +131,9 @@
   }
 
   function readUiAuthenticatedHeaders(url, headers = {}) {
+    if (state.writePolicy?.mode === "network") {
+      return headers;
+    }
     if (!state.writeAuthorization) {
       const failure = new Error("Sign in to enable this write.");
       failure.status = 401;

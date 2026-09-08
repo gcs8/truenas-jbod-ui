@@ -1,141 +1,86 @@
-# History Maintenance and Recovery
+# History maintenance and recovery
 
-This page is the operator guide for cleaning up saved history when a system is
-deleted, renamed, or rebuilt under a new `system_id`.
+Use the admin maintenance tools when a saved system is deleted, renamed, or rebuilt under a new `system_id`. Do not edit the SQLite database by hand.
 
-The admin maintenance area now exposes the safe paths directly:
+## Back up history before changing it
 
+Create a `Full Backup` in the admin sidecar before any destructive cleanup. Include the history database and any configuration, profiles, mappings, or cache files needed for recovery.
 
-## Export First If The History Matters
+If you are unsure whether to purge or adopt history, stop and export the backup first.
 
-Before a destructive cleanup, export a full backup bundle from the same admin
-panel.
+## Choose a delete action
 
-That gives you:
+The `Existing Systems` panel provides two delete actions.
 
-- the saved config
-- profile overrides
-- mapping and cache JSON
-- the history SQLite DB
+### Delete System
 
-If you are not sure whether to purge or adopt, export first.
+`Delete System` removes the saved configuration entry and leaves matching history rows in place. Use it when you plan to recreate the system with the same ID or adopt its history into another saved system.
+
+If you recreate the system with the same `system_id`, the old history continues to match it.
+
+### Delete + Purge History
+
+`Delete + Purge History` removes the saved configuration entry and deletes matching history rows. Use it only when you want a clean start and no longer need that history.
+
+Segmented history operations fail closed because these delete, purge, and adopt actions do not rewrite immutable segments. Use the version-checked recovery tools in [Segmented history v2](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/SEGMENTED_HISTORY_V2.md) and publish a complete replacement catalog generation.
+
+## Purge orphaned data
+
+Use `Purge Orphaned Data` when a system no longer exists in `config.yaml` and you no longer need its history.
+
+The action removes rows only for `system_id` values that are absent from the saved configuration. It does not remove rows for active saved systems.
+
+## Adopt removed system history
+
+Use `Adopt Removed System History` after renaming a saved system or recreating the same appliance under a new ID.
+
+1. Select one orphaned source `system_id`.
+2. Select one current saved target `system_id`.
+3. Run the adoption.
+4. Verify the target in the history drawer or history dashboard.
+
+Adoption rewrites history ownership for the whole source system ID. Use it for a change such as `old-system-id` to `replacement-system-id`, not for an individual disk move.
+
+Disk-oriented metrics can already follow a physical disk between locations when the read path has a strong disk identity. Slot events remain local to the slot where they occurred. Use adoption when the saved system ID itself changed.
 
 ## Leftover staging artifact
 
-Segmented rotation recovery names unexpected
-`.<hot-name>.segmented-*.sqlite3` and `.rotation-catalog-*.json` files in its
-unauthenticated staging error. Migration recovery and later-generation
-`--recover` also name every path for an unreferenced `.segment-*.sqlite3`
-temporary artifact. Do not assume migration or rotation owns a file because its
-name matches one of these patterns.
+Segmented recovery can report unexpected files named like `.<hot-name>.segmented-*.sqlite3`, `.rotation-catalog-*.json`, or `.segment-*.sqlite3`. Migration recovery reports every unreferenced `.segment-*.sqlite3` temporary artifact. A matching filename does not prove the migration or rotation process owns the file.
 
-1. Stop or otherwise quiesce the history service and every history writer or
-   maintenance job.
-2. Record the exact path and metadata for each reported file before changing
-   anything.
-3. Inspect the pending activation journal and active `catalog.json`. Prove that
-   each reported file is not journal-referenced and not catalog-selected.
-4. After that proof, remove only the named path. Leave every other hot, catalog,
-   staging, rollback, journal, and segment file untouched.
-5. Rerun dry-run recovery without `--apply`. Review its proposed action before
-   applying recovery.
+1. Stop or otherwise quiesce the history service and every history writer or maintenance job.
+2. Record the exact path and metadata for each reported file.
+3. Inspect the pending activation journal and active `catalog.json`.
+4. Prove that the reported file is not journal-referenced and not catalog-selected.
+5. Remove only the named path after proving it is unreferenced.
+6. Rerun dry-run recovery without `--apply`.
+7. Review the proposed action before applying recovery.
 
-Never use wildcard deletion in the history directory. If journal or catalog
-membership is unclear, keep the file and stop. Filename, age, or parseable
-contents do not establish ownership.
+Never use wildcard deletion in the history directory. Leave every other hot database, catalog, staging file, rollback file, journal, and segment untouched. If ownership or catalog membership is unclear, keep the file and stop. Filename, age, and parseable contents are not proof of ownership.
 
-## Delete System Vs Delete + Purge History
+## Common procedures
 
-While segmented history is active, these system-wide delete, purge, and adopt
-actions fail closed. They do not rewrite immutable segments. Use the version-gated
-segmented recovery tools and publish a complete replacement catalog generation
-instead of applying the hot-only maintenance flow to segmented history.
+### Rename a system
 
-The `Existing Systems` panel gives you two different delete behaviors:
+1. Save the replacement system under the new `system_id`.
+2. Delete the old system with `Delete System`. Do not purge its history.
+3. Run `Adopt Removed System History` from the old ID to the new ID.
+4. Verify the target system's history.
 
-- `Delete System`
-  - removes the saved config entry only
-  - leaves the history DB rows in place
-  - useful when you plan to re-add the system with the same id or adopt the
-    old rows later
-- `Delete + Purge History`
-  - removes the saved config entry
-  - deletes matching history rows for that `system_id`
-  - useful when you really want a clean start
+### Start with no old history
 
-If you delete a system and then recreate it with the same `system_id`, its old
-history will still line up naturally. If you recreate it under a new
-`system_id`, you either need adoption or orphan cleanup.
+1. Export a full backup if you may need the data later.
+2. Select `Delete + Purge History` for the saved system.
+3. Add the system again.
+4. Verify that its new history starts cleanly.
 
-## Purge Orphaned Data
+### Remove history from deleted test systems
 
-Use `Purge Orphaned Data` when:
+1. Delete the stale saved system entries without purging.
+2. Open `Purge Orphaned Data`.
+3. Confirm that only the intended orphaned IDs appear.
+4. Run the purge and verify current systems still have history.
 
-- a saved system is already gone from `config.yaml`
-- you no longer care about its history
-- you want the DB cleaned up without touching current systems
-
-This only removes rows whose `system_id` no longer exists in the saved config.
-It does not touch active saved systems.
-
-## Adopt Removed System History
-
-Use `Adopt Removed System History` when:
-
-- you renamed a saved system
-- you deleted an old id and recreated the same appliance under a new id
-- you want the old slot and metric history to move under the new saved system
-  without rewriting the DB by hand
-
-The current first pass is intentionally whole-system-id based:
-
-- pick one orphaned source `system_id`
-- pick one current saved target `system_id`
-- the admin sidecar rewrites saved history ownership into the target
-
-This is the right tool for cases like:
-
-- `old-system-id` -> `replacement-system-id`
-- lab rebuilds where the appliance identity changed but the chassis history is
-  still worth keeping
-
-## What Auto-Follows Already
-
-You do not need adoption for every disk move.
-
-The read path now already does this automatically when it has strong disk
-identity:
-
-- disk-oriented metrics can follow the same physical disk across homes
-- slot events stay local to the slot you opened
-
-That means:
-
-- if a disk moves from one system to another, lifetime disk metrics can still
-  show continuity
-- if a whole system id was renamed or rebuilt, adoption is still the right
-    cleanup tool for the saved history ownership itself
-
-## Good Patterns
-
-### Rename A System Cleanly
-
-1. Save the new system entry under the new `system_id`.
-2. Delete the old saved system without purging history.
-3. Use `Adopt Removed System History`.
-
-### Start Fresh With No Old Rows
-
-1. Export a backup if you may want the data later.
-2. Delete the saved system with `Delete + Purge History`.
-3. Re-add the system cleanly.
-
-### Clean Up Old Experiments
-
-1. Remove the stale saved system entries.
-2. Run `Purge Orphaned Data`.
-
-## Related Pages
+## Related pages
 
 - [[Admin UI and System Setup|Admin-UI-and-System-Setup]]
 - [[Backup, Restore, and Debug Bundles|Backup-Restore-and-Debug-Bundles]]

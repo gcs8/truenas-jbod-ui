@@ -171,7 +171,7 @@ class ReadUIAuthorizationTests(unittest.TestCase):
     ):
         return build_app(auth_mode=auth_mode, public_origin=public_origin)
 
-    def test_network_mode_keeps_reads_available_but_denies_every_mutation(self) -> None:
+    def test_network_mode_keeps_reads_and_mutations_available_without_auth(self) -> None:
         app = self.make_app(auth_mode="network")
 
         read_status, _headers, _body = asyncio.run(invoke_asgi(app, "/missing"))
@@ -182,10 +182,31 @@ class ReadUIAuthorizationTests(unittest.TestCase):
             asyncio.run(invoke_asgi(app, path, method=method))[0]
             for method, path in MUTATION_ROUTES
         ]
+        same_origin_mutation, _headers, _body = asyncio.run(
+            invoke_asgi(
+                app,
+                "/api/system-locator",
+                method="POST",
+                origin="http://ui.example.test",
+            )
+        )
+        cross_site_mutation, _headers, _body = asyncio.run(
+            invoke_asgi(
+                app,
+                "/api/system-locator",
+                method="POST",
+                origin="https://attacker.example",
+            )
+        )
 
         self.assertEqual(read_status, 404)
         self.assertEqual(read_only_post, 200)
-        self.assertEqual(mutation_statuses, [403] * len(MUTATION_ROUTES))
+        self.assertTrue(
+            all(status not in {401, 403} for status in mutation_statuses),
+            mutation_statuses,
+        )
+        self.assertNotIn(same_origin_mutation, {401, 403})
+        self.assertEqual(cross_site_mutation, 403)
 
     def test_basic_mode_keeps_reads_anonymous_and_requires_same_origin_for_mutations(self) -> None:
         app = self.make_app(
@@ -369,17 +390,16 @@ class ReadUIAuthorizationTests(unittest.TestCase):
         self.assertIn("admin_auth_password", ui_service["secrets"])
         env_example = (root / ".env.example").read_text(encoding="utf-8")
         self.assertIn("APP_PUBLIC_ORIGIN=", env_example)
-        self.assertIn("main UI mutations are disabled", env_example)
-        self.assertIn("main UI reads remain anonymous", env_example)
+        self.assertIn("no authentication", env_example)
+        self.assertIn("main UI reads and writes are available", env_example)
         self.assertNotIn("protects the full main UI", env_example)
 
 
 class ReadUIWritePolicyBootstrapTests(unittest.TestCase):
     """The main UI bootstrap must carry the effective write policy (#273).
 
-    The mutation guard denies every main-UI write in network mode; the page has to know
-    that before a click so the controls can be disabled with a reason instead of failing
-    on submit.
+    Network mode is the no-auth default, so its controls stay enabled. Basic mode
+    starts signed out and enables writes only after an in-page sign-in.
     """
 
     def _context(self, *, auth_mode: Literal["network", "basic"]) -> dict[str, object]:
@@ -412,13 +432,13 @@ class ReadUIWritePolicyBootstrapTests(unittest.TestCase):
             history_configured=False,
         )
 
-    def test_network_mode_context_disables_writes_with_operator_reason(self) -> None:
+    def test_network_mode_context_enables_writes_without_sign_in(self) -> None:
         context = self._context(auth_mode="network")
 
         policy = context["write_policy"]
-        self.assertEqual(policy["enabled"], False)
+        self.assertEqual(policy["enabled"], True)
         self.assertEqual(policy["mode"], "network")
-        self.assertIn("ADMIN_AUTH_MODE=basic", policy["reason"])
+        self.assertEqual(policy["reason"], "")
         self.assertEqual(json.loads(context["write_policy_json"]), policy)
 
         html = app_main.templates.get_template("index.html").render(context)
@@ -448,8 +468,8 @@ class ReadUIWritePolicyBootstrapTests(unittest.TestCase):
     def test_operator_docs_explain_in_page_sign_in_and_credential_lifetime(self) -> None:
         root = Path(__file__).resolve().parents[1]
         documents = (
-            root / "README.md",
             root / "docs" / "ADMIN_TRUST_BOUNDARY.md",
+            root / "wiki" / "Advanced-Configuration.md",
             root / "wiki" / "Docker-and-GHCR-Deployment.md",
         )
 

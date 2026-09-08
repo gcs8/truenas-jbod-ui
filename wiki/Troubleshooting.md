@@ -5,7 +5,7 @@ This page is the short list of the failures you are most likely to hit.
 Run these commands from the folder where your `compose.yaml` and `.env` live.
 If Docker is on another machine, replace `localhost` with that host name or IP.
 
-## Start Here
+## Start here
 
 Check that the containers are actually running:
 
@@ -30,7 +30,7 @@ If `livez` is not `ok`, fix the container/runtime problem first. If `livez` is
 healthy but `healthz` reports a warning or degraded dependency, read that
 payload before chasing layout bugs.
 
-## The App Starts But The UI Looks Empty
+## The app starts but the UI looks empty
 
 Common causes:
 
@@ -46,7 +46,7 @@ Good next steps:
 - run `docker compose logs --tail=150 enclosure-ui`
 - open `http://your-docker-host:8080/healthz`
 
-## The App Is Up But Slot Mapping Looks Wrong
+## The app is up but slot mapping looks wrong
 
 Common causes:
 
@@ -79,7 +79,7 @@ enclosure scope. Multi-system and multi-enclosure deployments likewise deny the
 legacy fallback and show one bounded warning with the affected count and the same
 re-save guidance.
 
-## The UI Says A Sudo Command Is Not Allowed
+## The UI says a sudo command is not allowed
 
 That means the app tried to run a command the SSH user cannot execute.
 
@@ -90,32 +90,34 @@ Fix it by:
 
 Do not broaden sudo more than needed.
 
-## Main-UI Writes Return 403
+## Main-UI writes return 401 or 403
 
-`Read UI mutations require ADMIN_AUTH_MODE=basic.` means the deployment is in
-the current-main network mode. Reads stay anonymous, but mapping, alias, import,
-locator, and LED writes are disabled. Set `ADMIN_AUTH_MODE=basic`, configure the
-shared credentials and exact `APP_PUBLIC_ORIGIN`, recreate the services, then
-use the in-page sign-in. Each page and tab starts signed out.
+In Basic mode, `Read UI authentication required.` means the page is signed out
+or the credentials are wrong. Sign in again on that page. A cross-origin error
+means `APP_PUBLIC_ORIGIN` does not exactly match the scheme, host, and port in
+the browser address bar.
 
-## Admin Mutations Return 403
+## Admin mutations return 403
 
 `Cross-origin admin mutation rejected.` means the browser origin does not match
-`ADMIN_PUBLIC_ORIGIN`. Set it to the exact scheme, host, and port shown in the
-browser, with no path, then recreate the admin container. Current main refuses
-to start if this setting is empty or malformed.
+the admin address. Without `ADMIN_PUBLIC_ORIGIN`, the service compares it with
+the request's own scheme, host, and port. Reverse-proxy deployments can set
+`ADMIN_PUBLIC_ORIGIN` to the exact public address shown in the browser, with no
+path. Basic mode requires that setting and refuses to start if it is empty or
+malformed.
 
-## Full Backup Returns 400
+## Full backup returns 400
 
 `Plaintext backup export is disabled.` means an unsanitized export was requested
 without encryption. Enable encryption. Set
-`ADMIN_ALLOW_PLAINTEXT_BACKUP_EXPORT=true` only for an intentional trusted-local
-workflow; the override does not make the archive safe to share.
+`ADMIN_ALLOW_PLAINTEXT_BACKUP_EXPORT=true` only for an intentional,
+access-restricted workflow; the override does not make the archive safe to share.
 
-## A Non-Root Container Gets Permission Denied
+## A non-root container gets permission denied
 
-If current-main UI or history startup reports `permission denied`, stop the
-stack and run the bounded ownership helper from the matching source checkout:
+If a source-built non-root UI or history container reports `permission denied`,
+stop the stack and run the bounded ownership helper from the matching source
+checkout:
 
 ```bash
 app_uid="${APP_UID:-10001}"
@@ -126,11 +128,11 @@ sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid "$app_uid" --gid "$a
 
 Run the dry check first. If `.env` overrides `APP_UID` or `APP_GID`, export the
 same values before running the block. Do not use recursive `chmod 777`, and do
-not run this current-main migration against the release-matched v0.22.2
-Compose/image pair. If SSH then fails to load `known_hosts`, verify that
+not run this source-build migration against the published v0.22.2 Compose/image
+pair. If SSH then fails to load `known_hosts`, verify that
 `data/known_hosts` is owned by the configured app UID/GID and uses mode `0660`.
 
-## SCALE Shows A Generic Runtime Profile
+## SCALE shows a generic runtime profile
 
 That usually means:
 
@@ -147,7 +149,7 @@ enclosure_profiles:
   "500304801e977aff": supermicro-ssg-6048r-rear-12
 ```
 
-## A Linux Host Has No SES Devices
+## A Linux host has no SES devices
 
 That is not fatal.
 
@@ -162,7 +164,7 @@ The host can still be useful as:
 - a profile-driven physical layout
 - an `mdadm` or NVMe topology target
 
-## SMART Fields Are Missing
+## SMART fields are missing
 
 Check whether:
 
@@ -171,7 +173,7 @@ Check whether:
 - `smartctl` sudo is allowed
 - `nvme-cli` sudo is allowed for Linux NVMe enhancement
 
-## The History Button Is Missing
+## The history button is missing
 
 The history sidecar is optional. If you expected it to be running:
 
@@ -188,7 +190,7 @@ docker compose --profile history pull
 docker compose --profile history up -d
 ```
 
-## The Admin Page Is Missing
+## The admin page is missing
 
 The admin sidecar is optional. If you expected it to be running:
 
@@ -211,7 +213,7 @@ Then open:
 http://your-docker-host:8082
 ```
 
-## The Browser Keeps Showing Old UI
+## The browser keeps showing old UI
 
 Try these in order:
 
@@ -233,7 +235,7 @@ docker compose restart enclosure-ui
 Only use `--build` or `docker-compose.dev.yml` if you intentionally cloned the
 repo and are running a source-build setup.
 
-## Multipath Or Pool Grouping Looks Wrong On CORE
+## Multipath or pool grouping looks wrong on CORE
 
 Check whether the SSH user can run:
 

@@ -1,6 +1,9 @@
-# SSH Setup and Sudo
+# SSH setup and sudo
 
-This page is the practical SSH and sudo guide.
+The app starts with the TrueNAS API alone. Add SSH after that startup works when
+you want richer inventory, SMART detail, topology evidence, or supported LED
+controls. SSH is optional enrichment and increases the host access available to
+the app.
 
 The short version:
 
@@ -16,7 +19,7 @@ read-only runtime commands instead of trying to synthesize Linux sudo rules.
 If the host is using password auth, leave `key_path` blank and use the admin
 sidecar's `Password Only / No Key` mode instead of forcing a fake key path.
 
-## Recommended SSH User Pattern
+## Recommended SSH user pattern
 
 - username: `jbodmap`
 - shell access only if you need it
@@ -99,7 +102,7 @@ ssh:
 Later connections must match the preloaded key. A key mismatch fails closed;
 verify the host before replacing its entry.
 
-## CORE Command Ideas
+## CORE command ideas
 
 ```text
 /sbin/glabel status
@@ -129,7 +132,7 @@ filtered `sysctl` adds kernel PCI topology hints such as
 `dbsf=pci0:130:0:0`, and `dmidecode -t slot` needs sudo on CORE so the app can
 join that PCI address to the motherboard slot designation.
 
-## SCALE Command Ideas
+## SCALE command ideas
 
 ```text
 /usr/sbin/zpool status -gP
@@ -141,7 +144,7 @@ sudo -n /usr/bin/sg_ses -p ec /dev/sg27
 sudo -n /usr/bin/sg_ses -p ec /dev/sg38
 ```
 
-## Generic Linux Command Ideas
+## Generic Linux command ideas
 
 ```text
 /usr/bin/lsblk -OJ
@@ -149,7 +152,7 @@ sudo -n /usr/sbin/mdadm --detail --scan
 /usr/sbin/nvme list-subsys -o json
 ```
 
-## ESXi Command Ideas
+## ESXi command ideas
 
 ```text
 vmware -v
@@ -172,7 +175,7 @@ path. If StorCLI is missing, the admin sidecar's `Host Prep / Vendor Tool
 Upload` panel is the intended place to stage and install an operator-supplied
 Broadcom bundle or VIB. The project does not ship that vendor package itself.
 
-## On-Demand Commands The App Runs Separately
+## On-demand commands the app runs separately
 
 These do not have to live in the standing command list:
 
@@ -195,13 +198,13 @@ with ESXi added later only as optional enrichment.
 ## Generated bootstrap permission previews
 
 The admin sidecar's Sudoers Preview is the canonical copy/paste source. The
-blocks below are generated from the same current-main policy used by the one-time
-bootstrap. Do not split them into partial SMART and SES files or add command
+blocks below match the policy used by the one-time bootstrap. Do not split them
+into partial SMART and SES files or add command
 wildcards. Linux-like policies must pass `visudo -cf` before installation.
 
 Anchored command regexes require sudo 1.9.10 or newer. On older hosts, enumerate
 exact per-device commands instead of replacing an argument regex with `*`.
-TrueNAS CORE stores its list through middleware, so review the generated
+TrueNAS CORE stores its list through middleware, so inspect the generated
 `midclt` payload and the installed sudo version there rather than running
 `visudo` against it. TrueNAS escapes backslashes while rendering stored command
 entries, so the numeric job-poll grant deliberately uses POSIX bracket classes
@@ -295,7 +298,7 @@ mode `0440`, then run `sudo visudo -cf /etc/sudoers.d/<file>` before moving it
 into service. The generated QuantaStor policy contains no `qs` root grant; its
 read-only `qs` commands run as the service account with local CLI credentials.
 
-## When To Widen Permissions
+## When to widen permissions
 
 Only widen sudo when a real feature requires it:
 

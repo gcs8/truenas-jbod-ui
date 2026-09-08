@@ -1,6 +1,6 @@
 # Documentation inventory and finding ledger
 
-This inventory fixes the review baseline at commit `c3c819f87211ace3ee5ec82e3be058df7b9b8191`. It covers `README.md` and every checked-in Wiki page present at that commit: 25 documents in all.
+This inventory fixes the review baseline at commit `c3c819f87211ace3ee5ec82e3be058df7b9b8191`. It covers `README.md` and the 23 checked-in public Wiki pages: 24 public documents in all. The maintainer-only Wiki publication runbook lives under `docs/` and is tracked here separately.
 
 The inventory is a release gate. `scripts/check_public_docs.py` checks the same set from a clean checkout and rejects missing pages, bad links, stale screenshot files, invalid YAML examples, missing command paths, and configuration keys that are absent from checked-in source or `.env.example`.
 
@@ -25,16 +25,16 @@ The inventory is a release gate. `scripts/check_public_docs.py` checks the same 
 | `wiki/Live-Enclosures-and-Storage-Views.md` | Revise | Remove obsolete live-derived images; retain current selector and view semantics. |
 | `wiki/Operations-Logging-and-Metrics.md` | Revise | Mark UDP syslog as trusted-network only and name an authenticated encrypted alternative. |
 | `wiki/Profiles-and-Custom-Layouts.md` | Revise | Remove obsolete live-derived images; retain profile validation and builder guidance. |
-| `wiki/Public-Demo-Site.md` | Replace | Replace live-derived build instructions with the checked-in synthetic fixture, exact source/build identities, and manual Pages gate. |
-| `wiki/Publishing-the-Wiki.md` | Revise | Remove live screenshot-capture instructions and document fixture-only screenshot publication. |
+| `wiki/Public-Demo-Site.md` | Replace | Give visitors a short guide to the synthetic demo, its privacy boundaries, screenshots, limitations, and related user guides. |
+| `docs/PUBLISHING_THE_WIKI.md` | Replace | Preserve the complete byte-verification, owner approval, screenshot review, publication, and readback runbook outside the public Wiki. |
 | `wiki/Quantastor-Setup.md` | Revise | Remove obsolete live-derived images; retain the current shared-slot HA guidance. |
 | `wiki/Quick-Start.md` | Revise | Make CA-verified TLS the first path and isolate the temporary insecure diagnostic exception. |
 | `wiki/SSH-Setup-and-Sudo.md` | Keep | Current generated grants and strict host-key guidance match source. |
 | `wiki/Troubleshooting.md` | Keep | Current startup, auth, history, and export symptoms match current behavior. |
 | `wiki/TrueNAS-CORE-Setup.md` | Keep | Current CORE API, SSH, and sudo guidance matches source. |
 | `wiki/TrueNAS-SCALE-Setup.md` | Keep | Current SCALE API, SSH, and sudo guidance matches source. |
-| `wiki/Visual-Tour.md` | Replace | Replace the v0.18 gallery with three current fixture-only public-demo screenshots and honest omissions. |
-| `wiki/_Sidebar.md` | Keep | Current navigation names resolve to the checked-in page set. |
+| `wiki/Visual-Tour.md` | Replace | Use the two current synthetic-demo screenshots to introduce the user-facing screens and their limitations. |
+| `wiki/_Sidebar.md` | Revise | Keep public navigation focused on user guides and remove the maintainer publication link. |
 
 ## Finding ledger
 

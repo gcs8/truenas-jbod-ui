@@ -33,9 +33,8 @@ view of which disks exist and how their paths group.
     `/usr/local/bin/midclt ^call core[.]get_jobs [[][[]"id","=",[0-9]+[]][]]$`
   - SCALE: `/usr/bin/midclt call disk.sync_all`,
     `/usr/bin/midclt ^call core[.]get_jobs [[][[]"id","=",[0-9]+[]][]]$`
-- The app runs with `ADMIN_AUTH_MODE=basic` and a configured public origin, the
-  same gate the identify LED controls use. In network mode the controls are
-  disabled with a reason.
+- In the default no-auth mode, anyone who can reach the main UI can use these
+  controls. In Basic mode, sign in on the live page before using them.
 - You are looking at the live view, not an offline snapshot or the public demo.
   Snapshot exports hide these controls.
 

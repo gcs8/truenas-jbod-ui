@@ -1,56 +1,47 @@
-# TrueNAS CORE Setup
+# TrueNAS CORE setup
 
-Use this page for the classic TrueNAS CORE path.
+Start with the middleware API. Add SSH only when you need stronger slot
+correlation, SAS details, topology diagnostics, or LED control.
 
-This is the smoothest starting point if your host exposes:
+## 1. Connect through the API
 
-- `enclosure.query`
-- `disk.query`
-- `pool.query`
-
-and optionally:
-
-- `sesutil`
-- `glabel`
-- `zpool`
-- `gmultipath`
-- `camcontrol`
-- `mprutil`
-
-## What CORE Can Do Well
-
-- API-driven disk and pool inventory
-- slot mapping from API or SSH enrichment
-- SES identify LED control through `sesutil`
-- multipath detail
-- SAS SMART detail
-- SAS fabric/topology diagnostics through read-only `mprutil` probes
-
-## 1. Make An API Key
-
-Create a read-only or appropriately scoped API key in the TrueNAS UI.
-
-Use the base host only in config:
+Create a read-only or appropriately scoped API key in TrueNAS. Enter the base
+host URL without `/api/v2.0`:
 
 ```text
 https://truenas.example.local
 ```
 
-Do not add `/api/v2.0`.
+An API-only system needs this shape:
 
-## 2. Optional But Recommended: Create An SSH User
+```yaml
+systems:
+  - id: truenas-core-a
+    label: TrueNAS CORE A
+    default_profile_id: supermicro-cse-946-top-60
+    truenas:
+      host: https://truenas.example.test
+      api_key: ""
+      platform: core
+      verify_ssl: false
+    ssh:
+      enabled: false
+```
 
-Use a dedicated non-root account such as `jbodmap`.
+Supply the API key through the setup UI or the documented secret setting. Open
+the main UI and confirm that disks and pools load before adding SSH.
 
-Recommended properties:
+This first connection does not verify the appliance certificate. After the UI
+works, [[Advanced Configuration|Advanced-Configuration]] explains how to enable
+verification with the system trust store or a private CA bundle.
 
-- SSH key only
-- no shell if your workflow allows it
-- command-limited sudo only for the exact inventory commands you need
+## 2. Add optional SSH enrichment
 
-## 3. Minimal CORE SSH Command Set
+Use a dedicated non-root account such as `jbodmap`, SSH key authentication, and
+command-limited sudo. Keep strict host-key checking enabled.
 
-This is a good first pass:
+The standing command list below adds pool, SES, multipath, HBA, PCI, and recent
+MPR/CAM event data. Preserve the commands exactly when you use this example.
 
 ```yaml
 ssh:
@@ -78,13 +69,20 @@ ssh:
     - messages=$({ tail -n 4000 /var/log/messages 2>/dev/null || sudo -n /usr/bin/tail -n 4000 /var/log/messages 2>/dev/null || true; } | egrep '(mpr[0-9]+:|\(da[0-9]+:mpr[0-9]+:)' || true); if [ -n "$messages" ]; then printf '%s\n' "$messages" | tail -n 400; else dmesg -a | egrep '(mpr[0-9]+:|\(da[0-9]+:mpr[0-9]+:)' | tail -n 400; fi
 ```
 
-Optional extra source:
+For dual-path SAS systems, you can also add:
 
 ```yaml
     - sudo -n /sbin/camcontrol devlist -v
 ```
 
-## 4. Example Single-System CORE Config
+Use the complete generated CORE policy in
+[[SSH Setup and Sudo|SSH-Setup-and-Sudo]]. It includes the bounded bootstrap
+rules, per-HBA forms, both supported `smartctl` paths, and disk-sync polling.
+Do not replace its anchored SMART arguments with wildcards. The SMART regular
+expressions require sudo 1.9.10 or newer. On older hosts, enumerate exact
+per-device commands.
+
+## 3. Configure the enriched system
 
 ```yaml
 systems:
@@ -123,20 +121,10 @@ systems:
         - messages=$({ tail -n 4000 /var/log/messages 2>/dev/null || sudo -n /usr/bin/tail -n 4000 /var/log/messages 2>/dev/null || true; } | egrep '(mpr[0-9]+:|\(da[0-9]+:mpr[0-9]+:)' || true); if [ -n "$messages" ]; then printf '%s\n' "$messages" | tail -n 400; else dmesg -a | egrep '(mpr[0-9]+:|\(da[0-9]+:mpr[0-9]+:)' | tail -n 400; fi
 ```
 
-## 5. Optional SAS Fabric / Topology Diagnostics
+## Optional SAS topology
 
-For dual-HBA, dual-path, or expander-heavy CORE systems, the topology work uses
-read-only `mprutil` output. The standing runtime commands above collect the
-non-unit summary, HBA PCI addresses through `pciconf -lv`, physical PCIe slot
-names through `dmidecode -t slot`, kernel PCI topology hints through filtered
-`sysctl dev.mpr.N.%location/%parent`, and filtered `/var/log/messages` MPR/CAM
-event evidence with `dmesg` fallback. The `pciconf` and `sysctl` lines do not
-need sudo. If `/var/log/messages` is root-only, timestamped syslog evidence
-needs the narrow `/usr/bin/tail -n 4000 /var/log/messages` sudo entry; without
-it, the same probe falls back to `dmesg -a` event order. The service account
-also needs sudo permission for `dmidecode -t slot` and per-HBA
-`mprutil` forms. The app discovers every adapter unit reported by
-`mprutil show adapters`, so a host with `/dev/mpr10` would be probed as:
+The app discovers every adapter unit returned by `mprutil show adapters` and
+runs the per-unit read commands. For example, adapter unit 10 uses:
 
 ```bash
 sudo -n /usr/sbin/mprutil -u 10 show adapter
@@ -146,35 +134,19 @@ sudo -n /usr/sbin/mprutil -u 10 show expanders
 sudo -n /usr/sbin/mprutil -u 10 show iocfacts
 ```
 
-Use the generated current-main CORE middleware preview in
-[[SSH Setup and Sudo|SSH-Setup-and-Sudo]]. It includes the complete bounded bootstrap policy,
-including per-HBA forms, both supported `smartctl` paths, and the disk-sync job
-poll commands. Do not shorten that preview or replace its anchored SMART
-arguments with wildcards. The SMART regex entries require sudo 1.9.10 or newer;
-on an older host, enumerate exact per-device commands.
+`pciconf`, filtered `sysctl`, and `dmidecode` add PCI and motherboard slot
+labels. The event probe reads filtered `/var/log/messages` when permitted and
+falls back to ordered `dmesg` output. Neither source is a persistent hardware
+counter.
 
-## 6. Optional LED Control
+## Optional identify LED control
 
-If your CORE host allows it, the app can use:
+CORE can use these `sesutil` forms when the host and enclosure support them:
 
 ```bash
 sudo -n /usr/sbin/sesutil locate -u /dev/sesX <slot> on
 sudo -n /usr/sbin/sesutil locate -u /dev/sesX <slot> off
 ```
 
-Keep that sudo as narrow as possible.
-
-## 7. Common CORE Notes
-
-- API-only mode can still be useful if you only want disk and pool metadata.
-- SSH is what usually unlocks the best slot correlation.
-- `camcontrol devlist -v` is especially useful on dual-path SAS systems.
-- `mprutil` is read-only here and only needed for the richer SAS fabric view.
-- `dmidecode -t slot` is read-only and lets the app label HBAs with the
-  motherboard PCIe slot designation, such as `CPU2 SLOT1 PCI-E 3.0 X8`.
-- Filtered `/var/log/messages` MPR/CAM events are used as timestamped recent
-  fault evidence, with `dmesg` order as a fallback. On CORE builds where
-  `/var/log/messages` is root-only, add `/usr/bin/tail -n 4000 /var/log/messages`
-  to the command-limited sudo list for timestamps; neither source is a
-  persistent hardware counter.
-- If a slot shows transport or cache fields as missing, check whether API SMART is sparse and whether SSH enrichment is allowed.
+Grant only the required commands. If API SMART data is sparse or slot fields are
+missing, check the SSH source status before changing the profile.

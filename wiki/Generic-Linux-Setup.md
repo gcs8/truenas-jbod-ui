@@ -1,46 +1,29 @@
-# Generic Linux Setup
+# Generic Linux setup
 
-Use this page for non-TrueNAS hosts where the app should still render a physical
-disk layout.
+Generic Linux support uses SSH. It fits `mdadm` hosts, NVMe systems, and Linux
+appliances that do not expose a useful disk inventory API. A profile supplies
+the physical chassis layout.
 
-The current generic Linux path is SSH-only.
+## 1. Choose a profile
 
-Today it is best for:
+Use a built-in profile or create one with `slot_hints`. The app cannot infer an
+arbitrary chassis shape from `lsblk` alone. See
+[[Profiles and Custom Layouts|Profiles-and-Custom-Layouts]].
 
-- `mdadm` hosts
-- NVMe-heavy systems
-- hosts where physical disk placement matters but no appliance API exists
-- appliance-style Linux boxes such as UniFi UNVR where SSH works but the vendor
-  API does not expose per-disk slot inventory
+## 2. Install the host tools
 
-## What Generic Linux Can Do Today
-
-- `lsblk` inventory
-- `mdadm --detail --scan` topology hints
-- `nvme list-subsys -o json` controller/subsystem mapping
-- on-demand `smartctl`
-- optional `nvme-cli` enrichment
-- profile-driven slot rendering
-
-## Important Limit
-
-Generic Linux does not magically infer arbitrary chassis geometry.
-
-You need either:
-
-- a built-in profile
-- or a custom profile with `slot_hints`
-
-## 1. Install The Packages
-
-Ubuntu example:
+On Ubuntu:
 
 ```bash
 sudo apt update
 sudo apt install -y sudo smartmontools sg3-utils lsscsi mdadm nvme-cli
 ```
 
-## 2. Create The SSH User
+Install only the tools needed by your command list and hardware.
+
+## 3. Create an SSH account
+
+This example creates a key-only `jbodmap` account:
 
 ```bash
 sudo adduser --disabled-password --gecos "" jbodmap
@@ -50,19 +33,22 @@ sudo chown jbodmap:jbodmap /home/jbodmap/.ssh/authorized_keys
 sudo chmod 600 /home/jbodmap/.ssh/authorized_keys
 ```
 
-## 3. Bounded Generic Linux sudo
+Preload and verify the host key before enabling strict host-key checking.
+
+## 4. Install bounded sudo rules
 
 Use the complete generated Linux policy in
-[[SSH Setup and Sudo|SSH-Setup-and-Sudo]]. It matches the one-time bootstrap and includes
-`sg_ses -p aes`, `sg_ses -p ec`, `sg_ses --join --filter`, identify on/off,
-all current bounded `smartctl` forms, `mdadm`, and the three NVMe probes.
+[[SSH Setup and Sudo|SSH-Setup-and-Sudo]]. It covers the supported SES reads,
+identify commands, `smartctl` forms, `mdadm`, and NVMe probes.
 
-The anchored command regexes require sudo 1.9.10 or newer. On an older host,
-enumerate exact per-device commands. Do not substitute argument wildcards.
-Save the generated block as one mode-`0440` file and pass it through
+The anchored command regular expressions require sudo 1.9.10 or newer. On an
+older host, enumerate exact per-device commands. Do not use argument wildcards.
+Save the generated policy as one mode-`0440` file and validate it with
 `visudo -cf` before installation.
 
-## 4. Example Generic Linux System Config
+## 5. Add the system
+
+A small NVMe system can start with `lsblk`, `mdadm`, and `nvme`:
 
 ```yaml
 systems:
@@ -86,7 +72,20 @@ systems:
         - /usr/sbin/nvme list-subsys -o json
 ```
 
-Password-only appliance example:
+The app runs `smartctl` on demand. `nvme list-subsys` adds controller and
+subsystem hints. Add SES commands only if the host exposes the corresponding
+`/dev/sg*` devices.
+
+## UniFi UNVR
+
+UNVR and UNVR Pro use the generic Linux path. Their built-in profiles are
+`ubiquiti-unvr-front-4` and `ubiquiti-unvr-pro-front-7`. The tested inventory
+path uses `lsblk`, `mdadm`, `smartctl`, and `ubntstorage` over SSH. It does not
+rely on `/sys/class/enclosure`.
+
+Some appliances permit only password authentication or a root SSH account. If
+that is the only supported path, keep the credential outside tracked YAML and
+restrict network access to the SSH service.
 
 ```yaml
 systems:
@@ -113,40 +112,12 @@ systems:
         - /usr/sbin/ubntstorage space inspect
 ```
 
-## 5. UniFi UNVR Family Notes
+Replace `REPLACE_ME` through the supported secret setting rather than committing
+a real password.
 
-The current first-pass UniFi UNVR path is generic Linux, not a dedicated
-vendor adapter.
+## Capability limits
 
-What was validated on the tested UNVR and UNVR Pro units:
-
-- Debian 11 userspace on the `alpine-unvr` kernel family
-- direct `smartctl` access to SATA disks over SSH
-- `mdadm` arrays for the appliance storage layout
-- `ubntstorage disk inspect` as the most useful on-box vendor slot source
-- no usable `/sys/class/enclosure` path on either tested unit
-
-What is still missing:
-
-- a documented per-disk Protect API endpoint for slot inventory
-- a validated SES/LED path across the family
-
-The current built-in profile is:
-
-- `ubiquiti-unvr-front-4` for the regular `4`-bay UNVR front view
-- `ubiquiti-unvr-pro-front-7` for the first-pass UNVR Pro `3-over-4` front view
-
-## 6. SES On Generic Linux
-
-If the host exposes SES devices like `/dev/sg*`, the app may be able to do
-enclosure mapping or LED work.
-
-If it does not, the app can still be very useful as an inventory-only physical
-layout tool.
-
-## 7. Common Generic Linux Notes
-
-- `nvme list-subsys` is excellent for controller-to-slot hints.
-- `smartctl` is still the base path for SMART detail.
-- `nvme-cli` adds cleaner controller-native metadata on top.
-- No `/dev/sg*` usually means no SES-driven LED path on that host.
+- A host without `/dev/sg*` usually has no SES mapping or SES identify path.
+- `slot_hints` may be required to match NVMe controllers to physical bays.
+- LED control appears only when the configured host path supports it.
+- Vendor APIs may omit per-disk slot data even when SSH inventory works.

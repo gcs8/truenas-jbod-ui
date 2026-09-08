@@ -32,7 +32,3 @@ Operations and Configuration
 - [[SSH Setup and Sudo|SSH-Setup-and-Sudo]]
 - [[Profiles and Custom Layouts|Profiles-and-Custom-Layouts]]
 - [[Advanced Configuration|Advanced-Configuration]]
-
-Maintainers
-
-- [[Publishing the Wiki|Publishing-the-Wiki]]

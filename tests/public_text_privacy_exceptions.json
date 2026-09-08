@@ -633,7 +633,7 @@
   "wiki/Docker-and-GHCR-Deployment.md": {
     "findings": {
       "internal_hostname": {
-        "sha256:71e4e6da9ad58267d63588348e897aa392a0a9057a18e1c51c9beb928632802a": 2
+        "sha256:d6a100b92737fa073b8bb383e919dfe774c11625bad40b1676d7e43f0ae6d66f": 3
       }
     },
     "reason": "Reviewed operator-documentation example; exact detector counts are pinned."
