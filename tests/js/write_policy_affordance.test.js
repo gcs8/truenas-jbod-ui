@@ -387,7 +387,10 @@ test("Storage Fabric rejects blocked alias writes and adopts 401/403 details", (
 
 test("main UI Basic credentials stay in memory and are sent only on explicit same-origin auth requests", async () => {
   const requests = [];
-  const state = { writeAuthorization: null };
+  const state = {
+    writeAuthorization: null,
+    writePolicy: { enabled: false, mode: "basic", reason: "Sign in." },
+  };
   const window = {
     location: {
       href: "https://ui.example.test/enclosures",
@@ -430,6 +433,37 @@ test("main UI Basic credentials stay in memory and are sent only on explicit sam
     /Sign in/,
   );
   assert.equal(requests.length, 2, "signed-out rejection must happen before fetch");
+});
+
+test("network-mode main and Storage Fabric mutations do not require Basic credentials", async () => {
+  for (const load of [loadFunctions, loadFabricFunctions]) {
+    const requests = [];
+    const state = {
+      writeAuthorization: null,
+      writePolicy: { enabled: true, mode: "network", reason: "" },
+    };
+    const window = {
+      location: {
+        href: "https://ui.example.test/enclosures",
+        origin: "https://ui.example.test",
+      },
+    };
+    const fetch = async (url, options) => {
+      requests.push({ url, options });
+      return { ok: true, status: 200, json: async () => ({ ok: true }) };
+    };
+    const fns = load(["readUiAuthenticatedHeaders", "fetchJson"], {
+      state,
+      window,
+      fetch,
+      URL,
+    });
+
+    await fns.fetchJson("/api/slots/0/led", { method: "POST", readUiAuth: true });
+
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].options.headers.Authorization, undefined);
+  }
 });
 
 test("successful sign-in rerenders feature-owned control state before exposing writes", async () => {

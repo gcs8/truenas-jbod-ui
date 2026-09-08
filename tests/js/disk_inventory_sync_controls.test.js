@@ -297,19 +297,18 @@ test("optional write-policy hooks disable the controls and click handler with th
   assert.equal(prePolicyMerge.buttons.full.disabled, false);
 });
 
-test("standalone network auth disables disk sync with the route's truthful reason", () => {
-  const h = harness({ platform: "core", authMode: "network" });
+test("network mode enables disk sync when the effective write policy allows writes", () => {
+  const h = harness({ platform: "core", authMode: "network", writePolicyAllowed: true });
 
   h.fns.renderDiskInventorySyncControls();
 
-  assert.equal(h.buttons.multipath.disabled, true);
-  assert.equal(h.buttons.full.disabled, true);
-  assert.match(h.buttons.full.title, /ADMIN_AUTH_MODE=basic/);
+  assert.equal(h.buttons.multipath.disabled, false);
+  assert.equal(h.buttons.full.disabled, false);
 
   h.fns.handleDiskInventorySyncClick("full");
   assert.deepEqual(h.runs, []);
-  assert.equal(h.state.diskInventorySync.armedMode, null);
-  assert.match(h.statuses.at(-1).message, /ADMIN_AUTH_MODE=basic/);
+  assert.equal(h.state.diskInventorySync.armedMode, "full");
+  assert.equal(h.buttons.full.textContent, "Confirm sync");
 });
 
 function diskInventorySyncRunHarness(selectedSystemId = "system-a") {
