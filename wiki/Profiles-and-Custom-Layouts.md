@@ -1,29 +1,17 @@
-# Profiles and Custom Layouts
+# Profiles and custom layouts
 
-The app now uses a profile-driven enclosure layout system.
+A profile controls how an enclosure looks. It defines bay placement, numbering,
+face style, labels, and tray orientation. It does not determine where inventory
+comes from.
 
-That means the app can now describe:
+A profile can render any of these selector entries:
 
-- built-in validated chassis
-- custom operator layouts
-- different front/rear wording
-- different tray-release orientation
-
-without creating a new one-off render path every time.
-
-## Profiles Are Not Storage Views
-
-Profiles define how a chassis should look.
-
-They do not decide whether something is:
-
-- a `Live Enclosure` discovered from the host
-- a `Saved Chassis View` that mirrors a live enclosure
+- a `Live Enclosure` discovered from a host
+- a `Saved Chassis View` linked to a live enclosure
 - a `Virtual Storage View` for internal disks such as NVMe carriers or SATADOMs
 
-If you want the runtime selector mental model, use:
-
-- [[Live Enclosures and Storage Views|Live-Enclosures-and-Storage-Views]]
+See [[Live Enclosures and Storage Views|Live-Enclosures-and-Storage-Views]] for
+how those entries differ.
 
 ## Built-In Profiles Right Now
 
@@ -48,49 +36,21 @@ If you want the runtime selector mental model, use:
 - `generic-front-102-8x14`
 - `generic-front-106-8x14`
 
-The Dell MD1280 whole-shelf profile exposes the top and bottom drawer profiles
-as selector sub-views. Their option IDs use
-`{enclosure_id}::{profile_id}`, where `profile_id` is
-`dell-md1280-drawer-top-42` or `dell-md1280-drawer-bottom-42`.
+The Dell MD1280 whole-shelf profile adds top and bottom drawer sub-views. Their
+selector IDs use `{enclosure_id}::{profile_id}` with
+`dell-md1280-drawer-top-42` or `dell-md1280-drawer-bottom-42` as the profile ID.
 
-## Where Custom Profiles Live
+## Create a custom profile
 
-By default:
+The admin sidecar includes an `Enclosure / Profile Builder`. Start from a
+built-in profile, adjust its face and bay layout, preview the result, then save
+it as a custom profile.
 
-```text
-/app/config/profiles.yaml
-```
+Edit `./config/profiles.yaml` directly when you need version-controlled YAML or
+a field that the builder does not expose. Inside the container, this file is
+`/app/config/profiles.yaml`.
 
-On the Docker host, that is usually:
-
-```text
-./config/profiles.yaml
-```
-
-## Builder Mode
-
-You no longer have to start with hand-editing YAML.
-
-The optional admin sidecar now includes a dedicated
-`Enclosure / Profile Builder` workspace that can:
-
-- load a built-in profile from the catalog
-- clone it into a reusable custom profile
-- adjust the face style, latch edge, bay count, and row groups
-- generate common slot-ordering patterns
-- save an explicit custom row matrix into `slot_layout`
-
-
-This is the recommended first pass for normal operator changes.
-
-Hand-editing `profiles.yaml` is still useful when:
-
-- you want to keep the file under your own version control
-- you need fields the current builder does not expose yet
-- you are defining a sparse or gapped `slot_layout`, using `null` for a visual
-  cell that has no bay
-
-## Example Custom Profile
+A small custom profile looks like this:
 
 ```yaml
 profiles:
@@ -111,47 +71,27 @@ profiles:
     row_groups: [2, 2]
 ```
 
-## Most Useful Fields
+## Layout fields
 
-- `id`
-- `label`
-- `panel_title`
-- `edge_label`
-- `face_style`
-- `latch_edge`
-- `bay_size`
-- `rows`
-- `columns`
-- `slot_layout`
-- `row_groups`
-- `slot_hints`
-- `slot_number_base`
+The fields used most often are:
 
-`slot_number_base` changes the displayed bay-label base for this profile. Use
-`0` for zero-based labels or `1` for chassis silk-screen labels that start at
-one. If omitted, the profile inherits the global layout value.
+- `id`, `label`, `panel_title`, and `edge_label` for names
+- `rows`, `columns`, `slot_layout`, and `row_groups` for bay placement
+- `face_style`, `latch_edge`, and `bay_size` for appearance
+- `slot_hints` for matching device or controller identifiers to bays
+- `slot_number_base` for zero-based or one-based displayed bay labels
 
-Current built-in `face_style` values are `generic`, `top-loader`, `drawer`,
-`front-drive`, `rear-drive`, `unifi-drive`, and `nvme-carrier`. These values
-select existing visual treatments; custom strings fall back to the generic
-shape rather than adding a new renderer.
+Set `slot_number_base` to `0` or `1`. If omitted, it inherits the global layout
+setting.
 
-## Slot Ordering In Builder Mode
+Supported built-in `face_style` values are `generic`, `top-loader`, `drawer`,
+`front-drive`, `rear-drive`, `unifi-drive`, and `nvme-carrier`. An unknown value
+uses the generic shape.
 
-The builder can now generate common numbering patterns without editing YAML
-directly.
+## Set slot order
 
-Examples:
-
-- `Bottom-Up By Rows`
-- `Top-Down By Rows`
-- `Bottom-Up By Columns`
-- `Top-Down By Columns`
-
-If none of those match the real hardware, switch the builder to
-`Custom Matrix` and enter the rows yourself.
-
-Example:
+The builder can generate bottom-up or top-down numbering by rows or columns. Use
+`Custom Matrix` when the hardware follows another order. For example:
 
 ```text
 02 05
@@ -159,7 +99,7 @@ Example:
 00 03
 ```
 
-That saves as:
+saves as:
 
 ```yaml
 slot_layout:
@@ -168,33 +108,15 @@ slot_layout:
   - [0, 3]
 ```
 
-## `latch_edge`
+Use `null` for an empty cell in a sparse or gapped layout.
 
-Use `latch_edge` to match the tray-release edge:
+Set `latch_edge` to `bottom`, `right`, `top`, or `left` to match the tray-release
+edge. This affects orientation only. It does not change slot identity.
 
-- `bottom`: vertical tray with release on bottom
-- `right`: horizontal tray with release on right
-- `top`: vertical tray with release on top
-- `left`: uncommon left-latch layouts
+## Add slot hints
 
-Examples:
-
-- CORE `60`-bay top-loader: `bottom`
-- SCALE front `24` and rear `12`: `right`
-- SYS-2029GP-TR right NVMe profile: `bottom`
-
-## `slot_hints`
-
-`slot_hints` matter most on generic Linux.
-
-They tell the app how to correlate a visual slot with real device/controller
-identifiers such as:
-
-- `nvme0`
-- `nvme1`
-- PCI addresses like `0000:01:00.0`
-
-Example:
+Generic Linux and NVMe layouts often need `slot_hints`. Each entry ties a visual
+bay to device or PCI identifiers:
 
 ```yaml
 slot_hints:
@@ -202,9 +124,12 @@ slot_hints:
   1: ["nvme1", "0000:02:00.0"]
 ```
 
-## Attaching A Profile To A System
+Verify these hints against the physical chassis before relying on the displayed
+slot number for service work.
 
-Use `default_profile_id` when one profile should usually win:
+## Attach profiles to systems
+
+Use `default_profile_id` when one profile applies to the system:
 
 ```yaml
 systems:
@@ -213,7 +138,7 @@ systems:
     default_profile_id: supermicro-sys-2029gp-tr-right-nvme-2
 ```
 
-Use `enclosure_profiles` when a system has multiple enclosure IDs:
+Use `enclosure_profiles` to assign profiles to specific enclosure IDs:
 
 ```yaml
 systems:
@@ -224,13 +149,5 @@ systems:
       "500304801e977aff": supermicro-ssg-6048r-rear-12
 ```
 
-## When To Make A Custom Profile
-
-Make one when:
-
-- you have a chassis the app does not know yet
-- you want a different visual orientation
-- you need explicit `slot_hints`
-- you are validating a future built-in profile
-
-If you want deeper schema detail, use the repo’s longer authoring doc too.
+Create a custom profile when no built-in profile matches the bay count,
+orientation, numbering, or device hints you have verified.

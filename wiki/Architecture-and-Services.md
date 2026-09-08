@@ -1,32 +1,23 @@
-# Architecture and Services
+# Architecture and services
 
-This page explains what runs where.
+The app runs on your Docker host and connects from there to each storage host.
+It has one required service and two optional sidecars.
 
-The short version:
-
-- the main UI is the read path on `:8080`
-- the history sidecar is optional and collects sampled slot data on `:8081`
-- the admin sidecar is optional and owns setup, runtime control, backup, and
-  maintenance workflows on `:8082`
-- all three services use the same published image when you deploy from GHCR
-- the app talks to your storage hosts from your Docker machine, not from
-  GitHub Pages or a hosted cloud backend
-
-## Service Map
+## Service map
 
 ```mermaid
 flowchart LR
     Browser["Browser"]
-    UI["Main UI :8080\nread-only enclosure view"]
-    History["History sidecar :8081\noptional samples and events"]
-    Admin["Admin sidecar :8082\noptional setup and maintenance"]
+    UI["Main UI :8080\nread-oriented enclosure view"]
+    History["History :8081\noptional samples and events"]
+    Admin["Admin :8082\noptional setup and maintenance"]
     Config["./config\nsystems, profiles, SSH material"]
     Data["./data\nmappings and caches"]
-    HistDB["./history\nSQLite history DB and backups"]
+    HistDB["./history\nSQLite history database"]
     Logs["./logs\nlocal logs"]
     Hosts["Storage hosts\nTrueNAS, Quantastor, ESXi, Linux, UniFi, BMC"]
     GHCR["GHCR image\nghcr.io/gcs8/truenas-jbod-ui"]
-    Pages["GitHub Pages demo\nstatic sample data only"]
+    Pages["GitHub Pages demo\nstatic sample data"]
 
     Browser --> UI
     Browser --> History
@@ -50,64 +41,58 @@ flowchart LR
     Pages -. no live backend .-> Browser
 ```
 
-## Services At A Glance
+## Services
 
-| Service | Default port | Required? | Main job | Typical command |
+| Service | Port | Required | Purpose | Start command |
 | --- | ---: | --- | --- | --- |
-| Main UI | `8080` | yes | physical enclosure view, slot details, safe read path | `docker compose up -d` |
-| History sidecar | `8081` | no | slot metric samples, slot events, snapshot history payloads | `docker compose --profile history up -d` |
-| Admin sidecar | `8082` | no | setup, SSH material, runtime controls, backups, maintenance | `docker compose --profile admin up -d enclosure-admin` |
+| Main UI | `8080` | yes | enclosure view, slot details, and host inventory | `docker compose up -d` |
+| History | `8081` | no | metric samples, events, and snapshot history | `docker compose --profile history up -d` |
+| Admin | `8082` | no | setup, runtime controls, profiles, backups, and maintenance | `docker compose --profile admin up -d enclosure-admin` |
 
-The main UI is designed to remain useful when the history and admin sidecars
-are stopped. History-backed features degrade visibly instead of breaking the
-base enclosure view.
+The main UI works without either sidecar. When history is stopped, the UI marks
+history-backed features unavailable instead of hiding the base enclosure view.
 
-## Local Folders
+All three services use the same published image. You still need local persistent
+folders for configuration and data.
 
-Keep these beside the checkout or deployment bundle:
+## Persistent folders
 
-| Path | Purpose |
+| Path | Contents |
 | --- | --- |
-| `./config` | saved systems, profiles, runtime overrides, optional SSH material |
-| `./config/ssh` | SSH keys if you let the app manage or reuse them |
-| `./config/backup-secrets` | private passphrase files for the one-shot backup service |
-| `./data` | slot mappings, detail cache, known host records |
-| `./history` | history sidecar SQLite DB and backups |
-| `./backups` | private scheduled backup archives |
+| `./config` | systems, profiles, runtime overrides, and optional SSH material |
+| `./config/ssh` | SSH keys mounted into the containers |
+| `./config/backup-secrets` | passphrase files for the one-shot backup service |
+| `./data` | slot mappings, detail cache, and known host records |
+| `./history` | the history SQLite database and history backups |
+| `./backups` | scheduled backup archives |
 | `./backup-status` | shared read-only scheduled backup status |
-| `./logs` | local app logs when configured |
+| `./logs` | application logs when file logging is configured |
 
-The published image does not remove the need for local config and persistent
-data. It only removes the need to build the container image yourself.
+Protect these folders as local application data. Do not expose the admin
+sidecar or its files to untrusted networks.
 
-## Live Host Access
+## Host connections
 
-Depending on platform and configuration, the app can use:
+The configured platform determines which connections the app uses:
 
 - TrueNAS middleware websocket API
 - Quantastor REST API
-- SSH commands for richer inventory and SMART detail
-- `sg_ses` or platform-local tools where supported
-- BMC/IPMI paths for validated Supermicro inventory
+- SSH for optional inventory, SMART, SES, and topology detail
+- BMC/IPMI for supported inventory and identify paths
 
-The app does not install packages on TrueNAS CORE or SCALE. For ESXi or other
-hosts, any host-prep package staging is an explicit admin action.
+The app does not install packages on TrueNAS or Quantastor. Any host preparation
+is a separate operator action.
 
-## Public Demo Boundary
+## Public demo
 
-A GitHub Pages demo belongs outside this live service map.
+The GitHub Pages demo loads synthetic data in the browser. It has no FastAPI
+backend, credentials, live host access, or admin actions. See
+[[Public Demo Site|Public-Demo-Site]].
 
-It loads scrubbed sample data directly in the browser from the checked-in
-`public-demo/` artifact. It must not connect to your storage hosts, run the
-FastAPI backend, hold secrets, or expose admin maintenance actions.
-
-See [[Public Demo Site|Public-Demo-Site]] and
-[[Demo and Offline Workflows|Demo-and-Offline-Workflows]].
-
-## Related Pages
+## Related pages
 
 - [[Quick Start|Quick-Start]]
 - [[Docker and GHCR Deployment|Docker-and-GHCR-Deployment]]
-- [[Operations, Logging, and Metrics|Operations-Logging-and-Metrics]]
 - [[Admin UI and System Setup|Admin-UI-and-System-Setup]]
 - [[History and Snapshot Export|History-and-Snapshot-Export]]
+- [[Operations, Logging, and Metrics|Operations-Logging-and-Metrics]]
