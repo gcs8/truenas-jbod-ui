@@ -320,10 +320,16 @@ class ContainerResourceContractTests(unittest.TestCase):
         assert scheduled_match is not None
         restore = restore_match.group(1)
         scheduled = scheduled_match.group(1)
-        self.assertLess(
-            restore.index("Supply the original passphrase"),
-            restore.index("inspects the exact bytes"),
+        restore_steps = " ".join(restore.split())
+        ordered_markers = (
+            "Supply the original passphrase",
+            "Select `Import Backup`",
+            "inspects the exact bytes",
+            "Confirm that inspection",
+            "short-lived, single-use receipt",
         )
+        marker_positions = [restore_steps.index(marker) for marker in ordered_markers]
+        self.assertEqual(marker_positions, sorted(marker_positions))
         for marker in (
             "1 GiB admin container",
             "1 MiB",
