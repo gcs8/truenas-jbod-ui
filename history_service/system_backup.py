@@ -313,9 +313,20 @@ class _DiskBackedDuplicateKeyTracker:
             )
             self.cursor = self.connection.cursor()
             return self
-        except Exception:
-            self.close()
-            raise ValueError("JSON duplicate-key validation could not be initialized.") from None
+        except BaseException as initialization_error:
+            if isinstance(initialization_error, Exception):
+                primary_error: BaseException = ValueError(
+                    "JSON duplicate-key validation could not be initialized."
+                )
+            else:
+                primary_error = initialization_error
+            try:
+                self.close()
+            except RuntimeError as cleanup_error:
+                primary_error.add_note(str(cleanup_error))
+            if primary_error is initialization_error:
+                raise
+            raise primary_error from None
 
     def new_scope(self) -> int:
         scope = self.next_scope

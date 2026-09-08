@@ -2961,6 +2961,91 @@ sys.stdout.flush()
         self.assertEqual(len(tracker_roots), 1)
         self.assertFalse(tracker_roots[0].exists())
 
+    def test_file_backed_json_duplicate_tracker_cleans_initialization_cancellation(
+        self,
+    ) -> None:
+        real_mkdtemp = tempfile.mkdtemp
+        tracker_roots: list[Path] = []
+
+        def allocate_tracker_workspace(
+            suffix: str | None = None,
+            prefix: str | None = None,
+            dir: str | os.PathLike[str] | None = None,
+        ) -> str:
+            self.assertIsNone(dir)
+            path = Path(real_mkdtemp(suffix=suffix, prefix=prefix, dir=self.temp_dir))
+            tracker_roots.append(path)
+            return str(path)
+
+        tracker = system_backup_module._DiskBackedDuplicateKeyTracker()
+        with (
+            patch.object(
+                system_backup_module.tempfile,
+                "mkdtemp",
+                side_effect=allocate_tracker_workspace,
+            ),
+            patch.object(
+                system_backup_module.sqlite3,
+                "connect",
+                side_effect=KeyboardInterrupt("synthetic initialization cancellation"),
+            ),
+            self.assertRaisesRegex(
+                KeyboardInterrupt,
+                "synthetic initialization cancellation",
+            ),
+        ):
+            tracker.__enter__()
+
+        self.assertEqual(len(tracker_roots), 1)
+        self.assertFalse(tracker_roots[0].exists())
+
+    def test_file_backed_json_duplicate_tracker_preserves_initialization_cancellation_when_cleanup_fails(
+        self,
+    ) -> None:
+        real_mkdtemp = tempfile.mkdtemp
+        tracker_roots: list[Path] = []
+
+        def allocate_tracker_workspace(
+            suffix: str | None = None,
+            prefix: str | None = None,
+            dir: str | os.PathLike[str] | None = None,
+        ) -> str:
+            self.assertIsNone(dir)
+            path = Path(real_mkdtemp(suffix=suffix, prefix=prefix, dir=self.temp_dir))
+            tracker_roots.append(path)
+            return str(path)
+
+        tracker = system_backup_module._DiskBackedDuplicateKeyTracker()
+        with (
+            patch.object(
+                system_backup_module.tempfile,
+                "mkdtemp",
+                side_effect=allocate_tracker_workspace,
+            ),
+            patch.object(
+                system_backup_module.sqlite3,
+                "connect",
+                side_effect=KeyboardInterrupt("synthetic initialization cancellation"),
+            ),
+            patch.object(
+                system_backup_module.shutil,
+                "rmtree",
+                side_effect=OSError("synthetic cleanup failure"),
+            ),
+            self.assertRaisesRegex(
+                KeyboardInterrupt,
+                "synthetic initialization cancellation",
+            ) as raised,
+        ):
+            tracker.__enter__()
+
+        self.assertEqual(len(tracker_roots), 1)
+        self.assertTrue(tracker_roots[0].exists())
+        self.assertIn(
+            "JSON duplicate-key tracker cleanup failed.",
+            getattr(raised.exception, "__notes__", ()),
+        )
+
     def test_file_backed_json_duplicate_tracker_cleans_workspace_after_cancellation(self) -> None:
         member_path = self.temp_dir / "cancelled-mapping.json"
         member_path.write_text(
