@@ -118,9 +118,23 @@ class PublicScreenshotContractTests(unittest.TestCase):
             encoding="utf-8"
         )
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        artifact_readme = (ROOT / "public-demo/README.md").read_text(encoding="utf-8")
+        visual_tour = (ROOT / "wiki/Visual-Tour.md").read_text(encoding="utf-8")
+        public_demo_guide = (ROOT / "wiki/Public-Demo-Site.md").read_text(
+            encoding="utf-8"
+        )
 
-        for document in (product_brief, readme):
-            self.assertIn("Mobile and tablet layouts are unsupported", document)
+        for document in (
+            product_brief,
+            readme,
+            artifact_readme,
+            visual_tour,
+            public_demo_guide,
+        ):
+            self.assertIn(
+                "Mobile and tablet layouts are unsupported",
+                " ".join(document.split()),
+            )
 
 
 if __name__ == "__main__":
