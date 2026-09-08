@@ -1,7 +1,7 @@
 {
   "enclosure": {
     "id": "demo-enclosure-60",
-    "label": "Demo 60-Bay Top Loader",
+    "label": "Demo 60-Bay",
     "name": "Demo Synthetic Enclosure",
     "profile_id": "supermicro-cse-946-top-60"
   },

@@ -113,7 +113,7 @@ test("public demo static artifact is explorable without a live backend", async (
   await expect(page.locator(".snapshot-banner-meta")).toContainText("7d");
   await expect(page.locator("#system-setup-button")).toHaveCount(0);
   await expect(page.locator("#export-snapshot-button")).toHaveCount(0);
-  await expect(selector.locator("option:checked")).toContainText("Snapshot · Demo 60-Bay Top Loader");
+  await expect(selector.locator("option:checked")).toContainText("Snapshot · Demo 60-Bay");
   await expect(page.locator("#api-status-chip")).toHaveText("API AT CAPTURE");
   await expect(page.locator("#ssh-status-chip")).toHaveText("SSH OFF AT CAPTURE");
   await expect(page.locator("#history-status-chip")).toHaveText("HIST PRELOADED");
@@ -242,6 +242,20 @@ test("public demo responsive and accessibility contract holds at supported viewp
     await expect(page.locator("main")).toHaveCount(1);
     await expect(page.locator("h1")).toHaveCount(1);
     await expect(page.locator("#enclosure-select")).toHaveAccessibleName(/enclosure|view/i);
+    if (viewport.width === 390) {
+      const selectedOptionFit = await page.locator("#enclosure-select").evaluate((select) => {
+        const style = getComputedStyle(select);
+        const context = document.createElement("canvas").getContext("2d");
+        context.font = style.font;
+        const textWidth = context.measureText(select.selectedOptions[0]?.text || "").width;
+        const availableWidth = select.clientWidth
+          - parseFloat(style.paddingLeft)
+          - parseFloat(style.paddingRight)
+          - 36;
+        return { availableWidth, textWidth };
+      });
+      expect(selectedOptionFit.textWidth).toBeLessThanOrEqual(selectedOptionFit.availableWidth);
+    }
     if (viewport.width <= 820) {
       await expect(page.locator("#slot-scroll-hint")).toBeVisible();
       await expect(page.locator("#slot-scroll-hint")).toContainText("Swipe or scroll bays horizontally");
