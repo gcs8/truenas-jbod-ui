@@ -57,10 +57,10 @@ cd /docker-local/truenas-jbod-ui
 
 curl -fsSL \
   -o compose.yaml \
-  https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/v0.23.0/docker-compose.yml
+  https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/v0.22.2/docker-compose.yml
 
 cat > .env <<'EOF'
-JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.23.0
+JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.22.2
 TRUENAS_HOST=https://truenas.example.test
 TRUENAS_API_KEY=replace-with-your-api-key
 TRUENAS_PLATFORM=core

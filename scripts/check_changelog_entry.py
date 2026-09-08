@@ -32,8 +32,8 @@ from pathlib import Path
 
 CHANGELOG_PATH = "CHANGELOG.md"
 UNRELEASED_HEADING = "## Unreleased"
-SEMVER_CORE = r"(?:0|[1-9]\d*)"
-SEMVER_PRERELEASE_IDENTIFIER = r"(?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
+SEMVER_CORE = r"(?:0|[1-9][0-9]*)"
+SEMVER_PRERELEASE_IDENTIFIER = r"(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
 SEMVER_BUILD_IDENTIFIER = r"[0-9A-Za-z-]+"
 RELEASE_HEADING = re.compile(
     rf"^## v{SEMVER_CORE}\.{SEMVER_CORE}\.{SEMVER_CORE}"

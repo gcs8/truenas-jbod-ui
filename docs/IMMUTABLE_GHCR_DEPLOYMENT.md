@@ -45,7 +45,7 @@ set -euo pipefail
 cd /docker-local/truenas-jbod-ui
 release_revision='REPLACE_WITH_40_HEX_SOURCE_REVISION'
 expected_image='REPLACE_WITH_WORKFLOW_IMMUTABLE_IMAGE'
-candidate_tag='ghcr.io/gcs8/truenas-jbod-ui:v0.23.0'
+candidate_tag='ghcr.io/gcs8/truenas-jbod-ui:v0.22.2'
 python3 scripts/update_immutable_deployment.py update . \
   --project-name truenas-jbod-ui \
   --source-revision "$release_revision" \

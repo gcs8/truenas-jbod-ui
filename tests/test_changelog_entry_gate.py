@@ -255,6 +255,8 @@ class ChangelogEntryParsingTests(unittest.TestCase):
             "## v1.2.3-01",
             "## v1.2.3-rc..1",
             "## v1.2.3+build..5",
+            "## v1١.2.3",
+            "## v1.2.3-1١",
         ):
             with self.subTest(invalid=invalid):
                 self.assertIsNone(gate.RELEASE_HEADING.fullmatch(invalid))
