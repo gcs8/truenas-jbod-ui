@@ -1,4 +1,4 @@
-# Quick Start
+# Quick start
 
 This guide installs the published Docker image for one TrueNAS CORE or SCALE
 system. Nothing is installed on TrueNAS.
@@ -72,15 +72,29 @@ curl http://your-docker-host:8080/livez
 
 The response should include `"status":"ok"`.
 
-## Access and authentication
+## Confirm the default startup
 
 The default setup has no login. Anyone who can reach port `8080` can use the
 controls shown in the main UI. The optional admin UI works the same way on port
 `8082`.
 
-Do not publish these ports directly to the Internet. If other people or devices
-can reach the ports and should not have access, enable the optional built-in
-authentication described in [[Advanced Configuration|Advanced-Configuration]].
+Get the basic API-only startup working before adding optional security or
+enrichment settings. Do not publish these ports directly to the Internet.
+
+## Harden access after startup
+
+Choose the controls that fit your environment after the first successful load:
+
+- Enable Basic authentication and set exact browser origins.
+- Put the app behind an HTTPS reverse proxy or use an encrypted network path.
+- Restrict port reachability with firewall rules or network segmentation.
+- Import the appliance CA and enable certificate verification.
+- Add SSH only when you want inventory enrichment or enabled hardware controls.
+
+Network location is not authentication. Anyone who can reach an app port can
+use the controls enabled on that port unless authentication is configured. See
+[[Advanced Configuration|Advanced-Configuration]] and
+[[SSH Setup and Sudo|SSH-Setup-and-Sudo]] for the opt-in steps.
 
 ## Optional history
 

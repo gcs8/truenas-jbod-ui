@@ -1,13 +1,12 @@
-# Advanced Configuration
+# Advanced configuration
 
-This page is for operators who want to tweak more than the defaults.
+This page adds optional security, enrichment, and tuning after the default
+API-only startup works.
 
 ## Optional authentication
 
 The default setup has no login. Anyone who can reach the published main or
-admin port can use the controls available there. An RFC1918 address does not
-make a client trusted. Guest Wi-Fi, shared LANs, and VPNs can all use private
-addresses.
+admin port can use the controls available there.
 
 Enable built-in Basic authentication when reachability is broader than the
 people who should control the app:
@@ -29,6 +28,12 @@ origin is missing or invalid.
 Each main-UI page starts signed out. The in-page sign-in keeps credentials in
 page memory and clears them on reload or sign-out. Basic credentials are only
 encoded, not encrypted, so use HTTPS or an encrypted VPN.
+
+An HTTPS reverse proxy protects credentials in transit and can provide another
+authentication layer. Firewall rules and network segmentation reduce who can
+reach the ports, but reachability still grants access to every enabled control
+when built-in or proxy authentication is absent. Do not publish the app ports
+directly to the Internet.
 
 ## Optional certificate verification
 
@@ -52,7 +57,7 @@ TRUENAS_TLS_SERVER_NAME=truenas.example.test
 
 Use the DNS name on the certificate for `TRUENAS_TLS_SERVER_NAME`.
 
-## Single-System vs Multi-System
+## Single-system vs multi-system
 
 The app supports:
 
@@ -67,7 +72,7 @@ use:
 If you want one app instance to manage multiple hosts, use `systems:` in
 `config/config.yaml`.
 
-## Good Multi-System Pattern
+## Multi-system example
 
 ```yaml
 default_system_id: archive-core
@@ -120,7 +125,7 @@ systems:
         - sudo -n /usr/bin/sg_ses -p ec /dev/sg38
 ```
 
-## App Tuning Knobs
+## App tuning knobs
 
 Useful app-level settings:
 
@@ -136,7 +141,7 @@ app:
   debug: false
 ```
 
-## What The Cache TTL Really Means
+## What the cache TTL means
 
 `snapshot_cache_ttl_seconds` controls how long rendered inventory snapshots
 stay warm.
@@ -163,7 +168,7 @@ Larger:
 - less load
 - slightly more stale view
 
-## Command Lists
+## Command lists
 
 Treat SSH command lists as:
 
@@ -183,7 +188,7 @@ Examples:
 
 That split helps keep the standing SSH probe lighter.
 
-## SSH Refresh Load
+## SSH refresh load
 
 Inventory refreshes batch configured commands and dynamic enrichment through one
 SSH session per target where possible, but operators should still keep refreshes
@@ -203,7 +208,7 @@ friendly to storage appliances:
 - watch app logs for SSH refresh command counts, failure counts, and duration
   after changing cache or command settings
 
-## Persistent Mapping Storage
+## Persistent mapping storage
 
 Mappings are stored in JSON on the bind-mounted data path.
 
@@ -213,7 +218,7 @@ That means:
 - they are easy to back up
 - they can be exported and imported in the UI
 
-### Mappings Saved Before The Scoped-Mapping Change
+### Mappings saved before the scoped-mapping change
 
 Mappings saved by older releases were stored without the system and enclosure
 they belong to. On a deployment with more than one configured system, or more
@@ -227,7 +232,7 @@ system- and enclosure-scoped key and removes the old unscoped aliases for that
 bay. Deployments with a single system and a single enclosure are unaffected,
 because there is nothing to disambiguate.
 
-## History Sidecar Retention Knobs
+## History sidecar retention knobs
 
 If you are running the optional history sidecar, the main retention knobs are:
 
@@ -280,7 +285,7 @@ If you want longer-lived copies on a different disk or NAS later, point
 `HISTORY_LONG_TERM_BACKUP_DIR` at that mounted path and leave the short-term
 local backup path alone.
 
-## When To Use `enclosure_profiles`
+## When to use `enclosure_profiles`
 
 Use `enclosure_profiles` when:
 
@@ -288,7 +293,7 @@ Use `enclosure_profiles` when:
 - you want deterministic profile selection
 - you want to prevent generic runtime profile fallback
 
-## When To Use A Custom Profile Instead Of Code
+## When to use a custom profile instead of code
 
 Prefer custom YAML when:
 

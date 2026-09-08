@@ -1,4 +1,4 @@
-# Admin UI and System Setup
+# Admin UI and system setup
 
 This page is the practical guide for launching and using the optional admin
 sidecar.
@@ -18,31 +18,10 @@ The read-only enclosure UI on `:8080` still works without this sidecar. The
 admin page is optional and separate on purpose, but it is a normal supported
 runtime service rather than a dev-only helper.
 
-## How To Launch It
+## Launch the admin UI
 
 Use the same folder you created in [[Quick Start|Quick-Start]], where
 `compose.yaml` and `.env` live.
-
-Before starting the sidecar, read the
-[Admin trust boundary](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/ADMIN_TRUST_BOUNDARY.md).
-The default setup has no login. Anyone who can reach port `8082` can change
-configuration and control the app's containers. An RFC1918 address does not
-make a client trusted. The mounted Docker socket gives the sidecar host-level
-container authority. Auto-stop limits exposure; it is not authentication.
-
-To opt into Basic authentication, add these values to `.env`:
-
-```dotenv
-ADMIN_AUTH_MODE=basic
-ADMIN_AUTH_USERNAME=operator
-ADMIN_AUTH_PASSWORD=replace-with-a-long-random-password
-APP_PUBLIC_ORIGIN=https://storage-ui.example.test
-ADMIN_PUBLIC_ORIGIN=https://storage-admin.example.test
-```
-
-In Basic mode, both origin settings are required and must match the addresses
-shown in the browser. See [[Advanced Configuration|Advanced-Configuration]] for
-the full explanation.
 
 If the main UI is already running and you only want to add the admin sidecar:
 
@@ -72,6 +51,34 @@ Then open:
 http://your-docker-host:8082
 ```
 
+The default setup has no login. Anyone who can reach port `8082` can change
+configuration and control the app's containers. The mounted Docker socket gives
+the sidecar host-level container authority. Auto-stop limits exposure; it is not
+authentication. Confirm the page loads, then stop the sidecar or continue with
+the optional hardening below.
+
+Read the
+[Admin trust boundary](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/ADMIN_TRUST_BOUNDARY.md)
+before leaving the sidecar running.
+
+### Optional authentication
+
+To opt into Basic authentication, add these values to `.env`:
+
+```dotenv
+ADMIN_AUTH_MODE=basic
+ADMIN_AUTH_USERNAME=operator
+ADMIN_AUTH_PASSWORD=replace-with-a-long-random-password
+APP_PUBLIC_ORIGIN=https://storage-ui.example.test
+ADMIN_PUBLIC_ORIGIN=https://storage-admin.example.test
+```
+
+In Basic mode, both origin settings are required and must match the addresses
+shown in the browser. Use HTTPS through a reverse proxy or an encrypted network
+path, and restrict port reachability with firewall rules or segmentation.
+Segmentation limits reachability but does not authenticate a client. See
+[[Advanced Configuration|Advanced-Configuration]] for the full explanation.
+
 With the shipped Compose file, the admin sidecar:
 
 - listens on port `8082`
@@ -97,7 +104,7 @@ The top of the admin page now has two section targets:
 - `Setup + Maintenance`
 - `Enclosure / Profile Builder`
 
-## What The Page Looks Like
+## What the page looks like
 
 
 The page is organized around one saved system at a time.
@@ -110,9 +117,9 @@ The common flow is:
 4. save the system config
 5. use runtime control or backup tools when needed
 
-## Main Areas
+## Main areas
 
-### Existing Systems
+### Existing systems
 
 Use `Load Into Form` to pull one saved system into the editor.
 
@@ -124,7 +131,7 @@ with the `Delete + Purge History` checkbox when you really want a clean break
 instead of keeping the old sidecar rows around for later adoption or orphan
 cleanup.
 
-### Profile Catalog and Preview
+### Profile catalog and preview
 
 The right side of the page shows:
 
@@ -133,7 +140,7 @@ The right side of the page shows:
 
 This is where you confirm the intended chassis shape before you save.
 
-### Enclosure / Profile Builder
+### Enclosure / profile builder
 
 The admin sidecar now also has a dedicated builder workspace for reusable
 custom chassis profiles.
@@ -150,7 +157,7 @@ The current builder intentionally stays preset-driven. It can save rectangular
 grids, common slot-ordering presets, and explicit `Custom Matrix` layouts, but
 it does not yet try to be a full drag-and-drop freeform editor.
 
-### Storage Views
+### Storage views
 
 The admin sidecar now uses one grouped `Add Storage View` flow.
 
@@ -167,13 +174,13 @@ If a live enclosure already auto-populates for the loaded system, the add list
 hides the duplicate saved chassis option so the admin UI does not encourage
 live-versus-saved clones.
 
-### SSH Key and Runtime Commands
+### SSH key and runtime commands
 
 Use the SSH section when you want to:
 
 - point at an existing key under `config/ssh`
 - generate a fresh Ed25519 keypair
-- review the recommended runtime command list for the target host
+- inspect the recommended runtime command list for the target host
 
 Saved SSH commands are hidden when an existing system is loaded. The editor
 shows placeholders rather than returning the command text to the browser. The
@@ -198,7 +205,7 @@ For VMware ESXi, the admin sidecar now keeps the setup intentionally narrower:
 - the Linux one-time bootstrap and sudoers preview flow stay disabled because
   ESXi is not using Linux sudo
 
-### ESXi Host Prep / Vendor Tool Upload
+### ESXi host prep / vendor tool upload
 
 The setup form now also includes an ESXi-only `Host Prep / Vendor Tool Upload`
 panel for operator-supplied vendor packages.
@@ -234,7 +241,7 @@ Important guardrails:
 - if a host only needs BMC-backed inventory, you can still use the `ipmi`
   platform and skip ESXi SSH entirely
 
-### TLS Trust
+### TLS trust
 
 Use the TLS inspection area when the remote host is using a private CA or
 self-signed certificate and you want verified HTTPS instead of setting
@@ -243,7 +250,7 @@ self-signed certificate and you want verified HTTPS instead of setting
 The sidecar can inspect the presented certificate chain and save trusted cert
 material for later runtime use.
 
-### Runtime Control
+### Runtime control
 
 Use runtime control when you need to:
 
@@ -262,7 +269,7 @@ Each runtime card also shows the live running app version it probed from that
 container plus the latest tagged stable release, so you can spot a stale or
 partially updated sidecar without jumping across three separate pages.
 
-### Runtime Behavior
+### Runtime behavior
 
 The admin sidecar also exposes the supported runtime behavior knobs for cache
 and refresh timing.
@@ -272,7 +279,7 @@ admin runtime overrides are editable and save to
 `config/runtime-overrides.yaml`. After saving those values, restart the read UI
 from the runtime cards so the main surface picks up the new timing behavior.
 
-## Backup, Restore, Debug, And Demo Data
+## Backup, restore, debug, and demo data
 
 The setup page exposes these tools, but the detailed guidance now lives on
 separate pages so the setup walkthrough stays readable:
@@ -287,7 +294,7 @@ separate pages so the setup walkthrough stays readable:
 The short rule: use the admin sidecar for real local maintenance, but keep
 demo/offline artifacts visibly separate from restore-grade backup bundles.
 
-## History Maintenance And Recovery
+## History maintenance and recovery
 
 The same backup/restore area now also holds the safe cleanup tools for saved
 history:
@@ -303,7 +310,7 @@ The detailed operator guidance lives on:
 
 - [[History Maintenance and Recovery|History-Maintenance-and-Recovery]]
 
-## Good First-Time Pattern
+## Good first-time pattern
 
 For a first-time setup on a new host:
 
@@ -322,25 +329,7 @@ If you also need a custom chassis profile, do that in the builder workspace
 after the basic system entry is saved, then come back to the setup view and
 attach the new profile-backed saved chassis layout there.
 
-## Advanced Source Builds
-
-Most users should use the published-image commands above. Use the source-build
-commands only when you are editing the app, testing an unmerged branch, or
-intentionally rebuilding the image on that machine.
-
-From a cloned repo:
-
-```bash
-docker compose -f docker-compose.dev.yml --profile admin up -d --build enclosure-admin
-```
-
-With history too:
-
-```bash
-docker compose -f docker-compose.dev.yml --profile admin --profile history up -d --build
-```
-
-## Related Pages
+## Related pages
 
 - [[Quick Start|Quick-Start]]
 - [[SSH Setup and Sudo|SSH-Setup-and-Sudo]]
