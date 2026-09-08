@@ -1282,14 +1282,14 @@ class MappingStore:
                 descriptor = os.open(
                     temp_path,
                     os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                    0o600,
+                    0o660,
                 )
             except FileExistsError:
                 continue
             temp_stat: os.stat_result | None = None
             temp_identity: _TempFileIdentity | None = None
             try:
-                os.fchmod(descriptor, 0o600)
+                os.fchmod(descriptor, 0o660)
                 temp_stat = os.fstat(descriptor)
                 if not stat.S_ISREG(temp_stat.st_mode):
                     raise OSError("Mapping temporary path is not a regular file.")
@@ -1297,8 +1297,8 @@ class MappingStore:
                     device=temp_stat.st_dev,
                     inode=temp_stat.st_ino,
                 )
-                if stat.S_IMODE(temp_stat.st_mode) != 0o600:
-                    raise OSError("Mapping temporary file mode is not 0600.")
+                if stat.S_IMODE(temp_stat.st_mode) != 0o660:
+                    raise OSError("Mapping temporary file mode is not 0660.")
             except Exception:
                 if temp_stat is None:
                     try:
