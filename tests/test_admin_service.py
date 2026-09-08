@@ -253,6 +253,111 @@ class BackupInspectionReceiptTests(unittest.TestCase):
                 now=131,
             )
 
+    def test_admitted_receipt_survives_later_pruning_and_remains_single_use(self) -> None:
+        nonces = iter((bytes.fromhex("34" * 16), bytes.fromhex("56" * 16)))
+        store = BackupInspectionReceiptStore(
+            signing_key=b"k" * 32,
+            ttl_seconds=30,
+            nonce_factory=lambda: next(nonces),
+        )
+        issued = store.issue(
+            self.archive,
+            observed_encryption_mode="plaintext",
+            now=100,
+        )
+        admission = store.begin_admission(
+            issued["receipt"],
+            expected_encryption_mode="plaintext",
+            now=120,
+        )
+
+        store.issue_digest(
+            "0" * 64,
+            observed_encryption_mode="plaintext",
+            now=131,
+        )
+        store.consume(
+            issued["receipt"],
+            self.archive,
+            expected_encryption_mode="plaintext",
+            admission=admission,
+            now=120,
+        )
+
+        with self.assertRaisesRegex(ValueError, "already used"):
+            store.consume(
+                issued["receipt"],
+                self.archive,
+                expected_encryption_mode="plaintext",
+                now=120,
+            )
+
+    def test_receipt_cannot_back_two_concurrent_admissions(self) -> None:
+        issued = self.store.issue(
+            self.archive,
+            observed_encryption_mode="encrypted",
+            now=100,
+        )
+        admission = self.store.begin_admission(
+            issued["receipt"],
+            expected_encryption_mode="encrypted",
+            now=120,
+        )
+
+        with self.assertRaisesRegex(ValueError, "already being imported"):
+            self.store.begin_admission(
+                issued["receipt"],
+                expected_encryption_mode="encrypted",
+                now=120,
+            )
+
+        self.store.release_admission(admission, now=120)
+        retry_admission = self.store.begin_admission(
+            issued["receipt"],
+            expected_encryption_mode="encrypted",
+            now=120,
+        )
+        self.store.release_admission(retry_admission, now=120)
+
+    def test_active_admission_count_is_bounded(self) -> None:
+        nonces = iter((bytes.fromhex("78" * 16), bytes.fromhex("9a" * 16)))
+        store = BackupInspectionReceiptStore(
+            signing_key=b"k" * 32,
+            ttl_seconds=30,
+            nonce_factory=lambda: next(nonces),
+            max_active_admissions=1,
+        )
+        first = store.issue(
+            self.archive,
+            observed_encryption_mode="plaintext",
+            now=100,
+        )
+        second = store.issue_digest(
+            "0" * 64,
+            observed_encryption_mode="plaintext",
+            now=100,
+        )
+        first_admission = store.begin_admission(
+            first["receipt"],
+            expected_encryption_mode="plaintext",
+            now=120,
+        )
+
+        with self.assertRaisesRegex(ValueError, "already in progress"):
+            store.begin_admission(
+                second["receipt"],
+                expected_encryption_mode="plaintext",
+                now=120,
+            )
+
+        store.release_admission(first_admission, now=120)
+        second_admission = store.begin_admission(
+            second["receipt"],
+            expected_encryption_mode="plaintext",
+            now=120,
+        )
+        store.release_admission(second_admission, now=120)
+
     def test_receipt_is_consumed_once_at_successful_import_admission(self) -> None:
         issued = self.store.issue(
             self.archive,
@@ -622,8 +727,18 @@ class MainAppBoundaryTests(unittest.TestCase):
         runtime_service = MagicMock()
         runtime_service.managed_containers = {}
         receipt_store = MagicMock()
+        receipt_store.begin_admission.return_value = "admission-token"
         request_clock = SimpleNamespace(now=100)
-        receive_probe.side_effect = lambda: setattr(request_clock, "now", 1000)
+
+        def receive_after_admission() -> None:
+            receipt_store.begin_admission.assert_called_once_with(
+                "server-receipt",
+                expected_encryption_mode="plaintext",
+                now=100,
+            )
+            request_clock.now = 1000
+
+        receive_probe.side_effect = receive_after_admission
 
         with (
             patch(
@@ -664,8 +779,10 @@ class MainAppBoundaryTests(unittest.TestCase):
             "server-receipt",
             hashlib.sha256(b"archive-bytes").hexdigest(),
             expected_encryption_mode="plaintext",
+            admission="admission-token",
             now=100,
         )
+        receipt_store.release_admission.assert_called_once_with("admission-token")
         receipt_store.consume.assert_not_called()
         service.import_bundle.assert_not_called()
         observed_metric = observe_operation.call_args.kwargs

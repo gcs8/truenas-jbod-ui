@@ -14,6 +14,7 @@ from typing import Callable
 
 RECEIPT_VERSION = 1
 DEFAULT_RECEIPT_TTL_SECONDS = 300
+DEFAULT_MAX_ACTIVE_ADMISSIONS = 32
 HASH_CHUNK_BYTES = 1024 * 1024
 _VALID_MODES = frozenset({"encrypted", "plaintext"})
 
@@ -48,16 +49,22 @@ class BackupInspectionReceiptStore:
         signing_key: bytes | None = None,
         ttl_seconds: int = DEFAULT_RECEIPT_TTL_SECONDS,
         nonce_factory: Callable[[], bytes] | None = None,
+        max_active_admissions: int = DEFAULT_MAX_ACTIVE_ADMISSIONS,
     ) -> None:
         if ttl_seconds <= 0:
             raise ValueError("Backup inspection receipt TTL must be positive.")
+        if max_active_admissions <= 0:
+            raise ValueError("Backup inspection admission limit must be positive.")
         self._signing_key = signing_key or secrets.token_bytes(32)
         if len(self._signing_key) < 32:
             raise ValueError("Backup inspection receipt signing key is too short.")
         self._ttl_seconds = ttl_seconds
+        self._max_active_admissions = max_active_admissions
         self._nonce_factory = nonce_factory or (lambda: secrets.token_bytes(16))
         self._lock = threading.Lock()
         self._issued: dict[str, tuple[str, str, int, int, bool]] = {}
+        self._admissions: dict[str, str] = {}
+        self._admitted_nonces: set[str] = set()
 
     @staticmethod
     def _validate_mode(mode: str) -> str:
@@ -132,14 +139,62 @@ class BackupInspectionReceiptStore:
         archive_path: Path,
         *,
         expected_encryption_mode: str,
+        admission: str | None = None,
         now: int | None = None,
     ) -> None:
         self.consume_digest(
             receipt,
             _archive_sha256(archive_path),
             expected_encryption_mode=expected_encryption_mode,
+            admission=admission,
             now=now,
         )
+
+    def begin_admission(
+        self,
+        receipt: str,
+        *,
+        expected_encryption_mode: str,
+        now: int | None = None,
+    ) -> str:
+        expected_mode = self._validate_mode(expected_encryption_mode)
+        current_time = int(time.time() if now is None else now)
+        receipt_digest, mode, issued_at, expires_at, nonce = self._decode_receipt(receipt)
+        if current_time > expires_at:
+            raise ValueError("Backup inspection receipt has expired.")
+        if mode != expected_mode:
+            raise ValueError(
+                "Backup inspection receipt encryption mode does not match the import mode."
+            )
+
+        expected_record = (receipt_digest, mode, issued_at, expires_at)
+        with self._lock:
+            record = self._issued.get(nonce)
+            if record is None or record[:4] != expected_record:
+                raise ValueError("Backup inspection receipt was not issued by this server.")
+            if record[4]:
+                raise ValueError("Backup inspection receipt was already used.")
+            if nonce in self._admitted_nonces:
+                raise ValueError("Backup inspection receipt is already being imported.")
+            if len(self._admissions) >= self._max_active_admissions:
+                raise ValueError("Too many backup imports are already in progress.")
+            for _ in range(8):
+                admission = secrets.token_hex(16)
+                if admission not in self._admissions:
+                    break
+            else:
+                raise RuntimeError("Unable to allocate a backup inspection admission.")
+            self._admissions[admission] = nonce
+            self._admitted_nonces.add(nonce)
+        return admission
+
+    def release_admission(self, admission: str, *, now: int | None = None) -> None:
+        current_time = int(time.time() if now is None else now)
+        with self._lock:
+            nonce = self._admissions.pop(admission, None)
+            if nonce is not None:
+                self._admitted_nonces.discard(nonce)
+            self._prune_expired_locked(current_time)
 
     def consume_digest(
         self,
@@ -147,12 +202,40 @@ class BackupInspectionReceiptStore:
         archive_digest: str,
         *,
         expected_encryption_mode: str,
+        admission: str | None = None,
         now: int | None = None,
     ) -> None:
         expected_mode = self._validate_mode(expected_encryption_mode)
         if not re.fullmatch(r"[0-9a-f]{64}", archive_digest):
             raise ValueError("Backup archive identity is invalid.")
         current_time = int(time.time() if now is None else now)
+        receipt_digest, mode, issued_at, expires_at, nonce = self._decode_receipt(receipt)
+        if current_time > expires_at:
+            raise ValueError("Backup inspection receipt has expired.")
+        if mode != expected_mode:
+            raise ValueError("Backup inspection receipt encryption mode does not match the import mode.")
+        if archive_digest != receipt_digest:
+            raise ValueError("Backup archive does not match its inspection receipt.")
+
+        expected_record = (receipt_digest, mode, issued_at, expires_at)
+        with self._lock:
+            record = self._issued.get(nonce)
+            if record is None or record[:4] != expected_record:
+                raise ValueError("Backup inspection receipt was not issued by this server.")
+            if record[4]:
+                raise ValueError("Backup inspection receipt was already used.")
+            if admission is None:
+                if nonce in self._admitted_nonces:
+                    raise ValueError("Backup inspection receipt is already being imported.")
+            elif self._admissions.get(admission) != nonce:
+                raise ValueError("Backup inspection receipt admission is invalid.")
+            self._issued[nonce] = (*record[:4], True)
+            if admission is not None:
+                self._admissions.pop(admission, None)
+                self._admitted_nonces.discard(nonce)
+            self._prune_expired_locked(current_time)
+
+    def _decode_receipt(self, receipt: str) -> tuple[str, str, int, int, str]:
         try:
             encoded_payload, encoded_signature = receipt.split(".", 1)
         except ValueError as exc:
@@ -196,26 +279,11 @@ class BackupInspectionReceiptStore:
             or not re.fullmatch(r"[0-9a-f]{32}", nonce)
         ):
             raise ValueError("Backup inspection receipt is invalid.")
-        if current_time > expires_at:
-            raise ValueError("Backup inspection receipt has expired.")
-        if mode != expected_mode:
-            raise ValueError("Backup inspection receipt encryption mode does not match the import mode.")
-        if archive_digest != receipt_digest:
-            raise ValueError("Backup archive does not match its inspection receipt.")
-
-        expected_record = (receipt_digest, mode, issued_at, expires_at)
-        with self._lock:
-            record = self._issued.get(nonce)
-            if record is None or record[:4] != expected_record:
-                raise ValueError("Backup inspection receipt was not issued by this server.")
-            if record[4]:
-                raise ValueError("Backup inspection receipt was already used.")
-            self._issued[nonce] = (*record[:4], True)
-            self._prune_expired_locked(current_time)
+        return receipt_digest, mode, issued_at, expires_at, nonce
 
     def _prune_expired_locked(self, now: int) -> None:
         self._issued = {
             nonce: record
             for nonce, record in self._issued.items()
-            if record[3] >= now
+            if record[3] >= now or nonce in self._admitted_nonces
         }
