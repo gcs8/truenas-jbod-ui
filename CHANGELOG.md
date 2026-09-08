@@ -34,10 +34,10 @@ an entry below.
 
 ### Highlights
 
-- Main-UI writes and browser admin mutations now require local authentication
-  and a configured public origin; a deployment on the shipped
-  `ADMIN_AUTH_MODE=network` default is read-only until `basic` mode and the
-  origins are set (#245, #201).
+- The main and admin UIs now work without application authentication or public
+  origin settings by default; Basic authentication, exact-origin checks, and
+  verified private TLS are optional hardening steps (#392, superseding the
+  defaults introduced by #245 and #201).
 - Dell MD1280 shelves render with full-chassis and per-drawer profiles built
   from the validated 84-bay layout (#157).
 - Segmented history gained crash-safe later-generation rotation, recovery of
@@ -50,6 +50,8 @@ an entry below.
 
 ### Breaking changes
 
+- Restored unauthenticated main and admin controls in default `network` mode
+  and made TLS certificate verification opt-in for new connections (#392)
 - Required local authentication for mutating main-UI requests and hardened the
   default Compose runtime contract (#245 and #246).
 - Required a configured admin public origin for browser-initiated admin
@@ -73,24 +75,18 @@ them before starting the new images.
   hour, now keeps the sidecar running until it is stopped. Set the value
   explicitly and recreate the admin container. Non-integer, negative, boolean,
   and exponential values are now rejected instead of being coerced (#240).
-- `ADMIN_AUTH_MODE`, `ADMIN_AUTH_USERNAME`, `ADMIN_AUTH_PASSWORD`, and
-  `APP_PUBLIC_ORIGIN` now govern main-UI writes, which require local
-  authentication. In the shipped default `ADMIN_AUTH_MODE=network` the main UI
-  is read-only: pages, static assets, health, metrics, and read-only API calls
-  stay anonymous, and every write -- slot-mapping save and clear, enclosure
-  alias edits, Storage Fabric alias edits, mapping import, LED locate, and the
-  system locator -- is rejected with `403`. To
-  keep those controls, set `ADMIN_AUTH_MODE=basic`, set `ADMIN_AUTH_USERNAME`
-  and `ADMIN_AUTH_PASSWORD`, and set `APP_PUBLIC_ORIGIN` to the exact origin
-  the browser uses. In `basic` mode the main UI refuses to start when
-  `APP_PUBLIC_ORIGIN` is not a valid origin, and cross-origin or contradictory
-  `Origin`/`Referer` writes fail closed (#245).
-- `ADMIN_PUBLIC_ORIGIN` must be set to the exact origin the admin UI is opened
-  on, because browser-initiated admin mutations are now compared against it
-  instead of the request's own host data. The shipped `.env.example` still
-  leaves it empty and still calls it optional; with no value configured,
-  browser admin mutations are rejected. Set it before upgrading. This gap is
-  tracked in #272 (#201).
+- The default `ADMIN_AUTH_MODE=network` now treats reachability as
+  authorization: anyone who can reach the main or admin port can use its
+  controls, and neither `APP_PUBLIC_ORIGIN` nor `ADMIN_PUBLIC_ORIGIN` is
+  required. Existing `network` deployments therefore gain unauthenticated
+  writes after upgrading. Keep the ports reachable only by authorized users,
+  or opt into `ADMIN_AUTH_MODE=basic`, credentials, and the exact origin for
+  each enabled UI. Basic credentials require HTTPS or an encrypted VPN because
+  HTTP Basic encoding is not encryption. New TrueNAS, QuantaStor, and BMC
+  connections also default to `verify_ssl: false`; existing explicit values
+  remain unchanged. Set verification to `true` and provide a CA bundle when the
+  appliance certificate is not already trusted. This supersedes the read-only
+  network-mode and mandatory-origin upgrade notes from #245 and #201 (#392).
 - `docker-compose.yml` now describes a hardened runtime and needs a one-time
   ownership step. The UI and history services run as `${APP_UID}:${APP_GID}`
   instead of root. The UI service also mounts `./config` read-only, so
