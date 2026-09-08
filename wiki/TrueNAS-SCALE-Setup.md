@@ -23,7 +23,7 @@ systems:
       host: https://scale.example.test
       api_key: ""
       platform: scale
-      verify_ssl: true
+      verify_ssl: false
     ssh:
       enabled: false
 ```
@@ -32,6 +32,10 @@ Supply the API key through the setup UI or the documented secret setting. Open
 the main UI and confirm that disk and pool inventory loads. Some SCALE systems
 do not return usable enclosure rows through middleware. That limitation does
 not prevent the API-only inventory from working.
+
+This first connection does not verify the appliance certificate. After the UI
+works, [[Advanced Configuration|Advanced-Configuration]] explains how to enable
+verification with the system trust store or a private CA bundle.
 
 ## 2. Add optional SSH enrichment
 

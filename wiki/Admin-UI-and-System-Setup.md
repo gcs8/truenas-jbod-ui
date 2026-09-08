@@ -14,7 +14,7 @@ Use it when you want:
 - reusable custom profile authoring through the dedicated builder workspace
 - saved storage-view editing without changing YAML by hand
 
-The read-only enclosure UI on `:8080` still works without this sidecar. The
+The main enclosure UI on `:8080` still works without this sidecar. The
 admin page is optional and separate on purpose, but it is a normal supported
 runtime service rather than a dev-only helper.
 
@@ -187,9 +187,8 @@ shows placeholders rather than returning the command text to the browser. The
 server resolves the saved list only when generating the bootstrap permission
 preview or applying the one-time setup action.
 
-This is especially useful on CORE and SCALE systems where the app can stay
-read-only in the main UI but still use richer SSH detail, LED control, and
-CORE SAS fabric/topology diagnostics.
+This is especially useful on CORE and SCALE systems where the main UI can use
+richer SSH detail, LED control, and CORE SAS fabric/topology diagnostics.
 
 For TrueNAS CORE, the permission preview is the same one-line
 `midclt call user.update USER_ID '{...}'` payload the bootstrap action applies
@@ -314,7 +313,7 @@ The detailed operator guidance lives on:
 
 For a first-time setup on a new host:
 
-1. start the main UI and confirm basic read-only inventory works
+1. start the main UI and confirm basic inventory loads
 2. start the admin sidecar on `:8082`
 3. load or create the target system entry
 4. configure SSH if you want richer mapping, SMART, or LED support

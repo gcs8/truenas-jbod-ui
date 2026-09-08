@@ -23,13 +23,17 @@ systems:
       host: https://truenas.example.test
       api_key: ""
       platform: core
-      verify_ssl: true
+      verify_ssl: false
     ssh:
       enabled: false
 ```
 
 Supply the API key through the setup UI or the documented secret setting. Open
 the main UI and confirm that disks and pools load before adding SSH.
+
+This first connection does not verify the appliance certificate. After the UI
+works, [[Advanced Configuration|Advanced-Configuration]] explains how to enable
+verification with the system trust store or a private CA bundle.
 
 ## 2. Add optional SSH enrichment
 

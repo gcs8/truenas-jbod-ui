@@ -68,8 +68,10 @@ folders for configuration and data.
 | `./backup-status` | shared read-only scheduled backup status |
 | `./logs` | application logs when file logging is configured |
 
-Protect these folders as local application data. Do not expose the admin
-sidecar or its files to untrusted networks.
+Protect these folders as local application data. The default has no application
+login. Anyone who can reach an enabled service can use the controls available
+there. Restrict port access to authorized users, or enable Basic authentication
+or an authenticated reverse proxy before widening access.
 
 ## Host connections
 

@@ -19,7 +19,7 @@ systems:
       api_user: jbodmap
       api_password: replace_me
       platform: quantastor
-      verify_ssl: true
+      verify_ssl: false
       timeout_seconds: 15
     ssh:
       enabled: false
@@ -29,6 +29,10 @@ Store the real API password through the supported secret setting. Save the
 system, open the main UI, and confirm that REST inventory loads. API-only mode
 can show the shared enclosure, disks, node context, metrics, and history when
 the appliance returns those fields.
+
+This first connection does not verify the appliance certificate. After the UI
+works, [[Advanced Configuration|Advanced-Configuration]] explains how to enable
+verification with the system trust store or a private CA bundle.
 
 Start the admin sidecar when you need the setup form:
 

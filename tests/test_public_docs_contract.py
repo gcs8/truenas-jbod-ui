@@ -50,6 +50,36 @@ def run_checker(*args: str) -> subprocess.CompletedProcess[str]:
 
 
 class PublicDocsContractTests(unittest.TestCase):
+    def test_platform_api_first_examples_keep_tls_verification_opt_in(self) -> None:
+        for relative_path in (
+            "wiki/TrueNAS-CORE-Setup.md",
+            "wiki/TrueNAS-SCALE-Setup.md",
+            "wiki/Quantastor-Setup.md",
+        ):
+            guide = (ROOT / relative_path).read_text(encoding="utf-8")
+            initial_setup = guide.split("## 2.", maxsplit=1)[0]
+            with self.subTest(guide=relative_path):
+                self.assertIn("verify_ssl: false", initial_setup)
+                self.assertNotIn("verify_ssl: true", initial_setup)
+
+    def test_admin_guide_does_not_describe_the_main_ui_as_read_only(self) -> None:
+        guide = (ROOT / "wiki/Admin-UI-and-System-Setup.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertNotIn("read-only enclosure UI", guide)
+        self.assertIn("main enclosure UI", guide)
+
+    def test_architecture_guide_states_the_reachability_boundary_plainly(self) -> None:
+        guide = (ROOT / "wiki/Architecture-and-Services.md").read_text(
+            encoding="utf-8"
+        )
+        normalized = " ".join(guide.split())
+
+        self.assertNotRegex(guide, r"(?i)trusted (?:network|LAN)")
+        self.assertIn("Anyone who can reach an enabled service", normalized)
+        self.assertIn("Basic authentication", normalized)
+
     def test_readme_is_a_short_human_facing_entry_point(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
 

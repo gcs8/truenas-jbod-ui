@@ -79,12 +79,14 @@ them before starting the new images.
   authorization: anyone who can reach the main or admin port can use its
   controls, and neither `APP_PUBLIC_ORIGIN` nor `ADMIN_PUBLIC_ORIGIN` is
   required. Existing `network` deployments therefore gain unauthenticated
-  writes after upgrading. Keep the ports reachable only by authorized users,
-  or opt into `ADMIN_AUTH_MODE=basic`, credentials, and the exact origin for
-  each enabled UI. Basic credentials require HTTPS or an encrypted VPN because
-  HTTP Basic encoding is not encryption. New TrueNAS, QuantaStor, and BMC
-  connections also default to `verify_ssl: false`; existing explicit values
-  remain unchanged. Set verification to `true` and provide a CA bundle when the
+  writes after upgrading. This includes mapping and import changes, enclosure
+  and Storage Fabric alias edits, disk inventory sync, LED controls, and the
+  system locator. Keep the ports reachable only by authorized users, or opt
+  into `ADMIN_AUTH_MODE=basic`, credentials, and the exact origin for each
+  enabled UI. Basic credentials require HTTPS or an encrypted VPN because HTTP
+  Basic encoding is not encryption. New TrueNAS, QuantaStor, and BMC connections
+  also default to `verify_ssl: false`; existing explicit values remain
+  unchanged. Set verification to `true` and provide a CA bundle when the
   appliance certificate is not already trusted. This supersedes the read-only
   network-mode and mandatory-origin upgrade notes from #245 and #201 (#392).
 - `docker-compose.yml` now describes a hardened runtime and needs a one-time
