@@ -19,9 +19,9 @@ Identify LEDs are available only on supported, configured paths.
 [[Visual Tour|Visual-Tour]] shows the interface with synthetic sample data.
 [[Troubleshooting]] covers missing disks, slots, and history.
 
-`v0.23.0` is the latest published release, dated 2026-09-08. Follow
+`v0.22.2` is the latest published release, dated 2026-09-01. Follow
 [[Quick Start|Quick-Start]] so the Compose file and image tag stay matched. See
-the [GitHub release](https://github.com/gcs8/truenas-jbod-ui/releases/tag/v0.23.0)
+the [GitHub release](https://github.com/gcs8/truenas-jbod-ui/releases/tag/v0.22.2)
 for release-specific details.
 
 ## What runs

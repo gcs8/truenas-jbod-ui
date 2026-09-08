@@ -32,14 +32,14 @@ class ReleaseStatusTests(unittest.TestCase):
         self.assertIn("# Release Notes - v0.23.0", release_notes)
         self.assertIn("two synthetic spares", release_notes)
 
-        release_url = "https://github.com/gcs8/truenas-jbod-ui/releases/tag/v0.23.0"
+        release_url = "https://github.com/gcs8/truenas-jbod-ui/releases/tag/v0.22.2"
         for current_doc in (roadmap, wiki_home):
             with self.subTest(document=current_doc[:40]):
-                self.assertIn("v0.23.0", current_doc)
+                self.assertIn("v0.22.2", current_doc)
                 self.assertIn("latest published release", current_doc)
-                self.assertIn("2026-09-08", current_doc)
+                self.assertIn("2026-09-01", current_doc)
                 self.assertIn(release_url, current_doc)
-                self.assertNotIn("v0.22.2` is the latest published release", current_doc)
+                self.assertNotIn("v0.22.1` is the latest published release", current_doc)
 
     def test_post_v0222_roadmap_reconciles_completed_follow_up_work(self) -> None:
         repository = Path(__file__).resolve().parents[1]

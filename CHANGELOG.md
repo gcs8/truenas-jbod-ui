@@ -212,6 +212,9 @@ them before starting the new images.
 
 ### Changed
 
+- Prepared the v0.23.0 version metadata, release notes and HOLD wrap, current
+  install guidance, production-shaped synthetic public demo, exact-byte
+  screenshots, and complete generated-release category labels (#395).
 - Split local validation into distinct portable safe and full modes, retained
   the performance baseline and exact CI source-gate parity, and corrected
   Windows browser commands (#384).
