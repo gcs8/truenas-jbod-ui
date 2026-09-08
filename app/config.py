@@ -126,7 +126,7 @@ class TrueNASConfig(BaseModel):
     api_user: str = ""
     api_password: str = ""
     platform: Literal["core", "scale", "linux", "quantastor", "esxi", "ipmi"] = "core"
-    verify_ssl: bool = True
+    verify_ssl: bool = False
     tls_ca_bundle_path: str | None = None
     tls_server_name: str | None = None
     timeout_seconds: int = 15
@@ -199,7 +199,7 @@ class BMCConfig(BaseModel):
     host: str = ""
     username: str = ""
     password: str = ""
-    verify_ssl: bool = True
+    verify_ssl: bool = False
     timeout_seconds: int = 15
 
     @field_validator("host", "username", mode="before")

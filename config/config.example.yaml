@@ -24,9 +24,9 @@ truenas:
   api_user: ""
   api_password: ""
   platform: core
-  # Leave this true by default. Only disable it intentionally for
-  # self-signed or rapidly-rotating lab appliances.
-  verify_ssl: true
+  # The beginner default accepts the appliance certificate without verification.
+  # Set this to true and add a CA bundle for a hardened deployment.
+  verify_ssl: false
   timeout_seconds: 15
   # Optional substring match against enclosure id/name/label.
   enclosure_filter: ""

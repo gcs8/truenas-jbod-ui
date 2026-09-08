@@ -4464,7 +4464,7 @@
       elements.setupTruenasHost.value = "";
     }
     if (elements.setupVerifySsl) {
-      elements.setupVerifySsl.checked = true;
+      elements.setupVerifySsl.checked = false;
     }
     if (elements.setupTlsCaBundlePath) {
       elements.setupTlsCaBundlePath.value = "";
@@ -4491,7 +4491,7 @@
     }
     setRedactedSecretField(elements.setupBmcPassword, false);
     if (elements.setupBmcVerifySsl) {
-      elements.setupBmcVerifySsl.checked = true;
+      elements.setupBmcVerifySsl.checked = false;
     }
     if (elements.setupBmcTimeoutSeconds) {
       elements.setupBmcTimeoutSeconds.value = "15";
@@ -4661,7 +4661,7 @@
       savedSecretConfigured(system, "bmc_password_configured", "bmc_password")
     );
     if (elements.setupBmcVerifySsl) {
-      elements.setupBmcVerifySsl.checked = system.bmc_verify_ssl !== false;
+      elements.setupBmcVerifySsl.checked = Boolean(system.bmc_verify_ssl);
     }
     if (elements.setupBmcTimeoutSeconds) {
       elements.setupBmcTimeoutSeconds.value = String(system.bmc_timeout_seconds || 15);

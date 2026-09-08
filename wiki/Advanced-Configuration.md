@@ -2,6 +2,56 @@
 
 This page is for operators who want to tweak more than the defaults.
 
+## Optional authentication
+
+The default setup has no login. Anyone who can reach the published main or
+admin port can use the controls available there. An RFC1918 address does not
+make a client trusted. Guest Wi-Fi, shared LANs, and VPNs can all use private
+addresses.
+
+Enable built-in Basic authentication when reachability is broader than the
+people who should control the app:
+
+```dotenv
+ADMIN_AUTH_MODE=basic
+ADMIN_AUTH_USERNAME=operator
+ADMIN_AUTH_PASSWORD=replace-with-a-long-random-password
+APP_PUBLIC_ORIGIN=https://storage-ui.example.test
+ADMIN_PUBLIC_ORIGIN=https://storage-admin.example.test
+```
+
+In Basic mode, the same username and password protect all admin pages and the
+write controls in the main UI. Main-UI inventory and history reads remain
+available without a login. Set each origin to the exact scheme, host, and port
+shown in the browser. Basic mode refuses to start the admin service when its
+origin is missing or invalid.
+
+Each main-UI page starts signed out. The in-page sign-in keeps credentials in
+page memory and clears them on reload or sign-out. Basic credentials are only
+encoded, not encrypted, so use HTTPS or an encrypted VPN.
+
+## Optional certificate verification
+
+The first-run default accepts a self-signed appliance certificate without
+verifying it. To verify the TrueNAS certificate, copy the CA certificate that
+signed it into the app's `config/tls` folder:
+
+```bash
+mkdir -p config/tls
+cp /path/to/truenas-ca.pem config/tls/truenas-ca.pem
+chmod 0644 config/tls/truenas-ca.pem
+```
+
+Then add these settings to `.env`:
+
+```dotenv
+TRUENAS_VERIFY_SSL=true
+TRUENAS_TLS_CA_BUNDLE_PATH=/app/config/tls/truenas-ca.pem
+TRUENAS_TLS_SERVER_NAME=truenas.example.test
+```
+
+Use the DNS name on the certificate for `TRUENAS_TLS_SERVER_NAME`.
+
 ## Single-System vs Multi-System
 
 The app supports:

@@ -18,10 +18,6 @@ The two screenshots on this page come from the checked-in synthetic public
 demo. They contain no live host, address, serial, credential, or history data.
 The public screenshot manifest binds their exact bytes to the demo artifact.
 
-This is a desktop operator application. Mobile and tablet layouts are
-unsupported. Incidental rendering on those devices is not a compatibility
-claim or documented workflow.
-
 ## Main Enclosure View
 
 The primary screen is a physical slot map. The goal is to make the bay location

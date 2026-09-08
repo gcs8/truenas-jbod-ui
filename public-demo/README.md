@@ -47,7 +47,7 @@ npx playwright test qa/public-demo.spec.js --retries=0
 The tests cover offline file mode, a Pages-style subpath, Chrome-compatible
 interaction, 1280- and 1920-pixel desktop layouts, keyboard focus, reduced
 motion, desktop zoom, forbidden live controls, console errors, and unexpected
-requests. Mobile and tablet layouts are unsupported and are not release gates.
+requests.
 
 ## Publish
 

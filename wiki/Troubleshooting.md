@@ -90,27 +90,27 @@ Fix it by:
 
 Do not broaden sudo more than needed.
 
-## Main-UI Writes Return 403
+## Main-UI Writes Return 401 Or 403
 
-`Read UI mutations require ADMIN_AUTH_MODE=basic.` means the deployment is in
-the current-main network mode. Reads stay anonymous, but mapping, alias, import,
-locator, and LED writes are disabled. Set `ADMIN_AUTH_MODE=basic`, configure the
-shared credentials and exact `APP_PUBLIC_ORIGIN`, recreate the services, then
-use the in-page sign-in. Each page and tab starts signed out.
+In Basic mode, `Read UI authentication required.` means the page is signed out
+or the credentials are wrong. Sign in again on that page. A cross-origin error
+means `APP_PUBLIC_ORIGIN` does not exactly match the scheme, host, and port in
+the browser address bar.
 
 ## Admin Mutations Return 403
 
 `Cross-origin admin mutation rejected.` means the browser origin does not match
 `ADMIN_PUBLIC_ORIGIN`. Set it to the exact scheme, host, and port shown in the
-browser, with no path, then recreate the admin container. Current main refuses
-to start if this setting is empty or malformed.
+browser, with no path, then recreate the admin container. This check applies in
+Basic mode. The admin service refuses to start in Basic mode if the setting is
+empty or malformed.
 
 ## Full Backup Returns 400
 
 `Plaintext backup export is disabled.` means an unsanitized export was requested
 without encryption. Enable encryption. Set
-`ADMIN_ALLOW_PLAINTEXT_BACKUP_EXPORT=true` only for an intentional trusted-local
-workflow; the override does not make the archive safe to share.
+`ADMIN_ALLOW_PLAINTEXT_BACKUP_EXPORT=true` only for an intentional,
+access-restricted workflow; the override does not make the archive safe to share.
 
 ## A Non-Root Container Gets Permission Denied
 

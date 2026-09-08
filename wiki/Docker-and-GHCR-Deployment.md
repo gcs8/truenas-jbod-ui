@@ -69,27 +69,29 @@ Open:
 http://your-docker-host:8080
 ```
 
-On current `main`, the default `ADMIN_AUTH_MODE=network` keeps this dashboard
-readable but renders the write controls disabled for mapping, alias, import,
-locator, and LED mutations. To enable operator controls,
-set shared Basic credentials and the exact main-UI origin:
+The default setup has no login. Anyone who can reach the published main or
+admin port can use the controls available there. Do not publish those ports
+directly to the Internet. To opt into Basic authentication, set shared
+credentials and the exact browser origins:
 
 ```dotenv
 ADMIN_AUTH_MODE=basic
 ADMIN_AUTH_USERNAME=operator
 ADMIN_AUTH_PASSWORD=replace-with-a-long-random-secret
 APP_PUBLIC_ORIGIN=https://storage-ui.example.local
+ADMIN_PUBLIC_ORIGIN=https://storage-admin.example.local
 ```
 
-Basic mode protects persistent and hardware-changing main-UI writes while reads
-remain anonymous. Use HTTPS through a reverse proxy or an encrypted private
-network; Basic credentials are not encrypted by HTTP itself.
+In Basic mode, both origin settings are required. Basic mode protects all admin
+pages and persistent or hardware-changing main-UI writes while reads remain
+anonymous. Use HTTPS through a reverse proxy or an encrypted private network;
+Basic credentials are not encrypted by HTTP itself.
 
 Each live page starts signed out. Use its in-page sign-in before a write. The
 browser holds the credentials only in page memory, sends them only to
 same-origin verification and mutation routes, and clears them on reload or
 sign-out. Separate tabs and the dedicated Storage Fabric page require their own
-sign-in. These read-UI policy controls are not in the v0.22.2 image.
+sign-in.
 
 ## Default non-root runtime on current main
 
@@ -482,17 +484,15 @@ runtime controls, or the profile builder:
 
 Before starting it, read the
 [Admin trust boundary](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/ADMIN_TRUST_BOUNDARY.md).
-On current `main`, set `ADMIN_PUBLIC_ORIGIN` to the exact browser origin before
-launch. The admin service refuses to start when it is missing or malformed. The
-default network
-mode has no application login and treats every client that can reach port
-`8082` as a trusted operator. The mounted Docker socket gives the sidecar
-host-level container authority. Restrict network reachability to trusted
-operators. Auto-stop limits exposure; it is not authentication.
+The default setup has no login. Anyone who can reach port `8082` can change
+configuration and control the app's containers. An RFC1918 address alone does
+not make that access safe. The mounted Docker socket gives the sidecar
+host-level container authority. Auto-stop limits exposure; it is not
+authentication.
 
-The v0.22.2 image predates this startup check. Keep the release-matched v0.22.2
-deployment restricted to trusted operators rather than treating the newer
-origin check as a release feature.
+In Basic mode, set `APP_PUBLIC_ORIGIN` and `ADMIN_PUBLIC_ORIGIN` to the exact
+addresses shown in the browser. The example earlier on this page includes all
+required values.
 
 ```bash
 docker compose --profile admin pull

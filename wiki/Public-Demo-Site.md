@@ -80,9 +80,6 @@ back and forward navigation, keyboard focus, reduced motion, a 200-percent
 desktop zoom-equivalent layout, 1280- and 1920-pixel desktop widths, console
 errors, and unexpected requests.
 
-Mobile and tablet layouts are unsupported. Incidental rendering on those
-devices is not a public-demo capability or compatibility claim.
-
 Firefox and WebKit are not release gates for this demo.
 
 ## Publication

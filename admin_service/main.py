@@ -409,14 +409,21 @@ def format_history_system_summary(summary: dict[str, Any]) -> str:
     )
 
 
-def create_app() -> FastAPI:
-    admin_settings = get_admin_settings()
-    if configured_origin_identity(admin_settings.public_origin) is None:
+def validate_admin_public_origin(admin_settings: AdminSettings) -> None:
+    if (
+        admin_settings.auth_mode == "basic"
+        and configured_origin_identity(admin_settings.public_origin) is None
+    ):
         raise ValueError(
             "ADMIN_PUBLIC_ORIGIN must be an absolute HTTP(S) origin that matches the address "
             "shown in the browser for the admin UI, for example http://jbod-admin.example.test:8082. "
-            "Browser-initiated admin changes are rejected without it, so the admin service refuses to start."
+            "Basic authentication requires this origin check."
         )
+
+
+def create_app() -> FastAPI:
+    admin_settings = get_admin_settings()
+    validate_admin_public_origin(admin_settings)
     admin_metrics_path = metrics_path()
     if (
         admin_metrics_path in {"/", "/livez", "/healthz", "/openapi.json"}
@@ -484,9 +491,10 @@ def create_app() -> FastAPI:
             "/healthz",
             admin_metrics_path,
         }
-        if request.method.upper() in {"POST", "PUT", "PATCH", "DELETE"} and not _request_origin_allowed(
-            request,
-            admin_settings,
+        if (
+            admin_settings.auth_mode == "basic"
+            and request.method.upper() in {"POST", "PUT", "PATCH", "DELETE"}
+            and not _request_origin_allowed(request, admin_settings)
         ):
             return JSONResponse(
                 {"detail": "Cross-origin admin mutation rejected."},

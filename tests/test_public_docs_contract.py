@@ -50,6 +50,40 @@ def run_checker(*args: str) -> subprocess.CompletedProcess[str]:
 
 
 class PublicDocsContractTests(unittest.TestCase):
+    def test_readme_is_a_short_human_facing_entry_point(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+        self.assertLessEqual(len(readme.splitlines()), 150)
+        for required in (
+            "https://gcs8.github.io/truenas-jbod-ui/",
+            "public-demo-overview.png",
+            "public-demo-history.png",
+            "TRUENAS_HOST=https://truenas.example.test",
+            "TRUENAS_API_KEY=replace-with-your-api-key",
+            "TRUENAS_PLATFORM=core",
+            "TRUENAS_VERIFY_SSL=false",
+            "docker compose up -d",
+            "wiki/Quick-Start.md",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, readme)
+
+        for internal_note in (
+            "Desktop support contract",
+            "documentation inventory",
+            "review baseline",
+            "source revision",
+            "release gate",
+            "current `main` source build",
+            "next release",
+            "ADMIN_PUBLIC_ORIGIN",
+            "APP_PUBLIC_ORIGIN",
+            "ADMIN_AUTH_MODE",
+            "TRUENAS_TLS_CA_BUNDLE_PATH",
+        ):
+            with self.subTest(internal_note=internal_note):
+                self.assertNotIn(internal_note, readme)
+
     def test_repository_has_exact_readme_and_wiki_document_set(self) -> None:
         actual = {path.relative_to(ROOT).as_posix() for path in (ROOT / "wiki").glob("*.md")}
 
@@ -87,14 +121,16 @@ class PublicDocsContractTests(unittest.TestCase):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, inventory)
 
-    def test_current_public_guidance_is_ca_first_and_warns_about_udp_syslog(self) -> None:
+    def test_quick_start_is_ca_optional_and_advanced_docs_cover_verification(self) -> None:
         quick_start = (ROOT / "wiki/Quick-Start.md").read_text(encoding="utf-8")
+        advanced = (ROOT / "wiki/Advanced-Configuration.md").read_text(encoding="utf-8")
         operations = (ROOT / "wiki/Operations-Logging-and-Metrics.md").read_text(encoding="utf-8")
 
-        self.assertIn("TRUENAS_VERIFY_SSL=true", quick_start)
-        self.assertIn("TRUENAS_TLS_CA_BUNDLE_PATH=/app/config/tls/truenas-ca.pem", quick_start)
-        self.assertIn("TRUENAS_TLS_SERVER_NAME=truenas.example.test", quick_start)
-        self.assertIn("Temporary insecure diagnostic", quick_start)
+        self.assertIn("TRUENAS_VERIFY_SSL=false", quick_start)
+        self.assertNotIn("TRUENAS_TLS_CA_BUNDLE_PATH", quick_start)
+        self.assertIn("TRUENAS_VERIFY_SSL=true", advanced)
+        self.assertIn("TRUENAS_TLS_CA_BUNDLE_PATH=/app/config/tls/truenas-ca.pem", advanced)
+        self.assertIn("TRUENAS_TLS_SERVER_NAME=truenas.example.test", advanced)
         self.assertIn("trusted, isolated logging network", operations)
         self.assertIn("authenticated and encrypted", operations)
 

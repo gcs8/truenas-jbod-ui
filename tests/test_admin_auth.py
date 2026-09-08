@@ -93,6 +93,29 @@ def basic_header(username: str, password: str) -> str:
 
 
 class AdminAuthenticationTests(unittest.TestCase):
+    def test_network_mode_is_the_no_auth_default_and_needs_no_origin(self) -> None:
+        settings = AdminSettings()
+
+        self.assertEqual(settings.auth_mode, "network")
+        self.assertIsNone(settings.auth_username)
+        self.assertIsNone(settings.auth_password)
+        self.assertIsNone(settings.public_origin)
+
+        with patch("admin_service.main.get_admin_settings", return_value=settings):
+            app = create_app()
+
+        get_status, _headers, _body = asyncio.run(invoke_asgi(app, "/missing"))
+        post_status, _headers, _body = asyncio.run(
+            invoke_asgi(
+                app,
+                "/missing",
+                method="POST",
+                origin="https://unrelated.example",
+            )
+        )
+        self.assertEqual(get_status, 404)
+        self.assertEqual(post_status, 404)
+
     def test_clean_backup_targets_rejects_admin_sidecar(self) -> None:
         with self.assertRaisesRegex(ValidationError, "clean_backup_targets"):
             AdminSettings(clean_backup_targets=["ui", "admin"])
@@ -257,9 +280,11 @@ class AdminAuthenticationTests(unittest.TestCase):
         )
         self.assertEqual(static_status, 401)
 
-    def test_origin_gate_wraps_every_admin_router_mutation(self) -> None:
+    def test_basic_mode_origin_gate_wraps_every_admin_router_mutation(self) -> None:
         settings = AdminSettings(
-            auth_mode="network",
+            auth_mode="basic",
+            auth_username="operator",
+            auth_password=SecretStr(MARKER_ALPHA),
             public_origin=ADMIN_TEST_PUBLIC_ORIGIN,
             auto_stop_seconds=0,
         )
@@ -282,6 +307,7 @@ class AdminAuthenticationTests(unittest.TestCase):
                         app,
                         path,
                         method=method,
+                        authorization=basic_header("operator", MARKER_ALPHA),
                         origin="https://attacker.example",
                     )
                 )
@@ -294,14 +320,22 @@ class AdminAuthenticationTests(unittest.TestCase):
     def test_network_boundary_mode_preserves_remote_unauthenticated_contract(self) -> None:
         settings = AdminSettings(
             auth_mode="network",
-            public_origin=ADMIN_TEST_PUBLIC_ORIGIN,
             auto_stop_seconds=0,
         )
         with patch("admin_service.main.get_admin_settings", return_value=settings):
             app = create_app()
 
         status, _headers, _body = asyncio.run(invoke_asgi(app, "/missing"))
+        write_status, _headers, _body = asyncio.run(
+            invoke_asgi(
+                app,
+                "/missing",
+                method="POST",
+                origin="https://unrelated.example",
+            )
+        )
         self.assertEqual(status, 404)
+        self.assertEqual(write_status, 404)
 
     def test_admin_test_env_replaces_a_blank_or_malformed_inherited_origin(self) -> None:
         # A shell that sourced .env inherits the shipped empty `ADMIN_PUBLIC_ORIGIN=` line as a
@@ -323,7 +357,7 @@ class AdminAuthenticationTests(unittest.TestCase):
             importlib.reload(admin_test_env)
             get_admin_settings.cache_clear()
 
-    def test_create_app_refuses_to_start_without_a_valid_public_origin(self) -> None:
+    def test_basic_mode_refuses_to_start_without_a_valid_public_origin(self) -> None:
         for public_origin in (
             None,
             "",
@@ -337,7 +371,9 @@ class AdminAuthenticationTests(unittest.TestCase):
         ):
             with self.subTest(public_origin=public_origin):
                 settings = AdminSettings(
-                    auth_mode="network",
+                    auth_mode="basic",
+                    auth_username="operator",
+                    auth_password=SecretStr(MARKER_ALPHA),
                     public_origin=public_origin,
                     auto_stop_seconds=0,
                 )
@@ -347,7 +383,9 @@ class AdminAuthenticationTests(unittest.TestCase):
 
     def test_configured_public_origin_gates_browser_mutations_on_a_real_route(self) -> None:
         settings = AdminSettings(
-            auth_mode="network",
+            auth_mode="basic",
+            auth_username="operator",
+            auth_password=SecretStr(MARKER_ALPHA),
             public_origin=ADMIN_TEST_PUBLIC_ORIGIN,
             auto_stop_seconds=0,
         )
@@ -359,6 +397,7 @@ class AdminAuthenticationTests(unittest.TestCase):
                 app,
                 "/api/admin/system-setup/sudoers-preview",
                 method="POST",
+                authorization=basic_header("operator", MARKER_ALPHA),
                 origin="http://admin.example.test",
             )
         )
@@ -367,6 +406,7 @@ class AdminAuthenticationTests(unittest.TestCase):
                 app,
                 "/api/admin/system-setup/sudoers-preview",
                 method="POST",
+                authorization=basic_header("operator", MARKER_ALPHA),
                 origin="http://admin.example.test:8082",
             )
         )
@@ -376,75 +416,64 @@ class AdminAuthenticationTests(unittest.TestCase):
         self.assertEqual(foreign_origin_status, 403)
         self.assertEqual(foreign_body, b'{"detail":"Cross-origin admin mutation rejected."}')
 
-    def test_browser_mutations_require_same_origin_in_both_auth_modes(self) -> None:
-        for settings, authorization in (
-            (
-                AdminSettings(
-                    auth_mode="network",
-                    public_origin=ADMIN_TEST_PUBLIC_ORIGIN,
-                    auto_stop_seconds=0,
-                ),
-                None,
-            ),
-            (
-                AdminSettings(
-                    auth_mode="basic",
-                    auth_username="operator",
-                    auth_password=SecretStr(MARKER_ALPHA),
-                    public_origin=ADMIN_TEST_PUBLIC_ORIGIN,
-                    auto_stop_seconds=0,
-                ),
-                basic_header("operator", MARKER_ALPHA),
-            ),
-        ):
-            with self.subTest(auth_mode=settings.auth_mode):
-                with patch("admin_service.main.get_admin_settings", return_value=settings):
-                    app = create_app()
-                cross_origin_status, _headers, _body = asyncio.run(
-                    invoke_asgi(
-                        app,
-                        "/missing",
-                        method="POST",
-                        authorization=authorization,
-                        origin="https://attacker.example",
-                    )
-                )
-                same_origin_status, _headers, _body = asyncio.run(
-                    invoke_asgi(
-                        app,
-                        "/missing",
-                        method="POST",
-                        authorization=authorization,
-                        origin="http://admin.example.test",
-                    )
-                )
-                cross_referer_status, _headers, _body = asyncio.run(
-                    invoke_asgi(
-                        app,
-                        "/missing",
-                        method="POST",
-                        authorization=authorization,
-                        referer="https://attacker.example/form",
-                    )
-                )
-                cli_status, _headers, _body = asyncio.run(
-                    invoke_asgi(
-                        app,
-                        "/missing",
-                        method="POST",
-                        authorization=authorization,
-                    )
-                )
-                self.assertEqual(cross_origin_status, 403)
-                self.assertEqual(cross_referer_status, 403)
-                self.assertEqual(same_origin_status, 404)
-                self.assertEqual(cli_status, 404)
+    def test_basic_mode_browser_mutations_require_same_origin(self) -> None:
+        settings = AdminSettings(
+            auth_mode="basic",
+            auth_username="operator",
+            auth_password=SecretStr(MARKER_ALPHA),
+            public_origin=ADMIN_TEST_PUBLIC_ORIGIN,
+            auto_stop_seconds=0,
+        )
+        authorization = basic_header("operator", MARKER_ALPHA)
+        with patch("admin_service.main.get_admin_settings", return_value=settings):
+            app = create_app()
+        cross_origin_status, _headers, _body = asyncio.run(
+            invoke_asgi(
+                app,
+                "/missing",
+                method="POST",
+                authorization=authorization,
+                origin="https://attacker.example",
+            )
+        )
+        same_origin_status, _headers, _body = asyncio.run(
+            invoke_asgi(
+                app,
+                "/missing",
+                method="POST",
+                authorization=authorization,
+                origin="http://admin.example.test",
+            )
+        )
+        cross_referer_status, _headers, _body = asyncio.run(
+            invoke_asgi(
+                app,
+                "/missing",
+                method="POST",
+                authorization=authorization,
+                referer="https://attacker.example/form",
+            )
+        )
+        cli_status, _headers, _body = asyncio.run(
+            invoke_asgi(
+                app,
+                "/missing",
+                method="POST",
+                authorization=authorization,
+            )
+        )
+        self.assertEqual(cross_origin_status, 403)
+        self.assertEqual(cross_referer_status, 403)
+        self.assertEqual(same_origin_status, 404)
+        self.assertEqual(cli_status, 404)
 
     def test_browser_mutations_do_not_trust_a_host_derived_origin(self) -> None:
         # The configured origin differs from the request's Host header; an Origin that
         # merely matches Host must still be rejected.
         settings = AdminSettings(
-            auth_mode="network",
+            auth_mode="basic",
+            auth_username="operator",
+            auth_password=SecretStr(MARKER_ALPHA),
             public_origin="https://admin.example.test:9443",
             auto_stop_seconds=0,
         )
@@ -456,6 +485,7 @@ class AdminAuthenticationTests(unittest.TestCase):
                 app,
                 "/missing",
                 method="POST",
+                authorization=basic_header("operator", MARKER_ALPHA),
                 origin="http://admin.example.test",
             )
         )
@@ -578,6 +608,7 @@ class AdminAuthenticationTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         env_example = (root / ".env.example").read_text(encoding="utf-8")
         readme = (root / "README.md").read_text(encoding="utf-8")
+        advanced = (root / "wiki" / "Advanced-Configuration.md").read_text(encoding="utf-8")
         security_doc = (root / "docs" / "ADMIN_TRUST_BOUNDARY.md").read_text(encoding="utf-8")
         compose = (root / "docker-compose.yml").read_text(encoding="utf-8")
         admin_template = (root / "admin_service" / "templates" / "index.html").read_text(encoding="utf-8")
@@ -590,8 +621,12 @@ class AdminAuthenticationTests(unittest.TestCase):
         ):
             self.assertIn(marker, env_example)
             self.assertIn(marker, compose)
-        self.assertIn("ADMIN_TRUST_BOUNDARY.md", readme)
-        self.assertIn("trusted operators", security_doc)
+        self.assertIn("The default setup has no login", readme)
+        self.assertIn("available as optional settings", readme)
+        self.assertIn("ADMIN_AUTH_MODE=basic", advanced)
+        self.assertIn("ADMIN_PUBLIC_ORIGIN", advanced)
+        self.assertIn("APP_PUBLIC_ORIGIN", advanced)
+        self.assertIn("Anyone who can reach", security_doc)
         self.assertIn("firewall", security_doc.lower())
         self.assertIn("VPN", security_doc)
         self.assertIn("Basic authentication", security_doc)

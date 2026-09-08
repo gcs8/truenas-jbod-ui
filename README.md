@@ -1,219 +1,132 @@
 # TrueNAS JBOD Enclosure UI
 
-Off-box enclosure and disk visualization for validated TrueNAS, ESXi, generic Linux, Quantastor, BMC/IPMI, and UniFi paths.
+TrueNAS JBOD Enclosure UI is a Docker application for seeing disks in their
+physical slots. It can show enclosure layout, disk details, storage paths,
+history, and identify LEDs when the connected system supports them.
 
-This project runs in Docker on a separate host and gives you a physical slot
-view, disk detail, topology context, and LED actions where the platform can
-support them. It is aimed at setups where the storage box itself does not have
-good built-in chassis visibility, or where the operator needs one place to look
-across multiple hosts and enclosure styles.
+It runs on a separate Docker host. Nothing is installed on TrueNAS.
 
-It does not install anything on TrueNAS CORE or SCALE. The app talks to storage
-hosts over their existing API, SSH, or BMC paths and renders what it can from
-there.
-
-## Desktop support contract
-
-This is a desktop operator application. Mobile and tablet layouts are unsupported.
-If a phone or tablet happens to render the page, that is incidental behavior,
-not a supported workflow or compatibility claim.
-
-Public demo:
-
-- [https://gcs8.github.io/truenas-jbod-ui/](https://gcs8.github.io/truenas-jbod-ui/)
+[Open the public demo](https://gcs8.github.io/truenas-jbod-ui/)
 
 ## Screenshots
 
-These images come from the checked-in synthetic public demo. They contain no
-live target data. The [screenshot manifest](docs/images/screenshots/manifest.json)
-binds each PNG to the exact demo artifact and source revision.
+The screenshots use demo data, not a live storage system.
 
 ### Enclosure overview
 
-![Synthetic 60-bay enclosure overview](docs/images/screenshots/public-demo-overview.png)
+![60-bay enclosure overview](docs/images/screenshots/public-demo-overview.png)
 
-### History panel
+### Disk history
 
-![Synthetic slot history panel](docs/images/screenshots/public-demo-history.png)
+![Disk history panel](docs/images/screenshots/public-demo-history.png)
 
-See the [public demo product brief](docs/PUBLIC_DEMO_PRODUCT_BRIEF.md) for the
-fixture, browser, privacy, and publication contract. The
-[documentation inventory](docs/DOCUMENTATION_INVENTORY.md) records the README
-and Wiki review baseline.
+## What it does
 
-## Features
+- Shows disks in a physical chassis layout
+- Displays model, serial number, size, temperature, health, and path details
+- Switches between connected systems and enclosure views
+- Saves custom slot mappings and chassis layouts
+- Shows pool, controller, SAS, and multipath context when available
+- Runs identify LEDs on supported systems
+- Adds disk history and change events with the optional history service
+- Provides setup, backup, restore, and maintenance tools in the optional admin UI
+- Exposes health and Prometheus-compatible metrics endpoints
 
-- Physical slot-map UI with profile-driven chassis rendering
-- Read-only Storage Fabric topology and path context where evidence exists
-- Per-slot detail for serial, model, size, temperature, topology, and health
-- Live enclosure switching plus saved chassis views and virtual storage views
-- Manual slot calibration and persistent slot mappings
-- History sidecar for slot metrics and change events
-- Optional admin sidecar for setup, runtime behavior, restore, profile editing,
-  and maintenance
-- TrueNAS API plus SSH enrichment where that improves topology or SMART detail
-- BMC-first inventory for validated Supermicro FatTwin nodes
-- ESXi read-only enrichment with `esxcli` and StorCLI where available
-- LED identify support where the target platform exposes a safe path
-- Prometheus/OpenMetrics endpoints plus starter Grafana dashboards for
-  runtime and history visibility
+## Supported systems
 
-## Validated Platforms
+The built-in profiles cover hardware that has been tested with the project:
 
-- TrueNAS CORE on a Supermicro CSE-946 style `60`-bay top-loading shelf
-- TrueNAS SCALE on a Supermicro `SSG-6048R-E1CR36L` with separate front `24`-bay and rear `12`-bay views
-- Supermicro FatTwin `SYS-F629P3-RC1B` through the built-in `ipmi` platform with a front `6`-bay view and inferred rear `2`-bay view
-- VMware ESXi `7.0.3` on that same FatTwin / Broadcom 3108 path with BMC-backed slot truth and optional StorCLI + host SMART enrichment
-- VMware ESXi `7.0.3` on a Supermicro `AOC-SLG4-2H8M2` with a read-only `2`-slot M.2 carrier view
-- Generic Linux on a Supermicro `SYS-2029GP-TR` with a profile-driven `2`-bay NVMe layout
-- OSNexus Quantastor on a Supermicro `SSG-2028R-DE2CR24L` shared-slot HA chassis
-- UniFi UNVR with a built-in `4`-bay front profile and vendor-local LED support
-- UniFi UNVR Pro with a built-in `7`-bay `3-over-4` front profile and first-pass LED support
+- TrueNAS CORE and SCALE
+- Generic Linux storage hosts
+- VMware ESXi
+- OSNexus QuantaStor
+- Supermicro BMC and IPMI inventory
+- UniFi UNVR and UNVR Pro
 
-## Quick Start
+Support varies by platform. Some systems provide inventory only, while others
+also provide SMART data, path details, or LED control. See the
+[platform guides](wiki/Home.md) for tested hardware and setup notes.
 
-### Run the published image
+## Quick start
+
+You need Docker Compose, the URL of your TrueNAS system, and a TrueNAS API key.
 
 ```bash
-mkdir -p /docker-local/truenas-jbod-ui/{config/ssh,config/tls,data,history/backups/long-term,logs}
+mkdir -p /docker-local/truenas-jbod-ui
 cd /docker-local/truenas-jbod-ui
-curl -fsSL -o compose.yaml https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/v0.22.2/docker-compose.yml
-# copy your trusted CA certificate before writing .env
-cp /path/to/truenas-ca.pem config/tls/truenas-ca.pem
-# create .env with your target, API key, and CA trust first
+
+curl -fsSL \
+  -o compose.yaml \
+  https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/v0.22.2/docker-compose.yml
+
 cat > .env <<'EOF'
 JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.22.2
 TRUENAS_HOST=https://truenas.example.test
 TRUENAS_API_KEY=replace-with-your-api-key
-TRUENAS_VERIFY_SSL=true
-TRUENAS_TLS_CA_BUNDLE_PATH=/app/config/tls/truenas-ca.pem
-TRUENAS_TLS_SERVER_NAME=truenas.example.test
+TRUENAS_PLATFORM=core
+TRUENAS_VERIFY_SSL=false
 EOF
-docker compose pull
+
 docker compose up -d
 ```
 
-The Compose file and image above are both from v0.22.2. Do not mix a Compose
-file from current `main` with that stable image. Use the source build below when
-you need current-main behavior.
+Replace the example URL and API key before starting. Use `scale` instead of
+`core` when connecting to TrueNAS SCALE.
 
-Optional services from the published image:
+Open `http://your-docker-host:8080`.
 
-The authentication behavior below describes the current `main` source build and
-the next release, not v0.22.2. The v0.22.2 image predates the startup origin
-requirement and read-UI disabled-write policy. Keep that stable release on a
-trusted network.
+`TRUENAS_VERIFY_SSL=false` skips certificate verification so systems with a
+self-signed certificate work on the first launch. After the app is working, you
+can enable certificate verification by following
+[Advanced configuration](wiki/Advanced-Configuration.md).
 
-Before starting the current-main admin profile, read the
-[Admin Trust Boundary](docs/ADMIN_TRUST_BOUNDARY.md). Its default network mode
-assumes every client that can reach port `8082` is a trusted operator. Set
-`ADMIN_PUBLIC_ORIGIN` in `.env` to the exact origin your browser shows for the
-admin UI (for example `http://jbod-admin.example.test:8082`); the admin service
-refuses to start while it is missing, because browser-initiated admin changes are
-rejected without it.
+The default setup has no login. Anyone who can reach the published port can use
+the controls available in that service. Do not publish the ports directly to
+the Internet. Built-in authentication and stricter browser-origin checks are
+available as optional settings.
 
-The same operator-auth settings now control main-UI writes. The compatibility
-default, `ADMIN_AUTH_MODE=network`, keeps inventory and history views available
-without a login but rejects mapping, alias, import, locator, and LED mutations.
-To enable those controls, set `ADMIN_AUTH_MODE=basic`, configure the shared
-username/password, and set `APP_PUBLIC_ORIGIN` to the exact main-UI origin.
-Basic mode starts each live page signed out. Use the in-page sign-in before a
-mapping, alias, locator, or LED change. The browser keeps those credentials in
-page memory and sends them only to the same-origin verification and mutation
-routes. It clears them on reload or sign-out. Reads stay anonymous.
-In network mode the main UI renders the write controls disabled with that
-reason before any click; a write the server still rejects with 401 or 403
-disables them again and shows the server's detail.
+For a slower walkthrough with health checks and troubleshooting, use the
+[Quick Start guide](wiki/Quick-Start.md).
+
+## Optional services
+
+The main UI works by itself. Start history when you want charts and saved disk
+events:
 
 ```bash
 docker compose --profile history up -d
+```
+
+Start the admin UI when you want guided setup, profile editing, backup and
+restore, or container controls:
+
+```bash
 docker compose --profile admin up -d enclosure-admin
-docker compose --profile history --profile admin up -d
 ```
 
-For syslog, metrics, health endpoints, image updates, and Grafana dashboards,
-use the operations guide:
+The default ports are:
 
-- [Operations, Logging, and Metrics](wiki/Operations-Logging-and-Metrics.md)
+- Main UI: `8080`
+- History service: `8081`
+- Admin UI: `8082`
 
-Open:
+## Documentation
 
-- `http://your-docker-host:8080`
-
-### Build from source
-
-Use this current `main` source build only for development or branch testing.
-
-```bash
-git clone https://github.com/gcs8/truenas-jbod-ui.git
-cd truenas-jbod-ui
-cp .env.example .env
-cp config/config.example.yaml config/config.yaml
-sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001
-sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001 --apply
-```
-
-Edit `.env` before the first start; values in `.env` override matching YAML settings.
-Replace the example connection values there, or remove an environment value when
-you intend `config/config.yaml` to own that setting.
-
-```bash
-docker compose -f docker-compose.dev.yml up -d --build
-```
-
-Optional services from source:
-
-```bash
-docker compose -f docker-compose.dev.yml --profile history up -d --build
-docker compose -f docker-compose.dev.yml --profile admin up -d --build enclosure-admin
-docker compose -f docker-compose.dev.yml --profile history --profile admin up -d --build
-```
-
-Open:
-
-- `http://your-docker-host:8080`
-
-The main UI can run by itself, but the sidecars are normal supported deploy
-options, not dev-only helpers.
-
-Ports:
-
-- main UI: `8080`
-- history sidecar: `8081`
-- admin sidecar: `8082`
-
-## Where The Detailed Docs Live
-
-The README is intentionally short. The deeper setup and operator docs live in
-the wiki:
-
-- [Wiki Home](wiki/Home.md)
 - [Quick Start](wiki/Quick-Start.md)
-- [Visual Tour](wiki/Visual-Tour.md)
-- [Architecture and Services](wiki/Architecture-and-Services.md)
-- [Admin UI and System Setup](wiki/Admin-UI-and-System-Setup.md)
-- [Admin Trust Boundary](docs/ADMIN_TRUST_BOUNDARY.md)
-- [Backup, Restore, and Debug Bundles](wiki/Backup-Restore-and-Debug-Bundles.md)
-- [Operations, Logging, and Metrics](wiki/Operations-Logging-and-Metrics.md)
-- [SSH Setup and Sudo](wiki/SSH-Setup-and-Sudo.md)
-- [Disk Replacement on CORE with SAS Multipath](docs/DISK_REPLACEMENT_CORE_MULTIPATH.md)
-- [Live Enclosures and Storage Views](wiki/Live-Enclosures-and-Storage-Views.md)
-- [Inventory Evidence Precedence](docs/INVENTORY_EVIDENCE_PRECEDENCE.md)
-- [Hardware Report Fixture Intake](docs/HARDWARE_REPORT_FIXTURE_INTAKE.md)
-- [History and Snapshot Export](wiki/History-and-Snapshot-Export.md)
-- [Segmented History v2](docs/SEGMENTED_HISTORY_V2.md)
-- [Demo and Offline Workflows](wiki/Demo-and-Offline-Workflows.md)
-- [Public Demo Site](wiki/Public-Demo-Site.md)
-- [Docker and GHCR Deployment](wiki/Docker-and-GHCR-Deployment.md)
+- [Docker deployment](wiki/Docker-and-GHCR-Deployment.md)
+- [TrueNAS CORE setup](wiki/TrueNAS-CORE-Setup.md)
+- [TrueNAS SCALE setup](wiki/TrueNAS-SCALE-Setup.md)
+- [SSH setup](wiki/SSH-Setup-and-Sudo.md)
+- [Admin UI](wiki/Admin-UI-and-System-Setup.md)
 - [Troubleshooting](wiki/Troubleshooting.md)
+- [All documentation](wiki/Home.md)
 
-## Current Limits
+## Current limits
 
-- The shipped profiles are intentionally tied to hardware that has actually been validated
-- ESXi support is read-only
-- The current `ipmi` path is focused on validated Supermicro BMC behavior, not every vendor
-- The richest ESXi physical-drive detail still depends on StorCLI being present on the host
-- Local Windows Docker Desktop remains a weaker perf baseline than the Linux dev/test VM, especially for history/export-heavy paths
+- Hardware outside the tested profiles may need a custom layout.
+- ESXi integration is read-only.
+- The IPMI path is focused on tested Supermicro systems.
+- Full ESXi drive details require StorCLI on the host.
 
 ## License
 

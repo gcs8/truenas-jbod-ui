@@ -14,6 +14,9 @@ from typing import Any
 
 import yaml
 
+from app.config import BMCConfig, TrueNASConfig
+from app.models.domain import QuantastorNodeDiscoveryRequest, SystemSetupRequest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 COMPOSE_FILES = ("docker-compose.yml", "docker-compose.dev.yml")
@@ -79,6 +82,56 @@ def writable_volume_targets(service: dict[str, Any]) -> set[str]:
 
 
 class ContainerResourceContractTests(unittest.TestCase):
+    def test_beginner_defaults_require_no_auth_origin_or_private_ca(self) -> None:
+        self.assertFalse(TrueNASConfig().verify_ssl)
+
+        env_example = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
+        self.assertIn("TRUENAS_VERIFY_SSL=false", env_example)
+        self.assertIn("ADMIN_AUTH_MODE=network", env_example)
+        self.assertIn("ADMIN_PUBLIC_ORIGIN=", env_example)
+        self.assertIn("APP_PUBLIC_ORIGIN=", env_example)
+
+        config = yaml.safe_load((REPO_ROOT / "config/config.example.yaml").read_text(encoding="utf-8"))
+        self.assertEqual(config["truenas"]["verify_ssl"], False)
+
+        for compose_name in COMPOSE_FILES:
+            services = yaml.safe_load((REPO_ROOT / compose_name).read_text(encoding="utf-8"))[
+                "services"
+            ]
+            with self.subTest(compose=compose_name):
+                self.assertEqual(
+                    services["enclosure-ui"]["environment"]["ADMIN_AUTH_MODE"],
+                    "${ADMIN_AUTH_MODE:-network}",
+                )
+                self.assertEqual(
+                    services["enclosure-admin"]["environment"]["ADMIN_AUTH_MODE"],
+                    "${ADMIN_AUTH_MODE:-network}",
+                )
+
+    def test_fresh_setup_forms_keep_tls_verification_opt_in(self) -> None:
+        setup = SystemSetupRequest(label="NAS", truenas_host="https://nas.example.test")
+        quantastor = QuantastorNodeDiscoveryRequest(
+            truenas_host="https://quantastor.example.test",
+            api_user="operator",
+            api_password="synthetic-password",
+        )
+        template = (REPO_ROOT / "admin_service/templates/index.html").read_text(
+            encoding="utf-8"
+        )
+        script = (REPO_ROOT / "admin_service/static/admin.js").read_text(encoding="utf-8")
+
+        self.assertFalse(setup.verify_ssl)
+        self.assertFalse(setup.bmc_verify_ssl)
+        self.assertFalse(quantastor.verify_ssl)
+        self.assertFalse(BMCConfig().verify_ssl)
+        self.assertNotRegex(template, r'id="setup-(?:bmc-)?verify-ssl"[^>]*\bchecked\b')
+        self.assertIn("elements.setupVerifySsl.checked = false;", script)
+        self.assertIn("elements.setupBmcVerifySsl.checked = false;", script)
+        self.assertIn(
+            "elements.setupBmcVerifySsl.checked = Boolean(system.bmc_verify_ssl);",
+            script,
+        )
+
     def test_public_docs_remove_obsolete_ssh_config_and_unsafe_permission_examples(self) -> None:
         docs = "\n".join(
             (REPO_ROOT / relative_path).read_text(encoding="utf-8")
@@ -188,7 +241,11 @@ class ContainerResourceContractTests(unittest.TestCase):
                     guide,
                 )
                 self.assertIn("ghcr.io/gcs8/truenas-jbod-ui:v0.22.2", guide)
-                self.assertRegex(guide, r"(?i)current `main`[^.]+source build")
+
+        deployment_guide = (REPO_ROOT / "wiki/Docker-and-GHCR-Deployment.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertRegex(deployment_guide, r"(?i)current `main`[^.]+source build")
 
         docs = "\n".join(
             (REPO_ROOT / relative_path).read_text(encoding="utf-8")
@@ -198,28 +255,26 @@ class ContainerResourceContractTests(unittest.TestCase):
         self.assertNotRegex(docs, r"JBOD_UI_IMAGE=[^\n]*v0\.18\.0")
 
     def test_admin_guides_match_current_origin_startup_and_read_ui_write_policy(self) -> None:
+        for relative_path in ("README.md", "wiki/Quick-Start.md"):
+            guide = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+            with self.subTest(beginner_guide=relative_path):
+                self.assertIn("default setup has no login", guide)
+                self.assertIn("Anyone who can reach", guide)
+                self.assertNotIn("ADMIN_PUBLIC_ORIGIN", guide)
+                self.assertNotIn("APP_PUBLIC_ORIGIN", guide)
+                self.assertNotIn("ADMIN_AUTH_MODE", guide)
+
         for relative_path in (
-            "README.md",
-            "wiki/Quick-Start.md",
+            "wiki/Advanced-Configuration.md",
             "wiki/Docker-and-GHCR-Deployment.md",
             "wiki/Admin-UI-and-System-Setup.md",
         ):
             guide = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
-            with self.subTest(guide=relative_path):
-                self.assertIn("ADMIN_PUBLIC_ORIGIN", guide)
-                self.assertRegex(guide, r"(?i)refuses to start")
-
-        for relative_path in (
-            "README.md",
-            "wiki/Quick-Start.md",
-            "wiki/Docker-and-GHCR-Deployment.md",
-        ):
-            guide = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
-            with self.subTest(guide=relative_path):
-                self.assertIn("ADMIN_AUTH_MODE=network", guide)
+            with self.subTest(advanced_guide=relative_path):
                 self.assertIn("ADMIN_AUTH_MODE=basic", guide)
-                self.assertRegex(guide, r"(?i)write controls disabled")
-                self.assertRegex(guide, r"(?i)starts?[^.]+signed out")
+                self.assertIn("ADMIN_PUBLIC_ORIGIN", guide)
+                self.assertIn("APP_PUBLIC_ORIGIN", guide)
+                self.assertRegex(guide, r"(?i)basic mode[^.]+origin")
 
     def test_admin_guides_distinguish_application_and_compose_auto_stop_defaults(self) -> None:
         for relative_path in (
@@ -329,7 +384,7 @@ class ContainerResourceContractTests(unittest.TestCase):
     def test_troubleshooting_covers_current_auth_export_and_nonroot_failures(self) -> None:
         guide = (REPO_ROOT / "wiki/Troubleshooting.md").read_text(encoding="utf-8")
         for expected in (
-            "Read UI mutations require ADMIN_AUTH_MODE=basic.",
+            "Read UI authentication required.",
             "Cross-origin admin mutation rejected.",
             "Plaintext backup export is disabled.",
             "permission denied",
@@ -938,9 +993,10 @@ class ContainerResourceContractTests(unittest.TestCase):
             deployment_guide,
             r"(?i)current `main` source build[^.]+ownership helper",
         )
-        self.assertIn("prepare_nonroot_bind_mounts.py", readme)
-        self.assertIn("prepare_nonroot_bind_mounts.py", quick_start)
-        self.assertIn("--apply", quick_start)
+        self.assertNotIn("prepare_nonroot_bind_mounts.py", readme)
+        self.assertNotIn("prepare_nonroot_bind_mounts.py", quick_start)
+        self.assertIn("prepare_nonroot_bind_mounts.py", deployment_guide)
+        self.assertIn("--apply", deployment_guide)
         self.assertNotIn("The base Compose file keeps the existing root-compatible", deployment_guide)
 
     def test_nonroot_overlay_preserves_backup_identity_with_app_data_group(self) -> None:
@@ -1024,48 +1080,44 @@ class ContainerResourceContractTests(unittest.TestCase):
         quick_start = (REPO_ROOT / "wiki/Quick-Start.md").read_text(encoding="utf-8")
 
         self.assertIn("`curl`", quick_start)
-        self.assertIn("write permission", quick_start)
-        self.assertIn("outbound HTTPS", quick_start)
+        self.assertIn("A folder you can write to", quick_start)
+        self.assertIn("Outbound HTTPS", quick_start)
         self.assertIn("GitHub and GHCR", quick_start)
         self.assertIn("firewall", quick_start)
 
     def test_source_build_guides_require_edit_before_start(self) -> None:
-        for relative_path in (
-            "README.md",
-            "wiki/Quick-Start.md",
-            "wiki/Docker-and-GHCR-Deployment.md",
-        ):
-            guide = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
-            with self.subTest(guide=relative_path):
-                self.assertIn("Edit `.env` before the first start", guide)
+        guide = (REPO_ROOT / "wiki/Docker-and-GHCR-Deployment.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("Edit `.env` before the first start", guide)
 
     def test_source_build_guides_explain_env_precedence(self) -> None:
-        for relative_path in (
-            "README.md",
-            "wiki/Quick-Start.md",
-            "wiki/Docker-and-GHCR-Deployment.md",
-        ):
-            guide = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
-            with self.subTest(guide=relative_path):
-                self.assertIn("values in `.env` override matching YAML settings", guide)
+        guide = (REPO_ROOT / "wiki/Docker-and-GHCR-Deployment.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("values in `.env` override matching YAML settings", guide)
 
-    def test_admin_launch_guides_repeat_trust_boundary(self) -> None:
+    def test_admin_launch_guides_explain_default_access_and_advanced_risk(self) -> None:
+        quick_start = (REPO_ROOT / "wiki/Quick-Start.md").read_text(encoding="utf-8")
+        self.assertIn("Anyone who can reach port `8080`", quick_start)
+        self.assertIn("Do not publish these ports directly to the Internet", quick_start)
+
         for relative_path in (
-            "wiki/Quick-Start.md",
             "wiki/Docker-and-GHCR-Deployment.md",
             "wiki/Admin-UI-and-System-Setup.md",
         ):
             guide = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+            normalized = " ".join(guide.split())
             with self.subTest(guide=relative_path):
                 self.assertIn(
                     "https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/ADMIN_TRUST_BOUNDARY.md",
                     guide,
                 )
                 self.assertIn("ADMIN_PUBLIC_ORIGIN", guide)
-                self.assertRegex(guide, r"(?i)refuses to start")
-                self.assertIn("trusted operator", guide)
+                self.assertRegex(guide, r"(?i)basic mode[^.]+origin")
+                self.assertIn("Anyone who can reach", guide)
                 self.assertIn("Docker socket", guide)
-                self.assertIn("Auto-stop limits exposure; it is not authentication", guide)
+                self.assertIn("Auto-stop limits exposure; it is not authentication", normalized)
 
     def test_secret_overlay_grants_only_required_service_scoped_files(self) -> None:
         overlay_path = REPO_ROOT / "docker-compose.secrets.yml"

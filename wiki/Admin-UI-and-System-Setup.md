@@ -25,13 +25,24 @@ Use the same folder you created in [[Quick Start|Quick-Start]], where
 
 Before starting the sidecar, read the
 [Admin trust boundary](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/ADMIN_TRUST_BOUNDARY.md).
-Set `ADMIN_PUBLIC_ORIGIN` to the exact scheme, host, and port shown in the
-browser for the admin UI. The current-main admin service refuses to start when
-the value is missing or malformed. The default network
-mode has no application login and treats every client that can reach port
-`8082` as a trusted operator. The mounted Docker socket gives the sidecar
-host-level container authority. Restrict network reachability to trusted
-operators. Auto-stop limits exposure; it is not authentication.
+The default setup has no login. Anyone who can reach port `8082` can change
+configuration and control the app's containers. An RFC1918 address does not
+make a client trusted. The mounted Docker socket gives the sidecar host-level
+container authority. Auto-stop limits exposure; it is not authentication.
+
+To opt into Basic authentication, add these values to `.env`:
+
+```dotenv
+ADMIN_AUTH_MODE=basic
+ADMIN_AUTH_USERNAME=operator
+ADMIN_AUTH_PASSWORD=replace-with-a-long-random-password
+APP_PUBLIC_ORIGIN=https://storage-ui.example.test
+ADMIN_PUBLIC_ORIGIN=https://storage-admin.example.test
+```
+
+In Basic mode, both origin settings are required and must match the addresses
+shown in the browser. See [[Advanced Configuration|Advanced-Configuration]] for
+the full explanation.
 
 If the main UI is already running and you only want to add the admin sidecar:
 
