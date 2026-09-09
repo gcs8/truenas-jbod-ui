@@ -118,7 +118,8 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
                 "ok": True,
                 "runtime_behavior": runtime_behavior,
                 "runtime": await build_runtime_payload(runtime_service),
-                "detail": "Runtime behavior overrides saved. Restart the Read UI container to apply them.",
+                "restart_required": ["ui"],
+                "detail": "Runtime behavior overrides saved. Restart the main UI to apply them.",
             }
         )
 
@@ -185,7 +186,7 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
     @router.post("/api/admin/debug/export")
     async def export_debug_bundle(
         payload: DebugBundleExportRequest,
-        stop_services: bool = Query(default=True),
+        stop_services: bool = Query(default=False),
         restart_services: bool = Query(default=True),
     ) -> Response:
         try:
@@ -711,9 +712,9 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
                 "systems": serialize_systems(refreshed_settings),
                 "default_system_id": refreshed_settings.default_system_id,
                 "detail": (
-                    "Config updated. Restart the Read UI container to pick up the revised system."
+                    "Saved. Restart the main UI to show the updated system."
                     if updated_existing
-                    else "Config saved. Restart the Read UI container to pick up the new system."
+                    else "Saved. Restart the main UI to show the new system."
                 ),
                 "updated_existing": updated_existing,
             }
@@ -753,7 +754,7 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
                 "updated_existing": bool(result.get("updated_existing")),
                 "updated_profile": bool(result.get("updated_profile")),
                 "detail": (
-                    f"Demo builder system {saved_system.label} saved. Restart the Read UI container to pick the synthetic chassis and views up cleanly."
+                    f"Demo builder system {saved_system.label} saved. Restart the main UI to show it."
                 ),
             }
         )
@@ -803,7 +804,7 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
         detail = f"Removed {deleted_label}."
         if purge_history:
             detail = f"{detail} {history_purge['detail']}"
-        detail = f"{detail} Restart the Read UI container to drop the deleted system from the live runtime."
+        detail = f"{detail} Restart the main UI to remove it there too."
         return await config_mutation_response(
             {
                 "ok": True,
@@ -1064,9 +1065,9 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
                 "profile": serialized_profile,
                 "profiles": serialized_profiles,
                 "detail": (
-                    "Custom enclosure profile updated. Restart the Read UI container to pick up the revised profile."
+                    "Custom enclosure profile updated. Restart the main UI to use the updated profile."
                     if updated_existing
-                    else "Custom enclosure profile saved. Restart the Read UI container to pick up the new profile."
+                    else "Custom enclosure profile saved. Restart the main UI to use the new profile."
                 ),
                 "updated_existing": updated_existing,
             }
@@ -1089,7 +1090,7 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
                 "deleted_label": deleted_label,
                 "profiles": serialize_profiles(refreshed_settings),
                 "detail": (
-                    f"Deleted custom profile {deleted_label}. Restart the Read UI container when you are ready to drop it from the runtime profile list too."
+                    f"Deleted custom profile {deleted_label}. Restart the main UI to remove it from the profile list too."
                 ),
             }
         )

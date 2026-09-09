@@ -40,7 +40,7 @@ test.describe("admin sidecar smoke", () => {
     await expect(page.locator("#debug-scrub-identifiers-toggle")).toBeVisible();
     await expect(page.locator("#setup-create-demo-button")).toBeVisible();
     await expect(page.locator("#setup-result")).toContainText(
-      "restart the read UI after a new system is added"
+      "Saved systems appear in the main UI after a restart."
     );
   });
 

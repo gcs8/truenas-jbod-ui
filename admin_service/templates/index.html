@@ -13,7 +13,7 @@
       </p>
       <div class="hero-actions">
         <button id="refresh-state-button" class="button secondary" type="button">Refresh State</button>
-        <a id="admin-origin-link" class="button ghost" href="#" target="_blank" rel="noopener">Open Another Admin Tab</a>
+        <a id="admin-origin-link" class="button ghost hidden" href="#" target="_blank" rel="noopener">Open at the configured address</a>
         <div class="hero-view-switcher" role="group" aria-label="Admin sections">
           <button class="button secondary small admin-view-button is-active" data-admin-view-button="operations" type="button">Setup + Maintenance</button>
           <button class="button secondary small admin-view-button" data-admin-view-button="builder" type="button">Enclosure / Profile Builder</button>
@@ -22,16 +22,8 @@
     </div>
     <div class="hero-meta">
       <div class="hero-stat">
-        <span class="hero-stat-label">Session Countdown</span>
+        <span class="hero-stat-label">Auto-stop</span>
         <span id="admin-countdown" class="hero-stat-value">Calculating...</span>
-      </div>
-      <div class="hero-stat">
-        <span class="hero-stat-label">Started</span>
-        <span id="admin-started-at" class="hero-stat-value">-</span>
-      </div>
-      <div class="hero-stat">
-        <span class="hero-stat-label">Expires</span>
-        <span id="admin-expires-at" class="hero-stat-value">-</span>
       </div>
       <div class="hero-stat">
         <span class="hero-stat-label">Configured Systems</span>
@@ -48,6 +40,8 @@
       </div>
     </div>
   </header>
+
+  <div id="admin-session-banner" class="status-banner hidden" role="alert" aria-live="assertive"></div>
 
   <div id="admin-status-banner" class="status-banner" role="status" aria-live="polite">
     Admin sidecar ready.
@@ -67,7 +61,7 @@
           <p class="eyebrow">Runtime Control</p>
           <h2>Containers</h2>
           <p class="panel-copy">
-            Stop the read UI or history sidecar here before a maintenance action, or let the
+            Stop the main UI or history collector here before a maintenance action, or let the
             backup actions below do it automatically for a cleaner snapshot.
           </p>
         </div>
@@ -140,11 +134,11 @@
           <div class="toggle-group">
             <label class="toggle">
               <input id="backup-export-stop-toggle" type="checkbox">
-              <span>Stop read UI and history before export</span>
+              <span>Pause the main UI and history while exporting (usually not needed)</span>
             </label>
             <label class="toggle">
               <input id="backup-export-restart-toggle" type="checkbox" checked>
-              <span>Restart anything stopped after export</span>
+              <span>Start them again afterwards</span>
             </label>
           </div>
 
@@ -199,12 +193,12 @@
 
             <div class="toggle-group">
               <label class="toggle">
-                <input id="debug-export-stop-toggle" type="checkbox" checked>
-                <span>Stop read UI and history before debug export</span>
+                <input id="debug-export-stop-toggle" type="checkbox">
+                <span>Pause the main UI and history while exporting (usually not needed)</span>
               </label>
               <label class="toggle">
                 <input id="debug-export-restart-toggle" type="checkbox" checked>
-                <span>Restart anything stopped after debug export</span>
+                <span>Start them again afterwards</span>
               </label>
             </div>
 
@@ -236,11 +230,11 @@
           <div class="toggle-group">
             <label class="toggle">
               <input id="backup-import-stop-toggle" type="checkbox" checked>
-              <span>Stop read UI and history before import</span>
+              <span>Pause the main UI and history while importing (recommended)</span>
             </label>
             <label class="toggle">
               <input id="backup-import-restart-toggle" type="checkbox" checked>
-              <span>Restart anything stopped after import</span>
+              <span>Start them again afterwards</span>
             </label>
           </div>
 
@@ -683,7 +677,7 @@
               <p id="setup-bootstrap-result" class="subtle action-note">
                 Bootstrap is off by default for saved systems. Enable it only when you intend to run one-time service-account setup.
               </p>
-              <div class="sudoers-preview-panel">
+              <div id="setup-bootstrap-sudoers-panel" class="sudoers-preview-panel">
                 <div class="preview-card-header">
                   <h4>Proposed Permission Update</h4>
                   <span id="setup-bootstrap-sudoers-name" class="badge">truenas-jbod-ui-jbodmap</span>
@@ -825,7 +819,7 @@
                     </label>
                     <label class="toggle">
                       <input id="setup-storage-view-show-main" type="checkbox" checked>
-                      <span>Show in main read UI</span>
+                      <span>Show in the main UI</span>
                     </label>
                     <label class="toggle">
                       <input id="setup-storage-view-show-admin" type="checkbox" checked>
@@ -907,7 +901,7 @@
             <button id="setup-create-demo-button" class="button secondary" type="button">Add Demo Builder System</button>
           </div>
           <p id="setup-result" class="subtle action-note">
-            Saving here updates the mounted config file; restart the read UI after a new system is added so it picks the new list up cleanly.
+            Saved systems appear in the main UI after a restart.
           </p>
         </div>
 

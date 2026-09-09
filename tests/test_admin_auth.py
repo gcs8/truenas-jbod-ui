@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import os
 import re
 import tempfile
@@ -84,6 +85,15 @@ async def invoke_asgi(
         for key, value in start.get("headers", [])
     }
     return int(start["status"]), response_headers, body
+
+
+def cross_origin_body(opened_at: str, accepted: str) -> bytes:
+    detail = (
+        f"This page was opened at {opened_at}, but the admin service only accepts changes "
+        f"from {accepted}. Open the admin UI at {accepted}, or set ADMIN_PUBLIC_ORIGIN in "
+        f".env to {opened_at} and recreate the admin container."
+    )
+    return json.dumps({"detail": detail}, separators=(",", ":")).encode("utf-8")
 
 
 def basic_header(username: str, password: str) -> str:
@@ -326,7 +336,7 @@ class AdminAuthenticationTests(unittest.TestCase):
                 self.assertEqual(status, 403)
                 self.assertEqual(
                     body,
-                    b'{"detail":"Cross-origin admin mutation rejected."}',
+                    cross_origin_body("https://attacker.example", ADMIN_TEST_PUBLIC_ORIGIN),
                 )
 
     def test_network_boundary_mode_preserves_remote_unauthenticated_contract(self) -> None:
@@ -354,7 +364,7 @@ class AdminAuthenticationTests(unittest.TestCase):
         self.assertEqual(cross_site_write_status, 403)
         self.assertEqual(
             cross_site_body,
-            b'{"detail":"Cross-origin admin mutation rejected."}',
+            cross_origin_body("https://unrelated.example", "http://admin.example.test"),
         )
 
     def test_default_admin_app_starts_without_an_origin_or_authentication(self) -> None:
@@ -430,7 +440,37 @@ class AdminAuthenticationTests(unittest.TestCase):
         # The empty request body reaches the handler and fails validation instead of the origin gate.
         self.assertEqual(same_origin_status, 422)
         self.assertEqual(foreign_origin_status, 403)
-        self.assertEqual(foreign_body, b'{"detail":"Cross-origin admin mutation rejected."}')
+        self.assertEqual(
+            foreign_body,
+            cross_origin_body("http://admin.example.test:8082", ADMIN_TEST_PUBLIC_ORIGIN),
+        )
+
+    def test_cross_origin_rejection_names_both_addresses_without_leaking_the_referer_path(self) -> None:
+        settings = AdminSettings(auth_mode="network", auto_stop_seconds=0)
+        with patch("admin_service.main.get_admin_settings", return_value=settings):
+            app = create_app()
+
+        status, _headers, body = asyncio.run(
+            invoke_asgi(
+                app,
+                "/missing",
+                method="POST",
+                referer="http://192.0.2.10:8082/admin/?view=builder",
+            )
+        )
+        same_origin_status, _headers, _body = asyncio.run(
+            invoke_asgi(
+                app,
+                "/missing",
+                method="POST",
+                referer="http://admin.example.test/?view=builder",
+            )
+        )
+
+        self.assertEqual(status, 403)
+        self.assertEqual(body, cross_origin_body("http://192.0.2.10:8082", "http://admin.example.test"))
+        self.assertNotIn(b"view=builder", body)
+        self.assertEqual(same_origin_status, 404)
 
     def test_basic_mode_browser_mutations_require_same_origin(self) -> None:
         settings = AdminSettings(

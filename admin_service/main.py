@@ -48,7 +48,12 @@ from app.config import (
     save_runtime_behavior_overrides,
 )
 from app.logging_config import configure_service_logging
-from app.http_auth import basic_auth_matches, configured_origin_identity, request_origin_allowed
+from app.http_auth import (
+    basic_auth_matches,
+    configured_origin_identity,
+    origin_identity,
+    request_origin_allowed,
+)
 from app.metrics import install_metrics, metrics_path, observe_backup_operation
 from app.script_json import register_script_json_filters
 from app.models.domain import (
@@ -87,6 +92,7 @@ from app.services.storage_view_templates import list_storage_view_templates
 from app.services.storage_views import resolve_system_storage_views
 from app.services.system_setup import (
     PRESERVE_SECRET_SENTINEL,
+    SECRET_REUSE_MISMATCH_DETAIL,
     SystemSetupService,
     default_ssh_commands_for_platform,
     resolve_preserved_secret,
@@ -200,9 +206,31 @@ def _basic_auth_matches(authorization: str | None, settings: AdminSettings) -> b
     )
 
 
+def _accepted_origin(request: Request, settings: AdminSettings) -> str:
+    return (settings.public_origin or f"{request.url.scheme}://{request.url.netloc}").rstrip("/")
+
+
 def _request_origin_allowed(request: Request, settings: AdminSettings) -> bool:
-    public_origin = settings.public_origin or f"{request.url.scheme}://{request.url.netloc}"
-    return request_origin_allowed(request, public_origin)
+    return request_origin_allowed(request, _accepted_origin(request, settings))
+
+
+def _describe_request_origin(request: Request) -> str:
+    identity = origin_identity(request.headers.get("origin") or request.headers.get("referer"))
+    if identity is None:
+        return "an unknown address"
+    scheme, host, port = identity
+    default_port = 443 if scheme == "https" else 80
+    return f"{scheme}://{host}" if port == default_port else f"{scheme}://{host}:{port}"
+
+
+def cross_origin_rejection_detail(request: Request, settings: AdminSettings) -> str:
+    opened_at = _describe_request_origin(request)
+    accepted = _accepted_origin(request, settings)
+    return (
+        f"This page was opened at {opened_at}, but the admin service only accepts changes "
+        f"from {accepted}. Open the admin UI at {accepted}, or set ADMIN_PUBLIC_ORIGIN in "
+        f".env to {opened_at} and recreate the admin container."
+    )
 
 
 def validate_admin_export_policy(
@@ -335,9 +363,7 @@ def resolve_saved_secondary_secret(
         return incoming
     system = next((item for item in settings.systems if item.id == system_id), None)
     if system is None or not matches_saved_connection(system):
-        raise ValueError(
-            "A saved secret can only be reused with its saved connection settings."
-        )
+        raise ValueError(SECRET_REUSE_MISMATCH_DETAIL)
     existing = saved_value(system) if system is not None else None
     return resolve_preserved_secret(incoming, existing)
 
@@ -504,7 +530,7 @@ def create_app() -> FastAPI:
             and not _request_origin_allowed(request, admin_settings)
         ):
             return JSONResponse(
-                {"detail": "Cross-origin admin mutation rejected."},
+                {"detail": cross_origin_rejection_detail(request, admin_settings)},
                 status_code=403,
             )
         if (
@@ -588,7 +614,7 @@ async def build_admin_state_payload(request: Request) -> dict[str, Any]:
             "import_restart_services": True,
             "included_paths": default_backup_included_paths(),
             "debug_packaging": "tar.zst",
-            "debug_stop_services": True,
+            "debug_stop_services": False,
             "debug_restart_services": True,
             "debug_included_paths": default_debug_included_paths(),
             "debug_scrub_secrets": True,
@@ -1139,10 +1165,12 @@ def compute_expires_at(settings: AdminSettings) -> datetime | None:
     return SERVICE_STARTED_AT + timedelta(seconds=settings.auto_stop_seconds)
 
 
-def resolve_public_origin(settings: AdminSettings, request: Request) -> str:
+def resolve_public_origin(settings: AdminSettings, request: Request) -> str | None:
+    # Only a configured origin is worth offering as "open the admin UI here";
+    # the request's own address is where the page already is.
     if settings.public_origin:
         return settings.public_origin.rstrip("/")
-    return str(request.base_url).rstrip("/")
+    return None
 
 
 async def _shutdown_after_ttl(auto_stop_seconds: int) -> None:
