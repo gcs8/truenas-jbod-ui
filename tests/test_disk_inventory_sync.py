@@ -195,10 +195,10 @@ class DiskInventorySyncServiceTests(unittest.IsolatedAsyncioTestCase):
             runner.commands,
             [f"sudo -n {SCALE_MIDCLT} call disk.sync_all", expected_poll, expected_poll],
         )
-        self.assertEqual(sleeps, [2.0])
+        self.assertEqual(sleeps, [5.0])
         self.assertEqual(result.state, "SUCCESS")
         self.assertEqual(result.job_id, 268071)
-        self.assertEqual(result.elapsed_seconds, 2.0)
+        self.assertEqual(result.elapsed_seconds, 5.0)
         self.assertFalse(result.timed_out)
         self.assertIsNone(result.error)
         self.assertEqual(result.message, "TrueNAS re-read its disk inventory. Refresh to see the updated bays.")

@@ -159,3 +159,52 @@ class SlotDetailStorePruneTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SlotDetailStoreSaveTests(unittest.TestCase):
+    @staticmethod
+    def _entry(slot: int, *, identifiers=None, smart_fields=None, model: str = "model") -> SlotDetailCacheEntry:
+        return SlotDetailCacheEntry(
+            system_id="system-a",
+            enclosure_id="enc-1",
+            slot=slot,
+            identifiers=identifiers or [f"SN-{slot:04d}"],
+            slot_fields={"model": model},
+            smart_fields=smart_fields or {},
+        )
+
+    def test_save_entries_skips_the_write_when_nothing_changed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SlotDetailStore(str(Path(temp_dir) / "slot_detail_cache.json"))
+            self.assertEqual(store.save_entries([self._entry(0), self._entry(1)]), 2)
+
+            with patch.object(store, "_write", wraps=store._write) as write:
+                self.assertEqual(store.save_entries([self._entry(0), self._entry(1)]), 0)
+                write.assert_not_called()
+                self.assertEqual(store.save_entries([self._entry(1, model="other")]), 1)
+                write.assert_called_once()
+
+    def test_save_entries_keeps_stored_smart_fields_for_the_same_disk(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SlotDetailStore(str(Path(temp_dir) / "slot_detail_cache.json"))
+            store.save_entries([self._entry(0, smart_fields={"available": True, "power_on_hours": 100})])
+
+            # A snapshot build only knows the slot fields; the SMART fields survive.
+            with patch.object(store, "_write", wraps=store._write) as write:
+                self.assertEqual(store.save_entries([self._entry(0)]), 0)
+                write.assert_not_called()
+            self.assertEqual(store.load_all()["system-a:enc-1:0"].smart_fields, {"available": True, "power_on_hours": 100})
+
+            # A different disk in the same bay starts clean.
+            self.assertEqual(store.save_entries([self._entry(0, identifiers=["SN-9999"])]), 1)
+            self.assertEqual(store.load_all()["system-a:enc-1:0"].smart_fields, {})
+
+    def test_changed_entries_reports_only_rows_that_differ_from_the_loaded_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SlotDetailStore(str(Path(temp_dir) / "slot_detail_cache.json"))
+            store.save_entries([self._entry(0, smart_fields={"available": True}), self._entry(1)])
+            loaded = store.load_all()
+
+            changed = store.changed_entries([self._entry(0), self._entry(1), self._entry(2)], loaded)
+
+            self.assertEqual([entry.slot for entry in changed], [2])

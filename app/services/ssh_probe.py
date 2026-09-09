@@ -152,6 +152,56 @@ class SSHCommandResult:
 CommandPlanner = Callable[[list[SSHCommandResult]], Iterable[str]]
 
 
+class SSHCommandSession:
+    """One SSH connection reused for several commands.
+
+    A job poll loop used to log in again for every poll, and a SMART grid
+    load logged in once per bay. This keeps one connection open and runs
+    commands over it, at most `max_channels` at a time, then closes it once.
+    """
+
+    def __init__(self, probe: "SSHProbe", client: paramiko.SSHClient, *, max_channels: int = 1) -> None:
+        self._probe = probe
+        self._client = client
+        self._channels = asyncio.Semaphore(max(1, max_channels))
+
+    async def run_command(
+        self,
+        command: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> SSHCommandResult:
+        async with self._channels:
+            return await asyncio.to_thread(
+                self._probe._run_single_command,
+                self._client,
+                command,
+                timeout_seconds=timeout_seconds,
+            )
+
+    async def run_planned_commands(
+        self,
+        planner: CommandPlanner,
+        *,
+        initial_commands: Iterable[str] | None = None,
+    ) -> list[SSHCommandResult]:
+        """Run one planned command sequence over the shared connection.
+
+        A transport or channel failure is raised rather than folded into the
+        results, so the caller can retry on a connection of its own.
+        """
+        async with self._channels:
+            return await asyncio.to_thread(
+                self._probe._run_planned_commands_sync,
+                planner,
+                initial_commands,
+                client=self._client,
+            )
+
+    async def close(self) -> None:
+        await asyncio.to_thread(self._client.close)
+
+
 class SSHProbe:
     def __init__(self, config: SSHConfig) -> None:
         self.config = config
@@ -160,6 +210,13 @@ class SSHProbe:
         if not self.config.enabled:
             raise ValueError("SSH fallback is disabled.")
         return self._client()
+
+    async def open_session(self, *, max_channels: int = 1) -> SSHCommandSession:
+        """Connect once and hand back a session that reuses the connection."""
+        if not self.config.enabled:
+            raise ValueError("SSH fallback is disabled.")
+        client = await asyncio.to_thread(self._client)
+        return SSHCommandSession(self, client, max_channels=max_channels)
 
     async def run_commands(
         self,
@@ -263,6 +320,8 @@ class SSHProbe:
         self,
         planner: CommandPlanner,
         initial_commands: Iterable[str] | None = None,
+        *,
+        client: paramiko.SSHClient | None = None,
     ) -> list[SSHCommandResult]:
         results: list[SSHCommandResult] = []
         seen_commands: set[str] = set()
@@ -271,6 +330,15 @@ class SSHProbe:
             pending_commands = self._new_commands(planner(results), seen_commands)
         if not pending_commands:
             return []
+
+        if client is not None:
+            # A shared connection stays open for its owner; a broken channel
+            # or transport is raised so the owner can retry on its own.
+            while pending_commands:
+                for command in pending_commands:
+                    results.append(self._run_single_command(client, command, raise_on_exception=True))
+                pending_commands = self._new_commands(planner(list(results)), seen_commands)
+            return results
 
         started = time.perf_counter()
         batch_count = 0
@@ -452,6 +520,7 @@ class SSHProbe:
         *,
         stdin_data: str | None = None,
         timeout_seconds: float | None = None,
+        raise_on_exception: bool = False,
     ) -> SSHCommandResult:
         safe_command = redact_ssh_command(command)
         logger.debug("Running SSH command: %s", safe_command)
@@ -498,6 +567,8 @@ class SSHProbe:
                 exit_code=exit_code,
             )
         except Exception as exc:
+            if raise_on_exception:
+                raise
             logger.warning(
                 "SSH command execution failed for %s@%s: %s",
                 self.config.user,

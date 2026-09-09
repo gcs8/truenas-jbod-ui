@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import heapq
 import ipaddress
 import json
 import logging
@@ -11,6 +12,7 @@ import shlex
 import time
 from collections import Counter, OrderedDict
 from collections.abc import Mapping
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Generic, Iterable, Literal, TypeVar
@@ -118,7 +120,7 @@ from app.services.parsers import (
     parse_ssh_outputs,
     shift_hex_identifier,
 )
-from app.services.ssh_probe import SSHCommandResult, SSHProbe, redact_ssh_command
+from app.services.ssh_probe import SSHCommandResult, SSHCommandSession, SSHProbe, redact_ssh_command
 from app.services.slot_detail_store import SlotDetailCacheEntry, SlotDetailStore
 from app.services.supermicro_bmc import BMCInventory, SupermicroBMCService
 from app.services.truenas_ws import (
@@ -130,7 +132,72 @@ from app.services.truenas_ws import (
 
 SmartCacheKey = tuple[str, str, str, int, tuple[str, ...]]
 SmartCacheGenerationToken = tuple[int, int]
+
+
+class _SmartCacheExpiryIndex(dict):
+    """SMART cache expiry map that also keeps a lazy min-heap of expiries.
+
+    Eviction used to scan every cached entry on every lookup and store. The
+    heap lets it pop only what has passed the horizon. Re-setting a key leaves
+    a stale heap item behind, which the pop recognises and skips.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._heap: list[tuple[datetime, int, SmartCacheKey]] = []
+        self._sequence = 0
+
+    def __setitem__(self, key: SmartCacheKey, value: datetime) -> None:
+        super().__setitem__(key, value)
+        self._sequence += 1
+        heapq.heappush(self._heap, (value, self._sequence, key))
+
+    def update(self, *args: Any, **kwargs: Any) -> None:
+        for key, value in dict(*args, **kwargs).items():
+            self[key] = value
+
+    def setdefault(self, key: SmartCacheKey, default: datetime) -> datetime:  # type: ignore[override]
+        if key not in self:
+            self[key] = default
+        return self[key]
+
+    def clear(self) -> None:
+        super().clear()
+        self._heap.clear()
+
+    def expired_keys(self, horizon: datetime) -> list[SmartCacheKey]:
+        expired: list[SmartCacheKey] = []
+        while self._heap and self._heap[0][0] <= horizon:
+            expires_at, _sequence, key = heapq.heappop(self._heap)
+            if self.get(key) == expires_at:
+                expired.append(key)
+        return expired
+
+
+@dataclass
+class _SmartBatchContext:
+    """State shared by every bay loaded in one SMART grid request.
+
+    The slot-detail file is read once and written once, the TrueNAS API login
+    is opened once (lazily) and reused, and each SSH host gets one connection
+    that every bay's commands share instead of one login per bay.
+    """
+
+    depth: int = 0
+    loaded_entries: dict[str, SlotDetailCacheEntry] | None = None
+    pending_entries: dict[str, SlotDetailCacheEntry] = field(default_factory=dict)
+    exit_stack: AsyncExitStack = field(default_factory=AsyncExitStack)
+    api_session: Any = None
+    api_session_failed: bool = False
+    api_session_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Host key -> open session, or None once opening it failed for this grid load.
+    ssh_sessions: dict[str, SSHCommandSession | None] = field(default_factory=dict)
+    ssh_session_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
 CacheValueT = TypeVar("CacheValueT")
+
+# OpenSSH allows ten sessions per connection by default (MaxSessions); stay
+# under it so a shared SMART connection never has a channel refused.
+SMART_SSH_MAX_SHARED_CHANNELS = 8
 
 # Expired SMART cache entries stay resident (and stale-servable) for a grace
 # window past their TTL so one slot's lookup cannot destroy the stale-serve
@@ -804,7 +871,7 @@ class InventoryService:
         self._cache: dict[str, InventorySnapshot] = {}
         self._cache_until: dict[str, datetime] = {}
         self._smart_cache: dict[SmartCacheKey, SmartSummaryView] = {}
-        self._smart_cache_until: dict[SmartCacheKey, datetime] = {}
+        self._smart_cache_until: dict[SmartCacheKey, datetime] = _SmartCacheExpiryIndex()
         self._smart_negative_cache: OrderedDict[
             SmartCacheKey,
             tuple[SmartSummaryView, datetime],
@@ -814,6 +881,7 @@ class InventoryService:
         self._smart_load_tasks: dict[SmartCacheKey, asyncio.Task[SmartSummaryView]] = {}
         self._smart_operation_limit = max(1, self.settings.app.smart_batch_max_concurrency)
         self._smart_operation_semaphore = asyncio.Semaphore(self._smart_operation_limit)
+        self._smart_batch: _SmartBatchContext | None = None
         self._source_bundle: InventorySourceBundle | None = None
         self._source_bundle_until: datetime = datetime.min.replace(tzinfo=timezone.utc)
         self._snapshot_locks: dict[str, asyncio.Lock] = {}
@@ -3013,11 +3081,17 @@ class InventoryService:
         except Exception:  # noqa: BLE001 - background refreshes should stay best-effort.
             logger.exception("Background SMART refresh failed for %s", cache_key)
 
-    def _apply_persisted_slot_details(self, slots: list[SlotView]) -> None:
+    def _apply_persisted_slot_details(
+        self,
+        slots: list[SlotView],
+        *,
+        loaded_entries: Mapping[str, SlotDetailCacheEntry] | None = None,
+    ) -> None:
         if not self.slot_detail_store or not slots:
             return
 
-        loaded_entries = self.slot_detail_store.load_all()
+        if loaded_entries is None:
+            loaded_entries = self.slot_detail_store.load_all()
         for slot_view in slots:
             entry = self.slot_detail_store.get_entry(
                 self.system.id,
@@ -3059,6 +3133,36 @@ class InventoryService:
     def _persist_slot_details(self, slots: list[SlotView]) -> None:
         self._persist_slot_detail_entries((self._build_slot_detail_entry(slot_view, smart_summary=None) for slot_view in slots))
 
+    async def _load_slot_detail_entries(self) -> Any:
+        """Read the slot-detail file once, off the event loop, or reuse the open batch's copy."""
+        if not self.slot_detail_store:
+            return {}
+        batch = self._smart_batch
+        if batch is not None and batch.loaded_entries is not None:
+            return batch.loaded_entries
+        return await asyncio.to_thread(self.slot_detail_store.load_all)
+
+    async def _persist_changed_slot_details(self, slots: list[SlotView], loaded_entries: Any) -> None:
+        """Save only the rows that differ from what was loaded; skip the write when nothing changed."""
+        if not self.slot_detail_store:
+            return
+        entries = [
+            entry
+            for entry in (self._build_slot_detail_entry(slot_view, smart_summary=None) for slot_view in slots)
+            if entry is not None
+        ]
+        if not entries:
+            return
+        known = loaded_entries if isinstance(loaded_entries, dict) else {}
+        changed = self.slot_detail_store.changed_entries(entries, known)
+        if not changed:
+            return
+        batch = self._smart_batch
+        if batch is not None and batch.loaded_entries is not None:
+            self._persist_slot_detail_entries(changed)
+            return
+        await asyncio.to_thread(self.slot_detail_store.save_entries, changed)
+
     def _persist_slot_detail_cache(
         self,
         slot_view: SlotView,
@@ -3074,12 +3178,31 @@ class InventoryService:
         normalized_entries = [entry for entry in entries if entry is not None]
         if not normalized_entries:
             return
+        batch = self._smart_batch
+        if batch is not None and batch.loaded_entries is not None:
+            # Inside a SMART grid load the rows are collected here and written
+            # once when the batch closes, so later bays in the same batch see
+            # them without another read of the file.
+            for entry in normalized_entries:
+                key = self.slot_detail_store.entry_key(entry)
+                merged = SlotDetailStore.merge_entry(batch.loaded_entries.get(key), entry)
+                if merged is None:
+                    continue
+                batch.loaded_entries[key] = merged
+                batch.pending_entries[key] = merged
+            return
         self.slot_detail_store.save_entries(normalized_entries)
 
     def _build_persisted_smart_summary(self, slot_view: SlotView) -> SmartSummaryView | None:
         if not self.slot_detail_store:
             return None
-        entry = self.slot_detail_store.get_entry(self.system.id, slot_view.enclosure_id, slot_view.slot)
+        batch = self._smart_batch
+        entry = self.slot_detail_store.get_entry(
+            self.system.id,
+            slot_view.enclosure_id,
+            slot_view.slot,
+            loaded_entries=batch.loaded_entries if batch is not None else None,
+        )
         if entry is None or not self._slot_detail_entry_matches(slot_view, entry):
             return None
         if not entry.smart_fields:
@@ -3330,15 +3453,45 @@ class InventoryService:
     def _disk_inventory_sync_elapsed(self, started: float) -> float:
         return round(max(0.0, float(self._disk_inventory_sync_clock() - started)), 1)
 
+    @asynccontextmanager
+    async def _disk_inventory_sync_session(self):
+        """Hold one SSH connection for a sync's start command and poll loop.
+
+        Only a real probe gets a session; test doubles keep going through
+        `_run_ssh_command`. The per-host lock is held only while connecting,
+        so a long poll loop does not block bay lights or SMART on the host.
+        """
+        session: SSHCommandSession | None = None
+        probe = self.ssh_probe
+        if isinstance(probe, SSHProbe) and probe.config.enabled and self._ssh_destination_authority_approved(None):
+            try:
+                async with self._ssh_session_lock_for_host(None):
+                    session = await probe.open_session()
+            except Exception as exc:  # noqa: BLE001 - fall back to one connection per command.
+                logger.warning("Disk sync could not keep one SSH connection open: %s", exc)
+                session = None
+        try:
+            yield session
+        finally:
+            if session is not None:
+                await session.close()
+
     async def _run_disk_inventory_sync_command(
         self,
         argv: list[str],
         *,
         failure_prefix: str,
         timeout_seconds: float | None = None,
+        session: SSHCommandSession | None = None,
     ) -> Any:
         command = shlex.join(["sudo", "-n", *argv])
-        result = await self._run_ssh_command(command, timeout_seconds=timeout_seconds)
+        result = None
+        if session is not None:
+            result = await session.run_command(command, timeout_seconds=timeout_seconds)
+        # Exit 255 marks a transport failure (dropped connection), not a
+        # command result, so retry that once on a fresh connection.
+        if result is None or (not result.ok and result.exit_code == 255):
+            result = await self._run_ssh_command(command, timeout_seconds=timeout_seconds)
         if not result.ok:
             detail = (
                 _bounded_middleware_text(result.stderr)
@@ -3349,38 +3502,40 @@ class InventoryService:
         return result
 
     async def _run_full_disk_inventory_sync(self, midclt: str, started: float) -> DiskInventorySyncResult:
-        start_result = await self._run_disk_inventory_sync_command(
-            [midclt, "call", "disk.sync_all"],
-            failure_prefix="TrueNAS could not start the full disk sync",
-        )
-        job_id = _parse_disk_inventory_sync_job_id(start_result.stdout)
-        if job_id is None:
-            raise TrueNASAPIError(
-                "TrueNAS did not return a job id for disk.sync_all, so the sync could not be tracked."
+        async with self._disk_inventory_sync_session() as session:
+            start_result = await self._run_disk_inventory_sync_command(
+                [midclt, "call", "disk.sync_all"],
+                failure_prefix="TrueNAS could not start the full disk sync",
+                session=session,
             )
-        self._disk_inventory_sync_active_job_id = job_id
-        timeout_seconds = max(1, int(self.settings.app.disk_inventory_sync_timeout_seconds))
-        poll_interval = max(0.0, float(self.settings.app.disk_inventory_sync_poll_interval_seconds))
-        while True:
-            state, error = await self._get_disk_inventory_sync_job_state(midclt, job_id)
-            elapsed = self._disk_inventory_sync_elapsed(started)
-            if state in DISK_INVENTORY_SYNC_TERMINAL_JOB_STATES:
-                self._disk_inventory_sync_active_job_id = None
-                break
-            if elapsed >= timeout_seconds:
-                return DiskInventorySyncResult(
-                    mode=DiskInventorySyncMode.full,
-                    state=state,
-                    job_id=job_id,
-                    elapsed_seconds=elapsed,
-                    timed_out=True,
-                    error=error,
-                    message=(
-                        f"TrueNAS is still running disk sync job {job_id} after {int(elapsed)} s. "
-                        "Check the job in the TrueNAS UI, then refresh here when it finishes."
-                    ),
+            job_id = _parse_disk_inventory_sync_job_id(start_result.stdout)
+            if job_id is None:
+                raise TrueNASAPIError(
+                    "TrueNAS did not return a job id for disk.sync_all, so the sync could not be tracked."
                 )
-            await self._disk_inventory_sync_sleep(poll_interval)
+            self._disk_inventory_sync_active_job_id = job_id
+            timeout_seconds = max(1, int(self.settings.app.disk_inventory_sync_timeout_seconds))
+            poll_interval = max(0.0, float(self.settings.app.disk_inventory_sync_poll_interval_seconds))
+            while True:
+                state, error = await self._get_disk_inventory_sync_job_state(midclt, job_id, session=session)
+                elapsed = self._disk_inventory_sync_elapsed(started)
+                if state in DISK_INVENTORY_SYNC_TERMINAL_JOB_STATES:
+                    self._disk_inventory_sync_active_job_id = None
+                    break
+                if elapsed >= timeout_seconds:
+                    return DiskInventorySyncResult(
+                        mode=DiskInventorySyncMode.full,
+                        state=state,
+                        job_id=job_id,
+                        elapsed_seconds=elapsed,
+                        timed_out=True,
+                        error=error,
+                        message=(
+                            f"TrueNAS is still running disk sync job {job_id} after {int(elapsed)} s. "
+                            "Check the job in the TrueNAS UI, then refresh here when it finishes."
+                        ),
+                    )
+                await self._disk_inventory_sync_sleep(poll_interval)
 
         if state == "SUCCESS":
             message = "TrueNAS re-read its disk inventory. Refresh to see the updated bays."
@@ -3401,11 +3556,14 @@ class InventoryService:
         self,
         midclt: str,
         job_id: int,
+        *,
+        session: SSHCommandSession | None = None,
     ) -> tuple[str, str | None]:
         job_filter = json.dumps([["id", "=", job_id]], separators=(",", ":"))
         poll_result = await self._run_disk_inventory_sync_command(
             [midclt, "call", "core.get_jobs", job_filter],
             failure_prefix=f"TrueNAS could not report disk sync job {job_id}",
+            session=session,
         )
         return _parse_disk_inventory_sync_job(poll_result.stdout, job_id)
 
@@ -3706,17 +3864,27 @@ class InventoryService:
         # bounds how old a stale-served summary can get.
         now = utcnow()
         eviction_horizon = now - self._smart_cache_stale_retention()
-        expired_keys = {
-            cache_key
-            for cache_key in set(self._smart_cache) | set(self._smart_cache_until)
-            if self._smart_cache_until.get(cache_key, datetime.min.replace(tzinfo=timezone.utc))
-            <= eviction_horizon
-        }
+        expiry_index = self._smart_cache_until
+        if isinstance(expiry_index, _SmartCacheExpiryIndex):
+            expired_keys = set(expiry_index.expired_keys(eviction_horizon))
+            # A summary with no recorded expiry counts as expired, as before.
+            expired_keys.update(self._smart_cache.keys() - expiry_index.keys())
+        else:
+            expired_keys = {
+                cache_key
+                for cache_key in set(self._smart_cache) | set(expiry_index)
+                if expiry_index.get(cache_key, datetime.min.replace(tzinfo=timezone.utc))
+                <= eviction_horizon
+            }
         if self._remove_smart_cache_keys(expired_keys):
             self._observe_inventory_cache_metrics()
-        for cache_key, (_summary, expires_at) in tuple(self._smart_negative_cache.items()):
-            if expires_at <= now:
-                self._smart_negative_cache.pop(cache_key, None)
+        negative_cache = self._smart_negative_cache
+        # A negative entry is dropped when a lookup finds it expired, so the
+        # full sweep only runs once the front entry has expired.
+        if negative_cache and next(iter(negative_cache.values()))[1] <= now:
+            for cache_key, (_summary, expires_at) in tuple(negative_cache.items()):
+                if expires_at <= now:
+                    negative_cache.pop(cache_key, None)
 
     def _store_smart_summary_cache(
         self,
@@ -3785,6 +3953,9 @@ class InventoryService:
             return cached
         if not bypass_negative_cache:
             negative_entry = self._smart_negative_cache.get(cache_key)
+            if negative_entry is not None and negative_entry[1] <= utcnow():
+                self._smart_negative_cache.pop(cache_key, None)
+                negative_entry = None
             if negative_entry is not None:
                 self._smart_negative_cache.move_to_end(cache_key)
                 add_perf_metadata(smart_cache="negative-hit")
@@ -3957,7 +4128,7 @@ class InventoryService:
         for candidate in candidates:
             try:
                 with perf_stage("smart.api.fetch_json", candidate=candidate):
-                    payload = await self.truenas_client.fetch_disk_smartctl(candidate, ["-a", "-j"])
+                    payload = await self._fetch_disk_smartctl(candidate, ["-a", "-j"])
             except TrueNASAPIError as exc:
                 last_error = str(exc)
                 continue
@@ -3974,7 +4145,7 @@ class InventoryService:
             if api_candidate and "smartctl-text" in groups:
                 try:
                     with perf_stage("smart.api.fetch_text_enrichment", candidate=api_candidate):
-                        enrichment_payload = await self.truenas_client.fetch_disk_smartctl(api_candidate, ["-x"])
+                        enrichment_payload = await self._fetch_disk_smartctl(api_candidate, ["-x"])
                 except TrueNASAPIError as exc:
                     last_error = str(exc)
                 else:
@@ -4079,7 +4250,127 @@ class InventoryService:
                         summary = self._fallback_smart_summary(slot_lookup.get(slot), str(exc))
                     return SmartBatchItem(slot=slot, summary=summary)
 
-            return await asyncio.gather(*(load_summary(slot) for slot in ordered_slots))
+            async with self._smart_batch_scope():
+                return await asyncio.gather(*(load_summary(slot) for slot in ordered_slots))
+
+    @asynccontextmanager
+    async def _smart_batch_scope(self):
+        """Share one slot-detail read, one API login, and one SSH session per host across a grid load.
+
+        Overlapping grid loads join the open batch; the last one out writes
+        the collected slot-detail rows and closes the shared connections.
+        """
+        batch = self._smart_batch
+        if batch is None:
+            batch = _SmartBatchContext()
+            if self.slot_detail_store:
+                loaded = await asyncio.to_thread(self.slot_detail_store.load_all)
+                if isinstance(loaded, dict):
+                    batch.loaded_entries = loaded
+            self._smart_batch = batch
+        batch.depth += 1
+        try:
+            yield batch
+        finally:
+            batch.depth -= 1
+            if batch.depth == 0 and self._smart_batch is batch:
+                self._smart_batch = None
+                await self._close_smart_batch(batch)
+
+    async def _close_smart_batch(self, batch: _SmartBatchContext) -> None:
+        try:
+            if batch.pending_entries and self.slot_detail_store:
+                pending = list(batch.pending_entries.values())
+                batch.pending_entries.clear()
+                try:
+                    await asyncio.to_thread(self.slot_detail_store.save_entries, pending)
+                except Exception as exc:  # noqa: BLE001 - the summaries were already served from memory.
+                    logger.warning("Could not save %s slot detail rows: %s", len(pending), exc)
+        finally:
+            sessions = [session for session in batch.ssh_sessions.values() if session is not None]
+            batch.ssh_sessions.clear()
+            for session in sessions:
+                try:
+                    await session.close()
+                except Exception as exc:  # noqa: BLE001 - closing a dead connection is not a failure.
+                    logger.debug("Shared SMART SSH connection did not close cleanly: %s", exc)
+            await batch.exit_stack.aclose()
+
+    async def _smart_batch_ssh_session(
+        self,
+        batch: _SmartBatchContext,
+        probe: SSHProbe,
+        host: str | None,
+    ) -> SSHCommandSession | None:
+        """Open the grid load's shared SSH connection for `host` on first use.
+
+        Bays share the connection with up to `smart_batch_max_concurrency`
+        commands in flight (capped below the OpenSSH default of ten sessions
+        per connection). The per-host lock is held only while connecting, so
+        bay lights and disk sync on the same host are not queued behind the
+        whole grid.
+        """
+        key = self._optional_ssh_backoff_key(host)
+        if key in batch.ssh_sessions:
+            return batch.ssh_sessions[key]
+        lock = batch.ssh_session_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            if key in batch.ssh_sessions:
+                return batch.ssh_sessions[key]
+            try:
+                async with self._ssh_session_lock_for_host(host):
+                    session = await probe.open_session(
+                        max_channels=min(self._smart_operation_limit, SMART_SSH_MAX_SHARED_CHANNELS)
+                    )
+            except Exception as exc:  # noqa: BLE001 - each bay falls back to its own connection.
+                logger.warning("Shared SMART SSH connection to %s could not be opened: %s", probe.config.host, exc)
+                session = None
+            batch.ssh_sessions[key] = session
+            return session
+
+    async def _drop_smart_batch_ssh_session(self, batch: _SmartBatchContext, host: str | None) -> None:
+        key = self._optional_ssh_backoff_key(host)
+        session = batch.ssh_sessions.get(key)
+        batch.ssh_sessions[key] = None
+        if session is not None:
+            try:
+                await session.close()
+            except Exception as exc:  # noqa: BLE001 - the connection is already broken.
+                logger.debug("Shared SMART SSH connection did not close cleanly: %s", exc)
+
+    async def _smart_batch_api_session(self, batch: _SmartBatchContext) -> Any:
+        """Open the shared TrueNAS API login on first use; None when it cannot be opened."""
+        if batch.api_session is not None:
+            return batch.api_session
+        if batch.api_session_failed or not isinstance(self.truenas_client, TrueNASWebsocketClient):
+            return None
+        async with batch.api_session_lock:
+            if batch.api_session is not None or batch.api_session_failed:
+                return batch.api_session
+            try:
+                batch.api_session = await batch.exit_stack.enter_async_context(
+                    self.truenas_client.smartctl_session()
+                )
+            except Exception as exc:  # noqa: BLE001 - each bay falls back to its own call.
+                batch.api_session_failed = True
+                logger.warning("Shared SMART API session could not be opened: %s", exc)
+                return None
+        return batch.api_session
+
+    async def _fetch_disk_smartctl(self, disk_name: str, args: list[str]) -> str:
+        batch = self._smart_batch
+        if batch is not None:
+            session = await self._smart_batch_api_session(batch)
+            if session is not None:
+                try:
+                    return await session.fetch_disk_smartctl(disk_name, args)
+                except TrueNASAPIError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - a dropped connection; reconnect per call.
+                    logger.warning("Shared SMART API session failed, reconnecting per call: %s", exc)
+                    batch.api_session = None
+                    batch.api_session_failed = True
+        return await self.truenas_client.fetch_disk_smartctl(disk_name, args)
 
     async def _fetch_smart_summary_over_ssh(
         self,
@@ -4580,9 +4871,10 @@ class InventoryService:
                 platform_context["bmc"] = bmc_context
 
         with perf_stage("inventory.slot_detail_cache.apply", slot_count=len(slots)):
-            self._apply_persisted_slot_details(slots)
+            loaded_slot_entries = await self._load_slot_detail_entries()
+            self._apply_persisted_slot_details(slots, loaded_entries=loaded_slot_entries)
         with perf_stage("inventory.slot_detail_cache.persist", slot_count=len(slots)):
-            self._persist_slot_details(slots)
+            await self._persist_changed_slot_details(slots, loaded_slot_entries)
 
         slots = self._attach_mapping_revisions(slots)
         summary = InventorySummary(
@@ -12041,6 +12333,19 @@ class InventoryService:
                 if not target_host or target_host == normalize_text(self.system.ssh.host)
                 else SSHProbe(self.system.ssh.model_copy(update={"host": target_host}))
             )
+            batch = self._smart_batch
+            if batch is not None:
+                session = await self._smart_batch_ssh_session(batch, probe, host)
+                if session is not None:
+                    try:
+                        return await session.run_planned_commands(planner, initial_commands=initial_list)
+                    except Exception as exc:  # noqa: BLE001 - retry this bay on its own connection.
+                        logger.warning(
+                            "Shared SMART SSH connection to %s failed; retrying on a new connection: %s",
+                            probe.config.host,
+                            exc,
+                        )
+                        await self._drop_smart_batch_ssh_session(batch, host)
             async with self._ssh_session_lock_for_host(host):
                 results = await probe.run_planned_commands(
                     planner,

@@ -102,7 +102,7 @@ class AppConfig(BaseModel):
     smart_prefetch_batch_concurrency: int = 2
     export_history_concurrency: int = 12
     disk_inventory_sync_timeout_seconds: int = 180
-    disk_inventory_sync_poll_interval_seconds: float = 2.0
+    disk_inventory_sync_poll_interval_seconds: float = 5.0
     export_cache_ttl_seconds: int = 60
     export_cache_max_entries: int = 8
     export_cache_max_bytes: int = 32 * 1024 * 1024

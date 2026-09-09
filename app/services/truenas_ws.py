@@ -167,6 +167,17 @@ class TrueNASRawData:
     cli_network_ports: list[dict[str, Any]] = field(default_factory=list)
 
 
+class _SmartctlSession:
+    """`disk.smartctl` calls issued over one already-authenticated connection."""
+
+    def __init__(self, client: "TrueNASWebsocketClient", call_method: MethodCaller) -> None:
+        self._client = client
+        self._call_method = call_method
+
+    async def fetch_disk_smartctl(self, disk_name: str, args: list[str] | None = None) -> str:
+        return await self._client._fetch_disk_smartctl_with(self._call_method, disk_name, args)
+
+
 class TrueNASWebsocketClient:
     """
     Minimal DDP websocket client for TrueNAS middleware calls.
@@ -223,19 +234,46 @@ class TrueNASWebsocketClient:
             )
 
     async def fetch_disk_smartctl(self, disk_name: str, args: list[str] | None = None) -> str:
-        command_args = args or ["-a", "-j"]
         async with self._session() as ws:
+            return await self._fetch_disk_smartctl_with(
+                lambda method, params: self._call(ws, method, params),
+                disk_name,
+                args,
+            )
+
+    @asynccontextmanager
+    async def smartctl_session(self):
+        """One login shared by many `disk.smartctl` calls.
+
+        A SMART grid load asks for every bay at once; opening a websocket,
+        finishing TLS, and logging in per call is the expensive part, so the
+        batch keeps one connection and issues the calls through a dispatcher.
+        """
+        async with self._session() as ws:
+            dispatcher = _MiddlewareCallDispatcher(ws)
             try:
-                result = await self._call(ws, "disk.smartctl", [disk_name, command_args])
-            except TrueNASAPIError as exc:
-                if self.config.platform == "scale" and "ENOMETHOD" in str(exc):
-                    raise TrueNASAPIError(
-                        "Detailed SMART JSON is not available through the SCALE websocket API on this system."
-                    ) from exc
-                raise
-            if not isinstance(result, str):
-                raise TrueNASAPIError(f"disk.smartctl returned unexpected payload type for {disk_name!r}.")
-            return result
+                yield _SmartctlSession(self, dispatcher.call)
+            finally:
+                await dispatcher.close()
+
+    async def _fetch_disk_smartctl_with(
+        self,
+        call_method: MethodCaller,
+        disk_name: str,
+        args: list[str] | None,
+    ) -> str:
+        command_args = args or ["-a", "-j"]
+        try:
+            result = await call_method("disk.smartctl", [disk_name, command_args])
+        except TrueNASAPIError as exc:
+            if self.config.platform == "scale" and "ENOMETHOD" in str(exc):
+                raise TrueNASAPIError(
+                    "Detailed SMART JSON is not available through the SCALE websocket API on this system."
+                ) from exc
+            raise
+        if not isinstance(result, str):
+            raise TrueNASAPIError(f"disk.smartctl returned unexpected payload type for {disk_name!r}.")
+        return result
 
     async def set_slot_status(self, enclosure_id: str, slot_number: int, status: str) -> None:
         async with self._session() as ws:
