@@ -1764,7 +1764,7 @@
           const selected = state.selectedTraceId === path.id;
           return `
             <div class="fabric-impact-card status-${classToken(path.state)}${selected ? " is-selected" : ""}">
-              <button type="button" class="fabric-impact-card-head" data-fabric-trace="${escapeHtml(path.id)}">
+              <button type="button" class="fabric-node-card fabric-impact-card-head" data-fabric-trace="${escapeHtml(path.id)}">
                 <span class="fabric-node-kind">${escapeHtml(path.controller || "path")}</span>
                 <strong>${escapeHtml(path.state || "unknown")}</strong>
                 <span>${escapeHtml(`${slots.length} affected bay${slots.length === 1 ? "" : "s"}`)}</span>
@@ -2696,10 +2696,10 @@
     const modeTargetAttribute = actionAttribute && modeIds.has(modeTarget)
       ? ` data-fabric-mode-target="${escapeHtml(modeTarget)}"`
       : "";
-    const headTag = actionAttribute ? "button" : "div";
-    const typeAttribute = headTag === "button" ? ' type="button"' : "";
-    const headText = tooltipText([["Layer", kind], ["Name", title], ["Context", subtitle]]);
-    const titleAttribute = headText ? ` title="${escapeHtml(headText)}"` : "";
+    const tagName = actionAttribute ? "button" : "div";
+    const typeAttribute = tagName === "button" ? ' type="button"' : "";
+    const summaryText = tooltipText([["Layer", kind], ["Name", title], ["Context", subtitle]]);
+    const titleAttribute = summaryText ? ` title="${escapeHtml(summaryText)}"` : "";
     const visibleFacts = facts.filter(([, value]) => value !== null && value !== undefined && value !== "");
     const detailFacts = [
       ...visibleFacts.slice(6),
@@ -2708,13 +2708,13 @@
     const factRows = renderDiskPathFactRows(visibleFacts.slice(0, 6));
     const detailRows = renderDiskPathFactRows(detailFacts);
     return `
-      <div class="disk-path-card status-${classToken(status)}${selected ? " is-selected" : ""} ${extra}">
-        <${headTag}${typeAttribute} class="disk-path-card-head" ${actionAttribute}${modeTargetAttribute}${titleAttribute}>
+      <div class="disk-path-card-cell">
+        <${tagName}${typeAttribute} class="disk-path-card status-${classToken(status)}${selected ? " is-selected" : ""} ${extra}" ${actionAttribute}${modeTargetAttribute}${titleAttribute}>
           <span class="disk-path-kind">${escapeHtml(kind)}</span>
           <strong>${escapeHtml(title || "n/a")}</strong>
           ${subtitle ? `<small>${escapeHtml(subtitle)}</small>` : ""}
-        </${headTag}>
-        ${factRows ? `<div class="disk-path-facts">${factRows}</div>` : ""}
+          ${factRows ? `<div class="disk-path-facts">${factRows}</div>` : ""}
+        </${tagName}>
         ${detailRows ? `
           <details class="disk-path-card-details">
             <summary>More details (${detailFacts.length})</summary>

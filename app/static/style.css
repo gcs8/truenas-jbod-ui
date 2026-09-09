@@ -1681,6 +1681,13 @@ textarea {
   background:
     linear-gradient(180deg, rgba(122, 169, 255, 0.08), rgba(255, 255, 255, 0.02)),
     rgba(13, 19, 25, 0.9);
+  cursor: default;
+}
+
+.fabric-trace-summary.is-visited:hover {
+  transform: none;
+  border-color: rgba(122, 169, 255, 0.34);
+  box-shadow: none;
 }
 
 .fabric-node-card.is-related:not(.is-selected),
@@ -1783,35 +1790,6 @@ textarea {
   min-width: 0;
 }
 
-.fabric-path-cell {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 4px;
-  min-width: 0;
-}
-
-.fabric-impact-card-head,
-.disk-path-card-head {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 4px;
-  width: 100%;
-  min-width: 0;
-  padding: 0;
-  border: 0;
-  background: none;
-  color: inherit;
-  font: inherit;
-  text-align: left;
-}
-
-button.fabric-impact-card-head,
-button.disk-path-card-head {
-  cursor: pointer;
-}
-
 .fabric-node-grid {
   grid-template-columns: repeat(auto-fit, minmax(136px, 1fr));
   gap: 6px;
@@ -1884,7 +1862,6 @@ button.disk-path-card-head {
 .fabric-impact-card {
   min-height: 184px;
   justify-content: flex-start;
-  cursor: default;
 }
 
 .fabric-impact-facts {
@@ -2090,7 +2067,11 @@ button.disk-path-card-head {
   transition: border-color 0.16s ease, box-shadow 0.16s ease, transform 0.16s ease;
 }
 
-.disk-path-card:has(> button.disk-path-card-head:hover),
+button.disk-path-card {
+  cursor: pointer;
+}
+
+button.disk-path-card:hover,
 .disk-path-card.is-selected {
   transform: translateY(-1px);
   border-color: rgba(85, 214, 235, 0.72);
@@ -2168,18 +2149,6 @@ button.disk-path-card-head {
 .disk-path-facts em {
   color: #7890a7;
   font-style: normal;
-}
-
-.disk-path-card-details {
-  width: 100%;
-  min-width: 0;
-}
-
-.disk-path-card-details > summary {
-  color: #8ea3b8;
-  font-family: var(--mono);
-  font-size: 0.62rem;
-  cursor: pointer;
 }
 
 .fabric-diagnostic-evidence {

@@ -346,7 +346,7 @@ test("slot overflow toggles and impact cards are siblings of their buttons, not 
   page.render();
   const impact = page.elements.get("fabric-map-panel").innerHTML;
   assert.doesNotMatch(impact, /<article/);
-  assert.match(impact, /<div class="fabric-impact-card[^"]*">\s*<button type="button" class="fabric-impact-card-head" data-fabric-trace="path:mpr0:active">/);
+  assert.match(impact, /<div class="fabric-impact-card[^"]*">\s*<button type="button" class="fabric-node-card fabric-impact-card-head" data-fabric-trace="path:mpr0:active">/);
 });
 
 test("the +N toggle expands the slot list in place without rebuilding the map", () => {
@@ -377,8 +377,11 @@ test("disk path cards show extra facts in a More details block instead of a hove
   page.state.selectedTraceId = "bay:3";
   page.render();
   const markup = page.elements.get("fabric-map-panel").innerHTML;
-  assert.match(markup, /<details class="disk-path-card-details">\s*<summary>More details \(\d+\)<\/summary>/);
-  const titles = Array.from(markup.matchAll(/class="disk-path-card-head"[^>]*title="([^"]*)"/g)).map((match) => match[1]);
+  assert.match(markup, /<\/(?:button|div)>\s*<details class="disk-path-card-details">\s*<summary>More details \(\d+\)<\/summary>/);
+  const cardBodies = Array.from(markup.matchAll(/<button[^>]*class="disk-path-card [^"]*"[^>]*>([\s\S]*?)<\/button>/g)).map((match) => match[1]);
+  assert.ok(cardBodies.length >= 4);
+  assert.ok(cardBodies.every((body) => !body.includes("<details")), "the details block is never inside the card button");
+  const titles = Array.from(markup.matchAll(/class="disk-path-card [^"]*"[^>]*title="([^"]*)"/g)).map((match) => match[1]);
   assert.ok(titles.length >= 4);
   assert.ok(titles.every((title) => title.split("\n").length <= 3), "tooltips are a short summary only");
 });
