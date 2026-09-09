@@ -30,6 +30,7 @@ The inventory is a release gate. `scripts/check_public_docs.py` checks the same 
 | `wiki/Quantastor-Setup.md` | Revise | Remove obsolete live-derived images; retain the current shared-slot HA guidance. |
 | `wiki/Quick-Start.md` | Revise | Make CA-verified TLS the first path and isolate the temporary insecure diagnostic exception. |
 | `wiki/SSH-Setup-and-Sudo.md` | Keep | Current generated grants and strict host-key guidance match source. |
+| `wiki/Storage-Fabric.md` | Keep | New page: the four views, focus strip, status chip states, renaming, and empty-page guidance match current behavior. |
 | `wiki/Troubleshooting.md` | Keep | Current startup, auth, history, and export symptoms match current behavior. |
 | `wiki/TrueNAS-CORE-Setup.md` | Keep | Current CORE API, SSH, and sudo guidance matches source. |
 | `wiki/TrueNAS-SCALE-Setup.md` | Keep | Current SCALE API, SSH, and sudo guidance matches source. |

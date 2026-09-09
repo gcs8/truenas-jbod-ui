@@ -1454,7 +1454,7 @@ class SasFabricSnapshotTests(unittest.TestCase):
         expected = {
             "_INVENTORY_SNAPSHOT_EVIDENCE": ("inventory snapshot",),
             "_PROFILE_SLOT_LAYOUT_EVIDENCE": ("profile slot layout",),
-            "_SLOT_MULTIPATH_EVIDENCE": ("slot.multipath.members",),
+            "_SLOT_MULTIPATH_EVIDENCE": ("multipath members",),
             "_LINUX_SES_PATH_EVIDENCE": (
                 "lsscsi -g",
                 "lsscsi -g -t",
@@ -1748,8 +1748,8 @@ class SasFabricSnapshotTests(unittest.TestCase):
                 "host_evidence": ["inventory snapshot"],
                 "bay_evidence": ["inventory snapshot"],
                 "warnings": [
-                    "Quantastor Storage Fabric is built from Quantastor storage-system, HA-node, pool, disk, and optional SES/qs evidence. "
-                    "Low-level controller, path, or expander hops are shown only when those sources prove them."
+                    "Quantastor Storage Fabric is built from Quantastor storage-system, HA-node, pool, disk and "
+                    "optional SES data; controller and expander hops appear only when those sources report them."
                 ],
                 "raw": {
                     "fabric_domain": "storage_fabric",
@@ -2318,7 +2318,7 @@ class SasFabricSnapshotTests(unittest.TestCase):
                 self.assertEqual(fabric.traces, [])
                 self.assertEqual(fabric.raw["fabric_domain"], "storage_fabric")
                 self.assertEqual(fabric.raw["fabric_kind"], fabric_kind)
-                self.assertIn("Storage Fabric evidence", fabric.warnings[0])
+                self.assertIn("nothing to map yet", fabric.warnings[0])
 
     def test_scale_snapshot_builds_linux_ses_graph(self) -> None:
         slots = [
@@ -2471,7 +2471,7 @@ class SasFabricSnapshotTests(unittest.TestCase):
         self.assertEqual(fabric.raw["fabric_kind"], "storage_scale")
         self.assertEqual(fabric.raw["fabric_domain"], "storage_fabric")
         self.assertEqual(fabric.nodes, [])
-        self.assertIn("Storage Fabric evidence", fabric.warnings[0])
+        self.assertIn("nothing to map yet", fabric.warnings[0])
 
     def test_linux_snapshot_without_ses_builds_storage_fabric_graph(self) -> None:
         slot = SlotView(
