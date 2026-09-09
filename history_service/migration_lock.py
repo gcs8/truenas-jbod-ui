@@ -6,6 +6,7 @@ import os
 import socket
 import sqlite3
 import stat
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -43,6 +44,32 @@ def _database_path_is_mount_point(database_path: Path) -> bool:
     return False
 
 
+_MOUNT_POINT_VERDICT_CACHE_LIMIT = 64
+_mount_point_verdicts: dict[tuple[int, int], bool] = {}
+_mount_point_verdicts_lock = threading.Lock()
+
+
+def _database_file_is_mount_point(canonical_path: Path, metadata: os.stat_result) -> bool:
+    """Parse mountinfo once per file identity; a refusal is never served from the cache.
+
+    Every connection takes the lock, and the mount check used to read and parse
+    /proc/self/mountinfo each time. The verdict cannot change while the file keeps
+    the same device and inode, so a clean verdict is remembered per (dev, ino).
+    """
+
+    identity = (int(metadata.st_dev), int(metadata.st_ino))
+    with _mount_point_verdicts_lock:
+        if _mount_point_verdicts.get(identity) is False:
+            return False
+    is_mount_point = _database_path_is_mount_point(canonical_path)
+    if not is_mount_point:
+        with _mount_point_verdicts_lock:
+            if len(_mount_point_verdicts) >= _MOUNT_POINT_VERDICT_CACHE_LIMIT:
+                _mount_point_verdicts.clear()
+            _mount_point_verdicts[identity] = False
+    return is_mount_point
+
+
 def _history_lock_address(database_path: Path) -> bytes:
     database_path = Path(database_path).absolute()
     canonical_parent = database_path.parent.resolve(strict=True)
@@ -52,7 +79,7 @@ def _history_lock_address(database_path: Path) -> bytes:
     except FileNotFoundError:
         metadata = None
     if metadata is not None:
-        if _database_path_is_mount_point(canonical_path):
+        if _database_file_is_mount_point(canonical_path, metadata):
             raise ValueError("History database file mount points are not supported; mount its parent directory.")
         if stat.S_ISLNK(metadata.st_mode):
             raise ValueError("History database path must not be a symlink.")
