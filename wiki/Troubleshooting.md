@@ -30,6 +30,22 @@ If `livez` is not `ok`, fix the container/runtime problem first. If `livez` is
 healthy but `healthz` reports a warning or degraded dependency, read that
 payload before chasing layout bugs.
 
+## A container keeps restarting
+
+`docker compose up -d` reports success even when a container fails as soon as
+it starts. Check:
+
+```bash
+docker compose ps
+docker compose logs --tail=50 enclosure-ui
+```
+
+A container that shows `Restarting` in `docker compose ps` has a startup
+error. Read the last line of its log: it names the setting or folder that
+stopped it. Use `enclosure-history` or `enclosure-admin` in place of
+`enclosure-ui` for the other services. The admin container does not restart
+on its own; it shows `Exited` instead.
+
 ## The app starts but the UI looks empty
 
 Common causes:
@@ -79,6 +95,14 @@ enclosure scope. Multi-system and multi-enclosure deployments likewise deny the
 legacy fallback and show one bounded warning with the affected count and the same
 re-save guidance.
 
+## Saving a bay assignment fails with 500
+
+`Unhandled application error` after saving a bay assignment means the main UI
+cannot write to its `data` folder. The usual cause is a folder owned by root
+while the container runs as the app user. Fix the ownership as described in
+[A non-root container gets permission denied](#a-non-root-container-gets-permission-denied),
+then save again.
+
 ## The UI says a sudo command is not allowed
 
 That means the app tried to run a command the SSH user cannot execute.
@@ -115,21 +139,38 @@ access-restricted workflow; the override does not make the archive safe to share
 
 ## A non-root container gets permission denied
 
-If a source-built non-root UI or history container reports `permission denied`,
-stop the stack and run the bounded ownership helper from the matching source
-checkout:
+The v0.23.0 Compose file runs the main UI and history as the app user
+(`APP_UID:APP_GID`, `10001:10001` unless `.env` says otherwise). If those
+containers report `permission denied`, the host folders are still owned by
+root, which is what an earlier release or a folder Docker created on first
+start leaves behind. Stop the stack and give the folders to the app user:
 
 ```bash
+docker compose down
 app_uid="${APP_UID:-10001}"
 app_gid="${APP_GID:-10001}"
+sudo chown -R "$app_uid:$app_gid" config data history logs
+docker compose up -d
+```
+
+If `.env` overrides `APP_UID` or `APP_GID`, export the same values before
+running the block. If you would rather keep root ownership, use the v0.22.2
+Compose file instead; it runs the services as root and needs no ownership
+change.
+
+If you have a source checkout, the bounded ownership helper does the same job
+with a dry check first:
+
+```bash
 sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid "$app_uid" --gid "$app_gid"
 sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid "$app_uid" --gid "$app_gid" --apply
 ```
 
-Run the dry check first. If `.env` overrides `APP_UID` or `APP_GID`, export the
-same values before running the block. Do not use recursive `chmod 777`, and do
-not run this source-build migration against the published v0.22.2 Compose/image
-pair. If SSH then fails to load `known_hosts`, verify that
+Run the dry check first. Do not use recursive `chmod 777`. Skip both blocks
+when `HISTORY_SEGMENT_CATALOG_PATH` is set and follow the segmented repair
+procedure in
+[[Backup, Restore, and Debug Bundles|Backup-Restore-and-Debug-Bundles]]
+instead. If SSH then fails to load `known_hosts`, verify that
 `data/known_hosts` is owned by the configured app UID/GID and uses mode `0660`.
 
 ## SCALE shows a generic runtime profile
@@ -189,6 +230,40 @@ Start or update it with:
 docker compose --profile history pull
 docker compose --profile history up -d
 ```
+
+## History says permission denied or readonly database
+
+`Permission denied: '/app/history/history.db'` or `attempt to write a readonly
+database` in the history log means the `history` folder or the database file
+is not writable by the user the container runs as. With the v0.23.0 Compose
+file that user is `APP_UID:APP_GID`. Give the folder to that user as described
+in
+[A non-root container gets permission denied](#a-non-root-container-gets-permission-denied),
+or use the root-compatible v0.22.2 Compose file. Do not use `chmod 777`.
+
+## History refuses to start after changing HISTORY_BIND_ADDRESS
+
+`Non-loopback history exposure requires refresh token mode.` in the history
+log means `HISTORY_BIND_ADDRESS` is no longer `127.0.0.1` but the token
+settings are missing. History listens off-loopback only with all of these in
+`.env`:
+
+```dotenv
+HISTORY_REFRESH_AUTH_MODE=token
+HISTORY_REFRESH_TOKEN=replace-with-a-long-private-value
+HISTORY_PUBLIC_ORIGIN=http://your-docker-host:8081
+```
+
+Use `HISTORY_REFRESH_TOKEN_FILE` with the secrets overlay instead of
+`HISTORY_REFRESH_TOKEN` when you keep the token in a file. Then recreate the
+history container:
+
+```bash
+docker compose --profile history up -d --force-recreate enclosure-history
+```
+
+To go back to localhost only, remove `HISTORY_BIND_ADDRESS` from `.env` and
+recreate the container the same way.
 
 ## The admin page is missing
 
