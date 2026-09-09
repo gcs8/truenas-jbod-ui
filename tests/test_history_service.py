@@ -1529,6 +1529,68 @@ class HistoryStoreTests(unittest.TestCase):
                 1,
             )
 
+    def test_pending_marker_refusal_names_the_recovery_command_and_logs_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            database_path = root / "history.db"
+            segments_directory = root / "segments"
+            segments_directory.mkdir()
+            catalog_path = segments_directory / "catalog.json"
+            HistoryStore(
+                str(database_path),
+                recover_unreadable_database=False,
+                segment_catalog_path=catalog_path,
+            )
+
+            cases = (
+                (
+                    activation_pending_path(database_path),
+                    "scripts/rotate_segmented_history.py",
+                    "--recover",
+                ),
+                (
+                    segments_directory / MIGRATION_PENDING_MARKER,
+                    "scripts/migrate_segmented_history.py",
+                    "--recover-rollback",
+                ),
+            )
+            for marker_path, script, mode in cases:
+                marker_path.write_text("{}", encoding="utf-8")
+                try:
+                    with self.assertLogs("history_service.store", level="ERROR") as logs:
+                        with self.assertRaises(sqlite3.OperationalError) as raised:
+                            HistoryStore(
+                                str(database_path),
+                                recover_unreadable_database=False,
+                                segment_catalog_path=catalog_path,
+                            )
+                    message = str(raised.exception)
+                    self.assertIn(
+                        f"docker compose run --rm --entrypoint python enclosure-history {script} "
+                        f"--source {database_path} --segments-dir {segments_directory} {mode}",
+                        message,
+                    )
+                    self.assertIn("start the history service again", message)
+                    self.assertIn(str(marker_path), message)
+                    self.assertEqual(len(logs.records), 1)
+                    self.assertIn(script, logs.records[0].getMessage())
+                finally:
+                    marker_path.unlink()
+
+            # Without a catalog the store cannot know the segments folder, so the
+            # message says which value is missing instead of guessing a path.
+            unsegmented_path = root / "plain.db"
+            HistoryStore(str(unsegmented_path), recover_unreadable_database=False)
+            marker_path = activation_pending_path(unsegmented_path)
+            marker_path.write_text("{}", encoding="utf-8")
+            try:
+                with self.assertRaises(sqlite3.OperationalError) as raised:
+                    HistoryStore(str(unsegmented_path), recover_unreadable_database=False)
+            finally:
+                marker_path.unlink()
+            self.assertIn("HISTORY_SEGMENT_CATALOG_PATH is not set", str(raised.exception))
+            self.assertIn("scripts/rotate_segmented_history.py", str(raised.exception))
+
     def test_store_refuses_reads_and_retention_claims_while_a_lifecycle_marker_is_pending(self) -> None:
         # PR #191 gated __init__ and _execute_write, but plain reads and the
         # segmented-retention claim/finish/release writes reached _connect

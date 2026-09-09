@@ -428,7 +428,11 @@ class HistoryStore:
         self._segment_reader_cache: SegmentedHistoryReader | None = None
         if self._initialize_enabled:
             with history_write_lock(self.file_path, blocking=False):
-                self._require_no_pending_lifecycle_markers()
+                try:
+                    self._require_no_pending_lifecycle_markers()
+                except sqlite3.OperationalError as exc:
+                    logger.error("%s", exc)
+                    raise
                 self._initialize(migration_lock_held=True)
 
     def _ensure_database_parent(self) -> None:
@@ -444,33 +448,58 @@ class HistoryStore:
 
     def _require_no_pending_lifecycle_markers(self) -> None:
         """
-        Refuse to touch the hot database while a rotation, migration, or
-        segmented restore is pending.
-
-        The markers are honoured by the segmented reader, but `_initialize`
-        (schema executescript, column adds, table-count sync, journal-mode
-        switch) and the collector's writes used to run regardless. A service
-        restart during a pending journal then mutated the hot file, and
-        `rotate --recover` could match neither the prior nor the candidate
-        digest (issue #174). Plain reads and the segmented-retention claim
-        writes reached `_connect` without this check and rewrote the journal
-        header the same way (issue #279), so `_connect` now calls it for every
-        connection. Raise the same error type the migration lock raises so
-        callers keep one failure path.
+        Refuse every connection while a rotation, migration or segmented
+        restore is pending; the marker file is the only source of truth.
         """
-        if path_entry_exists(activation_pending_path(self.file_path)):
+        activation_marker = activation_pending_path(self.file_path)
+        if path_entry_exists(activation_marker):
             raise sqlite3.OperationalError(
-                "Segmented history activation is pending; refusing to open the history "
-                "database until the pending rotation or restore is recovered."
+                self._pending_marker_message(
+                    "A segmented history rotation or restore was interrupted, so segmented "
+                    "history activation is pending and the history database stays closed "
+                    "until it is recovered.",
+                    script="scripts/rotate_segmented_history.py",
+                    mode="--recover",
+                    marker_path=activation_marker,
+                )
             )
         if self.segment_catalog_path is None:
             return
         pending_path = self.segment_catalog_path.parent / MIGRATION_PENDING_MARKER
         if path_entry_exists(pending_path):
             raise sqlite3.OperationalError(
-                "Segmented history migration recovery is pending; refusing to open the history "
-                "database until the pending migration is recovered."
+                self._pending_marker_message(
+                    "A segmented history migration was interrupted, so migration recovery "
+                    "is pending and the history database stays closed until it is recovered.",
+                    script="scripts/migrate_segmented_history.py",
+                    mode="--recover-rollback",
+                    marker_path=pending_path,
+                )
             )
+
+    def _pending_marker_message(
+        self,
+        summary: str,
+        *,
+        script: str,
+        mode: str,
+        marker_path: Path,
+    ) -> str:
+        if self.segment_catalog_path is not None:
+            segments_option = f"--segments-dir {self.segment_catalog_path.parent}"
+            catalog_note = ""
+        else:
+            segments_option = "--segments-dir <the segments folder>"
+            catalog_note = (
+                " HISTORY_SEGMENT_CATALOG_PATH is not set on this deployment, so give the "
+                "segments folder that the interrupted run used."
+            )
+        return (
+            f"{summary} Inspect it with: docker compose run --rm --entrypoint python "
+            f"enclosure-history {script} --source {self.file_path} {segments_option} {mode}"
+            f" (add --apply to carry it out), then start the history service again.{catalog_note}"
+            f" Marker file: {marker_path}."
+        )
 
     def _segmented_reader(self) -> SegmentedHistoryReader | None:
         if self.segment_catalog_path is None:
