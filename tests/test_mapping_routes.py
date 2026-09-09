@@ -212,10 +212,7 @@ class MappingImportRouteTests(unittest.TestCase):
             getattr(route, "path", ""): route
             for route in app_main.app.routes
         }
-        reason = (
-            "Mapping import is unavailable because this system disk inventory has no identified "
-            "physical enclosure or stable physical slot identities."
-        )
+        reason = "Bay mapping is not available because this system has no known enclosure."
         bundle = MappingBundle(mappings=[ManualMapping(slot=0, serial="UNSTABLE")])
         confirmation = MappingImportConfirmation(
             bundle=bundle,
@@ -377,10 +374,7 @@ class MappingImportRouteTests(unittest.TestCase):
             for route in app_main.app.routes
             if getattr(route, "path", "") == "/api/slots/{slot}/mapping"
         ]
-        reason = (
-            "Manual mapping is unavailable because this system disk has no identified physical "
-            "enclosure or stable physical location."
-        )
+        reason = "Bay mapping is not available because this system has no known enclosure."
         payload = MappingRequest(
             expected_revision="a" * 64,
             serial="UNSTABLE",

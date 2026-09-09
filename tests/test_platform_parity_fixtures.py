@@ -204,8 +204,7 @@ class PlatformParityFixtureTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(slot0.ssh_ses_targets[0]["ses_device"], "/dev/sg26")
             self.assertTrue(slot0.identify_active)
             self.assertIn(
-                "TrueNAS SCALE did not return enclosure rows, so this view is using Linux SES AES page parsing "
-                "for slot mapping on the selected enclosure.",
+                "TrueNAS did not report any enclosures, so bay positions come from the enclosure over SSH.",
                 snapshot.warnings,
             )
 
