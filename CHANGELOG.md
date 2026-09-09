@@ -26,6 +26,13 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Fixed
+
+- Isolated read-UI authentication settings so invalid admin-only settings
+  and unavailable admin directories no longer block UI startup (#467).
+
 ## v0.23.0 - 2026-09-08
 
 This release includes every pull request merged after `v0.22.2` through the
