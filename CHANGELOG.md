@@ -26,6 +26,14 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Docs
+
+- `config/config.example.yaml` now lists every option with its default and
+  shows one example system per platform, including ESXi, a BMC-only host,
+  and a storage view; the unused `app.verify_ssl` line is gone. (#489)
+
 ## v0.23.0 - 2026-09-08
 
 This release includes every pull request merged after `v0.22.2` through the
