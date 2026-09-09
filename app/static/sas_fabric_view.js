@@ -51,9 +51,11 @@
     expandedSlotLists: {},
     diagnosticTables: {},
     diagnosticPayloads: {},
+    openEvidencePanels: new Set(),
     smartSummaries: {},
     smartRequests: {},
     aliasEditObjectId: null,
+    aliasDraft: null,
     writePolicy: normalizeFabricWritePolicy(bootstrap.writePolicy),
     writeAuthorization: null,
     writeAuthPending: false,
@@ -305,12 +307,45 @@
     return String(value || "unknown").toLowerCase().replace(/[^a-z0-9_-]+/g, "-");
   }
 
+  const KIND_LABELS = {
+    host: "Host",
+    controller: "Controller",
+    path: "Path",
+    expander: "Expander",
+    "mpr-enclosure": "MPR Enclosure",
+    "ses-enclosure": "SES Enclosure",
+    "storage-enclosure": "Storage Enclosure",
+    backplane: "Backplane",
+    bay: "Bay",
+    pool: "Pool",
+    vdev: "Vdev",
+    "host-controller": "Host Controller",
+    "controller-path": "Controller Path",
+    "controller-expander": "Controller Expander",
+    "expander-enclosure": "Expander Enclosure",
+    "path-bay": "Path Bay",
+    "path-ses-enclosure": "Path SES Enclosure",
+    "path-storage-enclosure": "Path Storage Enclosure",
+    "ses-bay": "SES Bay",
+    "backplane-bay": "Backplane Bay",
+    "bay-pool": "Bay Pool",
+    "pool-vdev": "Pool Vdev",
+  };
+
+  const KIND_ACRONYMS = new Set(["mpr", "ses", "sg", "hba", "ioc", "sas", "scsi", "nvme", "bmc", "ipmi", "pci", "pcie", "lun"]);
+
   function formatKind(kind) {
-    return String(kind || "item")
-      .replace(/-/g, " ")
-      .replace(/\b\w/g, (letter) => letter.toUpperCase())
-      .replace("Mpr", "MPR")
-      .replace("Ses", "SES");
+    const key = String(kind || "item");
+    if (KIND_LABELS[key]) {
+      return KIND_LABELS[key];
+    }
+    return key
+      .split("-")
+      .filter(Boolean)
+      .map((word) => (KIND_ACRONYMS.has(word.toLowerCase())
+        ? word.toUpperCase()
+        : word.charAt(0).toUpperCase() + word.slice(1)))
+      .join(" ");
   }
 
   function formatSlotLabel(slotNumber) {
@@ -368,6 +403,19 @@
 
   function fabricViewCopy(fabric = state.fabric) {
     const platformLabel = fabricPlatformLabel(fabric);
+    const cache = fabricCache(fabric);
+    if (cache?.viewCopy && cache.viewCopyPlatform === platformLabel) {
+      return cache.viewCopy;
+    }
+    const copy = buildFabricViewCopy(fabric, platformLabel);
+    if (cache) {
+      cache.viewCopy = copy;
+      cache.viewCopyPlatform = platformLabel;
+    }
+    return copy;
+  }
+
+  function buildFabricViewCopy(fabric, platformLabel) {
     const kind = fabricKind(fabric);
     const linuxSes = kind === "linux_ses";
     if (linuxSes) {
@@ -677,12 +725,6 @@
     const rank = {
       path: 0,
       bay: 1,
-      controller: 2,
-      expander: 3,
-      "mpr-enclosure": 4,
-      "ses-enclosure": 5,
-      "storage-enclosure": 6,
-      backplane: 7,
     };
     return rank[traceItem?.kind] ?? 99;
   }
@@ -759,19 +801,62 @@
     return sorted.length > limit ? `${visible}, +${sorted.length - limit}` : visible;
   }
 
-  function renderSlotList(slots, { limit = 28, expandKey = "" } = {}) {
+  function slotListParts(slots, { limit = 28, expandKey = "" } = {}) {
     const sorted = sortedSlots(slots);
-    if (!sorted.length) {
+    const expanded = Boolean(expandKey && state.expandedSlotLists[expandKey]);
+    const visible = expanded ? sorted : sorted.slice(0, limit);
+    return {
+      sorted,
+      expanded,
+      labels: visible.map(formatSlotLabel).join(", "),
+      overflow: sorted.length - visible.length,
+      canToggle: Boolean(expandKey) && sorted.length > limit,
+    };
+  }
+
+  function slotOverflowLabel(parts) {
+    return parts.expanded ? "Show fewer" : `+${parts.overflow}`;
+  }
+
+  function renderSlotList(slots, options = {}) {
+    const parts = slotListParts(slots, options);
+    if (!parts.sorted.length) {
       return '<span class="fabric-empty-note">No mapped bays</span>';
     }
-    const expanded = expandKey && state.expandedSlotLists[expandKey];
-    const visible = expanded ? sorted : sorted.slice(0, limit);
-    const overflow = sorted.length - visible.length;
-    const labels = visible.map(formatSlotLabel).join(", ");
-    const overflowMarkup = expandKey && overflow > 0
-      ? ` <span class="fabric-overflow-button" role="button" tabindex="0" data-fabric-expand-slots="${escapeHtml(expandKey)}">+${overflow}</span>`
-      : "";
-    return `<span>${escapeHtml(labels)}</span>${overflowMarkup}`;
+    const listAttribute = options.expandKey ? ` data-fabric-slot-list="${escapeHtml(options.expandKey)}"` : "";
+    return `<span${listAttribute}>${escapeHtml(parts.labels)}</span>`;
+  }
+
+  function renderSlotOverflowToggle(slots, options = {}) {
+    const parts = slotListParts(slots, options);
+    if (!parts.canToggle) {
+      return "";
+    }
+    return `<button type="button" class="fabric-overflow-button" data-fabric-expand-slots="${escapeHtml(options.expandKey)}" aria-expanded="${parts.expanded ? "true" : "false"}">${escapeHtml(slotOverflowLabel(parts))}</button>`;
+  }
+
+  function slotsForExpandKey(key) {
+    const [kind, ...rest] = String(key || "").split(":");
+    const id = rest.join(":");
+    if (kind !== "path" || !id) {
+      return [];
+    }
+    const path = list(state.fabric?.paths).find((item) => item.id === id);
+    return sortedSlots(path?.slots || traceById(id)?.slots);
+  }
+
+  function refreshSlotList(key, toggleButton) {
+    const cell = toggleButton?.closest?.("[data-fabric-slot-cell]");
+    const listElement = cell?.querySelector?.("[data-fabric-slot-list]");
+    if (!cell || !listElement) {
+      return false;
+    }
+    const limit = Number(cell.dataset?.fabricSlotLimit) || 28;
+    const parts = slotListParts(slotsForExpandKey(key), { limit, expandKey: key });
+    listElement.textContent = parts.labels;
+    toggleButton.textContent = slotOverflowLabel(parts);
+    toggleButton.setAttribute("aria-expanded", parts.expanded ? "true" : "false");
+    return true;
   }
 
   function formatTimestamp(value) {
@@ -874,9 +959,18 @@
     return params;
   }
 
+  function appUrl(path, params = null) {
+    const base = document.baseURI || window.location?.href || "http://localhost/";
+    const url = new URL(String(path || "").replace(/^\/+/, ""), base);
+    const query = params ? params.toString() : "";
+    if (query) {
+      url.search = url.search ? `${url.search}&${query}` : `?${query}`;
+    }
+    return `${url.pathname}${url.search}`;
+  }
+
   function scopedUrl(path, options = {}) {
-    const params = selectedParams(options);
-    return params.toString() ? `${path}?${params.toString()}` : path;
+    return appUrl(path, selectedParams(options));
   }
 
   function replaceLocationIfChanged(nextUrl) {
@@ -889,10 +983,8 @@
   }
 
   function syncLocation() {
-    const pageParams = selectedParams({ includeMode: true });
-    replaceLocationIfChanged(pageParams.toString() ? `/sas-fabric?${pageParams.toString()}` : "/sas-fabric");
-    const backParams = selectedParams();
-    const backHref = backParams.toString() ? `/?${backParams.toString()}` : "/";
+    replaceLocationIfChanged(appUrl("sas-fabric", selectedParams({ includeMode: true })));
+    const backHref = appUrl("./", selectedParams());
     elements.backLinks.forEach((link) => {
       link.href = backHref;
     });
@@ -927,20 +1019,47 @@
     return payload;
   }
 
+  const fabricCaches = new WeakMap();
+  const snapshotSlotCaches = new WeakMap();
+
+  function fabricCache(fabric) {
+    if (!fabric || typeof fabric !== "object") {
+      return null;
+    }
+    let cache = fabricCaches.get(fabric);
+    if (!cache) {
+      cache = {};
+      fabricCaches.set(fabric, cache);
+    }
+    return cache;
+  }
+
+  function cachedFabricMap(fabric, name, build) {
+    const cache = fabricCache(fabric);
+    if (cache?.[name]) {
+      return cache[name];
+    }
+    const built = build(fabric);
+    if (cache) {
+      cache[name] = built;
+    }
+    return built;
+  }
+
   function nodeMap(fabric = state.fabric) {
-    return new Map(list(fabric?.nodes).map((node) => [node.id, node]));
+    return cachedFabricMap(fabric, "nodeMap", (item) => new Map(list(item?.nodes).map((node) => [node.id, node])));
   }
 
   function linkMap(fabric = state.fabric) {
-    return new Map(list(fabric?.links).map((link) => [link.id, link]));
+    return cachedFabricMap(fabric, "linkMap", (item) => new Map(list(item?.links).map((link) => [link.id, link])));
   }
 
   function traceMap(fabric = state.fabric) {
-    return new Map(list(fabric?.traces).map((trace) => [trace.id, trace]));
+    return cachedFabricMap(fabric, "traceMap", (item) => new Map(list(item?.traces).map((trace) => [trace.id, trace])));
   }
 
   function aliasMap(fabric = state.fabric) {
-    return new Map(list(fabric?.aliases).map((alias) => [alias.object_id, alias]));
+    return cachedFabricMap(fabric, "aliasMap", (item) => new Map(list(item?.aliases).map((alias) => [alias.object_id, alias])));
   }
 
   function aliasForObject(objectId, fabric = state.fabric) {
@@ -1279,7 +1398,22 @@
   }
 
   function slotByNumber(slotNumber) {
-    return list(state.snapshot?.slots).find((slot) => Number(slot.slot) === Number(slotNumber)) || null;
+    const snapshot = state.snapshot;
+    if (!snapshot || typeof snapshot !== "object") {
+      return null;
+    }
+    let slotsByNumber = snapshotSlotCaches.get(snapshot);
+    if (!slotsByNumber) {
+      slotsByNumber = new Map();
+      list(snapshot.slots).forEach((slot) => {
+        const key = Number(slot?.slot);
+        if (Number.isFinite(key) && !slotsByNumber.has(key)) {
+          slotsByNumber.set(key, slot);
+        }
+      });
+      snapshotSlotCaches.set(snapshot, slotsByNumber);
+    }
+    return slotsByNumber.get(Number(slotNumber)) || null;
   }
 
   function smartCacheKey(slotNumber) {
@@ -1413,6 +1547,9 @@
       })
       .finally(() => {
         delete state.smartRequests[key];
+        if (state.aliasEditObjectId) {
+          return;
+        }
         if (smartCacheKey(selectedSmartSlotNumber()) === key) {
           render();
         }
@@ -1474,13 +1611,17 @@
     const slots = sortedSlots(path.slots || trace?.slots);
     const related = selected || selectionTouchesSlots(slots);
     const stateName = path.state || trace?.metrics?.state || "unknown";
+    const slotListOptions = { limit: compact ? 16 : 28, expandKey: `path:${path.id}` };
     return `
-      <button type="button" class="fabric-path-card status-${classToken(stateName)}${selected ? " is-selected" : ""}${related ? " is-related" : ""}${compact ? " compact" : ""}" data-fabric-trace="${escapeHtml(path.id)}">
-        <span>${escapeHtml(path.controller || "path")}</span>
-        <strong>${escapeHtml(displayLabel(path) || stateName)}</strong>
-        <small>${escapeHtml(`${path.count || slots.length || 0} bay${(path.count || slots.length) === 1 ? "" : "s"}`)}</small>
-        <em>${renderSlotList(slots, { limit: compact ? 16 : 28, expandKey: `path:${path.id}` })}</em>
-      </button>
+      <div class="fabric-path-cell" data-fabric-slot-cell="${escapeHtml(slotListOptions.expandKey)}" data-fabric-slot-limit="${slotListOptions.limit}">
+        <button type="button" class="fabric-path-card status-${classToken(stateName)}${selected ? " is-selected" : ""}${related ? " is-related" : ""}${compact ? " compact" : ""}" data-fabric-trace="${escapeHtml(path.id)}">
+          <span>${escapeHtml(path.controller || "path")}</span>
+          <strong>${escapeHtml(displayLabel(path) || stateName)}</strong>
+          <small>${escapeHtml(`${path.count || slots.length || 0} bay${(path.count || slots.length) === 1 ? "" : "s"}`)}</small>
+          <em>${renderSlotList(slots, slotListOptions)}</em>
+        </button>
+        ${renderSlotOverflowToggle(slots, slotListOptions)}
+      </div>
     `;
   }
 
@@ -1622,17 +1763,19 @@
           const summary = affectedSlotSummary(slots);
           const selected = state.selectedTraceId === path.id;
           return `
-            <article class="fabric-impact-card status-${classToken(path.state)}${selected ? " is-selected" : ""}" data-fabric-trace="${escapeHtml(path.id)}" role="button" tabindex="0">
-              <span class="fabric-node-kind">${escapeHtml(path.controller || "path")}</span>
-              <strong>${escapeHtml(path.state || "unknown")}</strong>
-              <span>${escapeHtml(`${slots.length} affected bay${slots.length === 1 ? "" : "s"}`)}</span>
+            <div class="fabric-impact-card status-${classToken(path.state)}${selected ? " is-selected" : ""}">
+              <button type="button" class="fabric-impact-card-head" data-fabric-trace="${escapeHtml(path.id)}">
+                <span class="fabric-node-kind">${escapeHtml(path.controller || "path")}</span>
+                <strong>${escapeHtml(path.state || "unknown")}</strong>
+                <span>${escapeHtml(`${slots.length} affected bay${slots.length === 1 ? "" : "s"}`)}</span>
+              </button>
               <div class="fabric-impact-facts">
                 <span>Pools: ${escapeHtml(summary.pools.join(", ") || "n/a")}</span>
                 <span>Vdevs: ${escapeHtml(summary.vdevs.join(", ") || "n/a")}</span>
                 <span>Devices: ${escapeHtml(summary.devices.slice(0, 8).join(", ") || "n/a")}${summary.devices.length > 8 ? `, +${summary.devices.length - 8}` : ""}</span>
               </div>
               <div class="fabric-bay-grid compact">${renderBayChips(slots, 80, { modeTarget: "disk" })}</div>
-            </article>
+            </div>
           `;
         }).join("")}
       </div>
@@ -2365,8 +2508,9 @@
       ["Loginfo", diagnosticLoginfoSummary(diagnostics)],
       ["Operations", formatCountMap(diagnostics.operation_counts)],
     ].filter(([, value]) => value);
+    const rawKey = `${tableKey}:raw`;
     return `
-      <details class="fabric-diagnostic-evidence impact-${escapeHtml(panelImpact)}">
+      <details class="fabric-diagnostic-evidence impact-${escapeHtml(panelImpact)}"${state.openEvidencePanels.has(tableKey) ? " open" : ""} data-fabric-evidence-key="${escapeHtml(tableKey)}">
         <summary class="fabric-diagnostic-evidence-head">
           <span class="fabric-stage-title">Fault Evidence</span>
           <strong>${escapeHtml(summary || `${diagnostics.event_count} kernel events`)}</strong>
@@ -2380,7 +2524,7 @@
           </div>
           ${events.length ? `<ol class="fabric-diagnostic-events">${events.map(renderDiagnosticEvent).join("")}</ol>` : ""}
           ${rawRows.length ? `
-            <details class="fabric-diagnostic-raw">
+            <details class="fabric-diagnostic-raw"${state.openEvidencePanels.has(rawKey) ? " open" : ""} data-fabric-evidence-key="${escapeHtml(rawKey)}">
               <summary>Raw decoded buckets</summary>
               <div>
                 ${rawRows.map(([label, value]) => `<span><em>${escapeHtml(label)}</em>${escapeHtml(formatValue(value))}</span>`).join("")}
@@ -2532,7 +2676,7 @@
 
   function diskPathLabels(copy, linuxSes, storageFabric) {
     return {
-      host: linuxSes ? "Host" : storageFabric ? "Host" : "Host",
+      host: "Host",
       source: linuxSes ? "SES Source" : storageFabric ? "Storage Source" : "HBA",
       path: linuxSes ? "SES Link" : storageFabric ? "Storage Path" : "SAS Link",
       enclosure: linuxSes ? "SES Enclosure" : storageFabric ? "View / Enclosure" : "Expander / SES",
@@ -2552,24 +2696,39 @@
     const modeTargetAttribute = actionAttribute && modeIds.has(modeTarget)
       ? ` data-fabric-mode-target="${escapeHtml(modeTarget)}"`
       : "";
-    const tagName = actionAttribute ? "button" : "div";
-    const typeAttribute = tagName === "button" ? ' type="button"' : "";
-    const detailText = tooltipText([["Layer", kind], ["Name", title], ["Context", subtitle], ...facts, ...hoverFacts]);
-    const titleAttribute = detailText ? ` title="${escapeHtml(detailText)}"` : "";
-    const factRows = facts
-      .filter(([, value]) => value !== null && value !== undefined && value !== "")
-      .slice(0, 6)
-      .map(([label, value]) => `
+    const headTag = actionAttribute ? "button" : "div";
+    const typeAttribute = headTag === "button" ? ' type="button"' : "";
+    const headText = tooltipText([["Layer", kind], ["Name", title], ["Context", subtitle]]);
+    const titleAttribute = headText ? ` title="${escapeHtml(headText)}"` : "";
+    const visibleFacts = facts.filter(([, value]) => value !== null && value !== undefined && value !== "");
+    const detailFacts = [
+      ...visibleFacts.slice(6),
+      ...hoverFacts.filter(([, value]) => value !== null && value !== undefined && value !== ""),
+    ];
+    const factRows = renderDiskPathFactRows(visibleFacts.slice(0, 6));
+    const detailRows = renderDiskPathFactRows(detailFacts);
+    return `
+      <div class="disk-path-card status-${classToken(status)}${selected ? " is-selected" : ""} ${extra}">
+        <${headTag}${typeAttribute} class="disk-path-card-head" ${actionAttribute}${modeTargetAttribute}${titleAttribute}>
+          <span class="disk-path-kind">${escapeHtml(kind)}</span>
+          <strong>${escapeHtml(title || "n/a")}</strong>
+          ${subtitle ? `<small>${escapeHtml(subtitle)}</small>` : ""}
+        </${headTag}>
+        ${factRows ? `<div class="disk-path-facts">${factRows}</div>` : ""}
+        ${detailRows ? `
+          <details class="disk-path-card-details">
+            <summary>More details (${detailFacts.length})</summary>
+            <div class="disk-path-facts">${detailRows}</div>
+          </details>
+        ` : ""}
+      </div>
+    `;
+  }
+
+  function renderDiskPathFactRows(rows) {
+    return rows.map(([label, value]) => `
         <span><em>${escapeHtml(label)}</em>${escapeHtml(formatValue(value))}</span>
       `).join("");
-    return `
-      <${tagName}${typeAttribute} class="disk-path-card status-${classToken(status)}${selected ? " is-selected" : ""} ${extra}" ${actionAttribute}${modeTargetAttribute}${titleAttribute}>
-        <span class="disk-path-kind">${escapeHtml(kind)}</span>
-        <strong>${escapeHtml(title || "n/a")}</strong>
-        ${subtitle ? `<small>${escapeHtml(subtitle)}</small>` : ""}
-        ${factRows ? `<div class="disk-path-facts">${factRows}</div>` : ""}
-      </${tagName}>
-    `;
   }
 
   function renderDiskPathBayChip(slotNumber, activeSlotNumber, slotSet) {
@@ -3051,14 +3210,11 @@
 
   function renderTraceSummaryButton(trace) {
     const selected = state.selectedTraceId === trace.id;
-    const visited = selected || traceIsInSelectionTrail(trace.id);
-    const attributes = visited
-      ? 'disabled aria-disabled="true" data-fabric-trace-disabled="true"'
-      : `data-fabric-trace="${escapeHtml(trace.id)}"`;
+    const visited = !selected && traceIsInSelectionTrail(trace.id);
     const slotText = formatSlots(trace.slots, 18);
-    const trailText = visited ? `${slotText} / already in trace` : slotText;
+    const trailText = selected ? `${slotText} (selected)` : visited ? `${slotText} (visited)` : slotText;
     return `
-      <button type="button" class="fabric-trace-summary${selected ? " is-selected" : ""}${visited ? " is-visited" : ""}" ${attributes}>
+      <button type="button" class="fabric-trace-summary${selected ? " is-selected" : ""}${visited ? " is-visited" : ""}" data-fabric-trace="${escapeHtml(trace.id)}">
         <span>${escapeHtml(formatKind(trace.kind))}</span>
         <strong>${escapeHtml(displayLabel(trace) || trace.id)}</strong>
         <small>${escapeHtml(trailText)}</small>
@@ -3220,13 +3376,14 @@
       : ` title="${escapeHtml(fabricWritePolicyReason())}"`;
     const clearAttributes = savedLabel ? writeAttributes : (writeAttributes || " disabled");
     if (state.aliasEditObjectId === objectId) {
+      const draftLabel = typeof state.aliasDraft === "string" ? state.aliasDraft : savedLabel;
       return `
         <form class="kv-row fabric-alias-row is-editing" data-fabric-alias-form>
           <span>${escapeHtml(label)}</span>
           <div class="fabric-alias-editor">
             <input
               type="text"
-              value="${escapeHtml(savedLabel)}"
+              value="${escapeHtml(draftLabel)}"
               placeholder="${escapeHtml(fallbackLabel)}"
               maxlength="80"
               autocomplete="off"
@@ -3266,6 +3423,21 @@
     `;
   }
 
+  function openAliasEditor(objectId) {
+    state.aliasEditObjectId = objectId || null;
+    state.aliasDraft = null;
+  }
+
+  function closeAliasEditor() {
+    state.aliasEditObjectId = null;
+    state.aliasDraft = null;
+  }
+
+  function cancelAliasEdit() {
+    closeAliasEditor();
+    render();
+  }
+
   async function saveAliasFromForm(form, { clear = false } = {}) {
     if (fabricWriteBlockedByPolicy()) {
       render();
@@ -3292,7 +3464,7 @@
         readUiAuth: true,
         body: JSON.stringify(payload),
       });
-      state.aliasEditObjectId = null;
+      closeAliasEditor();
       const fabric = await fetchJson(scopedUrl("/api/sas-fabric"));
       applyFabric(fabric);
       render();
@@ -3659,7 +3831,93 @@
     renderInspector(fabric);
   }
 
+  const FOCUS_ATTRIBUTES = [
+    "data-fabric-node",
+    "data-fabric-trace",
+    "data-fabric-mode-target",
+    "data-fabric-breadcrumb",
+    "data-fabric-trace-home",
+    "data-fabric-expand-slots",
+    "data-fabric-alias-edit",
+    "data-fabric-alias-input",
+    "data-fabric-alias-cancel",
+    "data-fabric-alias-clear",
+    "data-fabric-diagnostic-page",
+    "data-fabric-diagnostic-key",
+    "data-fabric-diagnostic-filter-key",
+    "data-fabric-diagnostic-type-key",
+    "data-fabric-diagnostic-severity-key",
+    "data-fabric-diagnostic-confidence-key",
+  ];
+
+  function attributeSelector(name, value) {
+    return `[${name}="${String(value).replace(/["\\]/g, "\\$&")}"]`;
+  }
+
+  function rememberFocus() {
+    const active = document.activeElement;
+    if (!active || typeof active.getAttribute !== "function" || typeof active.closest !== "function") {
+      return null;
+    }
+    const container = active.closest("#fabric-map-panel, #fabric-inspector-body, #fabric-focus-strip");
+    if (!container || typeof container.querySelectorAll !== "function") {
+      return null;
+    }
+    const selector = FOCUS_ATTRIBUTES
+      .filter((name) => active.hasAttribute(name))
+      .map((name) => attributeSelector(name, active.getAttribute(name)))
+      .join("");
+    if (!selector) {
+      return null;
+    }
+    const matches = Array.from(container.querySelectorAll(selector));
+    return {
+      container,
+      selector,
+      index: Math.max(0, matches.indexOf(active)),
+      selectionStart: Number.isInteger(active.selectionStart) ? active.selectionStart : null,
+      selectionEnd: Number.isInteger(active.selectionEnd) ? active.selectionEnd : null,
+    };
+  }
+
+  function restoreFocus(memory) {
+    if (!memory) {
+      return;
+    }
+    const matches = Array.from(memory.container.querySelectorAll(memory.selector));
+    const target = matches[memory.index] || matches[0];
+    if (!target || typeof target.focus !== "function") {
+      return;
+    }
+    target.focus({ preventScroll: true });
+    if (memory.selectionStart !== null && typeof target.setSelectionRange === "function") {
+      target.setSelectionRange(memory.selectionStart, memory.selectionEnd ?? memory.selectionStart);
+    }
+  }
+
+  function rememberScroll(element) {
+    if (!element) {
+      return null;
+    }
+    return { element, top: element.scrollTop || 0, left: element.scrollLeft || 0 };
+  }
+
+  function restoreScroll(memory) {
+    if (!memory) {
+      return;
+    }
+    if (memory.element.scrollTop !== memory.top) {
+      memory.element.scrollTop = memory.top;
+    }
+    if (memory.element.scrollLeft !== memory.left) {
+      memory.element.scrollLeft = memory.left;
+    }
+  }
+
   function render() {
+    const focusMemory = rememberFocus();
+    const scrollMemory = [rememberScroll(elements.mapPanel), rememberScroll(elements.inspectorBody)];
+    const pageScroll = { x: window.scrollX || 0, y: window.scrollY || 0 };
     renderSelectors();
     renderSummary();
     renderStatus();
@@ -3671,6 +3929,11 @@
     ensureSelectedSmartSummary();
     syncLocation();
     elements.refreshButton.disabled = state.loading;
+    scrollMemory.forEach(restoreScroll);
+    if (typeof window.scrollTo === "function" && (window.scrollX !== pageScroll.x || window.scrollY !== pageScroll.y)) {
+      window.scrollTo(pageScroll.x, pageScroll.y);
+    }
+    restoreFocus(focusMemory);
   }
 
   function applySnapshot(snapshot) {
@@ -3699,15 +3962,14 @@
     state.error = null;
     render();
     try {
-      const snapshot = await fetchJson(scopedUrl("/api/inventory", { force }));
+      const [snapshot, fabric] = await Promise.all([
+        fetchJson(scopedUrl("/api/inventory", { force })),
+        fetchJson(scopedUrl("/api/sas-fabric", { force })),
+      ]);
       if (requestToken !== state.refreshRequestToken) {
         return;
       }
       applySnapshot(snapshot);
-      const fabric = await fetchJson(scopedUrl("/api/sas-fabric", { force }));
-      if (requestToken !== state.refreshRequestToken) {
-        return;
-      }
       applyFabric(fabric);
     } catch (error) {
       if (requestToken === state.refreshRequestToken) {
@@ -3739,7 +4001,7 @@
   });
 
   elements.refreshButton.addEventListener("click", () => {
-    void refreshFabric(true);
+    void refreshFabric(false);
   });
 
   elements.systemSelect.addEventListener("change", () => {
@@ -3797,7 +4059,7 @@
         render();
         return;
       }
-      state.aliasEditObjectId = aliasEditButton.dataset.fabricAliasEdit || null;
+      openAliasEditor(aliasEditButton.dataset.fabricAliasEdit);
       render();
       window.requestAnimationFrame(() => {
         const input = document.querySelector("[data-fabric-alias-input]");
@@ -3810,8 +4072,7 @@
     }
     const aliasCancelButton = target.closest("[data-fabric-alias-cancel]");
     if (aliasCancelButton) {
-      state.aliasEditObjectId = null;
-      render();
+      cancelAliasEdit();
       return;
     }
     const aliasClearButton = target.closest("[data-fabric-alias-clear]");
@@ -3842,7 +4103,9 @@
     if (expandButton) {
       const key = expandButton.dataset.fabricExpandSlots || "";
       state.expandedSlotLists[key] = !state.expandedSlotLists[key];
-      render();
+      if (!refreshSlotList(key, expandButton)) {
+        render();
+      }
       return;
     }
     const traceHomeButton = target.closest("[data-fabric-trace-home]");
@@ -3909,6 +4172,12 @@
 
   document.addEventListener("input", (event) => {
     const target = event.target instanceof HTMLInputElement ? event.target : null;
+    if (target?.matches("[data-fabric-alias-input]")) {
+      if (state.aliasEditObjectId && target.dataset.fabricAliasObject === state.aliasEditObjectId) {
+        state.aliasDraft = target.value;
+      }
+      return;
+    }
     if (!target?.matches("[data-fabric-diagnostic-filter-key]")) {
       return;
     }
@@ -3944,7 +4213,19 @@
 
   document.addEventListener("toggle", (event) => {
     const details = event.target instanceof HTMLDetailsElement ? event.target : null;
-    if (!details?.matches("[data-fabric-diagnostic-table-key]")) {
+    if (!details) {
+      return;
+    }
+    if (details.matches("[data-fabric-evidence-key]")) {
+      const key = details.dataset.fabricEvidenceKey || "";
+      if (details.open) {
+        state.openEvidencePanels.add(key);
+      } else {
+        state.openEvidencePanels.delete(key);
+      }
+      return;
+    }
+    if (!details.matches("[data-fabric-diagnostic-table-key]")) {
       return;
     }
     const key = details.dataset.fabricDiagnosticTableKey || "";
@@ -3952,15 +4233,15 @@
   }, true);
 
   document.addEventListener("keydown", (event) => {
-    if (event.key !== "Enter" && event.key !== " ") {
+    if (event.key !== "Escape" || !state.aliasEditObjectId) {
       return;
     }
     const target = event.target instanceof Element ? event.target : event.target?.parentElement;
-    if (!target?.closest("[data-fabric-mode-target], [data-fabric-diagnostic-page], [data-fabric-expand-slots], [data-fabric-trace-home], [data-fabric-breadcrumb], [data-fabric-trace], [data-fabric-node]")) {
+    if (!target?.closest("[data-fabric-alias-form]")) {
       return;
     }
     event.preventDefault();
-    handleFabricActivation(target);
+    cancelAliasEdit();
   });
 
   ensureSelectionForMode(state.fabric);
