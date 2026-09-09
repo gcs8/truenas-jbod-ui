@@ -79,6 +79,11 @@ from app.services.snapshot_export import (
     collect_configured_hostnames,
 )
 from app.services.truenas_ws import TrueNASAPIError
+from app.startup_checks import (
+    check_writable_dirs,
+    is_unwritable_path_error,
+    ui_writable_directories,
+)
 from history_service.operation_bounds import (
     ALLOWED_HISTORY_METRICS,
     HistoryBudgetExceeded,
@@ -589,6 +594,10 @@ def create_app() -> FastAPI:
     )
     app.state.operator_auth_settings = operator_auth_settings
     app.state.read_ui_public_origin = startup_settings.app.public_origin
+    startup_problems = check_writable_dirs(ui_writable_directories(startup_settings))
+    for problem in startup_problems:
+        logger.error("%s", problem)
+    app.state.startup_problems = tuple(startup_problems)
 
     app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
     install_metrics(app, service_name="enclosure-ui", version=__version__)
@@ -651,6 +660,7 @@ def build_index_context(
     history_configured: bool,
     read_ui_mutation_auth_mode: str = "network",
     admin_launch_url: str | None = None,
+    admin_launch_stopped: bool = False,
     app_version: str = __version__,
     release_status: dict[str, object] | None = None,
     snapshot_mode: bool = False,
@@ -701,6 +711,7 @@ def build_index_context(
         "initial_history_panel_open_json": initial_history_panel_open_json,
         "initial_history_io_chart_mode_json": initial_history_io_chart_mode_json,
         "admin_launch_url": admin_launch_url,
+        "admin_launch_stopped": admin_launch_stopped,
         "write_policy": write_policy,
         "write_policy_json": json.dumps(write_policy),
     }
@@ -811,27 +822,160 @@ async def ensure_read_slot_bounds(
     return layout_bounds
 
 
-def resolve_admin_launch_url(request: Request, settings: Settings) -> str | None:
-    service_url = str(settings.admin.service_url or "").strip()
-    if not service_url:
-        return None
+@dataclass(frozen=True, slots=True)
+class AdminLaunchState:
+    """What the System Setup button should show.
 
+    ``url`` is set when admin answered its health probe. ``stopped`` is set when
+    admin is configured but did not answer, which is the normal state once it
+    has stopped itself after an hour.
+    """
+
+    url: str | None
+    stopped: bool
+
+
+@dataclass(slots=True)
+class AdminProbeCacheEntry:
+    reachable: bool
+    expires_at_monotonic: float
+
+
+ADMIN_PROBE_SUCCESS_TTL_SECONDS = 30.0
+ADMIN_PROBE_FAILURE_TTL_SECONDS = 10.0
+ADMIN_PROBE_CACHE: dict[str, AdminProbeCacheEntry] = {}
+
+
+def _probe_admin_service(service_url: str, timeout_seconds: float) -> bool:
     health_url = f"{service_url.rstrip('/')}/healthz"
     health_request = urllib.request.Request(
         health_url,
         headers=request_id_headers({"Accept": "application/json"}),
     )
     try:
-        with urllib.request.urlopen(health_request, timeout=settings.admin.timeout_seconds) as response:
-            if getattr(response, "status", 200) >= 400:
-                return None
+        with urllib.request.urlopen(health_request, timeout=timeout_seconds) as response:
+            return getattr(response, "status", 200) < 400
     except (TimeoutError, urllib.error.URLError, ValueError):
+        return False
+
+
+def admin_service_reachable(service_url: str, timeout_seconds: float) -> bool:
+    """Probe admin's health endpoint, remembering the answer for a short while.
+
+    Admin is stopped by design most of the time, so without a cache every page
+    load would wait for a refused connection or a DNS miss.
+    """
+
+    now = time.monotonic()
+    cached = ADMIN_PROBE_CACHE.get(service_url)
+    if cached is not None and cached.expires_at_monotonic > now:
+        return cached.reachable
+    reachable = _probe_admin_service(service_url, timeout_seconds)
+    ttl_seconds = ADMIN_PROBE_SUCCESS_TTL_SECONDS if reachable else ADMIN_PROBE_FAILURE_TTL_SECONDS
+    ADMIN_PROBE_CACHE[service_url] = AdminProbeCacheEntry(
+        reachable=reachable,
+        expires_at_monotonic=now + ttl_seconds,
+    )
+    return reachable
+
+
+def resolve_admin_launch_url(request: Request, settings: Settings) -> AdminLaunchState | None:
+    service_url = str(settings.admin.service_url or "").strip()
+    if not service_url:
         return None
+    if not admin_service_reachable(service_url, settings.admin.timeout_seconds):
+        return AdminLaunchState(url=None, stopped=True)
 
     public_url = str(settings.admin.public_url or "").strip()
     if public_url:
-        return public_url.rstrip("/")
-    return f"{request.url.scheme}://{request.url.hostname}:{settings.admin.port}"
+        return AdminLaunchState(url=public_url.rstrip("/"), stopped=False)
+    return AdminLaunchState(
+        url=f"{request.url.scheme}://{request.url.hostname}:{settings.admin.port}",
+        stopped=False,
+    )
+
+
+def startup_problems_for(request: Request) -> list[str]:
+    """Return the startup sentences stored on the app, or nothing when the app has none."""
+
+    app_state = getattr(getattr(request, "app", None), "state", None)
+    return [str(problem) for problem in (getattr(app_state, "startup_problems", None) or ())]
+
+
+DATA_FOLDER_NOT_WRITABLE_DETAIL = (
+    "Could not save: the data folder is not writable by the app. See Troubleshooting."
+)
+
+
+def data_folder_not_writable_response(exc: OSError) -> JSONResponse:
+    logger.error("Could not write to the data folder: %s", exc)
+    return JSONResponse(
+        {
+            "ok": False,
+            "error": "data_folder_not_writable",
+            "detail": DATA_FOLDER_NOT_WRITABLE_DETAIL,
+        },
+        status_code=503,
+    )
+
+
+HEALTH_SUMMARY_ALL_OK = "All sources OK"
+HEALTH_SUMMARY_WAITING = "Waiting for the first inventory"
+
+
+def build_health_payload(
+    snapshot: InventorySnapshot | None,
+    *,
+    startup_problems: Collection[str] = (),
+) -> tuple[dict[str, object], int]:
+    """Describe service health in plain words and pick the HTTP status to send with it.
+
+    The status code is 503 whenever there is a problem an operator must act on:
+    a data folder the app cannot write, or a TrueNAS API that does not answer.
+    Waiting for the first inventory is not a problem, so it stays 200.
+    """
+
+    unwritable = [str(problem) for problem in startup_problems]
+    api_problem: str | None = None
+
+    if snapshot is None:
+        dependency_status = "unknown"
+        last_updated = None
+        sources: dict[str, object] = {}
+        warnings: list[str] = []
+        cache_state = "empty"
+    else:
+        api_status = snapshot.sources.get("api")
+        dependency_status = "ok" if api_status and api_status.ok else "degraded"
+        last_updated = snapshot.last_updated.isoformat()
+        sources = {name: status.model_dump(mode="json") for name, status in snapshot.sources.items()}
+        warnings = list(snapshot.warnings)
+        cache_state = "cached"
+        if dependency_status == "degraded":
+            api_message = (api_status.message if api_status else None) or "no details recorded"
+            api_problem = f"TrueNAS API unreachable: {api_message}"
+
+    problems = [*unwritable, *([api_problem] if api_problem else [])]
+    if unwritable:
+        summary = "Data folder not writable: " + "; ".join(unwritable)
+    elif api_problem:
+        summary = api_problem
+    elif snapshot is None:
+        summary = HEALTH_SUMMARY_WAITING
+    else:
+        summary = HEALTH_SUMMARY_ALL_OK
+
+    payload: dict[str, object] = {
+        "status": "ok" if not problems else "degraded",
+        "summary": summary,
+        "problems": problems,
+        "dependency_status": dependency_status,
+        "last_updated": last_updated,
+        "sources": sources,
+        "warnings": warnings,
+        "cache_state": cache_state,
+    }
+    return payload, (503 if problems else 200)
 
 
 app = create_app()

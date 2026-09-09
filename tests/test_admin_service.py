@@ -56,6 +56,8 @@ from app.config import (
     TrueNASConfig,
 )
 from app.main import app as main_app
+from app.main import ADMIN_PROBE_CACHE
+from app.main import AdminLaunchState
 from app.main import resolve_admin_launch_url
 from app.main import snapshot_state_busy_exception_handler
 from app.main import _clear_snapshot_export_source_cache_for_tests
@@ -471,9 +473,13 @@ class MainAppBoundaryTests(unittest.TestCase):
         _clear_snapshot_export_source_cache_for_tests()
 
     @staticmethod
-    def _call_main_route(path: str) -> object:
+    def _call_main_route(path: str, *args: object) -> object:
         route = next(route for route in main_app.routes if route.path == path)
-        return asyncio.run(route.endpoint())
+        return asyncio.run(route.endpoint(*args))
+
+    @staticmethod
+    def _health_request(startup_problems: tuple[str, ...] = ()) -> SimpleNamespace:
+        return SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(startup_problems=startup_problems)))
 
     def test_admin_sidecar_exposes_one_time_bootstrap_route(self) -> None:
         paths = {route.path for route in admin_app.routes}
@@ -1591,22 +1597,26 @@ class MainAppBoundaryTests(unittest.TestCase):
     def test_main_app_healthz_uses_cached_snapshot_only(self) -> None:
         fake_service = MagicMock()
         fake_snapshot = MagicMock()
-        fake_snapshot.sources = {"api": MagicMock(ok=True)}
+        api_status = MagicMock(ok=True)
+        api_status.model_dump.return_value = {"enabled": True, "ok": True, "message": "reachable"}
+        fake_snapshot.sources = {"api": api_status}
         fake_snapshot.last_updated = datetime(2026, 4, 25, 12, 0, tzinfo=timezone.utc)
         fake_snapshot.warnings = ["cached warning"]
-        fake_snapshot.model_dump.return_value = {"sources": {"api": {"enabled": True, "ok": True, "message": "reachable"}}}
         fake_service.peek_cached_snapshot.return_value = fake_snapshot
         fake_registry = MagicMock()
         fake_registry.get_service.return_value = fake_service
 
         with patch("app.main.get_inventory_registry", return_value=fake_registry):
-            response = self._call_main_route("/healthz")
+            response = self._call_main_route("/healthz", self._health_request())
 
         self.assertEqual(response.status_code, 200)
         payload = json.loads(response.body)
+        self.assertEqual(payload["summary"], "All sources OK")
         self.assertEqual(payload["dependency_status"], "ok")
         self.assertEqual(payload["cache_state"], "cached")
+        self.assertEqual(payload["sources"], {"api": {"enabled": True, "ok": True, "message": "reachable"}})
         fake_service.peek_cached_snapshot.assert_called_once_with()
+        fake_snapshot.model_dump.assert_not_called()
 
     def test_main_app_healthz_reports_unknown_when_cache_is_empty(self) -> None:
         fake_service = MagicMock()
@@ -1615,10 +1625,11 @@ class MainAppBoundaryTests(unittest.TestCase):
         fake_registry.get_service.return_value = fake_service
 
         with patch("app.main.get_inventory_registry", return_value=fake_registry):
-            response = self._call_main_route("/healthz")
+            response = self._call_main_route("/healthz", self._health_request())
 
         self.assertEqual(response.status_code, 200)
         payload = json.loads(response.body)
+        self.assertEqual(payload["summary"], "Waiting for the first inventory")
         self.assertEqual(payload["dependency_status"], "unknown")
         self.assertEqual(payload["cache_state"], "empty")
 
@@ -1764,6 +1775,8 @@ class MainAppBoundaryTests(unittest.TestCase):
         )
 
     def test_resolve_admin_launch_url_returns_public_url_when_sidecar_is_healthy(self) -> None:
+        ADMIN_PROBE_CACHE.clear()
+        self.addCleanup(ADMIN_PROBE_CACHE.clear)
         request = make_request(port=8080)
         settings = Settings(
             admin=AdminSurfaceConfig(
@@ -1782,11 +1795,13 @@ class MainAppBoundaryTests(unittest.TestCase):
         ):
             launch_url = resolve_admin_launch_url(request, settings)
 
-        self.assertEqual(launch_url, "http://127.0.0.1:8082")
+        self.assertEqual(launch_url, AdminLaunchState(url="http://127.0.0.1:8082", stopped=False))
         outbound_request = urlopen.call_args.args[0]
         self.assertEqual(outbound_request.get_header("X-request-id"), "e" * 32)
 
-    def test_resolve_admin_launch_url_hides_button_when_sidecar_is_down(self) -> None:
+    def test_resolve_admin_launch_url_reports_stopped_when_sidecar_is_down(self) -> None:
+        ADMIN_PROBE_CACHE.clear()
+        self.addCleanup(ADMIN_PROBE_CACHE.clear)
         request = make_request(port=8080)
         settings = Settings(
             admin=AdminSurfaceConfig(
@@ -1803,9 +1818,11 @@ class MainAppBoundaryTests(unittest.TestCase):
         ):
             launch_url = resolve_admin_launch_url(request, settings)
 
-        self.assertIsNone(launch_url)
+        self.assertEqual(launch_url, AdminLaunchState(url=None, stopped=True))
 
-    def test_resolve_admin_launch_url_hides_button_when_sidecar_times_out(self) -> None:
+    def test_resolve_admin_launch_url_reports_stopped_when_sidecar_times_out(self) -> None:
+        ADMIN_PROBE_CACHE.clear()
+        self.addCleanup(ADMIN_PROBE_CACHE.clear)
         request = make_request(port=8080)
         settings = Settings(
             admin=AdminSurfaceConfig(
@@ -1822,7 +1839,7 @@ class MainAppBoundaryTests(unittest.TestCase):
         ):
             launch_url = resolve_admin_launch_url(request, settings)
 
-        self.assertIsNone(launch_url)
+        self.assertEqual(launch_url, AdminLaunchState(url=None, stopped=True))
 
     def test_admin_runtime_version_probe_propagates_current_server_request_id(self) -> None:
         service = DockerRuntimeService(AdminSettings(docker_socket_path="/nonexistent.sock"))

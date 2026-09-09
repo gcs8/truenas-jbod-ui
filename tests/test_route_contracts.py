@@ -369,9 +369,10 @@ class RouteContractTests(unittest.TestCase):
         service.peek_cached_snapshot.return_value = None
         registry = MagicMock()
         registry.get_service.return_value = service
+        request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(startup_problems=())))
 
         with patch.object(app_main, "get_inventory_registry", return_value=registry) as getter:
-            response = asyncio.run(route.endpoint())
+            response = asyncio.run(route.endpoint(request))
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(json.loads(response.body)["cache_state"], "empty")
