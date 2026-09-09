@@ -26,6 +26,14 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Fixed
+
+- Led the public demo and saved copies with what the app does, moved
+  version, source revision and build ID into a collapsed block, and hid the
+  refresh controls and inventory evidence counters in saved copies. (#485)
+
 ## v0.23.0 - 2026-09-08
 
 This release includes every pull request merged after `v0.22.2` through the
