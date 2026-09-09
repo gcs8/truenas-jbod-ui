@@ -1,10 +1,10 @@
 # Roadmap
 
-This file tracks the current intended release direction after the `v0.22.2`
-maintenance release. `v0.22.2` is the latest published release, published on
-2026-09-01 from source commit
-`6473d05f46d8344146cbbd7d0cdbf44487613a3c`. See the
-[GitHub release](https://github.com/gcs8/truenas-jbod-ui/releases/tag/v0.22.2).
+This file tracks the current intended release direction after the `v0.23.0`
+release. `v0.23.0` is the latest published release, published on
+2026-09-09 from source commit
+`dbcd2ab31e9a46083693cf08802434ac8cfc1e43`. See the
+[GitHub release](https://github.com/gcs8/truenas-jbod-ui/releases/tag/v0.23.0).
 
 Older milestone notes such as [`docs/V0_2_ROADMAP.md`](./V0_2_ROADMAP.md) are
 kept for history, but this file is the active planning view.
@@ -65,7 +65,7 @@ through #270).
 - CI covers Python 3.12 and 3.14, container health, browser QA, public artifacts,
   Ruff, dependency checks, and CodeQL
 
-Development has resumed on `main` after the v0.22.2 tag and completed release
+Development has resumed on `main` after the v0.23.0 tag and completed release
 gates. The next lane should stay practical and incremental:
 
 - keep richer platform-native Storage Fabric enrichment in small validated

@@ -60,7 +60,7 @@ curl -fsSL \
   https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/v0.22.2/docker-compose.yml
 
 cat > .env <<'EOF'
-JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.22.2
+JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.23.0
 TRUENAS_HOST=https://truenas.example.test
 TRUENAS_API_KEY=replace-with-your-api-key
 TRUENAS_PLATFORM=core
@@ -72,6 +72,11 @@ docker compose up -d
 
 Replace the example URL and API key before starting. Use `scale` instead of
 `core` when connecting to TrueNAS SCALE.
+
+The Compose file comes from the v0.22.2 tag on purpose: it is the current
+root-compatible one. The v0.23.0 Compose file needs a one-time ownership step
+described in the release notes, and a root-compatible Compose file will ship
+in a later release.
 
 Open `http://your-docker-host:8080`.
 

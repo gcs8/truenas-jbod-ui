@@ -19,7 +19,3 @@ v0.23.0 is the first release after the v0.22.x segmented-history series. It comb
 - The hardened Compose file requires a one-time ownership preflight before first start. Stop the stack and run `scripts/prepare_nonroot_bind_mounts.py` first in dry-run mode, then with `--apply`, using the configured `APP_UID` and `APP_GID`.
 - Do not run the generic ownership helper recursively over an existing segmented-history tree. Follow the bounded repair procedure in the Backup, Restore, and Debug Bundles guide so immutable segments remain non-writable.
 - Rebuild or repull the complete image instead of upgrading dependencies in place.
-
-## Release process
-
-The v0.23.0 tag remains blocked until the versioned release wrap records successful exact-candidate source checks, Docker and sidecar runtime checks, browser and performance gates, disposable Linux encrypted restore QA, operator acceptance, and strict pre-tag validation. GHCR publication, deployment verification, Wiki/public-demo publication, and the post-release development reopen remain separate post-tag gates.

@@ -18,7 +18,7 @@ Validated executable candidate tree: `3fe79ee429f5453269dacf99f52130f88c3ba1ef`.
 
 Validated Linux QA image: `sha256:6a2b54ce2b25a2053ecceaf97a110311103b2d56ee7b5e2bf2195ba0d0e83af9`.
 
-Tag: `v0.23.0` pending. GitHub release pending.
+Tag: `v0.23.0`, published 2026-09-09. GitHub release published 2026-09-09 and marked Latest: https://github.com/gcs8/truenas-jbod-ui/releases/tag/v0.23.0.
 
 Validated against `docs/RELEASE_CHECKLIST.md`.
 

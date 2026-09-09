@@ -231,7 +231,7 @@ class ContainerResourceContractTests(unittest.TestCase):
         self.assertNotIn("--uid 10001 --gid 10001", troubleshooting)
         self.assertNotIn("owned by `10001:10001`", troubleshooting)
 
-    def test_published_install_guides_stay_on_v0222_until_v0230_is_published(self) -> None:
+    def test_published_install_guides_pin_the_v0230_image_on_the_root_compatible_compose(self) -> None:
         for relative_path in (
             "README.md",
             "wiki/Quick-Start.md",
@@ -243,8 +243,8 @@ class ContainerResourceContractTests(unittest.TestCase):
                     "https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/v0.22.2/docker-compose.yml",
                     guide,
                 )
-                self.assertIn("ghcr.io/gcs8/truenas-jbod-ui:v0.22.2", guide)
-                self.assertNotIn("ghcr.io/gcs8/truenas-jbod-ui:v0.23.0", guide)
+                self.assertIn("ghcr.io/gcs8/truenas-jbod-ui:v0.23.0", guide)
+                self.assertNotIn("ghcr.io/gcs8/truenas-jbod-ui:v0.22.2", guide)
 
         deployment_guide = (REPO_ROOT / "wiki/Docker-and-GHCR-Deployment.md").read_text(
             encoding="utf-8"
