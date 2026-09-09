@@ -13,3 +13,15 @@ logs/*
 !history/.gitkeep
 !history/backups/.gitkeep
 !logs/.gitkeep
+
+# Not needed by the image build; keeps the build context small.
+.git
+docs/
+wiki/
+public-demo/
+tests/
+qa/
+node_modules/
+playwright-report/
+test-results/
+*.md
