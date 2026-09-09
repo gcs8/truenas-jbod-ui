@@ -108,6 +108,7 @@ class ReleaseStatusService:
         self.interval_seconds = max(3600, int(interval_seconds or DEFAULT_RELEASE_CHECK_INTERVAL_SECONDS))
         self.timeout_seconds = max(1.0, float(timeout_seconds or DEFAULT_RELEASE_CHECK_TIMEOUT_SECONDS))
         self._lock = asyncio.Lock()
+        self._deadline_changed = asyncio.Event()
         self._next_refresh_at = 0.0
         self._failure_retry_index = 0
         self._payload: dict[str, Any] = self._build_payload(
@@ -140,7 +141,16 @@ class ReleaseStatusService:
 
         while True:
             await self.refresh()
-            await asyncio.sleep(max(0.0, self._next_refresh_at - monotonic()))
+            # Clear before reading the deadline, with no intervening await.
+            # Updates before this point are already reflected in the deadline;
+            # updates after it stay latched even before Event.wait starts.
+            self._deadline_changed.clear()
+            delay = max(0.0, self._next_refresh_at - monotonic())
+            try:
+                async with asyncio.timeout(delay):
+                    await self._deadline_changed.wait()
+            except asyncio.TimeoutError:
+                pass
 
     async def refresh(self, *, force: bool = False) -> dict[str, Any]:
         if not self.enabled:
@@ -160,6 +170,7 @@ class ReleaseStatusService:
                     self._failure_retry_index + 1, len(_FAILURE_RETRY_DELAYS_SECONDS) - 1
                 )
                 self._next_refresh_at = monotonic() + delay
+                self._deadline_changed.set()
                 logger.info("Release check failed for %s: %s", self.repo_full_name, exc)
                 if self._payload.get("latest_tag"):
                     return self.snapshot()
@@ -189,6 +200,7 @@ class ReleaseStatusService:
             )
             self._failure_retry_index = 0
             self._next_refresh_at = monotonic() + self.interval_seconds
+            self._deadline_changed.set()
             return self.snapshot()
 
     def _fetch_latest_release(self) -> dict[str, Any]:

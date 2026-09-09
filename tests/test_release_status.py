@@ -250,19 +250,134 @@ class ReleaseRetryTests(unittest.IsolatedAsyncioTestCase):
     async def test_periodic_loop_uses_failure_delays_then_success_interval(self) -> None:
         delays = []
 
-        async def sleep(delay):
+        async def wait():
+            delay = self.service._next_refresh_at - self.now
             delays.append(delay)
             self.now += delay
             if len(delays) == 2:
                 self.succeed()
             if len(delays) == 3:
                 raise asyncio.CancelledError
+            raise asyncio.TimeoutError
 
-        with patch("app.services.release_status.asyncio.sleep", side_effect=sleep):
+        with patch.object(self.service._deadline_changed, "wait", side_effect=wait):
             with self.assertRaises(asyncio.CancelledError):
                 await self.service.run_periodic_refresh()
         self.assertEqual(delays, [60, 300, 86400])
         self.assertEqual(self.urlopen.call_count, 3)
+
+    async def _settle_periodic(self) -> None:
+        # Bounded event-loop turns drain ready callbacks, without wall-clock waits.
+        for _ in range(12):
+            await asyncio.sleep(0)
+
+    async def _check_forced_refresh_wakeup(self, *, failure: bool) -> None:
+        self.succeed()
+        loop = asyncio.get_running_loop()
+        # Virtual time jumps are not real slow callbacks.
+        loop.slow_callback_duration = float("inf")
+        baseline = asyncio.all_tasks()
+
+        async def fetch(function):
+            return function()
+
+        with (
+            patch.object(loop, "time", side_effect=lambda: self.now),
+            patch("app.services.release_status.asyncio.to_thread", side_effect=fetch),
+        ):
+            periodic = asyncio.create_task(self.service.run_periodic_refresh())
+            try:
+                await self._settle_periodic()
+                self.assertEqual(self.urlopen.call_count, 1)
+                good = self.service.snapshot()
+                old_deadline = self.service._next_refresh_at
+                self.now += 10
+                if failure:
+                    self.urlopen.side_effect = OSError("forced failure")
+                await self.service.refresh(force=True)
+                if failure:
+                    self.assertEqual(self.service.snapshot(), good)
+                await self._settle_periodic()
+                deadline = self.service._next_refresh_at
+                self.assertEqual(deadline, self.now + (60 if failure else 86400))
+                # The active timer must move in either direction, not just the
+                # stored deadline. Inspect only live timers on this isolated loop.
+                timers = [timer.when() for timer in loop._scheduled if not timer.cancelled()]
+                self.assertIn(deadline, timers)
+                self.assertNotIn(old_deadline, timers)
+                self.succeed()
+                self.now = deadline - 1
+                await self._settle_periodic()
+                self.assertEqual(self.urlopen.call_count, 2)
+                self.now = deadline
+                await self._settle_periodic()
+                self.assertEqual(self.urlopen.call_count, 3)
+                self.assertEqual(self.service.snapshot()["status"], "current")
+            finally:
+                periodic.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await periodic
+                await self._settle_periodic()
+                self.assertEqual(asyncio.all_tasks(), baseline)
+                self.assertFalse([timer for timer in loop._scheduled if not timer.cancelled()])
+
+    async def test_forced_failure_interrupts_existing_day_wait(self) -> None:
+        await self._check_forced_refresh_wakeup(failure=True)
+
+    async def test_forced_success_replaces_existing_day_wait(self) -> None:
+        await self._check_forced_refresh_wakeup(failure=False)
+
+    async def test_deadline_update_before_wait_registration_is_not_lost(self) -> None:
+        self.succeed()
+        loop = asyncio.get_running_loop()
+        loop.slow_callback_duration = float("inf")
+        baseline = asyncio.all_tasks()
+        event = self.service._deadline_changed
+        original_wait = event.wait
+        registrations = 0
+
+        async def fetch(function):
+            return function()
+
+        async def wait():
+            nonlocal registrations
+            registrations += 1
+            if registrations == 1:
+                # Force an update after the timer is chosen but before the
+                # event has registered its waiter. The notification must latch.
+                self.now += 10
+                self.urlopen.side_effect = OSError("registration race")
+                await self.service.refresh(force=True)
+            await original_wait()
+
+        with (
+            patch.object(loop, "time", side_effect=lambda: self.now),
+            patch.object(event, "wait", side_effect=wait),
+            patch("app.services.release_status.asyncio.to_thread", side_effect=fetch),
+        ):
+            periodic = asyncio.create_task(self.service.run_periodic_refresh())
+            try:
+                await self._settle_periodic()
+                self.assertEqual(self.urlopen.call_count, 2)
+                self.assertEqual(registrations, 2)
+                self.assertEqual(
+                    [timer.when() for timer in loop._scheduled if not timer.cancelled()],
+                    [1070.0],
+                )
+                # Multiple updates before the periodic task resumes coalesce
+                # to the latest deadline. Cancel while a wakeup is pending.
+                self.succeed()
+                await self.service.refresh(force=True)
+                self.urlopen.side_effect = OSError("pending wake cancellation")
+                await self.service.refresh(force=True)
+            finally:
+                periodic.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await periodic
+                await self._settle_periodic()
+                self.assertEqual(asyncio.all_tasks(), baseline)
+                self.assertFalse(event._waiters)
+                self.assertFalse([timer for timer in loop._scheduled if not timer.cancelled()])
 
     async def test_disabled_checks_never_fetch_or_sleep_even_when_forced(self) -> None:
         service = ReleaseStatusService(current_version="0.14.1", enabled=False)
