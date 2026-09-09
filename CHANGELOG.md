@@ -26,6 +26,15 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Docs
+
+- Pointed the install pages at the published v0.23.0 image, recorded the tag
+  and release as published, collapsed the duplicate v0.23.0 changelog bullets,
+  rewrote the ownership upgrade note with a rollback paragraph, and stated
+  that only the published Compose files set the admin auto-stop timer (#462).
+
 ## v0.23.0 - 2026-09-08
 
 This release includes every pull request merged after `v0.22.2` through the
