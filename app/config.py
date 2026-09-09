@@ -514,6 +514,7 @@ ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
     "SSH_PORT": ("ssh", "port"),
     "SSH_USER": ("ssh", "user"),
     "SSH_KEY_PATH": ("ssh", "key_path"),
+    "SSH_KNOWN_HOSTS_PATH": ("ssh", "known_hosts_path"),
     "SSH_PASSWORD": ("ssh", "password"),
     "SSH_SUDO_PASSWORD": ("ssh", "sudo_password"),
     "SSH_STRICT_HOST_KEY_CHECKING": ("ssh", "strict_host_key_checking"),
@@ -618,7 +619,9 @@ def _parse_scalar(value: str) -> Any:
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
-    merged = dict(base)
+    # Copy nested mappings too: later in-place writes to the result (environment
+    # overrides) must not leak back into the defaults they are compared against.
+    merged = {key: _deep_merge(value, {}) if isinstance(value, dict) else value for key, value in base.items()}
     for key, value in override.items():
         if isinstance(value, dict) and isinstance(merged.get(key), dict):
             merged[key] = _deep_merge(merged[key], value)
@@ -875,14 +878,21 @@ def _apply_config_path_relative_defaults(
         if key not in merged_paths or merged_paths.get(key) in {defaults["paths"][key], legacy[key]}:
             merged_paths[key] = derived[key]
 
+    placeholder_known_hosts_paths = {
+        None,
+        defaults["ssh"]["known_hosts_path"],
+        legacy["known_hosts_path"],
+    }
     merged_ssh = merged.setdefault("ssh", {})
-    merged_ssh["known_hosts_path"] = derived["known_hosts_path"]
+    if merged_ssh.get("known_hosts_path") in placeholder_known_hosts_paths:
+        merged_ssh["known_hosts_path"] = derived["known_hosts_path"]
 
     for system_payload in merged.get("systems") or []:
         if not isinstance(system_payload, dict):
             continue
         ssh_payload = system_payload.setdefault("ssh", {})
-        ssh_payload["known_hosts_path"] = derived["known_hosts_path"]
+        if ssh_payload.get("known_hosts_path") in placeholder_known_hosts_paths:
+            ssh_payload["known_hosts_path"] = merged_ssh["known_hosts_path"]
 
     return merged
 
