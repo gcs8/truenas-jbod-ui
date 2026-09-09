@@ -1503,7 +1503,7 @@ class MainAppBoundaryTests(unittest.TestCase):
         self.assertIn("data-fabric-alias-edit", script_text)
         self.assertIn("/api/sas-fabric/aliases", script_text)
         self.assertIn("Time / Order", script_text)
-        self.assertIn("Filters apply only to this sample", script_text)
+        self.assertIn("Filters search only these.", script_text)
         self.assertIn("Previous event page", script_text)
         self.assertIn("PCI address", script_text)
         self.assertIn("PCIe slot", script_text)
