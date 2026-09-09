@@ -74,7 +74,7 @@ function buildFabric(slotCount = 40) {
   for (const slot of slotIds) {
     const c = slot % 2;
     const z = zoneOf(slot);
-    slots.push({ slot, present: true, physical_location_known: true, device_name: `da${slot}`, serial: `SN-${String(slot).padStart(4, "0")}`, model: "SYNTH-HDD", size_human: "18 TB", pool_name: "tank", vdev_name: `raidz2-${z}` });
+    slots.push({ slot, present: true, physical_location_known: true, device_name: `da${slot}`, serial: `SANITIZED-${String(slot).padStart(4, "0")}`, model: "SYNTH-HDD", size_human: "18 TB", pool_name: "tank", vdev_name: `raidz2-${z}` });
     nodes.push({ id: `bay:${slot}`, kind: "bay", label: `Bay ${String(slot).padStart(2, "0")}`, status: "online", related_slots: [slot], metrics: {}, raw: {} });
     traces.push({
       id: `bay:${slot}`,
@@ -427,7 +427,7 @@ test("node, trace, slot and copy lookups are cached per fabric object", () => {
   assert.equal(page.traceMap(page.fabric), page.traceMap(page.fabric));
   assert.equal(page.fabricViewCopy(page.fabric), page.fabricViewCopy(page.fabric));
   assert.equal(page.slotByNumber(3), page.slotByNumber(3));
-  assert.equal(page.slotByNumber(3).serial, "SN-0003");
+  assert.equal(page.slotByNumber(3).serial, "SANITIZED-0003");
   const nextFabric = { ...buildFabric(8), nodes: buildFabric(8).nodes.slice(0, 3) };
   page.applyFabric(nextFabric);
   assert.notEqual(page.nodeMap(nextFabric), page.nodeMap(page.fabric));
