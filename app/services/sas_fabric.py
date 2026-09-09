@@ -1671,10 +1671,6 @@ def _snapshot_has_linux_ses_evidence(snapshot: InventorySnapshot) -> bool:
     return any(_slot_ses_devices(slot) for slot in snapshot.slots)
 
 
-def _linux_ses_platform_phrase(platform_label: str) -> str:
-    return "Linux SES" if platform_label.strip().lower() == "linux" else f"{platform_label} Linux SES"
-
-
 def _platform_label(platform: str | None) -> str:
     normalized = normalize_text(platform).lower()
     return {
