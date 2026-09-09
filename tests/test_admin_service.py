@@ -1863,6 +1863,95 @@ class AdminHistoryStoreTests(unittest.TestCase):
 
 
 class AdminStatePayloadTests(unittest.TestCase):
+    def test_debug_export_bootstrap_defaults_do_not_stop_services(self) -> None:
+        defaults = self._build_minimal_state(Settings())["backup_defaults"]
+        self.assertIs(defaults["debug_stop_services"], False)
+        self.assertIs(defaults["debug_restart_services"], True)
+        self.assertIs(defaults["stop_services"], False)
+        self.assertIs(defaults["restart_services"], True)
+        self.assertIs(defaults["import_stop_services"], True)
+        self.assertIs(defaults["import_restart_services"], True)
+
+    def test_debug_export_template_defaults_do_not_stop_services(self) -> None:
+        from html.parser import HTMLParser
+
+        class Inputs(HTMLParser):
+            def __init__(self) -> None:
+                super().__init__()
+                self.inputs: dict[str, dict[str, str | None]] = {}
+
+            def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+                attributes = dict(attrs)
+                if tag == "input" and attributes.get("id"):
+                    self.inputs[str(attributes["id"])] = attributes
+
+        parser = Inputs()
+        template = admin_templates.get_template("index.html")
+        request = make_request()
+        request.scope["router"] = admin_app.router
+        parser.feed(template.render(request=request, admin_bootstrap_json="{}"))
+        for toggle, checked in (
+            ("debug-export-stop-toggle", False),
+            ("debug-export-restart-toggle", True),
+            ("backup-export-stop-toggle", False),
+            ("backup-export-restart-toggle", True),
+            ("backup-import-stop-toggle", True),
+            ("backup-import-restart-toggle", True),
+        ):
+            with self.subTest(toggle=toggle):
+                self.assertEqual("checked" in parser.inputs[toggle], checked)
+
+    def test_debug_export_route_default_reaches_maintenance_without_stopping(self) -> None:
+        self._exercise_debug_export_route(stop_services=None, restart_services=True)
+
+    def test_debug_export_route_preserves_explicit_stop_and_restart_choices(self) -> None:
+        for restart in (False, True):
+            with self.subTest(restart=restart):
+                self._exercise_debug_export_route(stop_services=True, restart_services=restart)
+
+    def _exercise_debug_export_route(
+        self, *, stop_services: bool | None, restart_services: bool
+    ) -> None:
+        from app.models.domain import DebugBundleExportRequest
+        from tests.test_admin_maintenance import FakeBackupService, FakeRuntimeService, build_service
+
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/debug/export")
+        defaults = {parameter.name: parameter.default for parameter in route.dependant.query_params}
+        runtime = FakeRuntimeService(["ui", "history"])
+        class DebugBackup(FakeBackupService):
+            def export_debug_bundle_to_file(self, **kwargs: Any) -> Any:
+                super().export_debug_bundle_to_file(**kwargs)
+                return SimpleNamespace(
+                    path="synthetic-debug.tar.zst", filename="synthetic-debug.tar.zst",
+                    manifest={}, media_type="application/octet-stream", cleanup=lambda: None,
+                )
+
+        backup = DebugBackup()
+        service = build_service(runtime, backup)
+        stopped = defaults["stop_services"] if stop_services is None else stop_services
+        with (
+            patch("admin_service.main.get_maintenance_service", return_value=service),
+        ):
+            response = asyncio.run(route.endpoint(
+                DebugBundleExportRequest(),
+                stop_services=stopped,
+                restart_services=restart_services,
+            ))
+        self.assertEqual(len(backup.debug_calls), 1)
+        expected_stops = ["ui", "history"] if stop_services else []
+        expected_restarts = expected_stops if restart_services else []
+        self.assertEqual(runtime.calls, [("stop", key) for key in expected_stops]
+                         + [("start", key) for key in expected_restarts])
+        headers = response.headers
+        self.assertEqual(headers["X-Admin-Stopped-Containers"], ",".join(expected_stops))
+        self.assertEqual(headers["X-Admin-Restarted-Containers"], ",".join(expected_restarts))
+        self.assertEqual(headers["X-Admin-Restart-Failures"], "")
+        self.assertEqual(backup.debug_calls[0]["maintenance_payload"]["stopped_containers"], expected_stops)
+        self.assertIs(defaults["restart_services"], True)
+        if stop_services is None:
+            self.assertIs(defaults["stop_services"], False)
+            self.assertEqual(runtime.running, ["ui", "history"])
+
     @staticmethod
     def _build_minimal_state(settings: Settings) -> dict[str, Any]:
         request = make_request(port=8082)
