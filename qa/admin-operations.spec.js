@@ -8,7 +8,7 @@ test.use({
 
 async function gotoAdmin(page) {
   await page.goto("/", { waitUntil: "domcontentloaded" });
-  await expect(page.getByRole("heading", { name: "System Setup And Recovery" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Admin", exact: true })).toBeVisible();
   await expect(page.locator("#backup-path-list")).toBeVisible();
   await expect(page.locator("#debug-path-list")).toBeVisible();
 }
@@ -194,5 +194,60 @@ test.describe("admin sidecar smoke", () => {
     await page.locator("#setup-storage-view-add-button").click();
 
     await expectTopLoaderPreviewGeometry("#setup-storage-view-preview-grid", page);
+  });
+
+  test("restart choices and failed timing drafts survive refresh", async ({ page }) => {
+    await gotoAdmin(page);
+    for (const prefix of ["backup-export", "backup-import", "debug-export"]) {
+      const stop = page.locator(`#${prefix}-stop-toggle`);
+      const restart = page.locator(`#${prefix}-restart-toggle`);
+      await stop.uncheck();
+      await expect(restart).toBeChecked();
+      await expect(restart).toBeDisabled();
+      await stop.check();
+      await expect(restart).toBeChecked();
+      await restart.uncheck();
+      await stop.uncheck();
+      await stop.check();
+      await expect(restart).not.toBeChecked();
+    }
+    const field = page.locator('input[data-runtime-behavior-key]:enabled').first();
+    await field.fill("99");
+    await field.focus();
+    await page.route("**/api/admin/runtime-behavior", route => route.fulfill({status: 200, contentType: "text/html", body: "<h1>Synthetic gateway response</h1>"}));
+    await page.locator("#runtime-behavior-save-button").click();
+    await expect(page.locator("#runtime-behavior-result")).toContainText("save outcome is unknown");
+    await expect(page.locator("#runtime-behavior-result")).toContainText("may already have been saved");
+    await expect(page.locator("#runtime-behavior-result")).not.toContainText(/retry/i);
+    await expect(field).toHaveValue("99");
+    await field.focus();
+    await page.locator("#refresh-state-button").evaluate(button => button.click());
+    await expect(page.locator("#admin-status-banner")).toContainText("state refreshed");
+    await expect(field).toHaveValue("99");
+    await expect(field).toBeFocused();
+  });
+
+  test("demo creation preserves a loaded existing synthetic system", async ({ page }) => {
+    test.skip(process.env.PLAYWRIGHT_ADMIN_SYNTHETIC_MUTATIONS !== "1", "Requires the isolated synthetic admin runner.");
+    const created = await page.request.post("/api/admin/system-setup", {data: {
+      system_id: "qa-safety-existing", label: "Synthetic existing system", platform: "linux",
+      truenas_host: "https://synthetic.example.invalid", ssh_enabled: false, make_default: true,
+    }});
+    expect(created.ok()).toBeTruthy();
+    await gotoAdmin(page);
+    const before = await (await page.request.get("/api/admin/state")).json();
+    const original = before.systems[0];
+    expect(original).toBeTruthy();
+    await page.locator("#setup-system-id").fill(original.id);
+    await page.locator("#setup-system-label").fill(original.label);
+    const posted = page.waitForRequest(request => request.url().endsWith("/api/admin/system-setup/demo") && request.method() === "POST");
+    await page.locator("#setup-create-demo-button").click();
+    const request = await posted;
+    expect(request.postDataJSON().replace_existing).toBe(false);
+    expect(request.postDataJSON().system_id).not.toBe(original.id);
+    await expect(page.locator("#setup-result")).toContainText(/created|saved/i);
+    const after = await (await page.request.get("/api/admin/state")).json();
+    expect(after.systems.find(system => system.id === original.id)).toEqual(original);
+    expect(after.systems.length).toBe(before.systems.length + 1);
   });
 });

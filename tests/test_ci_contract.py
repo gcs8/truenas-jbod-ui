@@ -114,14 +114,19 @@ class CIWorkflowContractTests(unittest.TestCase):
         self.assertFalse(config["app"]["startup_warm_cache_enabled"])
         self.assertFalse(config["app"]["startup_warm_smart_enabled"])
         self.assertEqual(
-            browser_step["env"]["APP_CONFIG_PATH"],
-            "${{ github.workspace }}/qa/fixtures/admin-cleanroom-config.yaml",
+            browser_step["env"].get("PLAYWRIGHT_ADMIN_SYNTHETIC_MUTATIONS"), "1"
         )
+        self.assertEqual(
+            browser_step["env"]["APP_CONFIG_PATH"],
+            "/tmp/truenas-jbod-ui-admin-cleanroom/config.yaml",
+        )
+        self.assertIn('cp qa/fixtures/admin-cleanroom-config.yaml "$APP_CONFIG_PATH"', commands)
         self.assertIn("npm ci --ignore-scripts", commands)
         self.assertIn("npx playwright test qa/admin-operations.spec.js", commands)
         self.assertIn("http://127.0.0.1:8082/healthz", commands)
         self.assertIn("git status --short", commands)
-        self.assertNotIn("test.skip", spec)
+        self.assertEqual(spec.count("test.skip("), 1)
+        self.assertIn('test.skip(process.env.PLAYWRIGHT_ADMIN_SYNTHETIC_MUTATIONS !== "1"', spec)
 
     def test_appliance_browser_specs_are_explicit_and_portable(self) -> None:
         contributing = self.read(ROOT / "CONTRIBUTING.md")

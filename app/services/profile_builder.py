@@ -12,7 +12,7 @@ from app.models.domain import EnclosureProfileRequest
 from app.services.profile_registry import ProfileRegistry, built_in_profile_ids, default_slot_layout
 
 
-_PROFILE_WRITE_LOCK = threading.Lock()
+_PROFILE_WRITE_LOCK = threading.RLock()
 
 
 def _normalize_profile_id(value: str | None, fallback_index: int) -> str:

@@ -155,6 +155,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_admin_auth",
             "tests.test_admin_runtime_routes",
             "tests.test_admin_service",
+            "tests.test_admin_safety",
             "tests.test_admin_ttl",
             "tests.test_disk_inventory_sync",
             "tests.test_disk_inventory_sync_grants",

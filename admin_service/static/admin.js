@@ -68,6 +68,8 @@
     selectedEsxiHostPrepToken:
       (Array.isArray(bootstrap.esxi_host_prep?.staged_packages) && bootstrap.esxi_host_prep.staged_packages[0]?.token)
       || "",
+    operationPromises: {},
+    runtimeBehaviorSaving: false,
     refreshInFlight: false,
     refreshPromise: null,
     refreshQueued: null,
@@ -856,6 +858,14 @@
     }
     const behavior = state.runtimeBehavior || {};
     const fields = Array.isArray(behavior.fields) ? behavior.fields : [];
+    // Preserve the actual DOM nodes, focus and drafts during unrelated refreshes.
+    const inputs = Array.from(elements.runtimeBehaviorFields.querySelectorAll("input[data-runtime-behavior-key]"));
+    const dirty = inputs.some((input) => {
+      const baseline = (state.runtimeBehaviorBaseline || fields).find((field) => field.key === input.dataset.runtimeBehaviorKey);
+      return baseline && input.value !== String(baseline.value ?? "");
+    });
+    if (state.runtimeBehaviorSaving || dirty) return;
+    state.runtimeBehaviorBaseline = fields;
     elements.runtimeBehaviorDetail.textContent = behavior.override_file
       ? `Override file: ${behavior.override_file}`
       : "";
@@ -913,7 +923,9 @@
     if (!elements.runtimeBehaviorSaveButton) {
       return;
     }
+    if (state.runtimeBehaviorSaving) return;
     const values = collectRuntimeBehaviorValues();
+    state.runtimeBehaviorSaving = true;
     elements.runtimeBehaviorSaveButton.disabled = true;
     if (elements.runtimeBehaviorResult) {
       elements.runtimeBehaviorResult.textContent = "Saving runtime behavior overrides...";
@@ -924,8 +936,21 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ values }),
       });
-      state.runtimeBehavior = payload.runtime_behavior || state.runtimeBehavior;
+      const fields = payload.runtime_behavior?.fields;
+      // The backend returns all loaded timing keys, integer effective values,
+      // and boolean ownership flags. Env-owned values need not fit write limits.
+      const expectedKeys = new Set((state.runtimeBehavior?.fields || []).map((field) => field.key));
+      if (!Array.isArray(fields) || !fields.length || fields.length !== expectedKeys.size
+          || new Set(fields.map((field) => field?.key)).size !== expectedKeys.size
+          || !fields.every((field) => field && typeof field.key === "string"
+            && expectedKeys.has(field.key) && Number.isInteger(field.value)
+            && typeof field.writable === "boolean")) {
+        throw new Error("Invalid timing save response.");
+      }
+      state.runtimeBehavior = payload.runtime_behavior;
       state.runtime = payload.runtime || state.runtime;
+      state.runtimeBehaviorBaseline = state.runtimeBehavior.fields;
+      state.runtimeBehaviorSaving = false;
       renderRuntimeBehaviorSettings();
       renderRuntimeCards();
       const detail = payload.detail || "Runtime behavior overrides saved.";
@@ -934,12 +959,17 @@
       }
       setBanner(detail, "success");
     } catch (error) {
-      const message = `Runtime behavior save failed: ${error.message || error}`;
+      const message = [400, 422].includes(error.status)
+        ? `Runtime behavior save rejected: ${error.message}. Draft retained.`
+        : "Runtime behavior save outcome is unknown. Changes may already have been saved. Draft retained; check the saved runtime settings before saving again."
+          + (error.requestId || "");
       if (elements.runtimeBehaviorResult) {
         elements.runtimeBehaviorResult.textContent = message;
       }
       setBanner(message, "error");
-      renderRuntimeBehaviorSettings();
+    } finally {
+      state.runtimeBehaviorSaving = false;
+      elements.runtimeBehaviorSaveButton.disabled = false;
     }
   }
 
@@ -981,7 +1011,9 @@
     if (sourceSelect) {
       sourceSelect.innerHTML = "";
       if (!orphanedSystems.length) {
-        sourceSelect.innerHTML = '<option value="">No removed-system history found</option>';
+        sourceSelect.innerHTML = state.orphanedHistoryError
+          ? '<option value="">History scan unavailable</option>'
+          : '<option value="">No removed-system history found</option>';
         sourceSelect.value = "";
         state.selectedHistoryAdoptSourceId = "";
       } else {
@@ -1019,7 +1051,7 @@
     }
 
     if (adoptButton) {
-      adoptButton.disabled = state.orphanedHistoryLoading || !orphanedSystems.length || !savedSystems.length;
+      adoptButton.disabled = state.orphanedHistoryLoading || Boolean(state.orphanedHistoryError) || !orphanedSystems.length || !savedSystems.length;
     }
   }
 
@@ -4382,8 +4414,11 @@
     });
     const debugPolicy = getDebugExportPolicy();
     const backupPolicy = getBackupExportPolicy();
+    if (elements.backupImportButton) {
+      elements.backupImportButton.disabled = Boolean(state.operationPromises?.importBackup);
+    }
     if (elements.backupExportButton) {
-      elements.backupExportButton.disabled = !state.selectedBackupPaths.length || !backupPolicy.allowed;
+      elements.backupExportButton.disabled = Boolean(state.operationPromises?.exportBackup) || !state.selectedBackupPaths.length || !backupPolicy.allowed;
     }
     if (elements.backupExportResult) {
       if (!backupPolicy.allowed) {
@@ -4397,35 +4432,29 @@
     if (elements.backupExportRestartToggle) {
       const stopEnabled = Boolean(elements.backupExportStopToggle?.checked);
       elements.backupExportRestartToggle.disabled = !stopEnabled;
-      if (!stopEnabled) {
-        elements.backupExportRestartToggle.checked = false;
-      }
+
     }
     if (elements.backupImportRestartToggle) {
       const stopEnabled = Boolean(elements.backupImportStopToggle?.checked);
       elements.backupImportRestartToggle.disabled = !stopEnabled;
-      if (!stopEnabled) {
-        elements.backupImportRestartToggle.checked = false;
-      }
+
     }
     if (elements.debugExportButton) {
-      elements.debugExportButton.disabled = !state.selectedDebugPaths.length || !debugPolicy.allowed;
+      elements.debugExportButton.disabled = Boolean(state.operationPromises?.exportDebugBundle) || !state.selectedDebugPaths.length || !debugPolicy.allowed;
     }
     if (elements.debugExportResult) {
       if (!debugPolicy.allowed) {
         elements.debugExportResult.textContent = debugPolicy.guidance;
         state.debugExportPolicyGuidanceActive = true;
       } else if (state.debugExportPolicyGuidanceActive) {
-        elements.debugExportResult.textContent = "Use this when you want a frozen local support snapshot without pretending it is the same thing as a restore-grade full backup.";
+        elements.debugExportResult.textContent = "Export a local support snapshot.";
         state.debugExportPolicyGuidanceActive = false;
       }
     }
     if (elements.debugExportRestartToggle) {
       const stopEnabled = Boolean(elements.debugExportStopToggle?.checked);
       elements.debugExportRestartToggle.disabled = !stopEnabled;
-      if (!stopEnabled) {
-        elements.debugExportRestartToggle.checked = false;
-      }
+
     }
   }
 
@@ -5033,11 +5062,20 @@
   }
 
   async function readJsonResponse(response) {
+    let payload;
     try {
-      return await response.json();
-    } catch (error) {
-      return null;
+      payload = await response.json();
+    } catch (_) {
+      payload = null;
     }
+    if (!payload || typeof payload !== "object" || Array.isArray(payload) || !Object.keys(payload).length) {
+      const rawId = response.headers?.get("X-Request-ID") || "";
+      const requestId = /^[A-Za-z0-9._-]{1,128}$/.test(rawId) ? ` Request ID: ${rawId}.` : "";
+      const error = new Error(`Invalid JSON response (${response.status || "unknown status"}). Retry or check the admin connection.${requestId}`);
+      error.requestId = requestId;
+      throw error;
+    }
+    return payload;
   }
 
   function restartFailureKeys(failures) {
@@ -5081,7 +5119,9 @@
     const response = await fetch(url, options);
     const payload = await readJsonResponse(response);
     if (!response.ok || (payload && payload.ok === false)) {
-      throw new Error(describeApiError(payload?.detail) || `Request failed with ${response.status}`);
+      const error = new Error(describeApiError(payload?.detail) || `Request failed with ${response.status}`);
+      error.status = response.status;
+      throw error;
     }
     return payload || {};
   }
@@ -5443,6 +5483,9 @@
     }
     try {
       const payload = await fetchJson("/api/admin/state");
+      if (!Array.isArray(payload.systems) || !Array.isArray(payload.profiles)) {
+        throw new Error("Invalid admin state response. Last known state retained; retry the refresh.");
+      }
       state.admin = payload.admin || {};
       state.appVersion = payload.app_version || state.appVersion;
       state.releaseStatus = payload.release_status || state.releaseStatus;
@@ -5704,7 +5747,23 @@
     state.runtimeActionControllers.forEach((controller) => controller.abort());
   }
 
-  async function exportBackup() {
+  function runBackupOperation(key, operation) {
+    state.operationPromises ||= {};
+    if (state.operationPromises[key]) return state.operationPromises[key];
+    const pending = Promise.resolve().then(operation).finally(() => {
+      delete state.operationPromises[key];
+      syncBackupControls();
+    });
+    state.operationPromises[key] = pending;
+    syncBackupControls();
+    return pending;
+  }
+
+  function exportBackup() {
+    return runBackupOperation("exportBackup", runExportBackup);
+  }
+
+  async function runExportBackup() {
     const encrypt = Boolean(elements.backupEncryptToggle?.checked);
     const passphrase = readOptionalSecretValue(elements.backupExportPassphrase);
     const packaging = elements.backupPackaging?.value || "tar.zst";
@@ -5722,7 +5781,7 @@
     }
     try {
       const stopServices = Boolean(elements.backupExportStopToggle?.checked);
-      const restartServices = Boolean(elements.backupExportRestartToggle?.checked);
+      const restartServices = stopServices && Boolean(elements.backupExportRestartToggle?.checked);
       const response = await fetch(
         `/api/admin/backup/export?stop_services=${String(stopServices)}&restart_services=${String(restartServices)}`,
         {
@@ -5775,7 +5834,11 @@
     }
   }
 
-  async function exportDebugBundle() {
+  function exportDebugBundle() {
+    return runBackupOperation("exportDebugBundle", runExportDebugBundle);
+  }
+
+  async function runExportDebugBundle() {
     const encrypt = Boolean(elements.debugEncryptToggle?.checked);
     const passphrase = readOptionalSecretValue(elements.debugExportPassphrase);
     const packaging = elements.debugPackaging?.value || "tar.zst";
@@ -5795,7 +5858,7 @@
     }
     try {
       const stopServices = Boolean(elements.debugExportStopToggle?.checked);
-      const restartServices = Boolean(elements.debugExportRestartToggle?.checked);
+      const restartServices = stopServices && Boolean(elements.debugExportRestartToggle?.checked);
       const response = await fetch(
         `/api/admin/debug/export?stop_services=${String(stopServices)}&restart_services=${String(restartServices)}`,
         {
@@ -5858,7 +5921,11 @@
     }
   }
 
-  async function importBackup() {
+  function importBackup() {
+    return runBackupOperation("importBackup", runImportBackup);
+  }
+
+  async function runImportBackup() {
     const file = readSelectedImportFile();
     const passphrase = readOptionalSecretValue(elements.backupImportPassphrase);
     if (!file) {
@@ -5873,7 +5940,7 @@
     }
     try {
       const stopServices = Boolean(elements.backupImportStopToggle?.checked);
-      const restartServices = Boolean(elements.backupImportRestartToggle?.checked);
+      const restartServices = stopServices && Boolean(elements.backupImportRestartToggle?.checked);
       const archiveBytes = await file.arrayBuffer();
       const secretHeaders = passphrase !== null
         ? { "X-Backup-Passphrase-Base64": encodeUtf8Base64(passphrase) }
@@ -5972,16 +6039,21 @@
       elements.setupResult.textContent = "Creating demo builder system...";
     }
     try {
-      const systemId = elements.setupSystemId?.value?.trim() || "";
-      const label = elements.setupSystemLabel?.value?.trim() || "";
+      let systemId = "demo-builder-lab";
+      let suffix = 2;
+      while (state.systems.some((system) => system.id === systemId) ||
+             state.profiles.some((profile) => profile.id === `${systemId}-chassis`)) {
+        systemId = `demo-builder-lab-${suffix++}`;
+      }
+      const label = "Demo Builder Lab";
       const payload = await fetchJson("/api/admin/system-setup/demo", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           ...(systemId ? { system_id: systemId } : {}),
           ...(label ? { label } : {}),
-          make_default: Boolean(elements.setupMakeDefault?.checked),
-          replace_existing: true,
+          make_default: false,
+          replace_existing: false,
         }),
       });
       await refreshState({ quiet: true });
@@ -6009,6 +6081,9 @@
   }
 
   async function purgeOrphanedHistory() {
+    if (state.historyPurgePending) return;
+    state.historyPurgePending = true;
+    let emptyPreview = false;
     if (elements.historyPurgeOrphanedButton) {
       elements.historyPurgeOrphanedButton.disabled = true;
     }
@@ -6016,8 +6091,23 @@
       elements.historyPurgeOrphanedResult.textContent = "Scanning for orphaned history rows...";
     }
     try {
+      const preview = await fetchJson("/api/admin/history/orphaned");
+      if (!Array.isArray(preview.orphaned_systems) || !preview.purge_preview_token) {
+        throw new Error("History preview is unavailable. Retry before purging.");
+      }
+      const candidates = preview.orphaned_systems;
+      if (!candidates.length) {
+        emptyPreview = true;
+        elements.historyPurgeOrphanedResult.textContent = "No orphaned history rows are available to purge.";
+        return;
+      }
+      const description = candidates.map((item) => `${item.system_id}: ${item.total_rows} rows`).join("\n");
+      elements.historyPurgeOrphanedResult.textContent = description;
+      if (!window.confirm(`Permanently delete this removed-system history? This is irreversible.\n\n${description}\n\nUse adoption instead to preserve history after a rename. Continue?`)) return;
       const payload = await fetchJson("/api/admin/history/purge-orphaned", {
         method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ preview_token: preview.purge_preview_token, confirm_irreversible: true }),
       });
       await loadOrphanedHistory({ quiet: true });
       if (elements.historyPurgeOrphanedResult) {
@@ -6034,8 +6124,9 @@
       }
       setBanner(`Orphaned history purge failed: ${error.message || error}`, "error");
     } finally {
+      state.historyPurgePending = false;
       if (elements.historyPurgeOrphanedButton) {
-        elements.historyPurgeOrphanedButton.disabled = false;
+        elements.historyPurgeOrphanedButton.disabled = emptyPreview;
       }
     }
   }
@@ -6050,7 +6141,12 @@
     }
     try {
       const payload = await fetchJson("/api/admin/history/orphaned");
-      state.orphanedHistory = Array.isArray(payload.orphaned_systems) ? payload.orphaned_systems : [];
+      if (!Array.isArray(payload.orphaned_systems)) throw new Error("Invalid history source response. Retry the scan.");
+      state.orphanedHistory = payload.orphaned_systems;
+      state.orphanedHistoryError = false;
+      if (elements.historyPurgeOrphanedButton) {
+        elements.historyPurgeOrphanedButton.disabled = Boolean(state.historyPurgePending) || !state.orphanedHistory.length;
+      }
       if (elements.historyAdoptResult) {
         elements.historyAdoptResult.textContent = state.orphanedHistory.length
           ? "Pick one removed system id and one current saved system id to rewrite the saved history ownership."
@@ -6060,7 +6156,7 @@
         renderHistoryMaintenance();
       }
     } catch (error) {
-      state.orphanedHistory = [];
+      state.orphanedHistoryError = true;
       if (elements.historyAdoptResult) {
         elements.historyAdoptResult.textContent = `Unable to inspect removed-system history: ${error.message || error}`;
       }

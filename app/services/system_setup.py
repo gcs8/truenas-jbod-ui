@@ -36,7 +36,7 @@ from app.services.sas_fabric import (
 )
 
 
-_CONFIG_WRITE_LOCK = threading.Lock()
+_CONFIG_WRITE_LOCK = threading.RLock()
 PRESERVE_SECRET_SENTINEL = "__TRUENAS_JBOD_KEEP_EXISTING_VALUE__"
 LINUX_NVME_LIST_SUBSYS_COMMAND = (
     "/usr/sbin/nvme list-subsys -o json 2>/dev/null || "
