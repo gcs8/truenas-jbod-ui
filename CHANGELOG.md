@@ -36,8 +36,7 @@ v0.23.0 release candidate.
 - The main and admin UIs now work without application authentication or public
   origin settings by default. Browser mutations still receive an automatic
   same-origin check. Basic authentication, explicit public-origin settings, and
-  verified private TLS are optional hardening steps (#392, superseding the
-  defaults introduced by #245 and #201).
+  verified private TLS are optional hardening steps (#392).
 - Dell MD1280 shelves render with full-chassis and per-drawer profiles built
   from the validated 84-bay layout (#157).
 - Segmented history gained crash-safe later-generation rotation, recovery of
@@ -50,13 +49,13 @@ v0.23.0 release candidate.
 
 ### Breaking changes
 
-- Restored unauthenticated main and admin controls in default `network` mode
-  and made TLS certificate verification opt-in for new connections (#392)
-- Required local authentication for mutating main-UI requests and hardened the
-  default Compose runtime contract (#245 and #246).
-- Required a configured admin public origin for browser-initiated admin
-  mutations and moved bootstrap and ESXi host-prep onto runtime-owned
-  known-hosts paths with strict host-key handling (#201).
+- Default `network` mode: anyone who can reach a published main or admin port
+  can use its controls, `APP_PUBLIC_ORIGIN` and `ADMIN_PUBLIC_ORIGIN` are
+  optional, and new connections default to `verify_ssl: false`. Basic
+  authentication and origin pinning are opt-in (#392, superseding #245 and
+  #201).
+- Moved bootstrap and ESXi host-prep onto runtime-owned known-hosts paths with
+  strict host-key handling (#201).
 - Scoped legacy manual slot mappings to single-system, single-enclosure
   deployments, rejected exact rows whose stored system ownership conflicts, and
   removed both legacy aliases when a canonical scoped mapping is saved (#249).
@@ -90,21 +89,40 @@ them before starting the new images.
   appliance certificate is not already trusted. This supersedes the read-only
   network-mode and mandatory-origin upgrade notes from #245 and #201 (#392).
 - `docker-compose.yml` now describes a hardened runtime and needs a one-time
-  ownership step. The UI and history services run as `${APP_UID}:${APP_GID}`
-  instead of root. The UI service also mounts `./config` read-only, so
-  operator configuration is edited on the host or through the admin sidecar
-  rather than from inside the UI container; the history service does not
-  mount `./config` at all. Every service now has a read-only image filesystem,
-  a private `/tmp`, all capabilities dropped, and `no-new-privileges`. The
-  admin service stays UID `0` for Docker control but runs as `0:${APP_GID}`
-  with only `CHOWN` and `FOWNER` added back and without its app-log mount.
-  Before the first start on the new file, stop the stack and use the configured
-  app identity for the ownership preflight and apply step:
-  `docker compose down`; `app_uid="${APP_UID:-10001}"`;
-  `app_gid="${APP_GID:-10001}"`;
-  `sudo python scripts/prepare_nonroot_bind_mounts.py . --uid "$app_uid" --gid "$app_gid"`;
-  then repeat the helper command with `--apply`. Without that step the non-root
-  services cannot write their bind-mounted state (#246).
+  ownership step. Skip this if `HISTORY_SEGMENT_CATALOG_PATH` is set and
+  follow the segmented repair procedure in the sealed-segments note below
+  instead. The UI and history services run as `${APP_UID}:${APP_GID}` instead
+  of root. The UI service also mounts `./config` read-only, so operator
+  configuration is edited on the host or through the admin sidecar rather than
+  from inside the UI container; the history service does not mount `./config`
+  at all. Every service now has a read-only image filesystem, a private
+  `/tmp`, all capabilities dropped, and `no-new-privileges`. The admin service
+  stays UID `0` for Docker control but runs as `0:${APP_GID}` with only
+  `CHOWN` and `FOWNER` added back and without its app-log mount. Before the
+  first start on the new file:
+
+  1. Stop the stack with `docker compose down`.
+  2. Run the ownership helper with the configured app identity as a dry run,
+     then again with `--apply`:
+
+     ```bash
+     app_uid="${APP_UID:-10001}"
+     app_gid="${APP_GID:-10001}"
+     sudo python scripts/prepare_nonroot_bind_mounts.py . --uid "$app_uid" --gid "$app_gid"
+     sudo python scripts/prepare_nonroot_bind_mounts.py . --uid "$app_uid" --gid "$app_gid" --apply
+     ```
+
+  3. Start the stack again with `docker compose up -d`.
+
+  The helper is in the source checkout, not in the published image, so a
+  deployment without a checkout should run the equivalent
+  `sudo chown -R "$app_uid:$app_gid" config data history logs` between steps
+  1 and 3. Without that step the non-root services cannot write their
+  bind-mounted state.
+
+  Rollback: put the previous Compose file back and run `docker compose up -d`.
+  Files changed to `$app_uid:$app_gid` stay readable and writable by root, so
+  the root-based services keep working (#246).
 - Legacy manual slot mappings saved by older releases under the unscoped
   `default:{slot}` and `{enclosure}:{slot}` key shapes are only resolved when
   the deployment has exactly one configured system and exactly one detected
@@ -197,14 +215,12 @@ them before starting the new images.
   and duration metrics (#248).
 - Added TrueNAS disk inventory sync actions (`disk.multipath_sync` on CORE,
   `disk.sync_all` on CORE and SCALE) to the enclosure header behind the main-UI
-  write gate, with exact-argument sudo grants and a CORE multipath disk
-  replacement runbook (#357).
+  write gate, with immutable target confirmation, convergence polling,
+  exact-argument sudo grants, and a CORE multipath disk replacement runbook
+  (#357 and #359).
 - Added one bounded snapshot warning when CORE multipath attribution is
   backfilled from `gmultipath list`, directing operators to the existing disk
   inventory controls without exposing device identifiers (#385).
-- Added guarded disk inventory synchronization controls for supported TrueNAS
-  systems, including immutable target confirmation and convergence polling
-  (#359).
 - Added memory-only in-page Basic sign-in for live-UI writes while keeping
   anonymous reads and same-origin request boundaries (#358).
 - Added release-time changelog coverage and exact GitHub Wiki byte verification
@@ -224,23 +240,6 @@ them before starting the new images.
   enclosure discovery alone fails. The API source now reports degraded and a
   failed query cannot replace the last trusted enclosure topology with a blank
   shelf (#292).
-- Restricted legacy unscoped manual mappings to one configured system with exactly
-  one discovered physical enclosure. When disks are visible but no physical
-  enclosure is identified, they now appear in a system-scoped virtual inventory
-  without physical bay or slot attribution; affected legacy mappings remain
-  stored and must be re-saved after selecting the discovered physical enclosure
-  (#249, #293).
-- Defaulted the admin auto-stop delay to disabled outside the published Compose
-  files and rejected coerced, negative, and nonnumeric values (#240).
-- Preserved enclosure-query and fetch failures instead of reporting an
-  apparently successful empty shelf, and kept trusted cached topology when a
-  refreshed source fails (#218).
-- Made scheduled-backup group identity order-insensitive, migrated compatible
-  status across genuine scope changes, and cleared incompatible success evidence
-  before the next attempt (#214).
-- Published sealed history segments and their catalog as `0640` inside a `0750`
-  directory shared with the backup group, and carried that contract through
-  migration, rotation, recovery, docs, and container checks (#216).
 - Defined a deterministic slot-evidence precedence, let authoritative live
   empty-bay evidence suppress rather than delete a stored manual mapping, and
   exposed the resolution tier through `mapping_source` (#194).
