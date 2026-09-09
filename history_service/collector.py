@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import logging
 import math
@@ -108,6 +109,7 @@ class HistoryCollector:
         self.last_slow_metrics_at: str | None = None
         self.last_success_at: str | None = None
         self.last_backup_at: str | None = None
+        self.last_backup_error: str | None = None
         self.last_retention_at: str | None = None
         self.last_retention_backup_at: str | None = None
         self.last_retention_attempt_at: str | None = None
@@ -474,10 +476,19 @@ class HistoryCollector:
                         )
                         if backup_path:
                             self.last_backup_at = observed_at
+                            self.last_backup_error = None
                             retention_backup_at = run_started
                             backup_succeeded = True
                 except Exception as exc:  # noqa: BLE001 - collection continues after backup failure.
-                    logger.warning("History backup snapshot failed: %s", exc)
+                    reason = self._describe_backup_failure(exc)
+                    self.last_backup_error = reason
+                    self._record_collection_stage(
+                        "db.backup.failed",
+                        0.0,
+                        reason=reason,
+                        error_type=type(exc).__name__,
+                    )
+                    logger.warning("History backup snapshot failed (%s): %s", reason, exc)
         self._raise_if_stopping()
         self._run_retention_if_due(
             run_started,
@@ -525,6 +536,7 @@ class HistoryCollector:
             "last_smart_evidence_at": self.last_smart_evidence_at,
             "last_success_at": self.last_success_at,
             "last_backup_at": self.last_backup_at,
+            "last_backup_error": self.last_backup_error,
             "last_retention_at": self.last_retention_at,
             "last_retention_backup_at": self.last_retention_backup_at,
             "last_retention_attempt_at": self.last_retention_attempt_at,
@@ -613,7 +625,7 @@ class HistoryCollector:
                     result="success",
                     duration_seconds=time.perf_counter() - started_monotonic,
                     status=self.status(),
-                    counts=self.store.estimated_counts(),
+                    counts=await asyncio.to_thread(self.store.estimated_counts),
                 )
             except HistoryCollectionAlreadyRunning:
                 logger.info("Skipping scheduled history collection because another collection pass is already running.")
@@ -782,10 +794,10 @@ class HistoryCollector:
         backup_succeeded: bool,
         backup_at: datetime | None = None,
     ) -> None:
-        if not backup_succeeded or not self._retention_due(now):
-            return
         segmented = self.settings.segment_catalog_path is not None
-        if segmented and backup_at is None:
+        if segmented and (not backup_succeeded or backup_at is None):
+            return
+        if not self._retention_due(now):
             return
         started = time.perf_counter()
         attempted_at = isoformat_utc(now)
@@ -925,6 +937,22 @@ class HistoryCollector:
         if latest.tzinfo is None:
             latest = latest.replace(tzinfo=timezone.utc)
         return now.astimezone(timezone.utc) - latest.astimezone(timezone.utc) >= timedelta(seconds=interval_seconds)
+
+    @staticmethod
+    def _describe_backup_failure(exc: BaseException) -> str:
+        """Turn a backup exception into a short sentence that carries no file paths."""
+
+        message = str(exc).lower()
+        error_number = getattr(exc, "errno", None)
+        if error_number == errno.ENOSPC or "disk is full" in message:
+            return "the disk is full"
+        if isinstance(exc, PermissionError) or error_number in {errno.EACCES, errno.EROFS}:
+            return "the backup folder is not writable"
+        if "readonly" in message or "read-only" in message:
+            return "the backup folder is not writable"
+        if "disk i/o" in message or error_number == errno.EIO:
+            return "the disk could not be read or written"
+        return "unexpected error; see the service logs"
 
     @staticmethod
     def _elapsed_seconds_since(value: str | None) -> int | None:
