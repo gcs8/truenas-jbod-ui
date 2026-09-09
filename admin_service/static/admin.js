@@ -3899,8 +3899,12 @@
       renderSudoersPreview({
         service_user: payload.service_user,
         enabled: false,
-        detail: "VMware ESXi does not use the Linux sudoers/bootstrap path. Save the SSH host, root or key-based auth, and read-only runtime commands directly instead.",
-        content: "# VMware ESXi does not use the Linux sudoers/bootstrap flow.\n# Keep the saved SSH credentials or key directly on the system entry instead.\n",
+        detail: payload.platform === "ipmi"
+          ? "This system is managed through its BMC. No host login is needed."
+          : "VMware ESXi does not use the Linux sudoers/bootstrap path. Save the SSH host, root or key-based auth, and read-only runtime commands directly instead.",
+        content: payload.platform === "ipmi"
+          ? "# This system is managed through its BMC. No host login is needed.\n"
+          : "# VMware ESXi does not use the Linux sudoers/bootstrap flow.\n# Keep the saved SSH credentials or key directly on the system entry instead.\n",
       });
       return;
     }
@@ -4184,7 +4188,9 @@
       elements.setupBootstrapFields.classList.toggle("is-disabled", sshEnabled && !bootstrapEnabled);
     }
     if (elements.setupBootstrapResult) {
-      if (!sshEnabled) {
+      if (currentSetupPlatform() === "ipmi") {
+        elements.setupBootstrapResult.textContent = "This system is managed through its BMC. No host login is needed.";
+      } else if (!sshEnabled) {
         elements.setupBootstrapResult.textContent = "Enable SSH enrichment first if you want to use one-time bootstrap.";
       } else if (!bootstrapSupported) {
         elements.setupBootstrapResult.textContent = "VMware ESXi does not use the one-time Linux service-account bootstrap. Save the SSH host, root or key-based auth, and read-only runtime commands directly instead.";
@@ -4995,7 +5001,9 @@
     }
     const setupPayload = collectSetupPayload();
     if (!platformSupportsBootstrap(setupPayload.platform)) {
-      throw new Error("VMware ESXi does not use the one-time Linux service-account bootstrap path.");
+      throw new Error(setupPayload.platform === "ipmi"
+        ? "This system is managed through its BMC. No host login is needed."
+        : "VMware ESXi does not use the one-time Linux service-account bootstrap path.");
     }
     if (!setupPayload.ssh_enabled) {
       throw new Error("Enable SSH enrichment first so the final service-account details are defined.");
