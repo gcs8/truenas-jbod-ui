@@ -1,3 +1,10 @@
+{% macro count(value, estimated=false) -%}
+{%- if value is none -%}<span title="not counted yet" aria-label="not counted yet">-</span>
+{%- else -%}{{ '~' if estimated else '' }}{{ value }}{%- endif -%}
+{%- endmacro %}
+{% macro timestamp(value, fallback='never') -%}
+{%- if value -%}<time datetime="{{ value }}">{{ value }}</time>{%- else -%}{{ fallback }}{%- endif -%}
+{%- endmacro %}
 <!doctype html>
 <html lang="en">
   <head>
@@ -10,22 +17,22 @@
     <main>
       <h1>{{ app_name }}</h1>
       <p>
-        Optional sidecar for slot history and lightweight SMART snapshots. This stays separate from
-        the main UI so collection can be enabled or disabled without changing the core dashboard.
+        Disk history: temperature, SMART counters and slot changes collected from your systems over time.
+        Turn collection on or off in System Setup.
       </p>
       <div class="actions" aria-label="History refresh actions">
         {% if direct_refresh_enabled %}
-        <button id="history-refresh-fast" type="button">Refresh Fast</button>
-        <button id="history-refresh-full" class="secondary" type="button">Refresh Full</button>
+        <button id="history-refresh-fast" type="button" title="Read current temperature and fast counters, normally using cached inventory. Does not request a full SMART scan.">Quick refresh</button>
+        <button id="history-refresh-full" class="secondary" type="button" title="Re-read inventory and full SMART data. Full refresh has a configurable cooldown, 15 minutes by default; the server enforces the configured wait.">Full refresh</button>
         <span id="history-refresh-status" class="action-status" role="status" aria-live="polite"></span>
         {% else %}
-        <span class="action-status">Refresh through the authenticated main UI or a bearer-authenticated API client.</span>
+        <span class="action-status">Refresh from the main page, or with an API token.</span>
         {% endif %}
       </div>
-      <div id="collector-activity-banner" class="collector-banner" role="status" aria-live="polite"{% if not collector_banner_text %} hidden{% endif %}>{{ collector_banner_text }}</div>
+      <div id="collector-activity-banner" class="collector-banner" role="status" aria-live="polite"{% if not collector_banner_text %} hidden{% endif %}>{{ collector_banner_text | replace('History background collection is backed off for', 'History collection paused for') }}</div>
 
-      <p id="history-collector-freshness" class="note-text" role="status" aria-live="polite">Collector status snapshot at page load; live checks require JavaScript.</p>
-      <p id="history-overview-freshness" class="note-text" role="status" aria-live="polite">Overview snapshot at page load; live checks require JavaScript.</p>
+      <p id="history-collector-freshness" class="note-text" role="status" aria-live="polite">Last checked: page load. Collector status snapshot; live checks require JavaScript.</p>
+      <p id="history-overview-freshness" class="note-text" role="status" aria-live="polite">Last checked: page load. Overview snapshot; live checks require JavaScript.</p>
       <section class="grid">
         <div class="card">
           <div class="label">Collector</div>
@@ -34,23 +41,23 @@
           </div>
         </div>
         <div class="card">
-          <div class="label">Tracked Slots</div>
-          <div id="tracked-slots-value" class="value">{{ counts.get('tracked_slots', 0) }}</div>
+          <div class="label">Tracked slots</div>
+          <div id="tracked-slots-value" class="value">{{ count(counts.get('tracked_slots')) }}</div>
         </div>
         <div class="card">
-          <div class="label">Slot Events</div>
-          <div id="slot-events-value" class="value">{{ format_count(counts.get('event_count', 0), estimated=counts_are_estimated) }}</div>
+          <div class="label">Slot changes</div>
+          <div id="slot-events-value" class="value">{{ count(counts.get('event_count'), estimated=counts_are_estimated) }}</div>
         </div>
         <div class="card">
-          <div class="label">Metric Samples</div>
-          <div id="metric-samples-value" class="value">{{ format_count(counts.get('metric_sample_count', 0), estimated=counts_are_estimated) }}</div>
+          <div class="label">Temperature and SMART readings</div>
+          <div id="metric-samples-value" class="value">{{ count(counts.get('metric_sample_count'), estimated=counts_are_estimated) }}</div>
         </div>
         <div class="card">
-          <div class="label">Metric Rollups</div>
-          <div id="metric-rollups-value" class="value">{{ format_count(counts.get('metric_rollup_count', 0), estimated=counts_are_estimated) }}</div>
+          <div class="label">Hourly summaries</div>
+          <div id="metric-rollups-value" class="value">{{ count(counts.get('metric_rollup_count'), estimated=counts_are_estimated) }}</div>
         </div>
         <div class="card">
-          <div class="label">DB Size</div>
+          <div class="label">Database size</div>
           <div id="db-size-value" class="value">{{ database_size_label }}</div>
         </div>
         <div class="card">
@@ -65,40 +72,41 @@
       </section>
 
       <section class="card">
-        <h2>Collector Status</h2>
-        <p>
-          Current collection: <code id="status-current-collection">{{ current_collection_label }}</code><br>
-          Last inventory pass: <code id="status-last-inventory-at">{{ status.get('last_inventory_at') or 'never' }}</code><br>
-          Last fast metrics pass: <code id="status-last-fast-metrics-at">{{ status.get('last_fast_metrics_at') or 'never' }}</code><br>
-          Last slow metrics pass: <code id="status-last-slow-metrics-at">{{ status.get('last_slow_metrics_at') or 'never' }}</code><br>
-          Last backup snapshot: <code id="status-last-backup-at">{{ status.get('last_backup_at') or 'never' }}</code><br>
-          Last retention pass: <code id="status-last-retention-at">{{ status.get('last_retention_at') or 'never' }}</code><br>
-          Last retention duration: <code id="status-last-retention-duration">{{ last_retention_duration_label }}</code><br>
-          Last retention rows removed: <code id="status-last-retention-rows-removed">{{ status.get('last_retention_rows_removed') or 0 }}</code><br>
-          Retention catch-up pending: <code id="status-last-retention-has-more">{{ 'yes' if status.get('last_retention_has_more') else 'no' }}</code><br>
-          Last retention failure: <code id="status-last-retention-error">{{ status.get('last_retention_error') or 'none' }}</code><br>
-          Last collection duration: <code id="status-last-collection-duration">{{ last_collection_duration_label }}</code><br>
-          Last schedule overrun: <code id="status-last-background-overrun">{{ last_background_overrun_label }}</code><br>
-          Last collection inventory: <code id="status-last-collection-inventory">{{ last_inventory_mode }}</code><br>
-          Next background pass: <code id="status-next-collection-at">{{ status.get('next_collection_at') or 'not scheduled' }}</code><br>
-          Background failures: <code id="status-background-failures">{{ status.get('background_consecutive_failures') or 0 }}</code><br>
-          Background backoff: <code id="status-background-backoff">{{ backoff_label }}</code><br>
-          Backoff until: <code id="status-background-backoff-until">{{ status.get('background_backoff_until') or 'not active' }}</code><br>
-          Last error: <code id="status-last-error">{{ status.get('last_error') or 'none' }}</code>
-        </p>
+        <h2>Collector status</h2>
+        <p>Times use your browser's local time. Without JavaScript, timestamps include their recorded UTC offset.</p>
+        <dl>
+          <dt>Collecting now</dt><dd id="status-current-collection">{{ current_collection_label if status.get('collection_running') else 'no' }}</dd>
+          <dt>Last shelf scan</dt><dd id="status-last-inventory-at">{{ timestamp(status.get('last_inventory_at'), 'never') }}</dd>
+          <dt>Last temperature reading</dt><dd id="status-last-fast-metrics-at">{{ timestamp(status.get('last_fast_metrics_at'), 'never') }}</dd>
+          <dt>Last full SMART reading</dt><dd id="status-last-slow-metrics-at">{{ timestamp(status.get('last_slow_metrics_at'), 'never') }}</dd>
+          <dt>Last backup</dt><dd id="status-last-backup-at">{{ timestamp(status.get('last_backup_at'), 'never') }}</dd>
+          <dt>Last cleanup</dt><dd id="status-last-retention-at">{{ timestamp(status.get('last_retention_at'), 'never') }}</dd>
+          <dt>Cleanup took</dt><dd id="status-last-retention-duration">{{ last_retention_duration_label }}</dd>
+          <dt>Rows removed</dt><dd id="status-last-retention-rows-removed">{{ count(status.get('last_retention_rows_removed')) }}</dd>
+          <dt>More cleanup pending</dt><dd id="status-last-retention-has-more">{{ 'yes' if status.get('last_retention_has_more') else 'no' }}</dd>
+          <dt>Cleanup error</dt><dd id="status-last-retention-error">{{ status.get('last_retention_error') or 'none' }}</dd>
+          <dt>Last run took</dt><dd id="status-last-collection-duration">{{ last_collection_duration_label }}</dd>
+          <dt>Ran late by</dt><dd id="status-last-background-overrun">{{ 'no' if status.get('last_background_overrun_seconds') == 0 else last_background_overrun_label }}</dd>
+          <dt>Last scan used</dt><dd id="status-last-collection-inventory">{{ 'fresh inventory' if status.get('last_collection_inventory_forced') is sameas true else 'cached inventory' if status.get('last_collection_inventory_forced') is sameas false else 'not recorded' }}</dd>
+          <dt>Next scan</dt><dd id="status-next-collection-at">{{ timestamp(status.get('next_collection_at'), 'not scheduled') }}</dd>
+          <dt>Consecutive collection failures</dt><dd id="status-background-failures">{{ count(status.get('background_consecutive_failures')) }}</dd>
+          <dt>Retry wait after errors</dt><dd id="status-background-backoff">{{ backoff_label }}</dd>
+          <dt>Retry after</dt><dd id="status-background-backoff-until">{{ timestamp(status.get('background_backoff_until'), 'not active') }}</dd>
+          <dt>Last error</dt><dd id="status-last-error">{{ status.get('last_error') or 'none' }}</dd>
+        </dl>
       </section>
 
       <section class="tracked-scopes-section">
-        <h2>Tracked Scopes</h2>
+        <h2>Systems and enclosures</h2>
         <table>
           <thead>
             <tr>
               <th>System</th>
               <th>Enclosure</th>
-              <th>Tracked Slots</th>
+              <th>Tracked slots</th>
               <th>Events</th>
-              <th>Metric Samples</th>
-              <th>Last Seen</th>
+              <th>Temperature and SMART readings</th>
+              <th>Last seen</th>
             </tr>
           </thead>
           <tbody id="tracked-scopes-body">
@@ -106,10 +114,10 @@
             <tr>
               <td>{{ scope.get('system_label') or scope.get('system_id') or 'unknown' }}</td>
               <td>{{ scope.get('enclosure_label') or scope.get('enclosure_id') or 'default' }}</td>
-              <td>{{ scope.get('tracked_slots') or 0 }}</td>
-              <td>{{ format_count(scope.get('event_count')) }}</td>
-              <td>{{ format_count(scope.get('metric_sample_count')) }}</td>
-              <td>{{ scope.get('last_seen_at') or 'never' }}</td>
+              <td>{{ count(scope.get('tracked_slots')) }}</td>
+              <td>{{ count(scope.get('event_count')) }}</td>
+              <td>{{ count(scope.get('metric_sample_count')) }}</td>
+              <td>{{ timestamp(scope.get('last_seen_at')) }}</td>
             </tr>
             {% else %}
             <tr><td colspan="6">No slot history has been collected yet.</td></tr>

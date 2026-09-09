@@ -11,7 +11,7 @@ async function flush() {
   for (let i = 0; i < 20; i += 1) await Promise.resolve();
 }
 
-function dashboard({ hidden = false, buttons = true } = {}) {
+function dashboard({ hidden = false, buttons = true, initial = { collector_running: true } } = {}) {
   let now = 0;
   let nextTimer = 0;
   const timers = new Map();
@@ -23,18 +23,21 @@ function dashboard({ hidden = false, buttons = true } = {}) {
       textContent: id === "collector-state-value" ? "Running" : "",
       disabled: false, hidden: false, classList: { toggle() {} },
       addEventListener(event, callback) { this[event] = callback; },
-      replaceChildren() {}, appendChild() {},
+      setAttribute(name, value) { this[name] = value; },
+      removeAttribute(name) { delete this[name]; },
+      replaceChildren(...children) { this.children = children; }, appendChild() {},
     });
     return elements.get(id);
   }
   const document = {
     hidden,
     getElementById(id) {
-      if (id === "history-dashboard-bootstrap") return { textContent: '{"collector_running":true}' };
+      if (id === "history-dashboard-bootstrap") return { textContent: JSON.stringify(initial) };
       if (!buttons && /history-refresh-(fast|full|status)/.test(id)) return null;
       return element(id);
     },
-    createElement() { return { textContent: "", appendChild() {} }; },
+    querySelectorAll() { return []; },
+    createElement() { return { textContent: "", children: [], setAttribute(name, value) { this[name] = value; }, appendChild(child) { this.children.push(child); } }; },
     addEventListener(event, callback) { listeners[event] = callback; },
   };
   const window = {
@@ -72,6 +75,44 @@ function dashboard({ hidden = false, buttons = true } = {}) {
     async click(mode) { element(`history-refresh-${mode}`).click(); await flush(); },
   };
 }
+
+test("presentation formats initial and polled times and does not invent startup", async () => {
+  const stamp = "2026-09-09T12:00:00+00:00";
+  const d = dashboard({ initial: { collector_running: true, last_inventory_at: stamp } });
+  assert.equal(d.element("status-last-inventory-at").textContent, new Date(stamp).toLocaleString());
+  assert.equal(d.element("collector-state-value").textContent, "Running");
+  d.poll.pollCollectorStatus();
+  await d.reply(0, { collector_running: false, last_inventory_at: "bad", last_fast_metrics_at: null, last_background_overrun_seconds: 0 });
+  assert.equal(d.element("status-last-inventory-at").textContent, "not recorded");
+  assert.equal(d.element("status-last-fast-metrics-at").textContent, "never");
+  assert.equal(d.element("status-last-background-overrun").textContent, "no");
+  assert.equal(d.element("collector-state-value").textContent, "Stopped");
+});
+
+test("missing counts stay distinct from zero with accessible explanations", async () => {
+  const d = dashboard();
+  d.poll.pollOverviewStatus();
+  await d.reply(0, { collector: { collector_running: true }, counts: { event_count: 0 }, counts_exact: true,
+    scopes: [{ system_label: "-", event_count: 0, last_seen_at: "2026-09-09T12:00:00Z" }] });
+  assert.equal(d.element("tracked-slots-value").textContent, "-");
+  assert.equal(d.element("tracked-slots-value")["aria-label"], "not counted yet");
+  assert.equal(d.element("slot-events-value").textContent, "0");
+  const cells = d.element("tracked-scopes-body").children[0].children;
+  assert.equal(cells[0]["aria-label"], undefined, "a system label is not a missing count");
+  assert.equal(cells[2].textContent, "-");
+  assert.equal(cells[2]["aria-label"], "not counted yet");
+  assert.equal(cells[3].textContent, "0");
+  assert.equal(cells[5].textContent, new Date("2026-09-09T12:00:00Z").toLocaleString());
+});
+
+test("status template uses semantic terms and plain labels", () => {
+  const template = fs.readFileSync(path.resolve(__dirname, "../../history_service/templates/dashboard.html"), "utf8");
+  assert.match(template, /<dl/);
+  assert.match(template, /<dt>Last shelf scan<\/dt>\s*<dd id="status-last-inventory-at"/);
+  assert.match(template, />Quick refresh<\/button>/);
+  assert.match(template, /Hourly summaries/);
+  assert.doesNotMatch(template, />Tracked Scopes</);
+});
 
 const overview = (running, count = 7) => ({ collector: { collector_running: running }, counts: { tracked_slots: count }, counts_exact: true });
 
@@ -284,8 +325,8 @@ for (const malformedBody of [false, true]) {
 
 test("template labels initial values as snapshots without depending on JavaScript", () => {
   const template = fs.readFileSync(path.resolve(__dirname, "../../history_service/templates/dashboard.html"), "utf8");
-  assert.match(template, /id="history-collector-freshness"[^>]*>Collector status snapshot at page load/);
-  assert.match(template, /id="history-overview-freshness"[^>]*>Overview snapshot at page load/);
+  assert.match(template, /id="history-collector-freshness"[^>]*>Last checked: page load\. Collector status snapshot/);
+  assert.match(template, /id="history-overview-freshness"[^>]*>Last checked: page load\. Overview snapshot/);
 });
 
 test("malformed health response is stale rather than an invented stopped collector", async () => {

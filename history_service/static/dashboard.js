@@ -27,9 +27,28 @@
 
   function formatCount(value, estimated = false) {
     if (value === null || value === undefined) {
-      return "deferred";
+      return "-";
     }
     return `${estimated ? "~" : ""}${value}`;
+  }
+
+  function setCount(id, value, estimated = false) {
+    const element = document.getElementById(id);
+    if (!element) return;
+    element.textContent = formatCount(value, estimated);
+    if (value === null || value === undefined) {
+      element.setAttribute("title", "not counted yet");
+      element.setAttribute("aria-label", "not counted yet");
+    } else {
+      element.removeAttribute("title");
+      element.removeAttribute("aria-label");
+    }
+  }
+
+  function formatTimestamp(value, fallback = "never") {
+    if (value === null || value === undefined || value === "") return fallback;
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? "not recorded" : date.toLocaleString();
   }
 
   function formatBytes(value) {
@@ -59,16 +78,16 @@
 
   function collectionInventoryLabel(value) {
     if (value === true) {
-      return "forced";
+      return "fresh inventory";
     }
     if (value === false) {
-      return "cached";
+      return "cached inventory";
     }
     return "not recorded";
   }
 
   function collectionDurationLabel(value) {
-    return Number.isFinite(Number(value)) ? `${Number(value).toFixed(1)}s` : "not recorded";
+    return value !== null && value !== undefined && value !== "" && Number.isFinite(Number(value)) ? `${Number(value).toFixed(1)}s` : "not recorded";
   }
 
   function backoffLabel(seconds) {
@@ -86,24 +105,24 @@
     }
     const currentCollection = collector.collection_running
       ? `${collector.collection_kind || "background"} for ${formatDuration(collector.collection_elapsed_seconds)}: ${collector.collection_activity || "working"}`
-      : "not running";
+      : "no";
     setText("status-current-collection", currentCollection);
-    setText("status-last-inventory-at", statusValue(collector.last_inventory_at));
-    setText("status-last-fast-metrics-at", statusValue(collector.last_fast_metrics_at));
-    setText("status-last-slow-metrics-at", statusValue(collector.last_slow_metrics_at));
-    setText("status-last-backup-at", statusValue(collector.last_backup_at));
-    setText("status-last-retention-at", statusValue(collector.last_retention_at));
+    setText("status-last-inventory-at", formatTimestamp(collector.last_inventory_at));
+    setText("status-last-fast-metrics-at", formatTimestamp(collector.last_fast_metrics_at));
+    setText("status-last-slow-metrics-at", formatTimestamp(collector.last_slow_metrics_at));
+    setText("status-last-backup-at", formatTimestamp(collector.last_backup_at));
+    setText("status-last-retention-at", formatTimestamp(collector.last_retention_at));
     setText("status-last-retention-duration", collectionDurationLabel(collector.last_retention_duration_seconds));
-    setText("status-last-retention-rows-removed", String(collector.last_retention_rows_removed || 0));
+    setCount("status-last-retention-rows-removed", collector.last_retention_rows_removed);
     setText("status-last-retention-has-more", collector.last_retention_has_more ? "yes" : "no");
     setText("status-last-retention-error", statusValue(collector.last_retention_error, "none"));
     setText("status-last-collection-duration", collectionDurationLabel(collector.last_collection_duration_seconds));
-    setText("status-last-background-overrun", collectionDurationLabel(collector.last_background_overrun_seconds));
+    setText("status-last-background-overrun", collector.last_background_overrun_seconds === 0 ? "no" : collectionDurationLabel(collector.last_background_overrun_seconds));
     setText("status-last-collection-inventory", collectionInventoryLabel(collector.last_collection_inventory_forced));
-    setText("status-next-collection-at", statusValue(collector.next_collection_at, "not scheduled"));
-    setText("status-background-failures", String(collector.background_consecutive_failures || 0));
+    setText("status-next-collection-at", formatTimestamp(collector.next_collection_at, "not scheduled"));
+    setCount("status-background-failures", collector.background_consecutive_failures);
     setText("status-background-backoff", backoffLabel(collector.background_backoff_seconds_remaining));
-    setText("status-background-backoff-until", statusValue(collector.background_backoff_until, "not active"));
+    setText("status-background-backoff-until", formatTimestamp(collector.background_backoff_until, "not active"));
     setText("status-last-error", statusValue(collector.last_error, "none"));
   }
 
@@ -113,10 +132,10 @@
     }
     const counts = payload.counts || {};
     const countsExact = Boolean(payload.counts_exact);
-    setText("tracked-slots-value", statusValue(counts.tracked_slots, "0"));
-    setText("slot-events-value", formatCount(counts.event_count, !countsExact));
-    setText("metric-samples-value", formatCount(counts.metric_sample_count, !countsExact));
-    setText("metric-rollups-value", formatCount(counts.metric_rollup_count, !countsExact));
+    setCount("tracked-slots-value", counts.tracked_slots);
+    setCount("slot-events-value", counts.event_count, !countsExact);
+    setCount("metric-samples-value", counts.metric_sample_count, !countsExact);
+    setCount("metric-rollups-value", counts.metric_rollup_count, !countsExact);
     setText("db-size-value", formatBytes(payload.database?.size_bytes ?? payload.database_size_bytes));
     renderScopes(payload.scopes || []);
   }
@@ -136,14 +155,18 @@
       const cells = [
         statusValue(scope.system_label || scope.system_id, "unknown"),
         statusValue(scope.enclosure_label || scope.enclosure_id, "default"),
-        statusValue(scope.tracked_slots, "0"),
+        formatCount(scope.tracked_slots),
         formatCount(scope.event_count),
         formatCount(scope.metric_sample_count),
-        statusValue(scope.last_seen_at, "never"),
+        formatTimestamp(scope.last_seen_at),
       ];
-      for (const value of cells) {
+      for (const [index, value] of cells.entries()) {
         const cell = document.createElement("td");
         cell.textContent = value;
+        if (index >= 2 && index <= 4 && value === "-") {
+          cell.setAttribute("title", "not counted yet");
+          cell.setAttribute("aria-label", "not counted yet");
+        }
         row.appendChild(cell);
       }
       return row;
@@ -165,7 +188,7 @@
     }
     const backoffRemaining = Number(collector.background_backoff_seconds_remaining || 0);
     if (backoffRemaining > 0) {
-      collectorBanner.textContent = `History background collection is backed off for ${formatDuration(backoffRemaining)} after repeated failures.`;
+      collectorBanner.textContent = `History collection paused for ${formatDuration(backoffRemaining)} after repeated failures.`;
       collectorBanner.hidden = false;
       return;
     }
@@ -228,7 +251,7 @@
   }
 
   function markOverviewStale(reason) {
-    setText("history-overview-freshness", `Overview stale: ${reason}. Showing last known counts and scopes.`);
+    setText("history-overview-freshness", `Overview stale: ${reason}. Showing last known counts and systems.`);
   }
 
   function acceptCollector(payload, ticket) {
@@ -322,7 +345,7 @@
     if (status) {
       status.textContent = mode === "full"
         ? "Running full history refresh..."
-        : "Running fast history refresh...";
+        : "Running quick history refresh...";
     }
     try {
       const request = boundedRequest("/api/history/refresh", {
@@ -379,7 +402,11 @@
   }
 
   const initialCollectorStatus = readInitialOverview();
+  renderCollectorStatus(initialCollectorStatus);
   renderCollectorBanner(initialCollectorStatus);
+  document.querySelectorAll("time[datetime]").forEach((element) => {
+    element.textContent = formatTimestamp(element.getAttribute("datetime"));
+  });
   if (document.hidden) {
     markCollectorStale("polling paused while page is hidden");
     markOverviewStale("polling paused while page is hidden");
