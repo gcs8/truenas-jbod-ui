@@ -33,12 +33,7 @@ class HistoryBackendError(RuntimeError):
 
 
 class HistoryBackendUnavailableError(HistoryBackendError):
-    """The backend could not be reached at all (connection refused, DNS, timeout).
-
-    Distinguished from HTTP-level failures so per-slot fallbacks can stop fanning out
-    once the backend is known to be unreachable instead of waiting out one timeout per
-    slot.
-    """
+    """The backend could not be reached at all (connection refused, DNS, timeout)."""
 
 
 class HistoryBackendResponseError(HistoryBackendError):
@@ -174,48 +169,6 @@ class HistoryBackendClient:
             "disk_history": payload.get("disk_history", {}),
         }
 
-    async def _fallback_scope_history(
-        self,
-        slots: list[int],
-        system_id: str | None,
-        enclosure_id: str | None,
-        *,
-        window_hours: int | None,
-    ) -> dict[int, dict[str, Any]]:
-        """Per-slot fallback for a failed batched scope call.
-
-        Bounded by ``fallback_max_concurrency`` so a degraded backend cannot saturate the
-        default thread pool, deduplicated so repeated slot ids cost one request, and
-        short-circuited: once one request proves the backend unreachable, the remaining
-        slots are marked unavailable without waiting out a timeout each.
-        """
-
-        unique_slots = list(dict.fromkeys(slots))
-        limit = max(1, int(self.config.fallback_max_concurrency or 0))
-        semaphore = asyncio.Semaphore(limit)
-        unreachable = asyncio.Event()
-
-        async def fetch_one(slot: int) -> dict[str, Any]:
-            if unreachable.is_set():
-                return self._failed_slot_payload(slot, system_id, enclosure_id)
-            async with semaphore:
-                if unreachable.is_set():
-                    return self._failed_slot_payload(slot, system_id, enclosure_id)
-                try:
-                    return await self._fetch_slot_history(slot, system_id, enclosure_id, window_hours=window_hours)
-                except HistoryBackendUnavailableError:
-                    if not unreachable.is_set():
-                        logger.warning(
-                            "History backend unreachable during per-slot fallback; skipping remaining slots."
-                        )
-                    unreachable.set()
-                except Exception:  # noqa: BLE001 - optional backend should degrade gracefully.
-                    logger.warning("History backend slot history request failed.")
-                return self._failed_slot_payload(slot, system_id, enclosure_id)
-
-        results = await asyncio.gather(*(fetch_one(slot) for slot in unique_slots))
-        return dict(zip(unique_slots, results, strict=True))
-
     async def get_scopes_history(
         self,
         *,
@@ -251,7 +204,8 @@ class HistoryBackendClient:
             detail = "History backend is not configured."
         else:
             try:
-                return await self._send_json("/api/history/scopes/bundle", document)
+                payload = await self._send_json("/api/history/scopes/bundle", document)
+                return self._normalize_scopes_history(payload, document["scopes"])
             except HistoryBackendPolicyError:
                 raise
             except HistoryBackendResponseError:
@@ -280,6 +234,83 @@ class HistoryBackendClient:
                 for scope in plan.scopes
             ],
             "budget": plan.budget_metadata(),
+        }
+
+    def _normalize_scopes_history(
+        self,
+        payload: dict[str, Any],
+        scopes: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Attach consumer metadata only to requested, identity-matched histories.
+
+        The store's wire format omits per-slot availability and identity. Missing
+        targets are not successful empty histories; explicit outage metadata at
+        any level must survive adaptation to both export and single-scope reads.
+        """
+        response_scopes = payload.get("scopes")
+        if not isinstance(response_scopes, list):
+            raise HistoryBackendResponseError(0, "History backend returned a malformed scope payload.")
+        by_identity: dict[tuple[str, str | None], dict[str, Any]] = {}
+        for scope in response_scopes:
+            if (
+                not isinstance(scope, dict)
+                or not isinstance(scope.get("system_id"), str)
+                or (scope.get("enclosure_id") is not None and not isinstance(scope["enclosure_id"], str))
+                or not isinstance(scope.get("histories"), dict)
+            ):
+                raise HistoryBackendResponseError(0, "History backend returned a malformed scope payload.")
+            identity = (scope["system_id"], scope.get("enclosure_id"))
+            if identity in by_identity:
+                raise HistoryBackendResponseError(0, "History backend returned duplicate scope identities.")
+            by_identity[identity] = scope
+
+        normalized = []
+        for requested in scopes:
+            system_id, enclosure_id = requested["system_id"], requested["enclosure_id"]
+            scope = by_identity.get((system_id, enclosure_id), {})
+            histories = scope.get("histories", {})
+            normalized.append({
+                **scope,
+                "system_id": system_id,
+                "enclosure_id": enclosure_id,
+                "histories": {
+                    str(slot): self._normalize_scope_slot(
+                        histories.get(str(slot)), slot, system_id, enclosure_id, payload, scope,
+                    )
+                    for slot in requested["slots"]
+                },
+            })
+        return {**payload, "scopes": normalized}
+
+    def _normalize_scope_slot(
+        self,
+        history: Any,
+        slot: int,
+        system_id: str | None,
+        enclosure_id: str | None,
+        *parents: dict[str, Any],
+    ) -> dict[str, Any]:
+        present = isinstance(history, dict)
+        history = history if present else {}
+        layers = (*parents, history)
+        configured = self.configured and all(layer.get("configured", True) is True for layer in layers)
+        available = configured and present and all(layer.get("available", True) is True for layer in layers)
+        detail = next((layer["detail"] for layer in reversed(layers) if layer.get("detail")), None)
+        if not available and detail is None:
+            detail = HISTORY_BACKEND_FAILURE_DETAIL if configured else "History backend is not configured."
+        return {
+            **history,
+            "configured": configured,
+            "available": available,
+            "detail": detail,
+            "slot": slot,
+            "system_id": system_id,
+            "enclosure_id": enclosure_id,
+            "metrics": history.get("metrics", {}),
+            "events": history.get("events", []),
+            "sample_counts": history.get("sample_counts", {}),
+            "latest_values": history.get("latest_values", {}),
+            "disk_history": history.get("disk_history", {}),
         }
 
     async def get_scope_history(
@@ -348,38 +379,12 @@ class HistoryBackendClient:
                 for slot in dict.fromkeys(slots)
             }
 
-        normalized: dict[int, dict[str, Any]] = {}
-        for slot in dict.fromkeys(slots):
-            history = histories.get(str(slot))
-            if isinstance(history, dict):
-                normalized[slot] = {
-                    "configured": True,
-                    "available": True,
-                    "detail": None,
-                    "slot": slot,
-                    "system_id": system_id,
-                    "enclosure_id": enclosure_id,
-                    "metrics": history.get("metrics", {}),
-                    "events": history.get("events", []),
-                    "sample_counts": history.get("sample_counts", {}),
-                    "latest_values": history.get("latest_values", {}),
-                    "disk_history": history.get("disk_history", {}),
-                }
-            else:
-                normalized[slot] = {
-                    "configured": True,
-                    "available": True,
-                    "detail": None,
-                    "slot": slot,
-                    "system_id": system_id,
-                    "enclosure_id": enclosure_id,
-                    "metrics": {},
-                    "events": [],
-                    "sample_counts": {},
-                    "latest_values": {},
-                    "disk_history": {},
-                }
-        return normalized
+        return {
+            slot: self._normalize_scope_slot(
+                histories.get(str(slot)), slot, system_id, enclosure_id, payload,
+            )
+            for slot in dict.fromkeys(slots)
+        }
 
     @staticmethod
     def _failed_slot_payload(

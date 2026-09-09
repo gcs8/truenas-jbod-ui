@@ -108,7 +108,7 @@ class HistoryBackendBoundsTests(unittest.IsolatedAsyncioTestCase):
         client = HistoryBackendClient(HistoryConfig(service_url="http://history-backend:8001"))
         with (
             patch.object(client, "_send_json", AsyncMock(side_effect=HistoryBackendPolicyError(413))) as send,
-            patch.object(client, "_fallback_scope_history", AsyncMock()) as fallback,
+            patch.object(client, "_fetch_json", AsyncMock()) as fallback,
         ):
             with self.assertRaises(HistoryBackendPolicyError):
                 await client.get_scope_history(
@@ -139,11 +139,30 @@ class HistoryBackendBoundsTests(unittest.IsolatedAsyncioTestCase):
                 metric_limit=24,
             )
         self.assertIn(999999, payload)
+        self.assertFalse(payload[999999]["available"], "A missing legacy slot is not successful empty history.")
         send.assert_awaited_once()
+        fetch.assert_awaited_once()
+        self.assertEqual(fetch.await_args.args[0], "/api/history/scopes/slots")
         params = fetch.await_args.kwargs["params"]
         self.assertEqual(params["metrics"], ["bytes_written"])
         self.assertEqual(params["event_limit"], 0)
         self.assertEqual(params["metric_limit"], 24)
+
+    async def test_response_rejection_never_fans_out_or_uses_legacy_get(self) -> None:
+        client = HistoryBackendClient(HistoryConfig(service_url="http://history-backend:8001"))
+        for status in (400, 500, 503):
+            with (
+                self.subTest(status=status),
+                patch.object(client, "_send_json", AsyncMock(side_effect=HistoryBackendResponseError(status))) as send,
+                patch.object(client, "_fetch_json", AsyncMock()) as fetch,
+            ):
+                with self.assertRaises(HistoryBackendResponseError):
+                    await client.get_scope_history(
+                        system_id="synthetic", enclosure_id="front", slots=[0, 1],
+                        window_hours=24, metrics=["temperature_c"], event_limit=0, metric_limit=1,
+                    )
+                send.assert_awaited_once()
+                fetch.assert_not_awaited()
 
     async def test_client_rejects_unbounded_request_before_network(self) -> None:
         client = HistoryBackendClient(HistoryConfig(service_url="http://history-backend:8001"))

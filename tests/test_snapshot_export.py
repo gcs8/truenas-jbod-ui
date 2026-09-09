@@ -9,7 +9,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from pydantic import ValidationError
 from starlette.datastructures import URLPath
@@ -31,7 +31,11 @@ from app.models.domain import (
     StorageViewRuntimeView,
     SystemOption,
 )
-from app.services.history_backend import HistoryBackendClient
+from app.services.history_backend import (
+    HISTORY_BACKEND_FAILURE_DETAIL,
+    HistoryBackendClient,
+    HistoryBackendUnavailableError,
+)
 from app.services.snapshot_export import (
     EXPORT_HISTORY_CACHE,
     EXPORT_RENDER_CACHE,
@@ -40,6 +44,9 @@ from app.services.snapshot_export import (
     SnapshotRedactor,
     collect_configured_hostnames,
 )
+from history_service import main as history_main
+from history_service.store import HistoryStore
+from tests import test_history_bulk_bounds
 from history_service.operation_bounds import (
     MAX_EVENT_ROWS,
     MAX_REQUEST_BYTES,
@@ -2699,6 +2706,168 @@ class SnapshotRedactorHostnameFormTests(unittest.TestCase):
         redacted = redactor.redact_snapshot(snapshot)
 
         self.assertEqual(redacted.warnings, ["collector on host-01 failed"])
+
+
+class HistoryResponseContractTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.client = HistoryBackendClient(HistoryConfig(service_url="http://synthetic-history.invalid"))
+        self.since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        self.clear_caches()
+        self.addCleanup(self.clear_caches)
+
+    @staticmethod
+    def clear_caches() -> None:
+        for cache in (EXPORT_HISTORY_CACHE, EXPORT_RENDER_CACHE, EXPORT_ZIP_CACHE):
+            cache.clear()
+
+    async def export(self, snapshot, *, redact_sensitive=False, multiple=False):
+        exporter = SnapshotExportService(Settings(), self.client, templates)
+        return await exporter.build_enclosure_snapshot_html(
+            request=build_request(), snapshot=snapshot,
+            live_enclosure_snapshots=({"front": snapshot, "rear": build_rear_snapshot()} if multiple else {"front": snapshot}),
+            selected_slot=0,
+            history_window_hours=24, history_panel_open=True, io_chart_mode="total",
+            redact_sensitive=redact_sensitive,
+        )
+
+    async def test_real_bulk_handler_store_client_export_keeps_available_history_and_identity(self) -> None:
+        snapshot = build_snapshot()
+        with tempfile.TemporaryDirectory() as directory:
+            store = HistoryStore(str(Path(directory) / "history.db"))
+            with store._connect() as connection:
+                connection.execute(
+                    "INSERT INTO metric_samples (observed_at, system_id, enclosure_key, "
+                    "enclosure_id, slot, slot_label, metric_name, value_real) VALUES (?,?,?,?,?,?,?,?)",
+                    ((datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(),
+                     snapshot.selected_system_id, "front", "front", 0, "00", "temperature_c", 37.0),
+                )
+                connection.execute(
+                    "INSERT INTO metric_samples (observed_at, system_id, enclosure_key, "
+                    "enclosure_id, slot, slot_label, metric_name, value_real) VALUES (?,?,?,?,?,?,?,?)",
+                    ((datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(),
+                     snapshot.selected_system_id, "rear", "rear", 0, "00", "temperature_c", 42.0),
+                )
+                connection.commit()
+
+            async def send(path, document):
+                self.assertEqual(path, "/api/history/scopes/bundle")
+                response = await history_main.scopes_history_bundle(
+                    test_history_bulk_bounds.HistoryBulkRouteBoundsTests._request(json.dumps(document).encode())
+                )
+                self.assertEqual(response.status_code, 200, response.body)
+                return json.loads(bytes(response.body))
+
+            with patch.object(history_main, "store", store), patch.object(self.client, "_send_json", side_effect=send) as sent:
+                for multiple, redact in ((False, False), (False, True), (True, False), (True, True)):
+                    with self.subTest(multiple=multiple, redact=redact):
+                        self.clear_caches()
+                        rendered = await self.export(
+                            build_snapshot_with_rear_option() if multiple else snapshot,
+                            redact_sensitive=redact, multiple=multiple,
+                        )
+                        self.assertTrue(rendered.history_available)
+                        self.assertIn("initialHistoryPanelOpen: true", rendered.html)
+                        system_id = rendered.snapshot.selected_system_id
+                        enclosure_id = rendered.snapshot.selected_enclosure_id
+                        key = SnapshotExportService._build_history_cache_key(system_id, enclosure_id, 0)
+                        history = rendered.history_cache[key]
+                        self.assertTrue(history["available"])
+                        self.assertTrue(history["configured"])
+                        self.assertEqual((history["system_id"], history["enclosure_id"], history["slot"]),
+                                         (system_id, enclosure_id, 0))
+                        self.assertEqual(history["metrics"]["temperature_c"][0]["value"], 37.0)
+                        self.assertEqual(history["sample_counts"]["temperature_c"], 1)
+                        sampled = [item for item in rendered.history_cache.values()
+                                   if item.get("sample_counts", {}).get("temperature_c")]
+                        self.assertEqual(sorted(item["latest_values"]["temperature_c"] for item in sampled),
+                                         [37.0, 42.0] if multiple else [37.0])
+                        self.assertEqual(len({item["enclosure_id"] for item in sampled}), 2 if multiple else 1)
+                        for item in sampled:
+                            self.assertTrue(item["available"])
+                            self.assertEqual(item["system_id"], system_id)
+                            cache_key = SnapshotExportService._build_history_cache_key(
+                                item["system_id"], item["enclosure_id"], item["slot"],
+                            )
+                            self.assertEqual(rendered.history_cache[cache_key], item)
+                self.assertEqual(sent.await_count, 4)
+
+    async def test_transport_outage_survives_single_scope_adapter_without_fanout(self) -> None:
+        with (
+            patch.object(self.client, "_send_json", side_effect=HistoryBackendUnavailableError("synthetic secret")) as sent,
+            patch.object(self.client, "_fetch_json", AsyncMock()) as fetched,
+        ):
+            result = await self.client.get_scope_history(
+                system_id="synthetic", enclosure_id="front", slots=[0, 1, 0],
+                window_hours=24, metrics=["temperature_c"], event_limit=0, metric_limit=1,
+            )
+        self.assertEqual(set(result), {0, 1})
+        for slot, history in result.items():
+            self.assertFalse(history["available"])
+            self.assertEqual(history["detail"], HISTORY_BACKEND_FAILURE_DETAIL)
+            self.assertEqual((history["system_id"], history["enclosure_id"], history["slot"]),
+                             ("synthetic", "front", slot))
+        sent.assert_awaited_once()
+        fetched.assert_not_awaited()
+        self.assertNotIn("synthetic secret", str(result))
+
+    async def test_transport_outage_export_stays_unavailable(self) -> None:
+        with patch.object(self.client, "_send_json", side_effect=HistoryBackendUnavailableError("offline")):
+            rendered = await self.export(build_snapshot())
+        self.assertFalse(rendered.history_available)
+        self.assertTrue(rendered.history_cache)
+        self.assertTrue(all(not history["available"] for history in rendered.history_cache.values()))
+
+    async def test_partial_response_matches_scope_identity_and_marks_missing_slots_unavailable(self) -> None:
+        scopes = [
+            {"system_id": "synthetic", "enclosure_id": "front", "slots": [0, 1]},
+            {"system_id": "synthetic", "enclosure_id": "rear", "slots": [0]},
+            {"system_id": "other", "enclosure_id": None, "slots": [0]},
+        ]
+        raw = {"budget": {"target_count": 4}, "scopes": [
+            {"system_id": "synthetic", "enclosure_id": "rear", "histories": {
+                "0": {"available": False, "detail": "History unavailable.", "metrics": {}}}},
+            {"system_id": "synthetic", "enclosure_id": "front", "histories": {
+                "0": {"metrics": {"temperature_c": []}, "disk_history": {"followed": True}},
+                "999": {"metrics": {}}}},
+        ]}
+        with patch.object(self.client, "_send_json", AsyncMock(return_value=raw)) as sent:
+            result = await self.client.get_scopes_history(
+                scopes=scopes, since=self.since, metrics=["temperature_c"], event_limit=0, metric_limit=1,
+            )
+        self.assertEqual(result["budget"], raw["budget"])
+        self.assertEqual(len(result["scopes"]), 3)
+        for expected, actual in zip(scopes, result["scopes"], strict=True):
+            self.assertEqual((actual["system_id"], actual["enclosure_id"]),
+                             (expected["system_id"], expected["enclosure_id"]))
+            self.assertEqual(set(actual["histories"]), {str(slot) for slot in expected["slots"]})
+            for slot, history in actual["histories"].items():
+                self.assertEqual((history["system_id"], history["enclosure_id"], history["slot"]),
+                                 (expected["system_id"], expected["enclosure_id"], int(slot)))
+        front, rear, missing = result["scopes"]
+        self.assertTrue(front["histories"]["0"]["available"])
+        self.assertTrue(front["histories"]["0"]["disk_history"]["followed"])
+        self.assertFalse(front["histories"]["1"]["available"])
+        self.assertFalse(rear["histories"]["0"]["available"])
+        self.assertEqual(rear["histories"]["0"]["detail"], "History unavailable.")
+        self.assertFalse(missing["histories"]["0"]["available"])
+        sent.assert_awaited_once()
+
+    async def test_explicit_unavailability_at_each_layer_is_not_promoted_to_success(self) -> None:
+        for layer in ("response", "scope", "slot"):
+            with self.subTest(layer=layer):
+                history = {"metrics": {}}
+                scope = {"system_id": "synthetic", "enclosure_id": "front", "histories": {"0": history}}
+                raw = {"scopes": [scope]}
+                {"response": raw, "scope": scope, "slot": history}[layer].update(
+                    available=False, detail="History unavailable."
+                )
+                with patch.object(self.client, "_send_json", AsyncMock(return_value=raw)):
+                    result = await self.client.get_scope_history(
+                        system_id="synthetic", enclosure_id="front", slots=[0],
+                        window_hours=24, metrics=["temperature_c"], event_limit=0, metric_limit=1,
+                    )
+                self.assertFalse(result[0]["available"])
+                self.assertEqual(result[0]["detail"], "History unavailable.")
 
 
 if __name__ == "__main__":
