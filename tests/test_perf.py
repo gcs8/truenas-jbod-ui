@@ -319,7 +319,7 @@ class PerfTraceTests(unittest.TestCase):
         self.assertEqual(payload["method"], "GET")
         self.assertEqual(payload["status_code"], 200)
         self.assertEqual(payload["component"], "enclosure-ui")
-        self.assertEqual(payload["release"], "0.22.2")
+        self.assertEqual(payload["release"], "0.23.0")
         serialized = json.dumps(payload)
         for forbidden in (
             "private-system-alpha",

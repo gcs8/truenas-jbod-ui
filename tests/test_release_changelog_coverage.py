@@ -451,11 +451,11 @@ class RenderReleaseNotesTests(unittest.TestCase):
         with self.assertRaises(render_release_notes.RenderError):
             render_release_notes.render(CHANGELOG_TEMPLATE, "## v0.1.0 - 2026-01-01")
 
-    def test_render_current_unreleased_section(self) -> None:
+    def test_render_current_v0230_section(self) -> None:
         repository = Path(__file__).resolve().parents[1]
         text = (repository / "CHANGELOG.md").read_text(encoding="utf-8")
 
-        rendered = render_release_notes.render(text, "## Unreleased")
+        rendered = render_release_notes.render(text, "## v0.23.0 - 2026-09-08")
 
         self.assertTrue(rendered.startswith("## Highlights\n\n- "))
         self.assertIn("## Upgrade notes", rendered)

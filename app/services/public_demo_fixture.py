@@ -94,7 +94,11 @@ class PublicDemoSlot(FixtureModel):
     size_bytes: int | None = Field(default=None, ge=1)
     size_human: str | None = Field(default=None, max_length=32)
     pool_name: str | None = Field(default=None, pattern=r"^demo-[a-z0-9-]+$", max_length=64)
-    vdev_name: str | None = Field(default=None, pattern=r"^(?:raidz2|mirror|spare)-[0-9]+$", max_length=32)
+    vdev_name: str | None = Field(
+        default=None,
+        pattern=r"^(?:(?:raidz2|mirror|spare)-[0-9]+|spares)$",
+        max_length=32,
+    )
     vdev_class: Literal["data", "special", "spare"] | None = None
     health: Literal["ONLINE", "AVAILABLE"] | None = None
     temperature_c: int | None = Field(default=None, ge=15, le=60)
@@ -467,7 +471,11 @@ def _slot_view(
         pool_name=source.pool_name,
         vdev_name=source.vdev_name,
         vdev_class=source.vdev_class,
-        topology_label=(f"{source.pool_name} > {source.vdev_name} > demo disk" if source.pool_name else None),
+        topology_label=(
+            f"{source.pool_name} > {source.vdev_name} > {source.vdev_class}"
+            if source.pool_name and source.vdev_name and source.vdev_class
+            else None
+        ),
         health=source.health,
         temperature_c=source.temperature_c,
         logical_unit_id=f"demo-lun-core-{source.slot:04d}" if occupied else None,

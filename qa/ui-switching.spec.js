@@ -437,9 +437,13 @@ test.describe("browser qa smoke", () => {
     const lastCollectionAt = new Date(Date.now() - 60_000).toISOString();
     const nextCollectionAt = new Date(Date.now() + 10 * 60_000).toISOString();
 
-    await page.route("**/api/history/refresh?mode=*", async (route) => {
-      const url = new URL(route.request().url());
-      const mode = url.searchParams.get("mode");
+    await page.route("**/api/history/refresh", async (route) => {
+      const request = route.request();
+      expect(request.method()).toBe("POST");
+      const payload = request.postDataJSON();
+      expect(Object.keys(payload)).toEqual(["mode"]);
+      const mode = payload.mode;
+      expect(["fast", "full"]).toContain(mode);
       modes.push(mode);
       await route.fulfill({
         status: 200,

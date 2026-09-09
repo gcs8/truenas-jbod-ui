@@ -58,6 +58,7 @@ from history_service.system_backup import (
     PROFILE_FILE_KEY,
     RUNTIME_OVERRIDES_FILE_KEY,
     SAS_FABRIC_ALIAS_FILE_KEY,
+    SEGMENT_FILE_MODE,
     SEVEN_ZIP_SIGNATURE,
     SEVEN_ZIP_TIMEOUT_SECONDS,
     SLOT_DETAIL_FILE_KEY,
@@ -4707,17 +4708,23 @@ sys.stdout.flush()
         transaction = _ImportActivationTransaction(
             {"first": b"FIRST", "second": b"SECOND"}
         )
-        real_copyfile = shutil.copyfile
+        real_copy_file_exclusive = transaction._copy_file_exclusive
 
-        def fail_second_copy(source, destination, *args, **kwargs):
+        def fail_second_copy(source, destination, *, owner, mode):
             if Path(destination).name == "second.key":
                 raise OSError("injected staging write failure")
-            return real_copyfile(source, destination, *args, **kwargs)
+            return real_copy_file_exclusive(
+                source,
+                destination,
+                owner=owner,
+                mode=mode,
+            )
 
         with self.assertRaisesRegex(OSError, "injected staging write failure"):
             with transaction:
-                with patch(
-                    "history_service.system_backup.shutil.copyfile",
+                with patch.object(
+                    transaction,
+                    "_copy_file_exclusive",
                     side_effect=fail_second_copy,
                 ):
                     transaction.activate_directory(
@@ -4891,6 +4898,156 @@ sys.stdout.flush()
                 transaction.activate_file(symlinked_parent / "missing.txt", "member")
 
         self.assertEqual(list(real_parent.iterdir()), [])
+
+    def test_missing_file_activation_keeps_descriptor_through_owner_mode_and_fsync(self) -> None:
+        target_path = self.temp_dir / "missing-target.txt"
+        transaction = _ImportActivationTransaction({"member": b"IMPORTED"})
+        real_fchown = os.fchown
+        real_fchmod = os.fchmod
+        real_fsync = os.fsync
+        events: list[tuple[str, int]] = []
+
+        def record_fchown(descriptor: int, uid: int, gid: int) -> None:
+            events.append(("fchown", descriptor))
+            real_fchown(descriptor, uid, gid)
+
+        def record_fchmod(descriptor: int, mode: int) -> None:
+            events.append(("fchmod", descriptor))
+            real_fchmod(descriptor, mode)
+
+        def record_fsync(descriptor: int) -> None:
+            if [name for name, _event_descriptor in events] == ["fchown", "fchmod"]:
+                events.append(("fsync", descriptor))
+            real_fsync(descriptor)
+
+        with transaction:
+            with (
+                patch("history_service.system_backup.os.fchown", side_effect=record_fchown),
+                patch("history_service.system_backup.os.fchmod", side_effect=record_fchmod),
+                patch("history_service.system_backup.os.fsync", side_effect=record_fsync),
+                patch.object(
+                    transaction,
+                    "_fsync_file",
+                    side_effect=PermissionError("synthetic path access lost after chown"),
+                ),
+            ):
+                transaction.activate_file(target_path, "member")
+            transaction.commit()
+
+        self.assertEqual(target_path.read_bytes(), b"IMPORTED")
+        self.assertEqual(target_path.stat().st_mode & 0o777, 0o660)
+        self.assertEqual([name for name, _descriptor in events], ["fchown", "fchmod", "fsync"])
+        self.assertEqual(len({descriptor for _name, descriptor in events}), 1)
+        self.assertEqual(list(self.temp_dir.glob(".missing-target.txt.restore-*")), [])
+
+    def test_directory_activation_does_not_reopen_owned_member_files(self) -> None:
+        target_dir = self.temp_dir / "missing-directory-target"
+        transaction = _ImportActivationTransaction({"member": b"IMPORTED"})
+
+        with transaction:
+            with patch.object(
+                transaction,
+                "_fsync_file",
+                side_effect=PermissionError("synthetic path access lost after chown"),
+            ) as fsync_file:
+                transaction.activate_directory(
+                    target_dir,
+                    [("member", Path("private/key"))],
+                )
+            transaction.commit()
+
+        restored = target_dir / "private/key"
+        self.assertEqual(restored.read_bytes(), b"IMPORTED")
+        self.assertEqual(restored.stat().st_mode & 0o777, 0o660)
+        fsync_file.assert_not_called()
+
+    def test_segmented_hot_staging_keeps_descriptor_through_metadata_and_fsync(self) -> None:
+        target_path = self.temp_dir / "missing-hot.sqlite3"
+        staged_path = self.temp_dir / ".missing-hot.sqlite3.restore-synthetic"
+        transaction = _ImportActivationTransaction({"hot": b"HOT"})
+        entry = transaction._record_target(target_path, expected_kind="file")
+
+        try:
+            with patch.object(
+                transaction,
+                "_fsync_file",
+                side_effect=PermissionError("synthetic path access lost after chown"),
+            ) as fsync_file:
+                transaction._stage_segmented_hot(
+                    staged_path,
+                    source_path=transaction._staged_member("hot"),
+                    target_path=target_path,
+                    entry=entry,
+                )
+
+            self.assertEqual(staged_path.read_bytes(), b"HOT")
+            self.assertEqual(staged_path.stat().st_mode & 0o777, 0o660)
+            fsync_file.assert_not_called()
+        finally:
+            transaction._cleanup_sibling_artifacts()
+            transaction._cleanup_root()
+
+    def test_segmented_hot_staging_does_not_claim_an_exclusive_open_race_loser(self) -> None:
+        target_path = self.temp_dir / "missing-hot.sqlite3"
+        staged_path = self.temp_dir / ".missing-hot.sqlite3.restore-synthetic"
+        transaction = _ImportActivationTransaction({"hot": b"HOT"})
+        entry = transaction._record_target(target_path, expected_kind="file")
+        real_copy_file_exclusive = transaction._copy_file_exclusive
+
+        def create_contender_before_exclusive_open(source, destination, *, owner, mode):
+            Path(destination).write_bytes(b"UNOWNED-RACER")
+            return real_copy_file_exclusive(
+                source,
+                destination,
+                owner=owner,
+                mode=mode,
+            )
+
+        try:
+            with patch.object(
+                transaction,
+                "_copy_file_exclusive",
+                side_effect=create_contender_before_exclusive_open,
+            ):
+                with self.assertRaises(FileExistsError):
+                    transaction._stage_segmented_hot(
+                        staged_path,
+                        source_path=transaction._staged_member("hot"),
+                        target_path=target_path,
+                        entry=entry,
+                    )
+
+            self.assertEqual(transaction._cleanup_sibling_artifacts(), [])
+            self.assertEqual(staged_path.read_bytes(), b"UNOWNED-RACER")
+        finally:
+            transaction._cleanup_root()
+
+    def test_segmented_directory_staging_does_not_reopen_owned_member_files(self) -> None:
+        target_dir = self.temp_dir / "missing-segments"
+        staged_dir = self.temp_dir / ".missing-segments.restore-synthetic"
+        transaction = _ImportActivationTransaction({"segment": b"SEGMENT"})
+        entry = transaction._record_target(target_dir, expected_kind="directory")
+
+        try:
+            with patch.object(
+                transaction,
+                "_fsync_file",
+                side_effect=PermissionError("synthetic path access lost after chown"),
+            ) as fsync_file:
+                transaction._stage_segmented_directory(
+                    staged_dir,
+                    target_dir=target_dir,
+                    entry=entry,
+                    members=[("segment", Path("segment.sqlite3"))],
+                )
+
+            restored = staged_dir / "segment.sqlite3"
+            self.assertEqual(restored.read_bytes(), b"SEGMENT")
+            self.assertEqual(restored.stat().st_mode & 0o777, SEGMENT_FILE_MODE)
+            fsync_file.assert_not_called()
+        finally:
+            transaction._cleanup_sibling_artifacts()
+            transaction._cleanup_root()
 
     def test_history_rollback_uses_store_snapshot_and_clears_sidecars(self) -> None:
         imported_source_dir = self.temp_dir / "imported-history-source"
@@ -5075,7 +5232,10 @@ sys.stdout.flush()
             {"file": b"IMPORTED", "key": b"IMPORTED-KEY"}
         )
 
-        with patch("history_service.system_backup.os.chown") as chown:
+        with (
+            patch("history_service.system_backup.os.chown") as chown,
+            patch("history_service.system_backup.os.fchown") as fchown,
+        ):
             with transaction:
                 transaction.activate_file(file_target, "file")
                 transaction.activate_directory(
@@ -5084,7 +5244,11 @@ sys.stdout.flush()
                 )
                 transaction.commit()
 
-        self.assertEqual(len(chown.call_args_list), 4)
+        self.assertEqual(len(chown.call_args_list), 2)
+        self.assertEqual(len(fchown.call_args_list), 2)
+        self.assertTrue(
+            all(call.args[1:] == expected_owner for call in fchown.call_args_list)
+        )
         self.assertTrue(
             all(
                 call.args[1:] == expected_owner
@@ -5093,7 +5257,7 @@ sys.stdout.flush()
             )
         )
 
-    def test_activation_applies_private_modes_to_missing_targets(self) -> None:
+    def test_activation_applies_shared_group_modes_to_missing_targets(self) -> None:
         file_target = self.temp_dir / "missing-file.txt"
         directory_target = self.temp_dir / "missing-directory"
         transaction = _ImportActivationTransaction(
@@ -5108,10 +5272,10 @@ sys.stdout.flush()
             )
             transaction.commit()
 
-        self.assertEqual(file_target.stat().st_mode & 0o777, 0o600)
-        self.assertEqual(directory_target.stat().st_mode & 0o777, 0o700)
-        self.assertEqual((directory_target / "nested").stat().st_mode & 0o777, 0o700)
-        self.assertEqual((directory_target / "nested/id_key").stat().st_mode & 0o777, 0o600)
+        self.assertEqual(file_target.stat().st_mode & 0o777, 0o660)
+        self.assertEqual(directory_target.stat().st_mode & 0o777, 0o770)
+        self.assertEqual((directory_target / "nested").stat().st_mode & 0o777, 0o770)
+        self.assertEqual((directory_target / "nested/id_key").stat().st_mode & 0o777, 0o660)
 
     def test_activation_inherits_parent_ownership_for_missing_targets(self) -> None:
         file_target = self.temp_dir / "missing-owner-file.txt"
@@ -5121,7 +5285,10 @@ sys.stdout.flush()
             {"file": b"IMPORTED", "key": b"IMPORTED-KEY"}
         )
 
-        with patch("history_service.system_backup.os.chown") as chown:
+        with (
+            patch("history_service.system_backup.os.chown") as chown,
+            patch("history_service.system_backup.os.fchown") as fchown,
+        ):
             with transaction:
                 transaction.activate_file(file_target, "file")
                 transaction.activate_directory(
@@ -5130,7 +5297,11 @@ sys.stdout.flush()
                 )
                 transaction.commit()
 
-        self.assertEqual(len(chown.call_args_list), 4)
+        self.assertEqual(len(chown.call_args_list), 2)
+        self.assertEqual(len(fchown.call_args_list), 2)
+        self.assertTrue(
+            all(call.args[1:] == expected_owner for call in fchown.call_args_list)
+        )
         self.assertTrue(
             all(
                 call.args[1:] == expected_owner
@@ -5145,7 +5316,10 @@ sys.stdout.flush()
         expected_owner = (directory_target.stat().st_uid, directory_target.stat().st_gid)
         transaction = _ImportActivationTransaction({"key": b"IMPORTED-KEY"})
 
-        with patch("history_service.system_backup.os.chown") as chown:
+        with (
+            patch("history_service.system_backup.os.chown") as chown,
+            patch("history_service.system_backup.os.fchown") as fchown,
+        ):
             with transaction:
                 transaction.activate_directory(
                     directory_target,
@@ -5153,7 +5327,9 @@ sys.stdout.flush()
                 )
                 transaction.commit()
 
-        self.assertEqual(len(chown.call_args_list), 3)
+        self.assertEqual(len(chown.call_args_list), 2)
+        fchown.assert_called_once()
+        self.assertEqual(fchown.call_args.args[1:], expected_owner)
         self.assertTrue(
             all(
                 call.args[1:] == expected_owner
@@ -5167,12 +5343,17 @@ sys.stdout.flush()
         expected_owner = (self.temp_dir.stat().st_uid, self.temp_dir.stat().st_gid)
         transaction = _ImportActivationTransaction({"file": b"IMPORTED"})
 
-        with patch("history_service.system_backup.os.chown") as chown:
+        with (
+            patch("history_service.system_backup.os.chown") as chown,
+            patch("history_service.system_backup.os.fchown") as fchown,
+        ):
             with transaction:
                 transaction.activate_file(file_target, "file")
                 transaction.commit()
 
-        self.assertEqual(len(chown.call_args_list), 3)
+        self.assertEqual(len(chown.call_args_list), 2)
+        fchown.assert_called_once()
+        self.assertEqual(fchown.call_args.args[1:], expected_owner)
         self.assertTrue(
             all(
                 call.args[1:] == expected_owner

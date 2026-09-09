@@ -231,7 +231,7 @@ class ContainerResourceContractTests(unittest.TestCase):
         self.assertNotIn("--uid 10001 --gid 10001", troubleshooting)
         self.assertNotIn("owned by `10001:10001`", troubleshooting)
 
-    def test_published_install_guides_pair_v0222_compose_and_image(self) -> None:
+    def test_published_install_guides_stay_on_v0222_until_v0230_is_published(self) -> None:
         for relative_path in (
             "README.md",
             "wiki/Quick-Start.md",
@@ -244,6 +244,7 @@ class ContainerResourceContractTests(unittest.TestCase):
                     guide,
                 )
                 self.assertIn("ghcr.io/gcs8/truenas-jbod-ui:v0.22.2", guide)
+                self.assertNotIn("ghcr.io/gcs8/truenas-jbod-ui:v0.23.0", guide)
 
         deployment_guide = (REPO_ROOT / "wiki/Docker-and-GHCR-Deployment.md").read_text(
             encoding="utf-8"
@@ -254,7 +255,7 @@ class ContainerResourceContractTests(unittest.TestCase):
             (REPO_ROOT / relative_path).read_text(encoding="utf-8")
             for relative_path in PUBLIC_DOCUMENT_PATHS
         )
-        self.assertNotIn("v0.22.3", docs)
+        self.assertNotIn("v0.23.1", docs)
         self.assertNotRegex(docs, r"JBOD_UI_IMAGE=[^\n]*v0\.18\.0")
 
     def test_admin_guides_match_current_origin_startup_and_read_ui_write_policy(self) -> None:

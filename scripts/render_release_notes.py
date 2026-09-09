@@ -2,8 +2,8 @@
 
 Usage::
 
-    python scripts/render_release_notes.py "## v0.22.3 - 2026-09-30" > notes.md
-    gh release create v0.22.3 --generate-notes --notes-file notes.md
+    python scripts/render_release_notes.py "## v0.23.0 - 2026-09-08" > notes.md
+    gh release create v0.23.0 --generate-notes --notes-file notes.md
 
 GitHub appends its generated, label-categorized pull request list (configured
 in ``.github/release.yml``) after the ``--notes-file`` text, so the release body
@@ -70,7 +70,7 @@ def render(text: str, header: str) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("section_header", help='Exact section header, for example "## v0.22.3 - 2026-09-30".')
+    parser.add_argument("section_header", help='Exact section header, for example "## v0.23.0 - 2026-09-08".')
     parser.add_argument("--changelog", type=Path, default=CHANGELOG_PATH, help="Path to CHANGELOG.md.")
     args = parser.parse_args(argv)
     try:

@@ -675,21 +675,24 @@
       "state": "healthy",
       "temperature_c": 29,
       "vdev_class": "spare",
-      "vdev_name": "spare-0"
+      "vdev_name": "spares"
     },
     {
       "bytes_read": 900516000000,
       "bytes_written": 500387000000,
       "device_name": "demo-disk-43",
-      "health": "AVAILABLE",
+      "health": "ONLINE",
       "model": "Demo Capacity HDD 18TB",
+      "pool_name": "demo-capacity",
       "power_on_hours": 13591,
       "serial": "DEMO-SN-CORE-0043",
       "size_bytes": 18000000000000,
       "size_human": "18 TB",
       "slot": 43,
       "state": "healthy",
-      "temperature_c": 30
+      "temperature_c": 30,
+      "vdev_class": "spare",
+      "vdev_name": "spares"
     },
     {
       "slot": 44,

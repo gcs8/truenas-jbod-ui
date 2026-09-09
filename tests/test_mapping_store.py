@@ -2025,7 +2025,7 @@ class MappingStoreInjectiveKeyV2Tests(unittest.TestCase):
                     else:
                         self.assertEqual(serials, {original.serial})
 
-    def test_atomic_writer_uses_exclusive_owner_only_temp(self) -> None:
+    def test_atomic_writer_uses_exclusive_shared_group_temp(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = self.make_store(temp_dir)
             observed: dict[str, int] = {}
@@ -2039,7 +2039,7 @@ class MappingStoreInjectiveKeyV2Tests(unittest.TestCase):
                     store.save_mapping(ManualMapping(
                         system_id="system-a", enclosure_id="enc-a", slot=1
                     ))
-            self.assertEqual(observed, {"mode": 0o600})
+            self.assertEqual(observed, {"mode": 0o660})
             self.assertFalse(store.file_path.exists())
             self.assertEqual(
                 list(store.file_path.parent.glob(f"{store.file_path.name}.*.tmp")), []
@@ -2425,6 +2425,24 @@ class MappingStoreAuthoritativeLoadTests(unittest.TestCase):
                 [self.mapping("NEW")],
             )
         raise AssertionError(f"unknown authority surface {operation}")
+
+    def test_first_mapping_generation_is_readable_and_writable_by_the_shared_app_group(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+
+            store.save_mapping(self.mapping())
+
+            self.assertEqual(store.file_path.stat().st_mode & 0o777, 0o660)
+
+    def test_mapping_replacement_upgrades_owner_only_mode_for_admin_backup_access(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+            self.write_valid_document(store, 2)
+            store.file_path.chmod(0o600)
+
+            store.save_mapping(self.mapping("NEW"))
+
+            self.assertEqual(store.file_path.stat().st_mode & 0o777, 0o660)
 
     def test_initial_source_read_errors_fail_closed_for_every_authority_surface(self) -> None:
         original_read_bytes = Path.read_bytes
@@ -2834,7 +2852,7 @@ class MappingStoreAuthoritativeLoadTests(unittest.TestCase):
                     self.SLOT,
                 )
 
-    def test_saves_publish_exact_owner_only_mode_under_every_umask(self) -> None:
+    def test_saves_publish_exact_shared_group_mode_under_every_umask(self) -> None:
         original_replace = os.replace
         for requested_umask in (0o000, 0o077, 0o777):
             with (
@@ -2861,8 +2879,8 @@ class MappingStoreAuthoritativeLoadTests(unittest.TestCase):
                 finally:
                     os.umask(previous_umask)
 
-                self.assertEqual(provisional_modes, [0o600])
-                self.assertEqual(os.stat(store.file_path).st_mode & 0o777, 0o600)
+                self.assertEqual(provisional_modes, [0o660])
+                self.assertEqual(os.stat(store.file_path).st_mode & 0o777, 0o660)
                 resolved = store.get_mapping(
                     self.SYSTEM_ID,
                     self.ENCLOSURE_ID,

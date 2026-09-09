@@ -99,6 +99,30 @@ class ReleaseWrapValidatorTests(unittest.TestCase):
         self.assertIn("runtime convergence was reverified", deployment_row)
         self.assertIn("Private deployment identifiers are not retained", deployment_row)
 
+    def test_v0230_pretag_wrap_is_complete_with_postpublish_hold(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        text = (repository / "docs" / "RELEASE_WRAP_0.23.0.md").read_text(encoding="utf-8")
+
+        self.assertEqual(
+            validate_release_wrap_text(
+                text,
+                allow_blocked=True,
+                phase="pre-tag",
+                require_wiki_verification=True,
+            ),
+            [],
+        )
+        self.assertEqual(
+            validate_release_wrap_text(
+                text,
+                phase="pre-tag",
+                require_wiki_verification=True,
+            ),
+            [],
+        )
+        self.assertIn("Pending owner publication: external wiki, public demo", text)
+        self.assertIn("GHCR publication, deployment, external Wiki/public-demo publication", text)
+
     def test_accepts_complete_release_wrap_evidence_table(self) -> None:
         issues = validate_release_wrap_text(_wrap_with_rows({}))
 

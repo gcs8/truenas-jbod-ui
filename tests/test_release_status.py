@@ -11,26 +11,26 @@ from app.services.release_status import ReleaseStatusService, describe_release_s
 
 
 class ReleaseStatusTests(unittest.TestCase):
-    def test_v0222_release_metadata_is_aligned(self) -> None:
+    def test_v0230_release_metadata_is_aligned(self) -> None:
         repository = Path(__file__).resolve().parents[1]
         package = json.loads((repository / "package.json").read_text(encoding="utf-8"))
         package_lock = json.loads((repository / "package-lock.json").read_text(encoding="utf-8"))
         changelog = (repository / "CHANGELOG.md").read_text(encoding="utf-8")
         roadmap = (repository / "docs" / "ROADMAP.md").read_text(encoding="utf-8")
         wiki_home = (repository / "wiki" / "Home.md").read_text(encoding="utf-8")
-        release_notes = (repository / "docs" / "RELEASE_NOTES_0.22.2.md").read_text(encoding="utf-8")
+        release_notes = (repository / "docs" / "RELEASE_NOTES_0.23.0.md").read_text(encoding="utf-8")
 
         from app import __version__
 
-        self.assertEqual(__version__, "0.22.2")
-        self.assertEqual(package["version"], "0.22.2")
-        self.assertEqual(package_lock["version"], "0.22.2")
-        self.assertEqual(package_lock["packages"][""]["version"], "0.22.2")
-        self.assertIn("## Unreleased", changelog)
-        self.assertLess(changelog.index("## Unreleased"), changelog.index("## v0.22.2"))
+        self.assertEqual(__version__, "0.23.0")
+        self.assertEqual(package["version"], "0.23.0")
+        self.assertEqual(package_lock["version"], "0.23.0")
+        self.assertEqual(package_lock["packages"][""]["version"], "0.23.0")
+        self.assertIn("## v0.23.0 - 2026-09-08", changelog)
+        self.assertLess(changelog.index("## v0.23.0"), changelog.index("## v0.22.2"))
         self.assertIn("## v0.22.2 - 2026-09-01", changelog)
-        self.assertIn("# Release Notes - v0.22.2", release_notes)
-        self.assertIn("issue #124", release_notes)
+        self.assertIn("# Release Notes - v0.23.0", release_notes)
+        self.assertIn("two synthetic spares", release_notes)
 
         release_url = "https://github.com/gcs8/truenas-jbod-ui/releases/tag/v0.22.2"
         for current_doc in (roadmap, wiki_home):

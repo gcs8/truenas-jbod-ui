@@ -670,18 +670,24 @@ class SegmentedRestoreRecoveryTests(unittest.TestCase):
                 packaging="zip",
                 included_paths=[HISTORY_DB_KEY],
             )
-            original_copyfile = shutil.copyfile
+            original_copy_file_exclusive = _ImportActivationTransaction._copy_file_exclusive
 
-            def crash_during_adjacent_stage(source_path, target_path, *args, **kwargs):
+            def crash_during_adjacent_stage(source_path, target_path, *, owner, mode):
                 target_path = Path(target_path)
                 if target_path.name.startswith(f".{target.name}.restore-"):
                     target_path.write_bytes(b"partial-candidate")
                     raise SimulatedRestoreCrash("candidate-hot-stage")
-                return original_copyfile(source_path, target_path, *args, **kwargs)
+                return original_copy_file_exclusive(
+                    source_path,
+                    target_path,
+                    owner=owner,
+                    mode=mode,
+                )
 
             try:
-                with patch(
-                    "history_service.system_backup.shutil.copyfile",
+                with patch.object(
+                    _ImportActivationTransaction,
+                    "_copy_file_exclusive",
                     side_effect=crash_during_adjacent_stage,
                 ):
                     with self.assertRaises(SimulatedRestoreCrash):

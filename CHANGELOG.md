@@ -26,11 +26,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
-## Unreleased
+## v0.23.0 - 2026-09-08
 
-Development has resumed on `main` after `v0.22.2`. Changes recorded here are
-not part of that published tag. Every pull request merged after `v0.22.2` has
-an entry below.
+This release includes every pull request merged after `v0.22.2` through the
+v0.23.0 release candidate.
 
 ### Highlights
 
@@ -213,6 +212,9 @@ them before starting the new images.
 
 ### Changed
 
+- Prepared the v0.23.0 version metadata, release notes and HOLD wrap, current
+  install guidance, production-shaped synthetic public demo, exact-byte
+  screenshots, and complete generated-release category labels (#395).
 - Split local validation into distinct portable safe and full modes, retained
   the performance baseline and exact CI source-gate parity, and corrected
   Windows browser commands (#384).
