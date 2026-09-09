@@ -212,6 +212,30 @@ def _build_sas_fabric_result(
     raw: dict[str, Any] | None = None,
     sort_controllers: bool = False,
 ) -> SasFabricSnapshot:
+    # Keep bay IDs/kinds for selection and alias compatibility, but never present
+    # a logical inventory ordinal as a known physical bay.
+    location_unknown_slots = [slot for slot in snapshot.slots if not slot.physical_location_known]
+    if location_unknown_slots:
+        warnings = [*(warnings or []), (
+            "Logical disk inventory (virtual): physical location unavailable for unmapped disks. "
+            "Disk numbers are inventory ordinals, not physical bays."
+        )]
+        for slot in location_unknown_slots:
+            object_id = f"bay:{slot.slot}"
+            provenance = {
+                "physical_location_known": False,
+                "virtual_enclosure": bool(slot.raw_status.get("virtual_enclosure")),
+            }
+            node = (nodes or {}).get(object_id)
+            trace = (traces or {}).get(object_id)
+            for item in (node, trace):
+                if item is not None:
+                    item.label = f"Disk {slot.slot + 1}"
+                    item.metrics.update(provenance)
+                    item.evidence = _dedupe_strings([*item.evidence, "physical location unavailable"])
+            if node is not None:
+                node.raw.update(provenance)
+        available = available or any(_slot_has_disk(slot) for slot in location_unknown_slots)
     controller_rows = controllers or []
     if sort_controllers:
         controller_rows = sorted(controller_rows, key=lambda item: str(item.get("name") or ""))
@@ -288,7 +312,7 @@ def _add_backplane_zone_nodes(
     nodes: dict[str, SasFabricNode],
     snapshot: InventorySnapshot,
 ) -> dict[int, dict[str, Any]]:
-    backplane_zones = _backplane_zones_for_slots(snapshot.slots)
+    backplane_zones = _backplane_zones_for_slots([slot for slot in snapshot.slots if slot.physical_location_known])
     for zone in backplane_zones.values():
         add_node(
             nodes,
@@ -369,6 +393,13 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
 
     adapter_summary = parse_mpr_adapter_summary(normalized_outputs.get("mprutil show adapters", ""))
     unit_data = _parse_unit_data(normalized_outputs)
+    if snapshot.slots and all(not slot.physical_location_known for slot in snapshot.slots):
+        # The legacy unit -1 placeholder is not observed controller evidence.
+        if -1 in unit_data and not any(
+            normalized_outputs.get(f"mprutil show {subcommand}", "").strip()
+            for subcommand in CORE_MPRUTIL_UNIT_SUBCOMMANDS
+        ):
+            unit_data.pop(-1)
     pci_controllers = parse_pciconf_sas_controllers(normalized_outputs.get("pciconf -lv", ""))
     pcie_slots = parse_dmidecode_slots(normalized_outputs.get("dmidecode slot", ""))
     mpr_sysctl_locations = parse_mpr_sysctl_locations(normalized_outputs.get("mpr sysctl pci locations", ""))
@@ -2130,7 +2161,10 @@ def _linux_storage_route(
         "enclosure_kind": "storage-enclosure",
         "enclosure_label": enclosure_label,
         "enclosure_raw_id": snapshot.selected_enclosure_id,
-        "enclosure_evidence": ["profile/storage view"],
+        "enclosure_evidence": (
+            ["inventory snapshot", "virtual inventory", "physical location unavailable"]
+            if not slot.physical_location_known else ["profile/storage view"]
+        ),
         "enclosure_raw": {
             "source": source,
             "fabric_kind": fabric_kind,
