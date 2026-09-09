@@ -9,7 +9,7 @@ import re
 import time
 import zipfile
 from collections import Counter, OrderedDict
-from collections.abc import Awaitable, Callable, Hashable
+from collections.abc import Awaitable, Callable, Hashable, Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from ipaddress import ip_address
@@ -49,11 +49,21 @@ DEFAULT_EXPORT_PENDING_BYTES = 32 * 1024 * 1024
 DEFAULT_EXPORT_RENDER_RESERVATION_BYTES = DEFAULT_EXPORT_PENDING_BYTES // DEFAULT_EXPORT_PENDING_KEYS
 EXPORT_MAX_CONFIGURED_HOSTNAMES = 256
 EXPORT_MAX_CONFIGURED_HOSTNAME_CHARS = 1024
+AOC_SLG4_2H8M2_CARD_IMAGE = "images/aoc-slg4-2h8m2.jpg"
+NVME_CARRIER_CARD_IMAGE = "images/hyper-m2-gen3-card.png"
+SATADOM_CARD_IMAGE = "images/satadom-ml-3ie3-v2.png"
 OFFLINE_IMAGE_ASSETS = {
-    "images/aoc-slg4-2h8m2.jpg": "image/jpeg",
-    "images/hyper-m2-gen3-card.png": "image/png",
-    "images/satadom-ml-3ie3-v2.png": "image/png",
+    AOC_SLG4_2H8M2_CARD_IMAGE: "image/jpeg",
+    NVME_CARRIER_CARD_IMAGE: "image/png",
+    SATADOM_CARD_IMAGE: "image/png",
 }
+# The main UI picks a card photo from these identities (see nvmeCarrierBoardLayout
+# and isSatadomBootTemplate in app.js); the exporter mirrors that choice so an
+# export only carries the photos its views and enclosures can draw.
+AOC_SLG4_2H8M2_TEMPLATE_ID = "aoc-slg4-2h8m2-2"
+AOC_SLG4_2H8M2_PROFILE_ID = "supermicro-aoc-slg4-2h8m2"
+SATADOM_PAIR_TEMPLATE_ID = "satadom-pair-2"
+NVME_CARRIER_FACE_STYLE = "nvme-carrier"
 IPV4_PATTERN = re.compile(r"(?<![\dA-Fa-f:])(?P<ip>(?:\d{1,3}\.){3}\d{1,3})(?![\dA-Fa-f:])")
 IPV6_PATTERN = re.compile(r"(?<![:\w])(?P<ip>(?:[0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f]{1,4})(?![:\w])")
 # Trailing DNS labels appended to a hostname token, so a redacted host swallows
@@ -855,6 +865,10 @@ class SnapshotExportService:
         self._render_cache = EXPORT_RENDER_CACHE
         self._zip_cache = EXPORT_ZIP_CACHE
         self._work_coordinator = work_coordinator or EXPORT_WORK_COORDINATOR
+        # Static text and photo data URLs are read once per service and reused by
+        # every render, including the repeated passes of an oversize export.
+        self._static_text_cache: dict[str, str] = {}
+        self._image_data_url_cache: dict[str, str] = {}
 
     async def build_enclosure_snapshot_export(
         self,
@@ -1249,6 +1263,149 @@ class SnapshotExportService:
                 ],
             )
         template = self.templates.env.get_template("index.html")
+
+        # Everything below is the same for every downsampling pass; only the history
+        # cache, its counts, and the export summary change per pass.
+        smart_summary_cache_for_export = dict(base_smart_summary_cache)
+        live_enclosure_smart_summary_cache_for_export = {
+            enclosure_id: dict(slot_cache)
+            for enclosure_id, slot_cache in base_live_enclosure_smart_summary_cache.items()
+        }
+        storage_view_smart_summary_cache_for_export = {
+            view_id: dict(slot_cache)
+            for view_id, slot_cache in base_storage_view_smart_summary_cache.items()
+        }
+        live_enclosure_snapshots_for_export = dict(live_enclosure_snapshots_for_render)
+        storage_view_runtime_for_export = storage_view_runtime
+        snapshot_for_export = snapshot
+        if redactor is not None:
+            snapshot_for_export = redactor.redact_snapshot(snapshot)
+            smart_summary_cache_for_export = redactor.redact_smart_summary_cache(smart_summary_cache_for_export)
+            live_enclosure_snapshots_for_export = {}
+            redacted_live_enclosure_smart_summary_cache: dict[str, dict[str, dict[str, Any]]] = {}
+            for enclosure_id, live_snapshot in live_enclosure_snapshots_for_render.items():
+                redacted_live_snapshot = redactor.redact_snapshot(live_snapshot)
+                redacted_enclosure_id = redacted_live_snapshot.selected_enclosure_id or redactor.redact_object(enclosure_id)
+                if not redacted_enclosure_id:
+                    continue
+                live_enclosure_snapshots_for_export[redacted_enclosure_id] = redacted_live_snapshot
+                redacted_live_enclosure_smart_summary_cache[redacted_enclosure_id] = redactor.redact_object(
+                    live_enclosure_smart_summary_cache_for_export.get(enclosure_id, {})
+                )
+            live_enclosure_smart_summary_cache_for_export = redacted_live_enclosure_smart_summary_cache
+            if storage_view_runtime_for_export is not None:
+                storage_view_runtime_for_export = StorageViewRuntimePayload.model_validate(
+                    redactor.redact_object(storage_view_runtime_for_export.model_dump(mode="json"))
+                )
+            storage_view_smart_summary_cache_for_export = redactor.redact_object(
+                storage_view_smart_summary_cache_for_export
+            )
+        storage_view_runtime_for_context = storage_view_runtime_for_export or StorageViewRuntimePayload(
+            system_id=snapshot_for_export.selected_system_id,
+            system_label=snapshot_for_export.selected_system_label,
+            views=[],
+        )
+
+        initial_selected_storage_view_id = None
+        if (
+            selected_storage_view_index is not None
+            and storage_view_runtime_for_export is not None
+            and selected_storage_view_index < len(storage_view_runtime_for_export.views)
+        ):
+            initial_selected_storage_view_id = storage_view_runtime_for_export.views[
+                selected_storage_view_index
+            ].id
+        initial_selected_slot = normalized_slot
+        if normalized_storage_view_id is not None and initial_selected_storage_view_id is None:
+            initial_selected_slot = None
+
+        smart_summary_count = sum(1 for payload in smart_summary_cache_for_export.values() if payload)
+        live_enclosure_smart_summary_count = sum(
+            1
+            for slot_cache in live_enclosure_smart_summary_cache_for_export.values()
+            for payload in slot_cache.values()
+            if payload
+        )
+        live_smart_summary_count = live_enclosure_smart_summary_count or smart_summary_count
+        storage_view_smart_summary_count = sum(
+            1
+            for slot_cache in storage_view_smart_summary_cache_for_export.values()
+            for payload in slot_cache.values()
+            if payload
+        )
+        total_smart_summary_count = live_smart_summary_count + storage_view_smart_summary_count
+        live_enclosure_count = len(live_enclosure_snapshots_for_export) or 1
+        visible_bay_count = (
+            sum(
+                live_snapshot.layout_slot_count or len(live_snapshot.slots)
+                for live_snapshot in live_enclosure_snapshots_for_export.values()
+            )
+            if live_enclosure_snapshots_for_export
+            else snapshot_for_export.layout_slot_count or len(snapshot_for_export.slots)
+        )
+        redaction_level = "partial" if redact_sensitive else "none"
+        redaction_label = "Partial" if redact_sensitive else (identifier_policy_label or "None")
+        redaction_note = (
+            "Host aliases and partial identifier masking applied"
+            if redact_sensitive
+            else identifier_policy_note or "Original identifiers included"
+        )
+        export_meta_base = {
+            "generated_at": generated_at.isoformat(),
+            "app_version": __version__,
+            "scope_kind": "system" if live_enclosure_count > 1 else "enclosure",
+            "scope_label": (
+                f"{snapshot_for_export.selected_system_label or snapshot_for_export.selected_system_id or 'Selected system'} ({live_enclosure_count} live enclosures)"
+                if live_enclosure_count > 1
+                else snapshot_for_export.selected_enclosure_label or snapshot_for_export.selected_enclosure_id or "Current Enclosure"
+            ),
+            "system_label": snapshot_for_export.selected_system_label,
+            "enclosure_count": live_enclosure_count,
+            "visible_bay_count": visible_bay_count,
+            "history_window_hours": normalized_window_hours,
+            "history_window_label": self._format_history_window_label(normalized_window_hours),
+            "smart_summary_count": total_smart_summary_count,
+            "storage_view_count": len(storage_view_runtime_for_export.views) if storage_view_runtime_for_export else 0,
+            "selected_slot": initial_selected_slot,
+            "selected_storage_view_id": initial_selected_storage_view_id,
+            "io_chart_mode": normalized_chart_mode,
+            "redaction": redaction_level,
+            "redaction_label": redaction_label,
+            "redaction_note": redaction_note,
+            "offline": True,
+            "size_limit_bytes": self.size_limit_bytes,
+            "size_limit_label": format_bytes(self.size_limit_bytes),
+        }
+        with perf_stage("snapshot_export.serialize_invariant_payloads"):
+            context_base = {
+                "request": request,
+                "sas_fabric_view_url": "#sas-fabric-panel",
+                "snapshot": snapshot_for_export,
+                "storage_view_runtime": storage_view_runtime_for_context,
+                "settings": self.settings,
+                "initial_snapshot_json": json.dumps(snapshot_for_export.model_dump(mode="json")),
+                "initial_storage_view_runtime_json": json.dumps(storage_view_runtime_for_context.model_dump(mode="json")),
+                "snapshot_mode": True,
+                "preloaded_smart_summary_json": json.dumps(smart_summary_cache_for_export),
+                "preloaded_snapshots_json": json.dumps(
+                    {
+                        enclosure_id: live_snapshot.model_dump(mode="json")
+                        for enclosure_id, live_snapshot in live_enclosure_snapshots_for_export.items()
+                    }
+                ),
+                "preloaded_snapshot_smart_summary_json": json.dumps(live_enclosure_smart_summary_cache_for_export),
+                "preloaded_storage_view_smart_summary_json": json.dumps(storage_view_smart_summary_cache_for_export),
+                "initial_selected_slot_json": json.dumps(initial_selected_slot),
+                "initial_selected_storage_view_id_json": json.dumps(initial_selected_storage_view_id),
+                "initial_history_timeframe_hours_json": json.dumps(normalized_window_hours),
+                "initial_history_io_chart_mode_json": json.dumps(normalized_chart_mode),
+            }
+        image_assets = self._referenced_image_assets(
+            (snapshot_for_export, *live_enclosure_snapshots_for_export.values()),
+            storage_view_runtime_for_export,
+        )
+        filename = self._build_filename(snapshot_for_export, generated_at)
+
         rendered_candidate: RenderedSnapshotExport | None = None
         for strategy in self._build_downsampling_strategies():
             with perf_stage(
@@ -1263,55 +1420,9 @@ class SnapshotExportService:
                     target_points_per_series=strategy["target_points_per_series"],
                     max_events_per_slot=strategy["max_events_per_slot"],
                 )
-            smart_summary_cache_for_export = dict(base_smart_summary_cache)
-            live_enclosure_smart_summary_cache_for_export = {
-                enclosure_id: dict(slot_cache)
-                for enclosure_id, slot_cache in base_live_enclosure_smart_summary_cache.items()
-            }
-            storage_view_smart_summary_cache_for_export = {
-                view_id: dict(slot_cache)
-                for view_id, slot_cache in base_storage_view_smart_summary_cache.items()
-            }
-            live_enclosure_snapshots_for_export = dict(live_enclosure_snapshots_for_render)
-            storage_view_runtime_for_export = storage_view_runtime
-            snapshot_for_export = snapshot
             if redactor is not None:
-                snapshot_for_export = redactor.redact_snapshot(snapshot)
                 history_cache_for_export = redactor.redact_history_cache(history_cache_for_export)
                 history_cache_for_export = self._rekey_history_cache(history_cache_for_export)
-                smart_summary_cache_for_export = redactor.redact_smart_summary_cache(smart_summary_cache_for_export)
-                live_enclosure_snapshots_for_export = {}
-                redacted_live_enclosure_smart_summary_cache: dict[str, dict[str, dict[str, Any]]] = {}
-                for enclosure_id, live_snapshot in live_enclosure_snapshots_for_render.items():
-                    redacted_live_snapshot = redactor.redact_snapshot(live_snapshot)
-                    redacted_enclosure_id = redacted_live_snapshot.selected_enclosure_id or redactor.redact_object(enclosure_id)
-                    if not redacted_enclosure_id:
-                        continue
-                    live_enclosure_snapshots_for_export[redacted_enclosure_id] = redacted_live_snapshot
-                    redacted_live_enclosure_smart_summary_cache[redacted_enclosure_id] = redactor.redact_object(
-                        live_enclosure_smart_summary_cache_for_export.get(enclosure_id, {})
-                    )
-                live_enclosure_smart_summary_cache_for_export = redacted_live_enclosure_smart_summary_cache
-                if storage_view_runtime_for_export is not None:
-                    storage_view_runtime_for_export = StorageViewRuntimePayload.model_validate(
-                        redactor.redact_object(storage_view_runtime_for_export.model_dump(mode="json"))
-                    )
-                storage_view_smart_summary_cache_for_export = redactor.redact_object(
-                    storage_view_smart_summary_cache_for_export
-                )
-
-            initial_selected_storage_view_id = None
-            if (
-                selected_storage_view_index is not None
-                and storage_view_runtime_for_export is not None
-                and selected_storage_view_index < len(storage_view_runtime_for_export.views)
-            ):
-                initial_selected_storage_view_id = storage_view_runtime_for_export.views[
-                    selected_storage_view_index
-                ].id
-            initial_selected_slot = normalized_slot
-            if normalized_storage_view_id is not None and initial_selected_storage_view_id is None:
-                initial_selected_slot = None
 
             tracked_slots = sum(1 for payload in history_cache_for_export.values() if payload.get("available"))
             metric_sample_count = sum(
@@ -1319,71 +1430,17 @@ class SnapshotExportService:
                 for payload in history_cache_for_export.values()
                 for samples in (payload.get("metrics") or {}).values()
             )
-            smart_summary_count = sum(1 for payload in smart_summary_cache_for_export.values() if payload)
-            live_enclosure_smart_summary_count = sum(
-                1
-                for slot_cache in live_enclosure_smart_summary_cache_for_export.values()
-                for payload in slot_cache.values()
-                if payload
-            )
-            live_smart_summary_count = live_enclosure_smart_summary_count or smart_summary_count
-            storage_view_smart_summary_count = sum(
-                1
-                for slot_cache in storage_view_smart_summary_cache_for_export.values()
-                for payload in slot_cache.values()
-                if payload
-            )
-            total_smart_summary_count = live_smart_summary_count + storage_view_smart_summary_count
             event_count = sum(len(payload.get("events") or []) for payload in history_cache_for_export.values())
             history_available = tracked_slots > 0
-            live_enclosure_count = len(live_enclosure_snapshots_for_export) or 1
-            visible_bay_count = (
-                sum(
-                    live_snapshot.layout_slot_count or len(live_snapshot.slots)
-                    for live_snapshot in live_enclosure_snapshots_for_export.values()
-                )
-                if live_enclosure_snapshots_for_export
-                else snapshot_for_export.layout_slot_count or len(snapshot_for_export.slots)
-            )
-            redaction_level = "partial" if redact_sensitive else "none"
-            redaction_label = "Partial" if redact_sensitive else (identifier_policy_label or "None")
-            redaction_note = (
-                "Host aliases and partial identifier masking applied"
-                if redact_sensitive
-                else identifier_policy_note or "Original identifiers included"
-            )
 
             export_meta = {
-                "generated_at": generated_at.isoformat(),
-                "app_version": __version__,
-                "scope_kind": "system" if live_enclosure_count > 1 else "enclosure",
-                "scope_label": (
-                    f"{snapshot_for_export.selected_system_label or snapshot_for_export.selected_system_id or 'Selected system'} ({live_enclosure_count} live enclosures)"
-                    if live_enclosure_count > 1
-                    else snapshot_for_export.selected_enclosure_label or snapshot_for_export.selected_enclosure_id or "Current Enclosure"
-                ),
-                "system_label": snapshot_for_export.selected_system_label,
-                "enclosure_count": live_enclosure_count,
-                "visible_bay_count": visible_bay_count,
-                "history_window_hours": normalized_window_hours,
-                "history_window_label": self._format_history_window_label(normalized_window_hours),
+                **export_meta_base,
                 "history_available": history_available,
                 "tracked_slots": tracked_slots,
                 "metric_sample_count": metric_sample_count,
-                "smart_summary_count": total_smart_summary_count,
-                "storage_view_count": len(storage_view_runtime_for_export.views) if storage_view_runtime_for_export else 0,
                 "event_count": event_count,
-                "selected_slot": initial_selected_slot,
-                "selected_storage_view_id": initial_selected_storage_view_id,
-                "io_chart_mode": normalized_chart_mode,
-                "redaction": redaction_level,
-                "redaction_label": redaction_label,
-                "redaction_note": redaction_note,
                 "downsampling_label": downsampling_meta["label"],
                 "downsampling_note": downsampling_meta["note"],
-                "offline": True,
-                "size_limit_bytes": self.size_limit_bytes,
-                "size_limit_label": format_bytes(self.size_limit_bytes),
             }
             history_summary = {
                 "counts": {
@@ -1398,51 +1455,15 @@ class SnapshotExportService:
             }
 
             context = {
-                "request": request,
-                "sas_fabric_view_url": "#sas-fabric-panel",
-                "snapshot": snapshot_for_export,
-                "storage_view_runtime": storage_view_runtime_for_export
-                or StorageViewRuntimePayload(
-                    system_id=snapshot_for_export.selected_system_id,
-                    system_label=snapshot_for_export.selected_system_label,
-                    views=[],
-                ),
-                "settings": self.settings,
-                "initial_snapshot_json": json.dumps(snapshot_for_export.model_dump(mode="json")),
-                "initial_storage_view_runtime_json": json.dumps(
-                    (
-                        storage_view_runtime_for_export
-                        or StorageViewRuntimePayload(
-                            system_id=snapshot_for_export.selected_system_id,
-                            system_label=snapshot_for_export.selected_system_label,
-                            views=[],
-                        )
-                    ).model_dump(mode="json")
-                ),
+                **context_base,
                 "history_configured": history_available,
-                "snapshot_mode": True,
                 "snapshot_export_meta": export_meta,
                 "snapshot_export_meta_json": json.dumps(export_meta),
                 "preloaded_history_json": json.dumps(history_cache_for_export),
-                "preloaded_smart_summary_json": json.dumps(smart_summary_cache_for_export),
-                "preloaded_snapshots_json": json.dumps(
-                    {
-                        enclosure_id: live_snapshot.model_dump(mode="json")
-                        for enclosure_id, live_snapshot in live_enclosure_snapshots_for_export.items()
-                    }
-                ),
-                "preloaded_snapshot_smart_summary_json": json.dumps(live_enclosure_smart_summary_cache_for_export),
-                "preloaded_storage_view_smart_summary_json": json.dumps(storage_view_smart_summary_cache_for_export),
                 "preloaded_history_summary_json": json.dumps(history_summary),
-                "initial_selected_slot_json": json.dumps(initial_selected_slot),
-                "initial_selected_storage_view_id_json": json.dumps(
-                    initial_selected_storage_view_id
-                ),
-                "initial_history_timeframe_hours_json": json.dumps(normalized_window_hours),
                 "initial_history_panel_open_json": json.dumps(
                     bool(history_panel_open and initial_selected_slot is not None and history_available)
                 ),
-                "initial_history_io_chart_mode_json": json.dumps(normalized_chart_mode),
             }
 
             with perf_stage("snapshot_export.render_template"):
@@ -1451,8 +1472,8 @@ class SnapshotExportService:
                     request,
                     template,
                     context,
+                    image_assets,
                 )
-            filename = self._build_filename(snapshot_for_export, generated_at)
             rendered_candidate = RenderedSnapshotExport(
                 cache_key=render_cache_key,
                 filename=filename,
@@ -1479,8 +1500,40 @@ class SnapshotExportService:
         request: Request,
         template: Any,
         context: dict[str, Any],
+        image_assets: frozenset[str] | None = None,
     ) -> str:
-        return self._inline_static_assets(request, template.render(context))
+        return self._inline_static_assets(request, template.render(context), image_assets)
+
+    @staticmethod
+    def _referenced_image_assets(
+        snapshots: Iterable[InventorySnapshot],
+        storage_view_runtime: StorageViewRuntimePayload | None,
+    ) -> frozenset[str]:
+        """Card photos the main UI can draw for this export.
+
+        The script keeps all three photo paths in its source, so the choice has to
+        come from what is exported: a carrier board photo behind every
+        ``nvme_carrier`` view or NVMe-carrier enclosure profile (the AOC-SLG4-2H8M2
+        has its own), and the SATADOM photo for a ``satadom-pair-2`` boot view.
+        """
+        referenced: set[str] = set()
+
+        def add_carrier_board(*identities: str | None) -> None:
+            if AOC_SLG4_2H8M2_TEMPLATE_ID in identities or AOC_SLG4_2H8M2_PROFILE_ID in identities:
+                referenced.add(AOC_SLG4_2H8M2_CARD_IMAGE)
+            else:
+                referenced.add(NVME_CARRIER_CARD_IMAGE)
+
+        for view in storage_view_runtime.views if storage_view_runtime is not None else []:
+            if view.kind == "nvme_carrier":
+                add_carrier_board(view.template_id, view.id)
+            elif view.kind == "boot_devices" and view.template_id == SATADOM_PAIR_TEMPLATE_ID:
+                referenced.add(SATADOM_CARD_IMAGE)
+        for candidate in snapshots:
+            profile = candidate.selected_profile
+            if profile is not None and profile.face_style == NVME_CARRIER_FACE_STYLE:
+                add_carrier_board(profile.id)
+        return frozenset(referenced)
 
     @staticmethod
     def _build_downsampling_strategies() -> list[dict[str, int | None]]:
@@ -2652,9 +2705,18 @@ class SnapshotExportService:
         window = history_window_hours if history_window_hours is not None else "all"
         return f"history|window={window}|{self._build_snapshot_signature(snapshot)}"
 
-    def _inline_static_assets(self, request: Request, html: str) -> str:
-        inline_css = (STATIC_DIR / "style.css").read_text(encoding="utf-8")
-        inline_js = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    def _inline_static_assets(
+        self,
+        request: Request,
+        html: str,
+        image_assets: Iterable[str] | None = None,
+    ) -> str:
+        """Embed the stylesheet, the script, and the card photos named by ``image_assets``.
+
+        ``None`` embeds every known photo; renders pass the set the export can draw.
+        """
+        inline_css = self._static_text("style.css")
+        inline_js = self._static_text("app.js")
         stylesheet_href = str(request.url_for("static", path="style.css"))
         script_src = str(request.url_for("static", path="app.js"))
 
@@ -2668,15 +2730,27 @@ class SnapshotExportService:
             f'<script src="{script_src}" defer></script>',
             f"<script>\n{inline_js}\n</script>",
         )
-        html = self._inline_static_image_assets(html)
+        html = self._inline_static_image_assets(html, image_assets)
         return html
 
-    @staticmethod
-    def _inline_static_image_assets(html: str) -> str:
-        for relative_path, mime_type in OFFLINE_IMAGE_ASSETS.items():
-            asset_path = STATIC_DIR / relative_path
-            encoded = base64.b64encode(asset_path.read_bytes()).decode("ascii")
-            data_url = f"data:{mime_type};base64,{encoded}"
+    def _static_text(self, name: str) -> str:
+        text = self._static_text_cache.get(name)
+        if text is None:
+            text = (STATIC_DIR / name).read_text(encoding="utf-8")
+            self._static_text_cache[name] = text
+        return text
+
+    def _image_data_url(self, relative_path: str) -> str:
+        data_url = self._image_data_url_cache.get(relative_path)
+        if data_url is None:
+            encoded = base64.b64encode((STATIC_DIR / relative_path).read_bytes()).decode("ascii")
+            data_url = f"data:{OFFLINE_IMAGE_ASSETS[relative_path]};base64,{encoded}"
+            self._image_data_url_cache[relative_path] = data_url
+        return data_url
+
+    def _inline_static_image_assets(self, html: str, image_assets: Iterable[str] | None = None) -> str:
+        for relative_path in OFFLINE_IMAGE_ASSETS if image_assets is None else image_assets:
+            data_url = self._image_data_url(relative_path)
             html = html.replace(f'"/static/{relative_path}"', f'"{data_url}"')
             html = html.replace(f"'/static/{relative_path}'", f"'{data_url}'")
         return html
