@@ -26,6 +26,25 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Security
+
+- Restore refuses a backup made by a newer version of the app before any file
+  is extracted or replaced, so a v0.24 backup cannot leave a v0.23 deployment
+  with settings it does not understand (#495).
+
+### Fixed
+
+- A pending history rotation, migration or restore marker now names the marker
+  file and the exact recovery command instead of only saying the database is
+  closed, and logs it once at startup. Restore checks free space in the history
+  and temporary folders before extracting, runs the full history integrity check
+  once per import instead of twice, and the backup and restore errors shown in
+  the admin UI are written in plain words with raw 7-Zip output kept in the log.
+  The in-memory import path that nothing in production used is gone; byte
+  imports now take the same file-backed path as the admin UI (#495).
+
 ## v0.23.0 - 2026-09-08
 
 This release includes every pull request merged after `v0.22.2` through the
