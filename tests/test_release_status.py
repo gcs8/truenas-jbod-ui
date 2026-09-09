@@ -144,7 +144,7 @@ class ReleaseStatusTests(unittest.TestCase):
         status, summary = describe_release_status("0.15.0-dev", "v0.14.1")
 
         self.assertEqual(status, "dev-build")
-        self.assertEqual(summary, "Dev build · latest stable v0.14.1")
+        self.assertEqual(summary, "Development build (newest release is v0.14.1)")
 
     def test_release_status_service_refresh_populates_latest_release_payload(self) -> None:
         payload = {
@@ -161,7 +161,7 @@ class ReleaseStatusTests(unittest.TestCase):
             snapshot = asyncio.run(service.refresh(force=True))
 
         self.assertEqual(snapshot["status"], "current")
-        self.assertEqual(snapshot["summary"], "Latest tagged release")
+        self.assertEqual(snapshot["summary"], "Up to date")
         self.assertEqual(snapshot["latest_tag"], "v0.14.1")
         self.assertEqual(snapshot["latest_url"], payload["html_url"])
 
@@ -172,5 +172,24 @@ class ReleaseStatusTests(unittest.TestCase):
             snapshot = asyncio.run(service.refresh(force=True))
 
         self.assertEqual(snapshot["status"], "error")
-        self.assertEqual(snapshot["summary"], "Release check unavailable")
+        self.assertEqual(snapshot["summary"], "Could not check for updates")
         self.assertIn("offline", snapshot["error"])
+
+    def test_describe_release_status_copy_avoids_git_speak(self) -> None:
+        self.assertEqual(describe_release_status("0.14.1", None), ("unknown", "Release information unavailable"))
+        self.assertEqual(describe_release_status("0.14.1-dev", "v0.14.1"), ("dev-build", "Development build of v0.14.1"))
+        self.assertEqual(describe_release_status("0.15.0", "v0.14.1"), ("ahead", "Newer than the latest release (v0.14.1)"))
+        for _status, summary in (
+            describe_release_status("0.14.1", "v0.14.1"),
+            describe_release_status("0.14.0", "v0.14.1"),
+            describe_release_status("0.15.0-dev", "v0.14.1"),
+        ):
+            self.assertFalse(summary.endswith("."), summary)
+            self.assertNotIn("tagged", summary.lower())
+
+    def test_initial_and_disabled_summaries_read_as_plain_words(self) -> None:
+        checking = ReleaseStatusService(current_version="0.14.1")
+        self.assertEqual(checking.snapshot()["summary"], "Checking for updates...")
+
+        disabled = ReleaseStatusService(current_version="0.14.1", enabled=False)
+        self.assertEqual(disabled.snapshot()["summary"], "Update checks are off")

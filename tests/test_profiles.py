@@ -26,6 +26,7 @@ from app.services.profile_registry import (
     ProfileRegistry,
     UNIFI_UNVR_FRONT_4_PROFILE_ID,
     UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID,
+    build_profile_reference_warnings,
     built_in_profile_ids,
 )
 
@@ -280,6 +281,35 @@ class ProfileRegistryTests(unittest.TestCase):
         self.assertIsNotNone(profile_106)
         self.assertEqual(profile_106.slot_layout[0][:2], [None, None])
         self.assertEqual(profile_106.slot_layout[3][:2], [104, 105])
+
+    def test_profile_reference_warnings_read_as_plain_words(self) -> None:
+        settings = get_settings().model_copy(
+            update={
+                "systems": [
+                    SystemConfig(
+                        id="lab",
+                        default_profile_id="missing-layout",
+                        enclosure_profiles={"shelf-1": "other-missing-layout"},
+                        truenas=TrueNASConfig(platform="core"),
+                    )
+                ]
+            }
+        )
+
+        messages = [warning["message"] for warning in build_profile_reference_warnings(settings)]
+
+        self.assertEqual(
+            messages,
+            [
+                "Default layout 'missing-layout' for system lab was not found. "
+                "Enclosures will be drawn from live data instead.",
+                "Layout 'other-missing-layout' for enclosure shelf-1 on system lab was not found. "
+                "The enclosure will be drawn from live data instead.",
+            ],
+        )
+        for message in messages:
+            self.assertNotIn("Runtime", message)
+            self.assertNotIn("references", message)
 
     def test_builtin_unvr_profile_can_be_selected_explicitly_for_linux_hosts(self) -> None:
         system = SystemConfig(

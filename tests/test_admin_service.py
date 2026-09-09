@@ -1308,7 +1308,7 @@ class MainAppBoundaryTests(unittest.TestCase):
 
     def test_unhandled_exception_handlers_redact_exception_details(self) -> None:
         for app, port, expected_detail in (
-            (main_app, 8080, "Unhandled application error; see application logs."),
+            (main_app, 8080, "Something went wrong on the server. The application log has details."),
             (admin_app, 8082, "Unhandled admin service error; see admin logs."),
         ):
             handler = app.exception_handlers[Exception]

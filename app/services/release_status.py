@@ -61,19 +61,19 @@ def _compare_version_tuples(left: tuple[int, ...], right: tuple[int, ...]) -> in
 def describe_release_status(current_version: str, latest_tag: str | None) -> tuple[str, str]:
     latest_display = _normalize_tag(latest_tag)
     if not latest_display:
-        return "unknown", "Latest release unavailable"
+        return "unknown", "Release information unavailable"
 
     current_normalized = str(current_version or "").strip()
     if not current_normalized:
-        return "unknown", f"Latest stable {latest_display}"
+        return "unknown", f"Newest release is {latest_display}"
 
     if current_normalized == latest_display or f"v{current_normalized}" == latest_display:
-        return "current", "Latest tagged release"
+        return "current", "Up to date"
 
     parsed_current = _parse_version(current_normalized)
     parsed_latest = _parse_version(latest_display)
     if not parsed_current or not parsed_latest:
-        return "known", f"Latest stable {latest_display}"
+        return "known", f"Newest release is {latest_display}"
 
     current_core, current_has_suffix = parsed_current
     latest_core, _ = parsed_latest
@@ -83,11 +83,11 @@ def describe_release_status(current_version: str, latest_tag: str | None) -> tup
         return "update-available", f"Update available: {latest_display}"
     if comparison == 0:
         if current_has_suffix:
-            return "dev-build", f"Pre-release build for {latest_display}"
-        return "current", "Latest tagged release"
+            return "dev-build", f"Development build of {latest_display}"
+        return "current", "Up to date"
     if current_has_suffix:
-        return "dev-build", f"Dev build · latest stable {latest_display}"
-    return "ahead", f"Ahead of latest tagged release {latest_display}"
+        return "dev-build", f"Development build (newest release is {latest_display})"
+    return "ahead", f"Newer than the latest release ({latest_display})"
 
 
 class ReleaseStatusService:
@@ -108,7 +108,7 @@ class ReleaseStatusService:
         self._lock = asyncio.Lock()
         self._payload: dict[str, Any] = self._build_payload(
             status="disabled" if not self.enabled else "checking",
-            summary="Release checks disabled." if not self.enabled else "Checking releases...",
+            summary="Update checks are off" if not self.enabled else "Checking for updates...",
             latest_tag=None,
             latest_name=None,
             latest_url=None,
@@ -124,7 +124,7 @@ class ReleaseStatusService:
         if not self.enabled:
             self._payload = self._build_payload(
                 status="disabled",
-                summary="Release checks disabled.",
+                summary="Update checks are off",
                 latest_tag=None,
                 latest_name=None,
                 latest_url=None,
@@ -162,7 +162,7 @@ class ReleaseStatusService:
                     return self.snapshot()
                 self._payload = self._build_payload(
                     status="error",
-                    summary="Release check unavailable",
+                    summary="Could not check for updates",
                     latest_tag=None,
                     latest_name=None,
                     latest_url=None,

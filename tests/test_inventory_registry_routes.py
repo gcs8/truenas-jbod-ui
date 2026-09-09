@@ -25,7 +25,7 @@ from app.services.inventory_registry import InventoryRegistry, SystemNotConfigur
 
 
 UNKNOWN_SYSTEM_ID = "retired-nas"
-UNKNOWN_SYSTEM_DETAIL = f"System '{UNKNOWN_SYSTEM_ID}' is not configured."
+UNKNOWN_SYSTEM_DETAIL = f'No system named "{UNKNOWN_SYSTEM_ID}" is configured.'
 
 
 def _registry_with_default_service(default_service: Mock) -> InventoryRegistry:

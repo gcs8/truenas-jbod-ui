@@ -93,7 +93,7 @@ class MainHistoryScopesBodyBoundTests(unittest.IsolatedAsyncioTestCase):
             payload,
             {
                 "ok": False,
-                "detail": "History request exceeds 65536 bytes.",
+                "detail": "History request is too large.",
             },
         )
         self.assertEqual(receive_calls, 0)
@@ -110,7 +110,7 @@ class MainHistoryScopesBodyBoundTests(unittest.IsolatedAsyncioTestCase):
             payload,
             {
                 "ok": False,
-                "detail": "History request exceeds 65536 bytes.",
+                "detail": "History request is too large.",
             },
         )
         self.assertEqual(receive_calls, 2)
@@ -217,7 +217,7 @@ class MainHistoryScopesBodyBoundTests(unittest.IsolatedAsyncioTestCase):
                 payload,
                 {
                     "ok": False,
-                    "detail": "History request Content-Type must be application/json or application/*+json.",
+                    "detail": "History request was not valid JSON.",
                 },
             )
             self.assertEqual(receive_calls, 0)

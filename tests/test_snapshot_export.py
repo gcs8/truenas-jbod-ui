@@ -701,8 +701,8 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("metric samples", rendered.html)
         self.assertIn("SMART summaries", rendered.html)
         self.assertIn("events", rendered.html)
-        self.assertIn("Downsampling None", rendered.html)
-        self.assertIn("None", rendered.export_meta["redaction_label"])
+        self.assertIn("Full history", rendered.html)
+        self.assertEqual(rendered.export_meta["redaction_label"], "Serials shown")
         self.assertEqual(rendered.export_meta["redaction"], "none")
         self.assertEqual(rendered.export_meta["event_count"], 0)
         self.assertNotIn('src="/static/app.js"', rendered.html)
@@ -742,7 +742,7 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("192.168.1.174", rendered.html)
         self.assertNotIn("5000c500c2a7f220", rendered.html)
         self.assertEqual(rendered.export_meta["redaction"], "partial")
-        self.assertEqual(rendered.export_meta["redaction_label"], "Partial")
+        self.assertEqual(rendered.export_meta["redaction_label"], "Serials hidden")
         redacted_cache_key = exporter._build_history_cache_key(
             rendered.snapshot.selected_system_id,
             rendered.snapshot.selected_enclosure_id,
@@ -925,7 +925,7 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rendered.snapshot.warnings, [original_warning])
         self.assertIn(original_warning, rendered.html)
         self.assertEqual(rendered.export_meta["redaction"], "none")
-        self.assertEqual(rendered.export_meta["redaction_label"], "None")
+        self.assertEqual(rendered.export_meta["redaction_label"], "Serials shown")
 
     async def test_partial_export_cache_varies_with_serialized_source_hostnames(self) -> None:
         hostname = "cache206.redact.invalid"
@@ -1322,7 +1322,7 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertNotEqual(rendered.export_meta["downsampling_label"], "None")
-        self.assertIn("rollups", rendered.export_meta["downsampling_note"])
+        self.assertIn("averaged", rendered.export_meta["downsampling_note"])
         self.assertLess(rendered.export_meta["metric_sample_count"], 288 * 5)
         self.assertLessEqual(rendered.export_meta["event_count"], 10)
 
@@ -1911,7 +1911,7 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(rendered.export_meta["storage_view_count"], 1)
         self.assertNotEqual(rendered.export_meta["downsampling_label"], "None")
-        self.assertIn("rollups", rendered.export_meta["downsampling_note"])
+        self.assertIn("averaged", rendered.export_meta["downsampling_note"])
         self.assertLess(rendered.export_meta["metric_sample_count"], 288 * 5 * 2)
         self.assertLess(rendered.export_meta["event_count"], 80 * 2)
         self.assertIn("archive-core|storage-view:boot-doms|0", rendered.history_cache)
@@ -1949,7 +1949,7 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rendered.export_meta["enclosure_count"], 2)
         self.assertEqual(rendered.export_meta["storage_view_count"], 1)
         self.assertNotEqual(rendered.export_meta["downsampling_label"], "None")
-        self.assertIn("rollups", rendered.export_meta["downsampling_note"])
+        self.assertIn("averaged", rendered.export_meta["downsampling_note"])
         self.assertLess(rendered.export_meta["metric_sample_count"], 288 * 5 * 3)
         self.assertLess(rendered.export_meta["event_count"], 80 * 3)
         self.assertIn("archive-core|rear|0", rendered.history_cache)

@@ -582,13 +582,13 @@ def build_profile_reference_warnings(settings: Settings) -> list[dict[str, str]]
             bounded_enclosure_id = _bounded_profile_reference_identifier(enclosure_id)
             warning["enclosure_id"] = bounded_enclosure_id
             warning["message"] = (
-                f"System {bounded_system_id} enclosure {bounded_enclosure_id} references unknown profile "
-                f"{bounded_profile_id}. Runtime geometry fallback will be used."
+                f"Layout '{bounded_profile_id}' for enclosure {bounded_enclosure_id} on system "
+                f"{bounded_system_id} was not found. The enclosure will be drawn from live data instead."
             )
         else:
             warning["message"] = (
-                f"System {bounded_system_id} references unknown default profile {bounded_profile_id}. "
-                "Runtime geometry fallback will be used."
+                f"Default layout '{bounded_profile_id}' for system {bounded_system_id} was not found. "
+                "Enclosures will be drawn from live data instead."
             )
         warnings.append(warning)
 
