@@ -878,21 +878,18 @@ def _apply_config_path_relative_defaults(
         if key not in merged_paths or merged_paths.get(key) in {defaults["paths"][key], legacy[key]}:
             merged_paths[key] = derived[key]
 
-    placeholder_known_hosts_paths = {
-        None,
-        defaults["ssh"]["known_hosts_path"],
-        legacy["known_hosts_path"],
-    }
+    # A known-hosts path chosen at the top level (config file or SSH_KNOWN_HOSTS_PATH)
+    # wins; unset, default and legacy container values fall back to the runtime layout.
     merged_ssh = merged.setdefault("ssh", {})
-    if merged_ssh.get("known_hosts_path") in placeholder_known_hosts_paths:
+    if merged_ssh.get("known_hosts_path") in {None, defaults["ssh"]["known_hosts_path"], legacy["known_hosts_path"]}:
         merged_ssh["known_hosts_path"] = derived["known_hosts_path"]
 
+    # Every system pins keys in that one shared file. Older admin versions wrote a
+    # per-system path that was never populated, so a per-system value is not a choice.
     for system_payload in merged.get("systems") or []:
         if not isinstance(system_payload, dict):
             continue
-        ssh_payload = system_payload.setdefault("ssh", {})
-        if ssh_payload.get("known_hosts_path") in placeholder_known_hosts_paths:
-            ssh_payload["known_hosts_path"] = merged_ssh["known_hosts_path"]
+        system_payload.setdefault("ssh", {})["known_hosts_path"] = merged_ssh["known_hosts_path"]
 
     return merged
 

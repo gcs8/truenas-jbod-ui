@@ -728,7 +728,9 @@ class KnownHostsPathSettingsTests(unittest.TestCase):
         self.assertEqual(Path(settings.ssh.known_hosts_path), derived)
         self.assertEqual([Path(system.ssh.known_hosts_path) for system in settings.systems], [derived])
 
-    def test_configured_known_hosts_path_is_honoured_for_the_top_level_and_each_system(self) -> None:
+    def test_configured_known_hosts_path_is_honoured_and_shared_by_every_system(self) -> None:
+        # Older admin versions wrote a per-system path that was never populated,
+        # so a per-system value still follows the shared top-level file.
         temp_root, settings = self._load_settings(
             [
                 "ssh:",
@@ -747,7 +749,7 @@ class KnownHostsPathSettingsTests(unittest.TestCase):
         self.assertEqual(settings.ssh.known_hosts_path, "/operator/chosen/known_hosts")
         self.assertEqual(
             [system.ssh.known_hosts_path for system in settings.systems],
-            ["/operator/chosen/known_hosts", "/operator/secondary/known_hosts"],
+            ["/operator/chosen/known_hosts", "/operator/chosen/known_hosts"],
         )
         self.assertNotEqual(Path(settings.ssh.known_hosts_path), temp_root / "known_hosts")
 
