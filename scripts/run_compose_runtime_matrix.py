@@ -182,6 +182,14 @@ def validate_free_disk(free_bytes: int, *, minimum_gib: int) -> int:
     return free_gib
 
 
+def _require_linux_docker_host(meminfo: Path = Path("/proc/meminfo")) -> None:
+    if not meminfo.exists():
+        raise SystemExit(
+            "This tool runs on a Linux Docker host. It reads /proc/meminfo and drives Docker "
+            "directly, neither of which is available here."
+        )
+
+
 def _read_available_memory_kib() -> int:
     for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
         if line.startswith("MemAvailable:"):
@@ -870,6 +878,7 @@ def _run_variant(
 
 def main() -> int:
     args = parse_args()
+    _require_linux_docker_host()
     if args.ack != "I_APPROVE_DISPOSABLE_COMPOSE_QA":
         raise RuntimeError("Explicit disposable-QA acknowledgement is required.")
     validate_exact_image(args.image, args.source_commit)

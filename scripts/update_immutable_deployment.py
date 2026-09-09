@@ -69,11 +69,20 @@ def _mode(path: Path) -> int:
     return stat.S_IMODE(path.lstat().st_mode)
 
 
+def _effective_uid() -> int:
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is None:
+        raise DeploymentError(
+            "this tool needs a Linux Docker host; run it on the host that owns the deployment"
+        )
+    return geteuid()
+
+
 def _require_private_directory(path: Path) -> None:
     info = path.lstat()
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
         raise DeploymentError(f"receipt path is not a real directory: {path.name}")
-    if info.st_uid != os.geteuid():
+    if info.st_uid != _effective_uid():
         raise DeploymentError("receipt directory owner does not match the effective user")
     if stat.S_IMODE(info.st_mode) != 0o700:
         raise DeploymentError("receipt directory must have mode 0700")
@@ -83,7 +92,7 @@ def _require_private_file(path: Path) -> None:
     info = path.lstat()
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
         raise DeploymentError(f"receipt entry is not a regular file: {path.name}")
-    if info.st_uid != os.geteuid():
+    if info.st_uid != _effective_uid():
         raise DeploymentError("receipt file owner does not match the effective user")
     if stat.S_IMODE(info.st_mode) != 0o600:
         raise DeploymentError("receipt files must have mode 0600")

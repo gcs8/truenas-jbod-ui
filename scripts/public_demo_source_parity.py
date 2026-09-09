@@ -6,9 +6,14 @@ import json
 from pathlib import Path
 import re
 import subprocess
+import sys
 from typing import Any
 
-from scripts.public_demo_inputs import PUBLIC_DEMO_INPUT_PATHS
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from scripts.public_demo_inputs import PUBLIC_DEMO_INPUT_PATHS  # noqa: E402
 
 
 SOURCE_PARITY_SCHEMA = 3
