@@ -36,6 +36,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Added
 
+- Showed a one-time dismissible notice in the main UI after the app is
+  updated; v0.23.0 says that network mode lets anyone who can reach the port
+  change bay assignments and lights, and where to add a sign-in. (#491)
+
 - Added a client-only, one-session SMART WebSocket batch API with bounded
   concurrency and DDP heartbeat handling; inventory integration remained
   separate (#503).
@@ -127,7 +131,6 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   digest, the expected font families are checked against the platform fonts
   Chromium reported rather than `fc-match`, and the default dispatch is a
   `qualification_only` run that writes no proposed manifest (#512).
-
 ## v0.23.0 - 2026-09-08
 
 This release includes every pull request merged after `v0.22.2` through the
