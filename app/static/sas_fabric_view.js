@@ -4,11 +4,11 @@
   const modeCopy = {
     lanes: {
       title: "Storage Lanes",
-      subtitle: "Top-down source lanes with paths, transport details, enclosures, views, and mapped bays aligned in each lane.",
+      subtitle: "Each storage source in its own lane: paths, enclosures or views, and the bays behind them.",
     },
     impact: {
       title: "Impact Map",
-      subtitle: "Start from paths and degraded states, then show affected slots, pools, vdevs, and trace hops.",
+      subtitle: "Start from a path, especially a degraded one, and see which bays, pools and vdevs it carries.",
     },
     trace: {
       title: "Physical Trace",
@@ -16,17 +16,17 @@
     },
     disk: {
       title: "Disk Path",
-      subtitle: "Pick a bay and render the available path evidence from host to source, enclosure or view, pool, vdev, and disk.",
+      subtitle: "Pick a bay to follow it from host to source, enclosure or view, pool, vdev and disk.",
     },
   };
   const coreModeCopy = {
     lanes: {
       title: "Storage Lanes",
-      subtitle: "Top-down HBA lanes with paths, expanders, enclosures, and impacted bays aligned in each lane.",
+      subtitle: "Each HBA in its own lane: paths, expanders, enclosures and the bays behind them.",
     },
     impact: {
       title: "Impact Map",
-      subtitle: "Start from paths and degraded states, then show affected slots, pools, vdevs, and trace hops.",
+      subtitle: "Start from a path, especially a degraded one, and see which bays, pools and vdevs it carries.",
     },
     trace: {
       title: "Physical Trace",
@@ -34,7 +34,7 @@
     },
     disk: {
       title: "Disk Path",
-      subtitle: "Pick a bay and render each controller path from host to HBA, SAS link, expander, backplane zone, and disk.",
+      subtitle: "Pick a bay to follow each controller path from host to HBA, SAS link, expander, backplane zone and disk.",
     },
   };
 
@@ -179,11 +179,11 @@
       if (state.writeAuthPending) {
         elements.authStatus.textContent = "Checking credentials...";
       } else if (signedIn && fabricWritePolicyAllowsWrites()) {
-        elements.authStatus.textContent = "Signed in for writes. Credentials clear on reload or sign-out.";
+        elements.authStatus.textContent = "Signed in. Renaming is enabled until you reload or sign out.";
       } else if (signedIn) {
         elements.authStatus.textContent = `Signed in, but writes are blocked. ${fabricWritePolicyReason()}`;
       } else {
-        elements.authStatus.textContent = "Reads remain anonymous. Credentials stay in this page only.";
+        elements.authStatus.textContent = "Sign in to rename items. You stay signed in until you reload this page.";
       }
     }
   }
@@ -422,8 +422,8 @@
     if (String(kind || "").startsWith("storage_") || fabric?.raw?.fabric_domain === "storage_fabric") {
       const storageCopyByKind = {
         storage_quantastor: {
-          pageSummary: "Quantastor HA-node, enclosure, pool, disk, and ownership/fence evidence for the selected storage view.",
-          unavailableMap: "No Quantastor Storage Fabric evidence is available for this selection yet.",
+          pageSummary: "Quantastor HA-node, enclosure, pool, disk and ownership details for the selected storage view.",
+          unavailableMap: "No Quantastor disk or enclosure data was found for this selection yet.",
           controllers: ["Sources", "storage system / HA node"],
           paths: ["Storage Paths", "pool, SES, or owner groups"],
           enclosures: ["Views", "Quantastor / SES objects"],
@@ -439,21 +439,21 @@
             ...modeCopy,
             lanes: {
               title: "Storage Lanes",
-              subtitle: "Quantastor HA nodes, SES paths, storage views, pool/vdev membership, and mapped bays grouped by source evidence.",
+              subtitle: "Quantastor HA nodes, SES paths, storage views, pool/vdev membership, and mapped bays grouped by HA node.",
             },
             trace: {
               title: "Physical Trace",
-              subtitle: "Follow the selected bay through HA ownership, SES path evidence, storage view, pool/vdev membership, and disk identity.",
+              subtitle: "Follow the selected bay through HA ownership, SES path, storage view, pool/vdev membership and disk identity.",
             },
             disk: {
               title: "Disk Path",
-              subtitle: "Pick a bay and show the Quantastor path evidence we can prove: HA node, SES device, view, pool, vdev, and disk.",
+              subtitle: "Pick a bay to follow it from HA node to SES device, view, pool, vdev and disk.",
             },
           },
         },
         storage_esxi: {
-          pageSummary: "ESXi host, controller, member, datastore, LUN, and SMART evidence for the selected local storage view.",
-          unavailableMap: "No ESXi Storage Fabric evidence is available for this selection yet.",
+          pageSummary: "ESXi host, controller, member, datastore, LUN and SMART details for the selected local storage view.",
+          unavailableMap: "No ESXi disk or controller data was found for this selection yet.",
           controllers: ["Sources", "ESXi / vendor CLI"],
           paths: ["Storage Paths", "controller/member groups"],
           enclosures: ["Enclosures", "vendor/BMC/profile objects"],
@@ -469,13 +469,13 @@
             ...modeCopy,
             disk: {
               title: "Disk Path",
-              subtitle: "Pick a bay and show the ESXi evidence we can prove: host, controller, member path, enclosure/profile, datastore or vdev, and disk.",
+              subtitle: "Pick a bay to follow it from host to controller, member path, enclosure or profile, datastore or vdev, and disk.",
             },
           },
         },
         storage_linux: {
-          pageSummary: "Linux block, NVMe, mdadm, profile, SMART, and optional SES evidence for the selected storage view.",
-          unavailableMap: "No Linux Storage Fabric evidence is available for this selection yet.",
+          pageSummary: "Linux block, NVMe, mdadm, profile, SMART and optional SES details for the selected storage view.",
+          unavailableMap: "No Linux disk or enclosure data was found for this selection yet.",
           controllers: ["Sources", "Linux storage source"],
           paths: ["Storage Paths", "block, NVMe, or mdadm groups"],
           enclosures: ["Views", "profile or enclosure objects"],
@@ -489,24 +489,24 @@
           },
         },
         storage_scale: {
-          pageSummary: "TrueNAS SCALE storage, pool, disk, Linux block, and optional SES evidence for the selected view.",
-          unavailableMap: "No SCALE Storage Fabric evidence is available for this selection yet.",
+          pageSummary: "TrueNAS SCALE storage, pool, disk, Linux block and optional SES details for the selected view.",
+          unavailableMap: "No TrueNAS SCALE disk or enclosure data was found for this selection yet.",
           controllers: ["Sources", "SCALE / Linux storage"],
           paths: ["Storage Paths", "pool, block, or SES groups"],
           enclosures: ["Enclosures", "middleware/profile objects"],
         },
         storage_bmc: {
-          pageSummary: "BMC slot and chassis evidence for the selected platform view.",
-          unavailableMap: "No BMC Storage Fabric evidence is available for this selection yet.",
+          pageSummary: "BMC slot and chassis details for the selected view.",
+          unavailableMap: "No BMC slot or chassis data was found for this selection yet.",
           controllers: ["Sources", "BMC / IPMI"],
           paths: ["Storage Paths", "slot inventory groups"],
           enclosures: ["Enclosures", "BMC chassis objects"],
         },
       };
       const details = storageCopyByKind[kind] || {
-        pageSummary: "Best-effort storage path evidence for the selected platform view.",
-        unavailableMap: `No Storage Fabric evidence is available for ${platformLabel}.`,
-        controllers: ["Sources", "platform evidence"],
+        pageSummary: "Storage path for the selected view.",
+        unavailableMap: `No disk or enclosure data was found for ${platformLabel}.`,
+        controllers: ["Sources", "reported by the platform"],
         paths: ["Storage Paths", "platform groups"],
         enclosures: ["Enclosures", "platform objects"],
       };
@@ -529,7 +529,7 @@
         summary: {
           controllers: details.controllers,
           paths: details.paths,
-          expanders: ["Transport Detail", "platform-native evidence"],
+          expanders: ["Transport Detail", "as reported by the platform"],
           enclosures: details.enclosures,
         },
         laneStages: {
@@ -550,7 +550,7 @@
         pageSummary: `Storage Fabric evidence is not available for ${platformLabel} in this snapshot.`,
         refresh: "Refresh Storage Fabric",
         statusBase: "STORAGE",
-        unavailableMap: `No Storage Fabric topology map is available for ${platformLabel}.`,
+        unavailableMap: `No Storage Fabric map is available for ${platformLabel}.`,
         modeLabels: {
           lanes: "Storage Lanes",
           impact: "Impact Map",
@@ -559,8 +559,8 @@
         },
         modes: modeCopy,
         summary: {
-          controllers: ["Sources", "no graph evidence"],
-          paths: ["Storage Paths", "no graph evidence"],
+          controllers: ["Sources", "none found"],
+          paths: ["Storage Paths", "none found"],
           expanders: ["Transport Detail", "not exposed"],
           enclosures: ["Enclosures", "platform inventory only"],
         },
@@ -577,10 +577,10 @@
     return {
       kind: "core_sas",
       eyebrow: "TrueNAS CORE / Storage Fabric",
-      pageSummary: "HBA, path, expander, SES, and affected-bay topology for the selected live enclosure.",
+      pageSummary: "Which HBA, path, expander and enclosure each bay hangs off, for the selected enclosure.",
       refresh: "Refresh Storage Fabric",
       statusBase: "STORAGE",
-      unavailableMap: "No topology map is available for this platform yet.",
+      unavailableMap: "No Storage Fabric map is available for this platform yet.",
       modeLabels: {
         lanes: "Storage Lanes",
         impact: "Impact Map",
@@ -597,10 +597,10 @@
         disk: "Disk",
       },
       summary: {
-        controllers: ["Controllers", "HBAs reported"],
-        paths: ["Paths", "multipath states"],
-        expanders: ["Expanders", "MPR expander rows"],
-        enclosures: ["Enclosures", "MPR/SES objects"],
+        controllers: ["HBAs", "reported by the host"],
+        paths: ["Paths", "active + standby"],
+        expanders: ["Expanders", "SAS expanders seen"],
+        enclosures: ["Enclosures", "seen by the HBA or SES"],
       },
       laneStages: {
         controller: "Controller",
@@ -1581,7 +1581,7 @@
       <div class="fabric-host-strip">
         ${renderNodeButton(hostNode, {
           label: displayLabel(hostNode) || "Host",
-          meta: `${controllerRecords.length} ${copy.hostControllerNoun}${controllerRecords.length === 1 ? "" : "s"} / ${list(fabric.nodes).length} nodes / ${list(fabric.links).length} links`,
+          meta: `${controllerRecords.length} ${copy.hostControllerNoun}${controllerRecords.length === 1 ? "" : "s"} / ${list(fabric.paths).length} path${list(fabric.paths).length === 1 ? "" : "s"} / ${list(fabric.traces).filter((trace) => trace.kind === "bay").length} bays`,
           extra: "host",
         })}
       </div>
@@ -2053,7 +2053,7 @@
     if (event?.timestamp || event?.timestamp_raw) {
       return "Source timestamp";
     }
-    return "Source dmesg did not include wall-clock timestamps; showing event order from the collected kernel buffer.";
+    return "The kernel log has no timestamps; this is the position in the log.";
   }
 
   function diagnosticRowSearchText(event) {
@@ -2171,11 +2171,11 @@
 
   function renderDiagnosticTableStatus({ start, end, total, filteredTotal, hasFilter, hasSourceTimestamps }) {
     return `
-      <strong>${escapeHtml(`Showing ${formatValue(start)}-${formatValue(end)} of ${formatValue(filteredTotal)} sampled events`)}</strong>
+      <strong>${escapeHtml(`Showing ${formatValue(start)}-${formatValue(end)} of ${formatValue(filteredTotal)} recent events`)}</strong>
       <small>${escapeHtml(hasFilter
-        ? `${formatValue(filteredTotal)} matches in the shipped sample; ${formatValue(total)} total events.`
-        : `${formatValue(total)} total events; newest ${formatValue(filteredTotal)} shipped. Filters apply only to this sample.`)}</small>
-      ${hasSourceTimestamps ? "" : '<small>No source timestamps in this dmesg slice; Time / Order falls back to event order.</small>'}
+        ? `${formatValue(filteredTotal)} matches in the listed events; ${formatValue(total)} in the kernel log.`
+        : `${formatValue(total)} events in the kernel log; the newest ${formatValue(filteredTotal)} are listed here. Filters search only these.`)}</small>
+      ${hasSourceTimestamps ? "" : '<small>The kernel log has no timestamps; events are listed in log order.</small>'}
     `;
   }
 
@@ -2764,7 +2764,7 @@
       renderDiskPathCard({
         kind: labels.path,
         title: pathTitle,
-        subtitle: compactDeviceLabel(seed.pathState?.ses_device || pathNode?.raw?.ses_device || mprDevice?.member_device_name || seed.device_name || displayLabel(pathNode) || "controller-level fabric", 42),
+        subtitle: compactDeviceLabel(seed.pathState?.ses_device || pathNode?.raw?.ses_device || mprDevice?.member_device_name || seed.device_name || displayLabel(pathNode) || "no per-disk path", 42),
         facts: [
           [linuxSes ? "SES device" : storageFabric ? "Path" : "Speed", linuxSes ? seed.pathState?.ses_device || pathNode?.raw?.ses_device : storageFabric ? pathNode?.raw?.path_type || pathNode?.raw?.source : formatLinkSpeed(mprDevice?.speed)],
           [linuxSes ? "Block SG" : "PHY", linuxSes ? seed.pathState?.sg_device : storageFabric ? null : expanderPhy?.phy],
@@ -2800,7 +2800,7 @@
       }),
       renderDiskPathCard({
         kind: labels.enclosure,
-        title: displayLabel(expanderNode) || displayLabel(enclosureNode) || sesNodes.map(displayLabel).filter(Boolean).join(" + ") || (linuxSes ? "SES enclosure" : storageFabric ? "Storage view" : "Expander unknown"),
+        title: displayLabel(expanderNode) || displayLabel(enclosureNode) || sesNodes.map(displayLabel).filter(Boolean).join(" + ") || (linuxSes ? "SES enclosure" : storageFabric ? "Storage view" : "Expander not reported"),
         subtitle: [
           linuxSes ? seed.pathState?.ses_device || pathNode?.raw?.ses_device || enclosureNode?.raw_id : null,
           !linuxSes && !storageFabric && displayLabel(enclosureNode) && displayLabel(enclosureNode) !== displayLabel(expanderNode) ? `MPR ${displayLabel(enclosureNode)}` : null,
@@ -3173,7 +3173,7 @@
         </section>
 
         <section class="fabric-inspector-section">
-          <h4>Source Evidence</h4>
+          <h4>Where this comes from</h4>
           <div class="fabric-evidence-chip-list">${evidenceChips(trace.evidence)}</div>
         </section>
 
@@ -3330,7 +3330,7 @@
           ${kvRow("Type", formatKind(trace.kind))}
           ${kvRow("Slots", formatSlots(trace.slots, 999))}
           ${metricRows(trace.metrics, { state: "State", count: "Affected bays", device_name: "Device", pool_name: "Pool", vdev_name: "Vdev" })}
-          ${kvRow("Evidence", trace.evidence)}
+          ${kvRow("Sources", trace.evidence)}
         </div>
         ${pathStates.length ? `
           <section class="fabric-inspector-section">
@@ -3364,7 +3364,7 @@
           ${kvRow("Raw ID", node.raw_id || "n/a")}
           ${kvRow("Slots", formatSlots(node.related_slots, 999))}
           ${metricRows(node.metrics, { pcie_slot: "PCIe slot", pci_address: "PCI address", linked_phys: "Linked PHYs", num_phys: "PHYs", path_counts: "Path counts" })}
-          ${kvRow("Evidence", node.evidence)}
+          ${kvRow("Sources", node.evidence)}
         </div>
         <section class="fabric-inspector-section">
           <h4>Related Traces</h4>
@@ -3393,7 +3393,7 @@
         const selected = enclosure.id === state.selectedEnclosureId ? " selected" : "";
         return `<option value="${escapeHtml(enclosure.id)}"${selected}>${escapeHtml(enclosure.label || enclosure.id)}</option>`;
       }).join("")
-      : '<option value="">Auto-selected</option>';
+      : '<option value="">No enclosures found</option>';
     setSelectOptionsIfChanged(elements.enclosureSelect, enclosureOptions);
     elements.enclosureSelect.value = state.selectedEnclosureId || "";
     elements.enclosureSelect.disabled = enclosures.length <= 1 || state.loading;
@@ -3481,7 +3481,7 @@
       elements.statusText.dataset.tone = "error";
     } else if (state.loading) {
       className += " partial";
-      text = `${copy.statusBase} ...`;
+      text = `${copy.statusBase} LOADING`;
       elements.statusText.textContent = fabric ? `Refreshing ${copy.statusBase.toLowerCase()} data.` : `Loading ${copy.statusBase.toLowerCase()} data.`;
       elements.statusText.dataset.tone = "info";
     } else if (fabric?.available === false) {
@@ -3566,7 +3566,7 @@
       diagnosticNode ? focusButton({
         label: "Fault focus",
         title: displayLabel(diagnosticNode) || diagnosticNode.id,
-        meta: diagnosticSummary(diagnostics) || "Most diagnostic evidence",
+        meta: diagnosticSummary(diagnostics) || "Most kernel errors",
         ref: { kind: "node", id: diagnosticNode.id },
         mode: "trace",
         tone: "error",

@@ -64,7 +64,7 @@ CORE_MPR_SYSCTL_LOCATION_COMMAND = (
 
 _INVENTORY_SNAPSHOT_EVIDENCE = ("inventory snapshot",)
 _PROFILE_SLOT_LAYOUT_EVIDENCE = ("profile slot layout",)
-_SLOT_MULTIPATH_EVIDENCE = ("slot.multipath.members",)
+_SLOT_MULTIPATH_EVIDENCE = ("multipath members",)
 _LINUX_SES_PATH_EVIDENCE = (
     "lsscsi -g",
     "lsscsi -g -t",
@@ -612,7 +612,7 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
                     label=ses_device,
                     raw_id=ses_device,
                     related_slots=[slot.slot],
-                    evidence=["slot.ssh_ses_device"],
+                    evidence=["SES enclosure device"],
                     raw={"ses_device": ses_device},
                 ),
             )
@@ -648,7 +648,7 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
                 ],
                 "mpr_devices": mpr_device_metrics,
             },
-            evidence=["inventory snapshot", "slot.multipath.members"],
+            evidence=["inventory snapshot", *_SLOT_MULTIPATH_EVIDENCE],
         )
 
     _scope_mpr_infrastructure(
@@ -780,8 +780,8 @@ def _build_linux_ses_fabric_snapshot(context: SasFabricBuildContext) -> SasFabri
     platform_label = "TrueNAS SCALE" if system.truenas.platform == "scale" else "Linux"
     if not slots_with_ses:
         fabric_warnings.append(
-            f"No {_linux_ses_platform_phrase(platform_label)} slot evidence is available for this selection. "
-            "Run stable lsblk --json, lsscsi -g -t, and sg_ses AES/EC/join probes before rendering a SCALE/Linux Storage Fabric map."
+            f"No SES enclosure data was found for this {platform_label} system. "
+            "Check that SSH works and that sg_ses is installed on the host (see Troubleshooting)."
         )
         return _build_unavailable_sas_fabric_snapshot(
             system=system,
@@ -1139,8 +1139,7 @@ def _build_platform_storage_fabric_snapshot(context: SasFabricBuildContext) -> S
 
     if not evidence_slots:
         fabric_warnings.append(
-            f"No Storage Fabric evidence is available for {platform_label}. "
-            "This selection needs platform inventory, slot, block-device, controller, or BMC evidence before a graph can render."
+            f"No disk or enclosure data was found for {platform_label}, so there is nothing to map yet."
         )
         return _build_unavailable_sas_fabric_snapshot(
             system=system,
@@ -1702,27 +1701,27 @@ def _storage_fabric_kind(platform: str | None) -> str:
 def _storage_fabric_scope_warning(platform_label: str, fabric_kind: str) -> str:
     if fabric_kind == "storage_quantastor":
         return (
-            f"{platform_label} Storage Fabric is built from Quantastor storage-system, "
-            "HA-node, pool, disk, and optional SES/qs evidence. Low-level controller, path, or expander hops are shown only when those sources prove them."
+            f"{platform_label} Storage Fabric is built from Quantastor storage-system, HA-node, pool, disk and "
+            "optional SES data; controller and expander hops appear only when those sources report them."
         )
     if fabric_kind == "storage_esxi":
         return (
-            f"{platform_label} Storage Fabric is built from ESXCLI and vendor controller evidence. "
-            "It shows host/controller/member relationships without enabling RAID-management actions."
+            f"{platform_label} Storage Fabric is built from ESXCLI and vendor controller data; "
+            "it shows host, controller and member relationships and never changes RAID settings."
         )
     if fabric_kind in {"storage_linux", "storage_scale"}:
         return (
-            f"{platform_label} Storage Fabric is built from Linux block, pool, profile, SMART, and optional SES evidence. "
-            "Unproven physical HBA or expander hops are kept out of the map."
+            f"{platform_label} Storage Fabric is built from Linux block, pool, profile, SMART and optional SES data; "
+            "HBA and expander hops are not shown."
         )
     if fabric_kind == "storage_bmc":
         return (
-            f"{platform_label} Storage Fabric is limited to BMC slot/chassis evidence for this selection. "
-            "Host storage paths need OS or vendor storage data."
+            f"{platform_label} Storage Fabric is built from BMC slot and chassis data only; "
+            "host storage paths need OS or vendor storage data."
         )
     return (
-        f"{platform_label} Storage Fabric is built from the platform evidence available in this snapshot. "
-        "Unproven physical hops are labeled by omission rather than inferred."
+        f"{platform_label} Storage Fabric is built from the data this platform reports; "
+        "hops it does not report are left out rather than guessed."
     )
 
 
