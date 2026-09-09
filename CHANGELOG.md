@@ -26,6 +26,15 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Fixed
+
+- Drew TrueNAS CORE bays from the count the enclosure reports instead of
+  always using the 60-bay CSE-946 face, listed small SES enclosures on CORE,
+  stopped the false SES warning on SCALE hosts without an expander, and kept
+  descriptor text from marking empty bays present or faulty. (#482)
+
 ## v0.23.0 - 2026-09-08
 
 This release includes every pull request merged after `v0.22.2` through the
