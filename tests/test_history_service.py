@@ -1454,28 +1454,34 @@ class HistoryStoreTests(unittest.TestCase):
                     with history_write_lock(database_path, blocking=False):
                         self.fail("File-mounted database entered the shared lock")
 
-    def test_shared_lock_parses_mountinfo_once_per_database_file(self) -> None:
+    def test_shared_lock_parses_mountinfo_once_until_the_mount_table_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             first_path = root / "history.db"
             first_path.write_bytes(b"")
             second_path = root / "other.db"
             second_path.write_bytes(b"")
-            migration_lock._mount_point_verdicts.clear()
-            checked_paths: list[Path] = []
+            migration_lock._mountinfo_cache.clear()
+            mount_table = "36 35 98:0 / / rw,noatime - ext4 /dev/root rw\n"
 
-            def record_clean_verdict(path: Path) -> bool:
-                checked_paths.append(path)
-                return False
-
-            with patch.object(migration_lock, "_database_path_is_mount_point", side_effect=record_clean_verdict):
+            with ExitStack() as stack:
+                reads = stack.enter_context(
+                    patch.object(migration_lock, "_read_mountinfo_text", return_value=mount_table)
+                )
+                parses = stack.enter_context(
+                    patch.object(
+                        migration_lock,
+                        "_parse_mountinfo_targets",
+                        wraps=migration_lock._parse_mountinfo_targets,
+                    )
+                )
                 first_address = migration_lock._history_lock_address(first_path)
                 self.assertEqual(migration_lock._history_lock_address(first_path), first_address)
-                self.assertEqual(migration_lock._history_lock_address(first_path), first_address)
-                self.assertEqual(checked_paths, [first_path.resolve()])
-
                 migration_lock._history_lock_address(second_path)
-                self.assertEqual(checked_paths, [first_path.resolve(), second_path.resolve()])
+
+                # The mount table is read on every check but parsed only once while unchanged.
+                self.assertEqual(reads.call_count, 3)
+                self.assertEqual(parses.call_count, 1)
 
             # A refusal is re-checked every time so an operator who unmounts the file
             # is never blocked by a remembered verdict.
@@ -1486,6 +1492,31 @@ class HistoryStoreTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "mount"):
                         migration_lock._history_lock_address(mounted_path)
                 self.assertEqual(refusing.call_count, 2)
+
+    def test_shared_lock_rejects_a_database_file_mount_point_with_a_warm_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            database_path = root / "history.db"
+            database_path.write_bytes(b"")
+            migration_lock._mountinfo_cache.clear()
+            clean_table = "36 35 98:0 / / rw,noatime - ext4 /dev/root rw\n"
+            encoded_target = str(database_path.resolve()).replace(" ", "\\040")
+            mounted_table = clean_table + f"37 36 98:0 / {encoded_target} rw - ext4 /dev/root rw\n"
+
+            with patch.object(migration_lock, "_read_mountinfo_text", return_value=clean_table):
+                clean_address = migration_lock._history_lock_address(database_path)
+                self.assertEqual(migration_lock._history_lock_address(database_path), clean_address)
+            self.assertEqual(len(migration_lock._mountinfo_cache), 1)
+
+            # The same file, same device and inode, later becomes a bind-mount target.
+            with patch.object(migration_lock, "_read_mountinfo_text", return_value=mounted_table):
+                with self.assertRaisesRegex(ValueError, "mount"):
+                    with history_write_lock(database_path, blocking=False):
+                        self.fail("File-mounted database entered the shared lock with a warm cache")
+
+            # Unmounting it lifts the refusal on the next check.
+            with patch.object(migration_lock, "_read_mountinfo_text", return_value=clean_table):
+                self.assertEqual(migration_lock._history_lock_address(database_path), clean_address)
 
     def test_shared_lock_converges_when_socket_keys_differ_for_the_same_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

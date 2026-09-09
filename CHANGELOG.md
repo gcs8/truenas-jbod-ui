@@ -31,8 +31,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 ### Performance
 
 - The history drawer read for one bay now opens a single SQLite connection
-  instead of one per query, and the history lock parses `/proc/self/mountinfo`
-  once per database file instead of on every lock. (#488)
+  instead of one per query, and the history lock re-parses `/proc/self/mountinfo`
+  only when the mount table changes instead of on every lock. (#488)
 
 ## v0.23.0 - 2026-09-08
 

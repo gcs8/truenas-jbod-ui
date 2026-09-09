@@ -31,43 +31,50 @@ def _decode_mountinfo_path(value: str) -> str:
     )
 
 
-def _database_path_is_mount_point(database_path: Path) -> bool:
+_mountinfo_cache: dict[str, frozenset[str]] = {}
+_mountinfo_cache_lock = threading.Lock()
+
+
+def _read_mountinfo_text() -> str:
     try:
-        lines = Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines()
+        return Path("/proc/self/mountinfo").read_text(encoding="utf-8")
     except OSError as exc:
         raise RuntimeError("History migration locking requires Linux mountinfo.") from exc
-    target = os.path.normpath(str(Path(database_path).absolute()))
-    for line in lines:
+
+
+def _parse_mountinfo_targets(text: str) -> frozenset[str]:
+    targets: set[str] = set()
+    for line in text.splitlines():
         fields = line.split()
-        if len(fields) > 4 and os.path.normpath(_decode_mountinfo_path(fields[4])) == target:
-            return True
-    return False
+        if len(fields) > 4:
+            targets.add(os.path.normpath(_decode_mountinfo_path(fields[4])))
+    return frozenset(targets)
 
 
-_MOUNT_POINT_VERDICT_CACHE_LIMIT = 64
-_mount_point_verdicts: dict[tuple[int, int], bool] = {}
-_mount_point_verdicts_lock = threading.Lock()
+def _mount_point_targets() -> frozenset[str]:
+    """Return every mount target, re-parsing mountinfo only when its text changed.
 
-
-def _database_file_is_mount_point(canonical_path: Path, metadata: os.stat_result) -> bool:
-    """Parse mountinfo once per file identity; a refusal is never served from the cache.
-
-    Every connection takes the lock, and the mount check used to read and parse
-    /proc/self/mountinfo each time. The verdict cannot change while the file keeps
-    the same device and inode, so a clean verdict is remembered per (dev, ino).
+    Every connection takes the lock, and the mount check used to parse
+    /proc/self/mountinfo each time. The text is still read on every check, so a
+    file that becomes a mount point later (a bind mount, or a recreated file
+    that reuses an inode) is never served a remembered verdict; only the parse
+    of an unchanged mount table is skipped.
     """
 
-    identity = (int(metadata.st_dev), int(metadata.st_ino))
-    with _mount_point_verdicts_lock:
-        if _mount_point_verdicts.get(identity) is False:
-            return False
-    is_mount_point = _database_path_is_mount_point(canonical_path)
-    if not is_mount_point:
-        with _mount_point_verdicts_lock:
-            if len(_mount_point_verdicts) >= _MOUNT_POINT_VERDICT_CACHE_LIMIT:
-                _mount_point_verdicts.clear()
-            _mount_point_verdicts[identity] = False
-    return is_mount_point
+    text = _read_mountinfo_text()
+    with _mountinfo_cache_lock:
+        targets = _mountinfo_cache.get(text)
+    if targets is None:
+        targets = _parse_mountinfo_targets(text)
+        with _mountinfo_cache_lock:
+            _mountinfo_cache.clear()
+            _mountinfo_cache[text] = targets
+    return targets
+
+
+def _database_path_is_mount_point(database_path: Path) -> bool:
+    target = os.path.normpath(str(Path(database_path).absolute()))
+    return target in _mount_point_targets()
 
 
 def _history_lock_address(database_path: Path) -> bytes:
@@ -79,7 +86,7 @@ def _history_lock_address(database_path: Path) -> bytes:
     except FileNotFoundError:
         metadata = None
     if metadata is not None:
-        if _database_file_is_mount_point(canonical_path, metadata):
+        if _database_path_is_mount_point(canonical_path):
             raise ValueError("History database file mount points are not supported; mount its parent directory.")
         if stat.S_ISLNK(metadata.st_mode):
             raise ValueError("History database path must not be a symlink.")
