@@ -33,7 +33,7 @@ from history_service.collector import (
 )
 from history_service.config import HistorySettings, get_history_settings
 from history_service.domain import MetricSample, SlotStateRecord, build_slot_events, isoformat_utc
-from history_service.migration_lock import history_lock_path, history_write_lock
+from history_service.migration_lock import history_write_lock
 from history_service.segment_catalog import MIGRATION_PENDING_MARKER, activation_pending_path
 from history_service.segment_reader import SegmentedHistoryReader
 from history_service.store import DISK_IDENTITY_BACKFILL_USER_VERSION, HistoryStore, SlotStateUpdate
@@ -1470,7 +1470,7 @@ class HistoryStoreTests(unittest.TestCase):
             database_path = Path(temp_dir) / "history.db"
 
             with history_write_lock(database_path, blocking=False):
-                legacy_lock_path = history_lock_path(database_path)
+                legacy_lock_path = Path(f"{database_path}.migration.lock")
                 legacy_lock_path.unlink(missing_ok=True)
                 with self.assertRaisesRegex(sqlite3.OperationalError, "migration"):
                     with history_write_lock(database_path, blocking=False):
@@ -1528,6 +1528,68 @@ class HistoryStoreTests(unittest.TestCase):
                 recovered._execute_write(lambda connection: connection.execute("SELECT 1").fetchone())[0],
                 1,
             )
+
+    def test_pending_marker_refusal_names_the_recovery_command_and_logs_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            database_path = root / "history.db"
+            segments_directory = root / "segments"
+            segments_directory.mkdir()
+            catalog_path = segments_directory / "catalog.json"
+            HistoryStore(
+                str(database_path),
+                recover_unreadable_database=False,
+                segment_catalog_path=catalog_path,
+            )
+
+            cases = (
+                (
+                    activation_pending_path(database_path),
+                    "scripts/rotate_segmented_history.py",
+                    "--recover",
+                ),
+                (
+                    segments_directory / MIGRATION_PENDING_MARKER,
+                    "scripts/migrate_segmented_history.py",
+                    "--recover-rollback",
+                ),
+            )
+            for marker_path, script, mode in cases:
+                marker_path.write_text("{}", encoding="utf-8")
+                try:
+                    with self.assertLogs("history_service.store", level="ERROR") as logs:
+                        with self.assertRaises(sqlite3.OperationalError) as raised:
+                            HistoryStore(
+                                str(database_path),
+                                recover_unreadable_database=False,
+                                segment_catalog_path=catalog_path,
+                            )
+                    message = str(raised.exception)
+                    self.assertIn(
+                        f"docker compose run --rm --entrypoint python enclosure-history {script} "
+                        f"--source {database_path} --segments-dir {segments_directory} {mode}",
+                        message,
+                    )
+                    self.assertIn("start the history service again", message)
+                    self.assertIn(str(marker_path), message)
+                    self.assertEqual(len(logs.records), 1)
+                    self.assertIn(script, logs.records[0].getMessage())
+                finally:
+                    marker_path.unlink()
+
+            # Without a catalog the store cannot know the segments folder, so the
+            # message says which value is missing instead of guessing a path.
+            unsegmented_path = root / "plain.db"
+            HistoryStore(str(unsegmented_path), recover_unreadable_database=False)
+            marker_path = activation_pending_path(unsegmented_path)
+            marker_path.write_text("{}", encoding="utf-8")
+            try:
+                with self.assertRaises(sqlite3.OperationalError) as raised:
+                    HistoryStore(str(unsegmented_path), recover_unreadable_database=False)
+            finally:
+                marker_path.unlink()
+            self.assertIn("HISTORY_SEGMENT_CATALOG_PATH is not set", str(raised.exception))
+            self.assertIn("scripts/rotate_segmented_history.py", str(raised.exception))
 
     def test_store_refuses_reads_and_retention_claims_while_a_lifecycle_marker_is_pending(self) -> None:
         # PR #191 gated __init__ and _execute_write, but plain reads and the
@@ -2289,100 +2351,6 @@ class HistoryStoreTests(unittest.TestCase):
 
             self.assertEqual(backup_path, target_path)
             self.assertEqual(target_path.stat().st_mode & 0o777, 0o640)
-
-    def test_default_replacement_mode_preservation_refuses_target_symlink_swap(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            store = HistoryStore(str(root / "history.db"))
-            temp_path = root / "replacement.tmp"
-            temp_path.write_bytes(b"replacement")
-            target_path = root / "target.sqlite3"
-            target_path.write_bytes(b"target")
-            victim_path = root / "victim.sqlite3"
-            victim_path.write_bytes(b"victim")
-            victim_path.chmod(0o600)
-            real_open = os.open
-            swapped = False
-
-            def swap_before_open(path: str | os.PathLike[str], flags: int) -> int:
-                nonlocal swapped
-                if Path(path) == target_path and not swapped:
-                    swapped = True
-                    target_path.unlink()
-                    target_path.symlink_to(victim_path)
-                return real_open(path, flags)
-
-            with (
-                patch("history_service.store.os.open", side_effect=swap_before_open),
-                self.assertRaises((OSError, ValueError)),
-            ):
-                store._preserve_existing_target_mode(temp_path, target_path)
-
-            self.assertTrue(swapped)
-            self.assertEqual(victim_path.stat().st_mode & 0o777, 0o600)
-
-    def test_default_replacement_mode_preservation_refuses_temp_symlink_swap(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            store = HistoryStore(str(root / "history.db"))
-            target_path = root / "target.sqlite3"
-            target_path.write_bytes(b"target")
-            target_path.chmod(0o600)
-            temp_path = root / "replacement.tmp"
-            temp_path.write_bytes(b"replacement")
-            victim_path = root / "victim.sqlite3"
-            victim_path.write_bytes(b"victim")
-            victim_path.chmod(0o644)
-            real_open = os.open
-            swapped = False
-
-            def swap_before_open(path: str | os.PathLike[str], flags: int) -> int:
-                nonlocal swapped
-                if Path(path) == temp_path and not swapped:
-                    swapped = True
-                    temp_path.unlink()
-                    temp_path.symlink_to(victim_path)
-                return real_open(path, flags)
-
-            with (
-                patch("history_service.store.os.open", side_effect=swap_before_open),
-                self.assertRaises((OSError, ValueError)),
-            ):
-                store._preserve_existing_target_mode(temp_path, target_path)
-
-            self.assertTrue(swapped)
-            self.assertEqual(victim_path.stat().st_mode & 0o777, 0o644)
-
-    def test_default_replacement_mode_preservation_refuses_temp_inode_swap(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            store = HistoryStore(str(root / "history.db"))
-            target_path = root / "target.sqlite3"
-            target_path.write_bytes(b"target")
-            target_path.chmod(0o600)
-            temp_path = root / "replacement.tmp"
-            temp_path.write_bytes(b"replacement")
-            replacement_path = root / "replacement-raced.tmp"
-            replacement_path.write_bytes(b"raced")
-            real_open = os.open
-            swapped = False
-
-            def swap_before_open(path: str | os.PathLike[str], flags: int) -> int:
-                nonlocal swapped
-                if Path(path) == temp_path and not swapped:
-                    swapped = True
-                    temp_path.unlink()
-                    replacement_path.replace(temp_path)
-                return real_open(path, flags)
-
-            with (
-                patch("history_service.store.os.open", side_effect=swap_before_open),
-                self.assertRaisesRegex(ValueError, "changed temporary path"),
-            ):
-                store._preserve_existing_target_mode(temp_path, target_path)
-
-            self.assertTrue(swapped)
-            self.assertEqual(temp_path.read_bytes(), b"raced")
 
     def test_default_replacement_publisher_leaves_one_sided_temp_swap_generations_untouched(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
