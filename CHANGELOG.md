@@ -26,6 +26,28 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Upgrade notes
+
+- `HISTORY_BACKUP_INTERVAL_SECONDS` now defaults to 86400 (daily) instead of
+  3600, and `HISTORY_BACKUP_RETENTION_COUNT` to 7 instead of 28, so the history
+  sidecar keeps at most 7 daily plus 4 weekly plus 3 monthly snapshot copies.
+  To keep the hourly cadence and 28 copies, set both variables to their old
+  values in `.env`; a `.env` copied from an earlier `.env.example` already
+  does. Databases created before this release keep reusing freed pages in
+  place; only newly created databases return space to the filesystem after
+  retention. (#483)
+
+### Changed
+
+- Single-file history retention now runs on its own schedule instead of
+  waiting for a successful backup snapshot, backup failures are reported in
+  plain words, the backup copy no longer blocks readers and writers, retention
+  batches of any size work, new databases return freed space after retention,
+  startup skips the full row counts, and the disk-identity backfill resumes
+  after a restart. (#483)
+
 ## v0.23.0 - 2026-09-08
 
 This release includes every pull request merged after `v0.22.2` through the
