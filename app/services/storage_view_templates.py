@@ -55,9 +55,8 @@ def list_storage_view_templates() -> list[StorageViewTemplate]:
             default_label="Front Bays",
             kind="ses_enclosure",
             summary=(
-                "Saved chassis overlay for a live SES-backed chassis or shelf. Live discovered "
-                "enclosures already auto-populate in the main UI, and this view lets you keep a "
-                "profile-backed mirror when you want one."
+                "A saved copy of a live SES enclosure. Use it when you want a fixed layout "
+                "that survives enclosure renumbering."
             ),
             rows=4,
             columns=6,
@@ -72,8 +71,7 @@ def list_storage_view_templates() -> list[StorageViewTemplate]:
             supports_led=True,
             supports_auto_discovery=True,
             notes=(
-                "Use this when you want a saved chassis view that mirrors a live SES enclosure. "
-                "The discovered live enclosure still appears on its own at runtime."
+                "The live enclosure still appears on its own; this view is a fixed copy of it."
             ),
         ),
         StorageViewTemplate(
@@ -113,8 +111,7 @@ def list_storage_view_templates() -> list[StorageViewTemplate]:
             default_label="AOC-SLG4-2H8M2",
             kind="nvme_carrier",
             summary=(
-                "Two-slot Supermicro M.2 RAID carrier card. The ESXi first pass binds StorCLI physical "
-                "members 13:0 and 13:1 to M2-1 and M2-2."
+                "Two-slot Supermicro M.2 RAID card. On ESXi the two RAID members map to M2-1 and M2-2."
             ),
             rows=2,
             columns=1,
@@ -137,10 +134,7 @@ def list_storage_view_templates() -> list[StorageViewTemplate]:
             },
             supports_led=False,
             supports_auto_discovery=False,
-            notes=(
-                "Read-only carrier view for the AOC-SLG4-2H8M2. LED/identify and RAID-management "
-                "actions intentionally stay disabled."
-            ),
+            notes="View only: LED and RAID actions are not available for this card.",
         ),
         StorageViewTemplate(
             id="satadom-pair-2",
@@ -165,7 +159,7 @@ def list_storage_view_templates() -> list[StorageViewTemplate]:
             },
             supports_led=False,
             supports_auto_discovery=False,
-            notes="Useful for mirrored boot devices or SATADOM pairs. Hide it from the main read UI later if you only want it as a maintenance view.",
+            notes="Useful for mirrored boot devices or SATADOM pairs. You can hide it from the main page later.",
         ),
         StorageViewTemplate(
             id="fat-twin-rear-2",
@@ -194,9 +188,8 @@ def list_storage_view_templates() -> list[StorageViewTemplate]:
             supports_led=False,
             supports_auto_discovery=False,
             notes=(
-                "First-pass rear two-bay view for FatTwin nodes. The stacked rear carrier renders "
-                "slot 01 above slot 00, and the BMC inventory path can bind those bays by "
-                "out-of-band slot number even when the host OS changes later."
+                "Two rear hot-swap bays on a FatTwin node. Slot 1 is drawn above slot 0. "
+                "Bays can be matched by BMC slot number."
             ),
         ),
         StorageViewTemplate(

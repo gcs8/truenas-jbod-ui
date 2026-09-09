@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import re
 import secrets
 import shlex
 import stat
@@ -2154,19 +2155,32 @@ class AdminStatePayloadTests(unittest.TestCase):
         self.assertTrue(
             any("/var/log/messages" in command for command in payload["setup_platform_defaults"]["core"]["ssh_commands"])
         )
+        jargon = re.compile(
+            r"sidecar|runtime|read UI|enrichment|evidence|first.pass|middleware|wildcard|payload|/dev/sg",
+            re.IGNORECASE,
+        )
+        for platform_key, defaults in payload["setup_platform_defaults"].items():
+            requirements = defaults["requirements"]
+            self.assertEqual(
+                set(requirements), {"summary", "required", "optional", "guidance"}, platform_key
+            )
+            self.assertTrue(requirements["summary"], platform_key)
+            self.assertTrue(requirements["required"], platform_key)
+            for text in [requirements["summary"], requirements["guidance"], *requirements["required"], *requirements["optional"]]:
+                self.assertIsNone(jargon.search(text), f"{platform_key}: {text}")
+                self.assertNotIn("Quantastor", text, platform_key)
         scale_requirements = payload["setup_platform_defaults"]["scale"]["requirements"]
-        self.assertIn("/usr/bin/lsscsi -g -t", scale_requirements["required"][1])
-        self.assertIn("/usr/bin/lsblk --json", scale_requirements["required"][1])
-        self.assertTrue(any("/dev/sgN" in item for item in scale_requirements["optional"]))
-        self.assertTrue(any("nvme-cli" in item for item in scale_requirements["optional"]))
-        self.assertTrue(any("sesutil" in item for item in scale_requirements["unsupported"]))
-        self.assertTrue(any("mprutil" in item for item in scale_requirements["unsupported"]))
+        self.assertIn("API key", scale_requirements["required"][0])
+        self.assertTrue(any("SSH login" in item for item in scale_requirements["optional"]))
         linux_requirements = payload["setup_platform_defaults"]["linux"]["requirements"]
-        self.assertTrue(any("lsblk --json" in item for item in linux_requirements["required"]))
-        self.assertIn("lsscsi -g -t", linux_requirements["guidance"])
+        self.assertTrue(any("SSH login" in item for item in linux_requirements["required"]))
         esxi_requirements = payload["setup_platform_defaults"]["esxi"]["requirements"]
-        self.assertTrue(any("Linux sudoers/bootstrap" in item for item in esxi_requirements["unsupported"]))
-        self.assertIn("/cN or /call", esxi_requirements["guidance"])
+        self.assertIn("host-managed", esxi_requirements["summary"])
+        self.assertIn("StorCLI", esxi_requirements["summary"])
+        self.assertIn("BMC", esxi_requirements["summary"])
+        self.assertIn("/c0", esxi_requirements["guidance"])
+        quantastor_requirements = payload["setup_platform_defaults"]["quantastor"]["requirements"]
+        self.assertIn("QuantaStor", quantastor_requirements["summary"])
         self.assertIn("esxi", payload["setup_platform_defaults"])
         self.assertIn("ipmi", payload["setup_platform_defaults"])
         self.assertEqual(payload["ssh_keys"][0]["name"], "id_truenas")
@@ -3011,6 +3025,49 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertEqual(payload["summary"]["removed_system_ids"], ["qs-cryostorage"])
         self.assertEqual(payload["valid_system_ids"], ["archive-core"])
         history_store.purge_orphaned_history.assert_called_once_with(["archive-core"])
+
+    def test_list_history_systems_route_returns_row_counts_for_every_system(self) -> None:
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/history/systems")
+        history_store = MagicMock()
+        history_store.list_history_system_summaries.return_value = [
+            {"system_id": "archive-core", "system_label": "Archive CORE", "total_rows": 1240},
+        ]
+
+        with patch("admin_service.main.get_history_store", return_value=history_store):
+            response = asyncio.run(route.endpoint())
+
+        payload = json.loads(response.body.decode("utf-8"))
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["systems"][0]["system_id"], "archive-core")
+        self.assertEqual(payload["systems"][0]["total_rows"], 1240)
+        history_store.list_history_system_summaries.assert_called_once_with()
+
+    def test_list_history_systems_route_fails_closed_without_leaking_store_errors(self) -> None:
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/history/systems")
+        history_store = MagicMock()
+        history_store.list_history_system_summaries.side_effect = RuntimeError("private sqlite path")
+
+        with patch("admin_service.main.get_history_store", return_value=history_store):
+            with self.assertRaises(HTTPException) as raised:
+                asyncio.run(route.endpoint())
+
+        self.assertEqual(raised.exception.status_code, 500)
+        self.assertEqual(raised.exception.detail, "Unable to inspect saved history; see admin logs.")
+
+    def test_admin_runtime_and_template_copy_avoid_implementation_words(self) -> None:
+        from app.config import RUNTIME_BEHAVIOR_APP_FIELDS
+        from app.services.storage_view_templates import list_storage_view_templates
+
+        jargon = re.compile(r"sidecar|read UI|first.pass|StorCLI physical|surface|TTL|stale", re.IGNORECASE)
+        for key, field in RUNTIME_BEHAVIOR_APP_FIELDS.items():
+            for text in (field["label"], field["description"]):
+                self.assertIsNone(jargon.search(text), f"{key}: {text}")
+        for template in list_storage_view_templates():
+            for text in (template.summary, template.notes or ""):
+                self.assertIsNone(jargon.search(text), f"{template.id}: {text}")
+        runtime = DockerRuntimeService(AdminSettings())
+        for container in runtime.managed_containers.values():
+            self.assertIsNone(jargon.search(container["description"]), container["description"])
 
     def test_list_orphaned_history_route_returns_history_sources(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/history/orphaned")

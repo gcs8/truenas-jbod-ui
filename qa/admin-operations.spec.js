@@ -113,6 +113,9 @@ test.describe("admin sidecar smoke", () => {
     await expect(page.locator("#setup-bootstrap-sudoers-preview")).toContainText(
       "does not use the Linux sudoers/bootstrap flow"
     );
+    await expect(page.locator("#setup-bootstrap-details")).not.toHaveAttribute("open", /.*/);
+    await expect(page.locator("#setup-ha-toggle")).toBeHidden();
+    await page.locator("#setup-ssh-commands-details > summary").click();
     await page.locator("#setup-load-recommended-button").click();
     await expect(page.locator("#setup-ssh-commands")).toHaveValue(/\/opt\/lsi\/storcli64\/storcli64 \/c0\/eall\/sall show all J/);
   });

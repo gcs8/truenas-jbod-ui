@@ -211,7 +211,7 @@ test("duplicate actions share one request and disable only that container until 
   assert.equal(harness.calls.filter(([, method]) => method === "POST").length, 1);
   assert.equal(harness.calls.filter(([url]) => url === "/api/admin/runtime").length, 2);
   assert.deepEqual(harness.buttons.map((button) => button.disabled), [false, false, false]);
-  assert.ok(harness.banners.some(([message, tone]) => tone === "success" && /confirmed running and healthy/i.test(message)));
+  assert.ok(harness.banners.some(([message, tone]) => tone === "success" && /is running and healthy/i.test(message)));
 });
 
 test("a hung action request is aborted before convergence polling begins", async () => {
@@ -285,7 +285,7 @@ test("stop is not reported successful until a follow-up observation has running 
 
   assert.equal(succeeded, true);
   assert.equal(harness.calls.filter(([url]) => url === "/api/admin/runtime").length, 2);
-  assert.ok(harness.banners.some(([message, tone]) => tone === "success" && /confirmed stopped/i.test(message)));
+  assert.ok(harness.banners.some(([message, tone]) => tone === "success" && /\bstopped\.$/i.test(message)));
 });
 
 test("start accepts running state when no health check is available", async () => {

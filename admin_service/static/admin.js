@@ -187,6 +187,7 @@
     setupSshHostLabel: document.getElementById("setup-ssh-host-label"),
     setupSshHost: document.getElementById("setup-ssh-host"),
     setupSshHostHelp: document.getElementById("setup-ssh-host-help"),
+    setupHaToggle: document.getElementById("setup-ha-toggle"),
     setupHaEnabled: document.getElementById("setup-ha-enabled"),
     setupHaPanel: document.getElementById("setup-ha-panel"),
     setupDiscoverHaNodesButton: document.getElementById("setup-discover-ha-nodes-button"),
@@ -252,7 +253,6 @@
     setupStorageViewOrder: document.getElementById("setup-storage-view-order"),
     setupStorageViewEnabled: document.getElementById("setup-storage-view-enabled"),
     setupStorageViewShowMain: document.getElementById("setup-storage-view-show-main"),
-    setupStorageViewShowAdmin: document.getElementById("setup-storage-view-show-admin"),
     setupStorageViewCollapsed: document.getElementById("setup-storage-view-collapsed"),
     setupStorageViewEnclosureIds: document.getElementById("setup-storage-view-enclosure-ids"),
     setupStorageViewPoolNames: document.getElementById("setup-storage-view-pool-names"),
@@ -274,13 +274,14 @@
     setupStorageViewPreviewSummary: document.getElementById("setup-storage-view-preview-summary"),
     setupStorageViewPreviewGrid: document.getElementById("setup-storage-view-preview-grid"),
     setupStorageViewPreviewMeta: document.getElementById("setup-storage-view-preview-meta"),
+    setupPanel: document.querySelector(".setup-panel"),
     setupCreateButton: document.getElementById("setup-create-button"),
     setupCreateDemoButton: document.getElementById("setup-create-demo-button"),
     setupResult: document.getElementById("setup-result"),
     existingSystemSelect: document.getElementById("existing-system-select"),
-    existingSystemLoadButton: document.getElementById("existing-system-load-button"),
     existingSystemDeleteButton: document.getElementById("existing-system-delete-button"),
     existingSystemDeleteHistoryToggle: document.getElementById("existing-system-delete-history-toggle"),
+    existingSystemDeleteHistoryLabel: document.getElementById("existing-system-delete-history-label"),
     existingSystemResetButton: document.getElementById("existing-system-reset-button"),
     existingSystemHelp: document.getElementById("existing-system-help"),
     existingSystemSummary: document.getElementById("existing-system-summary"),
@@ -739,8 +740,8 @@
     }
     const runtime = state.runtime || {};
     elements.runtimeDetail.textContent = runtime.available
-      ? `Runtime control is available through the mounted Docker socket.${runtime.version_detail ? ` ${runtime.version_detail}` : ""}`
-      : String(runtime.detail || "Runtime control is unavailable in this session.");
+      ? `Container controls are available.${runtime.version_detail ? ` ${runtime.version_detail}` : ""}`
+      : String(runtime.detail || "Container controls are unavailable (Docker socket not mounted).");
     const containers = Array.isArray(runtime.containers) ? runtime.containers : [];
     elements.runtimeCards.replaceChildren(...containers.map((container) => renderRuntimeCardElement(container)));
   }
@@ -837,7 +838,7 @@
     if (!actionRow.children.length) {
       const noAction = document.createElement("span");
       noAction.className = "subtle";
-      noAction.textContent = "No action available from this state.";
+      noAction.textContent = "Nothing to do.";
       actionRow.appendChild(noAction);
     }
 
@@ -864,10 +865,7 @@
         const key = String(field.key || "");
         const disabled = !field.writable;
         const ownerLabel = runtimeBehaviorOwnerLabel(field);
-        const source = String(field.source || "").trim();
-        const description = [field.description, source ? `Source: ${source}` : ""]
-          .filter(Boolean)
-          .join(" ");
+        const description = String(field.description || "").trim();
         const minimum = Number(field.minimum);
         const maximum = Number(field.maximum);
         const minAttr = Number.isFinite(minimum) ? ` min="${minimum}"` : "";
@@ -1122,6 +1120,9 @@
     const quantastor = currentSetupPlatform() === "quantastor";
     const haEnabled = quantastor && Boolean(elements.setupHaEnabled?.checked);
     syncSshHostCopy({ quantastor, haEnabled });
+    if (elements.setupHaToggle) {
+      elements.setupHaToggle.classList.toggle("hidden", !quantastor);
+    }
     if (elements.setupHaEnabled) {
       elements.setupHaEnabled.disabled = !quantastor;
     }
@@ -1153,18 +1154,19 @@
     }
     if (elements.setupHaNodesResult) {
       if (!quantastor) {
-        elements.setupHaNodesResult.textContent = "This HA-node helper only applies to Quantastor systems.";
+        elements.setupHaNodesResult.textContent = "";
       } else if (!haEnabled) {
-        elements.setupHaNodesResult.textContent = "Enable HA mode when this Quantastor entry should model multiple shared-SES nodes under one cluster-style system.";
+        elements.setupHaNodesResult.textContent = "Turn this on if two QuantaStor nodes share the same disk shelf.";
       } else if (state.haNodesLoading) {
-        elements.setupHaNodesResult.textContent = "Inspecting Quantastor node metadata from the current API settings...";
+        elements.setupHaNodesResult.textContent = "Loading nodes from QuantaStor...";
       } else if (currentQuantastorHaNodes().length) {
+        const nodeCount = currentQuantastorHaNodes().length;
         const nodesMissingHosts = currentQuantastorHaNodes().filter((node) => !node.host).length;
         elements.setupHaNodesResult.textContent = nodesMissingHosts
-          ? `Loaded ${currentQuantastorHaNodes().length} Quantastor HA node row${currentQuantastorHaNodes().length === 1 ? "" : "s"}. Quantastor did not publish ${nodesMissingHosts} SSH host${nodesMissingHosts === 1 ? "" : "s"} in the API response; runtime can still learn default-gateway node IPs after one real node is reachable.`
-          : `Loaded ${currentQuantastorHaNodes().length} Quantastor HA node row${currentQuantastorHaNodes().length === 1 ? "" : "s"}. API-published/default-gateway node hosts and shared SSH auth settings will be reused for node-targeted SSH.`;
+          ? `Loaded ${nodeCount} node${nodeCount === 1 ? "" : "s"}. ${nodesMissingHosts} of them ${nodesMissingHosts === 1 ? "has" : "have"} no address yet; fill it in or leave it blank and the app will find it once one node answers.`
+          : `Loaded ${nodeCount} node${nodeCount === 1 ? "" : "s"}.`;
       } else {
-        elements.setupHaNodesResult.textContent = "Use up to three HA node rows as fallbacks when the appliance does not publish node hosts.";
+        elements.setupHaNodesResult.textContent = "Up to three nodes.";
       }
     }
   }
@@ -1176,13 +1178,13 @@
     }
     if (elements.setupSshHost) {
       elements.setupSshHost.placeholder = quantastorHa
-        ? "Optional fallback; HA node rows are preferred"
+        ? "Optional; the nodes below are used first"
         : "Defaults to the same host";
     }
     if (elements.setupSshHostHelp) {
       elements.setupSshHostHelp.classList.toggle("hidden", !quantastorHa);
       elements.setupSshHostHelp.textContent = quantastorHa
-        ? "For Quantastor HA, node rows below are the SSH targets. This field is only a fallback seed and is skipped when it matches the API host."
+        ? "With HA on, the app connects to the nodes listed below."
         : "";
     }
   }
@@ -1213,8 +1215,8 @@
       return;
     }
     elements.setupCreateButton.textContent = isEditingLoadedSystem()
-      ? "Save System Changes"
-      : "Create System Entry";
+      ? "Save changes"
+      : "Save system";
   }
 
   function suggestedTlsBundleName() {
@@ -1341,11 +1343,55 @@
     const serverName = collectTlsServerName();
     if (elements.setupVerifySsl?.checked) {
       elements.setupVerifySslHelp.textContent = customBundlePath
-        ? `Uses normal CA and hostname validation with the system trust store plus ${customBundlePath}.${serverName ? ` Certificate validation and SNI will use ${serverName}.` : ""} Public CAs still work, and the extra PEM bundle lets you trust a private CA or the presented remote certificate material.`
-        : `Uses normal CA and hostname validation from the sidecar trust store.${serverName ? ` Certificate validation and SNI will use ${serverName}.` : ""} Public CAs work as-is, and you can inspect and import a private CA or presented remote certificate material below when you need extra trust anchors.`;
+        ? `Certificate checks are on, using ${customBundlePath}.${serverName ? ` The certificate must be issued for ${serverName}.` : ""}`
+        : `Certificate checks are on.${serverName ? ` The certificate must be issued for ${serverName}.` : ""} If your NAS uses a self-signed certificate, use 'Trust this server's certificate' below.`;
       return;
     }
-    elements.setupVerifySslHelp.textContent = "TLS certificate and hostname checks are disabled for this saved connection. Use this only when you intentionally want to trust the target without CA validation.";
+    elements.setupVerifySslHelp.textContent = "Certificate checks are off. Anyone on the network could impersonate this server.";
+  }
+
+  function historyRowCountForSystem(systemId) {
+    const rows = state.historyRowCounts?.[systemId];
+    return Number.isFinite(rows) ? rows : null;
+  }
+
+  function describeHistoryDeletion(systemId) {
+    const rows = systemId ? historyRowCountForSystem(systemId) : null;
+    return rows === null
+      ? "Also delete its history"
+      : `Also delete its history (${rows.toLocaleString()} row${rows === 1 ? "" : "s"})`;
+  }
+
+  async function loadHistoryRowCounts({ quiet = true } = {}) {
+    try {
+      const payload = await fetchJson("/api/admin/history/systems");
+      const counts = {};
+      (Array.isArray(payload.systems) ? payload.systems : []).forEach((item) => {
+        if (item && typeof item.system_id === "string") {
+          counts[item.system_id] = Number(item.total_rows) || 0;
+        }
+      });
+      state.historyRowCounts = counts;
+      return counts;
+    } catch (error) {
+      if (!quiet) {
+        setBanner(`Unable to count saved history: ${error.message || error}`, "error");
+      }
+      return null;
+    }
+  }
+
+  function hasUnsavedSetupChanges() {
+    return Boolean(state.setupDirty);
+  }
+
+  function confirmDiscardSetupChanges() {
+    if (!hasUnsavedSetupChanges()) {
+      return true;
+    }
+    const loadedSystem = getSystemById(state.loadedSystemId);
+    const target = loadedSystem ? loadedSystem.label || loadedSystem.id : "the new system";
+    return window.confirm(`Discard unsaved changes to ${target}?`);
   }
 
   function renderExistingSystems() {
@@ -1366,9 +1412,6 @@
     }
 
     const selectedSystem = getSystemById(state.selectedExistingSystemId);
-    if (elements.existingSystemLoadButton) {
-      elements.existingSystemLoadButton.disabled = !selectedSystem;
-    }
     if (elements.existingSystemDeleteButton) {
       elements.existingSystemDeleteButton.disabled = !selectedSystem;
     }
@@ -1378,16 +1421,19 @@
         elements.existingSystemDeleteHistoryToggle.checked = false;
       }
     }
+    if (elements.existingSystemDeleteHistoryLabel) {
+      elements.existingSystemDeleteHistoryLabel.textContent = describeHistoryDeletion(selectedSystem?.id);
+    }
     if (elements.existingSystemResetButton) {
       elements.existingSystemResetButton.disabled = !state.loadedSystemId;
     }
     if (elements.existingSystemHelp) {
       if (!selectedSystem) {
-        elements.existingSystemHelp.textContent = "No saved systems yet. This walkthrough will create the first one.";
+        elements.existingSystemHelp.textContent = "No systems yet. Fill in the form to add the first one.";
       } else if (isEditingLoadedSystem()) {
-        elements.existingSystemHelp.textContent = `Editing ${selectedSystem.label || selectedSystem.id}. Save with the same system id to update it in place, change the id to make a copy, or use Delete + Purge History if you want a fully clean re-add under a new id.`;
+        elements.existingSystemHelp.textContent = `Editing ${selectedSystem.label || selectedSystem.id}.`;
       } else {
-        elements.existingSystemHelp.textContent = `Load ${selectedSystem.label || selectedSystem.id} into the form to revise it, compare settings, clone it into a new system id, delete only the saved config entry, or pair delete with history cleanup when you want a fresh start.`;
+        elements.existingSystemHelp.textContent = `Select to edit ${selectedSystem.label || selectedSystem.id}.`;
       }
     }
     if (elements.existingSystemSummary) {
@@ -1435,7 +1481,7 @@
       return;
     }
     const selectedValue = elements.setupProfile.value || state.selectedProfileId || "";
-    const options = ['<option value="">Auto-select from platform</option>'].concat(
+    const options = ['<option value="">Detect automatically</option>'].concat(
       state.profiles.map((profile) => `<option value="${escapeHtml(profile.id)}">${escapeHtml(profile.label)}</option>`)
     );
     elements.setupProfile.innerHTML = options.join("");
@@ -1529,12 +1575,12 @@
   }
 
   const BUILDER_ORDERING_LABELS = {
-    "source-layout": "Source Layout",
-    "row-major-bottom": "Bottom-Up By Rows",
-    "row-major-top": "Top-Down By Rows",
-    "column-major-bottom": "Bottom-Up By Columns",
-    "column-major-top": "Top-Down By Columns",
-    "custom-layout": "Custom Matrix",
+    "source-layout": "Same as the source layout",
+    "row-major-bottom": "Bottom-up by rows",
+    "row-major-top": "Top-down by rows",
+    "column-major-bottom": "Bottom-up by columns",
+    "column-major-top": "Top-down by columns",
+    "custom-layout": "Typed bay numbers",
   };
 
   function builderOrderingLabel(ordering) {
@@ -1923,7 +1969,7 @@
         previewRows: sourceLayout,
         slotLayoutForSave: null,
         badge: "Source Layout",
-        summary: `Preserving the selected source profile geometry from ${sourceProfile.label}. Change rows, columns, or visible bays to generate a new layout order.`,
+        summary: `Same layout as ${sourceProfile.label}. Change rows, columns or visible bays to renumber it.`,
         error: null,
         orderingLabel: builderOrderingLabel(ordering),
       };
@@ -1933,12 +1979,12 @@
     const generatedRows = buildRectangularProfileLayout(draft.rows, draft.columns, draft.slot_count, effectiveOrdering);
     const orderingLabel = builderOrderingLabel(effectiveOrdering);
     const summary = ordering === "source-layout"
-      ? `Geometry no longer matches ${sourceProfile?.label || "the selected source profile"}, so the builder is previewing the default bottom-up row order. Pick another ordering or switch to Custom Matrix if you want a different draft.`
+      ? `Rows or columns no longer match ${sourceProfile?.label || "the source layout"}, so bays are numbered bottom-up by rows. Pick another order or type the bay numbers yourself.`
       : `Generating a ${orderingLabel.toLowerCase()} ${draft.rows} x ${draft.columns} profile with ${draft.slot_count} visible bays.`;
     return {
       previewRows: generatedRows,
       slotLayoutForSave: generatedRows,
-      badge: ordering === "source-layout" ? "Rectangular Draft" : orderingLabel,
+      badge: ordering === "source-layout" ? "Draft" : orderingLabel,
       summary,
       error: null,
       orderingLabel,
@@ -2073,7 +2119,7 @@
       elements.profileBuilderLayoutText.value = "";
     }
     if (elements.profileBuilderResult && !keepResult) {
-      elements.profileBuilderResult.textContent = "Load a profile from the catalog above, tune this first-pass builder form, then save it as a reusable custom profile.";
+      elements.profileBuilderResult.textContent = "Pick a layout on the left, change it, then save.";
     }
     renderProfileBuilder();
   }
@@ -2135,8 +2181,8 @@
     }
     if (elements.profileBuilderResult) {
       elements.profileBuilderResult.textContent = profile.is_custom
-        ? `Loaded custom profile ${profile.label || profile.id}. Save with the same id to update it in place, or change the id to create a copy.`
-        : `Loaded built-in profile ${profile.label || profile.id}. Save this draft with a new custom profile id to reuse it across systems.`;
+        ? `Loaded ${profile.label || profile.id}. Save with the same ID to update it, or change the ID to save a copy.`
+        : `Loaded the built-in layout ${profile.label || profile.id}. Give it a new ID and save.`;
     }
     renderProfileBuilder();
   }
@@ -2158,9 +2204,9 @@
     const sourceProfile = currentBuilderSourceProfile();
     const draft = readProfileBuilderDraft({ allowFallback: true });
     if (!draft || !sourceProfile) {
-      elements.profileBuilderBadge.textContent = "Preset / Lego";
+      elements.profileBuilderBadge.textContent = "Layout";
       elements.profileBuilderPreviewBadge.textContent = "Draft";
-      elements.profileBuilderPreviewSummary.textContent = "Load a source profile above to preview the custom geometry that will be saved.";
+      elements.profileBuilderPreviewSummary.textContent = "Pick a layout to preview it.";
       elements.profileBuilderPreviewGrid.innerHTML = "";
       elements.profileBuilderPreviewMeta.innerHTML = "";
       clearProfilePreviewGeometry(elements.profileBuilderPreviewGrid);
@@ -2175,7 +2221,7 @@
     const columnCount = previewRows.length
       ? Math.max(1, ...previewRows.map((row) => (Array.isArray(row) ? row.length : 0)))
       : Math.max(1, Number(draft.columns) || 1);
-    elements.profileBuilderBadge.textContent = state.loadedBuilderProfileId ? "Editing Custom" : "Clone To Custom";
+    elements.profileBuilderBadge.textContent = state.loadedBuilderProfileId ? "Editing" : "New copy";
     elements.profileBuilderPreviewBadge.textContent = layoutResolution.badge;
     elements.profileBuilderPreviewSummary.textContent = layoutResolution.summary;
     elements.profileBuilderPreviewGrid.style.gridTemplateColumns = "";
@@ -2423,13 +2469,13 @@
     const systemId = currentStorageViewSystemId();
     const hiddenProfiles = hiddenLiveChassisProfiles();
     if (!systemId) {
-      return "Storage views stay attached to one system, so internal carrier cards and boot media do not need to become separate systems. Live SES enclosures still show up on their own later, and a saved chassis view is only needed when you want a curated layout for that hardware.";
+      return "";
     }
     if (state.liveEnclosuresLoading) {
-      return `Checking live discovered enclosures on ${systemId} so duplicate saved chassis layouts can stay out of the add list.`;
+      return `Checking what ${systemId} already shows...`;
     }
     if (state.liveEnclosuresError) {
-      return `Unable to inspect live discovered enclosures on ${systemId} right now, so the full saved chassis layout list is still shown. Virtual/internal templates are unaffected.`;
+      return `Could not check what ${systemId} already shows, so every layout is listed.`;
     }
     if (hiddenProfiles.length) {
       const labels = hiddenProfiles
@@ -2437,9 +2483,9 @@
         .map((profile) => profile.label)
         .join(", ");
       const suffix = hiddenProfiles.length > 3 ? ", and more" : "";
-      return `Live discovered enclosures on ${systemId} already cover ${labels}${suffix}, so those duplicate saved chassis layouts are hidden here. Generic and internal layouts stay available for hardware that is not auto-discovered.`;
+      return `${systemId} already shows ${labels}${suffix}, so those layouts are not listed again.`;
     }
-    return `Live discovered enclosures already auto-populate on ${systemId}. Add a storage view here only when you want a saved chassis layout that is not already auto-discovered, or a virtual internal disk group attached to this host.`;
+    return "";
   }
 
   function storageViewAddOptionsHtml() {
@@ -2938,6 +2984,25 @@
       .join("");
   }
 
+  const STORAGE_VIEW_FIELDS_BY_KIND = {
+    ses_enclosure: ["profile", "enclosure_ids", "slot_labels"],
+    nvme_carrier: ["binding_mode", "serials", "pcie_addresses", "device_names", "slot_labels", "slot_sizes"],
+    boot_devices: ["binding_mode", "serials", "device_names", "slot_labels"],
+    manual: ["binding_mode", "pool_names", "serials", "device_names", "slot_labels"],
+  };
+
+  function storageViewFieldsForKind(kind, { haTargetsAvailable = false } = {}) {
+    const fields = STORAGE_VIEW_FIELDS_BY_KIND[kind] || STORAGE_VIEW_FIELDS_BY_KIND.manual;
+    return haTargetsAvailable ? [...fields, "target_system"] : fields;
+  }
+
+  function syncStorageViewFieldVisibility(kind, options = {}) {
+    const visible = new Set(storageViewFieldsForKind(kind, options));
+    (elements.setupStorageViewEditor?.querySelectorAll?.("[data-storage-view-field]") || []).forEach((field) => {
+      field.classList.toggle("hidden", !visible.has(field.dataset.storageViewField));
+    });
+  }
+
   function syncStorageViewEditorFromState() {
     const storageView = ensureStorageViewSelection();
     if (!elements.setupStorageViewEditor || !elements.setupStorageViewEmpty || !elements.setupStorageViewTemplateBadge) {
@@ -2971,15 +3036,17 @@
       elements.setupStorageViewProfile.value = selectedProfile?.id || storageView.profile_id || "";
       elements.setupStorageViewProfile.disabled = storageView.kind !== "ses_enclosure" || !state.profiles.length;
     }
+    const haTargetsAvailable = Boolean(
+      currentSetupPlatform() === "quantastor"
+      && Boolean(elements.setupHaEnabled?.checked)
+      && storageView.kind !== "ses_enclosure"
+      && haTargetOptions().length
+    );
     if (elements.setupStorageViewTargetSystem) {
       elements.setupStorageViewTargetSystem.value = storageView.binding?.target_system_id || "";
-      elements.setupStorageViewTargetSystem.disabled = !(
-        currentSetupPlatform() === "quantastor"
-        && Boolean(elements.setupHaEnabled?.checked)
-        && storageView.kind !== "ses_enclosure"
-        && haTargetOptions().length
-      );
+      elements.setupStorageViewTargetSystem.disabled = !haTargetsAvailable;
     }
+    syncStorageViewFieldVisibility(storageView.kind, { haTargetsAvailable });
     if (elements.setupStorageViewBindingMode) {
       elements.setupStorageViewBindingMode.value = storageView.binding?.mode || "auto";
     }
@@ -2991,9 +3058,6 @@
     }
     if (elements.setupStorageViewShowMain) {
       elements.setupStorageViewShowMain.checked = storageView.render?.show_in_main_ui !== false;
-    }
-    if (elements.setupStorageViewShowAdmin) {
-      elements.setupStorageViewShowAdmin.checked = storageView.render?.show_in_admin_ui !== false;
     }
     if (elements.setupStorageViewCollapsed) {
       elements.setupStorageViewCollapsed.checked = Boolean(storageView.render?.default_collapsed);
@@ -3021,8 +3085,7 @@
       elements.setupStorageViewSlotSizes.disabled = storageView.kind !== "nvme_carrier";
     }
     if (elements.setupStorageViewHelp) {
-      elements.setupStorageViewHelp.textContent = template?.notes
-        || storageViewAddHelpText();
+      elements.setupStorageViewHelp.textContent = storageViewAddHelpText();
     }
     if (elements.setupStorageViewEditorHelp) {
       const duplicateLiveEnclosures = storageView.kind === "ses_enclosure"
@@ -3031,15 +3094,14 @@
       const targetNode = haTargetOptions().find((node) => node.system_id === storageView.binding?.target_system_id)?.label
         || storageView.binding?.target_system_id
         || "";
+      const notes = [template?.summary, template?.notes].filter(Boolean).join(" ");
       elements.setupStorageViewEditorHelp.textContent = storageView.kind === "ses_enclosure"
         ? (duplicateLiveEnclosures.length
-          ? `This saved chassis view duplicates the live discovered enclosure${duplicateLiveEnclosures.length === 1 ? "" : "s"} ${duplicateLiveEnclosures.map((enclosure) => enclosure.label).join(", ")}. The live hardware already auto-populates separately, so keep this only if you still want a curated overlay.`
+          ? `${duplicateLiveEnclosures.map((enclosure) => enclosure.label).join(", ")} already ${duplicateLiveEnclosures.length === 1 ? "shows" : "show"} on the main page; keep this view only if you want a fixed copy as well.`
           : storageView.profile_id
-            ? "This saved chassis view keeps its own profile-backed layout while the real enclosure still appears separately in runtime discovery."
-            : "This legacy saved chassis view follows the current live profile until you pin a specific saved chassis layout here.")
-        : (targetNode
-          ? `${template?.summary || "The template defines the physical shape."} Binding hints and candidate matching are currently scoped to ${targetNode}.`
-          : (template?.summary || "The template defines the physical shape. Binding hints decide how disks or enclosures should land inside that shape later."));
+            ? notes
+            : "Pick a chassis layout to give this view a fixed shape.")
+        : (targetNode ? `${notes} Drives are matched on ${targetNode}.` : notes);
     }
     if (elements.setupStorageViewMoveUpButton) {
       elements.setupStorageViewMoveUpButton.disabled = state.storageViews[0]?.id === storageView.id;
@@ -3162,7 +3224,7 @@
       storageView.enabled = Boolean(elements.setupStorageViewEnabled?.checked);
       storageView.render = {
         show_in_main_ui: Boolean(elements.setupStorageViewShowMain?.checked),
-        show_in_admin_ui: Boolean(elements.setupStorageViewShowAdmin?.checked),
+        show_in_admin_ui: storageView.render?.show_in_admin_ui !== false,
         default_collapsed: Boolean(elements.setupStorageViewCollapsed?.checked),
       };
       storageView.binding = {
@@ -3336,40 +3398,30 @@
     const claimedElsewhereCount = state.storageViewCandidates.length - availableCandidates.length;
     elements.setupStorageViewCandidatesAddAllButton.disabled =
       !selectedStorageView || !availableCandidates.some((candidate) => !candidateBindingAlreadyAttached(candidate, selectedStorageView));
+    const where = `${systemId}${targetLabel ? ` (${targetLabel})` : ""}`;
     if (!selectedStorageView) {
-      elements.setupStorageViewCandidatesHelp.textContent = "Select a storage view first, then you can attach live unmapped inventory candidates to it.";
+      elements.setupStorageViewCandidatesHelp.textContent = "Select a view first.";
       elements.setupStorageViewCandidatesList.innerHTML = "";
       return;
     }
     if (!systemId) {
-      elements.setupStorageViewCandidatesHelp.textContent = "Load a saved system first so the admin sidecar can inspect live inventory and suggest unmapped candidates.";
+      elements.setupStorageViewCandidatesHelp.textContent = "Save or select a system first so its drives can be listed.";
       elements.setupStorageViewCandidatesList.innerHTML = "";
       return;
     }
     if (state.storageViewCandidatesLoading) {
-      elements.setupStorageViewCandidatesHelp.textContent = `Inspecting live inventory on ${systemId}${targetLabel ? ` for ${targetLabel}` : ""} for disks that are not already sitting in mapped slots...`;
+      elements.setupStorageViewCandidatesHelp.textContent = `Checking what ${where} already shows...`;
       elements.setupStorageViewCandidatesList.innerHTML = "";
       return;
     }
     if (!availableCandidates.length) {
-      if (selectedStorageView.kind === "ses_enclosure") {
-        elements.setupStorageViewCandidatesHelp.textContent = `This saved chassis view mirrors a live enclosure. The discovered enclosure auto-populates separately, and candidate shortcuts are usually only needed for virtual internal views on ${systemId}.`;
-        elements.setupStorageViewCandidatesList.innerHTML = "";
-        return;
-      }
-      if (claimedElsewhereCount > 0) {
-        elements.setupStorageViewCandidatesHelp.textContent = `All currently discovered unmapped candidates are already attached to other saved storage views on ${systemId}${targetLabel ? ` for ${targetLabel}` : ""}, so this view is intentionally not re-offering them.`;
-      } else {
-        elements.setupStorageViewCandidatesHelp.textContent = `No unmapped inventory candidates were found for ${systemId}${targetLabel ? ` on ${targetLabel}` : ""}. That usually means everything visible is already tied to a slot, or this host needs a manual binding for the next internal group.`;
-      }
+      elements.setupStorageViewCandidatesHelp.textContent = claimedElsewhereCount > 0
+        ? "Every unassigned drive is already in another view."
+        : `No unassigned drives on ${where}.`;
       elements.setupStorageViewCandidatesList.innerHTML = "";
       return;
     }
-    elements.setupStorageViewCandidatesHelp.textContent = selectedStorageView.kind === "ses_enclosure"
-      ? `These candidates come from live inventory on ${systemId}, but this saved chassis view already mirrors a separately discovered live enclosure. Candidate shortcuts are usually more useful for virtual internal views.`
-      : claimedElsewhereCount > 0
-        ? `These candidates come from live inventory on ${systemId}${targetLabel ? ` for ${targetLabel}` : ""}, exclude disks already sitting in mapped slots, and also hide disks already claimed by a different saved storage view.`
-        : `These candidates come from live inventory on ${systemId}${targetLabel ? ` for ${targetLabel}` : ""} and exclude disks already sitting in mapped slots. Use them as a safer shortcut for internal NVMe or boot-device views.`;
+    elements.setupStorageViewCandidatesHelp.textContent = `Drives on ${where} not yet shown in a view:`;
     elements.setupStorageViewCandidatesList.innerHTML = availableCandidates
       .map((candidate) => {
         const attached = candidateBindingAlreadyAttached(candidate, selectedStorageView);
@@ -3537,24 +3589,7 @@
   }
 
   function platformSetupCopy(platform) {
-    const requirements = platformRequirements(platform);
-    if (requirements?.summary) {
-      return String(requirements.summary);
-    }
-    switch (String(platform || "core").toLowerCase()) {
-      case "scale":
-        return "TrueNAS SCALE usually combines the middleware websocket path with Linux-side SSH enrichment for SMART detail, SES, and slot actions.";
-      case "linux":
-        return "Generic Linux setups are usually SSH-heavy, so pinning a trusted profile and SSH command set matters more than API auth here.";
-      case "quantastor":
-        return "Quantastor normally uses API user/password auth, with SSH reserved for the richer shared-slot and SES details.";
-      case "esxi":
-        return "VMware ESXi stays host-managed, with SSH and StorCLI providing the primary inventory while optional BMC access can add out-of-band drive locate and chassis UID control.";
-      case "ipmi":
-        return "IPMI / BMC Only systems use the out-of-band controller as the primary inventory path. Supermicro first-pass support prefers Redfish where it works, then falls back to the validated web XML path for drive locate and node UID control.";
-      default:
-        return "TrueNAS CORE usually wants an API key, with SSH as the optional fallback for enclosure mapping and LED control.";
-    }
+    return String(platformRequirements(platform)?.summary || "");
   }
 
   function renderSetupRequirementList(title, items, className) {
@@ -3582,9 +3617,8 @@
       return;
     }
     const groups = [
-      renderSetupRequirementList("Required", requirements.required, "is-required"),
+      renderSetupRequirementList("You will need", requirements.required, "is-required"),
       renderSetupRequirementList("Optional", requirements.optional, "is-optional"),
-      renderSetupRequirementList("Unsupported", requirements.unsupported, "is-unsupported"),
     ].filter(Boolean);
     const guidance = String(requirements.guidance || "").trim();
     elements.setupPlatformRequirements.innerHTML = `
@@ -3702,22 +3736,22 @@
     if (elements.setupBootstrapCopy) {
       elements.setupBootstrapCopy.textContent = bootstrapSupported
         ? platform === "core"
-          ? "Use temporary root or installer credentials once to create the final service account, install the selected public key, and optionally apply the shown TrueNAS CORE midclt permission command."
-          : "Use temporary root or installer credentials once to create the final service account, install the selected public key, and optionally write limited sudo rules."
+          ? "Log in once as root to create a limited user for this app, install its key and give it the TrueNAS permissions shown below. Root's password is not saved."
+          : "Log in once as root to create a limited user for this app, install its key and allow only the commands it needs. Root's password is not saved."
         : ipmiOnly
-          ? "IPMI / BMC Only entries skip the Linux bootstrap and sudoers flow. Save the BMC credentials directly here, and add SSH later only when you want extra host-side enrichment."
-          : "VMware ESXi stays on the saved SSH credentials or key directly. The Linux-style one-time service-account bootstrap and sudoers flow are intentionally disabled here.";
+          ? "Not needed for a management-controller-only system. Add SSH later if you want SMART details or bay positions."
+          : "Not available on VMware ESXi. The app logs in with the SSH user and password or key above.";
     }
     if (elements.setupSshCommandsNote) {
       elements.setupSshCommandsNote.innerHTML = unchangedRedactedSshCommands(elements.setupSshCommands)
-        ? "Saved SSH commands are hidden. Leave these placeholders unchanged to keep the saved list, replace them with a new list, or clear all lines to remove the saved commands. While the placeholders stay unchanged, the one-time bootstrap and its sudoers preview use the saved <code>sudo -n ...</code> lines."
+        ? "The saved commands are hidden. Leave these placeholder lines as they are to keep them, replace them with a new list, or clear every line to remove them."
         : bootstrapSupported
         ? platform === "core"
-          ? "These are the exact SSH commands the app runs. When you use the one-time bootstrap, any <code>sudo -n ...</code> lines here are also converted into the CORE <code>midclt user.update</code> permission payload, with on-demand SMART, LED-control, and topology diagnostic extras kept in place."
-          : "These are the exact SSH commands the app runs. When you use the one-time bootstrap, any <code>sudo -n ...</code> lines here are also converted into <code>NOPASSWD</code> sudo rules for the final service account, with the platform's on-demand SMART, LED-control, and topology diagnostic extras kept in place."
+          ? "One per line. Lines starting with <code>sudo</code> become the permissions given to the user created above."
+          : "One per line. Lines starting with <code>sudo</code> become the allowed commands for the user created above."
         : ipmiOnly
-          ? "These are optional host-side SSH commands only. The primary inventory path for an IPMI / BMC Only system is the saved BMC access above, so leaving SSH off is a valid first pass."
-          : "These are the exact SSH commands the app runs on the ESXi host. This path stays read-only and SSH-only, so no Linux sudoers/bootstrap conversion is used.";
+          ? "Optional. A management-controller-only system does not need SSH commands."
+          : "One per line. These run read-only on the ESXi host.";
     }
   }
 
@@ -3734,13 +3768,11 @@
     });
     if (elements.setupBmcHelp) {
       if (ipmiOnly) {
-        elements.setupBmcHelp.textContent = enabled
-          ? "This system uses BMC inventory as the primary path. Pick a profile that matches the chassis face so empty slots can render even when only a few drives are installed."
-          : "Enable BMC access here. IPMI / BMC Only systems require it.";
+        elements.setupBmcHelp.textContent = "This system is read through its management controller. Pick a chassis layout in step 1 so empty bays can be drawn.";
       } else if (enabled) {
-        elements.setupBmcHelp.textContent = "BMC access is enabled as optional out-of-band enrichment. The runtime will prefer Redfish where it works, then use the validated Supermicro web XML path for drive locate and UID control.";
+        elements.setupBmcHelp.textContent = "The app will use the management controller for drive and chassis lights.";
       } else {
-        elements.setupBmcHelp.textContent = "Leave this off when the platform API and SSH path already give you everything you need. Turn it on when you want Supermicro out-of-band inventory, drive locate control, or chassis UID support.";
+        elements.setupBmcHelp.textContent = "";
       }
     }
   }
@@ -4035,18 +4067,18 @@
       return;
     }
     if (!elements.setupSshEnabled?.checked) {
-      elements.setupSshKeyHelp.textContent = "SSH key controls unlock when SSH enrichment is enabled for this system.";
+      elements.setupSshKeyHelp.textContent = "Turn on SSH to choose a key.";
       return;
     }
     if (state.sshKeysLoading) {
-      elements.setupSshKeyHelp.textContent = "Loading SSH key pairs from config/ssh...";
+      elements.setupSshKeyHelp.textContent = "Loading keys...";
       return;
     }
     const mode = normalizeKeyMode(elements.setupSshKeyMode?.value);
     if (mode === "reuse") {
       const selectedKey = getSshKeyByName(elements.setupSshExistingKey?.value);
       if (!selectedKey) {
-        elements.setupSshKeyHelp.textContent = "No reusable keys were found yet. Generate one here or switch to a manual path.";
+        elements.setupSshKeyHelp.textContent = "No keys yet. Create one, or type a path.";
         return;
       }
       elements.setupSshKeyHelp.textContent = `Using ${selectedKey.runtime_private_path || selectedKey.private_path} (${selectedKey.fingerprint}).`;
@@ -4054,14 +4086,14 @@
     }
     if (mode === "generate") {
       const generatedName = normalizeKeyName(elements.setupGenerateKeyName?.value) || suggestedKeyName();
-      elements.setupSshKeyHelp.textContent = `New Ed25519 key pairs are written under config/ssh and become available at /run/ssh immediately. Suggested name: ${generatedName}.`;
+      elements.setupSshKeyHelp.textContent = `A new key will be created as ${generatedName}.`;
       return;
     }
     if (mode === "none") {
-      elements.setupSshKeyHelp.textContent = "Password-only mode clears the saved SSH key path. Use this when the target host accepts password auth and you do not want the runtime to try a private key first.";
+      elements.setupSshKeyHelp.textContent = "The app will log in with the SSH password only.";
       return;
     }
-    elements.setupSshKeyHelp.textContent = `Manual mode leaves the key path editable. Current path: ${elements.setupSshKeyPath?.value || "/run/ssh/id_truenas"}.`;
+    elements.setupSshKeyHelp.textContent = `Key path: ${elements.setupSshKeyPath?.value || "/run/ssh/id_truenas"}.`;
   }
 
   function syncKeyMode() {
@@ -4171,6 +4203,48 @@
     return currentStagedEsxiHostPrepPackages().find((item) => item.token === token) || null;
   }
 
+  function formatRelativeAge(value, now = Date.now()) {
+    const date = new Date(value || "");
+    if (!value || Number.isNaN(date.getTime())) {
+      return "";
+    }
+    const elapsedMinutes = Math.max(0, Math.round((now - date.getTime()) / 60000));
+    if (elapsedMinutes < 1) {
+      return "just now";
+    }
+    if (elapsedMinutes < 60) {
+      return `${elapsedMinutes} minute${elapsedMinutes === 1 ? "" : "s"} ago`;
+    }
+    const elapsedHours = Math.round(elapsedMinutes / 60);
+    if (elapsedHours < 48) {
+      return `${elapsedHours} hour${elapsedHours === 1 ? "" : "s"} ago`;
+    }
+    const elapsedDays = Math.round(elapsedHours / 24);
+    return `${elapsedDays} day${elapsedDays === 1 ? "" : "s"} ago`;
+  }
+
+  function describeStagedPackage(item) {
+    if (!item) {
+      return "";
+    }
+    const age = formatRelativeAge(item.created_at);
+    return [
+      item.filename || item.token || "package",
+      formatBytes(item.size_bytes),
+      age ? `uploaded ${age}` : "",
+    ].filter(Boolean).join(", ");
+  }
+
+  function describeEsxiHostPrepInstall(result) {
+    const verification = result?.verification?.summary || result?.verification;
+    return [
+      result?.remote_path ? `Copied to ${result.remote_path}.` : "",
+      result?.install_ok === false ? "The install command failed." : "",
+      typeof verification === "string" && verification ? verification : "",
+      result?.cleanup_result?.detail ? String(result.cleanup_result.detail) : "",
+    ].filter(Boolean).join(" ");
+  }
+
   function renderEsxiHostPrepPackages(preferredToken = state.selectedEsxiHostPrepToken || "") {
     const packages = currentStagedEsxiHostPrepPackages();
     if (elements.setupEsxiHostPrepTempDir) {
@@ -4203,9 +4277,7 @@
     state.selectedEsxiHostPrepToken = selectedToken;
     if (elements.setupEsxiHostPrepDetail) {
       const selectedPackage = packages.find((item) => item.token === selectedToken) || null;
-      elements.setupEsxiHostPrepDetail.textContent = selectedPackage
-        ? JSON.stringify(selectedPackage, null, 2)
-        : "";
+      elements.setupEsxiHostPrepDetail.textContent = describeStagedPackage(selectedPackage);
     }
   }
 
@@ -4222,8 +4294,8 @@
     renderEsxiHostPrepPackages(state.selectedEsxiHostPrepToken);
     if (elements.setupEsxiHostPrepCopy) {
       elements.setupEsxiHostPrepCopy.textContent = sshEnabled
-        ? "Upload an operator-supplied ESXi offline bundle or VIB into the admin sidecar temp area, then copy/install it on this host with the saved SSH credentials above."
-        : "Enable SSH enrichment above first. This ESXi host-prep path reuses the current SSH host, user, and password or key settings from this form.";
+        ? "Upload the StorCLI .zip or .vib from Broadcom, then install it on the host over SSH."
+        : "Turn on SSH above first. The install uses the SSH login from this form.";
     }
     if (elements.setupEsxiHostPrepPickButton) {
       elements.setupEsxiHostPrepPickButton.disabled = !sshEnabled;
@@ -4239,9 +4311,9 @@
     }
     if (elements.setupEsxiHostPrepResult) {
       if (!sshEnabled) {
-        elements.setupEsxiHostPrepResult.textContent = "Enable SSH enrichment first so the admin sidecar can copy and install the staged package on the ESXi host.";
+        elements.setupEsxiHostPrepResult.textContent = "Turn on SSH first.";
       } else if (!packages.length) {
-        elements.setupEsxiHostPrepResult.textContent = "Upload a user-supplied ESXi .zip or .vib first. The sidecar stages it temporarily and does not bundle vendor files into this project.";
+        elements.setupEsxiHostPrepResult.textContent = "Upload a .zip or .vib first.";
       }
     }
   }
@@ -4390,7 +4462,7 @@
         elements.backupExportResult.textContent = backupPolicy.guidance;
         state.backupExportPolicyGuidanceActive = true;
       } else if (state.backupExportPolicyGuidanceActive) {
-        elements.backupExportResult.textContent = "Exports can stay live, or you can pause the read surfaces first for a cleaner point-in-time bundle.";
+        elements.backupExportResult.textContent = "You can export while the app is running.";
         state.backupExportPolicyGuidanceActive = false;
       }
     }
@@ -4557,7 +4629,7 @@
       elements.setupTlsCaFileLabel.textContent = "No file selected";
     }
     if (elements.setupTlsImportResult) {
-      elements.setupTlsImportResult.textContent = "Import a PEM CA or certificate chain here when your TrueNAS or Quantastor host uses a private CA.";
+      elements.setupTlsImportResult.textContent = "Import your own CA certificate if your NAS uses one.";
     }
     if (elements.setupBootstrapResult) {
       elements.setupBootstrapResult.textContent = "Bootstrap is off by default for saved systems. Enable it only when you intend to run one-time service-account setup.";
@@ -4569,11 +4641,12 @@
       elements.setupEsxiHostPrepFileLabel.textContent = "No file selected";
     }
     if (elements.setupEsxiHostPrepResult) {
-      elements.setupEsxiHostPrepResult.textContent = "Upload a user-supplied ESXi .zip or .vib first. The sidecar stages it temporarily and does not bundle vendor files into this project.";
+      elements.setupEsxiHostPrepResult.textContent = "Upload a .zip or .vib first.";
     }
     if (elements.setupEsxiHostPrepDetail) {
       elements.setupEsxiHostPrepDetail.textContent = "";
     }
+    state.setupDirty = false;
     if (elements.setupResult) {
       elements.setupResult.textContent = "Saving here updates the mounted config file; restart the read UI after a new system is added so it picks the new list up cleanly.";
     }
@@ -4599,6 +4672,7 @@
     if (!system) {
       return;
     }
+    state.setupDirty = false;
     state.loadedSystemId = system.id || null;
     state.selectedExistingSystemId = system.id || state.selectedExistingSystemId;
     state.selectedProfileId = system.default_profile_id || "";
@@ -4737,8 +4811,8 @@
     }
     if (elements.setupTlsImportResult) {
       elements.setupTlsImportResult.textContent = system.tls_ca_bundle_path
-        ? `Current custom TLS trust bundle: ${system.tls_ca_bundle_path}`
-        : "Import a PEM CA or certificate chain here when your TrueNAS or Quantastor host uses a private CA.";
+        ? `Extra certificate file: ${system.tls_ca_bundle_path}`
+        : "Import your own CA certificate if your NAS uses one.";
     }
     syncTlsTrustStatus();
     const matchingKey = state.sshKeys.find((key) =>
@@ -4882,7 +4956,7 @@
 
   async function discoverQuantastorHaNodes() {
     if (currentSetupPlatform() !== "quantastor" || !elements.setupHaEnabled?.checked) {
-      setBanner("Enable Quantastor HA mode first so the discovered node list has somewhere to land.", "error");
+      setBanner("Turn on the QuantaStor HA option first.", "error");
       return;
     }
     state.haNodesLoading = true;
@@ -4919,11 +4993,11 @@
       const hostDiscovery = payload.host_discovery || {};
       const hostNote = hostDiscovery.message ? ` ${hostDiscovery.message}` : "";
       setBanner(
-        `Loaded ${state.haNodes.length} Quantastor HA node row${state.haNodes.length === 1 ? "" : "s"} from the appliance.${hostNote}`,
+        `Loaded ${state.haNodes.length} node${state.haNodes.length === 1 ? "" : "s"} from QuantaStor.${hostNote}`,
         hostDiscovery.attempted && hostDiscovery.ok === false ? "info" : "success"
       );
     } catch (error) {
-      setBanner(`Unable to load Quantastor HA nodes: ${error.message || error}`, "error");
+      setBanner(`Unable to load nodes from QuantaStor: ${error.message || error}`, "error");
     } finally {
       state.haNodesLoading = false;
       renderQuantastorHaSection();
@@ -4969,7 +5043,7 @@
       throw new Error("VMware ESXi does not use the one-time Linux service-account bootstrap path.");
     }
     if (!setupPayload.ssh_enabled) {
-      throw new Error("Enable SSH enrichment first so the final service-account details are defined.");
+      throw new Error("Turn on SSH first so the new user has a host and login to go with it.");
     }
     if (!setupPayload.ssh_user) {
       throw new Error("An SSH user is required before running the one-time bootstrap.");
@@ -5003,7 +5077,7 @@
       throw new Error("ESXi host prep is only available for VMware ESXi systems.");
     }
     if (!setupPayload.ssh_enabled) {
-      throw new Error("Enable SSH enrichment first so the admin sidecar can reach the ESXi host.");
+      throw new Error("Turn on SSH first so the app can reach the ESXi host.");
     }
     if (!setupPayload.ssh_host) {
       throw new Error("Enter the ESXi SSH host before running host prep.");
@@ -5047,12 +5121,90 @@
     return Object.keys(failures).filter(Boolean).join(",");
   }
 
+  function runtimeContainerLabel(containerKey) {
+    const containers = Array.isArray(state.runtime?.containers) ? state.runtime.containers : [];
+    return containers.find((container) => container?.key === containerKey)?.label || containerKey;
+  }
+
+  function describeContainerKeys(keys) {
+    return String(keys || "")
+      .split(",")
+      .map((key) => key.trim())
+      .filter(Boolean)
+      .map((key) => runtimeContainerLabel(key));
+  }
+
   function describeRestartFailures(failureKeys) {
-    const keys = String(failureKeys || "").split(",").map((key) => key.trim()).filter(Boolean);
-    return keys.length ? ` Restart failed: ${keys.join(", ")}.` : "";
+    const labels = describeContainerKeys(failureKeys);
+    return labels.length ? ` ${labels.join(", ")} did not start again.` : "";
+  }
+
+  function describePauseOutcome(stoppedKeys, restartedKeys, restartFailures) {
+    const stopped = describeContainerKeys(stoppedKeys === "none" ? "" : stoppedKeys);
+    const restarted = describeContainerKeys(restartedKeys === "none" ? "" : restartedKeys);
+    if (!stopped.length) {
+      return "";
+    }
+    if (restartFailures) {
+      return ` The app was paused.${describeRestartFailures(restartFailures)}`;
+    }
+    if (restarted.length) {
+      return " The app was paused and is running again.";
+    }
+    return ` ${stopped.join(", ")} ${stopped.length === 1 ? "is" : "are"} still stopped.`;
   }
 
   function describeApiError(detail) {
+    // Self-contained on purpose: tests load this function on its own.
+    const fieldLabels = {
+      label: "Name",
+      system_id: "System ID",
+      platform: "Platform",
+      truenas_host: "Host",
+      api_key: "API key",
+      api_user: "API user",
+      api_password: "API password",
+      verify_ssl: "Check the HTTPS certificate",
+      tls_ca_bundle_path: "Extra certificate file",
+      tls_server_name: "Name on the certificate",
+      enclosure_filter: "Enclosure filter",
+      timeout_seconds: "Timeout",
+      ssh_enabled: "Use SSH",
+      ssh_host: "SSH host",
+      ssh_port: "SSH port",
+      ssh_user: "SSH user",
+      ssh_key_path: "SSH key path",
+      ssh_password: "SSH password",
+      ssh_sudo_password: "Sudo password",
+      ssh_timeout_seconds: "SSH timeout",
+      ssh_commands: "SSH commands",
+      ha_enabled: "HA pair",
+      ha_nodes: "HA nodes",
+      bmc_enabled: "Management controller",
+      bmc_host: "Management controller host",
+      bmc_username: "Management controller user",
+      bmc_password: "Management controller password",
+      bmc_timeout_seconds: "Management controller timeout",
+      default_profile_id: "Chassis layout",
+      storage_views: "Storage views",
+      make_default: "Show this system first",
+      values: "Timing values",
+      included_paths: "Included items",
+      packaging: "File format",
+      passphrase: "Passphrase",
+      encrypt: "Encrypt",
+    };
+    const describeLocation = (loc) => (Array.isArray(loc) ? loc : [])
+      .map((part) => String(part))
+      .filter((part) => part && !["body", "query", "path", "header"].includes(part))
+      .map((part) => fieldLabels[part] || (/^\d+$/.test(part) ? `item ${Number(part) + 1}` : part.replace(/_/g, " ")))
+      .join(" > ");
+    const withLogHint = (message) => {
+      const text = String(message || "").trim();
+      return /see admin logs\.?$/i.test(text)
+        ? `${text.replace(/\.?$/, ".")} Run \`docker compose logs enclosure-admin\` for details.`
+        : String(message || "");
+    };
     if (detail === undefined || detail === null || detail === "") {
       return "";
     }
@@ -5060,7 +5212,7 @@
       return detail
         .map((item) => {
           if (item && typeof item === "object") {
-            const location = Array.isArray(item.loc) ? item.loc.join(".") : "";
+            const location = describeLocation(item.loc);
             const message = item.msg ? String(item.msg) : JSON.stringify(item);
             return location ? `${location}: ${message}` : message;
           }
@@ -5070,11 +5222,11 @@
     }
     if (detail && typeof detail === "object") {
       if (detail.msg) {
-        return String(detail.msg);
+        return withLogHint(detail.msg);
       }
       return JSON.stringify(detail);
     }
-    return String(detail);
+    return withLogHint(detail);
   }
 
   async function fetchJson(url, options = {}) {
@@ -5126,7 +5278,7 @@
       return;
     }
     if (!elements.setupSshEnabled?.checked) {
-      setBanner("Enable SSH enrichment first so the admin sidecar can reuse the ESXi SSH host and auth.", "error");
+      setBanner("Turn on SSH first so the upload can use the ESXi SSH login.", "error");
       return;
     }
     const file = elements.setupEsxiHostPrepFile?.files?.[0] || null;
@@ -5163,13 +5315,13 @@
         elements.setupEsxiHostPrepFileLabel.textContent = response.package?.filename || file.name;
       }
       if (elements.setupEsxiHostPrepResult) {
-        elements.setupEsxiHostPrepResult.textContent = `Staged ${response.package?.filename || file.name} in ${state.esxiHostPrep?.temp_dir || "/tmp"} for later ESXi install.`;
+        elements.setupEsxiHostPrepResult.textContent = `Uploaded ${response.package?.filename || file.name}. Press Install on host when you are ready.`;
       }
       if (elements.setupEsxiHostPrepDetail) {
-        elements.setupEsxiHostPrepDetail.textContent = JSON.stringify(response.package || {}, null, 2);
+        elements.setupEsxiHostPrepDetail.textContent = describeStagedPackage(response.package);
       }
       syncEsxiHostPrepFields();
-      setBanner(`Staged ESXi package ${response.package?.filename || file.name}.`, "success");
+      setBanner(`Uploaded ${response.package?.filename || file.name}.`, "success");
     } catch (error) {
       if (elements.setupEsxiHostPrepResult) {
         elements.setupEsxiHostPrepResult.textContent = `ESXi package upload failed: ${error.message || error}`;
@@ -5215,17 +5367,7 @@
         elements.setupEsxiHostPrepResult.textContent = result.detail || "ESXi host prep finished.";
       }
       if (elements.setupEsxiHostPrepDetail) {
-        elements.setupEsxiHostPrepDetail.textContent = JSON.stringify(
-          {
-            remote_path: result.remote_path,
-            install_command: result.install_command,
-            install_result: result.install_result,
-            verification: result.verification?.summary || result.verification,
-            cleanup_result: result.cleanup_result,
-          },
-          null,
-          2
-        );
+        elements.setupEsxiHostPrepDetail.textContent = describeEsxiHostPrepInstall(result);
       }
       syncEsxiHostPrepFields();
       setBanner(result.detail || "ESXi host prep finished.", result.install_ok ? "success" : "error");
@@ -5247,7 +5389,7 @@
   async function inspectTlsCertificate() {
     const host = collectTlsTargetHost();
     if (!host) {
-      setBanner("Enter the HTTPS host first so the admin sidecar knows which certificate to inspect.", "error");
+      setBanner("Enter the HTTPS host first.", "error");
       return;
     }
     if (elements.setupInspectTlsButton) {
@@ -5289,7 +5431,7 @@
   async function trustRemoteTlsCertificate() {
     const host = collectTlsTargetHost();
     if (!host) {
-      setBanner("Enter the HTTPS host first so the admin sidecar knows which remote certificate material to save for verified connections.", "error");
+      setBanner("Enter the HTTPS host first.", "error");
       return;
     }
     if (elements.setupTrustRemoteTlsButton) {
@@ -5439,7 +5581,7 @@
       elements.refreshStateButton.disabled = true;
     }
     if (!quiet) {
-      setBanner("Refreshing admin sidecar state...");
+      setBanner("Refreshing...");
     }
     try {
       const payload = await fetchJson("/api/admin/state");
@@ -5476,7 +5618,7 @@
         void fetchStorageViewCandidates({ quiet: true });
       }
       if (!quiet) {
-        setBanner("Admin sidecar state refreshed.", "success");
+        setBanner("Refreshed.", "success");
       }
     } catch (error) {
       setBanner(`Unable to refresh admin state: ${error.message || error}`, "error");
@@ -5602,9 +5744,12 @@
     }
 
     const lastState = describeRuntimeObservation(lastObservation);
-    const pollError = lastPollError ? ` Last poll error: ${lastPollError}.` : "";
+    const pollError = lastPollError ? ` Last check failed: ${lastPollError}.` : "";
+    const verb = action === "stop" ? "stop" : action === "restart" ? "restart" : "start";
+    const containers = Array.isArray(state.runtime?.containers) ? state.runtime.containers : [];
+    const label = containers.find((container) => container?.key === containerKey)?.label || containerKey;
     throw new Error(
-      `Timed out waiting for ${containerKey} ${action} convergence after ${maxAttempts} observations. Last observed: ${lastState}.${pollError}`
+      `Timed out waiting for ${label} to ${verb} (still: ${lastState}).${pollError} Check \`docker compose ps\` or try again.`
     );
   }
 
@@ -5617,7 +5762,9 @@
           : "Starting";
     const actionTimeoutMs = Math.max(1, Number(options.actionTimeoutMs) || 35000);
     const signal = options.signal;
-    setBanner(`${verb} ${containerKey} container...`);
+    const containers = Array.isArray(state.runtime?.containers) ? state.runtime.containers : [];
+    const label = containers.find((container) => container?.key === containerKey)?.label || containerKey;
+    setBanner(`${verb} ${label}...`);
     try {
       if (signal?.aborted) {
         throw new DOMException("Runtime action was cancelled.", "AbortError");
@@ -5659,20 +5806,21 @@
       const observation = await waitForRuntimeConvergence(containerKey, action, options);
       const health = String(observation.container?.health || "").trim().toLowerCase();
       if (action === "stop") {
-        setBanner(`${verb} ${containerKey} container confirmed stopped.`, "success");
+        setBanner(`${label} stopped.`, "success");
       } else if (health && health !== "unavailable") {
-        setBanner(`${verb} ${containerKey} container confirmed running and healthy.`, "success");
+        setBanner(`${label} is running and healthy.`, "success");
       } else {
-        setBanner(`${verb} ${containerKey} container confirmed running; health unavailable.`, "success");
+        setBanner(`${label} is running; health unavailable.`, "success");
       }
       return true;
     } catch (error) {
+      const actionLabel = action === "stop" ? "Stop" : action === "restart" ? "Restart" : "Start";
       if (error?.name === "AbortError" || signal?.aborted) {
-        setBanner(`Container ${action} polling cancelled for ${containerKey}.`, "info");
+        setBanner(`${actionLabel} of ${label} was cancelled.`, "info");
       } else if (error?.runtimeActionOutcomeUnknown) {
-        setBanner(`Container ${action} status unknown for ${containerKey}: ${error.message}`, "error");
+        setBanner(`${actionLabel} of ${label}: status unknown. ${error.message}`, "error");
       } else {
-        setBanner(`Container ${action} failed: ${error.message || error}`, "error");
+        setBanner(`${actionLabel} of ${label} failed: ${error.message || error}`, "error");
       }
       return false;
     }
@@ -5756,13 +5904,14 @@
       const stopped = response.headers.get("X-Admin-Stopped-Containers") || "none";
       const restarted = response.headers.get("X-Admin-Restarted-Containers") || "none";
       const restartFailures = response.headers.get("X-Admin-Restart-Failures") || "";
+      const exportSummary = `Backup saved (${formatBytes(blob.size)}, ${actualPackaging}).${describePauseOutcome(stopped, restarted, restartFailures)}`;
       if (elements.backupExportResult) {
-        elements.backupExportResult.textContent = `Exported ${actualPackaging}. Stopped: ${stopped}. Restarted: ${restarted}.${describeRestartFailures(restartFailures)}`;
+        elements.backupExportResult.textContent = exportSummary;
       }
       if (restartFailures) {
-        setBanner(`Full backup exported as ${actualPackaging}, but these containers did not restart: ${restartFailures}. Use the runtime cards to start them.`, "error");
+        setBanner(`${exportSummary} Use the Start buttons at the top of this page.`, "error");
       } else {
-        setBanner(`Full backup exported as ${actualPackaging}.`, "success");
+        setBanner(exportSummary, "success");
       }
       await refreshState({ quiet: true });
     } catch (error) {
@@ -5858,6 +6007,29 @@
     }
   }
 
+  function describeBackupInspection(inspection) {
+    const counts = inspection?.aggregate_counts || {};
+    const history = counts.history && typeof counts.history === "object" ? counts.history : null;
+    const historyRows = history
+      ? (Number(history.event_count) || 0) + (Number(history.metric_sample_count) || 0)
+      : null;
+    const countItem = (value, singular, plural = `${singular}s`) => (
+      Number.isFinite(Number(value)) && value !== null
+        ? `${Number(value).toLocaleString()} ${Number(value) === 1 ? singular : plural}`
+        : ""
+    );
+    const parts = [
+      countItem(counts.systems, "system"),
+      countItem(counts.profiles, "layout"),
+      countItem(counts.storage_views, "storage view"),
+      countItem(counts.mappings, "saved mapping"),
+      historyRows === null ? "" : countItem(historyRows, "history row"),
+    ].filter(Boolean);
+    const exportedAt = inspection?.exported_at ? formatLocalTimestamp(inspection.exported_at) : "";
+    const mode = inspection?.encryption_mode === "encrypted" ? "encrypted" : "not encrypted";
+    return `This backup contains ${parts.length ? parts.join(", ") : "no recognised data"}${exportedAt ? `, exported ${exportedAt}` : ""} (${mode}).`;
+  }
+
   async function importBackup() {
     const file = readSelectedImportFile();
     const passphrase = readOptionalSecretValue(elements.backupImportPassphrase);
@@ -5899,13 +6071,9 @@
       ) {
         throw new Error("Inspection did not return an observed encryption mode and receipt.");
       }
-      const aggregateSummary = JSON.stringify(inspection.aggregate_counts || {});
       const confirmed = window.confirm(
-        `Inspect ${file.name} before import.\n\n` +
-        `Observed encryption mode: ${inspection.encryption_mode}.\n` +
-        `Selected groups: ${(inspection.selected_groups || []).join(", ") || "none"}.\n` +
-        `Aggregate counts: ${aggregateSummary}.\n\n` +
-        "Import this exact inspected archive?"
+        `${describeBackupInspection(inspection)}\n\n` +
+        "Restoring replaces all current settings, mappings and history with this backup. Continue?"
       );
       if (!confirmed) {
         return;
@@ -5939,13 +6107,14 @@
       const preservedAbsentDetail = preservedAbsentGroups.length
         ? ` Preserved live data for source-absent groups: ${preservedAbsentGroups.join(", ")}.`
         : "";
+      const stopped = Array.isArray(payload.stopped_containers) ? payload.stopped_containers.join(",") : "";
+      const restarted = Array.isArray(payload.restarted_containers) ? payload.restarted_containers.join(",") : "";
+      const importSummary = `Restored ${file.name}.${describePauseOutcome(stopped, restarted, importRestartFailures)}${preservedAbsentDetail}`;
       if (elements.backupImportResult) {
-        const stopped = Array.isArray(payload.stopped_containers) ? payload.stopped_containers.join(", ") || "none" : "none";
-        const restarted = Array.isArray(payload.restarted_containers) ? payload.restarted_containers.join(", ") || "none" : "none";
-        elements.backupImportResult.textContent = `Imported ${file.name}. Stopped: ${stopped}. Restarted: ${restarted}.${describeRestartFailures(importRestartFailures)}${preservedAbsentDetail}`;
+        elements.backupImportResult.textContent = importSummary;
       }
       if (importRestartFailures) {
-        setBanner(`Full backup imported from ${file.name}, but these containers did not restart: ${importRestartFailures}. Use the runtime cards to start them.${preservedAbsentDetail}`, "error");
+        setBanner(`${importSummary} Use the Start buttons at the top of this page.`, "error");
       } else if (preservedAbsentGroups.length) {
         setBanner(`Full backup imported from ${file.name}.${preservedAbsentDetail}`, "info");
       } else {
@@ -6250,7 +6419,7 @@
         elements.setupBootstrapResult.textContent = `${result.detail || `Provisioned ${result.service_user || payload.service_user}.`} ${sudoState}`;
       }
       if (elements.setupResult) {
-        elements.setupResult.textContent = `Bootstrap finished for ${result.service_user || payload.service_user}. Save the system entry when you are ready to persist the final key-based connection details.`;
+        elements.setupResult.textContent = `User ${result.service_user || payload.service_user} is ready. Press Save to keep these settings.`;
       }
       setBanner(`Bootstrap complete for ${result.service_user || payload.service_user}.`, "success");
     } catch (error) {
@@ -6283,6 +6452,7 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
+      state.setupDirty = false;
       state.loadedSystemId = result.system?.id || state.loadedSystemId;
       state.selectedExistingSystemId = result.system?.id || state.selectedExistingSystemId;
       state.defaultSystemId = result.default_system_id || state.defaultSystemId;
@@ -6315,11 +6485,20 @@
     const deletingLoadedSystem = selectedSystem.id === state.loadedSystemId;
     const deletingDefaultSystem = selectedSystem.id === state.defaultSystemId;
     const purgeHistory = Boolean(elements.existingSystemDeleteHistoryToggle?.checked);
+    if (purgeHistory && historyRowCountForSystem(selectedSystem.id) === null) {
+      await loadHistoryRowCounts({ quiet: true });
+      renderExistingSystems();
+    }
+    const historyRows = historyRowCountForSystem(selectedSystem.id);
     const warningBits = [
-      deletingLoadedSystem ? "It is currently loaded into the editor." : null,
-      deletingDefaultSystem ? "It is the current default system." : null,
-      "This removes the saved config entry from config.yaml.",
-      purgeHistory ? "This also purges matching rows from the history sidecar database." : null,
+      deletingLoadedSystem ? "It is open in the form right now." : null,
+      deletingDefaultSystem ? "It is the system shown first." : null,
+      "This removes the system from this app.",
+      purgeHistory
+        ? (historyRows === null
+          ? "Its history will be deleted too."
+          : `Its history (${historyRows.toLocaleString()} row${historyRows === 1 ? "" : "s"}) will be deleted too.`)
+        : "Its history is kept.",
     ].filter(Boolean);
     const confirmation = window.confirm(
       `Delete ${selectedSystem.label || selectedSystem.id}?\n\n${warningBits.join(" ")}`
@@ -6336,8 +6515,8 @@
     }
     if (elements.setupResult) {
       elements.setupResult.textContent = purgeHistory
-        ? `Deleting ${selectedSystem.label || selectedSystem.id} and purging matching history rows...`
-        : `Deleting ${selectedSystem.label || selectedSystem.id} from the saved config...`;
+        ? `Deleting ${selectedSystem.label || selectedSystem.id} and its history...`
+        : `Deleting ${selectedSystem.label || selectedSystem.id}...`;
     }
 
     try {
@@ -6370,18 +6549,22 @@
       if (elements.existingSystemDeleteHistoryToggle) {
         elements.existingSystemDeleteHistoryToggle.checked = false;
       }
+      if (state.historyRowCounts) {
+        delete state.historyRowCounts[selectedSystem.id];
+      }
       if (payload.history_purge?.requested && !payload.history_purge.ok) {
         setBanner(
-          `Deleted system ${payload.deleted_label || selectedSystem.label || selectedSystem.id}, but ${payload.history_purge.detail || "saved history purge failed"}`,
+          `Deleted ${payload.deleted_label || selectedSystem.label || selectedSystem.id}, but its history could not be deleted: ${payload.history_purge.detail || "unknown error"}`,
           "error"
         );
       } else if (payload.history_purge?.requested) {
-        const suffix = Number(payload.history_purge.summary?.total_rows || 0) > 0
-          ? " and purged matching history"
-          : " and found no matching saved history";
-        setBanner(`Deleted system ${payload.deleted_label || selectedSystem.label || selectedSystem.id}${suffix}.`, "success");
+        const deletedRows = Number(payload.history_purge.summary?.total_rows || 0);
+        const suffix = deletedRows > 0
+          ? ` and its history (${deletedRows.toLocaleString()} row${deletedRows === 1 ? "" : "s"})`
+          : "; it had no saved history";
+        setBanner(`Deleted ${payload.deleted_label || selectedSystem.label || selectedSystem.id}${suffix}.`, "success");
       } else {
-        setBanner(`Deleted system ${payload.deleted_label || selectedSystem.label || selectedSystem.id}.`, "success");
+        setBanner(`Deleted ${payload.deleted_label || selectedSystem.label || selectedSystem.id}. Its history is kept.`, "success");
       }
     } catch (error) {
       if (elements.setupResult) {
@@ -6414,7 +6597,7 @@
       return;
     }
     if (Number(draft.slot_count) > Number(draft.rows) * Number(draft.columns)) {
-      setBanner("Visible bay count cannot exceed rows x columns in the first-pass rectangular builder.", "error");
+      setBanner("Bay count can't be more than rows x columns.", "error");
       return;
     }
     const layoutResolution = resolveBuilderDraftLayout(draft, sourceProfile);
@@ -6859,7 +7042,6 @@
       elements.setupStorageViewOrder,
       elements.setupStorageViewEnabled,
       elements.setupStorageViewShowMain,
-      elements.setupStorageViewShowAdmin,
       elements.setupStorageViewCollapsed,
       elements.setupStorageViewEnclosureIds,
       elements.setupStorageViewPoolNames,
@@ -6880,21 +7062,38 @@
       state.selectedExistingSystemId = elements.existingSystemSelect?.value || "";
       renderExistingSystems();
     });
-    elements.existingSystemLoadButton?.addEventListener("click", () => {
-      loadSystemIntoForm(getSystemById(elements.existingSystemSelect?.value || state.selectedExistingSystemId));
-    });
     elements.existingSystemDeleteButton?.addEventListener("click", () => {
       void deleteSelectedSystem();
     });
-    elements.existingSystemResetButton?.addEventListener("click", resetSetupForm);
+    elements.existingSystemResetButton?.addEventListener("click", () => {
+      if (confirmDiscardSetupChanges()) {
+        resetSetupForm();
+      }
+    });
+    elements.setupPanel?.addEventListener("input", (event) => {
+      if (event.target?.closest?.("[data-runtime-behavior-key], .setup-preview-column")) {
+        return;
+      }
+      state.setupDirty = true;
+    });
     elements.currentSystemsList?.addEventListener("click", (event) => {
       const button = event.target.closest("[data-existing-system-id]");
       if (!button) {
         return;
       }
-      state.selectedExistingSystemId = button.dataset.existingSystemId || "";
+      const system = getSystemById(button.dataset.existingSystemId || "");
+      if (!system) {
+        return;
+      }
+      if (system.id !== state.loadedSystemId && !confirmDiscardSetupChanges()) {
+        return;
+      }
+      state.selectedExistingSystemId = system.id;
       if (elements.existingSystemSelect) {
-        elements.existingSystemSelect.value = state.selectedExistingSystemId;
+        elements.existingSystemSelect.value = system.id;
+      }
+      if (system.id !== state.loadedSystemId) {
+        loadSystemIntoForm(system);
       }
       renderExistingSystems();
     });
@@ -6952,11 +7151,8 @@
     });
     elements.setupEsxiHostPrepPackageSelect?.addEventListener("change", () => {
       state.selectedEsxiHostPrepToken = elements.setupEsxiHostPrepPackageSelect?.value || "";
-      const selectedPackage = getSelectedEsxiHostPrepPackage();
       if (elements.setupEsxiHostPrepDetail) {
-        elements.setupEsxiHostPrepDetail.textContent = selectedPackage
-          ? JSON.stringify(selectedPackage, null, 2)
-          : "";
+        elements.setupEsxiHostPrepDetail.textContent = describeStagedPackage(getSelectedEsxiHostPrepPackage());
       }
     });
     elements.setupEsxiHostPrepUploadButton?.addEventListener("click", () => {
@@ -6974,7 +7170,7 @@
       syncTlsTrustStatus();
       renderTlsInspection();
       if (elements.setupTlsInspectionResult) {
-        elements.setupTlsInspectionResult.textContent = "This fetches the presented leaf certificate, and the full chain when the runtime exposes it, without trusting anything first so you can review SHA-256 and SHA-1 fingerprints before importing.";
+        elements.setupTlsInspectionResult.textContent = "Shows the certificate the server sends so you can compare its fingerprint before trusting it.";
       }
       const suggestedHost = suggestedConnectionHost();
       if (elements.setupSshEnabled?.checked && elements.setupSshHost && !elements.setupSshHost.value.trim()) {
