@@ -336,6 +336,11 @@ textarea {
   line-height: 1.15;
 }
 
+.snapshot-banner-about {
+  flex: 1 1 100%;
+  margin-bottom: 0;
+}
+
 .summary-card.compact {
   min-height: 0;
 }
