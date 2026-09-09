@@ -265,6 +265,9 @@
   const refreshButton = document.getElementById("refresh-button");
   const autoRefreshToggle = document.getElementById("auto-refresh-toggle");
   const refreshIntervalSelect = document.getElementById("refresh-interval-select");
+  const autoRefreshField = document.getElementById("auto-refresh-field");
+  const refreshIntervalField = document.getElementById("refresh-interval-field");
+  const inventoryEvidenceDisclosure = document.getElementById("inventory-evidence-disclosure");
   const refreshTimingStrip = document.getElementById("refresh-timing-strip");
   const refreshCountdownLabel = document.getElementById("refresh-countdown-label");
   const refreshCountdownBar = document.getElementById("refresh-countdown-bar");
@@ -3090,8 +3093,8 @@
     if (snapshotGeneratedNote) {
       const browserTimeZone = getBrowserTimeZone();
       snapshotGeneratedNote.textContent = browserTimeZone
-        ? `Rendered in viewer local time (${browserTimeZone})`
-        : "Rendered in viewer local time";
+        ? `Times shown in your local time zone (${browserTimeZone})`
+        : "Times shown in your local time zone";
     }
   }
 
@@ -8830,6 +8833,10 @@
     refreshButton.disabled = state.snapshotMode;
     autoRefreshToggle.disabled = state.snapshotMode;
     refreshIntervalSelect.disabled = state.snapshotMode || !state.autoRefresh;
+    // A saved copy cannot refresh, so the controls are hidden rather than left greyed out.
+    for (const control of [refreshButton, autoRefreshField, refreshIntervalField, inventoryEvidenceDisclosure]) {
+      control?.classList?.toggle("hidden", state.snapshotMode);
+    }
     renderTimingSurfaces();
     ensureTimingTick();
   }

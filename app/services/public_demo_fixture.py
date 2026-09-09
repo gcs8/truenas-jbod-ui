@@ -294,8 +294,8 @@ def build_public_demo_snapshot_bundle(
         raise RuntimeError(f"Built-in public demo profile is missing: {source.enclosure.profile_id}")
     profile = profile.model_copy(
         update={
-            "eyebrow": "Synthetic public demo / 60-bay top-loader",
-            "summary": "Invented deterministic disks demonstrate enclosure, pool, history, and saved-view workflows.",
+            "eyebrow": "Demo",
+            "summary": "A 60-bay JBOD with made-up disks. Click any bay to see the disk in it, its pool, temperature and history.",
             "panel_title": source.enclosure.label,
         }
     )
@@ -349,8 +349,8 @@ def build_public_demo_snapshot_bundle(
             ssh_slot_hint_count=0,
         ),
         warnings=[
-            "All displayed systems, disks, metrics, events, and identifiers are deterministic synthetic demo data.",
-            "No appliance, credentials, local history, or LED actions are connected to this static artifact.",
+            "Everything on this page is made-up demo data.",
+            "No storage system, credentials, history service or LED controls are connected to this page.",
         ],
     )
     smart = {
@@ -406,7 +406,7 @@ async def build_public_demo_html(
         io_chart_mode="total",
         generated_at=fixture.generated_at,
         identifier_policy_label="Synthetic IDs",
-        identifier_policy_note="Generated only from schema-validated, deterministic, checked-in synthetic values.",
+        identifier_policy_note="Made-up disks, serials and hosts. Nothing here comes from a real system.",
     )
     return rendered.html
 

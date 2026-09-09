@@ -132,7 +132,7 @@ def inject_visible_build_identity(html: str, *, source_revision: str, build_id: 
         '      <div class="summary-card compact">\n'
         '        <span class="summary-label">Redaction</span>\n'
         '        <span class="summary-value">Synthetic IDs</span>\n'
-        '        <span class="summary-note">Generated only from schema-validated, deterministic, checked-in synthetic values.</span>\n'
+        '        <span class="summary-note">Made-up disks, serials and hosts. Nothing here comes from a real system.</span>\n'
         "      </div>"
     )
     if html.count(marker) != 1:
@@ -142,12 +142,12 @@ def inject_visible_build_identity(html: str, *, source_revision: str, build_id: 
         '      <div class="summary-card compact">\n'
         '        <span class="summary-label">Source revision</span>\n'
         f'        <span class="summary-value public-demo-identity">{source_revision}</span>\n'
-        '        <span class="summary-note">exact Git commit for declared demo inputs</span>\n'
+        '        <span class="summary-note">Git commit of the files this demo was built from</span>\n'
         "      </div>\n"
         '      <div class="summary-card compact">\n'
         '        <span class="summary-label">Build ID</span>\n'
         f'        <span class="summary-value public-demo-identity">{build_id}</span>\n'
-        '        <span class="summary-note">deterministic input-manifest fingerprint</span>\n'
+        '        <span class="summary-note">fingerprint of that commit and the demo inputs</span>\n'
         "      </div>"
     )
     return html.replace(marker, marker + identity_cards, 1)

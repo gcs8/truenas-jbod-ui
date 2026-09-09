@@ -52,58 +52,66 @@
         {% if not snapshot_mode and release_status_payload and release_status_payload.latest_url %}
           <a class="meta-note version-note version-note-{{ release_status_payload.status or 'unknown' }}" id="app-version-note" href="{{ release_status_payload.latest_url }}" target="_blank" rel="noopener">{{ release_note }}</a>
         {% else %}
-          <span class="meta-note version-note version-note-{{ release_status_payload.status or 'unknown' }}" id="app-version-note">{% if snapshot_mode %}Snapshot artifact{% else %}{{ release_note }}{% endif %}</span>
+          <span class="meta-note version-note version-note-{{ release_status_payload.status or 'unknown' }}" id="app-version-note">{% if snapshot_mode %}Saved copy{% else %}{{ release_note }}{% endif %}</span>
         {% endif %}
       </div>
     </div>
   </header>
 
   {% if snapshot_mode %}
+  {% set snapshot_is_demo = snapshot_export_meta.redaction_label in ["Scrambled IDs", "Synthetic IDs"] %}
+  {% set snapshot_bay_count = snapshot_export_meta.visible_bay_count or snapshot.layout_slot_count or (snapshot.slots | length) %}
+  {% set snapshot_event_count = snapshot_export_meta.event_count or 0 %}
   <section class="panel snapshot-banner">
     <div class="snapshot-banner-copy">
-      <div class="snapshot-banner-badge">{% if snapshot_is_sanitized %}Frozen Sanitized Snapshot{% else %}Frozen Offline Artifact{% endif %}</div>
-      <p class="eyebrow">{% if snapshot_export_meta.redaction_label in ["Scrambled IDs", "Synthetic IDs"] %}Public Demo Artifact{% else %}Offline Snapshot{% endif %}</p>
-      <h2>Explorable Enclosure Snapshot</h2>
+      <div class="snapshot-banner-badge">{% if snapshot_is_demo %}Demo data{% else %}Offline copy{% endif %}</div>
+      <h2 id="snapshot-banner-title">{{ snapshot_export_meta.scope_label or snapshot.selected_enclosure_label or "Enclosure" }} - captured <span id="snapshot-banner-captured">{{ snapshot_export_meta.generated_at or snapshot.last_updated }}</span></h2>
       <p class="subtle">
-        {% if snapshot_is_sanitized %}Frozen, sanitized point-in-time snapshot. This is not live data. You can search, click slots, and inspect preloaded history offline.{% else %}Frozen point-in-time enclosure snapshot. Live actions are disabled, but you can still search, click slots, and inspect preloaded history offline.{% endif %}
+        {% if snapshot_is_demo %}Nothing here is live. Click bays, open history, try the heat map.{% else %}This is a saved copy, not live data. Live actions are off; search, bay details and history still work.{% endif %}
       </p>
-      <div class="snapshot-banner-facts">
-        <span class="snapshot-banner-fact">Artifact app v{{ snapshot_export_meta.app_version or "unknown" }}</span>
-        <span class="snapshot-banner-fact">{{ snapshot_export_meta.visible_bay_count or snapshot.layout_slot_count or (snapshot.slots | length) }} bays in artifact</span>
-        {% if snapshot_export_meta.enclosure_count and snapshot_export_meta.enclosure_count > 1 %}
-        <span class="snapshot-banner-fact">{{ snapshot_export_meta.enclosure_count }} live enclosures</span>
-        {% endif %}
-        {% if snapshot_export_meta.storage_view_count %}
-        <span class="snapshot-banner-fact">{{ snapshot_export_meta.storage_view_count }} saved/virtual views</span>
-        {% endif %}
-        <span class="snapshot-banner-fact">{{ snapshot_export_meta.metric_sample_count or 0 }} metric samples</span>
-        <span class="snapshot-banner-fact">{{ snapshot_export_meta.smart_summary_count or 0 }} slot/view SMART summaries</span>
-        <span class="snapshot-banner-fact">{{ snapshot_export_meta.event_count or 0 }} event{% if (snapshot_export_meta.event_count or 0) != 1 %}s{% endif %}</span>
-        <span class="snapshot-banner-fact">Downsampling {{ snapshot_export_meta.downsampling_label or "None" }}</span>
-      </div>
     </div>
     <div class="snapshot-banner-meta">
       <div class="summary-card compact">
         <span class="summary-label">Scope</span>
-        <span class="summary-value">{{ snapshot_export_meta.scope_label or "Current Enclosure" }}</span>
+        <span class="summary-value">{{ snapshot_bay_count }} bays{% if snapshot_export_meta.enclosure_count and snapshot_export_meta.enclosure_count > 1 %}, {{ snapshot_export_meta.enclosure_count }} enclosures{% endif %}{% if snapshot_export_meta.storage_view_count %}, {{ snapshot_export_meta.storage_view_count }} views{% endif %}</span>
         <span class="summary-note">{{ snapshot_export_meta.system_label or "Selected system" }}</span>
       </div>
       <div class="summary-card compact">
-        <span class="summary-label">Window</span>
+        <span class="summary-label">History window</span>
         <span class="summary-value">{{ snapshot_export_meta.history_window_label or "24h" }}</span>
-        <span class="summary-note">history view preserved</span>
+        <span class="summary-note">of history saved in this copy</span>
       </div>
       <div class="summary-card compact">
-        <span class="summary-label">Capture time</span>
+        <span class="summary-label">Captured</span>
         <span class="summary-value" id="snapshot-generated-value">{{ snapshot_export_meta.generated_at or snapshot.last_updated }}</span>
-        <span class="summary-note" id="snapshot-generated-note">re-rendered in viewer local time</span>
+        <span class="summary-note" id="snapshot-generated-note">Times shown in your local time zone</span>
+      </div>
+      <div class="summary-card compact">
+        <span class="summary-label">Identifiers</span>
+        <span class="summary-value">{% if snapshot_export_meta.redaction == "partial" %}Masked{% elif snapshot_is_demo %}Made up{% else %}Included{% endif %}</span>
+        <span class="summary-note">{% if snapshot_export_meta.redaction == "partial" %}serials and hosts partly hidden{% elif snapshot_is_demo %}no real disks or hosts{% else %}real serials and hosts{% endif %}</span>
+      </div>
+    </div>
+    <details class="summary-disclosure snapshot-banner-about">
+      <summary>{% if snapshot_is_demo %}About this demo{% else %}About this copy{% endif %}</summary>
+      <section class="summary-strip">
+      <div class="summary-card compact">
+        <span class="summary-label">App version</span>
+        <span class="summary-value" id="snapshot-app-version">v{{ snapshot_export_meta.app_version or "unknown" }}</span>
+        <span class="summary-note">app that saved this copy</span>
       </div>
       <div class="summary-card compact">
         <span class="summary-label">Redaction</span>
         <span class="summary-value">{{ snapshot_export_meta.redaction_label or "None" }}</span>
         <span class="summary-note">{{ snapshot_export_meta.redaction_note or "Original identifiers included" }}</span>
       </div>
-    </div>
+      <div class="summary-card compact">
+        <span class="summary-label">Contents</span>
+        <span class="summary-value">{{ snapshot_export_meta.metric_sample_count or 0 }} samples, {{ snapshot_export_meta.smart_summary_count or 0 }} SMART summaries, {{ snapshot_event_count }} event{% if snapshot_event_count != 1 %}s{% endif %}</span>
+        <span class="summary-note">{% if snapshot_export_meta.downsampling_label and snapshot_export_meta.downsampling_label != "None" %}history thinned: {{ snapshot_export_meta.downsampling_label }}{% else %}full history detail{% endif %}</span>
+      </div>
+      </section>
+    </details>
   </section>
   {% endif %}
 
@@ -118,12 +126,12 @@
     {% endif %}
     <button id="export-snapshot-button" class="button secondary">Export Snapshot</button>
     {% endif %}
-    <button id="refresh-button" class="button">Refresh Now</button>
-    <label class="toggle">
+    <button id="refresh-button" class="button{% if snapshot_mode %} hidden{% endif %}">Refresh Now</button>
+    <label class="toggle{% if snapshot_mode %} hidden{% endif %}" id="auto-refresh-field">
       <input id="auto-refresh-toggle" type="checkbox" checked>
       <span>Auto-refresh</span>
     </label>
-    <label class="field refresh-interval-field">
+    <label class="field refresh-interval-field{% if snapshot_mode %} hidden{% endif %}" id="refresh-interval-field">
       <span>Refresh Every</span>
       <select id="refresh-interval-select">
         <option value="15">15 sec</option>
@@ -240,7 +248,7 @@
     </div>
   </section>
 
-  <details class="summary-disclosure">
+  <details class="summary-disclosure{% if snapshot_mode %} hidden{% endif %}" id="inventory-evidence-disclosure">
     <summary>Inventory evidence counters</summary>
     <section class="summary-strip" id="summary-strip">
       <div class="summary-card">
