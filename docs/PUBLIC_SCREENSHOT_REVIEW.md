@@ -2,16 +2,18 @@
 
 This record covers the two desktop fixture screenshots generated from `public-demo/index.html`. The capture script used `file://`, UTC, fixed desktop viewports, reduced motion, and no network request.
 
-Source revision: `c7c9ca2741916c875be58e3f4e51768d79f6623d`
+Source revision: `dbcd2ab31e9a46083693cf08802434ac8cfc1e43`
 
-Source artifact SHA-256: `6c92df4d73d1356d686138214f4548552b30223a14d8361efeebdbda08bcf3c4`
+Source artifact SHA-256: `47df69547071bbff77b25c15b6f56bf96d14f366149781c6714213263813c8eb`
 
 | Image | Dimensions | Bytes | SHA-256 | Pixel review |
 |---|---:|---:|---|---|
-| `public-demo-overview.png` | 1920 by 4104 | 1123898 | `fb64ca80ccbf1041665161275f543c2ef907078900a7f894f567d7325c5b6473` | PASS |
-| `public-demo-history.png` | 1920 by 4860 | 1254195 | `98c60ad9d8b99e0613525dfec6678184046d7d6434115a5d5a3f6b79f27e7ceb` | PASS |
+| `public-demo-overview.png` | 1920 by 4104 | 1123548 | `3664d12cb3780a378edc26b64bbaea8c4d079604f6dde42c7cad39f9878950ac` | PASS |
+| `public-demo-history.png` | 1920 by 4860 | 1253949 | `cc6385e729437d41c6aca2cc3e56154a756aa741f76fc730c9b27b85f130ee24` | PASS |
 
 The exact pixels were checked for private addresses, hostnames, paths, credentials, key material, and non-demo device identifiers. The review also covered snapshot/live wording, selector clipping, panel overlap, page overflow, canvas-edge artifacts, count grammar, and the consistency of current, history, rate, power-on, and annualized values.
+
+The overview image selects slot 57's special-class mirror. It does not depict the spare group. The fixture and browser gates separately verify that slots 42 and 43 render in the single `demo-capacity > spares > spare` group.
 
 Mobile and tablet layouts are unsupported and are not part of this screenshot review.
 
