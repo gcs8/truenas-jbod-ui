@@ -26,13 +26,6 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
-## Unreleased
-
-### Internal
-
-- Excluded unrelated development output and private state from the Docker
-  build context while retaining required image inputs (#465).
-
 ## v0.23.0 - 2026-09-08
 
 This release includes every pull request merged after `v0.22.2` through the
