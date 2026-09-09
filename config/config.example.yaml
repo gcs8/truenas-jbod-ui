@@ -14,7 +14,6 @@ app:
   export_cache_max_bytes: 33554432
   log_level: INFO
   debug: false
-  verify_ssl: true
 
 truenas:
   # Use env vars for secrets in production.

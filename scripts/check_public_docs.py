@@ -21,6 +21,8 @@ WIKI_LINK_PATTERN = re.compile(r"\[\[(?:[^\]|]+\|)?(?P<target>[^\]]+)\]\]")
 FENCE_PATTERN = re.compile(r"^```(?P<language>[A-Za-z0-9_-]*)\s*\n(?P<body>.*?)^```\s*$", re.MULTILINE | re.DOTALL)
 HEADING_PATTERN = re.compile(r"^#{1,6}\s+(?P<title>.+?)\s*#*\s*$", re.MULTILINE)
 ENV_ASSIGNMENT_PATTERN = re.compile(r"^(?:export\s+|\$env:)?(?P<key>[A-Z][A-Z0-9_]+)\s*=", re.MULTILINE)
+# .env.example documents optional keys as commented-out lines such as `# KEY=value`.
+ENV_EXAMPLE_LINE_PATTERN = re.compile(r"^(?:#\s*)?(?P<key>[A-Z][A-Z0-9_]+)=", re.MULTILINE)
 SCRIPT_COMMAND_PATTERN = re.compile(
     r"(?:python(?:3)?|\.\\\.venv\\Scripts\\python\.exe)\s+(?P<path>(?:scripts|tests)/[^\s'\";]+\.py)"
 )
@@ -112,7 +114,7 @@ def heading_anchors(text: str) -> set[str]:
 def read_env_keys(root: Path) -> set[str]:
     keys = set(PROCEDURAL_ENV_KEYS)
     text = (root / ".env.example").read_text(encoding="utf-8")
-    keys.update(match.group("key") for match in ENV_ASSIGNMENT_PATTERN.finditer(text))
+    keys.update(match.group("key") for match in ENV_EXAMPLE_LINE_PATTERN.finditer(text))
     for relative_path in ("app/config.py", "history_service/config.py", "admin_service/config.py"):
         parsed = ast.parse((root / relative_path).read_text(encoding="utf-8"), filename=relative_path)
         for node in ast.walk(parsed):
