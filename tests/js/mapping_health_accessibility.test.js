@@ -71,28 +71,44 @@ test("mapping health separates matched empty unmatched and unknown bays", () => 
     { populated: 4, matched: 3, empty: 1, unmatched: 1, unknown: 2 },
   );
   assert.equal(result.total, 7);
-  assert.match(result.headline, /1 populated bay needs mapping/);
+  assert.equal(result.headline, "1 disk is not matched to a bay. Click it to assign one.");
   assert.equal(
     summarizeMappingHealth([{ slot: 0, state: "unknown" }], 1).headline,
-    "1 bay has unknown mapping state.",
+    "1 bay has an unknown state.",
+  );
+  assert.equal(
+    summarizeMappingHealth([{ slot: 0, state: "healthy" }], 1).headline,
+    "The only disk is in a known bay.",
   );
 });
 
-test("mapping health reports all matched and names bounded evidence sources", () => {
-  const { summarizeMappingHealth, mappingHealthEvidenceNote } = loadFunctions(
+test("mapping health reports all matched and names the bay sources in plain words", () => {
+  const { summarizeMappingHealth, mappingHealthSourceNote, mappingSourceLabel } = loadFunctions(
     APP_SOURCE,
-    ["summarizeMappingHealth", "mappingHealthEvidenceNote"],
+    ["summarizeMappingHealth", "mappingHealthSourceNote", "mappingSourceLabel"],
   );
   const slots = [
     { slot: 0, state: "healthy", mapping_source: "api" },
     { slot: 1, state: "healthy", mapping_source: "manual" },
     { slot: 2, state: "empty", mapping_source: "empty" },
   ];
-  assert.equal(summarizeMappingHealth(slots, 3).headline, "All 2 populated bays are matched.");
-  assert.equal(
-    mappingHealthEvidenceNote(slots, "2026-08-30T12:00:00Z"),
-    "Evidence: API and saved mapping. Snapshot: 2026-08-30T12:00:00Z.",
-  );
+  assert.equal(summarizeMappingHealth(slots, 3).headline, "All 2 disks are in known bays.");
+  assert.equal(mappingHealthSourceNote(slots), "Bay positions come from: TrueNAS API, saved assignment.");
+  assert.equal(mappingHealthSourceNote([{ slot: 0, state: "unknown", mapping_source: "unknown" }]), "Bay positions: source unknown.");
+  assert.doesNotMatch(mappingHealthSourceNote(slots), /evidence|snapshot:/i);
+});
+
+test("mapping source tokens are shown as plain labels in the bay details", () => {
+  const { mappingSourceLabel } = loadFunctions(APP_SOURCE, ["mappingSourceLabel"]);
+  assert.equal(mappingSourceLabel("inventory_candidate"), "inventory match");
+  assert.equal(mappingSourceLabel("scale_sg_ses"), "SSH (SES)");
+  assert.equal(mappingSourceLabel("snapshot_slot"), "saved snapshot");
+  assert.equal(mappingSourceLabel("live-derived-core-demo"), "demo data");
+  assert.equal(mappingSourceLabel("manual"), "saved assignment");
+  assert.equal(mappingSourceLabel(""), "n/a");
+  assert.equal(mappingSourceLabel("some_future_source"), "some future source");
+  assert.match(APP_SOURCE, /kvRow\("Bay reported by", mappingSourceLabel\(slot\.mapping_source\)\)/);
+  assert.doesNotMatch(APP_SOURCE, /kvRow\("Mapping", slot\.mapping_source\)/);
 });
 
 test("mapping health scope follows the selected saved view", () => {
@@ -137,7 +153,7 @@ test("mapping health scope follows the selected saved view", () => {
       unknown: 0,
       populated: 2,
       total: 3,
-      headline: "1 populated bay needs mapping.",
+      headline: "1 disk is not matched to a bay. Click it to assign one.",
     },
   );
   assert.equal(scope.slots[0].mapping_source, "inventory_candidate");
@@ -214,12 +230,18 @@ test("Fabric modes retain simpler pressed-button toolbar semantics", () => {
   assert.doesNotMatch(FABRIC_TEMPLATE, /role="tab(list)?"/);
 });
 
-test("heuristic and temperature metrics explain derivation and action context", () => {
+test("heat-map metric names match the wiki and the score context explains itself", () => {
   const definitions = functionSource(APP_SOURCE, "heatmapMetricDefinitions");
-  assert.match(definitions, /label:\s*"Derived Attention Score"/);
-  assert.match(definitions, /label:\s*"Temperature \(C\)"/);
-  assert.match(definitions, /label:\s*"Temperature vs View Average \(C\)"/);
+  assert.match(definitions, /label:\s*"Attention Score"/);
+  assert.match(definitions, /label:\s*"Temperature"/);
+  assert.match(definitions, /label:\s*"Temperature vs View Average"/);
+  assert.doesNotMatch(definitions, /Derived Attention Score|Temperature \(C\)/);
   assert.match(TEMPLATE, /id="heatmap-metric-context"[^>]*aria-live="polite"/);
-  assert.match(APP_SOURCE, /Higher scores combine relative temperature, errors, and write load; inspect the selected bay before acting\./);
+  const { heatmapMetricContextText } = loadFunctions(APP_SOURCE, ["heatmapMetricContextText"]);
+  assert.equal(
+    heatmapMetricContextText("attention_score"),
+    "Score 0-100: hotter than its neighbours, SMART errors, and heavy writes all add points. Hover a bay to see why.",
+  );
+  assert.equal(heatmapMetricContextText("bytes_read"), "");
   assert.match(APP_SOURCE, /Use the drive vendor's warning and critical thresholds when available\./);
 });

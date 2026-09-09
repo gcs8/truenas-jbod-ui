@@ -152,7 +152,7 @@ test("opening and canceling the editor preserves raw context and restores focus"
   fns.openEnclosureAliasEditor();
   assert.equal(state.enclosureAliasEditorOpen, true);
   assert.equal(input.value, "Archive East");
-  assert.equal(rawHint.textContent, "Raw: Dell Drawer 1-42 (Top)");
+  assert.equal(rawHint.textContent, "Reported name: Dell Drawer 1-42 (Top)");
   assert.equal(formClasses.contains("hidden"), false);
   assert.equal(buttonClasses.contains("hidden"), true);
   assert.equal(inputFocused, 1);
@@ -240,7 +240,7 @@ test("changing the selected enclosure closes an open alias draft", () => {
   assert.equal(state.enclosureAliasEditorScopeKey, null);
   assert.equal(formClasses.contains("hidden"), true);
   assert.equal(buttonClasses.contains("hidden"), false);
-  assert.equal(rawHint.textContent, "Raw: Shelf B");
+  assert.equal(rawHint.textContent, "Reported name: Shelf B");
 });
 
 test("live navigation closes an alias draft before changing selection", () => {
@@ -419,11 +419,11 @@ test("virtual inventory uses system-scoped disk copy without physical profile or
 
   assert.equal(profile.profileId, null);
   assert.equal(profile.profileLabel, null);
-  assert.equal(profile.eyebrow, "System A / Virtual inventory");
-  assert.match(profile.summary, /system-scoped disk inventory/i);
-  assert.match(profile.summary, /no physical enclosure orientation/i);
+  assert.equal(profile.eyebrow, "System A / All disks");
+  assert.match(profile.summary, /disks on this system/i);
+  assert.match(profile.summary, /not physical bays/i);
   assert.equal(profile.enclosureTitle, "System disk inventory (virtual)");
-  assert.equal(profile.edgeLabel, "System-scoped disks");
+  assert.equal(profile.edgeLabel, "Not a physical layout");
   assert.equal(profile.faceStyle, "generic");
   assert.equal(profile.latchEdge, "bottom");
   assert.deepEqual(profile.slotLayout, [[0, 1]]);

@@ -573,7 +573,7 @@
   }
 
   function selectorLabelForEnclosureOption(enclosure) {
-    const kind = state.snapshotMode ? "Snapshot" : "Live Enclosure";
+    const kind = state.snapshotMode ? "Saved copy" : "Enclosure";
     return `${kind} · ${enclosure?.label || enclosure?.id || "Unknown enclosure"}`;
   }
 
@@ -582,7 +582,7 @@
   }
 
   function storageViewKindLabel(view) {
-    return isSavedChassisView(view) ? "Saved Chassis View" : "Virtual Storage View";
+    return isSavedChassisView(view) ? "Saved view" : "Storage view";
   }
 
   function selectorLabelForStorageViewOption(view) {
@@ -1167,10 +1167,10 @@
       return {
         profileId: null,
         profileLabel: null,
-        eyebrow: `${systemLabel} / Virtual inventory`,
-        summary: "System-scoped disk inventory; no physical enclosure orientation or stable slot identity is claimed.",
+        eyebrow: `${systemLabel} / All disks`,
+        summary: "Disks on this system, numbered in the order TrueNAS lists them. Positions here are not physical bays.",
         enclosureTitle: enclosureLabel,
-        edgeLabel: "System-scoped disks",
+        edgeLabel: "Not a physical layout",
         faceStyle: "generic",
         latchEdge: "bottom",
         baySize: null,
@@ -1182,12 +1182,12 @@
     if (selectedStorageView) {
       const baseSummary =
         selectedStorageView.kind === "nvme_carrier"
-          ? "Runtime storage-view map for an internal 4x NVMe carrier card."
+          ? "Slots on the internal NVMe carrier card."
           : selectedStorageView.kind === "boot_devices"
-            ? "Runtime storage-view map for internal boot media."
+            ? "Boot drives."
             : selectedStorageView.backing_enclosure_label
-              ? `Saved chassis view layered on top of the live enclosure ${selectedStorageView.backing_enclosure_label}.`
-              : "Runtime storage-view map for the selected saved hardware view.";
+              ? `Saved layout for ${selectedStorageView.backing_enclosure_label}.`
+              : "Saved view.";
       return {
         profileId: profile?.id || selectedStorageView.profile_id || null,
         profileLabel: profile?.label || selectedStorageView.profile_label || null,
@@ -1231,7 +1231,7 @@
       profileId: profile?.id || null,
       profileLabel: profile?.label || null,
       eyebrow: profile?.eyebrow || systemLabel,
-      summary: profile?.summary || "Drive-bay map with API-or-SSH enrichment for the selected enclosure.",
+      summary: profile?.summary || "Front view of the selected enclosure. Click a bay for details.",
       enclosureTitle: (state.snapshot.enclosures || []).length > 1 ? enclosureLabel : (profile?.panel_title || enclosureLabel),
       edgeLabel: profile?.edge_label || "System front",
       faceStyle: profile?.face_style || "generic",
@@ -1275,7 +1275,7 @@
     enclosureAliasForm.classList.toggle("hidden", !available || !state.enclosureAliasEditorOpen);
     const enclosure = getSelectedEnclosureOption();
     if (enclosureAliasRawHint) {
-      enclosureAliasRawHint.textContent = enclosure?.raw_label ? `Raw: ${enclosure.raw_label}` : "";
+      enclosureAliasRawHint.textContent = enclosure?.raw_label ? `Reported name: ${enclosure.raw_label}` : "";
     }
   }
 
@@ -1288,7 +1288,7 @@
     state.enclosureAliasEditorScopeKey = currentEnclosureAliasScopeKey();
     enclosureAliasInput.value = enclosure?.alias || "";
     if (enclosureAliasRawHint) {
-      enclosureAliasRawHint.textContent = enclosure?.raw_label ? `Raw: ${enclosure.raw_label}` : "";
+      enclosureAliasRawHint.textContent = enclosure?.raw_label ? `Reported name: ${enclosure.raw_label}` : "";
     }
     enclosureAliasEditButton?.classList.add("hidden");
     enclosureAliasForm.classList.remove("hidden");
@@ -2135,7 +2135,7 @@
     if (!controllerRecords.length) {
       return `
         <div class="sas-fabric-host-row">${renderSasFabricNodeButton(hostNode, { meta: storagePayload ? "No storage sources reported" : "No HBA controllers reported" })}</div>
-        <div class="warning-item muted compact">${storagePayload ? "No storage source rows are available yet." : "No controller rows are available yet. Check CORE SSH and mprutil permissions."}</div>
+        <div class="warning-item muted compact">${storagePayload ? "No storage source rows are available yet." : "No controllers were reported. Check the SSH setup for this system in the admin console."}</div>
       `;
     }
     return `
@@ -2178,7 +2178,7 @@
         ${kvRow("Type", formatSasFabricKind(trace.kind))}
         ${kvRow("Slots", formatSasFabricSlots(trace.slots, 999))}
         ${sasFabricMetricRows(trace.metrics, { state: "State", count: "Affected bays", device_name: "Device", pool_name: "Pool", vdev_name: "Vdev" })}
-        ${kvRow("Evidence", formatSasFabricValue(trace.evidence))}
+        ${kvRow("Source", formatSasFabricValue(trace.evidence))}
       </div>
       ${pathStateMarkup}
       <div class="sas-fabric-inspector-section">
@@ -2194,14 +2194,14 @@
         ${kvRow("Object", sasFabricDisplayLabel(node) || node.id)}
         ${kvRow("Type", formatSasFabricKind(node.kind))}
         ${kvRow("Status", node.status || "n/a")}
-        ${kvRow("Raw ID", node.raw_id || "n/a", Boolean(node.raw_id))}
+        ${kvRow("Reported ID", node.raw_id || "n/a", Boolean(node.raw_id))}
         ${kvRow("Slots", formatSasFabricSlots(node.related_slots, 999))}
         ${sasFabricMetricRows(node.metrics, { pcie_slot: "PCIe slot", pci_address: "PCI address", linked_phys: "Linked PHYs", num_phys: "PHYs", path_counts: "Path counts" })}
-        ${kvRow("Evidence", formatSasFabricValue(node.evidence))}
+        ${kvRow("Source", formatSasFabricValue(node.evidence))}
       </div>
       ${node.kind === "controller" && node.raw?.iocfacts ? `
         <div class="sas-fabric-inspector-section">
-          <h4>IOC Facts</h4>
+          <h4>Controller details</h4>
           <div class="kv-grid">
             ${kvRow("Max targets", node.raw.iocfacts.maxtargets)}
             ${kvRow("Max expanders", node.raw.iocfacts.maxsasexpanders)}
@@ -2220,8 +2220,8 @@
     if (!fabric) {
       sasFabricInspectorTitle.textContent = "Fabric Inspector";
       sasFabricInspectorBody.innerHTML = state.snapshotMode
-        ? "No Storage Fabric payload is included in this snapshot."
-        : "Open topology to load the current Storage Fabric.";
+        ? "This offline copy does not include the connection map."
+        : "Press Topology to load the connection map.";
       return;
     }
     const trace = selectedSasFabricTrace();
@@ -2237,7 +2237,7 @@
       return;
     }
     sasFabricInspectorTitle.textContent = "Fabric Inspector";
-    sasFabricInspectorBody.innerHTML = "Select a controller, path, expander, SES enclosure, or bay to inspect the trace chain.";
+    sasFabricInspectorBody.innerHTML = "Pick a controller, cable path, or bay.";
   }
 
   function renderSasFabric() {
@@ -2270,23 +2270,23 @@
         ].join(" / ");
       } else {
         sasFabricSummary.textContent = state.sasFabric.loading
-          ? "Loading read-only Storage Fabric."
-          : "Read-only storage source, path, enclosure, and bay topology.";
+          ? "Loading..."
+          : "Shows how disks connect to controllers.";
       }
     }
     if (sasFabricStatus) {
       if (state.snapshotMode) {
         sasFabricStatus.className = "warning-item muted compact";
-        sasFabricStatus.textContent = "This offline snapshot does not include Storage Fabric data or live refresh capability.";
+        sasFabricStatus.textContent = "This offline copy does not include the connection map.";
       } else if (state.sasFabric.error) {
         sasFabricStatus.className = "warning-item compact";
         sasFabricStatus.textContent = `Storage Fabric load failed: ${state.sasFabric.error}`;
       } else if (state.sasFabric.loading) {
         sasFabricStatus.className = "warning-item muted compact";
-        sasFabricStatus.textContent = fabric ? "Refreshing Storage Fabric in the background." : "Loading read-only Storage Fabric.";
+        sasFabricStatus.textContent = fabric ? "Refreshing..." : "Loading...";
       } else if (fabric?.available === false) {
         sasFabricStatus.className = "warning-item compact";
-        sasFabricStatus.textContent = sasFabricList(fabric.warnings)[0] || "Storage Fabric is not available for this system.";
+        sasFabricStatus.textContent = sasFabricList(fabric.warnings)[0] || "Not available on this system.";
       } else if (sasFabricList(fabric?.warnings).length) {
         const fabricWarnings = sasFabricList(fabric.warnings);
         const enrichmentOnly = fabricWarnings.every(isSasFabricEnrichmentWarning);
@@ -2294,19 +2294,19 @@
         sasFabricStatus.textContent = fabricWarnings.join(" ");
       } else if (fabric) {
         sasFabricStatus.className = "warning-item muted compact";
-        sasFabricStatus.textContent = `Storage Fabric data loaded for ${fabric.selected_enclosure_label || fabric.system_label || "current selection"}.`;
+        sasFabricStatus.textContent = `Connection map loaded for ${fabric.selected_enclosure_label || fabric.system_label || "the current selection"}.`;
       } else {
         sasFabricStatus.className = "warning-item muted compact";
-        sasFabricStatus.textContent = "Open topology to load the current Storage Fabric.";
+        sasFabricStatus.textContent = "Press Topology to load the connection map.";
       }
     }
     if (sasFabricLanes) {
       if (!fabric) {
         sasFabricLanes.innerHTML = state.snapshotMode
-          ? '<div class="warning-item muted compact">No Storage Fabric payload is included in this snapshot.</div>'
-          : '<div class="warning-item muted compact">No Storage Fabric payload has been loaded yet.</div>';
+          ? '<div class="warning-item muted compact">This offline copy does not include the connection map.</div>'
+          : '<div class="warning-item muted compact">Not loaded yet.</div>';
       } else if (fabric.available === false) {
-        sasFabricLanes.innerHTML = '<div class="warning-item muted compact">No Storage Fabric map is available for this platform yet.</div>';
+        sasFabricLanes.innerHTML = '<div class="warning-item muted compact">Not available on this system.</div>';
       } else {
         sasFabricLanes.innerHTML = renderSasFabricMap(fabric);
       }
@@ -2509,7 +2509,7 @@
   }
 
   function writePolicyReason() {
-    return state.writePolicy?.reason || "Writes are disabled for this deployment.";
+    return state.writePolicy?.reason || "Changes are turned off on this server.";
   }
 
   function writePolicyControls() {
@@ -2583,7 +2583,7 @@
       return headers;
     }
     if (!state.writeAuthorization) {
-      const failure = new Error("Sign in to enable this write.");
+      const failure = new Error("Sign in to make changes.");
       failure.status = 401;
       throw failure;
     }
@@ -2627,11 +2627,11 @@
       if (state.writeAuthPending) {
         readUiAuthStatus.textContent = "Checking credentials...";
       } else if (signedIn && writePolicyAllowsWrites()) {
-        readUiAuthStatus.textContent = "Signed in for writes. Credentials clear on reload or sign-out.";
+        readUiAuthStatus.textContent = "Signed in. You will be signed out when you reload this page.";
       } else if (signedIn) {
-        readUiAuthStatus.textContent = `Signed in, but writes are blocked. ${writePolicyReason()}`;
+        readUiAuthStatus.textContent = `Signed in, but changes are blocked. ${writePolicyReason()}`;
       } else {
-        readUiAuthStatus.textContent = "Reads remain anonymous. Credentials stay in this page only.";
+        readUiAuthStatus.textContent = "You can look around without signing in.";
       }
     }
   }
@@ -2731,9 +2731,9 @@
     applyWritePolicy({
       enabled: false,
       mode: "basic",
-      reason: "Sign in to enable mapping, LED, and alias changes.",
+      reason: "Sign in to make changes.",
     });
-    setStatus("Signed out. Reads remain available.");
+    setStatus("Signed out. You can still look around.");
   }
 
   function uiPerfNow() {
@@ -2774,16 +2774,13 @@
   }
 
   function refreshStatusMessage(force, reason) {
-    if (reason === "system-switch") {
-      return "Loading system view...";
-    }
-    if (reason === "enclosure-switch") {
-      return "Loading enclosure view...";
+    if (reason === "system-switch" || reason === "enclosure-switch") {
+      return "Loading...";
     }
     if (reason === "startup-led-verify" || reason === "system-switch-led-verify" || reason === "enclosure-switch-led-verify") {
-      return "Checking current identify LED state...";
+      return "Checking locate lights...";
     }
-    return force ? "Refreshing inventory..." : "Auto-refreshing inventory...";
+    return force ? "Refreshing..." : "Auto refreshing...";
   }
 
   function shouldQueueIdentifyVerify() {
@@ -3066,7 +3063,7 @@
       return;
     }
     const timeZone = getBrowserTimeZone();
-    timezoneLabel.textContent = timeZone ? `Browser local time: ${timeZone}` : "Browser local time";
+    timezoneLabel.textContent = timeZone ? `Your local time (${timeZone})` : "Your local time";
   }
 
   function formatTimestamp(value) {
@@ -4225,7 +4222,7 @@
     return [
       {
         id: "attention_score",
-        label: "Derived Attention Score",
+        label: "Attention Score",
         shortLabel: "Score",
         fixedRange: [0, 100],
         value: (entry, entries, evaluation) => computeAttentionScore(entry, entries, evaluation),
@@ -4233,7 +4230,7 @@
       },
       {
         id: "temperature_c",
-        label: "Temperature (C)",
+        label: "Temperature",
         shortLabel: "Temp",
         historyMetrics: ["temperature_c"],
         value: (entry, _entries, evaluation) => heatmapMetricNumber(entry, "temperature_c", entry.slot?.temperature_c, evaluation),
@@ -4241,7 +4238,7 @@
       },
       {
         id: "temperature_delta_c",
-        label: "Temperature vs View Average (C)",
+        label: "Temperature vs View Average",
         shortLabel: "Delta",
         historyMetrics: ["temperature_c"],
         value: (entry, entries, evaluation) => computeTemperatureDelta(entry, entries, evaluation),
@@ -4378,7 +4375,7 @@
 
   function heatmapMetricContextText(metricId) {
     if (metricId === "attention_score") {
-      return "Higher scores combine relative temperature, errors, and write load; inspect the selected bay before acting.";
+      return "Score 0-100: hotter than its neighbours, SMART errors, and heavy writes all add points. Hover a bay to see why.";
     }
     if (metricId === "temperature_c") {
       return "Degrees Celsius. Use the drive vendor's warning and critical thresholds when available.";
@@ -4386,7 +4383,7 @@
     if (metricId === "temperature_delta_c") {
       return "Degrees Celsius relative to the current view average. Compare peer bays, then use vendor thresholds before acting.";
     }
-    return "Values come from the selected snapshot and optional history window.";
+    return "";
   }
 
   function heatmapMetricDefinition(metricId = state.heatmap.metric) {
@@ -6398,35 +6395,35 @@
     }
     if (estimate.selected_packaging === "auto") {
       if (estimate.auto_packaging === "html") {
-        return "Auto -> HTML";
+        return "Automatic: HTML file";
       }
       if (estimate.auto_packaging === "zip") {
-        return "Auto -> ZIP";
+        return "Automatic: ZIP file";
       }
       if (estimate.allow_oversize) {
-        return "Auto -> Oversize ZIP";
+        return "Automatic: ZIP file over the limit";
       }
-      return "Auto -> Over target";
+      return "Automatic: too large";
     }
     return estimatePackagingLabel(estimate.effective_packaging || estimate.selected_packaging);
   }
 
   function estimateCurrentPackagingMeta(estimate) {
     if (!estimate) {
-      return "Needs adjustment";
+      return "Too large";
     }
     if (estimate.selected_size_label) {
       if (estimate.selected_within_limit) {
         return estimate.selected_size_label;
       }
       if (estimate.selected_allowed) {
-        return `${estimate.selected_size_label} (over target)`;
+        return `${estimate.selected_size_label} (over the limit)`;
       }
     }
     if (estimate.auto_packaging === "oversize") {
-      return `ZIP ${estimate.zip_size_label || "n/a"} (over target)`;
+      return `ZIP ${estimate.zip_size_label || "n/a"} (over the limit)`;
     }
-    return "Needs adjustment";
+    return "Too large";
   }
 
   function buildEstimateAdvice(estimate) {
@@ -6436,40 +6433,41 @@
     const targetLabel = estimate.size_limit_label || "24 MiB";
     const downsamplingPart =
       estimate.downsampling_label && estimate.downsampling_label !== "None"
-        ? ` ${estimate.downsampling_note || `Adaptive ${estimate.downsampling_label} will be applied.`}`
+        ? ` ${estimate.downsampling_note || `History will be thinned to fit (${estimate.downsampling_label}).`}`
         : "";
+    const tooLargeAdvice = "Shorten the history window, mask serial numbers, or allow a larger file.";
 
     if (estimate.selected_packaging === "auto") {
       if (estimate.auto_packaging === "html") {
-        return `Auto should stay in HTML and fit under ${targetLabel}.${downsamplingPart}`;
+        return `Estimated ${estimate.html_size_label || "n/a"}: an HTML file under ${targetLabel}.${downsamplingPart}`;
       }
       if (estimate.auto_packaging === "zip") {
-        return `Auto is expected to switch to ZIP to stay under ${targetLabel}.${downsamplingPart}`;
+        return `The HTML file would be over ${targetLabel}, so a ZIP file of about ${estimate.zip_size_label || "n/a"} will be saved instead.${downsamplingPart}`;
       }
       if (estimate.allow_oversize) {
-        return `Even after adaptive rollups, both HTML and ZIP are still over ${targetLabel}. Oversize export is enabled, so Auto will continue as ZIP at about ${estimate.zip_size_label || "n/a"}.${downsamplingPart}`;
+        return `Both HTML and ZIP are over ${targetLabel}. Larger files are allowed, so a ZIP file of about ${estimate.zip_size_label || "n/a"} will be saved.${downsamplingPart}`;
       }
-      return `Even after adaptive rollups, both HTML and ZIP are still over ${targetLabel}. Try a shorter history window, enable redaction, or allow oversize.`;
+      return `Too large: both HTML and ZIP are over ${targetLabel}. ${tooLargeAdvice}`;
     }
 
     if (estimate.selected_packaging === "html") {
       if (estimate.selected_within_limit) {
-        return `Plain HTML is estimated to fit under ${targetLabel}.${downsamplingPart}`;
+        return `Estimated ${estimate.selected_size_label || estimate.html_size_label || "n/a"}: an HTML file under ${targetLabel}.${downsamplingPart}`;
       }
       if (estimate.selected_allowed) {
-        return `Plain HTML is estimated at ${estimate.selected_size_label || estimate.html_size_label} and exceeds ${targetLabel}. Oversize export is enabled, so it can still continue.${downsamplingPart}`;
+        return `The HTML file is estimated at ${estimate.selected_size_label || estimate.html_size_label} and is over ${targetLabel}. Larger files are allowed, so it can still be saved.${downsamplingPart}`;
       }
-      return `Plain HTML is estimated at ${estimate.selected_size_label || estimate.html_size_label} and would exceed ${targetLabel}. Try Auto, Force ZIP, a shorter history window, or allow oversize.`;
+      return `Too large: the HTML file is estimated at ${estimate.selected_size_label || estimate.html_size_label}, over ${targetLabel}. Choose Automatic or ZIP file, shorten the history window, mask serial numbers, or allow a larger file.`;
     }
 
     if (estimate.selected_packaging === "zip") {
       if (estimate.selected_within_limit) {
-        return `ZIP is estimated to fit under ${targetLabel}.${downsamplingPart}`;
+        return `Estimated ${estimate.selected_size_label || estimate.zip_size_label || "n/a"}: a ZIP file under ${targetLabel}.${downsamplingPart}`;
       }
       if (estimate.selected_allowed) {
-        return `ZIP is estimated at ${estimate.selected_size_label || estimate.zip_size_label} and exceeds ${targetLabel}. Oversize export is enabled, so it can still continue.${downsamplingPart}`;
+        return `The ZIP file is estimated at ${estimate.selected_size_label || estimate.zip_size_label} and is over ${targetLabel}. Larger files are allowed, so it can still be saved.${downsamplingPart}`;
       }
-      return `ZIP is estimated at ${estimate.selected_size_label || estimate.zip_size_label} and still exceeds ${targetLabel}. Try a shorter history window, enable redaction, or allow oversize.`;
+      return `Too large: the ZIP file is estimated at ${estimate.selected_size_label || estimate.zip_size_label}, over ${targetLabel}. ${tooLargeAdvice}`;
     }
 
     return "Estimate ready.";
@@ -6563,12 +6561,12 @@
         <div class="snapshot-export-estimate-card">
           <span class="snapshot-export-estimate-label">HTML</span>
           <span class="snapshot-export-estimate-value">${escapeHtml(estimate.html_size_label || "n/a")}</span>
-          <span class="snapshot-export-estimate-meta">${escapeHtml(estimate.html_within_limit ? "Fits target" : "Over target")}</span>
+          <span class="snapshot-export-estimate-meta">${escapeHtml(estimate.html_within_limit ? "OK" : "Too large")}</span>
         </div>
         <div class="snapshot-export-estimate-card">
           <span class="snapshot-export-estimate-label">ZIP</span>
           <span class="snapshot-export-estimate-value">${escapeHtml(estimate.zip_size_label || "n/a")}</span>
-          <span class="snapshot-export-estimate-meta">${escapeHtml(estimate.zip_within_limit ? "Fits target" : "Over target")}</span>
+          <span class="snapshot-export-estimate-meta">${escapeHtml(estimate.zip_within_limit ? "OK" : "Too large")}</span>
         </div>
         <div class="snapshot-export-estimate-card ${selectedTone === "error" ? "error" : selectedTone === "warning" ? "warning" : ""}">
           <span class="snapshot-export-estimate-label">Current Choice</span>
@@ -7090,7 +7088,7 @@
       smartEntry?.data?.transport_protocol === "ATA"
       && ((payload?.metrics?.bytes_read || []).length || (payload?.metrics?.bytes_written || []).length)
     )
-      ? "ATA read/write totals are lifetime SMART host counters. Lifetime shows the stored totals, while Rate converts them into per-hour movement between slower SMART samples."
+      ? "Read/write totals are lifetime counters from the disk. Lifetime shows the stored totals; Rate shows the change per hour between samples."
       : null;
     if (ataHistoryCounterNote) {
       notes.push(ataHistoryCounterNote);
@@ -7108,7 +7106,7 @@
     }
 
     const enduranceEstimateNote = Number.isInteger(smartEntry?.data?.estimated_remaining_bytes_written)
-      ? "Estimated write-endurance values extrapolate current writes against the NVMe percentage-used SMART field."
+      ? "Remaining write endurance is a projection from the current write rate and the NVMe percentage-used value."
       : null;
     if (enduranceEstimateNote) {
       notes.push(enduranceEstimateNote);
@@ -7123,14 +7121,14 @@
       && slowMetricCounts.length
       && slowMetricCounts.some((count) => count < temperatureSamples)
     ) {
-      notes.push("Read/write and power-on metrics are collected on the slower SMART cadence, so those samples can lag behind the latest temperature point.");
+      notes.push("Read/write totals update less often than temperature.");
     }
 
     const hasCounterScaleBreak =
       hasHistoryCounterScaleDiscontinuity("bytes_read", payload?.metrics?.bytes_read || [], windowHours, referenceTimestampMs)
       || hasHistoryCounterScaleDiscontinuity("bytes_written", payload?.metrics?.bytes_written || [], windowHours, referenceTimestampMs);
     if (hasCounterScaleBreak) {
-      notes.push("Read/write history includes an older low-scale sample, so Rate mode may need a few fresh slow samples to settle after the SMART counter-source correction.");
+      notes.push("Read/write history includes an older sample on a different scale, so Rate may take a few samples to settle.");
     }
 
     const diskHistory = payload?.disk_history;
@@ -7494,17 +7492,17 @@
       ? formatTimestamp(new Date(Number(freshness.fetchedAt)).toISOString())
       : "an unknown time";
     if (freshness.state === "fresh") {
-      return `History data is fresh. Fetched at ${fetchedAt}.`;
+      return "";
     }
     if (freshness.state === "refreshing") {
-      return `Refreshing cached history from ${fetchedAt}.`;
+      return `Refreshing history saved ${fetchedAt}.`;
     }
     if (freshness.state === "stale") {
       const errorDetail = freshness.error ? ` Refresh failed: ${freshness.error}.` : "";
-      return `Stale cached history from ${fetchedAt}.${errorDetail}`;
+      return `Showing history from ${fetchedAt}.${errorDetail}`;
     }
     if (freshness.state === "unavailable") {
-      return "History data is unavailable.";
+      return "History is unavailable.";
     }
     return "";
   }
@@ -7784,7 +7782,7 @@
       smartEntry?.data?.transport_protocol === "ATA"
       && (Number.isInteger(smartEntry?.data?.bytes_read) || Number.isInteger(smartEntry?.data?.bytes_written))
     )
-      ? "ATA read/write totals are lifetime SMART host counters and can exceed current pool usage, especially after array initialization, parity build, or rebuild."
+      ? "Read/write totals are lifetime counters from the disk and can be higher than current pool usage, for example after a rebuild."
       : null;
     const lowHourAnnualizedNote = (
       Number.isInteger(smartEntry?.data?.power_on_hours)
@@ -7794,7 +7792,7 @@
       ? "Annualized read/write is hidden until the disk has at least about 30 days of power-on time."
       : null;
     const enduranceEstimateNote = Number.isInteger(smartEntry?.data?.estimated_remaining_bytes_written)
-      ? "Estimated write-endurance values extrapolate current writes against the NVMe percentage-used SMART field."
+      ? "Remaining write endurance is a projection from the current write rate and the NVMe percentage-used value."
       : null;
     return [smartMessage, ledControlNote, ataVolumeCounterNote, lowHourAnnualizedNote, enduranceEstimateNote].filter(Boolean).join(" ");
   }
@@ -7858,8 +7856,8 @@
     if (!mappingEditorHasUnsavedChanges()) {
       return true;
     }
-    if (!window.confirm("Discard unsaved calibration edits and change selection?")) {
-      setStatus("Selection change canceled. Unsaved calibration edits were kept.");
+    if (!window.confirm("You have unsaved changes for this bay. Discard them?")) {
+      setStatus("Selection change canceled. Your unsaved changes were kept.");
       return false;
     }
     state.mappingFormScopeKey = null;
@@ -7892,9 +7890,9 @@
     const mappingSupported = slot?.mapping_supported !== false;
     if (mappingEmpty) {
       mappingEmpty.textContent = mappingSupported
-        ? "Select a slot to save or restore calibration details for that bay."
+        ? "Click a bay to save which disk sits in it."
         : (slot.mapping_reason
-          || "Manual mapping is unavailable because this disk has no stable physical location.");
+          || "This disk has no fixed bay, so it cannot be assigned.");
       mappingEmpty.classList.toggle("hidden", mappingSupported);
     }
     mappingForm.classList.toggle("hidden", !mappingSupported);
@@ -7906,13 +7904,13 @@
     if (enclosure?.kind !== "virtual" && !String(enclosure?.id || "").startsWith("virtual-system:")) {
       return null;
     }
-    return "Mapping import is unavailable because this system disk inventory has no identified physical enclosure or stable physical slot identities.";
+    return "Backups cannot be restored here because this system has no physical enclosure.";
   }
 
   function renderMappingImportControl() {
     const snapshotModeActive = typeof state !== "undefined" && Boolean(state.snapshotMode);
     const reason = snapshotModeActive
-      ? "Mapping backup actions are disabled in an offline snapshot export."
+      ? "Bay assignment backups cannot be changed in an offline copy."
       : mappingImportUnavailableReason();
     if (typeof exportMappingsButton !== "undefined" && exportMappingsButton) {
       exportMappingsButton.disabled = snapshotModeActive;
@@ -8006,7 +8004,7 @@
       showQuantastorContext ? kvRowIfMeaningful("SES Flags", formatSesStateValue(slot)) : "",
       kvRow("Enclosure", slot.enclosure_label || slot.enclosure_name || slot.enclosure_id),
       kvRow("LED", ledStatusLabel(slot)),
-      kvRow("Mapping", slot.mapping_source),
+      kvRow("Bay reported by", mappingSourceLabel(slot.mapping_source)),
       kvRow("Notes", slot.notes),
     ].filter(Boolean).join("");
 
@@ -8046,8 +8044,8 @@
       if (!storageViewSlot) {
         renderEmptyDetailState(
           isLiveStyledStorageView(selectedStorageView)
-            ? "Select a slot tile to view disk, pool, and mapping details."
-            : "Select a storage-view slot to inspect how a live disk landed in this saved layout.",
+            ? "Click a bay to see its disk."
+            : "Click a slot to see its disk.",
           { showDetailSecondary: isLiveStyledStorageView(selectedStorageView) }
         );
         return;
@@ -8087,7 +8085,7 @@
           const showLinkRate = showSasTransportFields || formatLinkRateValue(smartEntry) !== "n/a";
           return [
         kvRow("Storage View", selectedStorageView.label),
-        kvRow("Template", selectedStorageView.template_label || selectedStorageView.template_id),
+        kvRow("Layout", selectedStorageView.template_label || selectedStorageView.template_id),
         kvRow("Slot", storageViewSlot.slot_label),
         kvRowIfMeaningful("Configured Size", storageViewSlot.slot_size),
         kvRow("State", stateLabel(storageViewSlot)),
@@ -8144,7 +8142,7 @@
         kvRowIfMeaningful("Transport Address", storageViewSlot.transport_address),
         kvRowIfMeaningful("Placement", storageViewSlot.placement_key),
         kvRowIfMeaningful("Matched By", Array.isArray(storageViewSlot.match_reasons) ? storageViewSlot.match_reasons.join(", ") : null),
-        kvRowIfMeaningful("Assignment Rank", storageViewSlot.assignment_rank),
+        kvRowIfMeaningful("Match order", storageViewSlot.assignment_rank),
         kvRowIfMeaningful("Source", storageViewSlot.source),
         kvRowIfMeaningful("Notes", storageViewRuntimeSecondaryLabel(storageViewSlot)),
           ].filter(Boolean).join("");
@@ -8198,8 +8196,8 @@
 
     if (!hasStoragePeerGroup(slot)) {
       topologyContext.innerHTML = currentPlatform() === "linux"
-        ? '<div class="warning-item muted">This slot is not currently tied to a mapped mdadm stack.</div>'
-        : '<div class="warning-item muted">This slot is not currently tied to a pool vdev.</div>';
+        ? '<div class="warning-item muted">This disk is not in a RAID array.</div>'
+        : '<div class="warning-item muted">This disk is not in a pool.</div>';
       return;
     }
 
@@ -8258,17 +8256,16 @@
 
     if (!slot) {
       multipathContext.innerHTML = currentPlatform() === "linux"
-        ? '<div class="warning-item muted">Select a slot to inspect transport and member-path details when available.</div>'
-        : '<div class="warning-item muted">Select a multipath-backed slot to inspect active and standby member paths.</div>';
+        ? '<div class="warning-item muted">Click a disk to see its transport and path details.</div>'
+        : '<div class="warning-item muted">Click a disk with more than one path to see its active and standby paths.</div>';
       return;
     }
 
     const multipath = slot.multipath;
     if (!multipath) {
-      const stack = currentPlatform() === "linux" ? "a multipath stack" : "gmultipath";
       const message = state.snapshotMode
-        ? `This slot was not presented through ${stack} at capture.`
-        : `This slot is not currently presented through ${stack}.`;
+        ? "This disk had a single path when the copy was saved."
+        : "This disk has a single path.";
       multipathContext.innerHTML = `<div class="warning-item muted">${escapeHtml(message)}</div>`;
       return;
     }
@@ -8497,12 +8494,12 @@
 
   function snapshotSshStatus(ssh) {
     if (!ssh.enabled) {
-      return { className: "status-chip snapshot", textContent: "SSH OFF AT CAPTURE" };
+      return { className: "status-chip snapshot", textContent: "SSH: off at capture" };
     }
     if (!ssh.ok) {
-      return { className: "status-chip error", textContent: "SSH ERROR AT CAPTURE" };
+      return { className: "status-chip error", textContent: "SSH: error at capture" };
     }
-    return { className: "status-chip snapshot", textContent: "SSH AT CAPTURE" };
+    return { className: "status-chip snapshot", textContent: "SSH: OK at capture" };
   }
 
   function renderStatus() {
@@ -8515,8 +8512,8 @@
         snapshotStatusChip.className = "status-chip snapshot";
         snapshotStatusChip.textContent = "SNAPSHOT";
         snapshotStatusChip.title = generatedAt
-          ? `Frozen offline artifact generated ${formatTimestamp(generatedAt)}.`
-          : "Frozen offline artifact.";
+          ? `Offline copy saved ${formatTimestamp(generatedAt)}.`
+          : "Offline copy.";
       } else {
         snapshotStatusChip.className = "status-chip hidden";
         snapshotStatusChip.textContent = "SNAPSHOT";
@@ -8526,42 +8523,45 @@
 
     if (state.snapshotMode) {
       apiStatusChip.className = "status-chip snapshot";
-      apiStatusChip.textContent = api.ok ? "API AT CAPTURE" : "API ERROR AT CAPTURE";
-      apiStatusChip.title = "Recorded source state. No API is connected to this artifact.";
+      apiStatusChip.textContent = api.ok ? "TrueNAS API: OK at capture" : "TrueNAS API: error at capture";
+      apiStatusChip.title = "Recorded when this copy was saved. No TrueNAS API is connected.";
       const snapshotSsh = snapshotSshStatus(ssh);
       sshStatusChip.className = snapshotSsh.className;
       sshStatusChip.textContent = snapshotSsh.textContent;
-      sshStatusChip.title = "Recorded source state. No SSH session is connected to this artifact.";
+      sshStatusChip.title = "Recorded when this copy was saved. No SSH session is connected.";
     } else {
       apiStatusChip.className = `status-chip ${api.ok ? "ok" : "error"}`;
-      apiStatusChip.textContent = api.ok ? "API OK" : "API ERR";
+      apiStatusChip.textContent = api.ok ? "TrueNAS API: OK" : "TrueNAS API: error";
+      apiStatusChip.title = typeof api.message === "string" ? api.message : "";
 
+      // SSH that was never turned on is a normal setup, so it keeps the neutral chip style.
       let sshClass = "ok";
       if (!ssh.enabled) {
-        sshClass = "partial";
+        sshClass = "";
       } else if (!ssh.ok) {
         sshClass = "error";
       }
-      sshStatusChip.className = `status-chip ${sshClass}`;
-      sshStatusChip.textContent = !ssh.enabled ? "SSH OFF" : ssh.ok ? "SSH OK" : "SSH ERR";
+      sshStatusChip.className = `status-chip ${sshClass}`.trim();
+      sshStatusChip.textContent = !ssh.enabled ? "SSH: off" : ssh.ok ? "SSH: OK" : "SSH: error";
+      sshStatusChip.title = typeof ssh.message === "string" ? ssh.message : "";
     }
 
     if (historyStatusChip) {
       if (!state.history.configured) {
         historyStatusChip.className = "status-chip hidden";
-        historyStatusChip.textContent = "HIST";
+        historyStatusChip.textContent = "History";
         historyStatusChip.title = "";
       } else {
         let historyClass = "partial";
-        let historyText = "HIST ...";
+        let historyText = "History: checking";
         if (state.snapshotMode) {
           historyClass = "snapshot";
-          historyText = state.history.available ? "HIST PRELOADED" : "HIST OMITTED";
+          historyText = state.history.available ? "History: included" : "History: not included";
         } else if (state.history.available) {
           historyClass = "ok";
-          historyText = "HIST OK";
+          historyText = "History: on";
         } else if (state.history.checked && !state.history.loading) {
-          historyText = "HIST OFF";
+          historyText = "History: off";
         }
 
         const trackedSlots = state.history.counts?.tracked_slots;
@@ -8581,7 +8581,7 @@
           detailParts.push(state.history.detail);
         }
         if (!detailParts.length && state.history.loading) {
-          detailParts.push("Checking optional history backend.");
+          detailParts.push("Checking the history service.");
         }
 
         historyStatusChip.className = `status-chip ${historyClass}`;
@@ -8591,7 +8591,7 @@
     }
 
     lastUpdated.textContent = formatTimestamp(state.snapshot.last_updated);
-    lastUpdated.title = "Rendered in your browser's local timezone.";
+    lastUpdated.title = "Shown in your local time zone.";
     renderTimezoneLabel();
     renderSnapshotBanner();
     syncLocation();
@@ -8642,35 +8642,47 @@
     const populated = counts.matched + counts.unmatched;
     let headline;
     if (counts.unmatched > 0) {
-      headline = `${counts.unmatched} populated bay${counts.unmatched === 1 ? "" : "s"} need${counts.unmatched === 1 ? "s" : ""} mapping.`;
+      headline = counts.unmatched === 1
+        ? "1 disk is not matched to a bay. Click it to assign one."
+        : `${counts.unmatched} disks are not matched to a bay. Click them to assign one.`;
     } else if (counts.unknown > 0) {
-      headline = `${counts.unknown} bay${counts.unknown === 1 ? " has" : "s have"} unknown mapping state.`;
+      headline = `${counts.unknown} bay${counts.unknown === 1 ? " has" : "s have"} an unknown state.`;
     } else if (populated > 0) {
-      headline = `All ${populated} populated bay${populated === 1 ? " is" : "s are"} matched.`;
+      headline = populated === 1 ? "The only disk is in a known bay." : `All ${populated} disks are in known bays.`;
     } else {
-      headline = "No populated bays are reported in this view.";
+      headline = "No disks are reported in this view.";
     }
     return { ...counts, populated, total, headline };
   }
 
-  function mappingHealthEvidenceNote(slots, lastUpdatedValue) {
+  function mappingSourceLabel(source) {
     const labels = {
-      api: "API",
-      ssh: "SSH/SES",
+      api: "TrueNAS API",
+      ssh: "SSH (enclosure)",
       bmc: "BMC",
-      manual: "saved mapping",
-      modeled: "modeled fixture",
+      manual: "saved assignment",
+      modeled: "modeled layout",
       inventory_candidate: "inventory match",
-      snapshot_slot: "enclosure snapshot",
-      scale_sg_ses: "SCALE SG/SES",
-      "live-derived-core-demo": "sanitized demo fixture",
+      snapshot_slot: "saved snapshot",
+      scale_sg_ses: "SSH (SES)",
+      "live-derived-core-demo": "demo data",
+      unknown: "unknown",
+      empty: "empty bay",
+      placeholder: "no disk",
     };
+    const key = String(source || "").trim();
+    if (!key) {
+      return "n/a";
+    }
+    return labels[key] || key.replaceAll("_", " ");
+  }
+
+  function mappingHealthSourceNote(slots) {
     const sources = Array.from(new Set((Array.isArray(slots) ? slots : [])
       .map((slot) => String(slot?.mapping_source || "").trim())
       .filter((source) => source && source !== "unknown" && source !== "empty" && source !== "placeholder")
-      .map((source) => labels[source] || source.replaceAll("_", " "))));
-    const sourceText = sources.length ? sources.join(" and ") : "unknown mapping source";
-    return `Evidence: ${sourceText}. Snapshot: ${lastUpdatedValue || "time unavailable"}.`;
+      .map((source) => mappingSourceLabel(source))));
+    return sources.length ? `Bay positions come from: ${sources.join(", ")}.` : "Bay positions: source unknown.";
   }
 
   function renderSummary() {
@@ -8684,11 +8696,11 @@
     const healthScope = mappingHealthScope(state.snapshot, getSelectedStorageViewRuntime());
     const health = summarizeMappingHealth(healthScope.slots, healthScope.layoutSlotCount);
     if (mappingHealthSummary) {
-      mappingHealthSummary.textContent = `${healthScope.label}: ${health.headline} ${health.matched} matched, ${health.empty} empty, ${health.unmatched} unmatched, ${health.unknown} unknown.`;
+      mappingHealthSummary.textContent = `${healthScope.label}: ${health.headline}`;
       mappingHealthSummary.dataset.tone = health.unmatched > 0 ? "warning" : health.unknown > 0 ? "unknown" : "ok";
     }
     if (mappingHealthEvidence) {
-      mappingHealthEvidence.textContent = mappingHealthEvidenceNote(healthScope.slots, healthScope.lastUpdated);
+      mappingHealthEvidence.textContent = mappingHealthSourceNote(healthScope.slots);
     }
   }
 
@@ -8801,7 +8813,7 @@
     platformDetailsToggleButton.textContent = state.platformDetails.open ? "Hide Platform Details" : "Platform Details";
     platformDetailsToggleButton.setAttribute("aria-expanded", state.platformDetails.open ? "true" : "false");
     platformDetailsTitle.textContent = details.title || "Platform Details";
-    platformDetailsSummary.textContent = details.summary || "Read-only platform context.";
+    platformDetailsSummary.textContent = details.summary || "";
 
     if (!state.platformDetails.open) {
       platformDetailsPanel.classList.add("hidden");
@@ -8888,14 +8900,14 @@
         label: "Snapshot",
         ttlSeconds: SNAPSHOT_CACHE_TTL_SECONDS,
         startMs: snapshotStartMs,
-        title: "Browser-side countdown from the last accepted inventory snapshot.",
+        title: "Time left before the inventory shown here is considered stale.",
       },
       {
         key: "sources",
         label: "Sources",
         ttlSeconds: SOURCE_BUNDLE_CACHE_TTL_SECONDS,
         startMs: snapshotStartMs,
-        title: "Approximate API/SSH/BMC source-bundle reuse window for this view.",
+        title: "Time left before TrueNAS, SSH, and BMC answers are read again.",
       },
       {
         key: "smart",
@@ -8903,15 +8915,15 @@
         ttlSeconds: SMART_CACHE_TTL_SECONDS,
         startMs: smartStartMs,
         title: smartStartMs
-          ? "Countdown from the latest loaded SMART summary."
-          : "SMART cache countdown starts after summaries load.",
+          ? "Time left before SMART details are read again."
+          : "Starts counting once SMART details have loaded.",
       },
       {
         key: "ses",
-        label: "SES Paths",
+        label: "Enclosure paths",
         ttlSeconds: SG_SES_DEVICE_CACHE_TTL_SECONDS,
         startMs: snapshotStartMs,
-        title: "Approximate validated sg_ses device-path reuse window for dynamic SES discovery.",
+        title: "Time left before enclosure device paths are discovered again.",
       },
     ];
   }
@@ -8978,8 +8990,10 @@
     if (!cacheTimingChips) {
       return;
     }
-    cacheTimingChips.classList.toggle("hidden", state.snapshotMode);
-    if (state.snapshotMode) {
+    // Cache countdowns are a tuning aid, so they only show with the UI Timing panel.
+    const showChips = !state.snapshotMode && Boolean(state.uiPerf?.enabled);
+    cacheTimingChips.classList.toggle("hidden", !showChips);
+    if (!showChips) {
       if (cacheTimingChips.childElementCount) {
         cacheTimingChips.innerHTML = "";
       }
@@ -9031,7 +9045,7 @@
       return;
     }
     if (state.refreshesInFlight > 0) {
-      setTextIfChanged(refreshCountdownLabel, "Refresh running");
+      setTextIfChanged(refreshCountdownLabel, "Refreshing...");
       setBarWidthIfChanged(refreshCountdownBar, 1);
       return;
     }
@@ -9042,12 +9056,12 @@
     }
     const pauseReason = autoRefreshPauseReason();
     if (pauseReason === "hidden") {
-      setTextIfChanged(refreshCountdownLabel, "Auto refresh paused while tab is hidden");
+      setTextIfChanged(refreshCountdownLabel, "Auto refresh paused while this tab is hidden");
       setBarWidthIfChanged(refreshCountdownBar, 0);
       return;
     }
     if (pauseReason === "mapping") {
-      setTextIfChanged(refreshCountdownLabel, "Auto refresh paused for unsaved calibration edits");
+      setTextIfChanged(refreshCountdownLabel, "Auto refresh paused while you edit");
       setBarWidthIfChanged(refreshCountdownBar, 0);
       return;
     }
@@ -9284,7 +9298,7 @@
       if (exportSnapshotConfirm) {
         exportSnapshotConfirm.disabled = true;
       }
-      setStatus("Preparing enclosure snapshot export...");
+      setStatus("Preparing the offline copy...");
       const response = await fetch(buildScopedUrl("/api/export/enclosure-snapshot"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -9353,7 +9367,7 @@
         if (perfRun && state.uiPerf.currentRun?.id === perfRun.id) {
           archiveUiPerfRun(perfRun, "mapping-draft");
         }
-        setStatus("Refresh response deferred because calibration edits started while it was running.");
+        setStatus("Refresh result set aside because you started editing a bay while it ran.");
         return;
       }
       if (perfRun && state.uiPerf.currentRun?.id === perfRun.id) {
@@ -9393,7 +9407,7 @@
       scheduleSmartPrefetch();
       ensureHeatmapData();
       maybeFinalizeUiPerfRun(perfRun);
-      setStatus("Inventory updated.");
+      setStatus("Up to date.");
     } catch (error) {
       if (perfRun && state.uiPerf.currentRun?.id === perfRun.id) {
         archiveUiPerfRun(perfRun, "error", error.message || String(error));
@@ -9415,7 +9429,7 @@
 
   async function sendLedAction(action) {
     if (state.snapshotMode) {
-      setStatus("LED actions are disabled in an offline snapshot export.", "error");
+      setStatus("Locate lights cannot be changed in an offline copy.", "error");
       return;
     }
     if (writeBlockedByPolicy()) {
@@ -9456,13 +9470,13 @@
         return {
           label: "Sync multipath table",
           progressLabel: "multipath table",
-          explanation: "Runs TrueNAS disk.multipath_sync so the middleware rebuilds its multipath table from the kernel's gmultipath geoms. Pools and data are not touched.",
+          explanation: "Asks TrueNAS to rebuild its multipath table. Pools and data are not touched.",
         };
       case "full":
         return {
           label: "Full disk sync",
           progressLabel: "disk inventory",
-          explanation: "Runs TrueNAS disk.sync_all so the middleware re-reads every disk into its inventory. Pools and data are not touched.",
+          explanation: "Asks TrueNAS to re-scan all of its disks. Pools and data are not touched.",
         };
       default:
         return null;
@@ -9474,13 +9488,13 @@
     if (!diskInventorySyncPlatformSupported(platform)) {
       return {
         available: false,
-        reason: "TrueNAS disk inventory sync is unsupported on this platform because it needs the TrueNAS middleware.",
+        reason: "Only available on TrueNAS.",
       };
     }
     if (typeof writePolicyAllowsWrites === "function" && !writePolicyAllowsWrites()) {
       const reason = typeof writePolicyReason === "function"
         ? writePolicyReason()
-        : "Writes are disabled for this deployment.";
+        : "Changes are turned off on this server.";
       return { available: false, reason };
     }
     if (mode === "multipath" && platform !== "core") {
@@ -9490,11 +9504,11 @@
     if (!ssh || ssh.enabled === false) {
       return {
         available: false,
-        reason: "SSH is disabled for this system, so the app cannot ask the TrueNAS middleware to re-read its disks.",
+        reason: "SSH is off for this system, so the app cannot ask TrueNAS to re-scan its disks.",
       };
     }
     if (state.diskInventorySync.inFlight) {
-      return { available: false, reason: "A TrueNAS disk inventory sync is already running for this system." };
+      return { available: false, reason: "A disk re-scan is already running for this system." };
     }
     return { available: true, reason: "" };
   }
@@ -9603,7 +9617,7 @@
     }
     const summary = parts.length ? ` (${parts.join(", ")})` : "";
     const error = typeof result?.error === "string" && result.error ? ` ${result.error}` : "";
-    return `${result?.message || "TrueNAS disk inventory sync finished."}${summary}${error}`;
+    return `${result?.message || "Disk re-scan finished."}${summary}${error}`;
   }
 
   async function runDiskInventorySync(
@@ -9659,7 +9673,7 @@
     if (slot.mapping_supported === false) {
       setStatus(
         slot.mapping_reason
-          || "Manual mapping is unavailable because this disk has no stable physical location.",
+          || "This disk has no fixed bay, so it cannot be assigned.",
         "error",
       );
       return;
@@ -9679,7 +9693,7 @@
     };
 
     try {
-      setStatus(`Saving calibration for slot ${slot.slot_label}...`);
+      setStatus(`Saving bay assignment for bay ${slot.slot_label}...`);
       const result = await sendScopedRequest(`/api/slots/${slot.slot}/mapping`, {
         method: "POST",
         readUiAuth: true,
@@ -9792,12 +9806,12 @@
     const removals = preview?.removals || [];
     const unchanged = preview?.unchanged || [];
     return [
-      "Confirm this exact mapping import diff:",
+      "Restore these bay assignments?",
       `Add (${additions.length}): ${formatEntries(additions, (entry) => formatRecord(entry.incoming))}`,
       `Update (${updates.length}): ${formatEntries(updates, (entry) => formatChanges(entry.changes))}`,
       `Remove (${removals.length}): ${formatEntries(removals, (entry) => formatRecord(entry.current))}`,
       `Unchanged (${unchanged.length}): ${formatEntries(unchanged, () => "")}`,
-      "The import will be rejected if the active mapping scope changes before confirmation.",
+      "If the inventory changes before you confirm, the restore is canceled.",
     ].join("\n");
   }
 
@@ -10059,9 +10073,9 @@
   async function requestManualRefresh() {
     if (
       mappingEditorHasUnsavedChanges()
-      && !window.confirm("Refresh now? Unsaved calibration edits may be replaced if the selected slot changes.")
+      && !window.confirm("Refresh now? Unsaved changes for this bay may be lost if its disk changes.")
     ) {
-      setStatus("Manual refresh canceled. Unsaved calibration edits were kept.");
+      setStatus("Refresh canceled. Your unsaved changes were kept.");
       return false;
     }
     await refreshSnapshot(true, "manual-refresh");

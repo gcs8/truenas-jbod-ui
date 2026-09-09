@@ -128,7 +128,7 @@ class EnclosureAliasServerRenderTests(unittest.TestCase):
         self.assertIn("Archive East", title)
         self.assertNotIn("Raw Profile Title", title)
         self.assertIn('id="enclosure-alias-edit-button"', html)
-        self.assertIn("Raw: Shelf B", html)
+        self.assertIn("Reported name: Shelf B", html)
 
     def test_snapshot_render_omits_enclosure_alias_editor(self) -> None:
         html = self._html(snapshot_mode=True)
