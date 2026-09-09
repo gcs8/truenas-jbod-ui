@@ -87,20 +87,6 @@
     },
     "reason": "Reviewed source literal or validation pattern; exact detector counts are pinned."
   },
-  "config/config.example.yaml": {
-    "findings": {
-      "internal_hostname": {
-        "sha256:06117e57d3c71582d604d499c66153bc32bf9ce26c8ab16595f99946de060a50": 15
-      },
-      "rfc1918_ipv4": {
-        "sha256:6b8ef42a074f65ccd8a058fd2aaeddbe92ca7b631b789b3e9aa525d274383237": 3
-      },
-      "sas_wwn_identifier": {
-        "sha256:fae4aa3b4381531a9c75898321456a2fe55d193ac2dc23a7ab36d9c921ef92b7": 3
-      }
-    },
-    "reason": "Reviewed public configuration example; exact detector counts are pinned."
-  },
   "docs/ADMIN_TRUST_BOUNDARY.md": {
     "findings": {
       "internal_hostname": {
@@ -231,7 +217,6 @@
     },
     "reason": "Deterministic clean-room QA fixture; exact detector counts are pinned."
   },
-
   "scripts/run_private_qa_restore.py": {
     "findings": {
       "sas_wwn_identifier": {
@@ -649,7 +634,6 @@
     },
     "reason": "Reviewed operator-documentation example; exact detector counts are pinned."
   },
-
   "wiki/Profiles-and-Custom-Layouts.md": {
     "findings": {
       "sas_wwn_identifier": {
@@ -658,7 +642,6 @@
     },
     "reason": "Reviewed operator-documentation example; exact detector counts are pinned."
   },
-
   "wiki/Troubleshooting.md": {
     "findings": {
       "sas_wwn_identifier": {
