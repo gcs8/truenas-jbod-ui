@@ -927,12 +927,14 @@ def build_health_payload(
     snapshot: InventorySnapshot | None,
     *,
     startup_problems: Collection[str] = (),
-) -> tuple[dict[str, object], int]:
-    """Describe service health in plain words and pick the HTTP status to send with it.
+) -> dict[str, object]:
+    """Describe service health in plain words.
 
-    The status code is 503 whenever there is a problem an operator must act on:
-    a data folder the app cannot write, or a TrueNAS API that does not answer.
-    Waiting for the first inventory is not a problem, so it stays 200.
+    ``summary`` is one sentence and ``problems`` lists everything an operator
+    must act on: a data folder the app cannot write, or a TrueNAS API that does
+    not answer. Waiting for the first inventory is not a problem. The route
+    always answers HTTP 200 so the Compose healthcheck and existing monitors
+    keep working; read ``status`` and ``problems`` for the verdict.
     """
 
     unwritable = [str(problem) for problem in startup_problems]
@@ -975,7 +977,7 @@ def build_health_payload(
         "warnings": warnings,
         "cache_state": cache_state,
     }
-    return payload, (503 if problems else 200)
+    return payload
 
 
 app = create_app()

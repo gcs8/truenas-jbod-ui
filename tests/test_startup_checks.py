@@ -197,14 +197,14 @@ class WritabilityProbeTests(unittest.TestCase):
         self.assertFalse(is_unwritable_path_error(OSError(errno.ENOSPC, "No space left on device")))
         self.assertFalse(is_unwritable_path_error(RuntimeError("not an OSError")))
 
-    def test_ui_folders_are_the_data_and_logs_folders_once_each(self) -> None:
+    def test_ui_folders_are_the_data_and_logs_folders_once_each_and_never_the_config_folder(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             settings = Settings(
                 paths=PathConfig(
                     mapping_file=str(root / "data" / "mappings.json"),
                     sas_fabric_alias_file=str(root / "data" / "aliases.json"),
-                    profile_file=str(root / "data" / "profiles.yaml"),
+                    profile_file=str(root / "config" / "profiles.yaml"),
                     slot_detail_cache_file=str(root / "data" / "slot-details.json"),
                     log_file=str(root / "logs" / "app.log"),
                 )
@@ -353,17 +353,17 @@ class HealthzTests(unittest.TestCase):
         self.assertEqual(body["warnings"], ["SES data is partial"])
         self.assertEqual(body["cache_state"], "cached")
 
-    def test_unreachable_api_returns_503_with_the_reason(self) -> None:
+    def test_unreachable_api_stays_200_but_names_the_reason(self) -> None:
         status, body = self.call_healthz(_snapshot(api_ok=False, api_message="connection refused"))
-        self.assertEqual(status, 503)
+        self.assertEqual(status, 200)
         self.assertEqual(body["status"], "degraded")
         self.assertEqual(body["dependency_status"], "degraded")
         self.assertEqual(body["summary"], "TrueNAS API unreachable: connection refused")
         self.assertEqual(body["problems"], ["TrueNAS API unreachable: connection refused"])
 
-    def test_unwritable_data_folder_returns_503_even_before_the_first_inventory(self) -> None:
+    def test_unwritable_data_folder_is_degraded_even_before_the_first_inventory(self) -> None:
         status, body = self.call_healthz(None, problems=(CHOWN_SENTENCE,))
-        self.assertEqual(status, 503)
+        self.assertEqual(status, 200)
         self.assertEqual(body["status"], "degraded")
         self.assertEqual(body["dependency_status"], "unknown")
         self.assertEqual(body["summary"], f"Data folder not writable: {CHOWN_SENTENCE}")
@@ -371,7 +371,7 @@ class HealthzTests(unittest.TestCase):
 
     def test_unwritable_folder_and_unreachable_api_are_both_listed(self) -> None:
         status, body = self.call_healthz(_snapshot(api_ok=False, api_message=None), problems=(CHOWN_SENTENCE,))
-        self.assertEqual(status, 503)
+        self.assertEqual(status, 200)
         self.assertEqual(body["summary"], f"Data folder not writable: {CHOWN_SENTENCE}")
         self.assertEqual(
             body["problems"],

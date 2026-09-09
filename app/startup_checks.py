@@ -122,13 +122,17 @@ def check_writable_dirs(paths: Iterable[str | os.PathLike[str] | None]) -> list[
 
 
 def ui_writable_directories(settings: Any) -> list[str]:
-    """Folders the main UI must be able to write: the data folder and the logs folder."""
+    """Folders the main UI must be able to write: the data folder and the logs folder.
+
+    The config folder is left out on purpose: the main UI only reads
+    ``profiles.yaml`` and ``config.yaml``, and the published Compose files mount
+    it read-only.
+    """
 
     paths = settings.paths
     candidates = [
         os.path.dirname(paths.mapping_file),
         os.path.dirname(paths.sas_fabric_alias_file),
-        os.path.dirname(paths.profile_file),
         os.path.dirname(paths.slot_detail_cache_file),
         os.path.dirname(paths.log_file),
     ]

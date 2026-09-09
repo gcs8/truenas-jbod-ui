@@ -1121,10 +1121,10 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
         registry = get_inventory_registry()
         service = registry.get_service(None)
         snapshot = service.peek_cached_snapshot()
-        payload, status_code = build_health_payload(
+        payload = build_health_payload(
             snapshot,
             startup_problems=startup_problems_for(request),
         )
-        return JSONResponse(payload, status_code=status_code)
+        return JSONResponse(payload, status_code=200)
 
     return router

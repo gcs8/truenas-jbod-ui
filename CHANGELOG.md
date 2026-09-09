@@ -30,11 +30,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Changed
 
-- `/healthz` now answers HTTP 503 with a plain-words `summary` and a `problems`
-  list when the TrueNAS API is unreachable or a data folder is not writable,
-  says "Waiting for the first inventory" before the first poll, and reports
-  only the per-source status instead of the whole cached snapshot; `/livez` is
-  unchanged (#473)
+- `/healthz` now carries a plain-words `summary` and a `problems` list that name
+  an unreachable TrueNAS API or a data folder the app cannot write, says
+  "Waiting for the first inventory" before the first poll, and reports only
+  the per-source status instead of the whole cached snapshot; it still answers
+  HTTP 200 so the Compose healthcheck and existing monitors keep working, and
+  `/livez` is unchanged (#473)
 
 ### Fixed
 
