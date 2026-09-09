@@ -345,7 +345,7 @@ test("fetchStorageViewCandidates ignores a slow response for a system the operat
     currentStorageViewTargetSystemId() {
       return "";
     },
-    renderStorageViewCandidates() {},
+    scheduleStorageViewRender() {},
     setBanner(message, tone) {
       banners.push([message, tone]);
     },
@@ -398,7 +398,7 @@ test("clearing the selected system invalidates in-flight live-enclosure and cand
         return "";
       },
       renderStorageViews() {},
-      renderStorageViewCandidates() {},
+      scheduleStorageViewRender() {},
       setBanner(message, tone) {
         banners.push([message, tone]);
       },

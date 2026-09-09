@@ -79,6 +79,8 @@
     sudoersPreviewRequestSeq: 0,
     liveEnclosuresRequestSeq: 0,
     storageViewCandidatesRequestSeq: 0,
+    storageViewRenderFrameId: null,
+    storageViewRenderFull: false,
     haNodes: [],
     haNodesLoading: false,
     orphanedHistory: [],
@@ -523,7 +525,18 @@
       window.clearInterval(state.countdownTimerId);
     }
     updateAdminMeta();
-    state.countdownTimerId = window.setInterval(updateAdminMeta, 1000);
+    state.countdownTimerId = window.setInterval(tickCountdown, 1000);
+  }
+
+  function tickCountdown() {
+    // Only the countdown changes between ticks; the rest of the hero is rendered by refreshes.
+    if (!elements.countdown) {
+      return;
+    }
+    const text = formatCountdown();
+    if (elements.countdown.textContent !== text) {
+      elements.countdown.textContent = text;
+    }
   }
 
   function updateAdminMeta() {
@@ -617,8 +630,22 @@
     return groups.filter((group) => Array.isArray(group.bundle_types) && group.bundle_types.includes(bundleType));
   }
 
+  const bundlePathGroupIndex = { source: null, byKey: new Map() };
+
   function bundlePathGroupByKey(key) {
-    return bundlePathGroups("backup").concat(bundlePathGroups("debug")).find((group) => group.key === key) || null;
+    const groups = Array.isArray(state.backupDefaults?.path_groups) ? state.backupDefaults.path_groups : [];
+    if (bundlePathGroupIndex.source !== groups) {
+      // Index once per path_groups list (backup groups first, then debug) and reuse it
+      // until a refresh replaces the list.
+      bundlePathGroupIndex.source = groups;
+      bundlePathGroupIndex.byKey = new Map();
+      bundlePathGroups("backup").concat(bundlePathGroups("debug")).forEach((group) => {
+        if (!bundlePathGroupIndex.byKey.has(group.key)) {
+          bundlePathGroupIndex.byKey.set(group.key, group);
+        }
+      });
+    }
+    return bundlePathGroupIndex.byKey.get(key) || null;
   }
 
   function selectedBundlePathKeys(bundleType) {
@@ -1086,8 +1113,20 @@
       .slice(0, 3);
   }
 
+  const haNodeFieldCache = new Map();
+
   function haNodeFieldValue(index, kind) {
-    return document.querySelector(`[data-ha-node-${kind}="${index}"]`);
+    // The three HA node rows are static template markup, so look each field up once.
+    const cacheKey = `${kind}:${index}`;
+    const cached = haNodeFieldCache.get(cacheKey);
+    if (cached && cached.isConnected !== false) {
+      return cached;
+    }
+    const field = document.querySelector(`[data-ha-node-${kind}="${index}"]`);
+    if (field) {
+      haNodeFieldCache.set(cacheKey, field);
+    }
+    return field;
   }
 
   function readHaNodesFromInputs() {
@@ -1128,8 +1167,9 @@
     if (elements.setupHaPanel) {
       elements.setupHaPanel.classList.toggle("hidden", !haEnabled);
     }
+    const nodes = currentQuantastorHaNodes();
     [0, 1, 2].forEach((index) => {
-      const node = currentQuantastorHaNodes()[index] || { system_id: "", label: "", host: "" };
+      const node = nodes[index] || { system_id: "", label: "", host: "" };
       const systemIdField = haNodeFieldValue(index, "system-id");
       const labelField = haNodeFieldValue(index, "label");
       const hostField = haNodeFieldValue(index, "host");
@@ -1158,11 +1198,11 @@
         elements.setupHaNodesResult.textContent = "Enable HA mode when this Quantastor entry should model multiple shared-SES nodes under one cluster-style system.";
       } else if (state.haNodesLoading) {
         elements.setupHaNodesResult.textContent = "Inspecting Quantastor node metadata from the current API settings...";
-      } else if (currentQuantastorHaNodes().length) {
-        const nodesMissingHosts = currentQuantastorHaNodes().filter((node) => !node.host).length;
+      } else if (nodes.length) {
+        const nodesMissingHosts = nodes.filter((node) => !node.host).length;
         elements.setupHaNodesResult.textContent = nodesMissingHosts
-          ? `Loaded ${currentQuantastorHaNodes().length} Quantastor HA node row${currentQuantastorHaNodes().length === 1 ? "" : "s"}. Quantastor did not publish ${nodesMissingHosts} SSH host${nodesMissingHosts === 1 ? "" : "s"} in the API response; runtime can still learn default-gateway node IPs after one real node is reachable.`
-          : `Loaded ${currentQuantastorHaNodes().length} Quantastor HA node row${currentQuantastorHaNodes().length === 1 ? "" : "s"}. API-published/default-gateway node hosts and shared SSH auth settings will be reused for node-targeted SSH.`;
+          ? `Loaded ${nodes.length} Quantastor HA node row${nodes.length === 1 ? "" : "s"}. Quantastor did not publish ${nodesMissingHosts} SSH host${nodesMissingHosts === 1 ? "" : "s"} in the API response; runtime can still learn default-gateway node IPs after one real node is reachable.`
+          : `Loaded ${nodes.length} Quantastor HA node row${nodes.length === 1 ? "" : "s"}. API-published/default-gateway node hosts and shared SSH auth settings will be reused for node-targeted SSH.`;
       } else {
         elements.setupHaNodesResult.textContent = "Use up to three HA node rows as fallbacks when the appliance does not publish node hosts.";
       }
@@ -1541,11 +1581,11 @@
     return BUILDER_ORDERING_LABELS[ordering] || BUILDER_ORDERING_LABELS["row-major-bottom"];
   }
 
-  function layoutSlotCount(layout) {
-    return (Array.isArray(layout) ? layout : [])
-      .flat()
-      .filter((value) => Number.isInteger(value))
-      .length;
+  function countSlots(layout) {
+    return (Array.isArray(layout) ? layout : []).reduce(
+      (total, row) => total + (Array.isArray(row) ? row.filter((value) => Number.isInteger(value)).length : 0),
+      0
+    );
   }
 
   function buildRectangularProfileLayout(rows, columns, slotCount, ordering = "row-major-bottom") {
@@ -1690,13 +1730,6 @@
     return Array.isArray(rows) ? rows.filter((row) => Array.isArray(row)) : [];
   }
 
-  function countProfilePreviewSlots(rows) {
-    return normalizeProfilePreviewRows(rows).reduce(
-      (total, row) => total + row.filter((slotValue) => Number.isInteger(slotValue)).length,
-      0
-    );
-  }
-
   function normalizeProfilePreviewRowGroups(profile) {
     return (Array.isArray(profile?.row_groups) ? profile.row_groups : [])
       .map((value) => Number(value))
@@ -1750,7 +1783,7 @@
 
   function buildProfilePreviewGeometry(profile, previewRows, columnCount) {
     const rows = normalizeProfilePreviewRows(previewRows);
-    const slotCount = Number(profile?.slot_count) || countProfilePreviewSlots(rows);
+    const slotCount = Number(profile?.slot_count) || countSlots(rows);
     const driveScale = inferProfilePreviewDriveScale(profile, slotCount);
     return {
       faceStyle: profile?.face_style || "generic",
@@ -2019,7 +2052,7 @@
     if (!draft || !sourceProfile) {
       return false;
     }
-    const sourceSlotCount = Number(sourceProfile.slot_count) || buildProfileRows(sourceProfile).flat().filter((value) => Number.isInteger(value)).length;
+    const sourceSlotCount = Number(sourceProfile.slot_count) || countSlots(buildProfileRows(sourceProfile));
     return Number(draft.rows) === Number(sourceProfile.rows)
       && Number(draft.columns) === Number(sourceProfile.columns)
       && Number(draft.slot_count) === Number(sourceSlotCount);
@@ -2118,11 +2151,11 @@
       elements.profileBuilderColumns.value = String(Number(profile.columns) || 1);
     }
     if (elements.profileBuilderSlotCount) {
-      const slotCount = Number(profile.slot_count) || layoutSlotCount(buildProfileRows(profile));
+      const slotCount = Number(profile.slot_count) || countSlots(buildProfileRows(profile));
       elements.profileBuilderSlotCount.value = String(slotCount || 1);
     }
     const profileRows = buildProfileRows(profile);
-    const profileSlotCount = Number(profile.slot_count) || layoutSlotCount(profileRows);
+    const profileSlotCount = Number(profile.slot_count) || countSlots(profileRows);
     const detectedOrdering = detectGeneratedLayoutOrdering(profileRows, Number(profile.rows) || 1, Number(profile.columns) || 1, profileSlotCount);
     if (elements.profileBuilderOrdering) {
       elements.profileBuilderOrdering.value = detectedOrdering || "source-layout";
@@ -2236,7 +2269,7 @@
       buildProfilePreviewGeometry(profile, previewRows, columnCount)
     );
     elements.profilePreviewGrid.innerHTML = renderProfilePreviewCells(previewRows, columnCount, { profile });
-    const slotCount = Number(profile.slot_count) || previewRows.flat().filter((value) => Number.isInteger(value)).length;
+    const slotCount = Number(profile.slot_count) || countSlots(previewRows);
     const chips = [
       `${profile.rows} rows`,
       `${profile.columns} columns`,
@@ -2328,14 +2361,15 @@
     return normalized;
   }
 
+  const ALLOWED_M2_SIZES = new Set(["2230", "2242", "2260", "2280", "22110"]);
+
   function normalizeSlotSizeMap(rawMap) {
     const source = rawMap && typeof rawMap === "object" ? rawMap : {};
     const normalized = {};
-    const allowedSizes = new Set(["2230", "2242", "2260", "2280", "22110"]);
     Object.entries(source).forEach(([rawKey, rawValue]) => {
       const slotNumber = Number.parseInt(rawKey, 10);
       const sizeLabel = String(rawValue || "").trim();
-      if (!Number.isNaN(slotNumber) && slotNumber >= 0 && allowedSizes.has(sizeLabel)) {
+      if (!Number.isNaN(slotNumber) && slotNumber >= 0 && ALLOWED_M2_SIZES.has(sizeLabel)) {
         normalized[slotNumber] = sizeLabel;
       }
     });
@@ -2371,7 +2405,6 @@
 
   function parseSlotSizesText(value) {
     const parsed = {};
-    const allowedSizes = new Set(["2230", "2242", "2260", "2280", "22110"]);
     String(value || "")
       .split(/\r?\n/)
       .map((line) => line.trim())
@@ -2383,7 +2416,7 @@
         }
         const slotNumber = Number.parseInt(match[1], 10);
         const sizeLabel = String(match[2] || "").trim();
-        if (!Number.isNaN(slotNumber) && slotNumber >= 0 && allowedSizes.has(sizeLabel)) {
+        if (!Number.isNaN(slotNumber) && slotNumber >= 0 && ALLOWED_M2_SIZES.has(sizeLabel)) {
           parsed[slotNumber] = sizeLabel;
         }
       });
@@ -2709,24 +2742,11 @@
   }
 
   function buildSequentialLayout(rows, columns, slotCount) {
-    const safeRows = Math.max(1, Number(rows) || 1);
+    // Top-down, left-to-right numbering with every row padded to the full width.
     const safeColumns = Math.max(1, Number(columns) || 1);
-    const safeSlotCount = Math.max(1, Number(slotCount) || safeRows * safeColumns);
-    const layout = [];
-    let slotNumber = 0;
-    for (let rowIndex = 0; rowIndex < safeRows; rowIndex += 1) {
-      const row = [];
-      for (let columnIndex = 0; columnIndex < safeColumns; columnIndex += 1) {
-        if (slotNumber < safeSlotCount) {
-          row.push(slotNumber);
-          slotNumber += 1;
-        } else {
-          row.push(null);
-        }
-      }
-      layout.push(row);
-    }
-    return layout;
+    return buildRectangularProfileLayout(rows, safeColumns, slotCount, "row-major-top").map((row) =>
+      row.concat(Array.from({ length: safeColumns - row.length }, () => null))
+    );
   }
 
   function storageViewProfile(storageView, { fallbackToPinned = true } = {}) {
@@ -2815,7 +2835,7 @@
     const template = getStorageViewTemplate(storageView?.template_id);
     const selectedProfile = storageViewProfile(storageView);
     const previewRows = buildStorageViewRows(storageView);
-    const visibleSlots = previewRows.flat().filter((slotValue) => Number.isInteger(slotValue)).length;
+    const visibleSlots = countSlots(previewRows);
     const profileChip = storageView?.kind === "ses_enclosure" && selectedProfile
       ? `profile: ${selectedProfile.label}${storageView?.profile_id ? "" : " (live fallback)"}`
       : null;
@@ -3116,7 +3136,48 @@
       .join("");
   }
 
+  function requestRenderFrame(callback) {
+    return typeof requestAnimationFrame === "function" ? requestAnimationFrame(callback) : setTimeout(callback, 0);
+  }
+
+  function cancelRenderFrame(frameId) {
+    if (typeof cancelAnimationFrame === "function") {
+      cancelAnimationFrame(frameId);
+    } else {
+      clearTimeout(frameId);
+    }
+  }
+
+  function scheduleStorageViewRender({ full = true } = {}) {
+    // Loading a system, switching views, and both inventory fetches all ask for a render;
+    // collapse them into one paint per animation frame instead of rebuilding the panel each time.
+    state.storageViewRenderFull = Boolean(state.storageViewRenderFull) || full;
+    if (state.storageViewRenderFrameId != null) {
+      return;
+    }
+    state.storageViewRenderFrameId = requestRenderFrame(flushStorageViewRender);
+  }
+
+  function flushStorageViewRender() {
+    if (state.storageViewRenderFrameId == null) {
+      return;
+    }
+    cancelRenderFrame(state.storageViewRenderFrameId);
+    state.storageViewRenderFrameId = null;
+    const full = Boolean(state.storageViewRenderFull);
+    state.storageViewRenderFull = false;
+    if (full) {
+      renderStorageViewsNow();
+    } else {
+      renderStorageViewCandidates();
+    }
+  }
+
   function renderStorageViews() {
+    scheduleStorageViewRender({ full: true });
+  }
+
+  function renderStorageViewsNow() {
     renderStorageViewTemplateOptions();
     renderStorageViewList();
     syncStorageViewEditorFromState();
@@ -3148,6 +3209,8 @@
   }
 
   function saveStorageViewEditorToState() {
+    // Make sure the editor shows the selected view before reading it back.
+    flushStorageViewRender();
     updateSelectedStorageView((storageView) => {
       const previousId = storageView.id;
       const editedLabel = String(elements.setupStorageViewLabel?.value || "");
@@ -3410,13 +3473,13 @@
     const targetSystemId = currentStorageViewTargetSystemId();
     if (!systemId) {
       resetStorageViewCandidateState();
-      renderStorageViewCandidates();
+      scheduleStorageViewRender({ full: false });
       return;
     }
     const requestSeq = (state.storageViewCandidatesRequestSeq || 0) + 1;
     state.storageViewCandidatesRequestSeq = requestSeq;
     state.storageViewCandidatesLoading = true;
-    renderStorageViewCandidates();
+    scheduleStorageViewRender({ full: false });
     try {
       const params = new URLSearchParams({ system_id: systemId });
       if (targetSystemId) {
@@ -3448,7 +3511,7 @@
     } finally {
       if (requestSeq === state.storageViewCandidatesRequestSeq) {
         state.storageViewCandidatesLoading = false;
-        renderStorageViewCandidates();
+        scheduleStorageViewRender({ full: false });
       }
     }
   }
@@ -3537,24 +3600,8 @@
   }
 
   function platformSetupCopy(platform) {
-    const requirements = platformRequirements(platform);
-    if (requirements?.summary) {
-      return String(requirements.summary);
-    }
-    switch (String(platform || "core").toLowerCase()) {
-      case "scale":
-        return "TrueNAS SCALE usually combines the middleware websocket path with Linux-side SSH enrichment for SMART detail, SES, and slot actions.";
-      case "linux":
-        return "Generic Linux setups are usually SSH-heavy, so pinning a trusted profile and SSH command set matters more than API auth here.";
-      case "quantastor":
-        return "Quantastor normally uses API user/password auth, with SSH reserved for the richer shared-slot and SES details.";
-      case "esxi":
-        return "VMware ESXi stays host-managed, with SSH and StorCLI providing the primary inventory while optional BMC access can add out-of-band drive locate and chassis UID control.";
-      case "ipmi":
-        return "IPMI / BMC Only systems use the out-of-band controller as the primary inventory path. Supermicro first-pass support prefers Redfish where it works, then falls back to the validated web XML path for drive locate and node UID control.";
-      default:
-        return "TrueNAS CORE usually wants an API key, with SSH as the optional fallback for enclosure mapping and LED control.";
-    }
+    // The admin service sends a summary for every platform, so there is no client-side fallback.
+    return String(platformRequirements(platform)?.summary || "");
   }
 
   function renderSetupRequirementList(title, items, className) {
@@ -4094,9 +4141,16 @@
     syncKeyHelp();
   }
 
+  let sshFieldNodes = null;
+
   function syncSshFields() {
     const enabled = Boolean(elements.setupSshEnabled?.checked);
-    document.querySelectorAll("[data-ssh-field]").forEach((field) => {
+    if (!sshFieldNodes) {
+      // The SSH fields are static template markup; this runs on every platform change
+      // and SSH toggle, so look them up once instead of walking the document each time.
+      sshFieldNodes = Array.from(document.querySelectorAll("[data-ssh-field]"));
+    }
+    sshFieldNodes.forEach((field) => {
       field.disabled = !enabled;
     });
     if (elements.setupRefreshKeysButton) {
@@ -4121,7 +4175,6 @@
     syncBootstrapFields();
     syncEsxiHostPrepFields();
     syncKeyMode();
-    syncKeyHelp();
   }
 
   function bootstrapEnabledForSession() {
@@ -4519,9 +4572,6 @@
     }
     setRedactedSecretField(elements.setupSshPassword, false);
     setRedactedSecretField(elements.setupSshSudoPassword, false);
-    if (elements.setupSshKnownHosts) {
-      elements.setupSshKnownHosts.value = "/app/data/known_hosts";
-    }
     if (elements.setupSshStrictHostKey) {
       elements.setupSshStrictHostKey.checked = true;
     }
@@ -4764,7 +4814,6 @@
     renderProfilePreview();
     renderProfileCatalog();
     renderQuantastorHaSection();
-    renderStorageViews();
     renderTlsInspection();
     syncBmcFields();
     syncSshFields();
@@ -5078,12 +5127,52 @@
   }
 
   async function fetchJson(url, options = {}) {
-    const response = await fetch(url, options);
+    const response = await fetchWithTimeout(url, options);
     const payload = await readJsonResponse(response);
     if (!response.ok || (payload && payload.ok === false)) {
       throw new Error(describeApiError(payload?.detail) || `Request failed with ${response.status}`);
     }
     return payload || {};
+  }
+
+  const DEFAULT_REQUEST_TIMEOUT_MS = 60000;
+
+  function requestTimeoutError(timeoutMs) {
+    const seconds = Math.max(1, Math.round(timeoutMs / 1000));
+    const error = new Error(`Timed out after ${seconds} second${seconds === 1 ? "" : "s"}. Check that the host is reachable and try again.`);
+    error.name = "TimeoutError";
+    error.timedOut = true;
+    return error;
+  }
+
+  async function fetchWithTimeout(url, options = {}) {
+    // Every ordinary request gives up after timeoutMs so a stalled SSH or API hop
+    // cannot leave a panel on "Inspecting..." forever. Callers may pass their own
+    // signal (runtime actions do) and still get the timeout on top of it.
+    const { timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, signal: callerSignal, ...fetchOptions } = options;
+    const controller = new AbortController();
+    const cancel = () => controller.abort();
+    let timedOut = false;
+    const timerId = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, Math.max(1, Number(timeoutMs) || DEFAULT_REQUEST_TIMEOUT_MS));
+    if (callerSignal?.aborted) {
+      controller.abort();
+    } else {
+      callerSignal?.addEventListener("abort", cancel, { once: true });
+    }
+    try {
+      return await fetch(url, { ...fetchOptions, signal: controller.signal });
+    } catch (error) {
+      if (timedOut && !callerSignal?.aborted) {
+        throw requestTimeoutError(timeoutMs);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timerId);
+      callerSignal?.removeEventListener("abort", cancel);
+    }
   }
 
   function readOptionalSecretValue(field) {
@@ -5468,13 +5557,14 @@
       if (!state.selectedDebugPaths.length && Array.isArray(state.backupDefaults?.debug_included_paths)) {
         state.selectedDebugPaths = [...state.backupDefaults.debug_included_paths];
       }
-      state.paths = payload.paths || state.paths;
-      await loadOrphanedHistory({ quiet: true, render: false });
+      // Paint the fresh admin state first; the removed-system history scan hits SQLite
+      // and must not hold up container status or the saved-system lists.
       renderAll();
       if (state.loadedSystemId) {
         void fetchLiveEnclosures({ quiet: true });
         void fetchStorageViewCandidates({ quiet: true });
       }
+      await loadOrphanedHistory({ quiet: true });
       if (!quiet) {
         setBanner("Admin sidecar state refreshed.", "success");
       }
