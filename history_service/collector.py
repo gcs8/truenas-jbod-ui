@@ -4,6 +4,8 @@ import asyncio
 import json
 import logging
 import math
+import os
+import stat
 import threading
 import time
 import urllib.error
@@ -11,6 +13,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 from history_service.config import HistorySettings
@@ -96,6 +99,91 @@ class HistoryCollectionStopping(RuntimeError):
     pass
 
 
+class HistorySourceError(RuntimeError):
+    """A request to the main UI failed; ``kind`` says how without naming the host."""
+
+    kind = "unexpected"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        http_status: int | None = None,
+        timeout_seconds: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.http_status = http_status
+        self.timeout_seconds = timeout_seconds
+
+
+class HistorySourceUnreachable(HistorySourceError):
+    kind = "unreachable"
+
+
+class HistorySourceTimeout(HistorySourceError):
+    kind = "timeout"
+
+
+class HistorySourceRejected(HistorySourceError):
+    kind = "rejected"
+
+
+class HistorySourceBadPayload(HistorySourceError):
+    kind = "bad_payload"
+
+
+def source_error_kind(exc: BaseException) -> str:
+    return exc.kind if isinstance(exc, HistorySourceError) else "unexpected"
+
+
+# One fixed sentence per failure kind. The raw error text (which can name hosts,
+# URLs and paths) never leaves the history service logs.
+SOURCE_ERROR_SENTENCES = {
+    "unreachable": "Could not reach the main UI. Is it running?",
+    "timeout": "The main UI took too long to answer.",
+    "rejected": "The main UI rejected the request.",
+    "bad_payload": "The main UI sent an answer the history service could not read.",
+}
+
+
+def source_error_sentence(status: dict[str, Any], *, fallback: str) -> str:
+    """Return the plain sentence for a collector status's last error, or ``fallback``."""
+
+    kind = status.get("last_error_kind")
+    sentence = SOURCE_ERROR_SENTENCES.get(str(kind or ""))
+    if sentence is None:
+        return fallback
+    if kind == "rejected":
+        http_status = status.get("last_error_http_status")
+        if isinstance(http_status, int) and not isinstance(http_status, bool):
+            return f"The main UI rejected the request (HTTP {http_status})."
+    if kind == "timeout":
+        timeout_seconds = status.get("last_error_timeout_seconds")
+        if isinstance(timeout_seconds, (int, float)) and not isinstance(timeout_seconds, bool):
+            return f"The main UI took longer than {int(timeout_seconds)} s to answer."
+    return sentence
+
+
+RETENTION_ERROR_SENTENCES = {
+    "batch_size": "batch size too large (lower HISTORY_RETENTION_BATCH_SIZE)",
+    "readonly": "the history database is read-only",
+    "disk_full": "the disk holding the history database is full",
+    "backup_status_mode": "the scheduled backup status file has unsafe permissions (expected 0640)",
+    "unexpected": "unexpected error; see the history service logs",
+}
+
+
+def retention_error_kind(exc: BaseException) -> str:
+    text = str(exc).lower()
+    if "too many sql variables" in text:
+        return "batch_size"
+    if isinstance(exc, PermissionError) or "readonly" in text or "read-only" in text:
+        return "readonly"
+    if "disk i/o" in text or "database or disk is full" in text or "no space left" in text:
+        return "disk_full"
+    return "unexpected"
+
+
 class HistoryCollector:
     def __init__(self, settings: HistorySettings, store: HistoryStore) -> None:
         self.settings = settings
@@ -107,6 +195,7 @@ class HistoryCollector:
         self.last_fast_metrics_at: str | None = None
         self.last_slow_metrics_at: str | None = None
         self.last_success_at: str | None = None
+        self.last_completed_at: str | None = None
         self.last_backup_at: str | None = None
         self.last_retention_at: str | None = None
         self.last_retention_backup_at: str | None = None
@@ -119,7 +208,12 @@ class HistoryCollector:
         self.last_retention_daily_rollups_removed: int = 0
         self.last_retention_has_more: bool = False
         self.last_retention_error: str | None = None
+        self.last_retention_error_kind: str | None = None
+        self.retention_consecutive_failures: int = 0
         self.last_error: str | None = None
+        self.last_error_kind: str | None = None
+        self.last_error_http_status: int | None = None
+        self.last_error_timeout_seconds: int | None = None
         self.last_scope_count: int = 0
         self.current_collection_started_at: str | None = None
         self.current_collection_kind: str | None = None
@@ -139,6 +233,7 @@ class HistoryCollector:
         self.last_temperature_evidence_at: str | None = None
         self.last_smart_evidence_at: str | None = None
         self._scope_enumeration_complete = True
+        self._starting = False
         self.next_collection_at: datetime | None = None
         self._pending_topology_changes: dict[
             tuple[str, str, int],
@@ -211,6 +306,7 @@ class HistoryCollector:
                     cached_root_only=cached_root_only,
                 )
             )
+            self.last_completed_at = isoformat_utc()
         finally:
             self.last_collection_duration_seconds = round(time.perf_counter() - collection_started_monotonic, 3)
             self.last_collection_inventory_forced = self.current_collection_inventory_forced
@@ -485,14 +581,84 @@ class HistoryCollector:
             backup_at=retention_backup_at,
         )
         self.last_success_at = observed_at
-        self.last_error = None
+        self.clear_last_error()
         self._set_collection_activity("collection completed")
         self._clear_background_failure_backoff()
 
+    def record_last_error(self, exc: BaseException, *, message: str | None = None) -> None:
+        self.last_error = message if message is not None else str(exc)
+        self.last_error_kind = source_error_kind(exc)
+        self.last_error_http_status = getattr(exc, "http_status", None)
+        self.last_error_timeout_seconds = getattr(exc, "timeout_seconds", None)
+
+    def clear_last_error(self) -> None:
+        self.last_error = None
+        self.last_error_kind = None
+        self.last_error_http_status = None
+        self.last_error_timeout_seconds = None
+
+    def _record_retention_failure(self, exc: BaseException) -> None:
+        kind = retention_error_kind(exc)
+        self.last_retention_error_kind = kind
+        self.last_retention_error = RETENTION_ERROR_SENTENCES[kind]
+        self.retention_consecutive_failures += 1
+
+    def _clear_retention_failure(self) -> None:
+        self.last_retention_error = None
+        self.last_retention_error_kind = None
+        self.retention_consecutive_failures = 0
+
+    def _warn_if_backup_status_mode_unsafe(self, status_path: str) -> None:
+        """Name the one status-file problem the reader hides behind ``None``.
+
+        ``read_scheduled_backup_status`` treats a group- or world-writable file
+        like a missing one, which is right for safety but leaves the dashboard
+        saying "never" with no reason. This check only reports; the reader stays
+        the gate.
+        """
+
+        try:
+            metadata = os.lstat(status_path)
+        except OSError:
+            return
+        mode = stat.S_IMODE(metadata.st_mode)
+        if stat.S_ISREG(metadata.st_mode) and mode & 0o022:
+            self._record_unsafe_backup_status_mode(Path(status_path), mode)
+
+    def _record_unsafe_backup_status_mode(self, path: Path, mode: int) -> None:
+        if self.last_retention_error_kind != "backup_status_mode":
+            logger.warning(
+                "Scheduled backup status file %s has unsafe permissions (mode %04o, expected 0640); "
+                "segmented history cleanup is paused until the mode is fixed.",
+                path,
+                mode,
+            )
+        self.last_retention_error_kind = "backup_status_mode"
+        self.last_retention_error = RETENTION_ERROR_SENTENCES["backup_status_mode"]
+
+    def degraded_reason(self) -> str | None:
+        """Why ``/healthz`` reports ``degraded``, or ``None`` when the service is healthy.
+
+        Degraded means one of: the last background collection pass failed, the
+        history database is read-only, or cleanup has failed twice in a row. A
+        failed manual refresh alone does not count, and any later successful
+        pass clears the collection half.
+        """
+
+        if self.background_consecutive_failures > 0:
+            return "The last background collection failed."
+        if self.last_retention_error_kind == "readonly":
+            return "The history database is read-only."
+        if self.retention_consecutive_failures >= 2:
+            return "History cleanup has failed twice in a row."
+        return None
+
     def status(self) -> dict[str, Any]:
         collection_started_at = self.current_collection_started_at
+        collector_running = bool(self._task and not self._task.done())
         return {
-            "collector_running": bool(self._task and not self._task.done()),
+            "collector_running": collector_running,
+            "collector_starting": collector_running and self._starting,
             "collection_running": self.collection_running,
             "collection_started_at": collection_started_at,
             "collection_kind": self.current_collection_kind,
@@ -524,6 +690,7 @@ class HistoryCollector:
             "last_temperature_evidence_at": self.last_temperature_evidence_at,
             "last_smart_evidence_at": self.last_smart_evidence_at,
             "last_success_at": self.last_success_at,
+            "last_completed_at": self.last_completed_at,
             "last_backup_at": self.last_backup_at,
             "last_retention_at": self.last_retention_at,
             "last_retention_backup_at": self.last_retention_backup_at,
@@ -536,7 +703,12 @@ class HistoryCollector:
             "last_retention_daily_rollups_removed": self.last_retention_daily_rollups_removed,
             "last_retention_has_more": self.last_retention_has_more,
             "last_retention_error": self.last_retention_error,
+            "last_retention_error_kind": self.last_retention_error_kind,
+            "retention_consecutive_failures": self.retention_consecutive_failures,
             "last_error": self.last_error,
+            "last_error_kind": self.last_error_kind,
+            "last_error_http_status": self.last_error_http_status,
+            "last_error_timeout_seconds": self.last_error_timeout_seconds,
             "last_scope_count": self.last_scope_count,
             "source_base_url": self.settings.source_base_url,
             "sqlite_path": self.settings.sqlite_path,
@@ -555,6 +727,7 @@ class HistoryCollector:
 
     async def _run_loop(self) -> None:
         if self.settings.startup_grace_seconds > 0:
+            self._starting = True
             try:
                 await asyncio.wait_for(
                     self._stopping.wait(),
@@ -562,6 +735,8 @@ class HistoryCollector:
                 )
             except asyncio.TimeoutError:
                 pass
+            finally:
+                self._starting = False
 
         while not self._stopping.is_set():
             if self.collection_running:
@@ -613,7 +788,7 @@ class HistoryCollector:
                     result="success",
                     duration_seconds=time.perf_counter() - started_monotonic,
                     status=self.status(),
-                    counts=self.store.estimated_counts(),
+                    counts=await asyncio.to_thread(self.store.tracked_counts),
                 )
             except HistoryCollectionAlreadyRunning:
                 logger.info("Skipping scheduled history collection because another collection pass is already running.")
@@ -622,7 +797,7 @@ class HistoryCollector:
                 break
             except Exception as exc:  # noqa: BLE001 - keep the collector alive across transient appliance errors.
                 logger.exception("History collection pass failed")
-                self.last_error = str(exc)
+                self.record_last_error(exc)
                 self._record_background_failure(utcnow())
                 observe_history_collection_run(
                     service_name=HISTORY_METRICS_SERVICE_NAME,
@@ -749,6 +924,7 @@ class HistoryCollector:
         status_path = self.settings.scheduled_backup_status_file
         if not status_path:
             return None
+        self._warn_if_backup_status_mode_unsafe(status_path)
         status = read_scheduled_backup_status(status_path)
         if (
             status is None
@@ -821,7 +997,7 @@ class HistoryCollector:
         except Exception as exc:  # noqa: BLE001 - retention failure must not stop collection.
             duration = time.perf_counter() - started
             self.last_retention_duration_seconds = round(duration, 3)
-            self.last_retention_error = type(exc).__name__
+            self._record_retention_failure(exc)
             partial_result = getattr(exc, "retention_summary", None)
             if not isinstance(partial_result, dict):
                 partial_result = {}
@@ -829,8 +1005,9 @@ class HistoryCollector:
                 {**partial_result, "has_more": True}
             )
             logger.warning(
-                "History retention pass failed with %s; collection will continue.",
-                type(exc).__name__,
+                "History retention pass failed (%s: %s); collection will continue.",
+                self.last_retention_error,
+                exc,
             )
             observe_history_retention_run(
                 service_name=HISTORY_METRICS_SERVICE_NAME,
@@ -849,7 +1026,7 @@ class HistoryCollector:
         duration = time.perf_counter() - started
         self.last_retention_at = attempted_at
         self.last_retention_duration_seconds = round(duration, 3)
-        self.last_retention_error = None
+        self._clear_retention_failure()
         removed_rows = self._apply_retention_result(result)
         observe_history_retention_run(
             service_name=HISTORY_METRICS_SERVICE_NAME,
@@ -1679,18 +1856,31 @@ class HistoryCollector:
                 payload = json.load(response)
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"{method} {url} failed with HTTP {exc.code}: {detail}") from exc
+            raise HistorySourceRejected(
+                f"{method} {url} failed with HTTP {exc.code}: {detail}",
+                http_status=int(exc.code),
+            ) from exc
         except urllib.error.URLError as exc:
-            raise RuntimeError(f"{method} {url} failed: {exc.reason}") from exc
+            if isinstance(exc.reason, TimeoutError):
+                raise HistorySourceTimeout(
+                    f"{method} {url} timed out after {request_timeout_seconds}s",
+                    timeout_seconds=request_timeout_seconds,
+                ) from exc
+            raise HistorySourceUnreachable(f"{method} {url} failed: {exc.reason}") from exc
         except TimeoutError as exc:
-            raise RuntimeError(f"{method} {url} timed out after {request_timeout_seconds}s") from exc
+            raise HistorySourceTimeout(
+                f"{method} {url} timed out after {request_timeout_seconds}s",
+                timeout_seconds=request_timeout_seconds,
+            ) from exc
         except json.JSONDecodeError as exc:
-            raise RuntimeError(f"{method} {url} returned invalid JSON: {exc}") from exc
+            raise HistorySourceBadPayload(f"{method} {url} returned invalid JSON: {exc}") from exc
 
         if isinstance(payload, dict) and payload.get("ok") is False:
-            raise RuntimeError(str(payload.get("detail") or f"{method} {url} returned an application error."))
+            raise HistorySourceRejected(
+                str(payload.get("detail") or f"{method} {url} returned an application error.")
+            )
         if not isinstance(payload, dict):
-            raise RuntimeError(f"{method} {url} returned a non-object JSON payload.")
+            raise HistorySourceBadPayload(f"{method} {url} returned a non-object JSON payload.")
         return payload
 
     @staticmethod
