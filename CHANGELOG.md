@@ -26,6 +26,31 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Changed
+
+- `/healthz` now answers HTTP 503 with a plain-words `summary` and a `problems`
+  list when the TrueNAS API is unreachable or a data folder is not writable,
+  says "Waiting for the first inventory" before the first poll, and reports
+  only the per-source status instead of the whole cached snapshot; `/livez` is
+  unchanged (#473)
+
+### Fixed
+
+- The main UI and the history service now check at startup that the data,
+  logs, and history folders are writable and, when one is not, log one
+  sentence naming the folder, its owner, and the `chown` command to run on the
+  Docker host; the main UI also shows it in the warnings panel, and mapping
+  save, mapping clear, alias save, and mapping import answer 503 "Could not
+  save: the data folder is not writable by the app" instead of a generic 500
+  (#473)
+- The System Setup button no longer disappears when admin has stopped itself:
+  it stays on the page, disabled, with the `docker compose --profile admin up
+  -d enclosure-admin` command, and the admin health probe is cached (30 s
+  after success, 10 s after failure) and runs alongside the inventory fetch so
+  page loads no longer wait on a refused connection (#473)
+
 ## v0.23.0 - 2026-09-08
 
 This release includes every pull request merged after `v0.22.2` through the
