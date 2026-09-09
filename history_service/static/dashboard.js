@@ -111,7 +111,6 @@
     if (!payload) {
       return;
     }
-    renderCollectorStatus(payload);
     const counts = payload.counts || {};
     const countsExact = Boolean(payload.counts_exact);
     setText("tracked-slots-value", statusValue(counts.tracked_slots, "0"));
@@ -174,72 +173,221 @@
     collectorBanner.textContent = "";
   }
 
-  async function pollCollectorStatus() {
-    try {
-      const response = await fetch("/healthz", { cache: "no-store" });
-      if (!response.ok) {
-        return;
+  const READ_TIMEOUT_MS = 10000;
+  const REFRESH_TIMEOUT_MS = 120000;
+  let generation = 0;
+  let sequence = 0;
+  let collectorSequence = 0;
+  let refreshRunning = false;
+  let refreshUnknown = false;
+  const healthPoll = { url: "/healthz", delay: 2000, timer: null, active: null };
+  const overviewPoll = { url: "/api/history/overview", delay: 10000, timer: null, active: null };
+
+  // Bound the entire operation, including body consumption. Abort alone is not
+  // a settlement guarantee (and does not undo a POST on the server).
+  function boundedRequest(url, options, timeout, consume) {
+    const controller = new AbortController();
+    let rejectCanceled;
+    const canceled = new Promise((_resolve, reject) => { rejectCanceled = reject; });
+    function cancel() {
+      controller.abort();
+      rejectCanceled(new Error("Request canceled or timed out"));
+    }
+    const timer = window.setTimeout(cancel, timeout);
+    const work = (async () => {
+      const response = await fetch(url, { ...options, signal: controller.signal });
+      if (controller.signal.aborted) throw new Error("Request canceled");
+      const payload = await consume(response);
+      if (controller.signal.aborted) throw new Error("Request canceled");
+      return payload;
+    })();
+    return {
+      cancel,
+      promise: Promise.race([work, canceled]).finally(() => window.clearTimeout(timer)),
+    };
+  }
+
+  function markCollectorStale(reason) {
+    setText("history-collector-freshness", `Collector status stale: ${reason}. Showing last known values.`);
+    const stateValue = document.getElementById("collector-state-value");
+    if (stateValue) {
+      if (!stateValue.textContent.startsWith("Stale")) {
+        stateValue.textContent = `Stale (last known: ${stateValue.textContent.trim()})`;
       }
-      const payload = await response.json();
-      renderCollectorBanner(payload);
-      renderCollectorStatus(payload);
-    } catch (_error) {
-      // Keep the current banner state if a transient poll fails.
+      stateValue.classList.toggle("status-ok", false);
+      stateValue.classList.toggle("status-error", false);
+    }
+    const current = document.getElementById("status-current-collection");
+    if (current && !current.textContent.startsWith("Stale")) {
+      current.textContent = `Stale (last known: ${current.textContent})`;
+    }
+    if (collectorBanner) {
+      collectorBanner.hidden = false;
+      collectorBanner.textContent = "Collector activity is stale; current activity is unknown.";
     }
   }
 
-  async function pollOverviewStatus() {
-    try {
-      const response = await fetch("/api/history/overview", { cache: "no-store" });
-      if (!response.ok) {
-        return;
+  function markOverviewStale(reason) {
+    setText("history-overview-freshness", `Overview stale: ${reason}. Showing last known counts and scopes.`);
+  }
+
+  function acceptCollector(payload, ticket) {
+    // Health and overview share collector fields. A late older response (or
+    // failure) must not replace a newer observation from either endpoint.
+    if (ticket < collectorSequence) return;
+    collectorSequence = ticket;
+    renderCollectorStatus(payload);
+    renderCollectorBanner(payload);
+    setText("history-collector-freshness", "Collector status checked successfully.");
+  }
+
+  function schedulePoll(channel, delay = channel.delay) {
+    window.clearTimeout(channel.timer);
+    channel.timer = null;
+    if (document.hidden || refreshRunning || channel.active) return;
+    channel.timer = window.setTimeout(() => pollStatus(channel), delay);
+  }
+
+  function pollStatus(channel) {
+    if (document.hidden || refreshRunning) return Promise.resolve();
+    if (channel.active) return channel.active.promise;
+    window.clearTimeout(channel.timer);
+    channel.timer = null;
+    const epoch = generation;
+    const ticket = ++sequence;
+    const request = boundedRequest(channel.url, { cache: "no-store" }, READ_TIMEOUT_MS, async (response) => {
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return response.json();
+    });
+    channel.active = request;
+    request.promise = request.promise.then((payload) => {
+      if (epoch !== generation || document.hidden) return;
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)
+          || typeof (payload.collector || payload).collector_running !== "boolean") {
+        throw new Error("Invalid dashboard response");
       }
-      renderOverview(await response.json());
-    } catch (_error) {
-      // The cheap health poll still keeps the live collector status moving.
+      acceptCollector(payload, ticket);
+      if (channel === overviewPoll) {
+        renderOverview(payload);
+        setText("history-overview-freshness", "Overview checked successfully.");
+      }
+    }).catch(() => {
+      if (epoch !== generation || document.hidden) return;
+      if (ticket >= collectorSequence) {
+        collectorSequence = ticket;
+        markCollectorStale("latest check failed or timed out");
+      }
+      if (channel === overviewPoll) markOverviewStale("latest check failed or timed out");
+    }).finally(() => {
+      if (channel.active !== request) return;
+      channel.active = null;
+      schedulePoll(channel);
+    });
+    return request.promise;
+  }
+
+  function pollCollectorStatus() {
+    return pollStatus(healthPoll);
+  }
+
+  function pollOverviewStatus() {
+    return pollStatus(overviewPoll);
+  }
+
+  function pauseReads() {
+    generation += 1;
+    for (const channel of [healthPoll, overviewPoll]) {
+      window.clearTimeout(channel.timer);
+      channel.timer = null;
+      channel.active?.cancel();
+      channel.active = null;
     }
+  }
+
+  function resumeReads() {
+    if (document.hidden || refreshRunning) return;
+    pollCollectorStatus();
+    pollOverviewStatus();
   }
 
   async function runRefresh(mode) {
+    if (refreshRunning || refreshUnknown || !buttons.length) return;
+    refreshRunning = true;
+    pauseReads();
+    const epoch = generation;
+    const ticket = ++sequence;
     buttons.forEach((button) => button.disabled = true);
+    markCollectorStale("manual refresh in progress");
+    markOverviewStale("manual refresh in progress");
     if (status) {
       status.textContent = mode === "full"
         ? "Running full history refresh..."
         : "Running fast history refresh...";
     }
     try {
-      const response = await fetch("/api/history/refresh", {
+      const request = boundedRequest("/api/history/refresh", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ mode }),
+      }, REFRESH_TIMEOUT_MS, async (response) => {
+        const body = await response.text();
+        let payload;
+        try {
+          payload = JSON.parse(body);
+        } catch (_error) {
+          // An unreadable success response does not prove a write failed.
+          if (response.ok) throw new Error("Unreadable refresh response");
+          payload = { detail: body || `HTTP ${response.status}` };
+        }
+        if (!response.ok || payload?.ok === false) {
+          const error = new Error(payload?.detail || `Refresh failed with ${response.status}`);
+          // A gateway/server error can arrive after the collection started.
+          error.confirmedFailure = response.status < 500;
+          throw error;
+        }
+        if (payload?.ok !== true) throw new Error("Unconfirmed refresh response");
+        return payload;
       });
-      const body = await response.text();
-      let payload = {};
-      try {
-        payload = body ? JSON.parse(body) : {};
-      } catch (_error) {
-        payload = { detail: body || `HTTP ${response.status}` };
+      const payload = await request.promise;
+      if (status) status.textContent = payload.detail || "History refresh completed.";
+      // A visibility change invalidates UI data, not the write's outcome.
+      if (epoch === generation && !document.hidden) {
+        acceptCollector(payload, ticket);
+        renderOverview(payload);
+        setText("history-overview-freshness", "Overview checked successfully.");
       }
-      if (!response.ok || payload.ok === false) {
-        throw new Error(payload.detail || `Refresh failed with ${response.status}`);
-      }
-      if (status) {
-        status.textContent = payload.detail || "History refresh completed.";
-      }
-      renderOverview(payload);
-      buttons.forEach((button) => button.disabled = false);
     } catch (error) {
+      refreshUnknown = !error.confirmedFailure;
       if (status) {
-        status.textContent = `Refresh failed: ${error.message || error}`;
+        status.textContent = refreshUnknown
+          ? "Refresh outcome unknown: collection may still be running. Verify collector status before reloading this page to enable another refresh. No automatic retry was sent."
+          : `Refresh failed: ${error.message || error}`;
       }
-      buttons.forEach((button) => button.disabled = false);
+    } finally {
+      refreshRunning = false;
+      buttons.forEach((button) => button.disabled = refreshUnknown);
+      resumeReads();
     }
   }
 
   const initialCollectorStatus = readInitialOverview();
   renderCollectorBanner(initialCollectorStatus);
-  window.setInterval(pollCollectorStatus, 2000);
-  window.setInterval(pollOverviewStatus, 10000);
+  if (document.hidden) {
+    markCollectorStale("polling paused while page is hidden");
+    markOverviewStale("polling paused while page is hidden");
+  } else {
+    schedulePoll(healthPoll);
+    schedulePoll(overviewPoll);
+  }
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      pauseReads();
+      markCollectorStale("polling paused while page is hidden");
+      markOverviewStale("polling paused while page is hidden");
+    } else {
+      resumeReads();
+    }
+  });
   window.__HISTORY_DASHBOARD_POLL = {
     pollCollectorStatus,
     pollOverviewStatus,
