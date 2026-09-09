@@ -99,6 +99,7 @@ from app.services.parsers import (
     canonicalize_ssh_command,
     extract_nvme_controller_name,
     extract_enclosure_slot_candidates,
+    extract_enclosure_slot_count,
     format_bytes,
     merge_enclosure_meta,
     merge_slot_candidate_maps,
@@ -162,6 +163,10 @@ QUANTASTOR_OPTIONAL_SSH_BACKOFF_WARNING_REGEX = re.compile(
     r"Skipping optional SSH command batch after a recent connection startup failure; "
     r"retry after (?P<retry_at>\S+)"
 )
+# Raw slot status keys that carry a state word; every other key is free text
+# or an identifier and must not drive presence, fault, or identify detection.
+SLOT_STATUS_TEXT_KEYS = ("status", "value", "value_raw", "state", "sas_device_type")
+LINUX_VIRTUAL_BLOCK_DEVICE_REGEX = re.compile(r"(?:zram|loop|ram|nbd|rbd|drbd|md|dm-)\d+")
 _CORE_GMULTIPATH_BACKFILL_WARNING = (
     "TrueNAS API disk inventory omitted multipath metadata, so this snapshot used gmultipath list to "
     "backfill multipath attribution. Use the live TrueNAS disk inventory controls in the enclosure header to "
@@ -1261,7 +1266,6 @@ class InventoryService:
     ) -> dict[str, Any]:
         if self.sas_fabric_alias_store is None:
             return {"ok": False, "cleared": False, "alias": None}
-        from app.models.domain import SasFabricAlias
 
         object_text = normalize_text(object_id)
         if not object_text:
@@ -1900,7 +1904,7 @@ class InventoryService:
         if storage_view.binding.mode == "auto":
             return bool(reasons)
         if storage_view.binding.mode == "pool":
-            return "pool" in reasons or bool([reason for reason in reasons if reason != "pool"])
+            return "pool" in reasons
         if storage_view.binding.mode == "serial":
             return bool([reason for reason in reasons if reason in {"serial", "device", "pcie"}])
         return bool(reasons)
@@ -2852,6 +2856,11 @@ class InventoryService:
                         else "SCALE SES rediscovery completed with some failures."
                     ),
                 )
+            elif not scale_ses_failures and raw_data.enclosures:
+                # Finding no SES expander is the normal outcome on a plain
+                # HBA or SATA build. It is only worth a note when the API
+                # reported enclosures, so SES bay positions were expected.
+                warnings.append(self._scale_no_ses_over_ssh_note())
 
         if self.system.truenas.platform == "quantastor" and ssh_collected:
             try:
@@ -3555,14 +3564,13 @@ class InventoryService:
             loaded_slot_entries = self.slot_detail_store.load_all()
 
         resolved_enclosure_id = normalize_text(selected_enclosure_id)
-        snapshots = getattr(self, "_cache", {})
-        default_snapshot = snapshots.get("__default__")
+        default_snapshot = self._cache.get("__default__")
         if resolved_enclosure_id is None and default_snapshot is not None:
             resolved_enclosure_id = normalize_text(default_snapshot.selected_enclosure_id)
 
         candidate_enclosure_ids = {
             enclosure_id
-            for snapshot in snapshots.values()
+            for snapshot in self._cache.values()
             if (enclosure_id := normalize_text(snapshot.selected_enclosure_id)) is not None
         }
         cache_candidates: dict[tuple[str, int], SmartCacheKey] = {}
@@ -4089,10 +4097,7 @@ class InventoryService:
         slot_view: SlotView | None = None,
     ) -> tuple[SmartSummaryView | None, str | None]:
         if not self.system.ssh.enabled:
-            return None, (
-                "Detailed SMART JSON is not currently available through the SCALE API on this system, "
-                "and SSH fallback is disabled."
-            )
+            return None, "SMART detail needs SSH on this system, and SSH is turned off."
 
         host_candidates = [normalize_text(host) for host in (hosts or []) if normalize_text(host)]
         if not host_candidates:
@@ -4997,6 +5002,17 @@ class InventoryService:
         )
         layout_slot_count = infer_slot_count_from_layout(layout_rows, layout_count_fallback)
         slot_positions = layout_slot_positions(layout_rows)
+        reported_slot_count = selected_option.slot_count if selected_option is not None else None
+        if (
+            selected_profile is not None
+            and reported_slot_count
+            and layout_slot_count
+            and reported_slot_count > layout_slot_count
+        ):
+            warnings.append(
+                f"This enclosure reports {reported_slot_count} bays but the selected layout draws "
+                f"{layout_slot_count}, so the extra bays are not shown. Choose a matching layout in System Setup."
+            )
         # #260 pins one mapping load per correlation pass, so the entries are
         # loaded here and read back off the frame by every caller.
         loaded_mappings = self.mapping_store.load_all()
@@ -6135,7 +6151,7 @@ class InventoryService:
         )
         bmc_disks_by_serial = self._build_bmc_serial_disk_index(bmc_inventory, disk_records)
 
-        api_topology_members = self._build_quantastor_topology_members(raw_data, disk_records)
+        api_topology_members = self._build_quantastor_topology_members(raw_data)
         selected_meta = frame.selected_meta
         selected_meta["storage_system_id"] = selected_system_id
         empty_ssh = ParsedSSHData()
@@ -6877,7 +6893,6 @@ class InventoryService:
     def _build_quantastor_topology_members(
         self,
         raw_data: TrueNASRawData,
-        _disk_records: list[DiskRecord],
     ) -> dict[str, ZpoolMember]:
         pool_index = {
             normalize_text(str(pool.get("id")) if pool.get("id") is not None else None): pool
@@ -7029,27 +7044,9 @@ class InventoryService:
         ] or cluster_rows
 
         master_row = next((row for row in node_rows if self._quantastor_bool(row.get("isMaster"))), None)
-        selected_label = normalize_text(
-            str(selected_row.get("name") or selected_row.get("hostname") or selected_system_id)
-            if isinstance(selected_row, dict) and (selected_row.get("name") or selected_row.get("hostname") or selected_system_id)
-            else selected_system_id
-        ) or "selected node"
         warnings: list[str] = []
 
-        if master_row is not None:
-            master_id = normalize_text(str(master_row.get("id")) if master_row.get("id") is not None else None)
-            master_label = normalize_text(
-                str(master_row.get("name") or master_row.get("hostname") or master_id)
-                if (master_row.get("name") or master_row.get("hostname") or master_id) is not None
-                else None
-            ) or "unknown master"
-            if selected_system_id and master_id and selected_system_id != master_id:
-                warnings.append(
-                    f"Quantastor HA detected. Cluster master is {master_label}; selected view is {selected_label}."
-                )
-            else:
-                warnings.append(f"Quantastor HA detected. Cluster master is {master_label}.")
-        else:
+        if master_row is None:
             warnings.append(
                 "Quantastor HA groups were detected. This first-pass adapter renders storage-system-scoped views; "
                 "shared-slot ownership overlays and IO-fencing context are still future work."
@@ -8223,7 +8220,6 @@ class InventoryService:
         )
         if best_host:
             self._quantastor_preferred_ses_host = best_host
-            return overlay, failures
         return overlay, failures
 
     async def _fetch_scale_ses_overlay(self) -> tuple[ParsedSSHData, list[str]]:
@@ -8233,7 +8229,6 @@ class InventoryService:
         )
         if best_host:
             self._scale_preferred_ses_host = best_host
-            return overlay, failures
         return overlay, failures
 
     def _get_cached_sg_ses_devices(self, host: str) -> list[str]:
@@ -8331,11 +8326,8 @@ class InventoryService:
 
         devices = self._parse_sg_ses_discovery_devices(discovery_result.stdout)
         if not devices:
-            return (
-                [],
-                ParsedSSHData(),
-                [f"{failure_prefix} discovery found no usable sg_ses devices on {host}."],
-            )
+            logger.info("%s discovery found no sg_ses devices on %s.", failure_prefix, host)
+            return [], ParsedSSHData(), []
         page_results = [result for result in results if result.command != discovery_command]
         overlay, failures = await self._fetch_sg_ses_host_overlay(
             host,
@@ -8468,6 +8460,12 @@ class InventoryService:
         if merge_hosts and successful_overlays:
             best_overlay = self._augment_ses_targets_from_redundant_hosts(best_overlay, successful_overlays)
         return best_overlay, best_failures, best_host
+
+    def _scale_no_ses_over_ssh_note(self) -> str:
+        hosts = ", ".join(self._build_scale_ssh_hosts()) or "this system"
+        return (
+            f"No SES enclosure was found over SSH on {hosts}, so bay positions come from the TrueNAS API only."
+        )
 
     def _build_scale_ssh_hosts(self) -> list[str]:
         hosts: list[str] = []
@@ -9522,6 +9520,10 @@ class InventoryService:
                     id=enclosure_id,
                     label=enclosure_label or enclosure_name or enclosure_id,
                     name=enclosure_name,
+                    slot_count=extract_enclosure_slot_count(
+                        enclosure,
+                        self.settings.layout.api_slot_number_base,
+                    ),
                 )
             )
 
@@ -9638,9 +9640,12 @@ class InventoryService:
                 continue
             if option.id in excluded_ids:
                 continue
-            if option.slot_count and option.slot_count < 12:
-                continue
             haystack = " ".join(filter(None, [option.id, option.name, option.label])).lower()
+            # The motherboard's AHCI SGPIO pseudo-enclosure wraps the onboard
+            # SATA ports, not a drive shelf, so it is never offered as one.
+            # Real small cages (2-8 bay rear SSD backplanes) stay selectable.
+            if "ahci sgpio" in haystack:
+                continue
             if filter_value and filter_value not in haystack:
                 continue
             options.append(option)
@@ -10309,6 +10314,8 @@ class InventoryService:
             if device_type and device_type.lower() != "disk":
                 continue
             if re.fullmatch(r"mmcblk\d+(?:boot\d+|rpmb)", device_name):
+                continue
+            if LINUX_VIRTUAL_BLOCK_DEVICE_REGEX.fullmatch(device_name):
                 continue
             is_boot_media = supports_boot_media and self._is_linux_boot_media_device_name(device_name)
             is_supported_disk = bool(
@@ -11425,14 +11432,7 @@ class InventoryService:
         present = False if quantastor_ses_empty else (
             raw_present is True
             or disk is not None
-            or (
-                not ses_says_empty_without_disk
-                and (
-                    status_says_populated
-                    or identify_active
-                    or faulty
-                )
-            )
+            or (not ses_says_empty_without_disk and status_says_populated)
         )
 
         if identify_active:
@@ -12570,19 +12570,23 @@ class InventoryService:
 
     @staticmethod
     def _status_contains(raw_status: dict[str, Any], *needles: str) -> bool:
-        scalar_values: list[str] = []
-        for value in raw_status.values():
-            if value is None:
-                continue
-            if isinstance(value, dict):
-                scalar_values.extend(str(item).lower() for item in value.values() if not isinstance(item, (dict, list, tuple, set)) and item is not None)
-                continue
-            if isinstance(value, (list, tuple, set)):
-                scalar_values.extend(str(item).lower() for item in value if not isinstance(item, (dict, list, tuple, set)) and item is not None)
-                continue
-            scalar_values.append(str(value).lower())
-        haystack = " ".join(scalar_values)
-        return any(needle.lower() in haystack for needle in needles)
+        """Match status keywords at word starts in the slot's status fields only.
+
+        Descriptors, hints, and vendor payloads are free text ("Drive bay 3
+        fault LED" names an LED, not a fault) and never take part.
+        """
+        haystack = " ".join(
+            str(raw_status.get(key)).lower()
+            for key in SLOT_STATUS_TEXT_KEYS
+            if raw_status.get(key) is not None
+            and not isinstance(raw_status.get(key), (dict, list, tuple, set))
+        )
+        if not haystack:
+            return False
+        return any(
+            re.search(rf"(?<![a-z0-9]){re.escape(needle.lower())}", haystack) is not None
+            for needle in needles
+        )
 
     @staticmethod
     def _health_is_bad(*values: str | None) -> bool:

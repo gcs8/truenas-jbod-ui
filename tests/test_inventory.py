@@ -248,7 +248,7 @@ class InventoryHelpersTests(unittest.TestCase):
             name="Shelf A",
             rows=2,
             columns=2,
-            slot_count=4,
+            slot_count=3,
             slot_layout=[[2, None], [0, 1]],
         )
         selected_profile = EnclosureProfileView(
@@ -256,7 +256,7 @@ class InventoryHelpersTests(unittest.TestCase):
             label="Profile A",
             rows=2,
             columns=2,
-            slot_count=4,
+            slot_count=3,
             slot_layout=[[2, None], [0, 1]],
         )
         service.profile_registry = MagicMock()
@@ -4441,7 +4441,14 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
                         {"name": f"zram{index}", "type": "disk", "size": "2G"}
                         for index in range(10)
                     ],
+                    {"name": "nbd0", "type": "disk", "size": "2G"},
+                    {"name": "md127", "type": "disk", "size": "2G"},
+                    {"name": "dm-0", "type": "disk", "size": "2G"},
                     {"name": "loop0", "type": "loop", "size": "64M"},
+                    *[
+                        {"name": f"oddblk{index}", "type": "disk", "size": "2G"}
+                        for index in range(9)
+                    ],
                 ]
             )
             warnings: list[str] = []
@@ -4454,11 +4461,13 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             self.assertEqual(by_name["mmcblk0"].bus, "MMC")
             self.assertEqual(by_name["dasda"].smart_devices, ["dasda"])
             self.assertEqual(by_name["dasda"].bus, "CCW")
+            # Kernel-made virtual devices (zram, nbd, md, dm-) are skipped in
+            # silence; only names the app has never seen are worth a warning.
             self.assertEqual(
                 warnings,
                 [
                     "Skipped unrecognized Linux block devices: "
-                    "zram0, zram1, zram2, zram3, zram4, zram5, zram6, zram7 (+2 more)."
+                    "oddblk0, oddblk1, oddblk2, oddblk3, oddblk4, oddblk5, oddblk6, oddblk7 (+1 more)."
                 ],
             )
 
@@ -4727,7 +4736,7 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             self.assertEqual(slot_views[2].state.value, "empty")
             self.assertEqual(slot_views[2].mapping_source, "ubntstorage")
             self.assertTrue(any("UniFi UNVR Pro LED control is experimental." in warning for warning in warnings))
-            self.assertIn("Skipped unrecognized Linux block devices: zram0.", warnings)
+            self.assertFalse(any("Skipped unrecognized Linux block devices" in warning for warning in warnings))
 
     def test_correlate_linux_host_enables_unvr_led_backend_and_gpio_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -9248,7 +9257,9 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(snapshot.selected_profile.id, "supermicro-ssg-2028r-shared-front-24")
             self.assertEqual(len(snapshot.enclosures), 2)
             self.assertEqual({option.id for option in snapshot.enclosures}, {"node-a", "node-b"})
-            self.assertTrue(any("Cluster master is Node B; selected view is Node A." in warning for warning in snapshot.warnings))
+            # The HA master is a fact for the header, not a warning.
+            self.assertFalse(any("Cluster master is" in warning for warning in snapshot.warnings))
+            self.assertEqual(snapshot.platform_context.get("master_label"), "Node B")
             self.assertFalse(any("IO fencing is currently disabled" in warning for warning in snapshot.warnings))
             slot0 = next(slot for slot in snapshot.slots if slot.slot == 0)
             self.assertEqual(slot0.device_name, "sdb")
@@ -11007,33 +11018,7 @@ Enclosure Status diagnostic page:
             systems=[{"id": "node-a", "name": "ExampleQS-Right"}],
             pool_devices=[],
         )
-        disk = DiskRecord(
-            raw={"storagePoolId": "pool-1", "name": "disk/by-id/wwn-0x5000"},
-            device_name="disk/by-id/wwn-0x5000",
-            path_device_name="disk/by-id/wwn-0x5000",
-            multipath_name=None,
-            multipath_member=None,
-            serial="SERIAL-1",
-            model="MODEL-1",
-            size_bytes=None,
-            identifier="scsi-SERIAL-1",
-            health="ONLINE",
-            pool_name="HA-Pool-R10",
-            lunid=None,
-            bus=None,
-            temperature_c=None,
-            last_smart_test_type=None,
-            last_smart_test_status=None,
-            last_smart_test_lifetime_hours=None,
-            logical_block_size=None,
-            physical_block_size=None,
-            enclosure_id="node-a",
-            slot=0,
-            smart_devices=[],
-            lookup_keys={"disk/by-id/wwn-0x5000", "serial-1"},
-        )
-
-        members = service._build_quantastor_topology_members(raw_data, [disk])
+        members = service._build_quantastor_topology_members(raw_data)
 
         self.assertEqual(members, {})
 
@@ -16453,3 +16438,273 @@ class QuantastorMultiShelfSnapshotRegressionTests(unittest.IsolatedAsyncioTestCa
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InventoryDefaultRegressionTests(unittest.IsolatedAsyncioTestCase):
+    """CORE bay counts, small enclosures, SES notes, presence, and pool binding."""
+
+    @staticmethod
+    def _core_api_raw_data(bay_count: int) -> TrueNASRawData:
+        return TrueNASRawData(
+            enclosures=[
+                {
+                    "id": "enc-synthetic",
+                    "name": "Synthetic Shelf",
+                    "label": "Synthetic Shelf",
+                    "elements": [
+                        {
+                            "slot": index + 1,
+                            "dev": f"/dev/da{index}",
+                            "status": "OK",
+                            "descriptor": f"Slot{index:02d}",
+                        }
+                        for index in range(bay_count)
+                    ],
+                }
+            ],
+            disks=[
+                {
+                    "name": f"da{index}",
+                    "devname": f"da{index}",
+                    "serial": f"SN-{index:04d}",
+                    "model": "SYNTHETIC-MODEL",
+                    "size": 4_000_000_000_000,
+                    "identifier": f"{{serial_lunid}}SN-{index:04d}_5000c500{index:08x}",
+                    "lunid": f"5000c500{index:08x}",
+                    "enclosure": {"id": "enc-synthetic", "slot": index + 1},
+                    "pool": "tank",
+                }
+                for index in range(bay_count)
+            ],
+            pools=[],
+            disk_temperatures={},
+            smart_test_results=[],
+        )
+
+    def _core_service(self, temp_dir: str, raw_data: TrueNASRawData, **system_overrides) -> InventoryService:
+        settings = Settings()
+        system = SystemConfig(
+            id="core-synthetic",
+            label="Synthetic CORE",
+            truenas=TrueNASConfig(host="https://core.example.test", api_key="token", platform="core"),
+            **system_overrides,
+        )
+        service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+        service._get_inventory_source_bundle = AsyncMock(
+            return_value=InventorySourceBundle(
+                raw_data=raw_data,
+                ssh_outputs={},
+                ssh_collected=False,
+                warnings=[],
+                sources={},
+                scale_ses_data=ParsedSSHData(),
+                quantastor_ses_data=ParsedSSHData(),
+            )
+        )
+        return service
+
+    @staticmethod
+    def _bare_service(platform: str = "core") -> InventoryService:
+        settings = Settings()
+        system = SystemConfig(id=f"{platform}-synthetic", truenas=TrueNASConfig(platform=platform))
+        return InventoryService(
+            settings,
+            system,
+            MagicMock(),
+            MagicMock(),
+            None,
+            MagicMock(),
+            ProfileRegistry(settings),
+        )
+
+    async def test_core_draws_every_api_reported_bay_without_a_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._core_service(temp_dir, self._core_api_raw_data(84))
+            snapshot = await service.get_snapshot(force_refresh=True)
+
+        self.assertEqual(snapshot.layout_slot_count, 84)
+        self.assertEqual(len(snapshot.slots), 84)
+        self.assertEqual(sum(1 for slot in snapshot.slots if slot.present), 84)
+        self.assertTrue(snapshot.selected_profile.id.startswith("runtime-"))
+        self.assertEqual(snapshot.selected_profile.slot_count, 84)
+        self.assertFalse(any("bays" in warning for warning in snapshot.warnings))
+
+    async def test_core_small_chassis_is_not_padded_out_to_sixty_bays(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._core_service(temp_dir, self._core_api_raw_data(12))
+            snapshot = await service.get_snapshot(force_refresh=True)
+
+        self.assertEqual(snapshot.layout_slot_count, 12)
+        self.assertEqual(len(snapshot.slots), 12)
+        self.assertLessEqual(snapshot.selected_profile.columns, 12)
+        self.assertFalse(any("bays" in warning for warning in snapshot.warnings))
+
+    async def test_core_sixty_bay_shelf_keeps_the_cse_946_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._core_service(temp_dir, self._core_api_raw_data(60))
+            snapshot = await service.get_snapshot(force_refresh=True)
+
+        self.assertEqual(snapshot.selected_profile.id, CORE_CSE_946_PROFILE_ID)
+        self.assertEqual(len(snapshot.slots), 60)
+
+    async def test_core_explicit_smaller_profile_warns_about_hidden_bays(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._core_service(
+                temp_dir,
+                self._core_api_raw_data(84),
+                default_profile_id=CORE_CSE_946_PROFILE_ID,
+            )
+            snapshot = await service.get_snapshot(force_refresh=True)
+
+        self.assertEqual(snapshot.selected_profile.id, CORE_CSE_946_PROFILE_ID)
+        self.assertEqual(len(snapshot.slots), 60)
+        self.assertIn(
+            "This enclosure reports 84 bays but the selected layout draws 60, so the extra bays "
+            "are not shown. Choose a matching layout in System Setup.",
+            snapshot.warnings,
+        )
+
+    def test_core_ssh_small_enclosures_are_selectable_but_the_ahci_pseudo_enclosure_is_not(self) -> None:
+        service = self._bare_service()
+
+        def enclosure(enclosure_id: str, name: str, bays: int) -> SESMapEnclosure:
+            ses_device = f"/dev/ses-{enclosure_id}"
+            return SESMapEnclosure(
+                ses_device=ses_device,
+                enclosure_id=enclosure_id,
+                enclosure_name=name,
+                slots={
+                    index: SESMapSlot(slot_number=index, element_id=index, ses_device=ses_device)
+                    for index in range(bays)
+                },
+            )
+
+        ssh_data = ParsedSSHData(
+            ses_enclosures=[
+                enclosure("5000aaaa", "Rear SSD cage", 8),
+                enclosure("5000bbbb", "Front 24", 24),
+                enclosure("5000cccc", "Boot pair", 2),
+                enclosure("3061686369656d30", "AHCI SGPIO Enclosure 2.00", 6),
+            ]
+        )
+
+        options = service._build_core_ssh_enclosure_options(ssh_data, filter_value=None, excluded_ids=set())
+
+        self.assertEqual(
+            {(option.id, option.slot_count) for option in options},
+            {("5000aaaa", 8), ("5000bbbb", 24), ("5000cccc", 2)},
+        )
+
+    @staticmethod
+    def _scale_service(temp_dir: str, enclosures: list[dict]) -> InventoryService:
+        raw_data = TrueNASRawData(
+            enclosures=enclosures,
+            disks=[{"name": "sda", "serial": "SN-0001"}],
+            pools=[],
+            disk_temperatures={},
+            smart_test_results=[],
+        )
+        system = SystemConfig(
+            id="scale-synthetic",
+            truenas=TrueNASConfig(platform="scale", host="https://scale.example.test", api_key="token"),
+            ssh=SSHConfig(enabled=True, host="192.0.2.10", commands=[]),
+        )
+        api = AsyncMock()
+        api.fetch_all.return_value = raw_data
+        ssh = AsyncMock()
+        ssh.run_planned_commands.return_value = [
+            SSHCommandResult(command="synthetic-base", ok=True, stdout="base-output", exit_code=0)
+        ]
+        # Every SES discovery command succeeds but finds no sg_ses device,
+        # which is what a plain HBA or SATA build looks like over SSH.
+        ssh.run_command.side_effect = lambda command, **_kwargs: SSHCommandResult(
+            command=command, ok=True, stdout="", exit_code=0
+        )
+        return build_inventory_service(Settings(), system, api, ssh, temp_dir)
+
+    async def test_healthy_scale_without_a_ses_expander_has_no_warning_and_green_ssh(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._scale_service(temp_dir, enclosures=[])
+            bundle = await service._collect_inventory_source_bundle()
+
+        self.assertTrue(bundle.ssh_collected)
+        self.assertEqual(bundle.warnings, [])
+        self.assertTrue(bundle.sources["ssh"].ok)
+        self.assertFalse(bundle.scale_ses_data.ses_enclosures)
+
+    async def test_scale_with_api_enclosures_but_no_ses_over_ssh_gets_a_plain_note(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._scale_service(temp_dir, enclosures=[{"id": "enc-1", "name": "Shelf", "elements": []}])
+            bundle = await service._collect_inventory_source_bundle()
+
+        self.assertEqual(
+            bundle.warnings,
+            ["No SES enclosure was found over SSH on 192.0.2.10, so bay positions come from the TrueNAS API only."],
+        )
+        self.assertTrue(bundle.sources["ssh"].ok)
+
+    def test_descriptor_text_cannot_flip_an_empty_bay_to_fault(self) -> None:
+        service = self._bare_service()
+        enclosure_meta = {"id": "enc-1", "label": "Shelf", "name": None}
+
+        def build(raw_slot_status: dict) -> SlotView:
+            return service._build_slot_view(
+                slot=2,
+                row_index=0,
+                column_index=2,
+                enclosure_meta=enclosure_meta,
+                raw_slot_status=raw_slot_status,
+                disk=None,
+                mapping=None,
+                ssh_data=ParsedSSHData(),
+                api_topology_members={},
+                api_enclosure_ids={"enc-1"},
+            )
+
+        descriptor_only = build({"slot": 3, "descriptor": "Drive bay 3 fault LED", "enclosure_id": "enc-1"})
+        self.assertFalse(descriptor_only.present)
+        self.assertNotEqual(descriptor_only.state, SlotState.fault)
+
+        not_installed = build(
+            {"slot": 3, "status": "Not installed", "descriptor": "Drive bay 3 fault LED", "enclosure_id": "enc-1"}
+        )
+        self.assertFalse(not_installed.present)
+        self.assertEqual(not_installed.state, SlotState.empty)
+
+        # A real fault code still shows as a fault, but it does not invent a disk.
+        faulted = build({"slot": 3, "status": "Critical", "value": "fault", "enclosure_id": "enc-1"})
+        self.assertEqual(faulted.state, SlotState.fault)
+        self.assertFalse(faulted.present)
+
+        populated = build({"slot": 3, "status": "OK", "enclosure_id": "enc-1"})
+        self.assertTrue(populated.present)
+
+    def test_status_keywords_match_whole_words_in_status_fields_only(self) -> None:
+        self.assertTrue(InventoryService._status_contains({"status": "OK"}, "ok"))
+        self.assertTrue(InventoryService._status_contains({"value": "Fault sensed"}, "fault"))
+        self.assertTrue(InventoryService._status_contains({"status": "Faulted"}, "fault"))
+        self.assertFalse(InventoryService._status_contains({"status": "default"}, "fault"))
+        self.assertFalse(InventoryService._status_contains({"descriptor": "Drive bay 3 fault LED"}, "fault"))
+        self.assertFalse(InventoryService._status_contains({"mapping_resolution_source": "ses-empty"}, "empty"))
+        self.assertFalse(InventoryService._status_contains({"model_hint": "Brokenfault-2000"}, "fault"))
+
+    def test_pool_binding_mode_only_accepts_pool_matches(self) -> None:
+        from app.config import StorageViewBindingConfig
+
+        service = self._bare_service()
+        pool_view = StorageViewConfig(
+            id="tank-view",
+            label="Tank",
+            kind="manual",
+            template_id="manual",
+            binding=StorageViewBindingConfig(mode="pool"),
+        )
+        auto_view = pool_view.model_copy(update={"binding": StorageViewBindingConfig(mode="auto")})
+
+        with patch.object(service, "_candidate_match_reasons", return_value=["serial", "device"]):
+            self.assertFalse(service._candidate_matches_storage_view(pool_view, {}))
+            self.assertTrue(service._candidate_matches_storage_view(auto_view, {}))
+        with patch.object(service, "_candidate_match_reasons", return_value=["pool", "serial"]):
+            self.assertTrue(service._candidate_matches_storage_view(pool_view, {}))
+        with patch.object(service, "_candidate_match_reasons", return_value=[]):
+            self.assertFalse(service._candidate_matches_storage_view(pool_view, {}))

@@ -76,6 +76,52 @@ class ProfileRegistryTests(unittest.TestCase):
         self.assertEqual(profile.slot_layout[0], list(range(45, 60)))
         self.assertEqual(profile.slot_layout[-1], list(range(0, 15)))
 
+    def test_core_default_profile_follows_the_reported_bay_count(self) -> None:
+        registry = ProfileRegistry(get_settings())
+        system = SystemConfig(id="core-synthetic", truenas=TrueNASConfig(platform="core"))
+
+        def resolve(slot_count: int):
+            return registry.resolve_for_enclosure(
+                system,
+                EnclosureOption(id="enc-1", label="Shelf", slot_count=slot_count),
+                fallback_rows=4,
+                fallback_columns=15,
+                fallback_slot_count=slot_count,
+            )
+
+        # A 60-bay shelf, or no bay count at all, still gets the CSE-946 face.
+        self.assertEqual(resolve(60).id, CORE_CSE_946_PROFILE_ID)
+        no_count = registry.resolve_for_enclosure(
+            system, None, fallback_rows=4, fallback_columns=15, fallback_slot_count=None
+        )
+        self.assertEqual(no_count.id, CORE_CSE_946_PROFILE_ID)
+        self.assertEqual(registry.select_profile_id(system), CORE_CSE_946_PROFILE_ID)
+
+        # Any other bay count is drawn from the reported geometry.
+        big = resolve(84)
+        self.assertEqual(big.id, "runtime-enc-1")
+        self.assertEqual(big.slot_count, 84)
+        self.assertGreaterEqual(big.rows * big.columns, 84)
+        self.assertEqual(len([slot for row in big.slot_layout for slot in row if slot is not None]), 84)
+
+        small = resolve(12)
+        self.assertEqual(small.id, "runtime-enc-1")
+        self.assertEqual(small.slot_count, 12)
+        self.assertEqual((small.rows, small.columns), (1, 12))
+
+        # An explicit default profile is always respected.
+        explicit = SystemConfig(
+            id="core-explicit",
+            default_profile_id=CORE_CSE_946_PROFILE_ID,
+            truenas=TrueNASConfig(platform="core"),
+        )
+        chosen = registry.resolve_for_enclosure(
+            explicit,
+            EnclosureOption(id="enc-1", label="Shelf", slot_count=84),
+            fallback_slot_count=84,
+        )
+        self.assertEqual(chosen.id, CORE_CSE_946_PROFILE_ID)
+
     def test_builtin_scale_profiles_preserve_validated_front_and_rear_ordering(self) -> None:
         system = SystemConfig(id="offsite-scale", label="Offsite SCALE", truenas=TrueNASConfig(platform="scale"))
         registry = ProfileRegistry(get_settings())
