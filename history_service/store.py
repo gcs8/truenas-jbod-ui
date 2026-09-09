@@ -3034,65 +3034,6 @@ class HistoryStore:
             destination.flush()
             os.fsync(destination.fileno())
 
-    def _preserve_existing_target_mode(self, temp_path: Path, target_path: Path) -> None:
-        if self.permission_repair_enabled:
-            return
-        target_mode = self._stable_regular_file_mode(target_path)
-        if target_mode is None:
-            return
-
-        initial_metadata = temp_path.lstat()
-        if not stat.S_ISREG(initial_metadata.st_mode):
-            raise ValueError(f"History replacement refuses non-regular temporary path {temp_path}.")
-        flags = (
-            os.O_RDONLY
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_NONBLOCK", 0)
-        )
-        descriptor = os.open(temp_path, flags)
-        try:
-            opened_metadata = os.fstat(descriptor)
-            if not stat.S_ISREG(opened_metadata.st_mode):
-                raise ValueError(f"History replacement refuses non-regular temporary path {temp_path}.")
-            if (opened_metadata.st_dev, opened_metadata.st_ino) != (
-                initial_metadata.st_dev,
-                initial_metadata.st_ino,
-            ):
-                raise ValueError(f"History replacement refuses changed temporary path {temp_path}.")
-            if stat.S_IMODE(opened_metadata.st_mode) != target_mode:
-                os.fchmod(descriptor, target_mode)
-        finally:
-            os.close(descriptor)
-
-    @staticmethod
-    def _stable_regular_file_mode(path: Path) -> int | None:
-        try:
-            initial_metadata = path.lstat()
-        except FileNotFoundError:
-            return None
-        if not stat.S_ISREG(initial_metadata.st_mode):
-            raise ValueError(f"History replacement refuses non-regular target path {path}.")
-        flags = (
-            os.O_RDONLY
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_NONBLOCK", 0)
-        )
-        descriptor = os.open(path, flags)
-        try:
-            opened_metadata = os.fstat(descriptor)
-            if not stat.S_ISREG(opened_metadata.st_mode):
-                raise ValueError(f"History replacement refuses non-regular target path {path}.")
-            if (opened_metadata.st_dev, opened_metadata.st_ino) != (
-                initial_metadata.st_dev,
-                initial_metadata.st_ino,
-            ):
-                raise ValueError(f"History replacement refuses changed target path {path}.")
-            return stat.S_IMODE(opened_metadata.st_mode)
-        finally:
-            os.close(descriptor)
-
     @staticmethod
     def _empty_cleanup_summary() -> dict[str, Any]:
         return {

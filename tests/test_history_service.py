@@ -33,7 +33,7 @@ from history_service.collector import (
 )
 from history_service.config import HistorySettings, get_history_settings
 from history_service.domain import MetricSample, SlotStateRecord, build_slot_events, isoformat_utc
-from history_service.migration_lock import history_lock_path, history_write_lock
+from history_service.migration_lock import history_write_lock
 from history_service.segment_catalog import MIGRATION_PENDING_MARKER, activation_pending_path
 from history_service.segment_reader import SegmentedHistoryReader
 from history_service.store import DISK_IDENTITY_BACKFILL_USER_VERSION, HistoryStore, SlotStateUpdate
@@ -1470,7 +1470,7 @@ class HistoryStoreTests(unittest.TestCase):
             database_path = Path(temp_dir) / "history.db"
 
             with history_write_lock(database_path, blocking=False):
-                legacy_lock_path = history_lock_path(database_path)
+                legacy_lock_path = Path(f"{database_path}.migration.lock")
                 legacy_lock_path.unlink(missing_ok=True)
                 with self.assertRaisesRegex(sqlite3.OperationalError, "migration"):
                     with history_write_lock(database_path, blocking=False):
@@ -2351,100 +2351,6 @@ class HistoryStoreTests(unittest.TestCase):
 
             self.assertEqual(backup_path, target_path)
             self.assertEqual(target_path.stat().st_mode & 0o777, 0o640)
-
-    def test_default_replacement_mode_preservation_refuses_target_symlink_swap(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            store = HistoryStore(str(root / "history.db"))
-            temp_path = root / "replacement.tmp"
-            temp_path.write_bytes(b"replacement")
-            target_path = root / "target.sqlite3"
-            target_path.write_bytes(b"target")
-            victim_path = root / "victim.sqlite3"
-            victim_path.write_bytes(b"victim")
-            victim_path.chmod(0o600)
-            real_open = os.open
-            swapped = False
-
-            def swap_before_open(path: str | os.PathLike[str], flags: int) -> int:
-                nonlocal swapped
-                if Path(path) == target_path and not swapped:
-                    swapped = True
-                    target_path.unlink()
-                    target_path.symlink_to(victim_path)
-                return real_open(path, flags)
-
-            with (
-                patch("history_service.store.os.open", side_effect=swap_before_open),
-                self.assertRaises((OSError, ValueError)),
-            ):
-                store._preserve_existing_target_mode(temp_path, target_path)
-
-            self.assertTrue(swapped)
-            self.assertEqual(victim_path.stat().st_mode & 0o777, 0o600)
-
-    def test_default_replacement_mode_preservation_refuses_temp_symlink_swap(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            store = HistoryStore(str(root / "history.db"))
-            target_path = root / "target.sqlite3"
-            target_path.write_bytes(b"target")
-            target_path.chmod(0o600)
-            temp_path = root / "replacement.tmp"
-            temp_path.write_bytes(b"replacement")
-            victim_path = root / "victim.sqlite3"
-            victim_path.write_bytes(b"victim")
-            victim_path.chmod(0o644)
-            real_open = os.open
-            swapped = False
-
-            def swap_before_open(path: str | os.PathLike[str], flags: int) -> int:
-                nonlocal swapped
-                if Path(path) == temp_path and not swapped:
-                    swapped = True
-                    temp_path.unlink()
-                    temp_path.symlink_to(victim_path)
-                return real_open(path, flags)
-
-            with (
-                patch("history_service.store.os.open", side_effect=swap_before_open),
-                self.assertRaises((OSError, ValueError)),
-            ):
-                store._preserve_existing_target_mode(temp_path, target_path)
-
-            self.assertTrue(swapped)
-            self.assertEqual(victim_path.stat().st_mode & 0o777, 0o644)
-
-    def test_default_replacement_mode_preservation_refuses_temp_inode_swap(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            store = HistoryStore(str(root / "history.db"))
-            target_path = root / "target.sqlite3"
-            target_path.write_bytes(b"target")
-            target_path.chmod(0o600)
-            temp_path = root / "replacement.tmp"
-            temp_path.write_bytes(b"replacement")
-            replacement_path = root / "replacement-raced.tmp"
-            replacement_path.write_bytes(b"raced")
-            real_open = os.open
-            swapped = False
-
-            def swap_before_open(path: str | os.PathLike[str], flags: int) -> int:
-                nonlocal swapped
-                if Path(path) == temp_path and not swapped:
-                    swapped = True
-                    temp_path.unlink()
-                    replacement_path.replace(temp_path)
-                return real_open(path, flags)
-
-            with (
-                patch("history_service.store.os.open", side_effect=swap_before_open),
-                self.assertRaisesRegex(ValueError, "changed temporary path"),
-            ):
-                store._preserve_existing_target_mode(temp_path, target_path)
-
-            self.assertTrue(swapped)
-            self.assertEqual(temp_path.read_bytes(), b"raced")
 
     def test_default_replacement_publisher_leaves_one_sided_temp_swap_generations_untouched(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
