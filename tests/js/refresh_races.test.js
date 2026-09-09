@@ -73,7 +73,7 @@ function functionSource(source, name) {
 }
 
 function loadFunction(source, name, context = {}) {
-  const sandbox = vm.createContext({ ...context });
+  const sandbox = vm.createContext({ inventoryScopeMatchesSelection: () => true, currentUiScopeKey: () => "scope", captureMutationContext: () => ({}), mutationContextIsCurrent: () => true, finishMutationContext() {}, renderStorageViewRuntimeStatus() {}, ...context });
   vm.runInContext(`${functionSource(source, name)}\nthis.__loaded = ${name};`, sandbox, {
     filename: `${name}.behavior.js`,
   });
@@ -81,7 +81,7 @@ function loadFunction(source, name, context = {}) {
 }
 
 function loadFunctions(source, names, context = {}) {
-  const sandbox = vm.createContext({ ...context });
+  const sandbox = vm.createContext({ inventoryScopeMatchesSelection: () => true, currentUiScopeKey: () => "scope", captureMutationContext: () => ({}), mutationContextIsCurrent: () => true, finishMutationContext() {}, renderStorageViewRuntimeStatus() {}, ...context });
   const declarations = names.map((name) => functionSource(source, name)).join("\n");
   vm.runInContext(
     `${declarations}\n${names.map((name) => `this.${name} = ${name};`).join("\n")}`,
@@ -222,7 +222,9 @@ test("successful inventory refresh invalidates history before render and a faile
 
   events.length = 0;
   shouldFail = true;
+  state.storageViewsRuntimeLoading = true;
   await refreshSnapshot(true);
+  assert.match(state.storageViewsRuntimeError, /freshness is unverified/);
   assert.equal(events.includes("invalidate"), false);
   assert.deepEqual(events, ["stale:inventory unavailable"]);
 });
@@ -230,13 +232,14 @@ test("successful inventory refresh invalidates history before render and a faile
 test("storage-view refresh updates the live selector before the completed main render", async () => {
   const state = {
     snapshotMode: false,
+    selectedSystemId: "system-a",
     storageViewsRuntimeRequestToken: 0,
     storageViewsRuntimeLoading: false,
   };
   const events = [];
   const { fn: fetchStorageViewRuntime } = loadFunction(APP_SOURCE, "fetchStorageViewRuntime", {
     state,
-    renderSelectors() { events.push("loading-selectors"); },
+    renderSelectors() { events.push(state.storageViewsRuntimeLoading ? "loading-selectors" : "complete-selectors"); },
     buildSelectionParams() { return new URLSearchParams(); },
     URLSearchParams,
     async fetchJson() { return { system_id: "system-a", views: [] }; },
@@ -247,7 +250,7 @@ test("storage-view refresh updates the live selector before the completed main r
 
   await fetchStorageViewRuntime();
 
-  assert.deepEqual(events, ["loading-selectors", "apply", "complete"]);
+  assert.deepEqual(events, ["loading-selectors", "apply", "complete-selectors"]);
   assert.equal(state.storageViewsRuntimeLoading, false);
 });
 

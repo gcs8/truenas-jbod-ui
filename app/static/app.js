@@ -122,8 +122,10 @@
       packaging: normalizePersistedPackaging(persistedExportUi?.packaging),
       allowOversize: Boolean(persistedExportUi?.allowOversize),
       includeLiveEnclosures: false,
+      enclosureSelectionExpanded: false,
       selectedEnclosureIds: [],
       includeStorageViews: false,
+      viewSelectionExpanded: false,
       selectedStorageViewIds: [],
       running: false,
       estimate: {
@@ -472,6 +474,7 @@
   }
 
   function storageViewRuntimeViews() {
+    if (state.storageViewsRuntime?.system_id && state.storageViewsRuntime.system_id !== state.selectedSystemId) return [];
     const views = Array.isArray(state.storageViewsRuntime?.views) ? state.storageViewsRuntime.views : [];
     return [...views].sort((left, right) => (Number(left.order) || 0) - (Number(right.order) || 0));
   }
@@ -2377,6 +2380,100 @@
 
 
 
+  function currentUiScopeKey() {
+    return JSON.stringify([state.selectedSystemId || null, state.selectedEnclosureId || null]);
+  }
+
+  function inventoryScopeMatchesSelection() {
+    return Boolean(state.snapshot
+      && state.snapshot.selected_system_id === state.selectedSystemId
+      && (!state.selectedEnclosureId || state.snapshot.selected_enclosure_id === state.selectedEnclosureId));
+  }
+
+  function captureMutationContext(action) {
+    if (!inventoryScopeMatchesSelection() || (state.selectedStorageViewRuntimeId
+      && (state.storageViewsRuntimeLoading || state.storageViewsRuntimeError))) {
+      setStatus("Inventory for this selection is not loaded. Refresh before making changes.", "error");
+      return null;
+    }
+    const scope = currentUiScopeKey();
+    const key = JSON.stringify([scope, action]);
+    state.mutationsInFlight ||= {};
+    if (state.mutationsInFlight[key]) return null;
+    const context = {
+      key, scope, systemId: state.selectedSystemId,
+      epoch: state.latestRefreshToken || 0,
+      selectionEpoch: state.selectionEpoch || 0,
+      slot: state.selectedSlot,
+      view: state.selectedStorageViewRuntimeId || "",
+      draft: state.mappingDraftRevision || 0,
+    };
+    state.mutationsInFlight[key] = context;
+    return context;
+  }
+
+  function mutationContextIsCurrent(context) {
+    return Boolean(context && context.scope === currentUiScopeKey()
+      && context.epoch === (state.latestRefreshToken || 0)
+      && context.selectionEpoch === (state.selectionEpoch || 0)
+      && context.slot === state.selectedSlot
+      && context.view === (state.selectedStorageViewRuntimeId || "")
+      && context.draft === (state.mappingDraftRevision || 0));
+  }
+
+  function finishMutationContext(context, succeeded = false) {
+    if (!context) return;
+    delete state.mutationsInFlight[context.key];
+    // A browser scope change does not cancel the appliance write. Keep its
+    // outcome without presenting it as the result of the newly selected scope.
+    state.mutationResults ||= {};
+    state.mutationResults[context.key] = { succeeded };
+    for (const [key, snapshot] of Object.entries(state.snapshotReuseCache || {})) {
+      if (snapshot.selected_system_id === context.systemId) delete state.snapshotReuseCache[key];
+    }
+  }
+
+  function renderScopeAvailability() {
+    const matched = inventoryScopeMatchesSelection();
+    const runtimeUnavailable = Boolean(state.selectedStorageViewRuntimeId
+      && (state.storageViewsRuntimeLoading || state.storageViewsRuntimeError));
+    const unavailable = !matched || runtimeUnavailable;
+    for (const element of [grid, detailContent, detailSecondary, mappingForm]) {
+      if (element) element.inert = unavailable;
+    }
+    grid?.setAttribute("aria-busy", String(unavailable));
+    const note = document.getElementById("inventory-scope-note");
+    if (note) {
+      note.classList.toggle("hidden", !unavailable);
+      note.textContent = !matched
+        ? "Previous inventory, not the selected scope. Slot actions are unavailable until matching inventory loads. Use Refresh to retry."
+        : "Previous storage view. Slot actions are unavailable until its refresh succeeds.";
+    }
+    if (exportSnapshotButton) exportSnapshotButton.disabled = unavailable || state.export.running;
+    if (mappingImportFile) mappingImportFile.disabled = !matched;
+    if (!matched) {
+      for (const element of [enclosureAliasEditButton, importMappingsButton]) {
+        if (element) element.disabled = true;
+      }
+    }
+  }
+
+  function renderStorageViewRuntimeStatus() {
+    const note = document.getElementById("storage-view-runtime-note");
+    const retry = document.getElementById("storage-view-runtime-retry");
+    if (note) {
+      note.classList.toggle("hidden", !state.storageViewsRuntimeError && !state.storageViewsRuntimeLoading);
+      note.textContent = state.storageViewsRuntimeError
+        ? "Storage views unavailable. Previous views are not actionable. Retry the refresh."
+        : state.storageViewsRuntimeLoading ? "Refreshing storage views. Previous views are not actionable." : "";
+    }
+    if (retry) {
+      retry.classList.toggle("hidden", !state.storageViewsRuntimeError);
+      retry.disabled = state.storageViewsRuntimeLoading;
+    }
+    renderScopeAvailability();
+  }
+
   function cloneJsonValue(value) {
     return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
   }
@@ -2414,22 +2511,13 @@
     if (exact) {
       return cloneJsonValue(exact);
     }
-    const fallback = state.snapshotReuseCache[snapshotReuseCacheKey(systemId, null)];
-    return fallback ? cloneJsonValue(fallback) : null;
+    return null;
   }
 
   function applyReusableSnapshot(systemId, enclosureId = null) {
     const reusableSnapshot = findReusableSnapshot(systemId, enclosureId);
     if (!reusableSnapshot) {
       return false;
-    }
-    if (enclosureId) {
-      reusableSnapshot.selected_enclosure_id = enclosureId;
-      const selectedOption = (reusableSnapshot.enclosures || []).find((option) => option.id === enclosureId);
-      if (selectedOption) {
-        reusableSnapshot.selected_enclosure_label = selectedOption.label || reusableSnapshot.selected_enclosure_label;
-        reusableSnapshot.selected_enclosure_name = selectedOption.name || reusableSnapshot.selected_enclosure_name;
-      }
     }
     applySnapshot(reusableSnapshot);
     renderAll();
@@ -6585,69 +6673,63 @@
     `;
   }
 
+  function syncExportCheckboxRows(container, attribute, items) {
+    const existing = new Map(Array.from(container.querySelectorAll(`input[${attribute}]`))
+      .map(input => [input.getAttribute(attribute), input.closest("label")]));
+    const retained = new Set();
+    items.forEach((item, index) => {
+      let row = existing.get(item.id);
+      if (!row) {
+        row = document.createElement("label");
+        row.className = "snapshot-export-view-option";
+        const input = document.createElement("input");
+        input.type = "checkbox";
+        input.setAttribute(attribute, item.id);
+        row.append(input, document.createElement("span"));
+      }
+      retained.add(row);
+      const input = row.querySelector("input");
+      input.checked = item.checked;
+      input.disabled = item.disabled;
+      const span = row.querySelector("span");
+      const label = `${escapeHtml(item.label)}${item.meta ? `<small>${escapeHtml(item.meta)}</small>` : ""}`;
+      if (span.innerHTML !== label) span.innerHTML = label;
+      // Do not detach/reinsert unchanged controls: native keyboard focus stays put.
+      if (container.children[index] !== row) container.insertBefore(row, container.children[index] || null);
+    });
+    Array.from(container.children).forEach(row => { if (!retained.has(row)) row.remove(); });
+  }
+
   function renderSnapshotExportScopeControls() {
     if (exportIncludeEnclosuresToggle && exportEnclosureSelection) {
       const enclosures = exportableLiveEnclosures();
       const currentId = currentLiveEnclosureId();
+      const selectedIds = new Set(selectedExportEnclosureIds());
       exportIncludeEnclosuresToggle.checked = state.export.includeLiveEnclosures;
-      exportIncludeEnclosuresToggle.disabled = enclosures.length <= 1 || state.export.running || state.export.estimate.loading;
-      exportEnclosureSelection.classList.toggle("hidden", !state.export.includeLiveEnclosures || enclosures.length <= 1);
-      if (!enclosures.length || enclosures.length <= 1) {
-        exportEnclosureSelection.innerHTML = "";
-      } else {
-        const selectedIds = new Set(selectedExportEnclosureIds());
-        exportEnclosureSelection.innerHTML = enclosures
-          .map((enclosure) => {
-            const isCurrent = enclosure.id === currentId;
-            const checked = selectedIds.has(enclosure.id) || isCurrent ? " checked" : "";
-            const disabled = isCurrent || state.export.running || state.export.estimate.loading ? " disabled" : "";
-            const shape = [
-              Number.isFinite(Number(enclosure.slot_count)) ? `${Number(enclosure.slot_count)} bays` : "",
-              enclosure.profile_id || "",
-            ].filter(Boolean).join(" / ");
-            const meta = isCurrent ? "Current enclosure, always included" : shape;
-            return `
-              <label class="snapshot-export-view-option">
-                <input type="checkbox" data-export-enclosure-id="${escapeHtml(enclosure.id)}"${checked}${disabled}>
-                <span>
-                  ${escapeHtml(enclosure.label || enclosure.id)}
-                  ${meta ? `<small>${escapeHtml(meta)}</small>` : ""}
-                </span>
-              </label>
-            `;
-          })
-          .join("");
-      }
+      exportIncludeEnclosuresToggle.disabled = enclosures.length <= 1 || state.export.running;
+      exportEnclosureSelection.classList.toggle("hidden", !(state.export.includeLiveEnclosures || state.export.enclosureSelectionExpanded) || enclosures.length <= 1);
+      syncExportCheckboxRows(exportEnclosureSelection, "data-export-enclosure-id", enclosures.length <= 1 ? [] : enclosures.map(enclosure => ({
+        id: enclosure.id,
+        label: enclosure.label || enclosure.id,
+        checked: selectedIds.has(enclosure.id) || enclosure.id === currentId,
+        disabled: enclosure.id === currentId || state.export.running,
+        meta: enclosure.id === currentId ? "Current enclosure, always included"
+          : [Number.isFinite(Number(enclosure.slot_count)) ? `${Number(enclosure.slot_count)} bays` : "", enclosure.profile_id || ""].filter(Boolean).join(" / "),
+      })));
     }
-    if (!exportIncludeViewsToggle || !exportViewSelection) {
-      return;
-    }
+    if (!exportIncludeViewsToggle || !exportViewSelection) return;
     const views = exportableStorageViews();
-    exportIncludeViewsToggle.checked = state.export.includeStorageViews;
-    exportIncludeViewsToggle.disabled = !views.length || state.export.running || state.export.estimate.loading;
-    exportViewSelection.classList.toggle("hidden", !state.export.includeStorageViews || !views.length);
-    if (!views.length) {
-      exportViewSelection.innerHTML = "";
-      return;
-    }
     const selectedIds = new Set(selectedExportStorageViewIds());
-    exportViewSelection.innerHTML = views
-      .map((view) => {
-        const checked = selectedIds.has(view.id) ? " checked" : "";
-        const meta = [storageViewKindLabel(view), view.template_label || view.template_id]
-          .filter(Boolean)
-          .join(" / ");
-        return `
-          <label class="snapshot-export-view-option">
-            <input type="checkbox" data-export-storage-view-id="${escapeHtml(view.id)}"${checked}>
-            <span>
-              ${escapeHtml(view.label || view.id)}
-              ${meta ? `<small>${escapeHtml(meta)}</small>` : ""}
-            </span>
-          </label>
-        `;
-      })
-      .join("");
+    exportIncludeViewsToggle.checked = state.export.includeStorageViews;
+    exportIncludeViewsToggle.disabled = !views.length || state.export.running;
+    exportViewSelection.classList.toggle("hidden", !(state.export.includeStorageViews || state.export.viewSelectionExpanded) || !views.length);
+    syncExportCheckboxRows(exportViewSelection, "data-export-storage-view-id", views.map(view => ({
+      id: view.id,
+      label: view.label || view.id,
+      checked: selectedIds.has(view.id),
+      disabled: state.export.running,
+      meta: [storageViewKindLabel(view), view.template_label || view.template_id].filter(Boolean).join(" / "),
+    })));
   }
 
   async function refreshSnapshotExportEstimate() {
@@ -6714,11 +6796,33 @@
     }
   }
 
+  function snapshotExportSelectionDescription() {
+    const payload = snapshotExportRequestPayload();
+    if (payload.selected_storage_view_id) {
+      const view = getStorageViewRuntimeById(payload.selected_storage_view_id);
+      const slot = view?.slots?.find(item => item.slot_index === payload.selected_slot);
+      const name = view?.label || "Selected storage view";
+      if (!payload.storage_view_ids.includes(payload.selected_storage_view_id)) {
+        return `${name} is not included. Its slot selection will be cleared in the snapshot.`;
+      }
+      return slot
+        ? `${name} slot ${slot.slot_label || slot.slot_index} will stay selected in the snapshot.`
+        : `${name} has no selected slot. The snapshot will open without a slot selection.`;
+    }
+    const slot = getSlotById(payload.selected_slot);
+    return slot
+      ? `Slot ${slot.slot_label} will stay selected in the snapshot.`
+      : "No slot is currently selected, so the snapshot will open with no bay preselected.";
+  }
+
   function syncSnapshotExportDialog() {
     if (!exportSnapshotNote) {
       return;
     }
     renderSnapshotExportScopeControls();
+    for (const control of [exportRedactToggle, exportPackagingSelect, exportAllowOversizeToggle]) {
+      if (control) control.disabled = state.export.running;
+    }
     const scopeLabel =
       getSelectedEnclosureOption()?.label ||
       state.snapshot.selected_enclosure_label ||
@@ -6734,7 +6838,7 @@
         ? `${selectedViewCount} saved or virtual view${selectedViewCount === 1 ? "" : "s"}`
         : "",
     ].filter(Boolean);
-    const slot = getSlotById(state.selectedSlot);
+
     const parts = [
       `Scope ${scopeParts.join(" plus ")}.`,
       `Window ${formatHistoryWindowDescription(currentHistoryWindowHours())}.`,
@@ -6750,18 +6854,8 @@
         ? "Host and enclosure aliases plus partial ID masking are enabled."
         : "Full identifiers will be included.",
     ];
-    if (slot) {
-      parts.push(`Slot ${slot.slot_label} is currently selected and will stay selected in the snapshot.`);
-      if (!isHistoryAvailable()) {
-        parts.push("History is currently unavailable, so the snapshot will omit history data and hide the History action.");
-      } else if (state.history.panelOpen) {
-        parts.push("The history drawer is open now and will open in the snapshot too.");
-      } else {
-        parts.push("The history drawer is closed now and will stay closed in the snapshot.");
-      }
-    } else {
-      parts.push("No slot is currently selected, so the snapshot will open with no bay preselected.");
-    }
+    parts.push(snapshotExportSelectionDescription());
+    if (!isHistoryAvailable()) parts.push("History is unavailable and will be omitted.");
     if (state.export.estimate.data?.downsampling_label && state.export.estimate.data.downsampling_label !== "None") {
       parts.push(`Adaptive ${state.export.estimate.data.downsampling_label.toLowerCase()} will be used to stay closer to the size target.`);
     }
@@ -6771,7 +6865,7 @@
     exportSnapshotNote.textContent = parts.join(" ");
     if (exportSnapshotWindowHint) {
       if (isHistoryAvailable()) {
-        exportSnapshotWindowHint.textContent = `Snapshot history uses the current History window (${formatHistoryWindowDescription(currentHistoryWindowHours())}). Change it in the History drawer first if you want a different export range. New sessions default to 24h.`;
+        exportSnapshotWindowHint.textContent = `Change the export range in the History drawer. Current range: ${formatHistoryWindowDescription(currentHistoryWindowHours())}.`;
       } else {
         exportSnapshotWindowHint.textContent = "History is currently unavailable, so this snapshot will be exported without historical samples or events.";
       }
@@ -6804,6 +6898,9 @@
     if (state.export.includeStorageViews && !state.export.selectedStorageViewIds.length) {
       state.export.selectedStorageViewIds = exportableStorageViews().map((view) => view.id).filter(Boolean);
     }
+    // Start each dialog from inclusion state; row deselection must not collapse a focused list.
+    state.export.enclosureSelectionExpanded = state.export.includeLiveEnclosures;
+    state.export.viewSelectionExpanded = state.export.includeStorageViews;
     syncSnapshotExportDialog();
     if (typeof exportSnapshotDialog.showModal === "function") {
       if (!exportSnapshotDialog.open) {
@@ -7515,11 +7612,17 @@
     }
 
     const historyTarget = getSelectedHistoryTarget();
+    const retryButton = document.getElementById("history-retry-button");
+    if (retryButton) {
+      retryButton.classList.toggle("hidden", !state.history.panelError);
+      retryButton.disabled = state.history.panelLoading;
+    }
     const slot = historyTarget?.slot || null;
     const windowHours = currentHistoryWindowHours();
     const referenceTimestampMs = currentHistoryReferenceTimestampMs();
     historyIoModeButtons.forEach((button) => {
       button.classList.toggle("active", button.dataset.historyIoMode === state.history.ioChartMode);
+      button.setAttribute("aria-pressed", String(button.dataset.historyIoMode === state.history.ioChartMode));
     });
     if (historyTimeframeSelect) {
       historyTimeframeSelect.value = windowHours === null ? "all" : String(windowHours);
@@ -7528,6 +7631,7 @@
     const shouldShowButton = Boolean(slot) && isHistoryAvailable();
     historyToggleButton.classList.toggle("hidden", !shouldShowButton);
     historyToggleButton.textContent = state.history.panelOpen ? "Hide History" : "History";
+    historyToggleButton.setAttribute("aria-expanded", String(shouldShowButton && state.history.panelOpen));
     if (historyDrawerTitle) {
       historyDrawerTitle.textContent = slot ? `Slot ${slot.slot_label} History` : "Slot History";
     }
@@ -7566,7 +7670,7 @@
     if (state.history.panelError && !payload) {
       detailHistoryError.textContent = state.history.panelError;
       detailHistoryError.classList.remove("hidden");
-      detailHistorySummary.textContent = "History backend reachable, but this slot query failed.";
+      detailHistorySummary.textContent = "History query failed. Use Retry History to try again.";
       return;
     }
 
@@ -7846,6 +7950,7 @@
   }
 
   function markMappingFormDirty() {
+    state.mappingDraftRevision = (state.mappingDraftRevision || 0) + 1;
     if (state.mappingFormDirty) {
       return;
     }
@@ -9123,11 +9228,11 @@
           .join("");
         const savedChassisViewOptions = storageViews
           .filter((view) => isSavedChassisView(view))
-          .map((view) => `<option value="view:${escapeHtml(view.id)}">${escapeHtml(selectorLabelForStorageViewOption(view))}</option>`)
+          .map((view) => `<option value="view:${escapeHtml(view.id)}"${state.storageViewsRuntimeLoading || state.storageViewsRuntimeError ? " disabled" : ""}>${escapeHtml(selectorLabelForStorageViewOption(view))}${state.storageViewsRuntimeLoading || state.storageViewsRuntimeError ? " (previous)" : ""}</option>`)
           .join("");
         const virtualStorageViewOptions = storageViews
           .filter((view) => !isSavedChassisView(view))
-          .map((view) => `<option value="view:${escapeHtml(view.id)}">${escapeHtml(selectorLabelForStorageViewOption(view))}</option>`)
+          .map((view) => `<option value="view:${escapeHtml(view.id)}"${state.storageViewsRuntimeLoading || state.storageViewsRuntimeError ? " disabled" : ""}>${escapeHtml(selectorLabelForStorageViewOption(view))}${state.storageViewsRuntimeLoading || state.storageViewsRuntimeError ? " (previous)" : ""}</option>`)
           .join("");
         enclosureOptionsHtml = [
           enclosureOptions ? `<optgroup label="Live Enclosures">${enclosureOptions}</optgroup>` : "",
@@ -9162,12 +9267,16 @@
     renderRefreshControls();
     renderSelectors();
     renderMappingImportControl();
+    renderStorageViewRuntimeStatus();
   }
 
   function selectSlot(slotNumber) {
+    if (!inventoryScopeMatchesSelection() || (state.selectedStorageViewRuntimeId
+      && (state.storageViewsRuntimeLoading || state.storageViewsRuntimeError))) return false;
     if (state.selectedSlot !== slotNumber && !confirmMappingDraftDiscard()) {
       return false;
     }
+    if (state.selectedSlot !== slotNumber) state.selectionEpoch = (state.selectionEpoch || 0) + 1;
     state.selectedSlot = slotNumber;
     state.history.panelError = null;
     syncSasFabricTraceToSlot(slotNumber);
@@ -9181,6 +9290,7 @@
     if (state.selectedSlot !== null && !confirmMappingDraftDiscard()) {
       return false;
     }
+    if (state.selectedSlot !== null) state.selectionEpoch = (state.selectionEpoch || 0) + 1;
     state.selectedSlot = null;
     state.history.panelError = null;
     clearSasFabricBaySelection();
@@ -9237,30 +9347,37 @@
       return;
     }
     const requestToken = ++state.storageViewsRuntimeRequestToken;
+    const scope = currentUiScopeKey();
+    const selectedViewAtStart = state.selectedStorageViewRuntimeId;
+    const isCurrent = () => requestToken === state.storageViewsRuntimeRequestToken && scope === currentUiScopeKey();
     try {
       state.storageViewsRuntimeLoading = true;
       renderSelectors();
+      renderStorageViewRuntimeStatus();
       const params = buildSelectionParams();
       params.set("force", force ? "true" : "false");
       const payload = await fetchJson(`/api/storage-views?${params.toString()}`);
-      if (requestToken !== state.storageViewsRuntimeRequestToken) {
+      if (!isCurrent()) {
         return;
       }
+      if (payload.system_id !== state.selectedSystemId) throw new Error("Storage view response did not match the selected system.");
+      state.storageViewsRuntimeError = null;
       applyStorageViewRuntime(payload);
       if (!quiet) {
         setStatus(`Loaded ${Array.isArray(payload.views) ? payload.views.length : 0} storage view${Array.isArray(payload.views) && payload.views.length === 1 ? "" : "s"} for ${payload.system_label || payload.system_id || "the selected system"}.`);
       }
     } catch (error) {
-      if (requestToken !== state.storageViewsRuntimeRequestToken) {
+      if (!isCurrent()) {
         return;
       }
-      if (!quiet) {
-        setStatus(`Storage view refresh failed: ${error.message || error}`, "error");
-      }
+      state.storageViewsRuntimeError = error.message || String(error);
+      setStatus(`Storage view refresh failed: ${state.storageViewsRuntimeError}. Retry storage views.`, "error");
     } finally {
-      if (requestToken === state.storageViewsRuntimeRequestToken) {
+      if (isCurrent()) {
         state.storageViewsRuntimeLoading = false;
-        renderAll();
+        if (selectedViewAtStart || state.selectedStorageViewRuntimeId) renderAll();
+        else renderSelectors();
+        renderStorageViewRuntimeStatus();
       }
     }
   }
@@ -9281,6 +9398,7 @@
     }
     try {
       state.export.running = true;
+      syncSnapshotExportDialog();
       if (exportSnapshotConfirm) {
         exportSnapshotConfirm.disabled = true;
       }
@@ -9319,6 +9437,7 @@
       setStatus(`Snapshot export failed: ${error.message || error}`, "error");
     } finally {
       state.export.running = false;
+      syncSnapshotExportDialog();
       if (exportSnapshotConfirm) {
         exportSnapshotConfirm.disabled = false;
       }
@@ -9399,7 +9518,11 @@
         archiveUiPerfRun(perfRun, "error", error.message || String(error));
       }
       if (refreshToken === state.latestRefreshToken) {
+        if (state.storageViewsRuntimeLoading) {
+          state.storageViewsRuntimeError = "Inventory refresh failed; storage view freshness is unverified.";
+        }
         state.storageViewsRuntimeLoading = false;
+        renderStorageViewRuntimeStatus();
         markHistoryCachesStale(error);
         renderHistoryPanel();
         renderHeatmapControls();
@@ -9427,6 +9550,9 @@
       setStatus(slot.led_reason || `LED control is unavailable for slot ${slot.slot_label}.`, "error");
       return;
     }
+    const mutation = captureMutationContext("sendLedAction");
+    if (!mutation) return;
+    let succeeded = false;
     try {
       setStatus(`Sending ${action} for slot ${slot.slot_label}...`);
       const payload = await sendScopedRequest(`/api/slots/${slot.slot}/led`, {
@@ -9434,13 +9560,18 @@
         readUiAuth: true,
         body: JSON.stringify({ action }),
       });
+      succeeded = true;
+      if (!mutationContextIsCurrent(mutation)) return;
       applySnapshot(payload.snapshot);
       renderAll();
       scheduleSmartPrefetch();
       setStatus(`Slot ${slot.slot_label} LED action ${action} completed via ${ledBackendLabel(slot)}.`);
     } catch (error) {
+      if (!mutationContextIsCurrent(mutation)) return;
       handleWriteRejection(error);
       setStatus(`LED action failed: ${error.message || error}`, "error");
+    } finally {
+      finishMutationContext(mutation, succeeded);
     }
   }
 
@@ -9678,6 +9809,9 @@
       clear_identify_after_save: Boolean(formData.get("clear_identify_after_save")),
     };
 
+    const mutation = captureMutationContext("saveMapping");
+    if (!mutation) return;
+    let succeeded = false;
     try {
       setStatus(`Saving calibration for slot ${slot.slot_label}...`);
       const result = await sendScopedRequest(`/api/slots/${slot.slot}/mapping`, {
@@ -9685,6 +9819,8 @@
         readUiAuth: true,
         body: JSON.stringify(payload),
       });
+      succeeded = true;
+      if (!mutationContextIsCurrent(mutation)) return;
       applySnapshot(result.snapshot);
       invalidateHistoryCaches();
       state.mappingFormScopeKey = null;
@@ -9692,8 +9828,11 @@
       scheduleSmartPrefetch();
       setStatus(result.warning || `Saved mapping for slot ${slot.slot_label}.`);
     } catch (error) {
+      if (!mutationContextIsCurrent(mutation)) return;
       handleWriteRejection(error);
       setStatus(`Save mapping failed: ${error.message || error}`, "error");
+    } finally {
+      finishMutationContext(mutation, succeeded);
     }
   }
 
@@ -9723,6 +9862,9 @@
       return;
     }
 
+    const mutation = captureMutationContext("clearMapping");
+    if (!mutation) return;
+    let succeeded = false;
     try {
       setStatus(`Clearing mapping for slot ${slot.slot_label}...`);
       const queryParams = new URLSearchParams();
@@ -9732,6 +9874,8 @@
         { method: "DELETE", readUiAuth: true },
         queryParams,
       );
+      succeeded = true;
+      if (!mutationContextIsCurrent(mutation)) return;
       applySnapshot(result.snapshot);
       invalidateHistoryCaches();
       state.mappingFormScopeKey = null;
@@ -9739,8 +9883,11 @@
       scheduleSmartPrefetch();
       setStatus(`Cleared mapping for slot ${slot.slot_label}.`);
     } catch (error) {
+      if (!mutationContextIsCurrent(mutation)) return;
       handleWriteRejection(error);
       setStatus(`Clear mapping failed: ${error.message || error}`, "error");
+    } finally {
+      finishMutationContext(mutation, succeeded);
     }
   }
 
@@ -9821,14 +9968,19 @@
       }
       return;
     }
+    const mutation = captureMutationContext("importMappingsFromFile");
+    if (!mutation) return;
+    let succeeded = false;
     try {
       setStatus(`Previewing mappings from ${file.name}...`);
       const rawText = await file.text();
+      if (!mutationContextIsCurrent(mutation)) return;
       const bundle = JSON.parse(rawText);
       const preview = await sendScopedRequest("/api/mappings/import/preview", {
         method: "POST",
         body: JSON.stringify(bundle),
       });
+      if (!mutationContextIsCurrent(mutation)) return;
       if (!window.confirm(mappingImportPreviewMessage(preview))) {
         setStatus("Mapping import canceled after preview.");
         return;
@@ -9844,6 +9996,8 @@
           confirmed: true,
         }),
       });
+      succeeded = true;
+      if (!mutationContextIsCurrent(mutation)) return;
       applySnapshot(result.snapshot);
       invalidateHistoryCaches();
       state.mappingFormScopeKey = null;
@@ -9851,10 +10005,12 @@
       scheduleSmartPrefetch();
       setStatus(`Imported ${result.imported} mappings into the active scope.`);
     } catch (error) {
+      if (!mutationContextIsCurrent(mutation)) return;
       handleWriteRejection(error);
       setStatus(`Import failed: ${error.message || error}`, "error");
     } finally {
-      if (mappingImportFile) {
+      finishMutationContext(mutation, succeeded);
+      if (mutationContextIsCurrent(mutation) && mappingImportFile) {
         mappingImportFile.value = "";
       }
     }
@@ -10117,6 +10273,10 @@
     scheduleAutoRefresh();
   }
 
+  document.getElementById("storage-view-runtime-retry")?.addEventListener("click", () => {
+    void fetchStorageViewRuntime(true, false);
+  });
+
   bindDelegatedLiveGridInteractions();
   bindDelegatedGridKeyboardNavigation();
 
@@ -10140,6 +10300,10 @@
       if (nextSystemId !== state.selectedSystemId) {
         disarmDiskInventorySync();
       }
+      if (nextSystemId === state.selectedSystemId) return;
+      state.selectionEpoch = (state.selectionEpoch || 0) + 1;
+      state.storageViewsRuntimeRequestToken += 1;
+      state.storageViewsRuntimeError = null;
       state.selectedSystemId = nextSystemId;
       state.selectedEnclosureId = null;
       state.storageViewsRuntime = {
@@ -10154,6 +10318,7 @@
       resetSasFabricData();
       clearSelectedSlot();
       applyReusableSnapshot(state.selectedSystemId, null);
+      renderAll();
       await refreshSnapshot(false, "system-switch");
       queueIdentifyVerify("system-switch");
     });
@@ -10168,6 +10333,12 @@
         renderSelectors();
         return;
       }
+      if (rawValue.startsWith("view:") && (state.storageViewsRuntimeLoading || state.storageViewsRuntimeError)) {
+        renderSelectors();
+        return;
+      }
+      if (rawValue === currentValue) return;
+      state.selectionEpoch = (state.selectionEpoch || 0) + 1;
       const previousEstimateBasisKey = snapshotExportEstimateBasisKey();
       closeEnclosureAliasEditor(false);
       clearSelectedSlot();
@@ -10198,9 +10369,12 @@
       state.selectedStorageViewRuntimeId = "";
       state.selectedEnclosureId = rawValue.startsWith("enclosure:") ? rawValue.slice("enclosure:".length) : (rawValue || null);
       invalidateSnapshotExportEstimateIfBasisChanged(previousEstimateBasisKey);
+      state.storageViewsRuntimeRequestToken += 1;
+      state.storageViewsRuntimeError = null;
       state.storageViewsRuntimeLoading = true;
       resetSasFabricData();
       applyReusableSnapshot(state.selectedSystemId, state.selectedEnclosureId);
+      renderAll();
       await refreshSnapshot(false, "enclosure-switch");
       queueIdentifyVerify("enclosure-switch");
     });
@@ -10319,6 +10493,7 @@
     exportIncludeEnclosuresToggle.addEventListener("change", (event) => {
       const previousEstimateBasisKey = snapshotExportEstimateBasisKey();
       state.export.includeLiveEnclosures = Boolean(event.target.checked);
+      state.export.enclosureSelectionExpanded = state.export.includeLiveEnclosures;
       if (state.export.includeLiveEnclosures && selectedExportEnclosureIds().length <= 1) {
         state.export.selectedEnclosureIds = exportableLiveEnclosures().map((enclosure) => enclosure.id).filter(Boolean);
       }
@@ -10356,6 +10531,7 @@
     exportIncludeViewsToggle.addEventListener("change", (event) => {
       const previousEstimateBasisKey = snapshotExportEstimateBasisKey();
       state.export.includeStorageViews = Boolean(event.target.checked);
+      state.export.viewSelectionExpanded = state.export.includeStorageViews;
       if (state.export.includeStorageViews && !state.export.selectedStorageViewIds.length) {
         state.export.selectedStorageViewIds = exportableStorageViews().map((view) => view.id).filter(Boolean);
       }
@@ -10513,10 +10689,14 @@
       scheduleHeatmapTileOverlayRefresh();
     });
   }
+  document.getElementById("history-retry-button")?.addEventListener("click", () => {
+    void loadHistoryForSelectedSlot(true);
+  });
   if (historyCloseButton) {
     historyCloseButton.addEventListener("click", () => {
       state.history.panelOpen = false;
       renderHistoryPanel();
+      if (historyToggleButton?.isConnected) historyToggleButton.focus({ preventScroll: true });
     });
   }
   if (historyToggleButton) {
