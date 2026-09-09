@@ -63,6 +63,8 @@ from app.models.domain import ESXiHostPrepInstallRequest
 from app.models.domain import EnclosureOption
 from app.models.domain import EnclosureProfileRequest
 from app.models.domain import HistoryAdoptRequest
+from app.models.domain import InventorySnapshot
+from app.models.domain import SourceStatus
 from app.models.domain import QuantastorNodeDiscoveryRequest
 from app.models.domain import SnapshotExportRequest
 from app.models.domain import SystemSetupBootstrapRequest
@@ -1588,25 +1590,53 @@ class MainAppBoundaryTests(unittest.TestCase):
     def test_history_service_uses_shared_app_version(self) -> None:
         self.assertEqual(history_app.version, __version__)
 
-    def test_main_app_healthz_uses_cached_snapshot_only(self) -> None:
-        fake_service = MagicMock()
-        fake_snapshot = MagicMock()
-        fake_snapshot.sources = {"api": MagicMock(ok=True)}
-        fake_snapshot.last_updated = datetime(2026, 4, 25, 12, 0, tzinfo=timezone.utc)
-        fake_snapshot.warnings = ["cached warning"]
-        fake_snapshot.model_dump.return_value = {"sources": {"api": {"enabled": True, "ok": True, "message": "reachable"}}}
-        fake_service.peek_cached_snapshot.return_value = fake_snapshot
-        fake_registry = MagicMock()
-        fake_registry.get_service.return_value = fake_service
+    def test_main_app_healthz_serializes_sources_without_dumping_cached_snapshot(self) -> None:
+        cases = (
+            ("healthy", {"api": {"enabled": True, "ok": True, "message": "reachable"},
+                         "ssh": {"enabled": False, "ok": False, "message": None}}, "ok"),
+            ("degraded", {"api": {"enabled": True, "ok": False, "message": "unavailable"}}, "degraded"),
+            ("missing-api", {"ssh": {"enabled": True, "ok": True, "message": None}}, "degraded"),
+            ("empty-sources", {}, "degraded"),
+        )
+        for name, sources, dependency_status in cases:
+            with self.subTest(name=name):
+                snapshot = InventorySnapshot(
+                    slots=[],
+                    refresh_interval_seconds=30,
+                    last_updated=datetime(2026, 4, 25, 12, 0, tzinfo=timezone.utc),
+                    sources={key: SourceStatus(**value) for key, value in sources.items()},
+                    warnings=["cached warning", "synthetic warning: café"],
+                )
+                # Keep an exact oracle for the previous parent-serialization contract.
+                expected = {
+                    "status": "ok",
+                    "dependency_status": dependency_status,
+                    "last_updated": "2026-04-25T12:00:00+00:00",
+                    "sources": snapshot.model_dump(mode="json")["sources"],
+                    "warnings": ["cached warning", "synthetic warning: café"],
+                    "cache_state": "cached",
+                }
+                self.assertEqual(expected["sources"], sources)
+                fake_service = MagicMock()
+                fake_service.peek_cached_snapshot.return_value = snapshot
+                fake_registry = MagicMock()
+                fake_registry.get_service.return_value = fake_service
 
-        with patch("app.main.get_inventory_registry", return_value=fake_registry):
-            response = self._call_main_route("/healthz")
+                with (
+                    patch("app.main.get_inventory_registry", return_value=fake_registry),
+                    patch.object(
+                        InventorySnapshot, "model_dump",
+                        side_effect=AssertionError("healthz must not serialize the parent snapshot"),
+                    ) as parent_dump,
+                ):
+                    response = self._call_main_route("/healthz")
 
-        self.assertEqual(response.status_code, 200)
-        payload = json.loads(response.body)
-        self.assertEqual(payload["dependency_status"], "ok")
-        self.assertEqual(payload["cache_state"], "cached")
-        fake_service.peek_cached_snapshot.assert_called_once_with()
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.body, JSONResponse(expected).body)
+                parent_dump.assert_not_called()
+                fake_registry.get_service.assert_called_once_with(None)
+                fake_service.peek_cached_snapshot.assert_called_once_with()
+                fake_service.get_snapshot.assert_not_called()
 
     def test_main_app_healthz_reports_unknown_when_cache_is_empty(self) -> None:
         fake_service = MagicMock()
@@ -1618,9 +1648,20 @@ class MainAppBoundaryTests(unittest.TestCase):
             response = self._call_main_route("/healthz")
 
         self.assertEqual(response.status_code, 200)
-        payload = json.loads(response.body)
-        self.assertEqual(payload["dependency_status"], "unknown")
-        self.assertEqual(payload["cache_state"], "empty")
+        self.assertEqual(
+            response.body,
+            JSONResponse({
+                "status": "ok",
+                "dependency_status": "unknown",
+                "last_updated": None,
+                "sources": {},
+                "warnings": [],
+                "cache_state": "empty",
+            }).body,
+        )
+        fake_registry.get_service.assert_called_once_with(None)
+        fake_service.peek_cached_snapshot.assert_called_once_with()
+        fake_service.get_snapshot.assert_not_called()
 
     def test_snapshot_export_estimate_uses_stale_smart_cache(self) -> None:
         route = next(route for route in main_app.routes if route.path == "/api/export/enclosure-snapshot/estimate")
