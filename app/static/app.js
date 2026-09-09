@@ -277,6 +277,7 @@
   const timezoneLabel = document.getElementById("timezone-label");
   const snapshotGeneratedValue = document.getElementById("snapshot-generated-value");
   const snapshotGeneratedNote = document.getElementById("snapshot-generated-note");
+  const snapshotBannerCaptured = document.getElementById("snapshot-banner-captured");
   const snapshotStatusChip = document.getElementById("snapshot-status-chip");
   const apiStatusChip = document.getElementById("api-status-chip");
   const sshStatusChip = document.getElementById("ssh-status-chip");
@@ -3088,8 +3089,13 @@
       return;
     }
     const generatedAt = state.snapshotExportMeta?.generated_at || state.snapshot?.last_updated || null;
-    snapshotGeneratedValue.textContent = generatedAt ? formatTimestamp(generatedAt) : "Unknown";
+    const generatedLabel = generatedAt ? formatTimestamp(generatedAt) : "Unknown";
+    snapshotGeneratedValue.textContent = generatedLabel;
     snapshotGeneratedValue.title = generatedAt || "";
+    if (snapshotBannerCaptured) {
+      snapshotBannerCaptured.textContent = generatedLabel;
+      snapshotBannerCaptured.title = generatedAt || "";
+    }
     if (snapshotGeneratedNote) {
       const browserTimeZone = getBrowserTimeZone();
       snapshotGeneratedNote.textContent = browserTimeZone

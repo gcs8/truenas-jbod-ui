@@ -135,9 +135,11 @@ test("renderRefreshControls tolerates a template without the optional wrappers",
 test("the snapshot banner explains the capture time in plain words", () => {
   const snapshotGeneratedValue = element();
   const snapshotGeneratedNote = element();
+  const snapshotBannerCaptured = element();
   const renderSnapshotBanner = loadFunction("renderSnapshotBanner", {
     snapshotGeneratedValue,
     snapshotGeneratedNote,
+    snapshotBannerCaptured,
     state: {
       snapshotMode: true,
       snapshotExportMeta: { generated_at: "2026-09-01T10:00:00+00:00" },
@@ -150,6 +152,8 @@ test("the snapshot banner explains the capture time in plain words", () => {
   renderSnapshotBanner();
 
   assert.equal(snapshotGeneratedValue.textContent, "formatted:2026-09-01T10:00:00+00:00");
+  assert.equal(snapshotBannerCaptured.textContent, "formatted:2026-09-01T10:00:00+00:00");
+  assert.equal(snapshotBannerCaptured.title, "2026-09-01T10:00:00+00:00");
   assert.equal(snapshotGeneratedNote.textContent, "Times shown in your local time zone (Europe/Madrid)");
   assert.doesNotMatch(snapshotGeneratedNote.textContent, /viewer|artifact/i);
 });
