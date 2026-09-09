@@ -169,14 +169,14 @@ test("refreshState coalesces overlapping calls into one queued follow-up instead
     secondSettled = true;
   });
 
-  requests[0].resolve({ systems: [{ id: "old" }] });
+  requests[0].resolve({ profiles: [], systems: [{ id: "old" }] });
   await first;
   await flushPromises();
   assert.equal(requests.length, 2, "queued follow-up starts after the first refresh settles");
   assert.equal(secondSettled, false, "queued callers wait for the follow-up, not the first refresh");
   assert.deepEqual(state.systems, [{ id: "old" }]);
 
-  requests[1].resolve({ systems: [{ id: "new" }] });
+  requests[1].resolve({ profiles: [], systems: [{ id: "new" }] });
   await second;
   await third;
   assert.equal(secondSettled, true);
@@ -192,7 +192,7 @@ test("refreshState coalesces overlapping calls into one queued follow-up instead
   const fourth = refreshState({ quiet: true });
   await flushPromises();
   assert.equal(requests.length, 3, "after everything settles a new refresh starts immediately");
-  requests[2].resolve({ systems: [] });
+  requests[2].resolve({ profiles: [], systems: [] });
   await fourth;
 });
 
@@ -232,7 +232,7 @@ test("refreshState follow-up still runs when the in-flight refresh fails", async
   await first;
   await flushPromises();
   assert.equal(requests.length, 2, "a failed first refresh must not strand the queued follow-up");
-  requests[1].resolve({ systems: [{ id: "recovered" }] });
+  requests[1].resolve({ profiles: [], systems: [{ id: "recovered" }] });
   await queued;
   assert.deepEqual(state.systems, [{ id: "recovered" }]);
 });
@@ -447,13 +447,13 @@ test("backup export, debug export, and import errors are described instead of st
     /throw new Error\(payload\?\.detail \|\|/,
     "every raw payload?.detail throw must route through describeApiError"
   );
-  for (const name of ["exportBackup", "exportDebugBundle", "importBackup"]) {
+  for (const name of ["runExportBackup", "runExportDebugBundle", "runImportBackup"]) {
     assert.match(functionSource(name), /describeApiError\(payload\?\.detail\)/, `${name} must describe API errors`);
   }
 });
 
 test("backup import reports source-absent groups whose live data was preserved", () => {
-  const source = functionSource("importBackup");
+  const source = functionSource("runImportBackup");
 
   assert.match(source, /payload\.preserved_absent_groups/);
   assert.match(source, /Preserved live data/);

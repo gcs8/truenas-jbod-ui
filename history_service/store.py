@@ -2470,14 +2470,24 @@ class HistoryStore:
 
         return self._execute_write(operation)
 
-    def purge_orphaned_history(self, valid_system_ids: list[str] | tuple[str, ...]) -> dict[str, Any]:
+    def purge_orphaned_history(
+        self, valid_system_ids: list[str] | tuple[str, ...], *,
+        expected_summaries: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         self._require_unsegmented_operation("orphan purge")
         normalized_valid_ids = tuple(
             sorted({system_id.strip() for system_id in valid_system_ids if system_id and system_id.strip()})
         )
 
         def operation(connection: sqlite3.Connection) -> dict[str, Any]:
+            if expected_summaries is not None:
+                # Pin the preview comparison and deletion in one write transaction.
+                connection.execute("BEGIN IMMEDIATE")
             orphan_ids = self._list_cleanup_system_ids(connection, exclude_system_ids=normalized_valid_ids)
+            if expected_summaries is not None:
+                current = self._list_history_system_summaries(connection, exclude_system_ids=normalized_valid_ids)
+                if current != expected_summaries:
+                    raise ValueError("Orphaned history changed. Preview again before purging.")
             if not orphan_ids:
                 return self._empty_cleanup_summary()
             summary = self._delete_history_for_system_ids(connection, orphan_ids)
