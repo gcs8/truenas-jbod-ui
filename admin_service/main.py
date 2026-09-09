@@ -43,6 +43,7 @@ from app.config import (
     SSHConfig,
     Settings,
     TrueNASConfig,
+    build_unknown_config_key_warnings,
     get_settings,
     runtime_behavior_settings_payload,
     save_runtime_behavior_overrides,
@@ -417,6 +418,24 @@ def format_history_system_summary(summary: dict[str, Any]) -> str:
     )
 
 
+def prepare_admin_directories(admin_settings: AdminSettings) -> None:
+    """Create the folders admin writes to, or stop with one line that names the fix."""
+    for target, hint in (
+        (Path("/tmp"), "the admin container needs a writable /tmp"),
+        (
+            Path(admin_settings.host_prep_temp_dir),
+            "check ADMIN_HOST_PREP_TEMP_DIR and the admin container mounts",
+        ),
+    ):
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            reason = exc.strerror or type(exc).__name__
+            message = f"Admin cannot create the folder {target} ({reason}); {hint}."
+            logger.error("Configuration error: %s", message)
+            raise RuntimeError(message) from None
+
+
 def validate_admin_public_origin(admin_settings: AdminSettings) -> None:
     if (
         admin_settings.auth_mode == "basic"
@@ -448,6 +467,7 @@ def create_app() -> FastAPI:
     async def lifespan(_: FastAPI):
         shutdown_task: asyncio.Task[None] | None = None
         release_task: asyncio.Task[None] | None = None
+        prepare_admin_directories(admin_settings)
         try:
             cleanup_summary = await asyncio.to_thread(
                 get_esxi_host_prep_service().prune_stale_packages
@@ -570,7 +590,10 @@ async def build_admin_state_payload(request: Request) -> dict[str, Any]:
         "systems": serialize_systems(settings),
         "default_system_id": settings.default_system_id,
         "profiles": serialize_profiles(settings),
-        "configuration_warnings": build_profile_reference_warnings(settings),
+        "configuration_warnings": [
+            *build_profile_reference_warnings(settings),
+            *build_unknown_config_key_warnings(settings),
+        ],
         "storage_view_templates": serialize_storage_view_templates(),
         "setup_platform_defaults": serialize_platform_defaults(),
         "ssh_keys": ssh_keys,

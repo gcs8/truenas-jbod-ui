@@ -6,8 +6,10 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, StrictInt, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, StrictInt, ValidationError, model_validator
 
+from app.config_errors import ConfigurationError, describe_validation_error
+from app.env_values import annotation_is_text
 from app.secret_files import load_secret_environment_value
 
 
@@ -102,6 +104,13 @@ def _parse_scalar(value: str):
         return stripped
 
 
+EXACT_TEXT_FIELDS = frozenset({"auth_username", "auth_password"})
+
+
+def _field_is_text(field_name: str) -> bool:
+    return annotation_is_text(AdminSettings.model_fields[field_name].annotation)
+
+
 @lru_cache
 def get_admin_settings() -> AdminSettings:
     payload = AdminSettings().model_dump()
@@ -113,13 +122,24 @@ def get_admin_settings() -> AdminSettings:
         )
         if raw_value is None:
             continue
-        payload[field_name] = (
-            raw_value
-            if field_name in {"auth_username", "auth_password"}
-            else _parse_scalar(raw_value)
-        )
+        if field_name in EXACT_TEXT_FIELDS:
+            payload[field_name] = raw_value
+        elif not raw_value.strip():
+            continue
+        elif _field_is_text(field_name):
+            payload[field_name] = raw_value.strip()
+        else:
+            payload[field_name] = _parse_scalar(raw_value)
 
-    settings = AdminSettings.model_validate(payload)
-    Path("/tmp").mkdir(parents=True, exist_ok=True)
-    Path(settings.host_prep_temp_dir).mkdir(parents=True, exist_ok=True)
-    return settings
+    field_to_env = {field_name: env_name for env_name, field_name in ENV_OVERRIDES.items()}
+    try:
+        return AdminSettings.model_validate(payload)
+    except ValidationError as exc:
+        problems = describe_validation_error(
+            exc,
+            resolve_location=lambda location: (
+                (field_to_env[str(location[0])], ".env") if str(location[0]) in field_to_env else None
+            ),
+            default_source=".env",
+        )
+        raise ConfigurationError(problems) from None
