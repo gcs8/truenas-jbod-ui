@@ -26,6 +26,16 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Changed
+
+- Rewrote the admin setup, backup and maintenance copy in plain words, hid the
+  one-time bootstrap, SSH command list and QuantaStor HA controls until they are
+  needed, showed only the storage-view fields that apply, and made system pills,
+  delete confirmations, restore inspections and validation errors read as
+  sentences instead of developer strings. (#487)
+
 ## v0.23.0 - 2026-09-08
 
 This release includes every pull request merged after `v0.22.2` through the
