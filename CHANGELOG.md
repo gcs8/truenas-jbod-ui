@@ -26,6 +26,15 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Fixed
+
+- Raised the smallest Storage Fabric, disk-path and bay text to 12px, stopped
+  forcing the diagnostic chips to uppercase, let card labels wrap instead of
+  clipping device names, added a print stylesheet that keeps bay colours on a
+  white page, and darkened the empty NVMe bay size chip to AA contrast (#477)
+
 ## v0.23.0 - 2026-09-08
 
 This release includes every pull request merged after `v0.22.2` through the
