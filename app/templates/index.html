@@ -58,6 +58,10 @@
     </div>
   </header>
 
+  {% if system_notice %}
+  <p class="status-text" id="system-notice" role="status" data-tone="info">{{ system_notice }}</p>
+  {% endif %}
+
   {% if snapshot_mode %}
   <section class="panel snapshot-banner">
     <div class="snapshot-banner-copy">
