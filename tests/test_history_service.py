@@ -585,6 +585,32 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         workflow = (service_dir.parent / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
         self.assertIn("node --check history_service/static/dashboard.js", workflow)
 
+    def test_dashboard_labels_no_sample_metric_timestamps_as_attempts(self) -> None:
+        attempted_at = "2026-09-09T10:00:00+00:00"
+        markup = self._render_dashboard(
+            {
+                "collector_running": True,
+                "collection_running": False,
+                "last_fast_metrics_at": attempted_at,
+                "last_slow_metrics_at": attempted_at,
+            },
+            {"tracked_slots": 0, "event_count": 0, "metric_sample_count": 0},
+            [],
+        )
+
+        for label, element_id in (
+            ("Last temperature collection attempt", "status-last-fast-metrics-at"),
+            ("Last full SMART collection attempt", "status-last-slow-metrics-at"),
+        ):
+            with self.subTest(label=label):
+                self.assertRegex(
+                    markup,
+                    rf'<dt>{label}</dt><dd id="{element_id}">'
+                    rf'<time[^>]*datetime="{re.escape(attempted_at)}"[^>]*>.*?</time></dd>',
+                )
+        self.assertNotIn("Last temperature reading", markup)
+        self.assertNotIn("Last full SMART reading", markup)
+
     def test_dashboard_renders_fast_and_full_refresh_controls(self) -> None:
         markup = self._render_dashboard(
             {"collector_running": True},

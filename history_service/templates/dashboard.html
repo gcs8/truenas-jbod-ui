@@ -77,8 +77,8 @@
         <dl>
           <dt>Collecting now</dt><dd id="status-current-collection">{{ current_collection_label if status.get('collection_running') else 'no' }}</dd>
           <dt>Last shelf scan</dt><dd id="status-last-inventory-at">{{ timestamp(status.get('last_inventory_at'), 'never') }}</dd>
-          <dt>Last temperature reading</dt><dd id="status-last-fast-metrics-at">{{ timestamp(status.get('last_fast_metrics_at'), 'never') }}</dd>
-          <dt>Last full SMART reading</dt><dd id="status-last-slow-metrics-at">{{ timestamp(status.get('last_slow_metrics_at'), 'never') }}</dd>
+          <dt>Last temperature collection attempt</dt><dd id="status-last-fast-metrics-at">{{ timestamp(status.get('last_fast_metrics_at'), 'never') }}</dd>
+          <dt>Last full SMART collection attempt</dt><dd id="status-last-slow-metrics-at">{{ timestamp(status.get('last_slow_metrics_at'), 'never') }}</dd>
           <dt>Last backup</dt><dd id="status-last-backup-at">{{ timestamp(status.get('last_backup_at'), 'never') }}</dd>
           <dt>Last cleanup</dt><dd id="status-last-retention-at">{{ timestamp(status.get('last_retention_at'), 'never') }}</dd>
           <dt>Cleanup took</dt><dd id="status-last-retention-duration">{{ last_retention_duration_label }}</dd>
