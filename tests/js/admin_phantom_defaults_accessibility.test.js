@@ -276,6 +276,7 @@ test("countdown ticks reuse the existing release-note link", () => {
     formatCountdown: () => "1m 00s",
     formatLocalTimestamp: (value) => String(value),
     safeHttpUrl: (value) => value,
+    syncSessionBanner: () => {},
     state,
     URL,
     window: { location: { href: "http://127.0.0.1:8082/" } },
@@ -289,14 +290,14 @@ test("countdown ticks reuse the existing release-note link", () => {
   assert.equal(releaseNote.firstElementChild, firstLink);
 });
 
-test("missing admin expiry renders No auto-stop", () => {
+test("missing admin expiry renders Stays running", () => {
   const formatSource = sourceBetween(
-    "  function formatCountdown()",
-    "\n  function startCountdownTimer"
+    "  const SESSION_WARNING_MS",
+    "\n  function describeAutoStopDuration"
   );
   const { formatCountdown } = loadFunctions([formatSource], ["formatCountdown"], {
     state: { admin: { expires_at: null } },
   });
 
-  assert.equal(formatCountdown(), "No auto-stop");
+  assert.equal(formatCountdown(), "Stays running");
 });

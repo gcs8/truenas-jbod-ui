@@ -75,6 +75,7 @@
     runtimeActionPromises: new Map(),
     runtimeActionControllers: new Map(),
     countdownTimerId: null,
+    sessionStopped: false,
     sudoersPreviewTimerId: null,
     sudoersPreviewRequestSeq: 0,
     liveEnclosuresRequestSeq: 0,
@@ -92,6 +93,7 @@
 
   const elements = {
     banner: document.getElementById("admin-status-banner"),
+    sessionBanner: document.getElementById("admin-session-banner"),
     configurationWarnings: document.getElementById("admin-configuration-warnings"),
     configurationWarningList: document.getElementById("admin-configuration-warning-list"),
     refreshStateButton: document.getElementById("refresh-state-button"),
@@ -100,8 +102,6 @@
     adminViewPanels: Array.from(document.querySelectorAll("[data-admin-view-panel]")),
     adminViewSwitches: Array.from(document.querySelectorAll("[data-admin-view-switch]")),
     countdown: document.getElementById("admin-countdown"),
-    startedAt: document.getElementById("admin-started-at"),
-    expiresAt: document.getElementById("admin-expires-at"),
     systemCount: document.getElementById("admin-system-count"),
     profileCount: document.getElementById("admin-profile-count"),
     appVersion: document.getElementById("admin-app-version"),
@@ -221,6 +221,7 @@
     setupBootstrapSudoersName: document.getElementById("setup-bootstrap-sudoers-name"),
     setupBootstrapSudoersDetail: document.getElementById("setup-bootstrap-sudoers-detail"),
     setupBootstrapSudoersPreview: document.getElementById("setup-bootstrap-sudoers-preview"),
+    setupBootstrapSudoersPanel: document.getElementById("setup-bootstrap-sudoers-panel"),
     setupEsxiHostPrepPanel: document.getElementById("setup-esxi-host-prep-panel"),
     setupEsxiHostPrepCopy: document.getElementById("setup-esxi-host-prep-copy"),
     setupEsxiHostPrepTempDir: document.getElementById("setup-esxi-host-prep-temp-dir"),
@@ -499,23 +500,115 @@
     elements.setupTlsTrustDetail.textContent = trustStatus.detail || defaultTlsTrustDetail();
   }
 
-  function formatCountdown() {
+  const SESSION_WARNING_MS = 5 * 60 * 1000;
+  const ADMIN_START_COMMAND = "docker compose --profile admin up -d enclosure-admin";
+
+  function sessionRemainingMs() {
     if (!state.admin.expires_at) {
-      return "No auto-stop";
+      return null;
     }
     const expiresAt = new Date(state.admin.expires_at).getTime();
-    const remainingMs = expiresAt - Date.now();
+    if (Number.isNaN(expiresAt)) {
+      return null;
+    }
+    return expiresAt - Date.now();
+  }
+
+  function formatClockTime(value) {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) {
+      return "";
+    }
+    return date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  }
+
+  function formatCountdown() {
+    const remainingMs = sessionRemainingMs();
+    if (remainingMs === null) {
+      return "Stays running";
+    }
     if (remainingMs <= 0) {
-      return "Stopping now";
+      return "Stopped";
     }
     const totalSeconds = Math.floor(remainingMs / 1000);
     const hours = Math.floor(totalSeconds / 3600);
     const minutes = Math.floor((totalSeconds % 3600) / 60);
     const seconds = totalSeconds % 60;
-    if (hours > 0) {
-      return `${hours}h ${String(minutes).padStart(2, "0")}m ${String(seconds).padStart(2, "0")}s`;
+    const remaining = hours > 0
+      ? `${hours}h ${String(minutes).padStart(2, "0")}m ${String(seconds).padStart(2, "0")}s`
+      : `${minutes}m ${String(seconds).padStart(2, "0")}s`;
+    const clock = formatClockTime(state.admin.expires_at);
+    return clock ? `Auto-stops in ${remaining} (${clock})` : `Auto-stops in ${remaining}`;
+  }
+
+  function describeAutoStopDuration() {
+    const seconds = Number(state.admin.auto_stop_seconds) > 0 ? Number(state.admin.auto_stop_seconds) : 3600;
+    if (seconds % 3600 === 0) {
+      const hours = seconds / 3600;
+      return hours === 1 ? "1 hour" : `${hours} hours`;
     }
-    return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
+    const minutes = Math.max(1, Math.round(seconds / 60));
+    return minutes === 1 ? "1 minute" : `${minutes} minutes`;
+  }
+
+  function markAdminStopped() {
+    if (state.sessionStopped) {
+      return;
+    }
+    state.sessionStopped = true;
+    if (state.countdownTimerId) {
+      window.clearInterval(state.countdownTimerId);
+      state.countdownTimerId = null;
+    }
+    if (elements.countdown) {
+      elements.countdown.textContent = "Stopped";
+    }
+    if (elements.sessionBanner) {
+      const command = document.createElement("code");
+      command.textContent = ADMIN_START_COMMAND;
+      elements.sessionBanner.replaceChildren(
+        `Admin has stopped (it stops itself after ${describeAutoStopDuration()}). To start it again run `,
+        command,
+        ", then reload this page."
+      );
+      elements.sessionBanner.classList.remove("hidden", "is-warning");
+      elements.sessionBanner.classList.add("is-error");
+    }
+    document.querySelectorAll("button:not(.admin-view-button)").forEach((button) => {
+      button.disabled = true;
+    });
+  }
+
+  function syncSessionBanner() {
+    if (!elements.sessionBanner || state.sessionStopped) {
+      return;
+    }
+    const remainingMs = sessionRemainingMs();
+    if (remainingMs !== null && remainingMs <= 0) {
+      markAdminStopped();
+      return;
+    }
+    if (remainingMs === null || remainingMs > SESSION_WARNING_MS) {
+      elements.sessionBanner.classList.add("hidden");
+      return;
+    }
+    const minutes = Math.max(1, Math.ceil(remainingMs / 60000));
+    elements.sessionBanner.textContent =
+      `This admin session stops in ${minutes} ${minutes === 1 ? "minute" : "minutes"}. Save your work.`;
+    elements.sessionBanner.classList.remove("hidden", "is-error");
+    elements.sessionBanner.classList.add("is-warning");
+  }
+
+  async function fetchOrReportStopped(url, options) {
+    try {
+      return await fetch(url, options);
+    } catch (error) {
+      const remainingMs = sessionRemainingMs();
+      if (error?.name === "TypeError" && remainingMs !== null && remainingMs <= 0) {
+        markAdminStopped();
+      }
+      throw error;
+    }
   }
 
   function startCountdownTimer() {
@@ -530,12 +623,7 @@
     if (elements.countdown) {
       elements.countdown.textContent = formatCountdown();
     }
-    if (elements.startedAt) {
-      elements.startedAt.textContent = formatLocalTimestamp(state.admin.started_at);
-    }
-    if (elements.expiresAt) {
-      elements.expiresAt.textContent = state.admin.expires_at ? formatLocalTimestamp(state.admin.expires_at) : "Manual stop only";
-    }
+    syncSessionBanner();
     if (elements.systemCount) {
       elements.systemCount.textContent = String(state.systems.length);
     }
@@ -565,15 +653,23 @@
       }
     }
     if (elements.adminOriginLink) {
-      const origin = String(state.admin.public_origin || "").trim();
-      const originUrl = new URL(origin || window.location.href, window.location.href);
-      if (state.currentAdminView === "builder") {
-        originUrl.searchParams.set("view", "builder");
-      } else {
-        originUrl.searchParams.delete("view");
+      const configured = String(state.admin.public_origin || "").trim();
+      let configuredOrigin = "";
+      try {
+        configuredOrigin = configured ? new URL(configured).origin : "";
+      } catch (error) {
+        configuredOrigin = "";
       }
-      elements.adminOriginLink.href = originUrl.toString();
-      elements.adminOriginLink.classList.toggle("hidden", !origin);
+      const showLink = Boolean(configuredOrigin) && configuredOrigin !== String(window.location.origin || "");
+      if (showLink) {
+        const originUrl = new URL(window.location.pathname || "/", configuredOrigin);
+        if (state.currentAdminView === "builder") {
+          originUrl.searchParams.set("view", "builder");
+        }
+        elements.adminOriginLink.href = originUrl.toString();
+        elements.adminOriginLink.textContent = `Open at ${configuredOrigin}`;
+      }
+      elements.adminOriginLink.classList.toggle("hidden", !showLink);
     }
   }
 
@@ -930,7 +1026,7 @@
       renderRuntimeCards();
       const detail = payload.detail || "Runtime behavior overrides saved.";
       if (elements.runtimeBehaviorResult) {
-        elements.runtimeBehaviorResult.textContent = detail;
+        renderSaveResult(elements.runtimeBehaviorResult, detail, payload);
       }
       setBanner(detail, "success");
     } catch (error) {
@@ -1026,6 +1122,8 @@
   function currentSetupPlatform() {
     return String(elements.setupPlatform?.value || "core").toLowerCase();
   }
+
+  const BMC_ONLY_BOOTSTRAP_NOTE = "This system is managed through its BMC. No host login is needed.";
 
   function platformSupportsBootstrap(platform = currentSetupPlatform()) {
     return !["esxi", "ipmi"].includes(String(platform || "").toLowerCase());
@@ -2205,7 +2303,17 @@
     const loadedProfile = state.loadedBuilderProfileId
       ? getProfileById(state.loadedBuilderProfileId)
       : null;
-    elements.profileBuilderDeleteButton.disabled = !(loadedProfile && loadedProfile.is_custom);
+    const referenceCount = profileReferenceCount(loadedProfile);
+    elements.profileBuilderDeleteButton.disabled = !(loadedProfile && loadedProfile.is_custom) || referenceCount > 0;
+    elements.profileBuilderDeleteButton.title = referenceCount > 0 ? describeProfileReferences(referenceCount) : "";
+  }
+
+  function profileReferenceCount(profile) {
+    return Math.max(0, Number(profile?.reference_count) || 0);
+  }
+
+  function describeProfileReferences(count) {
+    return `Used by ${count} ${count === 1 ? "system" : "systems"}`;
   }
 
   function renderProfilePreview() {
@@ -3863,13 +3971,26 @@
       return;
     }
     const payload = collectSudoersPreviewPayload();
+    const bmcOnly = setupPlatformUsesBmcOnlyHost(payload.platform);
+    if (elements.setupBootstrapSudoersPanel) {
+      elements.setupBootstrapSudoersPanel.classList.toggle("hidden", bmcOnly);
+    }
     if (!platformSupportsBootstrap(payload.platform)) {
-      renderSudoersPreview({
-        service_user: payload.service_user,
-        enabled: false,
-        detail: "VMware ESXi does not use the Linux sudoers/bootstrap path. Save the SSH host, root or key-based auth, and read-only runtime commands directly instead.",
-        content: "# VMware ESXi does not use the Linux sudoers/bootstrap flow.\n# Keep the saved SSH credentials or key directly on the system entry instead.\n",
-      });
+      renderSudoersPreview(
+        bmcOnly
+          ? {
+            service_user: payload.service_user,
+            enabled: false,
+            detail: BMC_ONLY_BOOTSTRAP_NOTE,
+            content: "# No host permissions are needed for a BMC-managed system.\n",
+          }
+          : {
+            service_user: payload.service_user,
+            enabled: false,
+            detail: "VMware ESXi does not use the Linux sudoers/bootstrap path. Save the SSH host, root or key-based auth, and read-only runtime commands directly instead.",
+            content: "# VMware ESXi does not use the Linux sudoers/bootstrap flow.\n# Keep the saved SSH credentials or key directly on the system entry instead.\n",
+          }
+      );
       return;
     }
     if (!bootstrapEnabledForSession()) {
@@ -3967,6 +4088,10 @@
     return value === "generate" || value === "manual" || value === "none" ? value : "reuse";
   }
 
+  function defaultKeyMode() {
+    return state.sshKeys.length ? "reuse" : "generate";
+  }
+
   function normalizeKeyName(value) {
     return String(value || "")
       .trim()
@@ -4025,6 +4150,7 @@
     }
     const selectedKey = getSshKeyByName(elements.setupSshExistingKey?.value);
     if (!selectedKey) {
+      elements.setupSshKeyPath.value = "";
       return;
     }
     elements.setupSshKeyPath.value = selectedKey.runtime_private_path || selectedKey.private_path || elements.setupSshKeyPath.value;
@@ -4155,7 +4281,9 @@
       if (!sshEnabled) {
         elements.setupBootstrapResult.textContent = "Enable SSH enrichment first if you want to use one-time bootstrap.";
       } else if (!bootstrapSupported) {
-        elements.setupBootstrapResult.textContent = "VMware ESXi does not use the one-time Linux service-account bootstrap. Save the SSH host, root or key-based auth, and read-only runtime commands directly instead.";
+        elements.setupBootstrapResult.textContent = setupPlatformUsesBmcOnlyHost()
+          ? BMC_ONLY_BOOTSTRAP_NOTE
+          : "VMware ESXi does not use the one-time Linux service-account bootstrap. Save the SSH host, root or key-based auth, and read-only runtime commands directly instead.";
       } else if (!bootstrapEnabled) {
         elements.setupBootstrapResult.textContent = "Bootstrap is off by default for saved systems. Enable it only when you intend to run one-time service-account setup.";
       }
@@ -4512,10 +4640,10 @@
       elements.setupSshPort.value = "22";
     }
     if (elements.setupSshKeyMode) {
-      elements.setupSshKeyMode.value = "reuse";
+      elements.setupSshKeyMode.value = defaultKeyMode();
     }
     if (elements.setupSshKeyPath) {
-      elements.setupSshKeyPath.value = "/run/ssh/id_truenas";
+      elements.setupSshKeyPath.value = state.sshKeys.length ? "/run/ssh/id_truenas" : "";
     }
     setRedactedSecretField(elements.setupSshPassword, false);
     setRedactedSecretField(elements.setupSshSudoPassword, false);
@@ -4575,7 +4703,7 @@
       elements.setupEsxiHostPrepDetail.textContent = "";
     }
     if (elements.setupResult) {
-      elements.setupResult.textContent = "Saving here updates the mounted config file; restart the read UI after a new system is added so it picks the new list up cleanly.";
+      elements.setupResult.textContent = "Saved systems appear in the main UI after a restart.";
     }
     syncPlatformHelp();
     syncVerifySslHelp();
@@ -4966,7 +5094,11 @@
     }
     const setupPayload = collectSetupPayload();
     if (!platformSupportsBootstrap(setupPayload.platform)) {
-      throw new Error("VMware ESXi does not use the one-time Linux service-account bootstrap path.");
+      throw new Error(
+        setupPlatformUsesBmcOnlyHost(setupPayload.platform)
+          ? BMC_ONLY_BOOTSTRAP_NOTE
+          : "VMware ESXi does not use the one-time Linux service-account bootstrap path."
+      );
     }
     if (!setupPayload.ssh_enabled) {
       throw new Error("Enable SSH enrichment first so the final service-account details are defined.");
@@ -5047,9 +5179,109 @@
     return Object.keys(failures).filter(Boolean).join(",");
   }
 
-  function describeRestartFailures(failureKeys) {
-    const keys = String(failureKeys || "").split(",").map((key) => key.trim()).filter(Boolean);
-    return keys.length ? ` Restart failed: ${keys.join(", ")}.` : "";
+  function maintenanceKeys(value) {
+    const items = Array.isArray(value) ? value : String(value || "").split(",");
+    return items.map((item) => String(item || "").trim()).filter((item) => item && item !== "none");
+  }
+
+  function serviceName(key) {
+    const normalized = String(key || "").trim();
+    if (normalized === "ui") {
+      return "main UI";
+    }
+    if (normalized === "history") {
+      return "history collector";
+    }
+    const containers = Array.isArray(state.runtime?.containers) ? state.runtime.containers : [];
+    const container = containers.find((item) => String(item?.key || "") === normalized);
+    return String(container?.label || normalized || "service");
+  }
+
+  function describeServices(keys) {
+    const names = keys.map((key) => `the ${serviceName(key)}`);
+    if (names.length <= 1) {
+      return names.join("");
+    }
+    return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+  }
+
+  function createServiceActionButton(containerKey, action, label) {
+    const button = document.createElement("button");
+    button.className = "button secondary small";
+    button.type = "button";
+    button.textContent = label;
+    button.addEventListener("click", () => {
+      button.disabled = true;
+      void runRuntimeAction(containerKey, action).finally(() => {
+        button.disabled = false;
+      });
+    });
+    return button;
+  }
+
+  function describeMaintenanceOutcome({ stopped, restarted, failures } = {}) {
+    const failedKeys = maintenanceKeys(failures);
+    const restartedKeys = maintenanceKeys(restarted);
+    const stoppedKeys = maintenanceKeys(stopped);
+    const stillPausedKeys = stoppedKeys.filter((key) => !restartedKeys.includes(key) && !failedKeys.includes(key));
+    if (failedKeys.length) {
+      return {
+        ok: false,
+        sentence: `${describeServices(failedKeys)} did not start again.`,
+        startKeys: failedKeys,
+      };
+    }
+    if (stillPausedKeys.length) {
+      return {
+        ok: false,
+        sentence: `${describeServices(stillPausedKeys)} ${stillPausedKeys.length === 1 ? "is" : "are"} still paused.`,
+        startKeys: stillPausedKeys,
+      };
+    }
+    if (restartedKeys.length) {
+      return {
+        ok: true,
+        sentence: `${describeServices(restartedKeys)} ${restartedKeys.length === 1 ? "was" : "were"} paused and started again.`,
+        startKeys: [],
+      };
+    }
+    return { ok: true, sentence: "", startKeys: [] };
+  }
+
+  function renderMaintenanceResult(element, lead, outcome) {
+    if (!element) {
+      return;
+    }
+    if (outcome.ok) {
+      element.textContent = outcome.sentence
+        ? `${lead}. ${capitalize(outcome.sentence)}`
+        : `${lead}.`;
+      return;
+    }
+    element.textContent = `${lead}, but ${outcome.sentence}`;
+    outcome.startKeys.forEach((key) => {
+      element.append(" ", createServiceActionButton(key, "start", `Start ${serviceName(key)}`));
+    });
+  }
+
+  function capitalize(text) {
+    const value = String(text || "");
+    return value ? value[0].toUpperCase() + value.slice(1) : value;
+  }
+
+  function renderSaveResult(element, detail, payload = {}) {
+    if (payload?.runtime) {
+      state.runtime = payload.runtime;
+      renderRuntimeCards();
+    }
+    if (!element) {
+      return;
+    }
+    element.textContent = String(detail || "Saved.");
+    const restartKeys = maintenanceKeys(payload?.restart_required);
+    if (restartKeys.includes("ui")) {
+      element.append(" ", createServiceActionButton("ui", "restart", "Restart main UI now"));
+    }
   }
 
   function describeApiError(detail) {
@@ -5078,7 +5310,7 @@
   }
 
   async function fetchJson(url, options = {}) {
-    const response = await fetch(url, options);
+    const response = await fetchOrReportStopped(url, options);
     const payload = await readJsonResponse(response);
     if (!response.ok || (payload && payload.ok === false)) {
       throw new Error(describeApiError(payload?.detail) || `Request failed with ${response.status}`);
@@ -5753,16 +5985,16 @@
       anchor.click();
       anchor.remove();
       window.URL.revokeObjectURL(objectUrl);
-      const stopped = response.headers.get("X-Admin-Stopped-Containers") || "none";
-      const restarted = response.headers.get("X-Admin-Restarted-Containers") || "none";
-      const restartFailures = response.headers.get("X-Admin-Restart-Failures") || "";
-      if (elements.backupExportResult) {
-        elements.backupExportResult.textContent = `Exported ${actualPackaging}. Stopped: ${stopped}. Restarted: ${restarted}.${describeRestartFailures(restartFailures)}`;
-      }
-      if (restartFailures) {
-        setBanner(`Full backup exported as ${actualPackaging}, but these containers did not restart: ${restartFailures}. Use the runtime cards to start them.`, "error");
-      } else {
+      const outcome = describeMaintenanceOutcome({
+        stopped: response.headers.get("X-Admin-Stopped-Containers"),
+        restarted: response.headers.get("X-Admin-Restarted-Containers"),
+        failures: response.headers.get("X-Admin-Restart-Failures"),
+      });
+      renderMaintenanceResult(elements.backupExportResult, `Backup saved as ${actualPackaging}`, outcome);
+      if (outcome.ok) {
         setBanner(`Full backup exported as ${actualPackaging}.`, "success");
+      } else {
+        setBanner(`Full backup exported as ${actualPackaging}, but ${outcome.sentence} Use the Start button in the export result.`, "error");
       }
       await refreshState({ quiet: true });
     } catch (error) {
@@ -5828,9 +6060,11 @@
       anchor.click();
       anchor.remove();
       window.URL.revokeObjectURL(objectUrl);
-      const stopped = response.headers.get("X-Admin-Stopped-Containers") || "none";
-      const restarted = response.headers.get("X-Admin-Restarted-Containers") || "none";
-      const restartFailures = response.headers.get("X-Admin-Restart-Failures") || "";
+      const outcome = describeMaintenanceOutcome({
+        stopped: response.headers.get("X-Admin-Stopped-Containers"),
+        restarted: response.headers.get("X-Admin-Restarted-Containers"),
+        failures: response.headers.get("X-Admin-Restart-Failures"),
+      });
       const scrubbed = [];
       if (response.headers.get("X-Debug-Scrub-Secrets") === "true") {
         scrubbed.push("secrets");
@@ -5839,13 +6073,11 @@
         scrubbed.push("disk identifiers");
       }
       const scrubLabel = scrubbed.length ? `Scrubbed ${scrubbed.join(" + ")}` : "Raw";
-      if (elements.debugExportResult) {
-        elements.debugExportResult.textContent = `${scrubLabel} ${actualPackaging} debug bundle exported. Stopped: ${stopped}. Restarted: ${restarted}.${describeRestartFailures(restartFailures)}`;
-      }
-      if (restartFailures) {
-        setBanner(`${scrubLabel} debug bundle exported as ${actualPackaging}, but these containers did not restart: ${restartFailures}. Use the runtime cards to start them.`, "error");
-      } else {
+      renderMaintenanceResult(elements.debugExportResult, `${scrubLabel} ${actualPackaging} debug bundle exported`, outcome);
+      if (outcome.ok) {
         setBanner(`${scrubLabel} debug bundle exported as ${actualPackaging}.`, "success");
+      } else {
+        setBanner(`${scrubLabel} debug bundle exported as ${actualPackaging}, but ${outcome.sentence} Use the Start button in the export result.`, "error");
       }
       await refreshState({ quiet: true });
     } catch (error) {
@@ -5932,20 +6164,23 @@
       }
       state.systems = Array.isArray(payload.systems) ? payload.systems : state.systems;
       state.defaultSystemId = payload.default_system_id || state.defaultSystemId;
-      const importRestartFailures = restartFailureKeys(payload.restart_failures);
+      const outcome = describeMaintenanceOutcome({
+        stopped: payload.stopped_containers,
+        restarted: payload.restarted_containers,
+        failures: restartFailureKeys(payload.restart_failures),
+      });
       const preservedAbsentGroups = Array.isArray(payload.preserved_absent_groups)
         ? payload.preserved_absent_groups.filter(Boolean)
         : [];
       const preservedAbsentDetail = preservedAbsentGroups.length
         ? ` Preserved live data for source-absent groups: ${preservedAbsentGroups.join(", ")}.`
         : "";
-      if (elements.backupImportResult) {
-        const stopped = Array.isArray(payload.stopped_containers) ? payload.stopped_containers.join(", ") || "none" : "none";
-        const restarted = Array.isArray(payload.restarted_containers) ? payload.restarted_containers.join(", ") || "none" : "none";
-        elements.backupImportResult.textContent = `Imported ${file.name}. Stopped: ${stopped}. Restarted: ${restarted}.${describeRestartFailures(importRestartFailures)}${preservedAbsentDetail}`;
+      renderMaintenanceResult(elements.backupImportResult, `Imported ${file.name}`, outcome);
+      if (elements.backupImportResult && preservedAbsentDetail) {
+        elements.backupImportResult.append(preservedAbsentDetail);
       }
-      if (importRestartFailures) {
-        setBanner(`Full backup imported from ${file.name}, but these containers did not restart: ${importRestartFailures}. Use the runtime cards to start them.${preservedAbsentDetail}`, "error");
+      if (!outcome.ok) {
+        setBanner(`Full backup imported from ${file.name}, but ${outcome.sentence} Use the Start button in the import result.${preservedAbsentDetail}`, "error");
       } else if (preservedAbsentGroups.length) {
         setBanner(`Full backup imported from ${file.name}.${preservedAbsentDetail}`, "info");
       } else {
@@ -5992,9 +6227,7 @@
       } else {
         renderAll();
       }
-      if (elements.setupResult) {
-        elements.setupResult.textContent = payload.detail || "Demo builder system created.";
-      }
+      renderSaveResult(elements.setupResult, payload.detail || "Demo builder system created.", payload);
       setBanner(`Demo builder system ${payload.system?.label || "saved"}.`, "success");
     } catch (error) {
       if (elements.setupResult) {
@@ -6271,6 +6504,14 @@
       setBanner("System label and host are required before saving.", "error");
       return;
     }
+    if (
+      payload.ssh_enabled
+      && normalizeKeyMode(elements.setupSshKeyMode?.value) === "reuse"
+      && !getSshKeyByName(elements.setupSshExistingKey?.value)
+    ) {
+      setBanner("Choose or create an SSH key first.", "error");
+      return;
+    }
     if (elements.setupCreateButton) {
       elements.setupCreateButton.disabled = true;
     }
@@ -6286,18 +6527,23 @@
       state.loadedSystemId = result.system?.id || state.loadedSystemId;
       state.selectedExistingSystemId = result.system?.id || state.selectedExistingSystemId;
       state.defaultSystemId = result.default_system_id || state.defaultSystemId;
-      if (elements.setupResult) {
-        elements.setupResult.textContent = result.detail || `${result.updated_existing ? "Updated" : "Created"} ${result.system?.label || payload.label}. Restart the read UI to load the updated config cleanly.`;
-      }
+      renderSaveResult(
+        elements.setupResult,
+        result.detail || `${result.updated_existing ? "Updated" : "Created"} ${result.system?.label || payload.label}. Restart the main UI to show it.`,
+        result
+      );
       updateCreateButton();
       setBanner(`${result.updated_existing ? "Updated" : "Created"} system ${result.system?.label || payload.label}.`, "success");
       await refreshState({ quiet: true });
       void fetchStorageViewCandidates({ quiet: true });
     } catch (error) {
+      // The form draft is left untouched so a rejected save can be fixed and retried.
+      const reason = error.message || String(error);
+      const keptDraftNote = /only accepts changes from/.test(reason) ? " Your entries are still in the form." : "";
       if (elements.setupResult) {
-        elements.setupResult.textContent = `System setup failed: ${error.message || error}`;
+        elements.setupResult.textContent = `System setup failed: ${reason}${keptDraftNote}`;
       }
-      setBanner(`System setup failed: ${error.message || error}`, "error");
+      setBanner(`System setup failed: ${reason}${keptDraftNote}`, "error");
     } finally {
       if (elements.setupCreateButton) {
         elements.setupCreateButton.disabled = false;
@@ -6364,9 +6610,11 @@
         renderAll();
       }
 
-      if (elements.setupResult) {
-        elements.setupResult.textContent = payload.detail || `Removed ${payload.deleted_label || selectedSystem.label || selectedSystem.id}. Restart the read UI when you are ready to drop it from the live runtime list too.`;
-      }
+      renderSaveResult(
+        elements.setupResult,
+        payload.detail || `Removed ${payload.deleted_label || selectedSystem.label || selectedSystem.id}. Restart the main UI to remove it there too.`,
+        payload
+      );
       if (elements.existingSystemDeleteHistoryToggle) {
         elements.existingSystemDeleteHistoryToggle.checked = false;
       }
@@ -6470,9 +6718,7 @@
       } else {
         renderProfileBuilder();
       }
-      if (elements.profileBuilderResult) {
-        elements.profileBuilderResult.textContent = payload.detail || `Saved custom profile ${savedProfileId}.`;
-      }
+      renderSaveResult(elements.profileBuilderResult, payload.detail || `Saved custom profile ${savedProfileId}.`, payload);
       setBanner(
         payload.updated_existing
           ? `Updated custom profile ${payload.profile?.label || savedProfileId}.`
@@ -6498,9 +6744,18 @@
       setBanner("Load a saved custom profile into the builder first if you want to delete it.", "error");
       return;
     }
+    const referenceCount = profileReferenceCount(profile);
+    if (referenceCount > 0) {
+      const message = `${profile.label || profile.id} is ${describeProfileReferences(referenceCount).toLowerCase()}. Move them to another profile before deleting it.`;
+      if (elements.profileBuilderResult) {
+        elements.profileBuilderResult.textContent = message;
+      }
+      setBanner(message, "error");
+      return;
+    }
 
     const confirmation = window.confirm(
-      `Delete custom profile ${profile.label || profile.id}?\n\nThis removes it from profiles.yaml. Any saved systems or storage views still using it will block deletion until they are moved to another profile.`
+      `Delete custom profile ${profile.label || profile.id}?\n\nThis removes it from profiles.yaml.`
     );
     if (!confirmation) {
       return;
@@ -6520,9 +6775,7 @@
       state.loadedBuilderProfileId = "";
       await refreshState({ quiet: true });
       resetProfileBuilder({ keepResult: true });
-      if (elements.profileBuilderResult) {
-        elements.profileBuilderResult.textContent = payload.detail || `Deleted custom profile ${profile.label || profile.id}.`;
-      }
+      renderSaveResult(elements.profileBuilderResult, payload.detail || `Deleted custom profile ${profile.label || profile.id}.`, payload);
       setBanner(`Deleted custom profile ${profile.label || profile.id}.`, "success");
     } catch (error) {
       if (elements.profileBuilderResult) {
@@ -7045,7 +7298,7 @@
     elements.debugScrubIdentifiersToggle.checked = state.backupDefaults.debug_scrub_disk_identifiers !== false;
   }
   if (elements.debugExportStopToggle) {
-    elements.debugExportStopToggle.checked = state.backupDefaults.debug_stop_services !== false;
+    elements.debugExportStopToggle.checked = Boolean(state.backupDefaults.debug_stop_services);
   }
   if (elements.debugExportRestartToggle) {
     elements.debugExportRestartToggle.checked = Boolean(state.backupDefaults.debug_restart_services);
@@ -7054,7 +7307,10 @@
     elements.setupPlatform.value = "core";
   }
   if (elements.setupSshKeyMode) {
-    elements.setupSshKeyMode.value = "reuse";
+    elements.setupSshKeyMode.value = defaultKeyMode();
+  }
+  if (elements.setupSshKeyPath && !state.sshKeys.length) {
+    elements.setupSshKeyPath.value = "";
   }
   if (elements.setupGenerateKeyName) {
     elements.setupGenerateKeyName.value = suggestedKeyName();

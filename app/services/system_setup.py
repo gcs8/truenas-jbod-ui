@@ -229,6 +229,12 @@ def default_ssh_commands_for_platform(platform: str) -> list[str]:
     return list(SSHConfig().commands)
 
 
+SECRET_REUSE_MISMATCH_DETAIL = (
+    "You changed the host, user, or TLS settings, so the saved API key or password "
+    "cannot be reused. Enter it again and save."
+)
+
+
 class SystemSetupService:
     def __init__(self, config_path: str) -> None:
         self.config_path = Path(config_path)
@@ -343,9 +349,7 @@ class SystemSetupService:
                     tls_server_name=tls_server_name,
                 )
                 if not same_credential_authority(requested_authority, saved_authority):
-                    raise ValueError(
-                        "A saved secret can only be reused with its saved connection settings."
-                    )
+                    raise ValueError(SECRET_REUSE_MISMATCH_DETAIL)
 
             preserving_ssh_secret = any(
                 incoming == PRESERVE_SECRET_SENTINEL
@@ -375,9 +379,7 @@ class SystemSetupService:
                     strict_host_key_checking=payload.ssh_strict_host_key_checking,
                 )
                 if not same_credential_authorities(requested_authorities, saved_authorities):
-                    raise ValueError(
-                        "A saved secret can only be reused with its saved connection settings."
-                    )
+                    raise ValueError(SECRET_REUSE_MISMATCH_DETAIL)
 
             if payload.bmc_password == PRESERVE_SECRET_SENTINEL:
                 saved_authority = (
@@ -397,9 +399,7 @@ class SystemSetupService:
                     verify_tls=payload.bmc_verify_ssl,
                 )
                 if not same_credential_authority(requested_authority, saved_authority):
-                    raise ValueError(
-                        "A saved secret can only be reused with its saved connection settings."
-                    )
+                    raise ValueError(SECRET_REUSE_MISMATCH_DETAIL)
 
             def resolve_secret(incoming: str | None, existing: str | None = None) -> str:
                 return resolve_preserved_secret(incoming, existing)

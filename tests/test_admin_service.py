@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import inspect
 import json
 import secrets
 import shlex
@@ -43,6 +44,7 @@ from admin_service.main import enrich_quantastor_nodes_from_ssh
 from admin_service.main import get_esxi_host_prep_service
 from admin_service.main import get_history_store
 from admin_service.main import observe_backup_route
+from admin_service.main import resolve_public_origin
 from admin_service.main import stream_limited_request_body_to_file
 from admin_service.main import templates as admin_templates
 from app.config import (
@@ -2113,7 +2115,9 @@ class AdminStatePayloadTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["configuration_warnings"], [])
         self.assertEqual(payload["app_version"], __version__)
-        self.assertEqual(payload["admin"]["public_origin"], "http://localhost:8082")
+        self.assertIsNone(payload["admin"]["public_origin"])
+        self.assertFalse(payload["backup_defaults"]["debug_stop_services"])
+        self.assertTrue(payload["backup_defaults"]["debug_restart_services"])
         self.assertEqual(payload["default_system_id"], "archive-core")
         self.assertEqual(payload["systems"][0]["truenas_host"], "https://archive-core.local")
         self.assertFalse(payload["systems"][0]["verify_ssl"])
@@ -2709,6 +2713,31 @@ class AdminStatePayloadTests(unittest.TestCase):
         self.assertEqual(views[0]["template_id"], "nvme-carrier-4")
 
 
+    def test_resolve_public_origin_only_offers_a_configured_address(self) -> None:
+        request = make_request(host="192.0.2.10", port=8082)
+
+        self.assertIsNone(resolve_public_origin(AdminSettings(auto_stop_seconds=0), request))
+        self.assertEqual(
+            resolve_public_origin(
+                AdminSettings(auto_stop_seconds=0, public_origin="http://nas.example.test:8082/"),
+                request,
+            ),
+            "http://nas.example.test:8082",
+        )
+
+    def test_debug_export_route_defaults_to_not_pausing_services(self) -> None:
+        debug_route = next(route for route in admin_app.routes if route.path == "/api/admin/debug/export")
+        backup_route = next(route for route in admin_app.routes if route.path == "/api/admin/backup/export")
+        import_route = next(route for route in admin_app.routes if route.path == "/api/admin/backup/import")
+
+        for route in (debug_route, backup_route):
+            with self.subTest(path=route.path):
+                parameters = inspect.signature(route.endpoint).parameters
+                self.assertIs(parameters["stop_services"].default.default, False)
+                self.assertIs(parameters["restart_services"].default.default, True)
+        self.assertIs(inspect.signature(import_route.endpoint).parameters["stop_services"].default.default, True)
+
+
 class AdminSudoPreviewRouteTests(unittest.TestCase):
     def test_runtime_behavior_route_marks_read_ui_restart(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/runtime-behavior")
@@ -2739,6 +2768,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertEqual(payload["runtime_behavior"]["fields"][0]["key"], "source_bundle_cache_ttl_seconds")
         save_overrides.assert_called_once_with(settings, {"source_bundle_cache_ttl_seconds": 120})
         runtime_service.mark_restart_required.assert_called_once_with(("ui",))
+        self.assertEqual(payload["restart_required"], ["ui"])
+        self.assertEqual(payload["detail"], "Runtime behavior overrides saved. Restart the main UI to apply them.")
 
     def test_create_demo_system_route_accepts_missing_payload_and_marks_ui_restart(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/system-setup/demo")
@@ -2806,6 +2837,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertEqual(payload["system"]["id"], "demo-builder-lab")
         self.assertEqual(payload["profile"]["id"], "demo-builder-lab-chassis")
         runtime_service.mark_restart_required.assert_called_once_with(("ui",))
+        self.assertEqual(payload["restart_required"], ["ui"])
+        self.assertEqual(payload["detail"], "Demo builder system Demo Builder Lab saved. Restart the main UI to show it.")
 
     def test_delete_system_route_returns_updated_system_list(self) -> None:
         route = next(
@@ -4630,7 +4663,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         assert captured is not None
         self.assertEqual(captured.status_code, 400)
         detail = str(captured.detail)
-        self.assertIn("saved connection settings", detail)
+        self.assertIn("cannot be reused. Enter it again and save.", detail)
         self.assertNotIn(saved_api_password, detail)
         self.assertNotIn(fresh_ssh_password, detail)
 

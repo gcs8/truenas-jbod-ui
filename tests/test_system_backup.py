@@ -5985,7 +5985,7 @@ class SystemSetupServiceTests(unittest.TestCase):
                     **update,
                 }
 
-                with self.assertRaisesRegex(ValueError, "saved connection settings"):
+                with self.assertRaisesRegex(ValueError, "cannot be reused"):
                     SystemSetupService(str(config_path)).save_system(SystemSetupRequest(**request_values))
 
                 self.assertEqual(yaml.safe_load(config_path.read_text(encoding="utf-8")), original)
@@ -6034,7 +6034,7 @@ class SystemSetupServiceTests(unittest.TestCase):
                     **update,
                 }
 
-                with self.assertRaisesRegex(ValueError, "saved connection settings"):
+                with self.assertRaisesRegex(ValueError, "cannot be reused"):
                     SystemSetupService(str(config_path)).save_system(SystemSetupRequest(**request_values))
 
                 self.assertEqual(config_path.read_bytes(), original_bytes)
@@ -6147,7 +6147,7 @@ class SystemSetupServiceTests(unittest.TestCase):
                     **update,
                 }
 
-                with self.assertRaisesRegex(ValueError, "saved connection settings"):
+                with self.assertRaisesRegex(ValueError, "cannot be reused"):
                     SystemSetupService(str(config_path)).save_system(SystemSetupRequest(**request_values))
 
                 self.assertEqual(yaml.safe_load(config_path.read_text(encoding="utf-8")), original)
