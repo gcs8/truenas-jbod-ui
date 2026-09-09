@@ -32,18 +32,33 @@ class ReleaseStatusTests(unittest.TestCase):
         self.assertIn("# Release Notes - v0.23.0", release_notes)
         self.assertIn("two synthetic spares", release_notes)
 
-        release_url = "https://github.com/gcs8/truenas-jbod-ui/releases/tag/v0.22.2"
-        for current_doc in (roadmap, wiki_home):
-            with self.subTest(document=current_doc[:40]):
-                self.assertIn("v0.22.2", current_doc)
-                self.assertIn("latest published release", current_doc)
-                self.assertIn("2026-09-01", current_doc)
-                self.assertIn(release_url, current_doc)
-                self.assertNotIn("v0.22.1` is the latest published release", current_doc)
+        self.assertIn("`v0.23.0` is the latest published release", roadmap)
+        self.assertIn("2026-09-09", roadmap)
+        self.assertIn("https://github.com/gcs8/truenas-jbod-ui/releases/tag/v0.23.0", roadmap)
+        self.assertIn("docs/archive/ROADMAP_HISTORY.md", roadmap)
+        self.assertNotIn("v0.22.2` is the latest published release", roadmap)
 
-    def test_post_v0222_roadmap_reconciles_completed_follow_up_work(self) -> None:
+        release_url = "https://github.com/gcs8/truenas-jbod-ui/releases/tag/v0.22.2"
+        self.assertIn("v0.22.2", wiki_home)
+        self.assertIn("latest published release", wiki_home)
+        self.assertIn("2026-09-01", wiki_home)
+        self.assertIn(release_url, wiki_home)
+        self.assertNotIn("v0.22.1` is the latest published release", wiki_home)
+
+    def test_roadmap_is_short_and_points_at_the_archived_history(self) -> None:
         repository = Path(__file__).resolve().parents[1]
         roadmap = (repository / "docs" / "ROADMAP.md").read_text(encoding="utf-8")
+        history = repository / "docs" / "archive" / "ROADMAP_HISTORY.md"
+
+        self.assertLessEqual(len(roadmap.splitlines()), 60)
+        self.assertTrue(history.is_file())
+        for stale in ("Current status: shipped", "HANDOFF.md", "TODO.md", "V0_3_X_PLAN"):
+            with self.subTest(stale=stale):
+                self.assertNotIn(stale, roadmap)
+
+    def test_post_v0222_roadmap_history_reconciles_completed_follow_up_work(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        history = (repository / "docs" / "archive" / "ROADMAP_HISTORY.md").read_text(encoding="utf-8")
 
         for marker in (
             "Issue #119 closed",
@@ -53,19 +68,20 @@ class ReleaseStatusTests(unittest.TestCase):
             "#162",
         ):
             with self.subTest(marker=marker):
-                self.assertIn(marker, roadmap)
+                self.assertIn(marker, history)
 
-        self.assertNotIn("issue #119 and draft PR #121 remains", roadmap)
-        self.assertNotIn("publication also remains v0.22.3 work", roadmap)
+        self.assertNotIn("issue #119 and draft PR #121 remains", history)
+        self.assertNotIn("publication also remains v0.22.3 work", history)
 
     def test_roadmap_does_not_claim_absent_v011_plan_is_preserved_locally(self) -> None:
         repository = Path(__file__).resolve().parents[1]
-        roadmap = (repository / "docs" / "ROADMAP.md").read_text(encoding="utf-8")
-
-        self.assertNotRegex(
-            roadmap,
-            r"artifacts/deferred-docs/V0_11_0_PLAN\.md|preserved locally",
-        )
+        for relative in ("docs/ROADMAP.md", "docs/archive/ROADMAP_HISTORY.md"):
+            text = (repository / relative).read_text(encoding="utf-8")
+            with self.subTest(document=relative):
+                self.assertNotRegex(
+                    text,
+                    r"artifacts/deferred-docs/V0_11_0_PLAN\.md|preserved locally",
+                )
 
     def test_unreleased_changelog_records_selected_post_v0222_changes(self) -> None:
         repository = Path(__file__).resolve().parents[1]
