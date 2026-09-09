@@ -6,7 +6,7 @@ on:
       - main
   push:
     branches:
-      - "**"
+      - main
   workflow_dispatch:
 
 permissions:
@@ -602,7 +602,7 @@ jobs:
           rm -rf "$fixture_root"
           mkdir -p "$fixture_root"
           python scripts/build_current_source_browser_fixture.py --output "$SLOT_FOCUS_ARTIFACT"
-          npx playwright test qa/public-demo.spec.js --retries=0
+          npx playwright test qa/public-demo.spec.js qa/saved-view-selection.spec.js --retries=0
           status="$(git status --short)"
           if [ -n "$status" ]; then
             printf '%s\n' "$status"

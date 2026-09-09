@@ -165,7 +165,57 @@ class ChangelogEntryGateTests(unittest.TestCase):
         self.assertTrue(result.ok, result.messages)
         self.assertIn("dependencies", result.messages[0])
 
-    def test_change_outside_operator_visible_paths_requires_escape_label(self) -> None:
+    def test_change_outside_operator_visible_paths_passes_with_a_notice(self) -> None:
+        self._write("tests/test_service.py", "def test_more() -> None:\n    pass\n")
+        self._commit("test: more coverage")
+
+        result = self._evaluate()
+
+        self.assertTrue(result.ok, result.messages)
+        joined = "\n".join(result.messages)
+        self.assertIn("No operator-visible paths changed for #42", joined)
+        self.assertIn("no CHANGELOG entry is required", joined)
+        self.assertIn("no-changelog", joined)
+
+    def test_bullet_appended_to_a_shipped_release_section_fails_with_the_fix(self) -> None:
+        text = (self.repo / "CHANGELOG.md").read_text(encoding="utf-8")
+        self._write("CHANGELOG.md", text.replace("## Unreleased", "## v0.2.0 - 2026-02-01", 1))
+        self._commit("chore: cut v0.2.0")
+        _git(self.repo, "branch", "-f", "main", "topic")
+
+        self._write("app/service.py", "VALUE = 2\n")
+        text = (self.repo / "CHANGELOG.md").read_text(encoding="utf-8")
+        self._write(
+            "CHANGELOG.md",
+            text.replace("### Fixed\n\n", "### Fixed\n\n- Bumped the value (#42).\n", 1),
+        )
+        self._commit("fix: bump value")
+
+        result = self._evaluate()
+
+        self.assertFalse(result.ok)
+        joined = "\n".join(result.messages)
+        self.assertIn("has no '## Unreleased' section", joined)
+        self.assertIn("already shipped '## v0.2.0 - 2026-02-01' section", joined)
+        self.assertIn("Insert '## Unreleased'", joined)
+
+    def test_missing_entry_names_the_absent_unreleased_section(self) -> None:
+        text = (self.repo / "CHANGELOG.md").read_text(encoding="utf-8")
+        self._write("CHANGELOG.md", text.replace("## Unreleased", "## v0.2.0 - 2026-02-01", 1))
+        self._commit("chore: cut v0.2.0")
+        _git(self.repo, "branch", "-f", "main", "topic")
+
+        self._write("app/service.py", "VALUE = 2\n")
+        self._commit("fix: bump value")
+
+        result = self._evaluate()
+
+        self.assertFalse(result.ok)
+        joined = "\n".join(result.messages)
+        self.assertIn("CHANGELOG.md needs an entry for #42", joined)
+        self.assertIn("has no '## Unreleased' section yet", joined)
+
+    def test_excluded_and_unlisted_paths_together_still_pass_without_a_label(self) -> None:
         self._write("tests/test_service.py", "def test_more() -> None:\n    pass\n")
         self._write("README.md", "# readme\n")
         self._write("docs/RELEASE_WRAP_0.1.0.md", "wrap\n")
@@ -173,8 +223,8 @@ class ChangelogEntryGateTests(unittest.TestCase):
 
         result = self._evaluate()
 
-        self.assertFalse(result.ok)
-        self.assertIn("no-changelog", "\n".join(result.messages))
+        self.assertTrue(result.ok, result.messages)
+        self.assertIn("no CHANGELOG entry is required", "\n".join(result.messages))
 
     def test_change_outside_operator_visible_paths_with_escape_label_passes(self) -> None:
         self._write("tests/test_service.py", "def test_more() -> None:\n    pass\n")
