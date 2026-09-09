@@ -73,9 +73,21 @@ class SlotDetailStore:
 
         with self._lock:
             current = self.load_all()
+            merged = current.copy()
             for entry in entries:
-                current[self._slot_key(entry.system_id, entry.enclosure_id, entry.slot)] = entry
-            self._write(current)
+                merged[self._slot_key(entry.system_id, entry.enclosure_id, entry.slot)] = entry
+            # Compare final full JSON payloads, including freshness and identity.
+            # Model equality alone conflates JSON booleans, integers and floats.
+            if all(
+                key in current and (
+                    entry is current[key]
+                    or json.dumps(entry.model_dump(mode="json"), sort_keys=True)
+                    == json.dumps(current[key].model_dump(mode="json"), sort_keys=True)
+                )
+                for key, entry in merged.items()
+            ):
+                return
+            self._write(merged)
 
     def prune_unknown_systems(self, valid_system_ids: set[str]) -> int:
         with self._lock:
