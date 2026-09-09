@@ -3564,13 +3564,16 @@ class InventoryService:
             loaded_slot_entries = self.slot_detail_store.load_all()
 
         resolved_enclosure_id = normalize_text(selected_enclosure_id)
-        default_snapshot = self._cache.get("__default__")
+        # Route tests build this service without __init__, so the snapshot
+        # cache may be absent here.
+        snapshots = getattr(self, "_cache", {})
+        default_snapshot = snapshots.get("__default__")
         if resolved_enclosure_id is None and default_snapshot is not None:
             resolved_enclosure_id = normalize_text(default_snapshot.selected_enclosure_id)
 
         candidate_enclosure_ids = {
             enclosure_id
-            for snapshot in self._cache.values()
+            for snapshot in snapshots.values()
             if (enclosure_id := normalize_text(snapshot.selected_enclosure_id)) is not None
         }
         cache_candidates: dict[tuple[str, int], SmartCacheKey] = {}
