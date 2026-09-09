@@ -141,6 +141,83 @@ test("ordinary evidence-scope notes do not turn a healthy map partial", () => {
   assert.equal(status.statusTone, "info");
 });
 
+function loadDiskRenderers({ metrics = {}, slot = null, label = "Disk 1" } = {}) {
+  const trace = { id: "bay:0", kind: "bay", label, slots: [0], node_ids: [], link_ids: [], metrics };
+  const diskNode = { id: "bay:0", kind: "bay", label, related_slots: [0], metrics };
+  trace.node_ids = [diskNode.id];
+  const fabric = { available: true, traces: [trace], nodes: [diskNode], links: [], aliases: {} };
+  const elements = new Map();
+  const sandbox = vm.createContext({
+    URLSearchParams,
+    window: { location: { search: "" }, SAS_FABRIC_BOOTSTRAP: {
+      snapshot: { slots: slot ? [{ slot: 0, ...slot }] : [] }, fabric,
+    } },
+    document: {
+      getElementById(id) {
+        if (!elements.has(id)) elements.set(id, { innerHTML: "", textContent: "" });
+        return elements.get(id);
+      },
+      querySelectorAll: () => [],
+    },
+  });
+  // Load all production renderer functions, but not DOM event wiring or startup I/O.
+  const end = FABRIC_SOURCE.indexOf("  elements.modeButtons.forEach((button) => {", FABRIC_SOURCE.indexOf("  function render()"));
+  assert.ok(end > 0);
+  vm.runInContext(`${FABRIC_SOURCE.slice(0, end)}
+    state.selectedTraceId = "bay:0";
+    state.selectedDiskTraceId = "bay:0";
+    window.renderTest = { renderInspector, renderDiskPathMode, renderFocusStrip, renderTraceSummaryButton, renderBayChips, renderDiskPathBayChip, state };
+  })();`, sandbox);
+  return { ...sandbox.window.renderTest, fabric, trace, elements };
+}
+
+function visibleMarkup(markup) {
+  return markup.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+}
+
+for (const [name, payload] of [
+  ["trace provenance without snapshot", { metrics: { physical_location_known: false } }],
+  ["slot provenance", { slot: { physical_location_known: false } }],
+  ["trace denial overrides physical slot", { metrics: { physical_location_known: false }, slot: { physical_location_known: true } }],
+  ["slot denial overrides physical trace", { metrics: { physical_location_known: true }, slot: { physical_location_known: false } }],
+  ["virtual slot provenance", { slot: { raw_status: { virtual_enclosure: true } } }],
+  ["missing provenance", {}],
+]) {
+  test(`disk inspector and siblings do not assert physical bays: ${name}`, () => {
+    const ui = loadDiskRenderers(payload);
+    ui.renderInspector(ui.fabric);
+    assert.equal(ui.elements.get("fabric-inspector-title").textContent, "Selected Disk 1");
+    const inspector = ui.elements.get("fabric-inspector-body").innerHTML;
+    assert.match(inspector, /Selected Disk<\/span>/);
+    assert.match(inspector, /<strong>Disk 1<\/strong>/);
+    assert.doesNotMatch(visibleMarkup(inspector), /\bbays?\b|\bbackplane\b/i);
+    assert.match(inspector, /data-fabric-alias-edit="bay:0"/);
+    const diskPath = ui.renderDiskPathMode(ui.fabric);
+    assert.match(diskPath, /<strong>Disk 1<\/strong>/);
+    assert.doesNotMatch(visibleMarkup(diskPath), /\bBays?\b|\bBackplane\b/);
+    ui.renderFocusStrip(ui.fabric);
+    assert.doesNotMatch(visibleMarkup(ui.elements.get("fabric-focus-strip").innerHTML), /\bBay\b/);
+    assert.doesNotMatch(visibleMarkup(ui.renderTraceSummaryButton(ui.trace)), /\bBay\b/);
+    assert.doesNotMatch(ui.renderBayChips([0]), /title="Bay /);
+    assert.doesNotMatch(ui.renderDiskPathBayChip(0, 0, new Set([0])), /title="Bay /);
+    ui.state.selectedTraceId = null;
+    ui.state.selectedNodeId = "bay:0";
+    ui.renderInspector(ui.fabric);
+    assert.equal(ui.elements.get("fabric-inspector-title").textContent, "Selected Disk");
+    assert.doesNotMatch(visibleMarkup(ui.elements.get("fabric-inspector-body").innerHTML), /\bbays?\b/i);
+  });
+}
+
+test("known physical disk keeps bay labels and alias identity", () => {
+  const ui = loadDiskRenderers({ slot: { physical_location_known: true }, label: "Bay 00" });
+  ui.renderInspector(ui.fabric);
+  assert.equal(ui.elements.get("fabric-inspector-title").textContent, "Selected Bay 00");
+  assert.match(ui.elements.get("fabric-inspector-body").innerHTML, /Selected Bay<\/span>/);
+  assert.match(ui.renderDiskPathMode(ui.fabric), /<strong>Bay 00<\/strong>/);
+  assert.match(ui.renderDiskPathMode(ui.fabric), /Backplane Zone/);
+  assert.match(ui.elements.get("fabric-inspector-body").innerHTML, /data-fabric-alias-edit="bay:0"/);
+});
+
 test("renderStatus delegates available payload wording to fabricTrustStatus", () => {
   assert.match(functionSource("renderStatus"), /fabricTrustStatus\(fabric, copy\.statusBase\)/);
 });
