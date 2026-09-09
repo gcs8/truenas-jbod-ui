@@ -341,8 +341,16 @@
         }
         if (!response.ok || payload?.ok === false) {
           const error = new Error(payload?.detail || `Refresh failed with ${response.status}`);
-          // A gateway/server error can arrive after the collection started.
-          error.confirmedFailure = response.status < 500;
+          // Only the refresh handler's mode-bound failure envelope confirms
+          // a completed collection failure. Generic 5xx/gateway errors do not.
+          const applicationFailure = response.status === 500
+            && payload?.ok === false
+            && payload.mode === mode
+            && payload.detail === `History ${mode} refresh failed; see service logs.`
+            && typeof payload.collector?.collector_running === "boolean"
+            && typeof payload.collector?.collection_running === "boolean"
+            && payload.collector.last_error === payload.detail;
+          error.confirmedFailure = response.status < 500 || applicationFailure;
           throw error;
         }
         if (payload?.ok !== true) throw new Error("Unconfirmed refresh response");

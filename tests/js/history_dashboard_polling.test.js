@@ -207,6 +207,81 @@ test("explicit refresh refusal preserves detail and restores buttons", async () 
   assert.equal(d.element("history-refresh-full").disabled, false);
 });
 
+// Canonical HTTP 500 envelope from main.refresh_history's collection-failure
+// handler, also asserted by test_history_refresh_endpoint_returns_json_error_on_collection_failure.
+const failureEnvelope = require("../fixtures/history_refresh_failure.json");
+const applicationFailure = mode => ({
+  ...failureEnvelope,
+  mode,
+  detail: `History ${mode} refresh failed; see service logs.`,
+  collector: {
+    ...failureEnvelope.collector,
+    last_error: `History ${mode} refresh failed; see service logs.`,
+  },
+});
+
+for (const mode of ["fast", "full"]) {
+  test(`confirmed ${mode} application failure restores both buttons without retrying`, async () => {
+    const d = dashboard();
+    await d.click(mode);
+    await d.reply(0, applicationFailure(mode), 500);
+    assert.equal(d.element("history-refresh-status").textContent,
+      `Refresh failed: History ${mode} refresh failed; see service logs.`);
+    assert.equal(d.element("history-refresh-fast").disabled, false);
+    assert.equal(d.element("history-refresh-full").disabled, false);
+    await d.advance(30000);
+    assert.equal(d.requests.filter(r => r.options.method === "POST").length, 1);
+    await d.click(mode);
+    assert.equal(d.requests.filter(r => r.options.method === "POST").length, 2,
+      "only an explicit new click may retry a confirmed failure");
+  });
+}
+
+for (const [label, payload, code] of [
+  ["generic JSON 500", { ok: false, detail: "Internal Server Error" }, 500],
+  ["null JSON 500", null, 500],
+  ["wrong mode", applicationFailure("fast"), 500],
+  ["missing collector", { ...applicationFailure("full"), collector: undefined }, 500],
+  ["malformed collector", { ...applicationFailure("full"), collector: { collector_running: "true" } }, 500],
+  ["malformed collection state", { ...applicationFailure("full"), collector: { ...failureEnvelope.collector, collection_running: "false" } }, 500],
+  ["unbound collector error", { ...applicationFailure("full"), collector: { ...failureEnvelope.collector, last_error: "Gateway failure" } }, 500],
+  ["noncanonical detail", { ...applicationFailure("full"), detail: "Gateway failure" }, 500],
+  ["missing failure flag", { ...applicationFailure("full"), ok: undefined }, 500],
+  ["missing detail", { ...applicationFailure("full"), detail: undefined }, 500],
+  ["gateway status", applicationFailure("full"), 504],
+]) {
+  test(`${label} is not proof of completed application failure`, async () => {
+    const d = dashboard();
+    await d.click("full");
+    await d.reply(0, payload, code);
+    assert.match(d.element("history-refresh-status").textContent, /outcome unknown/i);
+    assert.equal(d.element("history-refresh-fast").disabled, true);
+    assert.equal(d.element("history-refresh-full").disabled, true);
+    await d.advance(30000);
+    await d.click("full");
+    assert.equal(d.requests.filter(r => r.options.method === "POST").length, 1);
+  });
+}
+
+for (const malformedBody of [false, true]) {
+  test(`${malformedBody ? "unreadable gateway body" : "network rejection"} keeps the write outcome unknown`, async () => {
+    const d = dashboard();
+    await d.click("full");
+    if (malformedBody) {
+      d.requests[0].resolve({ ok: false, status: 500, text: async () => "<html>Gateway error</html>" });
+    } else {
+      d.requests[0].reject(new TypeError("Failed to fetch"));
+    }
+    await flush();
+    assert.match(d.element("history-refresh-status").textContent, /outcome unknown/i);
+    assert.equal(d.element("history-refresh-fast").disabled, true);
+    assert.equal(d.element("history-refresh-full").disabled, true);
+    await d.advance(30000);
+    await d.click("fast");
+    assert.equal(d.requests.filter(r => r.options.method === "POST").length, 1);
+  });
+}
+
 test("template labels initial values as snapshots without depending on JavaScript", () => {
   const template = fs.readFileSync(path.resolve(__dirname, "../../history_service/templates/dashboard.html"), "utf8");
   assert.match(template, /id="history-collector-freshness"[^>]*>Collector status snapshot at page load/);
