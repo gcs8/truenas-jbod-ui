@@ -30,6 +30,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Clarified history status labels and timestamps, distinguished missing counts
+  from zero, and added semantic label/value associations (#470).
 - Bounded history dashboard polling, rejected stale responses, and marked
   retained values stale after failed checks. (#420)
 
