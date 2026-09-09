@@ -265,6 +265,14 @@ def index_request(app) -> Request:
 
 
 class ReadUIAuthorizationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # The upgrade-notice dismiss route writes a version record; keep it out of the checkout.
+        data_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(data_dir.cleanup)
+        patcher = patch.object(app_main, "upgrade_notice_data_dir", return_value=Path(data_dir.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def make_app(
         self,
         *,
