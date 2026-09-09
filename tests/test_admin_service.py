@@ -57,7 +57,7 @@ from app.config import (
 )
 from app.main import app as main_app
 from app.main import resolve_admin_launch_url
-from app.main import snapshot_state_busy_exception_handler
+from app.main import EXCEPTION_RESPONSES, mapped_exception_handler
 from app.main import _clear_snapshot_export_source_cache_for_tests
 from app.models.domain import ESXiHostPrepInstallRequest
 from app.models.domain import EnclosureOption
@@ -1329,8 +1329,9 @@ class MainAppBoundaryTests(unittest.TestCase):
     def test_snapshot_export_busy_uses_the_retryable_busy_handler(self) -> None:
         self.assertIs(
             main_app.exception_handlers.get(SnapshotExportBusyError),
-            snapshot_state_busy_exception_handler,
+            mapped_exception_handler,
         )
+        self.assertEqual(EXCEPTION_RESPONSES[SnapshotExportBusyError].retry_after_seconds, 5)
 
     def test_main_app_exposes_storage_view_runtime_route(self) -> None:
         paths = {route.path for route in main_app.routes}

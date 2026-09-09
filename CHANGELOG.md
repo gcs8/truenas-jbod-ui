@@ -26,6 +26,16 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Fixed
+
+- Honoured a configured SSH known-hosts path (config file or
+  `SSH_KNOWN_HOSTS_PATH`), reported an unknown `system_id` on the main page
+  instead of silently showing the default system, and mapped service errors
+  to responses from one table with a 5-second retry hint for busy exports.
+  (#475)
+
 ## v0.23.0 - 2026-09-08
 
 This release includes every pull request merged after `v0.22.2` through the

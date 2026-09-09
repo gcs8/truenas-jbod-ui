@@ -46,6 +46,14 @@ def _is_json_media_type(content_type: str | None) -> bool:
     return subtype == "json" or subtype.endswith("+json")
 
 
+def _unknown_system_notice(system_id: str, settings: Any) -> str:
+    default_label = next(
+        (system.label or system.id for system in settings.systems if system.id == settings.default_system_id),
+        settings.default_system_id or "the default system",
+    )
+    return f'System "{system_id}" is not configured. Showing {default_label} instead.'
+
+
 def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
     router = MainModuleAPIRouter(main_module, globals())
 
@@ -139,6 +147,11 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             if system_id in configured_system_ids
             else current_settings.default_system_id
         )
+        system_notice = (
+            None
+            if system_id is None or system_id in configured_system_ids
+            else _unknown_system_notice(system_id, current_settings)
+        )
         service = route_service(selected_system_id, enclosure_id=enclosure_id)
         admin_launch_url = await asyncio.to_thread(resolve_admin_launch_url, request, current_settings)
         snapshot = await service.get_snapshot(
@@ -162,6 +175,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
                 admin_launch_url=admin_launch_url,
                 app_version=__version__,
                 release_status=get_release_status_service().snapshot(),
+                system_notice=system_notice,
             ),
         )
 

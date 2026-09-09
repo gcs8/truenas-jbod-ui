@@ -19,6 +19,7 @@ from admin_service import main as admin_main
 from app import main as app_main
 from app.models.domain import SystemBackupExportRequest
 from app.services.inventory import SnapshotStateBusyError, UnknownEnclosureError
+from app.services.snapshot_export import SnapshotExportBusyError
 
 
 APP_ROUTE_MATRIX = [
@@ -193,20 +194,43 @@ class RouteContractTests(unittest.TestCase):
         )
         self.assertNotIn(b"caller-controlled-value", body)
 
-    def test_snapshot_capacity_error_maps_to_retryable_503(self) -> None:
-        response = asyncio.run(
-            app_main.snapshot_state_busy_exception_handler(
-                MagicMock(),
-                SnapshotStateBusyError(),
-            )
+    def test_capacity_errors_map_to_retryable_503_with_their_own_retry_hint(self) -> None:
+        cases = (
+            (SnapshotStateBusyError(), "1", "Snapshot state capacity is temporarily busy; retry later."),
+            (SnapshotExportBusyError(), "5", "Snapshot export capacity is busy; retry shortly."),
         )
+        for error, retry_after, detail in cases:
+            with self.subTest(error=type(error).__name__):
+                self.assertIs(app_main.app.exception_handlers[type(error)], app_main.mapped_exception_handler)
+                response = asyncio.run(app_main.mapped_exception_handler(MagicMock(), error))
 
-        self.assertEqual(response.status_code, 503)
-        self.assertEqual(response.headers["retry-after"], "1")
+                self.assertEqual(response.status_code, 503)
+                self.assertEqual(response.headers["retry-after"], retry_after)
+                self.assertEqual(json.loads(response.body), {"ok": False, "detail": detail})
+
+    def test_unknown_enclosure_maps_to_404_without_a_retry_hint(self) -> None:
+        response = asyncio.run(app_main.mapped_exception_handler(MagicMock(), UnknownEnclosureError()))
+
+        self.assertEqual(response.status_code, 404)
+        self.assertNotIn("retry-after", response.headers)
         self.assertEqual(
             json.loads(response.body),
-            {"ok": False, "detail": "Snapshot state capacity is temporarily busy; retry later."},
+            {"ok": False, "detail": "Requested enclosure is not available for this system."},
         )
+
+    def test_slot_bounds_reuse_the_exception_response_table(self) -> None:
+        for error, status_code, retry_after in (
+            (UnknownEnclosureError(), 404, None),
+            (SnapshotStateBusyError(), 503, "1"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                service = SimpleNamespace(get_snapshot=AsyncMock(side_effect=error))
+                with self.assertRaises(app_main.HTTPException) as raised:
+                    asyncio.run(app_main.resolve_layout_slots(service, None))
+
+                self.assertEqual(raised.exception.status_code, status_code)
+                self.assertEqual(raised.exception.detail, str(error))
+                self.assertEqual((raised.exception.headers or {}).get("Retry-After"), retry_after)
 
     def test_admin_route_matrix_is_frozen(self) -> None:
         self.assertEqual(_route_matrix(admin_main.create_app()), ADMIN_ROUTE_MATRIX)
