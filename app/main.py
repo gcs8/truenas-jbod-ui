@@ -118,31 +118,60 @@ class HistoryScopesProxyRequest(BaseModel):
     metric_limit: int
 
 
-async def system_not_configured_exception_handler(
-    _: Request,
-    exc: Exception,
-) -> JSONResponse:
-    return JSONResponse(
-        {"ok": False, "detail": str(exc)},
-        status_code=404,
+@dataclass(frozen=True)
+class ErrorResponseSpec:
+    """How one service exception reaches the browser: status, wording, and retry hint."""
+
+    status_code: int
+    detail: str | None = None
+    retry_after_seconds: int | None = None
+
+    def headers(self) -> dict[str, str] | None:
+        if self.retry_after_seconds is None:
+            return None
+        return {"Retry-After": str(self.retry_after_seconds)}
+
+    def detail_for(self, exc: Exception) -> str:
+        return self.detail if self.detail is not None else str(exc)
+
+
+UNKNOWN_ENCLOSURE_DETAIL = "Requested enclosure is not available for this system."
+ENCLOSURE_LAYOUT_UNAVAILABLE_DETAIL = "Unable to resolve selected enclosure layout."
+
+EXCEPTION_RESPONSES: dict[type[Exception], ErrorResponseSpec] = {
+    SystemNotConfiguredError: ErrorResponseSpec(status_code=404),
+    UnknownEnclosureError: ErrorResponseSpec(status_code=404, detail=UNKNOWN_ENCLOSURE_DETAIL),
+    SnapshotStateBusyError: ErrorResponseSpec(status_code=503, retry_after_seconds=1),
+    SnapshotExportBusyError: ErrorResponseSpec(status_code=503, retry_after_seconds=5),
+}
+
+
+def error_response_spec(exc: Exception) -> ErrorResponseSpec:
+    for exc_type in type(exc).__mro__:
+        spec = EXCEPTION_RESPONSES.get(exc_type)
+        if spec is not None:
+            return spec
+    raise KeyError(type(exc).__name__)
+
+
+def http_exception_for(exc: Exception) -> HTTPException:
+    spec = error_response_spec(exc)
+    return HTTPException(
+        status_code=spec.status_code,
+        detail=spec.detail_for(exc),
+        headers=spec.headers(),
     )
 
 
-async def unknown_enclosure_exception_handler(
+async def mapped_exception_handler(
     _: Request,
     exc: Exception,
 ) -> JSONResponse:
-    return JSONResponse({"ok": False, "detail": str(exc)}, status_code=404)
-
-
-async def snapshot_state_busy_exception_handler(
-    _: Request,
-    exc: Exception,
-) -> JSONResponse:
+    spec = error_response_spec(exc)
     return JSONResponse(
-        {"ok": False, "detail": str(exc)},
-        status_code=503,
-        headers={"Retry-After": "1"},
+        {"ok": False, "detail": spec.detail_for(exc)},
+        status_code=spec.status_code,
+        headers=spec.headers(),
     )
 
 
@@ -598,22 +627,8 @@ def create_app() -> FastAPI:
     from app.routes import build_router
 
     include_router_preserving_route_objects(app, build_router(sys.modules[__name__]))
-    app.add_exception_handler(
-        SystemNotConfiguredError,
-        system_not_configured_exception_handler,
-    )
-    app.add_exception_handler(
-        UnknownEnclosureError,
-        unknown_enclosure_exception_handler,
-    )
-    app.add_exception_handler(
-        SnapshotStateBusyError,
-        snapshot_state_busy_exception_handler,
-    )
-    app.add_exception_handler(
-        SnapshotExportBusyError,
-        snapshot_state_busy_exception_handler,
-    )
+    for mapped_exception_type in EXCEPTION_RESPONSES:
+        app.add_exception_handler(mapped_exception_type, mapped_exception_handler)
     app.add_exception_handler(
         MappingScopeConflict,
         mapping_scope_conflict_exception_handler,
@@ -667,6 +682,7 @@ def build_index_context(
     initial_history_timeframe_hours_json: str = "24",
     initial_history_panel_open_json: str = "false",
     initial_history_io_chart_mode_json: str = '"total"',
+    system_notice: str | None = None,
 ) -> dict[str, object]:
     sas_fabric_view_url = (
         "#sas-fabric-panel"
@@ -701,6 +717,7 @@ def build_index_context(
         "initial_history_panel_open_json": initial_history_panel_open_json,
         "initial_history_io_chart_mode_json": initial_history_io_chart_mode_json,
         "admin_launch_url": admin_launch_url,
+        "system_notice": system_notice,
         "write_policy": write_policy,
         "write_policy_json": json.dumps(write_policy),
     }
@@ -745,34 +762,25 @@ async def resolve_layout_slots(
     permitting a mutation against an unrelated bound.
     """
     if service is None:
-        raise HTTPException(status_code=503, detail="Unable to resolve selected enclosure layout.")
+        raise HTTPException(status_code=503, detail=ENCLOSURE_LAYOUT_UNAVAILABLE_DETAIL)
     try:
         snapshot = await service.get_snapshot(
             selected_enclosure_id=selected_enclosure_id,
             allow_stale_cache=True,
         )
-    except UnknownEnclosureError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except SnapshotStateBusyError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=str(exc),
-            headers={"Retry-After": "1"},
-        ) from exc
+    except (UnknownEnclosureError, SnapshotStateBusyError) as exc:
+        raise http_exception_for(exc) from exc
     except Exception as exc:  # noqa: BLE001 - expose a stable route error, not source details
         logger.debug("Slot bounds: selected enclosure snapshot unavailable (%s)", exc)
         raise HTTPException(
             status_code=503,
-            detail="Unable to resolve selected enclosure layout.",
+            detail=ENCLOSURE_LAYOUT_UNAVAILABLE_DETAIL,
         ) from exc
     if selected_enclosure_id and snapshot.selected_enclosure_id != selected_enclosure_id:
-        raise HTTPException(
-            status_code=404,
-            detail="Requested enclosure is not available for this system.",
-        )
+        raise HTTPException(status_code=404, detail=UNKNOWN_ENCLOSURE_DETAIL)
     layout_slots = snapshot_layout_slots(snapshot)
     if not layout_slots:
-        raise HTTPException(status_code=503, detail="Unable to resolve selected enclosure layout.")
+        raise HTTPException(status_code=503, detail=ENCLOSURE_LAYOUT_UNAVAILABLE_DETAIL)
     return layout_slots
 
 
