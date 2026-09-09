@@ -134,8 +134,10 @@ arguments, logs, status payloads, or metrics. The schedule is disabled by
 default and refuses to run unless the operator explicitly configures its
 destination, status file, retention count, included groups, and passphrase-file
 reference. A host timer invokes a separate one-shot container with no network,
-published port, or Docker socket. The admin sidecar retains its default
-`ADMIN_AUTO_STOP_SECONDS=3600` boundary.
+published port, or Docker socket. The published Compose files set
+`ADMIN_AUTO_STOP_SECONDS=3600`, so the admin sidecar stops itself after an
+hour when started from them; the application default is `0` (no auto-stop),
+so set the value explicitly in any other deployment.
 
 ## Deployment check
 

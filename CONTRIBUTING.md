@@ -146,7 +146,9 @@ Important framing:
 - It is intended for LAN/headless/local infrastructure use, not public Internet
   exposure.
 - It is explicitly started when needed.
-- It auto-stops by default after about 3600 seconds unless configured otherwise.
+- The published Compose files set `ADMIN_AUTO_STOP_SECONDS=3600`, so it stops
+  itself after about an hour when started from them. The application default
+  is `0` (no auto-stop), so set the value explicitly anywhere else.
 - It is powerful because it can touch config, runtime state, backups, and Docker
   control paths.
 
