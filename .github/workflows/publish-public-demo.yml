@@ -6,6 +6,8 @@ on:
       - ".github/workflows/publish-public-demo.yml"
       - "app/__init__.py"
       - "app/config.py"
+      - "app/config_errors.py"
+      - "app/env_values.py"
       - "app/logging_config.py"
       - "app/main.py"
       - "app/metrics.py"
