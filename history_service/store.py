@@ -42,6 +42,16 @@ PRIVATE_REPLACEMENT_DIR_PREFIX = ".history-replacement-"
 # the full-table UPDATE scans. Writers populate disk_identity_key on insert, so the
 # backfill only ever has work to do for rows that predate the column.
 DISK_IDENTITY_BACKFILL_USER_VERSION = 1
+DISK_IDENTITY_BACKFILL_BATCH_SIZE = 20_000
+DISK_IDENTITY_BACKFILL_PROGRESS_INTERVAL_SECONDS = 5.0
+DISK_IDENTITY_BACKFILL_TABLES = ("slot_state_current", "slot_events", "metric_samples")
+_DISK_IDENTITY_BACKFILL_PENDING_SQL = """
+    (disk_identity_key IS NULL OR trim(disk_identity_key) = '')
+    AND serial IS NOT NULL
+    AND trim(serial) <> ''
+    AND gptid IS NOT NULL
+    AND trim(gptid) <> ''
+"""
 SEGMENTED_RETENTION_STATE_NAME = "segmented_retention"
 SEGMENTED_RETENTION_STATES = frozenset({"ready", "claimed", "consumed"})
 
@@ -806,7 +816,14 @@ class HistoryStore:
 
     def _initialize_schema(self, *, migration_lock_held: bool = False) -> None:
         with closing(self._connect(migration_lock_held=migration_lock_held)) as connection:
-            connection.execute("SELECT name FROM sqlite_master LIMIT 1").fetchall()
+            existing_objects = connection.execute("SELECT name FROM sqlite_master LIMIT 1").fetchall()
+            if not existing_objects:
+                # Incremental mode lets retention hand freed pages back to the
+                # filesystem. Enabling WAL already wrote the first page, so the
+                # mode only takes effect through a VACUUM, which is instant while
+                # the database is still empty.
+                connection.execute("PRAGMA auto_vacuum=INCREMENTAL")
+                connection.execute("VACUUM")
             connection.executescript(SCHEMA)
             self._ensure_slot_state_columns(connection)
             self._ensure_slot_event_columns(connection)
@@ -817,8 +834,21 @@ class HistoryStore:
             connection.commit()
 
     @staticmethod
-    def _synchronize_table_counts(connection: sqlite3.Connection) -> None:
+    def _synchronize_table_counts(connection: sqlite3.Connection) -> list[str]:
+        """Seed a missing counter row from a full count; triggers keep seeded rows exact.
+
+        Returns the tables that were counted so callers and tests can see that a
+        routine start touched none of the large tables.
+        """
+
+        tracked_tables = {
+            str(row[0])
+            for row in connection.execute("SELECT table_name FROM history_table_counts").fetchall()
+        }
+        counted: list[str] = []
         for table_name in ("slot_events", "metric_samples", "metric_rollups"):
+            if table_name in tracked_tables:
+                continue
             connection.execute(
                 f"""
                 INSERT INTO history_table_counts (table_name, row_count)
@@ -828,6 +858,8 @@ class HistoryStore:
                 """,
                 (table_name,),
             )
+            counted.append(table_name)
+        return counted
 
     @staticmethod
     def _backfill_disk_identity_keys_once(connection: sqlite3.Connection) -> None:
@@ -851,22 +883,93 @@ class HistoryStore:
         HistoryStore._ensure_columns(connection, "metric_samples", METRIC_SAMPLE_OPTIONAL_COLUMNS)
 
     @staticmethod
-    def _backfill_disk_identity_keys(connection: sqlite3.Connection) -> None:
-        for table_name in ("slot_state_current", "slot_events", "metric_samples"):
-            connection.execute(
-                f"""
-                UPDATE {table_name}
-                SET disk_identity_key =
-                    lower(trim(serial)) || '|' ||
-                    lower(trim(coalesce(nullif(persistent_id_label, ''), 'unknown'))) || '|' ||
-                    lower(trim(gptid))
-                WHERE (disk_identity_key IS NULL OR trim(disk_identity_key) = '')
-                  AND serial IS NOT NULL
-                  AND trim(serial) <> ''
-                  AND gptid IS NOT NULL
-                  AND trim(gptid) <> ''
-                """
+    def _backfill_disk_identity_keys(
+        connection: sqlite3.Connection,
+        *,
+        batch_size: int | None = None,
+    ) -> int:
+        """Fill disk_identity_key on legacy rows in committed batches.
+
+        Each batch commits on its own, so a restart in the middle of a long upgrade
+        keeps the rows already done and only the remainder is scanned again; the
+        WHERE clause makes every batch idempotent.
+        """
+
+        rows_per_batch = max(1, int(batch_size or DISK_IDENTITY_BACKFILL_BATCH_SIZE))
+        pending_by_table: dict[str, int] = {}
+        for table_name in DISK_IDENTITY_BACKFILL_TABLES:
+            row = connection.execute(
+                f"SELECT COUNT(*) FROM {table_name} WHERE {_DISK_IDENTITY_BACKFILL_PENDING_SQL}"
+            ).fetchone()
+            pending_by_table[table_name] = int(row[0]) if row and row[0] is not None else 0
+        total_pending = sum(pending_by_table.values())
+        if not total_pending:
+            return 0
+        logger.info(
+            "Upgrading history database: %s rows to backfill (%s); this runs in batches of %s "
+            "and resumes where it left off if the service restarts.",
+            total_pending,
+            ", ".join(f"{name} {count}" for name, count in pending_by_table.items() if count),
+            rows_per_batch,
+        )
+        completed = 0
+        started = time.monotonic()
+        last_progress_at = started
+        for table_name, pending in pending_by_table.items():
+            if not pending:
+                continue
+            while True:
+                updated = HistoryStore._backfill_disk_identity_batch(
+                    connection,
+                    table_name,
+                    batch_size=rows_per_batch,
+                )
+                if updated <= 0:
+                    break
+                connection.commit()
+                completed += updated
+                now = time.monotonic()
+                if now - last_progress_at >= DISK_IDENTITY_BACKFILL_PROGRESS_INTERVAL_SECONDS:
+                    last_progress_at = now
+                    logger.info(
+                        "Upgrading history database: %s of %s rows backfilled after %.0f seconds.",
+                        completed,
+                        total_pending,
+                        now - started,
+                    )
+                if updated < rows_per_batch:
+                    break
+        logger.info(
+            "History database upgrade finished: %s rows backfilled in %.1f seconds.",
+            completed,
+            time.monotonic() - started,
+        )
+        return completed
+
+    @staticmethod
+    def _backfill_disk_identity_batch(
+        connection: sqlite3.Connection,
+        table_name: str,
+        *,
+        batch_size: int,
+    ) -> int:
+        cursor = connection.execute(
+            f"""
+            UPDATE {table_name}
+            SET disk_identity_key =
+                lower(trim(serial)) || '|' ||
+                lower(trim(coalesce(nullif(persistent_id_label, ''), 'unknown'))) || '|' ||
+                lower(trim(gptid))
+            WHERE rowid IN (
+                SELECT rowid
+                FROM {table_name}
+                WHERE {_DISK_IDENTITY_BACKFILL_PENDING_SQL}
+                LIMIT ?
             )
+            """,
+            (batch_size,),
+        )
+        return max(0, int(cursor.rowcount))
 
     @staticmethod
     def _ensure_identity_indexes(connection: sqlite3.Connection) -> None:
@@ -946,14 +1049,17 @@ class HistoryStore:
         temp_metadata = os.fstat(temp_fd)
 
         try:
+            # The copy is an ordinary WAL read: it needs neither the cross-process
+            # lifecycle lock nor the in-process write lock, so readers in other
+            # containers and this collector's own writes keep going while it runs.
+            with closing(self._connect()) as source_connection, closing(
+                sqlite3.connect(f"/proc/self/fd/{temp_fd}")
+            ) as backup_connection:
+                backup_connection.execute("PRAGMA journal_mode=MEMORY")
+                source_connection.backup(backup_connection)
+                backup_connection.commit()
             with history_write_lock(self.file_path, blocking=True):
                 with self._lock:
-                    with closing(self._connect(migration_lock_held=True)) as source_connection, closing(
-                        sqlite3.connect(f"/proc/self/fd/{temp_fd}")
-                    ) as backup_connection:
-                        backup_connection.execute("PRAGMA journal_mode=MEMORY")
-                        source_connection.backup(backup_connection)
-                        backup_connection.commit()
                     publish_descriptor = temp_fd
                     temp_fd = None
                     self._publish_replacement(
@@ -1385,7 +1491,34 @@ class HistoryStore:
                 break
 
         summary["total_rows_removed"] = self._retention_total_rows_removed(summary)
+        summary["pages_reclaimed"] = 0
+        if summary["total_rows_removed"] and not summary["interrupted"]:
+            summary["pages_reclaimed"] = self._reclaim_free_pages(migration_lock_held=migration_lock_held)
         return summary
+
+    def _reclaim_free_pages(self, *, migration_lock_held: bool) -> int:
+        """Hand pages freed by retention back to the filesystem and shrink the WAL.
+
+        incremental_vacuum only does work on databases created in incremental mode;
+        older databases keep reusing freed pages in place, exactly as before.
+        """
+
+        def operation(connection: sqlite3.Connection) -> int:
+            before = int(connection.execute("PRAGMA freelist_count").fetchone()[0])
+            if before:
+                connection.execute("PRAGMA incremental_vacuum").fetchall()
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+            after = int(connection.execute("PRAGMA freelist_count").fetchone()[0])
+            return max(0, before - after)
+
+        try:
+            return int(self._execute_write(operation, migration_lock_held=migration_lock_held))
+        except sqlite3.Error as exc:
+            logger.warning(
+                "History retention could not return free pages to the filesystem this pass: %s",
+                exc,
+            )
+            return 0
 
     @staticmethod
     def _retention_total_rows_removed(summary: dict[str, Any]) -> int:
@@ -1413,28 +1546,38 @@ class HistoryStore:
         cutoffs: dict[str, str | None],
         batch_size: int,
     ) -> dict[str, Any]:
-        metric_ids = cls._retention_row_ids(
-            connection,
-            table_name="metric_samples",
-            timestamp_column="observed_at",
-            cutoff=cutoffs["metric"],
-            batch_size=batch_size,
-        )
-        if metric_ids:
-            cls._roll_up_metric_rows(connection, metric_ids, bucket_seconds=3600)
-            cls._roll_up_metric_rows(connection, metric_ids, bucket_seconds=86400)
-            metric_samples_removed = cls._delete_rows_by_id(connection, "metric_samples", metric_ids)
-        else:
-            metric_samples_removed = 0
+        # The same ordered, bounded subquery selects the batch for both rollups and
+        # the delete, so the rows aggregated are exactly the rows removed and the
+        # batch size never turns into one SQL variable per row.
+        metric_samples_removed = 0
+        if cutoffs["metric"] is not None:
+            cls._roll_up_metric_rows(
+                connection,
+                cutoff=cutoffs["metric"],
+                batch_size=batch_size,
+                bucket_seconds=3600,
+            )
+            cls._roll_up_metric_rows(
+                connection,
+                cutoff=cutoffs["metric"],
+                batch_size=batch_size,
+                bucket_seconds=86400,
+            )
+            metric_samples_removed = cls._delete_expired_rows(
+                connection,
+                table_name="metric_samples",
+                timestamp_column="observed_at",
+                cutoff=cutoffs["metric"],
+                batch_size=batch_size,
+            )
 
-        event_ids = cls._retention_row_ids(
+        events_removed = cls._delete_expired_rows(
             connection,
             table_name="slot_events",
             timestamp_column="observed_at",
             cutoff=cutoffs["event"],
             batch_size=batch_size,
         )
-        events_removed = cls._delete_rows_by_id(connection, "slot_events", event_ids)
         hourly_rollups_removed = cls._delete_rollup_batch(
             connection,
             bucket_seconds=3600,
@@ -1464,60 +1607,48 @@ class HistoryStore:
         }
 
     @staticmethod
-    def _retention_row_ids(
+    def _expired_rows_subquery(table_name: str, timestamp_column: str) -> str:
+        return (
+            f"SELECT id FROM {table_name} WHERE {timestamp_column} < ? "
+            f"ORDER BY {timestamp_column}, id LIMIT ?"
+        )
+
+    @classmethod
+    def _delete_expired_rows(
+        cls,
         connection: sqlite3.Connection,
         *,
         table_name: str,
         timestamp_column: str,
         cutoff: str | None,
         batch_size: int,
-    ) -> list[int]:
-        if cutoff is None:
-            return []
-        rows = connection.execute(
-            f"""
-            SELECT id
-            FROM {table_name}
-            WHERE {timestamp_column} < ?
-            ORDER BY {timestamp_column}, id
-            LIMIT ?
-            """,
-            (cutoff, batch_size),
-        ).fetchall()
-        return [int(row[0]) for row in rows]
-
-    @staticmethod
-    def _delete_rows_by_id(
-        connection: sqlite3.Connection,
-        table_name: str,
-        row_ids: list[int],
     ) -> int:
-        if not row_ids:
+        if cutoff is None:
             return 0
-        placeholders = ", ".join("?" for _ in row_ids)
+        subquery = cls._expired_rows_subquery(table_name, timestamp_column)
         return int(
             connection.execute(
-                f"DELETE FROM {table_name} WHERE id IN ({placeholders})",
-                row_ids,
+                f"DELETE FROM {table_name} WHERE id IN ({subquery})",
+                (cutoff, batch_size),
             ).rowcount
         )
 
-    @staticmethod
+    @classmethod
     def _roll_up_metric_rows(
+        cls,
         connection: sqlite3.Connection,
-        row_ids: list[int],
         *,
+        cutoff: str,
+        batch_size: int,
         bucket_seconds: int,
     ) -> None:
-        if not row_ids:
-            return
         if bucket_seconds == 3600:
             bucket_expression = "strftime('%Y-%m-%dT%H:00:00+00:00', observed_at)"
         elif bucket_seconds == 86400:
             bucket_expression = "strftime('%Y-%m-%dT00:00:00+00:00', observed_at)"
         else:
             raise ValueError("Unsupported history rollup interval.")
-        placeholders = ", ".join("?" for _ in row_ids)
+        expired_rows = cls._expired_rows_subquery("metric_samples", "observed_at")
         connection.execute(
             f"""
             INSERT INTO metric_rollups (
@@ -1553,7 +1684,7 @@ class HistoryStore:
                         ORDER BY observed_at DESC, id DESC
                     ) AS rollup_rank
                 FROM metric_samples
-                WHERE id IN ({placeholders})
+                WHERE id IN ({expired_rows})
             ) selected_samples
             WHERE 1 = 1
               AND COALESCE(value_real, CAST(value_integer AS REAL)) IS NOT NULL
@@ -1593,7 +1724,7 @@ class HistoryStore:
                 logical_unit_id = COALESCE(excluded.logical_unit_id, metric_rollups.logical_unit_id),
                 sas_address = COALESCE(excluded.sas_address, metric_rollups.sas_address)
             """,
-            [bucket_seconds, *row_ids],
+            (bucket_seconds, cutoff, batch_size),
         )
 
     @staticmethod
@@ -2246,7 +2377,7 @@ class HistoryStore:
                 event_where_clauses = [*where_clauses]
                 event_parameters = [*parameters]
                 if since:
-                    event_where_clauses.append("julianday(observed_at) >= julianday(?)")
+                    event_where_clauses.append("observed_at >= ?")
                     event_parameters.append(since)
                 event_rows = connection.execute(
                     f"""
