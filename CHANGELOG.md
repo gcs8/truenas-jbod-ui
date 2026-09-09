@@ -26,6 +26,15 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Docs
+
+- The Storage Fabric page describes the hardware in plain words (HBAs, paths,
+  expanders, enclosures, bays), its warnings say what was not found and what
+  to check, and a new Storage Fabric wiki page explains the four views, the
+  status chip states and renaming. (#490)
+
 ## v0.23.0 - 2026-09-08
 
 This release includes every pull request merged after `v0.22.2` through the
