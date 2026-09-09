@@ -26,6 +26,17 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Docs
+
+- Replaced the wiki `HISTORY_BIND_ADDRESS=0.0.0.0` one-liner with the token
+  settings history needs off-loopback, added Troubleshooting entries for a
+  restarting container, history permission and readonly-database errors, the
+  500 on saving a bay assignment, and a changed bind address, added an
+  Upgrading wiki page with rollback steps, and corrected the segmented-history
+  version notes (#472).
+
 ## v0.23.0 - 2026-09-08
 
 This release includes every pull request merged after `v0.22.2` through the
