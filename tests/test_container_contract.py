@@ -352,7 +352,7 @@ class ContainerResourceContractTests(unittest.TestCase):
 
         for script_path in SEGMENTED_HISTORY_CLI_PATHS:
             self.assertIn(f"`/app/{script_path}`", export_guide)
-        self.assertRegex(export_guide, r"(?i)v0\.22\.2[^.]+does not contain")
+        self.assertRegex(export_guide, r"(?i)before v0\.23\.0[^.]+do not contain")
         self.assertNotRegex(export_guide, r"(?i)current `main`[^.]+source-build image")
         self.assertRegex(maintenance_guide, r"(?i)segmented history[^.]+fail closed")
         self.assertNotIn("qs-cryostorage", maintenance_guide)

@@ -104,7 +104,7 @@ Before running segmented maintenance commands, confirm the container contains th
 - `/app/scripts/query_segmented_history.py`
 - `/app/scripts/seal_history_segment.py`
 
-The v0.22.2 image does not contain these tools. Use an image that contains all four paths before running segmented-history commands.
+Images before v0.23.0 do not contain these tools. Use an image that contains all four paths before running segmented-history commands.
 
 Use the commands and version checks in [Segmented history v2](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/SEGMENTED_HISTORY_V2.md).
 
