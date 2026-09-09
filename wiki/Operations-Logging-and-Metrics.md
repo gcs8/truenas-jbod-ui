@@ -14,7 +14,7 @@ For installation, see [[Quick Start|Quick-Start]]. For service roles, see [[Arch
 | Show deployed images | `docker compose images` |
 | Follow all service logs | `docker compose logs -f` |
 | Disable metrics endpoints | `METRICS_ENABLED=false` |
-| Bind history off-host | `HISTORY_BIND_ADDRESS=0.0.0.0` |
+| Bind history off-host | `HISTORY_BIND_ADDRESS=0.0.0.0` plus the token settings under [Scrape metrics](#scrape-metrics) |
 
 ## Update published images
 
@@ -36,7 +36,7 @@ docker compose pull
 docker compose up -d
 ```
 
-Run `docker compose images` to confirm the image in use. See [[Docker and GHCR Deployment|Docker-and-GHCR-Deployment]] for deployment and rollback procedures.
+Run `docker compose images` to confirm the image in use. See [[Upgrading]] for the update and rollback steps and [[Docker and GHCR Deployment|Docker-and-GHCR-Deployment]] for deployment options.
 
 ## Check service health
 
@@ -134,11 +134,16 @@ The services expose Prometheus/OpenMetrics endpoints while metrics are enabled:
 - history sidecar: `http://your-docker-host:8081/metrics`
 - admin sidecar: `http://your-docker-host:8082/metrics`
 
-The history sidecar listens on loopback by default. To scrape it from another host, intentionally bind it off-host:
+The history sidecar listens on loopback by default. To scrape it from another host, bind it off-host on purpose with all of these lines in `.env`:
 
 ```dotenv
 HISTORY_BIND_ADDRESS=0.0.0.0
+HISTORY_REFRESH_AUTH_MODE=token
+HISTORY_REFRESH_TOKEN=replace-with-a-long-private-value
+HISTORY_PUBLIC_ORIGIN=http://your-docker-host:8081
 ```
+
+History refuses to start off-loopback without the token mode, a token, and the public origin. Use `HISTORY_REFRESH_TOKEN_FILE` with the secrets overlay instead of `HISTORY_REFRESH_TOKEN` when you keep the token in a file.
 
 Binding a service to `0.0.0.0` makes it reachable on every available interface unless host or network controls restrict it. Review that exposure before enabling the setting.
 
