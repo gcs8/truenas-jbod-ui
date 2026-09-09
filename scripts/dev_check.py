@@ -202,6 +202,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_container_contract",
             "tests.test_esxi_host_prep",
             "tests.test_immutable_deployment",
+            "tests.test_image_upgrade_contract",
             "tests.test_mapping_store",
             "tests.test_nonroot_migration",
             "tests.test_perf_harness",

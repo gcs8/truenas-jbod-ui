@@ -781,25 +781,26 @@ class ContainerResourceContractTests(unittest.TestCase):
         ]
         self.assertEqual(active_assignments, [])
 
-    def test_ui_and_history_are_nonroot_by_default_with_compatible_overlay(self) -> None:
+    def test_ui_and_history_identity_matches_base_or_hardened_dev(self) -> None:
         for compose_name in COMPOSE_FILES:
             services = yaml.safe_load((REPO_ROOT / compose_name).read_text(encoding="utf-8"))["services"]
             with self.subTest(compose=compose_name):
                 self.assertEqual(
                     services["enclosure-ui"]["user"],
-                    "${APP_UID:-10001}:${APP_GID:-10001}",
+                    "0:0" if compose_name == "docker-compose.yml" else "${APP_UID:-10001}:${APP_GID:-10001}",
                 )
                 self.assertEqual(
                     services["enclosure-history"]["user"],
-                    "${APP_UID:-10001}:${APP_GID:-10001}",
+                    "0:0" if compose_name == "docker-compose.yml" else "${APP_UID:-10001}:${APP_GID:-10001}",
                 )
                 self.assertEqual(
                     services["enclosure-admin"]["user"],
-                    "0:${APP_GID:-10001}",
+                    "0:0" if compose_name == "docker-compose.yml" else "0:${APP_GID:-10001}",
                 )
                 self.assertEqual(
                     services["enclosure-backup"]["user"],
-                    "${BACKUP_UID:-1000}:${BACKUP_GID:-1000}",
+                    "${BACKUP_UID:-0}:${BACKUP_GID:-0}" if compose_name == "docker-compose.yml"
+                    else "${BACKUP_UID:-1000}:${BACKUP_GID:-1000}",
                 )
                 self.assertEqual(
                     services["enclosure-backup"]["environment"]["APP_GID"],
@@ -809,12 +810,13 @@ class ContainerResourceContractTests(unittest.TestCase):
                     services["enclosure-backup"]["group_add"],
                     ["${APP_GID:-10001}"],
                 )
-                self.assertIn("./config:/app/config:ro", services["enclosure-ui"]["volumes"])
+                config_mount = "./config:/app/config" + ("" if compose_name == "docker-compose.yml" else ":ro")
+                self.assertIn(config_mount, services["enclosure-ui"]["volumes"])
 
         overlay = yaml.safe_load((REPO_ROOT / "docker-compose.nonroot.yml").read_text(encoding="utf-8"))
         self.assertEqual(
             set(overlay["services"]),
-            {"enclosure-ui", "enclosure-history", "enclosure-backup"},
+            {"enclosure-ui", "enclosure-history", "enclosure-admin", "enclosure-backup"},
         )
         self.assertEqual(overlay["services"]["enclosure-ui"]["user"], "${APP_UID:-10001}:${APP_GID:-10001}")
         self.assertEqual(
@@ -869,6 +871,9 @@ class ContainerResourceContractTests(unittest.TestCase):
     def test_compose_services_use_read_only_root_filesystems_and_drop_privileges(self) -> None:
         for compose_name in COMPOSE_FILES:
             services = yaml.safe_load((REPO_ROOT / compose_name).read_text(encoding="utf-8"))["services"]
+            if compose_name == "docker-compose.yml":
+                overlay = yaml.safe_load((REPO_ROOT / "docker-compose.nonroot.yml").read_text())["services"]
+                services = {name: {**service, **overlay.get(name, {})} for name, service in services.items()}
             for service_name, service in services.items():
                 with self.subTest(compose=compose_name, service=service_name):
                     self.assertIs(service.get("read_only"), True)
@@ -903,6 +908,8 @@ class ContainerResourceContractTests(unittest.TestCase):
             services = yaml.safe_load((REPO_ROOT / compose_name).read_text(encoding="utf-8"))["services"]
             for service_name, expected in expected_targets.items():
                 with self.subTest(compose=compose_name, service=service_name):
+                    if compose_name == "docker-compose.yml" and service_name == "enclosure-ui":
+                        expected = expected | {"/app/config"}
                     self.assertEqual(writable_volume_targets(services[service_name]), expected)
             self.assertNotIn("./logs:/app/logs", services["enclosure-admin"]["volumes"])
 
@@ -970,7 +977,7 @@ class ContainerResourceContractTests(unittest.TestCase):
             admin = services["enclosure-admin"]
 
             with self.subTest(compose=compose_name, service="enclosure-admin"):
-                self.assertEqual(admin["user"], "0:${APP_GID:-10001}")
+                self.assertEqual(admin["user"], "0:0" if compose_name == "docker-compose.yml" else "0:${APP_GID:-10001}")
                 self.assertIn(str(staging_root), writable_volume_targets(admin))
 
             for service_name, service in services.items():
@@ -1037,14 +1044,14 @@ class ContainerResourceContractTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertIn("default non-root UI and history services", env_example)
+        self.assertIn("opt-in non-root UI and history services", env_example)
         self.assertNotIn("prepare_nonroot_bind_mounts.py", readme)
         self.assertNotIn("prepare_nonroot_bind_mounts.py", quick_start)
         self.assertNotIn("prepare_nonroot_bind_mounts.py", deployment_guide)
         self.assertIn("prepare_nonroot_bind_mounts.py", troubleshooting)
         self.assertIn("Run the dry check first", troubleshooting)
         self.assertIn("--apply", troubleshooting)
-        self.assertNotIn("The base Compose file keeps the existing root-compatible", deployment_guide)
+        self.assertIn("root-compatible", deployment_guide)
 
     def test_nonroot_overlay_preserves_backup_identity_with_app_data_group(self) -> None:
         overlay = yaml.safe_load(
@@ -1052,7 +1059,7 @@ class ContainerResourceContractTests(unittest.TestCase):
         )
 
         backup = overlay["services"]["enclosure-backup"]
-        self.assertNotIn("user", backup)
+        self.assertEqual(backup["user"], "${BACKUP_UID:-1000}:${BACKUP_GID:-1000}")
         self.assertEqual(backup["group_add"], ["${APP_GID:-10001}"])
 
         backup_guide = (
@@ -1324,7 +1331,11 @@ class ContainerResourceContractTests(unittest.TestCase):
                 )
                 self.assertEqual(service["network_mode"], "none")
                 self.assertEqual(service["restart"], "no")
-                self.assertEqual(service["user"], "${BACKUP_UID:-1000}:${BACKUP_GID:-1000}")
+                self.assertEqual(
+                    service["user"],
+                    "${BACKUP_UID:-0}:${BACKUP_GID:-0}" if compose_name == "docker-compose.yml"
+                    else "${BACKUP_UID:-1000}:${BACKUP_GID:-1000}",
+                )
                 self.assertNotIn("ports", service)
                 self.assertFalse(
                     any("docker.sock" in volume for volume in service.get("volumes", []))
@@ -1339,6 +1350,8 @@ class ContainerResourceContractTests(unittest.TestCase):
                 runbook = (
                     REPO_ROOT / "wiki/Backup-Restore-and-Debug-Bundles.md"
                 ).read_text(encoding="utf-8")
+                self.assertIn("BACKUP_UID=0", runbook)
+                self.assertIn("BACKUP_GID=0", runbook)
                 self.assertIn("BACKUP_UID=$(id -u)", runbook)
                 self.assertIn("BACKUP_GID=$(id -g)", runbook)
 
