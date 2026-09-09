@@ -106,7 +106,9 @@ docker compose --profile history pull
 docker compose --profile history up -d
 ```
 
-History listens on `127.0.0.1:8081` by default.
+History listens on `127.0.0.1:8081` by default. Add `COMPOSE_PROFILES=history`
+to `.env` once so that later `docker compose pull` and `docker compose up -d`
+commands include history without the `--profile` flag.
 
 ## Optional admin UI
 
@@ -123,6 +125,10 @@ Open:
 ```text
 http://your-docker-host:8082
 ```
+
+The admin UI stops itself one hour after it starts. Run the same
+`docker compose --profile admin up -d enclosure-admin` command to start it
+again.
 
 ## Update
 

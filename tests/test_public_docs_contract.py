@@ -34,6 +34,7 @@ EXPECTED_WIKI_PAGES = {
     "wiki/Troubleshooting.md",
     "wiki/TrueNAS-CORE-Setup.md",
     "wiki/TrueNAS-SCALE-Setup.md",
+    "wiki/Upgrading.md",
     "wiki/Visual-Tour.md",
     "wiki/_Sidebar.md",
 }
@@ -119,8 +120,8 @@ class PublicDocsContractTests(unittest.TestCase):
 
         self.assertEqual(actual, EXPECTED_WIKI_PAGES)
         self.assertTrue((ROOT / "README.md").is_file())
-        self.assertEqual(len(actual), 23)
-        self.assertEqual(len(actual) + 1, 24)
+        self.assertEqual(len(actual), 24)
+        self.assertEqual(len(actual) + 1, 25)
         self.assertFalse((ROOT / "wiki/Publishing-the-Wiki.md").exists())
         self.assertTrue((ROOT / "docs/PUBLISHING_THE_WIKI.md").is_file())
 
@@ -128,7 +129,7 @@ class PublicDocsContractTests(unittest.TestCase):
         result = run_checker()
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("24 documents", result.stdout)
+        self.assertIn("25 documents", result.stdout)
         self.assertIn("local links", result.stdout)
         self.assertIn("YAML examples", result.stdout)
         self.assertIn("command paths", result.stdout)

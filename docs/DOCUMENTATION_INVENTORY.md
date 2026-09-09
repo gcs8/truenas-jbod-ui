@@ -1,6 +1,6 @@
 # Documentation inventory and finding ledger
 
-This inventory fixes the review baseline at commit `c3c819f87211ace3ee5ec82e3be058df7b9b8191`. It covers `README.md` and the 23 checked-in public Wiki pages: 24 public documents in all. The maintainer-only Wiki publication runbook lives under `docs/` and is tracked here separately.
+This inventory fixes the review baseline at commit `c3c819f87211ace3ee5ec82e3be058df7b9b8191`. It covers `README.md` and the 24 checked-in public Wiki pages: 25 public documents in all. The maintainer-only Wiki publication runbook lives under `docs/` and is tracked here separately.
 
 The inventory is a release gate. `scripts/check_public_docs.py` checks the same set from a clean checkout and rejects missing pages, bad links, stale screenshot files, invalid YAML examples, missing command paths, and configuration keys that are absent from checked-in source or `.env.example`.
 
@@ -33,6 +33,7 @@ The inventory is a release gate. `scripts/check_public_docs.py` checks the same 
 | `wiki/Troubleshooting.md` | Keep | Current startup, auth, history, and export symptoms match current behavior. |
 | `wiki/TrueNAS-CORE-Setup.md` | Keep | Current CORE API, SSH, and sudo guidance matches source. |
 | `wiki/TrueNAS-SCALE-Setup.md` | Keep | Current SCALE API, SSH, and sudo guidance matches source. |
+| `wiki/Upgrading.md` | Keep | Added after the baseline: image update, history, admin restart, and rollback steps in one place. |
 | `wiki/Visual-Tour.md` | Replace | Use the two current synthetic-demo screenshots to introduce the user-facing screens and their limitations. |
 | `wiki/_Sidebar.md` | Revise | Keep public navigation focused on user guides and remove the maintainer publication link. |
 
