@@ -348,5 +348,4 @@ repository under `docs/` and are linked here so they are easy to find:
 - [Roadmap](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/ROADMAP.md) and
   [release checklist](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/RELEASE_CHECKLIST.md)
   for what is next and how releases are cut. Older release notes, wraps, and
-  milestone plans are kept under
-  [`docs/archive/`](https://github.com/gcs8/truenas-jbod-ui/tree/main/docs/archive).
+  milestone plans are kept under `docs/archive/` in the repository.
