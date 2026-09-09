@@ -26,6 +26,7 @@ APP_ROUTE_MATRIX = [
     ("/static", (), "static", None, None),
     ("/metrics", ("GET",), "prometheus_metrics_endpoint", "starlette.responses.JSONResponse", None),
     ("/", ("GET",), "index", "starlette.responses.HTMLResponse", None),
+    ("/api/upgrade-notice/dismiss", ("POST",), "dismiss_upgrade_notice", "starlette.responses.JSONResponse", None),
     ("/sas-fabric", ("GET",), "sas_fabric_view", "starlette.responses.HTMLResponse", None),
     ("/api/inventory", ("GET",), "get_inventory", "starlette.responses.JSONResponse", "app.models.domain.InventorySnapshot"),
     ("/api/read-ui/auth/verify", ("GET",), "verify_read_ui_credentials", "starlette.responses.JSONResponse", None),

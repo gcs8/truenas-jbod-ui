@@ -149,6 +149,10 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             selected_enclosure_id=enclosure_id,
             snapshot=snapshot,
         )
+        upgrade_notice_payload = await asyncio.to_thread(
+            upgrade_notice.current_notice,
+            upgrade_notice_data_dir(current_settings),
+        )
         return templates.TemplateResponse(
             request,
             "index.html",
@@ -162,8 +166,25 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
                 admin_launch_url=admin_launch_url,
                 app_version=__version__,
                 release_status=get_release_status_service().snapshot(),
+                upgrade_notice_payload=upgrade_notice_payload,
             ),
         )
+
+    @router.post(
+        "/api/upgrade-notice/dismiss",
+        dependencies=[Depends(require_read_ui_mutation_authorization)],
+    )
+    async def dismiss_upgrade_notice() -> JSONResponse:
+        cleared = await asyncio.to_thread(
+            upgrade_notice.dismiss_notice,
+            upgrade_notice_data_dir(get_settings()),
+        )
+        if not cleared:
+            raise HTTPException(
+                status_code=503,
+                detail="The notice could not be saved as dismissed because the data directory is not writable.",
+            )
+        return JSONResponse({"ok": True})
 
     @router.get("/sas-fabric", response_class=HTMLResponse)
     async def sas_fabric_view(

@@ -194,6 +194,12 @@
   </dialog>
   {% endif %}
 
+  {% if not snapshot_mode and upgrade_notice %}
+  <section class="upgrade-notice" id="upgrade-notice" role="status" data-notice-version="{{ upgrade_notice.version }}">
+    <p class="upgrade-notice-text" id="upgrade-notice-text">{{ upgrade_notice.text }}</p>
+    <button class="button secondary small" id="upgrade-notice-dismiss" type="button">Got it</button>
+  </section>
+  {% endif %}
   <section class="status-strip" id="status-strip">
     <div class="status-chip hidden" id="snapshot-status-chip">SNAPSHOT</div>
     <div class="status-chip" id="api-status-chip">API</div>

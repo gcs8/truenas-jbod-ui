@@ -31,6 +31,7 @@ MUTATION_ROUTES = (
     ("POST", "/api/slots/0/mapping"),
     ("DELETE", "/api/slots/0/mapping"),
     ("POST", "/api/mappings/import"),
+    ("POST", "/api/upgrade-notice/dismiss"),
 )
 MUTATION_ROUTE_TEMPLATES = {
     ("POST", "/api/sas-fabric/aliases"),
@@ -41,6 +42,7 @@ MUTATION_ROUTE_TEMPLATES = {
     ("DELETE", "/api/slots/{slot}/mapping"),
     ("POST", "/api/mappings/import"),
     ("POST", "/api/history/refresh"),
+    ("POST", "/api/upgrade-notice/dismiss"),
 }
 READ_ONLY_NON_GET_ROUTES = {
     ("POST", "/api/mappings/import/preview"),

@@ -281,6 +281,8 @@
   const cacheTimingChips = document.getElementById("cache-timing-chips");
   const statusText = document.getElementById("status-text");
   const writePolicyNotice = document.getElementById("write-policy-notice");
+  const upgradeNotice = document.getElementById("upgrade-notice");
+  const upgradeNoticeDismiss = document.getElementById("upgrade-notice-dismiss");
   const readUiAuthPanel = document.getElementById("read-ui-auth-panel");
   const readUiAuthForm = document.getElementById("read-ui-auth-form");
   const readUiAuthUsername = document.getElementById("read-ui-auth-username");
@@ -2662,6 +2664,42 @@
     }
     setStatus(writePolicyReason(), "error");
     return true;
+  }
+
+  const UPGRADE_NOTICE_STORAGE_KEY = "truenas-jbod-ui.upgrade-notice-dismissed";
+
+  function upgradeNoticeVersion() {
+    return upgradeNotice?.dataset?.noticeVersion || "";
+  }
+
+  function upgradeNoticeDismissedLocally() {
+    const stored = loadStoredJson(UPGRADE_NOTICE_STORAGE_KEY);
+    return Boolean(stored && stored.version && stored.version === upgradeNoticeVersion());
+  }
+
+  function renderUpgradeNotice() {
+    if (!upgradeNotice) {
+      return;
+    }
+    upgradeNotice.classList.toggle("hidden", state.snapshotMode || upgradeNoticeDismissedLocally());
+  }
+
+  async function dismissUpgradeNotice() {
+    if (!upgradeNotice) {
+      return;
+    }
+    // Hide first so the notice never lingers; the server record is best effort and the
+    // browser remembers the dismissal when the write is refused (for example before sign-in).
+    storeJson(UPGRADE_NOTICE_STORAGE_KEY, { version: upgradeNoticeVersion() });
+    upgradeNotice.classList.add("hidden");
+    if (upgradeNoticeDismiss) {
+      upgradeNoticeDismiss.disabled = true;
+    }
+    try {
+      await fetchJson("/api/upgrade-notice/dismiss", { method: "POST", body: "{}", readUiAuth: true });
+    } catch (error) {
+      // A refused or failed write keeps the local dismissal only.
+    }
   }
 
   function handleWriteRejection(error) {
@@ -10250,6 +10288,11 @@
     renderRefreshControls();
     setStatus(`Auto-refresh interval set to ${formatRefreshInterval(state.refreshIntervalSeconds)}.`);
   });
+  if (upgradeNoticeDismiss) {
+    upgradeNoticeDismiss.addEventListener("click", () => {
+      void dismissUpgradeNotice();
+    });
+  }
   mappingForm.addEventListener("submit", saveMapping);
   mappingForm.addEventListener("input", markMappingFormDirty);
   mappingForm.addEventListener("change", markMappingFormDirty);
@@ -10579,6 +10622,7 @@
   renderWritePolicyNotice();
   syncWritePolicyControls();
   renderReadUiAuth();
+  renderUpgradeNotice();
   renderHeatmapControls();
   ensureHeatmapData();
   renderUiPerfPanel();
