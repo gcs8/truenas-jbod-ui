@@ -298,6 +298,8 @@ jobs:
           assert live["status"] == "ok"
           assert health == {
               "status": "ok",
+              "summary": "Waiting for the first inventory",
+              "problems": [],
               "dependency_status": "unknown",
               "last_updated": None,
               "sources": {},

@@ -22,6 +22,7 @@ from app.metrics import install_metrics
 from app.script_json import register_script_json_filters
 from app.services.history_status import project_public_collector_status
 from app.services.release_status import ReleaseStatusService
+from app.startup_checks import check_writable_dirs, history_writable_directories
 from history_service.collector import HistoryCollectionAlreadyRunning, HistoryCollector
 from history_service.config import HistorySettings, get_history_settings
 from history_service.operation_bounds import (
@@ -67,10 +68,12 @@ def build_history_store(settings: HistorySettings) -> HistoryStore:
     )
 
 
+logger = logging.getLogger(__name__)
 settings = get_history_settings()
+for _startup_problem in check_writable_dirs(history_writable_directories(settings)):
+    logger.error("%s", _startup_problem)
 store = build_history_store(settings)
 collector = HistoryCollector(settings, store)
-logger = logging.getLogger(__name__)
 refresh_admission = ManualRefreshAdmission(
     cooldown_seconds=settings.full_refresh_cooldown_seconds,
 )

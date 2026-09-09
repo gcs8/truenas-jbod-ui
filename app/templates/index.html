@@ -115,6 +115,11 @@
     {% if not snapshot_mode %}
     {% if admin_launch_url %}
     <a class="button secondary" href="{{ admin_launch_url }}" target="_blank" rel="noopener">System Setup</a>
+    {% elif admin_launch_stopped %}
+    <div class="field" id="admin-launch-stopped">
+      <button class="button secondary" type="button" disabled aria-describedby="admin-launch-stopped-note">System Setup</button>
+      <span class="summary-note" id="admin-launch-stopped-note">Admin is stopped (it stops itself after an hour). Start it on the Docker host: <code>docker compose --profile admin up -d enclosure-admin</code></span>
+    </div>
     {% endif %}
     <button id="export-snapshot-button" class="button secondary">Export Snapshot</button>
     {% endif %}

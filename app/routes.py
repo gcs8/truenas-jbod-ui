@@ -140,26 +140,35 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             else current_settings.default_system_id
         )
         service = route_service(selected_system_id, enclosure_id=enclosure_id)
-        admin_launch_url = await asyncio.to_thread(resolve_admin_launch_url, request, current_settings)
-        snapshot = await service.get_snapshot(
-            selected_enclosure_id=enclosure_id,
-            allow_stale_cache=True,
+        admin_launch, snapshot = await asyncio.gather(
+            asyncio.to_thread(resolve_admin_launch_url, request, current_settings),
+            service.get_snapshot(
+                selected_enclosure_id=enclosure_id,
+                allow_stale_cache=True,
+            ),
         )
         storage_view_runtime = await service.get_storage_view_runtime(
             selected_enclosure_id=enclosure_id,
             snapshot=snapshot,
+        )
+        startup_problems = startup_problems_for(request)
+        page_snapshot = (
+            snapshot.model_copy(update={"warnings": [*startup_problems, *snapshot.warnings]})
+            if startup_problems
+            else snapshot
         )
         return templates.TemplateResponse(
             request,
             "index.html",
             build_index_context(
                 request=request,
-                snapshot=snapshot,
+                snapshot=page_snapshot,
                 storage_view_runtime=storage_view_runtime,
                 settings=current_settings,
                 history_configured=bool(current_settings.history.service_url),
                 read_ui_mutation_auth_mode=request.app.state.operator_auth_settings.auth_mode,
-                admin_launch_url=admin_launch_url,
+                admin_launch_url=admin_launch.url if admin_launch else None,
+                admin_launch_stopped=bool(admin_launch and admin_launch.stopped),
                 app_version=__version__,
                 release_status=get_release_status_service().snapshot(),
             ),
@@ -270,6 +279,10 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except OSError as exc:
+            if not is_unwritable_path_error(exc):
+                raise
+            return data_folder_not_writable_response(exc)
         return JSONResponse(result)
 
     @router.get("/api/storage-views", response_model=StorageViewRuntimePayload)
@@ -404,6 +417,10 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             return mapping_scope_conflict_response()
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except OSError as exc:
+            if not is_unwritable_path_error(exc):
+                raise
+            return data_folder_not_writable_response(exc)
 
         led_warning = None
         led_changed = False
@@ -462,6 +479,10 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             return mapping_scope_conflict_response()
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except OSError as exc:
+            if not is_unwritable_path_error(exc):
+                raise
+            return data_folder_not_writable_response(exc)
         if cleared:
             service.invalidate_physical_enclosure_snapshot_cache(
                 reason="route.clear_mapping",
@@ -538,6 +559,10 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except ValueError:
             return JSONResponse(status_code=422, content={"detail": INVALID_MAPPING_BUNDLE_DETAIL})
+        except OSError as exc:
+            if not is_unwritable_path_error(exc):
+                raise
+            return data_folder_not_writable_response(exc)
         service.invalidate_snapshot_cache(reason="route.import_mappings")
         snapshot = await service.get_snapshot(selected_enclosure_id=enclosure_id)
         return JSONResponse(
@@ -1092,33 +1117,14 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
         )
 
     @router.get("/healthz")
-    async def healthz() -> JSONResponse:
+    async def healthz(request: Request) -> JSONResponse:
         registry = get_inventory_registry()
         service = registry.get_service(None)
         snapshot = service.peek_cached_snapshot()
-        if snapshot is None:
-            return JSONResponse(
-                {
-                    "status": "ok",
-                    "dependency_status": "unknown",
-                    "last_updated": None,
-                    "sources": {},
-                    "warnings": [],
-                    "cache_state": "empty",
-                },
-                status_code=200,
-            )
-        api_status = snapshot.sources.get("api")
-        return JSONResponse(
-            {
-                "status": "ok",
-                "dependency_status": "ok" if api_status and api_status.ok else "degraded",
-                "last_updated": snapshot.last_updated.isoformat(),
-                "sources": snapshot.model_dump(mode="json").get("sources", {}),
-                "warnings": snapshot.warnings,
-                "cache_state": "cached",
-            },
-            status_code=200,
+        payload = build_health_payload(
+            snapshot,
+            startup_problems=startup_problems_for(request),
         )
+        return JSONResponse(payload, status_code=200)
 
     return router

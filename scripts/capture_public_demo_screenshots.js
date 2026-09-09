@@ -88,6 +88,7 @@ async function capture(browser, plan, destination) {
     if (unexpected.length) {
       throw new Error(`capture attempted ${unexpected.length} network request(s)`);
     }
+    await page.mouse.move(0, 0);
     await page.screenshot({ path: destination, fullPage: true, animations: "disabled" });
   } finally {
     await context.close();
