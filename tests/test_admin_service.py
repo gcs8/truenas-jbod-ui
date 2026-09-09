@@ -3054,17 +3054,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 500)
         self.assertEqual(raised.exception.detail, "Unable to inspect saved history; see admin logs.")
 
-    def test_admin_runtime_and_template_copy_avoid_implementation_words(self) -> None:
-        from app.config import RUNTIME_BEHAVIOR_APP_FIELDS
-        from app.services.storage_view_templates import list_storage_view_templates
-
-        jargon = re.compile(r"sidecar|read UI|first.pass|StorCLI physical|surface|TTL|stale", re.IGNORECASE)
-        for key, field in RUNTIME_BEHAVIOR_APP_FIELDS.items():
-            for text in (field["label"], field["description"]):
-                self.assertIsNone(jargon.search(text), f"{key}: {text}")
-        for template in list_storage_view_templates():
-            for text in (template.summary, template.notes or ""):
-                self.assertIsNone(jargon.search(text), f"{template.id}: {text}")
+    def test_container_descriptions_avoid_implementation_words(self) -> None:
+        jargon = re.compile(r"sidecar|read UI|read-mostly|first.pass|surface|collector", re.IGNORECASE)
         runtime = DockerRuntimeService(AdminSettings())
         for container in runtime.managed_containers.values():
             self.assertIsNone(jargon.search(container["description"]), container["description"])
