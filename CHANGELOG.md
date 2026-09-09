@@ -26,6 +26,17 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Changed
+
+- Rewrote the main page copy in plain words: header and profile subtitles,
+  the bay status line and Summary panel, the Bay assignment panel, status
+  chips with the source message as tooltip and a neutral SSH-off style,
+  cache countdown chips shown only with UI Timing, plain "Bay reported by"
+  labels in Slot Details, and heat-map metric names that match the wiki
+  (#484).
+
 ## v0.23.0 - 2026-09-08
 
 This release includes every pull request merged after `v0.22.2` through the
