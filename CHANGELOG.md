@@ -26,6 +26,17 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Internal
+
+- Ran CI once per pull request instead of twice, stopped the label workflow from
+  cancelling itself on every push, let the changelog gate pass tests-only pull
+  requests with a notice and refuse bullets in a shipped release, made six
+  Linux-only scripts say so on Windows, added help text to the check scripts, and
+  made `dev_check.py --safe` pass on a clean Windows checkout with one-line SKIP
+  summaries (#494)
+
 ## v0.23.0 - 2026-09-08
 
 This release includes every pull request merged after `v0.22.2` through the
