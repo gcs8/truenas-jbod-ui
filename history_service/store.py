@@ -1137,17 +1137,27 @@ class HistoryStore:
             stale_path.unlink(missing_ok=True)
 
     def get_slot_state(self, system_id: str, enclosure_id: str | None, slot: int) -> SlotStateRecord | None:
-        enclosure_key = enclosure_id or ""
         with closing(self._connect()) as connection:
-            row = connection.execute(
-                """
-                SELECT *
-                FROM slot_state_current
-                WHERE system_id = ? AND enclosure_key = ? AND slot = ?
-                """,
-                (system_id, enclosure_key, slot),
-            ).fetchone()
-        return self._row_to_slot_state(row) if row else None
+            return self._select_slot_state(connection, system_id, enclosure_id, slot)
+
+    @classmethod
+    def _select_slot_state(
+        cls,
+        connection: sqlite3.Connection,
+        system_id: str,
+        enclosure_id: str | None,
+        slot: int,
+    ) -> SlotStateRecord | None:
+        enclosure_key = enclosure_id or ""
+        row = connection.execute(
+            """
+            SELECT *
+            FROM slot_state_current
+            WHERE system_id = ? AND enclosure_key = ? AND slot = ?
+            """,
+            (system_id, enclosure_key, slot),
+        ).fetchone()
+        return cls._row_to_slot_state(row) if row else None
 
     def upsert_slot_state(self, record: SlotStateRecord, observed_at: str) -> None:
         self._execute_write(lambda connection: self._upsert_slot_state_row(connection, record, observed_at))
@@ -1673,18 +1683,29 @@ class HistoryStore:
                 slot,
                 limit=limit,
             )
-        enclosure_key = enclosure_id or ""
         with closing(self._connect()) as connection:
-            rows = connection.execute(
-                """
-                SELECT *
-                FROM slot_events
-                WHERE system_id = ? AND enclosure_key = ? AND slot = ?
-                ORDER BY observed_at DESC, id DESC
-                LIMIT ?
-                """,
-                (system_id, enclosure_key, slot, limit),
-            ).fetchall()
+            return self._select_slot_events(connection, system_id, enclosure_id, slot, limit=limit)
+
+    @staticmethod
+    def _select_slot_events(
+        connection: sqlite3.Connection,
+        system_id: str,
+        enclosure_id: str | None,
+        slot: int,
+        *,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        enclosure_key = enclosure_id or ""
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM slot_events
+            WHERE system_id = ? AND enclosure_key = ? AND slot = ?
+            ORDER BY observed_at DESC, id DESC
+            LIMIT ?
+            """,
+            (system_id, enclosure_key, slot, limit),
+        ).fetchall()
         return [dict(row) for row in rows]
 
     def list_metric_samples(
@@ -1706,37 +1727,78 @@ class HistoryStore:
                 limit=limit,
                 since=since,
             )
+        with closing(self._connect()) as connection:
+            return self._select_metric_samples(
+                connection,
+                system_id,
+                enclosure_id,
+                slot,
+                metric_name=metric_name,
+                limit=limit,
+                since=since,
+            )
+
+    @classmethod
+    def _select_metric_samples(
+        cls,
+        connection: sqlite3.Connection,
+        system_id: str,
+        enclosure_id: str | None,
+        slot: int,
+        *,
+        metric_name: str | None,
+        limit: int,
+        since: str | None,
+    ) -> list[dict[str, Any]]:
         enclosure_key = enclosure_id or ""
         base_where_clauses = ["system_id = ?", "enclosure_key = ?", "slot = ?"]
         base_parameters: list[Any] = [system_id, enclosure_key, slot]
         if metric_name:
             base_where_clauses.append("metric_name = ?")
             base_parameters.append(metric_name)
+        return cls._select_samples_with_rollups(
+            connection,
+            base_where_clauses=base_where_clauses,
+            base_parameters=base_parameters,
+            limit=limit,
+            since=since,
+        )
+
+    @classmethod
+    def _select_samples_with_rollups(
+        cls,
+        connection: sqlite3.Connection,
+        *,
+        base_where_clauses: list[str],
+        base_parameters: list[Any],
+        limit: int,
+        since: str | None,
+    ) -> list[dict[str, Any]]:
         where_clauses = list(base_where_clauses)
         parameters = list(base_parameters)
         if since:
             where_clauses.append("observed_at >= ?")
             parameters.append(since)
         parameters.append(limit)
-
-        query = f"""
+        rows = connection.execute(
+            f"""
             SELECT *
             FROM metric_samples
             WHERE {' AND '.join(where_clauses)}
             ORDER BY observed_at DESC, id DESC
             LIMIT ?
-        """
-        with closing(self._connect()) as connection:
-            rows = connection.execute(query, parameters).fetchall()
-            samples = self._metric_rows_to_payload(rows)
-            return self._append_metric_rollups(
-                connection,
-                samples,
-                where_clauses=base_where_clauses,
-                parameters=base_parameters,
-                limit=limit,
-                since=since,
-            )
+            """,
+            parameters,
+        ).fetchall()
+        samples = cls._metric_rows_to_payload(rows)
+        return cls._append_metric_rollups(
+            connection,
+            samples,
+            where_clauses=base_where_clauses,
+            parameters=base_parameters,
+            limit=limit,
+            since=since,
+        )
 
     def list_disk_metric_samples(
         self,
@@ -1754,40 +1816,40 @@ class HistoryStore:
                 limit=limit,
                 since=since,
             )
+        with closing(self._connect()) as connection:
+            return self._select_disk_metric_samples(
+                connection,
+                disk_identity_key,
+                metric_name=metric_name,
+                limit=limit,
+                since=since,
+            )
+
+    @classmethod
+    def _select_disk_metric_samples(
+        cls,
+        connection: sqlite3.Connection,
+        disk_identity_key: str,
+        *,
+        metric_name: str | None,
+        limit: int,
+        since: str | None,
+    ) -> list[dict[str, Any]]:
         normalized_identity_key = disk_identity_key.strip()
         if not normalized_identity_key:
             return []
-
         base_where_clauses = ["disk_identity_key = ?"]
         base_parameters: list[Any] = [normalized_identity_key]
         if metric_name:
             base_where_clauses.append("metric_name = ?")
             base_parameters.append(metric_name)
-        where_clauses = list(base_where_clauses)
-        parameters = list(base_parameters)
-        if since:
-            where_clauses.append("observed_at >= ?")
-            parameters.append(since)
-        parameters.append(limit)
-
-        query = f"""
-            SELECT *
-            FROM metric_samples
-            WHERE {' AND '.join(where_clauses)}
-            ORDER BY observed_at DESC, id DESC
-            LIMIT ?
-        """
-        with closing(self._connect()) as connection:
-            rows = connection.execute(query, parameters).fetchall()
-            samples = self._metric_rows_to_payload(rows)
-            return self._append_metric_rollups(
-                connection,
-                samples,
-                where_clauses=base_where_clauses,
-                parameters=base_parameters,
-                limit=limit,
-                since=since,
-            )
+        return cls._select_samples_with_rollups(
+            connection,
+            base_where_clauses=base_where_clauses,
+            base_parameters=base_parameters,
+            limit=limit,
+            since=since,
+        )
 
     @classmethod
     def _append_metric_rollups(
@@ -1858,6 +1920,17 @@ class HistoryStore:
                 since=since,
                 limit=limit,
             )
+        with closing(self._connect()) as connection:
+            return self._select_disk_metric_homes(connection, disk_identity_key, since=since, limit=limit)
+
+    @staticmethod
+    def _select_disk_metric_homes(
+        connection: sqlite3.Connection,
+        disk_identity_key: str,
+        *,
+        since: str | None,
+        limit: int,
+    ) -> list[dict[str, Any]]:
         normalized_identity_key = disk_identity_key.strip()
         if not normalized_identity_key:
             return []
@@ -1931,8 +2004,7 @@ class HistoryStore:
             ORDER BY first_seen_at ASC, last_seen_at ASC, system_id ASC, enclosure_key ASC, slot ASC
             LIMIT ?
         """
-        with closing(self._connect()) as connection:
-            rows = connection.execute(query, [*parameters, limit]).fetchall()
+        rows = connection.execute(query, [*parameters, limit]).fetchall()
         return [dict(row) for row in rows]
 
     def list_followed_metric_samples(
@@ -1957,13 +2029,40 @@ class HistoryStore:
                 limit=limit,
                 since=since,
             )
-        disk_samples = self.list_disk_metric_samples(
+        with closing(self._connect()) as connection:
+            return self._select_followed_metric_samples(
+                connection,
+                system_id,
+                enclosure_id,
+                slot,
+                disk_identity_key,
+                metric_name=metric_name,
+                limit=limit,
+                since=since,
+            )
+
+    @classmethod
+    def _select_followed_metric_samples(
+        cls,
+        connection: sqlite3.Connection,
+        system_id: str,
+        enclosure_id: str | None,
+        slot: int,
+        disk_identity_key: str,
+        *,
+        metric_name: str | None,
+        limit: int,
+        since: str | None,
+    ) -> list[dict[str, Any]]:
+        disk_samples = cls._select_disk_metric_samples(
+            connection,
             disk_identity_key,
             metric_name=metric_name,
             limit=limit,
             since=since,
         )
-        local_samples = self.list_metric_samples(
+        local_samples = cls._select_metric_samples(
+            connection,
             system_id,
             enclosure_id,
             slot,
@@ -2013,9 +2112,34 @@ class HistoryStore:
                 metric_limits=metric_limits,
                 since=since,
             )
-        current = self.get_slot_state(system_id, enclosure_id, slot)
-        events = self.list_slot_events(system_id, enclosure_id, slot, limit=event_limit)
-        metric_limits = metric_limits or {}
+        # One connection serves the whole drawer read: the slot row, its events,
+        # every metric and the disk homes. Each query used to open its own
+        # connection and pay the lifecycle lock and PRAGMA setup again.
+        with closing(self._connect()) as connection:
+            return self._select_slot_history_bundle(
+                connection,
+                system_id,
+                enclosure_id,
+                slot,
+                event_limit=event_limit,
+                metric_limits=metric_limits or {},
+                since=since,
+            )
+
+    @classmethod
+    def _select_slot_history_bundle(
+        cls,
+        connection: sqlite3.Connection,
+        system_id: str,
+        enclosure_id: str | None,
+        slot: int,
+        *,
+        event_limit: int,
+        metric_limits: dict[str, int],
+        since: str | None,
+    ) -> dict[str, Any]:
+        current = cls._select_slot_state(connection, system_id, enclosure_id, slot)
+        events = cls._select_slot_events(connection, system_id, enclosure_id, slot, limit=event_limit)
 
         metrics: dict[str, list[dict[str, Any]]] = {}
         latest_values: dict[str, Any] = {}
@@ -2037,7 +2161,8 @@ class HistoryStore:
 
         for metric_name, limit in metric_limits.items():
             if current and current.disk_identity_key:
-                samples = self.list_followed_metric_samples(
+                samples = cls._select_followed_metric_samples(
+                    connection,
                     system_id,
                     enclosure_id,
                     slot,
@@ -2047,7 +2172,8 @@ class HistoryStore:
                     since=since,
                 )
             else:
-                samples = self.list_metric_samples(
+                samples = cls._select_metric_samples(
+                    connection,
                     system_id,
                     enclosure_id,
                     slot,
@@ -2060,7 +2186,12 @@ class HistoryStore:
             sample_counts[metric_name] = len(samples)
 
         if current and current.disk_identity_key:
-            homes = self.list_disk_metric_homes(current.disk_identity_key, since=since)
+            homes = cls._select_disk_metric_homes(
+                connection,
+                current.disk_identity_key,
+                since=since,
+                limit=MAX_HISTORY_QUERY_LIMIT,
+            )
             disk_history["identity_available"] = True
             disk_history["homes"] = homes
             def home_scope_key(home: dict[str, Any]) -> tuple[str | None, str, int]:

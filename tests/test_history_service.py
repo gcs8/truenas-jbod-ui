@@ -1454,6 +1454,70 @@ class HistoryStoreTests(unittest.TestCase):
                     with history_write_lock(database_path, blocking=False):
                         self.fail("File-mounted database entered the shared lock")
 
+    def test_shared_lock_parses_mountinfo_once_until_the_mount_table_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            first_path = root / "history.db"
+            first_path.write_bytes(b"")
+            second_path = root / "other.db"
+            second_path.write_bytes(b"")
+            migration_lock._mountinfo_cache.clear()
+            mount_table = "36 35 98:0 / / rw,noatime - ext4 /dev/root rw\n"
+
+            with ExitStack() as stack:
+                reads = stack.enter_context(
+                    patch.object(migration_lock, "_read_mountinfo_text", return_value=mount_table)
+                )
+                parses = stack.enter_context(
+                    patch.object(
+                        migration_lock,
+                        "_parse_mountinfo_targets",
+                        wraps=migration_lock._parse_mountinfo_targets,
+                    )
+                )
+                first_address = migration_lock._history_lock_address(first_path)
+                self.assertEqual(migration_lock._history_lock_address(first_path), first_address)
+                migration_lock._history_lock_address(second_path)
+
+                # The mount table is read on every check but parsed only once while unchanged.
+                self.assertEqual(reads.call_count, 3)
+                self.assertEqual(parses.call_count, 1)
+
+            # A refusal is re-checked every time so an operator who unmounts the file
+            # is never blocked by a remembered verdict.
+            mounted_path = root / "mounted.db"
+            mounted_path.write_bytes(b"")
+            with patch.object(migration_lock, "_database_path_is_mount_point", return_value=True) as refusing:
+                for _ in range(2):
+                    with self.assertRaisesRegex(ValueError, "mount"):
+                        migration_lock._history_lock_address(mounted_path)
+                self.assertEqual(refusing.call_count, 2)
+
+    def test_shared_lock_rejects_a_database_file_mount_point_with_a_warm_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            database_path = root / "history.db"
+            database_path.write_bytes(b"")
+            migration_lock._mountinfo_cache.clear()
+            clean_table = "36 35 98:0 / / rw,noatime - ext4 /dev/root rw\n"
+            encoded_target = str(database_path.resolve()).replace(" ", "\\040")
+            mounted_table = clean_table + f"37 36 98:0 / {encoded_target} rw - ext4 /dev/root rw\n"
+
+            with patch.object(migration_lock, "_read_mountinfo_text", return_value=clean_table):
+                clean_address = migration_lock._history_lock_address(database_path)
+                self.assertEqual(migration_lock._history_lock_address(database_path), clean_address)
+            self.assertEqual(len(migration_lock._mountinfo_cache), 1)
+
+            # The same file, same device and inode, later becomes a bind-mount target.
+            with patch.object(migration_lock, "_read_mountinfo_text", return_value=mounted_table):
+                with self.assertRaisesRegex(ValueError, "mount"):
+                    with history_write_lock(database_path, blocking=False):
+                        self.fail("File-mounted database entered the shared lock with a warm cache")
+
+            # Unmounting it lifts the refusal on the next check.
+            with patch.object(migration_lock, "_read_mountinfo_text", return_value=clean_table):
+                self.assertEqual(migration_lock._history_lock_address(database_path), clean_address)
+
     def test_shared_lock_converges_when_socket_keys_differ_for_the_same_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database_path = Path(temp_dir) / "history.db"
@@ -4356,6 +4420,67 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertEqual(payload["disk_history"]["prior_home_count"], 0)
         self.assertIsNotNone(payload["disk_history"]["current_home"])
         self.assertEqual(payload["disk_history"]["current_home"]["slot"], 0)
+
+    def test_get_slot_history_bundle_opens_one_connection(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        current_record = SlotStateRecord(
+            system_id="archive-core",
+            system_label="Archive CORE",
+            enclosure_key="enc-a",
+            enclosure_id="enc-a",
+            enclosure_label="Front Shelf",
+            slot=5,
+            slot_label="05",
+            present=True,
+            state="healthy",
+            identify_active=False,
+            device_name="da5",
+            serial="SERIAL-5",
+            model="Drive",
+            gptid="gptid/5",
+            pool_name="tank",
+            vdev_name="raidz2-0",
+            health="ONLINE",
+            persistent_id_label="GPTID",
+        )
+        store.upsert_slot_state(current_record, "2026-04-20T22:00:00+00:00")
+        store.insert_metric_samples(
+            [
+                replace(
+                    self._metric_sample("2026-04-20T23:00:00+00:00", 31),
+                    disk_identity_key=current_record.disk_identity_key,
+                ),
+                replace(
+                    self._metric_sample("2026-04-20T23:05:00+00:00", 32),
+                    disk_identity_key=current_record.disk_identity_key,
+                ),
+            ]
+        )
+        metric_limits = {
+            "temperature_c": 96,
+            "bytes_read": 60,
+            "bytes_written": 60,
+            "annualized_bytes_read": 60,
+            "annualized_bytes_written": 60,
+            "power_on_hours": 60,
+        }
+        expected = store.get_slot_history_bundle("archive-core", "enc-a", 5, metric_limits=metric_limits)
+        real_connect_locked = HistoryStore._connect_locked
+        connections_opened: list[int] = []
+
+        def counting_connect_locked(self_store: HistoryStore) -> sqlite3.Connection:
+            connections_opened.append(1)
+            return real_connect_locked(self_store)
+
+        with patch.object(HistoryStore, "_connect_locked", counting_connect_locked):
+            payload = store.get_slot_history_bundle("archive-core", "enc-a", 5, metric_limits=metric_limits)
+
+        self.assertEqual(len(connections_opened), 1)
+        self.assertEqual(payload, expected)
+        self.assertEqual([sample["value"] for sample in payload["metrics"]["temperature_c"]], [32, 31])
+        self.assertTrue(payload["disk_history"]["identity_available"])
+        self.assertEqual(len(payload["disk_history"]["homes"]), 1)
 
     def test_delete_system_history_removes_only_matching_system_rows(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())

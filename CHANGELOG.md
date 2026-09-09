@@ -26,6 +26,14 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Performance
+
+- The history drawer read for one bay now opens a single SQLite connection
+  instead of one per query, and the history lock re-parses `/proc/self/mountinfo`
+  only when the mount table changes instead of on every lock. (#488)
+
 ## v0.23.0 - 2026-09-08
 
 This release includes every pull request merged after `v0.22.2` through the

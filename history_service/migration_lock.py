@@ -6,6 +6,7 @@ import os
 import socket
 import sqlite3
 import stat
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -30,17 +31,50 @@ def _decode_mountinfo_path(value: str) -> str:
     )
 
 
-def _database_path_is_mount_point(database_path: Path) -> bool:
+_mountinfo_cache: dict[str, frozenset[str]] = {}
+_mountinfo_cache_lock = threading.Lock()
+
+
+def _read_mountinfo_text() -> str:
     try:
-        lines = Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines()
+        return Path("/proc/self/mountinfo").read_text(encoding="utf-8")
     except OSError as exc:
         raise RuntimeError("History migration locking requires Linux mountinfo.") from exc
-    target = os.path.normpath(str(Path(database_path).absolute()))
-    for line in lines:
+
+
+def _parse_mountinfo_targets(text: str) -> frozenset[str]:
+    targets: set[str] = set()
+    for line in text.splitlines():
         fields = line.split()
-        if len(fields) > 4 and os.path.normpath(_decode_mountinfo_path(fields[4])) == target:
-            return True
-    return False
+        if len(fields) > 4:
+            targets.add(os.path.normpath(_decode_mountinfo_path(fields[4])))
+    return frozenset(targets)
+
+
+def _mount_point_targets() -> frozenset[str]:
+    """Return every mount target, re-parsing mountinfo only when its text changed.
+
+    Every connection takes the lock, and the mount check used to parse
+    /proc/self/mountinfo each time. The text is still read on every check, so a
+    file that becomes a mount point later (a bind mount, or a recreated file
+    that reuses an inode) is never served a remembered verdict; only the parse
+    of an unchanged mount table is skipped.
+    """
+
+    text = _read_mountinfo_text()
+    with _mountinfo_cache_lock:
+        targets = _mountinfo_cache.get(text)
+    if targets is None:
+        targets = _parse_mountinfo_targets(text)
+        with _mountinfo_cache_lock:
+            _mountinfo_cache.clear()
+            _mountinfo_cache[text] = targets
+    return targets
+
+
+def _database_path_is_mount_point(database_path: Path) -> bool:
+    target = os.path.normpath(str(Path(database_path).absolute()))
+    return target in _mount_point_targets()
 
 
 def _history_lock_address(database_path: Path) -> bytes:
