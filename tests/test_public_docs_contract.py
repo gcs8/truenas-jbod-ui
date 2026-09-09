@@ -31,6 +31,7 @@ EXPECTED_WIKI_PAGES = {
     "wiki/Quantastor-Setup.md",
     "wiki/Quick-Start.md",
     "wiki/SSH-Setup-and-Sudo.md",
+    "wiki/Storage-Fabric.md",
     "wiki/Troubleshooting.md",
     "wiki/TrueNAS-CORE-Setup.md",
     "wiki/TrueNAS-SCALE-Setup.md",
@@ -119,7 +120,7 @@ class PublicDocsContractTests(unittest.TestCase):
 
         self.assertEqual(actual, EXPECTED_WIKI_PAGES)
         self.assertTrue((ROOT / "README.md").is_file())
-        self.assertEqual(len(actual), 23)
+        self.assertEqual(len(actual), 24)
         self.assertEqual(len(actual) + 1, 25)
         self.assertFalse((ROOT / "wiki/Publishing-the-Wiki.md").exists())
         self.assertTrue((ROOT / "docs/PUBLISHING_THE_WIKI.md").is_file())
