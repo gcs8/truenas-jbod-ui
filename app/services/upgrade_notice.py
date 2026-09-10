@@ -3,7 +3,8 @@
 The app remembers the last version it ran as a small JSON file next to the
 saved bay assignments. When the version changes, a notice is recorded and
 stays until someone dismisses it, so a restart or a second browser does not
-lose it. A fresh install (no file yet) records the version silently.
+lose it. Without a usable record, the previous version is unknown, including
+on fresh installs. That first observation also creates a notice.
 """
 
 from __future__ import annotations
@@ -21,18 +22,22 @@ logger = logging.getLogger(__name__)
 STATE_FILENAME = "last_seen_version.json"
 
 # Releases whose upgrade notes deserve a sentence in the UI itself. Keys are
-# exact version strings; the generic "Updated to vX.Y.Z." text is used otherwise.
+# exact version strings; other releases get only the observation/version prefix.
 VERSION_NOTICES: dict[str, str] = {
     "0.23.0": (
-        "Updated to v0.23.0. Anyone who can reach this port can change bay "
+        "In network mode, anyone who can reach this port can change bay "
         "assignments and lights. See Optional authentication on the Advanced "
         "Configuration wiki page to add a sign-in."
     ),
 }
 
 
-def notice_text(version: str) -> str:
-    return VERSION_NOTICES.get(version, f"Updated to v{version}.")
+def notice_text(version: str, *, previous: str | None = None, auth_mode: str = "network") -> str:
+    prefix = f"Updated to v{version}." if previous else f"Running v{version}. Previous version unknown."
+    detail = VERSION_NOTICES.get(version, "")
+    if version == "0.23.0" and auth_mode == "basic":
+        detail = "Sign-in is required to change bay assignments and lights. Reads remain anonymous."
+    return f"{prefix} {detail}" if detail else prefix
 
 
 def state_path(data_dir: Path) -> Path:
@@ -43,6 +48,9 @@ def _read_state(path: Path) -> dict[str, Any]:
     try:
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
+        return {}
+    except UnicodeDecodeError:
+        logger.warning("Ignoring unreadable version record at %s", path)
         return {}
     except OSError as exc:
         logger.warning("Unable to read %s: %s", path, exc)
@@ -67,7 +75,9 @@ def _write_state(path: Path, state: dict[str, Any]) -> bool:
     return True
 
 
-def current_notice(data_dir: Path, *, version: str = __version__) -> dict[str, str] | None:
+def current_notice(
+    data_dir: Path, *, version: str = __version__, auth_mode: str = "network",
+) -> dict[str, str] | None:
     """Record the running version and return the pending notice, if any.
 
     Called when the main page is rendered. The first call after a version
@@ -81,11 +91,10 @@ def current_notice(data_dir: Path, *, version: str = __version__) -> dict[str, s
     pending = state.get("notice") if isinstance(state.get("notice"), dict) else None
 
     if not isinstance(last_seen, str) or not last_seen:
-        # Fresh install: remember the version, nothing to announce.
-        _write_state(path, {"last_seen_version": version})
-        return None
-
-    if last_seen != version:
+        # Absence cannot distinguish a fresh install from an uninstrumented upgrade.
+        pending = {"version": version, "previous": ""}
+        _write_state(path, {"last_seen_version": version, "notice": pending})
+    elif last_seen != version:
         pending = {"version": version, "previous": last_seen}
         _write_state(path, {"last_seen_version": version, "notice": pending})
     elif pending is not None and pending.get("version") != version:
@@ -97,7 +106,7 @@ def current_notice(data_dir: Path, *, version: str = __version__) -> dict[str, s
     return {
         "version": version,
         "previous": str(pending.get("previous") or ""),
-        "text": notice_text(version),
+        "text": notice_text(version, previous=str(pending.get("previous") or ""), auth_mode=auth_mode),
     }
 
 

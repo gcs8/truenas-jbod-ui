@@ -25,13 +25,50 @@ def read_state(data_dir: Path) -> dict:
 
 
 class UpgradeNoticeServiceTests(unittest.TestCase):
-    def test_fresh_install_records_the_version_without_a_notice(self) -> None:
+    def test_absent_record_reports_unknown_previous_even_for_fresh_install(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             data_dir = Path(temp_dir) / "data"
 
+            notice = upgrade_notice.current_notice(data_dir, version="0.23.0")
+            self.assertIsNotNone(notice)
+            self.assertEqual(notice["previous"], "")
+            self.assertIn("Previous version unknown", notice["text"])
+            self.assertNotIn("Updated to", notice["text"])
+            self.assertEqual(upgrade_notice.current_notice(data_dir, version="0.23.0"), notice)
+            self.assertTrue(upgrade_notice.dismiss_notice(data_dir, version="0.23.0"))
             self.assertIsNone(upgrade_notice.current_notice(data_dir, version="0.23.0"))
 
-            self.assertEqual(read_state(data_dir), {"last_seen_version": "0.23.0"})
+    def test_uninstrumented_install_does_not_infer_upgrade_from_existing_mappings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir)
+            mapping_path = data_dir / "slot_mappings.json"
+            mapping_path.write_text('{"synthetic": "untouched"}', encoding="utf-8")
+            before = mapping_path.read_bytes()
+            notice = upgrade_notice.current_notice(data_dir, version="0.23.0")
+            self.assertIsNotNone(notice)
+            self.assertEqual(notice["previous"], "")
+            self.assertIn("Running v0.23.0. Previous version unknown.", notice["text"])
+            self.assertEqual(mapping_path.read_bytes(), before)
+
+    def test_invalid_record_shapes_report_unknown_previous(self) -> None:
+        for record in [[], {}, {"last_seen_version": None}, {"last_seen_version": 23}]:
+            with self.subTest(record=record), tempfile.TemporaryDirectory() as temp_dir:
+                data_dir = Path(temp_dir)
+                upgrade_notice.state_path(data_dir).write_text(json.dumps(record), encoding="utf-8")
+                notice = upgrade_notice.current_notice(data_dir, version="0.23.0")
+                self.assertIsNotNone(notice)
+                self.assertEqual(notice["previous"], "")
+                self.assertIn("Previous version unknown", notice["text"])
+
+    def test_pending_text_tracks_auth_mode_changes_without_persisting_auth(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir)
+            network = upgrade_notice.current_notice(data_dir, version="0.23.0", auth_mode="network")
+            before = upgrade_notice.state_path(data_dir).read_bytes()
+            basic = upgrade_notice.current_notice(data_dir, version="0.23.0", auth_mode="basic")
+            self.assertIn("In network mode", network["text"])
+            self.assertIn("Sign-in is required", basic["text"])
+            self.assertEqual(upgrade_notice.state_path(data_dir).read_bytes(), before)
 
     def test_version_change_produces_one_notice_that_persists_until_dismissed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -47,7 +84,7 @@ class UpgradeNoticeServiceTests(unittest.TestCase):
                     "version": "0.23.0",
                     "previous": "0.22.2",
                     "text": (
-                        "Updated to v0.23.0. Anyone who can reach this port can change bay "
+                        "Updated to v0.23.0. In network mode, anyone who can reach this port can change bay "
                         "assignments and lights. See Optional authentication on the Advanced "
                         "Configuration wiki page to add a sign-in."
                     ),
@@ -82,13 +119,41 @@ class UpgradeNoticeServiceTests(unittest.TestCase):
             self.assertIsNone(upgrade_notice.current_notice(data_dir, version="0.24.0"))
             self.assertEqual(read_state(data_dir), {"last_seen_version": "0.24.0"})
 
-    def test_unreadable_record_is_treated_as_a_fresh_install(self) -> None:
+    def test_unreadable_record_reports_unknown_previous(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             data_dir = Path(temp_dir)
             upgrade_notice.state_path(data_dir).write_text("{not json", encoding="utf-8")
 
+            notice = upgrade_notice.current_notice(data_dir, version="0.23.0")
+            self.assertIsNotNone(notice)
+            self.assertIn("Previous version unknown", notice["text"])
+            self.assertEqual(notice["previous"], "")
+
+    def test_invalid_utf8_record_reports_unknown_previous_and_persists(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir)
+            upgrade_notice.state_path(data_dir).write_bytes(b"\xff")
+
+            notice = upgrade_notice.current_notice(data_dir, version="0.23.0")
+
+            self.assertIsNotNone(notice)
+            self.assertEqual(notice["previous"], "")
+            self.assertIn("Running v0.23.0. Previous version unknown.", notice["text"])
+            self.assertNotIn("Updated to", notice["text"])
+            self.assertEqual(read_state(data_dir), {
+                "last_seen_version": "0.23.0",
+                "notice": {"version": "0.23.0", "previous": ""},
+            })
+            self.assertEqual(upgrade_notice.current_notice(data_dir, version="0.23.0"), notice)
+            self.assertTrue(upgrade_notice.dismiss_notice(data_dir, version="0.23.0"))
             self.assertIsNone(upgrade_notice.current_notice(data_dir, version="0.23.0"))
-            self.assertEqual(read_state(data_dir), {"last_seen_version": "0.23.0"})
+
+    def test_basic_mode_notice_uses_selected_policy_without_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            notice = upgrade_notice.current_notice(Path(temp_dir), version="0.23.0", auth_mode="basic")
+            self.assertIn("Sign-in is required to change bay assignments and lights", notice["text"])
+            self.assertNotIn("anyone who can reach", notice["text"])
+            self.assertNotIn("synthetic-passphrase", notice["text"])
 
     def test_dismiss_reports_an_unwritable_data_dir(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
