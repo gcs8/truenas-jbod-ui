@@ -391,6 +391,7 @@ async def build_public_demo_html(
         resolved_settings,
         PublicDemoHistoryBackend(fixture),
         templates,
+        embed_all_images=True,
     )
     rendered = await exporter.build_enclosure_snapshot_html(
         request=build_static_demo_request(),

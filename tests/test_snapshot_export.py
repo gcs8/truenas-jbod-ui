@@ -728,6 +728,30 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         runtime = build_storage_view_runtime()
         return runtime.model_copy(update={"views": [*runtime.views, view]})
 
+    async def test_demo_image_mode_does_not_share_selective_render_work_or_cache(self) -> None:
+        selective = SnapshotExportService(Settings(), FakeHistoryBackend(), templates)  # type: ignore[arg-type]
+        demo = SnapshotExportService(
+            Settings(), FakeHistoryBackend(), templates, embed_all_images=True,  # type: ignore[arg-type]
+        )
+        # Exercise the mode against an already populated shared render cache.
+        kwargs: dict[str, Any] = dict(
+            request=build_request(),
+            snapshot=build_snapshot(),
+            selected_slot=None,
+            history_window_hours=24,
+            io_chart_mode="total",
+        )
+        plain = await selective.build_enclosure_snapshot_html(**kwargs)
+        complete = await demo.build_enclosure_snapshot_html(**kwargs)
+        again = await selective.build_enclosure_snapshot_html(**kwargs)
+
+        self.assertNotEqual(plain.cache_key, complete.cache_key)
+        self.assertNotIn("data:image/", plain.html)
+        self.assertIs(again, plain)
+        for path in snapshot_export.OFFLINE_IMAGE_ASSETS:
+            self.assertTrue(self._card_photo_data_url(path) in complete.html, path)
+        self.assertEqual(complete.size_bytes, len(complete.html.encode("utf-8")))
+
     async def test_export_inlines_only_the_card_photos_its_views_can_draw(self) -> None:
         exporter = SnapshotExportService(Settings(), FakeHistoryBackend(), templates)  # type: ignore[arg-type]
         photos = {path: self._card_photo_data_url(path) for path in snapshot_export.OFFLINE_IMAGE_ASSETS}

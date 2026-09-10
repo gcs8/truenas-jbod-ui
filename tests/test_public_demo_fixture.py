@@ -325,6 +325,13 @@ class PublicDemoFixtureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([slot.slot_label for slot in nvme.slots], ["M2-1", "M2-2", "M2-3", "M2-4"])
         self.assertEqual(nvme.slots[0].model, "Demo NVMe Flash 2TB")
 
+    async def test_public_demo_embeds_all_declared_images_for_strict_source_parity(self) -> None:
+        from scripts.public_demo_source_parity import inline_source_errors
+
+        html = await build_public_demo_html()
+
+        self.assertEqual(inline_source_errors(html, ROOT), [])
+
     async def test_public_demo_html_is_deterministic_and_self_contained(self) -> None:
         first = await build_public_demo_html()
         clear_export_caches()

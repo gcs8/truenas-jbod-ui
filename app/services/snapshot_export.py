@@ -855,12 +855,16 @@ class SnapshotExportService:
         size_limit_bytes: int = DEFAULT_EXPORT_SIZE_LIMIT_BYTES,
         metrics_service_name: str = "enclosure-ui",
         work_coordinator: SnapshotExportWorkCoordinator | None = None,
+        embed_all_images: bool = False,
     ) -> None:
         self.settings = settings
         self.history_backend = history_backend
         self.templates = templates
         self.size_limit_bytes = size_limit_bytes
         self.metrics_service_name = metrics_service_name
+        # Public-demo source parity requires all declared image substitutions.
+        # Ordinary exports retain hardware-selective embedding.
+        self._embed_all_images = embed_all_images
         self._history_cache = EXPORT_HISTORY_CACHE
         self._render_cache = EXPORT_RENDER_CACHE
         self._zip_cache = EXPORT_ZIP_CACHE
@@ -1400,7 +1404,7 @@ class SnapshotExportService:
                 "initial_history_timeframe_hours_json": json.dumps(normalized_window_hours),
                 "initial_history_io_chart_mode_json": json.dumps(normalized_chart_mode),
             }
-        image_assets = self._referenced_image_assets(
+        image_assets = None if self._embed_all_images else self._referenced_image_assets(
             (snapshot_for_export, *live_enclosure_snapshots_for_export.values()),
             storage_view_runtime_for_export,
         )
@@ -2678,6 +2682,7 @@ class SnapshotExportService:
         return "|".join(
             [
                 "render",
+                f"images={'all' if self._embed_all_images else 'selected'}",
                 self._build_render_source_signature(snapshot, configured_hostnames),
                 f"smart={self._smart_summary_cache_fingerprint(smart_summary_cache)}",
                 f"live={self._live_enclosure_snapshots_fingerprint(live_enclosure_snapshots)}",
