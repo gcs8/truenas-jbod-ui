@@ -26,6 +26,15 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Fixed
+
+- The Storage Fabric page keeps keyboard focus, scroll position, open
+  kernel-error panels and a half-typed friendly name across renders, expands
+  long bay lists in place, keeps visited related traces clickable, and fetches
+  inventory and fabric together on refresh. (#478)
+
 ## v0.23.0 - 2026-09-08
 
 This release includes every pull request merged after `v0.22.2` through the

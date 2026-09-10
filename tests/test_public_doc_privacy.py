@@ -281,6 +281,23 @@ class PublicDocPrivacyTests(unittest.TestCase):
 
         self.assertNotEqual(first, replacement)
 
+    def test_fabric_host_label_exception_matches_exact_source_findings(self) -> None:
+        # YAML-shaped JavaScript object keys are still scanned, not bypassed.
+        literal_findings = _scan_text('host: "Host",\n')
+        self.assertEqual(
+            [category for category, _fingerprint in literal_findings],
+            ["internal_hostname"],
+        )
+        relative_path = "app/static/sas_fabric_view.js"
+        _reason, categories = REVIEWED_FINDING_EXCEPTIONS[relative_path]
+        expected = Counter({
+            (category, fingerprint): count
+            for category, fingerprints in categories.items()
+            for fingerprint, count in fingerprints.items()
+        })
+        actual = _scan_text((REPOSITORY_ROOT / relative_path).read_text(encoding="utf-8"))
+        self.assertEqual(actual, expected)
+
     def test_tracked_public_text_contains_no_unreviewed_private_lab_identifiers(self) -> None:
         expected: Counter[tuple[str, str, str]] = Counter()
         for path, (reason, categories) in REVIEWED_FINDING_EXCEPTIONS.items():
