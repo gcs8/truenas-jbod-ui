@@ -26,6 +26,14 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Fixed
+
+- Added released-schema history admission, bounded offline plaintext unsegmented
+  paused recovery, and main/admin recovery readiness while retaining original
+  evidence and requiring fresh-process admission after finalization (#500).
+
 ## v0.23.0 - 2026-09-08
 
 This release includes every pull request merged after `v0.22.2` through the
