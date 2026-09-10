@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -1060,7 +1061,12 @@ class ContainerResourceContractTests(unittest.TestCase):
 
         backup = overlay["services"]["enclosure-backup"]
         self.assertEqual(backup["user"], "${BACKUP_UID:-1000}:${BACKUP_GID:-1000}")
-        self.assertEqual(backup["group_add"], ["${APP_GID:-10001}"])
+        # Compose appends group_add lists; the overlay must inherit the base grant.
+        self.assertNotIn("group_add", backup)
+        base = yaml.safe_load((REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8"))
+        self.assertEqual(
+            base["services"]["enclosure-backup"]["group_add"], ["${APP_GID:-10001}"]
+        )
 
         backup_guide = (
             REPO_ROOT / "wiki/Backup-Restore-and-Debug-Bundles.md"
@@ -1069,6 +1075,75 @@ class ContainerResourceContractTests(unittest.TestCase):
         self.assertIn("Status files use `0640`", backup_guide)
         self.assertIn("segment directory uses exact mode `0750`", backup_guide)
         self.assertIn("segments and `catalog.json` use exact mode `0640`", backup_guide)
+
+    def test_real_compose_merge_preserves_backup_group_and_runtime_identity(self) -> None:
+        # Config rendering is daemon-free. Never load operator .env/config or start services.
+        binary = os.environ.get("COMPOSE_BINARY") or shutil.which("docker-compose")
+        if binary:
+            compose = [binary]
+        elif shutil.which("docker"):
+            compose = ["docker", "compose"]
+            version = subprocess.run(compose + ["version"], capture_output=True, timeout=30)
+            if version.returncode:
+                self.skipTest("Docker Compose plugin unavailable; real merge not validated")
+        else:
+            self.skipTest("Docker Compose unavailable; real merge not validated")
+
+        chains = (
+            ("docker-compose.yml",),
+            ("docker-compose.dev.yml",),
+            ("docker-compose.yml", "docker-compose.nonroot.yml"),
+            ("docker-compose.yml", "docker-compose.secrets.yml", "docker-compose.nonroot.yml"),
+            ("docker-compose.yml", "docker-compose.nonroot.yml", "docker-compose.secrets.yml"),
+        )
+        examples = (
+            ("defaults", "", "10001", "10001", "1000:1000", "0:0"),
+            ("example", (REPO_ROOT / ".env.example").read_text(encoding="utf-8"),
+             "10001", "10001", "1000:1000", "0:0"),
+            ("custom", "APP_UID=21001\nAPP_GID=21002\nBACKUP_UID=22001\nBACKUP_GID=22002\n",
+             "21001", "21002", "22001:22002", "22001:22002"),
+        )
+        with tempfile.TemporaryDirectory(prefix="compose-contract-") as temporary:
+            root = Path(temporary)
+            for name in SUPPORTED_COMPOSE_FILES:
+                shutil.copyfile(REPO_ROOT / name, root / name)
+            environment = {
+                "PATH": os.environ.get("PATH", ""),
+                "HOME": temporary,
+                "TMPDIR": temporary,
+                "DOCKER_CONFIG": str(root / "docker-config"),
+            }
+            for label, contents, uid, gid, hardened_backup, base_backup in examples:
+                (root / ".env").write_text(contents, encoding="utf-8")
+                for chain in chains:
+                    with self.subTest(environment=label, chain=chain):
+                        command = compose + ["--project-name", "contract", "--env-file", str(root / ".env")]
+                        for name in chain:
+                            command.extend(["-f", str(root / name)])
+                        result = subprocess.run(
+                            command + ["--profile", "*", "config", "--format", "json"],
+                            cwd=root, env=environment, text=True, capture_output=True, timeout=30,
+                        )
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        services = json.loads(result.stdout)["services"]
+                        hardened = "docker-compose.nonroot.yml" in chain or chain[0] == "docker-compose.dev.yml"
+                        backup = services["enclosure-backup"]
+                        self.assertEqual(backup["group_add"], [gid])
+                        self.assertEqual(backup["user"], hardened_backup if hardened else base_backup)
+                        for name in ("enclosure-ui", "enclosure-history", "enclosure-admin"):
+                            service = services[name]
+                            identity = f"{'0' if name == 'enclosure-admin' else uid}:{gid}"
+                            self.assertEqual(service["user"], identity if hardened else "0:0")
+                            self.assertEqual(service.get("read_only", False), hardened)
+                            if hardened:
+                                self.assertEqual(service["cap_drop"], ["ALL"])
+                                self.assertIn("/tmp", service["tmpfs"])
+                        if hardened:
+                            config_mount = next(
+                                mount for mount in services["enclosure-ui"]["volumes"]
+                                if mount["target"] == "/app/config"
+                            )
+                            self.assertTrue(config_mount["read_only"])
 
     def test_nonroot_migration_helper_is_bounded_no_follow_and_dry_run_by_default(self) -> None:
         helper = (REPO_ROOT / "scripts/prepare_nonroot_bind_mounts.py").read_text(encoding="utf-8")

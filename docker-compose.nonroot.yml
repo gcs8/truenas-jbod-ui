@@ -38,5 +38,4 @@ services:
 
   enclosure-backup:
     user: "${BACKUP_UID:-1000}:${BACKUP_GID:-1000}"
-    group_add:
-      - "${APP_GID:-10001}"
+    # Inherit group_add from the base; Compose appends overlay list entries.
