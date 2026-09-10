@@ -762,7 +762,7 @@
   function renderSlotList(slots, { limit = 28, expandKey = "" } = {}) {
     const sorted = sortedSlots(slots);
     if (!sorted.length) {
-      return '<span class="fabric-empty-note">No mapped bays</span>';
+      return '<span class="fabric-empty-note">No mapped disks</span>';
     }
     const expanded = expandKey && state.expandedSlotLists[expandKey];
     const visible = expanded ? sorted : sorted.slice(0, limit);
@@ -935,8 +935,16 @@
     return new Map(list(fabric?.links).map((link) => [link.id, link]));
   }
 
+  const traceLookupCache = new WeakMap();
+
   function traceMap(fabric = state.fabric) {
-    return new Map(list(fabric?.traces).map((trace) => [trace.id, trace]));
+    if (!fabric) return new Map();
+    let cached = traceLookupCache.get(fabric);
+    if (!cached || cached.source !== fabric.traces) {
+      cached = { source: fabric.traces, map: new Map(list(fabric.traces).map((trace) => [trace.id, trace])) };
+      traceLookupCache.set(fabric, cached);
+    }
+    return cached.map;
   }
 
   function aliasMap(fabric = state.fabric) {
@@ -1278,8 +1286,23 @@
     return node?.kind === "ses-enclosure" && sortedSlots(node.related_slots).includes(Number(slotNumber));
   }
 
+  const slotLookupCache = new WeakMap();
+
   function slotByNumber(slotNumber) {
-    return list(state.snapshot?.slots).find((slot) => Number(slot.slot) === Number(slotNumber)) || null;
+    const snapshot = state.snapshot;
+    if (!snapshot) return null;
+    let cached = slotLookupCache.get(snapshot);
+    if (!cached || cached.source !== snapshot.slots) {
+      const map = new Map();
+      for (const slot of list(snapshot.slots)) {
+        const number = Number(slot.slot);
+        // Preserve the first-match behavior of the previous snapshot scan.
+        if (!map.has(number)) map.set(number, slot);
+      }
+      cached = { source: snapshot.slots, map };
+      slotLookupCache.set(snapshot, cached);
+    }
+    return cached.map.get(Number(slotNumber)) || null;
   }
 
   // The bay kind/ID is a compatibility key, not physical-location evidence.
@@ -1479,6 +1502,12 @@
     ].filter(Boolean).join(" / ") || "n/a";
   }
 
+  // A count without complete, affirmative member evidence is not a location.
+  function aggregateDiskNoun(slots, count = slots.length) {
+    return slots.length > 0 && Number(count) === slots.length
+      && slots.every((slotNumber) => diskLocation(slotNumber).physical) ? "bay" : "disk";
+  }
+
   function renderPathButton(path, { compact = false } = {}) {
     const trace = traceById(path.id);
     const selected = state.selectedTraceId === path.id;
@@ -1489,7 +1518,7 @@
       <button type="button" class="fabric-path-card status-${classToken(stateName)}${selected ? " is-selected" : ""}${related ? " is-related" : ""}${compact ? " compact" : ""}" data-fabric-trace="${escapeHtml(path.id)}">
         <span>${escapeHtml(path.controller || "path")}</span>
         <strong>${escapeHtml(displayLabel(path) || stateName)}</strong>
-        <small>${escapeHtml(`${path.count || slots.length || 0} bay${(path.count || slots.length) === 1 ? "" : "s"}`)}</small>
+        <small>${escapeHtml(`${path.count || slots.length || 0} ${aggregateDiskNoun(slots, path.count || slots.length)}${(path.count || slots.length) === 1 ? "" : "s"}`)}</small>
         <em>${renderSlotList(slots, { limit: compact ? 16 : 28, expandKey: `path:${path.id}` })}</em>
       </button>
     `;
@@ -1507,7 +1536,7 @@
   function renderBayChips(slots, limit = 96, { modeTarget = "" } = {}) {
     const sorted = sortedSlots(slots);
     if (!sorted.length) {
-      return '<span class="fabric-empty-note">No mapped bays</span>';
+      return '<span class="fabric-empty-note">No mapped disks</span>';
     }
     const activeSlots = selectedSlots();
     const chips = sorted.slice(0, limit).map((slotNumber) => {
@@ -1523,7 +1552,7 @@
         </button>
       `;
     }).join("");
-    const overflow = sorted.length > limit ? `<span class="fabric-empty-note">+${sorted.length - limit} bays</span>` : "";
+    const overflow = sorted.length > limit ? `<span class="fabric-empty-note">+${sorted.length - limit} ${aggregateDiskNoun(sorted)}s</span>` : "";
     return `${chips}${overflow}`;
   }
 
@@ -1582,7 +1611,7 @@
             <div class="fabric-node-grid">${renderNodeGrid(enclosures, 8)}</div>
           </div>
           <div class="fabric-stage">
-            <span class="fabric-stage-title">${escapeHtml(copy.laneStages.bays)}</span>
+            <span class="fabric-stage-title">${escapeHtml(aggregateDiskNoun(slots) === "bay" ? copy.laneStages.bays : copy.laneStages.bays.replace("Bays", "Disks"))}</span>
             <div class="fabric-bay-grid">${renderBayChips(slots, 120)}</div>
           </div>
         </section>
@@ -1636,7 +1665,7 @@
             <article class="fabric-impact-card status-${classToken(path.state)}${selected ? " is-selected" : ""}" data-fabric-trace="${escapeHtml(path.id)}" role="button" tabindex="0">
               <span class="fabric-node-kind">${escapeHtml(path.controller || "path")}</span>
               <strong>${escapeHtml(path.state || "unknown")}</strong>
-              <span>${escapeHtml(`${slots.length} affected bay${slots.length === 1 ? "" : "s"}`)}</span>
+              <span>${escapeHtml(`${slots.length} affected ${aggregateDiskNoun(slots)}${slots.length === 1 ? "" : "s"}`)}</span>
               <div class="fabric-impact-facts">
                 <span>Pools: ${escapeHtml(summary.pools.join(", ") || "n/a")}</span>
                 <span>Vdevs: ${escapeHtml(summary.vdevs.join(", ") || "n/a")}</span>
