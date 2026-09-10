@@ -9,8 +9,11 @@ import logging
 import re
 import shlex
 import time
+import threading
+from contextlib import contextmanager
 from collections import Counter, OrderedDict
 from collections.abc import Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Generic, Iterable, Literal, TypeVar
@@ -779,6 +782,68 @@ class InventorySourceBundle:
     parsed_ssh_data_by_enclosure: dict[str, ParsedSSHData] = field(default_factory=dict)
 
 
+class SmartDetailBatch:
+    """Request-local persistence; never reuse the read snapshot for writes."""
+
+    def __init__(self, store: SlotDetailStore | None) -> None:
+        self.store = store
+        self.loaded: asyncio.Task[dict[str, SlotDetailCacheEntry]] | None = None
+        self.pending: list[SlotDetailCacheEntry] = []
+        self.generations: list[tuple[InventoryService, SmartCacheKey, SmartCacheGenerationToken]] = []
+        self.saved: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self.saved.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        self.dependencies: set[asyncio.Future[None]] = set()
+
+    async def entries(self) -> dict[str, SlotDetailCacheEntry]:
+        if self.store is None:
+            return {}
+        if self.loaded is None:
+            self.loaded = asyncio.create_task(asyncio.to_thread(self.store.load_all))
+        return await asyncio.shield(self.loaded)
+
+    @contextmanager
+    def commit_guard(self):
+        # A public batch belongs to one service/enclosure. Serialize only the
+        # final replacement with generation changes, never reads or JSON I/O.
+        if not self.generations:
+            yield True
+            return
+        service = self.generations[0][0]
+        with service._smart_persistence_lock:
+            yield all(
+                owner._smart_cache_generation_token(key) == generation
+                for owner, key, generation in self.generations
+            )
+
+    async def flush(self) -> None:
+        try:
+            if self.store is not None and self.pending:
+                # Reload/conflict checking remains under the store lock; the
+                # generation guard is rechecked at the canonical commit boundary.
+                await asyncio.to_thread(
+                    self.store.save_entries, self.pending,
+                    expected_entries=await self.entries(), commit_guard=self.commit_guard,
+                )
+        except BaseException as exc:
+            self.saved.set_exception(exc)
+            raise
+        else:
+            self.saved.set_result(None)
+
+    async def wait_dependencies(self) -> None:
+        # Publish our own save BEFORE waiting. Cross-owned overlapping batches
+        # can depend on each other's saves without waiting on whole batches.
+        outcomes = await asyncio.gather(
+            *(asyncio.shield(saved) for saved in self.dependencies), return_exceptions=True,
+        )
+        for outcome in outcomes:
+            if isinstance(outcome, BaseException):
+                raise outcome
+
+
+_smart_detail_batch: ContextVar[SmartDetailBatch | None] = ContextVar("smart_detail_batch", default=None)
+
+
 class InventoryService:
     def __init__(
         self,
@@ -809,9 +874,11 @@ class InventoryService:
             SmartCacheKey,
             tuple[SmartSummaryView, datetime],
         ] = OrderedDict()
+        self._smart_persistence_lock = threading.Lock()
         self._smart_cache_global_generation = 0
         self._smart_cache_enclosure_generations: dict[str, int] = {}
         self._smart_load_tasks: dict[SmartCacheKey, asyncio.Task[SmartSummaryView]] = {}
+        self._smart_load_batches: dict[asyncio.Task[SmartSummaryView], SmartDetailBatch] = {}
         self._smart_operation_limit = max(1, self.settings.app.smart_batch_max_concurrency)
         self._smart_operation_semaphore = asyncio.Semaphore(self._smart_operation_limit)
         self._source_bundle: InventorySourceBundle | None = None
@@ -1968,7 +2035,8 @@ class InventoryService:
             self._canonical_enclosure_options = None
             self._canonical_default_enclosure_id = None
             self._snapshot_topology_generation += 1
-            self._smart_cache_global_generation += 1
+            with self._smart_persistence_lock:
+                self._smart_cache_global_generation += 1
             smart_keys_to_remove = (
                 set(self._smart_cache)
                 | set(self._smart_cache_until)
@@ -1988,10 +2056,11 @@ class InventoryService:
             if any(key is None for key in requested_keys):
                 normalized_keys.add("__default__")
             snapshot_keys_to_remove = set(normalized_keys)
-            for key in snapshot_keys_to_remove:
-                self._smart_cache_enclosure_generations[key] = (
-                    self._smart_cache_enclosure_generations.get(key, 0) + 1
-                )
+            with self._smart_persistence_lock:
+                for key in snapshot_keys_to_remove:
+                    self._smart_cache_enclosure_generations[key] = (
+                        self._smart_cache_enclosure_generations.get(key, 0) + 1
+                    )
             smart_keys_to_remove = {
                 key
                 for key in (
@@ -3004,6 +3073,7 @@ class InventoryService:
         slot_view: SlotView,
         generation_token: SmartCacheGenerationToken,
     ) -> None:
+        token = _smart_detail_batch.set(None)
         try:
             await self._get_slot_smart_summary_for_slot_view(
                 slot_view,
@@ -3012,6 +3082,8 @@ class InventoryService:
             )
         except Exception:  # noqa: BLE001 - background refreshes should stay best-effort.
             logger.exception("Background SMART refresh failed for %s", cache_key)
+        finally:
+            _smart_detail_batch.reset(token)
 
     def _apply_persisted_slot_details(self, slots: list[SlotView]) -> None:
         if not self.slot_detail_store or not slots:
@@ -3076,10 +3148,15 @@ class InventoryService:
             return
         self.slot_detail_store.save_entries(normalized_entries)
 
-    def _build_persisted_smart_summary(self, slot_view: SlotView) -> SmartSummaryView | None:
+    def _build_persisted_smart_summary(
+        self, slot_view: SlotView,
+        *, loaded_entries: Mapping[str, SlotDetailCacheEntry] | None = None,
+    ) -> SmartSummaryView | None:
         if not self.slot_detail_store:
             return None
-        entry = self.slot_detail_store.get_entry(self.system.id, slot_view.enclosure_id, slot_view.slot)
+        entry = self.slot_detail_store.get_entry(
+            self.system.id, slot_view.enclosure_id, slot_view.slot, loaded_entries=loaded_entries,
+        )
         if entry is None or not self._slot_detail_entry_matches(slot_view, entry):
             return None
         if not entry.smart_fields:
@@ -3794,6 +3871,9 @@ class InventoryService:
         task = self._smart_load_tasks.get(cache_key)
         if task is None:
             generation_token = expected_generation or self._smart_cache_generation_token(cache_key)
+            detail_batch = _smart_detail_batch.get()
+            if detail_batch is not None and detail_batch.store is not self.slot_detail_store:
+                detail_batch = None
             task = asyncio.create_task(
                 self._run_smart_loader(
                     slot_view,
@@ -3801,13 +3881,25 @@ class InventoryService:
                     candidates=candidates,
                     generation_token=generation_token,
                     allow_stale_cache=allow_stale_cache,
+                    detail_batch=detail_batch,
                 )
             )
             self._smart_load_tasks[cache_key] = task
+            if detail_batch is not None:
+                self._smart_load_batches[task] = detail_batch
             task.add_done_callback(
                 lambda completed, key=cache_key: self._cleanup_smart_load_task(key, completed)
             )
-        return await asyncio.shield(task)
+        owner = self._smart_load_batches.get(task)
+        caller_batch = _smart_detail_batch.get()
+        if caller_batch is not None and caller_batch.store is not self.slot_detail_store:
+            caller_batch = None
+        if owner is not None and caller_batch is not None and owner is not caller_batch:
+            caller_batch.dependencies.add(owner.saved)
+        result = await asyncio.shield(task)
+        if owner is not None and caller_batch is None:
+            await asyncio.shield(owner.saved)
+        return result
 
     def _cleanup_smart_load_task(
         self,
@@ -3816,6 +3908,7 @@ class InventoryService:
     ) -> None:
         if self._smart_load_tasks.get(cache_key) is completed:
             self._smart_load_tasks.pop(cache_key, None)
+        self._smart_load_batches.pop(completed, None)
         if completed.cancelled():
             return
         completed.exception()
@@ -3828,6 +3921,7 @@ class InventoryService:
         candidates: list[str],
         generation_token: SmartCacheGenerationToken,
         allow_stale_cache: bool,
+        detail_batch: SmartDetailBatch | None = None,
     ) -> SmartSummaryView:
         async with self._smart_operation_semaphore:
             summary = await self._load_uncached_smart_summary(
@@ -3836,6 +3930,7 @@ class InventoryService:
                 candidates=candidates,
                 generation_token=generation_token,
                 allow_stale_cache=allow_stale_cache,
+                detail_batch=detail_batch,
             )
         if summary.available is False:
             self._store_negative_smart_summary(
@@ -3855,7 +3950,29 @@ class InventoryService:
         candidates: list[str],
         generation_token: SmartCacheGenerationToken,
         allow_stale_cache: bool,
+        detail_batch: SmartDetailBatch | None = None,
     ) -> SmartSummaryView:
+        # Single-slot/background loaders also keep disk operations off the loop.
+        batch = detail_batch or SmartDetailBatch(self.slot_detail_store)
+        await batch.entries()
+
+        async def persist(summary: SmartSummaryView) -> None:
+            entry = self._build_slot_detail_entry(slot_view, smart_summary=summary)
+            if entry is not None:
+                batch.pending.append(entry)
+                batch.generations.append((self, cache_key, generation_token))
+            if detail_batch is None:
+                await batch.flush()
+
+        async def persisted_summary() -> SmartSummaryView | None:
+            return self._build_persisted_smart_summary(
+                slot_view, loaded_entries=await batch.entries(),
+            )
+
+        async def merge_fallback(fallback: SmartSummaryView) -> SmartSummaryView | None:
+            persisted = await persisted_summary()
+            return self._merge_missing_smart_fields(fallback, persisted) if persisted is not None else None
+
         smartctl_device_type = self._smart_candidate_device_type(slot_view)
         if self.system.truenas.platform == "esxi":
             summary = await self._build_esxi_slot_smart_summary(slot_view)
@@ -3864,7 +3981,7 @@ class InventoryService:
                 summary,
                 expected_generation=generation_token,
             ):
-                self._persist_slot_detail_cache(slot_view, smart_summary=summary)
+                await persist(summary)
                 self._observe_inventory_cache_metrics()
             self._observe_smart_summary_request("esxi-live")
             return summary
@@ -3891,7 +4008,7 @@ class InventoryService:
                 summary,
                 expected_generation=generation_token,
             ):
-                self._persist_slot_detail_cache(slot_view, smart_summary=summary)
+                await persist(summary)
                 self._observe_inventory_cache_metrics()
             self._observe_smart_summary_request("quantastor-live")
             return summary
@@ -3901,11 +4018,11 @@ class InventoryService:
                 slot_view,
                 "No SMART-capable device path is available for this slot.",
             )
-            cached_fallback = self._merge_cached_smart_summary(slot_view, fallback)
+            cached_fallback = await merge_fallback(fallback)
             self._observe_smart_summary_request("no-device-fallback")
             return cached_fallback or fallback
 
-        persisted = self._build_persisted_smart_summary(slot_view)
+        persisted = await persisted_summary()
         if persisted is not None and allow_stale_cache:
             add_perf_metadata(smart_cache="persistent-hit")
             if self._store_smart_summary_cache(
@@ -3933,7 +4050,7 @@ class InventoryService:
                     summary,
                     expected_generation=generation_token,
                 ):
-                    self._persist_slot_detail_cache(slot_view, smart_summary=summary)
+                    await persist(summary)
                     self._observe_inventory_cache_metrics()
                 self._observe_smart_summary_request("ssh-live")
                 return summary
@@ -3947,7 +4064,7 @@ class InventoryService:
                     else "Detailed SMART data is not available for this Linux slot."
                 ),
             )
-            cached_fallback = self._merge_cached_smart_summary(slot_view, fallback)
+            cached_fallback = await merge_fallback(fallback)
             self._observe_smart_summary_request("fallback")
             return cached_fallback or fallback
 
@@ -4003,7 +4120,7 @@ class InventoryService:
                 api_summary,
                 expected_generation=generation_token,
             ):
-                self._persist_slot_detail_cache(slot_view, smart_summary=api_summary)
+                await persist(api_summary)
                 self._observe_inventory_cache_metrics()
             self._observe_smart_summary_request("api-live")
             return api_summary
@@ -4021,7 +4138,7 @@ class InventoryService:
                     ssh_summary,
                     expected_generation=generation_token,
                 ):
-                    self._persist_slot_detail_cache(slot_view, smart_summary=ssh_summary)
+                    await persist(ssh_summary)
                     self._observe_inventory_cache_metrics()
                 self._observe_smart_summary_request("ssh-live")
                 return ssh_summary
@@ -4032,7 +4149,7 @@ class InventoryService:
             slot_view,
             last_error or "SMART summary is unavailable for this slot.",
         )
-        cached_fallback = self._merge_cached_smart_summary(slot_view, fallback)
+        cached_fallback = await merge_fallback(fallback)
         self._observe_smart_summary_request("fallback")
         return cached_fallback or fallback
 
@@ -4066,6 +4183,7 @@ class InventoryService:
             if max_concurrency is not None:
                 effective_concurrency = min(effective_concurrency, max(1, max_concurrency))
             semaphore = asyncio.Semaphore(max(1, effective_concurrency))
+            detail_batch = SmartDetailBatch(self.slot_detail_store)
 
             async def load_summary(slot: int) -> SmartBatchItem:
                 async with semaphore:
@@ -4079,7 +4197,26 @@ class InventoryService:
                         summary = self._fallback_smart_summary(slot_lookup.get(slot), str(exc))
                     return SmartBatchItem(slot=slot, summary=summary)
 
-            return await asyncio.gather(*(load_summary(slot) for slot in ordered_slots))
+            async def complete_batch() -> list[SmartBatchItem]:
+                # Retain ownership through cancellation until loaders and disk save
+                # finish. Shared per-slot tasks can outlive the requesting caller.
+                token = _smart_detail_batch.set(detail_batch)
+                try:
+                    results = await asyncio.gather(
+                        *(load_summary(slot) for slot in ordered_slots), return_exceptions=True,
+                    )
+                finally:
+                    _smart_detail_batch.reset(token)
+                await detail_batch.flush()
+                await detail_batch.wait_dependencies()
+                for result in results:
+                    if isinstance(result, BaseException):
+                        raise result
+                return [result for result in results if isinstance(result, SmartBatchItem)]
+
+            task = asyncio.create_task(complete_batch())
+            task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+            return await asyncio.shield(task)
 
     async def _fetch_smart_summary_over_ssh(
         self,
