@@ -82,10 +82,10 @@
   "app/static/sas_fabric_view.js": {
     "findings": {
       "internal_hostname": {
-        "sha256:f164b56d535df3aedb8108009168b93db878915dc2c0417503ecd7f0ba2202f6": 5
+        "sha256:356cb04776f5373c82f98032b4a7b50933282f4d3d66414effbd766d6e3f9a94": 6
       }
     },
-    "reason": "Reviewed source literal or validation pattern; exact detector counts are pinned."
+    "reason": "Reviewed JavaScript host-key UI labels matched by the YAML host-field detector, not network hostnames. PR478 adds the generic Host kind label and simplifies the existing conditional Host label; exact values and counts remain pinned."
   },
   "config/config.example.yaml": {
     "findings": {
