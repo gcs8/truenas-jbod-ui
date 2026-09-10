@@ -3085,11 +3085,58 @@ class InventoryService:
         finally:
             _smart_detail_batch.reset(token)
 
-    def _apply_persisted_slot_details(self, slots: list[SlotView]) -> None:
+    async def _apply_and_persist_snapshot_slot_details(self, slots: list[SlotView]) -> None:
+        store = self.slot_detail_store
+        if store is None or not slots:
+            return
+        generations = [
+            (key, self._smart_cache_generation_token(key))
+            for key in (self._smart_cache_key(slot) for slot in slots)
+        ]
+
+        @contextmanager
+        def commit_guard():
+            with self._smart_persistence_lock:
+                yield all(self._smart_cache_generation_token(key) == generation for key, generation in generations)
+
+        def apply_and_save():
+            with perf_stage("inventory.slot_detail_cache.apply", slot_count=len(slots)):
+                loaded = store.load_all()
+                self._apply_persisted_slot_details(slots, loaded_entries=loaded)
+            with perf_stage("inventory.slot_detail_cache.persist", slot_count=len(slots)):
+                entries = [self._build_slot_detail_entry(slot, smart_summary=None) for slot in slots]
+                store.save_entries(
+                    [entry for entry in entries if entry is not None],
+                    expected_entries=loaded, commit_guard=commit_guard,
+                )
+
+        # The worker owns these request-local slots until it finishes. Retain the
+        # caller's snapshot lock/activity through repeated cancellation, including
+        # late failures, rather than letting a successor race a detached writer.
+        worker = asyncio.create_task(asyncio.to_thread(apply_and_save))
+        cancelled = False
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                cancelled = True
+            except Exception:
+                break
+        if cancelled:
+            if not worker.cancelled():
+                worker.exception()
+            raise asyncio.CancelledError
+        worker.result()
+
+    def _apply_persisted_slot_details(
+        self, slots: list[SlotView], *,
+        loaded_entries: Mapping[str, SlotDetailCacheEntry] | None = None,
+    ) -> None:
         if not self.slot_detail_store or not slots:
             return
 
-        loaded_entries = self.slot_detail_store.load_all()
+        if loaded_entries is None:
+            loaded_entries = self.slot_detail_store.load_all()
         for slot_view in slots:
             entry = self.slot_detail_store.get_entry(
                 self.system.id,
@@ -4716,10 +4763,7 @@ class InventoryService:
             else:
                 platform_context["bmc"] = bmc_context
 
-        with perf_stage("inventory.slot_detail_cache.apply", slot_count=len(slots)):
-            self._apply_persisted_slot_details(slots)
-        with perf_stage("inventory.slot_detail_cache.persist", slot_count=len(slots)):
-            self._persist_slot_details(slots)
+        await self._apply_and_persist_snapshot_slot_details(slots)
 
         slots = self._attach_mapping_revisions(slots)
         summary = InventorySummary(
