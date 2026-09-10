@@ -424,12 +424,28 @@ class SnapshotIOTests(unittest.IsolatedAsyncioTestCase):
                             outcomes = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 3)
                             self.assertIsInstance(outcomes[0], asyncio.CancelledError)
                             self.assertEqual(len(outcomes[1].slots), 1)
+                        # Drain completion callbacks before checking every loop
+                        # error context, including Python 3.14 shield diagnostics.
+                        await asyncio.sleep(0)
+                        await asyncio.sleep(0)
                         self.assertFalse(errors)
                         self.assertFalse(s._snapshot_activity)
                     finally:
                         release.set()
                         await asyncio.gather(*tasks, return_exceptions=True)
                         loop.set_exception_handler(previous)
+
+    async def test_snapshot_uncancelled_io_failure_propagates(self):
+        for phase in ('load_all', 'save_entries'):
+            with self.subTest(phase=phase), self.fixture(1) as (s, api, store, other):
+                await s.get_snapshot()
+                failure = RuntimeError('synthetic snapshot I/O failure')
+                with patch.object(store, phase, side_effect=failure):
+                    with self.assertRaises(RuntimeError) as caught:
+                        await s.get_snapshot(force_refresh=True)
+                self.assertIs(caught.exception, failure)
+                self.assertFalse(s._snapshot_activity)
+                self.assertEqual(len((await s.get_snapshot(force_refresh=True)).slots), 1)
 
     async def test_snapshot_commit_fenced_after_serialization(self):
         for cancel in (False, True):
@@ -504,6 +520,21 @@ class SnapshotIOTests(unittest.IsolatedAsyncioTestCase):
 
 class SmartGridConcurrencyTests(unittest.IsolatedAsyncioTestCase):
     fixture = SmartGridIOTests.fixture
+
+    async def asyncSetUp(self):
+        self.loop_errors = []
+        loop = asyncio.get_running_loop()
+        self.previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda loop, context: self.loop_errors.append(context))
+
+    async def asyncTearDown(self):
+        try:
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            self.assertEqual(self.loop_errors, [])
+        finally:
+            asyncio.get_running_loop().set_exception_handler(self.previous_handler)
+
     def setUp(self):
         self.guards = ExitStack()
         self.addCleanup(self.guards.close)
@@ -521,6 +552,76 @@ class SmartGridConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             return [t for t in asyncio.all_tasks() if t not in baseline and t is not asyncio.current_task() and not t.done()]
         await self.until(lambda: not remaining())
         self.assertEqual(remaining(), [])
+        # Task completion can precede shield's late-failure callback on 3.14.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    async def test_cancelled_retained_waits_observe_late_failure(self):
+        # Exercise each other inventory shield call site through its real caller.
+        for path in ('entries', 'dependencies', 'source_refresh', 'slot_loader', 'slot_saved'):
+            with self.subTest(path=path), self.fixture(1) as (s, api, store, other):
+                snapshot = await s.get_snapshot()
+                baseline = asyncio.all_tasks()
+                loop = asyncio.get_running_loop()
+                errors = []
+                previous = loop.get_exception_handler()
+                loop.set_exception_handler(lambda loop, context: errors.append(context))
+                entered, release = threading.Event(), threading.Event()
+                loop_thread = threading.get_ident()
+                failure = RuntimeError('synthetic retained failure')
+                def blocked():
+                    self.assertNotEqual(threading.get_ident(), loop_thread)
+                    entered.set()
+                    if not release.wait(3):
+                        raise AssertionError('worker release timeout')
+                    raise failure
+                worker = asyncio.create_task(asyncio.to_thread(blocked))
+                batch = SmartDetailBatch(store)
+                try:
+                    with ExitStack() as patches:
+                        if path == 'entries':
+                            batch.loaded = worker
+                            call = batch.entries()
+                        elif path == 'dependencies':
+                            batch.dependencies.add(worker)
+                            call = batch.wait_dependencies()
+                        elif path == 'source_refresh':
+                            patches.enter_context(patch.object(s, '_schedule_background_source_bundle_refresh', return_value=worker))
+                            call = s._background_snapshot_refresh('synthetic-enclosure')
+                        else:
+                            slot = snapshot.slots[0]
+                            key = s._smart_cache_key(slot)
+                            loader = worker
+                            if path == 'slot_saved':
+                                batch.saved = worker
+                                loader = loop.create_future()
+                                loader.set_result(SmartSummaryView())
+                                s._smart_load_batches[loader] = batch
+                            s._smart_load_tasks[key] = loader
+                            call = s._get_slot_smart_summary_for_slot_view(slot)
+                        caller = asyncio.create_task(call)
+                        await self.until(entered.is_set)
+                        # Let nested gather/dependency waiters reach suspension.
+                        for _ in range(5):
+                            await asyncio.sleep(0)
+                        for _ in range(2):
+                            caller.cancel()
+                            await asyncio.sleep(0)
+                        with self.assertRaises(asyncio.CancelledError):
+                            await caller
+                        self.assertFalse(worker.done())
+                        release.set()
+                        outcome = await asyncio.gather(worker, return_exceptions=True)
+                        self.assertIs(outcome[0], failure)
+                        await self.drain(baseline)
+                        self.assertEqual(errors, [], path)
+                finally:
+                    release.set()
+                    await asyncio.gather(worker, return_exceptions=True)
+                    await self.drain(baseline)
+                    loop.set_exception_handler(previous)
+                    s._smart_load_tasks.clear()
+                    s._smart_load_batches.clear()
 
     async def test_concurrent_same_and_different_grids(self):
         for second in ([0, 1], [1, 2], [2, 3]):
@@ -558,25 +659,37 @@ class SmartGridConcurrencyTests(unittest.IsolatedAsyncioTestCase):
                     before = store.file_path.read_bytes()
                     entered, release = threading.Event(), threading.Event()
                     real = getattr(store, phase)
+                    loop_thread = threading.get_ident()
                     def gated(*args, **kwargs):
+                        self.assertNotEqual(threading.get_ident(), loop_thread)
                         entered.set()
                         if not release.wait(3):
                             raise AssertionError('worker release timeout')
                         if fail:
                             raise RuntimeError('synthetic store failure')
                         return real(*args, **kwargs)
+                    errors = []
+                    loop = asyncio.get_running_loop()
+                    previous = loop.get_exception_handler()
+                    loop.set_exception_handler(lambda loop, context: errors.append(context))
                     try:
                         with patch.object(store, phase, gated):
                             a = asyncio.create_task(s.get_slot_smart_summaries([0, 1]))
                             await self.until(entered.is_set)
-                            a.cancel()
-                            a.cancel()
+                            for _ in range(2):
+                                a.cancel()
+                                await asyncio.sleep(0)
                             with self.assertRaises(asyncio.CancelledError):
                                 await a
+                            self.assertTrue(any(t not in baseline for t in asyncio.all_tasks()))
+                            self.assertEqual(store.file_path.read_bytes(), before)
                             release.set()
                             await self.drain(baseline)
+                        self.assertEqual(errors, [], 'late retained batch failure reached loop handler')
                     finally:
                         release.set()
+                        await self.drain(baseline)
+                        loop.set_exception_handler(previous)
                     self.assertFalse(s._smart_load_tasks)
                     self.assertFalse(s._smart_refresh_tasks)
                     self.assertIsNone(_smart_detail_batch.get())
