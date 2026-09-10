@@ -1,24 +1,12 @@
-# Public screenshot exact-byte review
+# Public screenshot review
 
-This record covers the two desktop fixture screenshots generated from `public-demo/index.html`. The capture script used `file://`, UTC, fixed desktop viewports, reduced motion, and no network request.
+Source revision: `54f0e9ed0dd53f189f12d6b8b5086245236f0659`
 
-Source revision: `dbcd2ab31e9a46083693cf08802434ac8cfc1e43`
+Source artifact SHA-256: `06b84ad983aa1f59d7c08e7b13ac0ad123186283d719fccecf4c0a04e3ec14fb`
 
-Source artifact SHA-256: `47df69547071bbff77b25c15b6f56bf96d14f366149781c6714213263813c8eb`
+Actual pixel review of both newly captured synthetic PNGs found no accidental clipping, overlap, or visible private data. Full-resolution images are retained with byte-identical wiki copies. Native-resolution/zoom viewing is required for dense bay labels; small muted labels, intentional ellipses, wrapped provenance hashes, blank vertical space and colored topology rails are visible caveats, not newly introduced recovery regressions. This does not certify contrast ratios or live recovery UX. Both views show HIST PRELOADED, not live recovery.
 
-| Image | Dimensions | Bytes | SHA-256 | Pixel review |
-|---|---:|---:|---|---|
-| `public-demo-overview.png` | 1920 by 4104 | 1123548 | `3664d12cb3780a378edc26b64bbaea8c4d079604f6dde42c7cad39f9878950ac` | PASS |
-| `public-demo-history.png` | 1920 by 4860 | 1253949 | `cc6385e729437d41c6aca2cc3e56154a756aa741f76fc730c9b27b85f130ee24` | PASS |
-
-The exact pixels were checked for private addresses, hostnames, paths, credentials, key material, and non-demo device identifiers. The review also covered snapshot/live wording, selector clipping, panel overlap, page overflow, canvas-edge artifacts, count grammar, and the consistency of current, history, rate, power-on, and annualized values.
-
-The overview image selects slot 57's special-class mirror. It does not depict the spare group. The fixture and browser gates separately verify that slots 42 and 43 render in the single `demo-capacity > spares > spare` group.
-
-Mobile and tablet layouts are unsupported and are not part of this screenshot review.
-
-No publication blocker remained. Source revision and Build ID are intentionally visible public-repository provenance, not fixture data or credentials.
-
-The byte checker independently verifies PNG framing, dimensions, sizes, hashes, docs/Wiki byte equality, artifact identity, source revision, and the `PASS` fields recorded here.
+- `public-demo-overview.png`: `24b0727ff4241716841dacc1e3997f3d9328469d6f3f71ceea889de371d66af8`, [1920, 4104] pixels, 1124816 bytes.
+- `public-demo-history.png`: `bd8cca2644afa83485aaece379eaa1b4f748b53dfe531bd43a288d8ee663762e`, [1920, 4860] pixels, 1255535 bytes.
 
 Final pixel verdict: `PASS`
