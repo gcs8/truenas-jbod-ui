@@ -30,6 +30,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Performance
 
+- Moved snapshot slot-detail persistence off the event loop with cancellation
+  draining and stale-write guards, preserving timestamp-advancing saves (#499).
 - Batched SMART grid persistence off the event loop, fenced invalidated writes,
   and propagated owning-save failures to in-flight joiners; snapshot persistence
   remained synchronous (#498).
