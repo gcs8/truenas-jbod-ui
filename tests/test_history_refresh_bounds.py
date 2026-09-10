@@ -27,7 +27,7 @@ class HistoryRefreshConfigTests(unittest.TestCase):
         self.assertIsNone(settings.refresh_token)
 
     def test_non_loopback_network_mode_fails_closed(self) -> None:
-        with self.assertRaisesRegex(ValueError, "token mode"):
+        with self.assertRaisesRegex(ValueError, "HISTORY_REFRESH_AUTH_MODE=token"):
             HistorySettings(published_bind_address="0.0.0.0", refresh_auth_mode="network")
 
     def test_exposed_token_mode_requires_token_and_strict_public_origin(self) -> None:

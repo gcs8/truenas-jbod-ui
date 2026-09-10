@@ -1,17 +1,23 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
+import types
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Union, get_args, get_origin
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, field_validator, model_validator
 
+from app.config_errors import ConfigurationError, describe_validation_error, format_location
+from app.env_values import annotation_is_text, env_is_set
 from app.secret_files import load_secret_environment_value
 from app.slot_layout import normalize_slot_layout, validate_slot_layout
+
+logger = logging.getLogger(__name__)
 
 
 def _standard_runtime_config_path() -> Path:
@@ -108,7 +114,6 @@ class AppConfig(BaseModel):
     export_cache_max_bytes: int = 32 * 1024 * 1024
     log_level: str = "INFO"
     debug: bool = False
-    verify_ssl: bool = True
 
 
 class PerfConfig(BaseModel):
@@ -492,7 +497,6 @@ ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
     "APP_EXPORT_CACHE_MAX_BYTES": ("app", "export_cache_max_bytes"),
     "APP_LOG_LEVEL": ("app", "log_level"),
     "APP_DEBUG": ("app", "debug"),
-    "APP_VERIFY_SSL": ("app", "verify_ssl"),
     "APP_CONFIG_PATH": ("config_file",),
     "PERF_TIMING_ENABLED": ("perf", "enabled"),
     "PERF_LOG_ALL_REQUESTS": ("perf", "log_all_requests"),
@@ -617,6 +621,87 @@ def _parse_scalar(value: str) -> Any:
         return value
 
 
+def _override_target_annotation(path: tuple[str, ...]) -> Any:
+    model: Any = Settings
+    annotation: Any = None
+    for key in path:
+        if not (isinstance(model, type) and issubclass(model, BaseModel)) or key not in model.model_fields:
+            return None
+        annotation = model.model_fields[key].annotation
+        model = annotation
+    return annotation
+
+
+def _override_is_text(path: tuple[str, ...]) -> bool:
+    return annotation_is_text(_override_target_annotation(path))
+
+
+def _model_annotation(annotation: Any) -> type[BaseModel] | None:
+    """Return the settings model behind ``annotation`` (``Model``, ``Model | None``, ``list[Model]``)."""
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return annotation
+    origin = get_origin(annotation)
+    if origin is list:
+        return _model_annotation(get_args(annotation)[0]) if get_args(annotation) else None
+    if origin is Union or origin is types.UnionType:
+        for member in get_args(annotation):
+            if member is not type(None):
+                nested = _model_annotation(member)
+                if nested is not None:
+                    return nested
+    return None
+
+
+def collect_unknown_config_keys(
+    payload: Any,
+    model: type[BaseModel] = Settings,
+    *,
+    prefix: str = "",
+) -> list[str]:
+    """List YAML keys that no settings model reads, as ``systems[0].truenas.bogus_field`` paths."""
+    unknown: list[str] = []
+    if not isinstance(payload, dict):
+        return unknown
+    for raw_key, value in payload.items():
+        key = str(raw_key)
+        path = f"{prefix}{key}"
+        field = model.model_fields.get(key)
+        if field is None:
+            unknown.append(path)
+            continue
+        nested_model = _model_annotation(field.annotation)
+        if nested_model is None:
+            continue
+        if get_origin(field.annotation) is list:
+            if isinstance(value, list):
+                for index, item in enumerate(value):
+                    unknown.extend(collect_unknown_config_keys(item, nested_model, prefix=f"{path}[{index}]."))
+        else:
+            unknown.extend(collect_unknown_config_keys(value, nested_model, prefix=f"{path}."))
+    return unknown
+
+
+def _unknown_key_message(config_path: Path, key: str) -> str:
+    return f"{config_path.name}: unknown key `{key}` is ignored."
+
+
+def build_unknown_config_key_warnings(settings: Settings) -> list[dict[str, str]]:
+    """Describe config file keys the app does not read, for the admin warning banner."""
+    config_path = Path(settings.config_file)
+    try:
+        yaml_config = _load_yaml_config(config_path)
+    except (OSError, ValueError, yaml.YAMLError):
+        return []
+    return [
+        {
+            "code": "unknown_config_key",
+            "key": key,
+            "message": _unknown_key_message(config_path, key),
+        }
+        for key in collect_unknown_config_keys(yaml_config)
+    ]
+
+
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     merged = dict(base)
     for key, value in override.items():
@@ -692,7 +777,7 @@ def _apply_legacy_cache_ttl_compat(
     legacy_explicit = (
         _explicit_app_field(yaml_config, "cache_ttl_seconds")
         or _explicit_app_field(runtime_overrides, "cache_ttl_seconds")
-        or os.getenv("APP_CACHE_TTL") is not None
+        or env_is_set("APP_CACHE_TTL")
     )
     if not legacy_explicit:
         return
@@ -701,13 +786,13 @@ def _apply_legacy_cache_ttl_compat(
     if (
         not _explicit_app_field(yaml_config, "snapshot_cache_ttl_seconds")
         and not _explicit_app_field(runtime_overrides, "snapshot_cache_ttl_seconds")
-        and os.getenv("APP_SNAPSHOT_CACHE_TTL_SECONDS") is None
+        and not env_is_set("APP_SNAPSHOT_CACHE_TTL_SECONDS")
     ):
         app_payload["snapshot_cache_ttl_seconds"] = legacy_value
     if (
         not _explicit_app_field(yaml_config, "source_bundle_cache_ttl_seconds")
         and not _explicit_app_field(runtime_overrides, "source_bundle_cache_ttl_seconds")
-        and os.getenv("APP_SOURCE_BUNDLE_CACHE_TTL_SECONDS") is None
+        and not env_is_set("APP_SOURCE_BUNDLE_CACHE_TTL_SECONDS")
     ):
         app_payload["source_bundle_cache_ttl_seconds"] = legacy_value
 
@@ -720,7 +805,7 @@ def _runtime_behavior_env_owner(
     metadata = RUNTIME_BEHAVIOR_APP_FIELDS.get(field_name) or {}
     for env_name in metadata.get("env") or ():
         normalized_env_name = str(env_name)
-        if os.getenv(normalized_env_name) is None:
+        if not env_is_set(normalized_env_name):
             continue
         if (
             normalized_env_name == "APP_CACHE_TTL"
@@ -1012,6 +1097,8 @@ def get_settings() -> Settings:
     yaml_config = _load_yaml_config(config_path)
     runtime_overrides_path = Path(_derive_runtime_layout_paths(config_path)["runtime_overrides_file"])
     runtime_overrides = _load_runtime_overrides_config(runtime_overrides_path)
+    for key in collect_unknown_config_keys(yaml_config):
+        logger.warning("%s", _unknown_key_message(config_path, key))
     merged = _deep_merge(defaults, yaml_config)
     merged = _deep_merge(merged, runtime_overrides)
 
@@ -1023,9 +1110,14 @@ def get_settings() -> Settings:
         )
         if raw_value is None:
             continue
-        parsed_value = (
-            raw_value if env_name in EXACT_STRING_ENV_OVERRIDES else _parse_scalar(raw_value)
-        )
+        if env_name in EXACT_STRING_ENV_OVERRIDES:
+            parsed_value = raw_value
+        elif not raw_value.strip():
+            continue
+        elif _override_is_text(target_path):
+            parsed_value = raw_value.strip()
+        else:
+            parsed_value = _parse_scalar(raw_value)
         _set_path_value(merged, target_path, parsed_value)
     _apply_legacy_cache_ttl_compat(merged, yaml_config, runtime_overrides)
 
@@ -1040,7 +1132,23 @@ def get_settings() -> Settings:
         profile_config = _load_profile_yaml(profile_path)
         merged["profiles"] = [*(merged.get("profiles") or []), *(profile_config.get("profiles") or [])]
 
-    settings = _normalize_systems(Settings.model_validate(merged))
+    env_by_target = {target_path: env_name for env_name, target_path in ENV_OVERRIDES.items()}
+
+    def resolve_location(location: tuple[int | str, ...]) -> tuple[str, str]:
+        parts = tuple(str(part) for part in location)
+        env_name = env_by_target.get(parts)
+        if env_name is not None and env_is_set(env_name):
+            return env_name, ".env"
+        source = runtime_overrides_path if _has_path(runtime_overrides, parts) else config_path
+        return format_location(location), str(source)
+
+    try:
+        validated = Settings.model_validate(merged)
+    except ValidationError as exc:
+        raise ConfigurationError(
+            describe_validation_error(exc, resolve_location=resolve_location, default_source=str(config_path))
+        ) from None
+    settings = _normalize_systems(validated)
     Path(settings.paths.mapping_file).parent.mkdir(parents=True, exist_ok=True)
     Path(settings.paths.sas_fabric_alias_file).parent.mkdir(parents=True, exist_ok=True)
     Path(settings.paths.log_file).parent.mkdir(parents=True, exist_ok=True)

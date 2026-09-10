@@ -12,9 +12,9 @@ import yaml
 from pydantic import SecretStr
 from starlette.requests import Request
 
-from admin_service.config import AdminSettings
 from app import main as app_main
 from app.config import AppConfig, Settings
+from app.read_ui_auth_settings import ReadUiAuthSettings
 from app.models.domain import (
     EnclosureOption,
     EnclosureProfileView,
@@ -127,19 +127,13 @@ def build_app(
     public_origin: str | None = None,
 ):
     settings = Settings(app=AppConfig(public_origin=public_origin))
-    auth_settings = AdminSettings(
+    auth_settings = ReadUiAuthSettings(
         auth_mode=auth_mode,
         auth_username="operator" if auth_mode == "basic" else None,
         auth_password=SecretStr("synthetic-passphrase") if auth_mode == "basic" else None,
-        auto_stop_seconds=0,
     )
     with patch.object(app_main, "get_settings", return_value=settings):
-        with patch.object(
-            app_main,
-            "get_admin_settings",
-            return_value=auth_settings,
-            create=True,
-        ):
+        with patch.object(app_main, "get_read_ui_auth_settings", return_value=auth_settings):
             return app_main.create_app()
 
 

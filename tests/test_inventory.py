@@ -759,8 +759,8 @@ class InventoryHelpersTests(unittest.TestCase):
         self.assertEqual(infer_slot_count_from_layout([[0, 1, 2, 38]], fallback=4), 4)
 
     def test_create_app_bounds_unknown_profile_startup_warnings(self) -> None:
-        from admin_service.config import AdminSettings
         from app import main as app_main
+        from app.read_ui_auth_settings import ReadUiAuthSettings
 
         private_marker = "/private/config/path/PRIVATE-MARKER"
         settings = Settings(
@@ -779,7 +779,7 @@ class InventoryHelpersTests(unittest.TestCase):
 
         with (
             patch.object(app_main, "get_settings", return_value=settings),
-            patch.object(app_main, "get_admin_settings", return_value=AdminSettings()),
+            patch.object(app_main, "get_read_ui_auth_settings", return_value=ReadUiAuthSettings()),
             patch.object(app_main, "configure_logging"),
             self.assertLogs("app.main", level="WARNING") as captured,
         ):

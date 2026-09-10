@@ -6,8 +6,10 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, field_validator, model_validator
 
+from app.config_errors import ConfigurationError, describe_validation_error
+from app.env_values import annotation_is_text, env_is_set
 from app.http_auth import configured_origin_identity
 from app.secret_files import load_secret_environment_value
 
@@ -124,13 +126,25 @@ class HistorySettings(BaseModel):
             loopback = False
         token = self.refresh_token.get_secret_value() if self.refresh_token is not None else ""
         if not loopback and self.refresh_auth_mode != "token":
-            raise ValueError("Non-loopback history exposure requires refresh token mode.")
+            raise ValueError(
+                "HISTORY_BIND_ADDRESS is not loopback. Set HISTORY_REFRESH_AUTH_MODE=token, "
+                "HISTORY_REFRESH_TOKEN (or _FILE) and HISTORY_PUBLIC_ORIGIN, or set it back to 127.0.0.1."
+            )
         if self.refresh_auth_mode == "token" and not token:
-            raise ValueError("History refresh token mode requires a non-empty token.")
+            raise ValueError(
+                "HISTORY_REFRESH_AUTH_MODE=token needs a token. Set HISTORY_REFRESH_TOKEN "
+                "(or HISTORY_REFRESH_TOKEN_FILE) to a non-empty value."
+            )
         if not loopback and configured_origin_identity(self.public_origin) is None:
-            raise ValueError("Non-loopback history exposure requires a valid HISTORY_PUBLIC_ORIGIN.")
+            raise ValueError(
+                "HISTORY_BIND_ADDRESS is not loopback, so HISTORY_PUBLIC_ORIGIN must be set to the "
+                "address the browser uses for history, for example http://192.0.2.10:8081."
+            )
         if self.public_origin is not None and configured_origin_identity(self.public_origin) is None:
-            raise ValueError("HISTORY_PUBLIC_ORIGIN must be an absolute HTTP(S) origin.")
+            raise ValueError(
+                "HISTORY_PUBLIC_ORIGIN must be an absolute HTTP(S) origin such as "
+                "http://192.0.2.10:8081, with no path."
+            )
 
         return self
 
@@ -202,22 +216,55 @@ def _parse_permission_mode(value: str) -> int:
     return int(normalized, 8)
 
 
+def _field_is_text(field_name: str) -> bool:
+    return annotation_is_text(HistorySettings.model_fields[field_name].annotation)
+
+
 @lru_cache
 def get_history_settings() -> HistorySettings:
     payload = HistorySettings().model_dump()
+    field_to_env = {field_name: env_name for env_name, field_name in ENV_OVERRIDES.items()}
+    field_to_env["refresh_token"] = "HISTORY_REFRESH_TOKEN"
     for env_name, field_name in ENV_OVERRIDES.items():
         raw_value = os.getenv(env_name)
-        if raw_value is None:
+        if raw_value is None or not raw_value.strip():
             continue
-        payload[field_name] = (
-            _parse_permission_mode(raw_value) if env_name in PERMISSION_MODE_ENV_VARS else _parse_scalar(raw_value)
-        )
+        if env_name in PERMISSION_MODE_ENV_VARS:
+            try:
+                payload[field_name] = _parse_permission_mode(raw_value)
+            except ValueError:
+                raise ConfigurationError(
+                    [f"{env_name} in .env must be an octal mode such as 0770 and must not be world-writable."]
+                ) from None
+        elif _field_is_text(field_name):
+            payload[field_name] = raw_value.strip()
+        else:
+            payload[field_name] = _parse_scalar(raw_value)
+
+    # Compose derives the published address from HISTORY_BIND_ADDRESS; honour the
+    # same variable when the service runs without Compose.
+    if not env_is_set("HISTORY_PUBLISHED_BIND_ADDRESS") and env_is_set("HISTORY_BIND_ADDRESS"):
+        payload["published_bind_address"] = str(os.getenv("HISTORY_BIND_ADDRESS")).strip()
+
+    # One cadence unless the fast interval is set on purpose: temperatures follow the shelf scan.
+    if not env_is_set("HISTORY_FAST_INTERVAL_SECONDS"):
+        payload["fast_interval_seconds"] = payload["poll_interval_seconds"]
 
     refresh_token = load_secret_environment_value("HISTORY_REFRESH_TOKEN")
     if refresh_token is not None:
         payload["refresh_token"] = refresh_token
 
-    settings = HistorySettings.model_validate(payload)
+    try:
+        settings = HistorySettings.model_validate(payload)
+    except ValidationError as exc:
+        problems = describe_validation_error(
+            exc,
+            resolve_location=lambda location: (
+                (field_to_env[str(location[0])], ".env") if str(location[0]) in field_to_env else None
+            ),
+            default_source=".env",
+        )
+        raise ConfigurationError(problems) from None
     Path(settings.sqlite_path).parent.mkdir(parents=True, exist_ok=True)
     Path(settings.backup_dir).mkdir(parents=True, exist_ok=True)
     if settings.long_term_backup_dir:

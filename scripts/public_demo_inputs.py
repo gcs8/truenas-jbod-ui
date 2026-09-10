@@ -11,6 +11,8 @@ PUBLIC_DEMO_INPUT_PATHS: tuple[Path, ...] = tuple(
             Path("tests/fixtures/public_demo/public_demo.json"),
             Path("app/__init__.py"),
             Path("app/config.py"),
+            Path("app/config_errors.py"),
+            Path("app/env_values.py"),
             Path("app/logging_config.py"),
             Path("app/main.py"),
             Path("app/metrics.py"),

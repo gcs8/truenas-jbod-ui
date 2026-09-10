@@ -26,6 +26,23 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Changed
+
+- Removed `app.verify_ssl` and `APP_VERIFY_SSL`, which nothing read, and
+  dropped the never-used `HISTORY_BACKEND_FALLBACK_CONCURRENCY` lines from
+  `.env.example`. (#486)
+
+### Fixed
+
+- Kept the main UI running when `.env` carries admin-only or blank values, and
+  replaced pydantic startup tracebacks with one plain line per problem that
+  names the `.env` variable or `config.yaml` key; the history off-loopback
+  error now says which variables to set, unknown `config.yaml` keys are
+  warned about, `.env.example` is safe to copy wholesale, and
+  `RELEASE_CHECK_*` reaches the history service. (#486)
+
 ## v0.23.0 - 2026-09-08
 
 This release includes every pull request merged after `v0.22.2` through the
