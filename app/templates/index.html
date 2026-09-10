@@ -141,12 +141,12 @@
   </section>
 
   {% if not snapshot_mode %}
-  <dialog id="export-snapshot-dialog" class="snapshot-export-dialog">
+  <dialog id="export-snapshot-dialog" class="snapshot-export-dialog" aria-labelledby="export-snapshot-title">
     <form method="dialog" class="snapshot-export-form">
       <div class="panel-header compact">
         <div>
-          <h2>Export Enclosure Snapshot</h2>
-          <p class="subtle">Current enclosure, offline HTML by default, with optional redaction and ZIP packaging.</p>
+          <h2 id="export-snapshot-title">Export Enclosure Snapshot</h2>
+          <p class="subtle">Frozen, offline inventory. Review scope and identifiers before sharing.</p>
         </div>
       </div>
       <div class="snapshot-export-grid">
@@ -180,7 +180,7 @@
         <div id="export-view-selection" class="snapshot-export-view-selection hidden"></div>
       </div>
       <p id="export-snapshot-note" class="subtle snapshot-export-note">
-        Default target stays under about 24 MiB. Auto will prefer HTML, then fall back to ZIP if needed.
+        Review the selected scope and estimated size.
       </p>
       <p id="export-snapshot-window-hint" class="snapshot-export-tip">
         Snapshot history uses the current History window. Change it in the History drawer first if you want a different export range.
@@ -194,6 +194,9 @@
   </dialog>
   {% endif %}
 
+  <p id="inventory-scope-note" class="subtle hidden" role="status"></p>
+  <p id="storage-view-runtime-note" class="subtle hidden" role="status"></p>
+  <button id="storage-view-runtime-retry" type="button" class="button secondary small hidden">Retry storage views</button>
   <section class="status-strip" id="status-strip">
     <div class="status-chip hidden" id="snapshot-status-chip">SNAPSHOT</div>
     <div class="status-chip" id="api-status-chip">API</div>
@@ -455,7 +458,7 @@
           <p class="subtle">Select a bay to inspect metadata or calibrate mapping.</p>
         </div>
         <div class="detail-panel-actions">
-          <button class="button secondary small hidden" id="history-toggle-button" type="button">History</button>
+          <button class="button secondary small hidden" id="history-toggle-button" aria-controls="detail-history-panel" aria-expanded="false" type="button">History</button>
           <div id="detail-led-controls" class="detail-led-controls hidden">
             <button class="button small" data-led-action="IDENTIFY">Identify On</button>
             <button class="button secondary small" data-led-action="CLEAR">Identify Off / Clear</button>
@@ -511,6 +514,7 @@
               <option value="all">All</option>
             </select>
           </label>
+          <button class="button secondary small hidden" id="history-retry-button" type="button">Retry History</button>
           <button class="button secondary small" id="history-close-button" type="button">Hide History</button>
         </div>
       </div>
