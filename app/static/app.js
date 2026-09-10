@@ -8557,6 +8557,9 @@
         if (state.snapshotMode) {
           historyClass = "snapshot";
           historyText = state.history.available ? "HIST PRELOADED" : "HIST OMITTED";
+        } else if (state.history.collector?.recovery_required === true) {
+          historyClass = "error";
+          historyText = "HIST RECOVERY";
         } else if (state.history.available) {
           historyClass = "ok";
           historyText = "HIST OK";

@@ -10,14 +10,16 @@ classified as corruption. Schema admission's supported set is unchanged.
 
 ## State and artifact ownership
 
-All new recovery evidence is in `<database>.recovery-required`, outside the
-replaceable main database. The directory is private (0700); `intent.json` is 0600.
+Initial pause evidence is in `<database>.recovery-required`, outside the
+replaceable main database. Explicit finalization also uses a parent finalizing
+gate and retained recovery archive, as described below. The pending directory
+is private (0700); `intent.json` is 0600.
 The existing lifecycle lock owns reservation, hashing and publication. Status
 inspection itself is read-only and does not acquire the database lock.
 
 | State | Authority and permitted behavior |
 | --- | --- |
-| No reservation | Ordinary schema admission may proceed. |
+| No pending/finalizing reservation and no unresolved archive, or a validated committed archive | Ordinary schema admission may proceed. |
 | Reserved directory, absent/incomplete/invalid intent | Recovery required; preserve source and evidence; no SQLite open, collection, mutation or automatic repair. |
 | Valid `phase=intent`, before/during/after quarantine | Recovery required. Source and/or retained names contain evidence. No move retry, replacement creation, automatic finalization or clearing. |
 | Intent inaccessible, malformed, unsafe or disappears after observation | Fail closed; observable pause remains. This is not a healthy first installation. |
@@ -27,10 +29,13 @@ main/WAL/SHM/rollback-journal facts: device/inode, size, modification time and
 SHA-256. Role names are fixed; the record contains no arbitrary paths or SQLite
 exception text. Records reject duplicate keys, unknown versions/fields, invalid
 shapes, unsafe modes/ownership, symlinks, hard-linked records and nonregular files.
-Status reads at most 8193 record bytes and never hashes database payloads or opens
-SQLite. `required` means an intent or finalization reservation, **not verified recovery
-artifacts**. Verification of retained contents belongs to the explicit
-recovery action; every status outcome other than `none` refuses normal operation.
+Pending-intent status reads at most 8193 bytes of the intent record and does not
+hash retained payloads. Status never opens SQLite. When the pending root and
+parent finalization gate are absent, status checks the bounded archive inventory,
+authenticates the terminal-selected completion protocol and hashes retained
+original evidence. `required` is a refusal state, not a statement that all
+artifacts were verified. Every status outcome other than `none` refuses normal
+operation; only explicit finalization creates the terminal decision.
 
 ## Publication order and interruption
 
@@ -105,8 +110,10 @@ including any archive, catalog, segment, migration/activation/rotation marker,
 operation record or staging inventory, refuse without cleanup. This conservative
 restriction is deliberate, not support for arbitrary production layouts.
 
-Local `inspect` exposes the validated ID and raw intent digest without hashing
-payloads or opening SQLite. HTTP status remains unchanged and identifier-free.
+Pending-intent local `inspect` exposes the validated ID and raw intent digest
+without hashing payloads or opening SQLite. Without the pending root, it delegates
+to terminal/archive observation, which may hash retained originals. HTTP status
+remains unchanged and identifier-free.
 The ID and digest select evidence and detect stale selections; they are not
 credentials or proof of backup freshness or provenance.
 
@@ -145,8 +152,8 @@ coordination does not implement recovery or prove supervised shutdown.
 
 ## Experimental journaled apply, still paused
 
-This developer candidate has an offline history-only publisher and explicit
-journaled resume. Do not run this unreviewed candidate against live history.
+The offline source protocol has bounded local acceptance. Live operation,
+supervised writer shutdown/restart and deployment remain unapproved.
 Publication and replay deliberately leave the recovery root present; only the
 separate explicit finalization command can complete the archive protocol.
 
@@ -236,8 +243,9 @@ not resume. Use the separate explicit finalization command below after applied-p
 
 ## Explicit evidence-preserving finalization and archived replay
 
-This command is for offline synthetic validation until the candidate is independently
-accepted. Keep all producers and publishers stopped, including automatic restarts.
+The offline source protocol has bounded local acceptance. Live operation,
+supervised writer shutdown/restart and deployment remain unapproved.
+Keep all producers and publishers stopped, including automatic restarts.
 After selected apply or pending resume reaches `applied-paused`, invoke:
 
 ```text
@@ -342,13 +350,16 @@ provided. Linux no-replace support is required; there is no replacing fallback.
 
 ## Deliberately incomplete acceptance
 
+Safe downstream main status and admin readiness observation are delivered,
+including persisted terminal decisions, latched old stores and fresh admission.
 Remaining #417 work includes corruption first detected during an already-running
-connection/collector pass (this slice detects corruption at normal initialization),
-main UI/backend and admin readiness/upgrade propagation and recovery UX,
-runtime verification of coordinated publishers, bounded legacy `.broken-*` assessment, and isolated container/runtime
-contention and throughput acceptance. These are not supplied by the new service
-HTTP gate. #416's full interrupted migration/backfill/row/count acceptance is
-also still open. No release or complete #416/#417 acceptance is implied.
+connection/collector pass, upgrade admission with #399, recovery actions/controller
+UX with #398, supervised publisher/writer shutdown and restart, bounded legacy
+`.broken-*` assessment, and isolated container/runtime contention and throughput
+acceptance. This slice detects corruption at normal initialization; polling never
+restarts collection or grants upgrade approval. #416's full interrupted
+migration/backfill/row/count acceptance also remains open. No release or complete
+#416/#417 acceptance is implied.
 
 Synthetic tests extend the already POSIX-classified schema suite. They exercise
 startup pause, missing/readable replacement restarts, private bounded metadata,

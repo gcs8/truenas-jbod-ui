@@ -9,6 +9,33 @@ const vm = require("node:vm");
 const ROOT = path.resolve(__dirname, "../..");
 const APP_SOURCE = fs.readFileSync(path.join(ROOT, "app/static/app.js"), "utf8");
 
+test("history status chip distinguishes recovery from stopped and clears on a fresh status", () => {
+  const start = APP_SOURCE.indexOf("    if (historyStatusChip) {");
+  const end = APP_SOURCE.indexOf("    lastUpdated.textContent", start);
+  assert.ok(start > 0 && end > start);
+  const chip = {};
+  const state = { snapshotMode: false, history: { configured: true, available: false,
+    checked: true, loading: false, counts: {}, collector: { recovery_required: true },
+    detail: "History recovery is required; collection is paused." } };
+  const context = vm.createContext({ state, historyStatusChip: chip, formatTimestamp: String });
+  const render = () => vm.runInContext(APP_SOURCE.slice(start, end), context);
+  render();
+  assert.equal(chip.textContent, "HIST RECOVERY");
+  assert.equal(chip.className, "status-chip error");
+  assert.match(chip.title, /recovery.*paused/);
+  state.history.collector = {};
+  state.history.detail = "History backend request failed; see application logs.";
+  render();
+  assert.equal(chip.textContent, "HIST OFF");
+  state.history.available = true;
+  render();
+  assert.equal(chip.textContent, "HIST OK");
+  state.snapshotMode = true;
+  state.history.collector = { recovery_required: true };
+  render();
+  assert.equal(chip.textContent, "HIST PRELOADED");
+});
+
 function functionSource(source, name) {
   const patterns = [`async function ${name}(`, `function ${name}(`];
   const start = patterns.reduce((found, pattern) => {

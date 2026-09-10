@@ -9,7 +9,10 @@ from pathlib import Path
 from typing import Any
 
 from admin_service.config import AdminSettings
+from app.config import HistoryConfig
 from app.request_context import request_id_headers
+from app.services.history_backend import HistoryBackendClient, HistoryBackendError
+from app.services.history_status import project_public_recovery_status
 
 
 class DockerRuntimeError(RuntimeError):
@@ -262,6 +265,8 @@ class DockerRuntimeService:
         for payload in container_payloads:
             payload["running_version"] = None
             payload["version_probe_error"] = None
+            if payload.get("key") == "history":
+                self._annotate_history_readiness(payload)
             if not payload.get("running"):
                 continue
             livez_url = str(self.managed_containers.get(payload["key"], {}).get("livez_url") or "").strip()
@@ -272,6 +277,33 @@ class DockerRuntimeService:
                 payload["running_version"] = self._probe_running_version(livez_url)
             except DockerRuntimeError as exc:
                 payload["version_probe_error"] = str(exc)
+
+    def _annotate_history_readiness(self, payload: dict[str, Any]) -> None:
+        payload["ready"] = False
+        if not payload.get("running"):
+            return
+        livez_url = str(self.managed_containers["history"].get("livez_url") or "").strip()
+        health: dict[str, Any] = {}
+        if livez_url.endswith("/livez"):
+            client = HistoryBackendClient(HistoryConfig(
+                service_url=livez_url.removesuffix("/livez"),
+            ))
+            try:
+                health = client._fetch_json_sync(
+                    "/healthz", {}, timeout_seconds=self.settings.container_version_probe_timeout_seconds,
+                )
+            except (HistoryBackendError, ValueError):
+                pass
+        recovery = project_public_recovery_status(health)
+        if recovery:
+            payload.update(recovery)
+            payload["lifecycle_state"] = "recovery_required"
+            payload["lifecycle_label"] = "Recovery Required"
+        elif health.get("status") in ("ok", "degraded") and health.get("ready") is not False:
+            payload["ready"] = True
+        else:
+            payload["lifecycle_state"] = "unavailable"
+            payload["lifecycle_label"] = "Readiness Unavailable"
 
     def _probe_running_version(self, livez_url: str) -> str:
         request = urllib.request.Request(

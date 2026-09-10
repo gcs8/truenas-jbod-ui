@@ -52,6 +52,90 @@ EXPECTED_PUBLIC_COLLECTOR_STATUS_FIELDS = (
 
 
 class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_nested_recovery_health_never_claims_available(self):
+        client = HistoryBackendClient(HistoryConfig(service_url="http://history.example.test"))
+        with patch.object(client, "_fetch_json", AsyncMock(return_value={
+            "status": "ok", "collector": {"recovery_required": True, "recovery_state": "invalid"},
+        })):
+            result = await client.get_status()
+        self.assertFalse(result["available"])
+        self.assertIs(result["ready"], False)
+
+    async def test_health_success_body_has_same_bound_and_duplicate_rejection(self):
+        client = HistoryBackendClient(HistoryConfig(service_url="http://history.example.test"))
+        for raw in (b'{"recovery_required":true,"recovery_required":false}',
+                    json.dumps({"recovery_required": True, "padding": "x" * 8192}).encode()):
+            response = MagicMock()
+            response.__enter__.return_value.read.side_effect = io.BytesIO(raw).read
+            response.__enter__.return_value.headers.items.return_value = []
+            with patch("app.services.history_backend.urllib.request.urlopen", return_value=response):
+                payload = await client.get_status()
+            self.assertFalse(payload["available"])
+            self.assertFalse(payload.get("recovery_required", False))
+            response.__enter__.return_value.read.assert_called_once_with(8193)
+
+    async def test_recovery_health_503_is_explicit_bounded_and_public(self):
+        client = HistoryBackendClient(HistoryConfig(service_url="http://history.example.test"))
+        raw = {"status": "recovery_required", "ready": False,
+               "recovery_required": True, "collection_paused": True,
+               "recovery_state": "required", "recovery_id": "status-leak-ZXQ9",
+               "path": "status-leak-ZXQ9", "counts": {"tracked_slots": 0}}
+        stream = io.BytesIO(json.dumps(raw).encode())
+        error = urllib.error.HTTPError("http://history.example.test/healthz", 503, "busy", {}, stream)
+        with patch("app.services.history_backend.urllib.request.urlopen", side_effect=error) as transport:
+            payload = await client.get_status()
+        self.assertTrue(payload.get("recovery_required"))
+        self.assertIs(payload.get("ready"), False)
+        self.assertFalse(payload["available"])
+        self.assertEqual(payload["status"], "recovery_required")
+        self.assertTrue(payload["collector"]["collection_paused"])
+        self.assertEqual(payload["counts"], {})
+        self.assertIn("recovery", payload["detail"].lower())
+        self.assertNotIn("status-leak-ZXQ9", json.dumps(payload))
+        self.assertTrue(stream.closed)
+        transport.assert_called_once()
+
+    def test_collector_recovery_projection_is_typed_and_drops_internal_state(self):
+        for state in ("required", "invalid", "unavailable", "status-leak-ZXQ9", {}, []):
+            with self.subTest(state=state):
+                raw = {"recovery_required": True, "ready": True, "collection_paused": False,
+                       "recovery_state": state, "recovery_id": "status-leak-ZXQ9"}
+                result = project_public_collector_status(raw, last_error_detail="safe")
+                self.assertEqual(result, {"recovery_required": True, "ready": False,
+                    "collection_paused": True,
+                    "recovery_state": state if isinstance(state, str) and state in ("required", "invalid", "unavailable") else "unavailable"})
+                self.assertNotIn("status-leak-ZXQ9", json.dumps(result))
+        for value in ("true", 1, [], None, False):
+            self.assertEqual(project_public_collector_status(
+                {"recovery_required": value, "recovery_state": "status-leak-ZXQ9"},
+                last_error_detail="safe"), {})
+
+    async def test_invalid_health_503_does_not_claim_recovery(self):
+        bodies = [b"busy", b"[]", b"\xff", b'{"recovery_required":"true"}',
+                  b'{"recovery_required":true,"recovery_required":false}',
+                  json.dumps({"recovery_required": True, "padding": "x" * 8192}).encode()]
+        client = HistoryBackendClient(HistoryConfig(service_url="http://history.example.test"))
+        for body in bodies:
+            with self.subTest(body_length=len(body)):
+                stream = io.BytesIO(body)
+                error = urllib.error.HTTPError("http://history.example.test/healthz", 503, "busy", {}, stream)
+                with patch("app.services.history_backend.urllib.request.urlopen", side_effect=error):
+                    payload = await client.get_status()
+                self.assertFalse(payload["available"])
+                self.assertFalse(payload.get("recovery_required", False))
+                self.assertTrue(stream.closed)
+
+    async def test_health_200_recovery_cannot_be_reported_available(self):
+        client = HistoryBackendClient(HistoryConfig(service_url="http://history.example.test"))
+        with patch.object(client, "_fetch_json", AsyncMock(return_value={
+            "recovery_required": True, "ready": True, "collection_paused": False,
+            "recovery_state": "invalid", "counts": {"tracked_slots": 12},
+        })):
+            payload = await client.get_status()
+        self.assertFalse(payload["available"])
+        self.assertIs(payload.get("ready"), False)
+        self.assertEqual(payload["counts"], {})
+
     LEAKING_EXCEPTION_TEXT = (
         "raw transport failure token=secret password=secret "
         "url=https://history.invalid/private payload={'credential': 'secret'} path=/srv/private/history.db"

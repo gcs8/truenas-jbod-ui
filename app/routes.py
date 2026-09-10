@@ -16,7 +16,7 @@ from app.services.history_backend import (
     HISTORY_BACKEND_DEGRADED_DETAIL,
     HistoryBackendBusyError,
 )
-from app.services.history_status import project_public_collector_status
+from app.services.history_status import project_public_history_status
 from history_service.operation_bounds import (
     HISTORY_READ_BUSY_DETAIL,
     HISTORY_READ_RETRY_AFTER_SECONDS,
@@ -707,15 +707,9 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
     async def get_history_status() -> JSONResponse:
         history_backend = get_history_backend()
         payload = await history_backend.get_status()
-        return JSONResponse(
-            {
-                **payload,
-                "collector": project_public_collector_status(
-                    payload.get("collector"),
-                    last_error_detail=HISTORY_BACKEND_DEGRADED_DETAIL,
-                ),
-            }
-        )
+        return JSONResponse(project_public_history_status(
+            payload, last_error_detail=HISTORY_BACKEND_DEGRADED_DETAIL,
+        ))
 
     @router.post(
         "/api/history/refresh",

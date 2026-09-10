@@ -122,7 +122,7 @@ def _record(stack, parent, name):
 
 
 def inspect(database: Path) -> dict:
-    """Bounded local selection metadata only. Does not hash evidence payloads."""
+    """Read-only local observation; terminal archive checks hash retained evidence."""
     try:
         database = _database(database)
         with ExitStack() as stack:

@@ -611,6 +611,17 @@ async def build_admin_state_payload(request: Request) -> dict[str, Any]:
     }
 
 
+def project_history_runtime_readiness(container: dict[str, Any]) -> dict[str, Any]:
+    from app.services.history_status import project_public_recovery_status
+
+    if container.get("key") != "history":
+        return {}
+    recovery = project_public_recovery_status(container)
+    if recovery:
+        return {**recovery, "lifecycle_state": "recovery_required", "lifecycle_label": "Recovery Required"}
+    return {"ready": container["ready"]} if type(container.get("ready")) is bool else {}
+
+
 async def build_runtime_payload(runtime_service: DockerRuntimeService | None = None) -> dict[str, Any]:
     service = runtime_service or get_runtime_service()
     runtime_payload = await asyncio.to_thread(service.status_payload)
@@ -649,6 +660,7 @@ def project_runtime_observation(runtime_payload: dict[str, Any] | None) -> dict[
             field_name: raw_container.get(field_name)
             for field_name in RUNTIME_OBSERVATION_CONTAINER_FIELDS
         }
+        container.update(project_history_runtime_readiness(raw_container))
         raw_release_status = raw_container.get("release_status")
         release_status = raw_release_status if isinstance(raw_release_status, dict) else {}
         container["release_status"] = {
@@ -687,6 +699,7 @@ def annotate_runtime_versions(
     )
     probe_errors_present = any(item.get("running") and item.get("version_probe_error") for item in containers)
     for item in containers:
+        item.update(project_history_runtime_readiness(item))
         running_version = str(item.get("running_version") or "").strip() or None
         if running_version:
             release_state, release_summary = describe_release_status(running_version, latest_tag)

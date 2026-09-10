@@ -1886,5 +1886,242 @@ raise SystemExit(code)
                 self.assertEqual(caught.exception.code, 2)
 
 
+class RecoveryStatusCompositionTests(unittest.TestCase):
+    """Real offline protocol evidence through history, main and admin observation."""
+
+    fixture = JournaledApplyTests.fixture
+    selections = staticmethod(FinalizationTests.selections)
+
+    @staticmethod
+    def _cli(args):
+        import contextlib
+        import io
+        from history_service import explicit_recovery
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = explicit_recovery.main(args)
+        return code, json.loads(output.getvalue())
+
+    @staticmethod
+    async def _request(application, path):
+        import asyncio
+
+        messages = []
+        sent = False
+
+        async def receive():
+            nonlocal sent
+            if not sent:
+                sent = True
+                return {"type": "http.request", "body": b"", "more_body": False}
+            await asyncio.Event().wait()
+
+        async def send(message):
+            messages.append(message)
+
+        await application({
+            "type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"},
+            "http_version": "1.1", "method": "GET", "scheme": "http", "path": path,
+            "raw_path": path.encode(), "query_string": b"", "root_path": "",
+            "headers": [(b"host", b"admin.example.test")],
+            "client": ("synthetic.test", 1), "server": ("admin.example.test", 8082),
+        }, receive, send)
+        return (next(m["status"] for m in messages if m["type"] == "http.response.start"),
+                b"".join(m.get("body", b"") for m in messages if m["type"] == "http.response.body"))
+
+    def _observe(self, database, store, *, paused):
+        import asyncio
+        import io
+        import urllib.error
+        from types import SimpleNamespace
+        # Import the clean-room settings before admin's import-time app factory.
+        from tests.admin_test_env import ADMIN_TEST_PUBLIC_ORIGIN
+        from admin_service import main as admin
+        from admin_service.config import AdminSettings
+        from admin_service.services.runtime_control import DockerRuntimeService
+        from app import main as frontend
+        from app.config import HistoryConfig
+        from app.services.history_backend import HistoryBackendClient
+        from history_service import main as producer
+        from history_service.collector import HistoryCollector
+        from history_service.config import HistorySettings
+
+        collector = HistoryCollector(HistorySettings(sqlite_path=str(database)), store)
+        before = inventory(database.parent)
+        with patch.object(producer, "store", store), patch.object(producer, "collector", collector):
+            live_code, live_body = asyncio.run(self._request(producer.app, "/livez"))
+            health_code, health_body = asyncio.run(self._request(producer.app, "/healthz"))
+        self.assertEqual(live_code, 200)
+        self.assertEqual(health_code, 503 if paused else 200)
+        if paused:
+            self.assertIs(json.loads(health_body)["ready"], False)
+            asyncio.run(collector.start())
+            self.assertIsNone(collector._task, "Observation must not start a paused collector")
+        else:
+            self.assertEqual(json.loads(health_body)["status"], "ok")
+
+        streams = []
+
+        def transport(request, *, timeout):
+            self.assertGreater(timeout, 0)
+            self.assertTrue(request.full_url.endswith("/healthz"))
+            stream = io.BytesIO(health_body)
+            streams.append(stream)
+            if health_code == 503:
+                raise urllib.error.HTTPError(request.full_url, 503, "synthetic pause", {}, stream)
+            stream.headers = {}
+            return stream
+
+        backend = HistoryBackendClient(HistoryConfig(service_url="http://synthetic.test"))
+        settings = AdminSettings(auth_mode="network", public_origin=ADMIN_TEST_PUBLIC_ORIGIN,
+                                 auto_stop_seconds=0, container_version_probe_timeout_seconds=0.25)
+        runtime = DockerRuntimeService(settings)
+        container = runtime._build_status_payload("history", {"State": "running", "Status": "Up (healthy)"})
+        with patch("app.services.history_backend.urllib.request.urlopen", side_effect=transport):
+            with patch.object(frontend, "get_history_backend", return_value=backend):
+                main_code, main_body = asyncio.run(self._request(frontend.app, "/api/history/status"))
+            with patch.object(runtime, "_probe_running_version", return_value="0.23.0"):
+                runtime._annotate_versions([container])
+        self.assertTrue(streams and all(stream.closed for stream in streams))
+        self.assertEqual(main_code, 200)
+        main_status = json.loads(main_body)
+        self.assertIs(main_status["available"], not paused)
+        if paused:
+            self.assertIs(main_status["ready"], False)
+            self.assertEqual(main_status["counts"], {})
+            self.assertEqual(main_status["scopes"], [])
+        else:
+            self.assertNotIn("recovery_required", main_status)
+        # Only Docker inventory is replaced; readiness came from actual history ASGI bytes.
+        with (patch.object(runtime, "status_payload", return_value={"available": True, "containers": [container]}),
+              patch.object(admin, "get_admin_settings", return_value=settings),
+              patch.object(admin, "get_runtime_service", return_value=runtime),
+              patch.object(admin, "get_release_status_service", return_value=SimpleNamespace(snapshot=lambda: {}))):
+            admin_code, admin_body = asyncio.run(self._request(admin.create_app(), "/api/admin/runtime"))
+        self.assertEqual(admin_code, 200)
+        public_container = json.loads(admin_body)["runtime"]["containers"][0]
+        self.assertIs(public_container["running"], True)
+        self.assertIs(public_container["ready"], not paused)
+        if paused:
+            self.assertEqual(public_container["lifecycle_label"], "Recovery Required")
+        else:
+            self.assertNotIn("recovery_required", public_container)
+        for raw in (live_body, health_body, main_body, admin_body):
+            for forbidden in (str(database).encode(), b"composition-private-sentinel", b"recovery-operation.json",
+                              b"intent.json", b"committed-", b"sha256"):
+                self.assertNotIn(forbidden, raw)
+        self.assertEqual(inventory(database.parent), before, "Status must not mutate recovery inventory")
+
+    def test_actual_terminal_completion_keeps_old_store_latched_and_fresh_status_ready(self):
+        from history_service.store import HistoryStore
+
+        with tempfile.TemporaryDirectory() as temporary:
+            db, args, payload = self.fixture(temporary)
+            old = HistoryStore(str(db))
+            self._observe(db, old, paused=True)
+            self.assertEqual(self._cli(args)[0], 5)
+            root = recovery_state.recovery_path(db)
+            rid = json.loads((root / "intent.json").read_bytes())["id"]
+            originals = {p.name: (p.read_bytes(), p.stat().st_ino, p.stat().st_nlink) for p in root.iterdir()}
+            self.assertEqual(self._cli(self.selections(db, rid))[0], 0)
+            for _ in range(2):
+                self._observe(db, old, paused=True)
+            fresh = HistoryStore(str(db))
+            self._observe(db, fresh, paused=False)
+            with closing(sqlite3.connect(db)) as connection:
+                self.assertEqual(connection.execute("SELECT system_id,value_integer FROM metric_samples").fetchall(),
+                                 [("synthetic-selected", 37)])
+            archive = db.with_name(db.name + ".recovery-archive-" + rid)
+            for name, facts in originals.items():
+                retained = archive / name
+                self.assertEqual((retained.read_bytes(), retained.stat().st_ino, retained.stat().st_nlink), facts)
+
+    def test_real_late_failure_states_project_persisted_decision_not_cli_exit(self):
+        from history_service import explicit_recovery as api
+        from history_service.store import HistoryStore
+
+        for fault in ("schema-five", "fsync-17", "fsync-18", "fsync-19", "fsync-20"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as temporary:
+                db, args, payload = self.fixture(temporary)
+                self.assertEqual(self._cli(args)[0], 5)
+                root = recovery_state.recovery_path(db)
+                rid = json.loads((root / "intent.json").read_bytes())["id"]
+                original = {p.name: (p.read_bytes(), p.stat().st_ino, p.stat().st_nlink) for p in root.iterdir()}
+                count = 0
+                real = api._validate_candidate if fault == "schema-five" else os.fsync
+                cut = 5 if fault == "schema-five" else int(fault.split("-")[1])
+
+                def fail(*args, **kwargs):
+                    nonlocal count
+                    count += 1
+                    if count == cut:
+                        raise OSError("composition-private-sentinel")
+                    return real(*args, **kwargs)
+
+                with patch.object(api if fault == "schema-five" else os,
+                                  "_validate_candidate" if fault == "schema-five" else "fsync", side_effect=fail):
+                    code, result = self._cli(self.selections(db, rid))
+                self.assertEqual(code, 5)
+                self.assertEqual(count, cut)
+                paused = fault not in ("fsync-19", "fsync-20")
+                self.assertEqual(result["state"], "refused" if paused else "outcome-unknown")
+                if paused:
+                    with patch.object(sqlite3, "connect", side_effect=AssertionError("Original evidence SQLite open")):
+                        fresh = HistoryStore(str(db))
+                        self._observe(db, fresh, paused=True)
+                else:
+                    self._observe(db, HistoryStore(str(db)), paused=False)
+                archive = db.with_name(db.name + ".recovery-archive-" + rid)
+                for name, facts in original.items():
+                    retained = archive / name
+                    self.assertEqual((retained.read_bytes(), retained.stat().st_ino, retained.stat().st_nlink), facts)
+
+    def test_corrupted_terminal_receipts_refuse_without_http_evidence_leakage(self):
+        from history_service.store import HistoryStore
+
+        for fault in ("missing-terminal", "unsafe-terminal", "malformed-completion", "same-byte-inode",
+                      "unknown-archive", "multiple-archive", "parent-alias"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as temporary:
+                db, args, payload = self.fixture(temporary)
+                self.assertEqual(self._cli(args)[0], 5)
+                root = recovery_state.recovery_path(db)
+                rid = json.loads((root / "intent.json").read_bytes())["id"]
+                self.assertEqual(self._cli(self.selections(db, rid))[0], 0)
+                archive = db.with_name(db.name + ".recovery-archive-" + rid)
+                terminal = next(archive.glob("committed-*"))
+                if fault == "missing-terminal":
+                    terminal.rmdir()
+                elif fault == "unsafe-terminal":
+                    terminal.chmod(0o755)
+                elif fault == "malformed-completion":
+                    completion = archive / "finalized.json"
+                    value = json.loads(completion.read_bytes())
+                    value["composition-private-sentinel"] = "credential-like-synthetic-marker"
+                    completion.write_text(json.dumps(value))
+                    # Bind the malformed bytes to the terminal, so validation must reject structure.
+                    terminal.rename(archive / f"committed-{digest(completion)}-{completion.stat().st_dev}-{completion.stat().st_ino}")
+                elif fault == "same-byte-inode":
+                    completion = archive / "finalized.json"
+                    raw = completion.read_bytes()
+                    completion.rename(Path(temporary) / "retained-completion")
+                    completion.write_bytes(raw)
+                    completion.chmod(0o600)
+                elif fault == "unknown-archive":
+                    (archive / "composition-private-sentinel").write_bytes(b"synthetic")
+                elif fault == "multiple-archive":
+                    db.with_name(db.name + ".recovery-archive-" + "0" * 32).mkdir(mode=0o700)
+                else:
+                    alias = Path(temporary) / "alias"
+                    alias.symlink_to(db.parent, target_is_directory=True)
+                    db = alias / db.name
+                paused = fault != "parent-alias"
+                if paused:
+                    with patch.object(sqlite3, "connect", side_effect=AssertionError("Original evidence SQLite open")):
+                        self._observe(db, HistoryStore(str(db)), paused=True)
+                else:
+                    self._observe(db, HistoryStore(str(db)), paused=False)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -14,7 +14,12 @@ from typing import Any
 from app.config import HistoryConfig
 from app.models.domain import utcnow
 from app.request_context import request_id_headers
-from app.services.history_status import project_public_collector_status
+from app.services.history_status import (
+    MAX_RECOVERY_STATUS_BYTES,
+    project_public_collector_status,
+    project_public_history_status,
+    project_public_recovery_status,
+)
 from history_service.operation_bounds import (
     ALLOWED_HISTORY_METRICS,
     HistoryBudgetExceeded,
@@ -97,6 +102,10 @@ class HistoryBackendClient:
                 "collector": {},
                 "scopes": [],
             }
+        if project_public_recovery_status(payload) or project_public_recovery_status(payload.get("collector")):
+            return project_public_history_status(
+                {**payload, "configured": True}, last_error_detail=HISTORY_BACKEND_DEGRADED_DETAIL,
+            )
         collector = project_public_collector_status(
             payload.get("collector"),
             last_error_detail=HISTORY_BACKEND_DEGRADED_DETAIL,
@@ -465,11 +474,15 @@ class HistoryBackendClient:
         self,
         path: str,
         params: dict[str, Any],
+        *,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
-        payload_bytes, _ = self._request_bytes_sync(path, params=params)
+        payload_bytes, _ = self._request_bytes_sync(path, params=params, timeout_seconds=timeout_seconds)
         try:
-            payload = json.loads(payload_bytes)
-        except json.JSONDecodeError as exc:
+            payload = json.loads(
+                payload_bytes, object_pairs_hook=_unique_status_object if path == "/healthz" else None,
+            )
+        except (ValueError, UnicodeError, RecursionError) as exc:
             raise HistoryBackendResponseError("History backend returned invalid JSON.") from exc
         if not isinstance(payload, dict):
             raise HistoryBackendResponseError("History backend returned a non-object JSON payload.")
@@ -483,6 +496,7 @@ class HistoryBackendClient:
         method: str = "GET",
         body: bytes | None = None,
         headers: dict[str, str] | None = None,
+        timeout_seconds: float | None = None,
     ) -> tuple[bytes, dict[str, str]]:
         filtered_params = {
             key: value
@@ -501,10 +515,32 @@ class HistoryBackendClient:
             headers=request_id_headers(headers),
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.config.timeout_seconds) as response:
+            with urllib.request.urlopen(
+                request, timeout=self.config.timeout_seconds if timeout_seconds is None else timeout_seconds,
+            ) as response:
+                if path == "/healthz" and method == "GET":
+                    raw = response.read(MAX_RECOVERY_STATUS_BYTES + 1)
+                    if len(raw) > MAX_RECOVERY_STATUS_BYTES:
+                        raise HistoryBackendResponseError(0, "History status response exceeds its byte limit.")
+                    return raw, dict(response.headers.items())
                 return response.read(), dict(response.headers.items())
         except urllib.error.HTTPError as exc:
             if exc.code == 503:
+                # Only the health observation accepts a paused 503 as status data.
+                # Bulk/read and mutation requests retain their existing busy policy.
+                try:
+                    if path == "/healthz" and method == "GET":
+                        raw = exc.read(MAX_RECOVERY_STATUS_BYTES + 1)
+                        if len(raw) <= MAX_RECOVERY_STATUS_BYTES:
+                            recovery = project_public_recovery_status(json.loads(
+                                raw, object_pairs_hook=_unique_status_object,
+                            ))
+                            if recovery:
+                                return json.dumps(recovery).encode("utf-8"), {}
+                except (ValueError, UnicodeError, OSError, RecursionError):
+                    pass
+                finally:
+                    exc.close()
                 raise HistoryBackendBusyError() from exc
             if exc.code in {401, 403, 413, 422, 429}:
                 raise HistoryBackendPolicyError(exc.code) from exc
@@ -513,3 +549,12 @@ class HistoryBackendClient:
             raise HistoryBackendUnavailableError(f"History backend request failed: {exc.reason}") from exc
         except (TimeoutError, socket.timeout) as exc:
             raise HistoryBackendUnavailableError("History backend request timed out.") from exc
+
+
+def _unique_status_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate status field.")
+        result[key] = value
+    return result

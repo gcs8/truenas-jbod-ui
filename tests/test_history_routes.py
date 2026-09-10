@@ -12,6 +12,35 @@ from app.models.domain import InventorySnapshot
 
 
 class SlotHistoryRouteTests(unittest.TestCase):
+    def test_status_asgi_reprojects_recovery_without_internal_top_level_fields(self):
+        async def request():
+            messages = []
+            async def receive():
+                return {"type": "http.request", "body": b"", "more_body": False}
+            async def send(message):
+                messages.append(message)
+            path = "/api/history/status"
+            await app_main.app({"type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"},
+                "http_version": "1.1", "method": "GET", "scheme": "http", "path": path,
+                "raw_path": path.encode(), "query_string": b"", "root_path": "",
+                "headers": [], "client": ("synthetic.test", 1), "server": ("synthetic.test", 80)}, receive, send)
+            return next(m["status"] for m in messages if m["type"] == "http.response.start"), b"".join(
+                m.get("body", b"") for m in messages if m["type"] == "http.response.body")
+        backend = Mock()
+        backend.get_status = AsyncMock(return_value={"configured": True, "available": True,
+            "ready": True, "recovery_required": True, "collection_paused": False,
+            "recovery_state": "status-leak-ZXQ9", "recovery_id": "status-leak-ZXQ9",
+            "detail": "status-leak-ZXQ9", "counts": {"tracked_slots": 0}, "collector": {}})
+        with patch.object(app_main, "get_history_backend", return_value=backend):
+            status, body = asyncio.run(request())
+        self.assertEqual(status, 200, "Status observation is not service readiness")
+        payload = json.loads(body)
+        self.assertIs(payload.get("ready"), False)
+        self.assertFalse(payload["available"])
+        self.assertEqual(payload["status"], "recovery_required")
+        self.assertEqual(payload["recovery_state"], "unavailable")
+        self.assertNotIn(b"status-leak-ZXQ9", body)
+
     def _route(self, path: str):
         return next(route for route in app_main.app.routes if getattr(route, "path", None) == path)
 

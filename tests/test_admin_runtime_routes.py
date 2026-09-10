@@ -74,6 +74,76 @@ def basic_header(username: str, password: str) -> str:
 
 
 class AdminRuntimeRouteTests(unittest.TestCase):
+    def test_history_readiness_probe_preserves_fractional_timeout_and_non_recovery_states(self):
+        import io
+        import urllib.error
+        from admin_service.services.runtime_control import DockerRuntimeService
+        settings = AdminSettings(container_version_probe_timeout_seconds=0.25)
+        service = DockerRuntimeService(settings)
+        for health, ready in (({"status": "ok"}, True), ({"status": "degraded"}, True),
+                              ({"status": "ok", "ready": False}, False), ({}, False)):
+            payload = service._build_status_payload("history", {"State": "running", "Status": "Up"})
+            response = MagicMock()
+            response.__enter__.return_value.read.side_effect = io.BytesIO(json.dumps(health).encode()).read
+            response.__enter__.return_value.headers.items.return_value = []
+            with (patch.object(service, "_probe_running_version", return_value="0.23.0"),
+                  patch("app.services.history_backend.urllib.request.urlopen", return_value=response) as transport):
+                service._annotate_versions([payload])
+            self.assertIs(payload["ready"], ready)
+            self.assertNotIn("recovery_required", payload)
+            self.assertEqual(transport.call_args.kwargs["timeout"], 0.25)
+            self.assertTrue(transport.call_args.args[0].full_url.endswith("/healthz"))
+        for failure in (urllib.error.URLError("status-leak-ZXQ9"),
+                        urllib.error.HTTPError("http://synthetic.test/healthz", 503, "busy", {}, io.BytesIO(b"busy"))):
+            payload = service._build_status_payload("history", {"State": "running", "Status": "Up"})
+            with patch("app.services.history_backend.urllib.request.urlopen", side_effect=failure):
+                service._annotate_history_readiness(payload)
+            self.assertFalse(payload["ready"])
+            self.assertNotIn("recovery_required", payload)
+            self.assertEqual(payload["lifecycle_label"], "Readiness Unavailable")
+            self.assertNotIn("status-leak-ZXQ9", json.dumps(payload))
+        stopped = service._build_status_payload("history", {"State": "exited"})
+        with patch("app.services.history_backend.urllib.request.urlopen") as transport:
+            service._annotate_versions([stopped])
+        transport.assert_not_called()
+        self.assertFalse(stopped["ready"])
+
+    def test_runtime_asgi_projects_recovery_and_not_ready(self):
+        settings = AdminSettings(auth_mode="network", public_origin=ADMIN_TEST_PUBLIC_ORIGIN, auto_stop_seconds=0)
+        runtime = self._runtime_service()
+        container = runtime.status_payload.return_value["containers"][0]
+        container.update(key="history", recovery_required=True, ready=True,
+                         collection_paused=False, recovery_state="status-leak-ZXQ9",
+                         recovery_id="status-leak-ZXQ9")
+        with (patch("admin_service.main.get_admin_settings", return_value=settings),
+              patch("admin_service.main.get_runtime_service", return_value=runtime),
+              patch("admin_service.main.get_release_status_service", return_value=SimpleNamespace(snapshot=lambda: {}))):
+            status, _, body = asyncio.run(invoke_asgi(create_app(), "/api/admin/runtime"))
+        self.assertEqual(status, 200)
+        result = json.loads(body)["runtime"]["containers"][0]
+        self.assertIs(result.get("ready"), False)
+        self.assertTrue(result["recovery_required"])
+        self.assertEqual(result["lifecycle_label"], "Recovery Required")
+        self.assertEqual(result["lifecycle_state"], "recovery_required")
+        self.assertNotIn(b"status-leak-ZXQ9", body)
+
+    def test_runtime_probes_history_readiness_separately_from_live_version(self):
+        import io
+        import urllib.error
+        from admin_service.services.runtime_control import DockerRuntimeService
+        service = DockerRuntimeService(AdminSettings())
+        payload = service._build_status_payload("history", {"State": "running", "Status": "Up (healthy)"})
+        error = urllib.error.HTTPError("http://synthetic.test/healthz", 503, "busy", {},
+            io.BytesIO(json.dumps({"recovery_required": True, "collection_paused": True,
+                "recovery_state": "required", "recovery_id": "status-leak-ZXQ9"}).encode()))
+        with (patch.object(service, "_probe_running_version", return_value="0.23.0"),
+              patch("app.services.history_backend.urllib.request.urlopen", side_effect=error)):
+            service._annotate_versions([payload])
+        self.assertEqual(payload["running_version"], "0.23.0")
+        self.assertIs(payload.get("ready"), False)
+        self.assertEqual(payload["lifecycle_label"], "Recovery Required")
+        self.assertNotIn("status-leak-ZXQ9", json.dumps(payload))
+
     def _runtime_service(self) -> MagicMock:
         service = MagicMock()
         service.status_payload.return_value = {

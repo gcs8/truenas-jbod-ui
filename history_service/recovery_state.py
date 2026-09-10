@@ -1,4 +1,4 @@
-"""Forward-only pause journal. No acknowledgement or automatic recovery.
+"""Forward-only pause journal. Observation never acknowledges or automatically recovers.
 
 All mutation requires the caller's history lifecycle lock. Like admission, this
 is a cooperative filesystem boundary, not protection against hostile rename/ABA
@@ -145,8 +145,9 @@ def _inspect_archives(database: Path) -> str:
 def require_recovery_clear(database: Path) -> None:
     """Refuse normal publishers on any reservation, including incomplete evidence.
 
-    Call before work and again under lifecycle ownership. This is only a refusal
-    gate, never evidence authentication or permission to recover.
+    Call before work and again under lifecycle ownership. This is only
+    normal-operation admission, never permission to recover or clear evidence;
+    terminal archive observation validates retained evidence.
     """
     if inspect_recovery(database) != "none":
         raise HistoryRecoveryRequired()
