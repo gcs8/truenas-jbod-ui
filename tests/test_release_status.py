@@ -113,10 +113,12 @@ class ReleaseStatusTests(unittest.TestCase):
         unreleased = changelog.split("## v0.22.2", maxsplit=1)[0]
         normalized = " ".join(unreleased.split())
 
-        self.assertIn("docker compose down", normalized)
-        self.assertIn('app_uid="${APP_UID:-10001}"', normalized)
-        self.assertIn('app_gid="${APP_GID:-10001}"', normalized)
-        self.assertIn('--uid "$app_uid" --gid "$app_gid"', normalized)
+        self.assertIn("Stop all writers", normalized)
+        self.assertIn("--project-name", normalized)
+        self.assertIn("--env-file", normalized)
+        self.assertIn("--profile", normalized)
+        self.assertIn('--uid "${app_uid:?set the effective APP_UID}"', normalized)
+        self.assertIn('--gid "${app_gid:?set the effective APP_GID}"', normalized)
         self.assertNotIn("--uid 10001 --gid 10001", normalized)
 
     def test_network_mode_upgrade_note_names_every_write_control(self) -> None:

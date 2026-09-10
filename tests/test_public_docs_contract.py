@@ -50,6 +50,44 @@ def run_checker(*args: str) -> subprocess.CompletedProcess[str]:
 
 
 class PublicDocsContractTests(unittest.TestCase):
+    def _assert_bounded_ownership_guidance(self, text: str) -> None:
+        normalized = " ".join(text.split())
+        self.assertNotRegex(text, r"chown\s+-R")
+        for marker in (
+            "v0.23.0", "scripts/prepare_nonroot_bind_mounts.py",
+            "config/config.yaml", "config/ssh", "config/tls",
+            "config/backup-secrets", "0770", "0660",
+            "APP_UID", "APP_GID", "HISTORY_SEGMENT_CATALOG_PATH",
+            "--project-name", "--env-file", "-f", "--profile",
+            "pre-upgrade backup", "not data-format compatibility",
+        ):
+            self.assertIn(marker, normalized)
+        markers = (
+            "Stop all writers", "dry run", "--apply", "Restart only",
+        )
+        positions = [normalized.index(marker) for marker in markers]
+        self.assertEqual(positions, sorted(positions))
+
+    def _ownership_guidance(self) -> str:
+        guide = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        return guide.split("- `docker-compose.yml` now describes", 1)[1].split(
+            "\n- Legacy manual slot mappings", 1
+        )[0]
+
+    def test_bounded_ownership_guidance(self) -> None:
+        self._assert_bounded_ownership_guidance(self._ownership_guidance())
+
+    def test_ownership_guidance_rejects_unsafe_mutations(self) -> None:
+        guide = self._ownership_guidance()
+        self._assert_bounded_ownership_guidance(guide)
+        for mutated in (
+            guide + '\nsudo chown -R "$app_uid:$app_gid" config data history logs',
+            guide.replace("config/backup-secrets", "other-path"),
+            guide.replace("dry run", "SWAP").replace("--apply", "dry run").replace("SWAP", "--apply"),
+        ):
+            with self.subTest(mutation=mutated[:60]), self.assertRaises(AssertionError):
+                self._assert_bounded_ownership_guidance(mutated)
+
     def test_platform_api_first_examples_keep_tls_verification_opt_in(self) -> None:
         for relative_path in (
             "wiki/TrueNAS-CORE-Setup.md",

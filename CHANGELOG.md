@@ -110,28 +110,47 @@ them before starting the new images.
   `CHOWN` and `FOWNER` added back and without its app-log mount. Before the
   first start on the new file:
 
-  1. Stop the stack with `docker compose down`.
-  2. Run the ownership helper with the configured app identity as a dry run,
-     then again with `--apply`:
+  1. Save a private pre-upgrade backup of the state, the previous image digest
+     or tag from `JBOD_UI_IMAGE`, the environment file, and every selected Compose
+     file. Record the project, ordered `-f` file chain, `--env-file`, active
+     `--profile` selections and service names. Retain those selections on every
+     Compose command; do not enable previously inactive admin or backup services.
+  2. Stop all writers, including scheduled backup jobs and admin, before changing
+     ownership. Use the recorded `docker compose --project-name ... --env-file ...
+     -f ... --profile ... stop` selection, not a different default project.
+  3. Obtain `scripts/prepare_nonroot_bind_mounts.py` from the v0.23.0 source at
+     commit `dbcd2ab31e9a46083693cf08802434ac8cfc1e43`. Replace the checkout path
+     below with that verified local checkout path. If the exact helper cannot be
+     obtained, stop; do not replace it with recursive ownership commands.
+     Set `app_uid` and `app_gid` explicitly to the effective `APP_UID` and
+     `APP_GID` of the selected non-root services. Shell variables do not
+     automatically read `.env`; do not assume defaults override configured IDs.
+  4. Run a dry run against the deployment directory, then use `--apply` only if
+     the preflight succeeds and the path scope and identities are correct:
 
      ```bash
-     app_uid="${APP_UID:-10001}"
-     app_gid="${APP_GID:-10001}"
-     sudo python scripts/prepare_nonroot_bind_mounts.py . --uid "$app_uid" --gid "$app_gid"
-     sudo python scripts/prepare_nonroot_bind_mounts.py . --uid "$app_uid" --gid "$app_gid" --apply
+     sudo python3 /path/to/v0.23.0-checkout/scripts/prepare_nonroot_bind_mounts.py . --uid "${app_uid:?set the effective APP_UID}" --gid "${app_gid:?set the effective APP_GID}"
+     sudo python3 /path/to/v0.23.0-checkout/scripts/prepare_nonroot_bind_mounts.py . --uid "${app_uid:?set the effective APP_UID}" --gid "${app_gid:?set the effective APP_GID}" --apply
      ```
 
-  3. Start the stack again with `docker compose up -d`.
+     The helper covers `data`, `history`, and `logs` recursively, the `config`
+     directory itself, and only `config/config.yaml`, `config/ssh`, and
+     `config/tls` beneath it. It excludes `config/backup-secrets` and other
+     unlisted config children. It sets directories to `0770` and files to
+     `0660` as well as their owner/group. A chown-only substitute is not equivalent.
+     Stop on a rejected symlink, stale artifact, unsupported platform or exceeded
+     bound; do not bypass the preflight. Use this only for the matching local
+     POSIX bind-mount layout, not custom paths or other storage backends.
+  5. Restart only the previously active services with the same recorded Compose
+     project, environment, ordered files and profiles, using `up -d` and the
+     recorded service names. Check their health and state before resuming jobs.
 
-  The helper is in the source checkout, not in the published image, so a
-  deployment without a checkout should run the equivalent
-  `sudo chown -R "$app_uid:$app_gid" config data history logs` between steps
-  1 and 3. Without that step the non-root services cannot write their
-  bind-mounted state.
-
-  Rollback: put the previous Compose file back and run `docker compose up -d`.
-  Files changed to `$app_uid:$app_gid` stay readable and writable by root, so
-  the root-based services keep working (#246).
+  Rollback restores the previous `JBOD_UI_IMAGE` pin and every changed Compose
+  file, using the same `--project-name`, `--env-file`, ordered `-f` and `--profile`
+  selection for `pull` and `up -d` with the previous service names. This restores
+  runtime selection, not data-format compatibility. If an older image cannot use
+  the updated state, keep writers stopped and follow its recovery procedure with
+  the private pre-upgrade backup. Do not delete history to make startup succeed (#246).
 - Legacy manual slot mappings saved by older releases under the unscoped
   `default:{slot}` and `{enclosure}:{slot}` key shapes are only resolved when
   the deployment has exactly one configured system and exactly one detected
