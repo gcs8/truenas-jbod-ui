@@ -7,6 +7,8 @@ restore, network, service startup, existing database input, or format changes.
 The 4 GiB cell targets the production member ceiling minus 1 MiB, not 4 GiB
 as a minimum. SQLite pages are hard-capped, and actual bytes are reported.
 JSON goes to stdout; all synthetic databases/archives are removed, even on failure.
+Workers are forked by a single-threaded supervisor with in-memory scratch ownership.
+Direct --worker-phase execution is refused; user-created marker files are not proof.
 A nonzero exit and explicit blocked cells are expected when 7z is unavailable.
 
 The phases are whole production API operations, not exclusive compressor spans:
@@ -17,10 +19,11 @@ admission and byte/row verification. Never add their timings as pipeline latency
 from __future__ import annotations
 
 import argparse
-from contextlib import closing
+from contextlib import closing, contextmanager
 import hashlib
 import json
 import math
+import multiprocessing
 import os
 from pathlib import Path
 import random
@@ -29,6 +32,7 @@ import secrets
 import shutil
 import signal
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -50,6 +54,56 @@ MAX_FIXTURE_ROWS = 1_000_000  # per populated table; two rows per iteration
 MAX_TIMEOUT = 600
 PROFILE = {"format": "7z", "encrypted": True, "codec": "LZMA2", "level": 5, "workers": 1}
 PHASES = ("fixture", "create", "inspect", "verify", "extract")
+
+
+# This registry is inherited only by forked children. Nothing on stdin, argv,
+# the filesystem or in the environment can register a caller-supplied root.
+_OWNED_RUNS = {}
+
+
+@contextmanager
+def owned_run(parent: Path, target_bytes: int, *, allow_large: bool = False):
+    preflight(parent, target_bytes)
+    if target_bytes != MIB and (not allow_large or not shutil.which("7z")):
+        raise ValueError("large fixture requires explicit admission and real codec")
+    with tempfile.TemporaryDirectory(prefix="full-backup-benchmark-", dir=parent) as name:
+        root = Path(name).resolve(strict=True)
+        info = root.lstat()
+        _OWNED_RUNS[str(root)] = (info.st_dev, info.st_ino, target_bytes)
+        try:
+            yield root
+        finally:
+            _OWNED_RUNS.pop(str(root), None)
+
+
+def admit_run(root: Path, target_bytes=None):
+    proof = _OWNED_RUNS.get(str(root))
+    if proof is None:
+        raise ValueError("scratch was not created by this operation")
+    info = root.lstat()
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+            or info.st_mode & 0o077 or (info.st_dev, info.st_ino) != proof[:2]
+            or root.resolve(strict=True) != root
+            or (target_bytes is not None and target_bytes != proof[2])):
+        raise ValueError("scratch identity or admission changed")
+    # No following aliases, even inside an owned root. This is a bounded
+    # synthetic tree, not a recursive inspection of operator data.
+    pending = [root]
+    count = 0
+    while pending:
+        directory = pending.pop()
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                count += 1
+                if count > 256:
+                    raise ValueError("unexpected scratch cardinality")
+                info = entry.stat(follow_symlinks=False)
+                if info.st_uid != os.getuid():
+                    raise ValueError("foreign scratch entry")
+                if stat.S_ISDIR(info.st_mode):
+                    pending.append(Path(entry.path))
+                elif not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise ValueError("aliased scratch entry")
 
 
 def file_digest(path: Path) -> str:
@@ -143,25 +197,29 @@ def generate_fixture(path: Path, target_bytes: int, *, seed: int = 397) -> dict:
         raise
 
 
-def prepare_config(root: Path):
+def prepare_config(root: Path, *, create: bool = True):
     from app.config import PathConfig, Settings
 
+    admit_run(root)
     config = root / "config" / "config.yaml"
-    config.parent.mkdir(exist_ok=True)
+    if create:
+        config.parent.mkdir()
     paths = PathConfig(**{key: str(root / "config" / (key + ".json"))
                          for key in PathConfig.model_fields})
     settings = Settings(config_file=str(config), paths=paths, systems=[])
     # JSON is valid YAML. Only synthetic settings, no environment loader.
-    config.write_text(json.dumps({"systems": [], "paths": paths.model_dump()}), encoding="utf-8")
+    if create:
+        with config.open("x", encoding="utf-8") as output:
+            output.write(json.dumps({"systems": [], "paths": paths.model_dump()}))
     return settings
 
 
-def synthetic_service(root: Path):
+def synthetic_service(root: Path, *, create_config: bool = True):
     from history_service.config import HistorySettings
     from history_service.store import HistoryStore
     from history_service.system_backup import SystemBackupService
 
-    settings = prepare_config(root)
+    settings = prepare_config(root, create=create_config)
 
     class SyntheticService(SystemBackupService):
         def _load_app_settings(self):
@@ -177,12 +235,15 @@ def synthetic_service(root: Path):
 
 def operation(phase: str, request: dict) -> dict:
     root = Path(request["root"])
+    admit_run(root, request.get("target_bytes"))
+    if phase not in PHASES:
+        raise ValueError("unknown phase")
     if phase == "fixture":
         fixture = generate_fixture(root / "history.db", request["target_bytes"], seed=request["seed"])
         return {"input_bytes": 0, "output_bytes": fixture["logical_bytes"], "fixture": fixture}
     from history_service.system_backup import HISTORY_DB_KEY, default_backup_included_paths
 
-    service = synthetic_service(root)
+    service = synthetic_service(root, create_config=phase == "create")
     archive = root / "bundle.7z"
     passphrase = request["passphrase"]
     if phase == "create":
@@ -233,8 +294,14 @@ def operation(phase: str, request: dict) -> dict:
 
 
 def worker(phase: str) -> int:
-    request = json.loads(sys.stdin.readline(8192))
-    timeout = request["timeout"]
+    try:
+        request = json.loads(sys.stdin.readline(8192))
+        admit_run(Path(request["root"]), request["target_bytes"])
+        timeout = request["timeout"]
+        if type(timeout) not in (int, float) or not math.isfinite(timeout) or not 0 < timeout <= MAX_TIMEOUT:
+            return 1
+    except (ValueError, TypeError, KeyError, OSError):
+        return 1
     resource.setrlimit(resource.RLIMIT_AS, (GIB, GIB))
     resource.setrlimit(resource.RLIMIT_CPU, (math.ceil(timeout), math.ceil(timeout) + 1))
     resource.setrlimit(resource.RLIMIT_FSIZE, (6 * GIB, 6 * GIB))
@@ -255,7 +322,66 @@ def worker(phase: str) -> int:
     return 0
 
 
-def measure_process(argv: list[str], request: dict, scratch: Path, *, timeout: float) -> dict:
+class OwnedWorkerProcess:
+    """Popen-shaped fork child retaining the parent's in-memory scratch proof.
+
+    Linux CLI only, fail closed if the supervisor has other Python threads.
+    No serializable proof and no alternate executable worker entrypoint.
+    """
+    def __init__(self, phase, *, cwd, env):
+        if threading.active_count() != 1:
+            raise ValueError("owned workers require a single-threaded supervisor")
+        read_in, write_in = os.pipe()
+        read_out, write_out = os.pipe()
+
+        def child():
+            try:
+                os.setsid()
+                os.close(write_in)
+                os.close(read_out)
+                os.environ.clear()
+                os.environ.update(env)
+                tempfile.tempdir = env["TMPDIR"]
+                os.chdir(cwd)
+                os.dup2(read_in, 0)
+                os.dup2(write_out, 1)
+                with open(os.devnull, "w") as sink:
+                    os.dup2(sink.fileno(), 2)
+                sys.stdin = os.fdopen(os.dup(0), "r")
+                sys.stdout = os.fdopen(os.dup(1), "w")
+                code = worker(phase)
+                sys.stdout.flush()
+                os._exit(code)
+            except BaseException:
+                os._exit(1)
+
+        self.process = multiprocessing.get_context("fork").Process(target=child)
+        try:
+            self.process.start()
+        except BaseException:
+            os.close(write_in)
+            os.close(read_out)
+            raise
+        finally:
+            os.close(read_in)
+            os.close(write_out)
+        self.pid = self.process.pid
+        assert self.pid is not None
+        self.stdin = os.fdopen(write_in, "wb")
+        self.stdout = os.fdopen(read_out, "rb")
+
+    @property
+    def returncode(self):
+        return self.process.exitcode
+
+    def wait(self, timeout=None):
+        self.process.join(timeout)
+        if self.process.is_alive():
+            raise subprocess.TimeoutExpired("owned worker", timeout)
+        return self.returncode
+
+
+def measure_process(argv: list[str], request: dict, scratch: Path, *, timeout: float, owned_phase=None) -> dict:
     """Run a phase with bounded pipe capture; never retain stderr or secrets."""
     scratch = scratch.resolve(strict=True)
     started = time.monotonic()
@@ -269,8 +395,12 @@ def measure_process(argv: list[str], request: dict, scratch: Path, *, timeout: f
     env = {"PATH": os.environ.get("PATH", os.defpath), "HOME": str(scratch),
            "TMPDIR": str(scratch), "LANG": "C.UTF-8", "PYTHONDONTWRITEBYTECODE": "1",
            "RELEASE_CHECK_ENABLED": "false"}
-    process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                               stderr=subprocess.DEVNULL, cwd=ROOT, env=env, start_new_session=True)
+    if owned_phase is not None:
+        admit_run(Path(request["root"]), request["target_bytes"])
+        process = OwnedWorkerProcess(owned_phase, cwd=ROOT, env=env)
+    else:
+        process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL, cwd=ROOT, env=env, start_new_session=True)
     captured = bytearray()
     read_failed = threading.Event()
 
@@ -278,7 +408,13 @@ def measure_process(argv: list[str], request: dict, scratch: Path, *, timeout: f
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
-            pass
+            # A fork child may not have reached setsid yet. Kill that child
+            # directly so timeout/cancellation cannot become a late write.
+            if owned_phase is not None:
+                try:
+                    os.kill(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
     def read_bounded():
         try:
@@ -312,10 +448,12 @@ def measure_process(argv: list[str], request: dict, scratch: Path, *, timeout: f
         process.stdout.close()
         result["supervisor_wall_seconds"] = time.monotonic() - started
         result["exit_code"] = process.returncode
+        if isinstance(process, OwnedWorkerProcess):
+            process.process.close()
     if result["state"] in ("timeout", "cancelled"):
         return result
     try:
-        if process.returncode == 0 and len(captured) <= 16384 and not read_failed.is_set():
+        if result["exit_code"] == 0 and len(captured) <= 16384 and not read_failed.is_set():
             payload = json.loads(captured)
             required = ("wall_seconds", "cpu_seconds", "peak_rss_bytes", "input_bytes", "output_bytes")
             if payload.get("state") == "complete" and all(type(payload.get(k)) in (int, float) and math.isfinite(payload[k]) and payload[k] >= 0 for k in required):
@@ -329,7 +467,7 @@ def measure_process(argv: list[str], request: dict, scratch: Path, *, timeout: f
     return result
 
 
-def benchmark(root: Path, target_bytes: int, *, seed: int, timeout: float) -> dict:
+def benchmark(root: Path, target_bytes: int, *, seed: int, timeout: float, allow_large: bool = False) -> dict:
     root = root.resolve(strict=True)
     preflight(root, target_bytes)
     source_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
@@ -339,14 +477,15 @@ def benchmark(root: Path, target_bytes: int, *, seed: int, timeout: float) -> di
               "sqlite": sqlite3.sqlite_version, "profile": PROFILE, "worker_cap": 1,
               "fixture_limits": fixture_limits(),
               "per_process_address_space_limit_bytes": GIB, "phase_timeout_seconds": timeout,
+              "process_model": "forked owned-scratch workers; RSS includes inherited supervisor memory",
               "rss_scope": "max Linux process high-water RSS across worker and reaped descendants; not concurrent aggregate",
               "timing_scope": "whole production operations; overlapping work, not additive; fixture excluded from backup timing",
               "candidate_profiles": [{"profile": "tar.zst+AES-256-GCM FULL", "state": "unsupported",
                                       "reason": "current production FULL encrypted export selects 7z; no supported alternate FULL export API; guards not bypassed"}],
               "large_matrix": [{"target_bytes": (size * GIB if size == 2 else fixture_limits()["maximum_target_bytes"]), "state": "not_run", "reason": "requires separate explicit opt-in and capacity/tool admission"} for size in (2, 4)],
               "phases": []}
-    with tempfile.TemporaryDirectory(prefix="full-backup-benchmark-", dir=root) as name:
-        run = Path(name)
+    with owned_run(root, target_bytes, allow_large=allow_large) as run:
+        name = str(run)
         secret = secrets.token_urlsafe(32)
         blocked = None
         for phase in PHASES:
@@ -360,8 +499,7 @@ def benchmark(root: Path, target_bytes: int, *, seed: int, timeout: float) -> di
             with tempfile.TemporaryDirectory(prefix="phase-", dir=run) as scratch:
                 request = {"root": str(run), "target_bytes": target_bytes, "seed": seed,
                            "timeout": timeout, "passphrase": secret}
-                result = measure_process([sys.executable, "-B", str(Path(__file__).resolve()), "--worker-phase", phase],
-                                         request, Path(scratch), timeout=timeout)
+                result = measure_process([], request, Path(scratch), timeout=timeout, owned_phase=phase)
             report["phases"].append({"phase": phase, **result})
             if result["state"] != "complete":
                 blocked = "preceding phase did not complete"
@@ -415,7 +553,7 @@ def main(argv=None) -> int:
                           "reason": "7z executable unavailable; no fixture allocated"}))
         return 2
     try:
-        report = benchmark(root, target, seed=args.seed, timeout=args.timeout)
+        report = benchmark(root, target, seed=args.seed, timeout=args.timeout, allow_large=args.allow_large)
     except ValueError:
         print(json.dumps({"state": "blocked", "synthetic_only": True, "release_acceptance": False,
                           "reason": "scratch free-space admission failed"}))

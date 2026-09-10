@@ -25,7 +25,105 @@ class FullBackupBenchmarkTests(unittest.TestCase):
         self.b = benchmark_full_backup
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
+        self.root = self.enterContext(self.b.owned_run(Path(self.tmp.name), self.b.MIB))
+
+    def test_direct_workers_refuse_unowned_roots_without_mutation(self):
+        for phase in self.b.PHASES:
+            for alias in ("plain", "root-link", "config-link", "hardlink"):
+                with self.subTest(phase=phase, alias=alias), tempfile.TemporaryDirectory() as name:
+                    root = Path(name)
+                    protected = root / "protected"
+                    protected.write_bytes(b"synthetic sentinel\x00unchanged")
+                    config = root / "config"
+                    config.mkdir()
+                    target = config / "config.yaml"
+                    if alias == "config-link":
+                        target.symlink_to(protected)
+                    elif alias == "hardlink":
+                        os.link(protected, target)
+                    else:
+                        target.write_bytes(protected.read_bytes())
+                    supplied = root
+                    if alias == "root-link":
+                        supplied = root / "alias"
+                        supplied.symlink_to(root, target_is_directory=True)
+                    before = {p.relative_to(root): p.read_bytes() for p in (protected, target)}
+                    request = {"root": str(supplied), "target_bytes": self.b.MIB,
+                               "timeout": 5, "seed": 397, "passphrase": "unit-only",
+                               "supervisor_token": "user-created-is-not-authority"}
+                    proc = subprocess.run([sys.executable, "-B", str(SCRIPT),
+                                           "--worker-phase", phase], input=json.dumps(request),
+                                          capture_output=True, text=True, timeout=15)
+                    self.assertEqual({p: (root / p).read_bytes() for p in before}, before)
+                    self.assertFalse((root / "history.db").exists())
+                    self.assertNotEqual(proc.returncode, 0)
+                    self.assertEqual(proc.stdout, "")
+
+    def test_worker_large_request_cannot_reach_operation(self):
+        request = {"root": str(self.root), "target_bytes": 2 * self.b.GIB,
+                   "timeout": 5, "seed": 397, "passphrase": "unit-only"}
+        with patch("sys.stdin", io.StringIO(json.dumps(request))), \
+                patch.object(self.b.resource, "setrlimit"), \
+                patch.object(self.b, "operation", return_value={}) as operation:
+            self.assertEqual(self.b.worker("fixture"), 1)
+        operation.assert_not_called()
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_owned_run_rejects_aliases_before_any_phase(self):
+        protected = Path(self.tmp.name) / "sentinel"
+        protected.write_bytes(b"synthetic protected bytes")
+        for alias in ("file-symlink", "dir-symlink", "hardlink"):
+            target = self.root / "alias"
+            if alias == "dir-symlink":
+                target.symlink_to(protected.parent, target_is_directory=True)
+            elif alias == "file-symlink":
+                target.symlink_to(protected)
+            else:
+                os.link(protected, target)
+            try:
+                for phase in self.b.PHASES:
+                    with self.subTest(alias=alias, phase=phase):
+                        with self.assertRaises(ValueError):
+                            self.b.operation(phase, {"root": str(self.root),
+                                                    "target_bytes": self.b.MIB})
+                        self.assertEqual(protected.read_bytes(), b"synthetic protected bytes")
+                        self.assertFalse((self.root / "config").exists())
+                        self.assertFalse((self.root / "history.db").exists())
+            finally:
+                target.unlink()
+
+    def test_owned_run_proof_is_revoked_on_exit(self):
+        with self.b.owned_run(Path(self.tmp.name), self.b.MIB) as run:
+            self.b.admit_run(run)
+        with self.assertRaises(ValueError):
+            self.b.admit_run(run)
+
+    def test_owned_worker_checks_timeout_and_binding_before_operation(self):
+        for timeout, size in ((0, self.b.MIB), (float("nan"), self.b.MIB),
+                              (601, self.b.MIB), (5, 2 * self.b.GIB)):
+            request = {"root": str(self.root), "target_bytes": size, "timeout": timeout}
+            with patch("sys.stdin", io.StringIO(json.dumps(request))), \
+                    patch.object(self.b, "operation") as operation:
+                self.assertEqual(self.b.worker("fixture"), 1)
+                operation.assert_not_called()
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_owned_large_run_requires_opt_in_and_codec_before_scratch(self):
+        for allowed in (False, True):
+            with patch.object(shutil, "which", return_value=None), \
+                    patch.object(tempfile, "TemporaryDirectory") as allocation:
+                with self.assertRaises(ValueError):
+                    with self.b.owned_run(self.root, 2 * self.b.GIB, allow_large=allowed):
+                        self.fail("large admission bypass")
+                allocation.assert_not_called()
+
+    def test_config_helper_never_overwrites_existing_sentinel(self):
+        (self.root / "config").mkdir()
+        target = self.root / "config/config.yaml"
+        target.write_bytes(b"synthetic config sentinel")
+        with self.assertRaises((ValueError, FileExistsError)):
+            self.b.prepare_config(self.root)
+        self.assertEqual(target.read_bytes(), b"synthetic config sentinel")
 
     def test_fixture_reproducible_real_sqlite_with_bounded_rows(self):
         with patch.object(Path, "read_bytes", side_effect=AssertionError("whole-file read")):
@@ -156,6 +254,36 @@ class FullBackupBenchmarkTests(unittest.TestCase):
         import time
         time.sleep(1.1)
         self.assertFalse(marker.exists())
+
+    def test_owned_worker_timeout_kills_descendants(self):
+        import time
+        marker = self.root / "late-owned-write"
+        child = f"import time; from pathlib import Path; time.sleep(1); Path({str(marker)!r}).touch()"
+
+        def blocked_operation(*args):
+            subprocess.Popen([sys.executable, "-c", child])
+            time.sleep(5)
+
+        request = {"root": str(self.root), "target_bytes": self.b.MIB, "timeout": 5}
+        with patch.object(self.b, "operation", side_effect=blocked_operation):
+            result = self.b.measure_process([], request, self.root, timeout=0.3, owned_phase="fixture")
+        self.assertEqual(result["state"], "timeout")
+        time.sleep(1.1)
+        self.assertFalse(marker.exists())
+
+    def test_owned_worker_timeout_before_session_creation_is_bounded(self):
+        import time
+        original = os.setsid
+
+        def delayed_session():
+            time.sleep(0.6)
+            original()
+
+        request = {"root": str(self.root), "target_bytes": self.b.MIB, "timeout": 5, "seed": 397}
+        with patch.object(os, "setsid", side_effect=delayed_session):
+            result = self.b.measure_process([], request, self.root, timeout=0.05, owned_phase="fixture")
+        self.assertEqual(result["state"], "timeout")
+        self.assertFalse((self.root / "history.db").exists(), "worker wrote after timeout")
 
     def test_cancelled_child_is_reaped(self):
         original = subprocess.Popen.wait
@@ -293,8 +421,10 @@ class FullBackupBenchmarkTests(unittest.TestCase):
             created = self.b.operation("create", request)
             self.assertGreater(created["output_bytes"], 0)
             self.assertGreater(created["input_bytes"], fixture["logical_bytes"])
+            config_before = (self.root / "config/config.yaml").read_bytes()
             for phase in ("inspect", "verify", "extract"):
                 result = self.b.operation(phase, request)
+                self.assertEqual((self.root / "config/config.yaml").read_bytes(), config_before)
                 self.assertEqual(result["input_bytes"], created["output_bytes"])
                 if phase == "extract":
                     self.assertEqual(result["rows"], fixture["rows"])
@@ -305,7 +435,6 @@ class FullBackupBenchmarkTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("7z"), "real 7z executable unavailable")
     def test_real_export_wrong_passphrase_corruption_and_cleanup(self):
         self.b.generate_fixture(self.root / "history.db", 1024 * 1024)
-        self.b.prepare_config(self.root)
         with patch.dict(os.environ, {"TMPDIR": str(self.root)}):
             old_tempdir = tempfile.tempdir
             tempfile.tempdir = str(self.root)
