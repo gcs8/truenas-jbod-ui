@@ -36,6 +36,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Added an explicit legacy Compose migration that forwarded history's published
+  bind address without replacing deployment customizations. (#497)
 - Kept the main UI running when `.env` carries admin-only or blank values, and
   replaced pydantic startup tracebacks with one plain line per problem that
   names the `.env` variable or `config.yaml` key; the history off-loopback
