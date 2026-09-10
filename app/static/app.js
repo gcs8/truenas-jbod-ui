@@ -9970,6 +9970,8 @@
     }
     const mutation = captureMutationContext("importMappingsFromFile");
     if (!mutation) return;
+    state.mappingImportFileOwner = mutation;
+    const selectedFile = mappingImportFile?.files?.[0];
     let succeeded = false;
     try {
       setStatus(`Previewing mappings from ${file.name}...`);
@@ -10010,8 +10012,13 @@
       setStatus(`Import failed: ${error.message || error}`, "error");
     } finally {
       finishMutationContext(mutation, succeeded);
-      if (mutationContextIsCurrent(mutation) && mappingImportFile) {
-        mappingImportFile.value = "";
+      // File cleanup belongs to this operation, even after its UI scope expires.
+      // Compare File identity, not its name, and never retire a newer operation.
+      if (state.mappingImportFileOwner === mutation) {
+        if (mappingImportFile && mappingImportFile.files?.[0] === selectedFile) {
+          mappingImportFile.value = "";
+        }
+        state.mappingImportFileOwner = null;
       }
     }
   }

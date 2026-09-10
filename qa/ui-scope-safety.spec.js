@@ -306,6 +306,61 @@ test("quiet storage-view failure exposes stale options and a working retry", asy
  expect(errors).toEqual([]);
 });
 
+for (const phase of ["read", "preview"]) {
+ test(`abandoned ${phase} import clears real input and permits same-file retry`, async ({page}) => {
+  await page.addInitScript(() => {
+   Object.defineProperty(window,"APP_BOOTSTRAP",{configurable:true,set(value){
+    value.writePolicy={enabled:true,mode:"network",reason:"Synthetic fixture write policy"};
+    Object.defineProperty(window,"APP_BOOTSTRAP",{value,writable:true,configurable:true});
+   }});
+  });
+  const errors=await openFixture(page);
+  const served=await page.evaluate(async()=>await (await fetch("/static/app.js")).text());
+  expect(served).toBe(appSource);
+  const requests=[]; let preview;
+  await page.route("**/api/mappings/import**",route=>{
+   requests.push(route.request().url());
+   if(route.request().url().includes("/preview")) {preview=route;return;}
+   return route.fulfill({contentType:"application/json",body:JSON.stringify({ok:false,detail:"No synthetic import authorized"})});
+  });
+  await page.evaluate(phase=>{
+   window.__importChanges=0;
+   document.querySelector("#mapping-import-file").addEventListener("change",()=>window.__importChanges++);
+   if(phase==="read") {
+    const original=File.prototype.text;
+    File.prototype.text=function(){
+     File.prototype.text=original;
+     return new Promise(resolve=>{window.__releaseImportRead=()=>original.call(this).then(resolve);});
+    };
+   }
+  },phase);
+  const input=page.locator("#mapping-import-file");
+  const file={name:"synthetic.json",mimeType:"application/json",buffer:Buffer.from("{}")};
+  await input.setInputFiles(file);
+  if(phase==="read") {
+   await expect.poll(()=>page.evaluate(()=>Boolean(window.__releaseImportRead))).toBe(true);
+   expect(requests).toHaveLength(0);
+  } else await expect.poll(()=>Boolean(preview)).toBe(true);
+  await page.locator('#mapping-form [name="notes"]').fill("Synthetic newer draft");
+  if(phase==="read") await page.evaluate(()=>window.__releaseImportRead());
+  else await preview.fulfill({contentType:"application/json",body:JSON.stringify({revision:"r",import_digest:"synthetic"})});
+  await expect(input).toHaveValue("");
+  expect(requests).toHaveLength(phase==="read"?0:1);
+  expect(requests.every(url=>url.includes("/preview"))).toBe(true);
+  preview=null;
+  await input.setInputFiles(file);
+  await expect.poll(()=>Boolean(preview)).toBe(true);
+  expect(await page.evaluate(()=>window.__importChanges)).toBe(2);
+  page.once("dialog",dialog=>dialog.dismiss());
+  await preview.fulfill({contentType:"application/json",body:JSON.stringify({revision:"r",import_digest:"synthetic"})});
+  await expect(input).toHaveValue("");
+  await expect(page.locator('#mapping-form [name="notes"]')).toHaveValue("Synthetic newer draft");
+  expect(requests).toHaveLength(phase==="read"?1:2);
+  expect(requests.every(url=>url.includes("/preview"))).toBe(true);
+  expect(errors).toEqual([]);
+ });
+}
+
 test("late LED completion cannot replace a newer shelf or its draft", async ({page}) => {
  await page.addInitScript(() => {
   Object.defineProperty(window,"APP_BOOTSTRAP",{configurable:true,set(value){

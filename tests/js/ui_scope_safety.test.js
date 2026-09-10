@@ -98,6 +98,98 @@ test("history and export declare honest accessible state", () => {
  assert.match(helpers.functionSource(source,"renderHistoryPanel"),/aria-pressed/);
 });
 
+function importFixture() {
+  const state = {snapshotMode:false, snapshot:{selected_system_id:"a",selected_enclosure_id:"one"}, selectedSystemId:"a",selectedEnclosureId:"one",selectedSlot:0,latestRefreshToken:1,mappingDraftRevision:0};
+  const input = {value:"",files:[]};
+  const requests = [], applied = [], errors = [];
+  const c = load([...guardNames,"importMappingsFromFile"], {
+    state, mappingImportFile:input, window:{confirm:()=>true},
+    mappingImportUnavailableReason:()=>"", mappingImportPreviewMessage:()=>"confirm",
+    writeBlockedByPolicy:()=>false, setStatus(){},
+    sendScopedRequest:async url => { requests.push(url); return url.endsWith("preview") ? {revision:"r"} : {snapshot:{},imported:1}; },
+    applySnapshot:s=>applied.push(s), invalidateHistoryCaches(){}, renderAll(){}, scheduleSmartPrefetch(){},
+    handleWriteRejection:e=>errors.push(e),
+  });
+  function select(file) { input.files=[file]; input.value=file.name; }
+  return {c,state,input,requests,applied,errors,select};
+}
+function abandonImport(state, transition) {
+  if (transition === "system") state.selectedSystemId="b";
+  if (transition === "enclosure") state.selectedEnclosureId="two";
+  if (transition === "slot") state.selectedSlot=1;
+  if (transition === "refresh") state.latestRefreshToken++;
+  if (transition === "draft") state.mappingDraftRevision++;
+}
+const tick = () => new Promise(resolve=>setImmediate(resolve));
+for (const phase of ["read", "preview"]) {
+  for (const transition of ["system","enclosure","slot","refresh","draft"]) {
+    for (const newerName of [null,"newer.json","synthetic.json"]) {
+      test(`import ownership ${phase}/${transition}/newer=${newerName}`, async () => {
+        const h=importFixture(), pending=deferred();
+        const file={name:"synthetic.json",text:()=>phase==="read"?pending.promise:Promise.resolve("{}")};
+        h.select(file);
+        h.c.sendScopedRequest=async url=>{h.requests.push(url); return pending.promise;};
+        const run=h.c.importMappingsFromFile(file);
+        await tick();
+        assert.equal(h.requests.length,phase==="read"?0:1);
+        abandonImport(h.state,transition);
+        const newer={name:newerName,text:async()=>"{}"};
+        if(newerName) h.select(newer);
+        pending.resolve(phase==="read"?"{}":{revision:"r"});
+        await run;
+        assert.equal(h.input.value,newerName || "");
+        if(newerName) assert.equal(h.input.files[0],newer);
+        assert.equal(h.requests.length,phase==="read"?0:1);
+        assert.equal(h.applied.length,0);
+        assert.equal(h.errors.length,0);
+      });
+    }
+  }
+}
+for (const phase of ["read","preview"]) {
+  test(`import ownership stale ${phase} error clears own file silently`, async()=>{
+    const h=importFixture(), pending=deferred();
+    const file={name:"synthetic.json",text:()=>phase==="read"?pending.promise:Promise.resolve("{}")};
+    h.select(file);
+    h.c.sendScopedRequest=async url=>{h.requests.push(url);return pending.promise;};
+    const run=h.c.importMappingsFromFile(file); await tick();
+    abandonImport(h.state,"draft"); pending.reject(new Error("synthetic failure")); await run;
+    assert.equal(h.input.value,""); assert.equal(h.errors.length,0); assert.equal(h.applied.length,0);
+  });
+}
+for (const outcome of ["success","cancel","read-error","preview-error","import-error"]) {
+  test(`import ownership ${outcome} cleanup`,async()=>{
+    const h=importFixture();
+    const file={name:"synthetic.json",text:async()=>{if(outcome==="read-error") throw new Error("read");return "{}";}};
+    h.select(file); h.c.window.confirm=()=>outcome!=="cancel";
+    h.c.sendScopedRequest=async url=>{h.requests.push(url);if(url.endsWith(outcome==="preview-error"?"preview":"import") && outcome.endsWith("error")) throw new Error("request");return {revision:"r",snapshot:{},imported:1};};
+    await h.c.importMappingsFromFile(file);
+    assert.equal(h.input.value,""); assert.equal(h.applied.length,outcome==="success"?1:0);
+    assert.equal(h.errors.length,outcome.endsWith("error")?1:0);
+  });
+}
+for (const sameObject of [false,true]) {
+  for (const reverse of [false,true]) {
+    test(`import ownership overlapping operations sameObject=${sameObject} reverse=${reverse}`,async()=>{
+      const h=importFixture(), first=deferred(), second=deferred(); let reads=0;
+      const a={name:"synthetic.json",text:()=>reads++===0?first.promise:second.promise};
+      const b=sameObject?a:{name:"synthetic.json",text:()=>second.promise};
+      h.select(a);const old=h.c.importMappingsFromFile(a);await tick();
+      h.state.selectedEnclosureId="two"; h.state.snapshot.selected_enclosure_id="two";
+      h.select(b);const newer=h.c.importMappingsFromFile(b);await tick();
+      if(reverse) {
+        second.resolve("{}"); await newer; assert.equal(h.input.value,"");
+        const third={name:"synthetic.json",text:async()=>"{}"}; h.select(third);
+        first.resolve("{}");await old;assert.equal(h.input.value,"synthetic.json");assert.equal(h.input.files[0],third);
+      } else {
+        first.resolve("{}");await old;assert.equal(h.input.value,"synthetic.json");assert.equal(h.input.files[0],b);
+        second.resolve("{}");await newer;assert.equal(h.input.value,"");
+      }
+      assert.equal(h.requests.length,2);assert.equal(h.applied.length,1);
+    });
+  }
+}
+
 test("runtime removal of selected view rerenders the now-live grid", async () => {
  const state={snapshotMode:false,selectedSystemId:"a",selectedEnclosureId:"one",selectedStorageViewRuntimeId:"removed",storageViewsRuntimeRequestToken:0};let rendered=0;
  const c=load(["currentUiScopeKey","fetchStorageViewRuntime"],{state,renderSelectors(){},renderAll(){rendered++;},renderStorageViewRuntimeStatus(){},buildSelectionParams:()=>new URLSearchParams(),fetchJson:async()=>({system_id:"a",views:[]}),applyStorageViewRuntime(){state.selectedStorageViewRuntimeId="";},setStatus(){}});
