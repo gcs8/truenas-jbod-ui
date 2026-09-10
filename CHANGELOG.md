@@ -26,6 +26,14 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Added
+
+- Added a client-only, one-session SMART WebSocket batch API with bounded
+  concurrency and DDP heartbeat handling; inventory integration remained
+  separate (#503).
+
 ## v0.23.0 - 2026-09-08
 
 This release includes every pull request merged after `v0.22.2` through the
