@@ -73,6 +73,14 @@ admin port can use the controls available there. Do not publish those ports
 directly to the Internet. Confirm the UI and health endpoints work before adding
 optional hardening.
 
+## Legacy history publication migration
+
+If you retain the v0.22.2 Compose file while updating the image, follow the
+[explicit history Compose migration](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/HISTORY_COMPOSE_MIGRATION.md).
+It forwards the published address without replacing deployment customizations
+or changing loopback and network-auth defaults. An image-only update cannot
+supply metadata that the old history service never receives.
+
 ## Optional hardening after startup
 
 To opt into Basic authentication, set shared credentials and the exact browser
