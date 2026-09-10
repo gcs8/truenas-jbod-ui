@@ -166,6 +166,54 @@ class ReleaseStatusTests(unittest.TestCase):
         self.assertEqual(snapshot["latest_tag"], "v0.14.1")
         self.assertEqual(snapshot["latest_url"], payload["html_url"])
 
+    def test_periodic_refresh_restarts_on_a_new_event_loop(self) -> None:
+        service = ReleaseStatusService(current_version="0.14.1")
+        now = 1000.0
+
+        async def lifespan() -> None:
+            nonlocal now
+            loop = asyncio.get_running_loop()
+            loop.slow_callback_duration = float("inf")
+            baseline = asyncio.all_tasks()
+
+            async def settle() -> None:
+                for _ in range(12):
+                    await asyncio.sleep(0)
+
+            async def fetch(function):
+                return function()
+
+            with (
+                patch.object(loop, "time", side_effect=lambda: now),
+                patch("app.services.release_status.monotonic", side_effect=lambda: now),
+                patch("app.services.release_status.asyncio.to_thread", side_effect=fetch),
+                patch.object(service, "_fetch_latest_release", return_value={"tag_name": "v0.14.1"}) as network,
+            ):
+                worker = asyncio.create_task(service.run_periodic_refresh())
+                try:
+                    await settle()
+                    # Surface a worker crash instead of masking it with cancellation.
+                    if worker.done():
+                        await worker
+                    before = network.call_count
+                    now = service._next_refresh_at
+                    await settle()
+                    self.assertEqual(network.call_count, before + 1)
+                    self.assertEqual(service.snapshot()["status"], "current")
+                    self.assertFalse(worker.done())
+                finally:
+                    worker.cancel()
+                    if not worker.done():
+                        with self.assertRaises(asyncio.CancelledError):
+                            await worker
+                    await settle()
+                    self.assertEqual(asyncio.all_tasks(), baseline)
+                    self.assertFalse([timer for timer in loop._scheduled if not timer.cancelled()])
+
+        # Reuse the instance, as the process-wide cached getters do on restart.
+        asyncio.run(lifespan())
+        asyncio.run(lifespan())
+
     def test_release_status_service_reports_error_when_initial_refresh_fails(self) -> None:
         service = ReleaseStatusService(current_version="0.15.0-dev")
 

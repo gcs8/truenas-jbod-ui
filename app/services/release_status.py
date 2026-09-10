@@ -139,18 +139,23 @@ class ReleaseStatusService:
             )
             return
 
-        while True:
-            await self.refresh()
-            # Clear before reading the deadline, with no intervening await.
-            # Updates before this point are already reflected in the deadline;
-            # updates after it stay latched even before Event.wait starts.
-            self._deadline_changed.clear()
-            delay = max(0.0, self._next_refresh_at - monotonic())
-            try:
-                async with asyncio.timeout(delay):
-                    await self._deadline_changed.wait()
-            except asyncio.TimeoutError:
-                pass
+        try:
+            while True:
+                await self.refresh()
+                # Clear before reading the deadline, with no intervening await.
+                # Updates before this point are already reflected in the deadline;
+                # updates after it stay latched even before Event.wait starts.
+                self._deadline_changed.clear()
+                delay = max(0.0, self._next_refresh_at - monotonic())
+                try:
+                    async with asyncio.timeout(delay):
+                        await self._deadline_changed.wait()
+                except asyncio.TimeoutError:
+                    pass
+        finally:
+            # Cached services survive lifespan restarts on a different loop.
+            # Retain the deadline, but discard the old loop-bound wake event.
+            self._deadline_changed = asyncio.Event()
 
     async def refresh(self, *, force: bool = False) -> dict[str, Any]:
         if not self.enabled:
