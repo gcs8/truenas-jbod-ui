@@ -88,20 +88,22 @@ function element(dataset = {}) {
 function harness({ stored = null, fetchResult = () => Promise.resolve({ ok: true }) } = {}) {
   const upgradeNotice = element({ noticeVersion: "0.23.0" });
   const upgradeNoticeDismiss = element();
+  const upgradeNoticeText = element();
   const writes = [];
   const requests = [];
   const functions = loadFunctions({
     upgradeNotice,
     upgradeNoticeDismiss,
+    upgradeNoticeText,
     state: { snapshotMode: false },
     loadStoredJson: () => stored,
-    storeJson: (key, payload) => writes.push([key, payload]),
+    storeJson: (key, payload) => { stored = payload; writes.push([key, payload]); },
     fetchJson: (url, options) => {
       requests.push([url, options]);
       return fetchResult();
     },
   });
-  return { ...functions, upgradeNotice, upgradeNoticeDismiss, writes, requests };
+  return { ...functions, upgradeNotice, upgradeNoticeDismiss, upgradeNoticeText, writes, requests };
 }
 
 test("a pending notice stays visible until it is dismissed", () => {
@@ -112,12 +114,14 @@ test("a pending notice stays visible until it is dismissed", () => {
   assert.equal(h.upgradeNotice.classList.contains("hidden"), false);
 });
 
-test("a notice this browser already dismissed for the same version stays hidden", () => {
+test("a locally dismissed notice still pending on the server offers a retry", () => {
   const h = harness({ stored: { version: "0.23.0" } });
 
   h.renderUpgradeNotice();
 
-  assert.equal(h.upgradeNotice.classList.contains("hidden"), true);
+  assert.equal(h.upgradeNotice.classList.contains("hidden"), false);
+  assert.match(h.upgradeNoticeText.textContent, /not saved for this install/);
+  assert.equal(h.upgradeNoticeDismiss.textContent, "Retry saving dismissal");
 });
 
 test("a dismissal remembered for an older version does not hide a new notice", () => {
@@ -144,14 +148,17 @@ test("dismissing hides the notice, remembers it locally and records it on the se
   assert.equal(h.requests[0][1].readUiAuth, true);
 });
 
-test("a refused server write still leaves the notice dismissed in this browser", async () => {
+test("a refused server write shows local acknowledgement without claiming install persistence", async () => {
   const failure = new Error("Sign in to enable this write.");
   failure.status = 401;
   const h = harness({ fetchResult: () => Promise.reject(failure) });
 
   await assert.doesNotReject(() => h.dismissUpgradeNotice());
 
-  assert.equal(h.upgradeNotice.classList.contains("hidden"), true);
+  assert.equal(h.upgradeNotice.classList.contains("hidden"), false);
+  assert.match(h.upgradeNoticeText.textContent, /not saved for this install/);
+  assert.equal(h.upgradeNoticeDismiss.disabled, false);
+  assert.equal(h.requests.length, 1);
   assert.equal(h.writes.length, 1);
 });
 
@@ -165,3 +172,22 @@ test("the template renders one notice above the status strip only when one is pe
   assert.match(TEMPLATE, /id="upgrade-notice-dismiss"[^>]*type="button"/);
   assert.equal((TEMPLATE.match(/id="upgrade-notice"/g) || []).length, 1);
 });
+
+for (const status of [403, 503]) {
+  test(`failed ${status} save stays local with one request per manual retry`, async () => {
+    let reject;
+    const h = harness({fetchResult: () => new Promise((_resolve, fail) => { reject = fail; })});
+    const first = h.dismissUpgradeNotice();
+    const duplicate = h.dismissUpgradeNotice();
+    assert.equal(h.requests.length, 1);
+    reject(Object.assign(new Error("Synthetic refusal"), {status}));
+    await Promise.all([first, duplicate]);
+    assert.match(h.upgradeNoticeText.textContent, /not saved for this install/);
+    assert.equal(h.upgradeNoticeDismiss.disabled, false);
+    const retry = h.dismissUpgradeNotice();
+    assert.equal(h.requests.length, 2);
+    reject(Object.assign(new Error("Synthetic refusal"), {status}));
+    await retry;
+    assert.equal(h.requests.length, 2);
+  });
+}

@@ -283,6 +283,7 @@
   const writePolicyNotice = document.getElementById("write-policy-notice");
   const upgradeNotice = document.getElementById("upgrade-notice");
   const upgradeNoticeDismiss = document.getElementById("upgrade-notice-dismiss");
+  const upgradeNoticeText = document.getElementById("upgrade-notice-text");
   const readUiAuthPanel = document.getElementById("read-ui-auth-panel");
   const readUiAuthForm = document.getElementById("read-ui-auth-form");
   const readUiAuthUsername = document.getElementById("read-ui-auth-username");
@@ -2681,24 +2682,32 @@
     if (!upgradeNotice) {
       return;
     }
-    upgradeNotice.classList.toggle("hidden", state.snapshotMode || upgradeNoticeDismissedLocally());
+    upgradeNotice.classList.toggle("hidden", state.snapshotMode);
+    if (upgradeNoticeDismissedLocally() || upgradeNotice.dataset.dismissedLocally === "true") {
+      // A server-rendered pending notice is not proof of install-wide dismissal.
+      if (upgradeNoticeText) {
+        upgradeNoticeText.textContent = "Notice acknowledged in this browser, but dismissal is not saved for this install. Sign in if required, then retry.";
+      }
+      if (upgradeNoticeDismiss) upgradeNoticeDismiss.textContent = "Retry saving dismissal";
+    }
   }
 
   async function dismissUpgradeNotice() {
-    if (!upgradeNotice) {
+    if (!upgradeNotice || upgradeNoticeDismiss?.disabled || state.snapshotMode) {
       return;
     }
-    // Hide first so the notice never lingers; the server record is best effort and the
-    // browser remembers the dismissal when the write is refused (for example before sign-in).
+    // Only this notice changes. Do not reload, reset drafts, or retry automatically.
     storeJson(UPGRADE_NOTICE_STORAGE_KEY, { version: upgradeNoticeVersion() });
-    upgradeNotice.classList.add("hidden");
+    upgradeNotice.dataset.dismissedLocally = "true";
     if (upgradeNoticeDismiss) {
       upgradeNoticeDismiss.disabled = true;
     }
     try {
       await fetchJson("/api/upgrade-notice/dismiss", { method: "POST", body: "{}", readUiAuth: true });
+      upgradeNotice.classList.add("hidden");
     } catch (error) {
-      // A refused or failed write keeps the local dismissal only.
+      if (upgradeNoticeDismiss) upgradeNoticeDismiss.disabled = false;
+      renderUpgradeNotice();
     }
   }
 

@@ -152,6 +152,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
         upgrade_notice_payload = await asyncio.to_thread(
             upgrade_notice.current_notice,
             upgrade_notice_data_dir(current_settings),
+            auth_mode=resolve_read_ui_write_policy(request)["mode"],
         )
         return templates.TemplateResponse(
             request,
