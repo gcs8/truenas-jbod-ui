@@ -14,8 +14,10 @@ Initial pause evidence is in `<database>.recovery-required`, outside the
 replaceable main database. Explicit finalization also uses a parent finalizing
 gate and retained recovery archive, as described below. The pending directory
 is private (0700); `intent.json` is 0600.
-The existing lifecycle lock owns reservation, hashing and publication. Status
-inspection itself is read-only and does not acquire the database lock.
+The existing lifecycle lock owns reservation, full startup hashing and
+publication. Status remains read-only. A store's first clear-state admission
+acquires nonblocking lifecycle ownership; later status checks reuse the admitted
+generation without recursively acquiring a live handle's lifecycle lock.
 
 | State | Authority and permitted behavior |
 | --- | --- |
@@ -31,11 +33,72 @@ exception text. Records reject duplicate keys, unknown versions/fields, invalid
 shapes, unsafe modes/ownership, symlinks, hard-linked records and nonregular files.
 Pending-intent status reads at most 8193 bytes of the intent record and does not
 hash retained payloads. Status never opens SQLite. When the pending root and
-parent finalization gate are absent, status checks the bounded archive inventory,
-authenticates the terminal-selected completion protocol and hashes retained
-original evidence. `required` is a refusal state, not a statement that all
+parent finalization gate are absent, fresh-store admission checks the bounded
+archive inventory, authenticates the terminal-selected completion protocol and
+hashes every retained original. Later store status checks compare the admitted
+filesystem generation and bounded receipt bytes, as described below. Standalone
+offline inspection still performs full archive validation. `required` is a refusal state, not a statement that all
 artifacts were verified. Every status outcome other than `none` refuses normal
 operation; only explicit finalization creates the terminal decision.
+
+## Validated generation during a store lifetime
+
+Full validation remains mandatory before fresh-store SQL admission. The service
+constructs its store before serving requests. A caller using `initialize=False`
+must perform its first admission outside async request execution. Concurrent
+first observations single-flight; a busy cold lifecycle lock refuses readiness
+rather than starting another audit or waiting while owning the generation lock.
+
+Before and after full validation, the store inventories the canonical parent,
+archive, exact members, and empty terminal directory. It retains the selected
+receipt bytes and all evidence members' device, inode, size, nanosecond mtime and
+ctime, type/mode, uid, gid, and link count. It compares descriptor facts with
+no-follow pathname observations beneath directory descriptors. Stable parent
+aliases remain supported; alias retargeting does not inherit admission.
+
+Every checked connection/cursor call, fetch, iterator advancement including
+exhaustion, context entry and successful exit retains the active-database and
+lifecycle checks. Store recovery/readiness observations share the same generation
+and pause latch. Warm checks open evidence descriptors and compare metadata and
+bounded protocol bytes, but never read or hash original main/WAL/SHM/journal
+payloads. Parent enumeration is capped at 4096 entries; archive enumeration at
+10; the terminal must be empty. Each check reads at most 8193 bytes for intent
+and 16385 bytes for each of four protocol records. These are work bounds, not
+filesystem latency or lock-wait deadlines.
+
+Parent device/inode, type/mode and uid/gid must match. Parent timestamps, size
+and child-directory link count are not frozen because ordinary live SQLite and
+other child creation changes them. Explicit schema-admitted permission repair
+may update exactly the intended parent mode through its checked descriptor;
+it cannot replace any archive authority. Active database writes remain allowed
+and are never compared with the historical completion payload digest.
+
+An observed evidence-generation change refuses and permanently pauses that
+store, including harmless metadata changes and same-inode writes followed by
+mtime restoration when ctime changes. Missing/replaced archives, altered
+receipts, unsafe links/modes/owners, unknown members and new generations do not
+trigger automatic full revalidation or re-admission. Restoring bytes cannot
+clear the latch; a still-changed generation remains `invalid`, and a later clear
+observation of a latched store projects `unavailable`. Closing a handle clears
+its lifecycle and callback ownership, not the store's generation or latch.
+Reconnect rechecks the same generation. A fresh store does not inherit its token,
+and a fork cannot use its parent's admission.
+
+This is the explicitly selected **filesystem-observable change contract**.
+Unchanged monitored metadata and receipt bytes stand in for warm payload reads.
+They are not cryptographic proof of unchanged payloads or enforced immutability.
+Timestamp collisions, stale filesystem observations, lower-layer damage,
+privileged metadata restoration and storage rollback can hide corruption from a
+warm check. Such damage is detected only when a later full validation reads it,
+including fresh startup. No periodic full audit is scheduled by this change.
+The local terminal receipt is not independent authenticated provenance. Hostile
+mutation immediately after a check, including rename/ABA around reads, remains
+outside the cooperative lifecycle contract.
+
+The pause latch is in memory, not a durable failure journal. Restart with still
+corrupt evidence refuses again; restart after complete external restoration does
+not inherit the old store's latch. Status never publishes, repairs, deletes or
+finalizes evidence, and `/livez` remains independent.
 
 ## Publication order and interruption
 

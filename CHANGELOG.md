@@ -32,7 +32,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 - Added released-schema history admission, bounded offline plaintext unsegmented
   paused recovery, and main/admin recovery readiness while retaining original
-  evidence and requiring fresh-process admission after finalization (#500).
+  evidence and requiring full fresh-process admission after finalization, then
+  bounded filesystem-generation checks that pause on observable evidence changes
+  without rereading retained payloads on warm SQL/status calls (#500).
 
 ## v0.23.0 - 2026-09-08
 

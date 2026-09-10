@@ -50,7 +50,7 @@ def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
-def inspect_recovery(database: Path) -> str:
+def inspect_recovery(database: Path, *, archive_check=None) -> str:
     """Bounded no-SQLite observation, including terminal archive validation."""
     try:
         finalization_path(database).lstat()
@@ -66,7 +66,7 @@ def inspect_recovery(database: Path) -> str:
     try:
         metadata = root.lstat()
     except FileNotFoundError:
-        return _inspect_archives(database)
+        return _inspect_archives(database, archive_check=archive_check)
     except OSError:
         return "unavailable"
     try:
@@ -111,7 +111,7 @@ def inspect_recovery(database: Path) -> str:
         return "invalid"
 
 
-def _inspect_archives(database: Path) -> str:
+def _inspect_archives(database: Path, *, archive_check=None) -> str:
     # Gate removal alone is never completion. A retained archive without an
     # authenticated terminal decision is a durable startup refusal reservation.
     try:
@@ -129,6 +129,8 @@ def _inspect_archives(database: Path) -> str:
                         archives.append(entry.name)
                         if len(archives) > 1:
                             return "invalid"
+            if archive_check is not None:
+                return "none" if archive_check(database, parent, archives[0] if archives else None) else "required"
             if not archives:
                 return "none"
             from history_service.recovery_finalize import committed_archive
@@ -137,7 +139,7 @@ def _inspect_archives(database: Path) -> str:
     except FileNotFoundError:
         # A missing parent is a normal first-run case; missing archive evidence
         # after parent admission must fail closed instead.
-        return "invalid" if 'parent' in locals() else "none"
+        return "invalid" if archive_check is not None or 'parent' in locals() else "none"
     except (OSError, ValueError, TypeError, KeyError, RecursionError):
         return "invalid"
 

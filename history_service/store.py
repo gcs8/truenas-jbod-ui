@@ -424,6 +424,8 @@ class HistoryStore:
                 raise ValueError(f"History {label} mode must be between 0000 and 0777.")
             if mode & 0o002:
                 raise ValueError(f"History {label} mode must not be world-writable.")
+        from history_service.recovery_generation import ValidatedGeneration
+        self._generation = ValidatedGeneration()
         self._recovery_latched = False
         self._ensure_database_parent()
         self._lock = threading.Lock()
@@ -432,22 +434,39 @@ class HistoryStore:
         self._segment_reader_lock = threading.Lock()
         self._segment_reader_identity: tuple[int, int, int, int] | None = None
         self._segment_reader_cache: SegmentedHistoryReader | None = None
-        if self._initialize_enabled and not self.recovery_status()["recovery_required"]:
+        if self._initialize_enabled and not self.recovery_status(_busy_raises=True)["recovery_required"]:
             with history_write_lock(self.file_path, blocking=False):
-                if not self.recovery_status()["recovery_required"]:
+                if not self.recovery_status(_lifecycle_owned=True)["recovery_required"]:
                     self._require_no_pending_lifecycle_markers()
                     self._initialize(migration_lock_held=True)
 
-    def recovery_status(self) -> dict[str, object]:
-        state = inspect_recovery(self.file_path)
-        self._recovery_latched = self._recovery_latched or state != "none"
-        if self._recovery_latched and state == "none":
-            state = "unavailable"
-        return {
-            "recovery_required": self._recovery_latched,
-            "collection_paused": self._recovery_latched,
-            "recovery_state": state,
-        }
+    def recovery_status(self, *, _lifecycle_owned: bool = False, _busy_raises: bool = False) -> dict[str, object]:
+        from history_service.migration_lock import _history_lifecycle_lock
+        with self._generation.lock:
+            # Cold observation single-flights under lifecycle ownership. Never
+            # wait for a handle's lifecycle lock while owning the forwarding lock.
+            cold = self._generation.token is None and not self._recovery_latched
+            ownership = (_history_lifecycle_lock(self.file_path, blocking=False)
+                         if cold and not _lifecycle_owned else nullcontext())
+            try:
+                with ownership:
+                    state = inspect_recovery(self.file_path, archive_check=self._generation.check_archive)
+            except sqlite3.OperationalError:
+                if _busy_raises:
+                    raise
+                state = "unavailable"
+            except (OSError, ValueError):
+                state = "unavailable"
+            self._recovery_latched = self._recovery_latched or state != "none"
+            if self._recovery_latched:
+                self._generation.failed = True
+                if state == "none":
+                    state = "unavailable"
+            return {
+                "recovery_required": self._recovery_latched,
+                "collection_paused": self._recovery_latched,
+                "recovery_state": state,
+            }
 
     def require_recovery_clear(self) -> None:
         if self.recovery_status()["recovery_required"]:
@@ -480,7 +499,8 @@ class HistoryStore:
         connection. Raise the same error type the migration lock raises so
         callers keep one failure path.
         """
-        self.require_recovery_clear()
+        if self.recovery_status(_lifecycle_owned=True)["recovery_required"]:
+            raise HistoryRecoveryRequired()
         if path_entry_exists(activation_pending_path(self.file_path)):
             raise sqlite3.OperationalError(
                 "Segmented history activation is pending; refusing to open the history "
@@ -711,7 +731,11 @@ class HistoryStore:
             return connection
 
     def _connect_locked(self) -> AdmittedConnection:
-        """Open and fully configure a connection while the lifecycle lock is held."""
+        with self._generation.lock:
+            return self._connect_generation_locked()
+
+    def _connect_generation_locked(self) -> AdmittedConnection:
+        """Open and configure under lifecycle and generation ownership."""
 
         self._require_no_pending_lifecycle_markers()
         self._create_database_file_for_shared_access()
@@ -751,7 +775,8 @@ class HistoryStore:
                 identity.check()
                 reader.close()
                 admission.pop_all()
-            return AdmittedConnection(connection, identity, self._require_no_pending_lifecycle_markers)
+            return AdmittedConnection(connection, identity, self._require_no_pending_lifecycle_markers,
+                                      guard_lock=self._generation.lock)
         except BaseException:
             identity.close()
             raise
@@ -2779,7 +2804,10 @@ class HistoryStore:
             current_mode = stat.S_IMODE(opened_metadata.st_mode)
             target_mode = self.shared_dir_mode if is_dir else self.shared_file_mode
             if target_mode != current_mode:
-                os.fchmod(descriptor, target_mode)
+                if is_dir and path == self.file_path.parent:
+                    self._generation.chmod_parent(descriptor, target_mode)
+                else:
+                    os.fchmod(descriptor, target_mode)
         finally:
             os.close(descriptor)
 

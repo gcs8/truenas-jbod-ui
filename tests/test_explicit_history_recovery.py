@@ -810,6 +810,375 @@ except sqlite3.OperationalError: sys.exit(0)
                 self.assertEqual(inventory(database.parent), before)
 
 
+class ValidatedGenerationTests(unittest.TestCase):
+    def finalized(self, temporary):
+        from history_service import explicit_recovery as api
+        fixture = FinalizationTests()
+        db, args, _ = fixture.fixture(temporary)
+        self.assertEqual(api.main(args), 5)
+        rid = args[args.index('--recovery-id') + 1]
+        self.assertEqual(api.main(fixture.selections(db, rid)), 0)
+        return db, db.with_name(db.name + '.recovery-archive-' + rid)
+
+    def test_generation_one_cold_hash_pass_zero_warm_payload_reads(self):
+        from history_service import explicit_recovery as api
+        from history_service.store import HistoryStore
+        with tempfile.TemporaryDirectory() as tmp:
+            db, archive = self.finalized(tmp)
+            reads = []
+            real_read = os.read
+            def read(fd, count):
+                raw = real_read(fd, count)
+                if os.readlink('/proc/self/fd/' + str(fd)).startswith(str(archive) + '/'):
+                    reads.append((Path(os.readlink('/proc/self/fd/' + str(fd))).name, len(raw)))
+                return raw
+            with patch.object(api, '_hash', wraps=api._hash) as hashes, patch.object(os, 'read', side_effect=read):
+                connect = sqlite3.connect
+                def admitted_connect(database, *args, **kwargs):
+                    if str(database) != ':memory:':
+                        self.assertEqual(hashes.call_count, 4, 'SQLite opened before full archive admission')
+                    return connect(database, *args, **kwargs)
+                with patch.object(sqlite3, 'connect', side_effect=admitted_connect):
+                    store = HistoryStore(str(db))
+                self.assertEqual(hashes.call_count, 4)
+                reads.clear()
+                hashes.reset_mock()
+                self.assertFalse(store.recovery_status()['recovery_required'])
+                with store._connect() as connection:
+                    for _ in range(10):
+                        self.assertEqual(connection.execute('SELECT 1').fetchone()[0], 1)
+                    self.assertEqual(len(list(connection.execute('SELECT 1 UNION ALL SELECT 2'))), 2)
+                    connection.commit()
+                self.assertEqual(hashes.call_count, 0)
+                self.assertTrue(reads)
+                self.assertFalse(set(name for name, _ in reads) & set(recovery_state.ARTIFACTS))
+
+    def test_generation_cold_publication_rejects_late_new_archive(self):
+        from history_service import recovery_finalize
+        from history_service.store import HistoryStore
+        with tempfile.TemporaryDirectory() as tmp:
+            db, archive = self.finalized(tmp)
+            real = recovery_finalize.committed_archive
+            def validate(*args):
+                result = real(*args)
+                db.with_name(db.name + '.recovery-archive-other').mkdir()
+                return result
+            with patch.object(recovery_finalize, 'committed_archive', side_effect=validate), patch.object(
+                    sqlite3, 'connect', side_effect=AssertionError('unvalidated SQLite open')):
+                store = HistoryStore(str(db), initialize=False)
+                self.assertTrue(store.recovery_status()['recovery_required'])
+
+    def test_generation_parent_permission_repair_remains_supported(self):
+        from history_service.store import HistoryStore
+        with tempfile.TemporaryDirectory() as tmp:
+            db, archive = self.finalized(tmp)
+            store = HistoryStore(str(db), permission_repair_enabled=True, shared_dir_mode=0o750)
+            self.assertEqual(stat.S_IMODE(db.parent.stat().st_mode), 0o750)
+            self.assertFalse(store.recovery_status()['recovery_required'])
+
+    def test_generation_restored_mtime_corruption_all_boundaries(self):
+        from history_service.store import HistoryStore
+        from history_service import explicit_recovery as api
+        for boundary in ('execute', 'fetch', 'next', 'exhaustion', 'commit', 'enter', 'exit', 'status', 'connect'):
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as tmp:
+                db, archive = self.finalized(tmp)
+                store = HistoryStore(str(db))
+                connection = store._connect()
+                cursor = connection.execute('SELECT 1')
+                if boundary == 'exhaustion':
+                    next(cursor)
+                original = archive / 'main'
+                info, raw = original.stat(), original.read_bytes()
+                with original.open('r+b') as stream:
+                    stream.write(bytes([raw[0] ^ 1]) + raw[1:])
+                os.utime(original, ns=(info.st_atime_ns, info.st_mtime_ns))
+                now = original.stat()
+                self.assertEqual((info.st_ino, info.st_size, info.st_mtime_ns),
+                                 (now.st_ino, now.st_size, now.st_mtime_ns))
+                self.assertNotEqual(info.st_ctime_ns, now.st_ctime_ns)
+                traced = []
+                connection._connection.set_trace_callback(traced.append)
+                actions = dict(execute=lambda: connection.execute('SELECT 2'), fetch=cursor.fetchone,
+                               next=lambda: next(cursor), exhaustion=lambda: next(cursor), commit=connection.commit,
+                               enter=connection.__enter__, exit=lambda: connection.__exit__(None, None, None))
+                try:
+                    if boundary == 'status':
+                        self.assertTrue(store.recovery_status()['recovery_required'])
+                    elif boundary == 'connect':
+                        connection.close()
+                        with self.assertRaises(recovery_state.HistoryRecoveryRequired):
+                            store._connect()
+                    else:
+                        with self.assertRaises(recovery_state.HistoryRecoveryRequired):
+                            actions[boundary]()
+                    self.assertEqual(traced, [])
+                finally:
+                    connection.close()
+                with patch.object(sqlite3, 'connect', side_effect=AssertionError('corrupt cold SQL')), patch.object(
+                        api, '_hash', wraps=api._hash) as hashes:
+                    self.assertTrue(HistoryStore(str(db)).recovery_status()['recovery_required'])
+                    self.assertGreater(hashes.call_count, 0)
+                with original.open('r+b') as stream:
+                    stream.write(raw)
+                os.utime(original, ns=(info.st_atime_ns, info.st_mtime_ns))
+                self.assertTrue(store.recovery_status()['recovery_required'])
+
+    def test_generation_warm_topology_and_metadata_invalidation(self):
+        from history_service.store import HistoryStore
+        cases = ['archive-delete', 'archive-replace', 'terminal-replace', 'terminal-extra',
+                 'extra-member', 'duplicate-archive', 'parent-replace', 'parent-mode',
+                 'root-mode', 'hardlink', 'reservation', 'finalizing', 'alias-retarget']
+        cases += [kind + ':' + name for kind in ('write', 'replace') for name in
+                  ('intent.json', 'recovery-operation.json', 'completed.json', 'finalized.json',
+                   'finalization-gate.json')]
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                db, archive = self.finalized(tmp)
+                alias = Path(tmp) / 'alias'
+                alias.symlink_to(db.parent, target_is_directory=True)
+                store = HistoryStore(str(alias / db.name))
+                terminal = next(archive.glob('committed-*'))
+                if case.startswith('write:'):
+                    path = archive / case.split(':')[1]
+                    with path.open('r+b') as stream:
+                        stream.write(path.read_bytes())
+                elif case.startswith('replace:'):
+                    path = archive / case.split(':')[1]
+                    parked = Path(tmp) / 'receipt'
+                    parked.write_bytes(path.read_bytes())
+                    parked.chmod(0o600)
+                    os.replace(parked, path)
+                elif case == 'archive-delete':
+                    archive.rename(Path(tmp) / 'parked')
+                elif case == 'archive-replace':
+                    archive.rename(Path(tmp) / 'parked')
+                    archive.mkdir(mode=0o700)
+                elif case == 'terminal-replace':
+                    terminal.rename(Path(tmp) / 'parked')
+                    terminal.mkdir(mode=0o700)
+                elif case == 'terminal-extra':
+                    (terminal / 'unexpected').touch()
+                elif case == 'extra-member':
+                    (archive / 'unexpected').touch()
+                elif case == 'duplicate-archive':
+                    db.with_name(db.name + '.recovery-archive-other').mkdir()
+                elif case == 'parent-replace':
+                    db.parent.rename(Path(tmp) / 'parked')
+                    db.parent.mkdir()
+                elif case == 'parent-mode':
+                    db.parent.chmod(0o750)
+                elif case == 'root-mode':
+                    archive.chmod(0o750)
+                elif case == 'hardlink':
+                    os.link(archive / 'main', Path(tmp) / 'linked')
+                elif case == 'reservation':
+                    recovery_state.recovery_path(db).mkdir(mode=0o700)
+                elif case == 'finalizing':
+                    recovery_state.finalization_path(db).touch()
+                elif case == 'alias-retarget':
+                    other = Path(tmp) / 'other'
+                    other.mkdir()
+                    alias.unlink()
+                    alias.symlink_to(other, target_is_directory=True)
+                with patch.object(sqlite3, 'connect', side_effect=AssertionError('changed generation SQL')):
+                    self.assertTrue(store.recovery_status()['recovery_required'])
+                    with self.assertRaises(recovery_state.HistoryRecoveryRequired):
+                        store._connect()
+
+    def test_generation_cold_singleflight_and_publication_mutation(self):
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+        from history_service import recovery_finalize
+        from history_service.store import HistoryStore
+        for mutate in (False, True):
+            with self.subTest(mutate=mutate), tempfile.TemporaryDirectory() as tmp:
+                db, archive = self.finalized(tmp)
+                store = HistoryStore(str(db), initialize=False)
+                reached, release = threading.Event(), threading.Event()
+                real = recovery_finalize.committed_archive
+                def validate(*args):
+                    result = real(*args)
+                    reached.set()
+                    if not release.wait(10):
+                        raise AssertionError('publication barrier timeout')
+                    return result
+                with patch.object(recovery_finalize, 'committed_archive', side_effect=validate) as full:
+                    with ThreadPoolExecutor(max_workers=2) as pool:
+                        first = pool.submit(store.recovery_status)
+                        try:
+                            self.assertTrue(reached.wait(10))
+                            second = pool.submit(store.recovery_status)
+                            if mutate:
+                                info = (archive / 'main').stat()
+                                os.utime(archive / 'main', ns=(info.st_atime_ns, info.st_mtime_ns))
+                        finally:
+                            release.set()
+                        self.assertEqual(first.result(timeout=10)['recovery_required'], mutate)
+                        self.assertEqual(second.result(timeout=10)['recovery_required'], mutate)
+                    self.assertEqual(full.call_count, 1)
+                    if mutate:
+                        self.assertIsNone(store._generation.token)
+
+    def test_generation_metadata_invisible_damage_is_only_caught_cold(self):
+        from history_service import explicit_recovery as api
+        from history_service.store import HistoryStore
+        with tempfile.TemporaryDirectory() as tmp:
+            db, archive = self.finalized(tmp)
+            store = HistoryStore(str(db))
+            original = archive / 'main'
+            before, raw = original.stat(), original.read_bytes()
+            with original.open('r+b') as stream:
+                stream.write(bytes([raw[0] ^ 1]) + raw[1:])
+            os.utime(original, ns=(before.st_atime_ns, before.st_mtime_ns))
+            identity = api._identity
+            def hidden_ctime(info):
+                values = identity(info)
+                if (info.st_dev, info.st_ino) == (before.st_dev, before.st_ino):
+                    return values[:4] + (before.st_ctime_ns,) + values[5:]
+                return values
+            # Deliberately simulate an observation that hides the write. This is
+            # the approved limitation, NOT a filesystem integrity guarantee.
+            with patch.object(api, '_identity', side_effect=hidden_ctime):
+                self.assertFalse(store.recovery_status()['recovery_required'])
+                with store._connect() as connection:
+                    self.assertEqual(connection.execute('SELECT 1').fetchone()[0], 1)
+                with patch.object(sqlite3, 'connect', side_effect=AssertionError('corrupt cold SQLite')):
+                    self.assertTrue(HistoryStore(str(db)).recovery_status()['recovery_required'])
+
+    def test_generation_no_archive_token_cannot_admit_later_generation(self):
+        from history_service.store import HistoryStore
+        with tempfile.TemporaryDirectory() as tmp:
+            db, archive = self.finalized(tmp)
+            parked = Path(tmp) / 'parked'
+            archive.rename(parked)
+            store = HistoryStore(str(db))
+            parked.rename(archive)
+            with patch.object(sqlite3, 'connect', side_effect=AssertionError('new generation SQL')):
+                self.assertTrue(store.recovery_status()['recovery_required'])
+                with self.assertRaises(recovery_state.HistoryRecoveryRequired):
+                    store._connect()
+
+    def test_generation_handle_close_and_cross_thread_status_latch(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from history_service.store import HistoryStore
+        with tempfile.TemporaryDirectory() as tmp:
+            db, archive = self.finalized(tmp)
+            store = HistoryStore(str(db))
+            connection = store._connect()
+            cursor = connection.execute('SELECT 1')
+            traced = []
+            connection._connection.set_trace_callback(traced.append)
+            try:
+                (archive / 'unexpected').touch()
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    self.assertTrue(pool.submit(store.recovery_status).result(timeout=10)['recovery_required'])
+                with self.assertRaises(recovery_state.HistoryRecoveryRequired):
+                    cursor.fetchone()
+                self.assertEqual(traced, [])
+            finally:
+                connection.close()
+            self.assertIsNone(connection._marker_check)
+            self.assertIsNone(connection._lifecycle)
+            with self.assertRaises(ValueError):
+                cursor.fetchone()
+            (archive / 'unexpected').unlink()
+            with self.assertRaises(recovery_state.HistoryRecoveryRequired):
+                store._connect()
+
+    def test_generation_preserves_protocol_record_size_limits(self):
+        from history_service import recovery_apply
+        from history_service.store import HistoryStore
+        dumps = json.dumps
+        def padded(value, *args, **kwargs):
+            raw = dumps(value, *args, **kwargs)
+            if isinstance(value, dict) and value.get('phase') == 'verified-archive':
+                return raw + ' ' * 8192
+            return raw
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(recovery_apply.json, 'dumps', side_effect=padded):
+                db, archive = self.finalized(tmp)
+            self.assertGreater((archive / 'finalized.json').stat().st_size, recovery_state.MAX_RECORD_BYTES)
+            self.assertFalse(HistoryStore(str(db)).recovery_status()['recovery_required'])
+
+    def test_generation_missing_parent_never_becomes_first_run(self):
+        from history_service.store import HistoryStore
+        with tempfile.TemporaryDirectory() as tmp:
+            db, archive = self.finalized(tmp)
+            store = HistoryStore(str(db))
+            db.parent.rename(Path(tmp) / 'parked-parent')
+            self.assertTrue(store.recovery_status()['recovery_required'])
+
+    def test_generation_status_cannot_invalidate_between_check_and_forward(self):
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+        from history_service.store import HistoryStore
+        with tempfile.TemporaryDirectory() as tmp:
+            db, archive = self.finalized(tmp)
+            store = HistoryStore(str(db))
+            connection = store._connect()
+            original_check = connection._marker_check
+            started, observed = threading.Event(), threading.Event()
+            order = []
+            connection._connection.set_trace_callback(lambda sql: order.append('SQL'))
+            def status():
+                started.set()
+                result = store.recovery_status()
+                order.append('status')
+                observed.set()
+                return result
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                futures = []
+                def check():
+                    original_check()
+                    (archive / 'unexpected').touch()
+                    futures.append(pool.submit(status))
+                    self.assertTrue(started.wait(10))
+                    self.assertFalse(observed.wait(0.1), 'status invalidated before forwarding')
+                connection._marker_check = check
+                try:
+                    connection.execute('SELECT 1')
+                    self.assertTrue(futures[0].result(timeout=10)['recovery_required'])
+                    self.assertEqual(order, ['SQL', 'status'])
+                    connection._marker_check = original_check
+                    with self.assertRaises(recovery_state.HistoryRecoveryRequired):
+                        connection.execute('SELECT 2')
+                finally:
+                    connection.close()
+
+    def test_generation_scan_limit_lost_access_and_fork_refuse(self):
+        from history_service.store import HistoryStore
+        for case in ('scan-limit', 'lost-access', 'fork'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                db, archive = self.finalized(tmp)
+                store = HistoryStore(str(db))
+                if case == 'scan-limit':
+                    for number in range(4096):
+                        (db.parent / ('extra-' + str(number))).touch()
+                elif case == 'lost-access':
+                    (archive / 'main').chmod(0)
+                else:
+                    store._generation.pid -= 1
+                with patch.object(sqlite3, 'connect', side_effect=AssertionError('unsafe generation SQL')):
+                    self.assertTrue(store.recovery_status()['recovery_required'])
+                    with self.assertRaises(recovery_state.HistoryRecoveryRequired):
+                        store._connect()
+
+    def test_generation_harmless_metadata_change_latches(self):
+        from history_service.store import HistoryStore
+        with tempfile.TemporaryDirectory() as tmp:
+            db, archive = self.finalized(tmp)
+            store = HistoryStore(str(db))
+            connection = store._connect()
+            self.addCleanup(connection.close)
+            original = archive / 'main'
+            info = original.stat()
+            os.utime(original, ns=(info.st_atime_ns, info.st_mtime_ns))
+            self.assertNotEqual(original.stat().st_ctime_ns, info.st_ctime_ns)
+            with self.assertRaises(recovery_state.HistoryRecoveryRequired):
+                connection.execute('SELECT 1')
+            self.assertTrue(store.recovery_status()['recovery_required'])
+
+
 class FinalizationTests(unittest.TestCase):
     fixture = JournaledApplyTests.fixture
 

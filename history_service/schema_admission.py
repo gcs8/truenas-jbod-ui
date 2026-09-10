@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import stat
 from contextlib import ExitStack
+import threading
 from typing import Any
 
 
@@ -74,21 +75,24 @@ class CheckedCursor:
         if not callable(value):
             return value
         def checked(*args, **kwargs):
-            self._owner.check()
-            result = value(*args, **kwargs)
-            return self if result is self._cursor else result
+            with self._owner._guard_lock:
+                self._owner.check()
+                result = value(*args, **kwargs)
+                return self if result is self._cursor else result
         return checked
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        self._owner.check()
-        return next(self._cursor)
+        with self._owner._guard_lock:
+            self._owner.check()
+            return next(self._cursor)
 
 
 class AdmittedConnection:
-    def __init__(self, connection, identity, marker_check):
+    def __init__(self, connection, identity, marker_check, *, guard_lock=None):
+        self._guard_lock = guard_lock if guard_lock is not None else threading.RLock()
         self._connection = connection
         self._identity = identity
         self._marker_check = marker_check
@@ -96,21 +100,23 @@ class AdmittedConnection:
         self._closed = False
 
     def check(self):
-        if self._closed:
-            raise ValueError("History database connection is closed.")
-        self._identity.check()
-        self._marker_check()
+        with self._guard_lock:
+            if self._closed:
+                raise ValueError("History database connection is closed.")
+            self._identity.check()
+            self._marker_check()
 
     def __getattr__(self, name: str) -> Any:
         value = getattr(self._connection, name)
         if not callable(value):
             return value
         def checked(*args, **kwargs):
-            self.check()
-            result = value(*args, **kwargs)
-            if name in ("execute", "executemany", "executescript", "cursor"):
-                return CheckedCursor(result, self)
-            return result
+            with self._guard_lock:
+                self.check()
+                result = value(*args, **kwargs)
+                if name in ("execute", "executemany", "executescript", "cursor"):
+                    return CheckedCursor(result, self)
+                return result
         return checked
 
     def __enter__(self):
@@ -118,23 +124,27 @@ class AdmittedConnection:
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        try:
-            if exc_type is None:
-                self.check()
-            return self._connection.__exit__(exc_type, exc, tb)
-        finally:
-            self.close()
+        with self._guard_lock:
+            try:
+                if exc_type is None:
+                    self.check()
+                return self._connection.__exit__(exc_type, exc, tb)
+            finally:
+                self.close()
 
     def close(self):
-        if self._closed:
-            return
-        self._closed = True
-        try:
-            self._connection.close()
-        finally:
-            self._identity.close()
-            if self._lifecycle is not None:
-                self._lifecycle.close()
+        with self._guard_lock:
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                self._connection.close()
+            finally:
+                self._identity.close()
+                self._marker_check = None
+                if self._lifecycle is not None:
+                    self._lifecycle.close()
+                    self._lifecycle = None
 
     def __del__(self):
         self.close()

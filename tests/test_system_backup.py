@@ -478,8 +478,15 @@ finally:
 
         for outcome in ("success", "late-failure", "rollback-failure", "missing-parent", "missing-rollback"):
             if outcome.startswith("missing"):
-                self.store.file_path = self.temp_dir / outcome / "nested" / "history.db"
+                # Each canonical database needs fresh admission. Retargeting an
+                # admitted store is now a generation mismatch, not a new first
+                # installation. The fresh store creates its nested parent, but
+                # leaves the main database absent for import/rollback coverage.
+                target_path = self.temp_dir / outcome / "nested" / "history.db"
+                self.store = HistoryStore(str(target_path), initialize=False)
                 self.backup_service.store = self.store
+                real_restore = self.store._restore_backup_locked
+                real_snapshot = self.store._create_backup_locked
             target = self.store.file_path
             self.config_path.write_bytes(original_config + b"\n# live before import\n")
             before = self.config_path.read_bytes()

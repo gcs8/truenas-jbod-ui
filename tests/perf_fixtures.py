@@ -397,10 +397,17 @@ def populate_modeled_history_store(store: HistoryStore, slot_count: int) -> None
 def _modeled_history_store(path: Path) -> Iterator[HistoryStore]:
     from history_service import store as history_store_module
 
+    # This portable modeled workload has no recovery archives and deliberately
+    # excludes POSIX lifecycle/admission observation. Real generation guards are
+    # exercised by the POSIX recovery suites, not this modeled UI budget fixture.
     with patch.object(
         history_store_module,
         "history_write_lock",
         side_effect=lambda *_args, **_kwargs: nullcontext(),
+    ), patch.object(
+        history_store_module.HistoryStore,
+        "recovery_status",
+        return_value={"recovery_required": False, "collection_paused": False, "recovery_state": "none"},
     ):
         yield history_store_module.HistoryStore(str(path))
 
