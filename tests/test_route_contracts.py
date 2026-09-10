@@ -85,6 +85,7 @@ ADMIN_ROUTE_MATRIX = [
     ("/api/admin/system-setup/{system_id}", ("DELETE",), "delete_system", "starlette.responses.JSONResponse", None),
     ("/api/admin/history/purge-orphaned", ("POST",), "purge_orphaned_history", "starlette.responses.JSONResponse", None),
     ("/api/admin/history/orphaned", ("GET",), "list_orphaned_history", "starlette.responses.JSONResponse", None),
+    ("/api/admin/history/systems", ("GET",), "list_history_systems", "starlette.responses.JSONResponse", None),
     ("/api/admin/history/adopt-removed-system", ("POST",), "adopt_removed_system_history", "starlette.responses.JSONResponse", None),
     ("/api/admin/system-setup/bootstrap", ("POST",), "bootstrap_service_account", "starlette.responses.JSONResponse", None),
     ("/api/admin/system-setup/sudoers-preview", ("POST",), "preview_sudoers_file", "starlette.responses.JSONResponse", None),

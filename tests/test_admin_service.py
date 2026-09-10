@@ -1409,7 +1409,7 @@ class MainAppBoundaryTests(unittest.TestCase):
 
         self.assertIn('id="admin-app-version"', template_text)
         self.assertIn('id="admin-release-note"', template_text)
-        self.assertIn('<option value="none">Password Only / No Key</option>', template_text)
+        self.assertIn('<option value="none">Password only (no key)</option>', template_text)
         self.assertIn('id="setup-esxi-host-prep-panel"', template_text)
         self.assertIn('id="setup-esxi-host-prep-package-select"', template_text)
         self.assertIn('id="setup-platform-requirements"', template_text)
