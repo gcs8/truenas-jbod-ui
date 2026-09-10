@@ -5,27 +5,37 @@ Use this page when a new release is out. The main UI header shows
 
 ## Move to a new release
 
-Find the new tag on the
-[releases page](https://github.com/gcs8/truenas-jbod-ui/releases); the newest
-one is marked Latest. Then, in the folder where `compose.yaml` and `.env` live:
+Find the target tag on the
+[releases page](https://github.com/gcs8/truenas-jbod-ui/releases). Publication
+alone is not upgrade qualification. Before changing the image, save a private
+pre-upgrade backup of state, the environment file, all selected Compose files,
+and the previous `JBOD_UI_IMAGE` digest or tag. A moving `latest` tag alone is
+not a reproducible rollback pin.
 
-1. Change the tag at the end of the `JBOD_UI_IMAGE` line in `.env` to the new
-   one, for example `v0.23.0`. Skip this step if the line ends in `latest`.
-2. Pull the new image and recreate the containers.
-3. Reload the main UI and check the version shown in the header.
+Record the existing project name, `--env-file`, ordered `-f` file chain,
+`--profile` selections and active service names. Keep them for update and
+rollback. Do not add inactive admin or backup services. In the deployment
+folder, change only `JBOD_UI_IMAGE` in the selected environment file to the
+chosen image pin. Ensure an exported shell value does not override that pin.
+Then run `pull` and `up -d` with that exact recorded selection and service list.
+For example, this is only for an existing project named `jbod-ui` with a single
+`compose.yaml`, `.env`, and UI plus history already active:
 
 ```bash
-docker compose pull
-docker compose up -d
+docker compose --project-name jbod-ui --env-file .env -f compose.yaml --profile history pull enclosure-ui enclosure-history
+docker compose --project-name jbod-ui --env-file .env -f compose.yaml --profile history up -d enclosure-ui enclosure-history
 ```
 
-Keep your existing Compose file for a normal image update. Replace it only when
-a release says so; the v0.23.0 Compose file runs the main UI and history as a
-non-root user and needs the ownership step in [[Troubleshooting]] before its
-first start.
+Adapt every selection to the existing deployment, retaining any overlays in
+order. Do not use `down` for a normal image update. Reload the UI and verify
+service health, version and retained state before resuming collection or jobs.
 
-If you run history without `COMPOSE_PROFILES=history` in `.env`, add
-`--profile history` to both commands so history is updated too.
+Keep the existing Compose files for a normal image update. Replacing them with
+the v0.23.0 non-root file is a separate migration requiring the bounded
+ownership procedure in [[Troubleshooting]], not a prerequisite to an image bump.
+The v0.23.0 `scripts/update_immutable_deployment.py` replaces the selected
+Compose files from its source revision during update; it is not an image-only
+shortcut. Do not assume unmerged helper changes are present in released source.
 
 ## History
 
@@ -47,11 +57,19 @@ docker compose --profile admin up -d enclosure-admin
 
 ## Rolling back a release
 
-1. Set `JBOD_UI_IMAGE` in `.env` back to the previous tag.
-2. Put the previous Compose file back if you replaced it during the upgrade.
-3. Run `docker compose pull` and `docker compose up -d` again.
+1. Stop writers before any state recovery. Restore `JBOD_UI_IMAGE` to the
+   recorded previous digest or tag in the selected environment file; ensure
+   shell interpolation does not override it.
+2. Restore every Compose file changed during migration. Retain the recorded
+   `--project-name`, `--env-file`, ordered `-f` file chain, `--profile`
+   selections and previous service list for both `pull` and `up -d`. Use the
+   same command shape as the update example with your actual prior selections.
+   Bare commands may select a different file or omit optional services.
+3. Check service health and retained state before restarting collection or jobs.
 
-History database changes are forward-only. If the older release does not start
-cleanly against the newer database, restore a backup of the `history` folder
-taken before the upgrade. Bay assignments in `data` and settings in `config`
-are not changed by an image update.
+This restores runtime selection, not data-format compatibility. History schema
+changes may prevent an older image from using newer state. If that occurs, keep
+writers stopped and follow the recovery procedure for the selected version with
+the private pre-upgrade backup. Do not delete history or assume an image pin
+restores data. These instructions do not establish predecessor upgrade,
+retention or rollback qualification for #399/#400.

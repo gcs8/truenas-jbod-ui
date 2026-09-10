@@ -139,39 +139,60 @@ access-restricted workflow; the override does not make the archive safe to share
 
 ## A non-root container gets permission denied
 
-The v0.23.0 Compose file runs the main UI and history as the app user
-(`APP_UID:APP_GID`, `10001:10001` unless `.env` says otherwise). If those
-containers report `permission denied`, the host folders are still owned by
-root, which is what an earlier release or a folder Docker created on first
-start leaves behind. Stop the stack and give the folders to the app user:
+The v0.23.0 Compose file runs the main UI and history as the app user.
+Permission errors can be caused by ownership, modes or mount configuration;
+confirm the effective service identity and failing path first. A normal image
+update that retains a root-compatible Compose file does not require an optional
+non-root ownership migration.
 
-```bash
-docker compose down
-app_uid="${APP_UID:-10001}"
-app_gid="${APP_GID:-10001}"
-sudo chown -R "$app_uid:$app_gid" config data history logs
-docker compose up -d
-```
+If `HISTORY_SEGMENT_CATALOG_PATH` is set, stop here and use the segmented repair
+procedure in [[Backup, Restore, and Debug Bundles|Backup-Restore-and-Debug-Bundles]].
+Do not apply this helper to sealed segments.
 
-If `.env` overrides `APP_UID` or `APP_GID`, export the same values before
-running the block. If you would rather keep root ownership, use the v0.22.2
-Compose file instead; it runs the services as root and needs no ownership
-change.
+1. Save a private pre-upgrade backup of the state, the previous image digest
+   or tag from `JBOD_UI_IMAGE`, the environment file, and every selected Compose
+   file. Record the project, ordered `-f` file chain, `--env-file`, active
+   `--profile` selections and service names. Retain those selections on every
+   Compose command; do not enable previously inactive admin or backup services.
+2. Stop all writers, including scheduled backup jobs and admin, before changing
+   ownership. Use the recorded `docker compose --project-name ... --env-file ...
+   -f ... --profile ... stop` selection, not a different default project.
+3. Obtain `scripts/prepare_nonroot_bind_mounts.py` from the v0.23.0 source at
+   commit `dbcd2ab31e9a46083693cf08802434ac8cfc1e43`. Replace the checkout path
+   below with that verified local checkout path. If the exact helper cannot be
+   obtained, stop; do not replace it with recursive ownership commands.
+   Set `app_uid` and `app_gid` explicitly to the effective `APP_UID` and
+   `APP_GID` of the selected non-root services. Shell variables do not
+   automatically read `.env`; do not assume defaults override configured IDs.
+4. Run a dry run against the deployment directory, then use `--apply` only if
+   the preflight succeeds and the path scope and identities are correct:
 
-If you have a source checkout, the bounded ownership helper does the same job
-with a dry check first:
+   ```bash
+   sudo python3 /path/to/v0.23.0-checkout/scripts/prepare_nonroot_bind_mounts.py . --uid "${app_uid:?set the effective APP_UID}" --gid "${app_gid:?set the effective APP_GID}"
+   sudo python3 /path/to/v0.23.0-checkout/scripts/prepare_nonroot_bind_mounts.py . --uid "${app_uid:?set the effective APP_UID}" --gid "${app_gid:?set the effective APP_GID}" --apply
+   ```
 
-```bash
-sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid "$app_uid" --gid "$app_gid"
-sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid "$app_uid" --gid "$app_gid" --apply
-```
+   The helper covers `data`, `history`, and `logs` recursively, the `config`
+   directory itself, and only `config/config.yaml`, `config/ssh`, and
+   `config/tls` beneath it. It excludes `config/backup-secrets` and other
+   unlisted config children. It sets directories to `0770` and files to
+   `0660` as well as their owner/group. A chown-only substitute is not equivalent.
+   Stop on a rejected symlink, stale artifact, unsupported platform or exceeded
+   bound; do not bypass the preflight. Use this only for the matching local
+   POSIX bind-mount layout, not custom paths or other storage backends.
+5. Restart only the previously active services with the same recorded Compose
+   project, environment, ordered files and profiles, using `up -d` and the
+   recorded service names. Check their health and state before resuming jobs.
 
-Run the dry check first. Do not use recursive `chmod 777`. Skip both blocks
-when `HISTORY_SEGMENT_CATALOG_PATH` is set and follow the segmented repair
-procedure in
-[[Backup, Restore, and Debug Bundles|Backup-Restore-and-Debug-Bundles]]
-instead. If SSH then fails to load `known_hosts`, verify that
-`data/known_hosts` is owned by the configured app UID/GID and uses mode `0660`.
+Rollback restores the previous `JBOD_UI_IMAGE` pin and every changed Compose
+file, using the same `--project-name`, `--env-file`, ordered `-f` and `--profile`
+selection for `pull` and `up -d` with the previous service names. This restores
+runtime selection, not data-format compatibility. If an older image cannot use
+the updated state, keep writers stopped and follow its recovery procedure with
+the private pre-upgrade backup. Do not delete history to make startup succeed.
+
+Do not use recursive `chmod 777`. If SSH fails to load `known_hosts`, verify
+that `data/known_hosts` is owned by the configured app UID/GID with mode `0660`.
 
 ## SCALE shows a generic runtime profile
 
