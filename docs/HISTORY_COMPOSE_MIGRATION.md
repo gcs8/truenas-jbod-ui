@@ -106,8 +106,12 @@ origin. Do not forge a loopback metadata value to bypass the guard.
 The address-only overlay preserves any existing refresh policy. Stock v0.22.2
 Compose does not forward the newer refresh settings to history, so setting them
 only in `.env` is not enough. If you deliberately choose exposed token mode,
-add these entries to your existing local history environment override before
-the migration file:
+add these entries to your existing local environment override for **both**
+services, after other overrides and before the address-only migration file.
+This inline-token example requires `HISTORY_REFRESH_TOKEN_FILE` to be absent
+from both resolved service environments. If that key exists (even blank), stop
+and use the file-backed path below; an inline value cannot override it in the
+application loader.
 
 ```yaml
 services:
@@ -116,16 +120,37 @@ services:
       HISTORY_REFRESH_AUTH_MODE: token
       HISTORY_REFRESH_TOKEN: ${HISTORY_REFRESH_TOKEN:?Set a nonempty history refresh token}
       HISTORY_PUBLIC_ORIGIN: ${HISTORY_PUBLIC_ORIGIN:?Set the exact history public origin}
+  enclosure-ui:
+    environment:
+      HISTORY_REFRESH_TOKEN: ${HISTORY_REFRESH_TOKEN:?Set a nonempty history refresh token}
 ```
 
 Set the actual secret privately, and use an origin such as
-`https://history.example.test` with your own host and port. The old UI's
-`env_file: .env` already forwards `HISTORY_REFRESH_TOKEN` to the UI. If using
-file-backed tokens instead, preserve the existing scoped secret mounts and
-`HISTORY_REFRESH_TOKEN_FILE` in both UI and history; do not replace them with the
-inline-token example. Compose syntax validation is not application startup
-validation, and an invalid origin or missing usable token still fails the
-application guard.
+`https://history.example.test` with your own host and port. Both explicit token
+entries use the same Compose interpolation source: shell values take precedence
+over CLI `--env-file` inputs, later CLI files override earlier ones, and the
+implicit project `.env` applies when no CLI env file is supplied. The old UI's
+literal `env_file: .env` is a separate service environment source; it does not
+follow your CLI env-file selection. Explicit `environment` entries above take
+precedence over that service file, preventing divergent UI/history credentials.
+A missing or empty interpolation token or origin refuses this example at
+Compose render time; malformed origins still fail the history loader.
+
+`HISTORY_PUBLIC_ORIGIN` configures the history service's browser-origin policy,
+not the UI's origin. The UI loader does not consume that key and its backend
+refresh sends the configured bearer token, not an Origin header. Preserve the
+UI's independent `APP_PUBLIC_ORIGIN` and auth settings; do not overwrite them
+with the history origin.
+
+For file-backed tokens instead, preserve the existing scoped read-only secret
+mounts and `HISTORY_REFRESH_TOKEN_FILE` in both UI and history. Both paths must
+resolve to the same usable secret bytes; identical inline token values alone do
+not prove this. Do not use the inline-token example or clear `_FILE` to an empty
+string: the loaders prefer `_FILE` whenever present, and a blank path fails.
+Keep the explicit history mode and required public-origin entries shown above,
+but omit the inline token entry in both services. Never dump resolved token
+values or mounted secret contents to compare them. Compose validation cannot
+read container-mounted token files or prove application startup acceptance.
 
 ## Activate only after review
 
@@ -133,8 +158,11 @@ This migration does not start services. After reviewing the resolved model,
 update the saved launch definition to retain the complete file chain with the
 new overlay last. Use that same definition for every later recreate or update.
 During an operator-approved maintenance window, recreate history with your
-existing selected image and verify its health and refresh behavior. Do not
-activate the backup or admin profile merely because it appears in an example.
+existing selected image and verify its health and refresh behavior. If you also
+changed the optional token policy, recreate the UI as well so both processes
+load the reviewed credentials; verify main-UI refresh authorization separately.
+Do not activate the backup or admin profile merely because it appears in an
+example.
 Container startup, ownership, and network reachability need separate runtime
 acceptance; daemon-free `config` checks do not prove them.
 
