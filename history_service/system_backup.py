@@ -20,7 +20,7 @@ import time
 import uuid
 import zipfile
 import zlib
-from contextlib import closing, nullcontext
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -1269,7 +1269,7 @@ class _ImportActivationTransaction:
         entry = self._record_history(store)
         self._ensure_parent_hierarchy(entry.target_path.parent)
         entry.mutated = True
-        store.restore_backup(self._staged_member(member_key))
+        self._restore_history_backup(store, self._staged_member(member_key))
         self._fsync_file(entry.target_path)
         self._fsync_directory(entry.target_path.parent)
 
@@ -1373,6 +1373,14 @@ class _ImportActivationTransaction:
         self._journal_order.append(journal_key)
         return entry
 
+    @staticmethod
+    def _create_history_backup(store: HistoryStore, backup_dir: Path) -> Path | None:
+        return store.create_backup(backup_dir, retention_count=1)
+
+    @staticmethod
+    def _restore_history_backup(store: HistoryStore, source: Path) -> None:
+        store.restore_backup(source)
+
     def _record_history(self, store: HistoryStore) -> _ImportRollbackEntry:
         target_path = store.file_path
         target_kind = self._validate_target_path(target_path, expected_kind="file")
@@ -1384,13 +1392,7 @@ class _ImportActivationTransaction:
                 )
         if target_kind == "file":
             backup_dir = self.rollback_root / f"history-{len(self._journal_order):04d}"
-            backup_path = store.create_backup(
-                backup_dir,
-                retention_count=1,
-                long_term_backup_dir=None,
-                weekly_retention_count=0,
-                monthly_retention_count=0,
-            )
+            backup_path = self._create_history_backup(store, backup_dir)
             if backup_path is None:
                 raise ValueError("Unable to create rollback snapshot for the live history database.")
             backup_path = Path(backup_path)
@@ -1484,7 +1486,7 @@ class _ImportActivationTransaction:
             if failures:
                 raise RuntimeError(self._failure_summary(failures))
         else:
-            entry.history_store.restore_backup(entry.backup_path)
+            self._restore_history_backup(entry.history_store, entry.backup_path)
             self._fsync_file(entry.target_path)
             self._fsync_directory(entry.target_path.parent)
         entry.mutated = False
@@ -1792,6 +1794,23 @@ def describe_bundle_groups(
             }
         )
     return descriptions
+
+
+class _HistoryLockOwnedImportTransaction(_ImportActivationTransaction):
+    """Only constructed/entered/exited inside the import's history_write_lock.
+
+    This structural call path keeps snapshot, activation and rollback under the
+    same ownership, without making public backup/restore locks reentrant or
+    exposing a caller-controlled lock bypass parameter.
+    """
+
+    @staticmethod
+    def _create_history_backup(store: HistoryStore, backup_dir: Path) -> Path | None:
+        return store._create_backup_locked(backup_dir, retention_count=1)
+
+    @staticmethod
+    def _restore_history_backup(store: HistoryStore, source: Path) -> None:
+        store._restore_backup_locked(source)
 
 
 class DebugScrubber:
@@ -2882,6 +2901,39 @@ class SystemBackupService:
             expected_encrypted=expected_encrypted,
         )
 
+    @contextmanager
+    def _import_lifecycle_lock(self):
+        # Gate every group, including config-only v1 imports, before constructing
+        # the transaction or creating a missing history parent for lock admission.
+        self.store.require_recovery_clear()
+        _ImportActivationTransaction._validate_target_path(
+            self.store.file_path, expected_kind="file",
+        )
+        created_parents: list[Path] = []
+        cursor = self.store.file_path.parent
+        while not cursor.exists():
+            created_parents.append(cursor)
+            cursor = cursor.parent
+        owned_parents: list[Path] = []
+        try:
+            for parent in reversed(created_parents):
+                try:
+                    parent.mkdir(mode=self.store.shared_dir_mode)
+                except FileExistsError:
+                    continue
+                owned_parents.append(parent)
+            with history_write_lock(self.store.file_path, blocking=False):
+                self.store.require_recovery_clear()
+                yield
+        finally:
+            # Only remove empty directories this invocation created. Retain any
+            # published database or incomplete rollback evidence.
+            for parent in reversed(owned_parents):
+                try:
+                    parent.rmdir()
+                except OSError:
+                    pass
+
     def _import_parsed_bundle(
         self,
         parsed: tuple[
@@ -2901,35 +2953,31 @@ class SystemBackupService:
             group_entries = self._manifest_group_entries(manifest)
             self._validate_manifest_member_metadata(manifest, extracted)
             self._preflight_selected_group_members(manifest, group_entries, extracted)
-            self._preflight_import_members(manifest, group_entries, extracted)
-            restore_destinations = self._build_restore_destination_graph(
-                manifest,
-                group_entries,
-                extracted,
-            )
-            self._prepare_segmented_history_import(manifest, extracted)
-            segmented_restore = manifest.get("schema_version") == SEGMENTED_BACKUP_SCHEMA_VERSION
-            segmented_activation = (
-                self._segmented_history_activation_members(
-                    manifest,
-                    extracted,
-                    group_entries,
-                )
-                if segmented_restore
-                else None
-            )
-            lock_context = (
-                history_write_lock(self.store.file_path, blocking=False)
-                if segmented_restore
-                else nullcontext()
-            )
-            transaction = _ImportActivationTransaction(
-                extracted,
-                history_store=self.store,
-            )
             marker: tuple[Path, dict[str, Any]] | None = None
             try:
-                with lock_context:
+                with self._import_lifecycle_lock():
+                    self._preflight_import_members(manifest, group_entries, extracted)
+                    restore_destinations = self._build_restore_destination_graph(
+                        manifest,
+                        group_entries,
+                        extracted,
+                    )
+                    self._prepare_segmented_history_import(manifest, extracted)
+                    segmented_restore = manifest.get("schema_version") == SEGMENTED_BACKUP_SCHEMA_VERSION
+                    segmented_activation = (
+                        self._segmented_history_activation_members(
+                            manifest,
+                            extracted,
+                            group_entries,
+                        )
+                        if segmented_restore
+                        else None
+                    )
+                    transaction_type = (
+                        _ImportActivationTransaction if segmented_restore
+                        else _HistoryLockOwnedImportTransaction
+                    )
+                    transaction = transaction_type(extracted, history_store=self.store)
                     try:
                         with transaction:
                             if segmented_activation is not None:

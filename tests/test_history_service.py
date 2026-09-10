@@ -1903,7 +1903,7 @@ class HistoryStoreTests(unittest.TestCase):
                 all(owned for name, owned in configuration_events if name in config_names),
                 configuration_events,
             )
-            self.assertIn(("SELECT 1", False), configuration_events)
+            self.assertIn(("SELECT 1", True), configuration_events)
 
     def test_connect_with_caller_owned_lifecycle_lock_does_not_reacquire_it(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1923,6 +1923,7 @@ class HistoryStoreTests(unittest.TestCase):
     def test_connect_closes_partial_connection_after_each_configuration_failure(self) -> None:
         class FailingConfigurationConnection:
             def __init__(self, failure_point: str) -> None:
+                self.real = sqlite3.connect(":memory:")
                 self.failure_point = failure_point
                 self.close_count = 0
                 self._row_factory: object = None
@@ -1937,13 +1938,14 @@ class HistoryStoreTests(unittest.TestCase):
                     raise RuntimeError("injected row factory failure")
                 self._row_factory = value
 
-            def execute(self, statement: str, _parameters: object = ()) -> MagicMock:
+            def execute(self, statement: str, _parameters: Any = ()) -> sqlite3.Cursor:
                 if self.failure_point == statement:
                     raise RuntimeError(f"injected {statement} failure")
-                return MagicMock()
+                return self.real.execute(statement, _parameters)
 
             def close(self) -> None:
                 self.close_count += 1
+                self.real.close()
 
         failure_points = (
             "row_factory",
@@ -1956,9 +1958,12 @@ class HistoryStoreTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as temp_dir:
                     store = HistoryStore(str(Path(temp_dir) / "history.db"), initialize=False)
                     connection = FailingConfigurationConnection(failure_point)
+                    real_connect = sqlite3.connect
                     with patch(
                         "history_service.store.sqlite3.connect",
-                        return_value=connection,
+                        side_effect=lambda path, **kwargs: (
+                            real_connect(path, **kwargs) if kwargs.get("uri") else connection
+                        ),
                     ):
                         with self.assertRaisesRegex(RuntimeError, "injected"):
                             store._connect(migration_lock_held=True)
@@ -4772,20 +4777,17 @@ class HistoryStoreTests(unittest.TestCase):
             [],
         )
 
-    def test_store_recovers_from_unreadable_database_file(self) -> None:
-        temp_dir = Path(tempfile.mkdtemp())
-        db_path = temp_dir / "history.db"
-        db_path.write_text("not a sqlite database", encoding="utf-8")
-
-        store = HistoryStore(str(db_path))
-        counts = store.counts()
-        broken_files = list(temp_dir.glob("history.db.broken-*"))
-
-        self.assertEqual(counts["tracked_slots"], 0)
-        self.assertEqual(counts["event_count"], 0)
-        self.assertEqual(counts["metric_sample_count"], 0)
-        self.assertTrue(db_path.exists())
-        self.assertEqual(len(broken_files), 1)
+    def test_store_pauses_from_unreadable_database_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "history.db"
+            original = b"not a sqlite database"
+            db_path.write_bytes(original)
+            store = HistoryStore(str(db_path))
+            with self.assertRaisesRegex(RuntimeError, "recovery required"):
+                store.counts()
+            self.assertFalse(db_path.exists())
+            self.assertEqual((Path(str(db_path) + ".recovery-required") / "main").read_bytes(), original)
+            self.assertTrue(store.recovery_status()["recovery_required"])
 
     def test_store_can_fail_closed_without_quarantining_unreadable_database(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
@@ -5008,66 +5010,8 @@ class HistoryStoreTests(unittest.TestCase):
 
         connection = sqlite3.connect(db_path)
         try:
-            connection.executescript(
-                """
-                CREATE TABLE slot_state_current (
-                    system_id TEXT NOT NULL,
-                    system_label TEXT,
-                    enclosure_key TEXT NOT NULL,
-                    enclosure_id TEXT,
-                    enclosure_label TEXT,
-                    slot INTEGER NOT NULL,
-                    slot_label TEXT NOT NULL,
-                    present INTEGER NOT NULL,
-                    state TEXT,
-                    identify_active INTEGER NOT NULL,
-                    device_name TEXT,
-                    serial TEXT,
-                    model TEXT,
-                    gptid TEXT,
-                    pool_name TEXT,
-                    vdev_name TEXT,
-                    health TEXT,
-                    last_seen_at TEXT NOT NULL,
-                    PRIMARY KEY (system_id, enclosure_key, slot)
-                );
-                CREATE TABLE slot_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    observed_at TEXT NOT NULL,
-                    system_id TEXT NOT NULL,
-                    system_label TEXT,
-                    enclosure_key TEXT NOT NULL,
-                    enclosure_id TEXT,
-                    enclosure_label TEXT,
-                    slot INTEGER NOT NULL,
-                    slot_label TEXT NOT NULL,
-                    event_type TEXT NOT NULL,
-                    previous_value TEXT,
-                    current_value TEXT,
-                    device_name TEXT,
-                    serial TEXT,
-                    details_json TEXT NOT NULL
-                );
-                CREATE TABLE metric_samples (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    observed_at TEXT NOT NULL,
-                    system_id TEXT NOT NULL,
-                    system_label TEXT,
-                    enclosure_key TEXT NOT NULL,
-                    enclosure_id TEXT,
-                    enclosure_label TEXT,
-                    slot INTEGER NOT NULL,
-                    slot_label TEXT NOT NULL,
-                    metric_name TEXT NOT NULL,
-                    value_integer INTEGER,
-                    value_real REAL,
-                    device_name TEXT,
-                    serial TEXT,
-                    model TEXT,
-                    state TEXT
-                );
-                """
-            )
+            from tests.history_schema_fixtures import RELEASE_SCHEMAS
+            connection.executescript(RELEASE_SCHEMAS[0][2])
             connection.commit()
         finally:
             connection.close()
@@ -5452,15 +5396,14 @@ class HistoryStoreTests(unittest.TestCase):
     def test_connect_uses_an_explicit_bounded_timeout(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         store = HistoryStore(str(temp_dir / "history.db"))
-        connection = MagicMock()
-
-        with patch("history_service.store.sqlite3.connect", return_value=connection) as connect:
+        with patch("history_service.store.sqlite3.connect", wraps=sqlite3.connect) as connect:
             returned_connection = store._connect()
+            returned_connection.close()
 
-        self.assertIs(returned_connection, connection)
-        self.assertIn("timeout", connect.call_args.kwargs)
-        self.assertGreater(connect.call_args.kwargs["timeout"], 0)
-        self.assertLessEqual(connect.call_args.kwargs["timeout"], 10)
+        for call in connect.call_args_list:
+            self.assertIn("timeout", call.kwargs)
+            self.assertGreater(call.kwargs["timeout"], 0)
+            self.assertLessEqual(call.kwargs["timeout"], 10)
 
     def test_store_retries_transient_database_locked_write(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
@@ -5506,8 +5449,8 @@ class HistoryStoreTests(unittest.TestCase):
         original_connect = sqlite3.connect
 
         class FailingWalConnection:
-            def __init__(self, path: str) -> None:
-                self._connection = original_connect(path)
+            def __init__(self, path: str, **kwargs) -> None:
+                self._connection = original_connect(path, **kwargs)
 
             def __enter__(self) -> sqlite3.Connection:
                 return self._connection.__enter__()
@@ -5534,7 +5477,7 @@ class HistoryStoreTests(unittest.TestCase):
         with (
             patch(
                 "history_service.store.sqlite3.connect",
-                side_effect=lambda path, **_kwargs: FailingWalConnection(path),
+                side_effect=lambda path, **kwargs: FailingWalConnection(path, **kwargs),
             ),
             self.assertLogs("history_service.store", level="WARNING") as logs,
         ):
@@ -5581,7 +5524,7 @@ class HistoryStoreTests(unittest.TestCase):
         with patch.object(store, "_normalize_database_permissions") as normalize_permissions:
             store.restore_backup(backup_path)
 
-        normalize_permissions.assert_called_once()
+        self.assertEqual(normalize_permissions.call_count, 3)
         self.assertTrue(db_path.exists())
         self.assertFalse(wal_path.exists())
         self.assertFalse(shm_path.exists())
@@ -5595,13 +5538,9 @@ class HistoryStoreTests(unittest.TestCase):
         db_path = temp_dir / "history.db"
         store = HistoryStore(str(db_path))
         legacy_path = temp_dir / "legacy.sqlite3"
-        backup_path = store.create_backup(temp_dir / "backups", retention_count=1)
-        self.assertIsNotNone(backup_path)
-        assert backup_path is not None
-        legacy_path.write_bytes(backup_path.read_bytes())
+        from tests.history_schema_fixtures import RELEASE_SCHEMAS
         with sqlite3.connect(legacy_path) as connection:
-            connection.execute("DROP TABLE metric_rollups")
-            connection.execute("DROP TABLE history_table_counts")
+            connection.executescript(RELEASE_SCHEMAS[1][2])
             connection.commit()
 
         store.restore_backup(legacy_path)
@@ -6101,6 +6040,7 @@ class HistoryCollectorTests(unittest.TestCase):
             ),
             MagicMock(),
         )
+        collector.store.recovery_status.return_value = {"recovery_required": False}
         worker_started = threading.Event()
         release_worker = threading.Event()
         worker_finished = threading.Event()
@@ -6144,6 +6084,7 @@ class HistoryCollectorTests(unittest.TestCase):
             ),
             store,
         )
+        collector.store.recovery_status.return_value = {"recovery_required": False}
         scopes = [
             ScopeSnapshot(
                 system_id=f"system-{index}",
@@ -6308,6 +6249,8 @@ class HistoryCollectorTests(unittest.TestCase):
             ),
             store,
         )
+
+        collector.store.recovery_status.return_value = {"recovery_required": False}
 
         async def run_once(**_: object) -> None:
             collector.last_success_at = isoformat_utc()

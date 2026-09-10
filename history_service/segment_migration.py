@@ -29,6 +29,7 @@ from history_service.segment_sealer import (
     seal_history_segment,
 )
 from history_service.migration_lock import history_write_lock
+from history_service.recovery_state import require_recovery_clear
 from history_service.store import SCHEMA
 
 
@@ -822,7 +823,9 @@ def migrate_segmented_history(
     key_id: str,
     apply: bool = False,
 ) -> dict[str, Any]:
+    require_recovery_clear(source)
     with history_write_lock(source, blocking=False):
+        require_recovery_clear(source)
         return _migrate_segmented_history_locked(
             source=source,
             segments_directory=segments_directory,
@@ -886,7 +889,9 @@ def rollback_segmented_history(
     segments_directory: Path,
     apply: bool = False,
 ) -> dict[str, Any]:
+    require_recovery_clear(source)
     with history_write_lock(source, blocking=False):
+        require_recovery_clear(source)
         return _rollback_segmented_history_locked(
             source=source,
             segments_directory=segments_directory,
@@ -1087,7 +1092,9 @@ def recover_pending_migration(
     segments_directory: Path,
     apply: bool = False,
 ) -> dict[str, Any]:
+    require_recovery_clear(source)
     with history_write_lock(source, blocking=False):
+        require_recovery_clear(source)
         return _recover_pending_migration_locked(
             source=source,
             segments_directory=segments_directory,

@@ -45,6 +45,7 @@ from history_service.refresh_auth import (
     read_refresh_document,
 )
 from history_service.store import HistoryStore
+from history_service.recovery_state import HistoryRecoveryRequired
 
 BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
@@ -313,6 +314,24 @@ app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="stat
 install_metrics(app, service_name="enclosure-history", version=__version__)
 
 
+@app.middleware("http")
+async def pause_recovery_requests(request: Request, call_next):
+    if request.url.path not in {"/livez", "/healthz", "/api/history/recovery-status"}:
+        if store.recovery_status()["recovery_required"]:
+            return JSONResponse({"detail": str(HistoryRecoveryRequired()), **store.recovery_status()}, status_code=503)
+    return await call_next(request)
+
+
+@app.exception_handler(HistoryRecoveryRequired)
+async def recovery_required_response(request: Request, exc: HistoryRecoveryRequired) -> JSONResponse:
+    return JSONResponse({"detail": str(exc), **store.recovery_status()}, status_code=503)
+
+
+@app.get("/api/history/recovery-status")
+async def recovery_status() -> JSONResponse:
+    return JSONResponse(store.recovery_status())
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request, exact_counts: bool = Query(default=False)) -> HTMLResponse:
     status = public_collector_status(collector.status())
@@ -339,6 +358,9 @@ async def index(request: Request, exact_counts: bool = Query(default=False)) -> 
 
 @app.get("/healthz")
 async def healthz() -> JSONResponse:
+    recovery = store.recovery_status()
+    if recovery["recovery_required"]:
+        return JSONResponse({"status": "recovery_required", "ready": False, **recovery}, status_code=503)
     collector_status = public_collector_status(collector.status())
     payload = {
         "status": "ok" if not collector.last_error else "degraded",

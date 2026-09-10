@@ -286,6 +286,263 @@ class SystemBackupServiceTests(unittest.TestCase):
     def tearDown(self) -> None:
         get_settings.cache_clear()
 
+    def test_v1_import_paused_before_transaction_and_under_lock(self) -> None:
+        from contextlib import contextmanager
+        from history_service.recovery_state import (
+            HistoryRecoveryRequired, recovery_path, pause_and_quarantine, ARTIFACTS,
+        )
+        from history_service.migration_lock import _history_lifecycle_lock
+        from tests.test_explicit_history_recovery import inventory
+
+        environment = patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)})
+        environment.start()
+        self.addCleanup(environment.stop)
+        get_settings.cache_clear()
+        for mixed in (False, True):
+            for race in (False, True):
+                for kind in ("partial", "malformed", "marker", "dangling", "retained", "both"):
+                    with self.subTest(mixed=mixed, race=race, kind=kind):
+                        self.store._recovery_latched = False
+                        artifact = self.backup_service.export_bundle(
+                            packaging="zip",
+                            included_paths=[CONFIG_FILE_KEY, HISTORY_DB_KEY] if mixed else [CONFIG_FILE_KEY],
+                        )
+                        reservation = recovery_path(self.history_db_path)
+                        marker = Path(f"{self.history_db_path}.recovery-required")
+
+                        after_pause = None
+
+                        def pause():
+                            nonlocal after_pause
+                            if kind in ("retained", "both"):
+                                pause_and_quarantine(self.history_db_path)
+                                if kind == "both":
+                                    for role, suffix in ARTIFACTS.items():
+                                        retained = reservation / role
+                                        if retained.exists():
+                                            os.link(retained, Path(f"{self.history_db_path}{suffix}"))
+                            elif kind in ("partial", "malformed"):
+                                reservation.mkdir(mode=0o700)
+                                if kind == "malformed":
+                                    (reservation / "intent.json").write_text("invalid")
+                            elif kind == "marker":
+                                marker.write_text("invalid")
+                            else:
+                                marker.symlink_to(self.temp_dir / "absent-marker")
+                            after_pause = inventory(self.temp_dir)
+
+                        @contextmanager
+                        def raced_lock(path, *, blocking):
+                            with history_write_lock(path, blocking=blocking):
+                                pause()
+                                yield
+
+                        before = self.config_path.read_bytes()
+                        if not race:
+                            with history_write_lock(self.history_db_path, blocking=False):
+                                pause()
+                        try:
+                            with patch.object(system_backup_module, "history_write_lock", side_effect=raced_lock if race else AssertionError("paused lock admission")):
+                                with patch.object(_ImportActivationTransaction, "__init__", side_effect=AssertionError("transaction constructed before refusal")):
+                                    with self.assertRaises(HistoryRecoveryRequired):
+                                        self.backup_service.import_bundle(artifact.content)
+                            self.assertEqual(self.config_path.read_bytes(), before)
+                            self.assertEqual(inventory(self.temp_dir), after_pause)
+                            with _history_lifecycle_lock(self.history_db_path, blocking=False):
+                                pass
+                        finally:
+                            if kind in ("retained", "both"):
+                                for role, suffix in ARTIFACTS.items():
+                                    retained = reservation / role
+                                    if retained.exists():
+                                        original = Path(f"{self.history_db_path}{suffix}")
+                                        original.unlink(missing_ok=True)
+                                        retained.rename(original)
+                            shutil.rmtree(reservation, ignore_errors=True)
+                            marker.unlink(missing_ok=True)
+                            self.store._recovery_latched = False
+
+    def test_v1_import_revalidates_destination_under_lock(self) -> None:
+        from contextlib import contextmanager
+
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}):
+            get_settings.cache_clear()
+            artifact = self.backup_service.export_bundle(
+                packaging="zip", included_paths=[CONFIG_FILE_KEY],
+            )
+            original = self.config_path.read_bytes()
+            parked = self.config_path.with_suffix(".parked")
+
+            @contextmanager
+            def raced_lock(path, *, blocking):
+                with history_write_lock(path, blocking=blocking):
+                    self.config_path.rename(parked)
+                    self.config_path.symlink_to(parked)
+                    yield
+
+            try:
+                with patch.object(system_backup_module, "history_write_lock", side_effect=raced_lock):
+                    with patch.object(_ImportActivationTransaction, "__init__", side_effect=AssertionError("premature transaction")):
+                        with self.assertRaisesRegex(ValueError, "symlink"):
+                            self.backup_service.import_bundle(artifact.content)
+                self.assertEqual(parked.read_bytes(), original)
+                self.assertTrue(self.config_path.is_symlink())
+                with history_write_lock(self.history_db_path, blocking=False):
+                    pass
+            finally:
+                if parked.exists():
+                    self.config_path.unlink()
+                    parked.rename(self.config_path)
+
+    def test_v1_public_restore_keeps_lock_and_latched_pause_guards(self) -> None:
+        from history_service.recovery_state import HistoryRecoveryRequired, recovery_path
+
+        backup = self.store.create_backup(self.temp_dir / "public-restore")
+        assert backup is not None
+        with history_write_lock(self.store.file_path, blocking=False):
+            with self.assertRaises(sqlite3.OperationalError):
+                self.store.restore_backup(backup)
+        self.store.restore_backup(backup)
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}):
+            get_settings.cache_clear()
+            artifact = self.backup_service.export_bundle(
+                packaging="zip", included_paths=[CONFIG_FILE_KEY],
+            )
+            marker = recovery_path(self.store.file_path)
+            marker.write_text("paused")
+            self.assertTrue(self.store.recovery_status()["recovery_required"])
+            marker.unlink()
+            before = self.config_path.read_bytes()
+            with self.assertRaises(HistoryRecoveryRequired):
+                self.backup_service.import_bundle(artifact.content)
+            with self.assertRaises(HistoryRecoveryRequired):
+                self.store.restore_backup(backup)
+            self.assertEqual(self.config_path.read_bytes(), before)
+            self.assertTrue(self.store.recovery_status()["recovery_required"])
+
+    def test_v1_import_lifecycle_child_process_deadline(self) -> None:
+        # A real child bounds regressions in blocking snapshot acquisition as well
+        # as nonblocking activation/rollback. No mocked lock may hide reacquisition.
+        result = subprocess.run(
+            [sys.executable, "-B", "-c", '''
+from tests.test_system_backup import SystemBackupServiceTests
+case = SystemBackupServiceTests()
+case.setUp()
+try:
+    case._exercise_v1_import_lifecycle()
+finally:
+    case.tearDown()
+'''],
+            cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def _exercise_v1_import_lifecycle(self) -> None:
+        environment = patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)})
+        environment.start()
+        self.addCleanup(environment.stop)
+        get_settings.cache_clear()
+        artifact = self.backup_service.export_bundle(
+            packaging="zip", included_paths=[CONFIG_FILE_KEY, HISTORY_DB_KEY],
+        )
+        original_config = self.config_path.read_bytes()
+        original_counts = self.store.counts()
+        real_activate = self.backup_service._activate_import_bundle
+        real_preflight = self.backup_service._preflight_import_members
+        real_restore = self.store._restore_backup_locked
+        real_snapshot = self.store._create_backup_locked
+        real_file = _ImportActivationTransaction.activate_file
+        observations = []
+
+        def locked(label):
+            with self.assertRaises(sqlite3.OperationalError):
+                with history_write_lock(self.store.file_path, blocking=False):
+                    pass
+            observations.append(label)
+
+        def snapshot(*args, **kwargs):
+            locked("snapshot")
+            return real_snapshot(*args, **kwargs)
+
+        def activate_file(transaction, *args, **kwargs):
+            locked("config-write")
+            return real_file(transaction, *args, **kwargs)
+
+        def preflight(*args, **kwargs):
+            locked("preflight")
+            return real_preflight(*args, **kwargs)
+
+        def restore(*args, **kwargs):
+            locked("restore")
+            return real_restore(*args, **kwargs)
+
+        for outcome in ("success", "late-failure", "rollback-failure", "missing-parent", "missing-rollback"):
+            if outcome.startswith("missing"):
+                self.store.file_path = self.temp_dir / outcome / "nested" / "history.db"
+                self.backup_service.store = self.store
+            target = self.store.file_path
+            self.config_path.write_bytes(original_config + b"\n# live before import\n")
+            before = self.config_path.read_bytes()
+            restore_calls = []
+            transaction_roots = []
+
+            def activate(*args, **kwargs):
+                locked("activate")
+                transaction_roots.append(args[5].root)
+                result = real_activate(*args, **kwargs)
+                if outcome in ("late-failure", "rollback-failure", "missing-rollback"):
+                    raise RuntimeError("injected late failure")
+                return result
+
+            def injected_restore(*args, **kwargs):
+                restore_calls.append(True)
+                locked("restore-attempt")
+                if outcome == "rollback-failure" and len(restore_calls) == 2:
+                    raise OSError("injected rollback failure")
+                return restore(*args, **kwargs)
+
+            with (
+                patch.object(self.store, "_create_backup_locked", side_effect=snapshot),
+                patch.object(_ImportActivationTransaction, "activate_file", new=activate_file),
+                patch.object(self.backup_service, "_preflight_import_members", side_effect=preflight),
+                patch.object(self.backup_service, "_activate_import_bundle", side_effect=activate),
+                patch.object(self.store, "_restore_backup_locked", side_effect=injected_restore),
+            ):
+                if outcome in ("late-failure", "rollback-failure", "missing-rollback"):
+                    with self.assertRaisesRegex(RuntimeError, "rollback is incomplete" if outcome == "rollback-failure" else "injected late failure"):
+                        self.backup_service.import_bundle(artifact.content)
+                    self.assertEqual(self.config_path.read_bytes(), before)
+                else:
+                    self.assertTrue(self.backup_service.import_bundle(artifact.content)["restored_history_database"])
+                    self.assertEqual(self.config_path.read_bytes(), original_config)
+            self.assertEqual(len(transaction_roots), 1)
+            transaction_root = transaction_roots[0]
+            if outcome == "rollback-failure":
+                self.assertTrue(transaction_root.is_dir())
+                self.assertTrue(any((transaction_root / "rollback").rglob("*.sqlite3")))
+                shutil.rmtree(transaction_root)
+            else:
+                self.assertFalse(transaction_root.exists())
+            if outcome == "missing-rollback":
+                self.assertFalse(target.exists())
+                for suffix in ("-wal", "-shm"):
+                    self.assertFalse(Path(f"{target}{suffix}").exists())
+                # The store retains its empty private replacement directory.
+                # No staged database may remain after completed rollback.
+                self.assertFalse(any(p.is_file() for p in target.parent.rglob("*")))
+                with history_write_lock(target, blocking=False):
+                    pass
+            else:
+                with history_write_lock(target, blocking=False):
+                    pass
+                self.assertEqual(self.store.counts(), original_counts)
+            if outcome == "late-failure":
+                self.assertEqual(len(restore_calls), 2)
+        self.assertIn("preflight", observations)
+        self.assertIn("restore", observations)
+        self.assertIn("snapshot", observations)
+        self.assertIn("config-write", observations)
+
     def test_blank_catalog_keeps_v1_reads_and_file_backups_working(self) -> None:
         settings = HistorySettings(
             sqlite_path=str(self.history_db_path),
@@ -3992,9 +4249,11 @@ sys.stdout.flush()
 
     def test_sixteen_mib_file_import_stays_below_eight_mib_python_heap(self) -> None:
         with sqlite3.connect(self.history_db_path) as connection:
-            connection.execute("CREATE TABLE qa_synthetic_filler (payload BLOB NOT NULL)")
+            # Keep the memory-pressure fixture inside the admitted schema.
             connection.execute(
-                "INSERT INTO qa_synthetic_filler(payload) VALUES (randomblob(?))",
+                "INSERT INTO slot_events (observed_at, system_id, enclosure_key, slot, "
+                "slot_label, event_type, details_json) "
+                "VALUES ('2026-01-01', 'synthetic', 'shelf', 1, '1', 'synthetic', randomblob(?))",
                 (16 * 1024 * 1024,),
             )
             connection.commit()

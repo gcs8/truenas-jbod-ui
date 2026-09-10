@@ -47,8 +47,13 @@ def _history_lock_address(database_path: Path) -> bytes:
     database_path = Path(database_path).absolute()
     canonical_parent = database_path.parent.resolve(strict=True)
     canonical_path = canonical_parent / database_path.name
+    _admit_normal_main(canonical_path)
+    return _canonical_lock_address(canonical_path)
+
+
+def _admit_normal_main(canonical_path: Path) -> None:
     try:
-        metadata = os.stat(database_path, follow_symlinks=False)
+        metadata = os.stat(canonical_path, follow_symlinks=False)
     except FileNotFoundError:
         metadata = None
     if metadata is not None:
@@ -60,6 +65,9 @@ def _history_lock_address(database_path: Path) -> bytes:
             raise ValueError("History database path must be a regular file.")
         if metadata.st_nlink != 1:
             raise ValueError("History database hard-link aliases are not supported.")
+
+
+def _canonical_lock_address(canonical_path: Path) -> bytes:
     digest = hashlib.sha256(os.fsencode(canonical_path)).hexdigest()[:40]
     return f"\0truenas-jbod-history-{digest}".encode("ascii")
 
@@ -70,7 +78,28 @@ def _history_lock_directory(database_path: Path) -> Path:
 
 @contextmanager
 def history_write_lock(database_path: Path, *, blocking: bool) -> Iterator[None]:
-    address = _history_lock_address(database_path)
+    address = _history_lock_address(database_path)  # Preserve normal pre-lock admission.
+    parent = _history_lock_directory(database_path)
+    with _acquire_history_lock(parent, address, blocking=blocking):
+        _admit_normal_main(parent / Path(database_path).name)
+        yield
+
+
+@contextmanager
+def _history_lifecycle_lock(database_path: Path, *, blocking: bool) -> Iterator[int]:
+    """Private ownership primitive, not file admission or recovery authority.
+
+    Normal callers must use history_write_lock. The offline read-only planner
+    authenticates every recorded location under this ownership before yielding.
+    """
+    parent = _history_lock_directory(database_path)
+    address = _canonical_lock_address(parent / Path(database_path).name)
+    with _acquire_history_lock(parent, address, blocking=blocking) as descriptor:
+        yield descriptor
+
+
+@contextmanager
+def _acquire_history_lock(parent: Path, address: bytes, *, blocking: bool) -> Iterator[int]:
     lock_socket = socket.socket(
         socket.AF_UNIX,
         socket.SOCK_DGRAM | getattr(socket, "SOCK_CLOEXEC", 0),
@@ -90,7 +119,7 @@ def history_write_lock(database_path: Path, *, blocking: bool) -> Iterator[None]
                     ) from exc
                 time.sleep(0.05)
         directory_descriptor = os.open(
-            _history_lock_directory(database_path),
+            parent,
             os.O_RDONLY
             | getattr(os, "O_DIRECTORY", 0)
             | getattr(os, "O_CLOEXEC", 0)
@@ -107,7 +136,11 @@ def history_write_lock(database_path: Path, *, blocking: bool) -> Iterator[None]
             raise sqlite3.OperationalError(
                 "History migration lock is held; write was not committed."
             ) from exc
-        yield
+        if (os.stat(parent).st_dev, os.stat(parent).st_ino) != (
+            os.fstat(directory_descriptor).st_dev, os.fstat(directory_descriptor).st_ino
+        ):
+            raise ValueError("History database parent changed during locking.")
+        yield directory_descriptor
     finally:
         if directory_descriptor >= 0:
             try:

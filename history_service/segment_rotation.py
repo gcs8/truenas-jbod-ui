@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from history_service.migration_lock import history_write_lock
+from history_service.recovery_state import require_recovery_clear
 from history_service.scheduled_backup import read_scheduled_backup_status
 from history_service.segment_catalog import activation_pending_path, path_entry_exists
 from history_service.segment_migration import (
@@ -814,7 +815,9 @@ def rotate_segmented_history(
     scheduled_backup_status_path: Path,
     apply: bool = False,
 ) -> dict[str, Any]:
+    require_recovery_clear(source)
     with history_write_lock(source, blocking=False):
+        require_recovery_clear(source)
         return _rotate_segmented_history_locked(
             source=source,
             segments_directory=segments_directory,
@@ -1142,7 +1145,9 @@ def recover_pending_rotation(
     segments_directory: Path,
     apply: bool = False,
 ) -> dict[str, Any]:
+    require_recovery_clear(source)
     with history_write_lock(source, blocking=False):
+        require_recovery_clear(source)
         return _recover_pending_rotation_locked(
             source=source,
             segments_directory=segments_directory,

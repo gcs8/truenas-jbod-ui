@@ -148,6 +148,8 @@ class HistoryCollector:
         set_history_collector_running(HISTORY_METRICS_SERVICE_NAME, False)
 
     async def start(self) -> None:
+        if self.store.recovery_status()["recovery_required"]:
+            return
         if self._task and not self._task.done():
             return
         self._stopping.clear()
@@ -194,6 +196,7 @@ class HistoryCollector:
         cached_root_only: bool,
         collection_kind: str,
     ) -> None:
+        self.store.require_recovery_clear()
         if not self._run_lock.acquire(blocking=False):
             raise HistoryCollectionAlreadyRunning("History collection already running.")
         collection_started_monotonic = time.perf_counter()
@@ -492,6 +495,7 @@ class HistoryCollector:
     def status(self) -> dict[str, Any]:
         collection_started_at = self.current_collection_started_at
         return {
+            **self.store.recovery_status(),
             "collector_running": bool(self._task and not self._task.done()),
             "collection_running": self.collection_running,
             "collection_started_at": collection_started_at,
@@ -564,6 +568,8 @@ class HistoryCollector:
                 pass
 
         while not self._stopping.is_set():
+            if self.store.recovery_status()["recovery_required"]:
+                return
             if self.collection_running:
                 logger.info("Skipping scheduled history collection because another collection pass is already running.")
                 target_interval = (

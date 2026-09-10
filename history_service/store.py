@@ -17,7 +17,12 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
 from history_service.domain import MetricSample, SlotEvent, SlotStateRecord
+from history_service.schema_compatibility import classify_schema
+from history_service.schema_admission import AdmittedConnection, DatabaseIdentity
 from history_service.operation_bounds import validate_store_scope_request
+from history_service.recovery_state import (
+    HistoryRecoveryRequired, inspect_recovery, pause_and_quarantine,
+)
 from history_service.segment_catalog import (
     MIGRATION_PENDING_MARKER,
     activation_pending_path,
@@ -419,6 +424,7 @@ class HistoryStore:
                 raise ValueError(f"History {label} mode must be between 0000 and 0777.")
             if mode & 0o002:
                 raise ValueError(f"History {label} mode must not be world-writable.")
+        self._recovery_latched = False
         self._ensure_database_parent()
         self._lock = threading.Lock()
         self._journal_mode_lock = threading.Lock()
@@ -426,10 +432,26 @@ class HistoryStore:
         self._segment_reader_lock = threading.Lock()
         self._segment_reader_identity: tuple[int, int, int, int] | None = None
         self._segment_reader_cache: SegmentedHistoryReader | None = None
-        if self._initialize_enabled:
+        if self._initialize_enabled and not self.recovery_status()["recovery_required"]:
             with history_write_lock(self.file_path, blocking=False):
-                self._require_no_pending_lifecycle_markers()
-                self._initialize(migration_lock_held=True)
+                if not self.recovery_status()["recovery_required"]:
+                    self._require_no_pending_lifecycle_markers()
+                    self._initialize(migration_lock_held=True)
+
+    def recovery_status(self) -> dict[str, object]:
+        state = inspect_recovery(self.file_path)
+        self._recovery_latched = self._recovery_latched or state != "none"
+        if self._recovery_latched and state == "none":
+            state = "unavailable"
+        return {
+            "recovery_required": self._recovery_latched,
+            "collection_paused": self._recovery_latched,
+            "recovery_state": state,
+        }
+
+    def require_recovery_clear(self) -> None:
+        if self.recovery_status()["recovery_required"]:
+            raise HistoryRecoveryRequired()
 
     def _ensure_database_parent(self) -> None:
         try:
@@ -438,7 +460,7 @@ class HistoryStore:
                 parents=True,
             )
         except FileExistsError:
-            self._normalize_shared_path_permissions(self.file_path.parent, is_dir=True)
+            # Existing paths are normalized only after schema admission.
             return
         self._set_shared_path_permissions(self.file_path.parent, is_dir=True)
 
@@ -458,6 +480,7 @@ class HistoryStore:
         connection. Raise the same error type the migration lock raises so
         callers keep one failure path.
         """
+        self.require_recovery_clear()
         if path_entry_exists(activation_pending_path(self.file_path)):
             raise sqlite3.OperationalError(
                 "Segmented history activation is pending; refusing to open the history "
@@ -473,6 +496,7 @@ class HistoryStore:
             )
 
     def _segmented_reader(self) -> SegmentedHistoryReader | None:
+        self.require_recovery_clear()
         if self.segment_catalog_path is None:
             return None
         if path_entry_exists(activation_pending_path(self.file_path)):
@@ -503,6 +527,7 @@ class HistoryStore:
             return reader
 
     def _require_unsegmented_operation(self, operation: str) -> None:
+        self.require_recovery_clear()
         if self.segment_catalog_path is not None:
             raise ValueError(
                 f"History {operation} is unavailable while segmented history is active."
@@ -534,7 +559,7 @@ class HistoryStore:
         self,
         *,
         migration_lock_held: bool = False,
-    ) -> Iterator[sqlite3.Connection]:
+    ) -> Iterator[AdmittedConnection]:
         lock_context = (
             nullcontext()
             if migration_lock_held
@@ -673,34 +698,65 @@ class HistoryStore:
                     )
                 raise
 
-    def _connect(self, *, migration_lock_held: bool = False) -> sqlite3.Connection:
+    def _connect(self, *, migration_lock_held: bool = False) -> AdmittedConnection:
         lock_context = (
             nullcontext()
             if migration_lock_held
             else history_write_lock(self.file_path, blocking=True)
         )
-        with lock_context:
-            return self._connect_locked()
+        with ExitStack() as lifecycle:
+            lifecycle.enter_context(lock_context)
+            connection = self._connect_locked()
+            connection._lifecycle = lifecycle.pop_all()
+            return connection
 
-    def _connect_locked(self) -> sqlite3.Connection:
+    def _connect_locked(self) -> AdmittedConnection:
         """Open and fully configure a connection while the lifecycle lock is held."""
 
         self._require_no_pending_lifecycle_markers()
-        connection = sqlite3.connect(
-            self.file_path,
-            timeout=SQLITE_CONNECT_TIMEOUT_SECONDS,
-        )
+        self._create_database_file_for_shared_access()
+        identity = DatabaseIdentity(self.file_path)
+        connection = None
         try:
-            connection.row_factory = sqlite3.Row
-            connection.execute(f"PRAGMA temp_store={SQLITE_TEMP_STORE}")
-            connection.execute(f"PRAGMA cache_size=-{SQLITE_CACHE_SIZE_KIB}")
-            self._ensure_journal_mode_locked(connection)
+            # The RO handle observes committed WAL frames and keeps a rejected
+            # RW handle from being the last WAL connection (checkpoint-on-close).
+            # It is not an immutable/pathname-only authorization to open a writer.
+            with ExitStack() as admission:
+                reader = admission.enter_context(closing(sqlite3.connect(
+                    self.file_path.absolute().as_uri() + "?mode=ro",
+                    uri=True, timeout=SQLITE_CONNECT_TIMEOUT_SECONDS,
+                )))
+                identity.check()
+                reader.execute("PRAGMA query_only=ON")
+                classify_schema(reader)
+                identity.check()
+                connection = sqlite3.connect(
+                    self.file_path, timeout=SQLITE_CONNECT_TIMEOUT_SECONDS,
+                )
+                admission.callback(connection.close)
+                identity.check()
+                connection.row_factory = sqlite3.Row
+                connection.execute("PRAGMA query_only=ON")
+                # Classify the actual handle retained through all later use.
+                classify_schema(connection)
+                identity.check()
+                self._require_no_pending_lifecycle_markers()
+                if self._initialize_enabled:
+                    self._normalize_database_permissions()
+                identity.check()
+                connection.execute("PRAGMA query_only=OFF")
+                connection.execute(f"PRAGMA temp_store={SQLITE_TEMP_STORE}")
+                connection.execute(f"PRAGMA cache_size=-{SQLITE_CACHE_SIZE_KIB}")
+                self._ensure_journal_mode_locked(connection)
+                identity.check()
+                reader.close()
+                admission.pop_all()
+            return AdmittedConnection(connection, identity, self._require_no_pending_lifecycle_markers)
         except BaseException:
-            connection.close()
+            identity.close()
             raise
-        return connection
 
-    def _ensure_journal_mode_locked(self, connection: sqlite3.Connection) -> None:
+    def _ensure_journal_mode_locked(self, connection: sqlite3.Connection | AdmittedConnection) -> None:
         try:
             stat_result = self.file_path.stat()
             identity = (int(stat_result.st_dev), int(stat_result.st_ino))
@@ -739,45 +795,29 @@ class HistoryStore:
         return total
 
     def _initialize(self, *, migration_lock_held: bool = False) -> None:
-        self._normalize_database_permissions()
+        self.require_recovery_clear()
         try:
             self._initialize_schema_and_permissions(migration_lock_held=migration_lock_held)
-        except sqlite3.OperationalError as exc:
-            if self._is_readonly_database_error(exc) and self._attempt_readonly_database_repair(exc):
+        except sqlite3.Error as exc:
+            if (isinstance(exc, sqlite3.OperationalError)
+                    and self._is_readonly_database_error(exc) and self._attempt_readonly_database_repair(exc)):
                 self._initialize_schema_and_permissions(migration_lock_held=migration_lock_held)
                 return
-            if (
-                not self.recover_unreadable_database
-                or not self._should_recover_database(exc)
-            ):
+            if not self.recover_unreadable_database or not self._should_recover_database(exc):
                 raise
-            broken_path = self._quarantine_database()
-            logger.warning(
-                "History database %s was unreadable; moved it to %s and created a fresh database. Error: %s",
-                self.file_path,
-                broken_path,
-                exc,
-            )
-            self._initialize_schema_and_permissions(migration_lock_held=migration_lock_held)
-        except sqlite3.Error as exc:
-            if (
-                not self.recover_unreadable_database
-                or not self._should_recover_database(exc)
-            ):
-                raise
-            broken_path = self._quarantine_database()
-            logger.warning(
-                "History database %s was unreadable; moved it to %s and created a fresh database. Error: %s",
-                self.file_path,
-                broken_path,
-                exc,
-            )
-            self._initialize_schema_and_permissions(migration_lock_held=migration_lock_held)
+            self._recovery_latched = True
+            try:
+                pause_and_quarantine(self.file_path)
+            except (OSError, HistoryRecoveryRequired):
+                # Reservation/intent is never removed on failure. Before reservation
+                # succeeds the corrupt original is still in place for next startup.
+                logger.error("History recovery evidence requires explicit assessment; collection paused.")
+            else:
+                logger.warning("History recovery required; collection paused pending explicit recovery.")
 
     def _initialize_schema_and_permissions(self, *, migration_lock_held: bool = False) -> None:
         self._create_database_file_for_shared_access()
         self._initialize_schema(migration_lock_held=migration_lock_held)
-        self._normalize_database_permissions()
 
     def _create_database_file_for_shared_access(self) -> None:
         # SQLite derives new WAL/SHM ownership and modes from the main database.
@@ -815,9 +855,11 @@ class HistoryStore:
             self._ensure_identity_indexes(connection)
             self._synchronize_table_counts(connection)
             connection.commit()
+            connection.check()
+            self._normalize_database_permissions()
 
     @staticmethod
-    def _synchronize_table_counts(connection: sqlite3.Connection) -> None:
+    def _synchronize_table_counts(connection: sqlite3.Connection | AdmittedConnection) -> None:
         for table_name in ("slot_events", "metric_samples", "metric_rollups"):
             connection.execute(
                 f"""
@@ -830,7 +872,7 @@ class HistoryStore:
             )
 
     @staticmethod
-    def _backfill_disk_identity_keys_once(connection: sqlite3.Connection) -> None:
+    def _backfill_disk_identity_keys_once(connection: sqlite3.Connection | AdmittedConnection) -> None:
         row = connection.execute("PRAGMA user_version").fetchone()
         current_version = int(row[0]) if row and row[0] is not None else 0
         if current_version >= DISK_IDENTITY_BACKFILL_USER_VERSION:
@@ -839,19 +881,19 @@ class HistoryStore:
         connection.execute(f"PRAGMA user_version = {int(DISK_IDENTITY_BACKFILL_USER_VERSION)}")
 
     @staticmethod
-    def _ensure_slot_state_columns(connection: sqlite3.Connection) -> None:
+    def _ensure_slot_state_columns(connection: sqlite3.Connection | AdmittedConnection) -> None:
         HistoryStore._ensure_columns(connection, "slot_state_current", SLOT_STATE_OPTIONAL_COLUMNS)
 
     @staticmethod
-    def _ensure_slot_event_columns(connection: sqlite3.Connection) -> None:
+    def _ensure_slot_event_columns(connection: sqlite3.Connection | AdmittedConnection) -> None:
         HistoryStore._ensure_columns(connection, "slot_events", SLOT_EVENT_OPTIONAL_COLUMNS)
 
     @staticmethod
-    def _ensure_metric_sample_columns(connection: sqlite3.Connection) -> None:
+    def _ensure_metric_sample_columns(connection: sqlite3.Connection | AdmittedConnection) -> None:
         HistoryStore._ensure_columns(connection, "metric_samples", METRIC_SAMPLE_OPTIONAL_COLUMNS)
 
     @staticmethod
-    def _backfill_disk_identity_keys(connection: sqlite3.Connection) -> None:
+    def _backfill_disk_identity_keys(connection: sqlite3.Connection | AdmittedConnection) -> None:
         for table_name in ("slot_state_current", "slot_events", "metric_samples"):
             connection.execute(
                 f"""
@@ -869,7 +911,7 @@ class HistoryStore:
             )
 
     @staticmethod
-    def _ensure_identity_indexes(connection: sqlite3.Connection) -> None:
+    def _ensure_identity_indexes(connection: sqlite3.Connection | AdmittedConnection) -> None:
         connection.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_slot_state_disk_identity
@@ -885,7 +927,7 @@ class HistoryStore:
 
     @staticmethod
     def _ensure_columns(
-        connection: sqlite3.Connection,
+        connection: sqlite3.Connection | AdmittedConnection,
         table_name: str,
         optional_columns: dict[str, str],
     ) -> None:
@@ -911,18 +953,27 @@ class HistoryStore:
             )
         )
 
-    def _quarantine_database(self) -> Path:
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        broken_path = self.file_path.with_name(f"{self.file_path.name}.broken-{timestamp}")
-        self.file_path.replace(broken_path)
-        for suffix in ("-shm", "-wal"):
-            sidecar_path = Path(f"{self.file_path}{suffix}")
-            if not sidecar_path.exists():
-                continue
-            sidecar_path.replace(broken_path.with_name(f"{broken_path.name}{suffix}"))
-        return broken_path
-
     def create_backup(
+        self,
+        backup_dir: str | Path,
+        *,
+        snapshot_label: str | None = None,
+        retention_count: int = 28,
+        long_term_backup_dir: str | Path | None = None,
+        weekly_retention_count: int = 0,
+        monthly_retention_count: int = 0,
+    ) -> Path | None:
+        self._require_unsegmented_operation("v1 backup")
+        with history_write_lock(self.file_path, blocking=True):
+            return self._create_backup_locked(
+                backup_dir, snapshot_label=snapshot_label,
+                retention_count=retention_count,
+                long_term_backup_dir=long_term_backup_dir,
+                weekly_retention_count=weekly_retention_count,
+                monthly_retention_count=monthly_retention_count,
+            )
+
+    def _create_backup_locked(
         self,
         backup_dir: str | Path,
         *,
@@ -946,32 +997,31 @@ class HistoryStore:
         temp_metadata = os.fstat(temp_fd)
 
         try:
-            with history_write_lock(self.file_path, blocking=True):
-                with self._lock:
-                    with closing(self._connect(migration_lock_held=True)) as source_connection, closing(
-                        sqlite3.connect(f"/proc/self/fd/{temp_fd}")
-                    ) as backup_connection:
-                        backup_connection.execute("PRAGMA journal_mode=MEMORY")
-                        source_connection.backup(backup_connection)
-                        backup_connection.commit()
-                    publish_descriptor = temp_fd
-                    temp_fd = None
-                    self._publish_replacement(
-                        temp_path,
+            with self._lock:
+                with closing(self._connect(migration_lock_held=True)) as source_connection, closing(
+                    sqlite3.connect(f"/proc/self/fd/{temp_fd}")
+                ) as backup_connection:
+                    backup_connection.execute("PRAGMA journal_mode=MEMORY")
+                    source_connection.backup(backup_connection)
+                    backup_connection.commit()
+                publish_descriptor = temp_fd
+                temp_fd = None
+                self._publish_replacement(
+                    temp_path,
+                    final_path,
+                    temp_descriptor=publish_descriptor,
+                )
+                self._prune_backup_snapshots(backup_root, retention_count)
+                try:
+                    self._promote_long_term_backups(
                         final_path,
-                        temp_descriptor=publish_descriptor,
+                        snapshot_label=snapshot_label,
+                        long_term_backup_dir=long_term_backup_dir,
+                        weekly_retention_count=weekly_retention_count,
+                        monthly_retention_count=monthly_retention_count,
                     )
-                    self._prune_backup_snapshots(backup_root, retention_count)
-                    try:
-                        self._promote_long_term_backups(
-                            final_path,
-                            snapshot_label=snapshot_label,
-                            long_term_backup_dir=long_term_backup_dir,
-                            weekly_retention_count=weekly_retention_count,
-                            monthly_retention_count=monthly_retention_count,
-                        )
-                    except Exception as exc:  # noqa: BLE001 - best-effort archival path should not break local backup rotation.
-                        logger.warning("History long-term backup promotion failed for %s: %s", final_path, exc)
+                except Exception as exc:  # noqa: BLE001 - best-effort archival path should not break local backup rotation.
+                    logger.warning("History long-term backup promotion failed for %s: %s", final_path, exc)
         finally:
             if temp_fd is not None:
                 os.close(temp_fd)
@@ -990,6 +1040,8 @@ class HistoryStore:
         return datetime.fromtimestamp(latest.stat().st_mtime, tz=timezone.utc)
 
     def _restore_backup_locked(self, source_path: str | Path) -> None:
+        self._require_unsegmented_operation("v1 restore")
+        self.require_recovery_clear()
         source = Path(source_path)
         if not source.exists():
             raise FileNotFoundError(f"Backup source {source} does not exist.")
@@ -1153,7 +1205,7 @@ class HistoryStore:
         self._execute_write(lambda connection: self._upsert_slot_state_row(connection, record, observed_at))
 
     @staticmethod
-    def _upsert_slot_state_row(connection: sqlite3.Connection, record: SlotStateRecord, observed_at: str) -> None:
+    def _upsert_slot_state_row(connection: sqlite3.Connection | AdmittedConnection, record: SlotStateRecord, observed_at: str) -> None:
         connection.execute(
             SLOT_STATE_UPSERT_SQL,
             _slot_state_record_values(record, observed_at),
@@ -1190,7 +1242,7 @@ class HistoryStore:
         if not updates:
             return
 
-        def apply(connection: sqlite3.Connection) -> None:
+        def apply(connection: sqlite3.Connection | AdmittedConnection) -> None:
             for update in updates:
                 if update.events:
                     self._insert_event_rows(connection, list(update.events))
@@ -1199,7 +1251,7 @@ class HistoryStore:
         self._execute_write(apply)
 
     @staticmethod
-    def _insert_event_rows(connection: sqlite3.Connection, events: list[SlotEvent]) -> None:
+    def _insert_event_rows(connection: sqlite3.Connection | AdmittedConnection, events: list[SlotEvent]) -> None:
         if not events:
             return
         connection.executemany(
@@ -1408,7 +1460,7 @@ class HistoryStore:
     @classmethod
     def _maintain_retention_batch(
         cls,
-        connection: sqlite3.Connection,
+        connection: sqlite3.Connection | AdmittedConnection,
         *,
         cutoffs: dict[str, str | None],
         batch_size: int,
@@ -1465,7 +1517,7 @@ class HistoryStore:
 
     @staticmethod
     def _retention_row_ids(
-        connection: sqlite3.Connection,
+        connection: sqlite3.Connection | AdmittedConnection,
         *,
         table_name: str,
         timestamp_column: str,
@@ -1488,7 +1540,7 @@ class HistoryStore:
 
     @staticmethod
     def _delete_rows_by_id(
-        connection: sqlite3.Connection,
+        connection: sqlite3.Connection | AdmittedConnection,
         table_name: str,
         row_ids: list[int],
     ) -> int:
@@ -1504,7 +1556,7 @@ class HistoryStore:
 
     @staticmethod
     def _roll_up_metric_rows(
-        connection: sqlite3.Connection,
+        connection: sqlite3.Connection | AdmittedConnection,
         row_ids: list[int],
         *,
         bucket_seconds: int,
@@ -1598,7 +1650,7 @@ class HistoryStore:
 
     @staticmethod
     def _delete_rollup_batch(
-        connection: sqlite3.Connection,
+        connection: sqlite3.Connection | AdmittedConnection,
         *,
         bucket_seconds: int,
         cutoff: str | None,
@@ -1624,7 +1676,7 @@ class HistoryStore:
 
     @staticmethod
     def _retention_rows_exist(
-        connection: sqlite3.Connection,
+        connection: sqlite3.Connection | AdmittedConnection,
         table_name: str,
         timestamp_column: str,
         cutoff: str | None,
@@ -1639,7 +1691,7 @@ class HistoryStore:
 
     @staticmethod
     def _rollups_exist(
-        connection: sqlite3.Connection,
+        connection: sqlite3.Connection | AdmittedConnection,
         bucket_seconds: int,
         cutoff: str | None,
     ) -> bool:
@@ -1792,7 +1844,7 @@ class HistoryStore:
     @classmethod
     def _append_metric_rollups(
         cls,
-        connection: sqlite3.Connection,
+        connection: sqlite3.Connection | AdmittedConnection,
         samples: list[dict[str, Any]],
         *,
         where_clauses: list[str],
@@ -2103,7 +2155,7 @@ class HistoryStore:
     @classmethod
     def _append_scope_metric_rollups(
         cls,
-        connection: sqlite3.Connection,
+        connection: sqlite3.Connection | AdmittedConnection,
         payload_by_slot: dict[int, dict[str, Any]],
         *,
         where_clauses: list[str],
@@ -2463,7 +2515,7 @@ class HistoryStore:
         if not normalized_system_id:
             return self._empty_cleanup_summary()
 
-        def operation(connection: sqlite3.Connection) -> dict[str, Any]:
+        def operation(connection: sqlite3.Connection | AdmittedConnection) -> dict[str, Any]:
             summary = self._delete_history_for_system_ids(connection, [normalized_system_id])
             summary["removed_system_ids"] = [normalized_system_id] if summary["total_rows"] else []
             return summary
@@ -2476,7 +2528,7 @@ class HistoryStore:
             sorted({system_id.strip() for system_id in valid_system_ids if system_id and system_id.strip()})
         )
 
-        def operation(connection: sqlite3.Connection) -> dict[str, Any]:
+        def operation(connection: sqlite3.Connection | AdmittedConnection) -> dict[str, Any]:
             orphan_ids = self._list_cleanup_system_ids(connection, exclude_system_ids=normalized_valid_ids)
             if not orphan_ids:
                 return self._empty_cleanup_summary()
@@ -2504,7 +2556,7 @@ class HistoryStore:
         if normalized_source_id == normalized_target_id:
             raise ValueError("Source and target system ids must be different.")
 
-        def operation(connection: sqlite3.Connection) -> dict[str, Any]:
+        def operation(connection: sqlite3.Connection | AdmittedConnection) -> dict[str, Any]:
             source_slot_count = int(
                 connection.execute(
                     "SELECT COUNT(*) FROM slot_state_current WHERE system_id = ?",
@@ -2656,7 +2708,20 @@ class HistoryStore:
             exc,
         )
         try:
-            self._normalize_database_permissions()
+            # A read-only admission failure (for example hot-journal recovery)
+            # must not turn into permission repair of an unclassified source.
+            # Callers already own the lifecycle lock; recheck rather than reuse
+            # an earlier pathname or cached admission after the failed handle.
+            self._require_no_pending_lifecycle_markers()
+            with closing(DatabaseIdentity(self.file_path)) as identity, closing(sqlite3.connect(
+                self.file_path.absolute().as_uri() + "?mode=ro",
+                uri=True, timeout=SQLITE_CONNECT_TIMEOUT_SECONDS,
+            )) as reader:
+                reader.execute("PRAGMA query_only=ON")
+                classify_schema(reader)
+                identity.check()
+                self._normalize_database_permissions()
+                identity.check()
         except OSError as repair_exc:
             logger.warning(
                 "History database %s permission repair failed: %s",
@@ -3076,7 +3141,7 @@ class HistoryStore:
         }
 
     @staticmethod
-    def _delete_history_for_system_ids(connection: sqlite3.Connection, system_ids: list[str]) -> dict[str, Any]:
+    def _delete_history_for_system_ids(connection: sqlite3.Connection | AdmittedConnection, system_ids: list[str]) -> dict[str, Any]:
         if not system_ids:
             return HistoryStore._empty_cleanup_summary()
 
@@ -3116,7 +3181,7 @@ class HistoryStore:
 
     @staticmethod
     def _list_history_system_summaries(
-        connection: sqlite3.Connection,
+        connection: sqlite3.Connection | AdmittedConnection,
         *,
         exclude_system_ids: tuple[str, ...] = (),
     ) -> list[dict[str, Any]]:
@@ -3204,7 +3269,7 @@ class HistoryStore:
 
     @staticmethod
     def _list_cleanup_system_ids(
-        connection: sqlite3.Connection,
+        connection: sqlite3.Connection | AdmittedConnection,
         *,
         exclude_system_ids: tuple[str, ...] = (),
     ) -> list[str]:
