@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import re
 import tempfile
 import threading
 import unittest
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -20,6 +22,7 @@ from app.config import BMCConfig, HANodeConfig, HistoryConfig, SSHConfig, Settin
 from app.main import templates
 from app.models.domain import (
     EnclosureOption,
+    EnclosureProfileView,
     InventorySnapshot,
     InventorySummary,
     SnapshotExportRequest,
@@ -711,10 +714,163 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("new URLSearchParams(target.search)", rendered.html)
         self.assertIn("buildScopedUrl(url, queryParams)", rendered.html)
         self.assertNotIn("`${url}?${params.toString()}`", rendered.html)
-        self.assertNotIn("/static/images/hyper-m2-gen3-card.png", rendered.html)
-        self.assertIn("data:image/png;base64", rendered.html)
+        self.assertNotIn("data:image/", rendered.html)
         self.assertNotIn("Export Snapshot", rendered.html)
         self.assertNotIn('id="sas-fabric-view-link"', rendered.html)
+
+    @staticmethod
+    def _card_photo_data_url(relative_path: str) -> str:
+        encoded = base64.b64encode((snapshot_export.STATIC_DIR / relative_path).read_bytes()).decode("ascii")
+        return f"data:{snapshot_export.OFFLINE_IMAGE_ASSETS[relative_path]};base64,{encoded}"
+
+    @staticmethod
+    def _runtime_with_view(view: StorageViewRuntimeView) -> StorageViewRuntimePayload:
+        runtime = build_storage_view_runtime()
+        return runtime.model_copy(update={"views": [*runtime.views, view]})
+
+    async def test_demo_image_mode_does_not_share_selective_render_work_or_cache(self) -> None:
+        selective = SnapshotExportService(Settings(), FakeHistoryBackend(), templates)  # type: ignore[arg-type]
+        demo = SnapshotExportService(
+            Settings(), FakeHistoryBackend(), templates, embed_all_images=True,  # type: ignore[arg-type]
+        )
+        # Exercise the mode against an already populated shared render cache.
+        kwargs: dict[str, Any] = dict(
+            request=build_request(),
+            snapshot=build_snapshot(),
+            selected_slot=None,
+            history_window_hours=24,
+            io_chart_mode="total",
+        )
+        plain = await selective.build_enclosure_snapshot_html(**kwargs)
+        complete = await demo.build_enclosure_snapshot_html(**kwargs)
+        again = await selective.build_enclosure_snapshot_html(**kwargs)
+
+        self.assertNotEqual(plain.cache_key, complete.cache_key)
+        self.assertNotIn("data:image/", plain.html)
+        self.assertIs(again, plain)
+        for path in snapshot_export.OFFLINE_IMAGE_ASSETS:
+            self.assertTrue(self._card_photo_data_url(path) in complete.html, path)
+        self.assertEqual(complete.size_bytes, len(complete.html.encode("utf-8")))
+
+    async def test_export_inlines_only_the_card_photos_its_views_can_draw(self) -> None:
+        exporter = SnapshotExportService(Settings(), FakeHistoryBackend(), templates)  # type: ignore[arg-type]
+        photos = {path: self._card_photo_data_url(path) for path in snapshot_export.OFFLINE_IMAGE_ASSETS}
+        carrier_profile = EnclosureProfileView(
+            id=snapshot_export.AOC_SLG4_2H8M2_PROFILE_ID,
+            label="AOC-SLG4-2H8M2",
+            face_style="nvme-carrier",
+            rows=1,
+            columns=2,
+        )
+        cases = {
+            "generic M.2 carrier view": (
+                build_snapshot(),
+                self._runtime_with_view(
+                    StorageViewRuntimeView(id="m2-carrier", label="M.2 carrier", kind="nvme_carrier", template_id="nvme-carrier-4")
+                ),
+                {snapshot_export.NVME_CARRIER_CARD_IMAGE},
+            ),
+            "AOC-SLG4-2H8M2 carrier view": (
+                build_snapshot(),
+                self._runtime_with_view(
+                    StorageViewRuntimeView(id="add-in-card", label="Add-in card", kind="nvme_carrier", template_id="aoc-slg4-2h8m2-2")
+                ),
+                {snapshot_export.AOC_SLG4_2H8M2_CARD_IMAGE},
+            ),
+            "SATADOM boot view": (
+                build_snapshot(),
+                self._runtime_with_view(
+                    StorageViewRuntimeView(id="doms", label="Boot DOMs", kind="boot_devices", template_id="satadom-pair-2")
+                ),
+                {snapshot_export.SATADOM_CARD_IMAGE},
+            ),
+            "NVMe-carrier enclosure profile": (
+                build_snapshot().model_copy(update={"selected_profile": carrier_profile}),
+                None,
+                {snapshot_export.AOC_SLG4_2H8M2_CARD_IMAGE},
+            ),
+        }
+        for label, (snapshot, runtime, expected) in cases.items():
+            with self.subTest(case=label):
+                rendered = await exporter.build_enclosure_snapshot_html(
+                    request=build_request(),
+                    snapshot=snapshot,
+                    smart_summary_cache=build_smart_summary_cache(),
+                    storage_view_runtime=runtime,
+                    selected_slot=0,
+                    history_window_hours=24,
+                    io_chart_mode="total",
+                )
+                inlined = {path for path, data_url in photos.items() if data_url in rendered.html}
+                self.assertEqual(inlined, expected)
+
+    async def test_static_assets_are_read_once_per_service(self) -> None:
+        exporter = SnapshotExportService(Settings(), FakeHistoryBackend(), templates)  # type: ignore[arg-type]
+        runtime = self._runtime_with_view(
+            StorageViewRuntimeView(id="m2-carrier", label="M.2 carrier", kind="nvme_carrier", template_id="nvme-carrier-4")
+        )
+        reads: Counter[str] = Counter()
+        original_read_text = Path.read_text
+        original_read_bytes = Path.read_bytes
+
+        def counting_read_text(path: Path, *args: Any, **kwargs: Any) -> str:
+            if path.parent == snapshot_export.STATIC_DIR:
+                reads[path.name] += 1
+            return original_read_text(path, *args, **kwargs)
+
+        def counting_read_bytes(path: Path) -> bytes:
+            if path.parent == snapshot_export.STATIC_DIR / "images":
+                reads[path.name] += 1
+            return original_read_bytes(path)
+
+        with patch.object(Path, "read_text", counting_read_text), patch.object(Path, "read_bytes", counting_read_bytes):
+            for history_window_hours in (24, 48):
+                await exporter.build_enclosure_snapshot_html(
+                    request=build_request(),
+                    snapshot=build_snapshot(),
+                    smart_summary_cache=build_smart_summary_cache(),
+                    storage_view_runtime=runtime,
+                    selected_slot=0,
+                    history_window_hours=history_window_hours,
+                    io_chart_mode="total",
+                )
+
+        self.assertEqual(reads, {"style.css": 1, "app.js": 1, "hyper-m2-gen3-card.png": 1})
+
+    async def test_oversize_export_redacts_the_snapshot_once_across_passes(self) -> None:
+        exporter = SnapshotExportService(
+            Settings(),
+            DenseHistoryBackend(),  # type: ignore[arg-type]
+            templates,
+            size_limit_bytes=1,
+        )
+        render_calls = 0
+        original_render = exporter._render_template_with_assets
+
+        def counting_render(*args: Any, **kwargs: Any) -> str:
+            nonlocal render_calls
+            render_calls += 1
+            return original_render(*args, **kwargs)
+
+        exporter._render_template_with_assets = counting_render  # type: ignore[method-assign]
+
+        with patch.object(
+            SnapshotRedactor, "redact_snapshot", autospec=True, side_effect=SnapshotRedactor.redact_snapshot
+        ) as redact_snapshot:
+            rendered = await exporter.build_enclosure_snapshot_html(
+                request=build_request(),
+                snapshot=build_snapshot(),
+                smart_summary_cache=build_smart_summary_cache(),
+                selected_slot=0,
+                history_window_hours=24,
+                io_chart_mode="total",
+                redact_sensitive=True,
+            )
+
+        self.assertEqual(render_calls, len(SnapshotExportService._build_downsampling_strategies()))
+        self.assertEqual(redact_snapshot.call_count, 1)
+        self.assertEqual(rendered.export_meta["redaction"], "partial")
+        self.assertNotIn("Archive CORE", rendered.html)
 
     async def test_service_redacts_sensitive_values_with_stable_aliases(self) -> None:
         snapshot = build_snapshot()
@@ -1107,11 +1263,11 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         loop = asyncio.get_running_loop()
         event_loop_released = threading.Event()
 
-        def blocking_inliner(request, html: str) -> str:
+        def blocking_inliner(request, html: str, *args: Any, **kwargs: Any) -> str:
             loop.call_soon_threadsafe(event_loop_released.set)
             if not event_loop_released.wait(timeout=0.5):
                 raise AssertionError("Template rendering blocked the event loop")
-            return original_inliner(request, html)
+            return original_inliner(request, html, *args, **kwargs)
 
         exporter._inline_static_assets = blocking_inliner  # type: ignore[method-assign]
 
@@ -2106,7 +2262,7 @@ class SnapshotExportPendingWorkTests(unittest.IsolatedAsyncioTestCase):
         release_second = threading.Event()
         render_calls = 0
 
-        def controlled_render(_request: Request, _template: Any, _context: dict[str, Any]) -> str:
+        def controlled_render(*_args: Any, **_kwargs: Any) -> str:
             nonlocal render_calls
             render_calls += 1
             if render_calls == 1:
@@ -2164,7 +2320,7 @@ class SnapshotExportPendingWorkTests(unittest.IsolatedAsyncioTestCase):
         release = threading.Event()
         render_calls = 0
 
-        def controlled_render(_request: Request, _template: Any, _context: dict[str, Any]) -> str:
+        def controlled_render(*_args: Any, **_kwargs: Any) -> str:
             nonlocal render_calls
             render_calls += 1
             started.set()
