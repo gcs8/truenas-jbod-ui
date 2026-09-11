@@ -35,16 +35,16 @@ class CIWorkflowContractTests(unittest.TestCase):
         contributing = self.read(ROOT / "CONTRIBUTING.md")
 
         self.assertEqual(triggers["pull_request"]["branches"], ["main"])
-        self.assertEqual(triggers["push"]["branches"], ["main"])
+        self.assertEqual(triggers["push"]["branches"], ["**"])
         self.assertIn("workflow_dispatch", triggers)
         self.assertIn(
-            "CI runs once per pull request targeting `main` and once per push to `main`.",
+            "CI runs on every branch push and on pull requests targeting `main`.",
             contributing,
         )
 
         codeql = yaml.safe_load(self.read(WORKFLOW_DIR / "codeql.yml"))
         codeql_triggers = codeql.get("on", codeql.get(True, {}))
-        self.assertEqual(codeql_triggers["push"]["branches"], ["main"])
+        self.assertEqual(codeql_triggers["push"]["branches"], ["main", "codex/**", "ci/**"])
         self.assertEqual(codeql_triggers["pull_request"]["branches"], ["main"])
 
     def test_public_demo_job_runs_every_synthetic_fixture_spec(self) -> None:

@@ -30,12 +30,13 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Internal
 
-- Ran CI once per pull request instead of twice, stopped the label workflow from
-  cancelling itself on every push, let the changelog gate pass tests-only pull
-  requests with a notice and refuse bullets in a shipped release, made six
-  Linux-only scripts say so on Windows, added help text to the check scripts, and
-  made `dev_check.py --safe` pass on a clean Windows checkout with one-line SKIP
-  summaries (#494)
+- Stopped the label workflow from cancelling itself on every push, let the
+  changelog gate pass tests-only pull requests with a notice and refuse bullets
+  in a shipped release, made six Linux-only scripts say so on Windows, added
+  help text to the check scripts, made `dev_check.py --safe` pass on a clean
+  Windows checkout with one-line SKIP summaries, and made the immutable
+  deployment updater refuse a non-Linux host before it pulls images or creates a
+  receipt directory (#494)
 
 ## v0.23.0 - 2026-09-08
 

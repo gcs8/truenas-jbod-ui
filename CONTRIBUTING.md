@@ -382,13 +382,13 @@ pre-tag gate recorded as `Pass` or justified `N/A`.
 
 ## Branch and CI policy
 
-CI runs once per pull request targeting `main` and once per push to `main`.
-A branch push without a pull request does not start CI; open the pull request
-(a draft is fine) or start the workflow by hand from the Actions tab. Branch
-names carry no meaning to CI, so contributors may use descriptive prefixes such
-as `feat/`, `fix/`, `refactor/`, `docs/`, `perf/`, `test/`, `ci/`, `codex/`, or
-`claude/`. CodeQL follows the same triggers plus a weekly schedule. Tag pushes
-are not part of this preflight workflow.
+CI runs on every branch push and on pull requests targeting `main`. The
+all-branch push contract keeps pre-PR validation independent of naming prefixes;
+contributors may use descriptive prefixes such as `feat/`, `fix/`, `refactor/`,
+`docs/`, `perf/`, `test/`, `ci/`, `codex/`, or `claude/` without creating a CI
+coverage gap. CodeQL runs on pushes to `main`, `codex/**` and `ci/**`, on pull
+requests targeting `main`, and on a weekly schedule. Tag pushes are not part of
+this preflight workflow.
 
 ## CI blocking policy
 
