@@ -254,8 +254,19 @@ http://127.0.0.1:8081
 ```
 
 If Docker is on another machine, leave it bound to localhost unless you have a
-reason to expose it. Use a tunnel, reverse proxy, or set
-`HISTORY_BIND_ADDRESS=0.0.0.0` intentionally.
+reason to expose it. Use a tunnel or reverse proxy, or bind it off-loopback on
+purpose with all of these lines in `.env`:
+
+```dotenv
+HISTORY_BIND_ADDRESS=0.0.0.0
+HISTORY_REFRESH_AUTH_MODE=token
+HISTORY_REFRESH_TOKEN=replace-with-a-long-private-value
+HISTORY_PUBLIC_ORIGIN=http://your-docker-host:8081
+```
+
+History refuses to start off-loopback without the token mode, a token, and the
+public origin. Use `HISTORY_REFRESH_TOKEN_FILE` with the secrets overlay instead
+of `HISTORY_REFRESH_TOKEN` when you keep the token in a file.
 
 Use [[History and Snapshot Export|History-and-Snapshot-Export]] for the visual
 walkthrough.

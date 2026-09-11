@@ -191,8 +191,8 @@ def check_docs(
 ) -> tuple[CheckReport, list[str]]:
     documents = markdown_documents(root)
     errors: list[str] = []
-    if len(documents) != 24:
-        errors.append(f"expected 24 README/Wiki documents, found {len(documents)}")
+    if len(documents) != 25:
+        errors.append(f"expected 25 README/Wiki documents, found {len(documents)}")
     env_keys = read_env_keys(root)
     local_links = wiki_links = external_links = image_count = yaml_examples = command_paths = config_keys = 0
     prose_patterns = 0

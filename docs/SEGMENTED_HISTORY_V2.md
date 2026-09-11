@@ -28,9 +28,8 @@ hot database fails closed; publication does not seize unrelated paths.
 
 The initial implementation uses one segment named `segment-0001.sqlite3` and a
 complete catalog named `generation-0001`. The schema validates `tombstones` and
-each replacement segment's `supersedes` list, but v0.22.2 does not publish later
-generations automatically. The v0.22.3 generation-2 recovery contract is defined
-below. It is a development contract, not authorization to rotate production.
+each replacement segment's `supersedes` list. Rotation to later generations is
+supported from v0.23.0. Before v0.23.0 only generation 0001 existed.
 
 ## Bounds
 

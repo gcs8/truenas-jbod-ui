@@ -217,9 +217,9 @@ class ContainerResourceContractTests(unittest.TestCase):
         ssh_guide = (REPO_ROOT / "wiki/SSH-Setup-and-Sudo.md").read_text(encoding="utf-8")
         troubleshooting = (REPO_ROOT / "wiki/Troubleshooting.md").read_text(encoding="utf-8")
 
-        for guide in (ssh_guide, troubleshooting):
-            self.assertIn('app_uid="${APP_UID:-10001}"', guide)
-            self.assertIn('app_gid="${APP_GID:-10001}"', guide)
+        self.assertIn('app_uid="${APP_UID:-10001}"', ssh_guide)
+        self.assertIn('app_gid="${APP_GID:-10001}"', ssh_guide)
+        self.assertIn("Set `app_uid` and `app_gid` explicitly", troubleshooting)
 
         self.assertIn('ssh_host="storage-host.example.test"', ssh_guide)
         self.assertIn('ssh-keyscan -H "$ssh_host"', ssh_guide)
@@ -227,7 +227,8 @@ class ContainerResourceContractTests(unittest.TestCase):
         self.assertNotIn(".local", ssh_guide)
         self.assertIn('-o "$app_uid" -g "$app_gid" -m 0660', ssh_guide)
         self.assertNotIn("-o 10001 -g 10001", ssh_guide)
-        self.assertIn('--uid "$app_uid" --gid "$app_gid"', troubleshooting)
+        self.assertIn('--uid "${app_uid:?set the effective APP_UID}"', troubleshooting)
+        self.assertIn('--gid "${app_gid:?set the effective APP_GID}"', troubleshooting)
         self.assertNotIn("--uid 10001 --gid 10001", troubleshooting)
         self.assertNotIn("owned by `10001:10001`", troubleshooting)
 
@@ -352,7 +353,7 @@ class ContainerResourceContractTests(unittest.TestCase):
 
         for script_path in SEGMENTED_HISTORY_CLI_PATHS:
             self.assertIn(f"`/app/{script_path}`", export_guide)
-        self.assertRegex(export_guide, r"(?i)v0\.22\.2[^.]+does not contain")
+        self.assertRegex(export_guide, r"(?i)before v0\.23\.0[^.]+do not contain")
         self.assertNotRegex(export_guide, r"(?i)current `main`[^.]+source-build image")
         self.assertRegex(maintenance_guide, r"(?i)segmented history[^.]+fail closed")
         self.assertNotIn("qs-cryostorage", maintenance_guide)
@@ -1042,7 +1043,8 @@ class ContainerResourceContractTests(unittest.TestCase):
         self.assertNotIn("prepare_nonroot_bind_mounts.py", quick_start)
         self.assertNotIn("prepare_nonroot_bind_mounts.py", deployment_guide)
         self.assertIn("prepare_nonroot_bind_mounts.py", troubleshooting)
-        self.assertIn("Run the dry check first", troubleshooting)
+        ownership = troubleshooting.split("## A non-root container gets permission denied", 1)[1].split("\n## ", 1)[0]
+        self.assertLess(ownership.index("dry run"), ownership.index("--apply"))
         self.assertIn("--apply", troubleshooting)
         self.assertNotIn("The base Compose file keeps the existing root-compatible", deployment_guide)
 

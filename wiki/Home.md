@@ -15,6 +15,7 @@ Identify LEDs are available only on supported, configured paths.
 3. Open `http://<docker-host>:8080` and confirm that the host inventory loads.
 4. Add SSH only if you need better slot mapping, SMART detail, topology data, or
    LED control.
+5. When a new release is out, follow [[Upgrading]].
 
 [[Visual Tour|Visual-Tour]] shows the interface with synthetic sample data.
 [[Troubleshooting]] covers missing disks, slots, and history.

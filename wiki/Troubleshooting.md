@@ -30,6 +30,22 @@ If `livez` is not `ok`, fix the container/runtime problem first. If `livez` is
 healthy but `healthz` reports a warning or degraded dependency, read that
 payload before chasing layout bugs.
 
+## A container keeps restarting
+
+`docker compose up -d` reports success even when a container fails as soon as
+it starts. Check:
+
+```bash
+docker compose ps
+docker compose logs --tail=50 enclosure-ui
+```
+
+A container that shows `Restarting` in `docker compose ps` has a startup
+error. Read the last line of its log: it names the setting or folder that
+stopped it. Use `enclosure-history` or `enclosure-admin` in place of
+`enclosure-ui` for the other services. The admin container does not restart
+on its own; it shows `Exited` instead.
+
 ## The app starts but the UI looks empty
 
 Common causes:
@@ -79,6 +95,14 @@ enclosure scope. Multi-system and multi-enclosure deployments likewise deny the
 legacy fallback and show one bounded warning with the affected count and the same
 re-save guidance.
 
+## Saving a bay assignment fails with 500
+
+`Unhandled application error` after saving a bay assignment means the main UI
+cannot write to its `data` folder. The usual cause is a folder owned by root
+while the container runs as the app user. Fix the ownership as described in
+[A non-root container gets permission denied](#a-non-root-container-gets-permission-denied),
+then save again.
+
 ## The UI says a sudo command is not allowed
 
 That means the app tried to run a command the SSH user cannot execute.
@@ -115,22 +139,60 @@ access-restricted workflow; the override does not make the archive safe to share
 
 ## A non-root container gets permission denied
 
-If a source-built non-root UI or history container reports `permission denied`,
-stop the stack and run the bounded ownership helper from the matching source
-checkout:
+The v0.23.0 Compose file runs the main UI and history as the app user.
+Permission errors can be caused by ownership, modes or mount configuration;
+confirm the effective service identity and failing path first. A normal image
+update that retains a root-compatible Compose file does not require an optional
+non-root ownership migration.
 
-```bash
-app_uid="${APP_UID:-10001}"
-app_gid="${APP_GID:-10001}"
-sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid "$app_uid" --gid "$app_gid"
-sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid "$app_uid" --gid "$app_gid" --apply
-```
+If `HISTORY_SEGMENT_CATALOG_PATH` is set, stop here and use the segmented repair
+procedure in [[Backup, Restore, and Debug Bundles|Backup-Restore-and-Debug-Bundles]].
+Do not apply this helper to sealed segments.
 
-Run the dry check first. If `.env` overrides `APP_UID` or `APP_GID`, export the
-same values before running the block. Do not use recursive `chmod 777`, and do
-not run this source-build migration against the published v0.22.2 Compose/image
-pair. If SSH then fails to load `known_hosts`, verify that
-`data/known_hosts` is owned by the configured app UID/GID and uses mode `0660`.
+1. Save a private pre-upgrade backup of the state, the previous image digest
+   or tag from `JBOD_UI_IMAGE`, the environment file, and every selected Compose
+   file. Record the project, ordered `-f` file chain, `--env-file`, active
+   `--profile` selections and service names. Retain those selections on every
+   Compose command; do not enable previously inactive admin or backup services.
+2. Stop all writers, including scheduled backup jobs and admin, before changing
+   ownership. Use the recorded `docker compose --project-name ... --env-file ...
+   -f ... --profile ... stop` selection, not a different default project.
+3. Obtain `scripts/prepare_nonroot_bind_mounts.py` from the v0.23.0 source at
+   commit `dbcd2ab31e9a46083693cf08802434ac8cfc1e43`. Replace the checkout path
+   below with that verified local checkout path. If the exact helper cannot be
+   obtained, stop; do not replace it with recursive ownership commands.
+   Set `app_uid` and `app_gid` explicitly to the effective `APP_UID` and
+   `APP_GID` of the selected non-root services. Shell variables do not
+   automatically read `.env`; do not assume defaults override configured IDs.
+4. Run a dry run against the deployment directory, then use `--apply` only if
+   the preflight succeeds and the path scope and identities are correct:
+
+   ```bash
+   sudo python3 /path/to/v0.23.0-checkout/scripts/prepare_nonroot_bind_mounts.py . --uid "${app_uid:?set the effective APP_UID}" --gid "${app_gid:?set the effective APP_GID}"
+   sudo python3 /path/to/v0.23.0-checkout/scripts/prepare_nonroot_bind_mounts.py . --uid "${app_uid:?set the effective APP_UID}" --gid "${app_gid:?set the effective APP_GID}" --apply
+   ```
+
+   The helper covers `data`, `history`, and `logs` recursively, the `config`
+   directory itself, and only `config/config.yaml`, `config/ssh`, and
+   `config/tls` beneath it. It excludes `config/backup-secrets` and other
+   unlisted config children. It sets directories to `0770` and files to
+   `0660` as well as their owner/group. A chown-only substitute is not equivalent.
+   Stop on a rejected symlink, stale artifact, unsupported platform or exceeded
+   bound; do not bypass the preflight. Use this only for the matching local
+   POSIX bind-mount layout, not custom paths or other storage backends.
+5. Restart only the previously active services with the same recorded Compose
+   project, environment, ordered files and profiles, using `up -d` and the
+   recorded service names. Check their health and state before resuming jobs.
+
+Rollback restores the previous `JBOD_UI_IMAGE` pin and every changed Compose
+file, using the same `--project-name`, `--env-file`, ordered `-f` and `--profile`
+selection for `pull` and `up -d` with the previous service names. This restores
+runtime selection, not data-format compatibility. If an older image cannot use
+the updated state, keep writers stopped and follow its recovery procedure with
+the private pre-upgrade backup. Do not delete history to make startup succeed.
+
+Do not use recursive `chmod 777`. If SSH fails to load `known_hosts`, verify
+that `data/known_hosts` is owned by the configured app UID/GID with mode `0660`.
 
 ## SCALE shows a generic runtime profile
 
@@ -189,6 +251,40 @@ Start or update it with:
 docker compose --profile history pull
 docker compose --profile history up -d
 ```
+
+## History says permission denied or readonly database
+
+`Permission denied: '/app/history/history.db'` or `attempt to write a readonly
+database` in the history log means the `history` folder or the database file
+is not writable by the user the container runs as. With the v0.23.0 Compose
+file that user is `APP_UID:APP_GID`. Give the folder to that user as described
+in
+[A non-root container gets permission denied](#a-non-root-container-gets-permission-denied),
+or use the root-compatible v0.22.2 Compose file. Do not use `chmod 777`.
+
+## History refuses to start after changing HISTORY_BIND_ADDRESS
+
+`Non-loopback history exposure requires refresh token mode.` in the history
+log means `HISTORY_BIND_ADDRESS` is no longer `127.0.0.1` but the token
+settings are missing. History listens off-loopback only with all of these in
+`.env`:
+
+```dotenv
+HISTORY_REFRESH_AUTH_MODE=token
+HISTORY_REFRESH_TOKEN=replace-with-a-long-private-value
+HISTORY_PUBLIC_ORIGIN=http://your-docker-host:8081
+```
+
+Use `HISTORY_REFRESH_TOKEN_FILE` with the secrets overlay instead of
+`HISTORY_REFRESH_TOKEN` when you keep the token in a file. Then recreate the
+history container:
+
+```bash
+docker compose --profile history up -d --force-recreate enclosure-history
+```
+
+To go back to localhost only, remove `HISTORY_BIND_ADDRESS` from `.env` and
+recreate the container the same way.
 
 ## The admin page is missing
 
