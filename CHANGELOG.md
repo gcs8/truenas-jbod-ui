@@ -36,6 +36,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Performance
 
+- Batched CORE SMART grid calls and rejected stale disk-identity results while
+  restoring fresh lookup after serial loss (#504).
 - Moved snapshot slot-detail persistence off the event loop with cancellation
   draining and stale-write guards, preserving timestamp-advancing saves (#499).
 - Batched SMART grid persistence off the event loop, fenced invalidated writes,
