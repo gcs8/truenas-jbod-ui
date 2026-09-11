@@ -191,7 +191,7 @@ test("first click arms with the explanation, second click runs exactly once and 
   assert.equal(h.buttons.multipath.dataset.armed, "true");
   assert.equal(h.buttons.full.textContent, "Full disk sync");
   assert.equal(h.hint.classList.contains("hidden"), false);
-  assert.match(h.hint.textContent, /disk\.multipath_sync/);
+  assert.match(h.hint.textContent, /rebuild its multipath table/);
   assert.match(h.hint.textContent, /Pools and data are not touched/);
   assert.equal(h.timers.length, 1);
   assert.equal(h.timers[0].ms, 6000);
@@ -212,7 +212,7 @@ test("arming the other mode re-arms instead of running", () => {
   h.fns.handleDiskInventorySyncClick("full");
   assert.equal(h.state.diskInventorySync.armedMode, "full");
   assert.deepEqual(h.runs, []);
-  assert.match(h.hint.textContent, /disk\.sync_all/);
+  assert.match(h.hint.textContent, /re-scan all of its disks/);
   assert.equal(h.buttons.multipath.textContent, "Sync multipath table");
   assert.equal(h.buttons.full.textContent, "Confirm sync");
 });
@@ -255,11 +255,11 @@ test("buttons are disabled with a title reason for SSH off, in-flight sync, and 
   const sshOff = harness({ platform: "core", sshEnabled: false });
   sshOff.fns.renderDiskInventorySyncControls();
   assert.equal(sshOff.buttons.full.disabled, true);
-  assert.match(sshOff.buttons.full.title, /SSH is disabled for this system/);
+  assert.match(sshOff.buttons.full.title, /SSH is off for this system/);
   sshOff.fns.handleDiskInventorySyncClick("full");
   assert.equal(sshOff.state.diskInventorySync.armedMode, null);
   assert.deepEqual(sshOff.runs, []);
-  assert.match(sshOff.statuses.at(-1).message, /SSH is disabled/);
+  assert.match(sshOff.statuses.at(-1).message, /SSH is off/);
 
   const busy = harness({ platform: "core" });
   busy.state.diskInventorySync.inFlight = true;
@@ -273,7 +273,7 @@ test("buttons are disabled with a title reason for SSH off, in-flight sync, and 
   assert.match(availability.reason, /only available on TrueNAS CORE/);
   scale.fns.renderDiskInventorySyncControls();
   assert.equal(scale.buttons.full.disabled, false);
-  assert.match(scale.buttons.full.title, /disk\.sync_all/);
+  assert.match(scale.buttons.full.title, /re-scan all of its disks/);
 });
 
 test("optional write-policy hooks disable the controls and click handler with the exact reason", () => {

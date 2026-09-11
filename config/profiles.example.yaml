@@ -2,7 +2,7 @@ profiles:
   - id: custom-lab-front-8
     label: Custom Lab Front 8
     eyebrow: Custom LAB / Front View
-    summary: Operator-defined front-drive layout loaded from profiles.yaml.
+    summary: Front of the chassis, 8 bays in 2 rows of 4.
     panel_title: Lab Front 8 Bay
     edge_label: Front of chassis
     face_style: front-drive

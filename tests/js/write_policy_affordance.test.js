@@ -614,7 +614,7 @@ test("a signed-in 403 state reports that writes remain blocked on both live page
     readUiAuthStatus: mainStatus,
   });
   main.renderReadUiAuth();
-  assert.match(mainStatus.textContent, /writes are blocked/i);
+  assert.match(mainStatus.textContent, /changes are blocked/i);
   assert.match(mainStatus.textContent, /Origin is not allowed/);
 
   const fabricStatus = node();

@@ -613,7 +613,7 @@ test("mapping import is disabled with a reason for the active virtual inventory"
 
   renderMappingImportControl();
 
-  assert.match(reason, /no identified physical enclosure/i);
+  assert.match(reason, /no physical enclosure/i);
   assert.equal(button.disabled, true);
   assert.equal(button.title, reason);
   assert.equal(reasonView.textContent, reason);
@@ -670,7 +670,8 @@ test("mapping import preview lists every exact scope and slot classification", (
   assert.match(message, /Update \(1\): enc-a slot 2.*serial: OLD → NEW/);
   assert.match(message, /Remove \(1\): enc-b slot 3.*serial=REMOVE/);
   assert.match(message, /Unchanged \(1\): default enclosure slot 4/);
-  assert.match(message, /rejected if the active mapping scope changes/i);
+  assert.match(message, /^Restore these bay assignments\?/);
+  assert.match(message, /inventory changes before you confirm/i);
 });
 
 test("mapping import previews and confirms the exact diff before rendering imported state", async () => {

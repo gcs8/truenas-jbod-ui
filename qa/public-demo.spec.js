@@ -113,10 +113,10 @@ test("public demo static artifact is explorable without a live backend", async (
   await expect(page.locator(".snapshot-banner-meta")).toContainText("7d");
   await expect(page.locator("#system-setup-button")).toHaveCount(0);
   await expect(page.locator("#export-snapshot-button")).toHaveCount(0);
-  await expect(selector.locator("option:checked")).toContainText("Snapshot · Demo 60-Bay Top Loader");
-  await expect(page.locator("#api-status-chip")).toHaveText("API AT CAPTURE");
-  await expect(page.locator("#ssh-status-chip")).toHaveText("SSH OFF AT CAPTURE");
-  await expect(page.locator("#history-status-chip")).toHaveText("HIST PRELOADED");
+  await expect(selector.locator("option:checked")).toContainText("Saved copy · Demo 60-Bay Top Loader");
+  await expect(page.locator("#api-status-chip")).toHaveText("TrueNAS API: OK at capture");
+  await expect(page.locator("#ssh-status-chip")).toHaveText("SSH: off at capture");
+  await expect(page.locator("#history-status-chip")).toHaveText("History: included");
   await expect(page.locator("#last-updated").locator("xpath=.." )).toContainText("Snapshot time");
   await expect(page.locator("#status-text")).toContainText("Frozen offline snapshot loaded");
 
@@ -124,13 +124,13 @@ test("public demo static artifact is explorable without a live backend", async (
   await page.locator("#sas-fabric-toggle-button").click();
   await expect(page.locator("#sas-fabric-panel")).toBeVisible();
   await expect(page.locator("#sas-fabric-status")).toContainText(
-    "This offline snapshot does not include Storage Fabric data or live refresh capability."
+    "This offline copy does not include the connection map."
   );
   await expect(page.locator("#sas-fabric-inspector-body")).toContainText(
-    "No Storage Fabric payload is included in this snapshot."
+    "This offline copy does not include the connection map."
   );
   await expect(page.locator("#sas-fabric-lanes")).toContainText(
-    "No Storage Fabric payload is included in this snapshot."
+    "This offline copy does not include the connection map."
   );
   await expect(page.locator("#sas-fabric-lanes")).not.toContainText("yet");
 
@@ -143,7 +143,7 @@ test("public demo static artifact is explorable without a live backend", async (
   await expect(page.locator("#detail-kv-grid")).toContainText("Demo Flash SSD 4TB");
   await expect(page.locator("#detail-kv-grid")).toContainText("DEMO-SN-CORE-0057");
   await expect(page.locator("#detail-kv-grid")).toContainText("mirror-8");
-  await expect(page.locator("#multipath-context")).toContainText("at capture");
+  await expect(page.locator("#multipath-context")).toContainText("when the copy was saved");
   await expect(page.locator("#multipath-context")).not.toContainText("currently");
   await page.locator("#history-toggle-button").click();
   await expect(page.locator("#history-metric-grid")).toContainText("Temperature");
@@ -484,7 +484,7 @@ test("enclosure selector keeps its quoted option, focus, and node across a norma
     sameOption: true,
     selected: true,
     value: "enclosure:synthetic-enclosure",
-    text: 'Snapshot · Synthetic "Enclosure"',
+    text: 'Saved copy · Synthetic "Enclosure"',
   });
   expect(consoleErrors).toEqual([]);
   expect(pageErrors).toEqual([]);

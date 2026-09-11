@@ -69,15 +69,15 @@ test("snapshot SSH status preserves disabled, success, and captured failure stat
 
   assert.deepEqual(
     { ...snapshotSshStatus({ enabled: false, ok: true }) },
-    { className: "status-chip snapshot", textContent: "SSH OFF AT CAPTURE" },
+    { className: "status-chip snapshot", textContent: "SSH: off at capture" },
   );
   assert.deepEqual(
     { ...snapshotSshStatus({ enabled: true, ok: true }) },
-    { className: "status-chip snapshot", textContent: "SSH AT CAPTURE" },
+    { className: "status-chip snapshot", textContent: "SSH: OK at capture" },
   );
   assert.deepEqual(
     { ...snapshotSshStatus({ enabled: true, ok: false }) },
-    { className: "status-chip error", textContent: "SSH ERROR AT CAPTURE" },
+    { className: "status-chip error", textContent: "SSH: error at capture" },
   );
 });
 

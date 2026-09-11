@@ -2,14 +2,14 @@
 
 This record covers the two desktop fixture screenshots generated from `public-demo/index.html`. The capture script used `file://`, UTC, fixed desktop viewports, reduced motion, and no network request.
 
-Source revision: `dbcd2ab31e9a46083693cf08802434ac8cfc1e43`
+Source revision: `1f5769c0364a3cd7bb1ec3cf7d711b78278c6f1a`
 
-Source artifact SHA-256: `47df69547071bbff77b25c15b6f56bf96d14f366149781c6714213263813c8eb`
+Source artifact SHA-256: `d495e4f84e0de139daca1889656f0ae07f46da8f8f9f1574f85850356f1c7609`
 
 | Image | Dimensions | Bytes | SHA-256 | Pixel review |
 |---|---:|---:|---|---|
-| `public-demo-overview.png` | 1920 by 4104 | 1123548 | `3664d12cb3780a378edc26b64bbaea8c4d079604f6dde42c7cad39f9878950ac` | PASS |
-| `public-demo-history.png` | 1920 by 4860 | 1253949 | `cc6385e729437d41c6aca2cc3e56154a756aa741f76fc730c9b27b85f130ee24` | PASS |
+| `public-demo-overview.png` | 1920 by 4216 | 971585 | `22f475ba55d820e927e3b8f0a13d92e06d51f70c0d34c85b435dee5ab310faf8` | PASS |
+| `public-demo-history.png` | 1920 by 4994 | 1090033 | `865f60826c850e00afb4ad9e4a7d8ce6f25a846651943643d193ac0672f96a9c` | PASS |
 
 The exact pixels were checked for private addresses, hostnames, paths, credentials, key material, and non-demo device identifiers. The review also covered snapshot/live wording, selector clipping, panel overlap, page overflow, canvas-edge artifacts, count grammar, and the consistency of current, history, rate, power-on, and annualized values.
 
