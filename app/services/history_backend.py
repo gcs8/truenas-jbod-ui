@@ -435,9 +435,9 @@ class HistoryBackendClient:
         try:
             payload = json.loads(payload_bytes)
         except json.JSONDecodeError as exc:
-            raise HistoryBackendResponseError("History backend returned invalid JSON.") from exc
+            raise HistoryBackendResponseError(0, "History backend returned invalid JSON.") from exc
         if not isinstance(payload, dict):
-            raise HistoryBackendResponseError("History backend returned a non-object JSON payload.")
+            raise HistoryBackendResponseError(0, "History backend returned a non-object JSON payload.")
         return payload
 
     def _request_bytes_sync(
