@@ -2733,8 +2733,17 @@
     writePolicyNotice.classList.remove("hidden");
   }
 
+  // The configured public origin comes from the bootstrap and from inventory
+  // refreshes; sign-in, sign-out and 401 handling send policies that do not
+  // carry it. Keep the last known origin so wrong-origin guidance can still
+  // name the address to open. A payload that does carry one wins.
   function applyWritePolicy(policy) {
-    state.writePolicy = normalizeWritePolicy(policy);
+    const retainedOrigin = state.writePolicy?.publicOrigin || "";
+    const nextPolicy = normalizeWritePolicy(policy);
+    if (!nextPolicy.publicOrigin) {
+      nextPolicy.publicOrigin = retainedOrigin;
+    }
+    state.writePolicy = nextPolicy;
     renderWritePolicyNotice();
     syncWritePolicyControls();
     renderReadUiAuth();
