@@ -39,8 +39,23 @@ shortcut. Do not assume unmerged helper changes are present in released source.
 
 ## History
 
-Nothing to do. The history service upgrades its database on first start with
-the new image.
+For a normal upgrade there is nothing to do: the history service upgrades its
+database on first start with the new image, and the upgrade is resumable if the
+container restarts part-way through.
+
+Two cases need attention before you rely on the data:
+
+- If the history container refuses to start and its log names a pending
+  recovery marker, an earlier rotation or restore did not finish. Follow
+  [[History Maintenance and Recovery|History-Maintenance-and-Recovery]] with
+  your pre-upgrade backup instead of deleting files.
+- If the log says the existing database was unreadable and was moved aside,
+  the service starts empty. The original file is kept next to it; recover it
+  from the same page before collection overwrites your history.
+
+These steps keep the upgrade moving. They do not establish that every older
+schema is accepted by every newer image; that qualification is tracked
+separately in #416 and #417.
 
 Segmented history is an advanced opt-in. Ignore the segmented-history pages
 and tools unless you set `HISTORY_SEGMENT_CATALOG_PATH` yourself.
