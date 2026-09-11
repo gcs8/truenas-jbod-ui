@@ -173,3 +173,19 @@ button:disabled {
 .tracked-scopes-section {
   margin-top: 24px;
 }
+
+.status-list {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 6px 18px;
+  margin: 0;
+}
+
+.status-list dt {
+  color: var(--muted);
+}
+
+.status-list dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}

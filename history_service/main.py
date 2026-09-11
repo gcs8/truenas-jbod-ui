@@ -22,7 +22,11 @@ from app.metrics import install_metrics
 from app.script_json import register_script_json_filters
 from app.services.history_status import project_public_collector_status
 from app.services.release_status import ReleaseStatusService
-from history_service.collector import HistoryCollectionAlreadyRunning, HistoryCollector
+from history_service.collector import (
+    HistoryCollectionAlreadyRunning,
+    HistoryCollector,
+    source_error_sentence,
+)
 from history_service.config import HistorySettings, get_history_settings
 from history_service.operation_bounds import (
     HISTORY_READ_BUSY_DETAIL,
@@ -79,6 +83,10 @@ bulk_history_read_admission = BulkHistoryReadAdmission(
 )
 bulk_history_read_operations: set[asyncio.Task[tuple[list[dict[str, object]], int]]] = set()
 HISTORY_COLLECTOR_ERROR_DETAIL = "History collector error; see service logs."
+# Per-system event and sample counts are a correlated COUNT(*) per row. They are
+# cheap while the database is small, so the dashboard shows them up to this many
+# tracked rows and shows a dash above it instead of a misleading placeholder.
+SCOPE_ACTIVITY_COUNT_ROW_LIMIT = 250_000
 SLOT_HISTORY_METRIC_LIMITS: dict[str, int] = {
     "temperature_c": 96,
     "bytes_read": 60,
@@ -265,12 +273,24 @@ def _history_read_busy_response() -> JSONResponse:
 def public_collector_status(
     status: object,
     *,
-    last_error_detail: str = HISTORY_COLLECTOR_ERROR_DETAIL,
+    last_error_detail: str | None = None,
 ) -> dict[str, object]:
-    return project_public_collector_status(
-        status,
-        last_error_detail=last_error_detail,
-    )
+    """Project the internal status to its public shape.
+
+    The collector's last error becomes one fixed sentence chosen by its kind
+    (``last_error_detail`` overrides that), and ``collector_starting`` rides along
+    so the page can say "Starting" during the startup grace period.
+    """
+
+    if not isinstance(status, dict):
+        return {}
+    detail = last_error_detail
+    if detail is None:
+        detail = source_error_sentence(status, fallback=HISTORY_COLLECTOR_ERROR_DETAIL)
+    projected = project_public_collector_status(status, last_error_detail=detail)
+    if "collector_starting" in status:
+        projected["collector_starting"] = bool(status["collector_starting"])
+    return projected
 
 
 def safe_http_url(value: object) -> str:
@@ -313,14 +333,33 @@ app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="stat
 install_metrics(app, service_name="enclosure-history", version=__version__)
 
 
+def scope_activity_counts_affordable(counts: dict[str, object]) -> bool:
+    total = 0
+    for key in ("event_count", "metric_sample_count", "metric_rollup_count"):
+        value = counts.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            total += value
+    return total <= SCOPE_ACTIVITY_COUNT_ROW_LIMIT
+
+
+async def _load_counts_and_scopes(
+    exact_counts: bool,
+) -> tuple[dict[str, object], list[dict[str, object]]]:
+    counts = cast(
+        dict[str, object],
+        await asyncio.to_thread(store.counts if exact_counts else store.tracked_counts),
+    )
+    scopes = await asyncio.to_thread(
+        store.list_scopes,
+        include_activity_counts=exact_counts or scope_activity_counts_affordable(counts),
+    )
+    return counts, scopes
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request, exact_counts: bool = Query(default=False)) -> HTMLResponse:
     status = public_collector_status(collector.status())
-    counts = cast(
-        dict[str, object],
-        await asyncio.to_thread(store.counts if exact_counts else store.estimated_counts),
-    )
-    scopes = await asyncio.to_thread(store.list_scopes, include_activity_counts=exact_counts)
+    counts, scopes = await _load_counts_and_scopes(exact_counts)
     database_size_bytes = await asyncio.to_thread(store.database_size_bytes)
     return templates.TemplateResponse(
         request,
@@ -339,12 +378,19 @@ async def index(request: Request, exact_counts: bool = Query(default=False)) -> 
 
 @app.get("/healthz")
 async def healthz() -> JSONResponse:
-    collector_status = public_collector_status(collector.status())
+    """Report ``ok`` or ``degraded``; the process is up either way, so always 200.
+
+    ``degraded`` means the last background collection failed, the history
+    database is read-only, or cleanup failed twice in a row. A failed manual
+    refresh on its own does not count, and ``detail`` says which it was.
+    """
+
+    degraded_reason = collector.degraded_reason()
     payload = {
-        "status": "ok" if not collector.last_error else "degraded",
-        "collector": collector_status,
+        "status": "degraded" if degraded_reason else "ok",
+        "detail": degraded_reason,
+        "collector": public_collector_status(collector.status()),
         "database_size_bytes": await asyncio.to_thread(store.database_size_bytes),
-        **collector_status,
     }
     return JSONResponse(payload, status_code=200)
 
@@ -362,15 +408,14 @@ async def livez() -> JSONResponse:
 
 @app.get("/api/history/overview")
 async def overview(exact_counts: bool = Query(default=False)) -> dict[str, object]:
-    counts = await asyncio.to_thread(store.counts if exact_counts else store.estimated_counts)
+    counts, scopes = await _load_counts_and_scopes(exact_counts)
     return {
         "collector": public_collector_status(collector.status()),
         "counts": counts,
-        "counts_exact": exact_counts or counts.get("estimated") is False,
         "database": {
             "size_bytes": await asyncio.to_thread(store.database_size_bytes),
         },
-        "scopes": await asyncio.to_thread(store.list_scopes, include_activity_counts=exact_counts),
+        "scopes": scopes,
     }
 
 
@@ -389,21 +434,17 @@ async def refresh_history(request: Request) -> dict[str, object] | JSONResponse:
         )
     admission = await refresh_admission.try_acquire(normalized_mode)
     if not admission.accepted:
-        detail = (
-            "History full refresh is cooling down."
-            if admission.status_code == 429
-            else "History refresh already running."
-        )
-        headers = (
-            {"Retry-After": str(admission.retry_after)}
-            if admission.retry_after is not None
-            else None
-        )
-        return JSONResponse(
-            {"ok": False, "mode": normalized_mode, "detail": detail},
-            status_code=admission.status_code or 409,
-            headers=headers,
-        )
+        body: dict[str, object] = {"ok": False, "mode": normalized_mode}
+        headers = None
+        if admission.status_code == 429 and admission.retry_after is not None:
+            body["detail"] = (
+                f"A full refresh ran recently. Try again in {plain_wait_label(admission.retry_after)}."
+            )
+            body["retry_after_seconds"] = admission.retry_after
+            headers = {"Retry-After": str(admission.retry_after)}
+        else:
+            body["detail"] = "History refresh already running."
+        return JSONResponse(body, status_code=admission.status_code or 409, headers=headers)
     try:
         await collector.run_once(
             force_fast=True,
@@ -420,25 +461,19 @@ async def refresh_history(request: Request) -> dict[str, object] | JSONResponse:
             },
             status_code=409,
         )
-    except Exception:  # noqa: BLE001 - report manual collection failures as structured API errors.
+    except Exception as exc:  # noqa: BLE001 - report manual collection failures as structured API errors.
         logger.exception("Manual history %s refresh failed", normalized_mode)
         failure_detail = f"History {normalized_mode} refresh failed; see service logs."
-        collector.last_error = failure_detail
+        # The status page and /healthz get the typed cause on their next poll; this
+        # reply keeps naming the refresh itself so its collector.last_error matches
+        # detail, which the dashboard uses to tell a real failure from a lost reply.
+        collector.record_last_error(exc)
         try:
             payload = await overview(exact_counts=False)
-            collector_payload = payload.get("collector")
-            payload["collector"] = public_collector_status(
-                collector_payload if isinstance(collector_payload, dict) else {},
-                last_error_detail=failure_detail,
-            )
         except Exception:  # noqa: BLE001 - keep the original refresh failure visible even if summary loading also fails.
             logger.exception("Manual history %s refresh failed while loading summary payload", normalized_mode)
-            payload = {
-                "collector": public_collector_status(collector.status(), last_error_detail=failure_detail),
-                "counts": {},
-                "counts_exact": False,
-                "scopes": [],
-            }
+            payload = {"counts": {}, "scopes": []}
+        payload["collector"] = public_collector_status(collector.status(), last_error_detail=failure_detail)
         return JSONResponse(
             {
                 "ok": False,
@@ -607,11 +642,25 @@ async def scopes_history_bundle(request: Request) -> JSONResponse:
     return bounded_history_json_response({"scopes": scope_payloads, "budget": budget})
 
 
-def format_count(value: object, *, estimated: bool = False) -> str:
+NOT_COUNTED_LABEL = "—"
+NOT_COUNTED_TITLE = "Not counted, to keep this page quick on a large history"
+
+
+def format_count(value: object) -> str:
     if value is None:
-        return "deferred"
-    prefix = "~" if estimated else ""
-    return f"{prefix}{value}"
+        return NOT_COUNTED_LABEL
+    return str(value)
+
+
+def plain_wait_label(seconds: object) -> str:
+    total = int(math.ceil(_duration_seconds(seconds)))
+    if total < 60:
+        return f"{max(1, total)} s"
+    minutes = int(math.ceil(total / 60))
+    if minutes < 60:
+        return f"{minutes} min"
+    hours, remainder = divmod(minutes, 60)
+    return f"{hours} h" if remainder == 0 else f"{hours} h {remainder} min"
 
 
 def format_bytes(value: int) -> str:
@@ -647,7 +696,7 @@ def format_duration(value: object) -> str:
 
 
 def dashboard_activity_labels(status: dict[str, object]) -> tuple[str, str]:
-    current_collection = "not running"
+    current_collection = "no"
     if status.get("collection_running"):
         collection_kind = str(status.get("collection_kind") or "background")
         collection_duration = format_duration(status.get("collection_elapsed_seconds"))
@@ -665,8 +714,7 @@ def dashboard_activity_labels(status: dict[str, object]) -> tuple[str, str]:
     if _duration_seconds(backoff_seconds) > 0:
         return (
             current_collection,
-            "History background collection is backed off for "
-            f"{format_duration(backoff_seconds)} after repeated failures.",
+            f"History collection paused for {format_duration(backoff_seconds)} after repeated failures.",
         )
     return current_collection, ""
 
@@ -674,15 +722,40 @@ def dashboard_activity_labels(status: dict[str, object]) -> tuple[str, str]:
 def collection_duration_label(value: object) -> str:
     if isinstance(value, (int, float)):
         return f"{float(value):.1f}s"
-    return "not recorded"
+    return NOT_COUNTED_LABEL
+
+
+def overrun_label(value: object) -> str:
+    if isinstance(value, (int, float)) and float(value) > 0:
+        return f"{float(value):.1f}s"
+    return "no"
 
 
 def collection_inventory_label(value: object) -> str:
     if value is True:
-        return "forced"
+        return "fresh inventory"
     if value is False:
-        return "cached"
-    return "not recorded"
+        return "cached inventory"
+    return NOT_COUNTED_LABEL
+
+
+def retry_label(status: dict[str, object]) -> str:
+    failures = status.get("background_consecutive_failures")
+    failure_count = failures if isinstance(failures, int) and not isinstance(failures, bool) else 0
+    streak = ""
+    if failure_count > 0:
+        noun = "failure" if failure_count == 1 else "failures"
+        streak = f" ({failure_count} {noun} so far)"
+    remaining = _duration_seconds(status.get("background_backoff_seconds_remaining"))
+    if remaining > 0:
+        return f"in {format_duration(remaining)}{streak}"
+    return f"now{streak}" if failure_count > 0 else "no"
+
+
+def collector_state_label(status: dict[str, object]) -> str:
+    if not status.get("collector_running"):
+        return "Stopped"
+    return "Starting" if status.get("collector_starting") else "Running"
 
 
 def build_dashboard_context(
@@ -695,9 +768,7 @@ def build_dashboard_context(
     release_status: dict[str, object] | None = None,
     database_size_bytes: int = 0,
 ) -> dict[str, object]:
-    counts_are_estimated = bool(counts.get("estimated"))
     release_payload = release_status or {}
-    backoff_seconds = int(status.get("background_backoff_seconds_remaining") or 0)
     current_collection_label, collector_banner_text = dashboard_activity_labels(status)
     return {
         "request": request,
@@ -706,20 +777,19 @@ def build_dashboard_context(
         "status": status,
         "counts": counts,
         "scopes": scopes,
-        "counts_are_estimated": counts_are_estimated,
         "database_size_label": format_bytes(database_size_bytes),
         "release_summary": str(release_payload.get("summary") or "Checking releases..."),
         "latest_url": safe_http_url(release_payload.get("latest_url")),
-        "backoff_label": f"{backoff_seconds}s remaining" if backoff_seconds > 0 else "inactive",
+        "collector_state_label": collector_state_label(status),
+        "retry_label": retry_label(status),
         "current_collection_label": current_collection_label,
         "collector_banner_text": collector_banner_text,
         "direct_refresh_enabled": settings.refresh_auth_mode == "network",
+        "full_refresh_cooldown_label": plain_wait_label(settings.full_refresh_cooldown_seconds),
         "last_collection_duration_label": collection_duration_label(
             status.get("last_collection_duration_seconds")
         ),
-        "last_background_overrun_label": collection_duration_label(
-            status.get("last_background_overrun_seconds")
-        ),
+        "last_background_overrun_label": overrun_label(status.get("last_background_overrun_seconds")),
         "last_retention_duration_label": collection_duration_label(
             status.get("last_retention_duration_seconds")
         ),
@@ -727,5 +797,6 @@ def build_dashboard_context(
             status.get("last_collection_inventory_forced")
         ),
         "format_count": format_count,
+        "not_counted_title": NOT_COUNTED_TITLE,
         "status_json": json.dumps(status),
     }

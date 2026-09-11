@@ -26,6 +26,17 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Fixed
+
+- The history dashboard now says what went wrong in plain words: one fixed
+  sentence per cause for the last collector error, plain cleanup failure
+  reasons, a defined `/healthz` degraded state with a `detail`, a cooldown
+  reply that names the wait with a countdown on the Full button, per-system
+  counts instead of the word "deferred", local-time timestamps and a
+  "Starting" collector state. (#492)
+
 ## v0.23.0 - 2026-09-08
 
 This release includes every pull request merged after `v0.22.2` through the

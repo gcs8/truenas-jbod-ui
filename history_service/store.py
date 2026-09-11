@@ -2417,14 +2417,12 @@ class HistoryStore:
             "metric_rollup_count": metric_rollup_count,
         }
 
-    def estimated_counts(self) -> dict[str, Any]:
+    def tracked_counts(self) -> dict[str, int]:
+        """Exact row counts kept current by triggers, so they cost one small read."""
+
         segmented_reader = self._segmented_reader()
         if segmented_reader is not None:
-            return {
-                **segmented_reader.counts(),
-                "estimated": False,
-                "count_mode": "segmented-exact",
-            }
+            return segmented_reader.counts()
         with closing(self._connect()) as connection:
             tracked_slots = int(connection.execute("SELECT COUNT(*) FROM slot_state_current").fetchone()[0])
             tracked_counts = {
@@ -2438,8 +2436,6 @@ class HistoryStore:
             "event_count": tracked_counts.get("slot_events", 0),
             "metric_sample_count": tracked_counts.get("metric_samples", 0),
             "metric_rollup_count": tracked_counts.get("metric_rollups", 0),
-            "estimated": False,
-            "count_mode": "tracked",
         }
 
     def list_history_system_summaries(

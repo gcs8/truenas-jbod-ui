@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import io
 import json
 import os
 import re
@@ -11,7 +12,9 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 from contextlib import ExitStack, contextmanager
+from html.parser import HTMLParser
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -22,6 +25,7 @@ from starlette.requests import Request
 
 from app.request_context import request_context
 from app.services.history_status import PUBLIC_COLLECTOR_STATUS_FIELDS
+from history_service import collector as history_collector_module
 from history_service import main as history_main
 from history_service import migration_lock
 from history_service import store as history_store
@@ -37,6 +41,48 @@ from history_service.migration_lock import history_lock_path, history_write_lock
 from history_service.segment_catalog import MIGRATION_PENDING_MARKER, activation_pending_path
 from history_service.segment_reader import SegmentedHistoryReader
 from history_service.store import DISK_IDENTITY_BACKFILL_USER_VERSION, HistoryStore, SlotStateUpdate
+
+
+
+
+class _VisibleTextExtractor(HTMLParser):
+    """Collect the text a reader sees, skipping script and style content."""
+
+    _SKIP_TAGS = frozenset({"script", "style"})
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._skip_depth = 0
+        self._chunks: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in self._SKIP_TAGS:
+            self._skip_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self._SKIP_TAGS and self._skip_depth:
+            self._skip_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if not self._skip_depth:
+            self._chunks.append(data)
+
+    def visible_text(self) -> str:
+        return " ".join(self._chunks)
+
+
+def visible_text_of(markup: str) -> str:
+    """Return reader-visible text from rendered markup.
+
+    A real parser rather than tag-shaped regexes: an attribute value containing
+    ">" and a closing tag written as "</script >" both defeat a regex strip and
+    would leak script text into the copy assertions as a false failure.
+    """
+
+    parser = _VisibleTextExtractor()
+    parser.feed(markup)
+    parser.close()
+    return parser.visible_text()
 
 
 @contextmanager
@@ -477,7 +523,7 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         route = next(route for route in history_main.app.routes if route.path == "/")
         with (
             patch.object(history_main.collector, "status", return_value=status),
-            patch.object(history_main.store, "estimated_counts", return_value=counts),
+            patch.object(history_main.store, "tracked_counts", return_value=counts),
             patch.object(history_main.store, "list_scopes", return_value=scopes),
             patch.object(history_main.store, "database_size_bytes", return_value=database_size_bytes),
             patch.object(
@@ -524,7 +570,7 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         }
         patches = (
             patch.object(history_main.collector, "status", return_value=status),
-            patch.object(history_main.store, "estimated_counts", return_value={"tracked_slots": 0}),
+            patch.object(history_main.store, "tracked_counts", return_value={"tracked_slots": 0}),
             patch.object(history_main.store, "list_scopes", return_value=[]),
             patch.object(history_main.store, "database_size_bytes", return_value=4096),
         )
@@ -548,10 +594,7 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         self.assertEqual(json.loads(match.group(1)), expected)
         health_payload = json.loads(health.body)
         self.assertEqual(health_payload["collector"], expected)
-        self.assertEqual(
-            set(health_payload),
-            {"status", "collector", "database_size_bytes", *expected},
-        )
+        self.assertEqual(set(health_payload), {"status", "detail", "collector", "database_size_bytes"})
         self.assertEqual(overview["collector"], expected)
         for serialized in (dashboard_bytes, health.body, json.dumps(overview).encode()):
             self.assertNotIn(b"status-leak-ZXQ9", serialized)
@@ -604,20 +647,31 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         self.assertIn('body: JSON.stringify({ mode })', script_source)
         self.assertIn("const body = await response.text();", script_source)
         self.assertIn("JSON.parse(body)", script_source)
-        self.assertIn("Next background pass", markup)
-        self.assertIn("Background backoff", markup)
-        self.assertIn("Last collection duration", markup)
-        self.assertIn("Last schedule overrun", markup)
-        self.assertIn('id="status-last-background-overrun"', markup)
-        self.assertIn("Last retention pass", markup)
+        self.assertIn(">Quick refresh<", markup)
+        self.assertIn(">Full refresh<", markup)
+        self.assertIn("Allowed once every 15 min.", markup)
+        self.assertIn('<dl class="status-list">', markup)
+        self.assertIn("<dt>Next scan</dt>", markup)
+        self.assertIn("<dt>Retrying after errors</dt>", markup)
+        self.assertIn('id="status-background-retry">no<', markup)
+        self.assertIn("<dt>Last collection took</dt>", markup)
+        self.assertIn("<dt>Ran late by</dt>", markup)
+        self.assertIn('id="status-last-background-overrun">no<', markup)
+        self.assertIn("<dt>Last cleanup</dt>", markup)
         self.assertIn('id="status-last-retention-at"', markup)
-        self.assertIn("Last retention rows removed", markup)
+        self.assertIn("<dt>Rows removed</dt>", markup)
         self.assertIn('id="status-last-retention-rows-removed"', markup)
-        self.assertIn("Last retention failure", markup)
+        self.assertIn("<dt>Cleanup error</dt>", markup)
         self.assertIn('id="status-last-retention-error"', markup)
-        self.assertIn("Last collection inventory", markup)
-        self.assertIn("DB Size", markup)
+        self.assertIn("<dt>Last scan used</dt>", markup)
+        self.assertIn("Database size", markup)
         self.assertIn("collector-activity-banner", markup)
+        visible_markup = visible_text_of(markup).lower()
+        for engineering_word in ("sidecar", "rollup", "scope", "overrun", "deferred", "backed off"):
+            with self.subTest(word=engineering_word):
+                self.assertNotIn(engineering_word, visible_markup)
+        for js_string in ('"deferred"', "backed off", "Background backoff"):
+            self.assertNotIn(js_string, script_source)
         self.assertIn("pollCollectorStatus", script_source)
         self.assertIn("pollOverviewStatus", script_source)
         self.assertIn("__HISTORY_DASHBOARD_POLL", script_source)
@@ -640,7 +694,7 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         self.assertNotIn('id="history-refresh-fast"', markup)
         self.assertNotIn('id="history-refresh-full"', markup)
         self.assertNotIn("synthetic-token", markup)
-        self.assertIn("authenticated main UI", markup)
+        self.assertIn("Refresh from the History drawer in the main UI", markup)
 
     def test_dashboard_omits_release_link_for_non_http_urls(self) -> None:
         markup = self._render_dashboard(
@@ -691,6 +745,7 @@ class HistoryDashboardRouteTests(unittest.TestCase):
             {
                 "collector_running": True,
                 "collection_running": False,
+                "background_consecutive_failures": 3,
                 "background_backoff_seconds_remaining": 125,
             },
             {"tracked_slots": 0, "event_count": 0, "metric_sample_count": 0},
@@ -699,10 +754,57 @@ class HistoryDashboardRouteTests(unittest.TestCase):
 
         self.assertRegex(
             markup,
-            r'id="collector-activity-banner"[^>]*>\s*History background collection is backed off for 2m 5s '
+            r'id="collector-activity-banner"[^>]*>\s*History collection paused for 2m 5s '
             r'after repeated failures\.',
         )
-        self.assertRegex(markup, r'id="status-current-collection">\s*not running')
+        self.assertRegex(markup, r'id="status-current-collection">\s*no<')
+        self.assertIn('id="status-background-retry">in 2m 5s (3 failures so far)<', markup)
+
+    def test_dashboard_reports_starting_collector_and_plain_error_sentences(self) -> None:
+        markup = self._render_dashboard(
+            {
+                "collector_running": True,
+                "collector_starting": True,
+                "last_error": "GET http://enclosure-ui:8000/api/inventory failed: [Errno 111] refused",
+                "last_error_kind": "unreachable",
+                "last_retention_error": "the history database is read-only",
+                "last_collection_inventory_forced": False,
+                "last_background_overrun_seconds": 0.0,
+                "next_collection_at": "2026-09-09T12:00:00+00:00",
+            },
+            {"tracked_slots": 0, "event_count": 0, "metric_sample_count": 0},
+            [],
+        )
+
+        self.assertRegex(markup, r'id="collector-state-value"[^>]*>\s*Starting')
+        self.assertIn('id="status-last-error">Could not reach the main UI. Is it running?<', markup)
+        self.assertIn('id="status-last-retention-error">the history database is read-only<', markup)
+        self.assertIn('id="status-last-collection-inventory">cached inventory<', markup)
+        self.assertIn(
+            'id="status-next-collection-at" data-timestamp="2026-09-09T12:00:00+00:00">2026-09-09T12:00:00+00:00<',
+            markup,
+        )
+        self.assertNotIn("enclosure-ui", markup)
+        self.assertNotIn("Errno", markup)
+
+    def test_dashboard_never_renders_deferred_for_uncounted_scope_columns(self) -> None:
+        markup = self._render_dashboard(
+            {"collector_running": True},
+            {"tracked_slots": 1, "event_count": 0, "metric_sample_count": 0},
+            [
+                {
+                    "system_label": "Lab NAS",
+                    "enclosure_label": "Shelf 1",
+                    "tracked_slots": 1,
+                    "event_count": None,
+                    "metric_sample_count": None,
+                    "last_seen_at": "2026-09-01T00:00:00+00:00",
+                }
+            ],
+        )
+
+        self.assertNotIn("deferred", markup)
+        self.assertEqual(markup.count(f'title="{history_main.NOT_COUNTED_TITLE}">—</td>'), 2)
 
     def test_dashboard_bootstrap_is_script_safe_and_round_trips(self) -> None:
         hostile_text = "</script><script>alert('&')</script>" + chr(0x2028) + chr(0x2029)
@@ -715,7 +817,6 @@ class HistoryDashboardRouteTests(unittest.TestCase):
             "tracked_slots": 1,
             "event_count": 2,
             "metric_sample_count": 3,
-            "estimated": True,
         }
         scopes = [
             {
@@ -762,20 +863,105 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         self.assertIn('href="http://testserver/history/static/dashboard.css"', markup)
         self.assertIn('src="http://testserver/history/static/dashboard.js"', markup)
 
-    def test_overview_marks_trigger_tracked_counts_as_exact(self) -> None:
-        with (
-            patch.object(history_main.collector, "status", return_value={}),
-            patch.object(
-                history_main.store,
-                "estimated_counts",
-                return_value={"tracked_slots": 1, "estimated": False, "count_mode": "tracked"},
+    def test_overview_counts_per_system_activity_only_while_the_history_is_small(self) -> None:
+        cases = (
+            ({"tracked_slots": 1, "event_count": 10, "metric_sample_count": 20, "metric_rollup_count": 5}, True),
+            (
+                {
+                    "tracked_slots": 1,
+                    "event_count": 0,
+                    "metric_sample_count": history_main.SCOPE_ACTIVITY_COUNT_ROW_LIMIT + 1,
+                    "metric_rollup_count": 0,
+                },
+                False,
             ),
+        )
+        for counts, expected_activity_counts in cases:
+            with (
+                self.subTest(expected_activity_counts=expected_activity_counts),
+                patch.object(history_main.collector, "status", return_value={}),
+                patch.object(history_main.store, "tracked_counts", return_value=counts),
+                patch.object(history_main.store, "list_scopes", return_value=[]) as list_scopes,
+                patch.object(history_main.store, "database_size_bytes", return_value=0),
+            ):
+                payload = asyncio.run(history_main.overview(exact_counts=False))
+
+                list_scopes.assert_called_once_with(include_activity_counts=expected_activity_counts)
+                self.assertEqual(payload["counts"], counts)
+                self.assertNotIn("counts_exact", payload)
+
+    def test_healthz_degraded_means_background_failure_or_broken_cleanup(self) -> None:
+        collector = HistoryCollector(HistorySettings(), MagicMock())
+
+        def health() -> dict[str, object]:
+            with (
+                patch.object(history_main, "collector", collector),
+                patch.object(history_main.store, "database_size_bytes", return_value=0),
+            ):
+                return json.loads(asyncio.run(history_main.healthz()).body)
+
+        self.assertEqual(health()["status"], "ok")
+
+        collector.record_last_error(RuntimeError("manual refresh failed"))
+        payload = health()
+        self.assertEqual(payload["status"], "ok")
+        self.assertIsNone(payload["detail"])
+        self.assertEqual(set(payload), {"status", "detail", "collector", "database_size_bytes"})
+
+        collector._record_background_failure(datetime(2026, 9, 9, tzinfo=timezone.utc))
+        payload = health()
+        self.assertEqual(payload["status"], "degraded")
+        self.assertEqual(payload["detail"], "The last background collection failed.")
+
+        collector._clear_background_failure_backoff()
+        collector._record_retention_failure(RuntimeError("database or disk is full"))
+        self.assertEqual(health()["status"], "ok")
+        collector._record_retention_failure(RuntimeError("database or disk is full"))
+        payload = health()
+        self.assertEqual(payload["status"], "degraded")
+        self.assertEqual(payload["detail"], "History cleanup has failed twice in a row.")
+
+        collector._clear_retention_failure()
+        collector._record_retention_failure(sqlite3.OperationalError("attempt to write a readonly database"))
+        payload = health()
+        self.assertEqual(payload["status"], "degraded")
+        self.assertEqual(payload["detail"], "The history database is read-only.")
+
+    def test_history_refresh_cooldown_reply_names_the_wait(self) -> None:
+        route = next(route for route in history_main.app.routes if route.path == "/api/history/refresh")
+        admission = history_main.ManualRefreshAdmission(cooldown_seconds=900, monotonic=MagicMock(return_value=1000.0))
+
+        with (
+            patch.object(history_main, "refresh_admission", admission),
+            patch.object(type(history_main.collector), "collection_running", new_callable=PropertyMock, return_value=False),
+            patch.object(history_main.collector, "run_once", new_callable=AsyncMock),
+            patch.object(history_main.collector, "status", return_value={"collector_running": True}),
+            patch.object(history_main.store, "tracked_counts", return_value={"tracked_slots": 0}),
             patch.object(history_main.store, "list_scopes", return_value=[]),
             patch.object(history_main.store, "database_size_bytes", return_value=0),
         ):
-            payload = asyncio.run(history_main.overview(exact_counts=False))
+            asyncio.run(route.endpoint(request=self._refresh_request("full")))
+            cooled = asyncio.run(route.endpoint(request=self._refresh_request("full")))
 
-        self.assertTrue(payload["counts_exact"])
+        self.assertEqual(cooled.status_code, 429)
+        self.assertEqual(cooled.headers["Retry-After"], "900")
+        self.assertEqual(
+            json.loads(cooled.body),
+            {
+                "ok": False,
+                "mode": "full",
+                "detail": "A full refresh ran recently. Try again in 15 min.",
+                "retry_after_seconds": 900,
+            },
+        )
+
+    def test_plain_wait_label_rounds_up_to_whole_units(self) -> None:
+        self.assertEqual(history_main.plain_wait_label(0), "1 s")
+        self.assertEqual(history_main.plain_wait_label(45), "45 s")
+        self.assertEqual(history_main.plain_wait_label(61), "2 min")
+        self.assertEqual(history_main.plain_wait_label(900), "15 min")
+        self.assertEqual(history_main.plain_wait_label(3600), "1 h")
+        self.assertEqual(history_main.plain_wait_label(5400), "1 h 30 min")
 
     def test_history_refresh_responses_keep_allowlist_on_success_and_conflict(self) -> None:
         route = next(route for route in history_main.app.routes if route.path == "/api/history/refresh")
@@ -795,7 +981,7 @@ class HistoryDashboardRouteTests(unittest.TestCase):
             patch.object(type(history_main.collector), "collection_running", new_callable=PropertyMock, return_value=False),
             patch.object(history_main.collector, "run_once", new_callable=AsyncMock),
             patch.object(history_main.collector, "status", return_value=status),
-            patch.object(history_main.store, "estimated_counts", return_value={"tracked_slots": 0}),
+            patch.object(history_main.store, "tracked_counts", return_value={"tracked_slots": 0}),
             patch.object(history_main.store, "list_scopes", return_value=[]),
             patch.object(history_main.store, "database_size_bytes", return_value=4096),
         ):
@@ -828,7 +1014,7 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         with (
             patch.object(history_main.collector, "run_once", new_callable=AsyncMock) as run_once,
             patch.object(history_main.collector, "status", return_value={"collector_running": True}),
-            patch.object(history_main.store, "estimated_counts", return_value={"tracked_slots": 0}),
+            patch.object(history_main.store, "tracked_counts", return_value={"tracked_slots": 0}),
             patch.object(history_main.store, "list_scopes", return_value=[]),
         ):
             payload = asyncio.run(route.endpoint(request=self._refresh_request("fast")))
@@ -841,7 +1027,6 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         )
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["mode"], "fast")
-        self.assertFalse(payload["counts_exact"])
 
     def test_history_refresh_endpoint_forces_full_collection(self) -> None:
         route = next(route for route in history_main.app.routes if route.path == "/api/history/refresh")
@@ -849,7 +1034,7 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         with (
             patch.object(history_main.collector, "run_once", new_callable=AsyncMock) as run_once,
             patch.object(history_main.collector, "status", return_value={"collector_running": True}),
-            patch.object(history_main.store, "estimated_counts", return_value={"tracked_slots": 0}),
+            patch.object(history_main.store, "tracked_counts", return_value={"tracked_slots": 0}),
             patch.object(history_main.store, "list_scopes", return_value=[]),
         ):
             payload = asyncio.run(route.endpoint(request=self._refresh_request("full")))
@@ -885,7 +1070,7 @@ class HistoryDashboardRouteTests(unittest.TestCase):
                     "future_internal_metadata": "status-leak-ZXQ9",
                 },
             ),
-            patch.object(history_main.store, "estimated_counts", return_value={"tracked_slots": 0}),
+            patch.object(history_main.store, "tracked_counts", return_value={"tracked_slots": 0}),
             patch.object(history_main.store, "list_scopes", return_value=[]),
             patch.object(history_main.logger, "exception"),
         ):
@@ -911,7 +1096,6 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         )
         self.assertNotIn("timed out after 45s", json.dumps(payload))
         self.assertNotIn("status-leak-ZXQ9", json.dumps(payload))
-        self.assertFalse(payload["counts_exact"])
 
     def test_history_refresh_endpoint_reports_existing_collection_as_conflict(self) -> None:
         route = next(route for route in history_main.app.routes if route.path == "/api/history/refresh")
@@ -924,7 +1108,7 @@ class HistoryDashboardRouteTests(unittest.TestCase):
                 "status",
                 return_value={"collector_running": True, "collection_running": True},
             ),
-            patch.object(history_main.store, "estimated_counts", return_value={"tracked_slots": 0}),
+            patch.object(history_main.store, "tracked_counts", return_value={"tracked_slots": 0}),
             patch.object(history_main.store, "list_scopes", return_value=[]),
         ):
             response = asyncio.run(route.endpoint(request=self._refresh_request("full")))
@@ -941,7 +1125,7 @@ class HistoryDashboardRouteTests(unittest.TestCase):
 
         with (
             patch.object(history_main.collector, "status", return_value={"collector_running": True}),
-            patch.object(history_main.store, "estimated_counts", return_value={"tracked_slots": 0}),
+            patch.object(history_main.store, "tracked_counts", return_value={"tracked_slots": 0}),
             patch.object(history_main.store, "database_size_bytes", return_value=4096),
             patch.object(history_main.store, "list_scopes", return_value=[]),
         ):
@@ -996,7 +1180,7 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         )
         store_results = {
             "counts": {"tracked_slots": 0},
-            "estimated_counts": {"tracked_slots": 0},
+            "tracked_counts": {"tracked_slots": 0},
             "list_scopes": [],
             "database_size_bytes": 0,
             "list_slot_events": [],
@@ -3584,11 +3768,9 @@ class HistoryStoreTests(unittest.TestCase):
             max_batches=2,
         )
 
-        fast_counts = store.estimated_counts()
+        fast_counts = store.tracked_counts()
         self.assertEqual(fast_counts["metric_sample_count"], 1)
         self.assertEqual(fast_counts["metric_rollup_count"], 0)
-        self.assertFalse(fast_counts["estimated"])
-        self.assertEqual(fast_counts["count_mode"], "tracked")
 
     def test_retention_rollups_remain_visible_in_batched_scope_and_disk_history(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
@@ -3655,7 +3837,7 @@ class HistoryStoreTests(unittest.TestCase):
 
         with patch("history_service.store.sqlite3.connect", side_effect=tracking_connect):
             store = HistoryStore(str(temp_dir / "history.db"))
-            store.estimated_counts()
+            store.tracked_counts()
             store.list_scopes()
 
         wal_statements = [
@@ -3998,16 +4180,14 @@ class HistoryStoreTests(unittest.TestCase):
             connection.commit()
 
         exact_counts = store.counts()
-        estimated_counts = store.estimated_counts()
+        tracked_counts = store.tracked_counts()
         fast_scopes = store.list_scopes(include_activity_counts=False)
         exact_scopes = store.list_scopes()
 
         self.assertEqual(exact_counts["tracked_slots"], 1)
         self.assertEqual(exact_counts["metric_sample_count"], 1)
-        self.assertEqual(estimated_counts["tracked_slots"], 1)
-        self.assertEqual(estimated_counts["metric_sample_count"], 1)
-        self.assertFalse(estimated_counts["estimated"])
-        self.assertEqual(estimated_counts["count_mode"], "tracked")
+        self.assertEqual(tracked_counts["tracked_slots"], 1)
+        self.assertEqual(tracked_counts["metric_sample_count"], 1)
         self.assertEqual(len(fast_scopes), 1)
         self.assertEqual(fast_scopes[0]["tracked_slots"], 1)
         self.assertIsNone(fast_scopes[0]["event_count"])
@@ -5606,7 +5786,7 @@ class HistoryStoreTests(unittest.TestCase):
 
         store.restore_backup(legacy_path)
 
-        self.assertEqual(store.estimated_counts()["metric_rollup_count"], 0)
+        self.assertEqual(store.tracked_counts()["metric_rollup_count"], 0)
         with store._connect() as connection:
             table_names = {
                 str(row[0])
@@ -6027,19 +6207,147 @@ class HistoryCollectorTests(unittest.TestCase):
         self.assertEqual(store.maintain_retention.call_count, 2)
         self.assertFalse(collector.status()["last_retention_has_more"])
 
-    def test_retention_failure_reports_only_exception_class_and_does_not_raise(self) -> None:
+    def test_retention_failure_reports_a_plain_sentence_and_does_not_raise(self) -> None:
         store = MagicMock()
         store.maintain_retention.side_effect = RuntimeError("private database path")
         collector = HistoryCollector(HistorySettings(), store)
 
-        collector._run_retention_if_due(
-            datetime(2026, 7, 1, tzinfo=timezone.utc),
-            backup_succeeded=True,
-        )
+        with self.assertLogs("history_service.collector", level="WARNING") as captured:
+            collector._run_retention_if_due(
+                datetime(2026, 7, 1, tzinfo=timezone.utc),
+                backup_succeeded=True,
+            )
 
         status = collector.status()
-        self.assertEqual(status["last_retention_error"], "RuntimeError")
+        self.assertEqual(status["last_retention_error"], "unexpected error; see the history service logs")
+        self.assertEqual(status["last_retention_error_kind"], "unexpected")
+        self.assertEqual(status["retention_consecutive_failures"], 1)
         self.assertNotIn("private database path", str(status))
+        self.assertNotIn("RuntimeError", str(status))
+        self.assertIn("private database path", "\n".join(captured.output))
+
+    def test_retention_failure_sentences_name_the_common_causes(self) -> None:
+        cases = (
+            (sqlite3.OperationalError("too many SQL variables"), "batch size too large (lower HISTORY_RETENTION_BATCH_SIZE)"),
+            (sqlite3.OperationalError("attempt to write a readonly database"), "the history database is read-only"),
+            (PermissionError(13, "Permission denied", "/private/history.db"), "the history database is read-only"),
+            (sqlite3.OperationalError("database or disk is full"), "the disk holding the history database is full"),
+            (OSError(28, "No space left on device"), "the disk holding the history database is full"),
+        )
+        for failure, sentence in cases:
+            with self.subTest(failure=failure):
+                store = MagicMock()
+                store.maintain_retention.side_effect = failure
+                collector = HistoryCollector(HistorySettings(), store)
+                with patch.object(history_collector_module.logger, "warning"):
+                    collector._run_retention_if_due(
+                        datetime(2026, 7, 1, tzinfo=timezone.utc),
+                        backup_succeeded=True,
+                    )
+                self.assertEqual(collector.status()["last_retention_error"], sentence)
+                self.assertNotIn("/private/", str(collector.status()))
+
+    def test_retention_success_clears_the_failure_sentence_and_streak(self) -> None:
+        store = MagicMock()
+        store.maintain_retention.side_effect = [
+            RuntimeError("boom"),
+            {
+                "metric_samples_removed": 0,
+                "events_removed": 0,
+                "hourly_rollups_removed": 0,
+                "daily_rollups_removed": 0,
+                "total_rows_removed": 0,
+                "batches_completed": 1,
+                "has_more": False,
+                "interrupted": False,
+            },
+        ]
+        collector = HistoryCollector(HistorySettings(retention_interval_seconds=1), store)
+        now = datetime(2026, 7, 1, tzinfo=timezone.utc)
+
+        with patch.object(history_collector_module.logger, "warning"):
+            collector._run_retention_if_due(now, backup_succeeded=True)
+        collector._run_retention_if_due(now + timedelta(hours=1), backup_succeeded=True)
+
+        status = collector.status()
+        self.assertIsNone(status["last_retention_error"])
+        self.assertIsNone(status["last_retention_error_kind"])
+        self.assertEqual(status["retention_consecutive_failures"], 0)
+
+    def test_unsafe_backup_status_file_mode_is_named_instead_of_hidden(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            status_path = Path(temp_dir) / "scheduled-backup.json"
+            status_path.write_text("{}", encoding="utf-8")
+            collector = HistoryCollector(
+                HistorySettings(
+                    segment_catalog_path=str(Path(temp_dir) / "segments"),
+                    scheduled_backup_status_file=str(status_path),
+                ),
+                MagicMock(),
+            )
+            with (
+                patch.object(history_collector_module.os, "lstat", return_value=os.stat_result((0o100664, 0, 0, 1, 0, 0, 2, 0, 0, 0))),
+                patch.object(history_collector_module, "read_scheduled_backup_status", return_value=None),
+                self.assertLogs("history_service.collector", level="WARNING") as captured,
+            ):
+                first = collector._segmented_backup_at_for_retention(datetime(2026, 9, 9, tzinfo=timezone.utc))
+                second = collector._segmented_backup_at_for_retention(datetime(2026, 9, 9, tzinfo=timezone.utc))
+
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        status = collector.status()
+        self.assertEqual(
+            status["last_retention_error"],
+            "the scheduled backup status file has unsafe permissions (expected 0640)",
+        )
+        self.assertEqual(status["last_retention_error_kind"], "backup_status_mode")
+        self.assertEqual(len(captured.output), 1)
+        self.assertIn("scheduled-backup.json", captured.output[0])
+        self.assertIn("mode 0664, expected 0640", captured.output[0])
+
+    def test_fetch_json_failures_carry_a_kind_but_keep_the_url_out_of_status(self) -> None:
+        collector = HistoryCollector(
+            HistorySettings(source_base_url="http://enclosure-ui:8000", request_timeout_seconds=7),
+            MagicMock(),
+        )
+        http_error = urllib.error.HTTPError("http://enclosure-ui:8000/api/inventory", 503, "busy", {}, io.BytesIO(b"down"))
+        cases = (
+            (urllib.error.URLError(ConnectionRefusedError(111, "refused")), "unreachable", "Could not reach the main UI. Is it running?"),
+            (urllib.error.URLError(TimeoutError("timed out")), "timeout", "The main UI took longer than 7 s to answer."),
+            (TimeoutError("timed out"), "timeout", "The main UI took longer than 7 s to answer."),
+            (http_error, "rejected", "The main UI rejected the request (HTTP 503)."),
+        )
+        for side_effect, kind, sentence in cases:
+            with self.subTest(kind=kind):
+                with patch("history_service.collector.urllib.request.urlopen", side_effect=side_effect):
+                    with self.assertRaises(RuntimeError) as captured:
+                        collector._fetch_json_sync("/api/inventory", {}, "GET", None, {})
+                collector.record_last_error(captured.exception)
+                status = collector.status()
+                self.assertEqual(status["last_error_kind"], kind)
+                self.assertIn("enclosure-ui", status["last_error"])
+                public = history_main.public_collector_status(status)
+                self.assertEqual(public["last_error"], sentence)
+                self.assertNotIn("enclosure-ui", json.dumps(public))
+
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b"not json"
+        with patch("history_service.collector.urllib.request.urlopen", return_value=response):
+            with self.assertRaises(RuntimeError) as captured:
+                collector._fetch_json_sync("/api/inventory", {}, "GET", None, {})
+        collector.record_last_error(captured.exception)
+        self.assertEqual(
+            history_main.public_collector_status(collector.status())["last_error"],
+            "The main UI sent an answer the history service could not read.",
+        )
+
+        collector.record_last_error(RuntimeError("something else entirely"))
+        self.assertEqual(
+            history_main.public_collector_status(collector.status())["last_error"],
+            history_main.HISTORY_COLLECTOR_ERROR_DETAIL,
+        )
+        collector.clear_last_error()
+        self.assertNotIn("last_error_kind", {k for k, v in collector.status().items() if v is not None})
 
     def test_retention_failure_reports_prior_commits_and_keeps_catchup_pending(self) -> None:
         store = MagicMock()
@@ -6135,7 +6443,7 @@ class HistoryCollectorTests(unittest.TestCase):
     def test_stop_request_prevents_later_scope_writes(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         store = MagicMock()
-        store.estimated_counts.return_value = {}
+        store.tracked_counts.return_value = {}
         collector = HistoryCollector(
             HistorySettings(
                 sqlite_path=str(temp_dir / "history.db"),
@@ -6299,7 +6607,7 @@ class HistoryCollectorTests(unittest.TestCase):
     def test_background_startup_collection_is_fast_only(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         store = MagicMock()
-        store.estimated_counts.return_value = {}
+        store.tracked_counts.return_value = {}
         collector = HistoryCollector(
             HistorySettings(
                 sqlite_path=str(temp_dir / "history.db"),
@@ -7353,6 +7661,7 @@ class HistoryCollectorTests(unittest.TestCase):
         status = collector.status()
         self.assertIsNone(status["last_error"])
         self.assertIsNotNone(status["last_success_at"])
+        self.assertIsNotNone(status["last_completed_at"])
         self.assertIsNotNone(status["last_slow_metrics_at"])
         failed_stage = next(entry for entry in status["collection_stage_timings"] if entry["stage"] == "smart.failed")
         self.assertEqual(failed_stage["system_id"], "archive-core")

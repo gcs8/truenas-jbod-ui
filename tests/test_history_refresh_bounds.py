@@ -184,7 +184,7 @@ class HistoryRefreshRequestTests(unittest.IsolatedAsyncioTestCase):
             patch.object(history_main, "refresh_admission", admission),
             patch.object(history_main.collector, "run_once", AsyncMock(side_effect=blocked_run_once)) as run_once,
             patch.object(type(history_main.collector), "collection_running", new_callable=PropertyMock, return_value=False),
-            patch.object(history_main.store, "estimated_counts", return_value={"tracked_slots": 0}) as counts,
+            patch.object(history_main.store, "tracked_counts", return_value={"tracked_slots": 0}) as counts,
             patch.object(history_main.store, "list_scopes", return_value=[]),
         ):
             winner = asyncio.create_task(route.endpoint(request=request))
