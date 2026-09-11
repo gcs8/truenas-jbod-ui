@@ -36,10 +36,27 @@ class CIWorkflowContractTests(unittest.TestCase):
 
         self.assertEqual(triggers["pull_request"]["branches"], ["main"])
         self.assertEqual(triggers["push"]["branches"], ["**"])
+        self.assertIn("workflow_dispatch", triggers)
         self.assertIn(
             "CI runs on every branch push and on pull requests targeting `main`.",
             contributing,
         )
+
+        codeql = yaml.safe_load(self.read(WORKFLOW_DIR / "codeql.yml"))
+        codeql_triggers = codeql.get("on", codeql.get(True, {}))
+        self.assertEqual(codeql_triggers["push"]["branches"], ["main", "codex/**", "ci/**"])
+        self.assertEqual(codeql_triggers["pull_request"]["branches"], ["main"])
+
+    def test_public_demo_job_runs_every_synthetic_fixture_spec(self) -> None:
+        workflow_text = self.read(CI_WORKFLOW)
+        self.assertIn(
+            "npx playwright test qa/public-demo.spec.js qa/saved-view-selection.spec.js --retries=0",
+            workflow_text,
+        )
+        contributing = self.read(ROOT / "CONTRIBUTING.md")
+        for spec in ("qa/saved-view-selection.spec.js", "qa/offline-snapshot.spec.js", "qa/private-restore.spec.js"):
+            with self.subTest(spec=spec):
+                self.assertIn(spec, contributing)
 
     def test_python_floor_and_ceiling_are_separate_matrix_entries(self) -> None:
         workflow = yaml.safe_load(self.read(CI_WORKFLOW))
@@ -252,7 +269,7 @@ class CIWorkflowContractTests(unittest.TestCase):
                 self.assertIn("python scripts/build_current_source_browser_fixture.py", workflow_text)
                 self.assertIn("PUBLIC_DEMO_ARTIFACT: public-demo/index.html", workflow_text)
                 self.assertIn("SLOT_FOCUS_ARTIFACT:", workflow_text)
-                self.assertIn("npx playwright test qa/public-demo.spec.js --retries=0", workflow_text)
+                self.assertRegex(workflow_text, r"npx playwright test qa/public-demo\.spec\.js[^\n]* --retries=0")
                 self.assertIn("npm ci --ignore-scripts", workflow_text)
                 self.assertIn('rm -rf "$fixture_root"', workflow_text)
                 self.assertIn("git status --short", workflow_text)
@@ -418,8 +435,9 @@ class CIWorkflowContractTests(unittest.TestCase):
 
         self.assertEqual(
             triggers["pull_request_target"]["types"],
-            ["opened", "edited", "synchronize", "reopened"],
+            ["opened", "edited", "reopened"],
         )
+        self.assertFalse(workflow["concurrency"]["cancel-in-progress"])
         self.assertEqual(workflow["permissions"], {"pull-requests": "write"})
         for job_name, job in workflow["jobs"].items():
             for step in job["steps"]:

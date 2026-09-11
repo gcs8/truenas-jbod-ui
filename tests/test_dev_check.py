@@ -208,12 +208,49 @@ class DevCheckPlanTests(unittest.TestCase):
         exclusion_skips = [skip for skip in plan.skips if skip.name.startswith("Windows exclusion:")]
         self.assertEqual(len(exclusion_skips), len(dev_check.WINDOWS_EXCLUSIONS))
         rendered = "\n".join(f"{skip.name}: {skip.reason}" for skip in exclusion_skips)
+        listed = "\n".join(module for skip in exclusion_skips for module in skip.details)
         for exclusion in dev_check.WINDOWS_EXCLUSIONS:
             self.assertIn(exclusion.category, rendered)
             self.assertIn(exclusion.reason, rendered)
+            self.assertIn(f"{len(exclusion.modules)} suites skipped", rendered)
             for module in exclusion.modules:
-                self.assertIn(module, rendered)
-        self.assertIn("tests.test_esxi_host_prep", rendered)
+                self.assertNotIn(module, rendered)
+                self.assertIn(module, listed)
+        self.assertIn("tests.test_esxi_host_prep", listed)
+        for line in rendered.splitlines():
+            self.assertLess(len(line), 240, line)
+
+    def test_runner_lists_skip_details_only_when_verbose(self) -> None:
+        plan = dev_check.Plan(
+            checks=(dev_check.Check("passing check", ("tool", "pass")),),
+            skips=(
+                dev_check.Skip(
+                    "Windows exclusion: sample",
+                    "2 suites skipped; need POSIX",
+                    details=("tests.test_alpha", "tests.test_beta"),
+                ),
+            ),
+        )
+        runner = lambda argv, **_kwargs: subprocess.CompletedProcess(argv, 0)  # noqa: E731
+
+        quiet = io.StringIO()
+        dev_check.run_plan(plan, root=ROOT, runner=runner, output=quiet)
+        self.assertIn("SKIP  Windows exclusion: sample: 2 suites skipped; need POSIX", quiet.getvalue())
+        self.assertNotIn("tests.test_alpha", quiet.getvalue())
+        self.assertIn("(--verbose lists the skipped suites)", quiet.getvalue())
+
+        verbose = io.StringIO()
+        dev_check.run_plan(plan, root=ROOT, runner=runner, output=verbose, verbose=True)
+        self.assertIn("        tests.test_alpha\n        tests.test_beta\n", verbose.getvalue())
+        self.assertNotIn("(--verbose lists the skipped suites)", verbose.getvalue())
+
+    def test_argument_parser_documents_modes_and_verbose(self) -> None:
+        parser = dev_check.build_parser()
+        rendered = parser.format_help()
+        self.assertIn("no Docker, network, or live data", rendered)
+        self.assertIn("checked-in public demo artifact", rendered)
+        self.assertTrue(parser.parse_args(["--safe", "--verbose"]).verbose)
+        self.assertFalse(parser.parse_args(["--safe"]).verbose)
 
     def test_mapping_store_suite_is_classified_as_posix_filesystem_semantics(
         self,

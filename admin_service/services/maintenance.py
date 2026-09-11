@@ -398,6 +398,9 @@ class AdminMaintenanceService:
         finally:
             try:
                 workspace.chmod(0o700)
+                # The staged copy is read-only; make it writable again so the
+                # removal also works where a read-only file cannot be unlinked.
+                snapshot.chmod(0o600)
                 shutil.rmtree(workspace)
             except Exception:
                 if primary_error is not None:

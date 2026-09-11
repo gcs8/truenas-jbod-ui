@@ -3,14 +3,15 @@ name: PR type labels
 # Applies the release-notes type label from the pull request title's
 # conventional prefix so `.github/release.yml` can categorize it. Runs in the
 # base branch context with the default token only; it never checks out or runs
-# pull request code and reads nothing but the event title and number.
+# pull request code and reads nothing but the event title and number. New
+# commits cannot change the result, so the workflow does not run on
+# `synchronize`, and queued runs finish instead of cancelling each other.
 
 on:
   pull_request_target:
     types:
       - opened
       - edited
-      - synchronize
       - reopened
 
 permissions:
@@ -18,7 +19,7 @@ permissions:
 
 concurrency:
   group: pr-labels-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   label:

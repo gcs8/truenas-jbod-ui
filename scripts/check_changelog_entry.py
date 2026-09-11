@@ -242,19 +242,27 @@ def evaluate(
         )
     if not relevant:
         return GateResult(
-            False,
+            True,
             [
-                f"No operator-visible paths changed for #{pr_number}; apply the "
-                f"'{NO_CHANGELOG_LABEL}' label and re-run the check."
+                f"No operator-visible paths changed for #{pr_number}; no CHANGELOG entry is required.",
+                f"A maintainer can add the '{NO_CHANGELOG_LABEL}' label so the release coverage "
+                "check skips this pull request as well.",
             ],
         )
 
+    head_lines = _head_changelog_lines(repo, head)
     added = added_line_numbers(repo, base, head, CHANGELOG_PATH) if CHANGELOG_PATH in paths else set()
-    selected_heading, entries = (
-        current_entries(_head_changelog_lines(repo, head))
-        if added
-        else (UNRELEASED_HEADING, [])
-    )
+    selected_heading, entries = current_entries(head_lines) if added else (UNRELEASED_HEADING, [])
+    if selected_heading != UNRELEASED_HEADING and not _heading_was_added(head_lines, selected_heading, added):
+        return GateResult(
+            False,
+            [
+                f"CHANGELOG.md has no '{UNRELEASED_HEADING}' section on this branch, so a bullet for "
+                f"#{pr_number} would land in the already shipped '{selected_heading}' section.",
+                f"Insert '{UNRELEASED_HEADING}', a blank line, and a '### <Subsection>' heading directly "
+                f"above '{selected_heading}', then put the bullet there.",
+            ],
+        )
     touched = [
         entry
         for entry in entries
@@ -277,6 +285,11 @@ def evaluate(
             + f". Shape: '- <one sentence in past tense> (#{pr_number})'. "
             "Wrap at about 80 columns; the '(#N)' may sit on the continuation line."
         )
+        if UNRELEASED_HEADING not in {line.strip() for line in head_lines if line.startswith("## ")}:
+            messages.append(
+                f"CHANGELOG.md has no '{UNRELEASED_HEADING}' section yet; insert it directly above the "
+                "top release heading first."
+            )
         messages.append(
             f"If this pull request is intentionally invisible to operators, apply the "
             f"'{NO_CHANGELOG_LABEL}' label and re-run the check instead."
@@ -297,6 +310,16 @@ def evaluate(
         f"{', '.join(subsections)}."
     )
     return GateResult(True, messages)
+
+
+def _heading_was_added(lines: list[str], heading: str, added: set[int]) -> bool:
+    """True when this pull request itself introduces ``heading`` (a release cut)."""
+
+    return any(
+        number in added
+        for number, raw in enumerate(lines, start=1)
+        if raw.startswith("## ") and raw.strip() == heading
+    )
 
 
 def _entry_was_added(entry: Entry, entries: list[Entry], added: set[int]) -> bool:

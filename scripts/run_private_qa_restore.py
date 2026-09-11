@@ -582,6 +582,14 @@ class _LoopbackProxySet:
             raise QaRestoreError("loopback service access ports were not released")
 
 
+def _require_linux_docker_host(meminfo: Path = Path("/proc/meminfo")) -> None:
+    if not meminfo.exists():
+        raise SystemExit(
+            "This tool runs on a Linux Docker QA host. It reads /proc/meminfo and drives Docker "
+            "directly, neither of which is available here."
+        )
+
+
 def _available_memory_kib() -> int:
     fields: dict[str, int] = {}
     for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
@@ -1528,6 +1536,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    _require_linux_docker_host()
     if args.approval != APPROVAL:
         raise QaRestoreError("private QA restore approval phrase did not match")
     if args.live_read_only and args.live_approval != LIVE_APPROVAL:

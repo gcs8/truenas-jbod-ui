@@ -69,11 +69,39 @@ def _mode(path: Path) -> int:
     return stat.S_IMODE(path.lstat().st_mode)
 
 
+LINUX_HOST_REQUIRED = (
+    "this tool needs a Linux Docker host; run it on the host that owns the deployment"
+)
+
+
+def _require_linux_docker_host() -> None:
+    """Refuse before any action begins on a host without POSIX identity.
+
+    Every receipt guarantee here rests on uid and mode checks, so a host with no
+    `geteuid` cannot honour them. This runs at entry rather than at first use:
+    the ownership checks are only reached while validating an *existing*
+    receipt, so without an entry guard an `update` on such a host would inspect
+    and pull images, download Compose files, and create or rename the receipt
+    directory before failing with an uncaught OSError from the directory fsync,
+    leaving `.jbod-ui-image-update` behind to reject every later update.
+    """
+
+    if getattr(os, "geteuid", None) is None:
+        raise DeploymentError(LINUX_HOST_REQUIRED)
+
+
+def _effective_uid() -> int:
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is None:
+        raise DeploymentError(LINUX_HOST_REQUIRED)
+    return geteuid()
+
+
 def _require_private_directory(path: Path) -> None:
     info = path.lstat()
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
         raise DeploymentError(f"receipt path is not a real directory: {path.name}")
-    if info.st_uid != os.geteuid():
+    if info.st_uid != _effective_uid():
         raise DeploymentError("receipt directory owner does not match the effective user")
     if stat.S_IMODE(info.st_mode) != 0o700:
         raise DeploymentError("receipt directory must have mode 0700")
@@ -83,7 +111,7 @@ def _require_private_file(path: Path) -> None:
     info = path.lstat()
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
         raise DeploymentError(f"receipt entry is not a regular file: {path.name}")
-    if info.st_uid != os.geteuid():
+    if info.st_uid != _effective_uid():
         raise DeploymentError("receipt file owner does not match the effective user")
     if stat.S_IMODE(info.st_mode) != 0o600:
         raise DeploymentError("receipt files must have mode 0600")
@@ -930,6 +958,7 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
+        _require_linux_docker_host()
         if args.action == "update":
             result = update_deployment(
                 DeploymentSpec(

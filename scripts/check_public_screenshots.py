@@ -36,7 +36,12 @@ FORBIDDEN_BYTE_PATTERNS = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Verify exact public screenshot bytes and fixture provenance.")
-    parser.add_argument("--root", type=Path, default=ROOT)
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=ROOT,
+        help="Repository checkout to verify, for example /srv/truenas-jbod-ui (default: this checkout).",
+    )
     return parser.parse_args()
 
 

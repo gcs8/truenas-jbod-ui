@@ -337,8 +337,12 @@ npx playwright test qa/public-demo.spec.js
 PLAYWRIGHT_ADMIN_BASE_URL=http://127.0.0.1:8082 npx playwright test qa/admin-operations.spec.js
 ```
 
-The switching and ESXi suites are live-appliance contracts, not portable fixture
-tests. Run them only against an intentionally configured stack:
+CI runs `qa/public-demo.spec.js` and `qa/saved-view-selection.spec.js` against
+synthetic fixtures in the public-demo job and `qa/admin-operations.spec.js` in
+the admin clean-room job. `qa/offline-snapshot.spec.js` and
+`qa/private-restore.spec.js` belong to the release checklist and the private QA
+restore drill. The switching and ESXi suites are live-appliance contracts, not
+portable fixture tests. Run them only against an intentionally configured stack:
 
 ```bash
 PLAYWRIGHT_LIVE_APPLIANCE_QA=1 npx playwright test qa/ui-switching.spec.js qa/esxi-smoke.spec.js
@@ -382,7 +386,9 @@ CI runs on every branch push and on pull requests targeting `main`. The
 all-branch push contract keeps pre-PR validation independent of naming prefixes;
 contributors may use descriptive prefixes such as `feat/`, `fix/`, `refactor/`,
 `docs/`, `perf/`, `test/`, `ci/`, `codex/`, or `claude/` without creating a CI
-coverage gap. Tag pushes are not part of this preflight workflow.
+coverage gap. CodeQL runs on pushes to `main`, `codex/**` and `ci/**`, on pull
+requests targeting `main`, and on a weekly schedule. Tag pushes are not part of
+this preflight workflow.
 
 ## CI blocking policy
 
@@ -592,9 +598,9 @@ labels plus that file. The rules:
   `Changelog entry` job after applying the label; it reads labels live.
   The `dependencies` label (Dependabot) skips the entry gate the same way,
   but those pull requests still appear in the release body under
-  Dependencies. Pull requests with no operator-visible paths must still carry
-  `no-changelog`; an unlabeled invisible pull request fails the entry gate so
-  release coverage cannot discover an implicit escape later.
+  Dependencies. A pull request that touches no operator-visible paths passes
+  the entry gate with a notice instead of a red check; a maintainer still adds
+  `no-changelog` to it before the release so the coverage check skips it.
 
 Two scripts enforce this:
 
@@ -604,9 +610,15 @@ Two scripts enforce this:
   release wrap and release notes files), `docker-compose*.yml`, `Dockerfile*`,
   or `.env.example`, it requires an added `(#N)` bullet for this pull request
   under `## Unreleased`, and the upgrade-note bullet when `breaking` is set.
-  The pull request number does not exist before `gh pr create`, so the first
-  run of a new pull request fails until the changelog line is pushed; add it
-  as the next commit. Locally:
+  It fails, with the fix spelled out, when the file has no `## Unreleased`
+  section and the bullet would land in a shipped release section. To satisfy
+  it:
+  1. Open the pull request first; the number does not exist before that, so
+     the first run is expected to fail.
+  2. If `CHANGELOG.md` starts with a `## vX.Y.Z` heading, insert
+     `## Unreleased`, a blank line, and a `### <Subsection>` heading above it.
+  3. Add the one-line bullet ending in `(#N)` and push; the check re-runs.
+  Locally:
   `python scripts/check_changelog_entry.py --base origin/main --pr <N>`.
 - `scripts/check_release_changelog_coverage.py <previous tag> "<section
   header>"` runs during release prep. It collects merged pull request numbers

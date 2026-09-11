@@ -7,6 +7,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+try:
+    import fcntl  # noqa: F401
+except ImportError:
+    sys.exit(
+        "This tool needs Linux. Run it inside the history container: "
+        "docker compose run --rm enclosure-history python /app/scripts/migrate_segmented_history.py --help"
+    )
+
 from history_service.segment_migration import (
     migrate_segmented_history,
     recover_pending_migration,

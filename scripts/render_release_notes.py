@@ -71,7 +71,12 @@ def render(text: str, header: str) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("section_header", help='Exact section header, for example "## v0.23.0 - 2026-09-08".')
-    parser.add_argument("--changelog", type=Path, default=CHANGELOG_PATH, help="Path to CHANGELOG.md.")
+    parser.add_argument(
+        "--changelog",
+        type=Path,
+        default=CHANGELOG_PATH,
+        help="CHANGELOG.md to read, for example ../release-branch/CHANGELOG.md (default: this checkout).",
+    )
     args = parser.parse_args(argv)
     try:
         sys.stdout.write(render(args.changelog.read_text(encoding="utf-8"), args.section_header))
