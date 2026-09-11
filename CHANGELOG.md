@@ -34,6 +34,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   write controls after a rejected write, honoured the configured refresh
   interval, added search results and a real empty-bay state, and asked for a
   reload after a container upgrade (#508)
+
 ### Performance
 
 - Delegated every bay-tile interaction to the grid, deferred hover SMART
