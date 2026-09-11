@@ -702,5 +702,3 @@ class ProfileRegistry:
             return None
 
         return None
-
-

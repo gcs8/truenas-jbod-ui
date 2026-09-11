@@ -633,4 +633,3 @@ class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
                 client._request_bytes_sync("/healthz")
         self.assertIn("HTTP 503", str(raised.exception))
         self.assertNotIsInstance(raised.exception, HistoryBackendUnavailableError)
-
