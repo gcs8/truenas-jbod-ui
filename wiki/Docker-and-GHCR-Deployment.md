@@ -66,8 +66,13 @@ docker compose up -d
 This path deliberately pairs the **v0.22.2 Compose file** with the **v0.23.0
 image**. That is not a mistake and the two are not required to match: v0.22.2 is
 the current root-compatible Compose file, and the v0.23.0 image runs against it.
-Keep this pairing until a v0.23.0 Compose file is published; change the image
-pin, not the Compose file.
+Keep this pairing until a release ships a root-compatible successor to the
+v0.22.2 Compose file (the change tracked in #399 and #426). A Compose file
+being published is not the same as it being qualified for a plain image
+update: the v0.23.0 file exists, but it needs the ownership procedure in the
+Troubleshooting page before it can start on an existing install. Until a
+root-compatible successor is released, change the image pin, not the Compose
+file.
 
 Open:
 
