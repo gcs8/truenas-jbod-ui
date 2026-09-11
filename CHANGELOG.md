@@ -34,6 +34,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   write controls after a rejected write, honoured the configured refresh
   interval, added search results and a real empty-bay state, and asked for a
   reload after a container upgrade (#508)
+### Performance
+
+- Delegated every bay-tile interaction to the grid, deferred hover SMART
+  fetches to the batch prefetch that already covers the bay, and indexed bay
+  lookups instead of scanning the slot list on every call (#510)
 
 ## v0.23.0 - 2026-09-08
 
