@@ -177,6 +177,41 @@ test("restore confirmation reads as a sentence instead of JSON", () => {
   assert.doesNotMatch(functionSource("importBackup"), /JSON\.stringify\(inspection/);
 });
 
+test("restore confirmation shows the older-version note before the replace warning", () => {
+  const { describeBackupRestoreConfirmation } = load(["describeBackupInspection", "describeBackupRestoreConfirmation"], {
+    formatLocalTimestamp: (value) => `on ${value}`,
+  });
+  const baseInspection = {
+    encryption_mode: "not_encrypted",
+    exported_at: "2026-09-01",
+    aggregate_counts: { systems: 1, profiles: 0, storage_views: 0, mappings: 0 },
+  };
+
+  const withNote = describeBackupRestoreConfirmation({
+    ...baseInspection,
+    app_version_note: "This backup was made by v0.22.2; settings and history will be brought up to date during restore.",
+  });
+  const noteIndex = withNote.indexOf(
+    "This backup was made by v0.22.2; settings and history will be brought up to date during restore."
+  );
+  const replaceIndex = withNote.indexOf("Restoring replaces all current settings");
+  assert.ok(noteIndex >= 0, "the version note must appear");
+  assert.ok(replaceIndex > noteIndex, "the version note must come before the replace warning");
+  assert.equal(
+    withNote.split("This backup was made by v0.22.2; settings and history will be brought up to date during restore.").length,
+    2,
+    "the version note must appear exactly once"
+  );
+
+  const withoutNote = describeBackupRestoreConfirmation({ ...baseInspection, app_version_note: null });
+  assert.doesNotMatch(withoutNote, /brought up to date during restore/);
+  assert.equal(
+    withoutNote,
+    `${describeBackupInspection(baseInspection)}\n\n` +
+      "Restoring replaces all current settings, mappings and history with this backup. Continue?"
+  );
+});
+
 test("staged ESXi packages are described as name, size and upload age", () => {
   const { describeStagedPackage } = load(["formatRelativeAge", "describeStagedPackage"], {
     formatBytes: () => "41 MiB",
