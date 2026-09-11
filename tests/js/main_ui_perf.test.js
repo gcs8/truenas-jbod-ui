@@ -287,3 +287,159 @@ test("stylesheet no longer carries rules for removed markup", () => {
     assert.equal(STYLES.includes(selector), false, `${selector} has no markup left to style`);
   }
 });
+
+
+const SMART_PREFETCH_FUNCTIONS = [
+  "ensureSmartSummaryOnInteraction",
+  "smartPrefetchPending",
+  "scheduleSmartPrefetch",
+  "currentSmartPrefetchScopeKey",
+  "runSmartPrefetch",
+  "shouldUseSingleSmartPrefetchRequest",
+  "applySmartPrefetchPayload",
+  "applySmartPrefetchError",
+  "candidateSlotsForSmartPrefetch",
+  "isSmartEntryCurrent",
+  "isSmartEntryInFlight",
+  "smartSummaryAgeMs",
+  "getSmartSummaryEntry",
+  "getSmartCacheKey",
+];
+
+function flushMicrotasks() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+// Loads the real candidate filter, cache-entry predicates and prefetch runner so
+// the queued-batch handover is exercised end to end instead of through stubs.
+function loadSmartPrefetchHarness(options = {}) {
+  const slots = options.slots || [
+    { slot: 1, present: true, device_name: "sdb" },
+    { slot: 2, present: true, device_name: "sdc" },
+  ];
+  const state = {
+    snapshotMode: false,
+    smartSummaries: {},
+    smartSummaryGeneration: 1,
+    smartPrefetchTimerId: null,
+    smartPrefetchRunning: false,
+    smartPrefetchToken: 0,
+    smartPrefetchScopeKey: null,
+    selectedSystemId: "sysA",
+    selectedEnclosureId: "encA",
+    hoveredSlot: null,
+    selectedSlot: null,
+    heatmap: { enabled: false },
+    snapshot: { slots, selected_system_id: "sysA", selected_enclosure_id: "encA" },
+  };
+  const timers = [];
+  const calls = { batches: [], ensure: 0, tooltip: 0, complete: 0, failures: [] };
+  const window = {
+    setTimeout(callback) {
+      timers.push(callback);
+      return timers.length;
+    },
+    clearTimeout() {},
+  };
+  const loaded = loadFunctions(SMART_PREFETCH_FUNCTIONS, {
+    state,
+    window,
+    Math,
+    Set,
+    Object,
+    String,
+    console,
+    SMART_SUMMARY_CACHE_TTL_MS: 30000,
+    SMART_PREFETCH_STALE_MS: 15000,
+    SMART_PREFETCH_DELAY_MS: 120,
+    SMART_PREFETCH_STRATEGY: options.strategy || "single",
+    SMART_PREFETCH_SINGLE_THRESHOLD: 128,
+    SMART_PREFETCH_CHUNK_SIZE: 24,
+    SMART_PREFETCH_BATCH_CONCURRENCY: 2,
+    getSlotById: (slotNumber) => slots.find((slot) => slot.slot === slotNumber) || null,
+    getPreloadedSmartSummariesForEnclosureId: () => ({}),
+    currentLiveEnclosureId: () => "encA",
+    updateSmartPrefetchViews: () => {},
+    logSmartPrefetchFailure: (message, error) => { calls.failures.push(String(error && error.message)); },
+    completeUiPerfSmart: () => { calls.complete += 1; },
+    refreshHoveredTooltip: () => { calls.tooltip += 1; },
+    ensureSmartSummary: async () => { calls.ensure += 1; },
+    requestSmartBatchForSlots: async (batch) => {
+      calls.batches.push(batch.map((slot) => slot.slot));
+      if (options.failBatch) {
+        throw new Error("smart-batch unavailable");
+      }
+      return { summaries: batch.map((slot) => ({ slot: slot.slot, summary: { available: true, temperature_c: 31 } })) };
+    },
+  });
+  return { ...loaded, state, slots, timers, calls };
+}
+
+test("a bay hovered during the queued window stays eligible for that batch", async () => {
+  const harness = loadSmartPrefetchHarness();
+  const { state, slots, timers, calls } = harness;
+
+  harness.scheduleSmartPrefetch();
+  assert.equal(timers.length, 1, "the prefetch must be queued behind a timer");
+  assert.equal(harness.smartPrefetchPending(), true);
+
+  state.hoveredSlot = 1;
+  await harness.ensureSmartSummaryOnInteraction(slots[0]);
+  assert.equal(calls.ensure, 0, "a covered bay must not race the batch with its own request");
+  assert.equal(calls.tooltip, 1, "the tooltip must still be told the bay is loading");
+
+  const candidates = harness.candidateSlotsForSmartPrefetch().map((slot) => slot.slot);
+  assert.deepEqual(candidates, [1, 2], "the hovered bay must remain a candidate for the queued batch");
+
+  timers[0]();
+  await flushMicrotasks();
+  await flushMicrotasks();
+
+  assert.deepEqual(calls.batches, [[1, 2]], "the queued batch must request the hovered bay");
+  const entry = state.smartSummaries[harness.getSmartCacheKey(slots[0])];
+  assert.equal(entry.loading, false, "the hovered bay must not stay loading after the batch resolves");
+  assert.deepEqual(entry.data, { available: true, temperature_c: 31 });
+  assert.equal(harness.candidateSlotsForSmartPrefetch().length, 0, "a resolved bay is no longer a candidate");
+});
+
+test("a failed queued batch clears the hovered bay instead of leaving it loading", async () => {
+  const harness = loadSmartPrefetchHarness({ failBatch: true });
+  const { state, slots, timers, calls } = harness;
+
+  harness.scheduleSmartPrefetch();
+  state.hoveredSlot = 1;
+  await harness.ensureSmartSummaryOnInteraction(slots[0]);
+  assert.ok(
+    harness.candidateSlotsForSmartPrefetch().some((slot) => slot.slot === 1),
+    "the hovered bay must be owned by the queued batch",
+  );
+
+  timers[0]();
+  await flushMicrotasks();
+  await flushMicrotasks();
+
+  assert.deepEqual(calls.batches, [[1, 2]]);
+  const entry = state.smartSummaries[harness.getSmartCacheKey(slots[0])];
+  assert.equal(entry.loading, false, "a failed batch must not leave the bay loading forever");
+  assert.equal(entry.refreshing, false);
+  assert.equal(entry.data.available, false);
+  assert.equal(entry.data.message, "smart-batch unavailable");
+});
+
+test("a cancelled prefetch run leaves the hovered bay eligible for the next run", async () => {
+  const harness = loadSmartPrefetchHarness();
+  const { state, slots, timers, calls } = harness;
+
+  harness.scheduleSmartPrefetch();
+  state.hoveredSlot = 1;
+  await harness.ensureSmartSummaryOnInteraction(slots[0]);
+
+  // A scope change supersedes the queued run before its timer fires.
+  state.smartPrefetchToken += 1;
+  timers[0]();
+  await flushMicrotasks();
+  assert.deepEqual(calls.batches, [], "the superseded run must not send a request");
+
+  const candidates = harness.candidateSlotsForSmartPrefetch().map((slot) => slot.slot);
+  assert.deepEqual(candidates, [1, 2], "the hovered bay must survive a cancelled run as a candidate");
+});
