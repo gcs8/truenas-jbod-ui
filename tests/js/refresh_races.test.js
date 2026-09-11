@@ -969,7 +969,7 @@ test("storage-view SMART completion cannot mutate a different active view", asyn
       getLiveBackedStorageViewSlot: () => null,
       getStorageViewSmartSummaryEntry: () => state.smartSummaries[cacheKey]?.data || null,
       getSmartSummaryEntry: () => null,
-      slotTooltip: () => "live label",
+      slotAccessibleName: () => "live label",
       buildStorageViewRuntimeTooltip: (_slot, activeView) => `${activeView.id}:slot-5`,
       refreshGridTileAriaLabel(slotIndex, label) {
         presentationEvents.push(`aria:${slotIndex}:${label}:${state.selectedStorageViewRuntimeId}`);
@@ -1022,7 +1022,7 @@ test("storage-view SMART completion cannot mutate the same view ID in a differen
       getLiveBackedStorageViewSlot: () => null,
       getStorageViewSmartSummaryEntry: () => state.smartSummaries[cacheKey]?.data || null,
       getSmartSummaryEntry: () => null,
-      slotTooltip: () => "live label",
+      slotAccessibleName: () => "live label",
       buildStorageViewRuntimeTooltip: () => "stale system-a label",
       refreshGridTileAriaLabel() { presentationEvents.push("aria"); },
       refreshHeatmapTileOverlays() { presentationEvents.push("heatmap"); },

@@ -27,6 +27,19 @@ from history_service.refresh_auth import read_limited_request_body
 MAX_HISTORY_SCOPES_REQUEST_BYTES = 64 * 1024
 
 
+def live_write_policy(request: Request) -> dict[str, Any]:
+    """Write policy for the main UI plus the public origin a browser must use.
+
+    The origin is only named when an operator configured one; otherwise the
+    browser has no better address to suggest than the one it is already on.
+    """
+    policy = dict(resolve_read_ui_write_policy(request))
+    app_state = getattr(request.app, "state", None)
+    public_origin = getattr(app_state, "read_ui_public_origin", None)
+    policy["public_origin"] = public_origin if isinstance(public_origin, str) and public_origin else None
+    return policy
+
+
 def _history_read_busy_response() -> JSONResponse:
     return JSONResponse(
         {"detail": HISTORY_READ_BUSY_DETAIL},
@@ -149,21 +162,20 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             selected_enclosure_id=enclosure_id,
             snapshot=snapshot,
         )
-        return templates.TemplateResponse(
-            request,
-            "index.html",
-            build_index_context(
-                request=request,
-                snapshot=snapshot,
-                storage_view_runtime=storage_view_runtime,
-                settings=current_settings,
-                history_configured=bool(current_settings.history.service_url),
-                read_ui_mutation_auth_mode=request.app.state.operator_auth_settings.auth_mode,
-                admin_launch_url=admin_launch_url,
-                app_version=__version__,
-                release_status=get_release_status_service().snapshot(),
-            ),
+        context = build_index_context(
+            request=request,
+            snapshot=snapshot,
+            storage_view_runtime=storage_view_runtime,
+            settings=current_settings,
+            history_configured=bool(current_settings.history.service_url),
+            read_ui_mutation_auth_mode=request.app.state.operator_auth_settings.auth_mode,
+            admin_launch_url=admin_launch_url,
+            app_version=__version__,
+            release_status=get_release_status_service().snapshot(),
         )
+        context["write_policy"] = live_write_policy(request)
+        context["write_policy_json"] = json.dumps(context["write_policy"])
+        return templates.TemplateResponse(request, "index.html", context)
 
     @router.get("/sas-fabric", response_class=HTMLResponse)
     async def sas_fabric_view(
@@ -207,20 +219,28 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
 
     @router.get("/api/inventory", response_model=InventorySnapshot)
     async def get_inventory(
+        request: Request,
         force: bool = False,
         system_id: str | None = None,
         enclosure_id: str | None = None,
-    ) -> InventorySnapshot:
+    ) -> JSONResponse:
         service = route_service(
             system_id,
             enclosure_id=enclosure_id,
             force_refresh=force,
         )
-        return await service.get_snapshot(
+        snapshot = await service.get_snapshot(
             force_refresh=force,
             selected_enclosure_id=enclosure_id,
             allow_stale_cache=not force,
         )
+        payload = snapshot.model_dump(mode="json")
+        # The browser re-syncs its write controls and its cached page from
+        # every refresh, so a rejected write or a container upgrade never
+        # leaves the page stuck on stale policy or stale JavaScript.
+        payload["write_policy"] = live_write_policy(request)
+        payload["app_version"] = __version__
+        return JSONResponse(payload)
 
     @router.get(
         "/api/read-ui/auth/verify",

@@ -1,7 +1,8 @@
 (function () {
   const bootstrap = window.APP_BOOTSTRAP || {};
   const supportedRefreshIntervals = [15, 30, 60, 300];
-  const bootstrapRefreshInterval = Number(bootstrap.refreshIntervalSeconds) || 30;
+  const bootstrapRefreshInterval = Number(bootstrap.refreshIntervalSeconds) > 0 ? Number(bootstrap.refreshIntervalSeconds) : 30;
+  const refreshIntervalOptions = refreshIntervalOptionsFor(bootstrapRefreshInterval);
   const refreshTiming = bootstrap.refreshTiming || {};
   const SMART_BATCH_REQUEST_MAX_CONCURRENCY = Math.max(1, Number(bootstrap.smartBatchMaxConcurrency) || 12);
   const SMART_PREFETCH_DELAY_MS = Math.max(1, Number(bootstrap.smartPrefetchDelayMs) || 120);
@@ -40,6 +41,16 @@
   function positiveSeconds(value, fallbackSeconds) {
     const numeric = Number(value);
     return Number.isFinite(numeric) && numeric > 0 ? numeric : fallbackSeconds;
+  }
+
+  // The admin settings accept any interval; the dropdown lists the common
+  // ones and adds the configured value so it is used and visible as chosen.
+  function refreshIntervalOptionsFor(configuredSeconds) {
+    const seconds = Number(configuredSeconds);
+    if (!Number.isFinite(seconds) || seconds <= 0 || supportedRefreshIntervals.includes(seconds)) {
+      return [...supportedRefreshIntervals];
+    }
+    return [...supportedRefreshIntervals, seconds].sort((left, right) => left - right);
   }
 
   const persistedHistoryUi = snapshotMode ? null : loadStoredJson(HISTORY_UI_STORAGE_KEY);
@@ -95,14 +106,16 @@
     snapshotReuseCache: {},
     search: "",
     autoRefresh: snapshotMode ? false : true,
-    refreshIntervalSeconds: supportedRefreshIntervals.includes(bootstrapRefreshInterval) ? bootstrapRefreshInterval : 30,
+    refreshIntervalSeconds: bootstrapRefreshInterval,
+    appUpdated: false,
+    detailSmartExpanded: false,
     timerId: null,
     timerScheduledAt: 0,
     timerDueAt: 0,
     timerDelayMs: 0,
     timingTickId: null,
     identifyVerifyTimerId: null,
-    diskInventorySync: { armedMode: null, armedSystemId: null, armTimerId: null, inFlight: false },
+    diskInventorySync: { inFlight: false },
     refreshesInFlight: 0,
     latestRefreshToken: 0,
     storageViewsRuntimeRequestToken: 0,
@@ -252,7 +265,9 @@
   const detailSecondary = document.getElementById("detail-secondary");
   const detailLedControls = document.getElementById("detail-led-controls");
   const diskInventorySyncControls = document.getElementById("disk-inventory-sync-controls");
-  const diskInventorySyncHint = document.getElementById("disk-inventory-sync-hint");
+  const searchClearButton = document.getElementById("search-clear");
+  const searchSummary = document.getElementById("search-summary");
+  const appVersionNote = document.getElementById("app-version-note");
   const detailSlotTitle = document.getElementById("detail-slot-title");
   const detailStatePill = document.getElementById("detail-state-pill");
   const detailKvGrid = document.getElementById("detail-kv-grid");
@@ -1013,10 +1028,11 @@
       }
       tile.setAttribute(
         "aria-label",
-        liveSlot
-          ? slotTooltip(liveSlot, getStorageViewSmartSummaryEntry(selectedView, slot) || getSmartSummaryEntry(liveSlot))
-          : buildStorageViewRuntimeTooltip(slot, selectedView)
+        liveSlot ? slotAccessibleName(liveSlot) : buildStorageViewRuntimeTooltip(slot, selectedView)
       );
+      if (liveSlot) {
+        tile.setAttribute("aria-describedby", "slot-tooltip");
+      }
       tile.innerHTML =
         selectedView.kind === "nvme_carrier"
           ? buildNvmeRuntimeTileMarkup(slot, selectedView)
@@ -1101,7 +1117,8 @@
       tile.style.top = metrics.top;
       tile.style.width = metrics.width;
       tile.style.minHeight = metrics.minHeight;
-      tile.setAttribute("aria-label", slotTooltip(liveSlot, getSmartSummaryEntry(liveSlot)));
+      tile.setAttribute("aria-label", slotAccessibleName(liveSlot));
+      tile.setAttribute("aria-describedby", "slot-tooltip");
       tile.innerHTML = buildNvmeRuntimeTileMarkup(displaySlot, { kind: "nvme_carrier" });
       applyHeatmapToTile(tile, heatmapContext, liveSlot.slot);
       tile.addEventListener("mouseenter", (event) => {
@@ -1360,6 +1377,9 @@
 
   async function clearEnclosureAlias() {
     if (!enclosureAliasInput) {
+      return;
+    }
+    if (!window.confirm("Remove this enclosure name? The name reported by the hardware will be shown instead.")) {
       return;
     }
     enclosureAliasInput.value = "";
@@ -1919,7 +1939,7 @@
     if (!expandKey || overflow <= 0) {
       return visibleText;
     }
-    return `${visibleText}, <span class="sas-fabric-slot-overflow" role="button" tabindex="0" data-sas-fabric-expand-slots="${escapeHtml(expandKey)}">+${overflow}</span>`;
+    return `${visibleText}, <button type="button" class="sas-fabric-slot-overflow" data-sas-fabric-expand-slots="${escapeHtml(expandKey)}">+${overflow}</button>`;
   }
 
   function toggleSasFabricSlotList(expandKey) {
@@ -2439,10 +2459,9 @@
   function applySnapshot(snapshot) {
     rememberReusableSnapshot(snapshot);
     const nextSystemId = snapshot.selected_system_id || state.selectedSystemId;
-    if (nextSystemId !== state.selectedSystemId) {
-      disarmDiskInventorySync();
-    }
     state.snapshot = snapshot;
+    syncWritePolicyFromSnapshot(snapshot);
+    noteServerAppVersion(snapshot.app_version);
     state.layoutRows = snapshot.layout_rows || state.layoutRows || [];
     state.selectedSystemId = nextSystemId;
     state.selectedEnclosureId = snapshot.selected_enclosure_id || null;
@@ -2487,21 +2506,82 @@
   }
 
   function setStatus(message, tone = "info") {
-    statusText.textContent = message;
+    setTextIfChanged(statusText, message);
     statusText.dataset.tone = tone;
   }
 
-  // Effective write policy for the main UI (#273). Offline snapshots have no
+  function noteServerAppVersion(serverVersion) {
+    const pageVersion = typeof bootstrap.appVersion === "string" ? bootstrap.appVersion : "";
+    if (!pageVersion || typeof serverVersion !== "string" || !serverVersion) {
+      return;
+    }
+    const updated = serverVersion !== pageVersion;
+    if (updated === Boolean(state.appUpdated)) {
+      return;
+    }
+    state.appUpdated = updated;
+    renderAppVersionNote();
+    if (updated) {
+      setStatus("The app was updated. Reload this page.", "error");
+    }
+  }
+
+  function renderAppVersionNote() {
+    if (!appVersionNote || !state.appUpdated) {
+      return;
+    }
+    setTextIfChanged(appVersionNote, "The app was updated. Reload this page.");
+    appVersionNote.className = "meta-note version-note version-note-update-available";
+  }
+
+  // Effective write policy for the main UI. Offline snapshots have no
   // policy. Basic-mode credentials exist only in this page's state.
   function normalizeWritePolicy(raw) {
     if (!raw || typeof raw !== "object") {
-      return { enabled: true, mode: "", reason: "" };
+      return { enabled: true, mode: "", reason: "", publicOrigin: "" };
     }
+    const publicOrigin = typeof raw.publicOrigin === "string"
+      ? raw.publicOrigin
+      : (typeof raw.public_origin === "string" ? raw.public_origin : "");
     return {
       enabled: raw.enabled !== false,
       mode: typeof raw.mode === "string" ? raw.mode : "",
       reason: typeof raw.reason === "string" ? raw.reason : "",
+      publicOrigin,
     };
+  }
+
+  // Every inventory refresh carries the server's current policy, so a page
+  // that was told "no" once follows the server again instead of staying
+  // locked until a reload. The server cannot see this page's sign-in, so a
+  // signed-in Basic-mode page keeps its own enabled state.
+  function syncWritePolicyFromSnapshot(snapshot) {
+    const raw = snapshot?.write_policy;
+    if (!raw || typeof raw !== "object") {
+      return false;
+    }
+    const policy = normalizeWritePolicy(raw);
+    if (policy.mode === "basic" && state.writeAuthorization) {
+      policy.enabled = true;
+      policy.reason = "";
+    }
+    applyWritePolicy(policy);
+    return true;
+  }
+
+  function describeWriteRejection(error) {
+    const originRefusals = [
+      "Cross-origin Read UI mutation rejected.",
+      "Read UI authorization mode is unavailable.",
+    ];
+    const detail = typeof error?.detail === "string" ? error.detail : "";
+    if (!originRefusals.includes(detail)) {
+      return detail || error?.message || `Request failed with ${Number(error?.status) || 403}`;
+    }
+    const origin = state.writePolicy?.publicOrigin || "";
+    return origin
+      ? `This server does not allow changes from this address. Open the UI at ${origin}.`
+      : "This server does not allow changes from this address.";
   }
 
   function writePolicyAllowsWrites() {
@@ -2624,14 +2704,18 @@
     if (readUiAuthPassword) readUiAuthPassword.disabled = state.writeAuthPending;
     if (readUiAuthSubmit) readUiAuthSubmit.disabled = state.writeAuthPending;
     if (readUiAuthStatus) {
+      let authStatusText;
       if (state.writeAuthPending) {
-        readUiAuthStatus.textContent = "Checking credentials...";
+        authStatusText = "Checking credentials...";
       } else if (signedIn && writePolicyAllowsWrites()) {
-        readUiAuthStatus.textContent = "Signed in for writes. Credentials clear on reload or sign-out.";
+        authStatusText = "Signed in for writes. Credentials clear on reload or sign-out.";
       } else if (signedIn) {
-        readUiAuthStatus.textContent = `Signed in, but writes are blocked. ${writePolicyReason()}`;
+        authStatusText = `Signed in, but writes are blocked. ${writePolicyReason()}`;
       } else {
-        readUiAuthStatus.textContent = "Reads remain anonymous. Credentials stay in this page only.";
+        authStatusText = "Reads remain anonymous. Credentials stay in this page only.";
+      }
+      if (readUiAuthStatus.textContent !== authStatusText) {
+        readUiAuthStatus.textContent = authStatusText;
       }
     }
   }
@@ -2671,14 +2755,19 @@
     }
     if (status === 401) {
       clearReadUiAuthorization();
+      applyWritePolicy({
+        enabled: false,
+        mode: state.writePolicy?.mode || "",
+        publicOrigin: state.writePolicy?.publicOrigin || "",
+        reason: typeof error?.detail === "string" && error.detail
+          ? error.detail
+          : error?.message || `Request failed with ${status}`,
+      });
+      return true;
     }
-    applyWritePolicy({
-      enabled: false,
-      mode: state.writePolicy?.mode || "",
-      reason: typeof error?.detail === "string" && error.detail
-        ? error.detail
-        : error?.message || `Request failed with ${status}`,
-    });
+    // A 403 refuses one request. The controls stay usable; the message says
+    // what to do, and the next refresh re-syncs the policy from the server.
+    error.message = describeWriteRejection(error);
     return true;
   }
 
@@ -2916,15 +3005,15 @@
     const currentSummary = state.uiPerf.currentRun ? buildUiPerfSummary(state.uiPerf.currentRun) : null;
     const latestSummary = currentSummary || state.uiPerf.recentRuns[0] || null;
     if (!latestSummary) {
-      uiPerfSummary.textContent = "Browser timing is idle.";
+      setTextIfChanged(uiPerfSummary, "Browser timing is idle.");
       uiPerfRecent.innerHTML = "";
       syncUiPerfGlobal();
       return;
     }
 
-    uiPerfSummary.textContent = currentSummary
+    setTextIfChanged(uiPerfSummary, currentSummary
       ? `Current ${currentSummary.reasonLabel.toLowerCase()} on ${uiPerfScopeLabel(currentSummary)}: request ${uiPerfMetricDisplay(currentSummary, "requestMs")}, paint ${uiPerfMetricDisplay(currentSummary, "paintMs")}, history ${uiPerfMetricDisplay(currentSummary, "historyReadyMs")}, SMART ${uiPerfMetricDisplay(currentSummary, "smartReadyMs")}, settled ${uiPerfMetricDisplay(currentSummary, "settledMs")}.`
-      : `Last ${latestSummary.reasonLabel.toLowerCase()} on ${uiPerfScopeLabel(latestSummary)}: request ${uiPerfMetricDisplay(latestSummary, "requestMs")}, paint ${uiPerfMetricDisplay(latestSummary, "paintMs")}, history ${uiPerfMetricDisplay(latestSummary, "historyReadyMs")}, SMART ${uiPerfMetricDisplay(latestSummary, "smartReadyMs")}, settled ${uiPerfMetricDisplay(latestSummary, "settledMs")}.`;
+      : `Last ${latestSummary.reasonLabel.toLowerCase()} on ${uiPerfScopeLabel(latestSummary)}: request ${uiPerfMetricDisplay(latestSummary, "requestMs")}, paint ${uiPerfMetricDisplay(latestSummary, "paintMs")}, history ${uiPerfMetricDisplay(latestSummary, "historyReadyMs")}, SMART ${uiPerfMetricDisplay(latestSummary, "smartReadyMs")}, settled ${uiPerfMetricDisplay(latestSummary, "settledMs")}.`);
 
     const recentCards = [];
     if (currentSummary) {
@@ -5330,7 +5419,7 @@
       heatmapMetricField.classList.toggle("hidden", !state.heatmap.enabled);
     }
     if (heatmapMetricContext) {
-      heatmapMetricContext.textContent = heatmapMetricContextText(metric.id);
+      setTextIfChanged(heatmapMetricContext, heatmapMetricContextText(metric.id));
       heatmapMetricContext.classList.toggle("hidden", !state.heatmap.enabled);
     }
     if (heatmapTimeframeField) {
@@ -5380,29 +5469,31 @@
       heatmapScrubValue.textContent = playbackLabel;
     }
     if (heatmapLegendMin) {
-      heatmapLegendMin.textContent = Number.isFinite(heatmapContext.min) ? activeMetric.format(heatmapContext.min) : "Low";
+      setTextIfChanged(heatmapLegendMin, Number.isFinite(heatmapContext.min) ? activeMetric.format(heatmapContext.min) : "Low");
     }
     if (heatmapLegendMax) {
-      heatmapLegendMax.textContent = Number.isFinite(heatmapContext.max) ? activeMetric.format(heatmapContext.max) : "High";
+      setTextIfChanged(heatmapLegendMax, Number.isFinite(heatmapContext.max) ? activeMetric.format(heatmapContext.max) : "High");
     }
     if (heatmapLegendStatus) {
+      let legendStatusText;
+      let legendStatusTitle = heatmapLegendStatus.title;
       if (state.heatmap.loading && state.heatmap.freshness === "refreshing") {
-        heatmapLegendStatus.textContent = "Refreshing cached history";
-        heatmapLegendStatus.title = "Cached heat map values remain visible while fresh history is requested.";
+        legendStatusText = "Refreshing cached history";
+        legendStatusTitle = "Cached heat map values remain visible while fresh history is requested.";
       } else if (state.heatmap.loading) {
-        heatmapLegendStatus.textContent = needsHistory ? `Loading ${formatHistoryWindowLabel(currentHeatmapWindowHours())}` : "Loading";
+        legendStatusText = needsHistory ? `Loading ${formatHistoryWindowLabel(currentHeatmapWindowHours())}` : "Loading";
       } else if (needsHistory && state.history.loading && !state.history.checked) {
-        heatmapLegendStatus.textContent = "Checking history";
-        heatmapLegendStatus.title = "";
+        legendStatusText = "Checking history";
+        legendStatusTitle = "";
       } else if (needsHistory && !isHistoryAvailable()) {
-        heatmapLegendStatus.textContent = "History unavailable";
-        heatmapLegendStatus.title = state.history.detail || "The history sidecar is not available.";
+        legendStatusText = "History unavailable";
+        legendStatusTitle = state.history.detail || "The history sidecar is not available.";
       } else if (state.heatmap.error && state.heatmap.freshness === "stale") {
-        heatmapLegendStatus.textContent = "Stale history - refresh failed";
-        heatmapLegendStatus.title = state.heatmap.error;
+        legendStatusText = "Stale history - refresh failed";
+        legendStatusTitle = state.heatmap.error;
       } else if (state.heatmap.error) {
-        heatmapLegendStatus.textContent = "History unavailable";
-        heatmapLegendStatus.title = state.heatmap.error;
+        legendStatusText = "History unavailable";
+        legendStatusTitle = state.heatmap.error;
       } else {
         const valueCount = heatmapContext.valueCount || 0;
         const windowLabel = needsHistory ? ` - ${formatHistoryWindowLabel(currentHeatmapWindowHours())}` : "";
@@ -5410,8 +5501,12 @@
         const scaleLabel = state.heatmap.sensitivity !== HEATMAP_DEFAULT_SCALE_SENSITIVITY
           ? ` - scale ${formatHeatmapScaleSensitivity(state.heatmap.sensitivity)}`
           : "";
-        heatmapLegendStatus.textContent = `${valueCount} value${valueCount === 1 ? "" : "s"}${windowLabel}${timelineLabel}${scaleLabel}`;
-        heatmapLegendStatus.title = "";
+        legendStatusText = `${valueCount} value${valueCount === 1 ? "" : "s"}${windowLabel}${timelineLabel}${scaleLabel}`;
+        legendStatusTitle = "";
+      }
+      setTextIfChanged(heatmapLegendStatus, legendStatusText);
+      if (heatmapLegendStatus.title !== legendStatusTitle) {
+        heatmapLegendStatus.title = legendStatusTitle;
       }
     }
   }
@@ -5597,8 +5692,57 @@
     return appendHeatmapTooltipLines(lines, slot.slot);
   }
 
-  function slotTooltip(slot, smartEntry) {
-    return buildTooltipLines(slot, smartEntry).join("\n");
+  // Short accessible name for a bay tile: "Slot 05, sda, pool tank, healthy".
+  // The full tooltip stays available through aria-describedby.
+  function slotAccessibleName(slot) {
+    const parts = [slotLocationLabel(slot)];
+    if (slot.device_name) {
+      parts.push(String(slot.device_name));
+    }
+    if (slot.pool_name) {
+      parts.push(`${currentPlatform() === "linux" ? "mount" : "pool"} ${slot.pool_name}`);
+    }
+    parts.push(slot.health ? String(slot.health).toLowerCase() : stateLabel(slot).toLowerCase());
+    return parts.join(", ");
+  }
+
+  function searchSummaryText(matched, total, term) {
+    if (!term) {
+      return "";
+    }
+    if (!matched) {
+      return `No bays match "${term}".`;
+    }
+    return `${matched} of ${total} bay${total === 1 ? "" : "s"} match`;
+  }
+
+  function renderSearchSummary({ autoSelect = false } = {}) {
+    const tiles = Array.from(grid.querySelectorAll(".slot-tile[data-slot]"));
+    const matches = tiles.filter((tile) => !tile.classList.contains("filtered-out"));
+    const term = state.search ? String(searchBox?.value || "").trim() : "";
+    if (searchSummary) {
+      setTextIfChanged(searchSummary, searchSummaryText(matches.length, tiles.length, term));
+      searchSummary.classList.toggle("hidden", !term);
+    }
+    if (searchClearButton) {
+      searchClearButton.classList.toggle("hidden", !term);
+    }
+    if (!autoSelect || !term || matches.length !== 1 || mappingEditorHasUnsavedChanges()) {
+      return;
+    }
+    const slotNumber = Number(matches[0].dataset.slot);
+    if (Number.isInteger(slotNumber) && state.selectedSlot !== slotNumber) {
+      selectSlot(slotNumber);
+    }
+  }
+
+  function clearSearch() {
+    if (searchBox) {
+      searchBox.value = "";
+    }
+    state.search = "";
+    refreshGridFilterState();
+    searchBox?.focus();
   }
 
   function passesFilter(slot) {
@@ -5625,10 +5769,11 @@
     return liveSlot ? passesFilter(liveSlot) : !state.search;
   }
 
-  function refreshGridFilterState() {
+  function refreshGridFilterState(options = {}) {
     grid.querySelectorAll(".slot-tile[data-slot]").forEach((tile) => {
       tile.classList.toggle("filtered-out", !gridTileMatchesFilter(tile));
     });
+    renderSearchSummary(options);
   }
 
   function refreshGridTileAriaLabel(slotNumber, label) {
@@ -5925,19 +6070,64 @@
     });
   }
 
+  function gridSlotPosition(slotNumber) {
+    const rows = activeLayoutRows();
+    for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
+      const columnIndex = (rows[rowIndex] || []).indexOf(slotNumber);
+      if (columnIndex >= 0) {
+        return { rowIndex, columnIndex, rows };
+      }
+    }
+    return null;
+  }
+
+  // Up and Down move to the nearest visible bay in the row above or below,
+  // so a four-row shelf is walked like the physical chassis.
+  function adjacentRowTile(tile, step) {
+    const position = gridSlotPosition(Number(tile.dataset.slot));
+    if (!position) {
+      return null;
+    }
+    const visibleBySlot = new Map(visibleGridTiles().map((candidate) => [Number(candidate.dataset.slot), candidate]));
+    for (let rowIndex = position.rowIndex + step; rowIndex >= 0 && rowIndex < position.rows.length; rowIndex += step) {
+      let nearest = null;
+      let nearestDistance = Infinity;
+      (position.rows[rowIndex] || []).forEach((slotNumber, columnIndex) => {
+        const candidate = visibleBySlot.get(slotNumber);
+        const distance = Math.abs(columnIndex - position.columnIndex);
+        if (candidate && distance < nearestDistance) {
+          nearest = candidate;
+          nearestDistance = distance;
+        }
+      });
+      if (nearest) {
+        return nearest;
+      }
+    }
+    return null;
+  }
+
+  function nextGridTileForKey(tile, key) {
+    const vertical = key === "ArrowUp" || key === "ArrowDown";
+    if (vertical && gridSlotPosition(Number(tile.dataset.slot))) {
+      return adjacentRowTile(tile, key === "ArrowUp" ? -1 : 1);
+    }
+    const tiles = visibleGridTiles();
+    const currentIndex = tiles.indexOf(tile);
+    if (currentIndex < 0) {
+      return null;
+    }
+    const delta = key === "ArrowLeft" || key === "ArrowUp" ? -1 : 1;
+    return tiles[currentIndex + delta] || null;
+  }
+
   function bindDelegatedGridKeyboardNavigation() {
     grid.addEventListener("keydown", (event) => {
       const tile = delegatedGridTile(event);
       if (!tile || !["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) {
         return;
       }
-      const tiles = visibleGridTiles();
-      const currentIndex = tiles.indexOf(tile);
-      if (currentIndex < 0) {
-        return;
-      }
-      const delta = event.key === "ArrowLeft" || event.key === "ArrowUp" ? -1 : 1;
-      const nextTile = tiles[currentIndex + delta];
+      const nextTile = nextGridTileForKey(tile, event.key);
       if (!nextTile) {
         return;
       }
@@ -5950,6 +6140,7 @@
     const focusedSlotKeyBeforeRender = focusedGridSlotKey();
     const finishGridRender = () => {
       refreshGridSelectionState();
+      renderSearchSummary();
       restoreGridFocus(focusedSlotKeyBeforeRender);
     };
     const selectedStorageView = getSelectedStorageViewRuntime();
@@ -6014,7 +6205,8 @@
         tile.classList.add("group-divider-after");
       }
       tile.dataset.slot = String(slot.slot);
-      tile.setAttribute("aria-label", slotTooltip(slot, getSmartSummaryEntry(slot)));
+      tile.setAttribute("aria-label", slotAccessibleName(slot));
+      tile.setAttribute("aria-describedby", "slot-tooltip");
       tile.setAttribute("aria-pressed", state.selectedSlot === slot.slot ? "true" : "false");
       tile.innerHTML = buildLiveSlotTileMarkup(slot);
       applyHeatmapToTile(tile, heatmapContext, slot.slot);
@@ -6043,6 +6235,25 @@
       return "";
     }
     return kvRow(label, value, copyable);
+  }
+
+  function isEmptyBay(slot) {
+    return slot?.state === "empty" && !slot.device_name && !slot.serial;
+  }
+
+  // SMART counters and transport facts stay one click away so the panel
+  // leads with the disk, its pool and its health.
+  function smartDetailsDisclosure(rows) {
+    const content = rows.filter(Boolean).join("");
+    if (!content) {
+      return "";
+    }
+    return `
+      <details class="detail-smart-details"${state.detailSmartExpanded ? " open" : ""}>
+        <summary>SMART details</summary>
+        <div class="kv-grid">${content}</div>
+      </details>
+    `;
   }
 
   async function copyTextToClipboard(text) {
@@ -7918,9 +8129,10 @@
       exportMappingsButton.disabled = snapshotModeActive;
       exportMappingsButton.title = snapshotModeActive ? reason : "";
     }
+    const policyBlocked = typeof writePolicyAllowsWrites === "function" && !writePolicyAllowsWrites();
     if (importMappingsButton) {
-      importMappingsButton.disabled = Boolean(reason);
-      importMappingsButton.title = reason || "";
+      importMappingsButton.disabled = Boolean(reason) || policyBlocked;
+      importMappingsButton.title = reason || (policyBlocked ? writePolicyReason() : "");
     }
     if (mappingImportUnavailable) {
       mappingImportUnavailable.textContent = reason || "";
@@ -7944,71 +8156,78 @@
     detailSlotTitle.textContent = detailTitle;
     detailStatePill.textContent = stateLabel(slot);
     detailStatePill.className = `state-pill state-${slot.state}`;
-    detailKvGrid.innerHTML = [
-      kvRow("Device", slot.device_name),
-      kvRow("Serial", slot.serial, true),
-      kvRow("Model", slot.model),
-      kvRow("Size", slot.size_human),
-      kvRow(persistentIdLabel(slot), slot.gptid, true),
-      kvRowIfMeaningful("Namespace EUI64", formatNamespaceEui64Value(slot, smartEntry), true),
-      kvRowIfMeaningful("Namespace NGUID", formatNamespaceNguidValue(smartEntry), true),
-      kvRow(currentPlatform() === "linux" ? "Mount" : "Pool", slot.pool_name),
-      kvRow(currentPlatform() === "linux" ? "Array" : "Vdev", slot.vdev_name),
-      kvRow(currentPlatform() === "linux" ? "Role" : "Class", slot.vdev_class),
-      kvRow("Topology", slot.topology_label),
-      showQuantastorContext ? kvRowIfMeaningful("Presented By", formatQuantastorContextValue(slot, "presented_by_label")) : "",
-      showQuantastorContext ? kvRowIfMeaningful("Pool Active On", formatQuantastorContextValue(slot, "pool_owner_label")) : "",
-      showQuantastorContext ? kvRowIfMeaningful("I/O Fence On", formatQuantastorContextValue(slot, "fence_owner_label")) : "",
-      showQuantastorContext ? kvRowIfMeaningful("Visible On", formatVisibleOnValue(slot)) : "",
-      showQuantastorContext ? kvRowIfMeaningful("SES Host", formatSesHostValue(slot)) : "",
-      kvRow(state.snapshotMode ? "Health at capture" : "Health", slot.health),
-      kvRow("Temp", formatTemperatureValue(slot, smartEntry)),
-      kvRowIfMeaningful("Warning Temp", formatWarningTemperatureValue(smartEntry)),
-      kvRowIfMeaningful("Critical Temp", formatCriticalTemperatureValue(smartEntry)),
-      kvRowIfMeaningful(
-        state.snapshotMode ? "SMART Status at capture" : "SMART Status",
-        formatSmartHealthStatusValue(smartEntry),
-      ),
-      kvRow("Last SMART Test", formatLastSmartTestValue(slot, smartEntry)),
-      kvRow("Power On", formatPowerOnValue(smartEntry)),
-      kvRowIfMeaningful("Power Cycles", formatPowerCycleValue(smartEntry)),
-      kvRowIfMeaningful("Power-On Resets", formatPowerOnResetsValue(smartEntry)),
-      kvRow("Sector Size", formatSectorSizeValue(slot, smartEntry)),
-      kvRow("Rotation", formatRotationValue(smartEntry)),
-      kvRow("Form Factor", formatFormFactorValue(smartEntry)),
-      kvRowIfMeaningful("Firmware", formatFirmwareValue(smartEntry)),
-      kvRowIfMeaningful("Protocol Version", formatProtocolVersionValue(smartEntry)),
-      kvRowIfMeaningful("Endurance", formatEnduranceValue(smartEntry)),
-      kvRowIfMeaningful("Available Spare", formatAvailableSpareValue(smartEntry)),
-      kvRowIfMeaningful("TRIM", formatTrimSupportedValue(smartEntry)),
-      kvRowIfMeaningful("Bytes Read", formatBytesReadValue(smartEntry)),
-      kvRowIfMeaningful("Bytes Written", formatBytesWrittenValue(smartEntry)),
-      kvRowIfMeaningful("Annualized Read", formatAnnualizedReadValue(smartEntry)),
-      kvRowIfMeaningful("Annualized Write", formatAnnualizedWriteValue(smartEntry)),
-      kvRowIfMeaningful("Est. TBW Left", formatEstimatedRemainingWriteValue(smartEntry)),
-      kvRowIfMeaningful("Read Commands", formatReadCommandsValue(smartEntry)),
-      kvRowIfMeaningful("Write Commands", formatWriteCommandsValue(smartEntry)),
-      kvRowIfMeaningful("Media Errors", formatMediaErrorsValue(smartEntry)),
-      kvRowIfMeaningful("Predictive Errors", formatPredictiveErrorsValue(smartEntry)),
-      kvRowIfMeaningful("Non-Medium Errors", formatNonMediumErrorsValue(smartEntry)),
-      kvRowIfMeaningful(readErrorCountLabel(smartEntry), formatReadErrorCountValue(smartEntry)),
-      kvRowIfMeaningful(writeErrorCountLabel(smartEntry), formatWriteErrorCountValue(smartEntry)),
-      kvRowIfMeaningful("Unsafe Shutdowns", formatUnsafeShutdownsValue(smartEntry)),
-      kvRowIfMeaningful("Hardware Resets", formatHardwareResetsValue(smartEntry)),
-      kvRowIfMeaningful("Interface CRC Errors", formatInterfaceCrcErrorsValue(smartEntry)),
-      kvRow("Read Cache", formatReadCacheValue(smartEntry)),
-      kvRow("Writeback Cache", formatWritebackCacheValue(smartEntry)),
-      kvRow("Transport", formatTransportValue(smartEntry)),
-      showSasTransportFields ? kvRow("Logical Unit ID", formatLogicalUnitIdValue(slot, smartEntry)) : "",
-      showSasTransportFields ? kvRow("SAS Address", formatSasAddressValue(slot, smartEntry)) : "",
-      showSasTransportFields ? kvRow("Attached SAS", formatAttachedSasAddressValue(slot, smartEntry)) : "",
-      showLinkRate ? kvRow("Link Rate", formatLinkRateValue(smartEntry)) : "",
-      showQuantastorContext ? kvRowIfMeaningful("SES Flags", formatSesStateValue(slot)) : "",
-      kvRow("Enclosure", slot.enclosure_label || slot.enclosure_name || slot.enclosure_id),
-      kvRow("LED", ledStatusLabel(slot)),
-      kvRow("Mapping", slot.mapping_source),
-      kvRow("Notes", slot.notes),
-    ].filter(Boolean).join("");
+    detailKvGrid.innerHTML = isEmptyBay(slot)
+      ? '<p class="detail-empty-bay">This bay is empty.</p>'
+      : [
+        kvRow("Device", slot.device_name),
+        kvRow("Serial", slot.serial, true),
+        kvRowIfMeaningful("Model", slot.model),
+        kvRowIfMeaningful("Size", slot.size_human),
+        kvRowIfMeaningful(persistentIdLabel(slot), slot.gptid, true),
+        kvRowIfMeaningful("Namespace EUI64", formatNamespaceEui64Value(slot, smartEntry), true),
+        kvRowIfMeaningful("Namespace NGUID", formatNamespaceNguidValue(smartEntry), true),
+        kvRow(currentPlatform() === "linux" ? "Mount" : "Pool", slot.pool_name),
+        kvRowIfMeaningful(currentPlatform() === "linux" ? "Array" : "Vdev", slot.vdev_name),
+        kvRowIfMeaningful(currentPlatform() === "linux" ? "Role" : "Class", slot.vdev_class),
+        kvRowIfMeaningful("Topology", slot.topology_label),
+        showQuantastorContext ? kvRowIfMeaningful("Presented By", formatQuantastorContextValue(slot, "presented_by_label")) : "",
+        showQuantastorContext ? kvRowIfMeaningful("Pool Active On", formatQuantastorContextValue(slot, "pool_owner_label")) : "",
+        showQuantastorContext ? kvRowIfMeaningful("I/O Fence On", formatQuantastorContextValue(slot, "fence_owner_label")) : "",
+        showQuantastorContext ? kvRowIfMeaningful("Visible On", formatVisibleOnValue(slot)) : "",
+        showQuantastorContext ? kvRowIfMeaningful("SES Host", formatSesHostValue(slot)) : "",
+        kvRow(state.snapshotMode ? "Health at capture" : "Health", slot.health),
+        kvRowIfMeaningful("Temp", formatTemperatureValue(slot, smartEntry)),
+        kvRowIfMeaningful(
+          state.snapshotMode ? "SMART Status at capture" : "SMART Status",
+          formatSmartHealthStatusValue(smartEntry),
+        ),
+        kvRowIfMeaningful("Enclosure", slot.enclosure_label || slot.enclosure_name || slot.enclosure_id),
+        kvRowIfMeaningful("LED", ledStatusLabel(slot)),
+        kvRowIfMeaningful("Mapping", slot.mapping_source),
+        kvRowIfMeaningful("Notes", slot.notes),
+        smartDetailsDisclosure([
+          kvRowIfMeaningful("Warning Temp", formatWarningTemperatureValue(smartEntry)),
+          kvRowIfMeaningful("Critical Temp", formatCriticalTemperatureValue(smartEntry)),
+          kvRowIfMeaningful("Last SMART Test", formatLastSmartTestValue(slot, smartEntry)),
+          kvRowIfMeaningful("Power On", formatPowerOnValue(smartEntry)),
+          kvRowIfMeaningful("Power Cycles", formatPowerCycleValue(smartEntry)),
+          kvRowIfMeaningful("Power-On Resets", formatPowerOnResetsValue(smartEntry)),
+          kvRowIfMeaningful("Sector Size", formatSectorSizeValue(slot, smartEntry)),
+          kvRowIfMeaningful("Rotation", formatRotationValue(smartEntry)),
+          kvRowIfMeaningful("Form Factor", formatFormFactorValue(smartEntry)),
+          kvRowIfMeaningful("Firmware", formatFirmwareValue(smartEntry)),
+          kvRowIfMeaningful("Protocol Version", formatProtocolVersionValue(smartEntry)),
+          kvRowIfMeaningful("Endurance", formatEnduranceValue(smartEntry)),
+          kvRowIfMeaningful("Available Spare", formatAvailableSpareValue(smartEntry)),
+          kvRowIfMeaningful("TRIM", formatTrimSupportedValue(smartEntry)),
+          kvRowIfMeaningful("Bytes Read", formatBytesReadValue(smartEntry)),
+          kvRowIfMeaningful("Bytes Written", formatBytesWrittenValue(smartEntry)),
+          kvRowIfMeaningful("Annualized Read", formatAnnualizedReadValue(smartEntry)),
+          kvRowIfMeaningful("Annualized Write", formatAnnualizedWriteValue(smartEntry)),
+          kvRowIfMeaningful("Est. TBW Left", formatEstimatedRemainingWriteValue(smartEntry)),
+          kvRowIfMeaningful("Read Commands", formatReadCommandsValue(smartEntry)),
+          kvRowIfMeaningful("Write Commands", formatWriteCommandsValue(smartEntry)),
+          kvRowIfMeaningful("Media Errors", formatMediaErrorsValue(smartEntry)),
+          kvRowIfMeaningful("Predictive Errors", formatPredictiveErrorsValue(smartEntry)),
+          kvRowIfMeaningful("Non-Medium Errors", formatNonMediumErrorsValue(smartEntry)),
+          kvRowIfMeaningful(readErrorCountLabel(smartEntry), formatReadErrorCountValue(smartEntry)),
+          kvRowIfMeaningful(writeErrorCountLabel(smartEntry), formatWriteErrorCountValue(smartEntry)),
+          kvRowIfMeaningful("Unsafe Shutdowns", formatUnsafeShutdownsValue(smartEntry)),
+          kvRowIfMeaningful("Hardware Resets", formatHardwareResetsValue(smartEntry)),
+          kvRowIfMeaningful("Interface CRC Errors", formatInterfaceCrcErrorsValue(smartEntry)),
+          kvRowIfMeaningful("Read Cache", formatReadCacheValue(smartEntry)),
+          kvRowIfMeaningful("Writeback Cache", formatWritebackCacheValue(smartEntry)),
+          kvRowIfMeaningful("Transport", formatTransportValue(smartEntry)),
+          showSasTransportFields ? kvRowIfMeaningful("Logical Unit ID", formatLogicalUnitIdValue(slot, smartEntry)) : "",
+          showSasTransportFields ? kvRowIfMeaningful("SAS Address", formatSasAddressValue(slot, smartEntry)) : "",
+          showSasTransportFields ? kvRowIfMeaningful("Attached SAS", formatAttachedSasAddressValue(slot, smartEntry)) : "",
+          showLinkRate ? kvRowIfMeaningful("Link Rate", formatLinkRateValue(smartEntry)) : "",
+          showQuantastorContext ? kvRowIfMeaningful("SES Flags", formatSesStateValue(slot)) : "",
+        ]),
+      ].filter(Boolean).join("");
+    detailKvGrid.querySelector(".detail-smart-details")?.addEventListener("toggle", (event) => {
+      state.detailSmartExpanded = Boolean(event.target.open);
+    });
 
     const smartNoteText = buildSmartNoteText(slot, smartEntry);
     if (smartNoteText) {
@@ -8684,11 +8903,14 @@
     const healthScope = mappingHealthScope(state.snapshot, getSelectedStorageViewRuntime());
     const health = summarizeMappingHealth(healthScope.slots, healthScope.layoutSlotCount);
     if (mappingHealthSummary) {
-      mappingHealthSummary.textContent = `${healthScope.label}: ${health.headline} ${health.matched} matched, ${health.empty} empty, ${health.unmatched} unmatched, ${health.unknown} unknown.`;
+      setTextIfChanged(
+        mappingHealthSummary,
+        `${healthScope.label}: ${health.headline} ${health.matched} matched, ${health.empty} empty, ${health.unmatched} unmatched, ${health.unknown} unknown.`,
+      );
       mappingHealthSummary.dataset.tone = health.unmatched > 0 ? "warning" : health.unknown > 0 ? "unknown" : "ok";
     }
     if (mappingHealthEvidence) {
-      mappingHealthEvidence.textContent = mappingHealthEvidenceNote(healthScope.slots, healthScope.lastUpdated);
+      setTextIfChanged(mappingHealthEvidence, mappingHealthEvidenceNote(healthScope.slots, healthScope.lastUpdated));
     }
   }
 
@@ -8824,8 +9046,25 @@
     wireCopyButtons(platformDetailsSections);
   }
 
+  function ensureRefreshIntervalOption() {
+    if (!refreshIntervalSelect) {
+      return;
+    }
+    const wanted = String(state.refreshIntervalSeconds);
+    const options = Array.from(refreshIntervalSelect.options || []);
+    if (options.some((option) => option.value === wanted)) {
+      return;
+    }
+    const option = document.createElement("option");
+    option.value = wanted;
+    option.textContent = `${formatRefreshInterval(state.refreshIntervalSeconds)} (server default)`;
+    const nextOption = options.find((candidate) => Number(candidate.value) > state.refreshIntervalSeconds) || null;
+    refreshIntervalSelect.insertBefore(option, nextOption);
+  }
+
   function renderRefreshControls() {
     autoRefreshToggle.checked = state.autoRefresh;
+    ensureRefreshIntervalOption();
     refreshIntervalSelect.value = String(state.refreshIntervalSeconds);
     refreshButton.disabled = state.snapshotMode;
     autoRefreshToggle.disabled = state.snapshotMode;
@@ -9116,7 +9355,7 @@
     if (enclosureSelect) {
       let enclosureOptionsHtml;
       if (!visibleEnclosures.length && !storageViews.length) {
-        enclosureOptionsHtml = '<option value="">Auto-selected</option>';
+        enclosureOptionsHtml = '<option value="">No enclosures found</option>';
       } else {
         const enclosureOptions = visibleEnclosures
           .map((enclosure) => `<option value="enclosure:${escapeHtml(enclosure.id)}">${escapeHtml(selectorLabelForEnclosureOption(enclosure))}</option>`)
@@ -9334,12 +9573,17 @@
     state.refreshesInFlight += 1;
     cancelAutoRefreshTimer();
     const mappingDraftAtStart = Boolean(state.mappingFormDirty);
+    // Background refreshes keep quiet: progress shows in the countdown strip
+    // and an earlier error stays on the status line until the user acts.
+    const background = reason === "auto-refresh" || String(reason).endsWith("-led-verify");
     const perfRun = beginUiPerfRun(reason, {
       systemId: state.selectedSystemId,
       enclosureId: state.selectedEnclosureId,
     });
     try {
-      setStatus(refreshStatusMessage(force, reason));
+      if (!background) {
+        setStatus(refreshStatusMessage(force, reason));
+      }
       const params = buildSelectionParams();
       params.set("force", force ? "true" : "false");
       const snapshot = await fetchJson(`/api/inventory?${params.toString()}`);
@@ -9393,7 +9637,9 @@
       scheduleSmartPrefetch();
       ensureHeatmapData();
       maybeFinalizeUiPerfRun(perfRun);
-      setStatus("Inventory updated.");
+      if (!background) {
+        setStatus("Inventory updated.");
+      }
     } catch (error) {
       if (perfRun && state.uiPerf.currentRun?.id === perfRun.id) {
         archiveUiPerfRun(perfRun, "error", error.message || String(error));
@@ -9444,8 +9690,9 @@
     }
   }
 
-  // TrueNAS disk inventory sync (#357): per-system action group in the enclosure
-  // header. Two-step confirm; runs behind the same write gate as the LED route.
+  // TrueNAS disk inventory sync: per-system action group in the enclosure
+  // header. A confirm dialog guards it; it runs behind the same write gate as
+  // the LED route.
   function diskInventorySyncPlatformSupported(platform) {
     return platform === "core" || platform === "scale";
   }
@@ -9507,15 +9754,8 @@
     const showGroup = !state.snapshotMode && diskInventorySyncPlatformSupported(platform);
     diskInventorySyncControls.classList.toggle("hidden", !showGroup);
     if (!showGroup) {
-      if (state.diskInventorySync.armedMode) {
-        disarmDiskInventorySync();
-      }
       return;
     }
-    const currentSystemId = state.selectedSystemId || state.snapshot?.selected_system_id;
-    const armedMode = state.diskInventorySync.armedSystemId === currentSystemId
-      ? state.diskInventorySync.armedMode
-      : null;
     diskInventorySyncButtons.forEach((button) => {
       const mode = button.dataset.diskInventorySyncMode;
       const spec = diskInventorySyncModeSpec(mode);
@@ -9524,46 +9764,16 @@
       }
       button.classList.toggle("hidden", mode === "multipath" && platform !== "core");
       const availability = diskInventorySyncModeAvailability(mode);
-      const armed = armedMode === mode;
       button.disabled = !availability.available;
       button.title = availability.available ? spec.explanation : availability.reason;
-      button.textContent = armed ? "Confirm sync" : spec.label;
-      button.dataset.armed = armed ? "true" : "false";
+      button.textContent = spec.label;
     });
-    if (diskInventorySyncHint) {
-      const spec = armedMode ? diskInventorySyncModeSpec(armedMode) : null;
-      diskInventorySyncHint.textContent = spec
-        ? `${spec.explanation} Click Confirm sync within a few seconds to run it.`
-        : "";
-      diskInventorySyncHint.classList.toggle("hidden", !spec);
-    }
   }
 
-  function disarmDiskInventorySync() {
-    if (state.diskInventorySync.armTimerId) {
-      window.clearTimeout(state.diskInventorySync.armTimerId);
-      state.diskInventorySync.armTimerId = null;
-    }
-    if (!state.diskInventorySync.armedMode && !state.diskInventorySync.armedSystemId) {
-      return;
-    }
-    state.diskInventorySync.armedMode = null;
-    state.diskInventorySync.armedSystemId = null;
-    renderDiskInventorySyncControls();
-  }
-
-  function armDiskInventorySync(mode) {
-    if (state.diskInventorySync.armTimerId) {
-      window.clearTimeout(state.diskInventorySync.armTimerId);
-    }
-    state.diskInventorySync.armedMode = mode;
-    state.diskInventorySync.armedSystemId = state.selectedSystemId || state.snapshot?.selected_system_id || null;
-    // Confirm window: the second click has to land within 6 s or the button disarms.
-    state.diskInventorySync.armTimerId = window.setTimeout(() => {
-      state.diskInventorySync.armTimerId = null;
-      disarmDiskInventorySync();
-    }, 6000);
-    renderDiskInventorySyncControls();
+  function diskInventorySyncConfirmText(mode) {
+    return mode === "multipath"
+      ? "Ask TrueNAS to rebuild its multipath table? Pools and data are not touched. This takes about a minute."
+      : "Ask TrueNAS to re-scan its disks? Pools and data are not touched. This takes about a minute.";
   }
 
   function handleDiskInventorySyncClick(mode) {
@@ -9573,21 +9783,15 @@
     }
     const availability = diskInventorySyncModeAvailability(mode);
     if (!availability.available) {
-      disarmDiskInventorySync();
       renderDiskInventorySyncControls();
       setStatus(availability.reason, "error");
       return;
     }
     const systemId = state.selectedSystemId || state.snapshot?.selected_system_id || null;
-    if (
-      state.diskInventorySync.armedMode === mode
-      && state.diskInventorySync.armedSystemId === systemId
-    ) {
-      disarmDiskInventorySync();
-      void runDiskInventorySync(mode, systemId);
+    if (!window.confirm(diskInventorySyncConfirmText(mode))) {
       return;
     }
-    armDiskInventorySync(mode);
+    void runDiskInventorySync(mode, systemId);
   }
 
   function formatDiskInventorySyncResult(result) {
@@ -9946,7 +10150,6 @@
     if (state.hoveredSlot === slot.slot) {
       refreshHoveredTooltip();
     }
-    refreshGridTileAriaLabel(slot.slot, slotTooltip(slot, getSmartSummaryEntry(slot)));
     if (state.heatmap.enabled) {
       refreshHeatmapTileOverlays();
     }
@@ -10012,10 +10215,9 @@
       refreshHoveredTooltip();
     }
     const liveSlot = getLiveBackedStorageViewSlot(view, slot);
-    const smartEntry = getStorageViewSmartSummaryEntry(view, slot) || (liveSlot ? getSmartSummaryEntry(liveSlot) : null);
     refreshGridTileAriaLabel(
       slot.slot_index,
-      liveSlot ? slotTooltip(liveSlot, smartEntry) : buildStorageViewRuntimeTooltip(slot, view)
+      liveSlot ? slotAccessibleName(liveSlot) : buildStorageViewRuntimeTooltip(slot, view)
     );
     if (state.heatmap.enabled) {
       refreshHeatmapTileOverlays();
@@ -10033,7 +10235,7 @@
       case 300:
         return "5 min";
       default:
-        return `${seconds} sec`;
+        return seconds > 0 && seconds % 60 === 0 ? `${seconds / 60} min` : `${seconds} sec`;
     }
   }
 
@@ -10122,8 +10324,17 @@
 
   searchBox.addEventListener("input", (event) => {
     state.search = event.target.value.trim().toLowerCase();
-    refreshGridFilterState();
+    refreshGridFilterState({ autoSelect: true });
   });
+  searchBox.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && state.search) {
+      event.preventDefault();
+      clearSearch();
+    }
+  });
+  if (searchClearButton) {
+    searchClearButton.addEventListener("click", clearSearch);
+  }
 
   refreshButton.addEventListener("click", () => {
     void requestManualRefresh();
@@ -10137,9 +10348,6 @@
       }
       const previousEstimateBasisKey = snapshotExportEstimateBasisKey();
       closeEnclosureAliasEditor(false);
-      if (nextSystemId !== state.selectedSystemId) {
-        disarmDiskInventorySync();
-      }
       state.selectedSystemId = nextSystemId;
       state.selectedEnclosureId = null;
       state.storageViewsRuntime = {
@@ -10245,7 +10453,7 @@
   });
   refreshIntervalSelect.addEventListener("change", (event) => {
     const selected = Number(event.target.value);
-    state.refreshIntervalSeconds = supportedRefreshIntervals.includes(selected) ? selected : 30;
+    state.refreshIntervalSeconds = refreshIntervalOptions.includes(selected) ? selected : 30;
     resetTimer();
     renderRefreshControls();
     setStatus(`Auto-refresh interval set to ${formatRefreshInterval(state.refreshIntervalSeconds)}.`);
@@ -10458,17 +10666,6 @@
         selectSasFabricNode(nodeButton.dataset.sasFabricNode || "");
       }
     });
-    sasFabricPanel.addEventListener("keydown", (event) => {
-      if (event.key !== "Enter" && event.key !== " ") {
-        return;
-      }
-      const expandButton = event.target.closest("[data-sas-fabric-expand-slots]");
-      if (!expandButton) {
-        return;
-      }
-      event.preventDefault();
-      toggleSasFabricSlotList(expandButton.dataset.sasFabricExpandSlots || "");
-    });
   }
   if (heatmapMetricSelect) {
     heatmapMetricSelect.addEventListener("change", () => {
@@ -10563,15 +10760,6 @@
 
   diskInventorySyncButtons.forEach((button) => {
     button.addEventListener("click", () => handleDiskInventorySyncClick(button.dataset.diskInventorySyncMode));
-  });
-  document.addEventListener("click", (event) => {
-    if (!state.diskInventorySync.armedMode) {
-      return;
-    }
-    if (diskInventorySyncControls && diskInventorySyncControls.contains(event.target)) {
-      return;
-    }
-    disarmDiskInventorySync();
   });
 
   rememberReusableSnapshot(state.snapshot);

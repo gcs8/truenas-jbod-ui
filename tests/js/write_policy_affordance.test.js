@@ -128,6 +128,8 @@ const POLICY_FUNCTIONS = [
   "applyWritePolicy",
   "clearReadUiAuthorization",
   "handleWriteRejection",
+  "describeWriteRejection",
+  "syncWritePolicyFromSnapshot",
   "writeBlockedByPolicy",
 ];
 
@@ -182,17 +184,19 @@ test("a missing bootstrap policy means writes stay enabled (snapshot artifacts u
   const { fns } = buildHarness(undefined);
   // Spread copies the sandbox-realm object so deepEqual compares values, not prototypes.
   const normalize = (raw) => ({ ...fns.normalizeWritePolicy(raw) });
-  assert.deepEqual(normalize(undefined), { enabled: true, mode: "", reason: "" });
-  assert.deepEqual(normalize(null), { enabled: true, mode: "", reason: "" });
+  assert.deepEqual(normalize(undefined), { enabled: true, mode: "", reason: "", publicOrigin: "" });
+  assert.deepEqual(normalize(null), { enabled: true, mode: "", reason: "", publicOrigin: "" });
   assert.deepEqual(normalize({ enabled: true, mode: "basic", reason: "" }), {
     enabled: true,
     mode: "basic",
     reason: "",
+    publicOrigin: "",
   });
-  assert.deepEqual(normalize({ enabled: false, mode: "network", reason: NETWORK_REASON }), {
+  assert.deepEqual(normalize({ enabled: false, mode: "network", reason: NETWORK_REASON, public_origin: "https://nas.example.test" }), {
     enabled: false,
     mode: "network",
     reason: NETWORK_REASON,
+    publicOrigin: "https://nas.example.test",
   });
 });
 
@@ -257,7 +261,7 @@ test("sign-in restores policy-owned controls without changing independently disa
   assert.equal(independentlyDisabled.getAttribute("aria-describedby"), "led-help");
 });
 
-test("a 401/403 write response applies the server detail as the disabled reason", () => {
+test("a 401 write response applies the server detail as the disabled reason", () => {
   const { fns, state, controls, writePolicyNotice, statuses } = buildHarness({ enabled: true, mode: "basic", reason: "" });
 
   const denied = new Error("Read UI authentication required.");
@@ -277,6 +281,70 @@ test("a 401/403 write response applies the server detail as the disabled reason"
 
   assert.equal(fns.writeBlockedByPolicy(), true);
   assert.deepEqual(statuses, [{ message: "Read UI authentication required.", tone: "error" }]);
+});
+
+test("a 403 refuses one request in plain words and leaves every write control usable", () => {
+  const { fns, state, controls, writePolicyNotice } = buildHarness({
+    enabled: true,
+    mode: "network",
+    reason: "",
+    publicOrigin: "https://nas.example.test",
+  });
+
+  const rejected = new Error("Cross-origin Read UI mutation rejected.");
+  rejected.status = 403;
+  rejected.detail = "Cross-origin Read UI mutation rejected.";
+  assert.equal(fns.handleWriteRejection(rejected), true);
+
+  assert.equal(rejected.message, "This server does not allow changes from this address. Open the UI at https://nas.example.test.");
+  assert.equal(state.writePolicy.enabled, true);
+  for (const element of controls) {
+    assert.equal(element.disabled, false, `${element.name} must stay usable after a per-request refusal`);
+  }
+  assert.equal(writePolicyNotice.classList.contains("hidden"), true);
+  assert.equal(fns.writeBlockedByPolicy(), false);
+
+  state.writePolicy.publicOrigin = "";
+  const unavailable = new Error("Read UI authorization mode is unavailable.");
+  unavailable.status = 403;
+  unavailable.detail = "Read UI authorization mode is unavailable.";
+  fns.handleWriteRejection(unavailable);
+  assert.equal(unavailable.message, "This server does not allow changes from this address.");
+
+  const other = new Error("Slot 4 is outside configured layout.");
+  other.status = 403;
+  other.detail = "Slot 4 is outside configured layout.";
+  fns.handleWriteRejection(other);
+  assert.equal(other.message, "Slot 4 is outside configured layout.");
+});
+
+test("every inventory refresh re-syncs the write policy from the server", () => {
+  const { fns, state, controls } = buildHarness({ enabled: false, mode: "network", reason: "Stale refusal." });
+  fns.syncWritePolicyControls();
+  assert.equal(controls[0].disabled, true);
+
+  assert.equal(fns.syncWritePolicyFromSnapshot({ slots: [] }), false, "a snapshot without a policy changes nothing");
+  assert.equal(state.writePolicy.enabled, false);
+
+  assert.equal(
+    fns.syncWritePolicyFromSnapshot({ write_policy: { enabled: true, mode: "network", reason: "", public_origin: "https://nas.example.test" } }),
+    true,
+  );
+  assert.equal(state.writePolicy.enabled, true);
+  assert.equal(state.writePolicy.publicOrigin, "https://nas.example.test");
+  for (const element of controls) {
+    assert.equal(element.disabled, false, `${element.name} follows the server policy after a refresh`);
+  }
+
+  state.writeAuthorization = "Basic synthetic";
+  fns.syncWritePolicyFromSnapshot({ write_policy: { enabled: false, mode: "basic", reason: "Sign in first." } });
+  assert.equal(state.writePolicy.enabled, true, "a signed-in Basic-mode page keeps its sign-in");
+  assert.equal(state.writePolicy.mode, "basic");
+
+  state.writeAuthorization = null;
+  fns.syncWritePolicyFromSnapshot({ write_policy: { enabled: false, mode: "basic", reason: "Sign in first." } });
+  assert.equal(state.writePolicy.enabled, false);
+  assert.equal(state.writePolicy.reason, "Sign in first.");
 });
 
 test("other write failures do not change the policy", () => {
@@ -646,10 +714,14 @@ test("a signed-in 403 state reports that writes remain blocked on both live page
 test("main and Storage Fabric templates expose memory-only sign-in and explicit sign-out controls", () => {
   for (const [template, prefix] of [[TEMPLATE, "read-ui"], [FABRIC_TEMPLATE, "fabric-read-ui"]]) {
     assert.match(template, new RegExp(`id="${prefix}-auth-form"`));
-    assert.match(template, new RegExp(`id="${prefix}-auth-username"[^>]+autocomplete="off"`));
-    assert.match(template, new RegExp(`id="${prefix}-auth-password"[^>]+type="password"[^>]+autocomplete="off"`));
+    assert.match(template, new RegExp(`id="${prefix}-auth-username"[^>]+autocomplete="(off|username)"`));
+    assert.match(template, new RegExp(`id="${prefix}-auth-password"[^>]+type="password"[^>]+autocomplete="(off|current-password)"`));
     assert.match(template, new RegExp(`id="${prefix}-auth-sign-out"`));
   }
+  // The main page lets a password manager fill the form; the memory-only
+  // lifecycle below is what keeps credentials out of storage, not autocomplete.
+  assert.match(TEMPLATE, /id="read-ui-auth-username"[^>]+autocomplete="username"/);
+  assert.match(TEMPLATE, /id="read-ui-auth-password"[^>]+autocomplete="current-password"/);
   const credentialLifecycleSource = [
     functionSource(APP_SOURCE, "submitReadUiSignIn"),
     functionSource(APP_SOURCE, "clearReadUiAuthorization"),

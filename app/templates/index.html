@@ -4,6 +4,7 @@
 {% set profile = snapshot.selected_profile %}
 {% set release_status_payload = release_status if release_status is defined and release_status else {} %}
 {% set release_note = release_status_payload.summary if release_status_payload and release_status_payload.summary else "Checking releases..." %}
+{% if release_status_payload and release_status_payload.status == "disabled" %}{% set release_note = "" %}{% endif %}
 {% set snapshot_is_sanitized = snapshot_mode and (snapshot_export_meta.redaction == "partial" or snapshot_export_meta.redaction_label in ["Scrambled IDs", "Synthetic IDs"]) %}
 <div class="app-shell">
   <header class="topbar">
@@ -37,7 +38,7 @@
               </option>
             {% endfor %}
           {% else %}
-            <option value="">Auto-selected</option>
+            <option value="">No enclosures found</option>
           {% endif %}
         </select>
       </div>
@@ -112,6 +113,8 @@
       <span>Search</span>
       <input id="search-box" type="search" placeholder="serial, disk, persistent id, pool, vdev">
     </label>
+    <button id="search-clear" class="button secondary small hidden" type="button" aria-controls="search-box">Clear search</button>
+    <span id="search-summary" class="search-summary hidden" role="status"></span>
     {% if not snapshot_mode %}
     {% if admin_launch_url %}
     <a class="button secondary" href="{{ admin_launch_url }}" target="_blank" rel="noopener">System Setup</a>
@@ -207,11 +210,11 @@
     <form class="read-ui-auth-form" id="read-ui-auth-form" autocomplete="off">
       <label>
         <span>Username</span>
-        <input id="read-ui-auth-username" autocomplete="off" type="text" required>
+        <input id="read-ui-auth-username" autocomplete="username" type="text" required>
       </label>
       <label>
         <span>Password</span>
-        <input id="read-ui-auth-password" type="password" autocomplete="off" required>
+        <input id="read-ui-auth-password" type="password" autocomplete="current-password" required>
       </label>
       <button class="button small" id="read-ui-auth-submit" type="submit">Sign in for writes</button>
     </form>
@@ -228,14 +231,14 @@
         <p class="subtle">Browser-side switch and render timing for the current page.</p>
       </div>
     </div>
-    <div id="ui-perf-summary" class="ui-perf-summary muted" aria-live="polite">Browser timing is idle.</div>
+    <div id="ui-perf-summary" class="ui-perf-summary muted">Browser timing is idle.</div>
     <div id="ui-perf-recent" class="ui-perf-recent"></div>
   </section>
 
   <section class="panel mapping-health-panel" aria-labelledby="mapping-health-title">
     <div class="mapping-health-copy">
       <span class="summary-label" id="mapping-health-title">Mapping health</span>
-      <strong id="mapping-health-summary" role="status" aria-live="polite">Calculating mapping health...</strong>
+      <strong id="mapping-health-summary">Calculating mapping health...</strong>
       <span class="summary-note" id="mapping-health-evidence">Evidence source and snapshot freshness will appear here.</span>
     </div>
   </section>
@@ -292,7 +295,7 @@
                 type="button"
                 aria-label="Edit enclosure name"
                 title="Edit enclosure name"
-              >✎</button>
+              ><span aria-hidden="true">✎</span><span class="enclosure-alias-edit-text">Rename</span></button>
               {% endif %}
             </div>
             {% if not snapshot_mode %}
@@ -301,7 +304,7 @@
               <div class="enclosure-alias-editor-row">
                 <input id="enclosure-alias-input" type="text" maxlength="256" autocomplete="off" aria-describedby="enclosure-alias-raw-hint">
                 <button class="button small" type="submit">Save</button>
-                <button class="button secondary small" id="enclosure-alias-clear" type="button">Clear</button>
+                <button class="button secondary small" id="enclosure-alias-clear" type="button">Remove name</button>
                 <button class="button secondary small" id="enclosure-alias-cancel" type="button">Cancel</button>
               </div>
               <span class="subtle" id="enclosure-alias-raw-hint">{% for enclosure in snapshot.enclosures %}{% if enclosure.id == snapshot.selected_enclosure_id and enclosure.raw_label %}Raw: {{ enclosure.raw_label }}{% endif %}{% endfor %}</span>
@@ -315,14 +318,9 @@
             <button class="button secondary small" id="heatmap-toggle-button" type="button" aria-pressed="false">
               Heat Map
             </button>
-            <button class="button secondary small" id="sas-fabric-toggle-button" type="button" aria-expanded="false">
-              Topology
+            <button class="button secondary small" id="sas-fabric-toggle-button" type="button" aria-expanded="false" aria-controls="sas-fabric-panel">
+              Connections
             </button>
-            {% if not snapshot_mode %}
-            <a class="button secondary small" id="sas-fabric-view-link" href="{{ sas_fabric_view_url }}">
-              Storage Fabric
-            </a>
-            {% endif %}
             <div id="disk-inventory-sync-controls" class="disk-inventory-sync-controls hidden" role="group" aria-label="TrueNAS disk inventory">
               <span class="disk-inventory-sync-label">TrueNAS disk inventory</span>
               <button class="button secondary small" id="disk-inventory-sync-multipath-button" type="button" data-disk-inventory-sync-mode="multipath">
@@ -331,7 +329,6 @@
               <button class="button secondary small" id="disk-inventory-sync-full-button" type="button" data-disk-inventory-sync-mode="full">
                 Full disk sync
               </button>
-              <span id="disk-inventory-sync-hint" class="disk-inventory-sync-hint hidden" role="note"></span>
             </div>
             <div id="heatmap-controls" class="heatmap-controls hidden">
               <label class="field heatmap-control-field heatmap-metric-field" id="heatmap-metric-field">
@@ -371,9 +368,9 @@
                 <span>Scale <output id="heatmap-scale-value">100%</output></span>
                 <input id="heatmap-scale-slider" type="range" min="0.5" max="2" step="0.25" value="1">
               </label>
-              <p id="heatmap-metric-context" class="heatmap-metric-context" aria-live="polite"></p>
+              <p id="heatmap-metric-context" class="heatmap-metric-context"></p>
             </div>
-            <div id="heatmap-legend" class="heatmap-legend hidden" aria-live="polite">
+            <div id="heatmap-legend" class="heatmap-legend hidden">
               <span id="heatmap-legend-min">Low</span>
               <span class="heatmap-legend-bar" aria-hidden="true"></span>
               <span id="heatmap-legend-max">High</span>
@@ -414,13 +411,18 @@
       <section id="sas-fabric-panel" class="panel sas-fabric-panel hidden">
         <div class="panel-header compact">
           <div>
-            <h2>Storage Fabric</h2>
+            <h2>Connections</h2>
             <p id="sas-fabric-summary" class="subtle">Read-only storage source, path, enclosure, and bay topology.</p>
           </div>
           <div class="panel-header-actions">
             <button class="button secondary small" id="sas-fabric-refresh-button" type="button">
               Refresh Storage Fabric
             </button>
+            {% if not snapshot_mode %}
+            <a class="button secondary small" id="sas-fabric-view-link" href="{{ sas_fabric_view_url }}">
+              Open full page
+            </a>
+            {% endif %}
           </div>
         </div>
         <div id="sas-fabric-status" class="warning-item muted compact" aria-live="polite">
@@ -662,6 +664,7 @@
     storageViewsRuntime: {{ initial_storage_view_runtime_json | script_json_text }},
     layoutRows: {{ snapshot.layout_rows | tojson }},
     refreshIntervalSeconds: {{ snapshot.refresh_interval_seconds }},
+    appVersion: {{ app_version | tojson }},
     smartBatchMaxConcurrency: {{ settings.app.smart_batch_max_concurrency }},
     smartPrefetchDelayMs: {{ settings.app.smart_prefetch_delay_ms }},
     smartPrefetchStrategy: {{ settings.app.smart_prefetch_strategy | tojson }},
