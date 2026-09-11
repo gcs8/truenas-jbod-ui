@@ -1563,7 +1563,11 @@ class SnapshotExportService:
     ) -> dict[str, str]:
         if not metric_rollup_applied and not event_trim_applied:
             return {
-                "label": "Full history",
+                # "None" is an API sentinel, not display copy: app.js treats any
+                # other label as adaptive downsampling (see buildEstimateAdvice
+                # and the export-dialog note). Changing it needs an explicit
+                # applied flag and every consumer updated.
+                "label": "None",
                 "note": "Every recorded sample is included",
             }
 

@@ -701,7 +701,7 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("metric samples", rendered.html)
         self.assertIn("SMART summaries", rendered.html)
         self.assertIn("events", rendered.html)
-        self.assertIn("Full history", rendered.html)
+        self.assertIn("Downsampling None", rendered.html)
         self.assertEqual(rendered.export_meta["redaction_label"], "Serials shown")
         self.assertEqual(rendered.export_meta["redaction"], "none")
         self.assertEqual(rendered.export_meta["event_count"], 0)

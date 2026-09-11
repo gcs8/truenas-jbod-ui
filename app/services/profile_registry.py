@@ -583,12 +583,13 @@ def build_profile_reference_warnings(settings: Settings) -> list[dict[str, str]]
             warning["enclosure_id"] = bounded_enclosure_id
             warning["message"] = (
                 f"Layout '{bounded_profile_id}' for enclosure {bounded_enclosure_id} on system "
-                f"{bounded_system_id} was not found. The enclosure will be drawn from live data instead."
+                f"{bounded_system_id} was not found. The enclosure will be drawn with fallback bay "
+                f"geometry, which may not match the hardware."
             )
         else:
             warning["message"] = (
                 f"Default layout '{bounded_profile_id}' for system {bounded_system_id} was not found. "
-                "Enclosures will be drawn from live data instead."
+                "Enclosures will be drawn with fallback bay geometry, which may not match the hardware."
             )
         warnings.append(warning)
 

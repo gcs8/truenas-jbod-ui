@@ -752,7 +752,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
         if not _is_json_media_type(request.headers.get("content-type")):
             raise HTTPException(
                 status_code=415,
-                detail="History request was not valid JSON.",
+                detail="Send this request with Content-Type: application/json.",
             )
         body = await read_limited_request_body(
             request,

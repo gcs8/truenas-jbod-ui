@@ -217,7 +217,7 @@ class MainHistoryScopesBodyBoundTests(unittest.IsolatedAsyncioTestCase):
                 payload,
                 {
                     "ok": False,
-                    "detail": "History request was not valid JSON.",
+                    "detail": "Send this request with Content-Type: application/json.",
                 },
             )
             self.assertEqual(receive_calls, 0)

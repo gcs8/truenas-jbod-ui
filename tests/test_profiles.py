@@ -302,9 +302,9 @@ class ProfileRegistryTests(unittest.TestCase):
             messages,
             [
                 "Default layout 'missing-layout' for system lab was not found. "
-                "Enclosures will be drawn from live data instead.",
+                "Enclosures will be drawn with fallback bay geometry, which may not match the hardware.",
                 "Layout 'other-missing-layout' for enclosure shelf-1 on system lab was not found. "
-                "The enclosure will be drawn from live data instead.",
+                "The enclosure will be drawn with fallback bay geometry, which may not match the hardware.",
             ],
         )
         for message in messages:
