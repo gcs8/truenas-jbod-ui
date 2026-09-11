@@ -1268,8 +1268,8 @@ class SystemBackupServiceTests(unittest.TestCase):
 
     def test_newer_schema_version_says_to_upgrade_first(self) -> None:
         for schema_version, expected in (
-            (3, "This backup was made by a newer version of the app (schema 3). Upgrade first, then restore."),
-            ("2", "This backup file is not in a format this app can restore (schema '2')."),
+            (3, "This backup was made by a newer version of the app (schema version 3). Upgrade first, then restore."),
+            ("2", "This backup file is not in a format this app can restore (schema version '2')."),
         ):
             with self.subTest(schema_version=schema_version):
                 archive_path = self.temp_dir / "schema.zip"
@@ -3786,6 +3786,7 @@ sys.stdout.flush()
                 "ok",
                 "schema_version",
                 "app_version",
+                "app_version_note",
                 "exported_at",
                 "encrypted",
                 "packaging",

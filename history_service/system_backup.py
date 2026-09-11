@@ -5290,11 +5290,11 @@ class SystemBackupService:
         ):
             return (
                 "This backup was made by a newer version of the app "
-                f"(schema {schema_version}). Upgrade first, then restore."
+                f"(schema version {schema_version}). Upgrade first, then restore."
             )
         return (
             "This backup file is not in a format this app can restore "
-            f"(schema {schema_version!r})."
+            f"(schema version {schema_version!r})."
         )
 
     @staticmethod
