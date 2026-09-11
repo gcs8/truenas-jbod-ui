@@ -110,12 +110,40 @@ Neither option should be read as a recommendation to merge in order to find out
 whether the workflow works. Option 2 is a decision to accept the file on main
 before its first run; option 1 keeps that decision open.
 
+## The first run is a tooling qualification
+
+The first dispatched run exists to qualify the tooling, not to produce images for
+the manifest. Give `ref` a specific full commit SHA on `main`, never a branch
+name: a branch moves, and a capture that cannot be tied to immutable content
+proves nothing later. Leave `qualification_only` at its default `true`. The run
+then skips `proposed-manifest.json` and uploads
+`public-demo-screenshot-qualification` instead of
+`public-demo-screenshot-candidate`, so its output cannot be mistaken for a
+candidate.
+
+What that run does and does not establish:
+
+- It shows that the container, the locked Playwright, the fonts, and the capture
+  script produce the same bytes twice **in that environment**. That is
+  repeatability, and it is all the two-capture comparison can prove.
+- It does **not** show that those bytes match the currently approved screenshots,
+  and it is not evidence for or against the committed PNGs. The approved images
+  were captured elsewhere; comparing across environments is exactly the thing
+  this page says not to do.
+- It records the platform font families and the resolved image digest, which is
+  what `EXPECTED_SANS_FALLBACK` and `EXPECTED_MONO_FALLBACK` are set from.
+
+Only after that qualification, and only when a maintainer is deliberately
+producing images to commit, is the workflow run with `qualification_only` set to
+`false`.
+
 ## How a maintainer produces a candidate
 
 1. Push the branch that changed the demo input and its rebuilt
    `public-demo/index.html`.
 2. Run the **Capture Public Demo Screenshots** workflow with
-   `workflow_dispatch` and set `ref` to that branch.
+   `workflow_dispatch`, set `ref` to the full commit SHA of that branch head, and
+   set `qualification_only` to `false`.
 3. The job checks out the ref, installs the locked dependencies, verifies the
    fonts, then runs `node scripts/capture_public_demo_screenshots.js` twice,
    restoring the checkout between the runs. If any PNG differs between run 1 and
@@ -126,9 +154,11 @@ before its first run; option 1 keeps that decision open.
    prints the manifest entries the captured bytes would need. Report mode reads
    no manifest and writes no file, and it always records
    `"pixel_review": "PENDING"`.
-5. Download the `public-demo-screenshot-candidate` artifact. It holds the two
-   PNGs, `run-1/` and `run-2/` for the comparison, `proposed-manifest.json`,
-   `sha256sums.txt`, and `capture.log`. Retention is 14 days.
+5. Download the artifact: `public-demo-screenshot-candidate` when
+   `qualification_only` was `false`, `public-demo-screenshot-qualification` when
+   it was `true`. It holds the two PNGs, `run-1/` and `run-2/` for the
+   comparison, `platform-fonts.json`, `capture.log`, and, on a candidate run,
+   `proposed-manifest.json`. Retention is 14 days.
 
 The job builds no artifact, commits nothing, pushes nothing, and opens no pull
 request. It runs with `permissions: contents: read`.

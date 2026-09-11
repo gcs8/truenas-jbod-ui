@@ -34,7 +34,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   inside the pinned Playwright Linux container, captures twice to prove the
   bytes are reproducible, and uploads the PNGs and proposed manifest entries for
   a human to approve; `scripts/check_public_screenshots.py --report` prints the
-  candidate hashes without asserting the manifest (#512).
+  candidate hashes without asserting the manifest. The container is pinned by
+  digest, the expected font families are checked against the platform fonts
+  Chromium reported rather than `fc-match`, and the default dispatch is a
+  `qualification_only` run that writes no proposed manifest (#512).
 
 ## v0.23.0 - 2026-09-08
 

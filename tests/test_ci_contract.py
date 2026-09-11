@@ -303,6 +303,32 @@ class CIWorkflowContractTests(unittest.TestCase):
             upload["with"]["path"], "${{ runner.temp }}/public-demo-screenshot-candidate"
         )
 
+    def test_screenshot_capture_qualification_run_cannot_pass_as_a_candidate(self) -> None:
+        workflow = yaml.safe_load(self.read(CAPTURE_SCREENSHOTS_WORKFLOW))
+        triggers = workflow.get("on", workflow.get(True, {}))
+        inputs = triggers["workflow_dispatch"]["inputs"]
+        job = workflow["jobs"]["capture"]
+        docs = self.read(ROOT / "docs" / "SCREENSHOT_CAPTURE.md")
+        capture_step = next(
+            run
+            for run in (str(step.get("run", "")) for step in job["steps"])
+            if "proposed-manifest.json" in run
+        )
+        upload = next(
+            step
+            for step in job["steps"]
+            if str(step.get("uses", "")).startswith("actions/upload-artifact@")
+        )
+
+        self.assertEqual(inputs["qualification_only"]["type"], "boolean")
+        self.assertIs(inputs["qualification_only"]["default"], True)
+        self.assertIn("commit SHA", inputs["ref"]["description"])
+        self.assertEqual(job["env"]["QUALIFICATION_ONLY"], "${{ inputs.qualification_only }}")
+        self.assertIn('if [ "$QUALIFICATION_ONLY" = "true" ]', capture_step)
+        self.assertIn("public-demo-screenshot-qualification", str(upload["with"]["name"]))
+        self.assertIn("public-demo-screenshot-candidate", str(upload["with"]["name"]))
+        self.assertIn("public-demo-screenshot-qualification", docs)
+
     def test_screenshot_capture_checks_the_fonts_chromium_actually_used(self) -> None:
         workflow = yaml.safe_load(self.read(CAPTURE_SCREENSHOTS_WORKFLOW))
         job = workflow["jobs"]["capture"]

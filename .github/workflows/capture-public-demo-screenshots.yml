@@ -1,16 +1,24 @@
 name: Capture Public Demo Screenshots
 
-# Dispatch-only. The job produces a candidate capture for a human to review and
-# commit. It never commits, pushes, opens a pull request, or writes the
-# screenshot manifest.
+# Dispatch-only. The job produces a capture for a human to review and commit. It
+# never commits, pushes, opens a pull request, or writes the screenshot manifest.
+#
+# The default run (qualification_only: true) qualifies the tooling against an
+# immutable commit SHA: it writes no proposed-manifest.json and uploads
+# public-demo-screenshot-qualification, so it cannot be mistaken for a candidate.
 
 on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "Branch, tag, or commit whose checked-in public-demo/index.html is captured."
+        description: "Full commit SHA whose checked-in public-demo/index.html is captured. Use a SHA, not a branch name, so the capture is tied to immutable content. The first run must target a commit SHA on main and is a tooling qualification, not a candidate."
         required: true
         type: string
+      qualification_only:
+        description: "Qualify the tooling only: skip proposed-manifest.json and name the artifact public-demo-screenshot-qualification, so the output cannot be mistaken for a candidate. Leave true unless a maintainer is deliberately producing a candidate."
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: read
@@ -41,6 +49,7 @@ jobs:
       CONTAINER_IMAGE: mcr.microsoft.com/playwright:v1.62.1-jammy@sha256:b3251f7ff1a9fa559a28d1c67eaa15fc1a9800f7845e82756caea7842967f615
       CONTAINER_TAG: mcr.microsoft.com/playwright:v1.62.1-jammy
       PLAYWRIGHT_VERSION: "1.62.1"
+      QUALIFICATION_ONLY: ${{ inputs.qualification_only }}
       # The families Chromium reported through CSS.getPlatformFontsForNode, not
       # the families fc-match resolves. Left empty until the first dispatched run
       # records them; once set, a font change in the image fails the job instead
@@ -162,9 +171,13 @@ jobs:
             node scripts/capture_public_demo_screenshots.js
             cp docs/images/screenshots/public-demo-overview.png "$CANDIDATE_DIR/run-2/"
             cp docs/images/screenshots/public-demo-history.png "$CANDIDATE_DIR/run-2/"
-            python3 scripts/check_public_screenshots.py --report \
-              > "$CANDIDATE_DIR/proposed-manifest.json"
-            cat "$CANDIDATE_DIR/proposed-manifest.json"
+            if [ "$QUALIFICATION_ONLY" = "true" ]; then
+              printf 'qualification_only run: not writing proposed-manifest.json\n'
+            else
+              python3 scripts/check_public_screenshots.py --report \
+                > "$CANDIDATE_DIR/proposed-manifest.json"
+              cat "$CANDIDATE_DIR/proposed-manifest.json"
+            fi
             git checkout -- docs/images/screenshots wiki/images
             differences=0
             for name in public-demo-overview.png public-demo-history.png; do
@@ -189,11 +202,11 @@ jobs:
             fi
           } 2>&1 | tee -a "$CANDIDATE_DIR/capture.log"
 
-      - name: Upload the candidate capture for human review
+      - name: Upload the capture for human review
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: public-demo-screenshot-candidate
+          name: ${{ inputs.qualification_only && 'public-demo-screenshot-qualification' || 'public-demo-screenshot-candidate' }}
           path: ${{ runner.temp }}/public-demo-screenshot-candidate
           retention-days: 14
           if-no-files-found: error
