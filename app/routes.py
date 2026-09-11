@@ -20,6 +20,7 @@ from app.services.history_status import project_public_collector_status
 from history_service.operation_bounds import (
     HISTORY_READ_BUSY_DETAIL,
     HISTORY_READ_RETRY_AFTER_SECONDS,
+    MAX_TARGETS,
 )
 from history_service.refresh_auth import read_limited_request_body
 
@@ -825,8 +826,11 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
         metric_limit: int = 60,
     ) -> JSONResponse:
         requested_slots = [int(slot) for slot in (slots or [])]
-        if len(requested_slots) > 347:
-            raise HTTPException(status_code=413, detail="History request exceeds target_count limit (347).")
+        if len(requested_slots) > MAX_TARGETS:
+            raise HTTPException(
+                status_code=413,
+                detail=f"History request exceeds target_count limit ({MAX_TARGETS}).",
+            )
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
         if not requested_slots or not isinstance(window_hours, int) or not 1 <= window_hours <= 8760:

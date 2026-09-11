@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from app.config import normalize_text  # noqa: F401 - re-exported for parser callers
 from app.services.profile_registry import (
     DELL_MD1280_PROFILE_ID,
     SCALE_SSG_FRONT_24_PROFILE_ID,
@@ -52,9 +53,7 @@ MAX_SES_ELEMENTS = 2 * 4096
 MAX_SES_OUTPUT_CHARS = 4 * 1024 * 1024
 MAX_SES_DEVICE_NAMES_PER_SLOT = 16
 MAX_SES_DEVICE_NAME_LENGTH = 128
-# Backward-compatible names for the AES parser's original bounds.
 MAX_SES_AES_DESCRIPTORS = MAX_SES_ELEMENTS
-MAX_SES_AES_OUTPUT_CHARS = MAX_SES_OUTPUT_CHARS
 
 
 @dataclass(slots=True)
@@ -216,11 +215,6 @@ class CamcontrolInfo:
     peer_devices: dict[str, list[str]] = field(default_factory=dict)
 
 
-def normalize_text(value: str | None) -> str | None:
-    if value is None:
-        return None
-    normalized = value.strip()
-    return normalized or None
 
 
 def normalize_device_name(value: str | None) -> str | None:

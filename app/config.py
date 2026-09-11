@@ -412,9 +412,6 @@ class HistoryConfig(BaseModel):
 
     service_url: str = ""
     timeout_seconds: int = 10
-    # Upper bound on concurrent per-slot requests when the batched scope endpoint fails
-    # and the client falls back to one request per slot.
-    fallback_max_concurrency: int = 4
     refresh_token: SecretStr | None = None
 
     @field_validator("refresh_token", mode="before")
@@ -521,7 +518,6 @@ ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
     "SSH_COMMANDS_JSON": ("ssh", "commands"),
     "HISTORY_BACKEND_URL": ("history", "service_url"),
     "HISTORY_BACKEND_TIMEOUT": ("history", "timeout_seconds"),
-    "HISTORY_BACKEND_FALLBACK_CONCURRENCY": ("history", "fallback_max_concurrency"),
     "HISTORY_REFRESH_TOKEN": ("history", "refresh_token"),
     "ADMIN_SERVICE_URL": ("admin", "service_url"),
     "ADMIN_PUBLIC_URL": ("admin", "public_url"),
@@ -668,15 +664,6 @@ def _has_path(source: dict[str, Any], path: tuple[str, ...]) -> bool:
             return False
         cursor = cursor[key]
     return True
-
-
-def _get_path_value(source: dict[str, Any], path: tuple[str, ...]) -> Any:
-    cursor: Any = source
-    for key in path:
-        if not isinstance(cursor, dict):
-            return None
-        cursor = cursor.get(key)
-    return cursor
 
 
 def _explicit_app_field(source: dict[str, Any], field_name: str) -> bool:

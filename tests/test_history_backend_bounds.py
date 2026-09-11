@@ -108,7 +108,7 @@ class HistoryBackendBoundsTests(unittest.IsolatedAsyncioTestCase):
         client = HistoryBackendClient(HistoryConfig(service_url="http://history-backend:8001"))
         with (
             patch.object(client, "_send_json", AsyncMock(side_effect=HistoryBackendPolicyError(413))) as send,
-            patch.object(client, "_fallback_scope_history", AsyncMock()) as fallback,
+            patch.object(client, "_fetch_slot_history", AsyncMock()) as fallback,
         ):
             with self.assertRaises(HistoryBackendPolicyError):
                 await client.get_scope_history(

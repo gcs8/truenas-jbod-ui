@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from typing import Iterable
 
 from app.config import EnclosureProfileConfig, Settings, SystemConfig
 from app.models.domain import EnclosureOption, EnclosureProfileView
@@ -705,8 +704,3 @@ class ProfileRegistry:
         return None
 
 
-def summarize_row_groups(row_groups: Iterable[int], total_columns: int) -> list[int]:
-    normalized = [group for group in row_groups if isinstance(group, int) and group > 0]
-    if not normalized or sum(normalized) != total_columns:
-        return [total_columns]
-    return normalized
