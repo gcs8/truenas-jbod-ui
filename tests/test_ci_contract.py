@@ -159,9 +159,8 @@ class CIWorkflowContractTests(unittest.TestCase):
                 if match.group("version") is None:
                     uncommented.append(f"{workflow_path.name}: {action}")
 
-        # 29 existing uses plus checkout, setup-python, and setup-node in the
-        # owner-gated Pages readback job.
-        self.assertEqual(action_count, 32)
+        # Existing 32 uses plus the trial's one pinned checkout.
+        self.assertEqual(action_count, 33)
         self.assertEqual(unpinned, [])
         self.assertEqual(uncommented, [])
 
