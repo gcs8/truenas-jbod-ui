@@ -1319,6 +1319,69 @@ class SystemBackupServiceTests(unittest.TestCase):
         finally:
             artifact.cleanup()
 
+    def test_restore_free_space_sums_staging_copies_on_one_filesystem(self) -> None:
+        from types import SimpleNamespace
+
+        member_bytes = 400
+        live_bytes = self.history_db_path.stat().st_size
+        manifest = {
+            "schema_version": 1,
+            "files": [{"key": "history", "group_key": HISTORY_DB_KEY}],
+        }
+        group_entries = {HISTORY_DB_KEY: {"selected": True, "present": True}}
+        extracted = {"history": b"h" * member_bytes}
+        temp_folder = Path(tempfile.gettempdir())
+        history_folder = self.history_db_path.parent
+        real_stat = os.stat
+
+        def stat_with_devices(devices: dict[str, int]):
+            def fake_stat(path, *args, **kwargs):
+                device_id = devices.get(os.path.normcase(str(path)))
+                if device_id is None:
+                    return real_stat(path, *args, **kwargs)
+                return SimpleNamespace(st_dev=device_id)
+
+            return fake_stat
+
+        shared_devices = {
+            os.path.normcase(str(temp_folder)): 11,
+            os.path.normcase(str(history_folder)): 11,
+        }
+        separate_devices = {
+            os.path.normcase(str(temp_folder)): 11,
+            os.path.normcase(str(history_folder)): 22,
+        }
+        # Enough for each folder on its own, short of both staged copies at once.
+        tight_free = member_bytes + live_bytes
+        tight_usage = SimpleNamespace(total=tight_free * 4, used=tight_free * 3, free=tight_free)
+        with (
+            patch("history_service.system_backup.shutil.disk_usage", return_value=tight_usage),
+            patch("history_service.system_backup.os.stat", side_effect=stat_with_devices(shared_devices)),
+            self.assertRaises(ValueError) as raised,
+        ):
+            self.backup_service._require_restore_free_space(manifest, group_entries, extracted)
+        message = str(raised.exception)
+        self.assertIn("Restore needs about", message)
+        self.assertIn(f"free in {temp_folder}", message)
+        self.assertIn(self.backup_service._format_size(2 * member_bytes + live_bytes), message)
+
+        with (
+            patch("history_service.system_backup.shutil.disk_usage", return_value=tight_usage),
+            patch(
+                "history_service.system_backup.os.stat",
+                side_effect=stat_with_devices(separate_devices),
+            ),
+        ):
+            self.backup_service._require_restore_free_space(manifest, group_entries, extracted)
+
+        roomy_free = 2 * member_bytes + live_bytes
+        roomy_usage = SimpleNamespace(total=roomy_free * 4, used=roomy_free * 3, free=roomy_free)
+        with (
+            patch("history_service.system_backup.shutil.disk_usage", return_value=roomy_usage),
+            patch("history_service.system_backup.os.stat", side_effect=stat_with_devices(shared_devices)),
+        ):
+            self.backup_service._require_restore_free_space(manifest, group_entries, extracted)
+
     def test_format_size_reads_like_a_person_wrote_it(self) -> None:
         format_size = SystemBackupService._format_size
         self.assertEqual(format_size(6 * 1024 ** 3 + 200 * 1024 ** 2), "6.2 GiB")

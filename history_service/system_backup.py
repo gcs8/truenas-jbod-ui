@@ -3737,10 +3737,29 @@ class SystemBackupService:
                 live_bytes = self.store.file_path.stat().st_size
             except OSError:
                 live_bytes = 0
-        checks = (
+        # A restore holds two staged copies at once: the import transaction stages every
+        # history member under the temp folder, and activation stages the hot database and
+        # segment tree beside the live files. Folders that share a filesystem therefore have
+        # to satisfy both requirements together.
+        requirements = (
             (Path(tempfile.gettempdir()), member_bytes + live_bytes),
             (self.store.file_path.parent, member_bytes),
         )
+        checks: list[tuple[Path, int]] = []
+        checks_by_device: dict[int, int] = {}
+        for folder, needed_bytes in requirements:
+            try:
+                device_id: int | None = os.stat(folder).st_dev
+            except OSError:
+                device_id = None
+            position = checks_by_device.get(device_id) if device_id is not None else None
+            if position is not None:
+                shared_folder, shared_bytes = checks[position]
+                checks[position] = (shared_folder, shared_bytes + needed_bytes)
+                continue
+            if device_id is not None:
+                checks_by_device[device_id] = len(checks)
+            checks.append((folder, needed_bytes))
         for folder, needed_bytes in checks:
             try:
                 free_bytes = shutil.disk_usage(folder).free
