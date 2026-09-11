@@ -178,7 +178,7 @@ test("restore confirmation reads as a sentence instead of JSON", () => {
 });
 
 test("restore confirmation shows the older-version note before the replace warning", () => {
-  const { describeBackupRestoreConfirmation } = load(["describeBackupInspection", "describeBackupRestoreConfirmation"], {
+  const { describeBackupInspection, describeBackupRestoreConfirmation } = load(["describeBackupInspection", "describeBackupRestoreConfirmation"], {
     formatLocalTimestamp: (value) => `on ${value}`,
   });
   const baseInspection = {

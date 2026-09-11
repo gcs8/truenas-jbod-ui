@@ -6030,6 +6030,12 @@
     return `This backup contains ${parts.length ? parts.join(", ") : "no recognised data"}${exportedAt ? `, exported ${exportedAt}` : ""} (${mode}).`;
   }
 
+  function describeBackupRestoreConfirmation(inspection) {
+    return `${describeBackupInspection(inspection)}\n\n` +
+      (inspection?.app_version_note ? `${inspection.app_version_note}\n\n` : "") +
+      "Restoring replaces all current settings, mappings and history with this backup. Continue?";
+  }
+
   async function importBackup() {
     const file = readSelectedImportFile();
     const passphrase = readOptionalSecretValue(elements.backupImportPassphrase);
@@ -6071,10 +6077,7 @@
       ) {
         throw new Error("Inspection did not return an observed encryption mode and receipt.");
       }
-      const confirmed = window.confirm(
-        `${describeBackupInspection(inspection)}\n\n` +
-        "Restoring replaces all current settings, mappings and history with this backup. Continue?"
-      );
+      const confirmed = window.confirm(describeBackupRestoreConfirmation(inspection));
       if (!confirmed) {
         return;
       }
