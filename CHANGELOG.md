@@ -26,6 +26,14 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Fixed
+
+- Refused restoring a backup made by a newer app version before unpacking it,
+  checked free space in the temp and history folders before a history restore
+  replaces anything, and reworded the schema refusals in plain words (#511)
+
 ## v0.23.0 - 2026-09-08
 
 This release includes every pull request merged after `v0.22.2` through the
