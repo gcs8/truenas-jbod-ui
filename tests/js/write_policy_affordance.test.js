@@ -739,3 +739,56 @@ test("every main and Storage Fabric mutation explicitly opts into the in-memory 
   }
   assert.match(functionSource(FABRIC_SOURCE, "saveAliasFromForm"), /readUiAuth:\s*true/);
 });
+
+test("a policy refresh keeps the configured public origin for wrong-origin guidance", async () => {
+  const state = {
+    snapshotMode: false,
+    writePolicy: {
+      enabled: false,
+      mode: "basic",
+      reason: "Sign in to enable mapping, LED, and alias changes.",
+      publicOrigin: "https://nas.example.test",
+    },
+    writeAuthorization: null,
+    writeAuthPending: false,
+    writeAuthRequestToken: 0,
+  };
+  const fns = loadFunctions([...POLICY_FUNCTIONS, "submitReadUiSignIn"], {
+    state,
+    ledButtons: [control("led-identify")],
+    clearMappingButton: control("clear-mapping"),
+    importMappingsButton: control("import-mappings"),
+    enclosureAliasEditButton: control("alias-edit"),
+    enclosureAliasClear: control("alias-clear"),
+    mappingForm: null,
+    enclosureAliasForm: null,
+    writePolicyNotice: { textContent: "", classList: classList(["hidden"]) },
+    readUiAuthPanel: null,
+    readUiAuthUsername: { value: "operator", disabled: false },
+    readUiAuthPassword: { value: "synthetic-passphrase", disabled: false },
+    encodeBasicAuthorization: () => "Basic synthetic",
+    fetchJson: async () => ({ ok: true }),
+    renderAll() {},
+    setStatus() {},
+  });
+  const crossOrigin = { status: 403, detail: "Cross-origin Read UI mutation rejected." };
+
+  await fns.submitReadUiSignIn({ preventDefault() {} });
+
+  assert.equal(state.writePolicy.enabled, true);
+  assert.equal(state.writePolicy.publicOrigin, "https://nas.example.test");
+  assert.equal(
+    fns.describeWriteRejection(crossOrigin),
+    "This server does not allow changes from this address. Open the UI at https://nas.example.test.",
+  );
+
+  // A later refresh whose payload omits the origin must not erase it either.
+  fns.syncWritePolicyFromSnapshot({ write_policy: { enabled: true, mode: "basic", reason: "" } });
+  assert.equal(state.writePolicy.publicOrigin, "https://nas.example.test");
+
+  // A server that reports a different origin still wins.
+  fns.syncWritePolicyFromSnapshot({
+    write_policy: { enabled: true, mode: "basic", reason: "", public_origin: "https://jbod.example.test" },
+  });
+  assert.equal(state.writePolicy.publicOrigin, "https://jbod.example.test");
+});
