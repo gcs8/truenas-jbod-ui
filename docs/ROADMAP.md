@@ -65,8 +65,11 @@ through #270).
 - CI covers Python 3.12 and 3.14, container health, browser QA, public artifacts,
   Ruff, dependency checks, and CodeQL
 
-Development has resumed on `main` after the v0.23.0 tag and completed release
-gates. The next lane should stay practical and incremental:
+Development has resumed on `main` after the v0.23.0 tag. The post-release gates
+are **not** complete: `docs/RELEASE_WRAP_0.23.0.md` still records
+docs/wiki/public-demo publication, GHCR publish verification, deployment
+refresh/sniff tests, and post-release reopen as required and `Blocked`. The next
+lane should stay practical and incremental:
 
 - keep richer platform-native Storage Fabric enrichment in small validated
   slices

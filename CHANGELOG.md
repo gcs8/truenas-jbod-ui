@@ -160,7 +160,7 @@ them before starting the new images.
   though the rows are still on disk; nothing was deleted. Re-save each
   affected mapping from the bay's detail panel. The canonical save writes the
   system- and enclosure-scoped key and removes the stale legacy aliases
-  (#249).
+  (#249, #293).
 - `SCHEDULED_BACKUP_INCLUDED_GROUPS_JSON` order no longer looks like a scope
   change, and scheduled-backup status from `v0.22.2` is migrated, not re-run:
   the recorded set of included backup groups is now compared without regard

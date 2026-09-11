@@ -63,8 +63,11 @@ docker compose pull
 docker compose up -d
 ```
 
-This path pairs the v0.22.2 Compose file and image. Keep the Compose file and
-image on the same version.
+This path deliberately pairs the **v0.22.2 Compose file** with the **v0.23.0
+image**. That is not a mistake and the two are not required to match: v0.22.2 is
+the current root-compatible Compose file, and the v0.23.0 image runs against it.
+Keep this pairing until a v0.23.0 Compose file is published; change the image
+pin, not the Compose file.
 
 Open:
 
