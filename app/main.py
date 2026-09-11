@@ -452,10 +452,6 @@ async def _load_live_enclosure_export_sources(
     return snapshots_by_enclosure, smart_summaries_by_enclosure
 
 
-def _clear_snapshot_export_source_cache_for_tests() -> None:
-    SNAPSHOT_EXPORT_SOURCE_CACHE.clear()
-
-
 READ_UI_SIGN_IN_REQUIRED_REASON = "Sign in to enable mapping, LED, and alias changes."
 READ_UI_WRITE_POLICY_UNAVAILABLE_REASON = "Write controls are unavailable because the authorization mode is unknown."
 

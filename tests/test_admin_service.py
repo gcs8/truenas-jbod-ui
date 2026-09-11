@@ -58,7 +58,7 @@ from app.config import (
 from app.main import app as main_app
 from app.main import resolve_admin_launch_url
 from app.main import snapshot_state_busy_exception_handler
-from app.main import _clear_snapshot_export_source_cache_for_tests
+from app.main import SNAPSHOT_EXPORT_SOURCE_CACHE
 from app.models.domain import ESXiHostPrepInstallRequest
 from app.models.domain import EnclosureOption
 from app.models.domain import EnclosureProfileRequest
@@ -468,7 +468,7 @@ class BackupImportRequestLimitTests(unittest.TestCase):
 
 class MainAppBoundaryTests(unittest.TestCase):
     def setUp(self) -> None:
-        _clear_snapshot_export_source_cache_for_tests()
+        SNAPSHOT_EXPORT_SOURCE_CACHE.clear()
 
     @staticmethod
     def _call_main_route(path: str) -> object:

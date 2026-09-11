@@ -26,6 +26,14 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Internal
+
+- Removed the unreachable per-slot history fallback and its concurrency
+  setting, unified the unavailable slot-history payload shape, and deleted
+  duplicated and caller-less helpers (#509)
+
 ## v0.23.0 - 2026-09-08
 
 This release includes every pull request merged after `v0.22.2` through the
