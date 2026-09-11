@@ -25,12 +25,27 @@ never on a workstation.
 
 | Thing | Pin |
 |---|---|
-| Container image | `mcr.microsoft.com/playwright:v1.62.1-jammy` |
+| Container image | `mcr.microsoft.com/playwright:v1.62.1-jammy@sha256:b3251f7ff1a9fa559a28d1c67eaa15fc1a9800f7845e82756caea7842967f615` |
 | Playwright package | `package-lock.json`, installed with `npm ci --ignore-scripts` |
 | Browser build | the Chromium inside that image |
 | Fonts | the font packages inside that image, listed in the run log |
 | Demo artifact | the checked-in `public-demo/index.html` at the dispatched ref |
 | Capture settings | `scripts/capture_public_demo_screenshots.js`: `file://` only, 1920 by 1080 viewport, dark scheme, UTC, reduced motion |
+
+The image is pinned by digest, not by tag alone. A tag in a registry can be
+moved to new bytes, and a moved tag would change the fonts or the Chromium build
+without changing anything in this repository. The workflow keeps the
+human-readable tag in a comment, in the `CONTAINER_TAG` variable, and in the run
+log, and `tests/test_ci_contract.py` fails if the `container.image` pin loses its
+`@sha256:` digest. Record a new digest without Docker:
+
+```bash
+curl -sSI -H "Accept: application/vnd.oci.image.index.v1+json" \
+  https://mcr.microsoft.com/v2/playwright/manifests/v1.62.1-jammy |
+  grep -i docker-content-digest
+```
+
+The tag list is at `https://mcr.microsoft.com/v2/playwright/tags/list`.
 
 The container tag and the locked Playwright version must match. The job reads
 the version out of `package-lock.json` and fails if the tag has drifted, because

@@ -28,11 +28,18 @@ jobs:
     name: Capture candidate public demo screenshots
     runs-on: ubuntu-latest
     container:
-      image: mcr.microsoft.com/playwright:v1.62.1-jammy
+      # Human-readable tag: mcr.microsoft.com/playwright:v1.62.1-jammy
+      # Pinned to the digest that tag resolved to on 2026-09-11, so a retag in
+      # the registry cannot change the fonts or the Chromium build under a
+      # capture. Re-record the digest with:
+      #   curl -sSI -H "Accept: application/vnd.oci.image.index.v1+json" \
+      #     https://mcr.microsoft.com/v2/playwright/manifests/v1.62.1-jammy
+      image: mcr.microsoft.com/playwright:v1.62.1-jammy@sha256:b3251f7ff1a9fa559a28d1c67eaa15fc1a9800f7845e82756caea7842967f615
     env:
       CANDIDATE_DIR: ${{ runner.temp }}/public-demo-screenshot-candidate
       CAPTURE_REF: ${{ inputs.ref }}
-      CONTAINER_IMAGE: mcr.microsoft.com/playwright:v1.62.1-jammy
+      CONTAINER_IMAGE: mcr.microsoft.com/playwright:v1.62.1-jammy@sha256:b3251f7ff1a9fa559a28d1c67eaa15fc1a9800f7845e82756caea7842967f615
+      CONTAINER_TAG: mcr.microsoft.com/playwright:v1.62.1-jammy
       PLAYWRIGHT_VERSION: "1.62.1"
       # Left empty until the first dispatched run records the resolved families.
       # Once set, a font change in the image fails the job instead of silently
@@ -59,6 +66,7 @@ jobs:
           {
             set -euo pipefail
             printf 'container image: %s\n' "$CONTAINER_IMAGE"
+            printf 'container tag: %s\n' "$CONTAINER_TAG"
             printf 'captured ref: %s\n' "$CAPTURE_REF"
             printf 'commit: %s\n' "$(git rev-parse HEAD)"
             printf 'node: %s\n' "$(node --version)"

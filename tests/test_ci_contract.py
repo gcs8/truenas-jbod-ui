@@ -272,11 +272,14 @@ class CIWorkflowContractTests(unittest.TestCase):
         self.assertIn("ref", triggers["workflow_dispatch"]["inputs"])
         self.assertEqual(workflow["permissions"], {"contents": "read"})
         self.assertNotIn("permissions", job)
-        self.assertEqual(
-            job["container"]["image"],
-            f"mcr.microsoft.com/playwright:v{locked_playwright}-jammy",
-        )
+        image = job["container"]["image"]
+        expected_tag = f"mcr.microsoft.com/playwright:v{locked_playwright}-jammy"
+        self.assertRegex(image, rf"^{re.escape(expected_tag)}@sha256:[0-9a-f]{{64}}$")
+        self.assertEqual(job["env"]["CONTAINER_IMAGE"], image)
+        self.assertEqual(job["env"]["CONTAINER_TAG"], expected_tag)
         self.assertEqual(job["env"]["PLAYWRIGHT_VERSION"], locked_playwright)
+        self.assertIn('printf \'container image: %s\\n\' "$CONTAINER_IMAGE"', commands)
+        self.assertIn('printf \'container tag: %s\\n\' "$CONTAINER_TAG"', commands)
 
         self.assertEqual(commands.count("node scripts/capture_public_demo_screenshots.js"), 2)
         self.assertIn('cmp -s "$CANDIDATE_DIR/run-1/$name" "$CANDIDATE_DIR/run-2/$name"', commands)
