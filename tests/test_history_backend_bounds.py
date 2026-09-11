@@ -157,6 +157,19 @@ class HistoryBackendBoundsTests(unittest.IsolatedAsyncioTestCase):
                 )
         send.assert_not_awaited()
 
+    def test_get_json_body_failures_carry_integer_status_and_plain_detail(self) -> None:
+        client = HistoryBackendClient(HistoryConfig(service_url="http://history-backend:8001"))
+        for label, body in (("invalid JSON", b"not json"), ("non-object payload", b"[1, 2]")):
+            with self.subTest(label):
+                with patch.object(client, "_request_bytes_sync", return_value=(body, {})):
+                    with self.assertRaises(HistoryBackendResponseError) as caught:
+                        client._fetch_json_sync("/api/history/scopes/bundle", {})
+                error = caught.exception
+                self.assertIsInstance(error.status_code, int)
+                self.assertEqual(error.status_code, 0)
+                self.assertNotIn("returned HTTP History", str(error))
+                self.assertTrue(str(error).endswith("."), str(error))
+
 
 if __name__ == "__main__":
     unittest.main()
