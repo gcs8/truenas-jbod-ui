@@ -866,6 +866,10 @@ class MainAppBoundaryTests(unittest.TestCase):
             "ok": True,
             "schema_version": 2,
             "app_version": "0.22.3",
+            "app_version_note": (
+                "This backup was made by v0.22.3; settings and history will be "
+                "brought up to date during restore."
+            ),
             "exported_at": "2030-01-02T03:04:05+00:00",
             "encrypted": True,
             "packaging": "7z",
@@ -913,6 +917,12 @@ class MainAppBoundaryTests(unittest.TestCase):
                 "inspection_receipt": "server-receipt",
                 "inspection_receipt_expires_at": 123456,
             },
+        )
+        # The admin page needs the older-version note to show it while the operator confirms.
+        self.assertEqual(
+            payload["app_version_note"],
+            "This backup was made by v0.22.3; settings and history will be "
+            "brought up to date during restore.",
         )
         inspected_path = service.inspect_bundle_file.call_args.args[0]
         self.assertFalse(inspected_path.exists())
