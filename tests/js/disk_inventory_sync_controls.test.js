@@ -71,8 +71,7 @@ const FUNCTION_NAMES = [
   "diskInventorySyncModeSpec",
   "diskInventorySyncModeAvailability",
   "renderDiskInventorySyncControls",
-  "disarmDiskInventorySync",
-  "armDiskInventorySync",
+  "diskInventorySyncConfirmText",
   "handleDiskInventorySyncClick",
 ];
 
@@ -111,34 +110,31 @@ function harness({
   sshEnabled = true,
   snapshotMode = false,
   authMode = "basic",
+  confirmAnswer = true,
   writePolicyAllowed,
   writePolicyBlockReason = "Writes are disabled by policy.",
 } = {}) {
-  const timers = [];
-  const cleared = [];
   const statuses = [];
   const runs = [];
+  const confirms = [];
   const state = {
     snapshotMode,
     selectedSystemId: "system-a",
     snapshot: { sources: { ssh: { enabled: sshEnabled, ok: true } } },
-    diskInventorySync: { armedMode: null, armedSystemId: null, armTimerId: null, inFlight: false },
+    diskInventorySync: { inFlight: false },
   };
   const buttons = { multipath: button("multipath"), full: button("full") };
   const controls = { classList: classList(["hidden"]) };
-  const hint = { classList: classList(["hidden"]), textContent: "" };
   const context = {
     bootstrap: { readUiMutationAuthMode: authMode },
     state,
     currentPlatform: () => platform,
     diskInventorySyncControls: controls,
-    diskInventorySyncHint: hint,
     diskInventorySyncButtons: [buttons.multipath, buttons.full],
     setStatus: (message, tone = "info") => statuses.push({ message, tone }),
     runDiskInventorySync: (mode, systemId) => { runs.push({ mode, systemId }); return Promise.resolve(); },
     window: {
-      setTimeout(fn, ms) { timers.push({ fn, ms }); return timers.length; },
-      clearTimeout(id) { cleared.push(id); },
+      confirm(message) { confirms.push(message); return confirmAnswer; },
     },
   };
   if (writePolicyAllowed !== undefined) {
@@ -146,7 +142,7 @@ function harness({
     context.writePolicyReason = () => writePolicyBlockReason;
   }
   const fns = loadFunctions(context);
-  return { fns, state, buttons, controls, hint, timers, cleared, statuses, runs };
+  return { fns, state, buttons, controls, statuses, runs, confirms };
 }
 
 test("controls stay hidden in snapshot mode and on platforms without the TrueNAS middleware", () => {
@@ -173,82 +169,45 @@ test("controls stay hidden in snapshot mode and on platforms without the TrueNAS
   assert.equal(scale.buttons.full.disabled, false);
 });
 
-test("a snapshot click never arms or runs anything", () => {
+test("a snapshot click never asks or runs anything", () => {
   const h = harness({ snapshotMode: true });
   h.fns.handleDiskInventorySyncClick("full");
-  assert.equal(h.state.diskInventorySync.armedMode, null);
+  assert.deepEqual(h.confirms, []);
   assert.deepEqual(h.runs, []);
   assert.equal(h.statuses.at(-1).tone, "error");
 });
 
-test("first click arms with the explanation, second click runs exactly once and disarms", () => {
+test("a click asks a plain question and runs exactly once when the user agrees", () => {
   const h = harness({ platform: "core" });
   h.fns.renderDiskInventorySyncControls();
 
   h.fns.handleDiskInventorySyncClick("multipath");
-  assert.equal(h.state.diskInventorySync.armedMode, "multipath");
-  assert.equal(h.buttons.multipath.textContent, "Confirm sync");
-  assert.equal(h.buttons.multipath.dataset.armed, "true");
-  assert.equal(h.buttons.full.textContent, "Full disk sync");
-  assert.equal(h.hint.classList.contains("hidden"), false);
-  assert.match(h.hint.textContent, /disk\.multipath_sync/);
-  assert.match(h.hint.textContent, /Pools and data are not touched/);
-  assert.equal(h.timers.length, 1);
-  assert.equal(h.timers[0].ms, 6000);
-  assert.deepEqual(h.runs, []);
-
-  h.fns.handleDiskInventorySyncClick("multipath");
+  assert.deepEqual(h.confirms, [
+    "Ask TrueNAS to rebuild its multipath table? Pools and data are not touched. This takes about a minute.",
+  ]);
   assert.deepEqual(h.runs, [{ mode: "multipath", systemId: "system-a" }]);
-  assert.equal(h.state.diskInventorySync.armedMode, null);
   assert.equal(h.buttons.multipath.textContent, "Sync multipath table");
-  assert.equal(h.buttons.multipath.dataset.armed, "false");
-  assert.equal(h.hint.classList.contains("hidden"), true);
-  assert.deepEqual(h.cleared, [1], "the arm timer is cleared when the sync runs");
+
+  h.fns.handleDiskInventorySyncClick("full");
+  assert.equal(h.confirms.at(-1), "Ask TrueNAS to re-scan its disks? Pools and data are not touched. This takes about a minute.");
+  assert.deepEqual(h.runs.at(-1), { mode: "full", systemId: "system-a" });
 });
 
-test("arming the other mode re-arms instead of running", () => {
-  const h = harness({ platform: "core" });
-  h.fns.handleDiskInventorySyncClick("multipath");
+test("declining the question runs nothing and leaves the buttons as they were", () => {
+  const h = harness({ platform: "core", confirmAnswer: false });
+  h.fns.renderDiskInventorySyncControls();
   h.fns.handleDiskInventorySyncClick("full");
-  assert.equal(h.state.diskInventorySync.armedMode, "full");
+  assert.equal(h.confirms.length, 1);
   assert.deepEqual(h.runs, []);
-  assert.match(h.hint.textContent, /disk\.sync_all/);
-  assert.equal(h.buttons.multipath.textContent, "Sync multipath table");
-  assert.equal(h.buttons.full.textContent, "Confirm sync");
+  assert.equal(h.buttons.full.textContent, "Full disk sync");
+  assert.equal(h.buttons.full.disabled, false);
 });
 
-test("changing systems after arming requires a fresh confirmation for the exact new system", () => {
+test("the run targets the system that was selected when the question was answered", () => {
   const h = harness({ platform: "core" });
-
-  h.fns.handleDiskInventorySyncClick("full");
-  assert.equal(h.state.diskInventorySync.armedSystemId, "system-a");
-
   h.state.selectedSystemId = "system-b";
   h.fns.handleDiskInventorySyncClick("full");
-
-  assert.deepEqual(h.runs, [], "system B must not inherit system A's confirmation");
-  assert.equal(h.state.diskInventorySync.armedMode, "full");
-  assert.equal(h.state.diskInventorySync.armedSystemId, "system-b");
-
-  h.fns.handleDiskInventorySyncClick("full");
   assert.deepEqual(h.runs, [{ mode: "full", systemId: "system-b" }]);
-});
-
-test("the arm window expiring or an outside disarm resets without running", () => {
-  const h = harness({ platform: "core" });
-  h.fns.handleDiskInventorySyncClick("full");
-  assert.equal(h.state.diskInventorySync.armedMode, "full");
-  h.timers[0].fn();
-  assert.equal(h.state.diskInventorySync.armedMode, null);
-  assert.equal(h.state.diskInventorySync.armTimerId, null);
-  assert.equal(h.buttons.full.textContent, "Full disk sync");
-  assert.deepEqual(h.runs, []);
-
-  h.fns.handleDiskInventorySyncClick("full");
-  h.fns.disarmDiskInventorySync();
-  assert.equal(h.state.diskInventorySync.armedMode, null);
-  assert.deepEqual(h.runs, []);
-  assert.equal(h.hint.classList.contains("hidden"), true);
 });
 
 test("buttons are disabled with a title reason for SSH off, in-flight sync, and unsupported mode", () => {
@@ -257,7 +216,7 @@ test("buttons are disabled with a title reason for SSH off, in-flight sync, and 
   assert.equal(sshOff.buttons.full.disabled, true);
   assert.match(sshOff.buttons.full.title, /SSH is disabled for this system/);
   sshOff.fns.handleDiskInventorySyncClick("full");
-  assert.equal(sshOff.state.diskInventorySync.armedMode, null);
+  assert.deepEqual(sshOff.confirms, []);
   assert.deepEqual(sshOff.runs, []);
   assert.match(sshOff.statuses.at(-1).message, /SSH is disabled/);
 
@@ -287,7 +246,7 @@ test("optional write-policy hooks disable the controls and click handler with th
   const clickBlocked = harness({ platform: "core", writePolicyAllowed: false, writePolicyBlockReason: reason });
   clickBlocked.fns.handleDiskInventorySyncClick("full");
   assert.deepEqual(clickBlocked.runs, []);
-  assert.equal(clickBlocked.state.diskInventorySync.armedMode, null);
+  assert.deepEqual(clickBlocked.confirms, []);
   assert.equal(clickBlocked.buttons.full.disabled, true);
   assert.equal(clickBlocked.buttons.full.title, reason);
   assert.deepEqual(clickBlocked.statuses.at(-1), { message: reason, tone: "error" });
@@ -306,9 +265,8 @@ test("network mode enables disk sync when the effective write policy allows writ
   assert.equal(h.buttons.full.disabled, false);
 
   h.fns.handleDiskInventorySyncClick("full");
-  assert.deepEqual(h.runs, []);
-  assert.equal(h.state.diskInventorySync.armedMode, "full");
-  assert.equal(h.buttons.full.textContent, "Confirm sync");
+  assert.equal(h.confirms.length, 1);
+  assert.deepEqual(h.runs, [{ mode: "full", systemId: "system-a" }]);
 });
 
 function diskInventorySyncRunHarness(selectedSystemId = "system-a") {
@@ -316,7 +274,7 @@ function diskInventorySyncRunHarness(selectedSystemId = "system-a") {
   const state = {
     selectedSystemId,
     snapshot: { selected_system_id: selectedSystemId },
-    diskInventorySync: { armedMode: null, armedSystemId: null, armTimerId: null, inFlight: false },
+    diskInventorySync: { inFlight: false },
   };
   const fns = loadNamedFunctions(
     ["diskInventorySyncModeSpec", "formatDiskInventorySyncResult", "runDiskInventorySync"],
@@ -364,12 +322,12 @@ test("run passes the in-page Basic-auth option to fetchJson", async () => {
 test("template places the action group in the enclosure header beside the view toggles", () => {
   const actionsStart = TEMPLATE.indexOf('<div class="panel-header-actions">');
   const groupStart = TEMPLATE.indexOf('id="disk-inventory-sync-controls"');
-  const fabricLink = TEMPLATE.indexOf('id="sas-fabric-view-link"');
+  const connectionsToggle = TEMPLATE.indexOf('id="sas-fabric-toggle-button"');
   const heatmapControls = TEMPLATE.indexOf('id="heatmap-controls"');
   const legend = TEMPLATE.indexOf('<div class="legend">');
   assert.notEqual(actionsStart, -1);
   assert.ok(groupStart > actionsStart, "group must be inside the header actions");
-  assert.ok(groupStart > fabricLink, "group sits right of the Storage Fabric toggle");
+  assert.ok(groupStart > connectionsToggle, "group sits right of the Connections toggle");
   assert.ok(groupStart < heatmapControls, "group precedes the heat map controls");
   assert.ok(groupStart < legend, "group precedes the legend");
   assert.ok(TEMPLATE.indexOf('id="detail-led-controls"') > legend, "group is not in the Slot Details panel");
@@ -377,15 +335,16 @@ test("template places the action group in the enclosure header beside the view t
   assert.match(TEMPLATE, /role="group" aria-label="TrueNAS disk inventory"/);
   assert.match(TEMPLATE, /data-disk-inventory-sync-mode="multipath"[^>]*>\s*Sync multipath table/);
   assert.match(TEMPLATE, /data-disk-inventory-sync-mode="full"[^>]*>\s*Full disk sync/);
-  assert.match(TEMPLATE, /id="disk-inventory-sync-hint"/);
+  assert.doesNotMatch(TEMPLATE, /disk-inventory-sync-hint/, "the timed confirm hint is gone");
   assert.match(STYLES, /\.disk-inventory-sync-controls\s*\{[^}]*flex-wrap:\s*wrap/);
-  assert.match(STYLES, /\.disk-inventory-sync-hint\s*\{[^}]*flex-basis:\s*100%/);
+  assert.doesNotMatch(STYLES, /data-armed/);
 });
 
-test("app wires the buttons, the outside-click disarm, and the guarded route", () => {
+test("app wires the buttons through a confirm dialog to the guarded route", () => {
   assert.match(APP_SOURCE, /querySelectorAll\("\[data-disk-inventory-sync-mode\]"\)/);
   assert.match(APP_SOURCE, /handleDiskInventorySyncClick\(button\.dataset\.diskInventorySyncMode\)/);
-  assert.match(APP_SOURCE, /diskInventorySyncControls\.contains\(event\.target\)/);
+  assert.match(functionSource(APP_SOURCE, "handleDiskInventorySyncClick"), /window\.confirm\(diskInventorySyncConfirmText\(mode\)\)/);
+  assert.doesNotMatch(APP_SOURCE, /armDiskInventorySync|armedMode|Confirm sync/);
   assert.match(APP_SOURCE, /\/api\/systems\/\$\{encodeURIComponent\(systemId\)\}\/disk-inventory-sync/);
   assert.match(APP_SOURCE, /JSON\.stringify\(\{ mode, confirm: true \}\)/);
   const renderAll = functionSource(APP_SOURCE, "renderAll");

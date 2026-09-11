@@ -143,8 +143,10 @@ test("mapping health scope follows the selected saved view", () => {
   assert.equal(scope.slots[0].mapping_source, "inventory_candidate");
 });
 
-test("main template exposes mapping health and polite status regions", () => {
-  assert.match(TEMPLATE, /id="mapping-health-summary"[^>]*role="status"[^>]*aria-live="polite"/);
+test("main template exposes mapping health without a live region and keeps the status line polite", () => {
+  const healthSummary = TEMPLATE.split("\n").find((line) => line.includes('id="mapping-health-summary"'));
+  assert.ok(healthSummary, "mapping health summary must exist");
+  assert.doesNotMatch(healthSummary, /aria-live|role="status"/);
   assert.match(TEMPLATE, /id="mapping-health-evidence"/);
   assert.match(TEMPLATE, /id="status-text"[^>]*role="status"[^>]*aria-live="polite"/);
   assert.match(FABRIC_TEMPLATE, /id="fabric-status-text"[^>]*role="status"[^>]*aria-live="polite"/);
@@ -219,7 +221,8 @@ test("heuristic and temperature metrics explain derivation and action context", 
   assert.match(definitions, /label:\s*"Derived Attention Score"/);
   assert.match(definitions, /label:\s*"Temperature \(C\)"/);
   assert.match(definitions, /label:\s*"Temperature vs View Average \(C\)"/);
-  assert.match(TEMPLATE, /id="heatmap-metric-context"[^>]*aria-live="polite"/);
+  assert.match(TEMPLATE, /id="heatmap-metric-context"/);
+  assert.doesNotMatch(TEMPLATE, /id="heatmap-metric-context"[^>]*aria-live/);
   assert.match(APP_SOURCE, /Higher scores combine relative temperature, errors, and write load; inspect the selected bay before acting\./);
   assert.match(APP_SOURCE, /Use the drive vendor's warning and critical thresholds when available\./);
 });

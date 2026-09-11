@@ -13,6 +13,7 @@ from fastapi.routing import APIRoute
 import tests.admin_test_env  # noqa: F401  (must precede admin_service.main)
 from admin_service import main as admin_main
 from app import main as app_main
+from app import routes as app_routes
 from app.config import Settings, SystemConfig
 from app.models.domain import (
     InventorySnapshot,
@@ -152,6 +153,7 @@ class UnknownSystemRouteTests(unittest.TestCase):
         with patch.object(app_main, "get_inventory_registry", return_value=registry):
             self.assert_unknown_system(
                 lambda: route.endpoint(
+                    request=_request("/api/inventory"),
                     force=False,
                     system_id=UNKNOWN_SYSTEM_ID,
                     enclosure_id=None,
@@ -159,6 +161,47 @@ class UnknownSystemRouteTests(unittest.TestCase):
             )
 
         default_service.get_snapshot.assert_not_awaited()
+
+    def test_inventory_read_carries_write_policy_and_app_version(self) -> None:
+        default_service = _default_service()
+        registry = _registry_with_default_service(default_service)
+        route = _route(app_main.app, "/api/inventory")
+        previous_origin = getattr(app_main.app.state, "read_ui_public_origin", None)
+        app_main.app.state.read_ui_public_origin = "https://nas.example.test"
+        try:
+            with patch.object(app_main, "get_inventory_registry", return_value=registry):
+                response = asyncio.run(
+                    route.endpoint(
+                        request=_request("/api/inventory"),
+                        force=False,
+                        system_id="system-a",
+                        enclosure_id=None,
+                    )
+                )
+        finally:
+            app_main.app.state.read_ui_public_origin = previous_origin
+
+        payload = json.loads(bytes(response.body))
+        self.assertEqual(payload["selected_system_id"], "system-a")
+        self.assertEqual(payload["app_version"], app_main.__version__)
+        self.assertEqual(payload["write_policy"]["public_origin"], "https://nas.example.test")
+        self.assertIn("enabled", payload["write_policy"])
+        self.assertIn("mode", payload["write_policy"])
+        self.assertIn("reason", payload["write_policy"])
+
+    def test_index_write_policy_names_the_public_origin_only_when_configured(self) -> None:
+        request = _request("/")
+        previous_origin = getattr(app_main.app.state, "read_ui_public_origin", None)
+        try:
+            app_main.app.state.read_ui_public_origin = None
+            self.assertIsNone(app_routes.live_write_policy(request)["public_origin"])
+            app_main.app.state.read_ui_public_origin = "https://nas.example.test"
+            self.assertEqual(
+                app_routes.live_write_policy(request)["public_origin"],
+                "https://nas.example.test",
+            )
+        finally:
+            app_main.app.state.read_ui_public_origin = previous_origin
 
     def test_explicit_unknown_locator_mutation_returns_404_without_calling_default_service(self) -> None:
         default_service = _default_service()
