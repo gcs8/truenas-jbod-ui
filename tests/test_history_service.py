@@ -14,6 +14,7 @@ import time
 import unittest
 import urllib.error
 from contextlib import ExitStack, contextmanager
+from html.parser import HTMLParser
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -40,6 +41,48 @@ from history_service.migration_lock import history_lock_path, history_write_lock
 from history_service.segment_catalog import MIGRATION_PENDING_MARKER, activation_pending_path
 from history_service.segment_reader import SegmentedHistoryReader
 from history_service.store import DISK_IDENTITY_BACKFILL_USER_VERSION, HistoryStore, SlotStateUpdate
+
+
+
+
+class _VisibleTextExtractor(HTMLParser):
+    """Collect the text a reader sees, skipping script and style content."""
+
+    _SKIP_TAGS = frozenset({"script", "style"})
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._skip_depth = 0
+        self._chunks: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in self._SKIP_TAGS:
+            self._skip_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self._SKIP_TAGS and self._skip_depth:
+            self._skip_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if not self._skip_depth:
+            self._chunks.append(data)
+
+    def visible_text(self) -> str:
+        return " ".join(self._chunks)
+
+
+def visible_text_of(markup: str) -> str:
+    """Return reader-visible text from rendered markup.
+
+    A real parser rather than tag-shaped regexes: an attribute value containing
+    ">" and a closing tag written as "</script >" both defeat a regex strip and
+    would leak script text into the copy assertions as a false failure.
+    """
+
+    parser = _VisibleTextExtractor()
+    parser.feed(markup)
+    parser.close()
+    return parser.visible_text()
 
 
 @contextmanager
@@ -623,11 +666,10 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         self.assertIn("<dt>Last scan used</dt>", markup)
         self.assertIn("Database size", markup)
         self.assertIn("collector-activity-banner", markup)
+        visible_markup = visible_text_of(markup).lower()
         for engineering_word in ("sidecar", "rollup", "scope", "overrun", "deferred", "backed off"):
             with self.subTest(word=engineering_word):
-                visible_markup = re.sub(r"<script\b.*?</script>", "", markup, flags=re.DOTALL)
-                visible_markup = re.sub(r"<[^>]+>", " ", visible_markup)
-                self.assertNotIn(engineering_word, visible_markup.lower())
+                self.assertNotIn(engineering_word, visible_markup)
         for js_string in ('"deferred"', "backed off", "Background backoff"):
             self.assertNotIn(js_string, script_source)
         self.assertIn("pollCollectorStatus", script_source)
