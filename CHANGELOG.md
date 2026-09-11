@@ -26,6 +26,16 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Internal
+
+- Added a dispatch-only workflow that recaptures the public-demo screenshots
+  inside the pinned Playwright Linux container, captures twice to prove the
+  bytes are reproducible, and uploads the PNGs and proposed manifest entries for
+  a human to approve; `scripts/check_public_screenshots.py --report` prints the
+  candidate hashes without asserting the manifest (#TBD).
+
 ## v0.23.0 - 2026-09-08
 
 This release includes every pull request merged after `v0.22.2` through the
