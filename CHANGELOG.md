@@ -26,6 +26,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Changed
+
+- Rewrote the warnings, bay-light and mapping reasons, SMART messages, HTTP error details, export banner labels and release-check summaries the main page shows, in plain words with no roadmap prose; the QuantaStor cluster master is shown in Platform Details instead of as a warning, and history backend log lines now say why a request failed (#496).
+
 ## v0.23.0 - 2026-09-08
 
 This release includes every pull request merged after `v0.22.2` through the

@@ -3,7 +3,7 @@
 {% block body %}
 {% set profile = snapshot.selected_profile %}
 {% set release_status_payload = release_status if release_status is defined and release_status else {} %}
-{% set release_note = release_status_payload.summary if release_status_payload and release_status_payload.summary else "Checking releases..." %}
+{% set release_note = release_status_payload.summary if release_status_payload and release_status_payload.summary else "Checking for updates..." %}
 {% set snapshot_is_sanitized = snapshot_mode and (snapshot_export_meta.redaction == "partial" or snapshot_export_meta.redaction_label in ["Scrambled IDs", "Synthetic IDs"]) %}
 <div class="app-shell">
   <header class="topbar">
@@ -101,7 +101,7 @@
       <div class="summary-card compact">
         <span class="summary-label">Redaction</span>
         <span class="summary-value">{{ snapshot_export_meta.redaction_label or "None" }}</span>
-        <span class="summary-note">{{ snapshot_export_meta.redaction_note or "Original identifiers included" }}</span>
+        <span class="summary-note">{{ snapshot_export_meta.redaction_note or "Real host names and serial numbers included" }}</span>
       </div>
     </div>
   </section>

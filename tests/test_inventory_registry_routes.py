@@ -25,7 +25,7 @@ from app.services.inventory_registry import InventoryRegistry, SystemNotConfigur
 
 
 UNKNOWN_SYSTEM_ID = "retired-nas"
-UNKNOWN_SYSTEM_DETAIL = f"System '{UNKNOWN_SYSTEM_ID}' is not configured."
+UNKNOWN_SYSTEM_DETAIL = f'No system named "{UNKNOWN_SYSTEM_ID}" is configured.'
 
 
 def _registry_with_default_service(default_service: Mock) -> InventoryRegistry:
@@ -104,7 +104,7 @@ class InventoryRegistrySelectionTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             SystemNotConfiguredError,
-            "^System 'retired-nas' is not configured\\.$",
+            '^No system named "retired-nas" is configured\\.$',
         ):
             registry.get_system(UNKNOWN_SYSTEM_ID)
 
@@ -114,7 +114,7 @@ class InventoryRegistrySelectionTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             SystemNotConfiguredError,
-            "^System 'retired-nas' is not configured\\.$",
+            '^No system named "retired-nas" is configured\\.$',
         ):
             registry.get_service(UNKNOWN_SYSTEM_ID)
 
@@ -125,7 +125,7 @@ class UnknownSystemRouteTests(unittest.TestCase):
     def assert_unknown_system(self, callback) -> None:
         with self.assertRaisesRegex(
             SystemNotConfiguredError,
-            "^System 'retired-nas' is not configured\\.$",
+            '^No system named "retired-nas" is configured\\.$',
         ):
             asyncio.run(callback())
 

@@ -24,8 +24,8 @@ from history_service.operation_bounds import (
 
 
 logger = logging.getLogger(__name__)
-HISTORY_BACKEND_FAILURE_DETAIL = "History backend request failed; see application logs."
-HISTORY_BACKEND_DEGRADED_DETAIL = "History backend is degraded; see history service logs."
+HISTORY_BACKEND_FAILURE_DETAIL = "History is temporarily unavailable."
+HISTORY_BACKEND_DEGRADED_DETAIL = "History is running with errors. Check the history service log."
 
 
 class HistoryBackendError(RuntimeError):
@@ -37,8 +37,13 @@ class HistoryBackendUnavailableError(HistoryBackendError):
 
     Distinguished from HTTP-level failures so per-slot fallbacks can stop fanning out
     once the backend is known to be unreachable instead of waiting out one timeout per
-    slot.
+    slot. ``reason`` is a short transport description that is safe to log; it is set
+    only where this module builds the error from a socket or URL failure.
     """
+
+    def __init__(self, message: str, *, reason: str | None = None) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 class HistoryBackendResponseError(HistoryBackendError):
@@ -53,6 +58,20 @@ class HistoryBackendResponseError(HistoryBackendError):
             self.status_code = status_code
             message = detail or f"History backend returned HTTP {self.status_code}."
         super().__init__(message)
+
+
+def _log_reason(exc: BaseException) -> str:
+    """Describe a failure for the application log without repeating its message.
+
+    Exception text can carry backend URLs, credentials, or private paths, so the log
+    names only the transport reason this module recorded, the HTTP status, or the
+    exception class.
+    """
+    if isinstance(exc, HistoryBackendUnavailableError) and exc.reason:
+        return exc.reason
+    if isinstance(exc, HistoryBackendResponseError) and exc.status_code:
+        return f"HTTP {exc.status_code}"
+    return type(exc).__name__
 
 
 class HistoryBackendBusyError(HistoryBackendResponseError):
@@ -87,8 +106,8 @@ class HistoryBackendClient:
 
         try:
             payload = await self._fetch_json("/healthz")
-        except Exception:  # noqa: BLE001 - surface optional-backend errors as degraded status.
-            logger.warning("History backend status request failed.")
+        except Exception as exc:  # noqa: BLE001 - surface optional-backend errors as degraded status.
+            logger.warning("History backend status request failed (%s).", _log_reason(exc))
             return {
                 "configured": True,
                 "available": False,
@@ -135,8 +154,8 @@ class HistoryBackendClient:
 
         try:
             return await self._fetch_slot_history(slot, system_id, enclosure_id, window_hours=window_hours)
-        except Exception:  # noqa: BLE001 - optional backend should degrade gracefully.
-            logger.warning("History backend slot history request failed.")
+        except Exception as exc:  # noqa: BLE001 - optional backend should degrade gracefully.
+            logger.warning("History backend slot history request failed (%s).", _log_reason(exc))
             return self._failed_slot_payload(slot, system_id, enclosure_id)
 
     async def _fetch_slot_history(
@@ -203,14 +222,15 @@ class HistoryBackendClient:
                     return self._failed_slot_payload(slot, system_id, enclosure_id)
                 try:
                     return await self._fetch_slot_history(slot, system_id, enclosure_id, window_hours=window_hours)
-                except HistoryBackendUnavailableError:
+                except HistoryBackendUnavailableError as exc:
                     if not unreachable.is_set():
                         logger.warning(
-                            "History backend unreachable during per-slot fallback; skipping remaining slots."
+                            "History backend unreachable during per-slot fallback; skipping remaining slots (%s).",
+                            _log_reason(exc),
                         )
                     unreachable.set()
-                except Exception:  # noqa: BLE001 - optional backend should degrade gracefully.
-                    logger.warning("History backend slot history request failed.")
+                except Exception as exc:  # noqa: BLE001 - optional backend should degrade gracefully.
+                    logger.warning("History backend slot history request failed (%s).", _log_reason(exc))
                 return self._failed_slot_payload(slot, system_id, enclosure_id)
 
         results = await asyncio.gather(*(fetch_one(slot) for slot in unique_slots))
@@ -256,8 +276,8 @@ class HistoryBackendClient:
                 raise
             except HistoryBackendResponseError:
                 raise
-            except (HistoryBackendUnavailableError, OSError):
-                logger.warning("History backend multi-scope request failed.")
+            except (HistoryBackendUnavailableError, OSError) as exc:
+                logger.warning("History backend multi-scope request failed (%s).", _log_reason(exc))
                 available = False
                 detail = HISTORY_BACKEND_FAILURE_DETAIL
         return {
@@ -341,8 +361,8 @@ class HistoryBackendClient:
                 raise HistoryBackendResponseError(0, "History backend returned a malformed histories payload.")
         except (HistoryBudgetExceeded, HistoryRequestShapeError) as exc:
             raise ValueError(str(exc)) from exc
-        except HistoryBackendUnavailableError:
-            logger.warning("History backend scope history request failed.")
+        except HistoryBackendUnavailableError as exc:
+            logger.warning("History backend scope history request failed (%s).", _log_reason(exc))
             return {
                 slot: self._failed_slot_payload(slot, system_id, enclosure_id)
                 for slot in dict.fromkeys(slots)
@@ -510,6 +530,11 @@ class HistoryBackendClient:
                 raise HistoryBackendPolicyError(exc.code) from exc
             raise HistoryBackendResponseError(exc.code) from exc
         except urllib.error.URLError as exc:
-            raise HistoryBackendUnavailableError(f"History backend request failed: {exc.reason}") from exc
+            raise HistoryBackendUnavailableError(
+                f"History backend request failed: {exc.reason}",
+                reason=str(exc.reason)[:160],
+            ) from exc
         except (TimeoutError, socket.timeout) as exc:
-            raise HistoryBackendUnavailableError("History backend request timed out.") from exc
+            raise HistoryBackendUnavailableError(
+                "History backend request timed out.", reason="timed out"
+            ) from exc

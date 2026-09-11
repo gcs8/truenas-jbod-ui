@@ -22,7 +22,7 @@ class SystemNotConfiguredError(LookupError):
 
     def __init__(self, system_id: str) -> None:
         self.system_id = system_id
-        super().__init__(f"System '{system_id}' is not configured.")
+        super().__init__(f'No system named "{system_id}" is configured.')
 
 
 class InventoryRegistry:

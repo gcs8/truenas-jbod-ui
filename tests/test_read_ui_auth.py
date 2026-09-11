@@ -320,7 +320,7 @@ class ReadUIAuthorizationTests(unittest.TestCase):
         self.assertEqual(unavailable_status, 403)
         self.assertEqual(
             json.loads(unavailable_body),
-            {"ok": False, "detail": "Read UI sign-in requires ADMIN_AUTH_MODE=basic."},
+            {"ok": False, "detail": "Sign-in is not enabled on this server."},
         )
 
     def test_basic_mode_requires_explicit_main_ui_public_origin(self) -> None:
@@ -450,7 +450,7 @@ class ReadUIWritePolicyBootstrapTests(unittest.TestCase):
         policy = context["write_policy"]
         self.assertEqual(policy["enabled"], False)
         self.assertEqual(policy["mode"], "basic")
-        self.assertEqual(policy["reason"], "Sign in to enable mapping, LED, and alias changes.")
+        self.assertEqual(policy["reason"], "Sign in to make changes.")
         self.assertEqual(json.loads(context["write_policy_json"]), policy)
 
     def test_snapshot_export_context_without_policy_renders_null(self) -> None:

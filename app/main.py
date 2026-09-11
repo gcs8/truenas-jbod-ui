@@ -456,8 +456,8 @@ def _clear_snapshot_export_source_cache_for_tests() -> None:
     SNAPSHOT_EXPORT_SOURCE_CACHE.clear()
 
 
-READ_UI_SIGN_IN_REQUIRED_REASON = "Sign in to enable mapping, LED, and alias changes."
-READ_UI_WRITE_POLICY_UNAVAILABLE_REASON = "Write controls are unavailable because the authorization mode is unknown."
+READ_UI_SIGN_IN_REQUIRED_REASON = "Sign in to make changes."
+READ_UI_WRITE_POLICY_UNAVAILABLE_REASON = "Changes are disabled because the sign-in settings could not be read."
 
 
 def build_read_ui_write_policy(auth_settings: Any | None) -> dict[str, object]:
@@ -500,7 +500,7 @@ def require_read_ui_basic_credentials(request: Request) -> None:
     if auth_settings.auth_mode != "basic":
         raise HTTPException(
             status_code=403,
-            detail="Read UI sign-in requires ADMIN_AUTH_MODE=basic.",
+            detail="Sign-in is not enabled on this server.",
         )
     if not basic_auth_matches(
         request.headers.get("authorization"),
@@ -524,19 +524,19 @@ def require_read_ui_mutation_authorization(request: Request) -> None:
         if not request_origin_allowed(request, public_origin):
             raise HTTPException(
                 status_code=403,
-                detail="Cross-origin Read UI mutation rejected.",
+                detail="This request came from a different site and was blocked.",
             )
         return
     if auth_settings.auth_mode != "basic":
         raise HTTPException(
             status_code=403,
-            detail="Read UI authorization mode is unavailable.",
+            detail="Changes are disabled because the sign-in settings could not be read.",
         )
     require_read_ui_basic_credentials(request)
     if not request_origin_allowed(request, request.app.state.read_ui_public_origin):
         raise HTTPException(
             status_code=403,
-            detail="Cross-origin Read UI mutation rejected.",
+            detail="This request came from a different site and was blocked.",
         )
 
 
@@ -635,7 +635,7 @@ def create_app() -> FastAPI:
     async def unhandled_exception_handler(_: Request, exc: Exception) -> JSONResponse:
         logger.error("Unhandled application error", exc_info=(type(exc), exc, exc.__traceback__))
         return JSONResponse(
-            {"ok": False, "detail": "Unhandled application error; see application logs."},
+            {"ok": False, "detail": "Something went wrong on the server. The application log has details."},
             status_code=500,
         )
 
@@ -708,7 +708,7 @@ def build_index_context(
 
 def check_slot_bounds(slot: int, layout_slots: Collection[int]) -> None:
     if slot < 0 or slot not in layout_slots:
-        raise HTTPException(status_code=404, detail=f"Slot {slot} is outside configured layout.")
+        raise HTTPException(status_code=404, detail=f"Slot {slot} is not part of this enclosure.")
 
 
 def snapshot_layout_slots(snapshot: Any) -> frozenset[int]:
@@ -782,7 +782,7 @@ async def ensure_slot_bounds(
     selected_enclosure_id: str | None = None,
 ) -> None:
     if slot < 0:
-        raise HTTPException(status_code=404, detail=f"Slot {slot} is outside configured layout.")
+        raise HTTPException(status_code=404, detail=f"Slot {slot} is not part of this enclosure.")
     check_slot_bounds(slot, await resolve_layout_slots(service, selected_enclosure_id))
 
 
@@ -804,7 +804,7 @@ async def ensure_read_slot_bounds(
     selected_enclosure_id: str | None = None,
 ) -> str:
     if slot < 0:
-        raise HTTPException(status_code=404, detail=f"Slot {slot} is outside configured layout.")
+        raise HTTPException(status_code=404, detail=f"Slot {slot} is not part of this enclosure.")
     layout_slots, layout_bounds = await resolve_read_layout_slots(service, selected_enclosure_id)
     if layout_slots is not None:
         check_slot_bounds(slot, layout_slots)

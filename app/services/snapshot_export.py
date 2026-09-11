@@ -135,7 +135,7 @@ class SnapshotExportPendingWork:
 
 
 class SnapshotExportBusyError(RuntimeError):
-    public_detail = "Snapshot export capacity is busy; retry shortly."
+    public_detail = "The server is busy. Try again in a moment."
 
     def __init__(self) -> None:
         super().__init__(self.public_detail)
@@ -355,12 +355,11 @@ class SnapshotExportTooLargeError(RuntimeError):
         self.archive_size_bytes = archive_size_bytes
         self.size_limit_bytes = size_limit_bytes
         parts = [
-            f"Snapshot export exceeds the default {format_bytes(size_limit_bytes)} size target.",
-            f"HTML: {format_bytes(html_size_bytes)}.",
+            f"This export is too large: HTML {format_bytes(html_size_bytes)}"
+            + (f", ZIP {format_bytes(archive_size_bytes)}" if archive_size_bytes is not None else "")
+            + f" (limit {format_bytes(size_limit_bytes)}).",
+            "Choose ZIP or allow a larger file.",
         ]
-        if archive_size_bytes is not None:
-            parts.append(f"ZIP: {format_bytes(archive_size_bytes)}.")
-        parts.append("Use Force ZIP or Allow oversize to continue.")
         super().__init__(" ".join(parts))
 
 
@@ -1346,11 +1345,11 @@ class SnapshotExportService:
                 else snapshot_for_export.layout_slot_count or len(snapshot_for_export.slots)
             )
             redaction_level = "partial" if redact_sensitive else "none"
-            redaction_label = "Partial" if redact_sensitive else (identifier_policy_label or "None")
+            redaction_label = "Serials hidden" if redact_sensitive else (identifier_policy_label or "Serials shown")
             redaction_note = (
-                "Host aliases and partial identifier masking applied"
+                "Host names replaced with aliases; serial numbers partly hidden"
                 if redact_sensitive
-                else identifier_policy_note or "Original identifiers included"
+                else identifier_policy_note or "Real host names and serial numbers included"
             )
 
             export_meta = {
@@ -1564,20 +1563,25 @@ class SnapshotExportService:
     ) -> dict[str, str]:
         if not metric_rollup_applied and not event_trim_applied:
             return {
+                # "None" is an API sentinel, not display copy: app.js treats any
+                # other label as adaptive downsampling (see buildEstimateAdvice
+                # and the export-dialog note). Changing it needs an explicit
+                # applied flag and every consumer updated.
                 "label": "None",
-                "note": "No rollups or downsampling applied",
+                "note": "Every recorded sample is included",
             }
 
         note_parts: list[str] = []
         if history_window_hours is not None:
-            note_parts.append(f"Filtered to the exported {self._format_history_window_label(history_window_hours)} window")
+            note_parts.append(f"Limited to the exported {self._format_history_window_label(history_window_hours)} window")
         if metric_rollup_applied and rollup_seconds:
-            label = f"{self._format_rollup_interval_label(rollup_seconds)} rollups"
-            note_parts.append(f"Metric samples grouped into {label.lower()}")
+            interval_label = self._format_rollup_interval_label(rollup_seconds)
+            label = f"Averaged ({interval_label})"
+            note_parts.append(f"Samples averaged over {interval_label} periods")
         else:
-            label = "Event cap"
+            label = "Events trimmed"
         if event_trim_applied and max_events_per_slot is not None:
-            note_parts.append(f"Recent events limited to {max_events_per_slot} per slot")
+            note_parts.append(f"Up to {max_events_per_slot} recent events per slot")
 
         return {
             "label": label,

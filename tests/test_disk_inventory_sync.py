@@ -498,7 +498,7 @@ class DiskInventorySyncRouteTests(unittest.TestCase):
                     )
 
                 self.assertEqual(caught.exception.status_code, 404)
-                self.assertEqual(caught.exception.detail, f"System {system_id!r} is not configured.")
+                self.assertEqual(caught.exception.detail, f'No system named "{system_id}" is configured.')
                 registry.has_system.assert_called_once_with(system_id)
                 registry.get_service.assert_not_called()
                 service.sync_disk_inventory.assert_not_awaited()
