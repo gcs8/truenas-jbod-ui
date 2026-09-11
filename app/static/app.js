@@ -3499,7 +3499,9 @@
   }
 
   function isSmartEntryInFlight(entry) {
-    if (!entry || (!entry.loading && !entry.refreshing)) {
+    // A queued entry only carries tooltip feedback: no request owns it yet, so it
+    // must stay eligible for the batch it is waiting on.
+    if (!entry || entry.queued || (!entry.loading && !entry.refreshing)) {
       return false;
     }
     const requestedAt = Number(entry.requestedAt) || 0;
@@ -3750,10 +3752,13 @@
     if (!coveredByPrefetch) {
       return ensureSmartSummary(slot);
     }
-    if (!entry?.data && !isSmartEntryInFlight(entry)) {
+    if (!entry?.data && !entry?.queued && !isSmartEntryInFlight(entry)) {
+      // queued, not loading in flight: the tooltip formatters read loading, while
+      // candidateSlotsForSmartPrefetch keeps the bay in the batch that owns it.
       state.smartSummaries[cacheKey] = {
         loading: true,
         refreshing: false,
+        queued: true,
         data: null,
         requestedAt: Date.now(),
         generation: state.smartSummaryGeneration,
