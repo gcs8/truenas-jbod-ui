@@ -303,6 +303,41 @@ class CIWorkflowContractTests(unittest.TestCase):
             upload["with"]["path"], "${{ runner.temp }}/public-demo-screenshot-candidate"
         )
 
+    def test_screenshot_capture_checks_the_fonts_chromium_actually_used(self) -> None:
+        workflow = yaml.safe_load(self.read(CAPTURE_SCREENSHOTS_WORKFLOW))
+        job = workflow["jobs"]["capture"]
+        runs = [str(step.get("run", "")) for step in job["steps"]]
+        probe_step = next(run for run in runs if "report_public_demo_platform_fonts.js" in run)
+        fc_match_step = next(run for run in runs if "fc-match" in run)
+        script = self.read(ROOT / "scripts" / "report_public_demo_platform_fonts.js")
+
+        self.assertIn(
+            'node scripts/report_public_demo_platform_fonts.js "$CANDIDATE_DIR/platform-fonts.json"',
+            probe_step,
+        )
+        # The expected families are compared against the platform fonts Chromium
+        # reported, not against fc-match, whose output stays informational.
+        for variable in ("EXPECTED_SANS_FALLBACK", "EXPECTED_MONO_FALLBACK"):
+            with self.subTest(variable=variable):
+                self.assertIn(variable, probe_step)
+                self.assertNotIn(variable, fc_match_step)
+        self.assertIn("probes.sans.dominant_family", probe_step)
+        self.assertIn("probes.mono.dominant_family", probe_step)
+        self.assertIn('"$CANDIDATE_DIR/platform-fonts.json"', probe_step)
+
+        for fragment in (
+            "CSS.getPlatformFontsForNode",
+            "DOM.enable",
+            "CSS.enable",
+            "DOM.getDocument",
+            "DOM.querySelector",
+            "newCDPSession",
+            "glyphCount",
+            "dominant_family",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, script)
+
     def test_public_demo_pages_request_allowlist_is_probe_specific(self) -> None:
         spec = self.read(PUBLIC_DEMO_SPEC)
 

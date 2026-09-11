@@ -54,11 +54,21 @@ already in the image. When Dependabot raises `@playwright/test`, raise the tag i
 `.github/workflows/capture-public-demo-screenshots.yml` in the same pull
 request.
 
-The job also prints the fallback family that `fc-match` resolves for
-`sans-serif` and `monospace`, plus every installed font package and its version.
-Once the first dispatched run records those two families, set
-`EXPECTED_SANS_FALLBACK` and `EXPECTED_MONO_FALLBACK` in the workflow `env` block
-so a later image change fails the job instead of quietly changing the pixels.
+The job prints the fallback family that `fc-match` resolves for `sans-serif` and
+`monospace`, plus every installed font package and its version. That output is
+informational: `fc-match` answers a fontconfig question, and the renderer is free
+to pick something else for the glyphs that end up in the PNG.
+
+The families that decide the pixels come from Chromium itself.
+`scripts/report_public_demo_platform_fonts.js` loads the demo artifact over
+`file://`, waits for the page to render, and asks the DevTools protocol
+(`CSS.getPlatformFontsForNode`) which platform fonts were used for a body text
+node and for a monospace node. It prints each family with its glyph count and
+writes `platform-fonts.json` into the artifact. `EXPECTED_SANS_FALLBACK` and
+`EXPECTED_MONO_FALLBACK` are compared against the family with the most glyphs in
+that report, not against `fc-match`. Both are empty until the first dispatched
+run records them; set them in the workflow `env` block afterwards, so a later
+image change fails the job instead of quietly changing the pixels.
 
 ## Running it before the workflow is merged
 

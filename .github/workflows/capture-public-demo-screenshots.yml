@@ -41,9 +41,10 @@ jobs:
       CONTAINER_IMAGE: mcr.microsoft.com/playwright:v1.62.1-jammy@sha256:b3251f7ff1a9fa559a28d1c67eaa15fc1a9800f7845e82756caea7842967f615
       CONTAINER_TAG: mcr.microsoft.com/playwright:v1.62.1-jammy
       PLAYWRIGHT_VERSION: "1.62.1"
-      # Left empty until the first dispatched run records the resolved families.
-      # Once set, a font change in the image fails the job instead of silently
-      # changing the pixels.
+      # The families Chromium reported through CSS.getPlatformFontsForNode, not
+      # the families fc-match resolves. Left empty until the first dispatched run
+      # records them; once set, a font change in the image fails the job instead
+      # of silently changing the pixels.
       EXPECTED_SANS_FALLBACK: ""
       EXPECTED_MONO_FALLBACK: ""
     steps:
@@ -120,14 +121,32 @@ jobs:
               echo "no sans-serif or monospace fallback font is installed" >&2
               exit 1
             fi
-            if [ -n "$EXPECTED_SANS_FALLBACK" ] && [ "$sans" != "$EXPECTED_SANS_FALLBACK" ]; then
-              printf 'sans-serif fallback changed: expected %s, found %s\n' \
-                "$EXPECTED_SANS_FALLBACK" "$sans" >&2
+            # Everything above is informational. fc-match answers a fontconfig
+            # question; the next step asks Chromium which families it actually
+            # rasterised the page with, and that is what is asserted.
+          } 2>&1 | tee -a "$CANDIDATE_DIR/capture.log"
+
+      - name: Check the fonts Chromium actually rendered the demo with
+        run: |
+          {
+            set -euo pipefail
+            node scripts/report_public_demo_platform_fonts.js "$CANDIDATE_DIR/platform-fonts.json"
+            platform_sans="$(node -e 'process.stdout.write(require(process.argv[1]).probes.sans.dominant_family)' "$CANDIDATE_DIR/platform-fonts.json")"
+            platform_mono="$(node -e 'process.stdout.write(require(process.argv[1]).probes.mono.dominant_family)' "$CANDIDATE_DIR/platform-fonts.json")"
+            printf 'platform sans family: %s\n' "$platform_sans"
+            printf 'platform mono family: %s\n' "$platform_mono"
+            if [ -z "$platform_sans" ] || [ -z "$platform_mono" ]; then
+              echo "Chromium reported no platform font family for the demo page" >&2
               exit 1
             fi
-            if [ -n "$EXPECTED_MONO_FALLBACK" ] && [ "$mono" != "$EXPECTED_MONO_FALLBACK" ]; then
-              printf 'monospace fallback changed: expected %s, found %s\n' \
-                "$EXPECTED_MONO_FALLBACK" "$mono" >&2
+            if [ -n "$EXPECTED_SANS_FALLBACK" ] && [ "$platform_sans" != "$EXPECTED_SANS_FALLBACK" ]; then
+              printf 'the sans family Chromium used changed: expected %s, found %s\n' \
+                "$EXPECTED_SANS_FALLBACK" "$platform_sans" >&2
+              exit 1
+            fi
+            if [ -n "$EXPECTED_MONO_FALLBACK" ] && [ "$platform_mono" != "$EXPECTED_MONO_FALLBACK" ]; then
+              printf 'the mono family Chromium used changed: expected %s, found %s\n' \
+                "$EXPECTED_MONO_FALLBACK" "$platform_mono" >&2
               exit 1
             fi
           } 2>&1 | tee -a "$CANDIDATE_DIR/capture.log"
