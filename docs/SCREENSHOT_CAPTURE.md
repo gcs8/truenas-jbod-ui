@@ -60,6 +60,46 @@ Once the first dispatched run records those two families, set
 `EXPECTED_SANS_FALLBACK` and `EXPECTED_MONO_FALLBACK` in the workflow `env` block
 so a later image change fails the job instead of quietly changing the pixels.
 
+## Running it before the workflow is merged
+
+A `workflow_dispatch` workflow cannot be dispatched while it exists only on a
+pull request branch. GitHub's documentation is explicit:
+
+- "This event will only trigger a workflow run if the workflow file exists on
+  the default branch."
+- "To trigger the `workflow_dispatch` event, your workflow must be in the
+  default branch."
+- "On the GitHub UI, the "Run workflow" button will be present if the workflow
+  file exists on the default branch. Once a workflow has run at least once, you
+  can dispatch it against any branch or tag via the GitHub API or GitHub CLI."
+
+So `gh workflow run capture-public-demo-screenshots.yml --ref <branch>` does not
+work from this pull request branch alone: `--ref` chooses which ref is checked
+out and which version of the workflow file runs, but the trigger itself is only
+registered from the copy on the default branch, and the "Run workflow" button
+does not appear at all. While the file lives only on the branch, GitHub has no
+registered `workflow_dispatch` trigger for it and rejects the dispatch; the same
+applies to the REST endpoint `POST
+/repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches`, whose docs say
+"You must configure your GitHub Actions workflow to run when the
+workflow_dispatch webhook event occurs."
+
+This has not been tested by dispatching, and there is no way to test it without
+first putting the file on a default branch somewhere. Two ways to get a first
+run, for the owners to choose between:
+
+1. **Fork.** Push the branch to a fork and make it the fork's default branch.
+   The workflow is then dispatchable there, against any ref of that fork, and
+   nothing lands in this repository until the owners are satisfied.
+2. **Merge the workflow first as a no-op tooling change.** The workflow is
+   dispatch-only, has `permissions: contents: read`, and no `push`,
+   `pull_request`, or `schedule` trigger, so merging it changes no gate and
+   starts no run. Dispatch comes afterwards, deliberately.
+
+Neither option should be read as a recommendation to merge in order to find out
+whether the workflow works. Option 2 is a decision to accept the file on main
+before its first run; option 1 keeps that decision open.
+
 ## How a maintainer produces a candidate
 
 1. Push the branch that changed the demo input and its rebuilt
