@@ -54,107 +54,68 @@ def resolve_preserved_secret(incoming: str | None, existing: str | None = None) 
 
 _PLATFORM_SETUP_REQUIREMENTS: dict[str, dict[str, object]] = {
     "core": {
-        "summary": "TrueNAS CORE uses middleware API inventory, with optional FreeBSD SSH enrichment for physical slots, SMART detail, identify LEDs, and SAS Fabric diagnostics.",
+        "summary": "Reads disks and pools through the TrueNAS API. Add SSH later for bay positions, bay lights, SMART details and SAS diagnostics.",
         "required": (
-            "TrueNAS CORE API key for base disks, pools, and enclosure rows.",
-            "Saved enclosure/profile selection when more than one live enclosure or view is present.",
+            "An API key from TrueNAS (Settings > API Keys).",
         ),
         "optional": (
-            "CORE SSH service account for sesutil, camcontrol, smartctl, and read-only mprutil diagnostics.",
-            "Narrow pciconf, dmidecode -t slot, and /var/log/messages tail permissions for HBA slot labels and timestamped SAS Fabric evidence.",
+            "An SSH login on the host for the extras above. This app can create one for you in step 3.",
         ),
-        "unsupported": (
-            "Linux lsscsi/sg_ses discovery is not used on CORE.",
-            "ESXi host-prep and Linux sudoers bootstrap flows are not CORE runtime paths.",
-        ),
-        "guidance": "Use the CORE midclt permission preview for command-limited sudo instead of adding broad shell access.",
+        "guidance": "",
     },
     "scale": {
-        "summary": "TrueNAS SCALE combines middleware API inventory with Linux-side SSH enrichment for SES slot mapping, SMART detail, and optional identify LEDs.",
+        "summary": "Reads disks and pools through the TrueNAS API. Add SSH for bay positions, bay lights and SMART details.",
         "required": (
-            "TrueNAS SCALE API key for disks, pools, and base inventory.",
-            "SSH commands /usr/bin/lsblk --json and /usr/bin/lsscsi -g -t when Linux evidence must provide block and SCSI transport detail.",
+            "An API key from TrueNAS (top-right user menu > API Keys).",
         ),
         "optional": (
-            "sg3_utils sg_ses AES/EC and --join --filter reads for each discovered /dev/sgN enclosure device.",
-            "smartmontools smartctl -x for SMART detail and history enrichment.",
-            "nvme-cli list-subsys JSON output for NVMe controller and PCIe-path context when NVMe devices are present.",
-            "sg_ses identify rules only after the SG device and slot mapping are verified.",
+            "An SSH login on the host for bay positions, bay lights and SMART details. This app can create one for you in step 3.",
+            "nvme-cli on the host if you want NVMe details.",
         ),
-        "unsupported": (
-            "TrueNAS CORE/BSD tools sesutil, mprutil, and camcontrol.",
-            "CORE-only SAS Fabric topology and mprutil diagnostics.",
-        ),
-        "guidance": "Let lsscsi -g -t name the live /dev/sgN devices and transport addresses, then prefer exact sg_ses -p aes/ec plus --join --filter rules for those devices; the wildcard bootstrap rules are a convenience, not a requirement to ask for BSD tools.",
+        "guidance": "",
     },
     "linux": {
-        "summary": "Generic Linux is SSH-first: inventory starts with lsblk, then profile, SES, BMC, mdadm, NVMe, or vendor sources determine how physical the view can be.",
+        "summary": "Reads disks over SSH. Bay positions come from a disk shelf (SES), a saved chassis layout, the management controller or a vendor tool, whichever this host has.",
         "required": (
-            "SSH host, user/key, and stable-column /usr/bin/lsblk --json output for base disk inventory.",
-            "A selected profile, storage view, SES source, BMC source, or vendor source when physical slot rendering is expected.",
+            "An SSH login on the host. This app can create one for you in step 3.",
         ),
         "optional": (
-            "mdadm for software RAID context and nvme-cli for NVMe subsystem context.",
-            "smartmontools smartctl -x for SMART detail and history enrichment.",
-            "lsscsi -g -t and sg3_utils sg_ses AES/EC/join reads for SES-backed chassis after lsscsi shows enclosure SG devices.",
-            "BMC/IPMI or vendor commands where the platform has proven slot metadata.",
+            "A chassis layout or storage view so bays can be drawn.",
+            "smartmontools for SMART details and sg3_utils for disk-shelf bay positions.",
         ),
-        "unsupported": (
-            "TrueNAS API-only setup.",
-            "CORE SAS Fabric mprutil diagnostics and ESXi host-prep package installation.",
-        ),
-        "guidance": "For Linux SES, grant sg_ses AES/EC/join reads for the exact SG devices discovered by lsscsi -g -t and only enable identify writes after slot mapping is proven.",
+        "guidance": "",
     },
     "quantastor": {
-        "summary": "Quantastor is REST-first, with optional HA-node SSH enrichment for shared SES faces, qs CLI details, and smartctl.",
+        "summary": "Reads storage systems and disks through the QuantaStor REST API. SSH to a node adds shared disk-shelf detail and SMART data.",
         "required": (
-            "Quantastor REST endpoint plus API user/password.",
-            "A selected storage system or enclosure view from the REST inventory.",
+            "The QuantaStor web address plus an API user and password.",
         ),
         "optional": (
-            "One or more HA-node SSH hosts when internal views or shared SES access need node-specific evidence.",
-            "qs CLI, sg_ses, and smartctl on the node that can see the shared enclosure.",
-            "Extra HA node hosts for redundant visibility and failover context.",
+            "An SSH login on a node that can see the shared disk shelf, or on each HA node.",
         ),
-        "unsupported": (
-            "TrueNAS CORE SAS Fabric topology.",
-            "ESXi host-prep and ESXi storage CLI install flow.",
-        ),
-        "guidance": "Treat Quantastor as a cluster plus visible HA nodes: REST owns the system view, and SSH should name the node that can actually see SES or internal media.",
+        "guidance": "",
     },
     "esxi": {
-        "summary": "VMware ESXi stays host-managed and read-only here; SSH, ESXCLI, and StorCLI provide inventory while optional BMC access can add out-of-band chassis context.",
+        "summary": "VMware ESXi is host-managed and read-only here. The app reads inventory over SSH with ESXCLI and StorCLI; add BMC access for chassis and drive lights.",
         "required": (
-            "ESXi SSH access for the saved host.",
-            "ESXCLI storage commands for adapters, devices, paths, filesystems, and VMFS extents.",
-            "Vendor storage CLI such as StorCLI or PercCLI for physical RAID-member detail.",
+            "An SSH login on the ESXi host (usually root).",
+            "StorCLI or PercCLI installed on the host. Step 3 can install it for you.",
         ),
         "optional": (
-            "Operator-supplied ESXi offline bundle or VIB for the host-prep upload/install flow.",
-            "BMC/IPMI access for out-of-band chassis or drive-locate context where supported.",
+            "Management controller (BMC) access for chassis and drive lights.",
         ),
-        "unsupported": (
-            "Linux sudoers/bootstrap and saved sudo-password flows.",
-            "TrueNAS API setup and CORE SAS Fabric diagnostics.",
-            "Slot identify writes from the ESXi storage path.",
-        ),
-        "guidance": "If the controller is not c0, edit the recommended StorCLI commands to the observed /cN or /call target before saving.",
+        "guidance": "If StorCLI shows your controller as something other than /c0, change /c0 in the SSH commands (to /cN or /call) before saving.",
     },
     "ipmi": {
-        "summary": "IPMI / BMC Only systems use out-of-band controller access as the primary path, usually paired with a saved profile so empty slots can render.",
+        "summary": "Uses only the server's management controller (BMC / IPMI). Pick a chassis layout so empty bays can be drawn.",
         "required": (
-            "BMC host, username, and password.",
-            "A profile that matches the chassis face when host-side inventory is not available.",
+            "The management controller's address, user name and password.",
+            "A chassis layout that matches the front of the server.",
         ),
         "optional": (
-            "Host SSH can be added later for SMART, SES, or storage-topology enrichment when a safe host path exists.",
-            "TLS certificate trust if the BMC exposes HTTPS with a private CA.",
+            "An SSH login on the host, added later, for SMART details and bay positions.",
         ),
-        "unsupported": (
-            "SMART detail, history, SES, and storage topology without a host-side source.",
-            "TrueNAS API, Linux sudoers bootstrap, and ESXi host-prep as primary BMC-only setup paths.",
-        ),
-        "guidance": "Use BMC-only entries for chassis/locator visibility first; add host-side SSH later only when you need disk health or topology data.",
+        "guidance": "",
     },
 }
 
@@ -166,7 +127,6 @@ def setup_requirements_for_platform(platform: str) -> dict[str, object]:
         "summary": str(payload.get("summary") or ""),
         "required": list(payload.get("required") or ()),
         "optional": list(payload.get("optional") or ()),
-        "unsupported": list(payload.get("unsupported") or ()),
         "guidance": str(payload.get("guidance") or ""),
     }
 

@@ -868,6 +868,16 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
             }
         )
 
+    @router.get("/api/admin/history/systems")
+    async def list_history_systems() -> JSONResponse:
+        history_store = get_history_store()
+        try:
+            systems = await asyncio.to_thread(history_store.list_history_system_summaries)
+        except Exception as exc:  # noqa: BLE001 - surface maintenance failures directly in admin.
+            logger.exception("Unable to inspect saved history")
+            raise HTTPException(status_code=500, detail="Unable to inspect saved history; see admin logs.") from exc
+        return JSONResponse({"ok": True, "systems": systems})
+
     @router.post("/api/admin/history/adopt-removed-system")
     async def adopt_removed_system_history(payload: HistoryAdoptRequest) -> JSONResponse:
         settings = reload_app_settings()

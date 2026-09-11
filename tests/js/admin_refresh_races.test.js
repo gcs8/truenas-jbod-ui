@@ -438,7 +438,7 @@ test("backup export, debug export, and import errors are described instead of st
   const described = describeApiError(validationDetail);
   assert.equal(
     described,
-    "body.included_paths.0: value is not a valid path; body.packaging: unexpected value"
+    "Included items > item 1: value is not a valid path; File format: unexpected value"
   );
   assert.doesNotMatch(described, /\[object Object\]/);
 

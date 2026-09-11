@@ -117,7 +117,7 @@ test("command guidance identifies only unchanged hidden placeholders as redacted
 
   const helpSource = functionSource("syncPlatformSpecificSetupFields");
   assert.match(helpSource, /unchangedRedactedSshCommands\(elements\.setupSshCommands\)/);
-  assert.match(helpSource, /Saved SSH commands are hidden/);
+  assert.match(helpSource, /The saved commands are hidden/);
 });
 
 test("form hydration and save collection use the redacted command contract", () => {

@@ -43,19 +43,19 @@ class DockerRuntimeService:
             "ui": {
                 "name": settings.container_ui_name,
                 "label": "Read UI",
-                "description": "Primary read-mostly enclosure UI.",
+                "description": "The main page you normally use.",
                 "livez_url": settings.container_ui_livez_url,
             },
             "history": {
                 "name": settings.container_history_name,
                 "label": "History Sidecar",
-                "description": "Optional SQLite history collector.",
+                "description": "Records disk history and charts.",
                 "livez_url": settings.container_history_livez_url,
             },
             "admin": {
                 "name": settings.container_admin_name,
                 "label": "Admin Sidecar",
-                "description": "Optional maintenance surface.",
+                "description": "This admin page.",
                 "livez_url": settings.container_admin_livez_url,
             },
         }
