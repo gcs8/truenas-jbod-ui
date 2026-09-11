@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import unittest
 from pathlib import Path
@@ -12,6 +13,7 @@ WORKFLOW_DIR = ROOT / ".github" / "workflows"
 CI_WORKFLOW = WORKFLOW_DIR / "ci.yml"
 PUBLISH_GHCR_WORKFLOW = WORKFLOW_DIR / "publish-ghcr.yml"
 PUBLISH_PUBLIC_DEMO_WORKFLOW = WORKFLOW_DIR / "publish-public-demo.yml"
+CAPTURE_SCREENSHOTS_WORKFLOW = WORKFLOW_DIR / "capture-public-demo-screenshots.yml"
 PUBLIC_DEMO_SPEC = ROOT / "qa" / "public-demo.spec.js"
 ADMIN_CLEANROOM_CONFIG = ROOT / "qa" / "fixtures" / "admin-cleanroom-config.yaml"
 ADMIN_CLEANROOM_SPEC = ROOT / "qa" / "admin-operations.spec.js"
@@ -160,8 +162,9 @@ class CIWorkflowContractTests(unittest.TestCase):
                     uncommented.append(f"{workflow_path.name}: {action}")
 
         # 29 existing uses plus checkout, setup-python, and setup-node in the
-        # owner-gated Pages readback job.
-        self.assertEqual(action_count, 32)
+        # owner-gated Pages readback job, plus checkout and upload-artifact in
+        # the dispatch-only screenshot capture workflow.
+        self.assertEqual(action_count, 34)
         self.assertEqual(unpinned, [])
         self.assertEqual(uncommented, [])
 
@@ -256,6 +259,46 @@ class CIWorkflowContractTests(unittest.TestCase):
                 self.assertIn("npm ci --ignore-scripts", workflow_text)
                 self.assertIn('rm -rf "$fixture_root"', workflow_text)
                 self.assertIn("git status --short", workflow_text)
+
+    def test_screenshot_capture_workflow_is_dispatch_only_pinned_and_read_only(self) -> None:
+        workflow = yaml.safe_load(self.read(CAPTURE_SCREENSHOTS_WORKFLOW))
+        lock = json.loads(self.read(ROOT / "package-lock.json"))
+        locked_playwright = lock["packages"]["node_modules/@playwright/test"]["version"]
+        triggers = workflow.get("on", workflow.get(True, {}))
+        job = workflow["jobs"]["capture"]
+        commands = "\n".join(str(step.get("run", "")) for step in job["steps"])
+
+        self.assertEqual(set(triggers), {"workflow_dispatch"})
+        self.assertIn("ref", triggers["workflow_dispatch"]["inputs"])
+        self.assertEqual(workflow["permissions"], {"contents": "read"})
+        self.assertNotIn("permissions", job)
+        self.assertEqual(
+            job["container"]["image"],
+            f"mcr.microsoft.com/playwright:v{locked_playwright}-jammy",
+        )
+        self.assertEqual(job["env"]["PLAYWRIGHT_VERSION"], locked_playwright)
+
+        self.assertEqual(commands.count("node scripts/capture_public_demo_screenshots.js"), 2)
+        self.assertIn('cmp -s "$CANDIDATE_DIR/run-1/$name" "$CANDIDATE_DIR/run-2/$name"', commands)
+        self.assertIn("the capture is not byte-reproducible in this environment", commands)
+        self.assertIn("npm ci --ignore-scripts", commands)
+        self.assertIn("scripts/check_public_screenshots.py --report", commands)
+        self.assertIn("fc-match", commands)
+        self.assertIn("git status --short", commands)
+        for forbidden in ("git push", "git commit", "gh pr ", "gh release", "peter-evans"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, self.read(CAPTURE_SCREENSHOTS_WORKFLOW))
+
+        upload = next(
+            step
+            for step in job["steps"]
+            if str(step.get("uses", "")).startswith("actions/upload-artifact@")
+        )
+        self.assertEqual(upload["with"]["retention-days"], 14)
+        self.assertEqual(upload["with"]["if-no-files-found"], "error")
+        self.assertEqual(
+            upload["with"]["path"], "${{ runner.temp }}/public-demo-screenshot-candidate"
+        )
 
     def test_public_demo_pages_request_allowlist_is_probe_specific(self) -> None:
         spec = self.read(PUBLIC_DEMO_SPEC)

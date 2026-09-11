@@ -1,0 +1,172 @@
+name: Capture Public Demo Screenshots
+
+# Dispatch-only. The job produces a candidate capture for a human to review and
+# commit. It never commits, pushes, opens a pull request, or writes the
+# screenshot manifest.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag, or commit whose checked-in public-demo/index.html is captured."
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-demo-screenshot-capture-${{ inputs.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  capture:
+    name: Capture candidate public demo screenshots
+    runs-on: ubuntu-latest
+    container:
+      image: mcr.microsoft.com/playwright:v1.62.1-jammy
+    env:
+      CANDIDATE_DIR: ${{ runner.temp }}/public-demo-screenshot-candidate
+      CAPTURE_REF: ${{ inputs.ref }}
+      CONTAINER_IMAGE: mcr.microsoft.com/playwright:v1.62.1-jammy
+      PLAYWRIGHT_VERSION: "1.62.1"
+      # Left empty until the first dispatched run records the resolved families.
+      # Once set, a font change in the image fails the job instead of silently
+      # changing the pixels.
+      EXPECTED_SANS_FALLBACK: ""
+      EXPECTED_MONO_FALLBACK: ""
+    steps:
+      - name: Check out the dispatched ref
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prepare the candidate directory and the run log
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          rm -rf "$CANDIDATE_DIR"
+          mkdir -p "$CANDIDATE_DIR/run-1" "$CANDIDATE_DIR/run-2"
+
+      - name: Record the pinned environment
+        run: |
+          {
+            set -euo pipefail
+            printf 'container image: %s\n' "$CONTAINER_IMAGE"
+            printf 'captured ref: %s\n' "$CAPTURE_REF"
+            printf 'commit: %s\n' "$(git rev-parse HEAD)"
+            printf 'node: %s\n' "$(node --version)"
+            printf 'npm: %s\n' "$(npm --version)"
+            printf 'python: %s\n' "$(python3 --version)"
+          } 2>&1 | tee -a "$CANDIDATE_DIR/capture.log"
+
+      - name: Install pinned browser QA dependencies
+        run: |
+          {
+            set -euo pipefail
+            npm ci --ignore-scripts
+          } 2>&1 | tee -a "$CANDIDATE_DIR/capture.log"
+
+      - name: Check the locked Playwright version matches the container tag
+        run: |
+          {
+            set -euo pipefail
+            locked="$(node -e 'process.stdout.write(require("./package-lock.json").packages["node_modules/@playwright/test"].version)')"
+            printf 'locked @playwright/test: %s\n' "$locked"
+            printf 'installed Playwright: %s\n' "$(npx playwright --version)"
+            if [ "$locked" != "$PLAYWRIGHT_VERSION" ]; then
+              printf 'container tag v%s does not match the locked Playwright version %s\n' \
+                "$PLAYWRIGHT_VERSION" "$locked" >&2
+              exit 1
+            fi
+          } 2>&1 | tee -a "$CANDIDATE_DIR/capture.log"
+
+      - name: Verify the fallback fonts the demo page renders with
+        run: |
+          {
+            set -euo pipefail
+            if ! command -v fc-match >/dev/null; then
+              echo "fontconfig is missing from the container image" >&2
+              exit 1
+            fi
+            echo "font packages in the image:"
+            dpkg-query -W -f='${Package} ${Version}\n' 'fonts-*' 'ttf-*' || true
+            # public-demo/index.html asks for "Segoe UI", Tahoma, Geneva,
+            # Verdana, sans-serif and for "Cascadia Mono", SFMono-Regular,
+            # Consolas, monospace. None of those faces ship on Linux, so every
+            # glyph comes from the fontconfig fallback.
+            for request in "Segoe UI" Tahoma Geneva Verdana "Cascadia Mono" SFMono-Regular Consolas; do
+              printf 'requested %s resolves to %s\n' "$request" "$(fc-match -f '%{family}' "$request")"
+            done
+            sans="$(fc-match -f '%{family}' sans-serif)"
+            mono="$(fc-match -f '%{family}' monospace)"
+            printf 'sans-serif fallback: %s\n' "$sans"
+            printf 'monospace fallback: %s\n' "$mono"
+            if [ -z "$sans" ] || [ -z "$mono" ]; then
+              echo "no sans-serif or monospace fallback font is installed" >&2
+              exit 1
+            fi
+            if [ -n "$EXPECTED_SANS_FALLBACK" ] && [ "$sans" != "$EXPECTED_SANS_FALLBACK" ]; then
+              printf 'sans-serif fallback changed: expected %s, found %s\n' \
+                "$EXPECTED_SANS_FALLBACK" "$sans" >&2
+              exit 1
+            fi
+            if [ -n "$EXPECTED_MONO_FALLBACK" ] && [ "$mono" != "$EXPECTED_MONO_FALLBACK" ]; then
+              printf 'monospace fallback changed: expected %s, found %s\n' \
+                "$EXPECTED_MONO_FALLBACK" "$mono" >&2
+              exit 1
+            fi
+          } 2>&1 | tee -a "$CANDIDATE_DIR/capture.log"
+
+      - name: Capture twice from the checked-in artifact and compare the bytes
+        run: |
+          {
+            set -euo pipefail
+            node scripts/capture_public_demo_screenshots.js
+            cp docs/images/screenshots/public-demo-overview.png "$CANDIDATE_DIR/run-1/"
+            cp docs/images/screenshots/public-demo-history.png "$CANDIDATE_DIR/run-1/"
+            git checkout -- docs/images/screenshots wiki/images
+            node scripts/capture_public_demo_screenshots.js
+            cp docs/images/screenshots/public-demo-overview.png "$CANDIDATE_DIR/run-2/"
+            cp docs/images/screenshots/public-demo-history.png "$CANDIDATE_DIR/run-2/"
+            python3 scripts/check_public_screenshots.py --report \
+              > "$CANDIDATE_DIR/proposed-manifest.json"
+            cat "$CANDIDATE_DIR/proposed-manifest.json"
+            git checkout -- docs/images/screenshots wiki/images
+            differences=0
+            for name in public-demo-overview.png public-demo-history.png; do
+              if cmp -s "$CANDIDATE_DIR/run-1/$name" "$CANDIDATE_DIR/run-2/$name"; then
+                printf 'reproducible across both runs: %s\n' "$name"
+              else
+                printf 'NOT reproducible across the two runs: %s\n' "$name" >&2
+                differences=$((differences + 1))
+              fi
+            done
+            cp "$CANDIDATE_DIR/run-2/public-demo-overview.png" "$CANDIDATE_DIR/"
+            cp "$CANDIDATE_DIR/run-2/public-demo-history.png" "$CANDIDATE_DIR/"
+            sha256sum "$CANDIDATE_DIR"/*.png
+            status="$(git status --short)"
+            if [ -n "$status" ]; then
+              printf 'the capture left the checkout dirty:\n%s\n' "$status" >&2
+              exit 1
+            fi
+            if [ "$differences" -ne 0 ]; then
+              echo "the capture is not byte-reproducible in this environment" >&2
+              exit 1
+            fi
+          } 2>&1 | tee -a "$CANDIDATE_DIR/capture.log"
+
+      - name: Upload the candidate capture for human review
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: public-demo-screenshot-candidate
+          path: ${{ runner.temp }}/public-demo-screenshot-candidate
+          retention-days: 14
+          if-no-files-found: error
