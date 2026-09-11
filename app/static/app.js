@@ -359,8 +359,16 @@
   const ledButtons = Array.from(document.querySelectorAll("[data-led-action]"));
   const diskInventorySyncButtons = Array.from(document.querySelectorAll("[data-disk-inventory-sync-mode]"));
 
+  // Bay lookups run once per tile on every render, search keystroke and hover,
+  // so they index the current slot list instead of scanning it each time.
   function getSlotById(slotNumber) {
-    return state.snapshot.slots.find((slot) => slot.slot === slotNumber) || null;
+    const slots = state.snapshot.slots || [];
+    let lookup = getSlotById.lookup;
+    if (!lookup || lookup.slots !== slots) {
+      lookup = { slots, byNumber: new Map(slots.map((slot) => [slot.slot, slot])) };
+      getSlotById.lookup = lookup;
+    }
+    return lookup.byNumber.get(slotNumber) || null;
   }
 
   function formatSlotLabel(slotNumber) {
@@ -565,11 +573,17 @@
     if (!Number.isInteger(normalizedSlotIndex)) {
       return null;
     }
-    const selectedView = getSelectedStorageViewRuntime();
-    if (!selectedView) {
-      return null;
+    return storageViewRuntimeSlotByIndex(getSelectedStorageViewRuntime(), normalizedSlotIndex);
+  }
+
+  function storageViewRuntimeSlotByIndex(view, slotIndex) {
+    const slots = Array.isArray(view?.slots) ? view.slots : [];
+    let lookup = storageViewRuntimeSlotByIndex.lookup;
+    if (!lookup || lookup.slots !== slots) {
+      lookup = { slots, byIndex: new Map(slots.map((slot) => [Number(slot.slot_index), slot])) };
+      storageViewRuntimeSlotByIndex.lookup = lookup;
     }
-    return (selectedView.slots || []).find((slot) => Number(slot.slot_index) === normalizedSlotIndex) || null;
+    return lookup.byIndex.get(slotIndex) || null;
   }
 
   function activeLayoutRows() {
@@ -814,46 +828,6 @@
     };
   }
 
-  function bindStorageViewTileInteractions(tile, slot, selectedView) {
-    tile.addEventListener("mouseenter", (event) => {
-      state.hoveredSlot = slot.slot_index;
-      refreshHoveredTooltip(tile);
-      positionSlotTooltip(event.clientX, event.clientY);
-      void ensureStorageViewSmartSummary(selectedView, slot);
-    });
-    tile.addEventListener("mousemove", (event) => {
-      if (state.hoveredSlot === slot.slot_index) {
-        positionSlotTooltip(event.clientX, event.clientY);
-      }
-    });
-    tile.addEventListener("mouseleave", () => {
-      if (state.hoveredSlot === slot.slot_index) {
-        state.hoveredSlot = null;
-      }
-      hideSlotTooltip();
-    });
-    tile.addEventListener("focus", () => {
-      state.hoveredSlot = slot.slot_index;
-      refreshHoveredTooltip(tile);
-      positionSlotTooltipFromElement(tile);
-      void ensureStorageViewSmartSummary(selectedView, slot);
-    });
-    tile.addEventListener("blur", () => {
-      if (state.hoveredSlot === slot.slot_index) {
-        state.hoveredSlot = null;
-      }
-      hideSlotTooltip();
-    });
-    tile.addEventListener("click", (event) => {
-      event.stopPropagation();
-      if (state.selectedSlot === slot.slot_index) {
-        clearSelectedSlot();
-        return;
-      }
-      selectSlot(slot.slot_index);
-    });
-  }
-
   function storageViewRuntimeShortLabel(slot) {
     if (!slot || !slot.occupied) {
       return "Empty";
@@ -961,7 +935,6 @@
         tile.setAttribute("aria-label", buildStorageViewRuntimeTooltip(slot, selectedView));
         tile.innerHTML = buildNvmeRuntimeTileMarkup(slot, selectedView);
         applyHeatmapToTile(tile, heatmapContext, slot.slot_index);
-        bindStorageViewTileInteractions(tile, slot, selectedView);
         board.appendChild(tile);
       });
 
@@ -1051,7 +1024,6 @@
             <span class="slot-latch" aria-hidden="true"></span>
           `;
       applyHeatmapToTile(tile, heatmapContext, slot.slot_index);
-      bindStorageViewTileInteractions(tile, slot, selectedView);
       container.appendChild(tile);
     };
 
@@ -1121,43 +1093,6 @@
       tile.setAttribute("aria-describedby", "slot-tooltip");
       tile.innerHTML = buildNvmeRuntimeTileMarkup(displaySlot, { kind: "nvme_carrier" });
       applyHeatmapToTile(tile, heatmapContext, liveSlot.slot);
-      tile.addEventListener("mouseenter", (event) => {
-        state.hoveredSlot = liveSlot.slot;
-        refreshHoveredTooltip(tile);
-        positionSlotTooltip(event.clientX, event.clientY);
-        void ensureSmartSummary(liveSlot);
-      });
-      tile.addEventListener("mousemove", (event) => {
-        if (state.hoveredSlot === liveSlot.slot) {
-          positionSlotTooltip(event.clientX, event.clientY);
-        }
-      });
-      tile.addEventListener("mouseleave", () => {
-        if (state.hoveredSlot === liveSlot.slot) {
-          state.hoveredSlot = null;
-        }
-        hideSlotTooltip();
-      });
-      tile.addEventListener("focus", () => {
-        state.hoveredSlot = liveSlot.slot;
-        refreshHoveredTooltip(tile);
-        positionSlotTooltipFromElement(tile);
-        void ensureSmartSummary(liveSlot);
-      });
-      tile.addEventListener("blur", () => {
-        if (state.hoveredSlot === liveSlot.slot) {
-          state.hoveredSlot = null;
-        }
-        hideSlotTooltip();
-      });
-      tile.addEventListener("click", (event) => {
-        event.stopPropagation();
-        if (state.selectedSlot === liveSlot.slot) {
-          clearSelectedSlot();
-          return;
-        }
-        selectSlot(liveSlot.slot);
-      });
       board.appendChild(tile);
     });
 
@@ -3564,7 +3499,9 @@
   }
 
   function isSmartEntryInFlight(entry) {
-    if (!entry || (!entry.loading && !entry.refreshing)) {
+    // A queued entry only carries tooltip feedback: no request owns it yet, so it
+    // must stay eligible for the batch it is waiting on.
+    if (!entry || entry.queued || (!entry.loading && !entry.refreshing)) {
       return false;
     }
     const requestedAt = Number(entry.requestedAt) || 0;
@@ -3792,6 +3729,45 @@
         }
       }
     }
+  }
+
+  function smartPrefetchPending() {
+    return Boolean(state.smartPrefetchTimerId) || Boolean(state.smartPrefetchRunning);
+  }
+
+  // Hovering or arrow-keying across bays used to send one SMART request per bay
+  // even while the batch prefetch for those same bays was queued or already
+  // running. When the batch covers the bay, the tooltip shows "Loading..." and
+  // waits for it instead of racing it with a second request.
+  function ensureSmartSummaryOnInteraction(slot) {
+    if (state.snapshotMode || !slot) {
+      return Promise.resolve();
+    }
+    const cacheKey = getSmartCacheKey(slot);
+    const entry = state.smartSummaries[cacheKey];
+    const settled = isSmartEntryCurrent(entry) && (entry?.data || isSmartEntryInFlight(entry));
+    const coveredByPrefetch = !settled
+      && smartPrefetchPending()
+      && candidateSlotsForSmartPrefetch().some((candidate) => candidate.slot === slot.slot);
+    if (!coveredByPrefetch) {
+      return ensureSmartSummary(slot);
+    }
+    if (!entry?.data && !entry?.queued && !isSmartEntryInFlight(entry)) {
+      // queued, not loading in flight: the tooltip formatters read loading, while
+      // candidateSlotsForSmartPrefetch keeps the bay in the batch that owns it.
+      state.smartSummaries[cacheKey] = {
+        loading: true,
+        refreshing: false,
+        queued: true,
+        data: null,
+        requestedAt: Date.now(),
+        generation: state.smartSummaryGeneration,
+      };
+    }
+    if (state.hoveredSlot === slot.slot) {
+      refreshHoveredTooltip();
+    }
+    return Promise.resolve();
   }
 
   function scheduleSmartPrefetch() {
@@ -5953,16 +5929,15 @@
     (matchingTile || fallbackTile || recoveryTarget)?.focus({ preventScroll: true });
   }
 
-  function fabricSlotNumberForGridTile(tile) {
+  function fabricSlotNumberForGridTile(tile, selectedStorageView = getSelectedStorageViewRuntime()) {
     const renderedSlotNumber = Number(tile?.dataset?.slot);
     if (!Number.isInteger(renderedSlotNumber)) {
       return null;
     }
-    const selectedStorageView = getSelectedStorageViewRuntime();
     if (!selectedStorageView) {
       return renderedSlotNumber;
     }
-    const storageViewSlot = getSelectedStorageViewRuntimeSlot(renderedSlotNumber);
+    const storageViewSlot = storageViewRuntimeSlotByIndex(selectedStorageView, renderedSlotNumber);
     const liveSlot = getLiveBackedStorageViewSlot(selectedStorageView, storageViewSlot);
     return Number.isInteger(liveSlot?.slot) ? liveSlot.slot : null;
   }
@@ -5970,6 +5945,7 @@
   function refreshGridSelectionState() {
     const peerContext = getSelectedPeerContext();
     const fabricSlots = sasFabricSelectedSlotSet();
+    const selectedStorageView = getSelectedStorageViewRuntime();
     grid.querySelectorAll(".slot-tile[data-slot]").forEach((tile) => {
       const slotNumber = Number(tile.dataset.slot);
       const selected = state.selectedSlot === slotNumber;
@@ -5980,7 +5956,7 @@
       tile.classList.toggle("peer-highlight", peerHighlighted);
       tile.classList.toggle("peer-dimmed", !selected && peerContext.active && !peerHighlighted);
 
-      const fabricSlotNumber = fabricSlotNumberForGridTile(tile);
+      const fabricSlotNumber = fabricSlotNumberForGridTile(tile, selectedStorageView);
       const fabricContextActive = fabricSlots.size > 0 && Number.isInteger(fabricSlotNumber);
       const fabricHighlighted = fabricContextActive && fabricSlots.has(fabricSlotNumber);
       tile.classList.toggle("fabric-highlight", fabricHighlighted);
@@ -5991,24 +5967,30 @@
     });
   }
 
-  function delegatedLiveSlot(tile) {
-    if (getSelectedStorageViewRuntime() || getSelectedProfile()?.face_style === "nvme-carrier") {
-      return null;
-    }
+  // Every tile kind resolves through the same delegated handlers on the grid:
+  // live bays, live NVMe carriers and saved storage views. Tiles carry no
+  // listeners of their own, so a re-render attaches nothing per bay.
+  function delegatedGridSlot(tile) {
     const slotNumber = Number(tile?.dataset?.slot);
     if (!Number.isInteger(slotNumber)) {
       return null;
     }
-    return getSlotById(slotNumber) || {
+    const view = getSelectedStorageViewRuntime();
+    if (view) {
+      const viewSlot = storageViewRuntimeSlotByIndex(view, slotNumber) || {
+        slot_index: slotNumber,
+        slot_label: `Slot ${slotNumber + 1}`,
+        occupied: false,
+        state: "empty",
+      };
+      return { key: slotNumber, view, viewSlot, liveSlot: null };
+    }
+    const liveSlot = getSlotById(slotNumber) || {
       slot: slotNumber,
       slot_label: formatSlotLabel(slotNumber),
       state: "unknown",
     };
-  }
-
-  function delegatedLiveTile(event) {
-    const tile = delegatedGridTile(event);
-    return tile && delegatedLiveSlot(tile) ? tile : null;
+    return { key: slotNumber, view: null, viewSlot: null, liveSlot };
   }
 
   function delegatedGridTile(event) {
@@ -6016,65 +5998,73 @@
     return tile && grid.contains(tile) ? tile : null;
   }
 
-  function bindDelegatedLiveGridInteractions() {
+  function requestDelegatedSlotSmartSummary(target) {
+    if (target.view) {
+      return ensureStorageViewSmartSummary(target.view, target.viewSlot);
+    }
+    return ensureSmartSummaryOnInteraction(target.liveSlot);
+  }
+
+  function endDelegatedTileHover(tile) {
+    if (state.hoveredSlot === Number(tile.dataset.slot)) {
+      state.hoveredSlot = null;
+    }
+    hideSlotTooltip();
+  }
+
+  function bindDelegatedGridInteractions() {
     grid.addEventListener("mouseover", (event) => {
-      const tile = delegatedLiveTile(event);
-      if (!tile || tile.contains(event.relatedTarget)) {
+      const tile = delegatedGridTile(event);
+      const target = tile ? delegatedGridSlot(tile) : null;
+      if (!target || tile.contains(event.relatedTarget)) {
         return;
       }
-      const slot = delegatedLiveSlot(tile);
-      state.hoveredSlot = slot.slot;
+      state.hoveredSlot = target.key;
       refreshHoveredTooltip(tile);
       positionSlotTooltip(event.clientX, event.clientY);
-      void ensureSmartSummary(slot);
+      void requestDelegatedSlotSmartSummary(target);
     });
     grid.addEventListener("mousemove", (event) => {
-      const tile = delegatedLiveTile(event);
+      const tile = delegatedGridTile(event);
       if (tile && state.hoveredSlot === Number(tile.dataset.slot)) {
         positionSlotTooltip(event.clientX, event.clientY);
       }
     });
     grid.addEventListener("mouseout", (event) => {
-      const tile = delegatedLiveTile(event);
+      const tile = delegatedGridTile(event);
       if (!tile || tile.contains(event.relatedTarget)) {
         return;
       }
-      if (state.hoveredSlot === Number(tile.dataset.slot)) {
-        state.hoveredSlot = null;
-      }
-      hideSlotTooltip();
+      endDelegatedTileHover(tile);
     });
     grid.addEventListener("focusin", (event) => {
-      const tile = delegatedLiveTile(event);
-      if (!tile) {
+      const tile = delegatedGridTile(event);
+      const target = tile ? delegatedGridSlot(tile) : null;
+      if (!target) {
         return;
       }
-      const slot = delegatedLiveSlot(tile);
-      state.hoveredSlot = slot.slot;
+      state.hoveredSlot = target.key;
       refreshHoveredTooltip(tile);
       positionSlotTooltipFromElement(tile);
-      void ensureSmartSummary(slot);
+      void requestDelegatedSlotSmartSummary(target);
     });
     grid.addEventListener("focusout", (event) => {
-      const tile = delegatedLiveTile(event);
+      const tile = delegatedGridTile(event);
       if (!tile || tile.contains(event.relatedTarget)) {
         return;
       }
-      if (state.hoveredSlot === Number(tile.dataset.slot)) {
-        state.hoveredSlot = null;
-      }
-      hideSlotTooltip();
+      endDelegatedTileHover(tile);
     });
     grid.addEventListener("click", (event) => {
-      const tile = delegatedLiveTile(event);
-      if (!tile) {
+      const tile = delegatedGridTile(event);
+      const target = tile ? delegatedGridSlot(tile) : null;
+      if (!target) {
         return;
       }
-      const slotNumber = Number(tile.dataset.slot);
-      if (state.selectedSlot === slotNumber) {
+      if (state.selectedSlot === target.key) {
         clearSelectedSlot();
       } else {
-        selectSlot(slotNumber);
+        selectSlot(target.key);
       }
     });
   }
@@ -10328,7 +10318,7 @@
     scheduleAutoRefresh();
   }
 
-  bindDelegatedLiveGridInteractions();
+  bindDelegatedGridInteractions();
   bindDelegatedGridKeyboardNavigation();
 
   searchBox.addEventListener("input", (event) => {
