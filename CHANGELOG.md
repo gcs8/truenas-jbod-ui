@@ -61,6 +61,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   checked free space in the temp and history folders before a history restore
   replaces anything, and reworded the schema refusals in plain words (#511)
 
+- Isolated read-UI authentication settings so invalid admin-only settings
+  and unavailable admin directories no longer block UI startup (#467).
+
 ### Performance
 
 - Reduced mapping revision work to one document read per batch while
