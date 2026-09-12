@@ -57,6 +57,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Included the remaining wait in full history-refresh cooldown responses,
   matching the existing Retry-After header (#471).
 
+- Refused restoring a backup made by a newer app version before unpacking it,
+  checked free space in the temp and history folders before a history restore
+  replaces anything, and reworded the schema refusals in plain words (#511)
+
 ### Performance
 
 - Reduced mapping revision work to one document read per batch while
