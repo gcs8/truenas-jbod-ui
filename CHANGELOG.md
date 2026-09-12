@@ -28,6 +28,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ## Unreleased
 
+### Added
+
+- Added a client-only, one-session SMART WebSocket batch API with bounded
+  concurrency and DDP heartbeat handling; inventory integration remained
+  separate (#503).
+
 ### Fixed
 
 - Retried failed release checks with bounded backoff instead of waiting a
