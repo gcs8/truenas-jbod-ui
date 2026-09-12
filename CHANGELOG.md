@@ -47,6 +47,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Reduced mapping revision work to one document read per batch while
   preserving conflict checks and calibration tokens. (#421)
 
+- Avoided serializing the full cached inventory for health checks while
+  preserving the response and cached-only behavior (#464).
+
 ## v0.23.0 - 2026-09-08
 
 This release includes every pull request merged after `v0.22.2` through the
