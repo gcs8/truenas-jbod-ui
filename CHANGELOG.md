@@ -54,6 +54,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Bounded history dashboard polling, rejected stale responses, and marked
   retained values stale after failed checks. (#420)
 
+- Included the remaining wait in full history-refresh cooldown responses,
+  matching the existing Retry-After header (#471).
+
 ### Performance
 
 - Reduced mapping revision work to one document read per batch while
