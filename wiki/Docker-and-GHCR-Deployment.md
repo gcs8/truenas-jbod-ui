@@ -59,8 +59,8 @@ docker compose pull
 docker compose up -d
 ```
 
-This path pairs the v0.22.2 Compose file and image. Keep the Compose file and
-image on the same version.
+This first-install example pairs the v0.22.2 Compose file and image. Later
+image-only updates preserve the existing compatible Compose file.
 
 Open:
 
@@ -169,6 +169,57 @@ The image is disposable. Your local folder is the part you keep.
 
 Back up this folder, not the container image.
 
+## Update
+
+In the deployment folder, change the existing `JBOD_UI_IMAGE` assignment in
+`.env` to the target release tag or immutable digest, then pull and recreate:
+
+```bash
+${EDITOR:-vi} .env
+docker compose pull
+docker compose up -d
+```
+
+Editing the pin is required when it names an older version or digest. Keep the
+existing Compose files, configuration, authentication, origins, and bind
+addresses. Do not download a replacement Compose file for a normal image update.
+
+Use the same ordered `-f` files and selected profiles for both commands. If you
+use history, for example, run `docker compose --profile history pull` followed
+by `docker compose --profile history up -d`. Alternatively, retain
+`COMPOSE_PROFILES=history` in `.env` so the three commands above include history.
+Include admin only when you intend it to be running; do not use `--profile '*'`
+to restart dormant admin or one-shot backup jobs. Preserve any existing secrets
+or non-root overlay rather than replacing it with the base file.
+
+Check `docker compose ps` and each enabled service's `/healthz` after startup.
+For rollback to a compatible predecessor, set `JBOD_UI_IMAGE` back to its
+recorded tag or digest and run the same pull and up commands with the same
+Compose files and profiles. Image rollback does not restore durable data.
+Review release compatibility notes and keep a verified backup before updating.
+
+## Optional container hardening
+
+The production base is root-compatible for existing root-owned UI, history, and
+admin bind mounts. It does not require ownership migration during image updates.
+`docker-compose.nonroot.yml` opts into non-root UI/history, read-only root
+filesystems, a temporary `/tmp`, dropped capabilities, no-new-privileges, and
+read-only UI configuration. Admin retains only `CHOWN` and `FOWNER` capabilities
+with the configured application group. The optional backup job retains its
+separate identity, no-network mode, read-only filesystem, and scoped mounts.
+
+Adopt this overlay separately, after checking bind-mount ownership using the
+[non-root troubleshooting steps](Troubleshooting.md). Download the overlay from
+the reviewed release/source revision that supplies these safeguards, then keep
+it in every Compose command, for example:
+
+```bash
+docker compose -f compose.yaml -f docker-compose.nonroot.yml --profile history pull
+docker compose -f compose.yaml -f docker-compose.nonroot.yml --profile history up -d
+```
+
+Do not remove a currently active hardening or secrets overlay during an update.
+
 ## Pick an image reference
 
 For most home labs, start with:
@@ -260,6 +311,9 @@ reason to expose it. Use a tunnel, reverse proxy, or set
 Use [[History and Snapshot Export|History-and-Snapshot-Export]] for the visual
 walkthrough.
 
+### Optional history permission repair
+
+This is a separate repair procedure, not an image-upgrade requirement.
 Automatic history permission repair is **disabled by default**. The sidecar
 does not silently widen `history/`, the SQLite database, or its WAL/SHM files.
 Prefer fixing the host directory's owner and group deliberately. Before a
@@ -289,7 +343,7 @@ stat -c '%U:%G %a %n' history history/history.db
 curl -fsS http://127.0.0.1:8081/healthz
 ```
 
-To **roll back**, stop the sidecar, disable repair, restore the owner/group and
+To **roll back the permission repair**, stop the sidecar, disable repair, restore the owner/group and
 modes recorded before migration, restore the previous image tag if needed, and
 recreate `enclosure-history`. Do not use `0777` or `0666` as a workaround.
 

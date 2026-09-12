@@ -7,6 +7,7 @@ import re
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+from time import monotonic
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -14,6 +15,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_RELEASE_CHECK_REPO = "gcs8/truenas-jbod-ui"
 DEFAULT_RELEASE_CHECK_INTERVAL_SECONDS = 86400
 DEFAULT_RELEASE_CHECK_TIMEOUT_SECONDS = 5.0
+_FAILURE_RETRY_DELAYS_SECONDS = (60, 300, 3600)
 
 _VERSION_RE = re.compile(r"^v?(?P<core>\d+(?:\.\d+){1,3})(?P<suffix>.*)$")
 
@@ -106,6 +108,9 @@ class ReleaseStatusService:
         self.interval_seconds = max(3600, int(interval_seconds or DEFAULT_RELEASE_CHECK_INTERVAL_SECONDS))
         self.timeout_seconds = max(1.0, float(timeout_seconds or DEFAULT_RELEASE_CHECK_TIMEOUT_SECONDS))
         self._lock = asyncio.Lock()
+        self._deadline_changed = asyncio.Event()
+        self._next_refresh_at = 0.0
+        self._failure_retry_index = 0
         self._payload: dict[str, Any] = self._build_payload(
             status="disabled" if not self.enabled else "checking",
             summary="Release checks disabled." if not self.enabled else "Checking releases...",
@@ -134,29 +139,43 @@ class ReleaseStatusService:
             )
             return
 
-        while True:
-            await self.refresh(force=True)
-            await asyncio.sleep(self.interval_seconds)
+        try:
+            while True:
+                await self.refresh()
+                # Clear before reading the deadline, with no intervening await.
+                # Updates before this point are already reflected in the deadline;
+                # updates after it stay latched even before Event.wait starts.
+                self._deadline_changed.clear()
+                delay = max(0.0, self._next_refresh_at - monotonic())
+                try:
+                    async with asyncio.timeout(delay):
+                        await self._deadline_changed.wait()
+                except asyncio.TimeoutError:
+                    pass
+        finally:
+            # Cached services survive lifespan restarts on a different loop.
+            # Retain the deadline, but discard the old loop-bound wake event.
+            self._deadline_changed = asyncio.Event()
 
     async def refresh(self, *, force: bool = False) -> dict[str, Any]:
         if not self.enabled:
             return self.snapshot()
 
         async with self._lock:
-            if not force:
-                checked_at = self._payload.get("checked_at")
-                if checked_at:
-                    try:
-                        checked_dt = datetime.fromisoformat(str(checked_at))
-                    except ValueError:
-                        checked_dt = None
-                    if checked_dt and (_utc_now() - checked_dt).total_seconds() < self.interval_seconds:
-                        return self.snapshot()
+            if not force and monotonic() < self._next_refresh_at:
+                return self.snapshot()
 
             checked_at_dt = _utc_now()
             try:
                 latest = await asyncio.to_thread(self._fetch_latest_release)
             except Exception as exc:  # noqa: BLE001 - cached service should fail softly.
+                # Keep retry timing separate from the last known good payload.
+                delay = _FAILURE_RETRY_DELAYS_SECONDS[self._failure_retry_index]
+                self._failure_retry_index = min(
+                    self._failure_retry_index + 1, len(_FAILURE_RETRY_DELAYS_SECONDS) - 1
+                )
+                self._next_refresh_at = monotonic() + delay
+                self._deadline_changed.set()
                 logger.info("Release check failed for %s: %s", self.repo_full_name, exc)
                 if self._payload.get("latest_tag"):
                     return self.snapshot()
@@ -184,6 +203,9 @@ class ReleaseStatusService:
                 checked_at=checked_at_dt,
                 error=None,
             )
+            self._failure_retry_index = 0
+            self._next_refresh_at = monotonic() + self.interval_seconds
+            self._deadline_changed.set()
             return self.snapshot()
 
     def _fetch_latest_release(self) -> dict[str, Any]:

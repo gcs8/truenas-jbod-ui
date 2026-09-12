@@ -63,6 +63,8 @@ from app.models.domain import ESXiHostPrepInstallRequest
 from app.models.domain import EnclosureOption
 from app.models.domain import EnclosureProfileRequest
 from app.models.domain import HistoryAdoptRequest
+from app.models.domain import InventorySnapshot
+from app.models.domain import SourceStatus
 from app.models.domain import QuantastorNodeDiscoveryRequest
 from app.models.domain import SnapshotExportRequest
 from app.models.domain import SystemSetupBootstrapRequest
@@ -866,6 +868,10 @@ class MainAppBoundaryTests(unittest.TestCase):
             "ok": True,
             "schema_version": 2,
             "app_version": "0.22.3",
+            "app_version_note": (
+                "This backup was made by v0.22.3; settings and history will be "
+                "brought up to date during restore."
+            ),
             "exported_at": "2030-01-02T03:04:05+00:00",
             "encrypted": True,
             "packaging": "7z",
@@ -913,6 +919,12 @@ class MainAppBoundaryTests(unittest.TestCase):
                 "inspection_receipt": "server-receipt",
                 "inspection_receipt_expires_at": 123456,
             },
+        )
+        # The admin page needs the older-version note to show it while the operator confirms.
+        self.assertEqual(
+            payload["app_version_note"],
+            "This backup was made by v0.22.3; settings and history will be "
+            "brought up to date during restore.",
         )
         inspected_path = service.inspect_bundle_file.call_args.args[0]
         self.assertFalse(inspected_path.exists())
@@ -1588,25 +1600,53 @@ class MainAppBoundaryTests(unittest.TestCase):
     def test_history_service_uses_shared_app_version(self) -> None:
         self.assertEqual(history_app.version, __version__)
 
-    def test_main_app_healthz_uses_cached_snapshot_only(self) -> None:
-        fake_service = MagicMock()
-        fake_snapshot = MagicMock()
-        fake_snapshot.sources = {"api": MagicMock(ok=True)}
-        fake_snapshot.last_updated = datetime(2026, 4, 25, 12, 0, tzinfo=timezone.utc)
-        fake_snapshot.warnings = ["cached warning"]
-        fake_snapshot.model_dump.return_value = {"sources": {"api": {"enabled": True, "ok": True, "message": "reachable"}}}
-        fake_service.peek_cached_snapshot.return_value = fake_snapshot
-        fake_registry = MagicMock()
-        fake_registry.get_service.return_value = fake_service
+    def test_main_app_healthz_serializes_sources_without_dumping_cached_snapshot(self) -> None:
+        cases = (
+            ("healthy", {"api": {"enabled": True, "ok": True, "message": "reachable"},
+                         "ssh": {"enabled": False, "ok": False, "message": None}}, "ok"),
+            ("degraded", {"api": {"enabled": True, "ok": False, "message": "unavailable"}}, "degraded"),
+            ("missing-api", {"ssh": {"enabled": True, "ok": True, "message": None}}, "degraded"),
+            ("empty-sources", {}, "degraded"),
+        )
+        for name, sources, dependency_status in cases:
+            with self.subTest(name=name):
+                snapshot = InventorySnapshot(
+                    slots=[],
+                    refresh_interval_seconds=30,
+                    last_updated=datetime(2026, 4, 25, 12, 0, tzinfo=timezone.utc),
+                    sources={key: SourceStatus(**value) for key, value in sources.items()},
+                    warnings=["cached warning", "synthetic warning: café"],
+                )
+                # Keep an exact oracle for the previous parent-serialization contract.
+                expected = {
+                    "status": "ok",
+                    "dependency_status": dependency_status,
+                    "last_updated": "2026-04-25T12:00:00+00:00",
+                    "sources": snapshot.model_dump(mode="json")["sources"],
+                    "warnings": ["cached warning", "synthetic warning: café"],
+                    "cache_state": "cached",
+                }
+                self.assertEqual(expected["sources"], sources)
+                fake_service = MagicMock()
+                fake_service.peek_cached_snapshot.return_value = snapshot
+                fake_registry = MagicMock()
+                fake_registry.get_service.return_value = fake_service
 
-        with patch("app.main.get_inventory_registry", return_value=fake_registry):
-            response = self._call_main_route("/healthz")
+                with (
+                    patch("app.main.get_inventory_registry", return_value=fake_registry),
+                    patch.object(
+                        InventorySnapshot, "model_dump",
+                        side_effect=AssertionError("healthz must not serialize the parent snapshot"),
+                    ) as parent_dump,
+                ):
+                    response = self._call_main_route("/healthz")
 
-        self.assertEqual(response.status_code, 200)
-        payload = json.loads(response.body)
-        self.assertEqual(payload["dependency_status"], "ok")
-        self.assertEqual(payload["cache_state"], "cached")
-        fake_service.peek_cached_snapshot.assert_called_once_with()
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.body, JSONResponse(expected).body)
+                parent_dump.assert_not_called()
+                fake_registry.get_service.assert_called_once_with(None)
+                fake_service.peek_cached_snapshot.assert_called_once_with()
+                fake_service.get_snapshot.assert_not_called()
 
     def test_main_app_healthz_reports_unknown_when_cache_is_empty(self) -> None:
         fake_service = MagicMock()
@@ -1618,9 +1658,20 @@ class MainAppBoundaryTests(unittest.TestCase):
             response = self._call_main_route("/healthz")
 
         self.assertEqual(response.status_code, 200)
-        payload = json.loads(response.body)
-        self.assertEqual(payload["dependency_status"], "unknown")
-        self.assertEqual(payload["cache_state"], "empty")
+        self.assertEqual(
+            response.body,
+            JSONResponse({
+                "status": "ok",
+                "dependency_status": "unknown",
+                "last_updated": None,
+                "sources": {},
+                "warnings": [],
+                "cache_state": "empty",
+            }).body,
+        )
+        fake_registry.get_service.assert_called_once_with(None)
+        fake_service.peek_cached_snapshot.assert_called_once_with()
+        fake_service.get_snapshot.assert_not_called()
 
     def test_snapshot_export_estimate_uses_stale_smart_cache(self) -> None:
         route = next(route for route in main_app.routes if route.path == "/api/export/enclosure-snapshot/estimate")
@@ -1863,6 +1914,95 @@ class AdminHistoryStoreTests(unittest.TestCase):
 
 
 class AdminStatePayloadTests(unittest.TestCase):
+    def test_debug_export_bootstrap_defaults_do_not_stop_services(self) -> None:
+        defaults = self._build_minimal_state(Settings())["backup_defaults"]
+        self.assertIs(defaults["debug_stop_services"], False)
+        self.assertIs(defaults["debug_restart_services"], True)
+        self.assertIs(defaults["stop_services"], False)
+        self.assertIs(defaults["restart_services"], True)
+        self.assertIs(defaults["import_stop_services"], True)
+        self.assertIs(defaults["import_restart_services"], True)
+
+    def test_debug_export_template_defaults_do_not_stop_services(self) -> None:
+        from html.parser import HTMLParser
+
+        class Inputs(HTMLParser):
+            def __init__(self) -> None:
+                super().__init__()
+                self.inputs: dict[str, dict[str, str | None]] = {}
+
+            def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+                attributes = dict(attrs)
+                if tag == "input" and attributes.get("id"):
+                    self.inputs[str(attributes["id"])] = attributes
+
+        parser = Inputs()
+        template = admin_templates.get_template("index.html")
+        request = make_request()
+        request.scope["router"] = admin_app.router
+        parser.feed(template.render(request=request, admin_bootstrap_json="{}"))
+        for toggle, checked in (
+            ("debug-export-stop-toggle", False),
+            ("debug-export-restart-toggle", True),
+            ("backup-export-stop-toggle", False),
+            ("backup-export-restart-toggle", True),
+            ("backup-import-stop-toggle", True),
+            ("backup-import-restart-toggle", True),
+        ):
+            with self.subTest(toggle=toggle):
+                self.assertEqual("checked" in parser.inputs[toggle], checked)
+
+    def test_debug_export_route_default_reaches_maintenance_without_stopping(self) -> None:
+        self._exercise_debug_export_route(stop_services=None, restart_services=True)
+
+    def test_debug_export_route_preserves_explicit_stop_and_restart_choices(self) -> None:
+        for restart in (False, True):
+            with self.subTest(restart=restart):
+                self._exercise_debug_export_route(stop_services=True, restart_services=restart)
+
+    def _exercise_debug_export_route(
+        self, *, stop_services: bool | None, restart_services: bool
+    ) -> None:
+        from app.models.domain import DebugBundleExportRequest
+        from tests.test_admin_maintenance import FakeBackupService, FakeRuntimeService, build_service
+
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/debug/export")
+        defaults = {parameter.name: parameter.default for parameter in route.dependant.query_params}
+        runtime = FakeRuntimeService(["ui", "history"])
+        class DebugBackup(FakeBackupService):
+            def export_debug_bundle_to_file(self, **kwargs: Any) -> Any:
+                super().export_debug_bundle_to_file(**kwargs)
+                return SimpleNamespace(
+                    path="synthetic-debug.tar.zst", filename="synthetic-debug.tar.zst",
+                    manifest={}, media_type="application/octet-stream", cleanup=lambda: None,
+                )
+
+        backup = DebugBackup()
+        service = build_service(runtime, backup)
+        stopped = defaults["stop_services"] if stop_services is None else stop_services
+        with (
+            patch("admin_service.main.get_maintenance_service", return_value=service),
+        ):
+            response = asyncio.run(route.endpoint(
+                DebugBundleExportRequest(),
+                stop_services=stopped,
+                restart_services=restart_services,
+            ))
+        self.assertEqual(len(backup.debug_calls), 1)
+        expected_stops = ["ui", "history"] if stop_services else []
+        expected_restarts = expected_stops if restart_services else []
+        self.assertEqual(runtime.calls, [("stop", key) for key in expected_stops]
+                         + [("start", key) for key in expected_restarts])
+        headers = response.headers
+        self.assertEqual(headers["X-Admin-Stopped-Containers"], ",".join(expected_stops))
+        self.assertEqual(headers["X-Admin-Restarted-Containers"], ",".join(expected_restarts))
+        self.assertEqual(headers["X-Admin-Restart-Failures"], "")
+        self.assertEqual(backup.debug_calls[0]["maintenance_payload"]["stopped_containers"], expected_stops)
+        self.assertIs(defaults["restart_services"], True)
+        if stop_services is None:
+            self.assertIs(defaults["stop_services"], False)
+            self.assertEqual(runtime.running, ["ui", "history"])
+
     @staticmethod
     def _build_minimal_state(settings: Settings) -> dict[str, Any]:
         request = make_request(port=8082)

@@ -1114,7 +1114,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
                 "status": "ok",
                 "dependency_status": "ok" if api_status and api_status.ok else "degraded",
                 "last_updated": snapshot.last_updated.isoformat(),
-                "sources": snapshot.model_dump(mode="json").get("sources", {}),
+                "sources": {name: status.model_dump(mode="json") for name, status in snapshot.sources.items()},
                 "warnings": snapshot.warnings,
                 "cache_state": "cached",
             },
