@@ -77,6 +77,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Avoided serializing the full cached inventory for health checks while
   preserving the response and cached-only behavior (#464).
 
+- Skipped exact repeated slot-detail saves while preserving timestamp and
+  identity changes; normal timestamp-advancing inventory saves still write (#479).
+
 ### Docs
 
 - Historical release notes, release wraps, and milestone plans moved to
