@@ -600,7 +600,11 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         self.assertIn('id="history-refresh-full"', markup)
         self.assertIn('src="http://testserver/static/dashboard.js"', markup)
         self.assertIn('href="http://testserver/static/dashboard.css"', markup)
-        self.assertIn('fetch("/api/history/refresh"', script_source)
+        self.assertIn('"/api/history/refresh"', script_source)
+        self.assertIn('id="history-collector-freshness"', markup)
+        self.assertIn("Collector status snapshot at page load", markup)
+        self.assertIn('id="history-overview-freshness"', markup)
+        self.assertIn("Overview snapshot at page load", markup)
         self.assertIn('body: JSON.stringify({ mode })', script_source)
         self.assertIn("const body = await response.text();", script_source)
         self.assertIn("JSON.parse(body)", script_source)
@@ -878,6 +882,7 @@ class HistoryDashboardRouteTests(unittest.TestCase):
                 "status",
                 return_value={
                     "collector_running": True,
+                    "collection_running": False,
                     "last_error": "POST http://enclosure-ui:8000/api/slots/smart-batch timed out after 45s",
                     "source_base_url": "https://collector.status-leak-ZXQ9.example.test",
                     "sqlite_path": "/synthetic/private/status-leak-ZXQ9/history.db",
@@ -889,7 +894,8 @@ class HistoryDashboardRouteTests(unittest.TestCase):
             patch.object(history_main.store, "list_scopes", return_value=[]),
             patch.object(history_main.logger, "exception"),
         ):
-            response = asyncio.run(route.endpoint(request=self._refresh_request("full")))
+            with patch.object(history_main.store, "database_size_bytes", return_value=0):
+                response = asyncio.run(route.endpoint(request=self._refresh_request("full")))
 
         run_once.assert_awaited_once_with(
             force_fast=True,
@@ -902,10 +908,13 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["mode"], "full")
         self.assertEqual(payload["detail"], "History full refresh failed; see service logs.")
+        fixture = Path(__file__).parent / "fixtures" / "history_refresh_failure.json"
+        self.assertEqual(payload, json.loads(fixture.read_text(encoding="utf-8")))
         self.assertEqual(
             payload["collector"],
             {
                 "collector_running": True,
+                "collection_running": False,
                 "last_error": "History full refresh failed; see service logs.",
             },
         )
