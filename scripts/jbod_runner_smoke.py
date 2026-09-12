@@ -29,11 +29,12 @@ def scratch_probe(root):
         if (path / 'scratch').read_bytes() != blob:
             raise RuntimeError('scratch round trip failed')
         database = path / 'synthetic.sqlite'
+        expected_rows = [(i, 'synthetic') for i in range(1000)]
         with closing(sqlite3.connect(database)) as db:
             if db.execute('PRAGMA journal_mode=WAL').fetchone()[0] != 'wal':
                 raise RuntimeError('WAL unavailable')
             db.execute('CREATE TABLE probe (id INTEGER PRIMARY KEY, value TEXT)')
-            db.executemany('INSERT INTO probe VALUES (?, ?)', [(i, 'synthetic') for i in range(1000)])
+            db.executemany('INSERT INTO probe VALUES (?, ?)', expected_rows)
             db.commit()
             db.execute("UPDATE probe SET value='rollback'")
             db.rollback()
@@ -42,6 +43,12 @@ def scratch_probe(root):
         with closing(sqlite3.connect(database)) as db:
             if db.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
                 raise RuntimeError('SQLite integrity check failed')
+            try:
+                reopened_rows = db.execute('SELECT id, value FROM probe ORDER BY id').fetchall()
+            except sqlite3.DatabaseError as error:
+                raise RuntimeError('SQLite committed rows unavailable after reopen') from error
+            if reopened_rows != expected_rows:
+                raise RuntimeError('SQLite committed rows changed after reopen')
 
 
 def needs_probe(python):
@@ -59,7 +66,7 @@ def main(profile="full"):
     if os.getuid() != 1001:
         raise RuntimeError('trial requires reviewed runner UID 1001')
     status = dict(line.split(':', 1) for line in Path('/proc/self/status').read_text().splitlines() if ':' in line)
-    if status['CapEff'].strip() != '0000000000000000' or status['NoNewPrivs'].strip() != '1':
+    if status['CapEff'].strip() != '0' * 16 or status['NoNewPrivs'].strip() != '1':
         raise RuntimeError('runner hardening differs from reviewed contract')
     require_prerequisites(profile)
     versions = probe_tools(profile)
@@ -70,7 +77,7 @@ def main(profile="full"):
                'source_files_sha256': {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
                                        for name in ('scripts/jbod_runner_smoke.py', 'scripts/ci_unittest.py')},
                'source_revision': os.environ.get('GITHUB_SHA', 'unpublished'),
-               'storage_checks': 'synthetic scratch, fsync, WAL, rollback, integrity, cleanup'}
+               'storage_checks': 'synthetic scratch, fsync, WAL, rollback, reopen rows, integrity, cleanup'}
     print(json.dumps(receipt, sort_keys=True))
 
 

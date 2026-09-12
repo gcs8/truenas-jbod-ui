@@ -143,6 +143,40 @@ class RunnerTrialTests(unittest.TestCase):
             self.assertEqual(list(Path(temp).iterdir()), [])
         smoke.needs_probe(sys.executable)
 
+    def test_scratch_probe_rejects_recreated_database_after_reopen(self):
+        from unittest.mock import patch
+        real_connect = smoke.sqlite3.connect
+        connections = 0
+
+        def recreate_before_reopen(database):
+            nonlocal connections
+            connections += 1
+            if connections == 2:
+                Path(database).unlink()
+            return real_connect(database)
+
+        with tempfile.TemporaryDirectory() as temp, patch.object(
+            smoke.sqlite3, 'connect', side_effect=recreate_before_reopen
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'committed rows'):
+                smoke.scratch_probe(temp)
+
+    def test_runtime_identity_requires_zero_effective_capabilities(self):
+        from unittest.mock import patch
+        valid_status = f"CapEff:\t{'0' * 16}\nNoNewPrivs:\t1\n"
+        invalid_status = f"CapEff:\t{'0' * 15}1\nNoNewPrivs:\t1\n"
+        with patch.object(smoke.os, 'getuid', return_value=1001), patch.object(
+            smoke.Path, 'read_text', return_value=valid_status
+        ), patch.object(smoke, 'require_prerequisites', side_effect=RuntimeError('reached prerequisites')):
+            with self.assertRaisesRegex(RuntimeError, 'reached prerequisites'):
+                smoke.main()
+        with patch.object(smoke.os, 'getuid', return_value=1001), patch.object(
+            smoke.Path, 'read_text', return_value=invalid_status
+        ), patch.object(smoke, 'require_prerequisites') as prerequisites:
+            with self.assertRaisesRegex(RuntimeError, 'runner hardening'):
+                smoke.main()
+            prerequisites.assert_not_called()
+
 
 class NativeProfileTests(unittest.TestCase):
     def test_profile_is_explicit_on_cli(self):
