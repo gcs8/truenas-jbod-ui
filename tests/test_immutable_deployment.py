@@ -178,9 +178,10 @@ class ImmutableDeploymentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = self.make_root(temp_dir)
             runtime = FakeRuntime(root)
+            spec = deployment.DeploymentSpec(**{**self.make_spec(root).__dict__, "replace_compose": True})
 
             result = deployment.update_deployment(
-                self.make_spec(root),
+                spec,
                 run=runtime.run,
                 download=runtime.download,
                 probe=runtime.probe,
@@ -232,9 +233,10 @@ class ImmutableDeploymentTests(unittest.TestCase):
             root = self.make_root(temp_dir)
             expected_env = (root / ".env").read_bytes()
             runtime = FakeRuntime(root, require_staged_env=True)
+            spec = deployment.DeploymentSpec(**{**self.make_spec(root).__dict__, "replace_compose": True})
 
             result = deployment.update_deployment(
-                self.make_spec(root),
+                spec,
                 run=runtime.run,
                 download=runtime.download,
                 probe=runtime.probe,
