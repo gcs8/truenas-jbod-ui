@@ -13,6 +13,28 @@ from app.services.inventory_registry import InventoryRegistry
 from app.services.slot_detail_store import SlotDetailCacheEntry, SlotDetailStore
 
 
+class SlotDetailStoreBatchConflictTests(unittest.TestCase):
+    def test_batch_reloads_under_lock_and_does_not_overwrite_conflicting_entries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SlotDetailStore(str(Path(directory) / "details.json"))
+            first = SlotDetailCacheEntry(system_id="invented-a", slot=0, identifiers=["disk-a"])
+            second = first.model_copy(update={"slot": 1})
+            store.save_entries([first, second])
+            baseline = store.load_all()
+            replacement = first.model_copy(update={"identifiers": ["disk-replaced"]})
+            other = first.model_copy(update={"system_id": "invented-b"})
+            # Real competing write after the batch's read snapshot.
+            with ThreadPoolExecutor(max_workers=1) as worker:
+                worker.submit(store.save_entries, [replacement, other]).result(timeout=5)
+            changed = second.model_copy(update={"updated_at": "2030-01-01T00:00:00+00:00"})
+            with patch.object(store, "load_all", wraps=store.load_all) as load:
+                store.save_entries([first, changed], expected_entries=baseline)
+                self.assertEqual(load.call_count, 1)
+            self.assertEqual(store.get_entry("invented-a", None, 0), replacement)
+            self.assertEqual(store.get_entry("invented-a", None, 1), changed)
+            self.assertEqual(store.get_entry("invented-b", None, 0), other)
+
+
 class SlotDetailStoreSaveTests(unittest.TestCase):
     @staticmethod
     def _entry(**updates) -> SlotDetailCacheEntry:

@@ -1,0 +1,711 @@
+"""Synthetic public-entry-point I/O acceptance for #448; no hardware benchmark.
+
+The batching/off-loop assertions intentionally expose remaining production work.
+Only collection/transport is fake: snapshot, SMART parsing, caches and disk stores
+are real. Snapshot and grid phases must never be combined in reported budgets.
+"""
+from __future__ import annotations
+
+import asyncio
+from collections import Counter
+from contextlib import ExitStack, contextmanager
+from datetime import datetime, timedelta, timezone
+import json
+from pathlib import Path
+import tempfile
+import threading
+import unittest
+from unittest.mock import AsyncMock, patch
+
+from app.config import EnclosureProfileConfig, Settings, SSHConfig, SystemConfig, TrueNASConfig
+from app.models.domain import SmartSummaryView
+from app.services.inventory import InventoryService, SmartDetailBatch, _smart_detail_batch
+from app.services.mapping_store import MappingStore
+from app.services.profile_registry import ProfileRegistry
+from app.services.slot_detail_store import SlotDetailCacheEntry, SlotDetailStore
+from app.services.truenas_ws import TrueNASAPIError, TrueNASRawData
+
+
+class StoreTrace:
+    """Observe real file operations, not dispatch calls or mocked store results."""
+
+    def __init__(self, store):
+        self.store = store
+        self.paths = {store.file_path, store.file_path.with_suffix(".tmp")}
+        self.loop_thread = threading.get_ident()
+        self.operations = Counter()
+        self.threads = Counter()
+        self.methods = Counter()
+        self.lock = threading.Lock()
+
+    def record(self, operation):
+        with self.lock:
+            self.operations[operation] += 1
+            category = "loop" if threading.get_ident() == self.loop_thread else "worker"
+            self.threads[category] += 1
+
+    @contextmanager
+    def capture(self):
+        real_open, real_replace = Path.open, Path.replace
+        real_load, real_dump = json.load, json.dump
+
+        def opened(path, mode="r", *args, **kwargs):
+            handle = real_open(path, mode, *args, **kwargs)
+            if path in self.paths:
+                self.record("write" if "w" in mode else "read")
+            return handle
+
+        def replaced(path, target):
+            result = real_replace(path, target)
+            if path in self.paths:
+                self.record("replace")
+            return result
+
+        def loaded(handle, *args, **kwargs):
+            result = real_load(handle, *args, **kwargs)
+            if Path(handle.name) in self.paths:
+                self.record("json_load")
+            return result
+
+        def dumped(payload, handle, *args, **kwargs):
+            result = real_dump(payload, handle, *args, **kwargs)
+            if Path(handle.name) in self.paths:
+                self.record("json_dump")
+            return result
+
+        def observed(name, original):
+            def call(*args, **kwargs):
+                with self.lock:
+                    self.methods[name] += 1
+                return original(*args, **kwargs)
+            return call
+
+        with ExitStack() as stack:
+            for owner, name, replacement in (
+                (Path, "open", opened), (Path, "replace", replaced),
+                (json, "load", loaded), (json, "dump", dumped),
+            ):
+                stack.enter_context(patch.object(owner, name, replacement))
+            for name in ("load_all", "get_entry", "save_entries", "_write"):
+                stack.enter_context(patch.object(self.store, name, observed(name, getattr(self.store, name))))
+            yield self
+
+    def report(self, phase, count):
+        print(json.dumps({"phase": phase, "slots": count, "operations": dict(self.operations),
+                          "store_calls": dict(self.methods), "thread_categories": dict(self.threads)}, sort_keys=True))
+
+
+class SyntheticAPI:
+    def __init__(self, count):
+        self.count = count
+        self.available = True
+        self.calls = 0
+        self.hours = 321
+
+    async def fetch_all(self):
+        disks = [{"name": f"da{i}", "serial": f"INVENTED-{i:03d}", "model": "Synthetic disk",
+                  "enclosure": {"id": "synthetic-enclosure", "slot": i}, "status": "ONLINE"}
+                 for i in range(self.count)]
+        return TrueNASRawData(
+            enclosures=[{"id": "synthetic-enclosure", "label": "Synthetic enclosure",
+                         "elements": [{"slot": i, "dev": f"/dev/da{i}", "status": "OK"}
+                                      for i in range(self.count)]}],
+            disks=disks, pools=[], disk_temperatures={}, smart_test_results=[],
+        )
+
+    async def fetch_disk_smartctl(self, device, args):
+        self.calls += 1
+        if not self.available:
+            raise TrueNASAPIError("Synthetic transport unavailable")
+        return json.dumps({"smart_status": {"passed": True}, "power_on_time": {"hours": self.hours},
+                "temperature": {"current": 31}, "device": {"protocol": "ATA"},
+                "model_name": "Synthetic disk"})
+
+
+class SmartGridIOTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        # Fail closed before any fixture can accidentally reach a real connection.
+        self.guards = ExitStack()
+        self.addCleanup(self.guards.close)
+        for target in ("socket.create_connection", "socket.socket.connect", "socket.socket.connect_ex",
+                       "paramiko.SSHClient.connect"):
+            self.guards.enter_context(patch(target, side_effect=AssertionError("Unexpected network connection")))
+
+    @contextmanager
+    def fixture(self, count):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = Settings(config_file=str(root / "unused.yaml"))
+            for name in ("runtime_overrides_file", "mapping_file", "sas_fabric_alias_file", "log_file",
+                         "profile_file", "slot_detail_cache_file"):
+                setattr(settings.paths, name, str(root / name))
+            settings.layout.api_slot_number_base = 0
+            settings.layout.rows = 1
+            settings.layout.columns = count
+            settings.layout.slot_count = count
+            settings.profiles = [EnclosureProfileConfig(id="synthetic-grid", label="Synthetic grid",
+                                                       rows=1, columns=count, slot_count=count,
+                                                       slot_layout=[list(range(count))])]
+            settings.app.snapshot_cache_ttl_seconds = 3600
+            settings.app.smart_cache_ttl_seconds = 3600
+            system = SystemConfig(id="synthetic-system", default_profile_id="synthetic-grid", truenas=TrueNASConfig(host="nas.invalid", platform="core"),
+                                  ssh=SSHConfig(enabled=False, host="ssh.invalid", key_path=str(root / "unused-key"),
+                                                known_hosts_path=str(root / "unused-hosts")))
+            api = SyntheticAPI(count)
+            store = SlotDetailStore(str(root / "slot-details.json"))
+            other = SlotDetailCacheEntry(system_id="other-synthetic-system", enclosure_id="synthetic-enclosure",
+                                         slot=0, identifiers=["other-invented-disk"],
+                                         slot_fields={"model": "Untouched synthetic model"},
+                                         updated_at="2001-01-01T00:00:00+00:00")
+            store.save_entries([other])
+            ssh = AsyncMock()
+            ssh.run_commands.side_effect = AssertionError("Unexpected SSH collection")
+            service = InventoryService(settings, system, api, ssh, None,
+                                       MappingStore(str(root / "mappings.json")), ProfileRegistry(settings), store)
+            yield service, api, store, other
+
+    async def snapshot(self, service, count):
+        trace = StoreTrace(service.slot_detail_store)
+        with trace.capture():
+            snapshot = await service.get_snapshot()
+        trace.report("snapshot", count)
+        self.assertEqual(len(snapshot.slots), count)
+        self.assertEqual(len({s.device_name for s in snapshot.slots}), count)
+        self.assertTrue(all(s.present for s in snapshot.slots))
+        return snapshot
+
+    async def grid(self, service, slots, phase="grid", **kwargs):
+        trace = StoreTrace(service.slot_detail_store)
+        with trace.capture():
+            result = await service.get_slot_smart_summaries(slots, **kwargs)
+        trace.report(phase, len(result))
+        self.assertEqual(trace.operations["read"], trace.operations["json_load"])
+        self.assertEqual(trace.operations["write"], trace.operations["json_dump"])
+        self.assertEqual(trace.operations["write"], trace.operations["replace"])
+        return result, trace
+
+    def assert_other(self, store, other):
+        self.assertEqual(store.get_entry(other.system_id, other.enclosure_id, other.slot), other)
+
+    def seed_history(self, service, snapshot):
+        entries = [service._build_slot_detail_entry(s, smart_summary=SmartSummaryView(available=True, power_on_hours=17))
+                   for s in snapshot.slots]
+        service.slot_detail_store.save_entries(entries)
+
+    async def test_cold_grid_has_constant_store_io(self):
+        for count in (1, 60, 84):
+            with self.subTest(slots=count), self.fixture(count) as (service, api, store, other):
+                snapshot = await self.snapshot(service, count)
+                slots = [s.slot for s in snapshot.slots]
+                result, trace = await self.grid(service, slots)
+                self.assertEqual([r.slot for r in result], slots)
+                self.assertTrue(all(r.summary.power_on_hours == api.hours for r in result))
+                self.assert_other(store, other)
+                self.assertLessEqual(trace.operations["read"], 2)
+                self.assertEqual(trace.operations["write"], 1)
+                self.assertEqual(trace.operations["replace"], 1)
+
+    async def test_persisted_fallback_loads_once_per_grid(self):
+        for count in (1, 60, 84):
+            with self.subTest(slots=count), self.fixture(count) as (service, api, store, other):
+                snapshot = await self.snapshot(service, count)
+                self.seed_history(service, snapshot)
+                before = store.file_path.read_bytes()
+                api.available = False
+                result, trace = await self.grid(service, [s.slot for s in snapshot.slots], "fallback")
+                self.assertEqual([r.slot for r in result], [s.slot for s in snapshot.slots])
+                self.assertTrue(all(r.summary.power_on_hours == 17 for r in result))
+                self.assertGreater(api.calls, 0)
+                self.assertEqual(before, store.file_path.read_bytes())
+                self.assert_other(store, other)
+                self.assertEqual(trace.operations["write"], 0)
+                self.assertEqual(trace.methods["save_entries"], 0)
+                self.assertEqual(trace.operations["read"], 1)
+
+    async def test_store_io_runs_off_event_loop(self):
+        for count in (1, 60, 84):
+            with self.subTest(slots=count), self.fixture(count) as (service, api, store, other):
+                snapshot = await self.snapshot(service, count)
+                _, trace = await self.grid(service, [s.slot for s in snapshot.slots])
+                self.assertGreater(sum(trace.operations.values()), 0)
+                self.assertEqual(trace.threads["loop"], 0)
+
+    async def test_warm_cache_order_dedup_and_invalid_requests(self):
+        for count in (1, 60, 84):
+            with self.subTest(slots=count), self.fixture(count) as (service, api, store, other):
+                snapshot = await self.snapshot(service, count)
+                slots = [s.slot for s in reversed(snapshot.slots)]
+                await self.grid(service, slots)
+                calls = api.calls
+                before = store.file_path.read_bytes()
+                result, trace = await self.grid(service, slots + slots + [-100, 99999], "warm")
+                self.assertEqual([r.slot for r in result], slots)
+                self.assertTrue(all(r.summary.power_on_hours == api.hours for r in result))
+                self.assertEqual(api.calls, calls)
+                self.assertEqual(sum(trace.operations.values()), 0)
+                self.assertEqual(before, store.file_path.read_bytes())
+                empty, trace = await self.grid(service, [-100, 99999], "invalid")
+                self.assertEqual(empty, [])
+                self.assertEqual(sum(trace.operations.values()), 0)
+                self.assert_other(store, other)
+
+    async def test_fallback_rejects_wrong_disk_identity(self):
+        with self.fixture(1) as (service, api, store, other):
+            snapshot = await self.snapshot(service, 1)
+            self.seed_history(service, snapshot)
+            entry = store.get_entry(service.system.id, snapshot.slots[0].enclosure_id, snapshot.slots[0].slot)
+            assert entry is not None
+            entry.identifiers = ["unrelated-invented-disk"]
+            store.save_entries([entry])
+            api.available = False
+            result, trace = await self.grid(service, [snapshot.slots[0].slot], "identity-rejection")
+            self.assertIsNone(result[0].summary.power_on_hours)
+            self.assertFalse(result[0].summary.available)
+            self.assertEqual(trace.operations["write"], 0)
+            self.assert_other(store, other)
+
+    async def test_default_refreshes_history_and_timestamp_only_change_is_written(self):
+        with self.fixture(1) as (service, api, store, other):
+            snapshot = await self.snapshot(service, 1)
+            self.seed_history(service, snapshot)
+            slots = [s.slot for s in snapshot.slots]
+            result, _ = await self.grid(service, slots, "history-default")
+            self.assertEqual(result[0].summary.power_on_hours, 321)
+            before = store.load_all()
+            # Expire positive entries rather than disabling the cache under test.
+            for key in service._smart_cache_until:
+                service._smart_cache_until[key] = datetime.now(timezone.utc) - timedelta(seconds=1)
+            future = datetime.now(timezone.utc) + timedelta(seconds=10)
+            with patch("app.services.slot_detail_store.utcnow", return_value=future):
+                result, trace = await self.grid(service, slots, "timestamp-only")
+            after = store.load_all()
+            key = store._slot_key(service.system.id, snapshot.slots[0].enclosure_id, slots[0])
+            self.assertEqual(before[key].smart_fields, after[key].smart_fields)
+            self.assertEqual(before[key].slot_fields, after[key].slot_fields)
+            self.assertEqual(before[key].identifiers, after[key].identifiers)
+            self.assertNotEqual(before[key].updated_at, after[key].updated_at)
+            self.assertEqual(trace.operations["write"], 1)
+            self.assert_other(store, other)
+
+    async def test_allow_stale_returns_history_then_default_request_refreshes(self):
+        with self.fixture(1) as (service, api, store, other):
+            snapshot = await self.snapshot(service, 1)
+            self.seed_history(service, snapshot)
+            # Keep actual scheduling intact. Completion of a scheduled task is not
+            # proof it fetched fresh data (the inherited loader can coalesce it).
+            with patch.object(service, "_schedule_background_smart_refresh",
+                              wraps=service._schedule_background_smart_refresh) as scheduled:
+                result, _ = await self.grid(service, [snapshot.slots[0].slot], "history-stale", allow_stale_cache=True)
+                self.assertEqual(result[0].summary.power_on_hours, 17)
+                scheduled.assert_called_once()
+                tasks = list(service._smart_refresh_tasks.values())
+                if tasks:
+                    await asyncio.wait_for(asyncio.gather(*tasks), 5)
+            result, _ = await self.grid(service, [snapshot.slots[0].slot], "history-default-after-stale")
+            self.assertEqual(result[0].summary.power_on_hours, 321)
+            self.assertGreater(api.calls, 0)
+            self.assert_other(store, other)
+
+    async def test_forced_snapshot_preserves_normal_freshness_writes(self):
+        with self.fixture(1) as (service, api, store, other):
+            await self.snapshot(service, 1)
+            before = store.load_all()
+            future = datetime.now(timezone.utc) + timedelta(seconds=10)
+            trace = StoreTrace(store)
+            with patch("app.services.slot_detail_store.utcnow", return_value=future), trace.capture():
+                await service.get_snapshot(force_refresh=True)
+            trace.report("snapshot-forced", 1)
+            self.assertEqual(trace.operations["write"], 1)
+            self.assertNotEqual(before, store.load_all())
+            self.assert_other(store, other)
+
+    async def test_negative_cache_bypass_performs_fresh_work(self):
+        with self.fixture(1) as (service, api, store, other):
+            snapshot = await self.snapshot(service, 1)
+            slots = [snapshot.slots[0].slot]
+            api.available = False
+            result, _ = await self.grid(service, slots, "negative-cold")
+            self.assertFalse(result[0].summary.available)
+            calls = api.calls
+            api.available = True
+            result, trace = await self.grid(service, slots, "negative-warm")
+            self.assertFalse(result[0].summary.available)
+            self.assertEqual(api.calls, calls)
+            self.assertEqual(sum(trace.operations.values()), 0)
+            result, trace = await self.grid(service, slots, "negative-bypass", bypass_negative_cache=True)
+            self.assertEqual(result[0].summary.power_on_hours, 321)
+            self.assertGreater(api.calls, calls)
+            self.assertEqual(trace.operations["write"], 1)
+            self.assert_other(store, other)
+
+    async def test_trace_control_exact_repeat_and_timestamp_mutation(self):
+        with self.fixture(1) as (service, api, store, other):
+            repeat = StoreTrace(store)
+            with repeat.capture():
+                await asyncio.to_thread(store.save_entries, [other])
+            self.assertEqual(repeat.operations, Counter(read=1, json_load=1))
+            self.assertEqual(repeat.threads["loop"], 0)
+            changed = other.model_copy(update={"updated_at": "2002-01-01T00:00:00+00:00"})
+            trace = StoreTrace(store)
+            with trace.capture():
+                await asyncio.to_thread(store.save_entries, [changed])
+            self.assertEqual(trace.operations, Counter(read=1, json_load=1, write=1, json_dump=1, replace=1))
+            self.assertEqual(trace.threads["worker"], 5)
+            self.assertEqual(trace.threads["loop"], 0)
+            self.assert_other(store, changed)
+
+
+# Reviewed concurrency regressions; original acceptance budgets above unchanged.
+
+class SmartGridConcurrencyTests(unittest.IsolatedAsyncioTestCase):
+    fixture = SmartGridIOTests.fixture
+    def setUp(self):
+        self.guards = ExitStack()
+        self.addCleanup(self.guards.close)
+        for target in ('socket.create_connection', 'socket.socket.connect', 'socket.socket.connect_ex', 'paramiko.SSHClient.connect'):
+            self.guards.enter_context(patch(target, side_effect=AssertionError('network forbidden')))
+
+    async def until(self, predicate):
+        async def spin():
+            while not predicate():
+                await asyncio.sleep(.001)
+        await asyncio.wait_for(spin(), 3)
+
+    async def drain(self, baseline):
+        def remaining():
+            return [t for t in asyncio.all_tasks() if t not in baseline and t is not asyncio.current_task() and not t.done()]
+        await self.until(lambda: not remaining())
+        self.assertEqual(remaining(), [])
+
+    async def test_concurrent_same_and_different_grids(self):
+        for second in ([0, 1], [1, 2], [2, 3]):
+            with self.subTest(second=second), self.fixture(4) as (s, api, store, other):
+                await s.get_snapshot()
+                baseline = asyncio.all_tasks()
+                entered, release = asyncio.Event(), asyncio.Event()
+                real = api.fetch_disk_smartctl
+                async def delayed(device, args):
+                    entered.set()
+                    await asyncio.wait_for(release.wait(), 3)
+                    return await real(device, args)
+                with patch.object(api, 'fetch_disk_smartctl', delayed):
+                    a = asyncio.create_task(s.get_slot_smart_summaries([0, 1]))
+                    await asyncio.wait_for(entered.wait(), 3)
+                    b = asyncio.create_task(s.get_slot_smart_summaries(second))
+                    await asyncio.sleep(.01)
+                    release.set()
+                    ra, rb = await asyncio.wait_for(asyncio.gather(a, b), 3)
+                self.assertEqual([x.slot for x in rb], second)
+                self.assertTrue(all(x.summary.power_on_hours == 321 for x in ra + rb))
+                self.assertEqual(api.calls, 2 * len(set([0, 1] + second)))
+                for slot in set([0, 1] + second):
+                    self.assertEqual(store.get_entry(s.system.id, 'synthetic-enclosure', slot).smart_fields['power_on_hours'], 321)
+                self.assertEqual(store.get_entry(other.system_id, other.enclosure_id, other.slot), other)
+                await self.drain(baseline)
+                self.assertIsNone(_smart_detail_batch.get())
+
+    async def test_cancel_during_load_and_save_success_and_failure(self):
+        for phase in ('load_all', 'save_entries'):
+            for fail in (False, True):
+                with self.subTest(phase=phase, fail=fail), self.fixture(2) as (s, api, store, other):
+                    await s.get_snapshot()
+                    baseline = asyncio.all_tasks()
+                    before = store.file_path.read_bytes()
+                    entered, release = threading.Event(), threading.Event()
+                    real = getattr(store, phase)
+                    def gated(*args, **kwargs):
+                        entered.set()
+                        if not release.wait(3):
+                            raise AssertionError('worker release timeout')
+                        if fail:
+                            raise RuntimeError('synthetic store failure')
+                        return real(*args, **kwargs)
+                    try:
+                        with patch.object(store, phase, gated):
+                            a = asyncio.create_task(s.get_slot_smart_summaries([0, 1]))
+                            await self.until(entered.is_set)
+                            a.cancel()
+                            a.cancel()
+                            with self.assertRaises(asyncio.CancelledError):
+                                await a
+                            release.set()
+                            await self.drain(baseline)
+                    finally:
+                        release.set()
+                    self.assertFalse(s._smart_load_tasks)
+                    self.assertFalse(s._smart_refresh_tasks)
+                    self.assertIsNone(_smart_detail_batch.get())
+                    if fail:
+                        self.assertEqual(store.file_path.read_bytes(), before)
+                    else:
+                        self.assertEqual(store.get_entry(s.system.id, 'synthetic-enclosure', 0).smart_fields['power_on_hours'], 321)
+
+    async def test_cancel_remote_then_join_and_cleanup(self):
+        with self.fixture(2) as (s, api, store, other):
+            await s.get_snapshot()
+            baseline = asyncio.all_tasks()
+            entered, release = asyncio.Event(), asyncio.Event()
+            real = api.fetch_disk_smartctl
+            async def gated(device, args):
+                entered.set()
+                await asyncio.wait_for(release.wait(), 3)
+                return await real(device, args)
+            with patch.object(api, 'fetch_disk_smartctl', gated):
+                a = asyncio.create_task(s.get_slot_smart_summaries([0, 1]))
+                await asyncio.wait_for(entered.wait(), 3)
+                a.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await a
+                b = asyncio.create_task(s.get_slot_smart_summaries([0, 1]))
+                release.set()
+                result = await asyncio.wait_for(b, 3)
+                self.assertEqual(len(result), 2)
+                await self.drain(baseline)
+            self.assertEqual(api.calls, 4)
+            self.assertEqual(store.get_entry(s.system.id, 'synthetic-enclosure', 0).smart_fields['power_on_hours'], 321)
+
+    async def test_background_context_reset_real_cached_refresh(self):
+        with self.fixture(1) as (s, api, store, other):
+            snapshot = await s.get_snapshot()
+            await s.get_slot_smart_summaries([0])
+            for key in s._smart_cache_until:
+                s._smart_cache_until[key] = datetime.now(timezone.utc) - timedelta(seconds=1)
+            api.hours = 654
+            parent = SmartDetailBatch(store)
+            baseline = asyncio.all_tasks()
+            token = _smart_detail_batch.set(parent)
+            try:
+                await s.get_slot_smart_summaries([0], allow_stale_cache=True)
+                await self.drain(baseline)
+                self.assertIs(_smart_detail_batch.get(), parent)
+            finally:
+                _smart_detail_batch.reset(token)
+            self.assertIsNone(parent.loaded)
+            self.assertEqual(parent.pending, [])
+            self.assertEqual(store.get_entry(s.system.id, snapshot.slots[0].enclosure_id, 0).smart_fields['power_on_hours'], 654)
+
+    async def test_real_store_concurrent_conflicts_exact_values(self):
+        with self.fixture(3) as (s, api, store, other):
+            await s.get_snapshot()
+            expected = store.load_all()
+            first = store.get_entry(s.system.id, 'synthetic-enclosure', 0)
+            second = store.get_entry(s.system.id, 'synthetic-enclosure', 1)
+            third = store.get_entry(s.system.id, 'synthetic-enclosure', 2)
+            # Exact JSON numeric distinction must fence a conflict.
+            first.slot_fields['probe'] = True
+            store.save_entries([first])
+            expected = store.load_all()
+            concurrent = first.model_copy(deep=True)
+            concurrent.slot_fields['probe'] = 1
+            changed_other = other.model_copy(update={'updated_at': '2040-01-01T00:00:00+00:00'})
+            await asyncio.to_thread(store.save_entries, [concurrent, changed_other])
+            newer_second = second.model_copy(update={'updated_at': '2041-01-01T00:00:00+00:00'})
+            await asyncio.to_thread(store.save_entries, [first, newer_second, third], expected_entries=expected)
+            self.assertIs(type(store.get_entry(s.system.id, first.enclosure_id, 0).slot_fields['probe']), int)
+            self.assertEqual(store.get_entry(s.system.id, second.enclosure_id, 1).updated_at, newer_second.updated_at)
+            self.assertEqual(store.get_entry(other.system_id, other.enclosure_id, other.slot), changed_other)
+            # A removed system entry must not be resurrected by the old read snapshot.
+            baseline = store.load_all()
+            await asyncio.to_thread(store.prune_unknown_systems, {other.system_id})
+            await asyncio.to_thread(store.save_entries, [first, second], expected_entries=baseline)
+            self.assertIsNone(store.get_entry(s.system.id, first.enclosure_id, 0))
+
+    async def test_generation_invalidation_fences_already_queued_entry(self):
+        with self.fixture(2) as (s, api, store, other):
+            await s.get_snapshot()
+            baseline = asyncio.all_tasks()
+            release = asyncio.Event()
+            real = api.fetch_disk_smartctl
+            async def delayed(device, args):
+                if device.endswith('da1'):
+                    await asyncio.wait_for(release.wait(), 3)
+                return await real(device, args)
+            with patch.object(api, 'fetch_disk_smartctl', delayed):
+                a = asyncio.create_task(s.get_slot_smart_summaries([0, 1]))
+                await self.until(lambda: bool(s._smart_cache))
+                self.assertFalse(store.get_entry(s.system.id, 'synthetic-enclosure', 0).smart_fields)
+                s.invalidate_snapshot_cache(reason='synthetic generation fence')
+                release.set()
+                await asyncio.wait_for(a, 3)
+                await self.drain(baseline)
+            entry = store.get_entry(s.system.id, 'synthetic-enclosure', 0)
+            print('GENERATION_PROBE', json.dumps({'smart_fields_after_invalidation': entry.smart_fields, 'in_memory_cache_empty': not s._smart_cache}))
+            self.assertFalse(entry.smart_fields, 'Old generation entry was flushed after invalidation')
+
+    async def test_inflight_join_surfaces_save_failure(self):
+        for cancel in (False, True):
+            for batch_join in (False, True):
+                with self.subTest(cancel=cancel, batch_join=batch_join):
+                    await self._inflight_join_failure(cancel=cancel, batch_join=batch_join)
+
+    async def _inflight_join_failure(self, *, cancel, batch_join):
+        with self.fixture(1) as (s, api, store, other):
+            await s.get_snapshot()
+            baseline = asyncio.all_tasks()
+            remote_entered, remote_release = asyncio.Event(), asyncio.Event()
+            save_entered, save_release = threading.Event(), threading.Event()
+            real = api.fetch_disk_smartctl
+            async def remote(device, args):
+                remote_entered.set()
+                await asyncio.wait_for(remote_release.wait(), 3)
+                return await real(device, args)
+            def save(*args, **kwargs):
+                save_entered.set()
+                if not save_release.wait(3):
+                    raise AssertionError('save release timed out')
+                raise OSError('synthetic disk-full failure')
+            try:
+                with patch.object(api, 'fetch_disk_smartctl', remote), patch.object(store, 'save_entries', save):
+                    a = asyncio.create_task(s.get_slot_smart_summaries([0]))
+                    await asyncio.wait_for(remote_entered.wait(), 3)
+                    b = asyncio.create_task(
+                        s.get_slot_smart_summaries([0]) if batch_join else s.get_slot_smart_summary(0)
+                    )
+                    # The API remains blocked, so the second request cannot get a positive cache hit.
+                    await asyncio.sleep(.02)
+                    self.assertFalse(s._smart_cache)
+                    self.assertEqual(len(s._smart_load_tasks), 1)
+                    remote_release.set()
+                    await self.until(save_entered.is_set)
+                    await asyncio.sleep(.02)
+                    premature = b.done()
+                    if cancel:
+                        a.cancel()
+                        with self.assertRaises(asyncio.CancelledError):
+                            await a
+                    save_release.set()
+                    results = await asyncio.wait_for(asyncio.gather(a, b, return_exceptions=True), 3)
+                    await self.drain(baseline)
+            finally:
+                save_release.set()
+                remote_release.set()
+            print('INFLIGHT_JOIN_FAILURE', {'owner': type(results[0]).__name__, 'joiner': type(results[1]).__name__, 'join_returned_before_save': premature, 'persisted': bool(store.get_entry(s.system.id, 'synthetic-enclosure', 0).smart_fields)})
+            self.assertIsInstance(results[0], asyncio.CancelledError if cancel else OSError)
+            self.assertIsInstance(results[1], OSError, 'The joined loader success hid its owning batch persistence failure')
+            self.assertFalse(premature)
+            if not cancel:
+                self.assertIs(results[0], results[1])
+            self.assertFalse(s._smart_load_batches)
+
+    async def test_cancelled_batch_does_not_write_invalidated_generation(self):
+        with self.fixture(2) as (s, api, store, other):
+            await s.get_snapshot()
+            baseline = asyncio.all_tasks()
+            release = asyncio.Event()
+            real = api.fetch_disk_smartctl
+            async def remote(device, args):
+                if device.endswith('da1'):
+                    await asyncio.wait_for(release.wait(), 3)
+                return await real(device, args)
+            with patch.object(api, 'fetch_disk_smartctl', remote):
+                a = asyncio.create_task(s.get_slot_smart_summaries([0, 1]))
+                await self.until(lambda: bool(s._smart_cache))
+                a.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await a
+                s.invalidate_snapshot_cache(reason='synthetic cancelled batch fence')
+                release.set()
+                await self.drain(baseline)
+            fields = store.get_entry(s.system.id, 'synthetic-enclosure', 0).smart_fields
+            print('CANCELLED_GENERATION', {'persisted_old_fields': fields, 'load_tasks': len(s._smart_load_tasks)})
+            self.assertFalse(fields, 'Cancelled owner later flushed an invalidated entry')
+
+
+    async def test_generation_fenced_at_worker_and_commit_boundary(self):
+        for phase in ('save_entries', 'json_dump'):
+            for cancel in (False, True):
+                for scoped in (False, True):
+                    with self.subTest(phase=phase, cancel=cancel, scoped=scoped), self.fixture(1) as (s, api, store, other):
+                        await s.get_snapshot()
+                        baseline = asyncio.all_tasks()
+                        before = store.file_path.read_bytes()
+                        entered, release = threading.Event(), threading.Event()
+                        real = store.save_entries if phase == 'save_entries' else json.dump
+                        def gated(*args, **kwargs):
+                            if phase == 'json_dump':
+                                result = real(*args, **kwargs)
+                            entered.set()
+                            if not release.wait(3):
+                                raise AssertionError('worker release timeout')
+                            return real(*args, **kwargs) if phase == 'save_entries' else result
+                        target = patch.object(store, 'save_entries', gated) if phase == 'save_entries' else patch('app.services.slot_detail_store.json.dump', gated)
+                        try:
+                            with target:
+                                owner = asyncio.create_task(s.get_slot_smart_summaries([0]))
+                                await self.until(entered.is_set)
+                                if cancel:
+                                    owner.cancel()
+                                    with self.assertRaises(asyncio.CancelledError):
+                                        await owner
+                                s.invalidate_snapshot_cache(reason='synthetic commit fence', cache_keys=['synthetic-enclosure'] if scoped else None)
+                                release.set()
+                                if not cancel:
+                                    await asyncio.wait_for(owner, 3)
+                                await self.drain(baseline)
+                        finally:
+                            release.set()
+                        self.assertEqual(store.file_path.read_bytes(), before)
+                        self.assertFalse(store.file_path.with_suffix('.tmp').exists())
+                        self.assertFalse(s._smart_load_tasks)
+
+    async def test_cross_owned_grids_publish_before_waiting_dependencies(self):
+        for fail in (False, True):
+            for cancel in (False, True):
+                with self.subTest(fail=fail, cancel=cancel), self.fixture(2) as (s, api, store, other):
+                    await s.get_snapshot()
+                    baseline = asyncio.all_tasks()
+                    before = store.file_path.read_bytes()
+                    entered = [asyncio.Event(), asyncio.Event()]
+                    release = asyncio.Event()
+                    batches = []
+                    real_helper = s._get_slot_smart_summary_for_slot_view
+                    real_remote = api.fetch_disk_smartctl
+                    async def helper(slot_view, **kwargs):
+                        batch = _smart_detail_batch.get()
+                        if batch not in batches:
+                            batches.append(batch)
+                        index = batches.index(batch)
+                        # A owns slot 0, B owns slot 1; their other tasks really join.
+                        if slot_view.slot != index:
+                            await asyncio.wait_for(entered[slot_view.slot].wait(), 3)
+                        return await real_helper(slot_view, **kwargs)
+                    async def remote(device, args):
+                        index = 1 if device.endswith('da1') else 0
+                        entered[index].set()
+                        await asyncio.wait_for(release.wait(), 3)
+                        return await real_remote(device, args)
+                    real_save = store.save_entries
+                    def save(*args, **kwargs):
+                        if fail:
+                            raise OSError('synthetic shared persistence failure')
+                        return real_save(*args, **kwargs)
+                    try:
+                        with patch.object(s, '_get_slot_smart_summary_for_slot_view', helper), patch.object(api, 'fetch_disk_smartctl', remote), patch.object(store, 'save_entries', save):
+                            a = asyncio.create_task(s.get_slot_smart_summaries([0, 1]))
+                            await asyncio.wait_for(entered[0].wait(), 3)
+                            b = asyncio.create_task(s.get_slot_smart_summaries([1, 0]))
+                            await asyncio.wait_for(entered[1].wait(), 3)
+                            await asyncio.sleep(.02)
+                            self.assertFalse(s._smart_cache)
+                            self.assertEqual(len(s._smart_load_tasks), 2)
+                            if cancel:
+                                a.cancel()
+                                with self.assertRaises(asyncio.CancelledError):
+                                    await a
+                            release.set()
+                            results = await asyncio.wait_for(asyncio.gather(a, b, return_exceptions=True), 3)
+                            await self.drain(baseline)
+                    finally:
+                        release.set()
+                    self.assertEqual(api.calls, 4)
+                    self.assertFalse(s._smart_load_tasks)
+                    if fail:
+                        self.assertIsInstance(results[1], OSError)
+                        if not cancel:
+                            self.assertIsInstance(results[0], OSError)
+                        self.assertEqual(store.file_path.read_bytes(), before)
+                    else:
+                        self.assertEqual([item.slot for item in results[1]], [1, 0])
+                        for slot in (0, 1):
+                            self.assertEqual(store.get_entry(s.system.id, 'synthetic-enclosure', slot).smart_fields['power_on_hours'], 321)
+                    self.assertEqual(store.get_entry(other.system_id, other.enclosure_id, other.slot), other)

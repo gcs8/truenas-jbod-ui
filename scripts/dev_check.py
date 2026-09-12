@@ -187,6 +187,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_segmented_restore_recovery",
             "tests.test_slot_bounds_routes",
             "tests.test_slot_detail_store",
+            "tests.test_smart_grid_io",
             "tests.test_snapshot_export",
             "tests.test_system_backup",
         ),
