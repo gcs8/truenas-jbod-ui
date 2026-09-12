@@ -64,6 +64,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Isolated read-UI authentication settings so invalid admin-only settings
   and unavailable admin directories no longer block UI startup (#467).
 
+- Clarified history status labels and timestamps, distinguished missing counts
+  from zero, and added semantic label/value associations (#470).
+- Bounded history dashboard polling, rejected stale responses, and marked
+  retained values stale after failed checks. (#420)
+
 ### Performance
 
 - Reduced mapping revision work to one document read per batch while
