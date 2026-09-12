@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -906,25 +907,26 @@ class ContainerResourceContractTests(unittest.TestCase):
         ]
         self.assertEqual(active_assignments, [])
 
-    def test_ui_and_history_are_nonroot_by_default_with_compatible_overlay(self) -> None:
+    def test_ui_and_history_identity_matches_base_or_hardened_dev(self) -> None:
         for compose_name in COMPOSE_FILES:
             services = yaml.safe_load((REPO_ROOT / compose_name).read_text(encoding="utf-8"))["services"]
             with self.subTest(compose=compose_name):
                 self.assertEqual(
                     services["enclosure-ui"]["user"],
-                    "${APP_UID:-10001}:${APP_GID:-10001}",
+                    "0:0" if compose_name == "docker-compose.yml" else "${APP_UID:-10001}:${APP_GID:-10001}",
                 )
                 self.assertEqual(
                     services["enclosure-history"]["user"],
-                    "${APP_UID:-10001}:${APP_GID:-10001}",
+                    "0:0" if compose_name == "docker-compose.yml" else "${APP_UID:-10001}:${APP_GID:-10001}",
                 )
                 self.assertEqual(
                     services["enclosure-admin"]["user"],
-                    "0:${APP_GID:-10001}",
+                    "0:0" if compose_name == "docker-compose.yml" else "0:${APP_GID:-10001}",
                 )
                 self.assertEqual(
                     services["enclosure-backup"]["user"],
-                    "${BACKUP_UID:-1000}:${BACKUP_GID:-1000}",
+                    "${BACKUP_UID:-0}:${BACKUP_GID:-0}" if compose_name == "docker-compose.yml"
+                    else "${BACKUP_UID:-1000}:${BACKUP_GID:-1000}",
                 )
                 self.assertEqual(
                     services["enclosure-backup"]["environment"]["APP_GID"],
@@ -934,12 +936,13 @@ class ContainerResourceContractTests(unittest.TestCase):
                     services["enclosure-backup"]["group_add"],
                     ["${APP_GID:-10001}"],
                 )
-                self.assertIn("./config:/app/config:ro", services["enclosure-ui"]["volumes"])
+                config_mount = "./config:/app/config" + ("" if compose_name == "docker-compose.yml" else ":ro")
+                self.assertIn(config_mount, services["enclosure-ui"]["volumes"])
 
         overlay = yaml.safe_load((REPO_ROOT / "docker-compose.nonroot.yml").read_text(encoding="utf-8"))
         self.assertEqual(
             set(overlay["services"]),
-            {"enclosure-ui", "enclosure-history", "enclosure-backup"},
+            {"enclosure-ui", "enclosure-history", "enclosure-admin", "enclosure-backup"},
         )
         self.assertEqual(overlay["services"]["enclosure-ui"]["user"], "${APP_UID:-10001}:${APP_GID:-10001}")
         self.assertEqual(
@@ -994,6 +997,9 @@ class ContainerResourceContractTests(unittest.TestCase):
     def test_compose_services_use_read_only_root_filesystems_and_drop_privileges(self) -> None:
         for compose_name in COMPOSE_FILES:
             services = yaml.safe_load((REPO_ROOT / compose_name).read_text(encoding="utf-8"))["services"]
+            if compose_name == "docker-compose.yml":
+                overlay = yaml.safe_load((REPO_ROOT / "docker-compose.nonroot.yml").read_text())["services"]
+                services = {name: {**service, **overlay.get(name, {})} for name, service in services.items()}
             for service_name, service in services.items():
                 with self.subTest(compose=compose_name, service=service_name):
                     self.assertIs(service.get("read_only"), True)
@@ -1028,6 +1034,8 @@ class ContainerResourceContractTests(unittest.TestCase):
             services = yaml.safe_load((REPO_ROOT / compose_name).read_text(encoding="utf-8"))["services"]
             for service_name, expected in expected_targets.items():
                 with self.subTest(compose=compose_name, service=service_name):
+                    if compose_name == "docker-compose.yml" and service_name == "enclosure-ui":
+                        expected = expected | {"/app/config"}
                     self.assertEqual(writable_volume_targets(services[service_name]), expected)
             self.assertNotIn("./logs:/app/logs", services["enclosure-admin"]["volumes"])
 
@@ -1095,7 +1103,7 @@ class ContainerResourceContractTests(unittest.TestCase):
             admin = services["enclosure-admin"]
 
             with self.subTest(compose=compose_name, service="enclosure-admin"):
-                self.assertEqual(admin["user"], "0:${APP_GID:-10001}")
+                self.assertEqual(admin["user"], "0:0" if compose_name == "docker-compose.yml" else "0:${APP_GID:-10001}")
                 self.assertIn(str(staging_root), writable_volume_targets(admin))
 
             for service_name, service in services.items():
@@ -1162,14 +1170,14 @@ class ContainerResourceContractTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertIn("default non-root UI and history services", env_example)
+        self.assertIn("opt-in non-root UI and history services", env_example)
         self.assertNotIn("prepare_nonroot_bind_mounts.py", readme)
         self.assertNotIn("prepare_nonroot_bind_mounts.py", quick_start)
         self.assertNotIn("prepare_nonroot_bind_mounts.py", deployment_guide)
         self.assertIn("prepare_nonroot_bind_mounts.py", troubleshooting)
         self.assertIn("Run the dry check first", troubleshooting)
         self.assertIn("--apply", troubleshooting)
-        self.assertNotIn("The base Compose file keeps the existing root-compatible", deployment_guide)
+        self.assertIn("root-compatible", deployment_guide)
 
     def test_nonroot_overlay_preserves_backup_identity_with_app_data_group(self) -> None:
         overlay = yaml.safe_load(
@@ -1177,8 +1185,13 @@ class ContainerResourceContractTests(unittest.TestCase):
         )
 
         backup = overlay["services"]["enclosure-backup"]
-        self.assertNotIn("user", backup)
-        self.assertEqual(backup["group_add"], ["${APP_GID:-10001}"])
+        self.assertEqual(backup["user"], "${BACKUP_UID:-1000}:${BACKUP_GID:-1000}")
+        # Compose appends group_add lists; the overlay must inherit the base grant.
+        self.assertNotIn("group_add", backup)
+        base = yaml.safe_load((REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8"))
+        self.assertEqual(
+            base["services"]["enclosure-backup"]["group_add"], ["${APP_GID:-10001}"]
+        )
 
         backup_guide = (
             REPO_ROOT / "wiki/Backup-Restore-and-Debug-Bundles.md"
@@ -1187,6 +1200,75 @@ class ContainerResourceContractTests(unittest.TestCase):
         self.assertIn("Status files use `0640`", backup_guide)
         self.assertIn("segment directory uses exact mode `0750`", backup_guide)
         self.assertIn("segments and `catalog.json` use exact mode `0640`", backup_guide)
+
+    def test_real_compose_merge_preserves_backup_group_and_runtime_identity(self) -> None:
+        # Config rendering is daemon-free. Never load operator .env/config or start services.
+        binary = os.environ.get("COMPOSE_BINARY") or shutil.which("docker-compose")
+        if binary:
+            compose = [binary]
+        elif shutil.which("docker"):
+            compose = ["docker", "compose"]
+            version = subprocess.run(compose + ["version"], capture_output=True, timeout=30)
+            if version.returncode:
+                self.skipTest("Docker Compose plugin unavailable; real merge not validated")
+        else:
+            self.skipTest("Docker Compose unavailable; real merge not validated")
+
+        chains = (
+            ("docker-compose.yml",),
+            ("docker-compose.dev.yml",),
+            ("docker-compose.yml", "docker-compose.nonroot.yml"),
+            ("docker-compose.yml", "docker-compose.secrets.yml", "docker-compose.nonroot.yml"),
+            ("docker-compose.yml", "docker-compose.nonroot.yml", "docker-compose.secrets.yml"),
+        )
+        examples = (
+            ("defaults", "", "10001", "10001", "1000:1000", "0:0"),
+            ("example", (REPO_ROOT / ".env.example").read_text(encoding="utf-8"),
+             "10001", "10001", "1000:1000", "0:0"),
+            ("custom", "APP_UID=21001\nAPP_GID=21002\nBACKUP_UID=22001\nBACKUP_GID=22002\n",
+             "21001", "21002", "22001:22002", "22001:22002"),
+        )
+        with tempfile.TemporaryDirectory(prefix="compose-contract-") as temporary:
+            root = Path(temporary)
+            for name in SUPPORTED_COMPOSE_FILES:
+                shutil.copyfile(REPO_ROOT / name, root / name)
+            environment = {
+                "PATH": os.environ.get("PATH", ""),
+                "HOME": temporary,
+                "TMPDIR": temporary,
+                "DOCKER_CONFIG": str(root / "docker-config"),
+            }
+            for label, contents, uid, gid, hardened_backup, base_backup in examples:
+                (root / ".env").write_text(contents, encoding="utf-8")
+                for chain in chains:
+                    with self.subTest(environment=label, chain=chain):
+                        command = compose + ["--project-name", "contract", "--env-file", str(root / ".env")]
+                        for name in chain:
+                            command.extend(["-f", str(root / name)])
+                        result = subprocess.run(
+                            command + ["--profile", "*", "config", "--format", "json"],
+                            cwd=root, env=environment, text=True, capture_output=True, timeout=30,
+                        )
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        services = json.loads(result.stdout)["services"]
+                        hardened = "docker-compose.nonroot.yml" in chain or chain[0] == "docker-compose.dev.yml"
+                        backup = services["enclosure-backup"]
+                        self.assertEqual(backup["group_add"], [gid])
+                        self.assertEqual(backup["user"], hardened_backup if hardened else base_backup)
+                        for name in ("enclosure-ui", "enclosure-history", "enclosure-admin"):
+                            service = services[name]
+                            identity = f"{'0' if name == 'enclosure-admin' else uid}:{gid}"
+                            self.assertEqual(service["user"], identity if hardened else "0:0")
+                            self.assertEqual(service.get("read_only", False), hardened)
+                            if hardened:
+                                self.assertEqual(service["cap_drop"], ["ALL"])
+                                self.assertIn("/tmp", service["tmpfs"])
+                        if hardened:
+                            config_mount = next(
+                                mount for mount in services["enclosure-ui"]["volumes"]
+                                if mount["target"] == "/app/config"
+                            )
+                            self.assertTrue(config_mount["read_only"])
 
     def test_nonroot_migration_helper_is_bounded_no_follow_and_dry_run_by_default(self) -> None:
         helper = (REPO_ROOT / "scripts/prepare_nonroot_bind_mounts.py").read_text(encoding="utf-8")
@@ -1449,7 +1531,11 @@ class ContainerResourceContractTests(unittest.TestCase):
                 )
                 self.assertEqual(service["network_mode"], "none")
                 self.assertEqual(service["restart"], "no")
-                self.assertEqual(service["user"], "${BACKUP_UID:-1000}:${BACKUP_GID:-1000}")
+                self.assertEqual(
+                    service["user"],
+                    "${BACKUP_UID:-0}:${BACKUP_GID:-0}" if compose_name == "docker-compose.yml"
+                    else "${BACKUP_UID:-1000}:${BACKUP_GID:-1000}",
+                )
                 self.assertNotIn("ports", service)
                 self.assertFalse(
                     any("docker.sock" in volume for volume in service.get("volumes", []))
@@ -1464,6 +1550,8 @@ class ContainerResourceContractTests(unittest.TestCase):
                 runbook = (
                     REPO_ROOT / "wiki/Backup-Restore-and-Debug-Bundles.md"
                 ).read_text(encoding="utf-8")
+                self.assertIn("BACKUP_UID=0", runbook)
+                self.assertIn("BACKUP_GID=0", runbook)
                 self.assertIn("BACKUP_UID=$(id -u)", runbook)
                 self.assertIn("BACKUP_GID=$(id -g)", runbook)
 
