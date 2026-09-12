@@ -28,6 +28,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ## Unreleased
 
+### Fixed
+
+- Retried failed release checks with bounded backoff instead of waiting a
+  full normal interval, preserving the last successful result (#469).
+
 ### Performance
 
 - Reduced mapping revision work to one document read per batch while
