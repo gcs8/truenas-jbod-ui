@@ -88,6 +88,17 @@ Built-in authentication and explicit public-origin settings are optional.
 For a slower walkthrough with health checks and troubleshooting, use the
 [Quick Start guide](wiki/Quick-Start.md).
 
+## Update
+
+Change `JBOD_UI_IMAGE` in the existing `.env` to the target release tag or
+immutable digest, then run `docker compose pull` and `docker compose up -d`.
+Keep your existing Compose files and pass the same `-f` files and selected
+profiles to both commands so optional history is updated too. Do not activate
+stopped admin or backup services just to update the UI.
+
+See the [update and rollback steps](wiki/Quick-Start.md#update). Optional
+hardening is separate from an image update; retain any hardening already chosen.
+
 ## Optional services
 
 The main UI works by itself. Start history when you want charts and saved disk
