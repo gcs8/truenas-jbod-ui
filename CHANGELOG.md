@@ -28,6 +28,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ## Unreleased
 
+### Upgrade notes
+
+- docker-compose.nonroot.yml: Keep this overlay for hardened deployments.
+  Image-only upgrades now preserve existing Compose files and wait for healthy
+  containers; optional backup defaults match the selected ownership setup. (#426)
+
 ### Added
 
 - Added a client-only, one-session SMART WebSocket batch API with bounded
