@@ -39,6 +39,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Made ownership-helper help available without POSIX dependencies and
   documented script roles and segment-sealer argument formats (#466).
 
+- Bounded history dashboard polling, rejected stale responses, and marked
+  retained values stale after failed checks. (#420)
+
 ### Performance
 
 - Reduced mapping revision work to one document read per batch while
