@@ -28,7 +28,24 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ## Unreleased
 
+### Fixed
+
+- Retried failed release checks with bounded backoff instead of waiting a
+  full normal interval, preserving the last successful result (#469).
+
+- Left read UI and history services running by default during debug export,
+  while preserving explicit stop and restart choices (#468).
+
+- Made ownership-helper help available without POSIX dependencies and
+  documented script roles and segment-sealer argument formats (#466).
+
+- Bounded history dashboard polling, rejected stale responses, and marked
+  retained values stale after failed checks. (#420)
+
 ### Performance
+
+- Reduced mapping revision work to one document read per batch while
+  preserving conflict checks and calibration tokens. (#421)
 
 - Avoided serializing the full cached inventory for health checks while
   preserving the response and cached-only behavior (#464).
