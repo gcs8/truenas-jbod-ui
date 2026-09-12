@@ -2,14 +2,7 @@ services:
   enclosure-ui:
     image: ${JBOD_UI_IMAGE:-ghcr.io/gcs8/truenas-jbod-ui:latest}
     container_name: truenas-jbod-ui
-    user: "${APP_UID:-10001}:${APP_GID:-10001}"
-    read_only: true
-    tmpfs:
-      - /tmp
-    cap_drop:
-      - ALL
-    security_opt:
-      - "no-new-privileges:true"
+    user: "0:0"
     env_file:
       - .env
     environment:
@@ -28,7 +21,7 @@ services:
     ports:
       - "${APP_BIND_ADDRESS:-0.0.0.0}:${APP_PORT:-8080}:8000"
     volumes:
-      - ./config:/app/config:ro
+      - ./config:/app/config
       - ./data:/app/data
       - ./logs:/app/logs
       - ./config/ssh:/run/ssh:ro
@@ -41,14 +34,7 @@ services:
       - history
     image: ${JBOD_UI_IMAGE:-ghcr.io/gcs8/truenas-jbod-ui:latest}
     container_name: truenas-jbod-history
-    user: "${APP_UID:-10001}:${APP_GID:-10001}"
-    read_only: true
-    tmpfs:
-      - /tmp
-    cap_drop:
-      - ALL
-    security_opt:
-      - "no-new-privileges:true"
+    user: "0:0"
     command: ["uvicorn", "history_service.main:app", "--host", "0.0.0.0", "--port", "8001"]
     environment:
       TMPDIR: /app/history
@@ -113,17 +99,7 @@ services:
       - admin
     image: ${JBOD_UI_IMAGE:-ghcr.io/gcs8/truenas-jbod-ui:latest}
     container_name: truenas-jbod-admin
-    user: "0:${APP_GID:-10001}"
-    read_only: true
-    tmpfs:
-      - /tmp
-    cap_drop:
-      - ALL
-    cap_add:
-      - CHOWN
-      - FOWNER
-    security_opt:
-      - "no-new-privileges:true"
+    user: "0:0"
     command: ["uvicorn", "admin_service.main:app", "--host", "0.0.0.0", "--port", "8002"]
     env_file:
       - .env
@@ -173,7 +149,9 @@ services:
       - backup
     image: ${JBOD_UI_IMAGE:-ghcr.io/gcs8/truenas-jbod-ui:latest}
     command: ["python", "-m", "history_service.scheduled_backup_main"]
-    user: "${BACKUP_UID:-1000}:${BACKUP_GID:-1000}"
+    # Match root-owned legacy and fresh history without repairing host ownership.
+    # A separate non-root backup identity requires the prepared nonroot overlay.
+    user: "${BACKUP_UID:-0}:${BACKUP_GID:-0}"
     read_only: true
     tmpfs:
       - /tmp

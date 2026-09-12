@@ -277,6 +277,7 @@ jobs:
               docker compose \
                 --project-directory "$compose_contract_root" \
                 -f "$compose_contract_root/compose.yaml" \
+              -f "$compose_contract_root/nonroot.yaml" \
                 --profile history --profile admin --profile backup \
                 down --volumes --remove-orphans
             fi
@@ -356,6 +357,7 @@ jobs:
           sudo install -d -m 2750 -o 1000 -g 10001 \
             "$compose_contract_root/backup-status"
           cp docker-compose.yml "$compose_contract_root/compose.yaml"
+          cp docker-compose.nonroot.yml "$compose_contract_root/nonroot.yaml"
           printf '%s\n' \
             "JBOD_UI_IMAGE=$image_id" \
             'APP_UID=10001' \
@@ -375,6 +377,7 @@ jobs:
             docker compose \
               --project-directory "$compose_contract_root" \
               -f "$compose_contract_root/compose.yaml" \
+              -f "$compose_contract_root/nonroot.yaml" \
               --profile history --profile admin --profile backup \
               run --rm --no-deps \
               -e "EXPECTED_UID=$expected_uid" \
@@ -429,7 +432,7 @@ jobs:
           probe_compose_service enclosure-history 10001 10001 0000000000000000 /app/history /app/history
           probe_compose_service enclosure-admin 0 10001 0000000000000009 /app/host-prep /app/data
           probe_compose_service enclosure-backup 1000 1000 0000000000000000 /app/backups /app/backups
-          printf '%s\n' 'base_compose_service_contracts=ok'
+          printf '%s\n' 'hardened_compose_service_contracts=ok'
 
           docker run --rm -i --user 1000:1000 --group-add 10001 \
             -v "$shared_probe_dir:/probe/shared:ro" \
