@@ -36,6 +36,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Left read UI and history services running by default during debug export,
   while preserving explicit stop and restart choices (#468).
 
+- Made ownership-helper help available without POSIX dependencies and
+  documented script roles and segment-sealer argument formats (#466).
+
 ### Performance
 
 - Reduced mapping revision work to one document read per batch while
