@@ -78,6 +78,7 @@ EXCLUDED_PATTERNS = (
     re.compile(r"^CHANGELOG\.md$"),
     re.compile(r"^docs/RELEASE_WRAP_[^/]*$"),
     re.compile(r"^docs/RELEASE_NOTES_[^/]*$"),
+    re.compile(r"^docs/archive/"),
 )
 
 HUNK_HEADER = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
