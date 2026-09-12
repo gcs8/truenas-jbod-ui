@@ -33,6 +33,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Retried failed release checks with bounded backoff instead of waiting a
   full normal interval, preserving the last successful result (#469).
 
+- Left read UI and history services running by default during debug export,
+  while preserving explicit stop and restart choices (#468).
+
 ### Performance
 
 - Reduced mapping revision work to one document read per batch while
