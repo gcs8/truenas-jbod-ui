@@ -4,6 +4,7 @@ import asyncio
 import io
 import json
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -32,18 +33,33 @@ class ReleaseStatusTests(unittest.TestCase):
         self.assertIn("# Release Notes - v0.23.0", release_notes)
         self.assertIn("two synthetic spares", release_notes)
 
-        release_url = "https://github.com/gcs8/truenas-jbod-ui/releases/tag/v0.22.2"
-        for current_doc in (roadmap, wiki_home):
-            with self.subTest(document=current_doc[:40]):
-                self.assertIn("v0.22.2", current_doc)
-                self.assertIn("latest published release", current_doc)
-                self.assertIn("2026-09-01", current_doc)
-                self.assertIn(release_url, current_doc)
-                self.assertNotIn("v0.22.1` is the latest published release", current_doc)
+        self.assertIn("`v0.23.0` is the latest published release", roadmap)
+        self.assertIn("2026-09-09", roadmap)
+        self.assertIn("https://github.com/gcs8/truenas-jbod-ui/releases/tag/v0.23.0", roadmap)
+        self.assertIn("docs/archive/ROADMAP_HISTORY.md", roadmap)
+        self.assertNotIn("v0.22.2` is the latest published release", roadmap)
 
-    def test_post_v0222_roadmap_reconciles_completed_follow_up_work(self) -> None:
+        release_url = "https://github.com/gcs8/truenas-jbod-ui/releases/tag/v0.22.2"
+        self.assertIn("v0.22.2", wiki_home)
+        self.assertIn("latest published release", wiki_home)
+        self.assertIn("2026-09-01", wiki_home)
+        self.assertIn(release_url, wiki_home)
+        self.assertNotIn("v0.22.1` is the latest published release", wiki_home)
+
+    def test_roadmap_is_short_and_points_at_the_archived_history(self) -> None:
         repository = Path(__file__).resolve().parents[1]
         roadmap = (repository / "docs" / "ROADMAP.md").read_text(encoding="utf-8")
+        history = repository / "docs" / "archive" / "ROADMAP_HISTORY.md"
+
+        self.assertLessEqual(len(roadmap.splitlines()), 60)
+        self.assertTrue(history.is_file())
+        for stale in ("Current status: shipped", "HANDOFF.md", "TODO.md", "V0_3_X_PLAN"):
+            with self.subTest(stale=stale):
+                self.assertNotIn(stale, roadmap)
+
+    def test_post_v0222_roadmap_history_reconciles_completed_follow_up_work(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        history = (repository / "docs" / "archive" / "ROADMAP_HISTORY.md").read_text(encoding="utf-8")
 
         for marker in (
             "Issue #119 closed",
@@ -53,19 +69,20 @@ class ReleaseStatusTests(unittest.TestCase):
             "#162",
         ):
             with self.subTest(marker=marker):
-                self.assertIn(marker, roadmap)
+                self.assertIn(marker, history)
 
-        self.assertNotIn("issue #119 and draft PR #121 remains", roadmap)
-        self.assertNotIn("publication also remains v0.22.3 work", roadmap)
+        self.assertNotIn("issue #119 and draft PR #121 remains", history)
+        self.assertNotIn("publication also remains v0.22.3 work", history)
 
     def test_roadmap_does_not_claim_absent_v011_plan_is_preserved_locally(self) -> None:
         repository = Path(__file__).resolve().parents[1]
-        roadmap = (repository / "docs" / "ROADMAP.md").read_text(encoding="utf-8")
-
-        self.assertNotRegex(
-            roadmap,
-            r"artifacts/deferred-docs/V0_11_0_PLAN\.md|preserved locally",
-        )
+        for relative in ("docs/ROADMAP.md", "docs/archive/ROADMAP_HISTORY.md"):
+            text = (repository / relative).read_text(encoding="utf-8")
+            with self.subTest(document=relative):
+                self.assertNotRegex(
+                    text,
+                    r"artifacts/deferred-docs/V0_11_0_PLAN\.md|preserved locally",
+                )
 
     def test_unreleased_changelog_records_selected_post_v0222_changes(self) -> None:
         repository = Path(__file__).resolve().parents[1]
@@ -165,6 +182,54 @@ class ReleaseStatusTests(unittest.TestCase):
         self.assertEqual(snapshot["latest_tag"], "v0.14.1")
         self.assertEqual(snapshot["latest_url"], payload["html_url"])
 
+    def test_periodic_refresh_restarts_on_a_new_event_loop(self) -> None:
+        service = ReleaseStatusService(current_version="0.14.1")
+        now = 1000.0
+
+        async def lifespan() -> None:
+            nonlocal now
+            loop = asyncio.get_running_loop()
+            loop.slow_callback_duration = float("inf")
+            baseline = asyncio.all_tasks()
+
+            async def settle() -> None:
+                for _ in range(12):
+                    await asyncio.sleep(0)
+
+            async def fetch(function):
+                return function()
+
+            with (
+                patch.object(loop, "time", side_effect=lambda: now),
+                patch("app.services.release_status.monotonic", side_effect=lambda: now),
+                patch("app.services.release_status.asyncio.to_thread", side_effect=fetch),
+                patch.object(service, "_fetch_latest_release", return_value={"tag_name": "v0.14.1"}) as network,
+            ):
+                worker = asyncio.create_task(service.run_periodic_refresh())
+                try:
+                    await settle()
+                    # Surface a worker crash instead of masking it with cancellation.
+                    if worker.done():
+                        await worker
+                    before = network.call_count
+                    now = service._next_refresh_at
+                    await settle()
+                    self.assertEqual(network.call_count, before + 1)
+                    self.assertEqual(service.snapshot()["status"], "current")
+                    self.assertFalse(worker.done())
+                finally:
+                    worker.cancel()
+                    if not worker.done():
+                        with self.assertRaises(asyncio.CancelledError):
+                            await worker
+                    await settle()
+                    self.assertEqual(asyncio.all_tasks(), baseline)
+                    self.assertFalse([timer for timer in loop._scheduled if not timer.cancelled()])
+
+        # Reuse the instance, as the process-wide cached getters do on restart.
+        asyncio.run(lifespan())
+        asyncio.run(lifespan())
+
     def test_release_status_service_reports_error_when_initial_refresh_fails(self) -> None:
         service = ReleaseStatusService(current_version="0.15.0-dev")
 
@@ -174,3 +239,263 @@ class ReleaseStatusTests(unittest.TestCase):
         self.assertEqual(snapshot["status"], "error")
         self.assertEqual(snapshot["summary"], "Release check unavailable")
         self.assertIn("offline", snapshot["error"])
+
+
+class ReleaseRetryTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.now = 1000.0
+        utc_clock = patch(
+            "app.services.release_status._utc_now",
+            side_effect=lambda: datetime.fromtimestamp(self.now, timezone.utc),
+        )
+        utc_clock.start()
+        self.addCleanup(utc_clock.stop)
+        self.clock = patch("app.services.release_status.monotonic", side_effect=lambda: self.now, create=True)
+        self.clock.start()
+        self.addCleanup(self.clock.stop)
+        self.network = patch("app.services.release_status.urllib.request.urlopen", side_effect=OSError("offline"))
+        self.urlopen = self.network.start()
+        self.addCleanup(self.network.stop)
+        self.service = ReleaseStatusService(current_version="0.14.1")
+
+    def succeed(self) -> None:
+        response = MagicMock()
+        response.__enter__.side_effect = lambda: io.BytesIO(json.dumps({
+            "tag_name": "v0.14.1",
+            "html_url": "https://github.com/gcs8/truenas-jbod-ui/releases/tag/v0.14.1",
+        }).encode())
+        self.urlopen.side_effect = None
+        self.urlopen.return_value = response
+
+    async def test_initial_failure_retries_at_one_minute_not_one_day(self) -> None:
+        self.assertEqual((await self.service.refresh())["status"], "error")
+        self.now += 59
+        await self.service.refresh()
+        self.assertEqual(self.urlopen.call_count, 1)
+        self.succeed()
+        self.now += 1
+        self.assertEqual((await self.service.refresh())["status"], "current")
+        self.assertEqual(self.urlopen.call_count, 2)
+
+    async def test_repeated_failures_back_off_and_cap_at_one_hour(self) -> None:
+        await self.service.refresh()
+        for calls, delay in enumerate((60, 300, 3600, 3600), start=1):
+            with self.subTest(delay=delay, calls=calls):
+                self.now += delay - 1
+                await self.service.refresh()
+                self.assertEqual(self.urlopen.call_count, calls)
+                self.now += 1
+                await self.service.refresh()
+                self.assertEqual(self.urlopen.call_count, calls + 1)
+
+    async def test_success_resets_backoff_and_restores_normal_interval(self) -> None:
+        await self.service.refresh()
+        self.now += 60
+        await self.service.refresh()
+        self.now += 300
+        self.succeed()
+        good = await self.service.refresh()
+        self.assertEqual(good["status"], "current")
+        self.now += 86399
+        await self.service.refresh()
+        self.assertEqual(self.urlopen.call_count, 3)
+        self.now += 1
+        self.urlopen.side_effect = OSError("offline again")
+        self.assertEqual(await self.service.refresh(), good)
+        self.assertEqual(self.urlopen.call_count, 4)
+        self.now += 59
+        self.assertEqual(await self.service.refresh(), good)
+        self.assertEqual(self.urlopen.call_count, 4)
+        self.now += 1
+        self.succeed()
+        self.assertEqual((await self.service.refresh())["status"], "current")
+        self.assertEqual(self.urlopen.call_count, 5)
+
+    async def test_periodic_loop_uses_failure_delays_then_success_interval(self) -> None:
+        delays = []
+
+        async def wait():
+            delay = self.service._next_refresh_at - self.now
+            delays.append(delay)
+            self.now += delay
+            if len(delays) == 2:
+                self.succeed()
+            if len(delays) == 3:
+                raise asyncio.CancelledError
+            raise asyncio.TimeoutError
+
+        with patch.object(self.service._deadline_changed, "wait", side_effect=wait):
+            with self.assertRaises(asyncio.CancelledError):
+                await self.service.run_periodic_refresh()
+        self.assertEqual(delays, [60, 300, 86400])
+        self.assertEqual(self.urlopen.call_count, 3)
+
+    async def _settle_periodic(self) -> None:
+        # Bounded event-loop turns drain ready callbacks, without wall-clock waits.
+        for _ in range(12):
+            await asyncio.sleep(0)
+
+    async def _check_forced_refresh_wakeup(self, *, failure: bool) -> None:
+        self.succeed()
+        loop = asyncio.get_running_loop()
+        # Virtual time jumps are not real slow callbacks.
+        loop.slow_callback_duration = float("inf")
+        baseline = asyncio.all_tasks()
+
+        async def fetch(function):
+            return function()
+
+        with (
+            patch.object(loop, "time", side_effect=lambda: self.now),
+            patch("app.services.release_status.asyncio.to_thread", side_effect=fetch),
+        ):
+            periodic = asyncio.create_task(self.service.run_periodic_refresh())
+            try:
+                await self._settle_periodic()
+                self.assertEqual(self.urlopen.call_count, 1)
+                good = self.service.snapshot()
+                old_deadline = self.service._next_refresh_at
+                self.now += 10
+                if failure:
+                    self.urlopen.side_effect = OSError("forced failure")
+                await self.service.refresh(force=True)
+                if failure:
+                    self.assertEqual(self.service.snapshot(), good)
+                await self._settle_periodic()
+                deadline = self.service._next_refresh_at
+                self.assertEqual(deadline, self.now + (60 if failure else 86400))
+                # The active timer must move in either direction, not just the
+                # stored deadline. Inspect only live timers on this isolated loop.
+                timers = [timer.when() for timer in loop._scheduled if not timer.cancelled()]
+                self.assertIn(deadline, timers)
+                self.assertNotIn(old_deadline, timers)
+                self.succeed()
+                self.now = deadline - 1
+                await self._settle_periodic()
+                self.assertEqual(self.urlopen.call_count, 2)
+                self.now = deadline
+                await self._settle_periodic()
+                self.assertEqual(self.urlopen.call_count, 3)
+                self.assertEqual(self.service.snapshot()["status"], "current")
+            finally:
+                periodic.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await periodic
+                await self._settle_periodic()
+                self.assertEqual(asyncio.all_tasks(), baseline)
+                self.assertFalse([timer for timer in loop._scheduled if not timer.cancelled()])
+
+    async def test_forced_failure_interrupts_existing_day_wait(self) -> None:
+        await self._check_forced_refresh_wakeup(failure=True)
+
+    async def test_forced_success_replaces_existing_day_wait(self) -> None:
+        await self._check_forced_refresh_wakeup(failure=False)
+
+    async def test_deadline_update_before_wait_registration_is_not_lost(self) -> None:
+        self.succeed()
+        loop = asyncio.get_running_loop()
+        loop.slow_callback_duration = float("inf")
+        baseline = asyncio.all_tasks()
+        event = self.service._deadline_changed
+        original_wait = event.wait
+        registrations = 0
+
+        async def fetch(function):
+            return function()
+
+        async def wait():
+            nonlocal registrations
+            registrations += 1
+            if registrations == 1:
+                # Force an update after the timer is chosen but before the
+                # event has registered its waiter. The notification must latch.
+                self.now += 10
+                self.urlopen.side_effect = OSError("registration race")
+                await self.service.refresh(force=True)
+            await original_wait()
+
+        with (
+            patch.object(loop, "time", side_effect=lambda: self.now),
+            patch.object(event, "wait", side_effect=wait),
+            patch("app.services.release_status.asyncio.to_thread", side_effect=fetch),
+        ):
+            periodic = asyncio.create_task(self.service.run_periodic_refresh())
+            try:
+                await self._settle_periodic()
+                self.assertEqual(self.urlopen.call_count, 2)
+                self.assertEqual(registrations, 2)
+                self.assertEqual(
+                    [timer.when() for timer in loop._scheduled if not timer.cancelled()],
+                    [1070.0],
+                )
+                # Multiple updates before the periodic task resumes coalesce
+                # to the latest deadline. Cancel while a wakeup is pending.
+                self.succeed()
+                await self.service.refresh(force=True)
+                self.urlopen.side_effect = OSError("pending wake cancellation")
+                await self.service.refresh(force=True)
+            finally:
+                periodic.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await periodic
+                await self._settle_periodic()
+                self.assertEqual(asyncio.all_tasks(), baseline)
+                self.assertFalse(event._waiters)
+                self.assertFalse([timer for timer in loop._scheduled if not timer.cancelled()])
+
+    async def test_disabled_checks_never_fetch_or_sleep_even_when_forced(self) -> None:
+        service = ReleaseStatusService(current_version="0.14.1", enabled=False)
+        with patch("app.services.release_status.asyncio.sleep") as sleep:
+            await service.run_periodic_refresh()
+            self.assertEqual((await service.refresh(force=True))["status"], "disabled")
+        sleep.assert_not_called()
+        self.urlopen.assert_not_called()
+
+    async def test_concurrent_due_refreshes_share_one_attempt(self) -> None:
+        await self.service.refresh()
+        self.now += 60
+        started = asyncio.Event()
+        finish = asyncio.Event()
+
+        async def fetch(function):
+            started.set()
+            await finish.wait()
+            return function()
+
+        self.succeed()
+        with patch("app.services.release_status.asyncio.to_thread", side_effect=fetch) as worker:
+            first = asyncio.create_task(self.service.refresh(force=True))
+            await started.wait()
+            second = asyncio.create_task(self.service.refresh())
+            await asyncio.sleep(0)
+            finish.set()
+            results = await asyncio.gather(first, second)
+        self.assertEqual(worker.call_count, 1)
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(results[0]["status"], "current")
+
+    async def test_retry_delay_starts_after_failed_attempt_finishes(self) -> None:
+        def slow_failure(*args, **kwargs):
+            self.now += 5
+            raise OSError("offline")
+
+        self.urlopen.side_effect = slow_failure
+        await self.service.refresh()
+        self.now += 59
+        await self.service.refresh()
+        self.assertEqual(self.urlopen.call_count, 1)
+        self.now += 1
+        await self.service.refresh()
+        self.assertEqual(self.urlopen.call_count, 2)
+
+    async def test_force_bypasses_deadline_but_success_keeps_interval_floor(self) -> None:
+        self.service = ReleaseStatusService(current_version="0.14.1", interval_seconds=1)
+        await self.service.refresh()
+        self.succeed()
+        self.assertEqual((await self.service.refresh(force=True))["status"], "current")
+        self.now += 3599
+        await self.service.refresh()
+        self.assertEqual(self.urlopen.call_count, 2)
+        self.now += 1
+        await self.service.refresh()
+        self.assertEqual(self.urlopen.call_count, 3)

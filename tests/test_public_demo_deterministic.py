@@ -250,7 +250,6 @@ class DeterministicPublicDemoContractTests(unittest.TestCase):
                 "public-demo/**",
                 "qa/public-demo.spec.js",
                 "README.md",
-                "docs/DOCUMENTATION_INVENTORY.md",
                 "docs/PUBLIC_DEMO_PRODUCT_BRIEF.md",
                 "docs/PUBLIC_SCREENSHOT_REVIEW.md",
                 "docs/images/screenshots/**",

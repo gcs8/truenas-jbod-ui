@@ -136,7 +136,7 @@
     },
     "reason": "Reviewed public documentation example; exact detector counts are pinned."
   },
-  "docs/STORAGE_VIEW_CONFIG_SKETCH.md": {
+  "docs/archive/STORAGE_VIEW_CONFIG_SKETCH.md": {
     "findings": {
       "internal_hostname": {
         "sha256:8651e716e2e5a1e65984c718ab296b6f5935b082238f1a72d0dbc06f7ad3a822": 2
@@ -153,7 +153,7 @@
     },
     "reason": "Reviewed public documentation example; exact detector counts are pinned."
   },
-  "docs/STORAGE_VIEW_NOTES.md": {
+  "docs/archive/STORAGE_VIEW_NOTES.md": {
     "findings": {
       "local_windows_drive_path": {
         "sha256:db48f10d2e9456c9da54ec5c9cdc6658a257392946f9bb10b62ae404515ea387": 1
@@ -161,7 +161,7 @@
     },
     "reason": "Reviewed public documentation example; exact detector counts are pinned."
   },
-  "docs/STORAGE_VIEW_PLAN.md": {
+  "docs/archive/STORAGE_VIEW_PLAN.md": {
     "findings": {
       "local_windows_drive_path": {
         "sha256:db48f10d2e9456c9da54ec5c9cdc6658a257392946f9bb10b62ae404515ea387": 1
@@ -180,7 +180,7 @@
     },
     "reason": "Reviewed public documentation example; exact detector counts are pinned."
   },
-  "docs/V0_20_SAS_FABRIC_PLAN.md": {
+  "docs/archive/V0_20_SAS_FABRIC_PLAN.md": {
     "findings": {
       "compact_lab_host_id": {
         "sha256:6827e135b9d9d07835934f36afdda7ca4f9f8c6d83d0671f8783d2319e9dc21e": 2
@@ -191,7 +191,7 @@
     },
     "reason": "Reviewed public documentation example; exact detector counts are pinned."
   },
-  "docs/V0_9_0_PLAN.md": {
+  "docs/archive/V0_9_0_PLAN.md": {
     "findings": {
       "local_windows_drive_path": {
         "sha256:2ff8e3b4c2b6bb61f35cda6199124efcd284fbed228cd7a901562ca807b6cac5": 2

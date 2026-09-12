@@ -94,6 +94,10 @@ class _MiddlewareCallDispatcher:
             self._pending.pop(request_id, None)
             if not future.done():
                 future.cancel()
+            elif not future.cancelled():
+                # A reader failure can settle this future while send() is still
+                # blocked. Observe it even if cancellation prevents awaiting it.
+                future.exception()
 
     async def close(self) -> None:
         if not self._reader_task.done():
@@ -113,6 +117,13 @@ class _MiddlewareCallDispatcher:
             while True:
                 raw_message = await self.ws.recv()
                 message = json.loads(raw_message)
+                if message.get("msg") == "ping":
+                    # DDP heartbeats are JSON messages, not WebSocket control frames.
+                    pong = {"msg": "pong"}
+                    if "id" in message:
+                        pong["id"] = message["id"]
+                    await self.ws.send(json.dumps(pong))
+                    continue
                 if message.get("msg") != "result":
                     continue
                 request_id = message.get("id")
@@ -236,6 +247,112 @@ class TrueNASWebsocketClient:
             if not isinstance(result, str):
                 raise TrueNASAPIError(f"disk.smartctl returned unexpected payload type for {disk_name!r}.")
             return result
+
+    async def smartctl_batch(
+        self, disks: list[str], args: list[str] | None = None, *, max_concurrency: int,
+    ) -> list[str]:
+        """Fetch a bounded, positional SMART batch over one authenticated session.
+
+        Fail fast without partial results or retries. The budget is request-local;
+        duplicate disk names remain separate calls. Cancellation drains owned work
+        before returning, including when the caller cancels more than once.
+        """
+        if type(max_concurrency) is not int or max_concurrency <= 0:
+            raise ValueError("max_concurrency must be a positive integer.")
+        if not isinstance(disks, (list, tuple)):
+            raise ValueError("disks must be a finite list or tuple of disk names.")
+        if len(disks) > MAX_DISK_INVENTORY_ROWS:
+            raise TrueNASAPIError(f"SMART batch exceeds the supported maximum of {MAX_DISK_INVENTORY_ROWS} disks.")
+        if any(not isinstance(disk, str) or not disk for disk in disks):
+            raise ValueError("disks must contain nonempty string disk names.")
+        if not disks:
+            return []
+        # Snapshot caller-owned containers before any await, without deduplication.
+        owner = asyncio.create_task(self._run_smartctl_batch(
+            list(disks), list(args or ["-a", "-j"]), min(max_concurrency, len(disks)),
+        ))
+        try:
+            await asyncio.wait({owner})
+        except asyncio.CancelledError:
+            owner.cancel()
+            # wait() doesn't propagate repeated cancellation into the cleanup
+            # owner (nor leave abandoned shield futures with late exceptions).
+            while not owner.done():
+                try:
+                    await asyncio.wait({owner})
+                except asyncio.CancelledError:
+                    pass
+            if not owner.cancelled():
+                owner.exception()
+            raise
+        return owner.result()
+
+    async def _run_smartctl_batch(self, disks: list[str], args: list[str], width: int) -> list[str]:
+        session = self._session()
+        async with asyncio.timeout(self.config.timeout_seconds):
+            ws = await session.__aenter__()
+        primary: BaseException | None = None
+        dispatcher = _MiddlewareCallDispatcher(ws)
+        positions = iter(enumerate(disks))
+        results = [""] * len(disks)
+
+        async def worker() -> None:
+            for position, disk in positions:
+                try:
+                    async with asyncio.timeout(self.config.timeout_seconds):
+                        result = await dispatcher.call("disk.smartctl", [disk, args])
+                except TrueNASAPIError as exc:
+                    if self.config.platform == "scale" and "ENOMETHOD" in str(exc):
+                        raise TrueNASAPIError(
+                            "Detailed SMART JSON is not available through the SCALE websocket API on this system."
+                        ) from exc
+                    raise
+                if not isinstance(result, str):
+                    raise TrueNASAPIError(f"disk.smartctl returned unexpected payload type for {disk!r}.")
+                results[position] = result
+
+        tasks = [asyncio.create_task(worker()) for _ in range(width)]
+        gathered = asyncio.gather(*tasks)
+        try:
+            # A reader can fail while a worker is still inside send(). Wake the
+            # batch immediately rather than waiting for that worker's deadline.
+            await asyncio.wait({gathered, dispatcher._reader_task}, return_when=asyncio.FIRST_COMPLETED)
+            if dispatcher._reader_task.done():
+                dispatcher._reader_task.result()
+            await gathered
+        except BaseException as exc:
+            primary = exc
+            raise
+        finally:
+            async def cleanup() -> None:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, gathered, return_exceptions=True)
+                try:
+                    await dispatcher.close()
+                finally:
+                    await session.__aexit__(
+                        type(primary) if primary else None, primary,
+                        primary.__traceback__ if primary else None,
+                    )
+
+            # Cancellation may arrive after a method already failed and cleanup
+            # started. Keep reader/session teardown owned in that race too.
+            closing = asyncio.create_task(cleanup())
+            cancelled: asyncio.CancelledError | None = None
+            while not closing.done():
+                try:
+                    await asyncio.wait({closing})
+                except asyncio.CancelledError as exc:
+                    cancelled = exc
+            try:
+                closing.result()
+            except BaseException:
+                if primary is None and cancelled is None:
+                    raise
+            if cancelled is not None:
+                raise cancelled
+        return results
 
     async def set_slot_status(self, enclosure_id: str, slot_number: int, status: str) -> None:
         async with self._session() as ws:
@@ -383,17 +500,29 @@ class TrueNASWebsocketClient:
         if not self.config.api_key:
             raise TrueNASAPIError("TRUENAS_API_KEY is required for API access.")
 
-        async with connect(
-            websocket_url,
-            ssl=ssl_context,
-            server_hostname=resolve_tls_server_name(self.config) if ssl_context else None,
-            open_timeout=self.config.timeout_seconds,
-            close_timeout=self.config.timeout_seconds,
-            ping_interval=20,
-            ping_timeout=self.config.timeout_seconds,
-        ) as ws:
-            await self._perform_handshake(ws)
-            yield ws
+        primary: BaseException | None = None
+        try:
+            async with connect(
+                websocket_url,
+                ssl=ssl_context,
+                server_hostname=resolve_tls_server_name(self.config) if ssl_context else None,
+                open_timeout=self.config.timeout_seconds,
+                close_timeout=self.config.timeout_seconds,
+                ping_interval=20,
+                ping_timeout=self.config.timeout_seconds,
+            ) as ws:
+                try:
+                    await self._perform_handshake(ws)
+                    yield ws
+                except BaseException as exc:
+                    primary = exc
+                    raise
+        except BaseException:
+            # Connection teardown must not replace authentication, method or
+            # cancellation failures, including failures before the session yields.
+            if primary is not None:
+                raise primary
+            raise
 
     async def _call(self, ws: ClientConnection, method: str, params: list[Any]) -> Any:
         request_id = str(uuid.uuid4())
@@ -412,7 +541,10 @@ class TrueNASWebsocketClient:
             msg_type = message.get("msg")
 
             if msg_type == "ping":
-                await ws.send(json.dumps({"msg": "pong"}))
+                pong = {"msg": "pong"}
+                if "id" in message:
+                    pong["id"] = message["id"]
+                await ws.send(json.dumps(pong))
                 continue
 
             if message.get("id") != request_id:
