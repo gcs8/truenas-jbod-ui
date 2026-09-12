@@ -388,7 +388,7 @@ python scripts/validate_release_wrap.py "$version" \
   `python scripts/render_release_notes.py "## vX.Y.Z - YYYY-MM-DD" > release-notes.md`
 - record the exact `Changelog coverage: pass (<N> PRs)` line in the release wrap
 - refresh the checked-in release notes file for the target tag, for example
-  `docs/RELEASE_NOTES_0.15.0.md`
+  `docs/RELEASE_NOTES_<version>.md`
 - review `README.md` for stale version or milestone wording
 - review `docs/ROADMAP.md` for stale "current direction" text
 - review profile/config docs for dead or outdated comments, especially builder
@@ -580,6 +580,10 @@ python scripts/validate_release_wrap.py "$version" \
   tear down only the temporary Linux QA restore containers, networks, and
   scratch runtime directories
 - start a new `Unreleased` section in `CHANGELOG.md` for follow-up work
+- `git mv` the previous release's `docs/RELEASE_NOTES_<version>.md` and
+  `docs/RELEASE_WRAP_<version>.md` into `docs/archive/` so only the current
+  release stays at the top level; `scripts/validate_release_wrap.py` reads
+  archived wraps from there
 - update `HANDOFF.md` and `TODO.md` with the shipped release state, GHCR digest,
   external wiki/public-demo state, deployment sniff results, and next branch
   only after the post-publish gates above are recorded

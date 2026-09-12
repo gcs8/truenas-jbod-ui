@@ -399,8 +399,12 @@ async def refresh_history(request: Request) -> dict[str, object] | JSONResponse:
             if admission.retry_after is not None
             else None
         )
+        refusal_payload: dict[str, object] = {"ok": False, "mode": normalized_mode, "detail": detail}
+        if admission.status_code == 429 and admission.retry_after is not None:
+            refusal_payload["detail"] = f"{detail} Try again in {admission.retry_after} s."
+            refusal_payload["retry_after_seconds"] = admission.retry_after
         return JSONResponse(
-            {"ok": False, "mode": normalized_mode, "detail": detail},
+            refusal_payload,
             status_code=admission.status_code or 409,
             headers=headers,
         )
