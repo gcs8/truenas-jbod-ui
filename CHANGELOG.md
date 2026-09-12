@@ -72,6 +72,13 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Avoided serializing the full cached inventory for health checks while
   preserving the response and cached-only behavior (#464).
 
+### Docs
+
+- Historical release notes, release wraps, and milestone plans moved to
+  `docs/archive/`; `docs/ROADMAP.md` now covers only the current release and
+  the next lane, every live reference document is linked from the wiki or
+  CONTRIBUTING, and seven unused screenshots were removed. (#476)
+
 ## v0.23.0 - 2026-09-08
 
 This release includes every pull request merged after `v0.22.2` through the

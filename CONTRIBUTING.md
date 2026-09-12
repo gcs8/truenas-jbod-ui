@@ -36,8 +36,8 @@ At the start of a work session:
      than only a closure comment
 
 For release or release-adjacent work, review `docs/RELEASE_CHECKLIST.md` before
-changes. Older cycle plans under `docs/` are historical records, not active
-scope.
+changes. Older cycle plans and release records under `docs/archive/` are
+historical records, not active scope.
 
 ## Standing Maintenance Priorities
 
@@ -190,6 +190,10 @@ Useful orientation files:
 - `CHANGELOG.md`
 - `docs/ROADMAP.md`
 - `docs/RELEASE_CHECKLIST.md`
+- `docs/PUBLISHING_THE_WIKI.md` for how the wiki source is verified and
+  published
+- `docs/SAS_DIAGNOSTIC_DECODER_SOURCES.md` when working on the SAS Fabric
+  decoders
 - relevant tests under `tests/` and `qa/`
 
 ### Tier 1: Safe Source Checks
@@ -531,6 +535,10 @@ verification only and do not deploy. An owner-approved `workflow_dispatch` run
 publishes the reviewed `public-demo/**` bytes. Commit, push, merge, exact-byte
 approval, publication, and public readback remain separate gates.
 
+`docs/PUBLIC_DEMO_PRODUCT_BRIEF.md` says what the demo is for and what it must
+not show. `docs/PUBLIC_SCREENSHOT_REVIEW.md` is the exact-byte review record
+for the checked-in desktop screenshots.
+
 ## Live Data Cautions
 
 Live data is evidence, not universal truth.
@@ -673,7 +681,7 @@ GitHub appends the label-categorized pull request list from
 `.github/release.yml`. Check the rendered release for pull requests that landed
 in the wrong category and fix the label rather than editing the body by hand.
 
-## AI / Codex Handoff Shape
+## Handoff shape
 
 Every substantial agent handoff should be concise and auditable.
 
@@ -708,7 +716,7 @@ Use this shape:
 - Known risks:
 - Deferred items:
 - Follow-up TODOs:
-- Questions for Ryoko/user:
+- Questions for the maintainer:
 ```
 
 For release work, also update the required release wrap evidence table from
