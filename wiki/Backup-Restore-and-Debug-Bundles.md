@@ -71,6 +71,26 @@ compensate for memory regressions.
 
 Scheduled backups run in a separate one-shot container with no published port, network, or Docker socket. Start that container from a host timer.
 
+The root-compatible base runs backup as `0:0`, matching history ownership for both
+new files and root-owned predecessor state. It still drops all capabilities,
+uses a read-only container filesystem, and enables no-new-privileges. Access uses
+ordinary owner/group permissions, not a root permission bypass. No upgrade step
+changes history ownership or makes data world-readable.
+
+The optional `docker-compose.nonroot.yml` overlay and development Compose retain
+the separate backup default `1000:1000`. Explicit `BACKUP_UID` and `BACKUP_GID`
+always win. Keep an existing prepared non-root deployment's full Compose chain
+and explicit IDs on image-only updates. Do not switch its producer to the root
+base while retaining a separate backup UID: newly created `root:root 0660` history
+is not readable by that UID. Conversely, do not switch an existing backup UID to
+root without preparing its private output, passphrase, and status ownership.
+
+If adopting the root-compatible base, use the root backup setup below. If retaining
+a separate backup UID, use the prepared non-root overlay and the explicit setup
+below. A separate UID cannot access a `root:root 0700` history directory just by
+adding a group. Changing only the producer's group also leaves old root-owned
+files inaccessible. Neither is an automatic upgrade repair.
+
 The admin application default for automatic stop is `0`. The supplied Compose files set the separately launched admin sidecar default to `3600` seconds.
 
 A scheduled backup that includes `history_db` uses encrypted `.7z`, including segmented history. A backup without `history_db` uses the native encrypted `.tar.zst.enc` envelope. The restore path accepts both formats.
@@ -80,8 +100,8 @@ A scheduled backup that includes `history_db` uses encrypted `.7z`, including se
 Create a private passphrase file under `config/backup-secrets`. Do not put the passphrase in `.env`, a command argument, or a unit file.
 
 ```bash
-BACKUP_UID=$(id -u)
-BACKUP_GID=$(id -g)
+BACKUP_UID=0
+BACKUP_GID=0
 APP_GID=10001
 sudo install -d -o "$BACKUP_UID" -g "$BACKUP_GID" -m 0700 \
   config/backup-secrets backups backups/scheduled
@@ -89,19 +109,25 @@ sudo install -d -o "$BACKUP_UID" -g "$APP_GID" -m 2750 backup-status
 sudo install -o "$BACKUP_UID" -g "$BACKUP_GID" -m 0600 /dev/null \
   config/backup-secrets/scheduled-backup-passphrase
 read -rsp 'Scheduled backup passphrase: ' BACKUP_PASSPHRASE
-printf '%s' "$BACKUP_PASSPHRASE" > config/backup-secrets/scheduled-backup-passphrase
+printf '%s' "$BACKUP_PASSPHRASE" | sudo tee config/backup-secrets/scheduled-backup-passphrase >/dev/null
 unset BACKUP_PASSPHRASE
 ```
 
 The Compose files mount `config/backup-secrets` read-only at `/run/backup-secrets`.
+
+These commands initialize a new backup setup, not an existing passphrase or
+archive directory. Preserve existing files on upgrade. For the prepared non-root
+overlay or development Compose, substitute `BACKUP_UID=$(id -u)` and
+`BACKUP_GID=$(id -g)` before running the initialization commands, then put those
+same numeric values in `.env`. Set `APP_GID` to the prepared application group.
 
 ### Configure the one-shot runner
 
 Add the complete runner configuration to the ignored local `.env`:
 
 ```dotenv
-BACKUP_UID=1000
-BACKUP_GID=1000
+BACKUP_UID=0
+BACKUP_GID=0
 SCHEDULED_BACKUP_ENABLED=true
 SCHEDULED_BACKUP_DIR=/app/backups/scheduled
 SCHEDULED_BACKUP_STATUS_FILE=/app/backup-status/scheduled-backup.json
@@ -111,19 +137,30 @@ SCHEDULED_BACKUP_PASSPHRASE_FILE=/run/backup-secrets/scheduled-backup-passphrase
 HISTORY_SEGMENTED_BACKUP_MAX_AGE_SECONDS=129600
 ```
 
-Replace `1000` with the values from `id -u` and `id -g`. Set `APP_GID` to the numeric application group used by the base Compose file.
+For the root base, keep `0:0`. For a prepared non-root deployment, replace these
+IDs with the values used to initialize the backup directories and passphrase.
+Blank IDs use each Compose chain's defaults; copying `.env.example` does not
+force a separate UID on the root base. `APP_GID` remains a positive shared-status
+group, default `10001`, even when history and backup run as root. Do not set it
+to `0` to match root history ownership; the status validator rejects that value.
 
-The backup container keeps its host UID and GID and receives `APP_GID` as a supplemental group. The setgid `2750` status directory makes atomic status-file replacements inherit that group. Status files use `0640`. Archives and the passphrase remain private `0600` files.
+The backup container keeps its selected UID and GID and receives `APP_GID` as a supplemental group. The setgid `2750` status directory makes atomic status-file replacements inherit that group. The directory must be owned by the selected backup UID and `APP_GID`; validation is unchanged for root. Status files use `0640`. Archives and the passphrase remain private `0600` files.
 
 The segment directory uses exact mode `0750`; segments and `catalog.json` use exact mode `0640`. Their owner and group match the hot history database.
 
-The non-root application UID owns segment publication. The backup UID reads the files through the `APP_GID` supplemental group and cannot modify them.
+The history database owner owns segment publication. With the root base, history
+and backup share that owner. With the prepared non-root overlay, the separate
+backup UID reads published segments through `APP_GID` and cannot modify them.
+In that overlay, history directories need group traversal, the hot database
+needs group read/write, and its parent needs group write for SQLite sidecars.
 
 Do not run migration, sealing, rotation, or recovery as host root when the hot database belongs to the non-root application UID. The publisher rejects a process whose effective UID does not own the hot database. This prevents a root-owned replacement from making the history service read-only.
 
 ### Repair old segmented-history permissions
 
-A deployment with a `0600` catalog or segments needs one bounded permission repair before a separate backup UID can read them.
+A deployment with a `0600` catalog or segments needs one bounded permission repair
+before adopting a separate backup UID. This is explicit non-root setup, not a
+requirement for root-owned state with the root-compatible base and root backup.
 
 1. Run `docker compose down`.
 2. Verify that the history root, `history.db`, `segments/catalog.json`, and cataloged `segment-*.sqlite3` paths point to the intended directories and regular files.

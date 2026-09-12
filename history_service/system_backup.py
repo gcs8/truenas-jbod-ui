@@ -4,6 +4,7 @@ import gzip
 import hashlib
 import io
 import json
+import logging
 import mmap
 import os
 import re
@@ -74,6 +75,8 @@ from history_service.segmented_restore import (
 )
 from history_service.store import SQLITE_CONNECT_TIMEOUT_SECONDS, HistoryStore
 
+
+logger = logging.getLogger(__name__)
 
 BUNDLE_SCHEMA_VERSION = 1
 SUPPORTED_BUNDLE_SCHEMA_VERSIONS = frozenset({1, 2})
@@ -2471,10 +2474,12 @@ class SystemBackupService:
             self._validate_manifest_member_metadata(manifest, extracted)
             self._preflight_selected_group_members(manifest, group_entries, extracted)
             self._preflight_import_members(manifest, group_entries, extracted)
+            self._require_restore_free_space(manifest, group_entries, extracted)
             result = {
                 "ok": True,
                 "schema_version": manifest.get("schema_version"),
                 "app_version": manifest.get("app_version"),
+                "app_version_note": self._app_version_note(manifest),
                 "exported_at": manifest.get("exported_at"),
                 "encrypted": bool(archive_meta.get("encrypted")),
                 "packaging": manifest.get("packaging") or detected_packaging,
@@ -2527,6 +2532,7 @@ class SystemBackupService:
             self._validate_manifest_member_metadata(manifest, extracted)
             self._preflight_selected_group_members(manifest, group_entries, extracted)
             self._preflight_import_members(manifest, group_entries, extracted)
+            self._require_restore_free_space(manifest, group_entries, extracted)
             self._build_restore_destination_graph(manifest, group_entries, extracted)
             self._prepare_segmented_history_import(manifest, extracted)
             if identity_callback is not None:
@@ -2902,6 +2908,10 @@ class SystemBackupService:
             self._validate_manifest_member_metadata(manifest, extracted)
             self._preflight_selected_group_members(manifest, group_entries, extracted)
             self._preflight_import_members(manifest, group_entries, extracted)
+            self._require_restore_free_space(manifest, group_entries, extracted)
+            version_note = self._app_version_note(manifest)
+            if version_note is not None:
+                logger.warning("%s", version_note)
             restore_destinations = self._build_restore_destination_graph(
                 manifest,
                 group_entries,
@@ -3701,6 +3711,72 @@ class SystemBackupService:
             raise ValueError("Slot detail payload must contain a slot_details object.")
         for entry in entries.values():
             SlotDetailCacheEntry.model_validate(entry)
+
+    def _require_restore_free_space(
+        self,
+        manifest: dict[str, Any],
+        group_entries: dict[str, dict[str, Any]],
+        extracted_members: dict[str, ExtractedMember],
+    ) -> None:
+        history_group = group_entries.get(HISTORY_DB_KEY)
+        if not self._manifest_group_selected(history_group) or not self._manifest_group_present(
+            history_group
+        ):
+            return
+        history_group_keys = {HISTORY_DB_KEY, HISTORY_SEGMENT_GROUP_KEY}
+        member_bytes = 0
+        for entry in manifest.get("files", []):
+            if not isinstance(entry, dict) or entry.get("group_key") not in history_group_keys:
+                continue
+            content = extracted_members.get(str(entry.get("key")))
+            if content is not None:
+                member_bytes += self._extracted_member_size(content)
+        live_bytes = 0
+        if manifest.get("schema_version") != SEGMENTED_BACKUP_SCHEMA_VERSION:
+            try:
+                live_bytes = self.store.file_path.stat().st_size
+            except OSError:
+                live_bytes = 0
+        # A restore holds two staged copies at once: the import transaction stages every
+        # history member under the temp folder, and activation stages the hot database and
+        # segment tree beside the live files. Folders that share a filesystem therefore have
+        # to satisfy both requirements together.
+        requirements = (
+            (Path(tempfile.gettempdir()), member_bytes + live_bytes),
+            (self.store.file_path.parent, member_bytes),
+        )
+        checks: list[tuple[Path, int]] = []
+        checks_by_device: dict[int, int] = {}
+        for folder, needed_bytes in requirements:
+            try:
+                device_id: int | None = os.stat(folder).st_dev
+            except OSError:
+                device_id = None
+            position = checks_by_device.get(device_id) if device_id is not None else None
+            if position is not None:
+                shared_folder, shared_bytes = checks[position]
+                checks[position] = (shared_folder, shared_bytes + needed_bytes)
+                continue
+            if device_id is not None:
+                checks_by_device[device_id] = len(checks)
+            checks.append((folder, needed_bytes))
+        for folder, needed_bytes in checks:
+            try:
+                free_bytes = shutil.disk_usage(folder).free
+            except OSError:
+                continue
+            if free_bytes < needed_bytes:
+                raise ValueError(
+                    f"Restore needs about {self._format_size(needed_bytes)} free in {folder}; "
+                    f"{self._format_size(free_bytes)} is available."
+                )
+
+    @staticmethod
+    def _format_size(size_bytes: int) -> str:
+        for unit, scale in (("GiB", 1024 ** 3), ("MiB", 1024 ** 2), ("KiB", 1024)):
+            if size_bytes >= scale:
+                return f"{size_bytes / scale:.1f} {unit}"
+        return f"{size_bytes} bytes"
 
     @staticmethod
     def _validate_history_member(content: ExtractedMember) -> None:
@@ -5215,10 +5291,65 @@ class SystemBackupService:
             raise ValueError("Backup bundle manifest is not valid JSON.")
         return manifest
 
+    @classmethod
+    def _validate_restore_schema_support(cls, manifest: dict[str, Any]) -> None:
+        schema_version = manifest.get("schema_version")
+        if (
+            type(schema_version) is not int
+            or schema_version not in SUPPORTED_BUNDLE_SCHEMA_VERSIONS
+        ):
+            raise ValueError(cls._unsupported_schema_message(schema_version))
+        cls._require_app_version_not_newer(manifest)
+
     @staticmethod
-    def _validate_restore_schema_support(manifest: dict[str, Any]) -> None:
-        if manifest.get("schema_version") not in SUPPORTED_BUNDLE_SCHEMA_VERSIONS:
-            raise ValueError("Backup bundle schema is not supported for restore.")
+    def _unsupported_schema_message(schema_version: Any) -> str:
+        if (
+            type(schema_version) is int
+            and schema_version > max(SUPPORTED_BUNDLE_SCHEMA_VERSIONS)
+        ):
+            return (
+                "This backup was made by a newer version of the app "
+                f"(schema version {schema_version}). Upgrade first, then restore."
+            )
+        return (
+            "This backup file is not in a format this app can restore "
+            f"(schema version {schema_version!r})."
+        )
+
+    @staticmethod
+    def _parse_app_version(value: Any) -> tuple[int, int, int] | None:
+        if not isinstance(value, str):
+            return None
+        match = re.match(r"\s*v?(\d+)\.(\d+)\.(\d+)", value)
+        if match is None:
+            return None
+        major, minor, patch = (int(part) for part in match.groups())
+        return major, minor, patch
+
+    @classmethod
+    def _require_app_version_not_newer(cls, manifest: dict[str, Any]) -> None:
+        bundle_version = cls._parse_app_version(manifest.get("app_version"))
+        current_version = cls._parse_app_version(__version__)
+        if bundle_version is None or current_version is None:
+            return
+        if bundle_version > current_version:
+            made_by = ".".join(str(part) for part in bundle_version)
+            raise ValueError(
+                f"This backup was made by v{made_by}; this deployment is v{__version__}. "
+                "Upgrade before restoring."
+            )
+
+    @classmethod
+    def _app_version_note(cls, manifest: dict[str, Any]) -> str | None:
+        bundle_version = cls._parse_app_version(manifest.get("app_version"))
+        current_version = cls._parse_app_version(__version__)
+        if bundle_version is None or current_version is None or bundle_version >= current_version:
+            return None
+        made_by = ".".join(str(part) for part in bundle_version)
+        return (
+            f"This backup was made by v{made_by}; settings and history will be "
+            "brought up to date during restore."
+        )
 
     @classmethod
     def _is_declared_history_manifest_member(
@@ -5265,7 +5396,7 @@ class SystemBackupService:
             type(schema_version) is not int
             or schema_version not in SUPPORTED_BUNDLE_SCHEMA_VERSIONS
         ):
-            raise ValueError(f"Unsupported backup schema version {schema_version!r}.")
+            raise ValueError(cls._unsupported_schema_message(schema_version))
         if manifest.get("format") != BUNDLE_FORMAT:
             raise ValueError("Backup bundle format is not recognized.")
         if schema_version == SEGMENTED_BACKUP_SCHEMA_VERSION:

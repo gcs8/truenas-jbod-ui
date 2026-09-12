@@ -454,6 +454,38 @@ Additional notes by area:
   - Validate archive member paths and restore targets defensively.
   - Do not imply public-facing/cloud exposure is supported.
 
+## Things that must move together
+
+Some strings, files and declarations in this repository are load-bearing: a
+test, a workflow, a generated artifact or a second copy depends on them
+byte-for-byte. Changing one without the others fails CI, or worse, passes CI
+while making a claim the code no longer keeps. Before you edit any of the items
+below, find every dependant listed next to it and change them in the same
+commit.
+
+When you add a new dependency of this kind, add it here, and if the dependency
+lives in code, add a short comment at the site naming this section so future
+editors can discover it there too. Existing sites are not all backfilled with
+that comment yet; the table below is the authoritative list either way.
+
+| If you change | Also change | Why |
+| --- | --- | --- |
+| Any file listed in `PUBLIC_DEMO_INPUT_PATHS` (`scripts/public_demo_inputs.py`): `app/main.py`, `app/config.py`, `app/static/app.js`, `app/static/style.css`, `app/templates/*.html`, the services and images it names | Rebuild `public-demo/index.html` with `scripts/build_public_demo.py --source-revision <the commit that changed the input>` in a following commit, then recapture the two screenshots on Linux and record the review (see below) | `tests.test_public_demo_fixture` and `tests.test_public_demo_provenance` fingerprint every declared input; `scripts/check_public_demo_artifact.py` refuses a stale artifact |
+| A Python module that a declared demo input imports (for example a new helper imported by `app/config.py`) | Add it to `PUBLIC_DEMO_INPUT_PATHS`, to the `paths:` list in `.github/workflows/publish-public-demo.yml`, and to the mirrored list in `tests/test_public_demo_deterministic.py` | `test_shared_input_graph_covers_recursive_local_python_imports` and `test_publish_workflow_watches_every_declared_input` compare the three lists |
+| `public-demo/index.html` | `docs/images/screenshots/manifest.json`, the two PNGs under `docs/images/screenshots/` and their byte-identical copies under `wiki/images/`, and the review record `docs/PUBLIC_SCREENSHOT_REVIEW.md` (revision, artifact hash, per-image hash, `PASS`) | `tests.test_public_screenshots` and `scripts/check_public_screenshots.py` bind the manifest to the exact artifact bytes; a Windows capture produces different bytes, so capture on Linux |
+| Any user-visible string the snapshot page shows | `qa/public-demo.spec.js` (Playwright assertions on the demo page) and the `tests/js` assertions that pin it | The CI job named `Checked-in public demo artifact` runs those specs, and only the first mismatch is reported per run |
+| `downsampling_label` and other values that look like copy but are compared in code (`"None"` is a sentinel read by two consumers in `app/static/app.js`) | Every consumer, or leave the value alone and change only the neighbouring note | A plain-language rename turns a sentinel into a false positive |
+| A warning or note that states where data came from (live data, cached topology, fallback geometry) | Only reword in a way that keeps the same claim; if the source is uncertain, say less, not more | Bay geometry is safety-relevant: an operator who believes a drawing came from live data may pull the wrong drive |
+| A new `tests/test_*.py` module | `WINDOWS_PORTABLE_TEST_MODULES` or `WINDOWS_EXCLUSIONS` in `scripts/dev_check.py` | `tests.test_dev_check` fails on an unclassified module, on every platform |
+| Serial numbers, WWNs, hostnames or addresses in any tracked text, including tests and fixtures | Use the synthetic forms the privacy scan accepts (`SANITIZED-` serials, `host.example.test`-style hosts, `192.0.2.x` addresses) or add a reviewed exception in `tests/public_text_privacy_exceptions.json` with a reason | `tests.test_public_doc_privacy` pins every finding by file, category and value hash |
+| A wiki page added or removed | The page count in `scripts/check_public_docs.py`, its row in `docs/DOCUMENTATION_INVENTORY.md`, the page set in `tests/test_public_docs_contract.py`, and `wiki/_Sidebar.md` | `check_public_docs.py` and the docs contract test count and enumerate pages |
+| `.env.example` comment wording that a test quotes (for example the `latest remains the compatibility default` sentence) | The quoting test in `tests/test_ghcr_release_contract.py`, or keep the sentence | The test pins the sentence |
+| A behaviour or policy that a workflow, a contract test, `CONTRIBUTING.md`, `CHANGELOG.md` and the PR body all describe (CI triggers, defaults, auto-stop) | All of them, in the same change; a revert that leaves one surface asserting the old behaviour is not a revert | `tests/test_ci_contract.py` and `tests/test_container_contract.py` assert the documented policy against the live files |
+
+When a change of this kind is deliberate, say so in the PR body under Risks and
+name the surfaces you updated, so the reviewer can check the set rather than
+rediscover it.
+
 ## Public Demo And Fixture Policy
 
 The checked-in public demo is reproducible from synthetic public repository
