@@ -190,7 +190,10 @@ jobs:
             done
             cp "$CANDIDATE_DIR/run-2/public-demo-overview.png" "$CANDIDATE_DIR/"
             cp "$CANDIDATE_DIR/run-2/public-demo-history.png" "$CANDIDATE_DIR/"
-            sha256sum "$CANDIDATE_DIR"/*.png
+            (
+              cd "$CANDIDATE_DIR"
+              sha256sum ./*.png | tee sha256sums.txt
+            )
             status="$(git status --short)"
             if [ -n "$status" ]; then
               printf 'the capture left the checkout dirty:\n%s\n' "$status" >&2

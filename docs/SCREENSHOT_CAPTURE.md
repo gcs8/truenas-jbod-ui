@@ -158,7 +158,8 @@ producing images to commit, is the workflow run with `qualification_only` set to
    `qualification_only` was `false`, `public-demo-screenshot-qualification` when
    it was `true`. It holds the two PNGs, `run-1/` and `run-2/` for the
    comparison, `platform-fonts.json`, `capture.log`, and, on a candidate run,
-   `proposed-manifest.json`. Retention is 14 days.
+   `proposed-manifest.json`. It also holds `sha256sums.txt` for checking the two
+   top-level PNGs after download. Retention is 14 days.
 
 The job builds no artifact, commits nothing, pushes nothing, and opens no pull
 request. It runs with `permissions: contents: read`.

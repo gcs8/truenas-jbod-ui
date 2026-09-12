@@ -14,6 +14,7 @@ CI_WORKFLOW = WORKFLOW_DIR / "ci.yml"
 PUBLISH_GHCR_WORKFLOW = WORKFLOW_DIR / "publish-ghcr.yml"
 PUBLISH_PUBLIC_DEMO_WORKFLOW = WORKFLOW_DIR / "publish-public-demo.yml"
 CAPTURE_SCREENSHOTS_WORKFLOW = WORKFLOW_DIR / "capture-public-demo-screenshots.yml"
+RELEASE_CHECKLIST = ROOT / "docs" / "RELEASE_CHECKLIST.md"
 PUBLIC_DEMO_SPEC = ROOT / "qa" / "public-demo.spec.js"
 ADMIN_CLEANROOM_CONFIG = ROOT / "qa" / "fixtures" / "admin-cleanroom-config.yaml"
 ADMIN_CLEANROOM_SPEC = ROOT / "qa" / "admin-operations.spec.js"
@@ -294,6 +295,10 @@ class CIWorkflowContractTests(unittest.TestCase):
         self.assertIn("the capture is not byte-reproducible in this environment", commands)
         self.assertIn("npm ci --ignore-scripts", commands)
         self.assertIn("scripts/check_public_screenshots.py --report", commands)
+        self.assertIn(
+            'sha256sum ./*.png | tee sha256sums.txt',
+            commands,
+        )
         self.assertIn("fc-match", commands)
         self.assertIn("git status --short", commands)
         for forbidden in ("git push", "git commit", "gh pr ", "gh release", "peter-evans"):
@@ -309,6 +314,29 @@ class CIWorkflowContractTests(unittest.TestCase):
         self.assertEqual(upload["with"]["if-no-files-found"], "error")
         self.assertEqual(
             upload["with"]["path"], "${{ runner.temp }}/public-demo-screenshot-candidate"
+        )
+
+    def test_release_checklist_uses_and_reviews_the_dispatch_capture_artifact(self) -> None:
+        checklist = self.read(RELEASE_CHECKLIST)
+        screenshot_section = checklist.split("## Screenshots", 1)[1].split("\n## ", 1)[0]
+
+        for required in (
+            "capture-public-demo-screenshots.yml",
+            "full commit SHA",
+            "qualification_only=false",
+            "public-demo-screenshot-candidate",
+            "gh run download",
+            "sha256sum --check sha256sums.txt",
+            "proposed-manifest.json",
+            "platform-fonts.json",
+            "capture.log",
+            "SCREENSHOT_CAPTURE.md",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, screenshot_section)
+        self.assertNotIn(
+            "node scripts/capture_public_demo_screenshots.js",
+            screenshot_section,
         )
 
     def test_screenshot_capture_qualification_run_cannot_pass_as_a_candidate(self) -> None:
