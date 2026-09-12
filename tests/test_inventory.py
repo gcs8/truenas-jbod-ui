@@ -779,7 +779,7 @@ class InventoryHelpersTests(unittest.TestCase):
 
         with (
             patch.object(app_main, "get_settings", return_value=settings),
-            patch.object(app_main, "get_admin_settings", return_value=AdminSettings()),
+            patch.object(app_main, "load_read_ui_auth_settings", return_value=AdminSettings()),
             patch.object(app_main, "configure_logging"),
             self.assertLogs("app.main", level="WARNING") as captured,
         ):

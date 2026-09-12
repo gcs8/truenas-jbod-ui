@@ -94,6 +94,14 @@ class CIWorkflowContractTests(unittest.TestCase):
         self.assertIn('"dependency_status": "unknown"', workflow_text)
         self.assertIn('"cache_state": "empty"', workflow_text)
         self.assertIn(
+            'cp docker-compose.nonroot.yml "$compose_contract_root/nonroot.yaml"',
+            workflow_text,
+        )
+        self.assertGreaterEqual(
+            workflow_text.count('-f "$compose_contract_root/nonroot.yaml"'), 2
+        )
+        self.assertIn("hardened_compose_service_contracts=ok", workflow_text)
+        self.assertIn(
             "probe_compose_service enclosure-admin 0 10001 0000000000000009 "
             "/app/host-prep /app/data",
             workflow_text,

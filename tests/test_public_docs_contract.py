@@ -135,25 +135,26 @@ class PublicDocsContractTests(unittest.TestCase):
         self.assertIn("configuration keys", result.stdout)
         self.assertIn("prose patterns", result.stdout)
 
-    def test_inventory_covers_every_current_document_once(self) -> None:
-        inventory_path = ROOT / "docs/DOCUMENTATION_INVENTORY.md"
-        inventory = inventory_path.read_text(encoding="utf-8")
-        expected = {"README.md", *EXPECTED_WIKI_PAGES}
+    def test_documentation_inventory_is_archived_and_publishing_guide_names_the_gate(self) -> None:
+        self.assertFalse((ROOT / "docs/DOCUMENTATION_INVENTORY.md").exists())
+        self.assertTrue((ROOT / "docs/archive/DOCUMENTATION_INVENTORY.md").is_file())
 
-        rows = []
-        for line in inventory.splitlines():
-            if not line.startswith("| `"):
-                continue
-            path = line.split("`", 2)[1]
-            if path in expected:
-                rows.append(path)
-        self.assertEqual(set(rows), expected)
-        self.assertEqual(len(rows), len(expected))
-        self.assertIn("`docs/PUBLISHING_THE_WIKI.md`", inventory)
-        self.assertIn("c3c819f87211ace3ee5ec82e3be058df7b9b8191", inventory)
-        for phrase in ("issue #328", "issue #329", "issue #330", "issue #331", "Fable", "Codex"):
-            with self.subTest(phrase=phrase):
-                self.assertIn(phrase, inventory)
+        publishing = (ROOT / "docs/PUBLISHING_THE_WIKI.md").read_text(encoding="utf-8")
+        self.assertIn("scripts/check_public_docs.py", publishing)
+
+    def test_every_live_reference_document_is_linked_from_the_wiki_or_contributing(self) -> None:
+        linkable = (
+            (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
+            + "".join((ROOT / page).read_text(encoding="utf-8") for page in sorted(EXPECTED_WIKI_PAGES))
+            + (ROOT / "README.md").read_text(encoding="utf-8")
+        )
+        current_release_files = {"RELEASE_NOTES_0.23.0.md", "RELEASE_WRAP_0.23.0.md"}
+        unlinked = [
+            path.name
+            for path in sorted((ROOT / "docs").glob("*.md"))
+            if path.name not in current_release_files and f"docs/{path.name}" not in linkable
+        ]
+        self.assertEqual(unlinked, [])
 
     def test_quick_start_is_ca_optional_and_advanced_docs_cover_verification(self) -> None:
         quick_start = (ROOT / "wiki/Quick-Start.md").read_text(encoding="utf-8")

@@ -223,6 +223,18 @@ def validate_release_wrap_text(
     return issues
 
 
+def release_wrap_path(repository: Path, version: str) -> Path:
+    """Return the release wrap for ``version``: current under docs/, older under docs/archive/."""
+
+    current = repository / "docs" / f"RELEASE_WRAP_{version}.md"
+    if current.exists():
+        return current
+    archived = repository / "docs" / "archive" / f"RELEASE_WRAP_{version}.md"
+    if archived.exists():
+        return archived
+    return current
+
+
 def validate_release_wrap_path(
     path: Path,
     *,
@@ -292,7 +304,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ValueError as exc:
         print(f"- {exc}")
         return 1
-    path = args.repository / "docs" / f"RELEASE_WRAP_{version}.md"
+    path = release_wrap_path(args.repository, version)
     wiki_verification = None
     rows = {}
     if path.exists():
