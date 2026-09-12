@@ -289,6 +289,15 @@ class CIWorkflowContractTests(unittest.TestCase):
         self.assertEqual(job["env"]["PLAYWRIGHT_VERSION"], locked_playwright)
         self.assertIn('printf \'container image: %s\\n\' "$CONTAINER_IMAGE"', commands)
         self.assertIn('printf \'container tag: %s\\n\' "$CONTAINER_TAG"', commands)
+        ref_check = next(
+            step
+            for step in job["steps"]
+            if step.get("name") == "Require the requested ref to be the checked-out commit SHA"
+        )
+        self.assertEqual(ref_check["env"]["REQUESTED_REF"], "${{ inputs.ref }}")
+        self.assertIn('[[ ! "$REQUESTED_REF" =~ ^[0-9a-f]{40}$ ]]', ref_check["run"])
+        self.assertIn('resolved_ref="$(git rev-parse HEAD)"', ref_check["run"])
+        self.assertIn('[ "$resolved_ref" != "$REQUESTED_REF" ]', ref_check["run"])
 
         self.assertEqual(commands.count("node scripts/capture_public_demo_screenshots.js"), 2)
         self.assertIn('cmp -s "$CANDIDATE_DIR/run-1/$name" "$CANDIDATE_DIR/run-2/$name"', commands)

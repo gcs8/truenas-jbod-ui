@@ -64,6 +64,21 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Require the requested ref to be the checked-out commit SHA
+        env:
+          REQUESTED_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$REQUESTED_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "ref must be a full 40-character lowercase commit SHA" >&2
+            exit 1
+          fi
+          resolved_ref="$(git rev-parse HEAD)"
+          if [ "$resolved_ref" != "$REQUESTED_REF" ]; then
+            printf 'requested commit %s resolved to %s\n' "$REQUESTED_REF" "$resolved_ref" >&2
+            exit 1
+          fi
+
       - name: Prepare the candidate directory and the run log
         run: |
           set -euo pipefail
