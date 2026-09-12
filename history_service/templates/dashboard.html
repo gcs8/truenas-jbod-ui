@@ -24,6 +24,8 @@
       </div>
       <div id="collector-activity-banner" class="collector-banner" role="status" aria-live="polite"{% if not collector_banner_text %} hidden{% endif %}>{{ collector_banner_text }}</div>
 
+      <p id="history-collector-freshness" class="note-text" role="status" aria-live="polite">Collector status snapshot at page load; live checks require JavaScript.</p>
+      <p id="history-overview-freshness" class="note-text" role="status" aria-live="polite">Overview snapshot at page load; live checks require JavaScript.</p>
       <section class="grid">
         <div class="card">
           <div class="label">Collector</div>
