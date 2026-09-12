@@ -33,6 +33,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Retried failed release checks with bounded backoff instead of waiting a
   full normal interval, preserving the last successful result (#469).
 
+### Performance
+
+- Reduced mapping revision work to one document read per batch while
+  preserving conflict checks and calibration tokens. (#421)
+
 ## v0.23.0 - 2026-09-08
 
 This release includes every pull request merged after `v0.22.2` through the
