@@ -12156,6 +12156,71 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
                             self.assertIsNone(cached)
                             self.assertIsNone(slot.model)
 
+    def test_snapshot_backfill_survives_a_serial_drop_while_a_strong_id_agrees(self) -> None:
+        # #520: the slot-detail cache exists to backfill stable fields when a
+        # live snapshot omits them. A serial that drops for one refresh must not
+        # delete the cached serial, model and size while a strong identifier
+        # still proves the same disk is in the bay.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = build_inventory_service(
+                Settings(),
+                SystemConfig(id="default", truenas=TrueNASConfig(platform="core")),
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            store = service.slot_detail_store
+
+            def slot_view(**fields) -> SlotView:
+                return SlotView(
+                    slot=5, slot_label="05", row_index=0, column_index=5,
+                    enclosure_id="enc-1", present=True, state=SlotState.healthy,
+                    device_name="da5", **fields,
+                )
+
+            full = slot_view(
+                serial="SER-VERIFY-005",
+                sas_address="5000c500a1b2c3d5",
+                model="ST12000NM0008",
+                size_human="12 TB",
+            )
+            asyncio.run(service._apply_and_persist_snapshot_slot_details([full]))
+            self.assertEqual(
+                store.get_entry("default", "enc-1", 5).slot_fields.get("serial"),
+                "SER-VERIFY-005",
+            )
+
+            # The #355 shape: the API disk record is incomplete for one refresh
+            # while SES still reports the bay's sas_address.
+            degraded = slot_view(sas_address="5000c500a1b2c3d5")
+            asyncio.run(service._apply_and_persist_snapshot_slot_details([degraded]))
+            self.assertEqual(degraded.serial, "SER-VERIFY-005")
+            self.assertEqual(degraded.model, "ST12000NM0008")
+            self.assertEqual(degraded.size_human, "12 TB")
+            entry = store.get_entry("default", "enc-1", 5)
+            self.assertEqual(entry.slot_fields.get("serial"), "SER-VERIFY-005")
+            self.assertEqual(entry.slot_fields.get("model"), "ST12000NM0008")
+            self.assertEqual(entry.slot_fields.get("size_human"), "12 TB")
+
+            # The published view carries the restored serial, so the identity the
+            # snapshot recorded must be the one every later SMART request keys
+            # off; otherwise the backfilled slot reads as identity-changed.
+            cache_key = service._smart_cache_key(degraded)
+            self.assertEqual(cache_key[-1], ("serial", "ser-verify-005"))
+            self.assertTrue(
+                service._smart_request_is_current(
+                    cache_key, service._smart_cache_generation_token(cache_key)
+                )
+            )
+
+            # #504's protection stands: a disagreeing serial rejects the entry
+            # even though the device alias and the bay are unchanged.
+            replaced = slot_view(serial="SER-REPLACEMENT", sas_address="5000c500a1b2c3d5")
+            self.assertFalse(service._slot_detail_entry_matches(replaced, entry))
+            asyncio.run(service._apply_and_persist_snapshot_slot_details([replaced]))
+            self.assertIsNone(replaced.model)
+            self.assertNotIn("model", store.get_entry("default", "enc-1", 5).slot_fields)
+
     def _assert_apply_loads_once(self, slot_count: int) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()
