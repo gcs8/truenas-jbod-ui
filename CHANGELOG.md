@@ -68,6 +68,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   from zero, and added semantic label/value associations (#470).
 - Bounded history dashboard polling, rejected stale responses, and marked
   retained values stale after failed checks. (#420)
+- Replaced the encrypted-backup PTY `select()` wait with `poll()` so valid high
+  file descriptors no longer fail before the passphrase prompt (#517).
 
 ### Performance
 
