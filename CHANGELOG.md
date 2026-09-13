@@ -135,6 +135,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Chromium reported rather than `fc-match`, and the default dispatch is a
   `qualification_only` run that writes no proposed manifest (#512).
 
+- Normalized pointer hover and focus before public-demo screenshot capture so
+  the exact-byte repeatability gate measures a settled page instead of a
+  transient transformed control (#519).
+
 ## v0.23.0 - 2026-09-08
 
 This release includes every pull request merged after `v0.22.2` through the
