@@ -122,6 +122,569 @@ class SyntheticAPI:
                 "model_name": "Synthetic disk"})
 
 
+class CoreGridPeer:
+    """Invented DDP server with independent sockets and aggregate counters."""
+
+    def __init__(self, raw, text=False):
+        self.raw, self.text = raw, text
+        self.connections = self.logins = self.closes = 0
+        self.active = self.peak = 0
+        self.methods = Counter()
+        self.fail_phase: str | None = None
+        self.gate: asyncio.Event | None = None
+        self.sent = []
+        self.replied = []
+        self.started = asyncio.Event()
+        self.gate_phase: str | None = None
+        self.hours = 321
+        self.json_extra = {}
+
+    def connect(self, url, **kwargs):
+        from contextlib import asynccontextmanager
+        peer = self
+
+        @asynccontextmanager
+        async def connection():
+            peer.connections += 1
+            queue = asyncio.Queue()
+            pending = []
+
+            class Socket:
+                async def send(self, raw):
+                    msg = json.loads(raw)
+                    if msg['msg'] == 'connect':
+                        queue.put_nowait({'msg': 'connected'})
+                        return
+                    if msg['msg'] == 'pong':
+                        return
+                    method = msg['method']
+                    reply = {'msg': 'result', 'id': msg['id']}
+                    if method == 'auth.login_with_api_key':
+                        peer.logins += 1
+                        reply['result'] = True
+                    elif method == 'disk.smartctl':
+                        device, args = msg['params']
+                        phase = 'json' if '-j' in args else 'text'
+                        peer.methods[phase] += 1
+                        peer.sent.append((device, phase))
+                        peer.active += 1
+                        peer.peak = max(peer.peak, peer.active)
+                        hours = peer.hours
+                        if peer.gate_phase is None or peer.gate_phase == phase:
+                            peer.started.set()
+                        async def respond():
+                            if peer.gate is not None and (peer.gate_phase is None or peer.gate_phase == phase):
+                                await peer.gate.wait()
+                            await asyncio.sleep(0)
+                            index = int(device.removeprefix('/dev/').removeprefix('da'))
+                            for _ in range(index % 3):
+                                await asyncio.sleep(0)
+                            if peer.fail_phase == 'invalid':
+                                reply['result'] = {'invalid': 'SMART payload'}
+                            elif peer.fail_phase == phase:
+                                reply['error'] = {'reason': 'synthetic unavailable'}
+                            elif phase == 'json':
+                                reply['result'] = json.dumps({'smart_status': {'passed': True},
+                                    'power_on_time': {'hours': hours + index},
+                                    'temperature': {'current': 31},
+                                    'device': {'protocol': 'ATA' if peer.text else 'NVMe'}, **peer.json_extra})
+                            else:
+                                reply['result'] = 'Read look-ahead is: Enabled\nWrite cache is: Enabled\n'
+                            peer.active -= 1
+                            peer.replied.append((device, phase))
+                            queue.put_nowait(reply)
+                        pending.append(asyncio.create_task(respond()))
+                        return
+                    else:
+                        reply['result'] = {'enclosure.query': peer.raw.enclosures,
+                            'disk.query': peer.raw.disks, 'pool.query': [],
+                            'disk.temperatures': {}, 'smart.test.results': []}[method]
+                    queue.put_nowait(reply)
+
+                async def recv(self):
+                    return json.dumps(await queue.get())
+
+            try:
+                yield Socket()
+            finally:
+                for task in pending:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                peer.closes += 1
+        return connection()
+
+
+class CoreGridWebsocketIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        SmartGridIOTests.setUp(self)
+
+    def fixture(self, count):
+        return SmartGridIOTests.fixture(self, count)
+
+    @contextmanager
+    def wire(self, service, peer):
+        from app.services.truenas_ws import TrueNASWebsocketClient
+        service.system.truenas.api_key = 'synthetic-test-token'
+        service.truenas_client = TrueNASWebsocketClient(service.system.truenas)
+        with patch('app.services.truenas_ws.connect', peer.connect):
+            yield
+
+    async def test_cold_core_grid_counts_real_sessions(self):
+        for count in (60, 84):
+            for text in (False, True):
+                with self.subTest(count=count, text=text), self.fixture(count) as (s, api, store, other):
+                    peer = CoreGridPeer(await api.fetch_all(), text)
+                    with self.wire(s, peer):
+                        snapshot = await s.get_snapshot()
+                        snapshot_sessions = peer.connections
+                        trace = StoreTrace(store)
+                        slots = [v.slot for v in reversed(snapshot.slots)]
+                        with trace.capture():
+                            result = await s.get_slot_smart_summaries(slots)
+                        counts = {'slots': count, 'text': text, 'snapshot_sessions': snapshot_sessions,
+                                  'grid_sessions': peer.connections - snapshot_sessions,
+                                  'combined_sessions': peer.connections, 'logins': peer.logins,
+                                  'closes': peer.closes, 'methods': dict(peer.methods), 'peak': peer.peak}
+                        print(json.dumps(counts, sort_keys=True))
+                        self.assertEqual([r.slot for r in result], slots)
+                        self.assertEqual([r.summary.power_on_hours for r in result], [321 + slot for slot in slots])
+                        self.assertEqual(peer.connections - snapshot_sessions, 2 if text else 1)
+                        self.assertNotEqual(peer.sent, peer.replied)
+                        self.assertEqual(peer.logins, peer.connections)
+                        self.assertEqual(peer.closes, peer.connections)
+                        self.assertEqual(peer.methods, Counter(json=count, **({'text': count} if text else {})))
+                        self.assertLessEqual(trace.operations['read'], 2)
+                        self.assertEqual(trace.operations['write'], 1)
+                        self.assertEqual(trace.threads['loop'], 0)
+
+    async def test_grid_request_and_service_budgets(self):
+        for budget in (1, 2, 12):
+            with self.subTest(budget=budget), self.fixture(84) as (s, api, store, other):
+                s._smart_operation_limit = budget
+                s._smart_operation_semaphore = asyncio.Semaphore(budget)
+                peer = CoreGridPeer(await api.fetch_all())
+                with self.wire(s, peer):
+                    await s.get_snapshot()
+                    await asyncio.wait_for(s.get_slot_smart_summaries(list(range(84)), max_concurrency=budget), 15)
+                    self.assertLessEqual(peer.peak, budget)
+                    self.assertEqual(peer.connections, 2)
+        for budget, cap in ((2, 1), (12, 2), (12, 12)):
+            with self.subTest(service=budget, request=cap), self.fixture(84) as (s, api, store, other):
+                s._smart_operation_limit = budget
+                s._smart_operation_semaphore = asyncio.Semaphore(budget)
+                peer = CoreGridPeer(await api.fetch_all())
+                peer.gate = asyncio.Event()
+                with self.wire(s, peer):
+                    await s.get_snapshot()
+                    owner = asyncio.create_task(s.get_slot_smart_summaries(list(range(40)), max_concurrency=cap))
+                    try:
+                        await asyncio.wait_for(peer.started.wait(), 3)
+                        for _ in range(100):
+                            if peer.active == cap:
+                                break
+                            await asyncio.sleep(0)
+                        self.assertEqual(peer.active, cap)
+                        overlap = asyncio.create_task(s.get_slot_smart_summaries(list(range(20, 80)), max_concurrency=cap))
+                        drawer = asyncio.create_task(s.get_slot_smart_summary(83))
+                        for _ in range(20):
+                            await asyncio.sleep(0)
+                        self.assertLessEqual(peer.peak, budget)
+                    finally:
+                        peer.gate.set()
+                    await asyncio.wait_for(asyncio.gather(owner, overlap, drawer), 10)
+                    self.assertLessEqual(peer.peak, budget)
+                    self.assertEqual(peer.methods['json'], 81)
+                    self.assertFalse(s._smart_load_tasks)
+
+    async def test_warm_stale_negative_and_partial_grid_admission(self):
+        with self.fixture(4) as (s, api, store, other):
+            peer = CoreGridPeer(await api.fetch_all())
+            with self.wire(s, peer):
+                await s.get_snapshot()
+                await s.get_slot_smart_summaries([0, 1])
+                before = peer.connections
+                trace = StoreTrace(store)
+                with trace.capture():
+                    result = await s.get_slot_smart_summaries([1, 0, 1, -1, 999])
+                self.assertEqual([r.slot for r in result], [1, 0])
+                self.assertEqual(peer.connections, before)
+                self.assertFalse(trace.operations)
+                await s.get_slot_smart_summaries([0, 1, 2, 3])
+                self.assertEqual(peer.connections, before + 1)
+                self.assertEqual(peer.methods['json'], 4)
+
+
+    async def test_phase_failure_preserves_slot_fallbacks(self):
+        for phase in ('json', 'text', 'invalid'):
+            with self.subTest(phase=phase), self.fixture(4) as (s, api, store, other):
+                peer = CoreGridPeer(await api.fetch_all(), text=True)
+                peer.fail_phase = phase
+                with self.wire(s, peer):
+                    await s.get_snapshot()
+                    result = await s.get_slot_smart_summaries([0, 1, 2, 3], max_concurrency=2)
+                    self.assertEqual([r.summary.available for r in result], [phase == 'text'] * 4)
+                    self.assertLessEqual(peer.peak, 2)
+                    self.assertEqual(peer.closes, peer.connections)
+                    print('FAILURE_SESSIONS', phase, peer.connections - 1, dict(peer.methods))
+                    if phase == 'text':
+                        self.assertEqual(peer.connections - 1, 6)
+                        self.assertEqual([r.summary.power_on_hours for r in result], [321, 322, 323, 324])
+                    else:
+                        before = peer.connections
+                        await s.get_slot_smart_summaries([0, 1, 2, 3])
+                        self.assertEqual(peer.connections, before)
+                        await s.get_slot_smart_summaries([0], bypass_negative_cache=True)
+                        self.assertGreater(peer.connections, before)
+                    self.assertFalse(s._smart_load_tasks)
+
+    async def test_cancelled_grid_retains_transport_and_save_owner(self):
+        for fail_save in (False, True):
+            with self.subTest(fail_save=fail_save), self.fixture(4) as (s, api, store, other):
+                peer = CoreGridPeer(await api.fetch_all())
+                peer.gate = asyncio.Event()
+                contexts = []
+                loop = asyncio.get_running_loop()
+                previous = loop.get_exception_handler()
+                loop.set_exception_handler(lambda _loop, context: contexts.append(context))
+                try:
+                    with self.wire(s, peer):
+                        await s.get_snapshot()
+                        real_save = store.save_entries
+                        def save(*args, **kwargs):
+                            if fail_save:
+                                raise OSError('invented save failure')
+                            return real_save(*args, **kwargs)
+                        with patch.object(store, 'save_entries', save):
+                            owner = asyncio.create_task(s.get_slot_smart_summaries([0, 1, 2, 3]))
+                            await asyncio.wait_for(peer.started.wait(), 3)
+                            joiner = asyncio.create_task(s.get_slot_smart_summaries([3, 2, 1, 0]))
+                            drawer = asyncio.create_task(s.get_slot_smart_summary(0))
+                            await asyncio.sleep(0)
+                            owner.cancel()
+                            await asyncio.sleep(0)
+                            owner.cancel()
+                            with self.assertRaises(asyncio.CancelledError):
+                                await owner
+                            peer.gate.set()
+                            results = await asyncio.wait_for(asyncio.gather(joiner, drawer, return_exceptions=True), 5)
+                            if fail_save:
+                                self.assertTrue(all(isinstance(r, OSError) for r in results))
+                            else:
+                                self.assertEqual([r.slot for r in results[0]], [3, 2, 1, 0])
+                            self.assertEqual(peer.connections, 2)
+                            self.assertFalse(s._smart_load_tasks)
+                            for _ in range(5):
+                                await asyncio.sleep(0)
+                            self.assertFalse(contexts)
+                finally:
+                    peer.gate.set()
+                    loop.set_exception_handler(previous)
+
+    async def test_invalidation_fences_batched_transport_results(self):
+        with self.fixture(4) as (s, api, store, other):
+            peer = CoreGridPeer(await api.fetch_all())
+            peer.gate = asyncio.Event()
+            with self.wire(s, peer):
+                await s.get_snapshot()
+                owner = asyncio.create_task(s.get_slot_smart_summaries([0, 1, 2, 3]))
+                try:
+                    await asyncio.wait_for(peer.started.wait(), 3)
+                    s.invalidate_snapshot_cache(reason='invented generation change')
+                finally:
+                    peer.gate.set()
+                await asyncio.wait_for(owner, 5)
+                self.assertFalse(s._smart_cache)
+                self.assertFalse(s._smart_negative_cache)
+                for slot in range(4):
+                    self.assertFalse(store.get_entry(s.system.id, 'synthetic-enclosure', slot).smart_fields)
+                self.assertEqual(store.get_entry(other.system_id, other.enclosure_id, other.slot), other)
+
+    async def test_replacement_identity_while_transport_awaits(self):
+        """A refreshed disk at reused da0 must not inherit the old load."""
+        with self.fixture(2) as (s, api, store, other):
+            peer = CoreGridPeer(await api.fetch_all())
+            peer.gate = asyncio.Event()
+            with self.wire(s, peer):
+                original = await s.get_snapshot()
+                original_slot = next(slot for slot in original.slots if slot.slot == 0)
+                self.assertEqual(original_slot.serial, 'INVENTED-000')
+                owner = asyncio.create_task(s.get_slot_smart_summaries([0]))
+                try:
+                    await asyncio.wait_for(peer.started.wait(), 3)
+                    self.assertEqual(peer.sent, [('da0', 'json')])
+                    # Replace only the peer's inventory identity, not the captured
+                    # SlotView, loader, generation, or transport implementation.
+                    peer.raw.disks[0]['serial'] = 'INVENTED-REPLACEMENT'
+                    replacement = await s.get_snapshot(force_refresh=True)
+                    replacement_slot = next(slot for slot in replacement.slots if slot.slot == 0)
+                    self.assertEqual(replacement_slot.serial, 'INVENTED-REPLACEMENT')
+                    self.assertEqual(replacement_slot.device_name, original_slot.device_name)
+                    replacement_entry = store.get_entry(s.system.id, 'synthetic-enclosure', 0)
+                    self.assertEqual(replacement_entry.slot_fields['serial'], 'INVENTED-REPLACEMENT')
+                    self.assertFalse(replacement_entry.smart_fields)
+                finally:
+                    peer.gate.set()
+                result = await asyncio.wait_for(owner, 5)
+                entry = store.get_entry(s.system.id, 'synthetic-enclosure', 0)
+                cached = s._smart_cache.get(s._smart_cache_key(replacement_slot))
+                print('REPLACEMENT_IDENTITY', json.dumps({
+                    'original_serial': original_slot.serial,
+                    'replacement_serial': replacement_slot.serial,
+                    'returned': result[0].model_dump(mode='json'),
+                    'replacement_entry_preserved': entry == replacement_entry,
+                    'cached_old_hours': cached.power_on_hours if cached else None,
+                    'connections': peer.connections,
+                    'logins': peer.logins, 'closes': peer.closes,
+                }, sort_keys=True))
+                self.assertEqual(entry, replacement_entry, 'Old load overwrote replacement disk persistence')
+                self.assertEqual(store.get_entry(other.system_id, other.enclosure_id, other.slot), other)
+                self.assertEqual(peer.connections, peer.closes)
+                self.assertFalse(s._smart_load_tasks)
+                self.assertIsNone(cached, 'Old disk SMART cached under replacement disk key')
+                self.assertFalse(s._smart_negative_cache)
+                self.assertFalse(result[0].summary.available)
+                self.assertIsNone(result[0].summary.power_on_hours)
+
+    async def test_serial_loss_return_and_replacement_public_matrix(self):
+        for single in (False, True):
+            for mode in ('inflight', 'warm', 'negative'):
+                for returned_serial in ('INVENTED-000', 'INVENTED-REPLACEMENT'):
+                    with self.subTest(single=single, mode=mode, returned_serial=returned_serial), self.fixture(2) as (s, api, store, other):
+                        peer = CoreGridPeer(await api.fetch_all())
+                        with self.wire(s, peer):
+                            await s.get_snapshot()
+                            async def request():
+                                if single:
+                                    return await s.get_slot_smart_summary(0)
+                                return (await s.get_slot_smart_summaries([0]))[0].summary
+                            owner = None
+                            if mode == 'warm':
+                                self.assertEqual((await request()).power_on_hours, 321)
+                            else:
+                                peer.gate = asyncio.Event()
+                                if mode == 'negative':
+                                    peer.fail_phase = 'invalid'
+                                owner = asyncio.create_task(request())
+                                await asyncio.wait_for(peer.started.wait(), 3)
+                            peer.raw.disks[0]['serial'] = None
+                            try:
+                                await s.get_snapshot(force_refresh=True)
+                            finally:
+                                if peer.gate is not None:
+                                    peer.gate.set()
+                            if owner is not None:
+                                stale = await asyncio.wait_for(owner, 5)
+                                self.assertFalse(stale.available)
+                                self.assertIsNone(stale.power_on_hours)
+                            peer.fail_phase = None
+                            peer.hours = 777
+                            calls = peer.methods['json']
+                            # Repeat the forced snapshot before fresh admission:
+                            # historical serial restoration must not block retry.
+                            lost = await s.get_snapshot(force_refresh=True)
+                            fresh = await request()
+                            self.assertTrue(fresh.available, 'Serial loss must admit current-device SMART')
+                            self.assertEqual(fresh.power_on_hours, 777)
+                            self.assertGreater(peer.methods['json'], calls)
+                            self.assertIsNone(lost.slots[0].serial, 'Device alias cannot prove historical serial')
+                            self.assertEqual(s._smart_cache_key(lost.slots[0])[-1], ('device', 'da0'))
+                            entry = store.get_entry(s.system.id, 'synthetic-enclosure', 0)
+                            self.assertNotIn('serial', entry.slot_fields)
+                            self.assertEqual(entry.smart_fields['power_on_hours'], 777)
+                            calls = peer.methods['json']
+                            self.assertEqual((await request()).power_on_hours, 777)
+                            self.assertEqual(peer.methods['json'], calls)
+                            peer.raw.disks[0]['serial'] = returned_serial
+                            peer.hours = 888
+                            await s.get_snapshot(force_refresh=True)
+                            self.assertFalse(s._smart_cache)
+                            self.assertFalse(s._smart_negative_cache)
+                            self.assertEqual((await request()).power_on_hours, 888)
+                            self.assertGreater(peer.methods['json'], calls)
+                            calls = peer.methods['json']
+                            self.assertEqual((await request()).power_on_hours, 888)
+                            self.assertEqual(peer.methods['json'], calls)
+                            entry = store.get_entry(s.system.id, 'synthetic-enclosure', 0)
+                            self.assertEqual(entry.slot_fields['serial'], returned_serial)
+                            self.assertEqual(entry.smart_fields['power_on_hours'], 888)
+                            self.assertEqual(store.get_entry(other.system_id, other.enclosure_id, other.slot), other)
+                            self.assertFalse(s._smart_load_tasks)
+                            self.assertFalse(s._smart_negative_cache)
+                            self.assertEqual(peer.connections, peer.closes)
+                            print('SERIAL_LOSS_PASS', single, mode, returned_serial)
+
+    async def test_identity_replacement_public_paths(self):
+        for single in (False, True):
+            for mode in ('inflight', 'negative', 'text', 'warm', 'background', 'aba'):
+                with self.subTest(single=single, mode=mode), self.fixture(2) as (s, api, store, other):
+                    peer = CoreGridPeer(await api.fetch_all(), text=mode == 'text')
+                    with self.wire(s, peer):
+                        snapshot = await s.get_snapshot()
+                        async def request(stale=False):
+                            if single:
+                                return await s.get_slot_smart_summary(0, allow_stale_cache=stale)
+                            return (await s.get_slot_smart_summaries([0], allow_stale_cache=stale))[0].summary
+                        owner = None
+                        refreshes = []
+                        if mode in ('warm', 'background'):
+                            self.assertEqual((await request()).power_on_hours, 321)
+                        if mode != 'warm':
+                            peer.started.clear()
+                            peer.gate = asyncio.Event()
+                            peer.gate_phase = 'text' if mode == 'text' else None
+                            if mode == 'negative':
+                                peer.fail_phase = 'invalid'
+                            if mode == 'background':
+                                key = s._smart_cache_key(snapshot.slots[0])
+                                s._smart_cache_until[key] = datetime.now(timezone.utc) - timedelta(seconds=1)
+                                self.assertEqual((await request(True)).power_on_hours, 321)
+                                refreshes = list(s._smart_refresh_tasks.values())
+                                owner = None
+                            else:
+                                owner = asyncio.create_task(request())
+                            await asyncio.wait_for(peer.started.wait(), 3)
+                        peer.raw.disks[0]['serial'] = 'INVENTED-REPLACEMENT'
+                        try:
+                            replacement = await s.get_snapshot(force_refresh=True)
+                            if mode == 'aba':
+                                peer.raw.disks[0]['serial'] = 'INVENTED-000'
+                                replacement = await s.get_snapshot(force_refresh=True)
+                        finally:
+                            if peer.gate is not None:
+                                peer.gate.set()
+                        if mode != 'warm':
+                            if owner is not None:
+                                old = await asyncio.wait_for(owner, 5)
+                                self.assertFalse(old.available, 'Old disk result returned after replacement')
+                                self.assertIsNone(old.power_on_hours)
+                            await asyncio.gather(*refreshes)
+                        key = s._smart_cache_key(replacement.slots[0])
+                        self.assertNotIn(key, s._smart_cache)
+                        self.assertNotIn(key, s._smart_negative_cache)
+                        entry = store.get_entry(s.system.id, 'synthetic-enclosure', 0)
+                        assert entry is not None
+                        self.assertFalse(entry.smart_fields, 'Replacement retained old disk SMART')
+                        peer.fail_phase = None
+                        peer.hours = 777
+                        before = peer.methods['json']
+                        fresh = await request()
+                        self.assertTrue(fresh.available)
+                        self.assertEqual(fresh.power_on_hours, 777)
+                        self.assertGreater(peer.methods['json'], before, 'Reused device must admit a new lookup')
+                        before = peer.connections
+                        self.assertEqual((await request()).power_on_hours, fresh.power_on_hours)
+                        self.assertEqual(peer.connections, before, 'Replacement warm lookup must use cache')
+                        self.assertEqual(store.get_entry(other.system_id, other.enclosure_id, other.slot), other)
+                        self.assertEqual(peer.connections, peer.closes)
+
+    async def test_optional_ssh_source_precedence_matrix(self):
+        from app.services.ssh_probe import SSHProbe, SSHCommandResult
+        scenarios = ('disabled', 'nvme', 'complete', 'sparse', 'advisory', 'ssh-failure',
+                     'api-failure', 'both-fail', 'alternate-device', 'alternate-binary')
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario), self.fixture(2) as (s, api, store, other):
+                peer = CoreGridPeer(await api.fetch_all(), text=scenario != 'nvme')
+                if scenario == 'complete':
+                    peer.json_extra = {
+                        'rotation_rate': 7200, 'form_factor': {'name': '2.5 inches'},
+                        'sata_version': {'string': 'SATA 3.3'},
+                        'interface_speed': {'current': {'string': '6 Gb/s'}},
+                        'read_lookahead': {'enabled': True}, 'write_cache': {'enabled': True},
+                        'ata_device_statistics': {'pages': [{'table': [
+                            {'name': name, 'value': 5} for name in ('Logical Sectors Read',
+                            'Logical Sectors Written', 'Number of Read Commands', 'Number of Write Commands')]}]},
+                    }
+                if scenario in ('api-failure', 'both-fail'):
+                    peer.fail_phase = 'json'
+                calls = []
+                async def run_planned(probe, planner, *, initial_commands):
+                    results = []
+                    commands = list(initial_commands)
+                    for _ in range(12):
+                        if not commands:
+                            return results
+                        for command in commands:
+                            calls.append((probe.config.host, command))
+                            failure = scenario in ('ssh-failure', 'both-fail')
+                            failure |= scenario == 'alternate-device' and command.endswith('/dev/da0')
+                            binary_missing = scenario == 'alternate-binary' and command.startswith('sudo -n smartctl ')
+                            payload = json.dumps({'smart_status': {'passed': True},
+                                'device': {'protocol': 'ATA'}, 'power_on_time': {'hours': 888}})
+                            if '-j' not in command:
+                                payload = 'Read look-ahead is: Enabled\nWrite cache is: Enabled\n'
+                            results.append(SSHCommandResult(command=command, ok=not (failure or binary_missing or scenario == 'advisory'),
+                                stdout='' if failure or binary_missing else payload,
+                                stderr='command not found' if binary_missing else ('synthetic disk unavailable' if failure else ''),
+                                exit_code=127 if binary_missing else (4 if failure else (8 if scenario == 'advisory' else 0))))
+                        commands = list(planner(results))
+                    self.fail('Synthetic SSH planner did not terminate')
+                with self.wire(s, peer):
+                    snapshot = await s.get_snapshot()
+                    s.system.ssh.enabled = scenario != 'disabled'
+                    s.ssh_probe = SSHProbe(s.system.ssh)
+                    snapshot.slots[0].smart_device_type = 'sat'
+                    if scenario == 'alternate-device':
+                        snapshot.slots[0].smart_device_names = ['da0', 'da9']
+                    # CORE uses its configured host, never QuantaStor preferred hosts.
+                    with patch.object(SSHProbe, 'run_planned_commands', run_planned):
+                        result = await s.get_slot_smart_summaries([0, 1], max_concurrency=1)
+                    expected_ssh = scenario not in ('disabled', 'nvme', 'complete')
+                    self.assertEqual(bool(calls), expected_ssh)
+                    self.assertEqual([item.slot for item in result], [0, 1])
+                    expected = [None, None] if scenario == 'both-fail' else (
+                        [321, 322] if scenario in ('disabled', 'nvme', 'complete', 'ssh-failure') else [888, 888])
+                    self.assertEqual([item.summary.power_on_hours for item in result], expected)
+                    if calls:
+                        self.assertTrue(all(host == 'ssh.invalid' for host, _command in calls))
+                        self.assertTrue(all('sudo -n ' in command for _host, command in calls))
+                        self.assertTrue(all('-d sat ' in command for _host, command in calls if command.endswith('/dev/da0')))
+                        self.assertTrue(all('-d sat ' not in command for _host, command in calls if command.endswith('/dev/da1')))
+                    if scenario == 'alternate-device':
+                        self.assertTrue(any(command.endswith('/dev/da9') for _host, command in calls))
+                    if scenario == 'alternate-binary':
+                        self.assertTrue(any('/usr/local/sbin/smartctl' in command for _host, command in calls))
+                    self.assertEqual(peer.connections, peer.closes)
+                    self.assertFalse(s._smart_load_tasks)
+                    self.assertEqual(store.get_entry(other.system_id, other.enclosure_id, other.slot), other)
+
+    async def test_freshness_survives_batched_transport(self):
+        with self.fixture(4) as (s, api, store, other):
+            peer = CoreGridPeer(await api.fetch_all())
+            with self.wire(s, peer):
+                snapshot = await s.get_snapshot()
+                SmartGridIOTests.seed_history(self, s, snapshot)
+                first = await s.get_slot_smart_summaries([0, 1, 2, 3])
+                self.assertEqual([r.summary.power_on_hours for r in first], [321, 322, 323, 324])
+                before = store.file_path.read_bytes()
+                for key in s._smart_cache_until:
+                    s._smart_cache_until[key] = datetime.now(timezone.utc) - timedelta(seconds=1)
+                trace = StoreTrace(store)
+                with trace.capture():
+                    await s.get_slot_smart_summaries([0, 1, 2, 3])
+                self.assertNotEqual(store.file_path.read_bytes(), before)
+                self.assertLessEqual(trace.operations['read'], 2)
+                self.assertEqual(trace.operations['write'], 1)
+                self.assertEqual(trace.operations['replace'], 1)
+                self.assertEqual(trace.threads['loop'], 0)
+                self.assertEqual(store.get_entry(other.system_id, other.enclosure_id, other.slot), other)
+
+    async def test_drawer_and_non_core_paths_unchanged(self):
+        with self.fixture(4) as (s, api, store, other):
+            peer = CoreGridPeer(await api.fetch_all(), text=True)
+            with self.wire(s, peer):
+                await s.get_snapshot()
+                await s.get_slot_smart_summary(0)
+                self.assertEqual(peer.connections, 3)
+                for platform in ('scale', 'linux', 'quantastor'):
+                    s.system.truenas.platform = platform
+                    s._smart_cache.clear()
+                    s._smart_negative_cache.clear()
+                    before = peer.connections
+                    await s.get_slot_smart_summaries([1, 2, 3])
+                    self.assertEqual(peer.connections, before)
+
+
 class SmartGridIOTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         # Fail closed before any fixture can accidentally reach a real connection.
