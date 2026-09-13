@@ -287,6 +287,8 @@ class CIWorkflowContractTests(unittest.TestCase):
         self.assertEqual(job["env"]["CONTAINER_IMAGE"], image)
         self.assertEqual(job["env"]["CONTAINER_TAG"], expected_tag)
         self.assertEqual(job["env"]["PLAYWRIGHT_VERSION"], locked_playwright)
+        self.assertNotIn("runner.", json.dumps(job["env"]))
+        self.assertNotIn("runner.", json.dumps(job["container"]))
         self.assertIn('printf \'container image: %s\\n\' "$CONTAINER_IMAGE"', commands)
         self.assertIn('printf \'container tag: %s\\n\' "$CONTAINER_TAG"', commands)
         ref_check = next(
@@ -298,6 +300,20 @@ class CIWorkflowContractTests(unittest.TestCase):
         self.assertIn('[[ ! "$REQUESTED_REF" =~ ^[0-9a-f]{40}$ ]]', ref_check["run"])
         self.assertIn('resolved_ref="$(git rev-parse HEAD)"', ref_check["run"])
         self.assertIn('[ "$resolved_ref" != "$REQUESTED_REF" ]', ref_check["run"])
+        self.assertEqual(
+            [step.get("name") for step in job["steps"][:3]],
+            [
+                "Check out the dispatched ref",
+                "Require the requested ref to be the checked-out commit SHA",
+                "Prepare the candidate directory and the run log",
+            ],
+        )
+        prepare = job["steps"][2]["run"]
+        self.assertIn('candidate_dir="$RUNNER_TEMP/public-demo-screenshot-candidate"', prepare)
+        self.assertIn('>> "$GITHUB_ENV"', prepare)
+        self.assertTrue(
+            all("$CANDIDATE_DIR" not in str(step.get("run", "")) for step in job["steps"][:2])
+        )
 
         self.assertEqual(commands.count("node scripts/capture_public_demo_screenshots.js"), 2)
         self.assertIn('cmp -s "$CANDIDATE_DIR/run-1/$name" "$CANDIDATE_DIR/run-2/$name"', commands)
@@ -322,7 +338,7 @@ class CIWorkflowContractTests(unittest.TestCase):
         self.assertEqual(upload["with"]["retention-days"], 14)
         self.assertEqual(upload["with"]["if-no-files-found"], "error")
         self.assertEqual(
-            upload["with"]["path"], "${{ runner.temp }}/public-demo-screenshot-candidate"
+            upload["with"]["path"], "${{ env.CANDIDATE_DIR }}"
         )
 
     def test_release_checklist_uses_and_reviews_the_dispatch_capture_artifact(self) -> None:

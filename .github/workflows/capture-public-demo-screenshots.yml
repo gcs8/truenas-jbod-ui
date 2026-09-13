@@ -44,7 +44,6 @@ jobs:
       #     https://mcr.microsoft.com/v2/playwright/manifests/v1.62.1-jammy
       image: mcr.microsoft.com/playwright:v1.62.1-jammy@sha256:b3251f7ff1a9fa559a28d1c67eaa15fc1a9800f7845e82756caea7842967f615
     env:
-      CANDIDATE_DIR: ${{ runner.temp }}/public-demo-screenshot-candidate
       CAPTURE_REF: ${{ inputs.ref }}
       CONTAINER_IMAGE: mcr.microsoft.com/playwright:v1.62.1-jammy@sha256:b3251f7ff1a9fa559a28d1c67eaa15fc1a9800f7845e82756caea7842967f615
       CONTAINER_TAG: mcr.microsoft.com/playwright:v1.62.1-jammy
@@ -82,9 +81,15 @@ jobs:
       - name: Prepare the candidate directory and the run log
         run: |
           set -euo pipefail
+          if [ -z "${RUNNER_TEMP:-}" ]; then
+            echo "RUNNER_TEMP is not set" >&2
+            exit 1
+          fi
+          candidate_dir="$RUNNER_TEMP/public-demo-screenshot-candidate"
+          printf 'CANDIDATE_DIR=%s\n' "$candidate_dir" >> "$GITHUB_ENV"
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          rm -rf "$CANDIDATE_DIR"
-          mkdir -p "$CANDIDATE_DIR/run-1" "$CANDIDATE_DIR/run-2"
+          rm -rf "$candidate_dir"
+          mkdir -p "$candidate_dir/run-1" "$candidate_dir/run-2"
 
       - name: Record the pinned environment
         run: |
@@ -225,6 +230,6 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ${{ inputs.qualification_only && 'public-demo-screenshot-qualification' || 'public-demo-screenshot-candidate' }}
-          path: ${{ runner.temp }}/public-demo-screenshot-candidate
+          path: ${{ env.CANDIDATE_DIR }}
           retention-days: 14
           if-no-files-found: error
