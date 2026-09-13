@@ -130,6 +130,14 @@ from app.services.truenas_ws import (
     TrueNASWebsocketClient,
     normalize_disk_inventory_rows,
 )
+from websockets.exceptions import ConnectionClosed
+
+# Transport-class failures of the CORE SMART batch mean "priming unavailable".
+# The batch is an optimisation over the bounded per-slot path, so a call that
+# outlasts the request timeout, a dropped socket or a closed connection must
+# degrade one shelf to that path instead of failing every slot in it (#523).
+# `TimeoutError` in particular is not a `TrueNASAPIError`.
+SMART_BATCH_TRANSPORT_ERRORS = (TrueNASAPIError, TimeoutError, OSError, ConnectionClosed)
 
 SmartCacheKey = tuple[str, str, str, int, tuple[str, ...], tuple[str, str]]
 SmartCacheGenerationToken = tuple[int, int, int]
@@ -4096,7 +4104,14 @@ class InventoryService:
         request_semaphore: asyncio.Semaphore | None = None,
     ) -> SmartSummaryView:
         # Never rendezvous behind the operation semaphore: budget one must work.
-        payloads = await core_payload if core_payload is not None else None
+        payloads = None
+        if core_payload is not None:
+            try:
+                payloads = await core_payload
+            except SMART_BATCH_TRANSPORT_ERRORS:
+                # A prime that could not finish leaves this slot on the per-slot
+                # path; only a programming error is allowed to fail the request.
+                payloads = None
         async with (request_semaphore or nullcontext()), self._smart_operation_semaphore:
             summary = await self._load_uncached_smart_summary(
                 slot_view,
@@ -4364,7 +4379,7 @@ class InventoryService:
                                 [candidates[0] for _slot, candidates, _future in selected],
                                 ["-a", "-j"], max_concurrency=permits,
                             )
-                        except TrueNASAPIError:
+                        except SMART_BATCH_TRANSPORT_ERRORS:
                             # The accepted client is fail-fast: retry the affected
                             # phase through the existing bounded per-slot path.
                             json_payloads = None
@@ -4384,7 +4399,7 @@ class InventoryService:
                                         [candidates[0] for _slot, candidates, _future in text_selected],
                                         ["-x"], max_concurrency=permits,
                                     )
-                                except TrueNASAPIError:
+                                except SMART_BATCH_TRANSPORT_ERRORS:
                                     pass
                                 else:
                                     for item, text in zip(text_selected, text_payloads):
@@ -4393,9 +4408,14 @@ class InventoryService:
                     finally:
                         for _ in range(permits):
                             self._smart_operation_semaphore.release()
+        except SMART_BATCH_TRANSPORT_ERRORS:
+            # Priming is unavailable, not broken: loaders keep whatever the
+            # phase did publish and the rest fall back to the per-slot path,
+            # rather than every slot inheriting one shelf-wide failure.
+            pass
         except BaseException as exc:
             # Settle every registered loader even when disk loading, parsing or a
-            # non-API transport failure prevents the phase from finishing.
+            # genuine programming error prevents the phase from finishing.
             error = exc
         for _slot, _candidates, future in cohort:
             if not future.done():

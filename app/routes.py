@@ -11,6 +11,8 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from websockets.exceptions import ConnectionClosed
+
 from app.route_compat import MainModuleAPIRouter
 from app.services.history_backend import (
     HISTORY_BACKEND_DEGRADED_DETAIL,
@@ -701,6 +703,15 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
                 )
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (TimeoutError, OSError, ConnectionClosed) as exc:
+            # #523: a call that outlasts the timeout, or a dropped socket, is a
+            # temporary unavailability of this shelf's SMART data and not a
+            # server fault. One slow disk must never render as a 500 for the
+            # whole grid, whichever layer the transport failure escapes from.
+            raise HTTPException(
+                status_code=503,
+                detail="SMART data is temporarily unavailable for this enclosure.",
+            ) from exc
         return SmartBatchResponse(summaries=summaries, layout_bounds=layout_bounds)
 
     @router.get("/api/history/status")
