@@ -190,6 +190,7 @@ Useful orientation files:
 - `CHANGELOG.md`
 - `docs/ROADMAP.md`
 - `docs/RELEASE_CHECKLIST.md`
+- `docs/JBOD_RUNNER_TRIAL.md` for the manual native runner trial boundary
 - `docs/SCREENSHOT_CAPTURE.md` when recapturing public-demo screenshots
 - `docs/PUBLISHING_THE_WIKI.md` for how the wiki source is verified and
   published
