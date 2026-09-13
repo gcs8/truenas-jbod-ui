@@ -50,11 +50,11 @@ jobs:
       PLAYWRIGHT_VERSION: "1.62.1"
       QUALIFICATION_ONLY: ${{ inputs.qualification_only }}
       # The families Chromium reported through CSS.getPlatformFontsForNode, not
-      # the families fc-match resolves. Left empty until the first dispatched run
-      # records them; once set, a font change in the image fails the job instead
-      # of silently changing the pixels.
-      EXPECTED_SANS_FALLBACK: ""
-      EXPECTED_MONO_FALLBACK: ""
+      # the families fc-match resolves. Recorded by qualification run 34734456858
+      # under the pinned container digest; a change now fails the job instead of
+      # silently changing the pixels.
+      EXPECTED_SANS_FALLBACK: "Liberation Sans"
+      EXPECTED_MONO_FALLBACK: "WenQuanYi Zen Hei Mono"
     steps:
       - name: Check out the dispatched ref
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

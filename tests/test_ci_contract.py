@@ -445,6 +445,8 @@ class CIWorkflowContractTests(unittest.TestCase):
             with self.subTest(variable=variable):
                 self.assertIn(variable, probe_step)
                 self.assertNotIn(variable, fc_match_step)
+        self.assertEqual(job["env"]["EXPECTED_SANS_FALLBACK"], "Liberation Sans")
+        self.assertEqual(job["env"]["EXPECTED_MONO_FALLBACK"], "WenQuanYi Zen Hei Mono")
         self.assertIn("probes.sans.dominant_family", probe_step)
         self.assertIn("probes.mono.dominant_family", probe_step)
         self.assertIn('"$CANDIDATE_DIR/platform-fonts.json"', probe_step)
