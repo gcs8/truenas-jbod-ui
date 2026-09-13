@@ -5,6 +5,8 @@ import json
 import struct
 import subprocess
 import sys
+import tempfile
+import zlib
 from pathlib import Path
 import unittest
 
@@ -21,6 +23,28 @@ EXPECTED_WIDTHS = {
     "public-demo-history.png": 1920,
     "public-demo-overview.png": 1920,
 }
+
+
+SYNTHETIC_REVISION = "0" * 39 + "1"
+
+
+def png_chunk(kind: bytes, payload: bytes) -> bytes:
+    return (
+        struct.pack(">I", len(payload))
+        + kind
+        + payload
+        + struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF)
+    )
+
+
+def synthetic_png(width: int, height: int, filler: bytes) -> bytes:
+    header = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + png_chunk(b"IHDR", header)
+        + png_chunk(b"IDAT", zlib.compress(filler))
+        + png_chunk(b"IEND", b"")
+    )
 
 
 def png_size(path: Path) -> tuple[int, int]:
@@ -72,6 +96,81 @@ class PublicScreenshotContractTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("4 image copies", result.stdout)
         self.assertIn("exact-byte", result.stdout)
+
+    def test_report_mode_describes_candidate_bytes_without_asserting_the_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            docs_root = root / "docs/images/screenshots"
+            docs_root.mkdir(parents=True)
+            (root / "public-demo").mkdir()
+            (root / "public-demo/index.html").write_bytes(
+                b'<!-- public-demo-source-parity {"source_revision": "'
+                + SYNTHETIC_REVISION.encode("ascii")
+                + b'"} -->\n<html></html>\n'
+            )
+            payloads = {
+                "public-demo-overview.png": synthetic_png(1920, 4104, b"overview"),
+                "public-demo-history.png": synthetic_png(1920, 4860, b"history"),
+            }
+            for name, payload in payloads.items():
+                (docs_root / name).write_bytes(payload)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/check_public_screenshots.py",
+                    "--root",
+                    str(root),
+                    "--report",
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["schema_version"], 1)
+            self.assertEqual(report["provenance"], "synthetic-public-demo")
+            self.assertEqual(report["source_revision"], SYNTHETIC_REVISION)
+            self.assertEqual(
+                report["source_artifact_sha256"],
+                hashlib.sha256((root / "public-demo/index.html").read_bytes()).hexdigest(),
+            )
+            self.assertEqual(set(report["images"]), EXPECTED_NAMES)
+            for name, payload in payloads.items():
+                with self.subTest(name=name):
+                    record = report["images"][name]
+                    self.assertEqual(record["pixel_review"], "PENDING")
+                    self.assertEqual(record["bytes"], len(payload))
+                    self.assertEqual(record["sha256"], hashlib.sha256(payload).hexdigest())
+                    self.assertEqual(record["dimensions"], [*png_size(docs_root / name)])
+            # No manifest exists in the temporary root, so report mode cannot be
+            # asserting one.
+            self.assertFalse((docs_root / "manifest.json").exists())
+
+    def test_report_mode_leaves_the_checked_in_manifest_and_images_untouched(self) -> None:
+        before = {
+            path: path.read_bytes()
+            for path in (MANIFEST_PATH, *sorted(DOCS_IMAGE_ROOT.glob("*.png")))
+        }
+
+        result = subprocess.run(
+            [sys.executable, "scripts/check_public_screenshots.py", "--report"],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        for record in report["images"].values():
+            self.assertEqual(record["pixel_review"], "PENDING")
+        for path, payload in before.items():
+            with self.subTest(path=path.name):
+                self.assertEqual(path.read_bytes(), payload)
 
     def test_pixel_review_record_names_every_exact_image_hash(self) -> None:
         manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
