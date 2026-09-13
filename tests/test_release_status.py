@@ -32,6 +32,9 @@ class ReleaseStatusTests(unittest.TestCase):
         self.assertIn("## v0.22.2 - 2026-09-01", changelog)
         self.assertIn("# Release Notes - v0.23.0", release_notes)
         self.assertIn("two synthetic spares", release_notes)
+        self.assertIn("tag and GitHub release were published", release_notes)
+        self.assertIn("Private deployment qualification remains unverified", release_notes)
+        self.assertNotIn("tag remains blocked", release_notes)
 
         self.assertIn("`v0.23.0` is the latest published release", roadmap)
         self.assertIn("2026-09-09", roadmap)

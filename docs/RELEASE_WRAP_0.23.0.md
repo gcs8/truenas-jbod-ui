@@ -44,20 +44,23 @@ The generated GitHub release-note set includes 139 pull requests: the 136 change
 | Snapshot/export/offline artifact gate | yes | Redacted Force ZIP export produced one offline HTML member; Chromium rendered 60 slots with no network requests, console errors, private endpoints, host paths, credential assignments, or long bare hex values. Later candidate changes were limited to backup/restore state handling | Pass |  |
 | Docs/wiki/public-demo gate | yes | Current full source gate found the deterministic public demo publishable at 2,070,273 raw bytes and 930,591 gzip bytes; 47 populated and 13 empty bays, adjacent slots 42 and 43 in one synthetic `spares` group, privacy scans, and two exact-byte screenshot reviews passed | Pass |  |
 | Docs/wiki/public-demo publication | yes | Pending owner publication: external wiki | Blocked |  |
-| GHCR publish verification | yes | [Publish GHCR workflow run 34293966354](https://github.com/gcs8/truenas-jbod-ui/actions/runs/34293966354) completed successfully for release source `dbcd2ab31e9a46083693cf08802434ac8cfc1e43`; package tags `0.23.0`, `v0.23.0`, and `latest` resolve to manifest `sha256:567d42025850a048186cf35adb2c97c071d27fa93f3071ec0eb3ddd71dd9df17` | Pass |  |
+| GHCR publish verification | yes | [Publish GHCR workflow run 34293966354](https://github.com/gcs8/truenas-jbod-ui/actions/runs/34293966354) completed successfully for release source `dbcd2ab31e9a46083693cf08802434ac8cfc1e43`; package tags `0.23.0`, `v0.23.0`, and `latest` resolve to `ghcr.io/gcs8/truenas-jbod-ui@sha256:567d42025850a048186cf35adb2c97c071d27fa93f3071ec0eb3ddd71dd9df17` | Pass |  |
 | Deployment refresh/sniff tests | yes | Private deployment qualification remains unverified; it still requires a verified encrypted FULL backup, immutable digest activation, health checks, sniff tests, and rollback evidence | Blocked |  |
-| Post-release reopen | yes | Development continued on `main` after the published tag and release | Pass |  |
+| Post-release reopen | yes | Development continued on branch `main` through commit `875b86d41247571ab8e386d56aa330e7ff648c1e`; the app version remains `0.23.0` | Pass |  |
 
 ## Current evidence
 
 - GitHub published tag and release `v0.23.0` on 2026-09-09 from source commit
   `dbcd2ab31e9a46083693cf08802434ac8cfc1e43`.
 - GHCR workflow run 34293966354 published package tags `0.23.0`, `v0.23.0`,
-  and `latest` on manifest
-  `sha256:567d42025850a048186cf35adb2c97c071d27fa93f3071ec0eb3ddd71dd9df17`.
+  and `latest` as
+  `ghcr.io/gcs8/truenas-jbod-ui@sha256:567d42025850a048186cf35adb2c97c071d27fa93f3071ec0eb3ddd71dd9df17`.
 - GitHub Pages deployment 6340637703 published the static public demo from
   repository commit `a98917a4ba21aef06adab7bf7adc2c4bf0663f05`. The external
   wiki still needs a separate synchronized publication.
+- Development reopened before private deployment qualification completed. The
+  remaining blocked rows keep that policy deviation visible and prevent this wrap
+  from representing the release as complete.
 - The validated executable candidate is commit `f66ab1e9336d41dca0528065fd3d5d0116cbf35d`, tree `3fe79ee429f5453269dacf99f52130f88c3ba1ef`, and Linux QA image `sha256:6a2b54ce2b25a2053ecceaf97a110311103b2d56ee7b5e2bf2195ba0d0e83af9`.
 - The encrypted FULL restore included config, runtime overrides, profiles, mappings, SAS Fabric aliases, slot cache, history, SSH keys, TLS trust, and known hosts. Inspection reported all ten groups present, no absent groups, and exact aggregate-count reconciliation after import.
 - Restore remediation preserved existing path modes, uses descriptor-owned exclusive copies through ownership, mode, and fsync, records segmented-hot sibling ownership only after successful exclusive creation, and assigns new shared runtime paths mode `0660` for files and `0770` for directories under the existing `${APP_GID}` trust boundary.

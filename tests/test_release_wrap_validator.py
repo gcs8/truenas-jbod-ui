@@ -150,8 +150,14 @@ class ReleaseWrapValidatorTests(unittest.TestCase):
         )
         self.assertIn("Tag: `v0.23.0`, published 2026-09-09", text)
         self.assertIn("https://github.com/gcs8/truenas-jbod-ui/actions/runs/34293966354", text)
+        self.assertIn(
+            "ghcr.io/gcs8/truenas-jbod-ui@sha256:567d42025850a048186cf35adb2c97c071d27fa93f3071ec0eb3ddd71dd9df17",
+            text,
+        )
         self.assertIn("Pending owner publication: external wiki", text)
         self.assertIn("Private deployment qualification remains unverified", text)
+        self.assertIn("app version remains `0.23.0`", text)
+        self.assertIn("Development reopened before private deployment qualification completed", text)
         self.assertNotIn("Tag: `v0.23.0` pending", text)
         self.assertNotIn("Do not tag or publish v0.23.0", text)
 
