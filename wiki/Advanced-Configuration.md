@@ -311,3 +311,41 @@ Prefer code only when:
 - a whole new inventory adapter is needed
 - the host needs new parser logic
 - the UI model itself must change
+
+## Reference documents in the repository
+
+The wiki covers day-to-day setup and operation. Longer references live in the
+repository under `docs/` and are linked here so they are easy to find:
+
+- [Immutable GHCR deployment](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/IMMUTABLE_GHCR_DEPLOYMENT.md):
+  pin an image digest, Compose files, and the update helper
+  `scripts/update_immutable_deployment.py` to one source revision.
+- [Admin trust boundary](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/ADMIN_TRUST_BOUNDARY.md):
+  what the optional admin service can change and how to limit who reaches it.
+- [Segmented history v2](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/SEGMENTED_HISTORY_V2.md):
+  history layout, migration, query limits, backup format, and recovery.
+- [Enclosure profile authoring](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/PROFILE_AUTHORING.md):
+  the profile-driven layout system behind custom chassis views.
+- [Read-only SSH setup](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/SSH_READ_ONLY_SETUP.md):
+  the least-privilege SSH account for live slot mapping.
+- [Disk replacement on TrueNAS CORE with SAS multipath](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/DISK_REPLACEMENT_CORE_MULTIPATH.md):
+  operator runbook for replacing or hot-adding a disk in a dual-path shelf.
+- [Inventory evidence precedence](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/INVENTORY_EVIDENCE_PRECEDENCE.md):
+  how contradicting observations of the same bay are resolved by source
+  strength.
+- [Performance budgets](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/PERFORMANCE_BUDGETS.md):
+  the deterministic 60-slot and 347-slot fixtures and the limits CI enforces.
+- [Hardware report fixture intake](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/HARDWARE_REPORT_FIXTURE_INTAKE.md):
+  how to contribute a sanitized hardware report that can become a parser test.
+- [Private QA restore and Compose matrix](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/PRIVATE_QA_RESTORE.md):
+  the release QA path that keeps public CI synthetic.
+- Platform notes for
+  [Quantastor](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/QUANTASTOR_NOTES.md),
+  [UniFi UNVR](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/UNVR_NOTES.md),
+  [ESXi](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/ESXI_PLATFORM_FEASIBILITY.md),
+  [a GPU server host](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/GPU_SERVER_NOTES.md),
+  and [photo-backed M.2 carrier layouts](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/M2_CARRIER_RENDERING_NOTES.md).
+- [Roadmap](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/ROADMAP.md) and
+  [release checklist](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/RELEASE_CHECKLIST.md)
+  for what is next and how releases are cut. Older release notes, wraps, and
+  milestone plans are kept under `docs/archive/` in the repository.

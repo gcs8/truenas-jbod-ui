@@ -28,7 +28,88 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ## Unreleased
 
+### Upgrade notes
+
+- docker-compose.nonroot.yml: Keep this overlay for hardened deployments.
+  Image-only upgrades now preserve existing Compose files and wait for healthy
+  containers; optional backup defaults match the selected ownership setup. (#426)
+
+### Added
+
+- Added a client-only, one-session SMART WebSocket batch API with bounded
+  concurrency and DDP heartbeat handling; inventory integration remained
+  separate (#503).
+
+### Fixed
+
+- Retried failed release checks with bounded backoff instead of waiting a
+  full normal interval, preserving the last successful result (#469).
+
+- Left read UI and history services running by default during debug export,
+  while preserving explicit stop and restart choices (#468).
+
+- Made ownership-helper help available without POSIX dependencies and
+  documented script roles and segment-sealer argument formats (#466).
+
+- Bounded history dashboard polling, rejected stale responses, and marked
+  retained values stale after failed checks. (#420)
+
+- Included the remaining wait in full history-refresh cooldown responses,
+  matching the existing Retry-After header (#471).
+
+- Refused restoring a backup made by a newer app version before unpacking it,
+  checked free space in the temp and history folders before a history restore
+  replaces anything, and reworded the schema refusals in plain words (#511)
+
+- Isolated read-UI authentication settings so invalid admin-only settings
+  and unavailable admin directories no longer block UI startup (#467).
+
+- Clarified history status labels and timestamps, distinguished missing counts
+  from zero, and added semantic label/value associations (#470).
+- Bounded history dashboard polling, rejected stale responses, and marked
+  retained values stale after failed checks. (#420)
+
+### Performance
+
+- Reduced mapping revision work to one document read per batch while
+  preserving conflict checks and calibration tokens. (#421)
+
+- Avoided serializing the full cached inventory for health checks while
+  preserving the response and cached-only behavior (#464).
+
+- Skipped exact repeated slot-detail saves while preserving timestamp and
+  identity changes; normal timestamp-advancing inventory saves still write (#479).
+
+- Batched SMART grid persistence off the event loop, fenced invalidated writes,
+  and propagated owning-save failures to in-flight joiners; snapshot persistence
+  remained synchronous (#498).
+- Skipped exact repeated slot-detail saves while preserving timestamp and
+  identity changes; normal timestamp-advancing inventory saves still write (#479).
+
+- Moved snapshot slot-detail persistence off the event loop with cancellation
+  draining and stale-write guards, preserving timestamp-advancing saves (#499).
+- Batched SMART grid persistence off the event loop, fenced invalidated writes,
+  and propagated owning-save failures to in-flight joiners; snapshot persistence
+  remained synchronous (#498).
+- Skipped exact repeated slot-detail saves while preserving timestamp and
+  identity changes; normal timestamp-advancing inventory saves still write (#479).
+
+- Batched CORE SMART grid calls and rejected stale disk-identity results while
+  restoring fresh lookup after serial loss (#504).
+- Moved snapshot slot-detail persistence off the event loop with cancellation
+  draining and stale-write guards, preserving timestamp-advancing saves (#499).
+- Batched SMART grid persistence off the event loop, fenced invalidated writes,
+  and propagated owning-save failures to in-flight joiners; snapshot persistence
+  remained synchronous (#498).
+- Skipped exact repeated slot-detail saves while preserving timestamp and
+  identity changes; normal timestamp-advancing inventory saves still write (#479).
+
 ### Docs
+
+- Historical release notes, release wraps, and milestone plans moved to
+  `docs/archive/`; `docs/ROADMAP.md` now covers only the current release and
+  the next lane, every live reference document is linked from the wiki or
+  CONTRIBUTING, and seven unused screenshots were removed. (#476)
 
 - `config/config.example.yaml` now lists every option with its default and
   shows one example system per platform, including ESXi, a BMC-only host,
