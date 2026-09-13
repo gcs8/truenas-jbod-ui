@@ -253,7 +253,7 @@ class SlotBoundsFollowSelectedEnclosureTests(unittest.TestCase):
             ConnectionClosedError(None, None),
         ):
             with self.subTest(error=type(error).__name__):
-                service = _service(layout_slot_count=84)
+                service = _service(layout_slot_count=84, selected_enclosure_id="invented-shelf")
                 service.get_slot_smart_summaries = AsyncMock(side_effect=error)
                 registry = Mock()
                 registry.get_service.return_value = service
@@ -268,7 +268,7 @@ class SlotBoundsFollowSelectedEnclosureTests(unittest.TestCase):
                     self.assertRaises(HTTPException) as raised,
                 ):
                     asyncio.run(route.endpoint(
-                        payload=payload, system_id="system-a", enclosure_id="50050cc11ac013fc",
+                        payload=payload, system_id="system-a", enclosure_id="invented-shelf",
                     ))
 
                 self.assertEqual(raised.exception.status_code, 503)

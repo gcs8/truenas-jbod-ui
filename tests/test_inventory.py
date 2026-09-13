@@ -12184,7 +12184,7 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
 
             full = slot_view(
                 serial="SER-VERIFY-005",
-                sas_address="5000c500a1b2c3d5",
+                sas_address="sas-invented-005",
                 model="ST12000NM0008",
                 size_human="12 TB",
             )
@@ -12196,7 +12196,7 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
 
             # The #355 shape: the API disk record is incomplete for one refresh
             # while SES still reports the bay's sas_address.
-            degraded = slot_view(sas_address="5000c500a1b2c3d5")
+            degraded = slot_view(sas_address="sas-invented-005")
             asyncio.run(service._apply_and_persist_snapshot_slot_details([degraded]))
             self.assertEqual(degraded.serial, "SER-VERIFY-005")
             self.assertEqual(degraded.model, "ST12000NM0008")
@@ -12219,7 +12219,7 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
 
             # #504's protection stands: a disagreeing serial rejects the entry
             # even though the device alias and the bay are unchanged.
-            replaced = slot_view(serial="SER-REPLACEMENT", sas_address="5000c500a1b2c3d5")
+            replaced = slot_view(serial="SER-REPLACEMENT", sas_address="sas-invented-005")
             self.assertFalse(service._slot_detail_entry_matches(replaced, entry))
             asyncio.run(service._apply_and_persist_snapshot_slot_details([replaced]))
             self.assertIsNone(replaced.model)
