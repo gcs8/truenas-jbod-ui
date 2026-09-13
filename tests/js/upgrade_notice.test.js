@@ -145,6 +145,7 @@ test("dismissing hides the notice, remembers it locally and records it on the se
   assert.equal(h.requests.length, 1);
   assert.equal(h.requests[0][0], "/api/upgrade-notice/dismiss");
   assert.equal(h.requests[0][1].method, "POST");
+  assert.deepEqual(JSON.parse(h.requests[0][1].body), { version: "0.23.0" });
   assert.equal(h.requests[0][1].readUiAuth, true);
 });
 

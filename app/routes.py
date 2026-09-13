@@ -175,11 +175,20 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
         "/api/upgrade-notice/dismiss",
         dependencies=[Depends(require_read_ui_mutation_authorization)],
     )
-    async def dismiss_upgrade_notice() -> JSONResponse:
-        cleared = await asyncio.to_thread(
-            upgrade_notice.dismiss_notice,
-            upgrade_notice_data_dir(get_settings()),
-        )
+    async def dismiss_upgrade_notice(
+        payload: upgrade_notice.UpgradeNoticeDismissRequest,
+    ) -> JSONResponse:
+        try:
+            cleared = await asyncio.to_thread(
+                upgrade_notice.dismiss_notice,
+                upgrade_notice_data_dir(get_settings()),
+                notice_version=payload.version,
+            )
+        except upgrade_notice.UpgradeNoticeVersionConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="A newer upgrade notice is pending. Reload the page before dismissing it.",
+            ) from exc
         if not cleared:
             raise HTTPException(
                 status_code=503,

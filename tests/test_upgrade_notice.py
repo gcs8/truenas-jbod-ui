@@ -35,7 +35,13 @@ class UpgradeNoticeServiceTests(unittest.TestCase):
             self.assertIn("Previous version unknown", notice["text"])
             self.assertNotIn("Updated to", notice["text"])
             self.assertEqual(upgrade_notice.current_notice(data_dir, version="0.23.0"), notice)
-            self.assertTrue(upgrade_notice.dismiss_notice(data_dir, version="0.23.0"))
+            self.assertTrue(
+                upgrade_notice.dismiss_notice(
+                    data_dir,
+                    notice_version="0.23.0",
+                    version="0.23.0",
+                )
+            )
             self.assertIsNone(upgrade_notice.current_notice(data_dir, version="0.23.0"))
 
     def test_uninstrumented_install_does_not_infer_upgrade_from_existing_mappings(self) -> None:
@@ -93,10 +99,39 @@ class UpgradeNoticeServiceTests(unittest.TestCase):
             self.assertEqual(second, first)
             self.assertEqual(read_state(data_dir)["notice"], {"version": "0.23.0", "previous": "0.22.2"})
 
-            self.assertTrue(upgrade_notice.dismiss_notice(data_dir, version="0.23.0"))
+            self.assertTrue(
+                upgrade_notice.dismiss_notice(
+                    data_dir,
+                    notice_version="0.23.0",
+                    version="0.23.0",
+                )
+            )
 
             self.assertIsNone(upgrade_notice.current_notice(data_dir, version="0.23.0"))
             self.assertEqual(read_state(data_dir), {"last_seen_version": "0.23.0"})
+
+    def test_stale_page_cannot_dismiss_a_newer_notice(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir)
+            upgrade_notice.current_notice(data_dir, version="0.23.0")
+            newer = upgrade_notice.current_notice(data_dir, version="0.24.0")
+
+            with self.assertRaises(upgrade_notice.UpgradeNoticeVersionConflict):
+                upgrade_notice.dismiss_notice(
+                    data_dir,
+                    notice_version="0.23.0",
+                    version="0.24.0",
+                )
+
+            self.assertEqual(upgrade_notice.current_notice(data_dir, version="0.24.0"), newer)
+            self.assertTrue(
+                upgrade_notice.dismiss_notice(
+                    data_dir,
+                    notice_version="0.24.0",
+                    version="0.24.0",
+                )
+            )
+            self.assertIsNone(upgrade_notice.current_notice(data_dir, version="0.24.0"))
 
     def test_unlisted_versions_get_the_generic_text(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -145,7 +180,13 @@ class UpgradeNoticeServiceTests(unittest.TestCase):
                 "notice": {"version": "0.23.0", "previous": ""},
             })
             self.assertEqual(upgrade_notice.current_notice(data_dir, version="0.23.0"), notice)
-            self.assertTrue(upgrade_notice.dismiss_notice(data_dir, version="0.23.0"))
+            self.assertTrue(
+                upgrade_notice.dismiss_notice(
+                    data_dir,
+                    notice_version="0.23.0",
+                    version="0.23.0",
+                )
+            )
             self.assertIsNone(upgrade_notice.current_notice(data_dir, version="0.23.0"))
 
     def test_basic_mode_notice_uses_selected_policy_without_credentials(self) -> None:
@@ -159,7 +200,13 @@ class UpgradeNoticeServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             data_dir = Path(temp_dir)
             with patch.object(upgrade_notice, "_write_state", return_value=False):
-                self.assertFalse(upgrade_notice.dismiss_notice(data_dir, version="0.23.0"))
+                self.assertFalse(
+                    upgrade_notice.dismiss_notice(
+                        data_dir,
+                        notice_version="0.23.0",
+                        version="0.23.0",
+                    )
+                )
 
 
 class UpgradeNoticeRouteTests(unittest.TestCase):
@@ -219,10 +266,16 @@ class UpgradeNoticeRouteTests(unittest.TestCase):
                 paths=PathConfig(mapping_file=str(data_dir / "slot_mappings.json")),
             )
             upgrade_notice.current_notice(data_dir, version="0.22.2")
+            upgrade_notice.current_notice(data_dir, version=__version__)
             app = build_app(auth_mode="network")
             with patch.object(app_main, "get_settings", return_value=settings):
                 status, _headers, _body = asyncio.run(
-                    invoke_asgi(app, "/api/upgrade-notice/dismiss", method="POST")
+                    invoke_asgi(
+                        app,
+                        "/api/upgrade-notice/dismiss",
+                        method="POST",
+                        body=json.dumps({"version": __version__}).encode("utf-8"),
+                    )
                 )
                 cross_site, _headers, _body = asyncio.run(
                     invoke_asgi(
@@ -230,12 +283,37 @@ class UpgradeNoticeRouteTests(unittest.TestCase):
                         "/api/upgrade-notice/dismiss",
                         method="POST",
                         origin="https://attacker.example",
+                        body=json.dumps({"version": __version__}).encode("utf-8"),
                     )
                 )
 
             self.assertEqual(status, 200)
             self.assertEqual(cross_site, 403)
             self.assertEqual(read_state(data_dir), {"last_seen_version": __version__})
+
+    def test_stale_page_dismissal_is_rejected_without_clearing_current_notice(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir) / "data"
+            settings = Settings(
+                app=AppConfig(),
+                paths=PathConfig(mapping_file=str(data_dir / "slot_mappings.json")),
+            )
+            current = upgrade_notice.current_notice(data_dir, version=__version__)
+            app = build_app(auth_mode="network")
+
+            with patch.object(app_main, "get_settings", return_value=settings):
+                status, _headers, body = asyncio.run(
+                    invoke_asgi(
+                        app,
+                        "/api/upgrade-notice/dismiss",
+                        method="POST",
+                        body=b'{"version":"0.22.2"}',
+                    )
+                )
+
+            self.assertEqual(status, 409)
+            self.assertIn("newer upgrade notice", json.loads(body)["detail"])
+            self.assertEqual(upgrade_notice.current_notice(data_dir, version=__version__), current)
 
     def test_dismiss_requires_sign_in_in_basic_mode(self) -> None:
         app = build_app(auth_mode="basic", public_origin="http://ui.example.test:8080")
@@ -247,7 +325,14 @@ class UpgradeNoticeRouteTests(unittest.TestCase):
     def test_dismiss_fails_closed_when_the_record_cannot_be_written(self) -> None:
         app = build_app(auth_mode="network")
         with patch.object(upgrade_notice, "dismiss_notice", return_value=False):
-            status, _headers, body = asyncio.run(invoke_asgi(app, "/api/upgrade-notice/dismiss", method="POST"))
+            status, _headers, body = asyncio.run(
+                invoke_asgi(
+                    app,
+                    "/api/upgrade-notice/dismiss",
+                    method="POST",
+                    body=json.dumps({"version": __version__}).encode("utf-8"),
+                )
+            )
 
         self.assertEqual(status, 503)
         self.assertIn("not writable", json.loads(body)["detail"])

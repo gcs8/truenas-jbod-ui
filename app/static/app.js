@@ -2703,7 +2703,11 @@
       upgradeNoticeDismiss.disabled = true;
     }
     try {
-      await fetchJson("/api/upgrade-notice/dismiss", { method: "POST", body: "{}", readUiAuth: true });
+      await fetchJson("/api/upgrade-notice/dismiss", {
+        method: "POST",
+        body: JSON.stringify({ version: upgradeNoticeVersion() }),
+        readUiAuth: true,
+      });
       upgradeNotice.classList.add("hidden");
     } catch (error) {
       if (upgradeNoticeDismiss) upgradeNoticeDismiss.disabled = false;

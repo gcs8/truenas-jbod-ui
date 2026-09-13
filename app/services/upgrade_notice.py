@@ -14,12 +14,24 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from pydantic import BaseModel, ConfigDict, Field
+
 from app import __version__
 
 
 logger = logging.getLogger(__name__)
 
 STATE_FILENAME = "last_seen_version.json"
+
+
+class UpgradeNoticeDismissRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: str = Field(min_length=1, max_length=64)
+
+
+class UpgradeNoticeVersionConflict(Exception):
+    """The browser tried to dismiss a notice for another app version."""
 
 # Releases whose upgrade notes deserve a sentence in the UI itself. Keys are
 # exact version strings; other releases get only the observation/version prefix.
@@ -110,10 +122,23 @@ def current_notice(
     }
 
 
-def dismiss_notice(data_dir: Path, *, version: str = __version__) -> bool:
-    """Clear the pending notice. Returns True when the record was updated."""
+def dismiss_notice(
+    data_dir: Path,
+    *,
+    notice_version: str,
+    version: str = __version__,
+) -> bool:
+    """Clear the matching pending notice. Returns True when the record was updated."""
+    if notice_version != version:
+        raise UpgradeNoticeVersionConflict
     path = state_path(data_dir)
     state = _read_state(path)
+    last_seen = state.get("last_seen_version")
+    pending = state.get("notice") if isinstance(state.get("notice"), dict) else None
+    if (isinstance(last_seen, str) and last_seen and last_seen != version) or (
+        pending is not None and pending.get("version") != notice_version
+    ):
+        raise UpgradeNoticeVersionConflict
     if "notice" not in state and state.get("last_seen_version") == version:
         return True
     return _write_state(path, {"last_seen_version": version})
