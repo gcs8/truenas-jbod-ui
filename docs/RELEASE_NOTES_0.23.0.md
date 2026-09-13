@@ -22,4 +22,9 @@ v0.23.0 is the first release after the v0.22.x segmented-history series. It comb
 
 ## Release process
 
-The v0.23.0 tag remains blocked until the versioned release wrap records successful exact-candidate source checks, Docker and sidecar runtime checks, browser and performance gates, disposable Linux encrypted restore QA, operator acceptance, and strict pre-tag validation. GHCR publication, deployment verification, Wiki/public-demo publication, and the post-release development reopen remain separate post-tag gates.
+The v0.23.0 tag and GitHub release were published on 2026-09-09 after the
+recorded pre-tag checks. The GHCR package and Pages demo are also published.
+Private deployment qualification remains unverified, and the external Wiki still
+needs a synchronized publication. The release wrap records those remaining gates;
+the beginner installation stays pinned to v0.22.2 until lifecycle qualification
+supports a newer default.

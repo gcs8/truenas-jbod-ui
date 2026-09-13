@@ -115,6 +115,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Docs
 
+- Reconciled the v0.23.0 release wrap and Wiki home page with the published
+  GitHub release, GHCR package, and Pages demo while retaining the qualified
+  v0.22.2 beginner-installation pin. (#518)
+
 - Historical release notes, release wraps, and milestone plans moved to
   `docs/archive/`; `docs/ROADMAP.md` now covers only the current release and
   the next lane, every live reference document is linked from the wiki or
@@ -134,6 +138,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   digest, the expected font families are checked against the platform fonts
   Chromium reported rather than `fc-match`, and the default dispatch is a
   `qualification_only` run that writes no proposed manifest (#512).
+
+- Normalized pointer hover and focus before public-demo screenshot capture so
+  the exact-byte repeatability gate measures a settled page instead of a
+  transient transformed control (#519).
+
 ## v0.23.0 - 2026-09-08
 
 This release includes every pull request merged after `v0.22.2` through the

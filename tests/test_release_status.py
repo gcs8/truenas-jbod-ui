@@ -32,6 +32,9 @@ class ReleaseStatusTests(unittest.TestCase):
         self.assertIn("## v0.22.2 - 2026-09-01", changelog)
         self.assertIn("# Release Notes - v0.23.0", release_notes)
         self.assertIn("two synthetic spares", release_notes)
+        self.assertIn("tag and GitHub release were published", release_notes)
+        self.assertIn("Private deployment qualification remains unverified", release_notes)
+        self.assertNotIn("tag remains blocked", release_notes)
 
         self.assertIn("`v0.23.0` is the latest published release", roadmap)
         self.assertIn("2026-09-09", roadmap)
@@ -39,12 +42,13 @@ class ReleaseStatusTests(unittest.TestCase):
         self.assertIn("docs/archive/ROADMAP_HISTORY.md", roadmap)
         self.assertNotIn("v0.22.2` is the latest published release", roadmap)
 
-        release_url = "https://github.com/gcs8/truenas-jbod-ui/releases/tag/v0.22.2"
-        self.assertIn("v0.22.2", wiki_home)
-        self.assertIn("latest published release", wiki_home)
-        self.assertIn("2026-09-01", wiki_home)
+        release_url = "https://github.com/gcs8/truenas-jbod-ui/releases/tag/v0.23.0"
+        normalized_wiki_home = " ".join(wiki_home.split())
+        self.assertIn("`v0.23.0` is the latest published release", wiki_home)
+        self.assertIn("2026-09-09", wiki_home)
         self.assertIn(release_url, wiki_home)
-        self.assertNotIn("v0.22.1` is the latest published release", wiki_home)
+        self.assertIn("beginner installation remains pinned to `v0.22.2`", normalized_wiki_home)
+        self.assertNotIn("`v0.22.2` is the latest published release", wiki_home)
 
     def test_roadmap_is_short_and_points_at_the_archived_history(self) -> None:
         repository = Path(__file__).resolve().parents[1]
