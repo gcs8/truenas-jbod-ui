@@ -6740,13 +6740,15 @@ class SystemBackupService:
             os.close(slave_fd)
             slave_fd = -1
             deadline = time.monotonic() + SEVEN_ZIP_TIMEOUT_SECONDS
+            poller = select.poll()
+            poller.register(master_fd, select.POLLIN | select.POLLHUP | select.POLLERR)
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     process.kill()
                     process.wait()
                     raise subprocess.TimeoutExpired(command, SEVEN_ZIP_TIMEOUT_SECONDS)
-                ready, _, _ = select.select([master_fd], [], [], min(remaining, 0.1))
+                ready = bool(poller.poll(max(1, int(min(remaining, 0.1) * 1000))))
                 if ready:
                     try:
                         chunk = os.read(master_fd, ARCHIVE_READ_CHUNK_BYTES)

@@ -37,6 +37,14 @@ FORBIDDEN_BYTE_PATTERNS = (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Verify exact public screenshot bytes and fixture provenance.")
     parser.add_argument("--root", type=Path, default=ROOT)
+    parser.add_argument(
+        "--report",
+        action="store_true",
+        help=(
+            "Print the manifest entries the screenshots on disk would need, as JSON, "
+            "without checking them against the checked-in manifest. Writes nothing."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -170,8 +178,53 @@ def check_screenshots(root: Path) -> list[str]:
     return errors
 
 
+def report_screenshots(root: Path) -> dict[str, object]:
+    """Describe the screenshots on disk as candidate manifest content.
+
+    The report never reads the checked-in manifest and never writes a file. Pixel
+    review stays PENDING: only a human reviewer may record PASS.
+    """
+    docs_root = root / "docs/images/screenshots"
+    artifact_path = root / "public-demo/index.html"
+    artifact = artifact_path.read_bytes() if artifact_path.is_file() else b""
+    try:
+        revision: str | None = public_demo_source_revision(artifact)
+    except ValueError:
+        revision = None
+
+    images: dict[str, object] = {}
+    for name in sorted(EXPECTED_NAMES):
+        docs_path = docs_root / name
+        if not docs_path.is_file():
+            images[name] = {"error": "missing"}
+            continue
+        payload = docs_path.read_bytes()
+        try:
+            width, height = read_png_size(payload)
+        except ValueError as exc:
+            images[name] = {"error": str(exc)}
+            continue
+        images[name] = {
+            "bytes": len(payload),
+            "dimensions": [width, height],
+            "pixel_review": "PENDING",
+            "sha256": sha256_bytes(payload),
+        }
+    return {
+        "images": images,
+        "provenance": "synthetic-public-demo",
+        "schema_version": 1,
+        "source_artifact_sha256": sha256_bytes(artifact),
+        "source_revision": revision,
+    }
+
+
 def main() -> int:
     args = parse_args()
+    if args.report:
+        report = report_screenshots(args.root.resolve())
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0
     errors = check_screenshots(args.root.resolve())
     if errors:
         for error in errors:

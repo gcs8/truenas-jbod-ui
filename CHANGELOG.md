@@ -68,6 +68,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   from zero, and added semantic label/value associations (#470).
 - Bounded history dashboard polling, rejected stale responses, and marked
   retained values stale after failed checks. (#420)
+- Replaced the encrypted-backup PTY `select()` wait with `poll()` so valid high
+  file descriptors no longer fail before the passphrase prompt (#517).
 
 ### Performance
 
@@ -77,12 +79,54 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Avoided serializing the full cached inventory for health checks while
   preserving the response and cached-only behavior (#464).
 
+- Skipped exact repeated slot-detail saves while preserving timestamp and
+  identity changes; normal timestamp-advancing inventory saves still write (#479).
+
+- Batched SMART grid persistence off the event loop, fenced invalidated writes,
+  and propagated owning-save failures to in-flight joiners; snapshot persistence
+  remained synchronous (#498).
+- Skipped exact repeated slot-detail saves while preserving timestamp and
+  identity changes; normal timestamp-advancing inventory saves still write (#479).
+
+- Moved snapshot slot-detail persistence off the event loop with cancellation
+  draining and stale-write guards, preserving timestamp-advancing saves (#499).
+- Batched SMART grid persistence off the event loop, fenced invalidated writes,
+  and propagated owning-save failures to in-flight joiners; snapshot persistence
+  remained synchronous (#498).
+- Skipped exact repeated slot-detail saves while preserving timestamp and
+  identity changes; normal timestamp-advancing inventory saves still write (#479).
+
+- Batched CORE SMART grid calls and rejected stale disk-identity results while
+  restoring fresh lookup after serial loss (#504).
+- Moved snapshot slot-detail persistence off the event loop with cancellation
+  draining and stale-write guards, preserving timestamp-advancing saves (#499).
+- Batched SMART grid persistence off the event loop, fenced invalidated writes,
+  and propagated owning-save failures to in-flight joiners; snapshot persistence
+  remained synchronous (#498).
+- Skipped exact repeated slot-detail saves while preserving timestamp and
+  identity changes; normal timestamp-advancing inventory saves still write (#479).
+
 ### Docs
 
 - Historical release notes, release wraps, and milestone plans moved to
   `docs/archive/`; `docs/ROADMAP.md` now covers only the current release and
   the next lane, every live reference document is linked from the wiki or
   CONTRIBUTING, and seven unused screenshots were removed. (#476)
+
+- `config/config.example.yaml` now lists every option with its default and
+  shows one example system per platform, including ESXi, a BMC-only host,
+  and a storage view; the unused `app.verify_ssl` line is gone. (#489)
+
+### Internal
+
+- Added a dispatch-only workflow that recaptures the public-demo screenshots
+  inside the pinned Playwright Linux container, captures twice to prove the
+  bytes are reproducible, and uploads the PNGs and proposed manifest entries for
+  a human to approve; `scripts/check_public_screenshots.py --report` prints the
+  candidate hashes without asserting the manifest. The container is pinned by
+  digest, the expected font families are checked against the platform fonts
+  Chromium reported rather than `fc-match`, and the default dispatch is a
+  `qualification_only` run that writes no proposed manifest (#512).
 
 ## v0.23.0 - 2026-09-08
 

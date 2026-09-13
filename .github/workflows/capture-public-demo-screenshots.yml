@@ -1,0 +1,235 @@
+name: Capture Public Demo Screenshots
+
+# Dispatch-only. The job produces a capture for a human to review and commit. It
+# never commits, pushes, opens a pull request, or writes the screenshot manifest.
+#
+# The default run (qualification_only: true) qualifies the tooling against an
+# immutable commit SHA: it writes no proposed-manifest.json and uploads
+# public-demo-screenshot-qualification, so it cannot be mistaken for a candidate.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Full commit SHA whose checked-in public-demo/index.html is captured. Use a SHA, not a branch name, so the capture is tied to immutable content. The first run must target a commit SHA on main and is a tooling qualification, not a candidate."
+        required: true
+        type: string
+      qualification_only:
+        description: "Qualify the tooling only: skip proposed-manifest.json and name the artifact public-demo-screenshot-qualification, so the output cannot be mistaken for a candidate. Leave true unless a maintainer is deliberately producing a candidate."
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-demo-screenshot-capture-${{ inputs.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  capture:
+    name: Capture candidate public demo screenshots
+    runs-on: ubuntu-latest
+    container:
+      # Human-readable tag: mcr.microsoft.com/playwright:v1.62.1-jammy
+      # Pinned to the digest that tag resolved to on 2026-09-11, so a retag in
+      # the registry cannot change the fonts or the Chromium build under a
+      # capture. Re-record the digest with:
+      #   curl -sSI -H "Accept: application/vnd.oci.image.index.v1+json" \
+      #     https://mcr.microsoft.com/v2/playwright/manifests/v1.62.1-jammy
+      image: mcr.microsoft.com/playwright:v1.62.1-jammy@sha256:b3251f7ff1a9fa559a28d1c67eaa15fc1a9800f7845e82756caea7842967f615
+    env:
+      CAPTURE_REF: ${{ inputs.ref }}
+      CONTAINER_IMAGE: mcr.microsoft.com/playwright:v1.62.1-jammy@sha256:b3251f7ff1a9fa559a28d1c67eaa15fc1a9800f7845e82756caea7842967f615
+      CONTAINER_TAG: mcr.microsoft.com/playwright:v1.62.1-jammy
+      PLAYWRIGHT_VERSION: "1.62.1"
+      QUALIFICATION_ONLY: ${{ inputs.qualification_only }}
+      # The families Chromium reported through CSS.getPlatformFontsForNode, not
+      # the families fc-match resolves. Recorded by qualification run 34734456858
+      # under the pinned container digest; a change now fails the job instead of
+      # silently changing the pixels.
+      EXPECTED_SANS_FALLBACK: "Liberation Sans"
+      EXPECTED_MONO_FALLBACK: "WenQuanYi Zen Hei Mono"
+    steps:
+      - name: Check out the dispatched ref
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require the requested ref to be the checked-out commit SHA
+        env:
+          REQUESTED_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$REQUESTED_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "ref must be a full 40-character lowercase commit SHA" >&2
+            exit 1
+          fi
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          resolved_ref="$(git rev-parse HEAD)"
+          if [ "$resolved_ref" != "$REQUESTED_REF" ]; then
+            printf 'requested commit %s resolved to %s\n' "$REQUESTED_REF" "$resolved_ref" >&2
+            exit 1
+          fi
+
+      - name: Prepare the candidate directory and the run log
+        run: |
+          set -euo pipefail
+          if [ -z "${RUNNER_TEMP:-}" ]; then
+            echo "RUNNER_TEMP is not set" >&2
+            exit 1
+          fi
+          candidate_dir="$RUNNER_TEMP/public-demo-screenshot-candidate"
+          printf 'CANDIDATE_DIR=%s\n' "$candidate_dir" >> "$GITHUB_ENV"
+          rm -rf "$candidate_dir"
+          mkdir -p "$candidate_dir/run-1" "$candidate_dir/run-2"
+
+      - name: Record the pinned environment
+        run: |
+          {
+            set -euo pipefail
+            printf 'container image: %s\n' "$CONTAINER_IMAGE"
+            printf 'container tag: %s\n' "$CONTAINER_TAG"
+            printf 'captured ref: %s\n' "$CAPTURE_REF"
+            printf 'commit: %s\n' "$(git rev-parse HEAD)"
+            printf 'node: %s\n' "$(node --version)"
+            printf 'npm: %s\n' "$(npm --version)"
+            printf 'python: %s\n' "$(python3 --version)"
+          } 2>&1 | tee -a "$CANDIDATE_DIR/capture.log"
+
+      - name: Install pinned browser QA dependencies
+        run: |
+          {
+            set -euo pipefail
+            npm ci --ignore-scripts
+          } 2>&1 | tee -a "$CANDIDATE_DIR/capture.log"
+
+      - name: Check the locked Playwright version matches the container tag
+        run: |
+          {
+            set -euo pipefail
+            locked="$(node -e 'process.stdout.write(require("./package-lock.json").packages["node_modules/@playwright/test"].version)')"
+            printf 'locked @playwright/test: %s\n' "$locked"
+            printf 'installed Playwright: %s\n' "$(npx playwright --version)"
+            if [ "$locked" != "$PLAYWRIGHT_VERSION" ]; then
+              printf 'container tag v%s does not match the locked Playwright version %s\n' \
+                "$PLAYWRIGHT_VERSION" "$locked" >&2
+              exit 1
+            fi
+          } 2>&1 | tee -a "$CANDIDATE_DIR/capture.log"
+
+      - name: Verify the fallback fonts the demo page renders with
+        run: |
+          {
+            set -euo pipefail
+            if ! command -v fc-match >/dev/null; then
+              echo "fontconfig is missing from the container image" >&2
+              exit 1
+            fi
+            echo "font packages in the image:"
+            dpkg-query -W -f='${Package} ${Version}\n' 'fonts-*' 'ttf-*' || true
+            # public-demo/index.html asks for "Segoe UI", Tahoma, Geneva,
+            # Verdana, sans-serif and for "Cascadia Mono", SFMono-Regular,
+            # Consolas, monospace. None of those faces ship on Linux, so every
+            # glyph comes from the fontconfig fallback.
+            for request in "Segoe UI" Tahoma Geneva Verdana "Cascadia Mono" SFMono-Regular Consolas; do
+              printf 'requested %s resolves to %s\n' "$request" "$(fc-match -f '%{family}' "$request")"
+            done
+            sans="$(fc-match -f '%{family}' sans-serif)"
+            mono="$(fc-match -f '%{family}' monospace)"
+            printf 'sans-serif fallback: %s\n' "$sans"
+            printf 'monospace fallback: %s\n' "$mono"
+            if [ -z "$sans" ] || [ -z "$mono" ]; then
+              echo "no sans-serif or monospace fallback font is installed" >&2
+              exit 1
+            fi
+            # Everything above is informational. fc-match answers a fontconfig
+            # question; the next step asks Chromium which families it actually
+            # rasterised the page with, and that is what is asserted.
+          } 2>&1 | tee -a "$CANDIDATE_DIR/capture.log"
+
+      - name: Check the fonts Chromium actually rendered the demo with
+        run: |
+          {
+            set -euo pipefail
+            node scripts/report_public_demo_platform_fonts.js "$CANDIDATE_DIR/platform-fonts.json"
+            platform_sans="$(node -e 'process.stdout.write(require(process.argv[1]).probes.sans.dominant_family)' "$CANDIDATE_DIR/platform-fonts.json")"
+            platform_mono="$(node -e 'process.stdout.write(require(process.argv[1]).probes.mono.dominant_family)' "$CANDIDATE_DIR/platform-fonts.json")"
+            printf 'platform sans family: %s\n' "$platform_sans"
+            printf 'platform mono family: %s\n' "$platform_mono"
+            if [ -z "$platform_sans" ] || [ -z "$platform_mono" ]; then
+              echo "Chromium reported no platform font family for the demo page" >&2
+              exit 1
+            fi
+            if [ -n "$EXPECTED_SANS_FALLBACK" ] && [ "$platform_sans" != "$EXPECTED_SANS_FALLBACK" ]; then
+              printf 'the sans family Chromium used changed: expected %s, found %s\n' \
+                "$EXPECTED_SANS_FALLBACK" "$platform_sans" >&2
+              exit 1
+            fi
+            if [ -n "$EXPECTED_MONO_FALLBACK" ] && [ "$platform_mono" != "$EXPECTED_MONO_FALLBACK" ]; then
+              printf 'the mono family Chromium used changed: expected %s, found %s\n' \
+                "$EXPECTED_MONO_FALLBACK" "$platform_mono" >&2
+              exit 1
+            fi
+          } 2>&1 | tee -a "$CANDIDATE_DIR/capture.log"
+
+      - name: Capture twice from the checked-in artifact and compare the bytes
+        run: |
+          {
+            set -euo pipefail
+            node scripts/capture_public_demo_screenshots.js
+            cp docs/images/screenshots/public-demo-overview.png "$CANDIDATE_DIR/run-1/"
+            cp docs/images/screenshots/public-demo-history.png "$CANDIDATE_DIR/run-1/"
+            git checkout -- docs/images/screenshots wiki/images
+            node scripts/capture_public_demo_screenshots.js
+            cp docs/images/screenshots/public-demo-overview.png "$CANDIDATE_DIR/run-2/"
+            cp docs/images/screenshots/public-demo-history.png "$CANDIDATE_DIR/run-2/"
+            if [ "$QUALIFICATION_ONLY" = "true" ]; then
+              printf 'qualification_only run: not writing proposed-manifest.json\n'
+            else
+              python3 scripts/check_public_screenshots.py --report \
+                > "$CANDIDATE_DIR/proposed-manifest.json"
+              cat "$CANDIDATE_DIR/proposed-manifest.json"
+            fi
+            git checkout -- docs/images/screenshots wiki/images
+            differences=0
+            for name in public-demo-overview.png public-demo-history.png; do
+              if cmp -s "$CANDIDATE_DIR/run-1/$name" "$CANDIDATE_DIR/run-2/$name"; then
+                printf 'reproducible across both runs: %s\n' "$name"
+              else
+                printf 'NOT reproducible across the two runs: %s\n' "$name" >&2
+                differences=$((differences + 1))
+              fi
+            done
+            cp "$CANDIDATE_DIR/run-2/public-demo-overview.png" "$CANDIDATE_DIR/"
+            cp "$CANDIDATE_DIR/run-2/public-demo-history.png" "$CANDIDATE_DIR/"
+            (
+              cd "$CANDIDATE_DIR"
+              sha256sum ./*.png | tee sha256sums.txt
+            )
+            status="$(git status --short)"
+            if [ -n "$status" ]; then
+              printf 'the capture left the checkout dirty:\n%s\n' "$status" >&2
+              exit 1
+            fi
+            if [ "$differences" -ne 0 ]; then
+              echo "the capture is not byte-reproducible in this environment" >&2
+              exit 1
+            fi
+          } 2>&1 | tee -a "$CANDIDATE_DIR/capture.log"
+
+      - name: Upload the capture for human review
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ inputs.qualification_only && 'public-demo-screenshot-qualification' || 'public-demo-screenshot-candidate' }}
+          path: ${{ env.CANDIDATE_DIR }}
+          retention-days: 14
+          if-no-files-found: error

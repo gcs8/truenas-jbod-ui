@@ -358,12 +358,38 @@ python scripts/validate_release_wrap.py "$version" \
 
 ## Screenshots
 
-- regenerate public screenshots only from the checked synthetic artifact:
-  `node scripts/capture_public_demo_screenshots.js`
+- follow [`SCREENSHOT_CAPTURE.md`](SCREENSHOT_CAPTURE.md); do not run the
+  capture script on the release maintainer's workstation
+- push the checked synthetic artifact, record its full commit SHA, and dispatch
+  the pinned workflow from its default-branch definition:
+
+  ```bash
+  candidate_sha="$(git rev-parse HEAD)"
+  gh workflow run capture-public-demo-screenshots.yml --ref main \
+    -f ref="$candidate_sha" -f qualification_only=false
+  ```
+
+- identify that dispatch's run ID, require `gh run watch <run-id> --exit-status`
+  to succeed, then retrieve its candidate artifact into a new empty directory:
+
+  ```bash
+  rm -rf /tmp/public-demo-screenshot-candidate
+  gh run download <run-id> \
+    --name public-demo-screenshot-candidate \
+    --dir /tmp/public-demo-screenshot-candidate
+  cd /tmp/public-demo-screenshot-candidate
+  sha256sum --check sha256sums.txt
+  ```
+
+- review `capture.log` for the requested full commit SHA and pinned environment,
+  `platform-fonts.json` for the rendered font families, and
+  `proposed-manifest.json` for the same PNG hashes reported by
+  `sha256sums.txt`; reject a missing or mismatched file
 - do not capture a live app, admin page, operator config, local history, or
   private deployment for the public README or Wiki
-- inspect `public-demo-overview.png` and `public-demo-history.png` at their
-  exact manifest hashes
+- inspect the downloaded `public-demo-overview.png` and
+  `public-demo-history.png` at the exact hashes in `sha256sums.txt`, then copy
+  the reviewed bytes into both docs and Wiki locations
 - after pixel review, set each manifest review field to `PASS` and run:
   - `python3 scripts/check_public_demo_artifact.py public-demo`
   - `python3 scripts/check_public_screenshots.py`
