@@ -127,7 +127,7 @@ class ReleaseWrapValidatorTests(unittest.TestCase):
         self.assertIn("runtime convergence was reverified", deployment_row)
         self.assertIn("Private deployment identifiers are not retained", deployment_row)
 
-    def test_v0230_pretag_wrap_is_complete_with_postpublish_hold(self) -> None:
+    def test_v0230_wrap_records_publication_and_remaining_holds(self) -> None:
         repository = Path(__file__).resolve().parents[1]
         text = (repository / "docs" / "RELEASE_WRAP_0.23.0.md").read_text(encoding="utf-8")
 
@@ -148,8 +148,12 @@ class ReleaseWrapValidatorTests(unittest.TestCase):
             ),
             [],
         )
-        self.assertIn("Pending owner publication: external wiki, public demo", text)
-        self.assertIn("GHCR publication, deployment, external Wiki/public-demo publication", text)
+        self.assertIn("Tag: `v0.23.0`, published 2026-09-09", text)
+        self.assertIn("https://github.com/gcs8/truenas-jbod-ui/actions/runs/34293966354", text)
+        self.assertIn("Pending owner publication: external wiki", text)
+        self.assertIn("Private deployment qualification remains unverified", text)
+        self.assertNotIn("Tag: `v0.23.0` pending", text)
+        self.assertNotIn("Do not tag or publish v0.23.0", text)
 
     def test_accepts_complete_release_wrap_evidence_table(self) -> None:
         issues = validate_release_wrap_text(_wrap_with_rows({}))
