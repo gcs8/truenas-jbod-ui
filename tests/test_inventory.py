@@ -12125,8 +12125,9 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
                         if mode == "replacement":
                             current[field_name] = "invented-b"
                         if mode == "fallback":
-                            # A remaining lower-priority ID does not license
-                            # restoring the missing historical primary identity.
+                            # A lower-priority strong ID that both observations
+                            # share does license restoring the missing primary
+                            # identity (#520); only an alias-only view does not.
                             fallback = "gptid" if field_name != "gptid" else "sas_address"
                             current[fallback] = historical[fallback] = "invented-fallback"
                         slot = SlotView(
@@ -12142,14 +12143,17 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
                         )
                         store = service.slot_detail_store
                         store.save_entries([entry])
+                        service._apply_persisted_slot_details([slot])
+                        # Identity is recorded from the published view, the order
+                        # `_apply_and_persist_snapshot_slot_details` uses, so a
+                        # field restored from cache cannot desynchronise the key
+                        # every later SMART request computes.
                         service._observe_smart_disk_identities([slot])
                         key = service._smart_cache_key(slot)
                         generation = service._smart_cache_generation_token(key)
-                        service._apply_persisted_slot_details([slot])
-                        self.assertEqual(service._smart_cache_key(slot), key)
                         self.assertTrue(service._smart_request_is_current(key, generation))
                         cached = service._build_persisted_smart_summary(slot)
-                        matched = mode == "same" or (mode == "fallback" and field_name == "gptid")
+                        matched = mode in ("same", "fallback")
                         if matched:
                             self.assertEqual(cached.power_on_hours, 321)
                         else:

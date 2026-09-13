@@ -3105,24 +3105,25 @@ class InventoryService:
             _smart_detail_batch.reset(token)
 
     async def _apply_and_persist_snapshot_slot_details(self, slots: list[SlotView]) -> None:
-        self._observe_smart_disk_identities(slots)
         store = self.slot_detail_store
         if store is None or not slots:
+            self._observe_smart_disk_identities(slots)
             return
-        generations = [
-            (key, self._smart_cache_generation_token(key))
-            for key in (self._smart_cache_key(slot) for slot in slots)
-        ]
+        loaded: Mapping[str, SlotDetailCacheEntry] = {}
+        generations: list[tuple[SmartCacheKey, SmartCacheGenerationToken]] = []
 
         @contextmanager
         def commit_guard():
             with self._smart_persistence_lock:
                 yield all(self._smart_request_is_current(key, generation) for key, generation in generations)
 
-        def apply_and_save():
+        def apply():
+            nonlocal loaded
             with perf_stage("inventory.slot_detail_cache.apply", slot_count=len(slots)):
                 loaded = store.load_all()
                 self._apply_persisted_slot_details(slots, loaded_entries=loaded)
+
+        def save():
             with perf_stage("inventory.slot_detail_cache.persist", slot_count=len(slots)):
                 entries = [self._build_slot_detail_entry(slot, smart_summary=None) for slot in slots]
                 store.save_entries(
@@ -3130,10 +3131,25 @@ class InventoryService:
                     expected_entries=loaded, commit_guard=commit_guard,
                 )
 
+        async def apply_observe_and_save():
+            await asyncio.to_thread(apply)
+            # Record identity from the published view, the same view every later
+            # SMART request keys off. Observing the pre-backfill view instead
+            # makes every slot whose serial came from the cache read as
+            # identity-changed for the rest of its life. Still on the loop, so
+            # the final-write fence is shared with retained SMART writers without
+            # being held over disk I/O.
+            self._observe_smart_disk_identities(slots)
+            generations.extend(
+                (key, self._smart_cache_generation_token(key))
+                for key in (self._smart_cache_key(slot) for slot in slots)
+            )
+            await asyncio.to_thread(save)
+
         # The worker owns these request-local slots until it finishes. Retain the
         # caller's snapshot lock/activity through repeated cancellation, including
         # late failures, rather than letting a successor race a detached writer.
-        worker = asyncio.create_task(asyncio.to_thread(apply_and_save))
+        worker = asyncio.create_task(apply_observe_and_save())
         cancelled = False
         while not worker.done():
             try:
@@ -3290,21 +3306,25 @@ class InventoryService:
     def _slot_detail_entry_matches(self, slot_view: SlotView, entry: SlotDetailCacheEntry) -> bool:
         if slot_view.state == SlotState.empty or not slot_view.present:
             return False
-        # Match the observed primary identity before historical enrichment.
-        # Loss/return of a serial is a new observation, not proof that a reused
-        # device alias still belongs to the historical disk. Reject that cache
-        # entry rather than restoring an ID that disagrees with SMART admission.
-        current_identity = previous_identity = None
+        # Admit the entry when the two observations agree on hardware identity,
+        # not when they happen to rank the same field first: a live view that
+        # drops its serial while SES still reports the bay's sas_address is the
+        # same disk. Require that nothing shared disagrees AND that at least one
+        # strong identifier is present on both sides and equal. A side that
+        # offers no strong identifier proves nothing, so loss/return of a serial
+        # down to a reusable device alias is still a new observation rather than
+        # licence to restore an ID that disagrees with SMART admission.
+        current_identity = previous_identity = shared_identity = False
         for field_name in ("serial", "logical_unit_id", "sas_address", "gptid"):
             current = normalize_text(getattr(slot_view, field_name))
             previous = normalize_text(entry.slot_fields.get(field_name)) or normalize_text(entry.smart_fields.get(field_name))
-            if current and current_identity is None:
-                current_identity = (field_name, current.lower())
-            if previous and previous_identity is None:
-                previous_identity = (field_name, previous.lower())
-            if current and previous and current.lower() != previous.lower():
-                return False
-        if current_identity != previous_identity:
+            current_identity = current_identity or bool(current)
+            previous_identity = previous_identity or bool(previous)
+            if current and previous:
+                if current.lower() != previous.lower():
+                    return False
+                shared_identity = True
+        if not shared_identity and (current_identity or previous_identity):
             return False
         # Both identity-poor entries retain device-scoped matching. This cannot
         # detect a physical swap that inventory never observes.
