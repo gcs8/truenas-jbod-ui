@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -298,6 +301,10 @@ class CIWorkflowContractTests(unittest.TestCase):
         )
         self.assertEqual(ref_check["env"]["REQUESTED_REF"], "${{ inputs.ref }}")
         self.assertIn('[[ ! "$REQUESTED_REF" =~ ^[0-9a-f]{40}$ ]]', ref_check["run"])
+        self.assertIn(
+            'git config --global --add safe.directory "$GITHUB_WORKSPACE"',
+            ref_check["run"],
+        )
         self.assertIn('resolved_ref="$(git rev-parse HEAD)"', ref_check["run"])
         self.assertIn('[ "$resolved_ref" != "$REQUESTED_REF" ]', ref_check["run"])
         self.assertEqual(
@@ -311,6 +318,7 @@ class CIWorkflowContractTests(unittest.TestCase):
         prepare = job["steps"][2]["run"]
         self.assertIn('candidate_dir="$RUNNER_TEMP/public-demo-screenshot-candidate"', prepare)
         self.assertIn('>> "$GITHUB_ENV"', prepare)
+        self.assertNotIn("safe.directory", prepare)
         self.assertTrue(
             all("$CANDIDATE_DIR" not in str(step.get("run", "")) for step in job["steps"][:2])
         )
@@ -363,6 +371,35 @@ class CIWorkflowContractTests(unittest.TestCase):
             "node scripts/capture_public_demo_screenshots.js",
             screenshot_section,
         )
+
+    def test_screenshot_capture_ref_guard_admits_container_checkout_ownership(self) -> None:
+        workflow = yaml.safe_load(self.read(CAPTURE_SCREENSHOTS_WORKFLOW))
+        guard = workflow["jobs"]["capture"]["steps"][1]["run"]
+        head = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=ROOT,
+            text=True,
+        ).strip()
+
+        with tempfile.TemporaryDirectory() as home:
+            result = subprocess.run(
+                ["bash", "-c", guard],
+                cwd=ROOT,
+                env={
+                    **os.environ,
+                    "GITHUB_WORKSPACE": str(ROOT),
+                    "GIT_TEST_ASSUME_DIFFERENT_OWNER": "1",
+                    "HOME": home,
+                    "REQUESTED_REF": head,
+                },
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                f"directory = {ROOT}",
+                (Path(home) / ".gitconfig").read_text(encoding="utf-8"),
+            )
 
     def test_screenshot_capture_qualification_run_cannot_pass_as_a_candidate(self) -> None:
         workflow = yaml.safe_load(self.read(CAPTURE_SCREENSHOTS_WORKFLOW))

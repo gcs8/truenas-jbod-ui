@@ -72,6 +72,7 @@ jobs:
             echo "ref must be a full 40-character lowercase commit SHA" >&2
             exit 1
           fi
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           resolved_ref="$(git rev-parse HEAD)"
           if [ "$resolved_ref" != "$REQUESTED_REF" ]; then
             printf 'requested commit %s resolved to %s\n' "$REQUESTED_REF" "$resolved_ref" >&2
@@ -87,7 +88,6 @@ jobs:
           fi
           candidate_dir="$RUNNER_TEMP/public-demo-screenshot-candidate"
           printf 'CANDIDATE_DIR=%s\n' "$candidate_dir" >> "$GITHUB_ENV"
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           rm -rf "$candidate_dir"
           mkdir -p "$candidate_dir/run-1" "$candidate_dir/run-2"
 
