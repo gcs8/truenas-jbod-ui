@@ -196,6 +196,11 @@ class PublicScreenshotContractTests(unittest.TestCase):
         capture_script = (ROOT / "scripts/capture_public_demo_screenshots.js").read_text(encoding="utf-8")
         self.assertIn("public-demo/index.html", capture_script)
         self.assertIn('timezoneId: "UTC"', capture_script)
+        self.assertIn('require("./screenshot_capture_state.js")', capture_script)
+        self.assertLess(
+            capture_script.index("await normalizeCaptureState(page)"),
+            capture_script.index("await page.screenshot"),
+        )
         self.assertNotIn("public-demo-mobile.png", capture_script)
         self.assertNotIn("http://localhost:8080", capture_script)
         self.assertNotIn("system_id", capture_script)

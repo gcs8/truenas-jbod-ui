@@ -30,7 +30,7 @@ never on a workstation.
 | Browser build | the Chromium inside that image |
 | Fonts | the font packages inside that image, listed in the run log |
 | Demo artifact | the checked-in `public-demo/index.html` at the dispatched ref |
-| Capture settings | `scripts/capture_public_demo_screenshots.js`: `file://` only, 1920 by 1080 viewport, dark scheme, UTC, reduced motion |
+| Capture settings | `scripts/capture_public_demo_screenshots.js`: `file://` only, 1920 by 1080 viewport, dark scheme, UTC, reduced motion, pointer moved off controls, focus cleared, two settled animation frames |
 
 The image is pinned by digest, not by tag alone. A tag in a registry can be
 moved to new bytes, and a moved tag would change the fonts or the Chromium build
@@ -146,10 +146,13 @@ producing images to commit, is the workflow run with `qualification_only` set to
    set `qualification_only` to `false`.
 3. The job checks out the ref, installs the locked dependencies, verifies the
    fonts, then runs `node scripts/capture_public_demo_screenshots.js` twice,
-   restoring the checkout between the runs. If any PNG differs between run 1 and
-   run 2, the job fails. That comparison is the reproducibility proof, and a
-   failure means the environment is not deterministic yet, not that the images
-   are wrong.
+   restoring the checkout between the runs. After each scripted interaction,
+   the capture moves the pointer off controls, clears focus, and waits for two
+   animation frames. This removes transient hover and focus rendering without
+   changing the application or rewriting captured pixels. If any PNG differs
+   between run 1 and run 2, the job fails. That comparison is the
+   reproducibility proof, and a failure means the environment is not
+   deterministic yet, not that the images are wrong.
 4. The job runs `python scripts/check_public_screenshots.py --report`, which
    prints the manifest entries the captured bytes would need. Report mode reads
    no manifest and writes no file, and it always records
