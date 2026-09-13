@@ -3,8 +3,8 @@ from __future__ import annotations
 import argparse
 import errno
 import os
-import resource
 import stat
+import sys
 from pathlib import Path
 
 APP_RECURSIVE_ROOTS = ("data", "history", "logs")
@@ -30,11 +30,14 @@ class OwnershipEntries(list[tuple[Path, os.stat_result]]):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Preflight or apply bounded non-root bind-mount ownership.")
-    parser.add_argument("root", type=Path, help="Deployment directory containing the known runtime roots.")
-    parser.add_argument("--uid", type=int, default=10001)
-    parser.add_argument("--gid", type=int, default=10001)
-    parser.add_argument("--apply", action="store_true", help="Apply ownership after a complete safe preflight.")
+    parser = argparse.ArgumentParser(
+        description="Preflight or apply bounded non-root bind-mount ownership on a POSIX deployment host.",
+        epilog="Default is read-only preflight. Run on the deployment host with POSIX ownership and descriptor support; --apply requires root.",
+    )
+    parser.add_argument("root", type=Path, help="Deployment directory containing config, data, history and logs, e.g. /srv/enclosure.")
+    parser.add_argument("--uid", type=int, default=10001, help="Target numeric user ID, e.g. 10001 (default: 10001).")
+    parser.add_argument("--gid", type=int, default=10001, help="Target numeric group ID, e.g. 10001 (default: 10001).")
+    parser.add_argument("--apply", action="store_true", help="As root, apply ownership and modes 0770 for directories / 0660 for files after a complete safe preflight.")
     return parser.parse_args()
 
 
@@ -370,6 +373,8 @@ def apply_ownership(
     uid: int,
     gid: int,
 ) -> None:
+    import resource
+
     if not isinstance(entries, OwnershipEntries):
         raise TypeError("ownership entries must come from descriptor-bound inventory")
     descriptor_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
@@ -446,6 +451,19 @@ def apply_ownership(
 
 def main() -> int:
     args = parse_args()
+    try:
+        _require_descriptor_support()
+        if any(not hasattr(os, name) for name in ("geteuid", "fchown", "fchmod")):
+            raise RuntimeError("POSIX identity and ownership APIs are unavailable")
+        # Delay the POSIX-only import until argparse has handled --help.
+        import resource  # noqa: F401
+    except (ImportError, RuntimeError) as exc:
+        print(
+            f"unsupported on this platform: {exc}; run this helper on the POSIX deployment host "
+            "with ownership and descriptor support, not inside the application container.",
+            file=sys.stderr,
+        )
+        return 1
     entries = inventory(args.root)
     if args.apply:
         if os.geteuid() != 0:

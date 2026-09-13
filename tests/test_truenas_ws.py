@@ -395,5 +395,484 @@ class TrueNASWebsocketClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(connect_mock.call_args.kwargs["server_hostname"], "TrueNAS.gcs8.io")
 
 
+class SyntheticDDPPeer:
+    """In-memory wire peer; only connect is replaced, not client methods."""
+
+    def __init__(self, width=1, *, mode="normal", close_error=False):
+        self.width = width
+        self.mode = mode
+        self.close_error = close_error
+        self.connections = self.logins = self.closes = 0
+        self.active = self.peak = 0
+        self.requests = []
+        self.replies = []
+        self.waiting = []
+        self.queue = asyncio.Queue()
+        self.started = asyncio.Event()
+        self.closing = asyncio.Event()
+        self.release = asyncio.Event()
+        self.reader_error = RuntimeError("synthetic reader failure")
+        self.reader_tasks = set()
+        self.send_tasks = set()
+        self.authenticated = False
+        self.late_error_raised = False
+
+    @asynccontextmanager
+    async def connect(self, url, **kwargs):
+        assert url == "wss://smart-batch.invalid/websocket"
+        self.connections += 1
+        self.authenticated = False
+        try:
+            await asyncio.sleep(0)
+            yield self
+        finally:
+            self.closes += 1
+            self.active = 0
+            if self.close_error:
+                raise RuntimeError("synthetic close failure")
+
+    async def send(self, raw):
+        message = json.loads(raw)
+        if message["msg"] == "connect":
+            assert message == {"msg": "connect", "version": "1", "support": ["1"]}
+            if self.mode != "handshake_timeout":
+                self.queue.put_nowait({"msg": "connected"})
+            return
+        if message["msg"] == "pong":
+            return
+        method = message["method"]
+        if method == "auth.login_with_api_key":
+            self.logins += 1
+            self.authenticated = self.mode != "auth_failure"
+            if self.mode != "auth_timeout":
+                self.queue.put_nowait({"msg": "result", "id": message["id"], "result": self.authenticated})
+            return
+        assert self.authenticated
+        if method == "enclosure.set_slot_status":
+            self.requests.append(message["params"])
+            self.queue.put_nowait({"msg": "result", "id": message["id"], "result": None})
+            return
+        assert method == "disk.smartctl"
+        self.send_tasks.add(asyncio.current_task())
+        self.requests.append(message["params"])
+        self.waiting.append(message)
+        self.active += 1
+        self.peak = max(self.peak, self.active)
+        self.started.set()
+        if self.mode in ("send", "send_reader_failure"):
+            if self.mode == "send_reader_failure":
+                self.queue.put_nowait(self.reader_error)
+            await asyncio.Future()
+        if self.mode in ("response", "late_reader", "timeout"):
+            return
+        if self.mode == "reader_failure":
+            self.queue.put_nowait(self.reader_error)
+            return
+        if len(self.waiting) == self.width:
+            for request in reversed(self.waiting):
+                reply = {"msg": "result", "id": request["id"], "result": request["params"][0]}
+                if self.mode in ("invalid", "invalid_late_reader"):
+                    reply["result"] = {"not": "SMART text"}
+                elif self.mode == "middleware":
+                    reply["error"] = {"reason": "ENOMETHOD"}
+                self.queue.put_nowait(reply)
+            self.waiting.clear()
+
+    async def recv(self):
+        self.reader_tasks.add(asyncio.current_task())
+        try:
+            message = await self.queue.get()
+        except asyncio.CancelledError:
+            if self.mode in ("late_reader", "invalid_late_reader") and self.authenticated:
+                self.closing.set()
+                await self.release.wait()
+                self.late_error_raised = True
+                raise self.reader_error
+            raise
+        if isinstance(message, Exception):
+            raise message
+        if message.get("msg") == "result" and isinstance(message.get("result"), str):
+            self.active -= 1
+            self.replies.append(message["result"])
+        return json.dumps(message)
+
+
+class PingGatedDDPPeer(SyntheticDDPPeer):
+    """Release real DDP results only after the exact application JSON pong.
+
+    WS448-1 reviewer reproduction: connect, authenticate, receive SMART, send
+    ping, withhold SMART until pong. Transport control frames cannot release it.
+    """
+
+    def __init__(self, *, phase="smart", ping=None, width=1, pong_mode="normal"):
+        super().__init__(width=width, mode="response")
+        self.phase = phase
+        self.ping = {"msg": "ping"} if ping is None else ping
+        self.expected_pong = {**self.ping, "msg": "pong"}
+        self.pong_mode = pong_mode
+        self.pongs = []
+        self.auth_request = None
+        self.pong_started = asyncio.Event()
+        self.pong_stopped = asyncio.Event()
+        self.receivers = self.peak_receivers = 0
+
+    async def send(self, raw):
+        message = json.loads(raw)
+        if message["msg"] == "pong":
+            self.pongs.append(message)
+            assert message == self.expected_pong, "DDP pong must preserve optional ping id exactly"
+            self.pong_started.set()
+            if self.pong_mode == "blocked":
+                try:
+                    await asyncio.Future()
+                finally:
+                    self.pong_stopped.set()
+            if self.pong_mode == "failure":
+                raise self.reader_error
+            if self.pong_mode == "repeat":
+                # Yield so a peer's application pings cannot starve test timers.
+                await asyncio.sleep(0.001)
+                self.queue.put_nowait(self.ping)
+                return
+            if self.auth_request is not None:
+                self.authenticated = True
+                self.queue.put_nowait({"msg": "result", "id": self.auth_request["id"], "result": True})
+                self.auth_request = None
+            else:
+                for request in reversed(self.waiting):
+                    self.queue.put_nowait({"msg": "result", "id": request["id"],
+                                           "result": "ping-ok" if self.width == 1 else request["params"][0]})
+                self.waiting.clear()
+            return
+        if message.get("method") == "auth.login_with_api_key" and self.phase == "auth":
+            self.logins += 1
+            self.auth_request = message
+            self.queue.put_nowait(self.ping)
+            return
+        await super().send(raw)
+        if message.get("method") == "disk.smartctl" and len(self.waiting) == self.width:
+            if self.phase == "smart":
+                self.queue.put_nowait(self.ping)
+            else:
+                for request in reversed(self.waiting):
+                    self.queue.put_nowait({"msg": "result", "id": request["id"],
+                                           "result": "ping-ok" if self.width == 1 else request["params"][0]})
+                self.waiting.clear()
+
+    async def recv(self):
+        self.receivers += 1
+        self.peak_receivers = max(self.peak_receivers, self.receivers)
+        try:
+            return await super().recv()
+        finally:
+            self.receivers -= 1
+
+
+class SmartctlBatchTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.client = TrueNASWebsocketClient(TrueNASConfig(
+            host="https://smart-batch.invalid", api_key="synthetic-ephemeral-token", platform="core",
+        ))
+        self.loop_errors = []
+        loop = asyncio.get_running_loop()
+        old_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: self.loop_errors.append(context))
+        self.addCleanup(loop.set_exception_handler, old_handler)
+        for target in ("socket.create_connection", "socket.socket.connect", "socket.getaddrinfo"):
+            blocker = patch(target, side_effect=AssertionError("unexpected network access"))
+            blocker.start()
+            self.addCleanup(blocker.stop)
+        self.baseline = set(asyncio.all_tasks())
+
+    async def asyncTearDown(self):
+        import gc
+        await asyncio.sleep(0)
+        gc.collect()
+        await asyncio.sleep(0)
+        self.assertEqual(self.loop_errors, [])
+        self.assertEqual([
+            t for t in asyncio.all_tasks() - self.baseline
+            if t is not asyncio.current_task() and not t.done()
+        ], [])
+
+    async def run_peer(self, peer, disks, *, budget=2, args=None):
+        with patch("app.services.truenas_ws.connect", peer.connect):
+            return await asyncio.wait_for(
+                self.client.smartctl_batch(disks, args, max_concurrency=budget), 5,
+            )
+
+    async def test_single_call_answers_ddp_ping_control(self):
+        peer = PingGatedDDPPeer()
+        with patch("app.services.truenas_ws.connect", peer.connect):
+            self.assertEqual(await asyncio.wait_for(self.client.fetch_disk_smartctl("a"), 1), "ping-ok")
+        self.assertEqual(peer.pongs, [{"msg": "pong"}])
+        self.assertEqual((peer.connections, peer.logins, peer.closes), (1, 1, 1))
+
+    async def test_batch_answers_ddp_ping_contract(self):
+        self.client.config.timeout_seconds = 0.1
+        peer = PingGatedDDPPeer()
+        with patch("app.services.truenas_ws.connect", peer.connect):
+            try:
+                result = await self.client.smartctl_batch(["a"], max_concurrency=1)
+            except TimeoutError:
+                self.fail(f"batch ignored DDP ping: pongs={len(peer.pongs)}, closes={peer.closes}; "
+                          "single-call control succeeds")
+        self.assertEqual(result, ["ping-ok"])
+        self.assertEqual(peer.pongs, [{"msg": "pong"}])
+        self.assertEqual((peer.connections, peer.logins, peer.closes, peer.peak_receivers), (1, 1, 1, 1))
+
+    async def test_ddp_optional_ping_id_during_auth_and_smart_core_and_scale(self):
+        self.client.config.timeout_seconds = 0.1
+        for platform in ("core", "scale"):
+            self.client.config.platform = platform
+            for phase in ("auth", "smart"):
+                for ping in ({"msg": "ping"}, {"msg": "ping", "id": "synthetic-ping"}, {"msg": "ping", "id": ""}):
+                    for batch in (False, True):
+                        with self.subTest(platform=platform, phase=phase, ping=ping, batch=batch):
+                            peer = PingGatedDDPPeer(phase=phase, ping=ping)
+                            with patch("app.services.truenas_ws.connect", peer.connect):
+                                operation = (self.client.smartctl_batch(["a"], max_concurrency=1) if batch
+                                             else self.client.fetch_disk_smartctl("a"))
+                                try:
+                                    result = await asyncio.wait_for(operation, 1)
+                                except TimeoutError:
+                                    self.fail("DDP ping prevented authentication or SMART progress")
+                            self.assertEqual(result, ["ping-ok"] if batch else "ping-ok")
+                            self.assertEqual(peer.pongs, [{**ping, "msg": "pong"}])
+                            self.assertEqual((peer.connections, peer.logins, peer.closes, peer.peak_receivers),
+                                             (1, 1, 1, 1))
+
+    async def test_ddp_ping_batch_reorders_results_without_extra_receiver(self):
+        peer = PingGatedDDPPeer(width=2, ping={"msg": "ping", "id": "reorder"})
+        self.client.config.timeout_seconds = 0.1
+        disks = ["a", "b", "c", "d"]
+        self.assertEqual(await self.run_peer(peer, disks), disks)
+        self.assertEqual(peer.replies, ["b", "a", "d", "c"])
+        self.assertEqual(peer.pongs, [{"msg": "pong", "id": "reorder"}] * 2)
+        self.assertEqual((peer.connections, peer.logins, peer.closes, peer.peak_receivers, peer.peak),
+                         (1, 1, 1, 1, 2))
+
+    async def test_ddp_pong_block_or_repeated_ping_does_not_reset_batch_deadline(self):
+        self.client.config.timeout_seconds = 0.03
+        for phase in ("auth", "smart"):
+            for mode in ("blocked", "repeat"):
+                with self.subTest(phase=phase, mode=mode):
+                    peer = PingGatedDDPPeer(phase=phase, pong_mode=mode)
+                    with patch("app.services.truenas_ws.connect", peer.connect):
+                        task = asyncio.create_task(self.client.smartctl_batch(["a"], max_concurrency=1))
+                        try:
+                            done, _ = await asyncio.wait({task}, timeout=1)
+                            self.assertIn(task, done, "application ping extended the configured deadline")
+                            with self.assertRaises(TimeoutError):
+                                task.result()
+                        finally:
+                            if not task.done():
+                                task.cancel()
+                            await asyncio.gather(task, return_exceptions=True)
+                    self.assertTrue(peer.pongs, "test must reach application pong send")
+                    self.assertEqual(peer.closes, 1)
+                    if mode == "blocked":
+                        self.assertTrue(peer.pong_stopped.is_set())
+
+    async def test_ddp_pong_send_failure_preserves_error_and_closes(self):
+        self.client.config.timeout_seconds = 0.1
+        for phase in ("auth", "smart"):
+            with self.subTest(phase=phase):
+                peer = PingGatedDDPPeer(phase=phase, pong_mode="failure")
+                with self.assertRaises(RuntimeError) as caught:
+                    await self.run_peer(peer, ["a"], budget=1)
+                self.assertIs(caught.exception, peer.reader_error)
+                self.assertEqual(peer.closes, 1)
+
+    async def test_ddp_pong_send_cancellation_drains_auth_and_dispatcher(self):
+        for phase in ("auth", "smart"):
+            with self.subTest(phase=phase):
+                peer = PingGatedDDPPeer(phase=phase, pong_mode="blocked")
+                with patch("app.services.truenas_ws.connect", peer.connect):
+                    task = asyncio.create_task(self.client.smartctl_batch(["a"], max_concurrency=1))
+                    try:
+                        await asyncio.wait_for(peer.pong_started.wait(), 1)
+                        task.cancel()
+                        await asyncio.sleep(0)
+                        task.cancel()
+                        with self.assertRaises(asyncio.CancelledError):
+                            await asyncio.wait_for(task, 1)
+                    finally:
+                        if not task.done():
+                            task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+                self.assertTrue(peer.pong_stopped.is_set())
+                self.assertEqual(peer.closes, 1)
+
+    async def test_single_call_predecessor_counts_separate_sessions(self):
+        for size in (60, 84):
+            with self.subTest(size=size):
+                peer = SyntheticDDPPeer()
+                disks = [f"invented{n}" for n in range(size)]
+                with patch("app.services.truenas_ws.connect", peer.connect):
+                    results = [await self.client.fetch_disk_smartctl(d) for d in disks]
+                self.assertEqual(results, disks)
+                self.assertEqual((peer.connections, peer.logins, peer.closes, peer.peak), (size, size, size, 1))
+
+    async def test_batch_one_session_bounded_parallelism_and_order(self):
+        for size in (60, 84):
+            for budget in (1, 2, 12):
+                with self.subTest(size=size, budget=budget):
+                    peer = SyntheticDDPPeer(width=budget)
+                    disks = [f"invented{n}" for n in range(size)]
+                    self.assertEqual(await self.run_peer(peer, disks, budget=budget), disks)
+                    self.assertEqual((peer.connections, peer.logins, peer.closes, peer.peak), (1, 1, 1, budget))
+                    self.assertEqual(len(peer.requests), size)
+                    self.assertEqual(peer.active, 0)
+                    if budget > 1:
+                        self.assertNotEqual(peer.replies, disks)
+                    self.assertTrue(all(request[1] == ["-a", "-j"] for request in peer.requests))
+
+    async def test_empty_and_invalid_admission_never_connect(self):
+        peer = SyntheticDDPPeer()
+        self.assertEqual(await self.run_peer(peer, [], budget=1), [])
+        for budget in (0, -1, True, 1.5, "2", None):
+            with self.subTest(budget=budget), self.assertRaises(ValueError):
+                await self.run_peer(peer, ["invented0"], budget=budget)
+        for disks in ("invented0", iter(["invented0"]), [None], [""], [1]):
+            with self.subTest(disks_type=type(disks).__name__), self.assertRaises(ValueError):
+                await self.run_peer(peer, disks)
+        with patch("app.services.truenas_ws.connect", peer.connect), self.assertRaises(TypeError):
+            await self.client.smartctl_batch(["invented0"])
+        with self.assertRaisesRegex(TrueNASAPIError, "4096"):
+            await self.run_peer(peer, ["invented0"] * 4097)
+        self.assertEqual(peer.connections, 0)
+
+    async def test_exact_limit_duplicates_and_explicit_args(self):
+        peer = SyntheticDDPPeer()
+        disks = ["invented0"] * 4096
+        self.assertEqual(await self.run_peer(peer, disks, budget=1, args=["-x", "-j"]), disks)
+        self.assertEqual(len(peer.requests), 4096)
+        self.assertTrue(all(r == ["invented0", ["-x", "-j"]] for r in peer.requests))
+        peer = SyntheticDDPPeer(width=2)
+        self.assertEqual(await self.run_peer(peer, ["same", "same"], budget=12, args=[]), ["same", "same"])
+        self.assertEqual(peer.peak, 2)
+        self.assertTrue(all(r[1] == ["-a", "-j"] for r in peer.requests))
+
+    async def test_invalid_middleware_and_reader_failures_close_session(self):
+        for mode, error, text in (
+            ("invalid", TrueNASAPIError, "unexpected payload type"),
+            ("middleware", TrueNASAPIError, "disk.smartctl failed"),
+            ("reader_failure", RuntimeError, "synthetic reader failure"),
+            ("auth_failure", TrueNASAPIError, "authentication failed"),
+        ):
+            with self.subTest(mode=mode):
+                peer = SyntheticDDPPeer(mode=mode)
+                with self.assertRaisesRegex(error, text) as caught:
+                    await self.run_peer(peer, ["invented0"] * 20)
+                if mode == "reader_failure":
+                    self.assertIs(caught.exception, peer.reader_error)
+                self.assertEqual((peer.connections, peer.logins, peer.closes), (1, 1, 1))
+                self.assertTrue(all(t.done() for t in peer.send_tasks))
+        self.client.config.platform = "scale"
+        with self.assertRaisesRegex(TrueNASAPIError, "Detailed SMART JSON is not available"):
+            await self.run_peer(SyntheticDDPPeer(mode="middleware"), ["invented0"])
+
+    async def test_reader_failure_interrupts_blocked_send_without_waiting_for_deadline(self):
+        peer = SyntheticDDPPeer(mode="send_reader_failure")
+        with self.assertRaises(RuntimeError) as caught:
+            await self.run_peer(peer, ["invented0"] * 20)
+        self.assertIs(caught.exception, peer.reader_error)
+        self.assertEqual(peer.closes, 1)
+
+    async def test_pending_send_response_handshake_and_auth_have_deadlines(self):
+        self.client.config.timeout_seconds = 0.02
+        for mode in ("send", "timeout", "handshake_timeout", "auth_timeout", "send_reader_failure"):
+            with self.subTest(mode=mode):
+                peer = SyntheticDDPPeer(mode=mode)
+                with patch("app.services.truenas_ws.connect", peer.connect):
+                    task = asyncio.create_task(self.client.smartctl_batch(["invented0"] * 20, max_concurrency=2))
+                    try:
+                        done, _ = await asyncio.wait({task}, timeout=1)
+                        self.assertIn(task, done, "configured per-call deadline did not finish the batch")
+                        with self.assertRaises((TimeoutError, RuntimeError)):
+                            task.result()
+                    finally:
+                        if not task.done():
+                            task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+                self.assertEqual(peer.closes, 1)
+                self.assertTrue(all(t.done() for t in peer.send_tasks))
+
+    async def test_cancellation_during_send_and_response_drains_workers(self):
+        for mode in ("send", "response"):
+            with self.subTest(mode=mode):
+                peer = SyntheticDDPPeer(mode=mode)
+                with patch("app.services.truenas_ws.connect", peer.connect):
+                    task = asyncio.create_task(self.client.smartctl_batch(["invented0"] * 20, max_concurrency=2))
+                    await asyncio.wait_for(peer.started.wait(), 2)
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await asyncio.wait_for(task, 2)
+                self.assertEqual(peer.closes, 1)
+                self.assertTrue(all(t.done() for t in peer.send_tasks))
+
+    async def test_repeated_cancellation_waits_for_late_reader_cleanup(self):
+        peer = SyntheticDDPPeer(mode="late_reader", close_error=True)
+        with patch("app.services.truenas_ws.connect", peer.connect):
+            task = asyncio.create_task(self.client.smartctl_batch(["invented0"] * 20, max_concurrency=2))
+            try:
+                await asyncio.wait_for(peer.started.wait(), 2)
+                task.cancel()
+                await asyncio.wait_for(peer.closing.wait(), 2)
+                task.cancel()
+                await asyncio.sleep(0)
+                self.assertFalse(task.done())
+            finally:
+                peer.release.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(task, 2)
+        self.assertEqual(peer.closes, 1)
+        self.assertTrue(all(t.done() for t in peer.send_tasks))
+
+    async def test_cancellation_during_failure_cleanup_keeps_session_owned(self):
+        peer = SyntheticDDPPeer(mode="invalid_late_reader")
+        with patch("app.services.truenas_ws.connect", peer.connect):
+            task = asyncio.create_task(self.client.smartctl_batch(["invented0"] * 20, max_concurrency=2))
+            try:
+                await asyncio.wait_for(peer.closing.wait(), 2)
+                task.cancel()
+                await asyncio.sleep(0)
+                task.cancel()
+                await asyncio.sleep(0)
+                self.assertFalse(task.done())
+            finally:
+                peer.release.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(task, 2)
+        self.assertEqual(peer.closes, 1)
+        self.assertTrue(peer.late_error_raised)
+
+    async def test_authentication_failure_survives_connection_cleanup_failure(self):
+        peer = SyntheticDDPPeer(mode="auth_failure", close_error=True)
+        with self.assertRaisesRegex(TrueNASAPIError, "authentication failed"):
+            await self.run_peer(peer, ["invented0"])
+        self.assertEqual(peer.closes, 1)
+
+    async def test_primary_reader_failure_survives_session_close_failure(self):
+        peer = SyntheticDDPPeer(mode="reader_failure", close_error=True)
+        with self.assertRaises(RuntimeError) as caught:
+            await self.run_peer(peer, ["invented0"] * 20)
+        self.assertIs(caught.exception, peer.reader_error)
+        self.assertEqual(peer.closes, 1)
+
+    async def test_existing_single_call_and_slot_status_contracts(self):
+        peer = SyntheticDDPPeer()
+        with patch("app.services.truenas_ws.connect", peer.connect):
+            self.assertEqual(await self.client.fetch_disk_smartctl("invented0", []), "invented0")
+            self.assertIsNone(await self.client.set_slot_status("synthetic-enclosure", 3, "IDENTIFY"))
+        self.assertEqual(peer.requests, [["invented0", ["-a", "-j"]], ["synthetic-enclosure", 3, "IDENTIFY"]])
+        self.assertEqual((peer.connections, peer.logins, peer.closes), (2, 2, 2))
+        self.client.config.platform = "scale"
+        with patch("app.services.truenas_ws.connect", SyntheticDDPPeer(mode="middleware").connect):
+            with self.assertRaisesRegex(TrueNASAPIError, "Detailed SMART JSON is not available"):
+                await self.client.fetch_disk_smartctl("invented0")
+
+
 if __name__ == "__main__":
     unittest.main()

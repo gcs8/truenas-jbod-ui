@@ -87,20 +87,6 @@
     },
     "reason": "Reviewed source literal or validation pattern; exact detector counts are pinned."
   },
-  "config/config.example.yaml": {
-    "findings": {
-      "internal_hostname": {
-        "sha256:06117e57d3c71582d604d499c66153bc32bf9ce26c8ab16595f99946de060a50": 15
-      },
-      "rfc1918_ipv4": {
-        "sha256:6b8ef42a074f65ccd8a058fd2aaeddbe92ca7b631b789b3e9aa525d274383237": 3
-      },
-      "sas_wwn_identifier": {
-        "sha256:fae4aa3b4381531a9c75898321456a2fe55d193ac2dc23a7ab36d9c921ef92b7": 3
-      }
-    },
-    "reason": "Reviewed public configuration example; exact detector counts are pinned."
-  },
   "docs/ADMIN_TRUST_BOUNDARY.md": {
     "findings": {
       "internal_hostname": {
@@ -136,7 +122,7 @@
     },
     "reason": "Reviewed public documentation example; exact detector counts are pinned."
   },
-  "docs/STORAGE_VIEW_CONFIG_SKETCH.md": {
+  "docs/archive/STORAGE_VIEW_CONFIG_SKETCH.md": {
     "findings": {
       "internal_hostname": {
         "sha256:8651e716e2e5a1e65984c718ab296b6f5935b082238f1a72d0dbc06f7ad3a822": 2
@@ -153,7 +139,7 @@
     },
     "reason": "Reviewed public documentation example; exact detector counts are pinned."
   },
-  "docs/STORAGE_VIEW_NOTES.md": {
+  "docs/archive/STORAGE_VIEW_NOTES.md": {
     "findings": {
       "local_windows_drive_path": {
         "sha256:db48f10d2e9456c9da54ec5c9cdc6658a257392946f9bb10b62ae404515ea387": 1
@@ -161,7 +147,7 @@
     },
     "reason": "Reviewed public documentation example; exact detector counts are pinned."
   },
-  "docs/STORAGE_VIEW_PLAN.md": {
+  "docs/archive/STORAGE_VIEW_PLAN.md": {
     "findings": {
       "local_windows_drive_path": {
         "sha256:db48f10d2e9456c9da54ec5c9cdc6658a257392946f9bb10b62ae404515ea387": 1
@@ -180,7 +166,7 @@
     },
     "reason": "Reviewed public documentation example; exact detector counts are pinned."
   },
-  "docs/V0_20_SAS_FABRIC_PLAN.md": {
+  "docs/archive/V0_20_SAS_FABRIC_PLAN.md": {
     "findings": {
       "compact_lab_host_id": {
         "sha256:6827e135b9d9d07835934f36afdda7ca4f9f8c6d83d0671f8783d2319e9dc21e": 2
@@ -191,7 +177,7 @@
     },
     "reason": "Reviewed public documentation example; exact detector counts are pinned."
   },
-  "docs/V0_9_0_PLAN.md": {
+  "docs/archive/V0_9_0_PLAN.md": {
     "findings": {
       "local_windows_drive_path": {
         "sha256:2ff8e3b4c2b6bb61f35cda6199124efcd284fbed228cd7a901562ca807b6cac5": 2
@@ -231,7 +217,6 @@
     },
     "reason": "Deterministic clean-room QA fixture; exact detector counts are pinned."
   },
-
   "scripts/run_private_qa_restore.py": {
     "findings": {
       "sas_wwn_identifier": {
@@ -649,7 +634,6 @@
     },
     "reason": "Reviewed operator-documentation example; exact detector counts are pinned."
   },
-
   "wiki/Profiles-and-Custom-Layouts.md": {
     "findings": {
       "sas_wwn_identifier": {
@@ -658,7 +642,6 @@
     },
     "reason": "Reviewed operator-documentation example; exact detector counts are pinned."
   },
-
   "wiki/Troubleshooting.md": {
     "findings": {
       "sas_wwn_identifier": {

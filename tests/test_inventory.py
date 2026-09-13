@@ -779,7 +779,7 @@ class InventoryHelpersTests(unittest.TestCase):
 
         with (
             patch.object(app_main, "get_settings", return_value=settings),
-            patch.object(app_main, "get_admin_settings", return_value=AdminSettings()),
+            patch.object(app_main, "load_read_ui_auth_settings", return_value=AdminSettings()),
             patch.object(app_main, "configure_logging"),
             self.assertLogs("app.main", level="WARNING") as captured,
         ):
@@ -7029,7 +7029,8 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
             first = await request
             second = await service._get_slot_smart_summary_for_slot_view(slot)
 
-            self.assertEqual(first.power_on_hours, 1)
+            self.assertFalse(first.available)
+            self.assertIsNone(first.power_on_hours)
             self.assertEqual(second.power_on_hours, 2)
             self.assertEqual(attempts, 2)
 
@@ -12105,6 +12106,56 @@ Enclosure Status diagnostic page:
 
 
 class InventorySlotDetailCacheTests(unittest.TestCase):
+    def test_historical_identity_cannot_change_observed_smart_admission(self) -> None:
+        fields = ("serial", "logical_unit_id", "sas_address", "gptid")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = build_inventory_service(
+                Settings(), SystemConfig(id="default", truenas=TrueNASConfig(platform="core")),
+                AsyncMock(), AsyncMock(), temp_dir,
+            )
+            for field_name in fields:
+                for mode in ("loss", "return", "replacement", "same", "fallback"):
+                    with self.subTest(field=field_name, mode=mode):
+                        current = {field_name: "invented-a"}
+                        historical = {field_name: "invented-a"}
+                        if mode in ("loss", "fallback"):
+                            current = {}
+                        if mode == "return":
+                            historical = {}
+                        if mode == "replacement":
+                            current[field_name] = "invented-b"
+                        if mode == "fallback":
+                            # A remaining lower-priority ID does not license
+                            # restoring the missing historical primary identity.
+                            fallback = "gptid" if field_name != "gptid" else "sas_address"
+                            current[fallback] = historical[fallback] = "invented-fallback"
+                        slot = SlotView(
+                            slot=0, slot_label="0", row_index=0, column_index=0,
+                            enclosure_id="enc-1", present=True, state=SlotState.healthy,
+                            device_name="da0", **current,
+                        )
+                        entry = SlotDetailCacheEntry(
+                            system_id="default", enclosure_id="enc-1", slot=0,
+                            identifiers=["da0", *historical.values()],
+                            slot_fields={"model": "cached-model", **historical},
+                            smart_fields={"available": True, "power_on_hours": 321},
+                        )
+                        store = service.slot_detail_store
+                        store.save_entries([entry])
+                        service._observe_smart_disk_identities([slot])
+                        key = service._smart_cache_key(slot)
+                        generation = service._smart_cache_generation_token(key)
+                        service._apply_persisted_slot_details([slot])
+                        self.assertEqual(service._smart_cache_key(slot), key)
+                        self.assertTrue(service._smart_request_is_current(key, generation))
+                        cached = service._build_persisted_smart_summary(slot)
+                        matched = mode == "same" or (mode == "fallback" and field_name == "gptid")
+                        if matched:
+                            self.assertEqual(cached.power_on_hours, 321)
+                        else:
+                            self.assertIsNone(cached)
+                            self.assertIsNone(slot.model)
+
     def _assert_apply_loads_once(self, slot_count: int) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()

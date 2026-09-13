@@ -588,7 +588,7 @@ async def build_admin_state_payload(request: Request) -> dict[str, Any]:
             "import_restart_services": True,
             "included_paths": default_backup_included_paths(),
             "debug_packaging": "tar.zst",
-            "debug_stop_services": True,
+            "debug_stop_services": False,
             "debug_restart_services": True,
             "debug_included_paths": default_debug_included_paths(),
             "debug_scrub_secrets": True,

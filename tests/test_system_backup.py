@@ -1209,6 +1209,186 @@ class SystemBackupServiceTests(unittest.TestCase):
         }
         return SystemBackupServiceTests._build_zip_bundle(manifest, archive_members)
 
+    def test_inspect_and_import_refuse_a_backup_from_a_newer_app_version_before_extraction(self) -> None:
+        manifest = {
+            "schema_version": BUNDLE_SCHEMA_VERSION,
+            "format": BUNDLE_FORMAT,
+            "app_version": "99.1.0",
+            "packaging": "zip",
+            "groups": [],
+            "files": [],
+        }
+        archive_path = self.temp_dir / "newer.zip"
+        archive_path.write_bytes(self._build_zip_bundle(manifest))
+        expected = "This backup was made by v99.1.0; this deployment is v"
+
+        with patch.object(
+            self.backup_service,
+            "_extract_manifest_zip_members_to_directory",
+            side_effect=AssertionError("payload extraction must not start"),
+        ):
+            with self.assertRaises(ValueError) as inspected:
+                self.backup_service.inspect_bundle_file(archive_path)
+            with self.assertRaises(ValueError) as imported:
+                self.backup_service.import_bundle_from_file(archive_path)
+
+        for raised in (inspected.exception, imported.exception):
+            self.assertIn(expected, str(raised))
+            self.assertIn("Upgrade before restoring.", str(raised))
+
+    def test_inspect_notes_an_older_app_version_and_accepts_unknown_ones(self) -> None:
+        cases = (
+            ("0.1.0", "This backup was made by v0.1.0; settings and history will be"),
+            ("0.0.0-test", "This backup was made by v0.0.0; settings and history will be"),
+            (system_backup_module.__version__, None),
+            ("not-a-version", None),
+            (None, None),
+        )
+        for app_version, expected_note in cases:
+            with self.subTest(app_version=app_version):
+                manifest: dict[str, Any] = {
+                    "schema_version": BUNDLE_SCHEMA_VERSION,
+                    "format": BUNDLE_FORMAT,
+                    "packaging": "zip",
+                    "groups": [],
+                    "files": [],
+                }
+                if app_version is not None:
+                    manifest["app_version"] = app_version
+                archive_path = self.temp_dir / "older.zip"
+                archive_path.write_bytes(self._build_zip_bundle(manifest))
+
+                result = self.backup_service.inspect_bundle_file(archive_path)
+
+                self.assertTrue(result["ok"])
+                if expected_note is None:
+                    self.assertIsNone(result["app_version_note"])
+                else:
+                    self.assertIn(expected_note, result["app_version_note"])
+
+    def test_newer_schema_version_says_to_upgrade_first(self) -> None:
+        for schema_version, expected in (
+            (3, "This backup was made by a newer version of the app (schema version 3). Upgrade first, then restore."),
+            ("2", "This backup file is not in a format this app can restore (schema version '2')."),
+        ):
+            with self.subTest(schema_version=schema_version):
+                archive_path = self.temp_dir / "schema.zip"
+                archive_path.write_bytes(
+                    self._build_zip_bundle(
+                        {
+                            "schema_version": schema_version,
+                            "format": BUNDLE_FORMAT,
+                            "groups": [],
+                            "files": [],
+                        }
+                    )
+                )
+                with self.assertRaises(ValueError) as raised:
+                    self.backup_service.inspect_bundle_file(archive_path)
+                self.assertEqual(str(raised.exception), expected)
+
+    def test_restore_refuses_when_free_space_is_short_before_touching_live_files(self) -> None:
+        self.store.insert_metric_samples([])
+        artifact = self.backup_service.export_bundle_to_file(
+            packaging="zip",
+            included_paths=[HISTORY_DB_KEY],
+        )
+        try:
+            live_before = self.history_db_path.read_bytes()
+            usage = shutil.disk_usage(self.temp_dir)
+            short = type(usage)(usage.total, usage.used, 1)
+            with (
+                patch("history_service.system_backup.shutil.disk_usage", return_value=short),
+                self.assertRaises(ValueError) as raised,
+            ):
+                self.backup_service.import_bundle_from_file(artifact.path)
+            message = str(raised.exception)
+            self.assertIn("Restore needs about", message)
+            self.assertIn("free in", message)
+            self.assertIn("1 bytes is available.", message)
+            self.assertEqual(self.history_db_path.read_bytes(), live_before)
+
+            with (
+                patch("history_service.system_backup.shutil.disk_usage", return_value=short),
+                self.assertRaisesRegex(ValueError, "Restore needs about"),
+            ):
+                self.backup_service.inspect_bundle_file(artifact.path)
+
+            result = self.backup_service.inspect_bundle_file(artifact.path)
+            self.assertTrue(result["ok"])
+        finally:
+            artifact.cleanup()
+
+    def test_restore_free_space_sums_staging_copies_on_one_filesystem(self) -> None:
+        from types import SimpleNamespace
+
+        member_bytes = 400
+        live_bytes = self.history_db_path.stat().st_size
+        manifest = {
+            "schema_version": 1,
+            "files": [{"key": "history", "group_key": HISTORY_DB_KEY}],
+        }
+        group_entries = {HISTORY_DB_KEY: {"selected": True, "present": True}}
+        extracted = {"history": b"h" * member_bytes}
+        temp_folder = Path(tempfile.gettempdir())
+        history_folder = self.history_db_path.parent
+        real_stat = os.stat
+
+        def stat_with_devices(devices: dict[str, int]):
+            def fake_stat(path, *args, **kwargs):
+                device_id = devices.get(os.path.normcase(str(path)))
+                if device_id is None:
+                    return real_stat(path, *args, **kwargs)
+                return SimpleNamespace(st_dev=device_id)
+
+            return fake_stat
+
+        shared_devices = {
+            os.path.normcase(str(temp_folder)): 11,
+            os.path.normcase(str(history_folder)): 11,
+        }
+        separate_devices = {
+            os.path.normcase(str(temp_folder)): 11,
+            os.path.normcase(str(history_folder)): 22,
+        }
+        # Enough for each folder on its own, short of both staged copies at once.
+        tight_free = member_bytes + live_bytes
+        tight_usage = SimpleNamespace(total=tight_free * 4, used=tight_free * 3, free=tight_free)
+        with (
+            patch("history_service.system_backup.shutil.disk_usage", return_value=tight_usage),
+            patch("history_service.system_backup.os.stat", side_effect=stat_with_devices(shared_devices)),
+            self.assertRaises(ValueError) as raised,
+        ):
+            self.backup_service._require_restore_free_space(manifest, group_entries, extracted)
+        message = str(raised.exception)
+        self.assertIn("Restore needs about", message)
+        self.assertIn(f"free in {temp_folder}", message)
+        self.assertIn(self.backup_service._format_size(2 * member_bytes + live_bytes), message)
+
+        with (
+            patch("history_service.system_backup.shutil.disk_usage", return_value=tight_usage),
+            patch(
+                "history_service.system_backup.os.stat",
+                side_effect=stat_with_devices(separate_devices),
+            ),
+        ):
+            self.backup_service._require_restore_free_space(manifest, group_entries, extracted)
+
+        roomy_free = 2 * member_bytes + live_bytes
+        roomy_usage = SimpleNamespace(total=roomy_free * 4, used=roomy_free * 3, free=roomy_free)
+        with (
+            patch("history_service.system_backup.shutil.disk_usage", return_value=roomy_usage),
+            patch("history_service.system_backup.os.stat", side_effect=stat_with_devices(shared_devices)),
+        ):
+            self.backup_service._require_restore_free_space(manifest, group_entries, extracted)
+
+    def test_format_size_reads_like_a_person_wrote_it(self) -> None:
+        format_size = SystemBackupService._format_size
+        self.assertEqual(format_size(6 * 1024 ** 3 + 200 * 1024 ** 2), "6.2 GiB")
+        self.assertEqual(format_size(3 * 1024 ** 2), "3.0 MiB")
+        self.assertEqual(format_size(1536), "1.5 KiB")
+        self.assertEqual(format_size(12), "12 bytes")
+
     def test_import_rejects_oversized_archive_before_format_processing(self) -> None:
         with patch("history_service.system_backup.MAX_BACKUP_ARCHIVE_BYTES", 4):
             with self.assertRaisesRegex(ValueError, "archive exceeds"):
@@ -2003,6 +2183,55 @@ sys.stdout.flush()
         self.assertNotIn(passphrase, result.args)
         self.assertNotIn(passphrase, result.stdout)
         self.assertNotIn(passphrase, result.stderr)
+        self.assertIn("Everything is Ok", result.stdout)
+
+    def test_7z_prompt_channel_supports_a_master_fd_above_select_limit(self) -> None:
+        try:
+            import pty  # noqa: F401 - preload before intentionally occupying descriptors
+            import resource
+        except ImportError:
+            self.skipTest("high-descriptor PTY coverage requires POSIX resource APIs")
+        soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft_limit != resource.RLIM_INFINITY and soft_limit <= 1040:
+            self.skipTest("the process descriptor limit leaves no room above the select boundary")
+
+        holders: list[int] = []
+        try:
+            while not holders or holders[-1] < 1023:
+                holders.append(os.open(os.devnull, os.O_RDONLY))
+        except OSError:
+            for fd in holders:
+                os.close(fd)
+            self.skipTest("the process descriptor limit is below the select boundary")
+
+        prompt_program = """
+import os
+import sys
+import termios
+
+if not os.isatty(0):
+    raise SystemExit(3)
+attributes = termios.tcgetattr(0)
+attributes[3] &= ~termios.ECHO
+termios.tcsetattr(0, termios.TCSANOW, attributes)
+sys.stdout.write("Enter password (will not be echoed):")
+sys.stdout.flush()
+if not sys.stdin.readline().endswith("\\n"):
+    raise SystemExit(4)
+sys.stdout.write("\\nEverything is Ok\\n")
+sys.stdout.flush()
+"""
+        try:
+            result = self.backup_service._run_7z_prompt_command(
+                [sys.executable, "-c", prompt_program],
+                cwd=None,
+                passphrase="synthetic prompt secret",
+            )
+        finally:
+            for fd in holders:
+                os.close(fd)
+
+        self.assertEqual(result.returncode, 0)
         self.assertIn("Everything is Ok", result.stdout)
 
     def test_7z_prompt_channel_rejects_line_breaks_before_process_start(self) -> None:
@@ -3669,6 +3898,7 @@ sys.stdout.flush()
                 "ok",
                 "schema_version",
                 "app_version",
+                "app_version_note",
                 "exported_at",
                 "encrypted",
                 "packaging",

@@ -9,8 +9,11 @@ import logging
 import re
 import shlex
 import time
+import threading
+from contextlib import contextmanager, nullcontext
 from collections import Counter, OrderedDict
 from collections.abc import Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Generic, Iterable, Literal, TypeVar
@@ -128,8 +131,8 @@ from app.services.truenas_ws import (
     normalize_disk_inventory_rows,
 )
 
-SmartCacheKey = tuple[str, str, str, int, tuple[str, ...]]
-SmartCacheGenerationToken = tuple[int, int]
+SmartCacheKey = tuple[str, str, str, int, tuple[str, ...], tuple[str, str]]
+SmartCacheGenerationToken = tuple[int, int, int]
 CacheValueT = TypeVar("CacheValueT")
 
 # Expired SMART cache entries stay resident (and stale-servable) for a grace
@@ -779,6 +782,85 @@ class InventorySourceBundle:
     parsed_ssh_data_by_enclosure: dict[str, ParsedSSHData] = field(default_factory=dict)
 
 
+RetainedResultT = TypeVar("RetainedResultT")
+
+
+async def _await_retained(future: asyncio.Future[RetainedResultT]) -> RetainedResultT:
+    """Cancel this waiter, not its retained work or another waiter's outcome."""
+    try:
+        if not future.done():
+            # Unlike an abandoned shield on Python 3.14, wait removes its
+            # callback on cancellation without logging a later worker failure.
+            await asyncio.wait({future})
+    except asyncio.CancelledError:
+        # Observe detached failures without changing what active joiners see.
+        future.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        raise
+    return future.result()
+
+
+class SmartDetailBatch:
+    """Request-local persistence; never reuse the read snapshot for writes."""
+
+    def __init__(self, store: SlotDetailStore | None) -> None:
+        self.store = store
+        self.loaded: asyncio.Task[dict[str, SlotDetailCacheEntry]] | None = None
+        self.pending: list[SlotDetailCacheEntry] = []
+        self.generations: list[tuple[InventoryService, SmartCacheKey, SmartCacheGenerationToken]] = []
+        self.saved: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self.saved.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        self.dependencies: set[asyncio.Future[None]] = set()
+
+    async def entries(self) -> dict[str, SlotDetailCacheEntry]:
+        if self.store is None:
+            return {}
+        if self.loaded is None:
+            self.loaded = asyncio.create_task(asyncio.to_thread(self.store.load_all))
+        return await _await_retained(self.loaded)
+
+    @contextmanager
+    def commit_guard(self):
+        # A public batch belongs to one service/enclosure. Serialize only the
+        # final replacement with generation changes, never reads or JSON I/O.
+        if not self.generations:
+            yield True
+            return
+        service = self.generations[0][0]
+        with service._smart_persistence_lock:
+            yield all(
+                owner._smart_request_is_current(key, generation)
+                for owner, key, generation in self.generations
+            )
+
+    async def flush(self) -> None:
+        try:
+            if self.store is not None and self.pending:
+                # Reload/conflict checking remains under the store lock; the
+                # generation guard is rechecked at the canonical commit boundary.
+                await asyncio.to_thread(
+                    self.store.save_entries, self.pending,
+                    expected_entries=await self.entries(), commit_guard=self.commit_guard,
+                )
+        except BaseException as exc:
+            self.saved.set_exception(exc)
+            raise
+        else:
+            self.saved.set_result(None)
+
+    async def wait_dependencies(self) -> None:
+        # Publish our own save BEFORE waiting. Cross-owned overlapping batches
+        # can depend on each other's saves without waiting on whole batches.
+        outcomes = await asyncio.gather(
+            *(_await_retained(saved) for saved in self.dependencies), return_exceptions=True,
+        )
+        for outcome in outcomes:
+            if isinstance(outcome, BaseException):
+                raise outcome
+
+
+_smart_detail_batch: ContextVar[SmartDetailBatch | None] = ContextVar("smart_detail_batch", default=None)
+
+
 class InventoryService:
     def __init__(
         self,
@@ -809,11 +891,15 @@ class InventoryService:
             SmartCacheKey,
             tuple[SmartSummaryView, datetime],
         ] = OrderedDict()
+        self._smart_persistence_lock = threading.Lock()
+        self._smart_disk_identities: dict[tuple, tuple[tuple[str, str], int]] = {}
         self._smart_cache_global_generation = 0
         self._smart_cache_enclosure_generations: dict[str, int] = {}
         self._smart_load_tasks: dict[SmartCacheKey, asyncio.Task[SmartSummaryView]] = {}
+        self._smart_load_batches: dict[asyncio.Task[SmartSummaryView], SmartDetailBatch] = {}
         self._smart_operation_limit = max(1, self.settings.app.smart_batch_max_concurrency)
         self._smart_operation_semaphore = asyncio.Semaphore(self._smart_operation_limit)
+        self._core_grid_reservation_lock = asyncio.Lock()
         self._source_bundle: InventorySourceBundle | None = None
         self._source_bundle_until: datetime = datetime.min.replace(tzinfo=timezone.utc)
         self._snapshot_locks: dict[str, asyncio.Lock] = {}
@@ -1968,7 +2054,8 @@ class InventoryService:
             self._canonical_enclosure_options = None
             self._canonical_default_enclosure_id = None
             self._snapshot_topology_generation += 1
-            self._smart_cache_global_generation += 1
+            with self._smart_persistence_lock:
+                self._smart_cache_global_generation += 1
             smart_keys_to_remove = (
                 set(self._smart_cache)
                 | set(self._smart_cache_until)
@@ -1988,10 +2075,11 @@ class InventoryService:
             if any(key is None for key in requested_keys):
                 normalized_keys.add("__default__")
             snapshot_keys_to_remove = set(normalized_keys)
-            for key in snapshot_keys_to_remove:
-                self._smart_cache_enclosure_generations[key] = (
-                    self._smart_cache_enclosure_generations.get(key, 0) + 1
-                )
+            with self._smart_persistence_lock:
+                for key in snapshot_keys_to_remove:
+                    self._smart_cache_enclosure_generations[key] = (
+                        self._smart_cache_enclosure_generations.get(key, 0) + 1
+                    )
             smart_keys_to_remove = {
                 key
                 for key in (
@@ -2947,7 +3035,7 @@ class InventoryService:
 
     async def _background_snapshot_refresh(self, cache_key: str) -> None:
         try:
-            source_refresh_succeeded = await asyncio.shield(self._schedule_background_source_bundle_refresh())
+            source_refresh_succeeded = await _await_retained(self._schedule_background_source_bundle_refresh())
             if not source_refresh_succeeded:
                 return
             await self._get_snapshot_result(
@@ -3004,6 +3092,7 @@ class InventoryService:
         slot_view: SlotView,
         generation_token: SmartCacheGenerationToken,
     ) -> None:
+        token = _smart_detail_batch.set(None)
         try:
             await self._get_slot_smart_summary_for_slot_view(
                 slot_view,
@@ -3012,12 +3101,64 @@ class InventoryService:
             )
         except Exception:  # noqa: BLE001 - background refreshes should stay best-effort.
             logger.exception("Background SMART refresh failed for %s", cache_key)
+        finally:
+            _smart_detail_batch.reset(token)
 
-    def _apply_persisted_slot_details(self, slots: list[SlotView]) -> None:
+    async def _apply_and_persist_snapshot_slot_details(self, slots: list[SlotView]) -> None:
+        self._observe_smart_disk_identities(slots)
+        store = self.slot_detail_store
+        if store is None or not slots:
+            return
+        generations = [
+            (key, self._smart_cache_generation_token(key))
+            for key in (self._smart_cache_key(slot) for slot in slots)
+        ]
+
+        @contextmanager
+        def commit_guard():
+            with self._smart_persistence_lock:
+                yield all(self._smart_request_is_current(key, generation) for key, generation in generations)
+
+        def apply_and_save():
+            with perf_stage("inventory.slot_detail_cache.apply", slot_count=len(slots)):
+                loaded = store.load_all()
+                self._apply_persisted_slot_details(slots, loaded_entries=loaded)
+            with perf_stage("inventory.slot_detail_cache.persist", slot_count=len(slots)):
+                entries = [self._build_slot_detail_entry(slot, smart_summary=None) for slot in slots]
+                store.save_entries(
+                    [entry for entry in entries if entry is not None],
+                    expected_entries=loaded, commit_guard=commit_guard,
+                )
+
+        # The worker owns these request-local slots until it finishes. Retain the
+        # caller's snapshot lock/activity through repeated cancellation, including
+        # late failures, rather than letting a successor race a detached writer.
+        worker = asyncio.create_task(asyncio.to_thread(apply_and_save))
+        cancelled = False
+        while not worker.done():
+            try:
+                # wait() leaves the worker running on caller cancellation and
+                # removes its completion callback on every abandoned wait.
+                # A cancelled shield instead reports late worker failures to
+                # the loop on Python 3.14, even when we retrieve them below.
+                await asyncio.wait({worker})
+            except asyncio.CancelledError:
+                cancelled = True
+        if cancelled:
+            if not worker.cancelled():
+                worker.exception()
+            raise asyncio.CancelledError
+        worker.result()
+
+    def _apply_persisted_slot_details(
+        self, slots: list[SlotView], *,
+        loaded_entries: Mapping[str, SlotDetailCacheEntry] | None = None,
+    ) -> None:
         if not self.slot_detail_store or not slots:
             return
 
-        loaded_entries = self.slot_detail_store.load_all()
+        if loaded_entries is None:
+            loaded_entries = self.slot_detail_store.load_all()
         for slot_view in slots:
             entry = self.slot_detail_store.get_entry(
                 self.system.id,
@@ -3076,10 +3217,15 @@ class InventoryService:
             return
         self.slot_detail_store.save_entries(normalized_entries)
 
-    def _build_persisted_smart_summary(self, slot_view: SlotView) -> SmartSummaryView | None:
+    def _build_persisted_smart_summary(
+        self, slot_view: SlotView,
+        *, loaded_entries: Mapping[str, SlotDetailCacheEntry] | None = None,
+    ) -> SmartSummaryView | None:
         if not self.slot_detail_store:
             return None
-        entry = self.slot_detail_store.get_entry(self.system.id, slot_view.enclosure_id, slot_view.slot)
+        entry = self.slot_detail_store.get_entry(
+            self.system.id, slot_view.enclosure_id, slot_view.slot, loaded_entries=loaded_entries,
+        )
         if entry is None or not self._slot_detail_entry_matches(slot_view, entry):
             return None
         if not entry.smart_fields:
@@ -3144,6 +3290,24 @@ class InventoryService:
     def _slot_detail_entry_matches(self, slot_view: SlotView, entry: SlotDetailCacheEntry) -> bool:
         if slot_view.state == SlotState.empty or not slot_view.present:
             return False
+        # Match the observed primary identity before historical enrichment.
+        # Loss/return of a serial is a new observation, not proof that a reused
+        # device alias still belongs to the historical disk. Reject that cache
+        # entry rather than restoring an ID that disagrees with SMART admission.
+        current_identity = previous_identity = None
+        for field_name in ("serial", "logical_unit_id", "sas_address", "gptid"):
+            current = normalize_text(getattr(slot_view, field_name))
+            previous = normalize_text(entry.slot_fields.get(field_name)) or normalize_text(entry.smart_fields.get(field_name))
+            if current and current_identity is None:
+                current_identity = (field_name, current.lower())
+            if previous and previous_identity is None:
+                previous_identity = (field_name, previous.lower())
+            if current and previous and current.lower() != previous.lower():
+                return False
+        if current_identity != previous_identity:
+            return False
+        # Both identity-poor entries retain device-scoped matching. This cannot
+        # detect a physical swap that inventory never observes.
         current_identifiers = self._slot_detail_identifiers(slot_view)
         if not current_identifiers:
             return False
@@ -3670,6 +3834,49 @@ class InventoryService:
             )
         )
 
+    @staticmethod
+    def _smart_disk_identity(slot_view: SlotView) -> tuple[str, str]:
+        if not slot_view.present or slot_view.state == SlotState.empty:
+            return ("empty", "")
+        for field_name in ("serial", "logical_unit_id", "sas_address", "gptid"):
+            value = normalize_text(getattr(slot_view, field_name))
+            if value:
+                return (field_name, value.lower())
+        # Identity-poor inventory retains device-scoped behavior; no claim of
+        # detecting an unobservable physical replacement is possible.
+        return ("device", normalize_text(slot_view.device_name) or "")
+
+    def _observe_smart_disk_identities(self, slots: list[SlotView]) -> None:
+        # Observe before snapshot persistence can yield. Share the final-write
+        # fence with retained SMART writers, without holding it over disk I/O.
+        changed = set()
+        with self._smart_persistence_lock:
+            for slot in slots:
+                key = self._smart_cache_key(slot)
+                scope, identity = key[:4], key[5]
+                previous, generation = self._smart_disk_identities.get(scope, (identity, 0))
+                if previous != identity:
+                    generation += 1
+                    changed.add(scope)
+                self._smart_disk_identities[scope] = (identity, generation)
+        for cache in (self._smart_cache, self._smart_cache_until, self._smart_negative_cache,
+                      self._smart_load_tasks, self._smart_refresh_tasks):
+            for key in list(cache):
+                if key[:4] in changed:
+                    # Detach, do not cancel retained owners. New occupants (even
+                    # A -> B -> A) must not join a prior generation's request.
+                    cache.pop(key, None)
+
+    def _smart_disk_is_current(self, key: SmartCacheKey) -> bool:
+        return self._smart_disk_identities.get(key[:4], (key[5], 0))[0] == key[5]
+
+    def _smart_request_is_current(self, key: SmartCacheKey, generation: SmartCacheGenerationToken) -> bool:
+        return self._smart_disk_is_current(key) and self._smart_cache_generation_token(key) == generation
+
+    @staticmethod
+    def _replaced_disk_smart_summary() -> SmartSummaryView:
+        return SmartSummaryView(available=False, message="Disk identity changed during SMART lookup; retry for the current disk.")
+
     def _smart_cache_key(self, slot_view: SlotView) -> SmartCacheKey:
         return (
             self.system.id,
@@ -3677,6 +3884,7 @@ class InventoryService:
             normalize_text(slot_view.enclosure_id) or "__default__",
             slot_view.slot,
             tuple(self._smart_candidate_devices(slot_view)),
+            self._smart_disk_identity(slot_view),
         )
 
     def _smart_cache_generation_token(
@@ -3686,6 +3894,7 @@ class InventoryService:
         return (
             self._smart_cache_global_generation,
             self._smart_cache_enclosure_generations.get(cache_key[2], 0),
+            self._smart_disk_identities.get(cache_key[:4], (cache_key[5], 0))[1],
         )
 
     def _remove_smart_cache_keys(self, cache_keys: Iterable[SmartCacheKey]) -> bool:
@@ -3727,7 +3936,7 @@ class InventoryService:
         expected_generation: SmartCacheGenerationToken | None = None,
     ) -> bool:
         cache_key = self._smart_cache_key(slot_view)
-        if summary.available is False:
+        if summary.available is False or not self._smart_disk_is_current(cache_key):
             return False
         if (
             expected_generation is not None
@@ -3749,7 +3958,8 @@ class InventoryService:
     ) -> bool:
         if summary.available is not False:
             return False
-        if self._smart_cache_generation_token(cache_key) != expected_generation:
+        if (not self._smart_disk_is_current(cache_key)
+                or self._smart_cache_generation_token(cache_key) != expected_generation):
             return False
         self._evict_expired_smart_cache_entries()
         self._smart_negative_cache.pop(cache_key, None)
@@ -3768,8 +3978,17 @@ class InventoryService:
         allow_stale_cache: bool = False,
         bypass_negative_cache: bool = False,
         expected_generation: SmartCacheGenerationToken | None = None,
+        core_cohort: list | None = None,
+        request_semaphore: asyncio.Semaphore | None = None,
+        admitted: asyncio.Event | None = None,
     ) -> SmartSummaryView:
+        # Admission has no suspension until the per-key owner is registered.
+        if admitted is not None:
+            admitted.set()
         cache_key = self._smart_cache_key(slot_view)
+        generation_token = expected_generation or self._smart_cache_generation_token(cache_key)
+        if not self._smart_request_is_current(cache_key, generation_token):
+            return self._replaced_disk_smart_summary()
         candidates = list(cache_key[4])
         self._evict_expired_smart_cache_entries()
         cache_until = self._smart_cache_until.get(cache_key, datetime.min.replace(tzinfo=timezone.utc))
@@ -3794,6 +4013,13 @@ class InventoryService:
         task = self._smart_load_tasks.get(cache_key)
         if task is None:
             generation_token = expected_generation or self._smart_cache_generation_token(cache_key)
+            detail_batch = _smart_detail_batch.get()
+            if detail_batch is not None and detail_batch.store is not self.slot_detail_store:
+                detail_batch = None
+            core_payload = None
+            if core_cohort is not None and candidates:
+                core_payload = asyncio.get_running_loop().create_future()
+                core_cohort.append((slot_view, candidates, core_payload))
             task = asyncio.create_task(
                 self._run_smart_loader(
                     slot_view,
@@ -3801,13 +4027,29 @@ class InventoryService:
                     candidates=candidates,
                     generation_token=generation_token,
                     allow_stale_cache=allow_stale_cache,
+                    detail_batch=detail_batch,
+                    core_payload=core_payload,
+                    request_semaphore=request_semaphore,
                 )
             )
             self._smart_load_tasks[cache_key] = task
+            if detail_batch is not None:
+                self._smart_load_batches[task] = detail_batch
             task.add_done_callback(
                 lambda completed, key=cache_key: self._cleanup_smart_load_task(key, completed)
             )
-        return await asyncio.shield(task)
+        owner = self._smart_load_batches.get(task)
+        caller_batch = _smart_detail_batch.get()
+        if caller_batch is not None and caller_batch.store is not self.slot_detail_store:
+            caller_batch = None
+        if owner is not None and caller_batch is not None and owner is not caller_batch:
+            caller_batch.dependencies.add(owner.saved)
+        result = await _await_retained(task)
+        if owner is not None and caller_batch is None:
+            await _await_retained(owner.saved)
+        if not self._smart_request_is_current(cache_key, generation_token):
+            return self._replaced_disk_smart_summary()
+        return result
 
     def _cleanup_smart_load_task(
         self,
@@ -3816,6 +4058,7 @@ class InventoryService:
     ) -> None:
         if self._smart_load_tasks.get(cache_key) is completed:
             self._smart_load_tasks.pop(cache_key, None)
+        self._smart_load_batches.pop(completed, None)
         if completed.cancelled():
             return
         completed.exception()
@@ -3828,15 +4071,24 @@ class InventoryService:
         candidates: list[str],
         generation_token: SmartCacheGenerationToken,
         allow_stale_cache: bool,
+        detail_batch: SmartDetailBatch | None = None,
+        core_payload: asyncio.Future | None = None,
+        request_semaphore: asyncio.Semaphore | None = None,
     ) -> SmartSummaryView:
-        async with self._smart_operation_semaphore:
+        # Never rendezvous behind the operation semaphore: budget one must work.
+        payloads = await core_payload if core_payload is not None else None
+        async with (request_semaphore or nullcontext()), self._smart_operation_semaphore:
             summary = await self._load_uncached_smart_summary(
                 slot_view,
                 cache_key=cache_key,
                 candidates=candidates,
                 generation_token=generation_token,
                 allow_stale_cache=allow_stale_cache,
+                detail_batch=detail_batch,
+                core_payloads=payloads,
             )
+        if not self._smart_request_is_current(cache_key, generation_token):
+            return self._replaced_disk_smart_summary()
         if summary.available is False:
             self._store_negative_smart_summary(
                 cache_key,
@@ -3855,7 +4107,30 @@ class InventoryService:
         candidates: list[str],
         generation_token: SmartCacheGenerationToken,
         allow_stale_cache: bool,
+        detail_batch: SmartDetailBatch | None = None,
+        core_payloads: tuple[str, str | None] | None = None,
     ) -> SmartSummaryView:
+        # Single-slot/background loaders also keep disk operations off the loop.
+        batch = detail_batch or SmartDetailBatch(self.slot_detail_store)
+        await batch.entries()
+
+        async def persist(summary: SmartSummaryView) -> None:
+            entry = self._build_slot_detail_entry(slot_view, smart_summary=summary)
+            if entry is not None:
+                batch.pending.append(entry)
+                batch.generations.append((self, cache_key, generation_token))
+            if detail_batch is None:
+                await batch.flush()
+
+        async def persisted_summary() -> SmartSummaryView | None:
+            return self._build_persisted_smart_summary(
+                slot_view, loaded_entries=await batch.entries(),
+            )
+
+        async def merge_fallback(fallback: SmartSummaryView) -> SmartSummaryView | None:
+            persisted = await persisted_summary()
+            return self._merge_missing_smart_fields(fallback, persisted) if persisted is not None else None
+
         smartctl_device_type = self._smart_candidate_device_type(slot_view)
         if self.system.truenas.platform == "esxi":
             summary = await self._build_esxi_slot_smart_summary(slot_view)
@@ -3864,7 +4139,7 @@ class InventoryService:
                 summary,
                 expected_generation=generation_token,
             ):
-                self._persist_slot_detail_cache(slot_view, smart_summary=summary)
+                await persist(summary)
                 self._observe_inventory_cache_metrics()
             self._observe_smart_summary_request("esxi-live")
             return summary
@@ -3891,7 +4166,7 @@ class InventoryService:
                 summary,
                 expected_generation=generation_token,
             ):
-                self._persist_slot_detail_cache(slot_view, smart_summary=summary)
+                await persist(summary)
                 self._observe_inventory_cache_metrics()
             self._observe_smart_summary_request("quantastor-live")
             return summary
@@ -3901,11 +4176,11 @@ class InventoryService:
                 slot_view,
                 "No SMART-capable device path is available for this slot.",
             )
-            cached_fallback = self._merge_cached_smart_summary(slot_view, fallback)
+            cached_fallback = await merge_fallback(fallback)
             self._observe_smart_summary_request("no-device-fallback")
             return cached_fallback or fallback
 
-        persisted = self._build_persisted_smart_summary(slot_view)
+        persisted = await persisted_summary()
         if persisted is not None and allow_stale_cache:
             add_perf_metadata(smart_cache="persistent-hit")
             if self._store_smart_summary_cache(
@@ -3933,7 +4208,7 @@ class InventoryService:
                     summary,
                     expected_generation=generation_token,
                 ):
-                    self._persist_slot_detail_cache(slot_view, smart_summary=summary)
+                    await persist(summary)
                     self._observe_inventory_cache_metrics()
                 self._observe_smart_summary_request("ssh-live")
                 return summary
@@ -3947,7 +4222,7 @@ class InventoryService:
                     else "Detailed SMART data is not available for this Linux slot."
                 ),
             )
-            cached_fallback = self._merge_cached_smart_summary(slot_view, fallback)
+            cached_fallback = await merge_fallback(fallback)
             self._observe_smart_summary_request("fallback")
             return cached_fallback or fallback
 
@@ -3957,7 +4232,10 @@ class InventoryService:
         for candidate in candidates:
             try:
                 with perf_stage("smart.api.fetch_json", candidate=candidate):
-                    payload = await self.truenas_client.fetch_disk_smartctl(candidate, ["-a", "-j"])
+                    if core_payloads is not None and candidate == candidates[0]:
+                        payload = core_payloads[0]
+                    else:
+                        payload = await self.truenas_client.fetch_disk_smartctl(candidate, ["-a", "-j"])
             except TrueNASAPIError as exc:
                 last_error = str(exc)
                 continue
@@ -3974,7 +4252,10 @@ class InventoryService:
             if api_candidate and "smartctl-text" in groups:
                 try:
                     with perf_stage("smart.api.fetch_text_enrichment", candidate=api_candidate):
-                        enrichment_payload = await self.truenas_client.fetch_disk_smartctl(api_candidate, ["-x"])
+                        if core_payloads is not None and core_payloads[1] is not None:
+                            enrichment_payload = core_payloads[1]
+                        else:
+                            enrichment_payload = await self.truenas_client.fetch_disk_smartctl(api_candidate, ["-x"])
                 except TrueNASAPIError as exc:
                     last_error = str(exc)
                 else:
@@ -4003,7 +4284,7 @@ class InventoryService:
                 api_summary,
                 expected_generation=generation_token,
             ):
-                self._persist_slot_detail_cache(slot_view, smart_summary=api_summary)
+                await persist(api_summary)
                 self._observe_inventory_cache_metrics()
             self._observe_smart_summary_request("api-live")
             return api_summary
@@ -4021,7 +4302,7 @@ class InventoryService:
                     ssh_summary,
                     expected_generation=generation_token,
                 ):
-                    self._persist_slot_detail_cache(slot_view, smart_summary=ssh_summary)
+                    await persist(ssh_summary)
                     self._observe_inventory_cache_metrics()
                 self._observe_smart_summary_request("ssh-live")
                 return ssh_summary
@@ -4032,9 +4313,76 @@ class InventoryService:
             slot_view,
             last_error or "SMART summary is unavailable for this slot.",
         )
-        cached_fallback = self._merge_cached_smart_summary(slot_view, fallback)
+        cached_fallback = await merge_fallback(fallback)
         self._observe_smart_summary_request("fallback")
         return cached_fallback or fallback
+
+    async def _prime_core_grid(
+        self, cohort: list, detail_batch: SmartDetailBatch, width: int, allow_stale_cache: bool,
+    ) -> None:
+        """Prime only newly registered foreground owners; loaders retain publication."""
+        if not cohort:
+            return
+        payloads = {}
+        error = None
+        permits = 0
+        try:
+            entries = await detail_batch.entries()
+            selected = [item for item in cohort if not (
+                allow_stale_cache and self._build_persisted_smart_summary(item[0], loaded_entries=entries) is not None
+            )]
+            if selected:
+                # Serialize multi-permit reservations. Drawers use the same service
+                # budget, while two grids cannot deadlock holding partial budgets.
+                async with self._core_grid_reservation_lock:
+                    try:
+                        for _ in range(min(width, len(selected))):
+                            await self._smart_operation_semaphore.acquire()
+                            permits += 1
+                        try:
+                            json_payloads = await self.truenas_client.smartctl_batch(
+                                [candidates[0] for _slot, candidates, _future in selected],
+                                ["-a", "-j"], max_concurrency=permits,
+                            )
+                        except TrueNASAPIError:
+                            # The accepted client is fail-fast: retry the affected
+                            # phase through the existing bounded per-slot path.
+                            json_payloads = None
+                        if json_payloads is not None:
+                            text_selected = []
+                            for item, payload in zip(selected, json_payloads):
+                                slot, candidates, future = item
+                                payloads[future] = (payload, None)
+                                summary = self._merge_smart_summary(
+                                    slot, SmartSummaryView.model_validate(parse_smartctl_summary(payload)),
+                                )
+                                if "smartctl-text" in self._smart_enrichment_plan(summary, slot, candidates)[1]:
+                                    text_selected.append(item)
+                            if text_selected:
+                                try:
+                                    text_payloads = await self.truenas_client.smartctl_batch(
+                                        [candidates[0] for _slot, candidates, _future in text_selected],
+                                        ["-x"], max_concurrency=permits,
+                                    )
+                                except TrueNASAPIError:
+                                    pass
+                                else:
+                                    for item, text in zip(text_selected, text_payloads):
+                                        future = item[2]
+                                        payloads[future] = (payloads[future][0], text)
+                    finally:
+                        for _ in range(permits):
+                            self._smart_operation_semaphore.release()
+        except BaseException as exc:
+            # Settle every registered loader even when disk loading, parsing or a
+            # non-API transport failure prevents the phase from finishing.
+            error = exc
+        for _slot, _candidates, future in cohort:
+            if not future.done():
+                if error is not None:
+                    future.set_exception(error)
+                else:
+                    future.set_result(payloads.get(future))
 
     async def get_slot_smart_summaries(
         self,
@@ -4066,20 +4414,60 @@ class InventoryService:
             if max_concurrency is not None:
                 effective_concurrency = min(effective_concurrency, max(1, max_concurrency))
             semaphore = asyncio.Semaphore(max(1, effective_concurrency))
+            detail_batch = SmartDetailBatch(self.slot_detail_store)
+            core_cohort = [] if (self.system.truenas.platform == "core"
+                                 and isinstance(self.truenas_client, TrueNASWebsocketClient)) else None
+            admissions = {slot: asyncio.Event() for slot in ordered_slots}
+            identities = {slot: self._smart_cache_key(slot_lookup[slot]) for slot in ordered_slots}
+            generations = {slot: self._smart_cache_generation_token(key) for slot, key in identities.items()}
 
             async def load_summary(slot: int) -> SmartBatchItem:
-                async with semaphore:
+                async with (semaphore if core_cohort is None else nullcontext()):
                     try:
                         summary = await self._get_slot_smart_summary_for_slot_view(
                             slot_lookup[slot],
                             allow_stale_cache=allow_stale_cache,
                             bypass_negative_cache=bypass_negative_cache,
+                            **({"core_cohort": core_cohort, "request_semaphore": semaphore,
+                                "admitted": admissions[slot]} if core_cohort is not None else {}),
                         )
                     except TrueNASAPIError as exc:
                         summary = self._fallback_smart_summary(slot_lookup.get(slot), str(exc))
                     return SmartBatchItem(slot=slot, summary=summary)
 
-            return await asyncio.gather(*(load_summary(slot) for slot in ordered_slots))
+            async def complete_batch() -> list[SmartBatchItem]:
+                # Retain ownership through cancellation until loaders and disk save
+                # finish. Shared per-slot tasks can outlive the requesting caller.
+                token = _smart_detail_batch.set(detail_batch)
+                try:
+                    loaders = [asyncio.create_task(load_summary(slot)) for slot in ordered_slots]
+                    if core_cohort is not None:
+                        await asyncio.gather(*(event.wait() for event in admissions.values()))
+                        await self._prime_core_grid(core_cohort, detail_batch,
+                                                    effective_concurrency, allow_stale_cache)
+                    results = await asyncio.gather(*loaders, return_exceptions=True)
+                finally:
+                    _smart_detail_batch.reset(token)
+                await detail_batch.flush()
+                await detail_batch.wait_dependencies()
+                for result in results:
+                    if isinstance(result, BaseException):
+                        raise result
+                for result in results:
+                    if isinstance(result, SmartBatchItem) and not self._smart_request_is_current(
+                        identities[result.slot], generations[result.slot],
+                    ):
+                        result.summary = self._replaced_disk_smart_summary()
+                return [result for result in results if isinstance(result, SmartBatchItem)]
+
+            task = asyncio.create_task(complete_batch())
+            task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+            results = await _await_retained(task)
+            # The public caller may resume after the retained batch completed
+            # and a replacement snapshot was observed in the intervening turn.
+            return [SmartBatchItem(slot=item.slot, summary=(item.summary if self._smart_request_is_current(
+                identities[item.slot], generations[item.slot],
+            ) else self._replaced_disk_smart_summary())) for item in results]
 
     async def _fetch_smart_summary_over_ssh(
         self,
@@ -4579,10 +4967,7 @@ class InventoryService:
             else:
                 platform_context["bmc"] = bmc_context
 
-        with perf_stage("inventory.slot_detail_cache.apply", slot_count=len(slots)):
-            self._apply_persisted_slot_details(slots)
-        with perf_stage("inventory.slot_detail_cache.persist", slot_count=len(slots)):
-            self._persist_slot_details(slots)
+        await self._apply_and_persist_snapshot_slot_details(slots)
 
         slots = self._attach_mapping_revisions(slots)
         summary = InventorySummary(

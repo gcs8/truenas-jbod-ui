@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import json
+import os
 import re
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -12,6 +16,8 @@ WORKFLOW_DIR = ROOT / ".github" / "workflows"
 CI_WORKFLOW = WORKFLOW_DIR / "ci.yml"
 PUBLISH_GHCR_WORKFLOW = WORKFLOW_DIR / "publish-ghcr.yml"
 PUBLISH_PUBLIC_DEMO_WORKFLOW = WORKFLOW_DIR / "publish-public-demo.yml"
+CAPTURE_SCREENSHOTS_WORKFLOW = WORKFLOW_DIR / "capture-public-demo-screenshots.yml"
+RELEASE_CHECKLIST = ROOT / "docs" / "RELEASE_CHECKLIST.md"
 PUBLIC_DEMO_SPEC = ROOT / "qa" / "public-demo.spec.js"
 ADMIN_CLEANROOM_CONFIG = ROOT / "qa" / "fixtures" / "admin-cleanroom-config.yaml"
 ADMIN_CLEANROOM_SPEC = ROOT / "qa" / "admin-operations.spec.js"
@@ -92,6 +98,14 @@ class CIWorkflowContractTests(unittest.TestCase):
         self.assertIn('"dependency_status": "unknown"', workflow_text)
         self.assertIn('"cache_state": "empty"', workflow_text)
         self.assertIn(
+            'cp docker-compose.nonroot.yml "$compose_contract_root/nonroot.yaml"',
+            workflow_text,
+        )
+        self.assertGreaterEqual(
+            workflow_text.count('-f "$compose_contract_root/nonroot.yaml"'), 2
+        )
+        self.assertIn("hardened_compose_service_contracts=ok", workflow_text)
+        self.assertIn(
             "probe_compose_service enclosure-admin 0 10001 0000000000000009 "
             "/app/host-prep /app/data",
             workflow_text,
@@ -160,8 +174,9 @@ class CIWorkflowContractTests(unittest.TestCase):
                     uncommented.append(f"{workflow_path.name}: {action}")
 
         # 29 existing uses plus checkout, setup-python, and setup-node in the
-        # owner-gated Pages readback job.
-        self.assertEqual(action_count, 32)
+        # owner-gated Pages readback job, plus checkout and upload-artifact in
+        # the dispatch-only screenshot capture workflow.
+        self.assertEqual(action_count, 34)
         self.assertEqual(unpinned, [])
         self.assertEqual(uncommented, [])
 
@@ -256,6 +271,198 @@ class CIWorkflowContractTests(unittest.TestCase):
                 self.assertIn("npm ci --ignore-scripts", workflow_text)
                 self.assertIn('rm -rf "$fixture_root"', workflow_text)
                 self.assertIn("git status --short", workflow_text)
+
+    def test_screenshot_capture_workflow_is_dispatch_only_pinned_and_read_only(self) -> None:
+        workflow = yaml.safe_load(self.read(CAPTURE_SCREENSHOTS_WORKFLOW))
+        lock = json.loads(self.read(ROOT / "package-lock.json"))
+        locked_playwright = lock["packages"]["node_modules/@playwright/test"]["version"]
+        triggers = workflow.get("on", workflow.get(True, {}))
+        job = workflow["jobs"]["capture"]
+        commands = "\n".join(str(step.get("run", "")) for step in job["steps"])
+
+        self.assertEqual(set(triggers), {"workflow_dispatch"})
+        self.assertIn("ref", triggers["workflow_dispatch"]["inputs"])
+        self.assertEqual(workflow["permissions"], {"contents": "read"})
+        self.assertNotIn("permissions", job)
+        image = job["container"]["image"]
+        expected_tag = f"mcr.microsoft.com/playwright:v{locked_playwright}-jammy"
+        self.assertRegex(image, rf"^{re.escape(expected_tag)}@sha256:[0-9a-f]{{64}}$")
+        self.assertEqual(job["env"]["CONTAINER_IMAGE"], image)
+        self.assertEqual(job["env"]["CONTAINER_TAG"], expected_tag)
+        self.assertEqual(job["env"]["PLAYWRIGHT_VERSION"], locked_playwright)
+        self.assertNotIn("runner.", json.dumps(job["env"]))
+        self.assertNotIn("runner.", json.dumps(job["container"]))
+        self.assertIn('printf \'container image: %s\\n\' "$CONTAINER_IMAGE"', commands)
+        self.assertIn('printf \'container tag: %s\\n\' "$CONTAINER_TAG"', commands)
+        ref_check = next(
+            step
+            for step in job["steps"]
+            if step.get("name") == "Require the requested ref to be the checked-out commit SHA"
+        )
+        self.assertEqual(ref_check["env"]["REQUESTED_REF"], "${{ inputs.ref }}")
+        self.assertIn('[[ ! "$REQUESTED_REF" =~ ^[0-9a-f]{40}$ ]]', ref_check["run"])
+        self.assertIn(
+            'git config --global --add safe.directory "$GITHUB_WORKSPACE"',
+            ref_check["run"],
+        )
+        self.assertIn('resolved_ref="$(git rev-parse HEAD)"', ref_check["run"])
+        self.assertIn('[ "$resolved_ref" != "$REQUESTED_REF" ]', ref_check["run"])
+        self.assertEqual(
+            [step.get("name") for step in job["steps"][:3]],
+            [
+                "Check out the dispatched ref",
+                "Require the requested ref to be the checked-out commit SHA",
+                "Prepare the candidate directory and the run log",
+            ],
+        )
+        prepare = job["steps"][2]["run"]
+        self.assertIn('candidate_dir="$RUNNER_TEMP/public-demo-screenshot-candidate"', prepare)
+        self.assertIn('>> "$GITHUB_ENV"', prepare)
+        self.assertNotIn("safe.directory", prepare)
+        self.assertTrue(
+            all("$CANDIDATE_DIR" not in str(step.get("run", "")) for step in job["steps"][:2])
+        )
+
+        self.assertEqual(commands.count("node scripts/capture_public_demo_screenshots.js"), 2)
+        self.assertIn('cmp -s "$CANDIDATE_DIR/run-1/$name" "$CANDIDATE_DIR/run-2/$name"', commands)
+        self.assertIn("the capture is not byte-reproducible in this environment", commands)
+        self.assertIn("npm ci --ignore-scripts", commands)
+        self.assertIn("scripts/check_public_screenshots.py --report", commands)
+        self.assertIn(
+            'sha256sum ./*.png | tee sha256sums.txt',
+            commands,
+        )
+        self.assertIn("fc-match", commands)
+        self.assertIn("git status --short", commands)
+        for forbidden in ("git push", "git commit", "gh pr ", "gh release", "peter-evans"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, self.read(CAPTURE_SCREENSHOTS_WORKFLOW))
+
+        upload = next(
+            step
+            for step in job["steps"]
+            if str(step.get("uses", "")).startswith("actions/upload-artifact@")
+        )
+        self.assertEqual(upload["with"]["retention-days"], 14)
+        self.assertEqual(upload["with"]["if-no-files-found"], "error")
+        self.assertEqual(
+            upload["with"]["path"], "${{ env.CANDIDATE_DIR }}"
+        )
+
+    def test_release_checklist_uses_and_reviews_the_dispatch_capture_artifact(self) -> None:
+        checklist = self.read(RELEASE_CHECKLIST)
+        screenshot_section = checklist.split("## Screenshots", 1)[1].split("\n## ", 1)[0]
+
+        for required in (
+            "capture-public-demo-screenshots.yml",
+            "full commit SHA",
+            "qualification_only=false",
+            "public-demo-screenshot-candidate",
+            "gh run download",
+            "sha256sum --check sha256sums.txt",
+            "proposed-manifest.json",
+            "platform-fonts.json",
+            "capture.log",
+            "SCREENSHOT_CAPTURE.md",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, screenshot_section)
+        self.assertNotIn(
+            "node scripts/capture_public_demo_screenshots.js",
+            screenshot_section,
+        )
+
+    def test_screenshot_capture_ref_guard_admits_container_checkout_ownership(self) -> None:
+        workflow = yaml.safe_load(self.read(CAPTURE_SCREENSHOTS_WORKFLOW))
+        guard = workflow["jobs"]["capture"]["steps"][1]["run"]
+        head = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=ROOT,
+            text=True,
+        ).strip()
+
+        with tempfile.TemporaryDirectory() as home:
+            result = subprocess.run(
+                ["bash", "-c", guard],
+                cwd=ROOT,
+                env={
+                    **os.environ,
+                    "GITHUB_WORKSPACE": str(ROOT),
+                    "GIT_TEST_ASSUME_DIFFERENT_OWNER": "1",
+                    "HOME": home,
+                    "REQUESTED_REF": head,
+                },
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                f"directory = {ROOT}",
+                (Path(home) / ".gitconfig").read_text(encoding="utf-8"),
+            )
+
+    def test_screenshot_capture_qualification_run_cannot_pass_as_a_candidate(self) -> None:
+        workflow = yaml.safe_load(self.read(CAPTURE_SCREENSHOTS_WORKFLOW))
+        triggers = workflow.get("on", workflow.get(True, {}))
+        inputs = triggers["workflow_dispatch"]["inputs"]
+        job = workflow["jobs"]["capture"]
+        docs = self.read(ROOT / "docs" / "SCREENSHOT_CAPTURE.md")
+        capture_step = next(
+            run
+            for run in (str(step.get("run", "")) for step in job["steps"])
+            if "proposed-manifest.json" in run
+        )
+        upload = next(
+            step
+            for step in job["steps"]
+            if str(step.get("uses", "")).startswith("actions/upload-artifact@")
+        )
+
+        self.assertEqual(inputs["qualification_only"]["type"], "boolean")
+        self.assertIs(inputs["qualification_only"]["default"], True)
+        self.assertIn("commit SHA", inputs["ref"]["description"])
+        self.assertEqual(job["env"]["QUALIFICATION_ONLY"], "${{ inputs.qualification_only }}")
+        self.assertIn('if [ "$QUALIFICATION_ONLY" = "true" ]', capture_step)
+        self.assertIn("public-demo-screenshot-qualification", str(upload["with"]["name"]))
+        self.assertIn("public-demo-screenshot-candidate", str(upload["with"]["name"]))
+        self.assertIn("public-demo-screenshot-qualification", docs)
+
+    def test_screenshot_capture_checks_the_fonts_chromium_actually_used(self) -> None:
+        workflow = yaml.safe_load(self.read(CAPTURE_SCREENSHOTS_WORKFLOW))
+        job = workflow["jobs"]["capture"]
+        runs = [str(step.get("run", "")) for step in job["steps"]]
+        probe_step = next(run for run in runs if "report_public_demo_platform_fonts.js" in run)
+        fc_match_step = next(run for run in runs if "fc-match" in run)
+        script = self.read(ROOT / "scripts" / "report_public_demo_platform_fonts.js")
+
+        self.assertIn(
+            'node scripts/report_public_demo_platform_fonts.js "$CANDIDATE_DIR/platform-fonts.json"',
+            probe_step,
+        )
+        # The expected families are compared against the platform fonts Chromium
+        # reported, not against fc-match, whose output stays informational.
+        for variable in ("EXPECTED_SANS_FALLBACK", "EXPECTED_MONO_FALLBACK"):
+            with self.subTest(variable=variable):
+                self.assertIn(variable, probe_step)
+                self.assertNotIn(variable, fc_match_step)
+        self.assertEqual(job["env"]["EXPECTED_SANS_FALLBACK"], "Liberation Sans")
+        self.assertEqual(job["env"]["EXPECTED_MONO_FALLBACK"], "WenQuanYi Zen Hei Mono")
+        self.assertIn("probes.sans.dominant_family", probe_step)
+        self.assertIn("probes.mono.dominant_family", probe_step)
+        self.assertIn('"$CANDIDATE_DIR/platform-fonts.json"', probe_step)
+
+        for fragment in (
+            "CSS.getPlatformFontsForNode",
+            "DOM.enable",
+            "CSS.enable",
+            "DOM.getDocument",
+            "DOM.querySelector",
+            "newCDPSession",
+            "glyphCount",
+            "dominant_family",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, script)
 
     def test_public_demo_pages_request_allowlist_is_probe_specific(self) -> None:
         spec = self.read(PUBLIC_DEMO_SPEC)

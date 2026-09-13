@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import os
 import re
 import shlex
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -81,6 +83,130 @@ def writable_volume_targets(service: dict[str, Any]) -> set[str]:
     return targets
 
 
+def docker_context_excludes(relative_path: str, rules: str) -> bool:
+    """Evaluate the bounded Docker pattern subset used here, not gitignore.
+
+    Paths are context-root relative; a matched parent excludes descendants.
+    Support component globs, whole-component **, and ordered ! exceptions.
+    Reject unsupported syntax rather than silently pretending to model Docker.
+    This is source-contract evidence, not a Docker build/context transfer.
+    """
+    def matches(pattern: tuple[str, ...], parts: tuple[str, ...]) -> bool:
+        if not pattern:
+            return not parts
+        if pattern[0] == "**":
+            return matches(pattern[1:], parts) or bool(
+                parts and matches(pattern, parts[1:])
+            )
+        return bool(
+            parts
+            and fnmatch.fnmatchcase(parts[0], pattern[0])
+            and matches(pattern[1:], parts[1:])
+        )
+
+    parts = PurePosixPath(relative_path).parts
+    excluded = False
+    for raw in rules.splitlines():
+        rule = raw.strip()
+        if not rule or rule.startswith("#"):
+            continue
+        negate = rule.startswith("!")
+        pattern = rule[1:] if negate else rule
+        components = tuple(pattern.strip("/").split("/"))
+        if (
+            not pattern
+            or any(char in pattern for char in "\\\\[]")
+            or any("**" in part and part != "**" for part in components)
+            or any(part in ("", ".", "..") for part in components)
+        ):
+            raise ValueError(f"Unsupported Docker ignore pattern: {rule}")
+        if any(matches(components, parts[:end]) for end in range(1, len(parts) + 1)):
+            excluded = not negate
+    return excluded
+
+
+class DockerContextContractTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.rules = (REPO_ROOT / ".dockerignore").read_text(encoding="utf-8")
+
+    def test_matcher_models_root_globs_parents_and_ordered_exceptions(self) -> None:
+        rules = "# comment\n/docs/\n*.md\n**/__pycache__/\nconfig/*\n!config/example.yaml\n"
+        for path in ("docs/images/example.png", "README.md", "app/__pycache__/x.pyc",
+                     "__pycache__/x.pyc", "config/ssh/id_test"):
+            with self.subTest(excluded=path):
+                self.assertTrue(docker_context_excludes(path, rules))
+        for path in ("app/docs/help.html", "app/static/help.md", "config/example.yaml"):
+            with self.subTest(included=path):
+                self.assertFalse(docker_context_excludes(path, rules))
+        self.assertTrue(docker_context_excludes("config/example.yaml", rules + "config/*\n"))
+        self.assertFalse(docker_context_excludes("app/x.py", "**/*.pyc\n"))
+        self.assertTrue(docker_context_excludes("app/nested/x.pyc", "**/*.pyc\n"))
+        with self.assertRaises(ValueError):
+            docker_context_excludes("x", "a/**b\n")
+
+    def test_unrelated_and_private_paths_are_excluded_without_reading_them(self) -> None:
+        paths = (
+            ".git", ".git/objects/example", ".github/workflows/ci.yml",
+            "docs/images/example.png", "wiki/images/example.png", "public-demo/index.html",
+            "tests/fixtures/example.json", "qa/example.spec.js", "node_modules/pkg/index.js",
+            "playwright-report/index.html", "test-results/example.png", "artifacts/report.json",
+            ".worktrees/topic/app/main.py", "worktrees/topic/app/main.py",
+            ".venv/lib/example.py", "venv/lib/example.py", ".pytest_cache/example",
+            ".ruff_cache/example", "htmlcov/index.html", ".coverage", "coverage.xml",
+            "README.md", "HANDOFF.md", "TODO.md", "PLANS.md",
+            ".env", ".env.example", "secrets.env", "secrets/token",
+            "config/config.yaml", "config/profiles.yaml", "config/ssh/id_test",
+            "config/tls/client.pem", "config/backup-secrets/passphrase",
+            "data/known_hosts", "history/nested/history.sqlite3", "logs/app.log",
+            "backups/scheduled/archive.7z", "backup-status/scheduled-backup.json",
+            "host-prep/package.deb", "app/__pycache__/main.pyc", "app/nested/x.pyo",
+            "app/.env", "app/.env.example", "app/secrets.env", "app/client.key",
+            "app/client.pem", "app/.ssh/id_test", "app/id_rsa", "app/id_ed25519",
+            "app/known_hosts", "app/nested/.git/objects/example",
+        )
+        for path in paths:
+            with self.subTest(path=path):
+                self.assertTrue(docker_context_excludes(path, self.rules), path)
+
+    def test_every_dockerfile_copy_source_and_tracked_descendant_is_included(self) -> None:
+        # Git lists names only. Never open runtime config, keys, or generated demos.
+        tracked = subprocess.check_output(
+            ["git", "ls-files", "-z"], cwd=REPO_ROOT,
+        ).decode().split("\0")
+        tracked = [name for name in tracked if name]
+        dockerfiles = [name for name in tracked if PurePosixPath(name).name == "Dockerfile"
+                       or PurePosixPath(name).name.startswith("Dockerfile.")
+                       or PurePosixPath(name).name.endswith(".Dockerfile")]
+        self.assertTrue(dockerfiles)
+        self.assertFalse([name for name in tracked if name.endswith(".dockerignore")
+                          and name != ".dockerignore"], "Review Dockerfile-specific ignore rules")
+        sources = []
+        for name in dockerfiles:
+            text = (REPO_ROOT / name).read_text(encoding="utf-8").replace("\\\n", " ")
+            for line in text.splitlines():
+                words = shlex.split(line, comments=True)
+                if not words or words[0].upper() not in ("COPY", "ADD"):
+                    continue
+                # Fail closed when the simple local COPY contract changes.
+                self.assertEqual(words[0].upper(), "COPY", name)
+                self.assertEqual(len(words), 3, (name, line))
+                source = words[1]
+                self.assertNotRegex(source, r"[\[\]{}*$?]|^[-/]|\.\.")
+                sources.append(source.rstrip("/"))
+        self.assertTrue(sources)
+        for source in sources:
+            children = [name for name in tracked if name == source or name.startswith(source + "/")]
+            self.assertTrue(children, f"COPY source missing: {source}")
+            for name in (source, *children):
+                with self.subTest(source=source, path=name):
+                    self.assertFalse(docker_context_excludes(name, self.rules), f"COPY input excluded: {name}")
+        for name in ("Dockerfile", ".dockerignore", "app/static/future.png",
+                     "app/templates/future.html", "history_service/static/future.js",
+                     "admin_service/static/future.css"):
+            with self.subTest(future_input=name):
+                self.assertFalse(docker_context_excludes(name, self.rules), name)
+
+
 class ContainerResourceContractTests(unittest.TestCase):
     def test_beginner_defaults_require_no_auth_origin_or_private_ca(self) -> None:
         self.assertFalse(TrueNASConfig().verify_ssl)
@@ -95,7 +221,7 @@ class ContainerResourceContractTests(unittest.TestCase):
         config = yaml.safe_load(config_example)
         self.assertEqual(config["truenas"]["verify_ssl"], False)
         self.assertNotIn("#       verify_ssl: true", config_example)
-        self.assertEqual(config_example.count("#       verify_ssl: false"), 6)
+        self.assertEqual(config_example.count("#       verify_ssl: false"), 9)
 
         for compose_name in COMPOSE_FILES:
             services = yaml.safe_load((REPO_ROOT / compose_name).read_text(encoding="utf-8"))[
@@ -781,25 +907,26 @@ class ContainerResourceContractTests(unittest.TestCase):
         ]
         self.assertEqual(active_assignments, [])
 
-    def test_ui_and_history_are_nonroot_by_default_with_compatible_overlay(self) -> None:
+    def test_ui_and_history_identity_matches_base_or_hardened_dev(self) -> None:
         for compose_name in COMPOSE_FILES:
             services = yaml.safe_load((REPO_ROOT / compose_name).read_text(encoding="utf-8"))["services"]
             with self.subTest(compose=compose_name):
                 self.assertEqual(
                     services["enclosure-ui"]["user"],
-                    "${APP_UID:-10001}:${APP_GID:-10001}",
+                    "0:0" if compose_name == "docker-compose.yml" else "${APP_UID:-10001}:${APP_GID:-10001}",
                 )
                 self.assertEqual(
                     services["enclosure-history"]["user"],
-                    "${APP_UID:-10001}:${APP_GID:-10001}",
+                    "0:0" if compose_name == "docker-compose.yml" else "${APP_UID:-10001}:${APP_GID:-10001}",
                 )
                 self.assertEqual(
                     services["enclosure-admin"]["user"],
-                    "0:${APP_GID:-10001}",
+                    "0:0" if compose_name == "docker-compose.yml" else "0:${APP_GID:-10001}",
                 )
                 self.assertEqual(
                     services["enclosure-backup"]["user"],
-                    "${BACKUP_UID:-1000}:${BACKUP_GID:-1000}",
+                    "${BACKUP_UID:-0}:${BACKUP_GID:-0}" if compose_name == "docker-compose.yml"
+                    else "${BACKUP_UID:-1000}:${BACKUP_GID:-1000}",
                 )
                 self.assertEqual(
                     services["enclosure-backup"]["environment"]["APP_GID"],
@@ -809,12 +936,13 @@ class ContainerResourceContractTests(unittest.TestCase):
                     services["enclosure-backup"]["group_add"],
                     ["${APP_GID:-10001}"],
                 )
-                self.assertIn("./config:/app/config:ro", services["enclosure-ui"]["volumes"])
+                config_mount = "./config:/app/config" + ("" if compose_name == "docker-compose.yml" else ":ro")
+                self.assertIn(config_mount, services["enclosure-ui"]["volumes"])
 
         overlay = yaml.safe_load((REPO_ROOT / "docker-compose.nonroot.yml").read_text(encoding="utf-8"))
         self.assertEqual(
             set(overlay["services"]),
-            {"enclosure-ui", "enclosure-history", "enclosure-backup"},
+            {"enclosure-ui", "enclosure-history", "enclosure-admin", "enclosure-backup"},
         )
         self.assertEqual(overlay["services"]["enclosure-ui"]["user"], "${APP_UID:-10001}:${APP_GID:-10001}")
         self.assertEqual(
@@ -869,6 +997,9 @@ class ContainerResourceContractTests(unittest.TestCase):
     def test_compose_services_use_read_only_root_filesystems_and_drop_privileges(self) -> None:
         for compose_name in COMPOSE_FILES:
             services = yaml.safe_load((REPO_ROOT / compose_name).read_text(encoding="utf-8"))["services"]
+            if compose_name == "docker-compose.yml":
+                overlay = yaml.safe_load((REPO_ROOT / "docker-compose.nonroot.yml").read_text())["services"]
+                services = {name: {**service, **overlay.get(name, {})} for name, service in services.items()}
             for service_name, service in services.items():
                 with self.subTest(compose=compose_name, service=service_name):
                     self.assertIs(service.get("read_only"), True)
@@ -903,6 +1034,8 @@ class ContainerResourceContractTests(unittest.TestCase):
             services = yaml.safe_load((REPO_ROOT / compose_name).read_text(encoding="utf-8"))["services"]
             for service_name, expected in expected_targets.items():
                 with self.subTest(compose=compose_name, service=service_name):
+                    if compose_name == "docker-compose.yml" and service_name == "enclosure-ui":
+                        expected = expected | {"/app/config"}
                     self.assertEqual(writable_volume_targets(services[service_name]), expected)
             self.assertNotIn("./logs:/app/logs", services["enclosure-admin"]["volumes"])
 
@@ -970,7 +1103,7 @@ class ContainerResourceContractTests(unittest.TestCase):
             admin = services["enclosure-admin"]
 
             with self.subTest(compose=compose_name, service="enclosure-admin"):
-                self.assertEqual(admin["user"], "0:${APP_GID:-10001}")
+                self.assertEqual(admin["user"], "0:0" if compose_name == "docker-compose.yml" else "0:${APP_GID:-10001}")
                 self.assertIn(str(staging_root), writable_volume_targets(admin))
 
             for service_name, service in services.items():
@@ -1037,14 +1170,14 @@ class ContainerResourceContractTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertIn("default non-root UI and history services", env_example)
+        self.assertIn("opt-in non-root UI and history services", env_example)
         self.assertNotIn("prepare_nonroot_bind_mounts.py", readme)
         self.assertNotIn("prepare_nonroot_bind_mounts.py", quick_start)
         self.assertNotIn("prepare_nonroot_bind_mounts.py", deployment_guide)
         self.assertIn("prepare_nonroot_bind_mounts.py", troubleshooting)
         self.assertIn("Run the dry check first", troubleshooting)
         self.assertIn("--apply", troubleshooting)
-        self.assertNotIn("The base Compose file keeps the existing root-compatible", deployment_guide)
+        self.assertIn("root-compatible", deployment_guide)
 
     def test_nonroot_overlay_preserves_backup_identity_with_app_data_group(self) -> None:
         overlay = yaml.safe_load(
@@ -1052,8 +1185,13 @@ class ContainerResourceContractTests(unittest.TestCase):
         )
 
         backup = overlay["services"]["enclosure-backup"]
-        self.assertNotIn("user", backup)
-        self.assertEqual(backup["group_add"], ["${APP_GID:-10001}"])
+        self.assertEqual(backup["user"], "${BACKUP_UID:-1000}:${BACKUP_GID:-1000}")
+        # Compose appends group_add lists; the overlay must inherit the base grant.
+        self.assertNotIn("group_add", backup)
+        base = yaml.safe_load((REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8"))
+        self.assertEqual(
+            base["services"]["enclosure-backup"]["group_add"], ["${APP_GID:-10001}"]
+        )
 
         backup_guide = (
             REPO_ROOT / "wiki/Backup-Restore-and-Debug-Bundles.md"
@@ -1062,6 +1200,75 @@ class ContainerResourceContractTests(unittest.TestCase):
         self.assertIn("Status files use `0640`", backup_guide)
         self.assertIn("segment directory uses exact mode `0750`", backup_guide)
         self.assertIn("segments and `catalog.json` use exact mode `0640`", backup_guide)
+
+    def test_real_compose_merge_preserves_backup_group_and_runtime_identity(self) -> None:
+        # Config rendering is daemon-free. Never load operator .env/config or start services.
+        binary = os.environ.get("COMPOSE_BINARY") or shutil.which("docker-compose")
+        if binary:
+            compose = [binary]
+        elif shutil.which("docker"):
+            compose = ["docker", "compose"]
+            version = subprocess.run(compose + ["version"], capture_output=True, timeout=30)
+            if version.returncode:
+                self.skipTest("Docker Compose plugin unavailable; real merge not validated")
+        else:
+            self.skipTest("Docker Compose unavailable; real merge not validated")
+
+        chains = (
+            ("docker-compose.yml",),
+            ("docker-compose.dev.yml",),
+            ("docker-compose.yml", "docker-compose.nonroot.yml"),
+            ("docker-compose.yml", "docker-compose.secrets.yml", "docker-compose.nonroot.yml"),
+            ("docker-compose.yml", "docker-compose.nonroot.yml", "docker-compose.secrets.yml"),
+        )
+        examples = (
+            ("defaults", "", "10001", "10001", "1000:1000", "0:0"),
+            ("example", (REPO_ROOT / ".env.example").read_text(encoding="utf-8"),
+             "10001", "10001", "1000:1000", "0:0"),
+            ("custom", "APP_UID=21001\nAPP_GID=21002\nBACKUP_UID=22001\nBACKUP_GID=22002\n",
+             "21001", "21002", "22001:22002", "22001:22002"),
+        )
+        with tempfile.TemporaryDirectory(prefix="compose-contract-") as temporary:
+            root = Path(temporary)
+            for name in SUPPORTED_COMPOSE_FILES:
+                shutil.copyfile(REPO_ROOT / name, root / name)
+            environment = {
+                "PATH": os.environ.get("PATH", ""),
+                "HOME": temporary,
+                "TMPDIR": temporary,
+                "DOCKER_CONFIG": str(root / "docker-config"),
+            }
+            for label, contents, uid, gid, hardened_backup, base_backup in examples:
+                (root / ".env").write_text(contents, encoding="utf-8")
+                for chain in chains:
+                    with self.subTest(environment=label, chain=chain):
+                        command = compose + ["--project-name", "contract", "--env-file", str(root / ".env")]
+                        for name in chain:
+                            command.extend(["-f", str(root / name)])
+                        result = subprocess.run(
+                            command + ["--profile", "*", "config", "--format", "json"],
+                            cwd=root, env=environment, text=True, capture_output=True, timeout=30,
+                        )
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        services = json.loads(result.stdout)["services"]
+                        hardened = "docker-compose.nonroot.yml" in chain or chain[0] == "docker-compose.dev.yml"
+                        backup = services["enclosure-backup"]
+                        self.assertEqual(backup["group_add"], [gid])
+                        self.assertEqual(backup["user"], hardened_backup if hardened else base_backup)
+                        for name in ("enclosure-ui", "enclosure-history", "enclosure-admin"):
+                            service = services[name]
+                            identity = f"{'0' if name == 'enclosure-admin' else uid}:{gid}"
+                            self.assertEqual(service["user"], identity if hardened else "0:0")
+                            self.assertEqual(service.get("read_only", False), hardened)
+                            if hardened:
+                                self.assertEqual(service["cap_drop"], ["ALL"])
+                                self.assertIn("/tmp", service["tmpfs"])
+                        if hardened:
+                            config_mount = next(
+                                mount for mount in services["enclosure-ui"]["volumes"]
+                                if mount["target"] == "/app/config"
+                            )
+                            self.assertTrue(config_mount["read_only"])
 
     def test_nonroot_migration_helper_is_bounded_no_follow_and_dry_run_by_default(self) -> None:
         helper = (REPO_ROOT / "scripts/prepare_nonroot_bind_mounts.py").read_text(encoding="utf-8")
@@ -1324,7 +1531,11 @@ class ContainerResourceContractTests(unittest.TestCase):
                 )
                 self.assertEqual(service["network_mode"], "none")
                 self.assertEqual(service["restart"], "no")
-                self.assertEqual(service["user"], "${BACKUP_UID:-1000}:${BACKUP_GID:-1000}")
+                self.assertEqual(
+                    service["user"],
+                    "${BACKUP_UID:-0}:${BACKUP_GID:-0}" if compose_name == "docker-compose.yml"
+                    else "${BACKUP_UID:-1000}:${BACKUP_GID:-1000}",
+                )
                 self.assertNotIn("ports", service)
                 self.assertFalse(
                     any("docker.sock" in volume for volume in service.get("volumes", []))
@@ -1339,6 +1550,8 @@ class ContainerResourceContractTests(unittest.TestCase):
                 runbook = (
                     REPO_ROOT / "wiki/Backup-Restore-and-Debug-Bundles.md"
                 ).read_text(encoding="utf-8")
+                self.assertIn("BACKUP_UID=0", runbook)
+                self.assertIn("BACKUP_GID=0", runbook)
                 self.assertIn("BACKUP_UID=$(id -u)", runbook)
                 self.assertIn("BACKUP_GID=$(id -g)", runbook)
 
