@@ -292,6 +292,26 @@ class HistoryBackendClient:
     ) -> dict[str, Any]:
         present = isinstance(history, dict)
         history = history if present else {}
+        metrics = history.get("metrics", {})
+        events = history.get("events", [])
+        sample_counts = history.get("sample_counts", {})
+        latest_values = history.get("latest_values", {})
+        disk_history = history.get("disk_history", {})
+        if present and (
+            not isinstance(metrics, dict)
+            or any(
+                not isinstance(metric_name, str)
+                or not isinstance(samples, list)
+                or any(not isinstance(sample, dict) for sample in samples)
+                for metric_name, samples in metrics.items()
+            )
+            or not isinstance(events, list)
+            or any(not isinstance(event, dict) for event in events)
+            or not isinstance(sample_counts, dict)
+            or not isinstance(latest_values, dict)
+            or not isinstance(disk_history, dict)
+        ):
+            raise HistoryBackendResponseError(0, "History backend returned a malformed slot history payload.")
         layers = (*parents, history)
         configured = self.configured and all(layer.get("configured", True) is True for layer in layers)
         available = configured and present and all(layer.get("available", True) is True for layer in layers)
@@ -306,11 +326,11 @@ class HistoryBackendClient:
             "slot": slot,
             "system_id": system_id,
             "enclosure_id": enclosure_id,
-            "metrics": history.get("metrics", {}),
-            "events": history.get("events", []),
-            "sample_counts": history.get("sample_counts", {}),
-            "latest_values": history.get("latest_values", {}),
-            "disk_history": history.get("disk_history", {}),
+            "metrics": metrics,
+            "events": events,
+            "sample_counts": sample_counts,
+            "latest_values": latest_values,
+            "disk_history": disk_history,
         }
 
     async def get_scope_history(

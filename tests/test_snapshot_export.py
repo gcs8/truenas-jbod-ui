@@ -34,6 +34,7 @@ from app.models.domain import (
 from app.services.history_backend import (
     HISTORY_BACKEND_FAILURE_DETAIL,
     HistoryBackendClient,
+    HistoryBackendResponseError,
     HistoryBackendUnavailableError,
 )
 from app.services.snapshot_export import (
@@ -2816,6 +2817,39 @@ class HistoryResponseContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(rendered.history_available)
         self.assertTrue(rendered.history_cache)
         self.assertTrue(all(not history["available"] for history in rendered.history_cache.values()))
+
+    async def test_malformed_inner_slot_collections_fail_before_export(self) -> None:
+        snapshot = build_snapshot()
+        valid = {
+            "metrics": {},
+            "events": [],
+            "sample_counts": {},
+            "latest_values": {},
+            "disk_history": {},
+        }
+        for replacement in (
+            {"metrics": "malformed-nonempty"},
+            {"metrics": {"temperature_c": ["not-a-sample"]}},
+            {"events": {"bad": "shape"}},
+            {"events": ["not-an-event"]},
+        ):
+            response = {
+                "scopes": [
+                    {
+                        "system_id": snapshot.selected_system_id,
+                        "enclosure_id": snapshot.selected_enclosure_id,
+                        "histories": {"0": {**valid, **replacement}},
+                    }
+                ]
+            }
+            with self.subTest(replacement=replacement), patch.object(
+                self.client,
+                "_send_json",
+                AsyncMock(return_value=response),
+            ):
+                self.clear_caches()
+                with self.assertRaisesRegex(HistoryBackendResponseError, "malformed slot history"):
+                    await self.export(snapshot)
 
     async def test_partial_response_matches_scope_identity_and_marks_missing_slots_unavailable(self) -> None:
         scopes = [
