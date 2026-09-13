@@ -2185,6 +2185,46 @@ sys.stdout.flush()
         self.assertNotIn(passphrase, result.stderr)
         self.assertIn("Everything is Ok", result.stdout)
 
+    def test_7z_prompt_channel_supports_a_master_fd_above_select_limit(self) -> None:
+        holders: list[int] = []
+        try:
+            while not holders or holders[-1] < 1023:
+                holders.append(os.open(os.devnull, os.O_RDONLY))
+        except OSError:
+            for fd in holders:
+                os.close(fd)
+            self.skipTest("the process descriptor limit is below the select boundary")
+
+        prompt_program = """
+import os
+import sys
+import termios
+
+if not os.isatty(0):
+    raise SystemExit(3)
+attributes = termios.tcgetattr(0)
+attributes[3] &= ~termios.ECHO
+termios.tcsetattr(0, termios.TCSANOW, attributes)
+sys.stdout.write("Enter password (will not be echoed):")
+sys.stdout.flush()
+if not sys.stdin.readline().endswith("\\n"):
+    raise SystemExit(4)
+sys.stdout.write("\\nEverything is Ok\\n")
+sys.stdout.flush()
+"""
+        try:
+            result = self.backup_service._run_7z_prompt_command(
+                [sys.executable, "-c", prompt_program],
+                cwd=None,
+                passphrase="synthetic prompt secret",
+            )
+        finally:
+            for fd in holders:
+                os.close(fd)
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("Everything is Ok", result.stdout)
+
     def test_7z_prompt_channel_rejects_line_breaks_before_process_start(self) -> None:
         with patch("history_service.system_backup.subprocess.Popen") as popen:
             with self.assertRaisesRegex(ValueError, "line breaks"):
