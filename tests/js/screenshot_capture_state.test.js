@@ -17,7 +17,10 @@ test("normalizer moves the pointer away, blurs focus, and waits two frames", asy
   global.document = {
     activeElement,
     querySelectorAll(selector) {
-      assert.equal(selector, "button:hover, a:hover, [role='button']:hover");
+      assert.equal(
+        selector,
+        "button:hover, a[href]:hover, input:hover, select:hover, textarea:hover, [role='button']:hover, [tabindex]:not([tabindex='-1']):hover"
+      );
       events.push("hover-check");
       return [];
     },
@@ -66,6 +69,42 @@ test("normalizer fails if an interactive element remains hovered", async () => {
 
   try {
     await assert.rejects(normalizeCaptureState(page), /interactive element remains hovered/);
+  } finally {
+    global.document = priorDocument;
+    global.requestAnimationFrame = priorAnimationFrame;
+  }
+});
+
+test("normalizer fails if a blur handler restores interactive focus after two frames", async () => {
+  const priorDocument = global.document;
+  const priorAnimationFrame = global.requestAnimationFrame;
+  const button = {
+    matches(selector) {
+      return selector.includes("button");
+    },
+    blur() {
+      global.document.activeElement = null;
+      requestAnimationFrame(() => requestAnimationFrame(() => {
+        global.document.activeElement = button;
+      }));
+    },
+  };
+  global.document = {
+    activeElement: button,
+    querySelectorAll() {
+      return [];
+    },
+  };
+  global.requestAnimationFrame = (callback) => setImmediate(callback);
+  const page = {
+    mouse: { async move() {} },
+    async evaluate(callback) {
+      return callback();
+    },
+  };
+
+  try {
+    await assert.rejects(normalizeCaptureState(page), /interactive element remains focused/);
   } finally {
     global.document = priorDocument;
     global.requestAnimationFrame = priorAnimationFrame;
