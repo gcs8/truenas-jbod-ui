@@ -143,7 +143,7 @@ class RunnerTrialTests(unittest.TestCase):
             self.assertEqual(list(Path(temp).iterdir()), [])
         smoke.needs_probe(sys.executable)
 
-    def test_scratch_probe_rejects_recreated_database_after_reopen(self):
+    def test_scratch_probe_rejects_valid_looking_recreated_database_after_reopen(self):
         from unittest.mock import patch
         real_connect = smoke.sqlite3.connect
         connections = 0
@@ -153,12 +153,46 @@ class RunnerTrialTests(unittest.TestCase):
             connections += 1
             if connections == 2:
                 Path(database).unlink()
+                replacement = real_connect(database)
+                try:
+                    replacement.execute('CREATE TABLE probe (id INTEGER PRIMARY KEY, value TEXT)')
+                    replacement.executemany(
+                        'INSERT INTO probe VALUES (?, ?)',
+                        [(i, 'synthetic') for i in range(1000)],
+                    )
+                    replacement.commit()
+                finally:
+                    replacement.close()
             return real_connect(database)
 
         with tempfile.TemporaryDirectory() as temp, patch.object(
             smoke.sqlite3, 'connect', side_effect=recreate_before_reopen
         ):
-            with self.assertRaisesRegex(RuntimeError, 'committed rows'):
+            with self.assertRaisesRegex(RuntimeError, 'identity or content'):
+                smoke.scratch_probe(temp)
+
+    def test_scratch_probe_rejects_same_inode_content_change_before_reopen(self):
+        from unittest.mock import patch
+        real_connect = smoke.sqlite3.connect
+        connections = 0
+
+        def alter_before_reopen(database, **kwargs):
+            nonlocal connections
+            connections += 1
+            if connections == 2:
+                altered = real_connect(database, **kwargs)
+                try:
+                    altered.execute('CREATE TABLE unexpected (value TEXT)')
+                    altered.execute("INSERT INTO unexpected VALUES ('changed')")
+                    altered.commit()
+                finally:
+                    altered.close()
+            return real_connect(database, **kwargs)
+
+        with tempfile.TemporaryDirectory() as temp, patch.object(
+            smoke.sqlite3, 'connect', side_effect=alter_before_reopen
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'identity or content'):
                 smoke.scratch_probe(temp)
 
     def test_runtime_identity_requires_zero_effective_capabilities(self):

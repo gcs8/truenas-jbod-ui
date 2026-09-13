@@ -40,7 +40,15 @@ def scratch_probe(root):
             db.rollback()
             if db.execute("SELECT count(*) FROM probe WHERE value='synthetic'").fetchone()[0] != 1000:
                 raise RuntimeError('SQLite rollback failed')
+        original = database.stat()
+        original_identity = (original.st_dev, original.st_ino, original.st_size)
+        original_digest = hashlib.sha256(database.read_bytes()).digest()
         with closing(sqlite3.connect(database)) as db:
+            reopened = database.stat()
+            reopened_identity = (reopened.st_dev, reopened.st_ino, reopened.st_size)
+            if (reopened_identity != original_identity
+                    or hashlib.sha256(database.read_bytes()).digest() != original_digest):
+                raise RuntimeError('SQLite identity or content changed before reopen')
             if db.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
                 raise RuntimeError('SQLite integrity check failed')
             try:
@@ -49,6 +57,11 @@ def scratch_probe(root):
                 raise RuntimeError('SQLite committed rows unavailable after reopen') from error
             if reopened_rows != expected_rows:
                 raise RuntimeError('SQLite committed rows changed after reopen')
+            final = database.stat()
+            final_identity = (final.st_dev, final.st_ino, final.st_size)
+            if (final_identity != original_identity
+                    or hashlib.sha256(database.read_bytes()).digest() != original_digest):
+                raise RuntimeError('SQLite identity or content changed during reopen')
 
 
 def needs_probe(python):
@@ -77,7 +90,7 @@ def main(profile="full"):
                'source_files_sha256': {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
                                        for name in ('scripts/jbod_runner_smoke.py', 'scripts/ci_unittest.py')},
                'source_revision': os.environ.get('GITHUB_SHA', 'unpublished'),
-               'storage_checks': 'synthetic scratch, fsync, WAL, rollback, reopen rows, integrity, cleanup'}
+               'storage_checks': 'synthetic scratch, fsync, WAL, rollback, reopen identity and rows, integrity, cleanup'}
     print(json.dumps(receipt, sort_keys=True))
 
 
