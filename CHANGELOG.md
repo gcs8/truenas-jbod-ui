@@ -64,6 +64,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Isolated read-UI authentication settings so invalid admin-only settings
   and unavailable admin directories no longer block UI startup (#467).
 
+- Clarified history status labels and timestamps, distinguished missing counts
+  from zero, and added semantic label/value associations (#470).
+- Bounded history dashboard polling, rejected stale responses, and marked
+  retained values stale after failed checks. (#420)
+
 ### Performance
 
 - Reduced mapping revision work to one document read per batch while
@@ -72,12 +77,43 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Avoided serializing the full cached inventory for health checks while
   preserving the response and cached-only behavior (#464).
 
+- Skipped exact repeated slot-detail saves while preserving timestamp and
+  identity changes; normal timestamp-advancing inventory saves still write (#479).
+
+- Batched SMART grid persistence off the event loop, fenced invalidated writes,
+  and propagated owning-save failures to in-flight joiners; snapshot persistence
+  remained synchronous (#498).
+- Skipped exact repeated slot-detail saves while preserving timestamp and
+  identity changes; normal timestamp-advancing inventory saves still write (#479).
+
+- Moved snapshot slot-detail persistence off the event loop with cancellation
+  draining and stale-write guards, preserving timestamp-advancing saves (#499).
+- Batched SMART grid persistence off the event loop, fenced invalidated writes,
+  and propagated owning-save failures to in-flight joiners; snapshot persistence
+  remained synchronous (#498).
+- Skipped exact repeated slot-detail saves while preserving timestamp and
+  identity changes; normal timestamp-advancing inventory saves still write (#479).
+
+- Batched CORE SMART grid calls and rejected stale disk-identity results while
+  restoring fresh lookup after serial loss (#504).
+- Moved snapshot slot-detail persistence off the event loop with cancellation
+  draining and stale-write guards, preserving timestamp-advancing saves (#499).
+- Batched SMART grid persistence off the event loop, fenced invalidated writes,
+  and propagated owning-save failures to in-flight joiners; snapshot persistence
+  remained synchronous (#498).
+- Skipped exact repeated slot-detail saves while preserving timestamp and
+  identity changes; normal timestamp-advancing inventory saves still write (#479).
+
 ### Docs
 
 - Historical release notes, release wraps, and milestone plans moved to
   `docs/archive/`; `docs/ROADMAP.md` now covers only the current release and
   the next lane, every live reference document is linked from the wiki or
   CONTRIBUTING, and seven unused screenshots were removed. (#476)
+
+- `config/config.example.yaml` now lists every option with its default and
+  shows one example system per platform, including ESXi, a BMC-only host,
+  and a storage view; the unused `app.verify_ssl` line is gone. (#489)
 
 ### Internal
 

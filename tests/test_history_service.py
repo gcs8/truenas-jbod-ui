@@ -585,6 +585,32 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         workflow = (service_dir.parent / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
         self.assertIn("node --check history_service/static/dashboard.js", workflow)
 
+    def test_dashboard_labels_no_sample_metric_timestamps_as_attempts(self) -> None:
+        attempted_at = "2026-09-09T10:00:00+00:00"
+        markup = self._render_dashboard(
+            {
+                "collector_running": True,
+                "collection_running": False,
+                "last_fast_metrics_at": attempted_at,
+                "last_slow_metrics_at": attempted_at,
+            },
+            {"tracked_slots": 0, "event_count": 0, "metric_sample_count": 0},
+            [],
+        )
+
+        for label, element_id in (
+            ("Last temperature collection attempt", "status-last-fast-metrics-at"),
+            ("Last full SMART collection attempt", "status-last-slow-metrics-at"),
+        ):
+            with self.subTest(label=label):
+                self.assertRegex(
+                    markup,
+                    rf'<dt>{label}</dt><dd id="{element_id}">'
+                    rf'<time[^>]*datetime="{re.escape(attempted_at)}"[^>]*>.*?</time></dd>',
+                )
+        self.assertNotIn("Last temperature reading", markup)
+        self.assertNotIn("Last full SMART reading", markup)
+
     def test_dashboard_renders_fast_and_full_refresh_controls(self) -> None:
         markup = self._render_dashboard(
             {"collector_running": True},
@@ -602,25 +628,25 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         self.assertIn('href="http://testserver/static/dashboard.css"', markup)
         self.assertIn('"/api/history/refresh"', script_source)
         self.assertIn('id="history-collector-freshness"', markup)
-        self.assertIn("Collector status snapshot at page load", markup)
+        self.assertIn("Last checked: page load. Collector status snapshot", markup)
         self.assertIn('id="history-overview-freshness"', markup)
-        self.assertIn("Overview snapshot at page load", markup)
+        self.assertIn("Last checked: page load. Overview snapshot", markup)
         self.assertIn('body: JSON.stringify({ mode })', script_source)
         self.assertIn("const body = await response.text();", script_source)
         self.assertIn("JSON.parse(body)", script_source)
-        self.assertIn("Next background pass", markup)
-        self.assertIn("Background backoff", markup)
-        self.assertIn("Last collection duration", markup)
-        self.assertIn("Last schedule overrun", markup)
+        self.assertIn("Next scan", markup)
+        self.assertIn("Retry wait after errors", markup)
+        self.assertIn("Last run took", markup)
+        self.assertIn("Ran late by", markup)
         self.assertIn('id="status-last-background-overrun"', markup)
-        self.assertIn("Last retention pass", markup)
+        self.assertIn("Last cleanup", markup)
         self.assertIn('id="status-last-retention-at"', markup)
-        self.assertIn("Last retention rows removed", markup)
+        self.assertIn("Rows removed", markup)
         self.assertIn('id="status-last-retention-rows-removed"', markup)
-        self.assertIn("Last retention failure", markup)
+        self.assertIn("Cleanup error", markup)
         self.assertIn('id="status-last-retention-error"', markup)
-        self.assertIn("Last collection inventory", markup)
-        self.assertIn("DB Size", markup)
+        self.assertIn("Last scan used", markup)
+        self.assertIn("Database size", markup)
         self.assertIn("collector-activity-banner", markup)
         self.assertIn("pollCollectorStatus", script_source)
         self.assertIn("pollOverviewStatus", script_source)
@@ -644,7 +670,7 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         self.assertNotIn('id="history-refresh-fast"', markup)
         self.assertNotIn('id="history-refresh-full"', markup)
         self.assertNotIn("synthetic-token", markup)
-        self.assertIn("authenticated main UI", markup)
+        self.assertIn("Refresh from the main page", markup)
 
     def test_dashboard_omits_release_link_for_non_http_urls(self) -> None:
         markup = self._render_dashboard(
@@ -703,10 +729,10 @@ class HistoryDashboardRouteTests(unittest.TestCase):
 
         self.assertRegex(
             markup,
-            r'id="collector-activity-banner"[^>]*>\s*History background collection is backed off for 2m 5s '
+            r'id="collector-activity-banner"[^>]*>\s*History collection paused for 2m 5s '
             r'after repeated failures\.',
         )
-        self.assertRegex(markup, r'id="status-current-collection">\s*not running')
+        self.assertRegex(markup, r'id="status-current-collection">\s*no')
 
     def test_dashboard_bootstrap_is_script_safe_and_round_trips(self) -> None:
         hostile_text = "</script><script>alert('&')</script>" + chr(0x2028) + chr(0x2029)

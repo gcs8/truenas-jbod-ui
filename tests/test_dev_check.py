@@ -221,6 +221,14 @@ class DevCheckPlanTests(unittest.TestCase):
                 self.assertIn(module, rendered)
         self.assertIn("tests.test_esxi_host_prep", rendered)
 
+    def test_smart_grid_io_is_classified_by_inventory_import_graph(self) -> None:
+        exclusion = next(
+            item for item in dev_check.WINDOWS_EXCLUSIONS
+            if item.category == "fcntl-dependent history/backup import graph"
+        )
+        self.assertNotIn("tests.test_smart_grid_io", dev_check.WINDOWS_PORTABLE_TEST_MODULES)
+        self.assertIn("tests.test_smart_grid_io", exclusion.modules)
+
     def test_mapping_store_suite_is_classified_as_posix_filesystem_semantics(
         self,
     ) -> None:

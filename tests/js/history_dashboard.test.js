@@ -78,6 +78,7 @@ test("history dashboard JavaScript is an extracted static asset", () => {
 test("dashboard formatters preserve count, byte, duration, and status labels", () => {
   const functions = loadFunctions([
     "formatDuration",
+    "formatTimestamp",
     "formatCount",
     "formatBytes",
     "statusValue",
@@ -87,12 +88,19 @@ test("dashboard formatters preserve count, byte, duration, and status labels", (
   ]);
 
   assert.equal(functions.formatDuration(125), "2m 5s");
-  assert.equal(functions.formatCount(null), "deferred");
+  assert.equal(functions.formatCount(null), "-");
+  assert.equal(functions.formatCount(undefined), "-");
+  assert.equal(functions.formatCount(0), "0");
+  assert.equal(functions.formatTimestamp(null), "never");
+  assert.equal(functions.formatTimestamp("bad"), "not recorded");
+  assert.equal(functions.formatTimestamp("", "not scheduled"), "not scheduled");
+  assert.equal(functions.formatTimestamp("2026-09-09T12:00:00Z"), new Date("2026-09-09T12:00:00Z").toLocaleString());
+  assert.equal(functions.collectionDurationLabel(null), "not recorded");
   assert.equal(functions.formatCount(12, true), "~12");
   assert.equal(functions.formatBytes(1536), "1.5 KiB");
   assert.equal(functions.statusValue("", "unknown"), "unknown");
-  assert.equal(functions.collectionInventoryLabel(true), "forced");
-  assert.equal(functions.collectionInventoryLabel(false), "cached");
+  assert.equal(functions.collectionInventoryLabel(true), "fresh inventory");
+  assert.equal(functions.collectionInventoryLabel(false), "cached inventory");
   assert.equal(functions.collectionInventoryLabel(null), "not recorded");
   assert.equal(functions.collectionDurationLabel(1.25), "1.3s");
   assert.equal(functions.backoffLabel(1.2), "2s remaining");
