@@ -1695,7 +1695,7 @@ class HistoryStoreTests(unittest.TestCase):
             store = HistoryStore(str(root / "history.db"))
             backup_has_thread_lock = threading.Event()
             backup_has_lifecycle_lock = threading.Event()
-            writer_attempted_lifecycle_lock = threading.Event()
+            writer_completed = threading.Event()
             writer_waits_for_thread_lock = threading.Event()
             backup_errors: list[BaseException] = []
             writer_errors: list[BaseException] = []
@@ -1710,9 +1710,11 @@ class HistoryStoreTests(unittest.TestCase):
                     real_thread_lock.acquire()
                     if current_thread is backup_thread:
                         backup_has_thread_lock.set()
-                        if backup_has_lifecycle_lock.is_set() and not writer_attempted_lifecycle_lock.wait(5):
+                        # Hold the lifecycle lock through the real writer attempt,
+                        # not merely its announcement before lock acquisition.
+                        if backup_has_lifecycle_lock.is_set() and not writer_completed.wait(5):
                             real_thread_lock.release()
-                            raise TimeoutError("ordinary writer did not attempt the lifecycle lock")
+                            raise TimeoutError("ordinary writer did not complete the lifecycle lock attempt")
                     return self
 
                 def __exit__(self, *args: object) -> None:
@@ -1742,6 +1744,8 @@ class HistoryStoreTests(unittest.TestCase):
                     )
                 except BaseException as exc:
                     writer_errors.append(exc)
+                finally:
+                    writer_completed.set()
 
             backup_thread = threading.Thread(target=run_backup, name="history-backup")
             writer_thread = threading.Thread(target=run_writer, name="ordinary-history-writer")
@@ -1757,8 +1761,6 @@ class HistoryStoreTests(unittest.TestCase):
                         "lifecycle lock, and ordinary writer holds the lifecycle lock while waiting "
                         "for the thread lock"
                     )
-                if current_thread is writer_thread:
-                    writer_attempted_lifecycle_lock.set()
                 with history_write_lock(*args, **kwargs):
                     if current_thread is backup_thread:
                         backup_has_lifecycle_lock.set()
