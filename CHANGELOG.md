@@ -42,6 +42,13 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Backfilled a slot's serial, model and size from the cache when a live view drops
+  the serial while another strong identifier still agrees, instead of refusing the
+  cache and overwriting it with the degraded view (#524).
+- Kept one slow CORE disk from failing the whole SMART grid: a batch reply past the
+  call timeout now falls back to the per-slot path for that shelf and the batch route
+  answers 503 instead of 500 for every slot (#524).
+
 - Retried failed release checks with bounded backoff instead of waiting a
   full normal interval, preserving the last successful result (#469).
 
