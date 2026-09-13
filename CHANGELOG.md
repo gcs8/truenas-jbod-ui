@@ -86,6 +86,14 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Skipped exact repeated slot-detail saves while preserving timestamp and
   identity changes; normal timestamp-advancing inventory saves still write (#479).
 
+- Moved snapshot slot-detail persistence off the event loop with cancellation
+  draining and stale-write guards, preserving timestamp-advancing saves (#499).
+- Batched SMART grid persistence off the event loop, fenced invalidated writes,
+  and propagated owning-save failures to in-flight joiners; snapshot persistence
+  remained synchronous (#498).
+- Skipped exact repeated slot-detail saves while preserving timestamp and
+  identity changes; normal timestamp-advancing inventory saves still write (#479).
+
 ### Docs
 
 - Historical release notes, release wraps, and milestone plans moved to

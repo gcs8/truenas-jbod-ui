@@ -782,6 +782,23 @@ class InventorySourceBundle:
     parsed_ssh_data_by_enclosure: dict[str, ParsedSSHData] = field(default_factory=dict)
 
 
+RetainedResultT = TypeVar("RetainedResultT")
+
+
+async def _await_retained(future: asyncio.Future[RetainedResultT]) -> RetainedResultT:
+    """Cancel this waiter, not its retained work or another waiter's outcome."""
+    try:
+        if not future.done():
+            # Unlike an abandoned shield on Python 3.14, wait removes its
+            # callback on cancellation without logging a later worker failure.
+            await asyncio.wait({future})
+    except asyncio.CancelledError:
+        # Observe detached failures without changing what active joiners see.
+        future.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        raise
+    return future.result()
+
+
 class SmartDetailBatch:
     """Request-local persistence; never reuse the read snapshot for writes."""
 
@@ -799,7 +816,7 @@ class SmartDetailBatch:
             return {}
         if self.loaded is None:
             self.loaded = asyncio.create_task(asyncio.to_thread(self.store.load_all))
-        return await asyncio.shield(self.loaded)
+        return await _await_retained(self.loaded)
 
     @contextmanager
     def commit_guard(self):
@@ -834,7 +851,7 @@ class SmartDetailBatch:
         # Publish our own save BEFORE waiting. Cross-owned overlapping batches
         # can depend on each other's saves without waiting on whole batches.
         outcomes = await asyncio.gather(
-            *(asyncio.shield(saved) for saved in self.dependencies), return_exceptions=True,
+            *(_await_retained(saved) for saved in self.dependencies), return_exceptions=True,
         )
         for outcome in outcomes:
             if isinstance(outcome, BaseException):
@@ -3016,7 +3033,7 @@ class InventoryService:
 
     async def _background_snapshot_refresh(self, cache_key: str) -> None:
         try:
-            source_refresh_succeeded = await asyncio.shield(self._schedule_background_source_bundle_refresh())
+            source_refresh_succeeded = await _await_retained(self._schedule_background_source_bundle_refresh())
             if not source_refresh_succeeded:
                 return
             await self._get_snapshot_result(
@@ -3085,11 +3102,60 @@ class InventoryService:
         finally:
             _smart_detail_batch.reset(token)
 
-    def _apply_persisted_slot_details(self, slots: list[SlotView]) -> None:
+    async def _apply_and_persist_snapshot_slot_details(self, slots: list[SlotView]) -> None:
+        store = self.slot_detail_store
+        if store is None or not slots:
+            return
+        generations = [
+            (key, self._smart_cache_generation_token(key))
+            for key in (self._smart_cache_key(slot) for slot in slots)
+        ]
+
+        @contextmanager
+        def commit_guard():
+            with self._smart_persistence_lock:
+                yield all(self._smart_cache_generation_token(key) == generation for key, generation in generations)
+
+        def apply_and_save():
+            with perf_stage("inventory.slot_detail_cache.apply", slot_count=len(slots)):
+                loaded = store.load_all()
+                self._apply_persisted_slot_details(slots, loaded_entries=loaded)
+            with perf_stage("inventory.slot_detail_cache.persist", slot_count=len(slots)):
+                entries = [self._build_slot_detail_entry(slot, smart_summary=None) for slot in slots]
+                store.save_entries(
+                    [entry for entry in entries if entry is not None],
+                    expected_entries=loaded, commit_guard=commit_guard,
+                )
+
+        # The worker owns these request-local slots until it finishes. Retain the
+        # caller's snapshot lock/activity through repeated cancellation, including
+        # late failures, rather than letting a successor race a detached writer.
+        worker = asyncio.create_task(asyncio.to_thread(apply_and_save))
+        cancelled = False
+        while not worker.done():
+            try:
+                # wait() leaves the worker running on caller cancellation and
+                # removes its completion callback on every abandoned wait.
+                # A cancelled shield instead reports late worker failures to
+                # the loop on Python 3.14, even when we retrieve them below.
+                await asyncio.wait({worker})
+            except asyncio.CancelledError:
+                cancelled = True
+        if cancelled:
+            if not worker.cancelled():
+                worker.exception()
+            raise asyncio.CancelledError
+        worker.result()
+
+    def _apply_persisted_slot_details(
+        self, slots: list[SlotView], *,
+        loaded_entries: Mapping[str, SlotDetailCacheEntry] | None = None,
+    ) -> None:
         if not self.slot_detail_store or not slots:
             return
 
-        loaded_entries = self.slot_detail_store.load_all()
+        if loaded_entries is None:
+            loaded_entries = self.slot_detail_store.load_all()
         for slot_view in slots:
             entry = self.slot_detail_store.get_entry(
                 self.system.id,
@@ -3896,9 +3962,9 @@ class InventoryService:
             caller_batch = None
         if owner is not None and caller_batch is not None and owner is not caller_batch:
             caller_batch.dependencies.add(owner.saved)
-        result = await asyncio.shield(task)
+        result = await _await_retained(task)
         if owner is not None and caller_batch is None:
-            await asyncio.shield(owner.saved)
+            await _await_retained(owner.saved)
         return result
 
     def _cleanup_smart_load_task(
@@ -4216,7 +4282,7 @@ class InventoryService:
 
             task = asyncio.create_task(complete_batch())
             task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
-            return await asyncio.shield(task)
+            return await _await_retained(task)
 
     async def _fetch_smart_summary_over_ssh(
         self,
@@ -4716,10 +4782,7 @@ class InventoryService:
             else:
                 platform_context["bmc"] = bmc_context
 
-        with perf_stage("inventory.slot_detail_cache.apply", slot_count=len(slots)):
-            self._apply_persisted_slot_details(slots)
-        with perf_stage("inventory.slot_detail_cache.persist", slot_count=len(slots)):
-            self._persist_slot_details(slots)
+        await self._apply_and_persist_snapshot_slot_details(slots)
 
         slots = self._attach_mapping_revisions(slots)
         summary = InventorySummary(
