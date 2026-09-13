@@ -2186,6 +2186,15 @@ sys.stdout.flush()
         self.assertIn("Everything is Ok", result.stdout)
 
     def test_7z_prompt_channel_supports_a_master_fd_above_select_limit(self) -> None:
+        try:
+            import pty  # noqa: F401 - preload before intentionally occupying descriptors
+            import resource
+        except ImportError:
+            self.skipTest("high-descriptor PTY coverage requires POSIX resource APIs")
+        soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft_limit != resource.RLIM_INFINITY and soft_limit <= 1040:
+            self.skipTest("the process descriptor limit leaves no room above the select boundary")
+
         holders: list[int] = []
         try:
             while not holders or holders[-1] < 1023:
