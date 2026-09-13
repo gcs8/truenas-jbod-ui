@@ -15,6 +15,12 @@ WINDOWS_NPM_SHIM = r"C:\Program Files\nodejs\npm.cmd"
 
 
 class DevCheckPlanTests(unittest.TestCase):
+    def test_nonroot_cli_is_portable_without_posix_ownership_suite(self) -> None:
+        check, skips = dev_check._windows_test_check(ROOT, "python")
+        self.assertIn("tests.test_nonroot_cli", check.argv)
+        self.assertNotIn("tests.test_nonroot_migration", check.argv)
+        self.assertTrue(any("tests.test_nonroot_migration" in skip.reason for skip in skips))
+
     @staticmethod
     def _copy_ci_contract(root: Path) -> None:
         workflow = root / ".github" / "workflows" / "ci.yml"
