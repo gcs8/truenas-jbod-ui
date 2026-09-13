@@ -71,6 +71,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Replaced the encrypted-backup PTY `select()` wait with `poll()` so valid high
   file descriptors no longer fail before the passphrase prompt (#517).
 
+- Preserved history availability, scope identity and outage errors across
+  bulk responses and offline exports. (#423)
+
 ### Performance
 
 - Reduced mapping revision work to one document read per batch while

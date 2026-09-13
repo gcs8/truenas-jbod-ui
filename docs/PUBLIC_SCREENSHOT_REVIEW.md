@@ -1,26 +1,28 @@
 # Public screenshot exact-byte review
 
-This record covers the two desktop fixture screenshots generated from `public-demo/index.html`. The capture script used `file://`, UTC, fixed desktop viewports, reduced motion, and no network request.
+This record covers the two desktop fixture screenshots generated from `public-demo/index.html`. The pinned Linux capture used `file://`, UTC, a 1920 by 1080 viewport, reduced motion, and no network request. GitHub Actions run `34737325999` captured each image twice and produced byte-identical copies.
 
-Source revision: `e216f95c32446e21b3a27253c09be5b7e4a16b0f`
+Source revision: `0ea42a60616e0b987a3c7a73568abf7f57de01fe`
 
-Source artifact SHA-256: `6921490bbf79df5f8eecb3e30f6ab376759d61f38ba254f8964c45d671f3f519`
+Source artifact SHA-256: `dd537fdb2d148e1755ec09bb6890a87242053ca7d15d6020adb6bb420bf954eb`
 
 | Image | Dimensions | Bytes | SHA-256 | Pixel review |
 |---|---:|---:|---|---|
-| `public-demo-overview.png` | 1920 by 4104 | 1123930 | `c01a9c1ed228bb7942cf43129d5b6b2ce23fd72b99e3c3495691ed372293a0f2` | PASS |
-| `public-demo-history.png` | 1920 by 4860 | 1254272 | `6eabf96beb3c996357943b2913c5f1e96d914b4154715a58cd9033a1263b3911` | PASS |
+| `public-demo-overview.png` | 1920 by 4092 | 1098831 | `fcc7adba57b5ae32f4c21c9204ab95d5db0cd5709eae5c075383ab34c0cc4eda` | PASS |
+| `public-demo-history.png` | 1920 by 4852 | 1225499 | `a5e8ea696081f530475845f0d2d26a2d1538955b7813f5c4998fcfd5d6a0881b` | PASS |
 
-Both exact PNGs were loaded and inspected with vision tooling before setting the two manifest review attestations. No additional crops were needed. The review covered private addresses, hostnames, paths, credentials, key material, and non-demo device identifiers; none were visible. Source revision and Build ID are intentional public-repository provenance, not credentials.
+Both exact PNGs were loaded and inspected with vision tooling before setting the manifest attestations. The review checked for private addresses, hostnames, paths, credentials, key material, and non-demo device identifiers. None were visible. Source revision and Build ID are intentional public-repository provenance.
 
-Neither image showed unintended panel overlap, page overflow, selector clipping, or canvas-edge artifacts. Narrow bay labels use intentional ellipses; full selected-slot identifiers remain readable in Slot Details. The tall details column leaves unused space without collisions.
+Neither image showed unintended overlap, clipping, missing assets, corrupted text, or canvas-edge artifacts. Narrow bay labels use intentional ellipses. Full selected-slot identifiers remain readable in Slot Details. Equal-height cards leave unused space but do not hide or collide with content.
 
-The frozen/offline and at-capture wording is explicit. Disabled refresh and calibration controls retain live-oriented labels, a minor presentation ambiguity rather than a claim of live capability. Their disabled state is covered separately by browser checks. No source or UI changes were made for this observation.
+The selected slot is 57. Its device, serial, persistent ID, health, temperature, pool, vdev, and special-class topology agree across the enclosure, Slot Details, Topology Context, Calibration Mapping, and history panel. The map contains every bay from 00 through 59 exactly once. Its 47 populated and 13 empty bays match Mapping Health.
 
-Both images select slot 57's special-class mirror, not the spare group. Selected device, serial, persistent ID, topology peers, capture timestamps, and mapping counts agree across panels. The history image repeats the detail values and shows the preserved temperature range, five samples, seven-day deltas and rates. Lifetime annualized values are distinct from the seven-day rate; power-on days are displayed as completed days. Aggregate event and slot/view counts have broader scope than the selected slot and are not independently established by pixels alone.
+The checked-in fixture preserves the spare group at slots 42 and 43. Both bays appear populated in the images. Their narrow tile labels are ellipsized, so the spare class is not readable from the screenshot alone; the fixture and public-demo contract tests establish that grouping. The selected special-class peer group at slots 57 through 59 is visibly consistent.
 
-Mobile and tablet layouts are unsupported and are not part of this screenshot review.
+The history image shows five samples from January 8 through January 15, 2026. Its latest, minimum, and maximum temperatures match the chart. Read/write totals, seven-day deltas, rates, capture time, and selected identity agree with the overview. The one aggregate event does not claim to belong to the selected slot.
 
-No pixel-review blocker remained. This review is not authorization for publication. The byte checker independently verifies PNG framing, dimensions, sizes, hashes, docs/Wiki byte equality, artifact identity, source revision, and the `PASS` fields recorded here.
+The frozen, synthetic, offline wording is explicit. Live refresh, calibration, backup, and LED actions are unavailable as expected. No pixel-review blocker remained. This review does not authorize publication by itself; the exact-byte checker still verifies framing, dimensions, sizes, hashes, docs/Wiki byte identity, artifact identity, source revision, and the `PASS` fields.
+
+Mobile and tablet layouts are unsupported and are not part of this review.
 
 Final pixel verdict: `PASS`
