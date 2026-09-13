@@ -221,7 +221,7 @@ class ContainerResourceContractTests(unittest.TestCase):
         config = yaml.safe_load(config_example)
         self.assertEqual(config["truenas"]["verify_ssl"], False)
         self.assertNotIn("#       verify_ssl: true", config_example)
-        self.assertEqual(config_example.count("#       verify_ssl: false"), 6)
+        self.assertEqual(config_example.count("#       verify_ssl: false"), 9)
 
         for compose_name in COMPOSE_FILES:
             services = yaml.safe_load((REPO_ROOT / compose_name).read_text(encoding="utf-8"))[

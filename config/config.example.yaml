@@ -1,49 +1,113 @@
+# Copy this file to config/config.yaml and change only the lines you need.
+# Every value below is the built-in default unless the comment says otherwise,
+# so a copied line you leave alone changes nothing. Values in .env win over
+# this file. Keep secrets in .env or secret files, not here.
+
 app:
+  # Address and port the main UI listens on inside the container.
   host: 0.0.0.0
   port: 8080
+  # Public URL the browser reaches the main UI through, for example
+  # https://bays.example.test. Leave empty to let the app accept the origin it is
+  # served from.
+  public_origin: null
+  # Browser auto-refresh cadence.
   refresh_interval_seconds: 30
+  # How long a cached snapshot is served as fresh before a background refresh.
   snapshot_cache_ttl_seconds: 10
+  # Reuse window for API, SSH, and BMC reads shared across pages.
   source_bundle_cache_ttl_seconds: 60
-  smart_cache_ttl_seconds: 300
-  sg_ses_device_cache_ttl_seconds: 300
-  # Legacy compatibility fallback for older deployments that still set APP_CACHE_TTL.
+  # Older deployments set only this value; the two settings above take
+  # precedence when present.
   cache_ttl_seconds: 10
+  # Reuse window for per-disk SMART detail.
+  smart_cache_ttl_seconds: 300
+  # Reuse window for discovered sg_ses enclosure device paths on Linux hosts.
+  sg_ses_device_cache_ttl_seconds: 300
+  # Check GitHub for a newer release and show a notice in the main UI.
+  release_check_enabled: true
+  release_check_repo: gcs8/truenas-jbod-ui
+  release_check_interval_seconds: 86400
+  release_check_timeout_seconds: 5.0
+  # Fill the inventory cache at startup instead of on the first page load.
+  startup_warm_cache_enabled: false
+  # Also read SMART detail for every disk at startup (slower start, faster first page).
+  startup_warm_smart_enabled: false
+  # Upper bound on SMART reads running at the same time.
+  smart_batch_max_concurrency: 12
+  # Delay before the main UI starts fetching SMART detail in the background.
+  smart_prefetch_delay_ms: 120
+  # auto picks single or chunked from the disk count; chunked pages through
+  # smart_prefetch_chunk_size disks at a time.
+  smart_prefetch_strategy: auto
+  smart_prefetch_single_threshold: 128
+  smart_prefetch_chunk_size: 24
+  smart_prefetch_batch_concurrency: 2
+  # Parallel history reads while building an export.
+  export_history_concurrency: 12
+  # How long a disk inventory sync may run, and how often its progress is polled.
+  disk_inventory_sync_timeout_seconds: 180
+  disk_inventory_sync_poll_interval_seconds: 2.0
+  # Export cache: entries expire after this many seconds, and the cache keeps at
+  # most this many entries and this many bytes across history, HTML, and ZIP exports.
   export_cache_ttl_seconds: 60
   export_cache_max_entries: 8
-  # Shared logical payload-byte ceiling across history, rendered HTML, and ZIP export caches.
   export_cache_max_bytes: 33554432
+  # DEBUG, INFO, WARNING, or ERROR.
   log_level: INFO
+  # Extra diagnostic output in logs and responses. Leave off in normal use.
   debug: false
-  verify_ssl: true
 
+perf:
+  # Log per-request timing stages. Off unless you are chasing a slow page.
+  enabled: false
+  # Log every request, not only slow ones.
+  log_all_requests: false
+  # Requests or stages slower than these thresholds are logged when enabled.
+  slow_request_ms: 1000
+  slow_stage_ms: 250
+
+# The primary storage system. To watch more than one, use the systems list
+# further down instead; the app then ignores this section.
 truenas:
-  # Use env vars for secrets in production.
   # Base appliance URL only, without /api/v2.0 or /qstorapi.
-  host: https://truenas.example.local
+  host: https://truenas.example.test
+  # Use TRUENAS_API_KEY (or the _FILE variant) in .env instead of writing a key here.
   api_key: ""
+  # Username and password login for platforms without API keys (Quantastor).
   api_user: ""
   api_password: ""
+  # core, scale, linux, quantastor, esxi, or ipmi. See the systems examples below.
   platform: core
   # The beginner default accepts the appliance certificate without verification.
-  # Set this to true and add a CA bundle for a hardened deployment.
+  # For verified HTTPS against a private CA, set verify_ssl to true, point
+  # tls_ca_bundle_path at a PEM bundle mounted under /app/config (for example
+  # /app/config/ca/home-ca.pem), and set tls_server_name only when the
+  # certificate name differs from the host in the URL.
   verify_ssl: false
+  tls_ca_bundle_path: null
+  tls_server_name: null
   timeout_seconds: 15
-  # Optional substring match against enclosure id/name/label.
-  enclosure_filter: ""
+  # Optional substring match against enclosure id, name, or label.
+  enclosure_filter: null
 
 ssh:
+  # SSH is optional. It adds disk-to-bay mapping detail the API cannot provide.
   enabled: false
-  host: truenas.example.local
-  # Optional extra node/controller hosts to try when the primary SSH host does
-  # not expose the best enclosure-control path.
+  host: truenas.example.test
+  # Optional extra node or controller hosts to try when the primary SSH host
+  # does not expose the best enclosure-control path.
   extra_hosts: []
+  # Quantastor HA only: see the quantastor example in the systems list.
+  ha_enabled: false
+  ha_nodes: []
   port: 22
   user: jbodmap
   # Mount your SSH key into ./config/ssh on the Docker host.
   key_path: /run/ssh/id_truenas
   # Optional: use this for password-only appliances when key auth is not available.
   password: ""
-  # Optional: set via SSH_SUDO_PASSWORD env var if your CORE build only supports
+  # Optional: set via SSH_SUDO_PASSWORD in .env if your CORE build only supports
   # passworded command-limited sudo.
   sudo_password: ""
   # First connection pins the observed host key here, then future SSH
@@ -51,6 +115,8 @@ ssh:
   known_hosts_path: /app/data/known_hosts
   strict_host_key_checking: true
   timeout_seconds: 15
+  # Commands the read-only SSH user may run. These are the TrueNAS CORE defaults;
+  # the systems examples below show the SCALE, Linux, and ESXi bundles.
   commands:
     - /sbin/glabel status
     - /usr/local/sbin/zpool status -gP
@@ -63,23 +129,48 @@ ssh:
   # Optional extra hint source if you also allow command-limited sudo for camcontrol:
   #  - sudo -n /sbin/camcontrol devlist -v
 
-# Optional v0.2+ multi-system shape. When present, the app builds one inventory
-# client per system and shows a picker in the header.
+history:
+  # Where the main UI reads disk history from. docker-compose.yml sets
+  # HISTORY_BACKEND_URL to http://enclosure-history:8001 when the history
+  # service is enabled; leave empty to run without history.
+  service_url: ""
+  timeout_seconds: 10
+  # Concurrent per-disk history requests when the batched read fails.
+  fallback_max_concurrency: 4
+  # Token that lets the main UI ask the history service for a refresh. Set it
+  # with HISTORY_REFRESH_TOKEN in .env rather than here.
+  refresh_token: ""
+
+admin:
+  # Where the main UI reaches the optional admin service. docker-compose.yml
+  # sets ADMIN_SERVICE_URL to http://enclosure-admin:8002 when admin is enabled.
+  service_url: ""
+  # URL the browser uses to open admin, if it differs from the service URL.
+  public_url: null
+  port: 8082
+  # How long the main UI waits for admin before treating it as stopped.
+  timeout_seconds: 0.75
+
+# Optional: watch more than one storage system. When systems is present, the app
+# builds one inventory client per entry, shows a picker in the header, and
+# ignores the top-level truenas and ssh sections. Each entry accepts the same
+# truenas and ssh keys shown above plus the extra keys shown here.
 #
 # default_system_id: truenas-core-a
 # systems:
 #   - id: truenas-core-a
 #     label: TrueNAS CORE A
+#     # Profile id from the built-in list or your profiles.yaml.
 #     default_profile_id: supermicro-cse-946-top-60
 #     truenas:
-#       host: https://truenas-core-a.example.local
+#       host: https://truenas-core-a.example.test
 #       api_key: ""
 #       platform: core
 #       verify_ssl: false
-#       enclosure_filter: ""
+#       enclosure_filter: null
 #     ssh:
 #       enabled: true
-#       host: truenas-core-a.example.local
+#       host: truenas-core-a.example.test
 #       user: jbodmap
 #       key_path: /run/ssh/id_truenas
 #       sudo_password: ""
@@ -91,20 +182,21 @@ ssh:
 #         - gmultipath list
 #         - sudo -n /usr/sbin/sesutil map
 #         - sudo -n /usr/sbin/sesutil show
-#     # Optional enclosure-specific override if you want to force a profile id:
-#     # enclosure_profiles:
-#     #   "500304801f715f3f": supermicro-cse-946-top-60
+#     # Optional: force a profile for one enclosure. The key is the enclosure id
+#     # shown in admin under the system's enclosures.
+#     enclosure_profiles:
+#       "<enclosure-id-from-admin>": supermicro-cse-946-top-60
 #   - id: offsite-scale
 #     label: Offsite SCALE
 #     default_profile_id: supermicro-ssg-6048r-front-24
 #     truenas:
-#       host: https://scale.example.local
+#       host: https://scale.example.test
 #       api_key: ""
 #       platform: scale
 #       verify_ssl: false
 #     ssh:
 #       enabled: true
-#       host: scale.example.local
+#       host: scale.example.test
 #       user: jbodmap
 #       key_path: /run/ssh/id_truenas
 #       known_hosts_path: /app/data/known_hosts
@@ -123,22 +215,23 @@ ssh:
 #         - sudo -n /usr/bin/sg_ses -p ec /dev/sg26
 #         - sudo -n /usr/bin/sg_ses -p ec /dev/sg37
 #         # smartctl does not need to live in the standing command list; the app
-#         # runs it on demand for the selected slot, but the user still needs
+#         # runs it on demand for the selected disk, but the user still needs
 #         # sudo permission for /usr/sbin/smartctl on the SCALE host.
 #     enclosure_profiles:
-#       "5003048001c1043f": supermicro-ssg-6048r-front-24
-#       "500304801e977aff": supermicro-ssg-6048r-rear-12
+#       "<front-enclosure-id>": supermicro-ssg-6048r-front-24
+#       "<rear-enclosure-id>": supermicro-ssg-6048r-rear-12
 #   - id: gpu-server
 #     label: GPU Server Linux
 #     default_profile_id: supermicro-sys-2029gp-tr-right-nvme-2
 #     truenas:
-#       host: http://gpu-server.example.local
+#       # Plain Linux hosts have no appliance API; SSH provides the inventory.
+#       host: http://gpu-server.example.test
 #       api_key: ""
 #       platform: linux
 #       verify_ssl: false
 #     ssh:
 #       enabled: true
-#       host: gpu-server.example.local
+#       host: gpu-server.example.test
 #       user: jbodmap
 #       key_path: /run/ssh/id_truenas
 #       known_hosts_path: /app/data/known_hosts
@@ -148,17 +241,107 @@ ssh:
 #         - sudo -n /usr/sbin/mdadm --detail --scan
 #         - /usr/sbin/nvme list-subsys -o json
 #         - /usr/bin/lsscsi -g -t
+#     # Extra views for disks that are not in a SES enclosure: M.2 carrier cards,
+#     # boot devices, or a hand-built layout. template_id names a built-in
+#     # template (ses-auto, nvme-carrier-4, aoc-slg4-2h8m2-2, satadom-pair-2,
+#     # fat-twin-rear-2, embedded-boot-media-1) or a profile id for manual views.
+#     storage_views:
+#       - id: nvme-carrier
+#         label: NVMe carrier card
+#         # ses_enclosure, nvme_carrier, boot_devices, or manual.
+#         kind: nvme_carrier
+#         template_id: nvme-carrier-4
+#         # Optional profile id when the template does not fix the layout.
+#         profile_id: null
+#         enabled: true
+#         # Lower numbers sort first in the main UI.
+#         order: 20
+#         render:
+#           show_in_main_ui: true
+#           show_in_admin_ui: true
+#           default_collapsed: false
+#         # How disks are matched to this view: auto lets the app decide; pool,
+#         # serial, and hybrid use the lists below. target_system_id pins the
+#         # view to one system when several share the same hardware.
+#         binding:
+#           mode: serial
+#           target_system_id: null
+#           enclosure_ids: []
+#           pool_names: []
+#           serials:
+#             - SANITIZED-NVME-0001
+#             - SANITIZED-NVME-0002
+#           pcie_addresses: []
+#           device_names: []
+#         # Optional per-slot label and M.2 length (2230, 2242, 2260, 2280, 22110).
+#         layout_overrides:
+#           slot_labels:
+#             0: M2-1
+#             1: M2-2
+#           slot_sizes:
+#             0: "2280"
+#             1: "2280"
+#   - id: esxi-host
+#     label: ESXi host
+#     # ESXi is SSH-only: the app reads esxcli and StorCLI output over SSH and
+#     # never changes anything on the host. There is no appliance API to configure.
+#     default_profile_id: null
+#     truenas:
+#       host: https://esxi-host.example.test
+#       platform: esxi
+#       verify_ssl: false
+#     ssh:
+#       enabled: true
+#       host: esxi-host.example.test
+#       user: jbodmap
+#       key_path: /run/ssh/id_truenas
+#       known_hosts_path: /app/data/known_hosts
+#       strict_host_key_checking: true
+#       # The bundle admin fills in for an ESXi system: esxcli storage context
+#       # plus StorCLI drive JSON when the StorCLI VIB is installed.
+#       commands:
+#         - vmware -v
+#         - esxcli system version get
+#         - esxcli software vib list
+#         - esxcli storage core adapter list
+#         - esxcli storage core device list
+#         - esxcli storage core path list
+#         - esxcli storage filesystem list
+#         - esxcli storage vmfs extent list
+#         - esxcli storage san sas list
+#         - /opt/lsi/storcli64/storcli64 /c0 show all J
+#         - /opt/lsi/storcli64/storcli64 /c0/vall show all J
+#         - /opt/lsi/storcli64/storcli64 /c0/eall/sall show all J
+#   - id: bmc-only-host
+#     label: BMC-only host
+#     # ipmi reads bays and disks from a Supermicro BMC over Redfish and needs
+#     # no SSH. Add ssh as well when the host can also be reached that way.
+#     default_profile_id: null
+#     truenas:
+#       host: https://bmc-only-host.example.test
+#       platform: ipmi
+#       verify_ssl: false
+#     bmc:
+#       enabled: true
+#       host: bmc-only-host.example.test
+#       username: readonly
+#       # Set the password in .env or through admin rather than here.
+#       password: ""
+#       # Most BMCs ship a self-signed certificate; turn this on only after you
+#       # trust it.
+#       verify_ssl: false
+#       timeout_seconds: 15
 #   - id: unvr
 #     label: UniFi UNVR
 #     default_profile_id: ubiquiti-unvr-front-4
 #     truenas:
-#       host: https://unvr.example.local
+#       host: https://unvr.example.test
 #       api_key: ""
 #       platform: linux
 #       verify_ssl: false
 #     ssh:
 #       enabled: true
-#       host: unvr.example.local
+#       host: unvr.example.test
 #       port: 22
 #       user: root
 #       key_path: ""
@@ -174,13 +357,13 @@ ssh:
 #     label: UniFi UNVR Pro
 #     default_profile_id: ubiquiti-unvr-pro-front-7
 #     truenas:
-#       host: https://unvr-pro.example.local
+#       host: https://unvr-pro.example.test
 #       api_key: ""
 #       platform: linux
 #       verify_ssl: false
 #     ssh:
 #       enabled: true
-#       host: unvr-pro.example.local
+#       host: unvr-pro.example.test
 #       port: 22
 #       user: root
 #       key_path: ""
@@ -196,7 +379,7 @@ ssh:
 #     label: Quantastor Lab
 #     default_profile_id: supermicro-ssg-2028r-shared-front-24
 #     truenas:
-#       host: https://quantastor.example.local
+#       host: https://quantastor.example.test
 #       api_user: admin
 #       api_password: ""
 #       platform: quantastor
@@ -204,19 +387,19 @@ ssh:
 #     ssh:
 #       enabled: true
 #       # For Quantastor HA, keep the shared API / grid-management VIP in
-#       # truenas.host. SSH enrichment targets real node hosts instead; the app
-#       # auto-discovers HA node hostnames/IPs from Quantastor API rows and,
-#       # after one node is reachable, from the `qs network-port-list` row whose
-#       # interface carries the default gateway.
-#       host: 10.0.0.30
+#       # truenas.host. SSH targets the real node hosts instead; the app
+#       # discovers HA node hostnames from the Quantastor API and, once one node
+#       # answers, from the `qs network-port-list` row that carries the default
+#       # gateway.
+#       host: 192.0.2.30
 #       ha_enabled: true
 #       ha_nodes:
 #         - system_id: left-node-id-from-api
 #           label: Quantastor Left
-#           host: 10.0.0.30  # optional fallback if the API does not expose it
+#           host: 192.0.2.30  # optional fallback if the API does not expose it
 #         - system_id: right-node-id-from-api
 #           label: Quantastor Right
-#           host: 10.0.0.31  # optional fallback if the API does not expose it
+#           host: 192.0.2.31  # optional fallback if the API does not expose it
 #       port: 22
 #       user: jbodmap
 #       key_path: /run/ssh/id_truenas
@@ -225,13 +408,13 @@ ssh:
 #       commands: []
 #     # Quantastor can supplement the REST view with `qs disk-list`,
 #     # `qs hw-disk-list`, `qs hw-enclosure-list`, and `qs network-port-list`
-#     # over SSH when the
-#     # appliance API is missing slot/controller detail. For HA systems, the
-#     # app avoids SSHing to the shared API endpoint and uses node hosts so
-#     # pool-owned follow-up probes land on the node that can actually see
-#     # the local SES, CLI, and smartctl context.
+#     # over SSH when the appliance API is missing slot or controller detail.
+#     # For HA systems the app avoids SSHing to the shared API endpoint and uses
+#     # the node hosts, so follow-up probes land on the node that can see the
+#     # local SES, CLI, and smartctl context.
 
 layout:
+  # Fallback grid when no enclosure profile matches: 60 bays as 4 rows of 15.
   slot_count: 60
   rows: 4
   columns: 15
@@ -240,9 +423,18 @@ layout:
   # TrueNAS enclosure APIs often use 1-based slot numbering.
   api_slot_number_base: 1
 
+# Files the app writes. The defaults follow the config file's location, so you
+# only need these when the data or log folders live somewhere unusual.
 paths:
+  # Settings saved from admin that override the app section above.
+  runtime_overrides_file: /app/config/runtime-overrides.yaml
   mapping_file: /app/data/slot_mappings.json
   sas_fabric_alias_file: /app/data/sas_fabric_aliases.json
+  slot_detail_cache_file: /app/data/slot_detail_cache.json
   log_file: /app/logs/app.log
   # Optional custom profile file for profile-driven enclosure layouts.
   profile_file: /app/config/profiles.yaml
+
+# Enclosure profiles normally live in profiles.yaml (see profiles.example.yaml),
+# but a profiles list here is accepted too.
+# profiles: []
