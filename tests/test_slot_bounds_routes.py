@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, Mock, call, patch
 
 from fastapi import HTTPException
 from pydantic import ValidationError
+from websockets.exceptions import ConnectionClosedError
 
 from app import main as app_main
 from app.config import Settings, SystemConfig, TrueNASConfig
@@ -240,6 +241,37 @@ class SlotBoundsFollowSelectedEnclosureTests(unittest.TestCase):
                 asyncio.run(route.endpoint(payload=payload, system_id="system-a", enclosure_id="50050cc11ac013fc"))
 
         self.assertEqual(service.get_snapshot.await_count, 2)
+
+    def test_smart_batch_transport_failure_is_not_a_server_fault(self) -> None:
+        # #523: a slow or dropped middleware call is a temporary unavailability
+        # of the shelf's SMART data. The endpoint must not answer 500 for every
+        # slot, whichever layer the transport failure escapes from.
+        route = _route("/api/slots/smart-batch", "POST")
+        for error in (
+            TimeoutError("invented slow disk"),
+            OSError("invented socket failure"),
+            ConnectionClosedError(None, None),
+        ):
+            with self.subTest(error=type(error).__name__):
+                service = _service(layout_slot_count=84)
+                service.get_slot_smart_summaries = AsyncMock(side_effect=error)
+                registry = Mock()
+                registry.get_service.return_value = service
+                payload = Mock()
+                payload.slots = [5, 63]
+                payload.max_concurrency = 2
+
+                with (
+                    patch.object(app_main, "get_inventory_registry", return_value=registry),
+                    patch.object(app_main, "get_settings", return_value=self.settings),
+                    patch.object(app_main, "add_perf_metadata"),
+                    self.assertRaises(HTTPException) as raised,
+                ):
+                    asyncio.run(route.endpoint(
+                        payload=payload, system_id="system-a", enclosure_id="50050cc11ac013fc",
+                    ))
+
+                self.assertEqual(raised.exception.status_code, 503)
 
 
 class SlotBoundsFollowRenderedSlotsTests(unittest.TestCase):

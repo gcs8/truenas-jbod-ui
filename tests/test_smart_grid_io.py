@@ -338,6 +338,37 @@ class CoreGridWebsocketIntegrationTests(unittest.IsolatedAsyncioTestCase):
                         self.assertGreater(peer.connections, before)
                     self.assertFalse(s._smart_load_tasks)
 
+    async def test_slow_batch_reply_degrades_to_per_slot_fallbacks(self):
+        # #523: smartctl_batch wraps every middleware call in the request timeout
+        # and the builtin TimeoutError is not a TrueNASAPIError, so one disk that
+        # answers later than the timeout failed the whole shelf with a 500. The
+        # batch is an optimisation; losing it must degrade to the per-slot path.
+        with self.fixture(4) as (s, api, store, other):
+            peer = CoreGridPeer(await api.fetch_all())
+            peer.gate = asyncio.Event()
+            peer.gate_phase = 'json'
+            with self.wire(s, peer):
+                s.truenas_client.config.timeout_seconds = 0.3
+                await s.get_snapshot()
+
+                async def release_after_the_batch_deadline():
+                    await asyncio.sleep(0.8)
+                    peer.gate.set()
+
+                releaser = asyncio.create_task(release_after_the_batch_deadline())
+                try:
+                    result = await asyncio.wait_for(
+                        s.get_slot_smart_summaries([0, 1, 2, 3], max_concurrency=2), 20,
+                    )
+                finally:
+                    peer.gate.set()
+                    await releaser
+                self.assertEqual([r.slot for r in result], [0, 1, 2, 3])
+                self.assertEqual([r.summary.available for r in result], [True] * 4)
+                self.assertEqual([r.summary.power_on_hours for r in result], [321, 322, 323, 324])
+                self.assertEqual(peer.closes, peer.connections)
+                self.assertFalse(s._smart_load_tasks)
+
     async def test_cancelled_grid_retains_transport_and_save_owner(self):
         for fail_save in (False, True):
             with self.subTest(fail_save=fail_save), self.fixture(4) as (s, api, store, other):
