@@ -519,10 +519,15 @@ class CoreGridWebsocketIntegrationTests(unittest.IsolatedAsyncioTestCase):
                             self.assertEqual(fresh.power_on_hours, 777)
                             self.assertGreater(peer.methods['json'], calls)
                             self.assertIsNone(lost.slots[0].serial, 'Device alias cannot prove historical serial')
-                            self.assertEqual(s._smart_cache_key(lost.slots[0])[-1], ('device', 'da0'))
+                            self.assertEqual(lost.slots[0].identity_state, 'unknown')
+                            self.assertEqual(s._smart_cache_key(lost.slots[0])[-1], ('unknown', 'da0'))
+                            # #525: the window cannot say which disk is in the
+                            # bay, so the last-known row stays as historical
+                            # evidence and the SMART read taken while the disk
+                            # is unidentifiable is not filed under it.
                             entry = store.get_entry(s.system.id, 'synthetic-enclosure', 0)
-                            self.assertNotIn('serial', entry.slot_fields)
-                            self.assertEqual(entry.smart_fields['power_on_hours'], 777)
+                            self.assertEqual(entry.slot_fields['serial'], 'INVENTED-000')
+                            self.assertNotEqual(entry.smart_fields.get('power_on_hours'), 777)
                             calls = peer.methods['json']
                             self.assertEqual((await request()).power_on_hours, 777)
                             self.assertEqual(peer.methods['json'], calls)
