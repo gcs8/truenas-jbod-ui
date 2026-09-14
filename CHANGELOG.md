@@ -56,6 +56,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Kept one slow CORE disk from failing the whole SMART grid: a batch reply past the
   call timeout now falls back to the per-slot path for that shelf and the batch route
   answers 503 instead of 500 for every slot (#524).
+- Bounded every per-slot `disk.smartctl` call by the configured TrueNAS call timeout.
+  A disk that never answers now yields that slot's unavailable summary instead of
+  holding the whole grid request open behind it (#524).
 
 - Retried failed release checks with bounded backoff instead of waiting a
   full normal interval, preserving the last successful result (#469).
