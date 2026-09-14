@@ -34,6 +34,7 @@
   const HISTORY_UI_STORAGE_KEY = "truenas-jbod-ui.history-ui.v1";
   const EXPORT_UI_STORAGE_KEY = "truenas-jbod-ui.export-ui.v1";
   const snapshotMode = Boolean(bootstrap.snapshotMode);
+  const preloadedSasFabric = snapshotMode ? (bootstrap.preloadedSasFabric || null) : null;
   const UI_PERF_ENABLED = Boolean(bootstrap.uiPerfEnabled) && !snapshotMode;
   const UI_PERF_HISTORY_LIMIT = 6;
 
@@ -191,7 +192,7 @@
       open: false,
       loading: false,
       error: null,
-      data: null,
+      data: preloadedSasFabric,
       scopeKey: null,
       pendingScopeKey: null,
       selectedTraceId: null,
@@ -2336,7 +2337,9 @@
     if (sasFabricStatus) {
       if (state.snapshotMode) {
         sasFabricStatus.className = "warning-item muted compact";
-        sasFabricStatus.textContent = "This offline snapshot does not include Storage Fabric data or live refresh capability.";
+        sasFabricStatus.textContent = fabric
+          ? "This offline snapshot embeds a frozen Storage Fabric map; it cannot refresh."
+          : "This offline snapshot does not include Storage Fabric data or live refresh capability.";
       } else if (state.sasFabric.error) {
         sasFabricStatus.className = "warning-item compact";
         sasFabricStatus.textContent = `Storage Fabric load failed: ${state.sasFabric.error}`;
