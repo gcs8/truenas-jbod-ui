@@ -30,7 +30,7 @@ test("the checked-in public demo embeds a frozen fabric payload that lights the 
   assert.notEqual(start, -1, "the artifact must carry a preloadedSasFabric bootstrap entry");
   const end = PUBLIC_DEMO.indexOf("\n", start);
   const raw = PUBLIC_DEMO.slice(start + marker.length, end).replace(/,$/, "");
-  const payload = JSON.parse(JSON.parse(raw));
+  const payload = JSON.parse(raw);
 
   assert.equal(payload.available, true);
   assert.equal(payload.platform, "core");
