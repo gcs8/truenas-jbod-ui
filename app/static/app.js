@@ -1552,6 +1552,23 @@
     return breakpoints;
   }
 
+  // The one description of an enclosure's physical bay grid: rows in the order
+  // the chassis draws them (latch edge last), each row split into the profile's
+  // column groups, with the group breakpoints and the flat top-loader grouping
+  // already resolved from `buildChassisGeometry`'s output. Every grid-like bay
+  // surface renders from this so a bay number is always in the same place.
+  function buildLayoutGridRows(layoutRows, geometry) {
+    return normalizeLayoutRows(layoutRows).map((row) => {
+      const groups = splitRowIntoGroups(row, geometry);
+      return {
+        slots: row,
+        groups,
+        flatGrouped: String(geometry?.layoutMode || "").startsWith("top-loader") && groups.length > 1,
+        breakpoints: rowGroupBreakpoints(groups),
+      };
+    });
+  }
+
   function flatGroupedColumnTemplate(slotCount, breakpoints) {
     const columns = [];
     for (let index = 0; index < slotCount; index += 1) {
@@ -1599,7 +1616,8 @@
   }
 
   function renderChassisRows(layoutRows, geometry, appendTile) {
-    normalizeLayoutRows(layoutRows).forEach((row) => {
+    buildLayoutGridRows(layoutRows, geometry).forEach((layoutRow) => {
+      const row = layoutRow.slots;
       const rowWrapper = document.createElement("div");
       rowWrapper.className = "slot-row";
 
@@ -1607,9 +1625,9 @@
       rowSlots.className = "row-slots";
       rowSlots.dataset.slotCount = String(row.length);
 
-      const rowGroups = splitRowIntoGroups(row, geometry);
-      const isFlatTopLoaderGrouping = String(geometry?.layoutMode || "").startsWith("top-loader") && rowGroups.length > 1;
-      const flatGroupBreakpoints = rowGroupBreakpoints(rowGroups);
+      const rowGroups = layoutRow.groups;
+      const isFlatTopLoaderGrouping = layoutRow.flatGrouped;
+      const flatGroupBreakpoints = layoutRow.breakpoints;
 
       if (isFlatTopLoaderGrouping) {
         rowSlots.classList.add("row-slots-flat-grouped");
@@ -2025,22 +2043,63 @@
     `;
   }
 
+  function renderSasFabricFlatBayChips(sorted, selectedSlots, limit) {
+    const chips = sorted.slice(0, limit).map((slotNumber) => {
+      const selected = selectedSlots.has(slotNumber) || state.selectedSlot === slotNumber;
+      return `<button type="button" class="sas-fabric-bay-chip${selected ? " is-selected" : ""}" data-sas-fabric-slot="${slotNumber}">${escapeHtml(formatSlotLabel(slotNumber))}</button>`;
+    }).join("");
+    const overflow = sorted.length > limit ? `<span class="sas-fabric-bay-overflow">+${sorted.length - limit}</span>` : "";
+    return `${chips}${overflow}`;
+  }
+
+  function sasFabricBayGridCell(slotNumber, impactedSlots, selectedSlots, slotsByNumber) {
+    if (!Number.isInteger(slotNumber)) {
+      return '<span class="sas-fabric-bay-gap" aria-hidden="true"></span>';
+    }
+    const label = escapeHtml(formatSlotLabel(slotNumber));
+    if (impactedSlots.has(slotNumber)) {
+      const selected = selectedSlots.has(slotNumber) || state.selectedSlot === slotNumber;
+      return `<button type="button" class="sas-fabric-bay-chip${selected ? " is-selected" : ""}" data-sas-fabric-slot="${slotNumber}">${label}</button>`;
+    }
+    const slot = slotsByNumber.get(slotNumber);
+    const populated = Boolean(slot) && String(slot.state || "").toLowerCase() !== "empty";
+    return `<span class="sas-fabric-bay-chip ${populated ? "is-outside" : "is-empty"}" title="${label}">${label}</span>`;
+  }
+
+  // The bay grid is the enclosure, with the affected bays lit: same rows in the
+  // same order, same column groups, same gaps, so a bay number never moves
+  // between the Enclosure tab and the Storage Fabric tab. `limit` only applies
+  // to the flat fallback used when the active view has no layout rows.
   function renderSasFabricBayChips(slots, limit = 60) {
     const sorted = sasFabricSortedSlots(slots);
     if (!sorted.length) {
       return '<span class="sas-fabric-empty-note">No mapped bays</span>';
     }
     const selectedSlots = sasFabricSelectedSlotSet();
-    const chips = sorted.slice(0, limit).map((slotNumber) => {
-      const selected = selectedSlots.has(slotNumber) || state.selectedSlot === slotNumber;
-      return `
-        <button type="button" class="sas-fabric-bay-chip${selected ? " is-selected" : ""}" data-sas-fabric-slot="${slotNumber}">
-          ${escapeHtml(formatSlotLabel(slotNumber))}
-        </button>
-      `;
+    const viewProfile = buildViewProfile();
+    const layoutRows = activeLayoutRows();
+    const geometry = buildChassisGeometry(viewProfile, layoutRows);
+    const gridRows = buildLayoutGridRows(layoutRows, geometry);
+    if (!gridRows.length) {
+      return `${renderSasFabricFlatBayChips(sorted, selectedSlots, limit)}<span class="sas-fabric-bay-layout-note">No enclosure layout for this view; bays are listed in bay order.</span>`;
+    }
+    const impactedSlots = new Set(sorted);
+    const slotsByNumber = new Map(sasFabricList(state.snapshot.slots).map((slot) => [slot.slot, slot]));
+    const rowsMarkup = gridRows.map((layoutRow) => {
+      const groups = layoutRow.groups.map((group) => `
+        <div class="sas-fabric-bay-group" style="--sas-fabric-bay-columns: ${group.length}">
+          ${group.map((slotNumber) => sasFabricBayGridCell(slotNumber, impactedSlots, selectedSlots, slotsByNumber)).join("")}
+        </div>
+      `).join('<span class="sas-fabric-bay-divider" aria-hidden="true"></span>');
+      return `<div class="sas-fabric-bay-row">${groups}</div>`;
     }).join("");
-    const overflow = sorted.length > limit ? `<span class="sas-fabric-bay-overflow">+${sorted.length - limit}</span>` : "";
-    return `${chips}${overflow}`;
+    const edgeLabel = viewProfile?.edgeLabel || "System front";
+    return `
+      <div class="sas-fabric-bay-layout" data-layout-mode="${escapeHtml(geometry.layoutMode)}" data-latch-edge="${escapeHtml(geometry.latchEdge)}">
+        ${rowsMarkup}
+        <span class="sas-fabric-bay-edge-label">${escapeHtml(edgeLabel)}</span>
+      </div>
+    `;
   }
 
   function renderSasFabricCompactNodes(nodes, limit = 8) {
