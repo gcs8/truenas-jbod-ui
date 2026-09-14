@@ -36,6 +36,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Added
 
+- Added a JSON-RPC 2.0 websocket transport selectable per TrueNAS host with
+  `api_dialect` (and `api_version` to pin a documented API release), keeping the
+  DDP default for CORE and existing hosts (#529).
 - Added a client-only, one-session SMART WebSocket batch API with bounded
   concurrency and DDP heartbeat handling; inventory integration remained
   separate (#503).
