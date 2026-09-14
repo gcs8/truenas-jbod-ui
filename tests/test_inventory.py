@@ -12225,6 +12225,136 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
             self.assertIsNone(replaced.model)
             self.assertNotIn("model", store.get_entry("default", "enc-1", 5).slot_fields)
 
+    def test_unknown_identity_window_neither_backfills_nor_overwrites_the_cache(self) -> None:
+        # #525: sas_address is bay-scoped - an expander reports the same address
+        # for whatever disk occupies the bay - so it cannot prove the same disk
+        # is still there. A live view that keeps only the bay address is
+        # identity-unknown for that window: no cached serial, model, size or
+        # SMART reaches the published view, the last-known entry survives as
+        # historical evidence rather than being overwritten by the degraded row,
+        # and no SMART lookup in the window is served from or stored under the
+        # departed serial. A differing strong identifier afterwards is admitted
+        # as a replacement with a new identity generation.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = build_inventory_service(
+                Settings(),
+                SystemConfig(id="default", truenas=TrueNASConfig(platform="core")),
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            store = service.slot_detail_store
+
+            def slot_view(**fields) -> SlotView:
+                return SlotView(
+                    slot=5, slot_label="05", row_index=0, column_index=5,
+                    enclosure_id="enc-1", present=True, state=SlotState.healthy,
+                    device_name="da5", **fields,
+                )
+
+            full = slot_view(
+                serial="SER-VERIFY-005",
+                sas_address="sas-invented-005",
+                model="ST12000NM0008",
+                size_human="12 TB",
+            )
+            asyncio.run(service._apply_and_persist_snapshot_slot_details([full]))
+            service._persist_slot_detail_cache(
+                full, smart_summary=SmartSummaryView(available=True, power_on_hours=321),
+            )
+            self.assertEqual(full.identity_state, "known")
+            self.assertEqual(
+                store.get_entry("default", "enc-1", 5).slot_fields.get("serial"),
+                "SER-VERIFY-005",
+            )
+            self.assertEqual(
+                store.get_entry("default", "enc-1", 5).smart_fields.get("power_on_hours"), 321,
+            )
+            first_key = service._smart_cache_key(full)
+            first_generation = service._smart_cache_generation_token(first_key)
+
+            # The API disk record is incomplete for one refresh while SES still
+            # reports the bay's sas_address.
+            degraded = slot_view(sas_address="sas-invented-005")
+            asyncio.run(service._apply_and_persist_snapshot_slot_details([degraded]))
+            self.assertEqual(degraded.identity_state, "unknown")
+            self.assertIsNone(degraded.serial)
+            self.assertIsNone(degraded.model)
+            self.assertIsNone(degraded.size_human)
+            self.assertIsNone(service._build_persisted_smart_summary(degraded))
+            entry = store.get_entry("default", "enc-1", 5)
+            self.assertEqual(entry.slot_fields.get("serial"), "SER-VERIFY-005")
+            self.assertEqual(entry.slot_fields.get("model"), "ST12000NM0008")
+            self.assertEqual(entry.slot_fields.get("size_human"), "12 TB")
+            self.assertEqual(entry.smart_fields.get("power_on_hours"), 321)
+
+            # A SMART lookup inside the window is keyed off an unknown identity,
+            # the departed serial's generation is spent, and the result cannot
+            # be written back over the last-known row.
+            degraded_key = service._smart_cache_key(degraded)
+            self.assertEqual(degraded_key[-1][0], "unknown")
+            self.assertNotEqual(degraded_key[-1], first_key[-1])
+            self.assertFalse(service._smart_request_is_current(first_key, first_generation))
+            service._persist_slot_detail_cache(
+                degraded, smart_summary=SmartSummaryView(available=True, power_on_hours=999),
+            )
+            entry = store.get_entry("default", "enc-1", 5)
+            self.assertEqual(entry.slot_fields.get("serial"), "SER-VERIFY-005")
+            self.assertEqual(entry.smart_fields.get("power_on_hours"), 321)
+
+            # A strong identifier returns and disagrees: a replacement disk, so a
+            # new identity generation and a new persisted entry.
+            replacement = slot_view(serial="SER-REPLACEMENT", sas_address="sas-invented-005")
+            asyncio.run(service._apply_and_persist_snapshot_slot_details([replacement]))
+            self.assertEqual(replacement.identity_state, "known")
+            self.assertIsNone(replacement.model)
+            replacement_key = service._smart_cache_key(replacement)
+            self.assertNotEqual(
+                service._smart_cache_generation_token(replacement_key), first_generation,
+            )
+            entry = store.get_entry("default", "enc-1", 5)
+            self.assertEqual(entry.slot_fields.get("serial"), "SER-REPLACEMENT")
+            self.assertNotIn("model", entry.slot_fields)
+            self.assertEqual(entry.smart_fields, {})
+
+    def test_a_returning_serial_that_agrees_resumes_the_last_known_entry(self) -> None:
+        # #525 requirement 3: when the strong identifier that returns is the one
+        # already on record, the last-known entry resumes as current and its
+        # stable fields are backfilled again.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = build_inventory_service(
+                Settings(),
+                SystemConfig(id="default", truenas=TrueNASConfig(platform="core")),
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+
+            def slot_view(**fields) -> SlotView:
+                return SlotView(
+                    slot=5, slot_label="05", row_index=0, column_index=5,
+                    enclosure_id="enc-1", present=True, state=SlotState.healthy,
+                    device_name="da5", **fields,
+                )
+
+            full = slot_view(
+                serial="SER-VERIFY-005", sas_address="sas-invented-005",
+                model="ST12000NM0008", size_human="12 TB",
+            )
+            asyncio.run(service._apply_and_persist_snapshot_slot_details([full]))
+            asyncio.run(
+                service._apply_and_persist_snapshot_slot_details(
+                    [slot_view(sas_address="sas-invented-005")]
+                )
+            )
+
+            returned = slot_view(serial="SER-VERIFY-005", sas_address="sas-invented-005")
+            asyncio.run(service._apply_and_persist_snapshot_slot_details([returned]))
+
+            self.assertEqual(returned.identity_state, "known")
+            self.assertEqual(returned.model, "ST12000NM0008")
+            self.assertEqual(returned.size_human, "12 TB")
+
     def _assert_apply_loads_once(self, slot_count: int) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()
