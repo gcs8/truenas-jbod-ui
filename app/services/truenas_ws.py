@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import logging
 import ssl
@@ -8,12 +9,12 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from dataclasses import field
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Iterator
 from urllib.parse import urlsplit, urlunsplit
 
 from websockets.asyncio.client import ClientConnection, connect
 
-from app.config import TrueNASConfig
+from app.config import TRUENAS_API_VERSION_PATTERN, TrueNASConfig
 from app.services.tls_context import build_tls_client_context, resolve_tls_server_name
 
 logger = logging.getLogger(__name__)
@@ -38,10 +39,62 @@ _DISK_IDENTITY_KEYS = (
 
 
 class TrueNASAPIError(RuntimeError):
-    pass
+    retryable = False
+
+    def __init__(
+        self,
+        *args: Any,
+        errname: str | None = None,
+        reason: str | None = None,
+        code: int | None = None,
+    ) -> None:
+        super().__init__(*args)
+        self.errname = errname
+        self.reason = reason
+        self.code = code
+
+
+class TrueNASAPIBusyError(TrueNASAPIError):
+    """The middleware refused the call for capacity reasons; the same call may succeed later."""
+
+    retryable = True
+
+
+# Custom JSON-RPC codes documented by the TrueNAS middleware.
+JSONRPC_TOO_MANY_CONCURRENT_CALLS = -32000
+JSONRPC_METHOD_CALL_ERROR = -32001
 
 
 MethodCaller = Callable[[str, list[Any]], Awaitable[Any]]
+
+
+def build_jsonrpc_error(method: str, error: Any) -> TrueNASAPIError:
+    """Map a JSON-RPC error object onto the app's API error.
+
+    `data.trace` is middleware internals and is deliberately never carried into
+    the message the UI shows; `errname` and `reason` are what an operator acts on.
+    """
+    code: int | None = None
+    errname = reason = message_text = ""
+    if isinstance(error, dict):
+        raw_code = error.get("code")
+        if isinstance(raw_code, int) and not isinstance(raw_code, bool):
+            code = raw_code
+        message_text = str(error.get("message") or "").strip()
+        data = error.get("data")
+        if isinstance(data, dict):
+            errname = str(data.get("errname") or "").strip()
+            reason = str(data.get("reason") or "").strip()
+    detail = ": ".join(part for part in (errname, reason) if part) or message_text
+    if not detail:
+        detail = f"code {code}" if code is not None else "unspecified middleware error"
+    error_class = TrueNASAPIBusyError if code == JSONRPC_TOO_MANY_CONCURRENT_CALLS else TrueNASAPIError
+    return error_class(
+        f"{method} failed: {detail}",
+        errname=errname or None,
+        reason=reason or None,
+        code=code,
+    )
 
 
 def normalize_disk_inventory_rows(value: Any, *, source: str = "disk inventory") -> list[dict[str, Any]]:
@@ -72,20 +125,26 @@ def normalize_disk_inventory_rows(value: Any, *, source: str = "disk inventory")
 class _MiddlewareCallDispatcher:
     def __init__(self, ws: ClientConnection) -> None:
         self.ws = ws
-        self._pending: dict[str, tuple[str, asyncio.Future[Any]]] = {}
+        self._pending: dict[Any, tuple[str, asyncio.Future[Any]]] = {}
         self._reader_task = asyncio.create_task(self._reader())
 
-    async def call(self, method: str, params: list[Any]) -> Any:
-        request_id = str(uuid.uuid4())
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future[Any] = loop.create_future()
-        self._pending[request_id] = (method, future)
-        payload = {
+    def _next_request_id(self) -> Any:
+        return str(uuid.uuid4())
+
+    def _build_payload(self, request_id: Any, method: str, params: list[Any]) -> dict[str, Any]:
+        return {
             "id": request_id,
             "msg": "method",
             "method": method,
             "params": params,
         }
+
+    async def call(self, method: str, params: list[Any]) -> Any:
+        request_id = self._next_request_id()
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[Any] = loop.create_future()
+        self._pending[request_id] = (method, future)
+        payload = self._build_payload(request_id, method, params)
         logger.debug("Calling TrueNAS websocket method %s", method)
         try:
             await self.ws.send(json.dumps(payload))
@@ -112,33 +171,36 @@ class _MiddlewareCallDispatcher:
             # cancellation that initiated shutdown.
             pass
 
+    async def _handle_message(self, message: dict[str, Any]) -> None:
+        if message.get("msg") == "ping":
+            # DDP heartbeats are JSON messages, not WebSocket control frames.
+            pong = {"msg": "pong"}
+            if "id" in message:
+                pong["id"] = message["id"]
+            await self.ws.send(json.dumps(pong))
+            return
+        if message.get("msg") != "result":
+            return
+        request_id = message.get("id")
+        if not isinstance(request_id, str):
+            return
+        pending = self._pending.get(request_id)
+        if pending is None:
+            return
+        method, future = pending
+        if future.done():
+            return
+        if message.get("error"):
+            future.set_exception(TrueNASAPIError(f"{method} failed: {message['error']}"))
+        else:
+            future.set_result(message.get("result"))
+
     async def _reader(self) -> None:
         try:
             while True:
                 raw_message = await self.ws.recv()
                 message = json.loads(raw_message)
-                if message.get("msg") == "ping":
-                    # DDP heartbeats are JSON messages, not WebSocket control frames.
-                    pong = {"msg": "pong"}
-                    if "id" in message:
-                        pong["id"] = message["id"]
-                    await self.ws.send(json.dumps(pong))
-                    continue
-                if message.get("msg") != "result":
-                    continue
-                request_id = message.get("id")
-                if not isinstance(request_id, str):
-                    continue
-                pending = self._pending.get(request_id)
-                if pending is None:
-                    continue
-                method, future = pending
-                if future.done():
-                    continue
-                if message.get("error"):
-                    future.set_exception(TrueNASAPIError(f"{method} failed: {message['error']}"))
-                else:
-                    future.set_result(message.get("result"))
+                await self._handle_message(message)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -146,6 +208,50 @@ class _MiddlewareCallDispatcher:
                 if not future.done():
                     future.set_exception(exc)
             raise
+
+
+class _JsonRpcCallDispatcher(_MiddlewareCallDispatcher):
+    """JSON-RPC 2.0 calls over one connection.
+
+    Reuses the pending-call and reader lifecycle above; only the request shape,
+    the id space (integers, unique per connection) and the response mapping
+    differ. Keepalive is the WebSocket ping/pong the client library answers, not
+    a DDP heartbeat message.
+    """
+
+    def __init__(self, ws: ClientConnection, *, request_ids: Iterator[int] | None = None) -> None:
+        self._request_ids = request_ids if request_ids is not None else itertools.count(1)
+        super().__init__(ws)
+
+    def _next_request_id(self) -> int:
+        return next(self._request_ids)
+
+    def _build_payload(self, request_id: Any, method: str, params: list[Any]) -> dict[str, Any]:
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": method,
+            "params": params,
+        }
+
+    async def _handle_message(self, message: dict[str, Any]) -> None:
+        if not isinstance(message, dict) or "id" not in message:
+            # Notifications carry no id and answer no call.
+            return
+        request_id = message.get("id")
+        if not isinstance(request_id, int) or isinstance(request_id, bool):
+            return
+        pending = self._pending.get(request_id)
+        if pending is None:
+            return
+        method, future = pending
+        if future.done():
+            return
+        error = message.get("error")
+        if error is not None:
+            future.set_exception(build_jsonrpc_error(method, error))
+        else:
+            future.set_result(message.get("result"))
 
 
 def build_websocket_url(host: str) -> str:
@@ -157,6 +263,21 @@ def build_websocket_url(host: str) -> str:
     path = parsed.path.rstrip("/")
     path = f"{path}/websocket" if path else "/websocket"
     return urlunsplit((scheme, parsed.netloc, path, "", ""))
+
+
+def build_jsonrpc_url(host: str, api_version: str = "current") -> str:
+    if not TRUENAS_API_VERSION_PATTERN.fullmatch(api_version or ""):
+        raise TrueNASAPIError(
+            f"Unsupported TrueNAS api_version {api_version!r}; expected 'current' or a pinned 'vX.Y.Z'."
+        )
+
+    if "://" not in host:
+        host = f"https://{host}"
+
+    parsed = urlsplit(host)
+    scheme = "wss" if parsed.scheme == "https" else "ws"
+    path = parsed.path.rstrip("/")
+    return urlunsplit((scheme, parsed.netloc, f"{path}/api/{api_version}", "", ""))
 
 
 @dataclass(slots=True)
@@ -180,19 +301,43 @@ class TrueNASRawData:
 
 class TrueNASWebsocketClient:
     """
-    Minimal DDP websocket client for TrueNAS middleware calls.
+    Minimal websocket client for TrueNAS middleware calls.
 
-    TrueNAS CORE and SCALE both expose `auth.login_with_api_key` and method calls
-    through the `/websocket` endpoint. We keep the call surface intentionally small:
-    only the methods needed by this app live here.
+    Two wire dialects sit behind one call surface, chosen per host by
+    `config.api_dialect`:
+
+    * `ddp` (default) speaks the legacy `/websocket` endpoint that TrueNAS CORE
+      and every SCALE release expose.
+    * `jsonrpc` speaks the JSON-RPC 2.0 API at `/api/<api_version>` that SCALE
+      25.04 and newer document as supported; CORE has no such endpoint.
+
+    Both expose `auth.login_with_api_key` and method calls. We keep the call
+    surface intentionally small: only the methods needed by this app live here.
     """
 
     def __init__(self, config: TrueNASConfig) -> None:
         self.config = config
+        # JSON-RPC ids must be unique per connection. One counter per client
+        # keeps the handshake call and the dispatcher from colliding.
+        self._jsonrpc_request_ids = itertools.count(1)
+
+    @property
+    def _uses_jsonrpc(self) -> bool:
+        return self.config.api_dialect == "jsonrpc"
+
+    def _endpoint_url(self) -> str:
+        if self._uses_jsonrpc:
+            return build_jsonrpc_url(self.config.host, self.config.api_version)
+        return build_websocket_url(self.config.host)
+
+    def _make_dispatcher(self, ws: ClientConnection) -> _MiddlewareCallDispatcher:
+        if self._uses_jsonrpc:
+            return _JsonRpcCallDispatcher(ws, request_ids=self._jsonrpc_request_ids)
+        return _MiddlewareCallDispatcher(ws)
 
     async def fetch_all(self) -> TrueNASRawData:
         async with self._session() as ws:
-            dispatcher = _MiddlewareCallDispatcher(ws)
+            dispatcher = self._make_dispatcher(ws)
 
             async def fetch_enclosures() -> tuple[list[dict[str, Any]], bool]:
                 try:
@@ -292,7 +437,7 @@ class TrueNASWebsocketClient:
         async with asyncio.timeout(self.config.timeout_seconds):
             ws = await session.__aenter__()
         primary: BaseException | None = None
-        dispatcher = _MiddlewareCallDispatcher(ws)
+        dispatcher = self._make_dispatcher(ws)
         positions = iter(enumerate(disks))
         results = [""] * len(disks)
 
@@ -359,12 +504,18 @@ class TrueNASWebsocketClient:
             await self._call(ws, "enclosure.set_slot_status", [enclosure_id, slot_number, status])
 
     def _ssl_context(self) -> ssl.SSLContext | None:
-        websocket_url = build_websocket_url(self.config.host)
+        websocket_url = self._endpoint_url()
         if not websocket_url.startswith("wss://"):
             return None
         return build_tls_client_context(self.config)
 
     async def _perform_handshake(self, ws: ClientConnection) -> None:
+        if self._uses_jsonrpc:
+            # JSON-RPC 2.0 has no session handshake; authentication is the first call.
+            if await self._call(ws, "auth.login_with_api_key", [self.config.api_key]) is not True:
+                raise TrueNASAPIError("TrueNAS API authentication failed.")
+            return
+
         await ws.send(json.dumps({"msg": "connect", "version": "1", "support": ["1"]}))
         response = json.loads(await ws.recv())
         if response.get("msg") != "connected":
@@ -494,7 +645,7 @@ class TrueNASWebsocketClient:
 
     @asynccontextmanager
     async def _session(self):
-        websocket_url = build_websocket_url(self.config.host)
+        websocket_url = self._endpoint_url()
         ssl_context = self._ssl_context()
 
         if not self.config.api_key:
@@ -525,6 +676,37 @@ class TrueNASWebsocketClient:
             raise
 
     async def _call(self, ws: ClientConnection, method: str, params: list[Any]) -> Any:
+        if self._uses_jsonrpc:
+            return await self._call_jsonrpc(ws, method, params)
+        return await self._call_ddp(ws, method, params)
+
+    async def _call_jsonrpc(self, ws: ClientConnection, method: str, params: list[Any]) -> Any:
+        request_id = next(self._jsonrpc_request_ids)
+        payload = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": method,
+            "params": params,
+        }
+        logger.debug("Calling TrueNAS JSON-RPC method %s", method)
+        await ws.send(json.dumps(payload))
+
+        while True:
+            message = json.loads(await ws.recv())
+            if not isinstance(message, dict):
+                continue
+            response_id = message.get("id")
+            # Notifications carry no id; a reply for another id answers another call.
+            if not isinstance(response_id, int) or isinstance(response_id, bool):
+                continue
+            if response_id != request_id:
+                continue
+            error = message.get("error")
+            if error is not None:
+                raise build_jsonrpc_error(method, error)
+            return message.get("result")
+
+    async def _call_ddp(self, ws: ClientConnection, method: str, params: list[Any]) -> Any:
         request_id = str(uuid.uuid4())
         payload = {
             "id": request_id,
