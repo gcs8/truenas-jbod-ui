@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
+import socket
 import tempfile
 import unittest
 from collections import OrderedDict
@@ -242,36 +244,63 @@ class SlotBoundsFollowSelectedEnclosureTests(unittest.TestCase):
 
         self.assertEqual(service.get_snapshot.await_count, 2)
 
+    def _smart_batch_failure(self, error: Exception) -> Exception:
+        """Drive the batch endpoint with a service that fails, return what escapes."""
+        route = _route("/api/slots/smart-batch", "POST")
+        service = _service(layout_slot_count=84, selected_enclosure_id="invented-shelf")
+        service.get_slot_smart_summaries = AsyncMock(side_effect=error)
+        registry = Mock()
+        registry.get_service.return_value = service
+        payload = Mock()
+        payload.slots = [5, 63]
+        payload.max_concurrency = 2
+
+        with (
+            patch.object(app_main, "get_inventory_registry", return_value=registry),
+            patch.object(app_main, "get_settings", return_value=self.settings),
+            patch.object(app_main, "add_perf_metadata"),
+            self.assertRaises(Exception) as raised,
+        ):
+            asyncio.run(route.endpoint(
+                payload=payload, system_id="system-a", enclosure_id="invented-shelf",
+            ))
+        return raised.exception
+
     def test_smart_batch_transport_failure_is_not_a_server_fault(self) -> None:
         # #523: a slow or dropped middleware call is a temporary unavailability
         # of the shelf's SMART data. The endpoint must not answer 500 for every
         # slot, whichever layer the transport failure escapes from.
-        route = _route("/api/slots/smart-batch", "POST")
         for error in (
             TimeoutError("invented slow disk"),
-            OSError("invented socket failure"),
+            ConnectionRefusedError("invented refused connection"),
+            ConnectionResetError("invented reset connection"),
+            socket.gaierror("invented name resolution failure"),
+            OSError(errno.EHOSTUNREACH, "invented unreachable host"),
             ConnectionClosedError(None, None),
         ):
             with self.subTest(error=type(error).__name__):
-                service = _service(layout_slot_count=84, selected_enclosure_id="invented-shelf")
-                service.get_slot_smart_summaries = AsyncMock(side_effect=error)
-                registry = Mock()
-                registry.get_service.return_value = service
-                payload = Mock()
-                payload.slots = [5, 63]
-                payload.max_concurrency = 2
+                raised = self._smart_batch_failure(error)
+                self.assertIsInstance(raised, HTTPException)
+                self.assertEqual(raised.status_code, 503)
 
-                with (
-                    patch.object(app_main, "get_inventory_registry", return_value=registry),
-                    patch.object(app_main, "get_settings", return_value=self.settings),
-                    patch.object(app_main, "add_perf_metadata"),
-                    self.assertRaises(HTTPException) as raised,
-                ):
-                    asyncio.run(route.endpoint(
-                        payload=payload, system_id="system-a", enclosure_id="invented-shelf",
-                    ))
-
-                self.assertEqual(raised.exception.status_code, 503)
+    def test_smart_batch_filesystem_failure_is_not_a_transient_outage(self) -> None:
+        # #526: OSError is equally the base of every filesystem failure, and the
+        # slot-detail store raises those unwrapped through the SMART batch
+        # (`SlotDetailStore._write` -> `SmartDetailBatch.flush` ->
+        # `complete_batch`). A data directory the app cannot write must keep
+        # reaching the data-directory handling rather than being relabelled as a
+        # transient enclosure outage that an operator is invited to wait out.
+        for error in (
+            PermissionError(errno.EACCES, "invented unwritable data directory"),
+            OSError(errno.ENOSPC, "invented full filesystem"),
+            OSError(errno.EROFS, "invented read-only filesystem"),
+            FileNotFoundError(errno.ENOENT, "invented missing data directory"),
+            IsADirectoryError(errno.EISDIR, "invented directory in the way"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                raised = self._smart_batch_failure(error)
+                self.assertNotIsInstance(raised, HTTPException)
+                self.assertIs(type(raised), type(error))
 
 
 class SlotBoundsFollowRenderedSlotsTests(unittest.TestCase):
