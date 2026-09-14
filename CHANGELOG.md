@@ -43,8 +43,16 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 ### Fixed
 
 - Backfilled a slot's serial, model and size from the cache when a live view drops
-  the serial while another strong identifier still agrees, instead of refusing the
-  cache and overwriting it with the degraded view (#524).
+  the serial while another strong identifier - a serial, logical unit id or gptid -
+  still agrees, instead of refusing the cache and overwriting it with the degraded
+  view (#524).
+- Stopped treating a bay's SAS address as disk identity. A live view carrying none
+  of the strong identifiers is now reported as `identity_state: "unknown"`: no
+  cached identity or SMART data is shown as current for it, the last-known cache
+  entry is kept as historical evidence instead of being overwritten by the degraded
+  row, and SMART reads taken during that window are isolated from the departed
+  disk's identity. A strong identifier that returns and disagrees is admitted as a
+  replacement (#524).
 - Kept one slow CORE disk from failing the whole SMART grid: a batch reply past the
   call timeout now falls back to the per-slot path for that shelf and the batch route
   answers 503 instead of 500 for every slot (#524).
