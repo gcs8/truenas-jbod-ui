@@ -138,6 +138,8 @@ class CoreGridPeer:
         self.gate_phase: str | None = None
         self.hours = 321
         self.json_extra = {}
+        # Devices whose disk.smartctl call is accepted and never answered.
+        self.stall_devices: set[str] = set()
 
     def connect(self, url, **kwargs):
         from contextlib import asynccontextmanager
@@ -173,6 +175,10 @@ class CoreGridPeer:
                         if peer.gate_phase is None or peer.gate_phase == phase:
                             peer.started.set()
                         async def respond():
+                            if device.removeprefix('/dev/') in peer.stall_devices:
+                                # Accepted, never answered: only a caller-side
+                                # deadline can end this call.
+                                await asyncio.Event().wait()
                             if peer.gate is not None and (peer.gate_phase is None or peer.gate_phase == phase):
                                 await peer.gate.wait()
                             await asyncio.sleep(0)
@@ -338,6 +344,71 @@ class CoreGridWebsocketIntegrationTests(unittest.IsolatedAsyncioTestCase):
                         self.assertGreater(peer.connections, before)
                     self.assertFalse(s._smart_load_tasks)
 
+    async def test_slow_batch_reply_degrades_to_per_slot_fallbacks(self):
+        # #523: smartctl_batch wraps every middleware call in the request timeout
+        # and the builtin TimeoutError is not a TrueNASAPIError, so one disk that
+        # answers later than the timeout failed the whole shelf with a 500. The
+        # batch is an optimisation; losing it must degrade to the per-slot path.
+        # The per-slot path carries the same call timeout since #524 round 2, so
+        # the disk answers after the batch deadline but inside the per-slot one;
+        # a disk slower than the configured timeout on both attempts is the
+        # subject of test_one_stalled_fallback_call_cannot_suspend_the_whole_grid.
+        with self.fixture(4) as (s, api, store, other):
+            peer = CoreGridPeer(await api.fetch_all())
+            peer.gate = asyncio.Event()
+            peer.gate_phase = 'json'
+            with self.wire(s, peer):
+                s.truenas_client.config.timeout_seconds = 0.3
+                await s.get_snapshot()
+
+                async def release_after_the_batch_deadline():
+                    # Past the 0.3s batch deadline, and inside the per-slot
+                    # window that only opens once the batch has already expired.
+                    await asyncio.sleep(0.45)
+                    peer.gate.set()
+
+                releaser = asyncio.create_task(release_after_the_batch_deadline())
+                try:
+                    result = await asyncio.wait_for(
+                        s.get_slot_smart_summaries([0, 1, 2, 3], max_concurrency=2), 20,
+                    )
+                finally:
+                    peer.gate.set()
+                    await releaser
+                self.assertEqual([r.slot for r in result], [0, 1, 2, 3])
+                self.assertEqual([r.summary.available for r in result], [True] * 4)
+                self.assertEqual([r.summary.power_on_hours for r in result], [321, 322, 323, 324])
+                self.assertEqual(peer.closes, peer.connections)
+                self.assertFalse(s._smart_load_tasks)
+
+    async def test_one_stalled_fallback_call_cannot_suspend_the_whole_grid(self):
+        # #524 round 2: when smartctl_batch times out, _prime_core_grid degrades
+        # to the per-slot path - but that path called disk.smartctl with no
+        # deadline of its own. One disk that is never answered then held
+        # complete_batch() open for every slot in the grid, so the bounded
+        # batch failure became an unbounded request. Each per-slot call must
+        # carry the same TrueNAS call timeout the batch applies, and its expiry
+        # must be that one slot's unavailable summary.
+        with self.fixture(4) as (s, api, store, other):
+            peer = CoreGridPeer(await api.fetch_all())
+            peer.stall_devices = {'da2'}
+            with self.wire(s, peer):
+                s.truenas_client.config.timeout_seconds = 0.3
+                await s.get_snapshot()
+                result = await asyncio.wait_for(
+                    s.get_slot_smart_summaries([0, 1, 2, 3], max_concurrency=2), 20,
+                )
+                summaries = {item.slot: item.summary for item in result}
+                self.assertEqual([item.slot for item in result], [0, 1, 2, 3])
+                self.assertFalse(summaries[2].available)
+                self.assertIsNone(summaries[2].power_on_hours)
+                self.assertIn('timed out', (summaries[2].message or '').lower())
+                self.assertEqual([summaries[slot].available for slot in (0, 1, 3)], [True] * 3)
+                self.assertEqual(
+                    [summaries[slot].power_on_hours for slot in (0, 1, 3)], [321, 322, 324],
+                )
+                self.assertFalse(s._smart_load_tasks)
+
     async def test_cancelled_grid_retains_transport_and_save_owner(self):
         for fail_save in (False, True):
             with self.subTest(fail_save=fail_save), self.fixture(4) as (s, api, store, other):
@@ -488,10 +559,15 @@ class CoreGridWebsocketIntegrationTests(unittest.IsolatedAsyncioTestCase):
                             self.assertEqual(fresh.power_on_hours, 777)
                             self.assertGreater(peer.methods['json'], calls)
                             self.assertIsNone(lost.slots[0].serial, 'Device alias cannot prove historical serial')
-                            self.assertEqual(s._smart_cache_key(lost.slots[0])[-1], ('device', 'da0'))
+                            self.assertEqual(lost.slots[0].identity_state, 'unknown')
+                            self.assertEqual(s._smart_cache_key(lost.slots[0])[-1], ('unknown', 'da0'))
+                            # #525: the window cannot say which disk is in the
+                            # bay, so the last-known row stays as historical
+                            # evidence and the SMART read taken while the disk
+                            # is unidentifiable is not filed under it.
                             entry = store.get_entry(s.system.id, 'synthetic-enclosure', 0)
-                            self.assertNotIn('serial', entry.slot_fields)
-                            self.assertEqual(entry.smart_fields['power_on_hours'], 777)
+                            self.assertEqual(entry.slot_fields['serial'], 'INVENTED-000')
+                            self.assertNotEqual(entry.smart_fields.get('power_on_hours'), 777)
                             calls = peer.methods['json']
                             self.assertEqual((await request()).power_on_hours, 777)
                             self.assertEqual(peer.methods['json'], calls)

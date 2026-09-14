@@ -1,17 +1,17 @@
 # Public screenshot exact-byte review
 
-This record covers the two desktop fixture screenshots generated from `public-demo/index.html`. The pinned Linux capture used `file://`, UTC, a 1920 by 1080 viewport, reduced motion, and no network request. GitHub Actions run `34737325999` captured each image twice and produced byte-identical copies.
+This record covers the two desktop fixture screenshots generated from `public-demo/index.html`. The pinned Linux capture used `file://`, UTC, a 1920 by 1080 viewport, reduced motion, and no network request. GitHub Actions run `34806868870` captured each image twice and produced byte-identical copies.
 
-Source revision: `0ea42a60616e0b987a3c7a73568abf7f57de01fe`
+Source revision: `0c6f65ac86bfca8a4cd673ee108b117464d340d2`
 
-Source artifact SHA-256: `dd537fdb2d148e1755ec09bb6890a87242053ca7d15d6020adb6bb420bf954eb`
+Source artifact SHA-256: `8ff43fd7f57dfad49ef84d8eebc40d76cd4f1a49216c636a66a683e40a7a058c`
 
 | Image | Dimensions | Bytes | SHA-256 | Pixel review |
 |---|---:|---:|---|---|
-| `public-demo-overview.png` | 1920 by 4092 | 1098831 | `fcc7adba57b5ae32f4c21c9204ab95d5db0cd5709eae5c075383ab34c0cc4eda` | PASS |
-| `public-demo-history.png` | 1920 by 4852 | 1225499 | `a5e8ea696081f530475845f0d2d26a2d1538955b7813f5c4998fcfd5d6a0881b` | PASS |
+| `public-demo-overview.png` | 1920 by 4092 | 1100354 | `5ad1a32a43f742cfe32dcf9a50d683e93f481ccd280a01c3dc294156da29059a` | PASS |
+| `public-demo-history.png` | 1920 by 4852 | 1226950 | `2e6f215b6f0626ff64bbe63ad30405a1328cd1c02bcf25522c8f9d8973021bfe` | PASS |
 
-Both exact PNGs were loaded and inspected with vision tooling before setting the manifest attestations. The review checked for private addresses, hostnames, paths, credentials, key material, and non-demo device identifiers. None were visible. Source revision and Build ID are intentional public-repository provenance.
+Both exact PNGs were loaded and inspected with vision tooling before setting the manifest attestations. The review checked for private addresses, hostnames, paths, credentials, key material, and non-demo device identifiers. None were visible. Source revision and Build ID are intentional public-repository provenance, not appliance or private identifiers.
 
 Neither image showed unintended overlap, clipping, missing assets, corrupted text, or canvas-edge artifacts. Narrow bay labels use intentional ellipses. Full selected-slot identifiers remain readable in Slot Details. Equal-height cards leave unused space but do not hide or collide with content.
 

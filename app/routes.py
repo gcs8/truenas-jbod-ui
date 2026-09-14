@@ -5,11 +5,15 @@ from __future__ import annotations
 # ruff: noqa: F821
 
 import email.message
+import errno
 import json
+import socket
 from types import ModuleType
 from typing import Any
 
 from pydantic import ValidationError
+
+from websockets.exceptions import ConnectionClosed
 
 from app.route_compat import MainModuleAPIRouter
 from app.services.history_backend import (
@@ -44,6 +48,38 @@ def _is_json_media_type(content_type: str | None) -> bool:
         return False
     subtype = message.get_content_subtype()
     return subtype == "json" or subtype.endswith("+json")
+
+
+SMART_BATCH_TRANSPORT_EXCEPTIONS = (
+    TimeoutError,
+    ConnectionClosed,
+    ConnectionError,
+    socket.gaierror,
+    socket.herror,
+)
+# Socket-class errno values a bare `OSError` can carry. `OSError` itself is NOT
+# transport: it is equally the base of PermissionError, ENOSPC, EROFS and every
+# other filesystem failure, and the slot-detail store raises those unwrapped
+# through the SMART batch (#526). Those must keep reaching the data-directory
+# handling with its own message instead of being relabelled as a shelf outage.
+SMART_BATCH_TRANSPORT_ERRNOS = frozenset(
+    number
+    for number in (
+        getattr(errno, name, None)
+        for name in (
+            "EADDRNOTAVAIL", "ECONNABORTED", "ECONNREFUSED", "ECONNRESET",
+            "EHOSTDOWN", "EHOSTUNREACH", "ENETDOWN", "ENETRESET", "ENETUNREACH",
+            "ENOTCONN", "ENOTSOCK", "EPROTO", "ESHUTDOWN", "ETIMEDOUT",
+        )
+    )
+    if number is not None
+)
+
+
+def _is_smart_batch_transport_failure(exc: BaseException) -> bool:
+    if isinstance(exc, SMART_BATCH_TRANSPORT_EXCEPTIONS):
+        return True
+    return isinstance(exc, OSError) and exc.errno in SMART_BATCH_TRANSPORT_ERRNOS
 
 
 def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
@@ -701,6 +737,20 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
                 )
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (OSError, ConnectionClosed) as exc:
+            # #523: a call that outlasts the timeout, or a dropped socket, is a
+            # temporary unavailability of this shelf's SMART data and not a
+            # server fault. One slow disk must never render as a 500 for the
+            # whole grid, whichever layer the transport failure escapes from.
+            # #526: only the transport may say that. A filesystem failure shares
+            # OSError's base but means the data directory is misconfigured, so
+            # it propagates unchanged to the handling that reports that instead.
+            if not _is_smart_batch_transport_failure(exc):
+                raise
+            raise HTTPException(
+                status_code=503,
+                detail="SMART data is temporarily unavailable for this enclosure.",
+            ) from exc
         return SmartBatchResponse(summaries=summaries, layout_bounds=layout_bounds)
 
     @router.get("/api/history/status")
