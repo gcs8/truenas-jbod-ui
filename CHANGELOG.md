@@ -132,6 +132,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Internal
 
+- Gave the checked-in public demo a frozen synthetic Storage Fabric payload so
+  the published overview screenshot exercises the enclosure-shaped bay grid;
+  the snapshot renderer accepts the payload through one optional argument that
+  operator exports leave unset, so no live fabric identifier can reach an
+  exported file by that route (#532).
+
 - Added a dispatch-only workflow that recaptures the public-demo screenshots
   inside the pinned Playwright Linux container, captures twice to prove the
   bytes are reproducible, and uploads the PNGs and proposed manifest entries for
