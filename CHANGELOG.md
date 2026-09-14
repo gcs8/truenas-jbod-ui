@@ -46,7 +46,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   physical layout instead of a flat sorted chip list, so a bay number sits in
   the same place there as on the Enclosure tab, with un-impacted and empty
   bays shown as placeholders and the chassis edge label repeated underneath
-  (#TBD).
+  (#532).
 
 - Retried failed release checks with bounded backoff instead of waiting a
   full normal interval, preserving the last successful result (#469).
