@@ -12127,8 +12127,9 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
                         if mode == "fallback":
                             # A lower-priority strong ID that both observations
                             # share does license restoring the missing primary
-                            # identity (#520); only an alias-only view does not.
-                            fallback = "gptid" if field_name != "gptid" else "sas_address"
+                            # identity (#520); only a view with no strong ID at
+                            # all does not (#525).
+                            fallback = "gptid" if field_name != "gptid" else "logical_unit_id"
                             current[fallback] = historical[fallback] = "invented-fallback"
                         slot = SlotView(
                             slot=0, slot_label="0", row_index=0, column_index=0,
@@ -12153,7 +12154,12 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
                         generation = service._smart_cache_generation_token(key)
                         self.assertTrue(service._smart_request_is_current(key, generation))
                         cached = service._build_persisted_smart_summary(slot)
-                        matched = mode in ("same", "fallback")
+                        # #525: an agreeing sas_address is not identity. It is
+                        # the bay's address, not the disk's, so on its own it
+                        # admits nothing even when both sides report it.
+                        matched = mode == "fallback" or (
+                            mode == "same" and field_name in inventory_module.STRONG_SLOT_IDENTITY_FIELDS
+                        )
                         if matched:
                             self.assertEqual(cached.power_on_hours, 321)
                         else:
@@ -12164,7 +12170,10 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
         # #520: the slot-detail cache exists to backfill stable fields when a
         # live snapshot omits them. A serial that drops for one refresh must not
         # delete the cached serial, model and size while a strong identifier
-        # still proves the same disk is in the bay.
+        # still proves the same disk is in the bay. Since #525 the strong tier
+        # is serial, logical_unit_id and gptid only: the gptid below is what
+        # licenses the backfill, and the bay's sas_address rides along without
+        # authorizing anything.
         with tempfile.TemporaryDirectory() as temp_dir:
             service = build_inventory_service(
                 Settings(),
@@ -12184,6 +12193,7 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
 
             full = slot_view(
                 serial="SER-VERIFY-005",
+                gptid="gptid/invented-005",
                 sas_address="sas-invented-005",
                 model="ST12000NM0008",
                 size_human="12 TB",
@@ -12195,8 +12205,8 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
             )
 
             # The #355 shape: the API disk record is incomplete for one refresh
-            # while SES still reports the bay's sas_address.
-            degraded = slot_view(sas_address="sas-invented-005")
+            # while the pool label and the bay's sas_address still report.
+            degraded = slot_view(gptid="gptid/invented-005", sas_address="sas-invented-005")
             asyncio.run(service._apply_and_persist_snapshot_slot_details([degraded]))
             self.assertEqual(degraded.serial, "SER-VERIFY-005")
             self.assertEqual(degraded.model, "ST12000NM0008")
@@ -12219,7 +12229,7 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
 
             # #504's protection stands: a disagreeing serial rejects the entry
             # even though the device alias and the bay are unchanged.
-            replaced = slot_view(serial="SER-REPLACEMENT", sas_address="sas-invented-005")
+            replaced = slot_view(serial="SER-REPLACEMENT", gptid="gptid/invented-005")
             self.assertFalse(service._slot_detail_entry_matches(replaced, entry))
             asyncio.run(service._apply_and_persist_snapshot_slot_details([replaced]))
             self.assertIsNone(replaced.model)
@@ -12376,6 +12386,7 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
                     present=True,
                     state=SlotState.healthy,
                     device_name=f"da{slot}",
+                    serial=f"SER-INVENTED-{slot}",
                 )
                 for slot in range(slot_count)
             ]
@@ -12388,8 +12399,8 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
                         system_id=system.id,
                         enclosure_id="enc-1",
                         slot=slot,
-                        identifiers=[f"da{slot}"],
-                        slot_fields={"model": f"cached-model-{slot}"},
+                        identifiers=[f"da{slot}", f"ser-invented-{slot}"],
+                        slot_fields={"model": f"cached-model-{slot}", "serial": f"SER-INVENTED-{slot}"},
                     )
                     for slot in range(slot_count)
                 ]
@@ -12460,6 +12471,7 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
                     present=True,
                     state=SlotState.healthy,
                     device_name="da0",
+                    serial="SER-INVENTED-0",
                 ),
                 SlotView(
                     slot=1,
@@ -12470,6 +12482,7 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
                     present=True,
                     state=SlotState.healthy,
                     device_name="da1",
+                    serial="SER-INVENTED-1",
                     model="live-model",
                 ),
                 SlotView(
@@ -12481,6 +12494,7 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
                     present=True,
                     state=SlotState.healthy,
                     device_name="da2",
+                    serial="SER-INVENTED-2",
                 ),
             ]
             store = service.slot_detail_store
@@ -12492,22 +12506,22 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
                         system_id=system.id,
                         enclosure_id="enc-1",
                         slot=0,
-                        identifiers=["da0"],
-                        slot_fields={"model": "cached-model"},
+                        identifiers=["da0", "ser-invented-0"],
+                        slot_fields={"model": "cached-model", "serial": "SER-INVENTED-0"},
                     ),
                     SlotDetailCacheEntry(
                         system_id=system.id,
                         enclosure_id="enc-1",
                         slot=1,
-                        identifiers=["da1"],
-                        slot_fields={"model": "stale-model"},
+                        identifiers=["da1", "ser-invented-1"],
+                        slot_fields={"model": "stale-model", "serial": "SER-INVENTED-1"},
                     ),
                     SlotDetailCacheEntry(
                         system_id=system.id,
                         enclosure_id="enc-1",
                         slot=2,
                         identifiers=["different-device"],
-                        slot_fields={"model": "wrong-model"},
+                        slot_fields={"model": "wrong-model", "serial": "SER-INVENTED-OTHER"},
                     ),
                 ]
             )
@@ -12568,6 +12582,7 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
                         present=True,
                         state=SlotState.healthy,
                         device_name=f"da{slot}",
+                        serial=f"SER-INVENTED-{slot}",
                         model=f"model-{slot}",
                     )
                     for slot in range(slot_count)

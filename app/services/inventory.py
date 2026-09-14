@@ -325,6 +325,13 @@ STABLE_SLOT_DETAIL_FIELDS = (
     "notes",
     "operator_context",
 )
+# Only the strong tier proves which disk occupies a bay: a serial, a logical
+# unit id and a gptid all belong to the disk and travel with it. sas_address is
+# bay-scoped - the expander reports the same address for whatever is plugged in
+# - so it may contradict a cached entry but must never authorize restoring one
+# (#525). device_name is likewise a reusable alias.
+STRONG_SLOT_IDENTITY_FIELDS = ("serial", "logical_unit_id", "gptid")
+SLOT_IDENTITY_FIELDS = (*STRONG_SLOT_IDENTITY_FIELDS, "sas_address")
 STABLE_SMART_DETAIL_FIELDS = (
     "logical_block_size",
     "physical_block_size",
@@ -3115,6 +3122,7 @@ class InventoryService:
     async def _apply_and_persist_snapshot_slot_details(self, slots: list[SlotView]) -> None:
         store = self.slot_detail_store
         if store is None or not slots:
+            self._mark_slot_identity_states(slots)
             self._observe_smart_disk_identities(slots)
             return
         loaded: Mapping[str, SlotDetailCacheEntry] = {}
@@ -3141,6 +3149,7 @@ class InventoryService:
 
         async def apply_observe_and_save():
             await asyncio.to_thread(apply)
+            self._mark_slot_identity_states(slots)
             # Record identity from the published view, the same view every later
             # SMART request keys off. Observing the pre-backfill view instead
             # makes every slot whose serial came from the cache read as
@@ -3173,6 +3182,21 @@ class InventoryService:
                 worker.exception()
             raise asyncio.CancelledError
         worker.result()
+
+    @staticmethod
+    def _slot_identity_state(slot_view: SlotView) -> Literal["known", "unknown"]:
+        # An empty bay has nothing to identify, so its state is known.
+        if not slot_view.present or slot_view.state == SlotState.empty:
+            return "known"
+        if any(normalize_text(getattr(slot_view, field_name)) for field_name in STRONG_SLOT_IDENTITY_FIELDS):
+            return "known"
+        return "unknown"
+
+    def _mark_slot_identity_states(self, slots: list[SlotView]) -> None:
+        # Mark the published view, after any backfill: what the operator sees is
+        # what the flag has to describe.
+        for slot_view in slots:
+            slot_view.identity_state = self._slot_identity_state(slot_view)
 
     def _apply_persisted_slot_details(
         self, slots: list[SlotView], *,
@@ -3278,6 +3302,12 @@ class InventoryService:
         identifiers = sorted(self._slot_detail_identifiers(slot_view))
         if not identifiers:
             return None
+        if self._slot_identity_state(slot_view) == "unknown":
+            # Writing this row would overwrite the last-known entry with one
+            # that cannot say which disk it describes, and would file any SMART
+            # read taken during the window under the departed disk. Persist
+            # nothing; the previous entry stays as historical evidence (#525).
+            return None
 
         slot_fields: dict[str, Any] = {}
         for field_name in STABLE_SLOT_DETAIL_FIELDS:
@@ -3315,27 +3345,28 @@ class InventoryService:
         if slot_view.state == SlotState.empty or not slot_view.present:
             return False
         # Admit the entry when the two observations agree on hardware identity,
-        # not when they happen to rank the same field first: a live view that
-        # drops its serial while SES still reports the bay's sas_address is the
-        # same disk. Require that nothing shared disagrees AND that at least one
-        # strong identifier is present on both sides and equal. A side that
-        # offers no strong identifier proves nothing, so loss/return of a serial
-        # down to a reusable device alias is still a new observation rather than
-        # licence to restore an ID that disagrees with SMART admission.
-        current_identity = previous_identity = shared_identity = False
-        for field_name in ("serial", "logical_unit_id", "sas_address", "gptid"):
+        # not when they happen to rank the same field first. Identity is the
+        # strong tier only: a live view that has lost every strong identifier
+        # cannot say which disk is in the bay, and a bay-scoped sas_address
+        # agreeing proves only that the bay is the same one (#525). Such a view
+        # is identity-unknown, so nothing cached may be restored onto it.
+        if self._slot_identity_state(slot_view) == "unknown":
+            return False
+        shared_identity = False
+        for field_name in SLOT_IDENTITY_FIELDS:
             current = normalize_text(getattr(slot_view, field_name))
             previous = normalize_text(entry.slot_fields.get(field_name)) or normalize_text(entry.smart_fields.get(field_name))
-            current_identity = current_identity or bool(current)
-            previous_identity = previous_identity or bool(previous)
             if current and previous:
+                # A disagreement on any identity field, sas_address included,
+                # still rejects the entry: contradiction is cheap to trust.
                 if current.lower() != previous.lower():
                     return False
-                shared_identity = True
-        if not shared_identity and (current_identity or previous_identity):
+                shared_identity = shared_identity or field_name in STRONG_SLOT_IDENTITY_FIELDS
+        # The remembered disk must be the one now observed, so a strong
+        # identifier has to be present on both sides and equal. An entry that
+        # offers none is historical evidence about a different observation.
+        if not shared_identity:
             return False
-        # Both identity-poor entries retain device-scoped matching. This cannot
-        # detect a physical swap that inventory never observes.
         current_identifiers = self._slot_detail_identifiers(slot_view)
         if not current_identifiers:
             return False
@@ -3866,13 +3897,17 @@ class InventoryService:
     def _smart_disk_identity(slot_view: SlotView) -> tuple[str, str]:
         if not slot_view.present or slot_view.state == SlotState.empty:
             return ("empty", "")
-        for field_name in ("serial", "logical_unit_id", "sas_address", "gptid"):
+        for field_name in STRONG_SLOT_IDENTITY_FIELDS:
             value = normalize_text(getattr(slot_view, field_name))
             if value:
                 return (field_name, value.lower())
-        # Identity-poor inventory retains device-scoped behavior; no claim of
-        # detecting an unobservable physical replacement is possible.
-        return ("device", normalize_text(slot_view.device_name) or "")
+        # No strong identifier: the bay's sas_address and the device alias are
+        # both reusable, so the occupant is unknown. Keying the window under an
+        # explicit unknown identity isolates it - entering and leaving the
+        # window each bump the bay's identity generation, so no SMART read taken
+        # while the disk is unidentifiable is served from, or stored under, the
+        # serial that was there before (#525).
+        return ("unknown", normalize_text(slot_view.device_name) or "")
 
     def _observe_smart_disk_identities(self, slots: list[SlotView]) -> None:
         # Observe before snapshot persistence can yield. Share the final-write
