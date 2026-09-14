@@ -487,6 +487,18 @@ class SystemSetupService:
                         existing_system.truenas.api_password if existing_system is not None else None,
                     ),
                     platform=payload.platform,
+                    # The setup form does not carry the dialect yet, so a save
+                    # must not silently move a JSON-RPC host back onto DDP.
+                    api_dialect=(
+                        existing_system.truenas.api_dialect
+                        if existing_system is not None
+                        else TrueNASConfig.model_fields["api_dialect"].default
+                    ),
+                    api_version=(
+                        existing_system.truenas.api_version
+                        if existing_system is not None
+                        else TrueNASConfig.model_fields["api_version"].default
+                    ),
                     verify_ssl=payload.verify_ssl,
                     tls_ca_bundle_path=tls_ca_bundle_path,
                     tls_server_name=tls_server_name,
