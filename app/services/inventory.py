@@ -4305,7 +4305,7 @@ class InventoryService:
                     if core_payloads is not None and candidate == candidates[0]:
                         payload = core_payloads[0]
                     else:
-                        payload = await self.truenas_client.fetch_disk_smartctl(candidate, ["-a", "-j"])
+                        payload = await self._fetch_disk_smartctl_bounded(candidate, ["-a", "-j"])
             except TrueNASAPIError as exc:
                 last_error = str(exc)
                 continue
@@ -4325,7 +4325,7 @@ class InventoryService:
                         if core_payloads is not None and core_payloads[1] is not None:
                             enrichment_payload = core_payloads[1]
                         else:
-                            enrichment_payload = await self.truenas_client.fetch_disk_smartctl(api_candidate, ["-x"])
+                            enrichment_payload = await self._fetch_disk_smartctl_bounded(api_candidate, ["-x"])
                 except TrueNASAPIError as exc:
                     last_error = str(exc)
                 else:
@@ -4386,6 +4386,31 @@ class InventoryService:
         cached_fallback = await merge_fallback(fallback)
         self._observe_smart_summary_request("fallback")
         return cached_fallback or fallback
+
+    def _smart_call_timeout_seconds(self) -> float:
+        # One budget for every SMART middleware call. `smartctl_batch` already
+        # wraps each `disk.smartctl` in `TrueNASConfig.timeout_seconds`
+        # (TRUENAS_TIMEOUT); the per-slot path is the fallback for that same
+        # call and gets the same deadline rather than a number of its own.
+        timeout = float(self.system.truenas.timeout_seconds)
+        return timeout if timeout > 0 else 1.0
+
+    async def _fetch_disk_smartctl_bounded(self, candidate: str, args: list[str]) -> str:
+        # Fail closed on a disk that never answers. Without a deadline here, a
+        # batch that timed out on one slow disk degraded to a per-slot path
+        # that waited forever, so `complete_batch()` held every other slot in
+        # the grid open too: a bounded failure became an unbounded request
+        # (#524). Expiry is reported through the same channel as any other
+        # failed call, so it becomes this slot's unavailable summary with a
+        # fixed reason and leaves the rest of the grid intact.
+        timeout = self._smart_call_timeout_seconds()
+        try:
+            async with asyncio.timeout(timeout):
+                return await self.truenas_client.fetch_disk_smartctl(candidate, args)
+        except TimeoutError as exc:
+            raise TrueNASAPIError(
+                f"SMART lookup for {candidate} timed out after {timeout:g}s; the disk did not answer."
+            ) from exc
 
     async def _prime_core_grid(
         self, cohort: list, detail_batch: SmartDetailBatch, width: int, allow_stale_cache: bool,

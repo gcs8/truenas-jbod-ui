@@ -349,6 +349,10 @@ class CoreGridWebsocketIntegrationTests(unittest.IsolatedAsyncioTestCase):
         # and the builtin TimeoutError is not a TrueNASAPIError, so one disk that
         # answers later than the timeout failed the whole shelf with a 500. The
         # batch is an optimisation; losing it must degrade to the per-slot path.
+        # The per-slot path carries the same call timeout since #524 round 2, so
+        # the disk answers after the batch deadline but inside the per-slot one;
+        # a disk slower than the configured timeout on both attempts is the
+        # subject of test_one_stalled_fallback_call_cannot_suspend_the_whole_grid.
         with self.fixture(4) as (s, api, store, other):
             peer = CoreGridPeer(await api.fetch_all())
             peer.gate = asyncio.Event()
@@ -358,7 +362,9 @@ class CoreGridWebsocketIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 await s.get_snapshot()
 
                 async def release_after_the_batch_deadline():
-                    await asyncio.sleep(0.8)
+                    # Past the 0.3s batch deadline, and inside the per-slot
+                    # window that only opens once the batch has already expired.
+                    await asyncio.sleep(0.45)
                     peer.gate.set()
 
                 releaser = asyncio.create_task(release_after_the_batch_deadline())
