@@ -1,15 +1,15 @@
 # Public screenshot exact-byte review
 
-This record covers the two desktop fixture screenshots generated from `public-demo/index.html`. The pinned Linux capture used `file://`, UTC, a 1920 by 1080 viewport, reduced motion, and no network request. GitHub Actions run `34737325999` captured each image twice and produced byte-identical copies.
+This record covers the two desktop fixture screenshots generated from `public-demo/index.html`. The pinned Linux capture used `file://`, UTC, a 1920 by 1080 viewport, reduced motion, and no network request. GitHub Actions run `34811222108` captured each image twice and produced byte-identical copies.
 
-Source revision: `0ea42a60616e0b987a3c7a73568abf7f57de01fe`
+Source revision: `b2e78c1ae4694e1df5c36f946404532ba4bd53f4`
 
-Source artifact SHA-256: `dd537fdb2d148e1755ec09bb6890a87242053ca7d15d6020adb6bb420bf954eb`
+Source artifact SHA-256: `9409e159a87f9d78f8d7d8afdb3518be637e295c4feb55585d65dd229b9e35de`
 
 | Image | Dimensions | Bytes | SHA-256 | Pixel review |
 |---|---:|---:|---|---|
-| `public-demo-overview.png` | 1920 by 4092 | 1098831 | `fcc7adba57b5ae32f4c21c9204ab95d5db0cd5709eae5c075383ab34c0cc4eda` | PASS |
-| `public-demo-history.png` | 1920 by 4852 | 1225499 | `a5e8ea696081f530475845f0d2d26a2d1538955b7813f5c4998fcfd5d6a0881b` | PASS |
+| `public-demo-overview.png` | 1920 by 4092 | 1099561 | `6b0949d78424a8e2bcb4d0080ccbb7bef0525a212f1be69fb71df1fa85d893d0` | PASS |
+| `public-demo-history.png` | 1920 by 4852 | 1226073 | `127e205d138eec86af1069fd05bdb503daabed3d154dd022835854878453dc40` | PASS |
 
 Both exact PNGs were loaded and inspected with vision tooling before setting the manifest attestations. The review checked for private addresses, hostnames, paths, credentials, key material, and non-demo device identifiers. None were visible. Source revision and Build ID are intentional public-repository provenance.
 
