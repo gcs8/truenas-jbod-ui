@@ -42,6 +42,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Drew the Storage Fabric impacted/mapped bay grid in the active enclosure's
+  physical layout instead of a flat sorted chip list, so a bay number sits in
+  the same place there as on the Enclosure tab, with un-impacted and empty
+  bays shown as placeholders and the chassis edge label repeated underneath
+  (#532).
+
 - Retried failed release checks with bounded backoff instead of waiting a
   full normal interval, preserving the last successful result (#469).
 
@@ -125,6 +131,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   and a storage view; the unused `app.verify_ssl` line is gone. (#489)
 
 ### Internal
+
+- Gave the checked-in public demo a frozen synthetic Storage Fabric payload so
+  the published overview screenshot exercises the enclosure-shaped bay grid;
+  the snapshot renderer accepts the payload through one optional argument that
+  operator exports leave unset, so no live fabric identifier can reach an
+  exported file by that route (#532).
 
 - Added a dispatch-only workflow that recaptures the public-demo screenshots
   inside the pinned Playwright Linux container, captures twice to prove the

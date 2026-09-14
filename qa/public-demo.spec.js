@@ -124,15 +124,51 @@ test("public demo static artifact is explorable without a live backend", async (
   await page.locator("#sas-fabric-toggle-button").click();
   await expect(page.locator("#sas-fabric-panel")).toBeVisible();
   await expect(page.locator("#sas-fabric-status")).toContainText(
-    "This offline snapshot does not include Storage Fabric data or live refresh capability."
+    "This offline snapshot embeds a frozen Storage Fabric map; it cannot refresh."
   );
-  await expect(page.locator("#sas-fabric-inspector-body")).toContainText(
-    "No Storage Fabric payload is included in this snapshot."
-  );
-  await expect(page.locator("#sas-fabric-lanes")).toContainText(
+  await expect(page.locator("#sas-fabric-lanes")).not.toContainText(
     "No Storage Fabric payload is included in this snapshot."
   );
   await expect(page.locator("#sas-fabric-lanes")).not.toContainText("yet");
+
+  // The bay grid must be the enclosure, not a flat wrapped chip list: one
+  // layout per controller lane, four rows each, the 6 | 6 | 3 column groups
+  // the CSE-946 profile declares, and the same edge cue the chassis prints.
+  const fabricLayouts = page.locator("#sas-fabric-lanes .sas-fabric-bay-layout");
+  await expect(fabricLayouts).toHaveCount(2);
+  const firstLayout = fabricLayouts.first();
+  await expect(firstLayout.locator(".sas-fabric-bay-row")).toHaveCount(4);
+  await expect(firstLayout.locator(".sas-fabric-bay-row").first().locator(".sas-fabric-bay-group")).toHaveCount(3);
+  await expect(firstLayout.locator(".sas-fabric-bay-chip")).toHaveCount(60);
+  await expect(firstLayout.locator(".sas-fabric-bay-edge-label")).toHaveText("System front / latch edge");
+  await expect(page.locator("#sas-fabric-lanes .sas-fabric-bay-overflow")).toHaveCount(0);
+
+  // Lane one owns bays 0-44: those are selectable chips, and the bays it does
+  // not own are placeholders - dim where the fixture has a disk, empty where
+  // it does not.
+  await expect(firstLayout.locator('button.sas-fabric-bay-chip[data-sas-fabric-slot="0"]')).toHaveCount(1);
+  await expect(firstLayout.locator('button.sas-fabric-bay-chip[data-sas-fabric-slot="57"]')).toHaveCount(0);
+  await expect(firstLayout.locator("span.sas-fabric-bay-chip.is-outside")).not.toHaveCount(0);
+  await expect(firstLayout.locator("span.sas-fabric-bay-chip.is-empty")).not.toHaveCount(0);
+
+  // Bay 00 is the bottom-left tile on the Enclosure tab; it must also be the
+  // bottom-left cell of the fabric grid.
+  const lastRowFirstChip = firstLayout
+    .locator(".sas-fabric-bay-row")
+    .last()
+    .locator(".sas-fabric-bay-chip")
+    .first();
+  await expect(lastRowFirstChip).toHaveText("00");
+  const firstRowFirstChip = firstLayout
+    .locator(".sas-fabric-bay-row")
+    .first()
+    .locator(".sas-fabric-bay-chip")
+    .first();
+  await expect(firstRowFirstChip).toHaveText("45");
+
+  await expect(page.locator("#sas-fabric-inspector-body")).not.toContainText(
+    "No Storage Fabric payload is included in this snapshot."
+  );
 
   await expect(selector).toBeEnabled();
   await expect(page.locator("#chassis-shell")).toHaveAttribute("data-face-style", "top-loader");

@@ -688,6 +688,7 @@
     preloadedSnapshotSmartSummaries: {{ preloaded_snapshot_smart_summary_json | script_json_text }},
     preloadedStorageViewSmartSummaries: {{ preloaded_storage_view_smart_summary_json | script_json_text }},
     preloadedHistorySummary: {{ preloaded_history_summary_json | script_json_text }},
+    preloadedSasFabric: {{ preloaded_sas_fabric_json | default("null") | script_json_text }},
     initialSelectedSlot: {{ initial_selected_slot_json | script_json_text }},
     initialSelectedStorageViewId: {{ initial_selected_storage_view_id_json | script_json_text }},
     initialHistoryTimeframeHours: {{ initial_history_timeframe_hours_json | script_json_text }},
