@@ -60,6 +60,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   A disk that never answers now yields that slot's unavailable summary instead of
   holding the whole grid request open behind it (#524).
 
+- Kept last-good SMART data across inventory refreshes and restarts. Every snapshot
+  build used to replace a slot's cached entry with one that held no SMART fields, so
+  the persisted layer the SMART grid and exports serve was erased within one snapshot
+  TTL of being written. Carried-forward values keep the timestamp of the read that
+  produced them and are marked stale; only a successful read replaces them (#TBD).
+
 - Reported an unusable data directory on the SMART grid as the local fault it is.
   A filesystem failure while caching SMART results now answers 500 with a message
   naming the data directory and logs one line, instead of a 503 that reads as a

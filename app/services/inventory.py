@@ -3141,7 +3141,12 @@ class InventoryService:
 
         def save():
             with perf_stage("inventory.slot_detail_cache.persist", slot_count=len(slots)):
-                entries = [self._build_slot_detail_entry(slot, smart_summary=None) for slot in slots]
+                # `loaded` is the same read the apply step used; reuse it so the
+                # last-good SMART carry-forward costs no extra file I/O (#521).
+                entries = [
+                    self._build_slot_detail_entry(slot, smart_summary=None, loaded_entries=loaded)
+                    for slot in slots
+                ]
                 store.save_entries(
                     [entry for entry in entries if entry is not None],
                     expected_entries=loaded, commit_guard=commit_guard,
@@ -3298,6 +3303,7 @@ class InventoryService:
         slot_view: SlotView,
         *,
         smart_summary: SmartSummaryView | None,
+        loaded_entries: Mapping[str, SlotDetailCacheEntry] | None = None,
     ) -> SlotDetailCacheEntry | None:
         identifiers = sorted(self._slot_detail_identifiers(slot_view))
         if not identifiers:
@@ -3320,6 +3326,8 @@ class InventoryService:
                 slot_fields[field_name] = value
 
         smart_fields: dict[str, Any] = {}
+        smart_updated_at: str | None = None
+        smart_stale = False
         if smart_summary is not None:
             for field_name in STABLE_SMART_DETAIL_FIELDS:
                 value = getattr(smart_summary, field_name)
@@ -3328,6 +3336,21 @@ class InventoryService:
                 smart_fields[field_name] = value
             if smart_fields:
                 smart_fields["available"] = smart_summary.available
+                smart_updated_at = utcnow().isoformat()
+        if not smart_fields:
+            # No SMART read produced this entry, so it must not speak for the
+            # SMART half. Carry the last-good fields forward for the same disk
+            # instead of replacing them with nothing: the snapshot path rebuilds
+            # an entry for every present slot on every refresh, and a whole-entry
+            # replace there erased the layer the persistent-hit path, the
+            # fallback merge and the exports all claim to serve (#521). The
+            # values keep the timestamp of the read that produced them and are
+            # marked stale, so nothing reads them as current.
+            previous = self._previous_slot_detail_entry(slot_view, loaded_entries=loaded_entries)
+            if previous is not None and previous.smart_fields:
+                smart_fields = dict(previous.smart_fields)
+                smart_updated_at = previous.smart_updated_at or previous.updated_at
+                smart_stale = True
 
         if not slot_fields and not smart_fields:
             return None
@@ -3339,7 +3362,24 @@ class InventoryService:
             identifiers=identifiers,
             slot_fields=slot_fields,
             smart_fields=smart_fields,
+            smart_updated_at=smart_updated_at,
+            smart_stale=smart_stale,
         )
+
+    def _previous_slot_detail_entry(
+        self, slot_view: SlotView, *,
+        loaded_entries: Mapping[str, SlotDetailCacheEntry] | None = None,
+    ) -> SlotDetailCacheEntry | None:
+        """The stored entry for this bay, only when it describes this same disk."""
+        store = self.slot_detail_store
+        if store is None:
+            return None
+        entry = store.get_entry(
+            self.system.id, slot_view.enclosure_id, slot_view.slot, loaded_entries=loaded_entries,
+        )
+        if entry is None or not self._slot_detail_entry_matches(slot_view, entry):
+            return None
+        return entry
 
     def _slot_detail_entry_matches(self, slot_view: SlotView, entry: SlotDetailCacheEntry) -> bool:
         if slot_view.state == SlotState.empty or not slot_view.present:
@@ -4185,7 +4225,9 @@ class InventoryService:
         await batch.entries()
 
         async def persist(summary: SmartSummaryView) -> None:
-            entry = self._build_slot_detail_entry(slot_view, smart_summary=summary)
+            entry = self._build_slot_detail_entry(
+                slot_view, smart_summary=summary, loaded_entries=await batch.entries(),
+            )
             if entry is not None:
                 batch.pending.append(entry)
                 batch.generations.append((self, cache_key, generation_token))
