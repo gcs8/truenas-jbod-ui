@@ -132,6 +132,7 @@ WINDOWS_PORTABLE_TEST_MODULES = (
     "tests.test_release_changelog_coverage",
     "tests.test_release_status",
     "tests.test_release_wrap_validator",
+    "tests.test_scripts_help",
     "tests.test_ssh_probe",
     "tests.test_tls_trust",
     "tests.test_truenas_ws",
@@ -748,8 +749,23 @@ def build_parser() -> argparse.ArgumentParser:
         description="Run the authoritative platform-aware source validation gates."
     )
     mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--safe", dest="mode", action="store_const", const="safe")
-    mode.add_argument("--full", dest="mode", action="store_const", const="full")
+    mode.add_argument(
+        "--safe",
+        dest="mode",
+        action="store_const",
+        const="safe",
+        help=(
+            "Run the source gates that need no Docker, network or live data: unit tests, "
+            "compileall, ruff, JS syntax, JS unit tests, diff hygiene and the perf baseline."
+        ),
+    )
+    mode.add_argument(
+        "--full",
+        dest="mode",
+        action="store_const",
+        const="full",
+        help="Everything in --safe plus the checked-in public-demo artifact check.",
+    )
     return parser
 
 

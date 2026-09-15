@@ -51,6 +51,39 @@ def _script_paths() -> list[Path]:
     return sorted(path for path in SCRIPTS_DIR.glob("*.py"))
 
 
+def _is_command_line_entry_point(path: Path) -> bool:
+    """True for scripts an operator runs; the shared data modules have no main guard."""
+    return 'if __name__ == "__main__":' in path.read_text(encoding="utf-8")
+
+
+def _argument_help_text(help_output: str, argument: str) -> str:
+    """Return the help text argparse printed for one flag, joined across wraps."""
+    lines = help_output.splitlines()
+    # Skip the usage block: it repeats every flag with no description.
+    for offset, line in enumerate(lines):
+        if not line.strip():
+            lines = lines[offset + 1:]
+            break
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped.startswith(argument):
+            continue
+        indent = len(line) - len(line.lstrip())
+        remainder = stripped[len(argument):]
+        parts: list[str] = []
+        if "  " in remainder:
+            parts.append(remainder.split("  ", 1)[1].strip())
+        for continuation in lines[index + 1:]:
+            if not continuation.strip():
+                break
+            continuation_indent = len(continuation) - len(continuation.lstrip())
+            if continuation_indent <= indent:
+                break
+            parts.append(continuation.strip())
+        return " ".join(part for part in parts if part).strip()
+    return ""
+
+
 def _run_help(path: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, str(path), "--help"],
@@ -72,7 +105,7 @@ class ScriptHelpTests(unittest.TestCase):
                 if result.returncode != 0:
                     failures.append(f"{path.name}: exit {result.returncode}: {result.stderr.strip()[-200:]}")
                     continue
-                if "usage" not in result.stdout.lower():
+                if _is_command_line_entry_point(path) and "usage" not in result.stdout.lower():
                     failures.append(f"{path.name}: no usage line in stdout")
         self.assertEqual(failures, [], "\n".join(failures))
 
@@ -86,17 +119,7 @@ class ScriptHelpTests(unittest.TestCase):
             text = result.stdout
             for argument in arguments:
                 self.assertIn(argument, text, f"{name} does not offer {argument}")
-                described = False
-                for line in text.splitlines():
-                    stripped = line.strip()
-                    if not stripped.startswith(argument):
-                        continue
-                    remainder = stripped[len(argument):]
-                    # argparse puts the metavar right after the flag; help text
-                    # follows after at least two spaces, or on the next line.
-                    if "  " in remainder and remainder.split("  ", 1)[1].strip():
-                        described = True
-                if not described:
+                if not _argument_help_text(text, argument):
                     missing.append(f"{name} {argument}")
         self.assertEqual(missing, [], "\n".join(missing))
 
