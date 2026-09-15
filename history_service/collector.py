@@ -14,6 +14,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from history_service.config import HistorySettings
+from history_service.diagnostics import (
+    HistorySourceError,
+    classify_collection_failure,
+    classify_retention_failure,
+)
 from app.request_context import request_id_headers
 from app.metrics import (
     observe_history_collection_run,
@@ -119,7 +124,10 @@ class HistoryCollector:
         self.last_retention_daily_rollups_removed: int = 0
         self.last_retention_has_more: bool = False
         self.last_retention_error: str | None = None
+        self.last_retention_error_kind: str | None = None
         self.last_error: str | None = None
+        self.last_error_kind: str | None = None
+        self.last_error_summary: str | None = None
         self.last_scope_count: int = 0
         self.current_collection_started_at: str | None = None
         self.current_collection_kind: str | None = None
@@ -485,7 +493,7 @@ class HistoryCollector:
             backup_at=retention_backup_at,
         )
         self.last_success_at = observed_at
-        self.last_error = None
+        self.clear_failure_diagnostics()
         self._set_collection_activity("collection completed")
         self._clear_background_failure_backoff()
 
@@ -536,7 +544,10 @@ class HistoryCollector:
             "last_retention_daily_rollups_removed": self.last_retention_daily_rollups_removed,
             "last_retention_has_more": self.last_retention_has_more,
             "last_retention_error": self.last_retention_error,
+            "last_retention_error_kind": self.last_retention_error_kind,
             "last_error": self.last_error,
+            "last_error_kind": self.last_error_kind,
+            "last_error_summary": self.last_error_summary,
             "last_scope_count": self.last_scope_count,
             "source_base_url": self.settings.source_base_url,
             "sqlite_path": self.settings.sqlite_path,
@@ -623,6 +634,7 @@ class HistoryCollector:
             except Exception as exc:  # noqa: BLE001 - keep the collector alive across transient appliance errors.
                 logger.exception("History collection pass failed")
                 self.last_error = str(exc)
+                self.record_failure_diagnostics(exc)
                 self._record_background_failure(utcnow())
                 observe_history_collection_run(
                     service_name=HISTORY_METRICS_SERVICE_NAME,
@@ -821,7 +833,9 @@ class HistoryCollector:
         except Exception as exc:  # noqa: BLE001 - retention failure must not stop collection.
             duration = time.perf_counter() - started
             self.last_retention_duration_seconds = round(duration, 3)
-            self.last_retention_error = type(exc).__name__
+            retention_kind, retention_summary = classify_retention_failure(exc)
+            self.last_retention_error_kind = retention_kind
+            self.last_retention_error = retention_summary
             partial_result = getattr(exc, "retention_summary", None)
             if not isinstance(partial_result, dict):
                 partial_result = {}
@@ -829,8 +843,9 @@ class HistoryCollector:
                 {**partial_result, "has_more": True}
             )
             logger.warning(
-                "History retention pass failed with %s; collection will continue.",
-                type(exc).__name__,
+                "History retention pass failed: %s; collection will continue. Cause: %s",
+                retention_summary,
+                exc,
             )
             observe_history_retention_run(
                 service_name=HISTORY_METRICS_SERVICE_NAME,
@@ -843,6 +858,7 @@ class HistoryCollector:
                 "db.retention.failed",
                 duration,
                 error_type=type(exc).__name__,
+                error_kind=retention_kind,
             )
             return
 
@@ -850,6 +866,7 @@ class HistoryCollector:
         self.last_retention_at = attempted_at
         self.last_retention_duration_seconds = round(duration, 3)
         self.last_retention_error = None
+        self.last_retention_error_kind = None
         removed_rows = self._apply_retention_result(result)
         observe_history_retention_run(
             service_name=HISTORY_METRICS_SERVICE_NAME,
@@ -887,6 +904,16 @@ class HistoryCollector:
             "hourly_rollups": self.last_retention_hourly_rollups_removed,
             "daily_rollups": self.last_retention_daily_rollups_removed,
         }
+
+    def record_failure_diagnostics(self, exc: BaseException) -> None:
+        """Record the fixed kind and sentence for a failed collection pass."""
+
+        self.last_error_kind, self.last_error_summary = classify_collection_failure(exc)
+
+    def clear_failure_diagnostics(self) -> None:
+        self.last_error = None
+        self.last_error_kind = None
+        self.last_error_summary = None
 
     def _retention_due(self, now: datetime) -> bool:
         if self.last_retention_has_more:
@@ -1679,18 +1706,28 @@ class HistoryCollector:
                 payload = json.load(response)
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"{method} {url} failed with HTTP {exc.code}: {detail}") from exc
+            raise HistorySourceError.rejected(
+                f"{method} {url} failed with HTTP {exc.code}: {detail}",
+                status_code=exc.code,
+            ) from exc
         except urllib.error.URLError as exc:
-            raise RuntimeError(f"{method} {url} failed: {exc.reason}") from exc
+            raise HistorySourceError.unreachable(f"{method} {url} failed: {exc.reason}") from exc
         except TimeoutError as exc:
-            raise RuntimeError(f"{method} {url} timed out after {request_timeout_seconds}s") from exc
+            raise HistorySourceError.timeout(
+                f"{method} {url} timed out after {request_timeout_seconds}s",
+                timeout_seconds=request_timeout_seconds,
+            ) from exc
         except json.JSONDecodeError as exc:
-            raise RuntimeError(f"{method} {url} returned invalid JSON: {exc}") from exc
+            raise HistorySourceError.bad_payload(
+                f"{method} {url} returned invalid JSON: {exc}"
+            ) from exc
 
         if isinstance(payload, dict) and payload.get("ok") is False:
-            raise RuntimeError(str(payload.get("detail") or f"{method} {url} returned an application error."))
+            raise HistorySourceError.error_reply(
+                str(payload.get("detail") or f"{method} {url} returned an application error.")
+            )
         if not isinstance(payload, dict):
-            raise RuntimeError(f"{method} {url} returned a non-object JSON payload.")
+            raise HistorySourceError.bad_payload(f"{method} {url} returned a non-object JSON payload.")
         return payload
 
     @staticmethod

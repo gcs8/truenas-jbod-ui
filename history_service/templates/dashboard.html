@@ -93,6 +93,8 @@
           <dt>Retry wait after errors</dt><dd id="status-background-backoff">{{ backoff_label }}</dd>
           <dt>Retry after</dt><dd id="status-background-backoff-until">{{ timestamp(status.get('background_backoff_until'), 'not active') }}</dd>
           <dt>Last error</dt><dd id="status-last-error">{{ status.get('last_error') or 'none' }}</dd>
+          <dt>What went wrong</dt><dd id="status-last-error-summary">{{ status.get('last_error_summary') or 'nothing recorded' }}</dd>
+          <dt>Full refresh available</dt><dd id="status-full-refresh-available">{{ timestamp(status.get('full_refresh_available_at'), 'now') }}</dd>
         </dl>
       </section>
 

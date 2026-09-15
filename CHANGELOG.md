@@ -42,6 +42,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Replaced the generic history collector error, the retention class name, and
+  the invisible full-refresh cooldown with fixed, secret-free sentences and a
+  published cooldown deadline (#TBD).
+
 - Retried failed release checks with bounded backoff instead of waiting a
   full normal interval, preserving the last successful result (#469).
 

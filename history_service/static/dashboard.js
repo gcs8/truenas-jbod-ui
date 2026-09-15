@@ -124,6 +124,8 @@
     setText("status-background-backoff", backoffLabel(collector.background_backoff_seconds_remaining));
     setText("status-background-backoff-until", formatTimestamp(collector.background_backoff_until, "not active"));
     setText("status-last-error", statusValue(collector.last_error, "none"));
+    setText("status-last-error-summary", statusValue(collector.last_error_summary, "nothing recorded"));
+    setText("status-full-refresh-available", formatTimestamp(collector.full_refresh_available_at, "now"));
   }
 
   function renderOverview(payload) {

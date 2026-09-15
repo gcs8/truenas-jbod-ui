@@ -5,7 +5,9 @@ import json
 import logging
 import math
 import os
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import cast
@@ -24,6 +26,7 @@ from app.services.history_status import project_public_collector_status
 from app.services.release_status import ReleaseStatusService
 from history_service.collector import HistoryCollectionAlreadyRunning, HistoryCollector
 from history_service.config import HistorySettings, get_history_settings
+from history_service.domain import isoformat_utc, utcnow
 from history_service.operation_bounds import (
     HISTORY_READ_BUSY_DETAIL,
     HISTORY_READ_RETRY_AFTER_SECONDS,
@@ -79,6 +82,17 @@ bulk_history_read_admission = BulkHistoryReadAdmission(
 )
 bulk_history_read_operations: set[asyncio.Task[tuple[list[dict[str, object]], int]]] = set()
 HISTORY_COLLECTOR_ERROR_DETAIL = "History collector error; see service logs."
+# Fixed-vocabulary diagnostics from history_service.diagnostics. They are safe to
+# publish (no URLs, paths or appliance text), so the dashboard shows them next to
+# the redacted last_error, which stays generic for the main UI projection.
+HISTORY_DIAGNOSTIC_STATUS_FIELDS = (
+    "last_error_kind",
+    "last_error_summary",
+    "last_retention_error_kind",
+    "last_retention_skip_reason",
+    "last_retention_skip_until",
+    "last_retention_ran_without_backup",
+)
 SLOT_HISTORY_METRIC_LIMITS: dict[str, int] = {
     "temperature_c": 96,
     "bytes_read": 60,
@@ -267,10 +281,23 @@ def public_collector_status(
     *,
     last_error_detail: str = HISTORY_COLLECTOR_ERROR_DETAIL,
 ) -> dict[str, object]:
-    return project_public_collector_status(
+    projected = project_public_collector_status(
         status,
         last_error_detail=last_error_detail,
     )
+    if not projected:
+        return projected
+    if isinstance(status, Mapping):
+        for field in HISTORY_DIAGNOSTIC_STATUS_FIELDS:
+            projected[field] = status.get(field)
+    cooldown = refresh_admission.cooldown_state()
+    remaining = int(cooldown["seconds_remaining"])
+    projected["full_refresh_cooldown_seconds"] = int(cooldown["cooldown_seconds"])
+    projected["full_refresh_cooldown_seconds_remaining"] = remaining
+    projected["full_refresh_available_at"] = (
+        isoformat_utc(utcnow() + timedelta(seconds=remaining)) if remaining > 0 else None
+    )
+    return projected
 
 
 def safe_http_url(value: object) -> str:
@@ -424,10 +451,11 @@ async def refresh_history(request: Request) -> dict[str, object] | JSONResponse:
             },
             status_code=409,
         )
-    except Exception:  # noqa: BLE001 - report manual collection failures as structured API errors.
+    except Exception as exc:  # noqa: BLE001 - report manual collection failures as structured API errors.
         logger.exception("Manual history %s refresh failed", normalized_mode)
         failure_detail = f"History {normalized_mode} refresh failed; see service logs."
         collector.last_error = failure_detail
+        collector.record_failure_diagnostics(exc)
         try:
             payload = await overview(exact_counts=False)
             collector_payload = payload.get("collector")
