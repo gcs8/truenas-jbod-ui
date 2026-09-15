@@ -126,6 +126,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Internal
 
+- Replaced the chain of command comparisons behind the SSH command failure
+  contexts with a lookup table and pinned every answer with tests; the debug
+  output is unchanged (#TBD)
+
 - Added a dispatch-only workflow that recaptures the public-demo screenshots
   inside the pinned Playwright Linux container, captures twice to prove the
   bytes are reproducible, and uploads the PNGs and proposed manifest entries for
