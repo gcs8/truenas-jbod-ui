@@ -78,7 +78,13 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Reported an unusable data directory on the SMART grid as the local fault it is.
   A filesystem failure while caching SMART results now answers 500 with a message
   naming the data directory and logs one line, instead of a 503 that reads as a
-  passing enclosure outage (#537).
+  passing enclosure outage. An unreadable TLS CA bundle raises its own error and
+  names the bundle, instead of sending the operator to the data directory (#537).
+
+- Stopped a shelf where every disk stalls from holding a SMART batch open for one
+  per-call timeout per round. The batch carries a deadline measured from the last
+  disk that answered; positions it never reaches are reported so the grid falls
+  back for them (#537).
 
 - Retried failed release checks with bounded backoff instead of waiting a
   full normal interval, preserving the last successful result (#469).

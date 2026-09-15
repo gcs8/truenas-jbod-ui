@@ -21,6 +21,7 @@ from app.services.history_backend import (
     HistoryBackendBusyError,
 )
 from app.services.history_status import project_public_collector_status
+from app.services.tls_context import TlsTrustConfigurationError
 from history_service.operation_bounds import (
     HISTORY_READ_BUSY_DETAIL,
     HISTORY_READ_RETRY_AFTER_SECONDS,
@@ -90,6 +91,15 @@ SMART_BATCH_LOCAL_STORAGE_DETAIL = (
     "SMART data could not be stored: the application data directory is not "
     "usable. This is a local fault, not a shelf outage, and retrying will not "
     "clear it; check the data directory's permissions, ownership and free space."
+)
+
+# #537: a configured CA bundle that cannot be read is also a local fault that
+# retrying will not clear, but it lives on the TLS path, so it gets its own
+# sentence instead of sending the operator to the data directory.
+SMART_BATCH_TLS_TRUST_DETAIL = (
+    "SMART data could not be fetched: the configured TLS CA bundle for this "
+    "system could not be loaded. This is a local configuration fault, not a "
+    "shelf outage; check the CA bundle path and its permissions."
 )
 
 
@@ -748,6 +758,20 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
                 )
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except TlsTrustConfigurationError as exc:
+            # #537: classified before the broad OSError branch below, which
+            # would otherwise report a missing CA bundle's ENOENT as a
+            # slot-detail-cache write failure and name the wrong path.
+            logger.error(
+                "SMART batch could not load the TLS CA bundle for enclosure %s: %s",
+                enclosure_id,
+                exc,
+                exc_info=exc,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=SMART_BATCH_TLS_TRUST_DETAIL,
+            ) from exc
         except (OSError, ConnectionClosed) as exc:
             # #523: a call that outlasts the timeout, or a dropped socket, is a
             # temporary unavailability of this shelf's SMART data and not a

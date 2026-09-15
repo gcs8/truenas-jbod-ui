@@ -178,6 +178,11 @@ class TrueNASRawData:
     cli_network_ports: list[dict[str, Any]] = field(default_factory=list)
 
 
+# #537: how much longer than one call the whole phase may take before the
+# remaining positions are reported instead of started.
+SMART_BATCH_PHASE_DEADLINE_MULTIPLIER = 2
+
+
 class TrueNASWebsocketClient:
     """
     Minimal DDP websocket client for TrueNAS middleware calls.
@@ -306,11 +311,35 @@ class TrueNASWebsocketClient:
         dispatcher = _MiddlewareCallDispatcher(ws)
         positions = iter(enumerate(disks))
         results: list[Any] = [""] * len(disks)
+        # #537: the per-call deadline is per disk, so a shelf where every disk
+        # stalls costs one timeout per round: 84 disks at width 12 held the
+        # batch open for about seven of them. The phase carries its own
+        # deadline, measured from the last disk that actually answered, so a
+        # healthy long batch keeps going while a stalled one stops after a
+        # bounded wait and reports the positions it never reached; the caller
+        # falls back for those instead of waiting.
+        phase_seconds = self.config.timeout_seconds * SMART_BATCH_PHASE_DEADLINE_MULTIPLIER
+        loop = asyncio.get_running_loop()
+        phase_deadline = loop.time() + phase_seconds
+
+        def note_progress() -> None:
+            nonlocal phase_deadline
+            phase_deadline = max(phase_deadline, loop.time() + phase_seconds)
 
         async def worker() -> None:
             for position, disk in positions:
+                remaining = phase_deadline - loop.time()
+                if remaining <= 0:
+                    expired = TimeoutError(
+                        f"disk.smartctl for {disk!r} was not started within the "
+                        f"{phase_seconds:g}s batch deadline."
+                    )
+                    if not return_exceptions:
+                        raise expired
+                    results[position] = expired
+                    continue
                 try:
-                    async with asyncio.timeout(self.config.timeout_seconds):
+                    async with asyncio.timeout(min(self.config.timeout_seconds, remaining)):
                         result = await dispatcher.call("disk.smartctl", [disk, args])
                 except TrueNASAPIError as exc:
                     if self.config.platform == "scale" and "ENOMETHOD" in str(exc):
@@ -348,6 +377,7 @@ class TrueNASWebsocketClient:
                     results[position] = payload_error
                     continue
                 results[position] = result
+                note_progress()
 
         tasks = [asyncio.create_task(worker()) for _ in range(width)]
         gathered = asyncio.gather(*tasks)
