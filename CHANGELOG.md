@@ -111,6 +111,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Docs
 
+- `docs/SCREENSHOT_CAPTURE.md` now records the font fallback families the
+  capture workflow has pinned since #516, the qualification run that recorded
+  them, and the re-qualification a maintainer owes before changing either;
+  `tests/test_ci_contract.py` reads the pair out of the workflow so the doc
+  cannot drift from the enforced values again. (#536)
+
 - Reconciled the v0.23.0 release wrap and Wiki home page with the published
   GitHub release, GHCR package, and Pages demo while retaining the qualified
   v0.22.2 beginner-installation pin. (#518)
@@ -138,6 +144,14 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Normalized pointer hover and focus before public-demo screenshot capture so
   the exact-byte repeatability gate measures a settled page instead of a
   transient transformed control (#519).
+
+- Stopped the coverage tracer and `tracemalloc` from multiplying each other in
+  the peak-heap probes: probes now run through `tests/heap_probe.py`, which
+  detaches the active trace function while it measures. The 16 MiB
+  streaming-JSON preflight probe took 365.2s of the 535.2s Python 3.12 test
+  body on run 34815729312 and 4.2s on the untraced 3.14 job in the same run;
+  the probes now also report the product's heap instead of the product's plus
+  the tracer's (#536).
 
 ## v0.23.0 - 2026-09-08
 

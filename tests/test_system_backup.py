@@ -13,7 +13,6 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-import tracemalloc
 import unittest
 import warnings
 import zipfile
@@ -23,6 +22,7 @@ from unittest.mock import patch
 
 import yaml
 
+from tests import heap_probe
 from app.config import PathConfig, Settings, get_settings
 from app.models.domain import (
     DebugBundleExportRequest,
@@ -1942,7 +1942,7 @@ class SystemBackupServiceTests(unittest.TestCase):
             )
         )
 
-        tracemalloc.start()
+        heap_probe.start()
         try:
             with self.assertRaisesRegex(ValueError, "compression ratio"):
                 self.backup_service._decompress_tar_archive_to_file(
@@ -1950,9 +1950,9 @@ class SystemBackupServiceTests(unittest.TestCase):
                     output_path,
                     "tar.zst",
                 )
-            _, peak_bytes = tracemalloc.get_traced_memory()
+            _, peak_bytes = heap_probe.get_traced_memory()
         finally:
-            tracemalloc.stop()
+            heap_probe.stop()
             output_path.unlink(missing_ok=True)
 
         self.assertLess(peak_bytes, 8 * 1024 * 1024)
@@ -3067,16 +3067,16 @@ sys.stdout.flush()
             output.write(b'}}')
         self.assertEqual(member_path.stat().st_size, payload_bytes)
 
-        tracemalloc.start()
+        heap_probe.start()
         try:
             accepted_entries = self.backup_service._validate_streaming_json_member(
                 member_path,
                 "slot_mappings",
                 ManualMapping,
             )
-            _, peak_bytes = tracemalloc.get_traced_memory()
+            _, peak_bytes = heap_probe.get_traced_memory()
         finally:
-            tracemalloc.stop()
+            heap_probe.stop()
 
         self.assertEqual(accepted_entries, mapping_entries)
         self.assertLess(peak_bytes, 8 * 1024 * 1024)
@@ -4235,10 +4235,10 @@ sys.stdout.flush()
                 included_paths=[HISTORY_DB_KEY],
             )
             try:
-                tracemalloc.start()
+                heap_probe.start()
                 result = self.backup_service.import_bundle_from_file(artifact.path)
-                _, peak_bytes = tracemalloc.get_traced_memory()
-                tracemalloc.stop()
+                _, peak_bytes = heap_probe.get_traced_memory()
+                heap_probe.stop()
             finally:
                 artifact.cleanup()
 
@@ -4294,14 +4294,14 @@ sys.stdout.flush()
                 "synthetic flat allocation passphrase",
             )
 
-            tracemalloc.start()
+            heap_probe.start()
             self.backup_service._decrypt_scheduled_archive_to_file(
                 encrypted_path,
                 decrypted_path,
                 "synthetic flat allocation passphrase",
             )
-            _, peak_bytes = tracemalloc.get_traced_memory()
-            tracemalloc.stop()
+            _, peak_bytes = heap_probe.get_traced_memory()
+            heap_probe.stop()
             peaks.append(peak_bytes)
             self.assertEqual(
                 self.backup_service._extracted_member_sha256(source_path),
@@ -4326,13 +4326,13 @@ sys.stdout.flush()
             ),
         ):
             get_settings.cache_clear()
-            tracemalloc.start()
+            heap_probe.start()
             artifact = self.backup_service.export_bundle_to_file(
                 packaging="zip",
                 included_paths=[HISTORY_DB_KEY],
             )
-            _, peak_bytes = tracemalloc.get_traced_memory()
-            tracemalloc.stop()
+            _, peak_bytes = heap_probe.get_traced_memory()
+            heap_probe.stop()
 
         try:
             self.assertTrue(artifact.path.is_file())
