@@ -73,8 +73,9 @@ class UpgradeNotesContractTests(unittest.TestCase):
 
         self.assertEqual(len(authentication), 1, breaking)
         self.assertIn("#392", authentication[0])
-        self.assertNotIn("(#201)", "\n".join(breaking))
-        self.assertNotIn("(#245 and #246)", "\n".join(breaking))
+        joined = "\n".join(breaking)
+        self.assertNotIn("Required local authentication", joined)
+        self.assertNotIn("Required a configured admin public origin", joined)
 
     def test_one_feature_is_one_added_bullet(self) -> None:
         added = "\n".join(bullets(subsection(release_section("v0.23.0"), "Added")))
