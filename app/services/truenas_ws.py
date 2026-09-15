@@ -178,6 +178,11 @@ class TrueNASRawData:
     cli_network_ports: list[dict[str, Any]] = field(default_factory=list)
 
 
+# #537: how much longer than one call the whole phase may take before the
+# remaining positions are reported instead of started.
+SMART_BATCH_PHASE_DEADLINE_MULTIPLIER = 2
+
+
 class TrueNASWebsocketClient:
     """
     Minimal DDP websocket client for TrueNAS middleware calls.
@@ -250,12 +255,20 @@ class TrueNASWebsocketClient:
 
     async def smartctl_batch(
         self, disks: list[str], args: list[str] | None = None, *, max_concurrency: int,
-    ) -> list[str]:
+        return_exceptions: bool = False,
+    ) -> list[str] | list[str | BaseException]:
         """Fetch a bounded, positional SMART batch over one authenticated session.
 
         Fail fast without partial results or retries. The budget is request-local;
         duplicate disk names remain separate calls. Cancellation drains owned work
         before returning, including when the caller cancels more than once.
+
+        With ``return_exceptions``, a failure that belongs to ONE disk - a
+        middleware rejection for a device it cannot open or a name not in its
+        disk table (#522), or a reply slower than the per-call deadline (#523) -
+        is returned at that disk's position instead of discarding the whole
+        batch. A failure of the session itself still raises: no result in it is
+        trustworthy, and there is nothing to keep.
         """
         if type(max_concurrency) is not int or max_concurrency <= 0:
             raise ValueError("max_concurrency must be a positive integer.")
@@ -270,6 +283,7 @@ class TrueNASWebsocketClient:
         # Snapshot caller-owned containers before any await, without deduplication.
         owner = asyncio.create_task(self._run_smartctl_batch(
             list(disks), list(args or ["-a", "-j"]), min(max_concurrency, len(disks)),
+            return_exceptions=bool(return_exceptions),
         ))
         try:
             await asyncio.wait({owner})
@@ -287,29 +301,83 @@ class TrueNASWebsocketClient:
             raise
         return owner.result()
 
-    async def _run_smartctl_batch(self, disks: list[str], args: list[str], width: int) -> list[str]:
+    async def _run_smartctl_batch(
+        self, disks: list[str], args: list[str], width: int, *, return_exceptions: bool = False,
+    ) -> list[str] | list[str | BaseException]:
         session = self._session()
         async with asyncio.timeout(self.config.timeout_seconds):
             ws = await session.__aenter__()
         primary: BaseException | None = None
         dispatcher = _MiddlewareCallDispatcher(ws)
         positions = iter(enumerate(disks))
-        results = [""] * len(disks)
+        results: list[Any] = [""] * len(disks)
+        # #537: the per-call deadline is per disk, so a shelf where every disk
+        # stalls costs one timeout per round: 84 disks at width 12 held the
+        # batch open for about seven of them. The phase carries its own
+        # deadline, measured from the last disk that actually answered, so a
+        # healthy long batch keeps going while a stalled one stops after a
+        # bounded wait and reports the positions it never reached; the caller
+        # falls back for those instead of waiting.
+        phase_seconds = self.config.timeout_seconds * SMART_BATCH_PHASE_DEADLINE_MULTIPLIER
+        loop = asyncio.get_running_loop()
+        phase_deadline = loop.time() + phase_seconds
+
+        def note_progress() -> None:
+            nonlocal phase_deadline
+            phase_deadline = max(phase_deadline, loop.time() + phase_seconds)
 
         async def worker() -> None:
             for position, disk in positions:
+                remaining = phase_deadline - loop.time()
+                if remaining <= 0:
+                    expired = TimeoutError(
+                        f"disk.smartctl for {disk!r} was not started within the "
+                        f"{phase_seconds:g}s batch deadline."
+                    )
+                    if not return_exceptions:
+                        raise expired
+                    results[position] = expired
+                    continue
                 try:
-                    async with asyncio.timeout(self.config.timeout_seconds):
+                    async with asyncio.timeout(min(self.config.timeout_seconds, remaining)):
                         result = await dispatcher.call("disk.smartctl", [disk, args])
                 except TrueNASAPIError as exc:
                     if self.config.platform == "scale" and "ENOMETHOD" in str(exc):
+                        # Not about this disk: the method is absent, so nothing
+                        # in this batch can succeed. Fail the whole batch.
                         raise TrueNASAPIError(
                             "Detailed SMART JSON is not available through the SCALE websocket API on this system."
                         ) from exc
-                    raise
+                    if not return_exceptions:
+                        raise
+                    results[position] = exc
+                    continue
+                except TimeoutError as exc:
+                    if not return_exceptions:
+                        raise
+                    # A reply slower than the per-call deadline belongs to this
+                    # disk, not to the session: the dispatcher has already
+                    # dropped the request id, so a late reply is discarded
+                    # rather than settling another position, and the remaining
+                    # workers keep draining the queue (#523). Reported as a
+                    # named TimeoutError so the caller's log says which disk.
+                    timeout_error = TimeoutError(
+                        f"disk.smartctl for {disk!r} did not answer within "
+                        f"{self.config.timeout_seconds:g}s."
+                    )
+                    timeout_error.__cause__ = exc
+                    results[position] = timeout_error
+                    continue
                 if not isinstance(result, str):
-                    raise TrueNASAPIError(f"disk.smartctl returned unexpected payload type for {disk!r}.")
+                    payload_error = TrueNASAPIError(
+                        f"disk.smartctl returned unexpected payload type for {disk!r}."
+                    )
+                    if not return_exceptions:
+                        raise payload_error
+                    results[position] = payload_error
+                    continue
                 results[position] = result
+                note_progress()
 
         tasks = [asyncio.create_task(worker()) for _ in range(width)]
         gathered = asyncio.gather(*tasks)

@@ -32,6 +32,22 @@ def resolve_tls_server_name(config: TrueNASConfig) -> str | None:
     return parsed.hostname
 
 
+class TlsTrustConfigurationError(RuntimeError):
+    """The configured CA bundle cannot be used, so nothing can be verified.
+
+    #537: this used to surface as a bare `OSError` (ENOENT for a missing
+    bundle), which callers that also handle storage failures reported as an
+    unusable application data directory, sending the operator to the wrong
+    path. It is deliberately not an `OSError`.
+    """
+
+    def __init__(self, bundle_path: str, cause: BaseException) -> None:
+        self.bundle_path = bundle_path
+        super().__init__(
+            f"The configured TLS CA bundle {bundle_path} could not be loaded: {cause}"
+        )
+
+
 def build_tls_client_context(config: TrueNASConfig) -> ssl.SSLContext | None:
     if not host_uses_tls(config.host):
         return None
@@ -40,7 +56,12 @@ def build_tls_client_context(config: TrueNASConfig) -> ssl.SSLContext | None:
     context.minimum_version = ssl.TLSVersion.TLSv1_2
     if config.verify_ssl:
         if config.tls_ca_bundle_path:
-            context.load_verify_locations(cafile=config.tls_ca_bundle_path)
+            try:
+                context.load_verify_locations(cafile=config.tls_ca_bundle_path)
+            except OSError as exc:
+                # Includes ssl.SSLError for a malformed bundle. Verification
+                # was asked for, so this fails rather than falling back.
+                raise TlsTrustConfigurationError(config.tls_ca_bundle_path, exc) from exc
             if hasattr(ssl, "VERIFY_X509_PARTIAL_CHAIN"):
                 context.verify_flags |= ssl.VERIFY_X509_PARTIAL_CHAIN
         return context
