@@ -926,6 +926,77 @@ class SmartGridIOTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(trace.operations["write"], 1)
             self.assert_other(store, other)
 
+    async def test_snapshot_refresh_keeps_last_good_smart_fields(self):
+        # #521: every snapshot build persisted an entry with smart_fields={} for
+        # every present slot, and save_entries replaces the whole entry, so the
+        # SMART half of the cache was erased at most one snapshot TTL (10 s by
+        # default) after it was written and never survived a restart. The
+        # "persistent-hit" path, the fallback merge and the export path all
+        # promise a last-good SMART layer that was empty on every deployment.
+        with self.fixture(2) as (service, api, store, other):
+            snapshot = await self.snapshot(service, 2)
+            slots = [s.slot for s in snapshot.slots]
+            result, _ = await self.grid(service, slots, "smart-persist")
+            self.assertTrue(all(r.summary.power_on_hours == api.hours for r in result))
+            keys = [store._slot_key(service.system.id, s.enclosure_id, s.slot) for s in snapshot.slots]
+            before = store.load_all()
+            for key in keys:
+                self.assertEqual(before[key].smart_fields.get("power_on_hours"), api.hours)
+                self.assertFalse(before[key].smart_stale, "a fresh read is not stale")
+                self.assertTrue(before[key].smart_updated_at)
+
+            await service.get_snapshot(force_refresh=True)
+
+            after = store.load_all()
+            for key in keys:
+                self.assertEqual(after[key].smart_fields, before[key].smart_fields)
+                # The values are last-good, not current: they keep the timestamp
+                # of the read that produced them and say so.
+                self.assertEqual(after[key].smart_updated_at, before[key].smart_updated_at)
+                self.assertTrue(after[key].smart_stale)
+            self.assert_other(store, other)
+
+    async def test_last_good_smart_survives_a_restart_and_a_failed_read(self):
+        # The other half of #521: the first snapshot after boot ran before any
+        # SMART request could read the cache, so a restart wiped the layer. A
+        # reopened store must still serve it, a failed read must not overwrite
+        # it, and the next successful read must clear the stale mark.
+        with self.fixture(1) as (service, api, store, other):
+            snapshot = await self.snapshot(service, 1)
+            slots = [s.slot for s in snapshot.slots]
+            await self.grid(service, slots, "smart-persist")
+            key = store._slot_key(service.system.id, snapshot.slots[0].enclosure_id, slots[0])
+            persisted = store.load_all()[key]
+
+            reopened = SlotDetailStore(str(store.file_path))
+            service.slot_detail_store = reopened
+            await service.get_snapshot(force_refresh=True)
+            self.assertEqual(reopened.load_all()[key].smart_fields, persisted.smart_fields)
+
+            # A failed read keeps the last-good values rather than clearing them.
+            api.available = False
+            service._smart_cache.clear()
+            service._smart_cache_until.clear()
+            service._smart_negative_cache.clear()
+            result, _ = await self.grid(service, slots, "smart-failed-read")
+            self.assertEqual(result[0].summary.power_on_hours, api.hours)
+            kept = reopened.load_all()[key]
+            self.assertEqual(kept.smart_fields, persisted.smart_fields)
+            self.assertEqual(kept.smart_updated_at, persisted.smart_updated_at)
+
+            # A successful read overwrites them and clears the stale mark.
+            api.available = True
+            api.hours = 999
+            service._smart_cache.clear()
+            service._smart_cache_until.clear()
+            service._smart_negative_cache.clear()
+            result, _ = await self.grid(service, slots, "smart-fresh-read")
+            refreshed = reopened.load_all()[key]
+            self.assertEqual(refreshed.smart_fields.get("power_on_hours"), 999)
+            self.assertFalse(refreshed.smart_stale)
+            self.assertNotEqual(refreshed.smart_updated_at, persisted.smart_updated_at)
+            self.assert_other(store, other)
+
     async def test_allow_stale_returns_history_then_default_request_refreshes(self):
         with self.fixture(1) as (service, api, store, other):
             snapshot = await self.snapshot(service, 1)
