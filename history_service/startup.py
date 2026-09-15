@@ -6,6 +6,11 @@ container with a bare traceback. This module retries a bounded number of times
 (an operator fixing ownership while the container comes up is the common case)
 and then fails once with the path, the owner and the command to run, recording
 the same reason for `/healthz` and for anything else that wants to report it.
+
+The caller decides what a terminal failure means. `history_service.main` keeps
+the process up and serves the recorded reason, because restarting does not
+change a directory's ownership: a rethrow here would only repeat the retries
+and the traceback under `restart: unless-stopped`.
 """
 from __future__ import annotations
 
@@ -47,10 +52,20 @@ def _record(reason: str | None) -> None:
     _startup_failure_reason = reason
 
 
+def _resolve_directory(directory: Path | str | Callable[[], Path | str]) -> Path | str:
+    """Resolve a directory that may only be knowable after settings load."""
+    if callable(directory):
+        try:
+            return directory()
+        except Exception:  # pragma: no cover - the reason must survive this
+            return "the history directory"
+    return directory
+
+
 def open_history_store_with_retries(
     factory: Callable[[], T],
     *,
-    directory: Path | str,
+    directory: Path | str | Callable[[], Path | str],
     attempts: int = DEFAULT_ATTEMPTS,
     initial_backoff_seconds: float = DEFAULT_INITIAL_BACKOFF_SECONDS,
     sleep: Callable[[float], None] = time.sleep,
@@ -71,7 +86,7 @@ def open_history_store_with_retries(
             if not is_unwritable_error(exc):
                 _record(None)
                 raise
-            reason = describe_unwritable_directory(directory)
+            reason = describe_unwritable_directory(_resolve_directory(directory))
             if attempt >= attempts:
                 _record(reason)
                 logger.error("%s", reason)

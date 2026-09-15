@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import errno
 import os
+import sqlite3
 from pathlib import Path
 
 UNWRITABLE_ERRNOS = frozenset(
@@ -19,6 +20,36 @@ UNWRITABLE_ERRNOS = frozenset(
 )
 
 SAVE_DETAIL = "Could not save: the data folder is not writable by the app. See Troubleshooting."
+
+# SQLite reports a read-only directory as a message with no errno, so the
+# errno test alone misses exactly the startup failure this module explains.
+# Only these two messages are permission failures; "database is locked" and a
+# malformed image keep their own error.
+SQLITE_UNWRITABLE_MESSAGES = (
+    "attempt to write a readonly database",
+    "unable to open database file",
+)
+
+# The operator runs the repair on the Docker host, where the container paths
+# do not exist. Compose binds these host sources, so name those instead.
+CONTAINER_BIND_SOURCES = (
+    ("/app/backup-status", "./backup-status"),
+    ("/app/config", "./config"),
+    ("/app/data", "./data"),
+    ("/app/history", "./history"),
+    ("/app/logs", "./logs"),
+)
+
+
+def host_repair_path(directory: Path | str) -> str:
+    """The path an operator types on the Docker host for `directory`."""
+    text = Path(directory).as_posix()
+    for container, host in CONTAINER_BIND_SOURCES:
+        if text == container:
+            return host
+        if text.startswith(container + "/"):
+            return host + text[len(container):]
+    return str(directory)
 
 
 def _running_identity() -> tuple[int | None, int | None]:
@@ -41,11 +72,12 @@ def describe_unwritable_directory(directory: Path | str) -> str:
 
     owner = f"owned by uid {owner_uid}" if owner_uid is not None else "owner unknown"
     running = f"running as uid {running_uid}" if running_uid is not None else "running as this user"
+    target = host_repair_path(path)
     if running_uid is None or running_gid is None:
-        remedy = f"On the Docker host, give the app user write access to {path}."
+        remedy = f"On the Docker host, give the app user write access to {target}."
     else:
         remedy = (
-            f"On the Docker host run: sudo chown -R {running_uid}:{running_gid} {path}"
+            f"On the Docker host run: sudo chown -R {running_uid}:{running_gid} {target}"
         )
     return f"Cannot write to {path} ({owner}, {running}). {remedy}"
 
@@ -63,7 +95,11 @@ class StorageDirectoryUnwritable(RuntimeError):
 
 
 def is_unwritable_error(exc: BaseException) -> bool:
-    return isinstance(exc, OSError) and exc.errno in UNWRITABLE_ERRNOS
+    if isinstance(exc, OSError) and exc.errno in UNWRITABLE_ERRNOS:
+        return True
+    if type(exc) is sqlite3.OperationalError:
+        return str(exc).strip().lower() in SQLITE_UNWRITABLE_MESSAGES
+    return False
 
 
 def unwritable_directory_error(
