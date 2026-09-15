@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import errno
 import os
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +11,7 @@ from unittest.mock import patch
 from app.services.storage_writability import (
     StorageDirectoryUnwritable,
     describe_unwritable_directory,
+    is_unwritable_error,
     unwritable_directory_error,
 )
 from history_service.startup import (
@@ -139,6 +141,94 @@ class HistoryStartupRetryTests(unittest.TestCase):
         self.assertIsNotNone(recorded)
         assert recorded is not None
         self.assertIn(str(directory), recorded)
+
+
+class SqliteUnwritableClassificationTests(unittest.TestCase):
+    """SQLite reports a read-only directory as a message, not as an errno."""
+
+    def test_sqlite_read_only_and_open_failures_are_unwritable(self) -> None:
+        for message in (
+            "attempt to write a readonly database",
+            "unable to open database file",
+        ):
+            with self.subTest(message=message):
+                self.assertTrue(is_unwritable_error(sqlite3.OperationalError(message)))
+
+    def test_locked_and_corrupt_databases_keep_their_own_failure(self) -> None:
+        for error in (
+            sqlite3.OperationalError("database is locked"),
+            sqlite3.OperationalError("no such table: samples"),
+            sqlite3.DatabaseError("database disk image is malformed"),
+        ):
+            with self.subTest(error=str(error)):
+                self.assertFalse(is_unwritable_error(error))
+
+
+class HostRepairInstructionTests(unittest.TestCase):
+    """The operator runs the repair on the host, so it must name a host path."""
+
+    def test_a_container_mount_is_named_by_its_host_bind_source(self) -> None:
+        message = describe_unwritable_directory(Path("/app/history"))
+        remedy = message.split("On the Docker host", 1)[1]
+
+        self.assertIn("./history", remedy)
+        self.assertNotIn("/app/history", remedy)
+
+    def test_a_path_inside_a_container_mount_keeps_its_relative_tail(self) -> None:
+        message = describe_unwritable_directory(Path("/app/data/mappings"))
+        remedy = message.split("On the Docker host", 1)[1]
+
+        self.assertIn("./data/mappings", remedy)
+        self.assertNotIn("/app/data", remedy)
+
+    def test_a_path_outside_the_container_mounts_is_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            message = describe_unwritable_directory(Path(raw))
+
+        self.assertIn(raw, message.split("On the Docker host", 1)[1])
+
+
+class HistoryRuntimeStartupTests(unittest.TestCase):
+    """Settings-time directory creation is part of the guarded startup."""
+
+    def test_a_settings_time_permission_failure_is_retried_and_explained(self) -> None:
+        from history_service import main as history_main
+
+        calls: list[int] = []
+
+        def failing_settings() -> object:
+            calls.append(1)
+            raise PermissionError(errno.EACCES, "Permission denied")
+
+        with patch.object(history_main, "get_history_settings", failing_settings):
+            with self.assertRaises(HistoryStartupError) as raised:
+                history_main.open_history_runtime(
+                    attempts=2,
+                    initial_backoff_seconds=0.0,
+                    sleep=lambda _seconds: None,
+                )
+
+        self.assertEqual(len(calls), 2, "the settings mkdir must be retried")
+        self.assertIn("Cannot write to", raised.exception.reason)
+
+    def test_a_terminal_failure_reports_unavailable_instead_of_crash_looping(self) -> None:
+        from history_service import main as history_main
+
+        def failing_settings() -> object:
+            raise PermissionError(errno.EACCES, "Permission denied")
+
+        with patch.object(history_main, "get_history_settings", failing_settings):
+            settings, store, reason = history_main.load_history_runtime(
+                attempts=1,
+                initial_backoff_seconds=0.0,
+                sleep=lambda _seconds: None,
+            )
+
+        self.assertIsNone(store, "the process must stay up with no store")
+        self.assertIsNotNone(reason)
+        assert reason is not None
+        self.assertIn("Cannot write to", reason)
+        self.assertIsNotNone(settings, "a default settings object keeps the app importable")
 
 
 class MappingStoreUnwritableTests(unittest.TestCase):
