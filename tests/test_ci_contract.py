@@ -730,7 +730,7 @@ class CIWorkflowContractTests(unittest.TestCase):
 
 
 class CIRunsOncePerPullRequestTests(unittest.TestCase):
-    """#TBD: one CI run per head commit, no CANCELLED required check."""
+    """#541: one CI run per head commit, no CANCELLED required check."""
 
     def read(self, path: Path) -> str:
         return path.read_text(encoding="utf-8")
@@ -743,7 +743,10 @@ class CIRunsOncePerPullRequestTests(unittest.TestCase):
         self.assertEqual(route["outputs"]["run"], "${{ steps.decide.outputs.run }}")
         self.assertEqual(route["permissions"]["pull-requests"], "read")
         self.assertIn('if [ "${EVENT_NAME}" != "push" ]', script)
-        self.assertIn('gh pr list --repo "$GH_REPO" --head "$BRANCH_NAME" --state open', script)
+        self.assertIn(
+            'gh pr list --repo "$GH_REPO" --head "$BRANCH_NAME" --base main --state open',
+            script,
+        )
         self.assertIn('echo "run=false" >> "$GITHUB_OUTPUT"', script)
 
     def test_push_runs_only_defer_to_pull_requests_this_workflow_runs(self) -> None:

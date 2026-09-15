@@ -32,7 +32,7 @@ jobs:
       # open pull request the `pull_request` run covers the same commit, so the
       # push run's jobs skip instead of repeating eight jobs. Skipped jobs
       # satisfy required checks; cancelling the duplicate would show as a
-      # CANCELLED check instead (#TBD).
+      # CANCELLED check instead (#541).
       - name: Decide whether this run is the one for this head commit
         id: decide
         env:
@@ -55,10 +55,14 @@ jobs:
             exit 0
           fi
 
-          # An unreadable pull request list runs the preflight rather than
-          # skipping it, so an API failure can never hide a broken branch.
+          # `pull_request` only fires for pull requests into main, so only
+          # those cover this commit; a stacked pull request into another
+          # branch never runs this workflow and must not suppress the push
+          # run. An unreadable pull request list runs the preflight rather
+          # than skipping it, so an API failure can never hide a broken
+          # branch.
           open_pull_requests="$(
-            gh pr list --repo "$GH_REPO" --head "$BRANCH_NAME" --state open \
+            gh pr list --repo "$GH_REPO" --head "$BRANCH_NAME" --base main --state open \
               --json number --jq 'length' || echo ""
           )"
           if [ -z "${open_pull_requests}" ]; then
@@ -69,7 +73,7 @@ jobs:
 
           if [ "${open_pull_requests}" -gt 0 ]; then
             echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::Branch ${BRANCH_NAME} has an open pull request; its pull_request run covers this commit."
+            echo "::notice::Branch ${BRANCH_NAME} has an open pull request into main; its pull_request run covers this commit."
           else
             echo "run=true" >> "$GITHUB_OUTPUT"
             echo "no open pull request for ${BRANCH_NAME}: running the full preflight."
