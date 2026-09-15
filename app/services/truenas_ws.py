@@ -250,12 +250,19 @@ class TrueNASWebsocketClient:
 
     async def smartctl_batch(
         self, disks: list[str], args: list[str] | None = None, *, max_concurrency: int,
-    ) -> list[str]:
+        return_exceptions: bool = False,
+    ) -> list[str] | list[str | BaseException]:
         """Fetch a bounded, positional SMART batch over one authenticated session.
 
         Fail fast without partial results or retries. The budget is request-local;
         duplicate disk names remain separate calls. Cancellation drains owned work
         before returning, including when the caller cancels more than once.
+
+        With ``return_exceptions``, a failure that belongs to ONE disk - a
+        middleware rejection for a device it cannot open, or a name not in its
+        disk table - is returned at that disk's position instead of discarding
+        the whole batch (#522). A failure of the session itself still raises: no
+        result in it is trustworthy, and there is nothing to keep.
         """
         if type(max_concurrency) is not int or max_concurrency <= 0:
             raise ValueError("max_concurrency must be a positive integer.")
@@ -270,6 +277,7 @@ class TrueNASWebsocketClient:
         # Snapshot caller-owned containers before any await, without deduplication.
         owner = asyncio.create_task(self._run_smartctl_batch(
             list(disks), list(args or ["-a", "-j"]), min(max_concurrency, len(disks)),
+            return_exceptions=bool(return_exceptions),
         ))
         try:
             await asyncio.wait({owner})
@@ -287,14 +295,16 @@ class TrueNASWebsocketClient:
             raise
         return owner.result()
 
-    async def _run_smartctl_batch(self, disks: list[str], args: list[str], width: int) -> list[str]:
+    async def _run_smartctl_batch(
+        self, disks: list[str], args: list[str], width: int, *, return_exceptions: bool = False,
+    ) -> list[str] | list[str | BaseException]:
         session = self._session()
         async with asyncio.timeout(self.config.timeout_seconds):
             ws = await session.__aenter__()
         primary: BaseException | None = None
         dispatcher = _MiddlewareCallDispatcher(ws)
         positions = iter(enumerate(disks))
-        results = [""] * len(disks)
+        results: list[Any] = [""] * len(disks)
 
         async def worker() -> None:
             for position, disk in positions:
@@ -303,12 +313,23 @@ class TrueNASWebsocketClient:
                         result = await dispatcher.call("disk.smartctl", [disk, args])
                 except TrueNASAPIError as exc:
                     if self.config.platform == "scale" and "ENOMETHOD" in str(exc):
+                        # Not about this disk: the method is absent, so nothing
+                        # in this batch can succeed. Fail the whole batch.
                         raise TrueNASAPIError(
                             "Detailed SMART JSON is not available through the SCALE websocket API on this system."
                         ) from exc
-                    raise
+                    if not return_exceptions:
+                        raise
+                    results[position] = exc
+                    continue
                 if not isinstance(result, str):
-                    raise TrueNASAPIError(f"disk.smartctl returned unexpected payload type for {disk!r}.")
+                    payload_error = TrueNASAPIError(
+                        f"disk.smartctl returned unexpected payload type for {disk!r}."
+                    )
+                    if not return_exceptions:
+                        raise payload_error
+                    results[position] = payload_error
+                    continue
                 results[position] = result
 
         tasks = [asyncio.create_task(worker()) for _ in range(width)]

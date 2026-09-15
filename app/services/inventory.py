@@ -4479,16 +4479,25 @@ class InventoryService:
                         try:
                             json_payloads = await self.truenas_client.smartctl_batch(
                                 [candidates[0] for _slot, candidates, _future in selected],
-                                ["-a", "-j"], max_concurrency=permits,
+                                ["-a", "-j"], max_concurrency=permits, return_exceptions=True,
                             )
                         except SMART_BATCH_TRANSPORT_ERRORS:
-                            # The accepted client is fail-fast: retry the affected
-                            # phase through the existing bounded per-slot path.
+                            # The session itself failed, so nothing in it can be
+                            # kept: retry the affected phase through the existing
+                            # bounded per-slot path.
                             json_payloads = None
                         if json_payloads is not None:
                             text_selected = []
                             for item, payload in zip(selected, json_payloads):
                                 slot, candidates, future = item
+                                if isinstance(payload, BaseException):
+                                    # One disk's failure is one slot's fallback.
+                                    # Discarding the batch here sent every slot
+                                    # back through the per-slot path, so a shelf
+                                    # with one failing drive - the shelf the grid
+                                    # is opened for - cost more than v0.23.0 did
+                                    # (#522).
+                                    continue
                                 payloads[future] = (payload, None)
                                 summary = self._merge_smart_summary(
                                     slot, SmartSummaryView.model_validate(parse_smartctl_summary(payload)),
@@ -4499,12 +4508,16 @@ class InventoryService:
                                 try:
                                     text_payloads = await self.truenas_client.smartctl_batch(
                                         [candidates[0] for _slot, candidates, _future in text_selected],
-                                        ["-x"], max_concurrency=permits,
+                                        ["-x"], max_concurrency=permits, return_exceptions=True,
                                     )
                                 except SMART_BATCH_TRANSPORT_ERRORS:
                                     pass
                                 else:
                                     for item, text in zip(text_selected, text_payloads):
+                                        if isinstance(text, BaseException):
+                                            # The JSON half of this slot stands;
+                                            # only its enrichment is missing.
+                                            continue
                                         future = item[2]
                                         payloads[future] = (payloads[future][0], text)
                     finally:

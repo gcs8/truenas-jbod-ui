@@ -60,6 +60,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   A disk that never answers now yields that slot's unavailable summary instead of
   holding the whole grid request open behind it (#524).
 
+- Kept the CORE SMART grid's partial batch results when middleware rejects one
+  disk, retrying only that slot through the per-slot path instead of discarding
+  every reply in the batch and re-fetching the whole shelf one disk at a time
+  (#TBD).
+
 - Kept last-good SMART data across inventory refreshes and restarts. Every snapshot
   build used to replace a slot's cached entry with one that held no SMART fields, so
   the persisted layer the SMART grid and exports serve was erased within one snapshot
