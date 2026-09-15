@@ -537,6 +537,15 @@ class HistoryDashboardRouteTests(unittest.TestCase):
                 "last_error",
             )
         }
+        # The fixed-vocabulary diagnostics are added only when the collector
+        # reported them; the cooldown deadline is always published.
+        expected.update(
+            {
+                "full_refresh_cooldown_seconds": history_main.settings.full_refresh_cooldown_seconds,
+                "full_refresh_cooldown_seconds_remaining": 0,
+                "full_refresh_available_at": None,
+            }
+        )
         patches = (
             patch.object(history_main.collector, "status", return_value=status),
             patch.object(history_main.store, "estimated_counts", return_value={"tracked_slots": 0}),

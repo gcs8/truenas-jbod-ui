@@ -291,7 +291,8 @@ def public_collector_status(
         return projected
     if isinstance(status, Mapping):
         for field in HISTORY_DIAGNOSTIC_STATUS_FIELDS:
-            projected[field] = status.get(field)
+            if field in status:
+                projected[field] = status[field]
     cooldown = refresh_admission.cooldown_state()
     remaining = int(cooldown["seconds_remaining"])
     projected["full_refresh_cooldown_seconds"] = int(cooldown["cooldown_seconds"])
