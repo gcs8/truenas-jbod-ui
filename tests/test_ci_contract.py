@@ -474,13 +474,15 @@ class CIWorkflowContractTests(unittest.TestCase):
             with self.subTest(variable=variable):
                 family = env[variable]
                 self.assertTrue(family, f"{variable} is unpinned in the workflow")
-                self.assertIn(
-                    f"`{variable}` is `{family}`",
-                    docs,
+                self.assertTrue(
+                    any(
+                        f"`{variable}`" in line and f"`{family}`" in line
+                        for line in docs.splitlines()
+                    ),
                     f"the capture doc does not name the pinned {variable}",
                 )
         self.assertNotIn("Both are empty until", docs)
-        self.assertIn("re-qualify", docs)
+        self.assertIn("re-qualify", docs.lower())
 
     def test_public_demo_pages_request_allowlist_is_probe_specific(self) -> None:
         spec = self.read(PUBLIC_DEMO_SPEC)

@@ -111,6 +111,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Docs
 
+- `docs/SCREENSHOT_CAPTURE.md` now records the font fallback families the
+  capture workflow has pinned since #516, the qualification run that recorded
+  them, and the re-qualification a maintainer owes before changing either;
+  `tests/test_ci_contract.py` reads the pair out of the workflow so the doc
+  cannot drift from the enforced values again. (#TBD)
+
 - Reconciled the v0.23.0 release wrap and Wiki home page with the published
   GitHub release, GHCR package, and Pages demo while retaining the qualified
   v0.22.2 beginner-installation pin. (#518)
