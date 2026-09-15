@@ -49,8 +49,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Replaced the generic 500 a mapping or alias save returned when the data
   folder is not writable with a 503 and a plain sentence, and stopped the
   history service crash-looping on an unwritable history folder: it now retries
-  with bounded backoff and then reports the path, the owner and the command to
-  run (#538)
+  with bounded backoff, then stays up with an unhealthy `/healthz` and a 503 on
+  every other route, naming the path, the owner and the host command to run.
+  That command names the host bind source (`./history`) rather than the
+  container path, and a read-only SQLite database counts as unwritable even
+  though it carries no errno (#538)
 
 - Retried failed release checks with bounded backoff instead of waiting a
   full normal interval, preserving the last successful result (#469).
