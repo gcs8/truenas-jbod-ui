@@ -368,10 +368,22 @@ class HistoryConfigTests(unittest.TestCase):
         self.assertEqual(settings.failure_backoff_initial_seconds, 30)
         self.assertEqual(settings.failure_backoff_max_seconds, 900)
 
-    def test_history_settings_default_backup_interval_matches_slow_interval(self) -> None:
+    def test_history_settings_default_backup_footprint_is_documented(self) -> None:
         settings = HistorySettings()
 
-        self.assertEqual(settings.backup_interval_seconds, settings.slow_interval_seconds)
+        self.assertEqual(settings.backup_interval_seconds, 86400)
+        self.assertEqual(settings.backup_retention_count, 7)
+        self.assertEqual(settings.weekly_backup_retention_count, 4)
+        self.assertEqual(settings.monthly_backup_retention_count, 3)
+
+    def test_history_settings_reject_an_unusable_backup_copy_count(self) -> None:
+        with self.assertRaises(ValueError):
+            HistorySettings(backup_retention_count=0)
+
+    def test_history_settings_bound_the_retention_backup_skip_window(self) -> None:
+        self.assertEqual(HistorySettings().retention_backup_skip_max_seconds, 86400)
+        with self.assertRaises(ValueError):
+            HistorySettings(retention_backup_skip_max_seconds=-1)
 
     def test_history_settings_fast_collection_uses_cached_inventory_by_default(self) -> None:
         self.assertFalse(HistorySettings().force_inventory_on_fast_collection)
@@ -6135,9 +6147,77 @@ class HistoryCollectorTests(unittest.TestCase):
             },
         )
 
-    def test_retention_requires_a_successful_same_pass_backup(self) -> None:
+    def test_retention_runs_on_a_failed_pass_when_a_recent_backup_exists(self) -> None:
+        now = datetime(2026, 7, 1, tzinfo=timezone.utc)
         store = MagicMock()
+        store.latest_backup_snapshot_at.return_value = now - timedelta(hours=6)
         collector = HistoryCollector(HistorySettings(), store)
+
+        collector._run_retention_if_due(now, backup_succeeded=False)
+
+        store.maintain_retention.assert_called_once()
+        status = collector.status()
+        self.assertIsNone(status["last_retention_skip_reason"])
+        self.assertFalse(status["last_retention_ran_without_backup"])
+
+    def test_retention_skip_without_any_backup_is_bounded_and_records_a_reason(self) -> None:
+        now = datetime(2026, 7, 1, tzinfo=timezone.utc)
+        store = MagicMock()
+        store.latest_backup_snapshot_at.return_value = None
+        collector = HistoryCollector(
+            HistorySettings(retention_backup_skip_max_seconds=86400),
+            store,
+        )
+
+        collector._run_retention_if_due(now, backup_succeeded=False)
+
+        store.maintain_retention.assert_not_called()
+        skipped = collector.status()
+        self.assertEqual(
+            skipped["last_retention_skip_reason"],
+            "Waiting for a successful database backup before pruning.",
+        )
+        self.assertEqual(skipped["last_retention_skip_until"], "2026-07-02T00:00:00+00:00")
+        self.assertIsNone(skipped["last_retention_attempt_at"])
+
+        collector._run_retention_if_due(now + timedelta(hours=2), backup_succeeded=False)
+        store.maintain_retention.assert_not_called()
+
+        collector._run_retention_if_due(now + timedelta(hours=25), backup_succeeded=False)
+
+        store.maintain_retention.assert_called_once()
+        ran = collector.status()
+        self.assertTrue(ran["last_retention_ran_without_backup"])
+        self.assertEqual(
+            ran["last_retention_skip_reason"],
+            "Pruned without a recent database backup because backups are failing.",
+        )
+
+    def test_retention_skip_window_clears_once_a_backup_succeeds(self) -> None:
+        now = datetime(2026, 7, 1, tzinfo=timezone.utc)
+        store = MagicMock()
+        store.latest_backup_snapshot_at.return_value = None
+        collector = HistoryCollector(HistorySettings(), store)
+
+        collector._run_retention_if_due(now, backup_succeeded=False)
+        collector._run_retention_if_due(now + timedelta(hours=1), backup_succeeded=True)
+
+        store.maintain_retention.assert_called_once()
+        status = collector.status()
+        self.assertIsNone(status["last_retention_skip_reason"])
+        self.assertIsNone(status["last_retention_skip_until"])
+        self.assertFalse(status["last_retention_ran_without_backup"])
+
+    def test_segmented_retention_still_requires_its_scheduled_backup(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = MagicMock()
+        collector = HistoryCollector(
+            HistorySettings(
+                sqlite_path=str(temp_dir / "history.db"),
+                segment_catalog_path=str(temp_dir / "segments" / "catalog.json"),
+            ),
+            store,
+        )
 
         collector._run_retention_if_due(
             datetime(2026, 7, 1, tzinfo=timezone.utc),
@@ -6146,6 +6226,43 @@ class HistoryCollectorTests(unittest.TestCase):
 
         store.maintain_retention.assert_not_called()
         self.assertIsNone(collector.status()["last_retention_attempt_at"])
+
+    def test_backup_failure_records_a_plain_reason_for_the_dashboard(self) -> None:
+        store = MagicMock()
+        store.latest_backup_snapshot_at.return_value = None
+        store.create_backup.side_effect = PermissionError(13, "Permission denied")
+        collector = HistoryCollector(
+            HistorySettings(startup_grace_seconds=0),
+            store,
+        )
+        collector.last_fast_metrics_at = collector.started_at
+        collector._enumerate_scopes = AsyncMock(return_value=[])  # type: ignore[method-assign]
+
+        asyncio.run(collector.run_once(force_slow=True))
+
+        status = collector.status()
+        self.assertEqual(status["last_backup_error_kind"], "permission_denied")
+        self.assertEqual(
+            status["last_backup_error"],
+            "The history service may not write the backup directory. (PermissionError)",
+        )
+        self.assertNotIn("Permission denied", str(status["last_backup_error"]))
+
+    def test_successful_backup_clears_the_recorded_backup_failure(self) -> None:
+        store = MagicMock()
+        store.latest_backup_snapshot_at.return_value = None
+        store.create_backup.return_value = Path("history-2026.sqlite3")
+        collector = HistoryCollector(HistorySettings(startup_grace_seconds=0), store)
+        collector.last_backup_error = "The disk holding the history backups is full. (OSError)"
+        collector.last_backup_error_kind = "disk_full"
+        collector.last_fast_metrics_at = collector.started_at
+        collector._enumerate_scopes = AsyncMock(return_value=[])  # type: ignore[method-assign]
+
+        asyncio.run(collector.run_once(force_slow=True))
+
+        status = collector.status()
+        self.assertIsNone(status["last_backup_error"])
+        self.assertIsNone(status["last_backup_error_kind"])
 
     def test_stop_waits_for_inflight_worker_before_returning(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
