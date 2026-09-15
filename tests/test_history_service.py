@@ -6200,6 +6200,36 @@ class HistoryCollectorTests(unittest.TestCase):
             "Pruned without a recent database backup because backups are failing.",
         )
 
+    def test_the_retention_skip_deadline_is_anchored_to_the_newest_backup(self) -> None:
+        # The deadline used to start at the pass that noticed the miss, so a
+        # container restarting more often than the window postponed pruning
+        # forever. The newest backup survives a restart, so anchor on it.
+        now = datetime(2026, 7, 1, tzinfo=timezone.utc)
+        store = MagicMock()
+        settings = HistorySettings(retention_backup_skip_max_seconds=86400)
+        stale_for = timedelta(hours=2)
+        usable_for = HistoryCollector(settings, store)._usable_backup_max_age()
+        store.latest_backup_snapshot_at.return_value = now - usable_for - stale_for
+
+        first = HistoryCollector(settings, store)
+        first._run_retention_if_due(now, backup_succeeded=False)
+        deadline = first.status()["last_retention_skip_until"]
+
+        store.maintain_retention.assert_not_called()
+        self.assertEqual(deadline, "2026-07-01T22:00:00+00:00")
+
+        restarted = HistoryCollector(settings, store)
+        restarted._run_retention_if_due(now + timedelta(hours=12), backup_succeeded=False)
+
+        store.maintain_retention.assert_not_called()
+        self.assertEqual(restarted.status()["last_retention_skip_until"], deadline)
+
+        after_the_deadline = HistoryCollector(settings, store)
+        after_the_deadline._run_retention_if_due(now + timedelta(hours=23), backup_succeeded=False)
+
+        store.maintain_retention.assert_called_once()
+        self.assertTrue(after_the_deadline.status()["last_retention_ran_without_backup"])
+
     def test_retention_skip_window_clears_once_a_backup_succeeds(self) -> None:
         now = datetime(2026, 7, 1, tzinfo=timezone.utc)
         store = MagicMock()
