@@ -121,6 +121,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Docs
 
+- Documented which backups a deployment accepts (a newer app or schema
+  version is refused before anything is replaced) and the unwritable data or
+  history folder symptom, with the command that fixes it (#TBD)
+
 - Reconciled the v0.23.0 release wrap and Wiki home page with the published
   GitHub release, GHCR package, and Pages demo while retaining the qualified
   v0.22.2 beginner-installation pin. (#518)
