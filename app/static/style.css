@@ -873,6 +873,23 @@ textarea {
   padding: 0 16px;
 }
 
+.upgrade-notice {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+  margin: -8px 0 18px;
+  padding: 12px 16px;
+  border: 1px solid rgba(91, 183, 255, 0.35);
+  border-radius: 14px;
+  background: rgba(91, 183, 255, 0.08);
+}
+
+.upgrade-notice-text {
+  flex: 1 1 320px;
+  margin: 0;
+}
+
 .read-ui-auth-panel {
   display: flex;
   align-items: center;

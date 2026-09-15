@@ -36,6 +36,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Added
 
+- Showed a one-time dismissible notice in the main UI after the app is
+  updated; v0.23.0 says that network mode lets anyone who can reach the port
+  change bay assignments and lights, and where to add a sign-in. (#491)
+
 - Added a client-only, one-session SMART WebSocket batch API with bounded
   concurrency and DDP heartbeat handling; inventory integration remained
   separate (#503).

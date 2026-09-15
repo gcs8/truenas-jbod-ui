@@ -281,6 +281,9 @@
   const cacheTimingChips = document.getElementById("cache-timing-chips");
   const statusText = document.getElementById("status-text");
   const writePolicyNotice = document.getElementById("write-policy-notice");
+  const upgradeNotice = document.getElementById("upgrade-notice");
+  const upgradeNoticeDismiss = document.getElementById("upgrade-notice-dismiss");
+  const upgradeNoticeText = document.getElementById("upgrade-notice-text");
   const readUiAuthPanel = document.getElementById("read-ui-auth-panel");
   const readUiAuthForm = document.getElementById("read-ui-auth-form");
   const readUiAuthUsername = document.getElementById("read-ui-auth-username");
@@ -2662,6 +2665,54 @@
     }
     setStatus(writePolicyReason(), "error");
     return true;
+  }
+
+  const UPGRADE_NOTICE_STORAGE_KEY = "truenas-jbod-ui.upgrade-notice-dismissed";
+
+  function upgradeNoticeVersion() {
+    return upgradeNotice?.dataset?.noticeVersion || "";
+  }
+
+  function upgradeNoticeDismissedLocally() {
+    const stored = loadStoredJson(UPGRADE_NOTICE_STORAGE_KEY);
+    return Boolean(stored && stored.version && stored.version === upgradeNoticeVersion());
+  }
+
+  function renderUpgradeNotice() {
+    if (!upgradeNotice) {
+      return;
+    }
+    upgradeNotice.classList.toggle("hidden", state.snapshotMode);
+    if (upgradeNoticeDismissedLocally() || upgradeNotice.dataset.dismissedLocally === "true") {
+      // A server-rendered pending notice is not proof of install-wide dismissal.
+      if (upgradeNoticeText) {
+        upgradeNoticeText.textContent = "Notice acknowledged in this browser, but dismissal is not saved for this install. Sign in if required, then retry.";
+      }
+      if (upgradeNoticeDismiss) upgradeNoticeDismiss.textContent = "Retry saving dismissal";
+    }
+  }
+
+  async function dismissUpgradeNotice() {
+    if (!upgradeNotice || upgradeNoticeDismiss?.disabled || state.snapshotMode) {
+      return;
+    }
+    // Only this notice changes. Do not reload, reset drafts, or retry automatically.
+    storeJson(UPGRADE_NOTICE_STORAGE_KEY, { version: upgradeNoticeVersion() });
+    upgradeNotice.dataset.dismissedLocally = "true";
+    if (upgradeNoticeDismiss) {
+      upgradeNoticeDismiss.disabled = true;
+    }
+    try {
+      await fetchJson("/api/upgrade-notice/dismiss", {
+        method: "POST",
+        body: JSON.stringify({ version: upgradeNoticeVersion() }),
+        readUiAuth: true,
+      });
+      upgradeNotice.classList.add("hidden");
+    } catch (error) {
+      if (upgradeNoticeDismiss) upgradeNoticeDismiss.disabled = false;
+      renderUpgradeNotice();
+    }
   }
 
   function handleWriteRejection(error) {
@@ -10250,6 +10301,11 @@
     renderRefreshControls();
     setStatus(`Auto-refresh interval set to ${formatRefreshInterval(state.refreshIntervalSeconds)}.`);
   });
+  if (upgradeNoticeDismiss) {
+    upgradeNoticeDismiss.addEventListener("click", () => {
+      void dismissUpgradeNotice();
+    });
+  }
   mappingForm.addEventListener("submit", saveMapping);
   mappingForm.addEventListener("input", markMappingFormDirty);
   mappingForm.addEventListener("change", markMappingFormDirty);
@@ -10579,6 +10635,7 @@
   renderWritePolicyNotice();
   syncWritePolicyControls();
   renderReadUiAuth();
+  renderUpgradeNotice();
   renderHeatmapControls();
   ensureHeatmapData();
   renderUiPerfPanel();
