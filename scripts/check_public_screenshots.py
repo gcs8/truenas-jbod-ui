@@ -36,7 +36,12 @@ FORBIDDEN_BYTE_PATTERNS = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Verify exact public screenshot bytes and fixture provenance.")
-    parser.add_argument("--root", type=Path, default=ROOT)
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=ROOT,
+        help="Repository root holding the screenshots and their manifest (default: the checkout this script lives in).",
+    )
     parser.add_argument(
         "--report",
         action="store_true",
