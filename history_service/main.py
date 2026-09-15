@@ -44,6 +44,7 @@ from history_service.refresh_auth import (
     read_limited_request_body,
     read_refresh_document,
 )
+from history_service.startup import open_history_store_with_retries
 from history_service.store import HistoryStore
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -68,7 +69,10 @@ def build_history_store(settings: HistorySettings) -> HistoryStore:
 
 
 settings = get_history_settings()
-store = build_history_store(settings)
+store = open_history_store_with_retries(
+    lambda: build_history_store(settings),
+    directory=Path(settings.sqlite_path).parent,
+)
 collector = HistoryCollector(settings, store)
 logger = logging.getLogger(__name__)
 refresh_admission = ManualRefreshAdmission(

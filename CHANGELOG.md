@@ -42,6 +42,16 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Made `--help` work on every script under `scripts/` off Linux, and described
+  the arguments an operator has to fill in, including the segmented-history
+  source, segments directory, cutoff and key id (#TBD)
+
+- Replaced the generic 500 a mapping or alias save returned when the data
+  folder is not writable with a 503 and a plain sentence, and stopped the
+  history service crash-looping on an unwritable history folder: it now retries
+  with bounded backoff and then reports the path, the owner and the command to
+  run (#TBD)
+
 - Retried failed release checks with bounded backoff instead of waiting a
   full normal interval, preserving the last successful result (#469).
 

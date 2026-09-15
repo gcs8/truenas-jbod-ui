@@ -134,6 +134,7 @@ WINDOWS_PORTABLE_TEST_MODULES = (
     "tests.test_release_wrap_validator",
     "tests.test_scripts_help",
     "tests.test_ssh_probe",
+    "tests.test_startup_writability",
     "tests.test_tls_trust",
     "tests.test_truenas_ws",
     "tests.test_wiki_drift_verifier",

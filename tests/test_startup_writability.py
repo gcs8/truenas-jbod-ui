@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -27,7 +28,9 @@ class DescribeUnwritableDirectoryTests(unittest.TestCase):
 
         self.assertIn(str(directory), message)
         self.assertIn("Cannot write to", message)
-        self.assertIn("chown", message)
+        # The chown command needs the uid this process runs as; Windows has no
+        # POSIX identity, so the line names the fix in words there instead.
+        self.assertIn("chown" if hasattr(os, "geteuid") else "write access", message)
         self.assertNotIn("Traceback", message)
 
     def test_only_permission_shaped_errors_are_classified(self) -> None:
@@ -75,7 +78,7 @@ class HistoryStartupRetryTests(unittest.TestCase):
         self.assertEqual(slept, [1.0, 2.0], "each retry must back off further")
         reason = raised.exception.reason
         self.assertIn(str(directory), reason)
-        self.assertIn("chown", reason)
+        self.assertIn("chown" if hasattr(os, "geteuid") else "write access", reason)
         self.assertEqual(str(raised.exception), reason)
 
     def test_a_directory_that_becomes_writable_starts_normally(self) -> None:
