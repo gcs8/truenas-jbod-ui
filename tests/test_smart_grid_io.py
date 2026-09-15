@@ -420,6 +420,40 @@ class CoreGridWebsocketIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(peer.closes, peer.connections)
                 self.assertFalse(s._smart_load_tasks)
 
+    async def test_one_slow_disk_costs_one_slot_not_the_batch(self):
+        # #523, the half #524 left open. #524 stopped a batch timeout from
+        # answering 500 for the shelf, but the degradation is still all-or-
+        # nothing: the builtin TimeoutError from one disk's per-call deadline
+        # fails the gather, so every slot loses its batch payload and re-fetches
+        # individually. Bound the slow disk to its own slot. `da2` is accepted
+        # and never answered, so only a deadline can end that call; the other
+        # three answer immediately and must keep what the batch already had.
+        with self.fixture(4) as (s, api, store, other):
+            peer = CoreGridPeer(await api.fetch_all())
+            peer.stall_devices = {'da2'}
+            with self.wire(s, peer):
+                s.truenas_client.config.timeout_seconds = 0.3
+                await s.get_snapshot()
+                snapshot_sessions = peer.connections
+                result = await asyncio.wait_for(
+                    s.get_slot_smart_summaries([0, 1, 2, 3], max_concurrency=2), 20,
+                )
+                summaries = {item.slot: item.summary for item in result}
+                self.assertEqual([item.slot for item in result], [0, 1, 2, 3])
+                self.assertEqual(
+                    [summaries[slot].power_on_hours for slot in (0, 1, 3)], [321, 322, 324],
+                )
+                self.assertFalse(summaries[2].available)
+                self.assertIn('timed out', (summaries[2].message or '').lower())
+                grid_sessions = peer.connections - snapshot_sessions
+                print('SLOW_DISK_SESSIONS', grid_sessions, dict(peer.methods))
+                # One batch, plus the one per-slot retry for the slow disk; the
+                # three healthy slots never reach the per-slot path.
+                self.assertEqual(grid_sessions, 2)
+                self.assertEqual(peer.methods['json'], 5)
+                self.assertEqual(peer.closes, peer.connections)
+                self.assertFalse(s._smart_load_tasks)
+
     async def test_one_stalled_fallback_call_cannot_suspend_the_whole_grid(self):
         # #524 round 2: when smartctl_batch times out, _prime_core_grid degrades
         # to the per-slot path - but that path called disk.smartctl with no
