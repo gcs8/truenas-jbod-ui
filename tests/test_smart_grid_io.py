@@ -140,6 +140,9 @@ class CoreGridPeer:
         self.json_extra = {}
         # Devices whose disk.smartctl call is accepted and never answered.
         self.stall_devices: set[str] = set()
+        # Devices middleware rejects individually, as it does for a disk it
+        # cannot open or a name missing from its disk table (#522).
+        self.fail_devices: set[str] = set()
 
     def connect(self, url, **kwargs):
         from contextlib import asynccontextmanager
@@ -185,7 +188,9 @@ class CoreGridPeer:
                             index = int(device.removeprefix('/dev/').removeprefix('da'))
                             for _ in range(index % 3):
                                 await asyncio.sleep(0)
-                            if peer.fail_phase == 'invalid':
+                            if device.removeprefix('/dev/') in peer.fail_devices:
+                                reply['error'] = {'reason': 'synthetic per-disk rejection'}
+                            elif peer.fail_phase == 'invalid':
                                 reply['result'] = {'invalid': 'SMART payload'}
                             elif peer.fail_phase == phase:
                                 reply['error'] = {'reason': 'synthetic unavailable'}
@@ -343,6 +348,40 @@ class CoreGridWebsocketIntegrationTests(unittest.IsolatedAsyncioTestCase):
                         await s.get_slot_smart_summaries([0], bypass_negative_cache=True)
                         self.assertGreater(peer.connections, before)
                     self.assertFalse(s._smart_load_tasks)
+
+    async def test_one_rejected_disk_keeps_the_rest_of_the_batch(self):
+        # #522: the client batch is fail-fast, so one disk middleware rejects -
+        # a dead drive, or the multipath member name of #355 - discarded every
+        # successful reply in the same batch and sent all N slots back through
+        # the per-slot path. On a shelf with a failing drive, the case the grid
+        # exists for, #503/#504 then did strictly more work than v0.23.0: one
+        # batch session plus N individual ones. Keep the partial results and
+        # retry only the slot that failed.
+        with self.fixture(4) as (s, api, store, other):
+            peer = CoreGridPeer(await api.fetch_all())
+            peer.fail_devices = {'da2'}
+            with self.wire(s, peer):
+                await s.get_snapshot()
+                snapshot_sessions = peer.connections
+                result = await asyncio.wait_for(
+                    s.get_slot_smart_summaries([0, 1, 2, 3], max_concurrency=2), 20,
+                )
+                summaries = {item.slot: item.summary for item in result}
+                self.assertEqual([item.slot for item in result], [0, 1, 2, 3])
+                # The three healthy disks answered inside the batch and keep
+                # their values; the rejected one is the only degraded slot.
+                self.assertEqual(
+                    [summaries[slot].power_on_hours for slot in (0, 1, 3)], [321, 322, 324],
+                )
+                self.assertFalse(summaries[2].available)
+                # One batch session, and one per-slot retry for the failed slot
+                # only - not one per slot in the shelf.
+                grid_sessions = peer.connections - snapshot_sessions
+                print('PARTIAL_BATCH_SESSIONS', grid_sessions, dict(peer.methods))
+                self.assertEqual(grid_sessions, 2)
+                self.assertEqual(peer.methods['json'], 5)
+                self.assertEqual(peer.closes, peer.connections)
+                self.assertFalse(s._smart_load_tasks)
 
     async def test_slow_batch_reply_degrades_to_per_slot_fallbacks(self):
         # #523: smartctl_batch wraps every middleware call in the request timeout
