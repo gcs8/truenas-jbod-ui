@@ -463,6 +463,25 @@ class CIWorkflowContractTests(unittest.TestCase):
             with self.subTest(fragment=fragment):
                 self.assertIn(fragment, script)
 
+    def test_screenshot_capture_doc_quotes_the_pinned_fallback_families(self) -> None:
+        """docs/SCREENSHOT_CAPTURE.md must not drift from the enforced pins (#528)."""
+
+        workflow = yaml.safe_load(self.read(CAPTURE_SCREENSHOTS_WORKFLOW))
+        env = workflow["jobs"]["capture"]["env"]
+        docs = self.read(ROOT / "docs" / "SCREENSHOT_CAPTURE.md")
+
+        for variable in ("EXPECTED_SANS_FALLBACK", "EXPECTED_MONO_FALLBACK"):
+            with self.subTest(variable=variable):
+                family = env[variable]
+                self.assertTrue(family, f"{variable} is unpinned in the workflow")
+                self.assertIn(
+                    f"`{variable}` is `{family}`",
+                    docs,
+                    f"the capture doc does not name the pinned {variable}",
+                )
+        self.assertNotIn("Both are empty until", docs)
+        self.assertIn("re-qualify", docs)
+
     def test_public_demo_pages_request_allowlist_is_probe_specific(self) -> None:
         spec = self.read(PUBLIC_DEMO_SPEC)
 
