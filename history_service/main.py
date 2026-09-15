@@ -92,6 +92,8 @@ HISTORY_DIAGNOSTIC_STATUS_FIELDS = (
     "last_retention_skip_reason",
     "last_retention_skip_until",
     "last_retention_ran_without_backup",
+    "last_backup_error",
+    "last_backup_error_kind",
 )
 SLOT_HISTORY_METRIC_LIMITS: dict[str, int] = {
     "temperature_c": 96,

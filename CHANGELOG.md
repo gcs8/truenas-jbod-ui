@@ -42,6 +42,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Ran history retention on its own schedule instead of only after a successful
+  hourly backup, bounded the wait for a failing backup, and cut the default
+  backup footprint to a daily copy kept for a week (#TBD).
+
 - Replaced the generic history collector error, the retention class name, and
   the invisible full-refresh cooldown with fixed, secret-free sentences and a
   published cooldown deadline (#TBD).

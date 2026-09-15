@@ -15,7 +15,10 @@ from typing import Any
 
 from history_service.config import HistorySettings
 from history_service.diagnostics import (
+    RETENTION_RAN_WITHOUT_BACKUP,
+    RETENTION_SKIP_WAITING_FOR_BACKUP,
     HistorySourceError,
+    classify_backup_failure,
     classify_collection_failure,
     classify_retention_failure,
 )
@@ -125,6 +128,13 @@ class HistoryCollector:
         self.last_retention_has_more: bool = False
         self.last_retention_error: str | None = None
         self.last_retention_error_kind: str | None = None
+        self.last_retention_skip_reason: str | None = None
+        self.last_retention_skip_until: str | None = None
+        self.last_retention_ran_without_backup: bool = False
+        self.last_backup_error: str | None = None
+        self.last_backup_error_kind: str | None = None
+        self._retention_backup_missing_since: datetime | None = None
+        self._retention_skip_warned_at: datetime | None = None
         self.last_error: str | None = None
         self.last_error_kind: str | None = None
         self.last_error_summary: str | None = None
@@ -484,8 +494,17 @@ class HistoryCollector:
                             self.last_backup_at = observed_at
                             retention_backup_at = run_started
                             backup_succeeded = True
+                            self.last_backup_error = None
+                            self.last_backup_error_kind = None
                 except Exception as exc:  # noqa: BLE001 - collection continues after backup failure.
-                    logger.warning("History backup snapshot failed: %s", exc)
+                    backup_kind, backup_summary = classify_backup_failure(exc)
+                    self.last_backup_error_kind = backup_kind
+                    self.last_backup_error = backup_summary
+                    logger.warning(
+                        "History backup snapshot failed: %s Cause: %s",
+                        backup_summary,
+                        exc,
+                    )
         self._raise_if_stopping()
         self._run_retention_if_due(
             run_started,
@@ -545,6 +564,11 @@ class HistoryCollector:
             "last_retention_has_more": self.last_retention_has_more,
             "last_retention_error": self.last_retention_error,
             "last_retention_error_kind": self.last_retention_error_kind,
+            "last_retention_skip_reason": self.last_retention_skip_reason,
+            "last_retention_skip_until": self.last_retention_skip_until,
+            "last_retention_ran_without_backup": self.last_retention_ran_without_backup,
+            "last_backup_error": self.last_backup_error,
+            "last_backup_error_kind": self.last_backup_error_kind,
             "last_error": self.last_error,
             "last_error_kind": self.last_error_kind,
             "last_error_summary": self.last_error_summary,
@@ -794,10 +818,18 @@ class HistoryCollector:
         backup_succeeded: bool,
         backup_at: datetime | None = None,
     ) -> None:
-        if not backup_succeeded or not self._retention_due(now):
+        if not self._retention_due(now):
             return
         segmented = self.settings.segment_catalog_path is not None
-        if segmented and backup_at is None:
+        if segmented:
+            # Segmented retention consumes a sealed scheduled backup; without one
+            # there is nothing to claim, so that gate stays.
+            if not backup_succeeded or backup_at is None:
+                return
+            self.last_retention_skip_reason = None
+            self.last_retention_skip_until = None
+            self.last_retention_ran_without_backup = False
+        elif not self._retention_backup_guard_allows(now, backup_succeeded=backup_succeeded):
             return
         started = time.perf_counter()
         attempted_at = isoformat_utc(now)
@@ -905,6 +937,78 @@ class HistoryCollector:
             "daily_rollups": self.last_retention_daily_rollups_removed,
         }
 
+    def _usable_backup_max_age(self) -> timedelta:
+        """Return how old a backup may be and still cover what retention prunes."""
+
+        retention_days = max(0, int(self.settings.raw_metric_retention_days))
+        return timedelta(days=retention_days) if retention_days > 0 else timedelta(days=1)
+
+    def _retention_backup_guard_allows(self, now: datetime, *, backup_succeeded: bool) -> bool:
+        """Decide whether unsegmented retention may run in this pass.
+
+        Retention is not part of the backup: gating it on the hourly snapshot
+        means one unwritable backup directory stops pruning forever and the
+        database grows until the disk is full (#455). A usable backup lets
+        retention run silently; an absent one delays it for a bounded window
+        with a published deadline, after which retention runs anyway and says
+        so.
+        """
+
+        normalized_now = now.astimezone(timezone.utc)
+        latest_backup_at = None if backup_succeeded else self._latest_backup_at()
+        if backup_succeeded or (
+            latest_backup_at is not None
+            and timedelta(0) <= normalized_now - latest_backup_at <= self._usable_backup_max_age()
+        ):
+            self._retention_backup_missing_since = None
+            self._retention_skip_warned_at = None
+            self.last_retention_skip_reason = None
+            self.last_retention_skip_until = None
+            self.last_retention_ran_without_backup = False
+            return True
+
+        skip_window = timedelta(
+            seconds=max(0, int(self.settings.retention_backup_skip_max_seconds))
+        )
+        if self._retention_backup_missing_since is None:
+            self._retention_backup_missing_since = normalized_now
+        deadline = self._retention_backup_missing_since + skip_window
+        if normalized_now < deadline:
+            self.last_retention_skip_reason = RETENTION_SKIP_WAITING_FOR_BACKUP
+            self.last_retention_skip_until = isoformat_utc(deadline)
+            self.last_retention_ran_without_backup = False
+            self._warn_retention_skipped(normalized_now, deadline)
+            self._record_collection_stage(
+                "db.retention.skipped",
+                0.0,
+                reason="waiting_for_backup",
+                retry_after=isoformat_utc(deadline),
+            )
+            return False
+
+        self.last_retention_skip_reason = RETENTION_RAN_WITHOUT_BACKUP
+        self.last_retention_skip_until = None
+        self.last_retention_ran_without_backup = True
+        logger.warning(
+            "History retention is pruning without a usable database backup after %s seconds: %s",
+            int(skip_window.total_seconds()),
+            self.last_backup_error or "no backup snapshot was found",
+        )
+        return True
+
+    def _warn_retention_skipped(self, now: datetime, deadline: datetime) -> None:
+        if (
+            self._retention_skip_warned_at is not None
+            and now - self._retention_skip_warned_at < timedelta(hours=1)
+        ):
+            return
+        self._retention_skip_warned_at = now
+        logger.warning(
+            "History retention is waiting for a usable database backup until %s: %s",
+            isoformat_utc(deadline),
+            self.last_backup_error or "no backup snapshot was found",
+        )
+
     def record_failure_diagnostics(self, exc: BaseException) -> None:
         """Record the fixed kind and sentence for a failed collection pass."""
 
@@ -940,7 +1044,10 @@ class HistoryCollector:
                 return latest.astimezone(timezone.utc)
             except ValueError:
                 pass
-        return self.store.latest_backup_snapshot_at(self.settings.backup_dir)
+        latest = self.store.latest_backup_snapshot_at(self.settings.backup_dir)
+        if not isinstance(latest, datetime):
+            return None
+        return latest if latest.tzinfo else latest.replace(tzinfo=timezone.utc)
 
     def _backup_due(self, now: datetime, *, latest_backup_at: datetime | None = None) -> bool:
         interval_seconds = max(0, int(self.settings.backup_interval_seconds or 0))

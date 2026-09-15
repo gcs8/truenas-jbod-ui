@@ -16,6 +16,16 @@ MAX_DIAGNOSTIC_SUMMARY_CHARS = 160
 
 UNEXPECTED_COLLECTION_SUMMARY = "Unexpected collector error; see the service logs."
 UNEXPECTED_RETENTION_SUMMARY = "Unexpected retention error; see the service logs."
+UNEXPECTED_BACKUP_SUMMARY = "Unexpected backup error; see the service logs."
+
+# Retention guard vocabulary. Retention must never wait on a failing backup
+# forever, so it either waits with a published deadline or says it went ahead.
+RETENTION_SKIP_WAITING_FOR_BACKUP = (
+    "Waiting for a successful database backup before pruning."
+)
+RETENTION_RAN_WITHOUT_BACKUP = (
+    "Pruned without a recent database backup because backups are failing."
+)
 
 SOURCE_FAILURE_SENTENCES: dict[str, str] = {
     "source_unreachable": "Could not reach the main UI service.",
@@ -50,6 +60,16 @@ _RETENTION_MESSAGE_RULES: tuple[tuple[str, str], ...] = (
     ("permission denied", "permission_denied"),
     ("unable to open database file", "missing_database"),
 )
+
+BACKUP_FAILURE_SENTENCES: dict[str, str] = {
+    "database_read_only": "The history database is read-only.",
+    "disk_full": "The disk holding the history backups is full.",
+    "disk_io_error": "The history database reported a disk I/O error.",
+    "database_locked": "The history database was locked by another writer.",
+    "permission_denied": "The history service may not write the backup directory.",
+    "missing_database": "The history backup directory is missing.",
+    "retention_batch_too_large": "The backup could not be written in one statement.",
+}
 
 _RETENTION_ERRNO_KINDS: dict[int, str] = {
     errno.ENOSPC: "disk_full",
@@ -112,9 +132,11 @@ def classify_collection_failure(exc: BaseException) -> tuple[str, str]:
     return "unexpected", _with_detail(UNEXPECTED_COLLECTION_SUMMARY, type(exc).__name__)
 
 
-def classify_retention_failure(exc: BaseException) -> tuple[str, str]:
-    """Return the fixed (kind, sentence) pair for a retention failure."""
-
+def _classify_storage_failure(
+    exc: BaseException,
+    sentences: dict[str, str],
+    fallback: str,
+) -> tuple[str, str]:
     kind: str | None = None
     raw_errno = getattr(exc, "errno", None)
     if isinstance(raw_errno, int):
@@ -126,6 +148,26 @@ def classify_retention_failure(exc: BaseException) -> tuple[str, str]:
                 kind = candidate
                 break
     detail = type(exc).__name__
-    if kind is None:
-        return "unexpected", _with_detail(UNEXPECTED_RETENTION_SUMMARY, detail)
-    return kind, _with_detail(RETENTION_FAILURE_SENTENCES[kind], detail)
+    if kind is None or kind not in sentences:
+        return "unexpected", _with_detail(fallback, detail)
+    return kind, _with_detail(sentences[kind], detail)
+
+
+def classify_retention_failure(exc: BaseException) -> tuple[str, str]:
+    """Return the fixed (kind, sentence) pair for a retention failure."""
+
+    return _classify_storage_failure(
+        exc,
+        RETENTION_FAILURE_SENTENCES,
+        UNEXPECTED_RETENTION_SUMMARY,
+    )
+
+
+def classify_backup_failure(exc: BaseException) -> tuple[str, str]:
+    """Return the fixed (kind, sentence) pair for a backup snapshot failure."""
+
+    return _classify_storage_failure(
+        exc,
+        BACKUP_FAILURE_SENTENCES,
+        UNEXPECTED_BACKUP_SUMMARY,
+    )
