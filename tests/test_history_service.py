@@ -8675,3 +8675,183 @@ class HistoryDashboardDiagnosticStatusTests(unittest.TestCase):
 
     def test_public_status_of_a_non_mapping_stays_empty(self) -> None:
         self.assertEqual(history_main.public_collector_status(None), {})
+
+
+class HistoryReadConnectionBudgetTests(unittest.TestCase):
+    """#457: one slot bundle must not cost fifteen SQLite connections."""
+
+    @staticmethod
+    def _seed_store(temp_dir: Path) -> HistoryStore:
+        store = HistoryStore(str(temp_dir / "history.db"))
+        record = SlotStateRecord(
+            system_id="archive-core",
+            system_label="Archive CORE",
+            enclosure_key="enc-a",
+            enclosure_id="enc-a",
+            enclosure_label="Front Shelf",
+            slot=5,
+            slot_label="05",
+            present=True,
+            state="healthy",
+            identify_active=False,
+            device_name="da5",
+            serial="SERIAL-5",
+            model="Drive 5",
+            gptid="eui.000000000000001000a075012b91c7cf",
+            pool_name="tank",
+            vdev_name="raidz2-0",
+            health="ONLINE",
+            persistent_id_label="EUI64",
+            logical_unit_id="0x5000cca27c7f0005",
+            sas_address="0x5000cca27c7f1005",
+        )
+        store.upsert_slot_state(record, "2026-04-10T22:00:00+00:00")
+        store.insert_events(
+            build_slot_events(
+                record,
+                replace(record, health="DEGRADED"),
+                "2026-04-10T23:00:00+00:00",
+            )
+        )
+        store.insert_metric_samples(
+            [
+                MetricSample(
+                    observed_at="2026-04-10T23:00:00+00:00",
+                    system_id="archive-core",
+                    system_label="Archive CORE",
+                    enclosure_key="enc-a",
+                    enclosure_id="enc-a",
+                    enclosure_label="Front Shelf",
+                    slot=5,
+                    slot_label="05",
+                    metric_name=metric_name,
+                    value_integer=100,
+                    value_real=None,
+                    device_name="da5",
+                    serial="SERIAL-5",
+                    model="Drive 5",
+                    state="healthy",
+                    gptid="eui.000000000000001000a075012b91c7cf",
+                    persistent_id_label="EUI64",
+                    logical_unit_id="0x5000cca27c7f0005",
+                    sas_address="0x5000cca27c7f1005",
+                )
+                for metric_name in ("temperature_c", "bytes_read", "bytes_written")
+            ]
+        )
+        return store
+
+    def test_slot_history_bundle_opens_one_connection(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = self._seed_store(temp_dir)
+        opened = 0
+        original_connect_locked = store._connect_locked
+
+        def counting_connect_locked():
+            nonlocal opened
+            opened += 1
+            return original_connect_locked()
+
+        store._connect_locked = counting_connect_locked  # type: ignore[method-assign]
+        payload = store.get_slot_history_bundle(
+            "archive-core",
+            "enc-a",
+            5,
+            metric_limits={"temperature_c": 10, "bytes_read": 10, "bytes_written": 10},
+        )
+
+        self.assertEqual(opened, 1)
+        self.assertEqual(len(payload["events"]), 1)
+        self.assertEqual(len(payload["metrics"]["temperature_c"]), 1)
+        self.assertTrue(payload["disk_history"]["identity_available"])
+
+    def test_bundle_result_is_unchanged_by_the_shared_connection(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = self._seed_store(temp_dir)
+
+        bundle = store.get_slot_history_bundle(
+            "archive-core",
+            "enc-a",
+            5,
+            metric_limits={"temperature_c": 10},
+        )
+        separately = {
+            "events": store.list_slot_events("archive-core", "enc-a", 5, limit=12),
+            "samples": store.list_metric_samples(
+                "archive-core",
+                "enc-a",
+                5,
+                metric_name="temperature_c",
+                limit=10,
+            ),
+        }
+
+        self.assertEqual(bundle["events"], separately["events"])
+        self.assertEqual(bundle["metrics"]["temperature_c"], separately["samples"])
+
+
+class HistoryLockAddressCacheTests(unittest.TestCase):
+    """#457: every write lock re-read and re-parsed /proc/self/mountinfo."""
+
+    def setUp(self) -> None:
+        migration_lock.clear_lock_address_cache()
+
+    def tearDown(self) -> None:
+        migration_lock.clear_lock_address_cache()
+
+    def test_mountinfo_is_parsed_once_per_database_identity(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        database_path = temp_dir / "history.db"
+        database_path.write_text("seed", encoding="utf-8")
+        calls = 0
+        original = migration_lock._database_path_is_mount_point
+
+        def counting_mount_point_check(path):
+            nonlocal calls
+            calls += 1
+            return original(path)
+
+        with patch.object(
+            migration_lock,
+            "_database_path_is_mount_point",
+            counting_mount_point_check,
+        ):
+            first = migration_lock._history_lock_address(database_path)
+            for _ in range(4):
+                self.assertEqual(migration_lock._history_lock_address(database_path), first)
+            self.assertEqual(calls, 1)
+
+            # Writes keep the inode, so the cached validation still holds.
+            database_path.write_text("more", encoding="utf-8")
+            self.assertEqual(migration_lock._history_lock_address(database_path), first)
+            self.assertEqual(calls, 1)
+
+            # A replaced file is a new identity and must be validated again.
+            database_path.unlink()
+            database_path.write_text("replaced", encoding="utf-8")
+            self.assertEqual(migration_lock._history_lock_address(database_path), first)
+            self.assertEqual(calls, 2)
+
+    def test_cached_addresses_do_not_grow_without_bound(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        for index in range(migration_lock.LOCK_ADDRESS_CACHE_MAX_ENTRIES + 8):
+            candidate = temp_dir / f"history-{index}.db"
+            candidate.write_text("seed", encoding="utf-8")
+            migration_lock._history_lock_address(candidate)
+
+        self.assertLessEqual(
+            migration_lock.lock_address_cache_size(),
+            migration_lock.LOCK_ADDRESS_CACHE_MAX_ENTRIES,
+        )
+
+    def test_rejected_paths_are_still_rejected_when_cached(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        database_path = temp_dir / "history.db"
+        database_path.write_text("seed", encoding="utf-8")
+        link_path = temp_dir / "history-link.db"
+        link_path.hardlink_to(database_path)
+
+        with self.assertRaises(ValueError):
+            migration_lock._history_lock_address(database_path)
+        with self.assertRaises(ValueError):
+            migration_lock._history_lock_address(database_path)
