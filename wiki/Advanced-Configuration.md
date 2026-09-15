@@ -250,28 +250,47 @@ If you are running the optional history sidecar, the main retention knobs are:
 - `HISTORY_EVENT_RETENTION_DAYS`
 - `HISTORY_HOURLY_ROLLUP_RETENTION_DAYS`
 - `HISTORY_DAILY_ROLLUP_RETENTION_DAYS`
+- `HISTORY_BACKUP_INTERVAL_SECONDS`
 - `HISTORY_RETENTION_INTERVAL_SECONDS`
 - `HISTORY_RETENTION_BATCH_SIZE`
 - `HISTORY_RETENTION_MAX_BATCHES_PER_RUN`
+- `HISTORY_RETENTION_BACKUP_SKIP_MAX_SECONDS`
 - `HISTORY_SEGMENT_CATALOG_PATH` for an already migrated segmented deployment
 
 The default behavior is:
 
-- keep short-term rotating SQLite snapshots under `./history/backups`
+- take one full SQLite snapshot a day under `./history/backups`
+- keep `7` of those rotating daily snapshots
 - keep `4` weekly promoted copies
 - keep `3` monthly promoted copies
 - keep raw metric samples for `30` days and slot events for `365` days
 - keep hourly metric rollups for `365` days and daily rollups for `1825` days
 - run retention hourly in at most `20` transactions of `5000` rows per table
 
+Each copy is the size of the live database, so the default footprint is at most
+`14` database-sized files: `7` daily plus `4` weekly plus `3` monthly. Lower
+`HISTORY_BACKUP_RETENTION_COUNT` to shrink the short-term set; the value must be
+at least `1`.
+
 Set any of the four retention-day values to `0` to keep that data tier forever.
 Each retention transaction commits separately, so a stop or restart resumes from
-the remaining rows instead of restarting one large delete. The collector starts
-retention only after creating a backup successfully in the same slow pass.
-SQLite reuses pages
-released by pruning. The database file therefore plateaus near its high-water
-size rather than shrinking after every pass; retention does not run `VACUUM` or
-replace the live database.
+the remaining rows instead of restarting one large delete.
+
+Retention runs on its own schedule and is not part of the backup. It prunes
+whenever the snapshot taken in that pass succeeded, or a snapshot on disk is
+younger than `HISTORY_RAW_METRIC_RETENTION_DAYS`. When neither is true, for
+example because the backup directory is unwritable or the disk is full,
+retention waits for at most `HISTORY_RETENTION_BACKUP_SKIP_MAX_SECONDS`
+(`86400` by default) and the dashboard shows the reason and the time pruning
+resumes. After that deadline retention prunes anyway and says that it ran
+without a recent backup, so a failing backup can no longer stop pruning until
+the database fills the disk. Set the value to `0` to prune immediately whatever
+the backup did. Segmented deployments keep their own gate: their retention
+consumes a sealed scheduled backup and waits for one.
+
+SQLite reuses pages released by pruning. The database file therefore plateaus
+near its high-water size rather than shrinking after every pass; retention does
+not run `VACUUM` or replace the live database.
 
 History queries combine retained raw values with hourly and daily rollups.
 Temperature and annualized-rate rollups use the sample-count-weighted average;

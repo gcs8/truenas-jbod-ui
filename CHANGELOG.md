@@ -123,6 +123,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Docs
 
+- Documented the history retention schedule, the bounded wait for a failing
+  backup, the default backup footprint, and what each dashboard diagnostic cell
+  now says (#TBD).
+
 - Reconciled the v0.23.0 release wrap and Wiki home page with the published
   GitHub release, GHCR package, and Pages demo while retaining the qualified
   v0.22.2 beginner-installation pin. (#518)

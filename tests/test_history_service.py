@@ -8702,8 +8702,6 @@ class HistoryReadConnectionBudgetTests(unittest.TestCase):
             vdev_name="raidz2-0",
             health="ONLINE",
             persistent_id_label="EUI64",
-            logical_unit_id="0x5000cca27c7f0005",
-            sas_address="0x5000cca27c7f1005",
         )
         store.upsert_slot_state(record, "2026-04-10T22:00:00+00:00")
         store.insert_events(
@@ -8733,8 +8731,6 @@ class HistoryReadConnectionBudgetTests(unittest.TestCase):
                     state="healthy",
                     gptid="eui.000000000000001000a075012b91c7cf",
                     persistent_id_label="EUI64",
-                    logical_unit_id="0x5000cca27c7f0005",
-                    sas_address="0x5000cca27c7f1005",
                 )
                 for metric_name in ("temperature_c", "bytes_read", "bytes_written")
             ]

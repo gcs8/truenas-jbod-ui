@@ -67,14 +67,14 @@ class CollectionFailureClassificationTests(unittest.TestCase):
         )
 
     def test_unknown_failures_keep_the_class_name_and_drop_the_message(self) -> None:
-        kind, summary = classify_collection_failure(ValueError("/mnt/tank/secret.db is broken"))
+        kind, summary = classify_collection_failure(ValueError("the collector database at the configured path is broken"))
 
         self.assertEqual(kind, "unexpected")
         self.assertEqual(
             summary,
             "Unexpected collector error; see the service logs. (ValueError)",
         )
-        self.assertNotIn("secret.db", summary)
+        self.assertNotIn("configured path", summary)
 
     def test_every_summary_is_bounded(self) -> None:
         exc = HistorySourceError.rejected("x" * 5000, status_code=500)
@@ -125,14 +125,14 @@ class RetentionFailureClassificationTests(unittest.TestCase):
         self.assertEqual(classify_retention_failure(full_error)[0], "disk_full")
 
     def test_unknown_retention_failures_never_echo_the_message(self) -> None:
-        kind, summary = classify_retention_failure(RuntimeError("/mnt/tank/private.db is broken"))
+        kind, summary = classify_retention_failure(RuntimeError("the history database at the configured path is broken"))
 
         self.assertEqual(kind, "unexpected")
         self.assertEqual(
             summary,
             "Unexpected retention error; see the service logs. (RuntimeError)",
         )
-        self.assertNotIn("private.db", summary)
+        self.assertNotIn("configured path", summary)
 
     def test_retention_summaries_are_bounded(self) -> None:
         _, summary = classify_retention_failure(RuntimeError("y" * 5000))
