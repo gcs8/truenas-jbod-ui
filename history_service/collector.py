@@ -971,7 +971,10 @@ class HistoryCollector:
             seconds=max(0, int(self.settings.retention_backup_skip_max_seconds))
         )
         if self._retention_backup_missing_since is None:
-            self._retention_backup_missing_since = normalized_now
+            self._retention_backup_missing_since = self._retention_wait_started_at(
+                normalized_now,
+                latest_backup_at,
+            )
         deadline = self._retention_backup_missing_since + skip_window
         if normalized_now < deadline:
             self.last_retention_skip_reason = RETENTION_SKIP_WAITING_FOR_BACKUP
@@ -995,6 +998,24 @@ class HistoryCollector:
             self.last_backup_error or "no backup snapshot was found",
         )
         return True
+
+    def _retention_wait_started_at(
+        self,
+        now: datetime,
+        latest_backup_at: datetime | None,
+    ) -> datetime:
+        """Return when the usable-backup window closed.
+
+        Anchoring on the current pass restarted the wait on every container
+        restart, so a service that restarts more often than the skip window
+        never pruned. The newest backup survives a restart, so derive the
+        anchor from it and clamp it to now; with no backup at all there is
+        nothing durable to derive from and the wait starts here.
+        """
+        if latest_backup_at is None:
+            return now
+        went_stale_at = latest_backup_at + self._usable_backup_max_age()
+        return min(went_stale_at, now)
 
     def _warn_retention_skipped(self, now: datetime, deadline: datetime) -> None:
         if (
