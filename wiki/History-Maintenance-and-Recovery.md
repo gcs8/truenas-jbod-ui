@@ -57,6 +57,27 @@ Segmented recovery can report unexpected files named like `.<hot-name>.segmented
 
 Never use wildcard deletion in the history directory. Leave every other hot database, catalog, staging file, rollback file, journal, and segment untouched. If ownership or catalog membership is unclear, keep the file and stop. Filename, age, and parseable contents are not proof of ownership.
 
+## Read the history dashboard diagnostics
+
+The history dashboard reports failures as plain sentences. The raw exception
+text, which can carry URLs, file paths, and appliance replies, stays in the
+service logs.
+
+| Cell | What it means |
+| --- | --- |
+| `Last error` | A collection pass failed. The text stays generic on purpose. |
+| `What went wrong` | The classified reason for that failure, such as not reaching the main UI, a request timeout, or a rejected request with its status code. |
+| `Backup error` | The last snapshot attempt failed, named in plain words: a full disk, an unwritable backup directory, or a read-only database. |
+| `Cleanup error` | The last retention pass failed. A batch size above the SQLite variable limit names `HISTORY_RETENTION_BATCH_SIZE` as the setting to lower. |
+| `Cleanup waiting` | Retention is holding off because no recent backup exists. |
+| `Cleanup resumes by` | The deadline after which retention prunes anyway. |
+| `Full refresh available` | When the next manual full refresh is allowed, instead of a refusal after the fact. |
+
+If `Cleanup waiting` stays set, fix the backup first: read `Backup error`, check
+that the backup directory is writable by the history service and has free
+space, then confirm that `Last backup` moves forward. Pruning resumes on its own
+once a snapshot succeeds, and no later than `Cleanup resumes by`.
+
 ## Common procedures
 
 ### Rename a system

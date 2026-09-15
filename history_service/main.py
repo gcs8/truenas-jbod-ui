@@ -5,7 +5,9 @@ import json
 import logging
 import math
 import os
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import cast
@@ -24,6 +26,7 @@ from app.services.history_status import project_public_collector_status
 from app.services.release_status import ReleaseStatusService
 from history_service.collector import HistoryCollectionAlreadyRunning, HistoryCollector
 from history_service.config import HistorySettings, get_history_settings
+from history_service.domain import isoformat_utc, utcnow
 from history_service.operation_bounds import (
     HISTORY_READ_BUSY_DETAIL,
     HISTORY_READ_RETRY_AFTER_SECONDS,
@@ -79,6 +82,19 @@ bulk_history_read_admission = BulkHistoryReadAdmission(
 )
 bulk_history_read_operations: set[asyncio.Task[tuple[list[dict[str, object]], int]]] = set()
 HISTORY_COLLECTOR_ERROR_DETAIL = "History collector error; see service logs."
+# Fixed-vocabulary diagnostics from history_service.diagnostics. They are safe to
+# publish (no URLs, paths or appliance text), so the dashboard shows them next to
+# the redacted last_error, which stays generic for the main UI projection.
+HISTORY_DIAGNOSTIC_STATUS_FIELDS = (
+    "last_error_kind",
+    "last_error_summary",
+    "last_retention_error_kind",
+    "last_retention_skip_reason",
+    "last_retention_skip_until",
+    "last_retention_ran_without_backup",
+    "last_backup_error",
+    "last_backup_error_kind",
+)
 SLOT_HISTORY_METRIC_LIMITS: dict[str, int] = {
     "temperature_c": 96,
     "bytes_read": 60,
@@ -267,10 +283,37 @@ def public_collector_status(
     *,
     last_error_detail: str = HISTORY_COLLECTOR_ERROR_DETAIL,
 ) -> dict[str, object]:
-    return project_public_collector_status(
+    projected = project_public_collector_status(
         status,
         last_error_detail=last_error_detail,
     )
+    if not projected:
+        return projected
+    if isinstance(status, Mapping):
+        for field in HISTORY_DIAGNOSTIC_STATUS_FIELDS:
+            if field in status:
+                projected[field] = status[field]
+    return projected
+
+
+def refresh_cooldown_status() -> dict[str, object]:
+    """Publish the full-refresh cooldown deadline the dashboard renders.
+
+    It sits beside the collector status rather than inside it: the collector
+    status is an exact allowlist (app/services/history_status.py), and the
+    cooldown belongs to this service's manual refresh admission, not to a
+    collection pass.
+    """
+
+    cooldown = refresh_admission.cooldown_state()
+    remaining = int(cooldown["seconds_remaining"])
+    return {
+        "full_refresh_cooldown_seconds": int(cooldown["cooldown_seconds"]),
+        "full_refresh_cooldown_seconds_remaining": remaining,
+        "full_refresh_available_at": (
+            isoformat_utc(utcnow() + timedelta(seconds=remaining)) if remaining > 0 else None
+        ),
+    }
 
 
 def safe_http_url(value: object) -> str:
@@ -333,6 +376,7 @@ async def index(request: Request, exact_counts: bool = Query(default=False)) -> 
             app_version=__version__,
             release_status=get_release_status_service().snapshot(),
             database_size_bytes=database_size_bytes,
+            refresh=refresh_cooldown_status(),
         ),
     )
 
@@ -365,6 +409,7 @@ async def overview(exact_counts: bool = Query(default=False)) -> dict[str, objec
     counts = await asyncio.to_thread(store.counts if exact_counts else store.estimated_counts)
     return {
         "collector": public_collector_status(collector.status()),
+        "refresh": refresh_cooldown_status(),
         "counts": counts,
         "counts_exact": exact_counts or counts.get("estimated") is False,
         "database": {
@@ -424,10 +469,11 @@ async def refresh_history(request: Request) -> dict[str, object] | JSONResponse:
             },
             status_code=409,
         )
-    except Exception:  # noqa: BLE001 - report manual collection failures as structured API errors.
+    except Exception as exc:  # noqa: BLE001 - report manual collection failures as structured API errors.
         logger.exception("Manual history %s refresh failed", normalized_mode)
         failure_detail = f"History {normalized_mode} refresh failed; see service logs."
         collector.last_error = failure_detail
+        collector.record_failure_diagnostics(exc)
         try:
             payload = await overview(exact_counts=False)
             collector_payload = payload.get("collector")
@@ -698,6 +744,7 @@ def build_dashboard_context(
     app_version: str,
     release_status: dict[str, object] | None = None,
     database_size_bytes: int = 0,
+    refresh: dict[str, object] | None = None,
 ) -> dict[str, object]:
     counts_are_estimated = bool(counts.get("estimated"))
     release_payload = release_status or {}
@@ -731,5 +778,6 @@ def build_dashboard_context(
             status.get("last_collection_inventory_forced")
         ),
         "format_count": format_count,
+        "refresh": refresh or {},
         "status_json": json.dumps(status),
     }

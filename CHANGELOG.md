@@ -42,6 +42,14 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Ran history retention on its own schedule instead of only after a successful
+  hourly backup, bounded the wait for a failing backup, and cut the default
+  backup footprint to a daily copy kept for a week (#539).
+
+- Replaced the generic history collector error, the retention class name, and
+  the invisible full-refresh cooldown with fixed, secret-free sentences and a
+  published cooldown deadline (#539).
+
 - Retried failed release checks with bounded backoff instead of waiting a
   full normal interval, preserving the last successful result (#469).
 
@@ -75,6 +83,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   bulk responses and offline exports. (#423)
 
 ### Performance
+
+- Served a slot history bundle from one SQLite connection instead of fifteen
+  and cached the history lock address per database identity instead of parsing
+  /proc/self/mountinfo on every lock (#539).
 
 - Reduced mapping revision work to one document read per batch while
   preserving conflict checks and calibration tokens. (#421)
@@ -110,6 +122,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   identity changes; normal timestamp-advancing inventory saves still write (#479).
 
 ### Docs
+
+- Documented the history retention schedule, the bounded wait for a failing
+  backup, the default backup footprint, and what each dashboard diagnostic cell
+  now says (#539).
 
 - Reconciled the v0.23.0 release wrap and Wiki home page with the published
   GitHub release, GHCR package, and Pages demo while retaining the qualified
