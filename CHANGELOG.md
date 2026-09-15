@@ -47,29 +47,29 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   `docker-compose.nonroot.yml` overlay rather than a helper the image does not
   ship, the notes gained a rollback path, and the breaking-changes list no
   longer asks for the authentication and public-origin settings #392 reversed
-  before release (#TBD).
+  before release (#541).
 
 - Corrected the off-loopback history recipes: the deployment and operations
   pages now set refresh-token mode, a token, and `HISTORY_PUBLIC_ORIGIN`
   alongside `HISTORY_BIND_ADDRESS`, which is what the service requires to
   start, and `.env.example` records that Compose derives
   `HISTORY_PUBLISHED_BIND_ADDRESS` and never passes `RELEASE_CHECK_*` to the
-  history sidecar (#TBD).
+  history sidecar (#541).
 
 - Added a "Rolling back a release" section to the deployment page covering the
   image pin, the data that a rollback does not revert, and the history restore
-  path, and pointed the operations page at it (#TBD).
+  path, and pointed the operations page at it (#541).
 
 ### Fixed
 
 - Ran each CI job once per pull request: a branch push whose branch already
   has an open pull request now defers to that pull request's run, CodeQL
   analyses pushes to `main` only, and the pull request type labeller no
-  longer re-runs and cancels itself on every push (#TBD).
+  longer re-runs and cancels itself on every push (#541).
 
 - Stopped the `Changelog entry` gate from blocking contributors who cannot
   apply the `no-changelog` label: it reports the missing entry and passes for
-  authors without write access, and still blocks for maintainers (#TBD).
+  authors without write access, and still blocks for maintainers (#541).
 
 - Retried failed release checks with bounded backoff instead of waiting a
   full normal interval, preserving the last successful result (#469).
@@ -272,7 +272,7 @@ them before starting the new images.
   the older image cannot open the history database, stop the stack and restore
   it from a scheduled backup as described in
   [Backup, Restore, and Debug Bundles](wiki/Backup-Restore-and-Debug-Bundles.md#optional-scheduled-state-backups),
-  then start the older image again (#TBD).
+  then start the older image again (#541).
 - Legacy manual slot mappings saved by older releases under the unscoped
   `default:{slot}` and `{enclosure}:{slot}` key shapes are only resolved when
   the deployment has exactly one configured system and exactly one detected
