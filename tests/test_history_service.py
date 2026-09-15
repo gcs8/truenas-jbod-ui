@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import io
 import json
 import os
 import re
@@ -11,6 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -32,6 +34,7 @@ from history_service.collector import (
     ScopeSnapshot,
 )
 from history_service.config import HistorySettings, get_history_settings
+from history_service.diagnostics import HistorySourceError
 from history_service.domain import MetricSample, SlotStateRecord, build_slot_events, isoformat_utc
 from history_service.migration_lock import history_lock_path, history_write_lock
 from history_service.segment_catalog import MIGRATION_PENDING_MARKER, activation_pending_path
@@ -6062,7 +6065,7 @@ class HistoryCollectorTests(unittest.TestCase):
         self.assertEqual(store.maintain_retention.call_count, 2)
         self.assertFalse(collector.status()["last_retention_has_more"])
 
-    def test_retention_failure_reports_only_exception_class_and_does_not_raise(self) -> None:
+    def test_retention_failure_reports_a_plain_sentence_and_does_not_raise(self) -> None:
         store = MagicMock()
         store.maintain_retention.side_effect = RuntimeError("private database path")
         collector = HistoryCollector(HistorySettings(), store)
@@ -6073,8 +6076,26 @@ class HistoryCollectorTests(unittest.TestCase):
         )
 
         status = collector.status()
-        self.assertEqual(status["last_retention_error"], "RuntimeError")
+        self.assertEqual(
+            status["last_retention_error"],
+            "Unexpected retention error; see the service logs. (RuntimeError)",
+        )
+        self.assertEqual(status["last_retention_error_kind"], "unexpected")
         self.assertNotIn("private database path", str(status))
+
+    def test_retention_batch_overflow_names_the_setting_to_lower(self) -> None:
+        store = MagicMock()
+        store.maintain_retention.side_effect = sqlite3.OperationalError("too many SQL variables")
+        collector = HistoryCollector(HistorySettings(), store)
+
+        collector._run_retention_if_due(
+            datetime(2026, 7, 1, tzinfo=timezone.utc),
+            backup_succeeded=True,
+        )
+
+        status = collector.status()
+        self.assertEqual(status["last_retention_error_kind"], "retention_batch_too_large")
+        self.assertIn("HISTORY_RETENTION_BATCH_SIZE", str(status["last_retention_error"]))
 
     def test_retention_failure_reports_prior_commits_and_keeps_catchup_pending(self) -> None:
         store = MagicMock()
@@ -8424,3 +8445,116 @@ class HistoryCollectorTests(unittest.TestCase):
         self.assertIsNotNone(loaded)
         self.assertEqual(loaded.vdev_name, "mirror-0")
         self.assertEqual(loaded.topology_label, "HA-Pool-R10 > mirror-0 > data (Active on QSOSN-Right)")
+
+
+class HistoryCollectorDiagnosticsTests(unittest.TestCase):
+    @staticmethod
+    def _collector() -> HistoryCollector:
+        return HistoryCollector(HistorySettings(request_timeout_seconds=45), MagicMock())
+
+    def test_unreachable_source_is_raised_as_a_classified_error(self) -> None:
+        collector = self._collector()
+
+        with patch(
+            "history_service.collector.urllib.request.urlopen",
+            side_effect=urllib.error.URLError("Connection refused"),
+        ):
+            with self.assertRaises(HistorySourceError) as caught:
+                collector._fetch_json_sync("/api/slots", {}, "GET", None, {}, None)
+
+        self.assertEqual(caught.exception.kind, "source_unreachable")
+        self.assertEqual(caught.exception.summary, "Could not reach the main UI service.")
+        self.assertIn("/api/slots", str(caught.exception))
+
+    def test_timeout_and_http_rejection_carry_bounded_details(self) -> None:
+        collector = self._collector()
+
+        with patch(
+            "history_service.collector.urllib.request.urlopen",
+            side_effect=TimeoutError(),
+        ):
+            with self.assertRaises(HistorySourceError) as timed_out:
+                collector._fetch_json_sync("/api/slots", {}, "GET", None, {}, None)
+        self.assertEqual(timed_out.exception.kind, "source_timeout")
+        self.assertIn("timeout 45 s", timed_out.exception.summary)
+
+        rejection = urllib.error.HTTPError(
+            "http://enclosure-ui:8000/api/slots",
+            500,
+            "Server Error",
+            {},
+            io.BytesIO(b"secret-token=abc"),
+        )
+        with patch("history_service.collector.urllib.request.urlopen", side_effect=rejection):
+            with self.assertRaises(HistorySourceError) as rejected:
+                collector._fetch_json_sync("/api/slots", {}, "GET", None, {}, None)
+        self.assertEqual(rejected.exception.kind, "source_rejected")
+        self.assertEqual(
+            rejected.exception.summary,
+            "The main UI rejected the request. (HTTP 500)",
+        )
+        self.assertNotIn("secret-token", rejected.exception.summary)
+
+    def test_status_publishes_the_failure_kind_and_summary_and_clears_them(self) -> None:
+        collector = self._collector()
+
+        collector.record_failure_diagnostics(
+            HistorySourceError.unreachable("GET http://enclosure-ui:8000/api/slots failed")
+        )
+        collector.last_error = "GET http://enclosure-ui:8000/api/slots failed"
+
+        status = collector.status()
+        self.assertEqual(status["last_error_kind"], "source_unreachable")
+        self.assertEqual(status["last_error_summary"], "Could not reach the main UI service.")
+
+        collector.clear_failure_diagnostics()
+        cleared = collector.status()
+        self.assertIsNone(cleared["last_error_kind"])
+        self.assertIsNone(cleared["last_error_summary"])
+        self.assertIsNone(cleared["last_error"])
+
+
+class HistoryDashboardDiagnosticStatusTests(unittest.TestCase):
+    def setUp(self) -> None:
+        history_main.refresh_admission = history_main.ManualRefreshAdmission(
+            cooldown_seconds=history_main.settings.full_refresh_cooldown_seconds
+        )
+
+    def test_public_status_keeps_the_diagnostic_fields_the_dashboard_reads(self) -> None:
+        projected = history_main.public_collector_status(
+            {
+                "collector_running": True,
+                "last_error": "GET http://enclosure-ui:8000/api/slots failed",
+                "last_error_kind": "source_unreachable",
+                "last_error_summary": "Could not reach the main UI service.",
+                "last_retention_error": "The history database is read-only. (OperationalError)",
+                "last_retention_error_kind": "database_read_only",
+            }
+        )
+
+        self.assertEqual(projected["last_error"], history_main.HISTORY_COLLECTOR_ERROR_DETAIL)
+        self.assertEqual(projected["last_error_kind"], "source_unreachable")
+        self.assertEqual(
+            projected["last_error_summary"],
+            "Could not reach the main UI service.",
+        )
+        self.assertEqual(projected["last_retention_error_kind"], "database_read_only")
+
+    def test_public_status_publishes_the_full_refresh_cooldown_deadline(self) -> None:
+        idle = history_main.public_collector_status({"collector_running": True})
+        self.assertEqual(
+            idle["full_refresh_cooldown_seconds"],
+            history_main.settings.full_refresh_cooldown_seconds,
+        )
+        self.assertEqual(idle["full_refresh_cooldown_seconds_remaining"], 0)
+        self.assertIsNone(idle["full_refresh_available_at"])
+
+        asyncio.run(history_main.refresh_admission.try_acquire("full"))
+        asyncio.run(history_main.refresh_admission.release())
+
+        cooling = history_main.public_collector_status({"collector_running": True})
+        self.assertGreater(cooling["full_refresh_cooldown_seconds_remaining"], 0)
+        self.assertIsInstance(cooling["full_refresh_available_at"], str)
+
+    def test_public_status_of_a_non_mapping_stays_empty(self) -> None:
+        self.assertEqual(history_main.public_collector_status(None), {})
