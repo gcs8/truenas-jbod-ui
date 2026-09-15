@@ -293,14 +293,27 @@ def public_collector_status(
         for field in HISTORY_DIAGNOSTIC_STATUS_FIELDS:
             if field in status:
                 projected[field] = status[field]
+    return projected
+
+
+def refresh_cooldown_status() -> dict[str, object]:
+    """Publish the full-refresh cooldown deadline the dashboard renders.
+
+    It sits beside the collector status rather than inside it: the collector
+    status is an exact allowlist (app/services/history_status.py), and the
+    cooldown belongs to this service's manual refresh admission, not to a
+    collection pass.
+    """
+
     cooldown = refresh_admission.cooldown_state()
     remaining = int(cooldown["seconds_remaining"])
-    projected["full_refresh_cooldown_seconds"] = int(cooldown["cooldown_seconds"])
-    projected["full_refresh_cooldown_seconds_remaining"] = remaining
-    projected["full_refresh_available_at"] = (
-        isoformat_utc(utcnow() + timedelta(seconds=remaining)) if remaining > 0 else None
-    )
-    return projected
+    return {
+        "full_refresh_cooldown_seconds": int(cooldown["cooldown_seconds"]),
+        "full_refresh_cooldown_seconds_remaining": remaining,
+        "full_refresh_available_at": (
+            isoformat_utc(utcnow() + timedelta(seconds=remaining)) if remaining > 0 else None
+        ),
+    }
 
 
 def safe_http_url(value: object) -> str:
@@ -363,6 +376,7 @@ async def index(request: Request, exact_counts: bool = Query(default=False)) -> 
             app_version=__version__,
             release_status=get_release_status_service().snapshot(),
             database_size_bytes=database_size_bytes,
+            refresh=refresh_cooldown_status(),
         ),
     )
 
@@ -395,6 +409,7 @@ async def overview(exact_counts: bool = Query(default=False)) -> dict[str, objec
     counts = await asyncio.to_thread(store.counts if exact_counts else store.estimated_counts)
     return {
         "collector": public_collector_status(collector.status()),
+        "refresh": refresh_cooldown_status(),
         "counts": counts,
         "counts_exact": exact_counts or counts.get("estimated") is False,
         "database": {
@@ -729,6 +744,7 @@ def build_dashboard_context(
     app_version: str,
     release_status: dict[str, object] | None = None,
     database_size_bytes: int = 0,
+    refresh: dict[str, object] | None = None,
 ) -> dict[str, object]:
     counts_are_estimated = bool(counts.get("estimated"))
     release_payload = release_status or {}
@@ -762,5 +778,6 @@ def build_dashboard_context(
             status.get("last_collection_inventory_forced")
         ),
         "format_count": format_count,
+        "refresh": refresh or {},
         "status_json": json.dumps(status),
     }

@@ -537,15 +537,6 @@ class HistoryDashboardRouteTests(unittest.TestCase):
                 "last_error",
             )
         }
-        # The fixed-vocabulary diagnostics are added only when the collector
-        # reported them; the cooldown deadline is always published.
-        expected.update(
-            {
-                "full_refresh_cooldown_seconds": history_main.settings.full_refresh_cooldown_seconds,
-                "full_refresh_cooldown_seconds_remaining": 0,
-                "full_refresh_available_at": None,
-            }
-        )
         patches = (
             patch.object(history_main.collector, "status", return_value=status),
             patch.object(history_main.store, "estimated_counts", return_value={"tracked_slots": 0}),
@@ -959,7 +950,14 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         self.assertEqual(payload["mode"], "full")
         self.assertEqual(payload["detail"], "History full refresh failed; see service logs.")
         fixture = Path(__file__).parent / "fixtures" / "history_refresh_failure.json"
+        refresh_block = payload.pop("refresh")
         self.assertEqual(payload, json.loads(fixture.read_text(encoding="utf-8")))
+        self.assertEqual(
+            refresh_block["full_refresh_cooldown_seconds"],
+            history_main.settings.full_refresh_cooldown_seconds,
+        )
+        self.assertGreater(refresh_block["full_refresh_cooldown_seconds_remaining"], 0)
+        self.assertIsInstance(refresh_block["full_refresh_available_at"], str)
         self.assertEqual(
             payload["collector"],
             {
@@ -8666,19 +8664,23 @@ class HistoryDashboardDiagnosticStatusTests(unittest.TestCase):
         )
         self.assertEqual(projected["last_retention_error_kind"], "database_read_only")
 
-    def test_public_status_publishes_the_full_refresh_cooldown_deadline(self) -> None:
-        idle = history_main.public_collector_status({"collector_running": True})
+    def test_refresh_cooldown_status_publishes_the_deadline_beside_the_collector(self) -> None:
+        idle = history_main.refresh_cooldown_status()
         self.assertEqual(
             idle["full_refresh_cooldown_seconds"],
             history_main.settings.full_refresh_cooldown_seconds,
         )
         self.assertEqual(idle["full_refresh_cooldown_seconds_remaining"], 0)
         self.assertIsNone(idle["full_refresh_available_at"])
+        self.assertNotIn(
+            "full_refresh_cooldown_seconds",
+            history_main.public_collector_status({"collector_running": True}),
+        )
 
         asyncio.run(history_main.refresh_admission.try_acquire("full"))
         asyncio.run(history_main.refresh_admission.release())
 
-        cooling = history_main.public_collector_status({"collector_running": True})
+        cooling = history_main.refresh_cooldown_status()
         self.assertGreater(cooling["full_refresh_cooldown_seconds_remaining"], 0)
         self.assertIsInstance(cooling["full_refresh_available_at"], str)
 
@@ -8832,8 +8834,11 @@ class HistoryLockAddressCacheTests(unittest.TestCase):
             self.assertEqual(calls, 1)
 
             # A replaced file is a new identity and must be validated again.
-            database_path.unlink()
-            database_path.write_text("replaced", encoding="utf-8")
+            # The replacement is created while the original still exists, so the
+            # two inodes cannot collide.
+            replacement = temp_dir / "history-replacement.db"
+            replacement.write_text("replaced", encoding="utf-8")
+            os.replace(replacement, database_path)
             self.assertEqual(migration_lock._history_lock_address(database_path), first)
             self.assertEqual(calls, 2)
 
