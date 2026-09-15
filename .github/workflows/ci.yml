@@ -17,8 +17,68 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  route:
+    name: Run routing
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+    steps:
+      # One run per head commit. `push` still fires on every branch so a branch
+      # is validated before a pull request exists, but once that branch has an
+      # open pull request the `pull_request` run covers the same commit, so the
+      # push run's jobs skip instead of repeating eight jobs. Skipped jobs
+      # satisfy required checks; cancelling the duplicate would show as a
+      # CANCELLED check instead (#TBD).
+      - name: Decide whether this run is the one for this head commit
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          BRANCH_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [ "${EVENT_NAME}" != "push" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "${EVENT_NAME} event: running the full preflight."
+            exit 0
+          fi
+
+          if [ "${BRANCH_NAME}" = "main" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "push to main: running the full preflight."
+            exit 0
+          fi
+
+          # An unreadable pull request list runs the preflight rather than
+          # skipping it, so an API failure can never hide a broken branch.
+          open_pull_requests="$(
+            gh pr list --repo "$GH_REPO" --head "$BRANCH_NAME" --state open \
+              --json number --jq 'length' || echo ""
+          )"
+          if [ -z "${open_pull_requests}" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::Could not list pull requests for ${BRANCH_NAME}; running the full preflight."
+            exit 0
+          fi
+
+          if [ "${open_pull_requests}" -gt 0 ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Branch ${BRANCH_NAME} has an open pull request; its pull_request run covers this commit."
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "no open pull request for ${BRANCH_NAME}: running the full preflight."
+          fi
+
   diff-hygiene:
     name: Diff hygiene
+    needs: route
+    if: needs.route.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -76,6 +136,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR_ASSOCIATION: ${{ github.event.pull_request.author_association }}
         run: |
           set -euo pipefail
           # Labels are read live so applying `no-changelog` and re-running the
@@ -84,14 +145,27 @@ jobs:
           # under Dependencies. The gate script itself only runs git; it
           # never talks to the network.
           labels="$(gh pr view "$PR_NUMBER" --json labels --jq '[.labels[].name] | join(",")')"
+
+          # Only a contributor with write access can apply `no-changelog`, so
+          # for everyone else the gate reports what is missing and passes; a
+          # maintainer adds the label or the bullet before merge (#TBD).
+          mode=()
+          case "${PR_AUTHOR_ASSOCIATION:-NONE}" in
+            OWNER|MEMBER|COLLABORATOR) ;;
+            *) mode=(--advisory) ;;
+          esac
+
           python3 scripts/check_changelog_entry.py \
             --base "$PR_BASE_SHA" \
             --head HEAD \
             --pr "$PR_NUMBER" \
-            --labels "$labels"
+            --labels "$labels" \
+            "${mode[@]}"
 
   python-source:
     name: Python compile and unittest (${{ matrix.python-version }})
+    needs: route
+    if: needs.route.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -178,6 +252,8 @@ jobs:
 
   ruff-check:
     name: Bounded Ruff
+    needs: route
+    if: needs.route.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -205,6 +281,8 @@ jobs:
 
   javascript-source:
     name: JavaScript syntax and npm lock
+    needs: route
+    if: needs.route.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -247,6 +325,8 @@ jobs:
 
   container-smoke:
     name: Production container smoke
+    needs: route
+    if: needs.route.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -463,6 +543,8 @@ jobs:
 
   admin-browser-cleanroom:
     name: Admin clean-room browser QA
+    needs: route
+    if: needs.route.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -539,9 +621,11 @@ jobs:
 
   public-demo-artifact:
     name: Checked-in public demo artifact
+    if: needs.route.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs:
+      - route
       - javascript-source
       - python-source
     env:

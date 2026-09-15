@@ -42,6 +42,15 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Ran each CI job once per pull request: a branch push whose branch already
+  has an open pull request now defers to that pull request's run, CodeQL
+  analyses pushes to `main` only, and the pull request type labeller no
+  longer re-runs and cancels itself on every push (#TBD).
+
+- Stopped the `Changelog entry` gate from blocking contributors who cannot
+  apply the `no-changelog` label: it reports the missing entry and passes for
+  authors without write access, and still blocks for maintainers (#TBD).
+
 - Retried failed release checks with bounded backoff instead of waiting a
   full normal interval, preserving the last successful result (#469).
 

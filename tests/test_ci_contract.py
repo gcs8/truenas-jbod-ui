@@ -624,7 +624,7 @@ class CIWorkflowContractTests(unittest.TestCase):
 
         self.assertEqual(
             triggers["pull_request_target"]["types"],
-            ["opened", "edited", "synchronize", "reopened"],
+            ["opened", "edited", "reopened"],
         )
         self.assertEqual(workflow["permissions"], {"pull-requests": "write"})
         for job_name, job in workflow["jobs"].items():
