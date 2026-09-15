@@ -259,10 +259,11 @@ class TrueNASWebsocketClient:
         before returning, including when the caller cancels more than once.
 
         With ``return_exceptions``, a failure that belongs to ONE disk - a
-        middleware rejection for a device it cannot open, or a name not in its
-        disk table - is returned at that disk's position instead of discarding
-        the whole batch (#522). A failure of the session itself still raises: no
-        result in it is trustworthy, and there is nothing to keep.
+        middleware rejection for a device it cannot open or a name not in its
+        disk table (#522), or a reply slower than the per-call deadline (#523) -
+        is returned at that disk's position instead of discarding the whole
+        batch. A failure of the session itself still raises: no result in it is
+        trustworthy, and there is nothing to keep.
         """
         if type(max_concurrency) is not int or max_concurrency <= 0:
             raise ValueError("max_concurrency must be a positive integer.")
@@ -321,6 +322,22 @@ class TrueNASWebsocketClient:
                     if not return_exceptions:
                         raise
                     results[position] = exc
+                    continue
+                except TimeoutError as exc:
+                    if not return_exceptions:
+                        raise
+                    # A reply slower than the per-call deadline belongs to this
+                    # disk, not to the session: the dispatcher has already
+                    # dropped the request id, so a late reply is discarded
+                    # rather than settling another position, and the remaining
+                    # workers keep draining the queue (#523). Reported as a
+                    # named TimeoutError so the caller's log says which disk.
+                    timeout_error = TimeoutError(
+                        f"disk.smartctl for {disk!r} did not answer within "
+                        f"{self.config.timeout_seconds:g}s."
+                    )
+                    timeout_error.__cause__ = exc
+                    results[position] = timeout_error
                     continue
                 if not isinstance(result, str):
                     payload_error = TrueNASAPIError(

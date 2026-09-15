@@ -60,6 +60,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   A disk that never answers now yields that slot's unavailable summary instead of
   holding the whole grid request open behind it (#524).
 
+- Bounded a slow CORE disk to its own slot inside the SMART batch. A reply past the
+  per-call timeout now degrades that one slot and leaves every other slot its batch
+  result, instead of sending the whole shelf back through the per-slot path (#TBD).
+
 - Kept the CORE SMART grid's partial batch results when middleware rejects one
   disk, retrying only that slot through the per-slot path instead of discarding
   every reply in the batch and re-fetching the whole shelf one disk at a time
