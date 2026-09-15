@@ -40,6 +40,19 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   concurrency and DDP heartbeat handling; inventory integration remained
   separate (#503).
 
+### Docs
+
+- Corrected the off-loopback history recipes: the deployment and operations
+  pages now set refresh-token mode, a token, and `HISTORY_PUBLIC_ORIGIN`
+  alongside `HISTORY_BIND_ADDRESS`, which is what the service requires to
+  start, and `.env.example` records that Compose derives
+  `HISTORY_PUBLISHED_BIND_ADDRESS` and never passes `RELEASE_CHECK_*` to the
+  history sidecar (#TBD).
+
+- Added a "Rolling back a release" section to the deployment page covering the
+  image pin, the data that a rollback does not revert, and the history restore
+  path, and pointed the operations page at it (#TBD).
+
 ### Fixed
 
 - Ran each CI job once per pull request: a branch push whose branch already

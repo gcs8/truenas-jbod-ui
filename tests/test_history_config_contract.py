@@ -85,10 +85,13 @@ class HistoryEnvDocumentationDriftTests(unittest.TestCase):
 
         block = self.history_environment_block()
         documented = self.documented_keys()
+        # A key the service block sets from another variable (the published
+        # bind address is derived from HISTORY_BIND_ADDRESS) still reaches the
+        # sidecar; only a key the block never mentions is unwired.
         unwired = {
             key
             for key in ENV_OVERRIDES
-            if key in documented and "${" + key not in block
+            if key in documented and key + ":" not in block
         }
 
         self.assertEqual(unwired, set(self.UNWIRED_SIDECAR_KEYS))
