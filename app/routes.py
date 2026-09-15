@@ -82,6 +82,17 @@ def _is_smart_batch_transport_failure(exc: BaseException) -> bool:
     return isinstance(exc, OSError) and exc.errno in SMART_BATCH_TRANSPORT_ERRNOS
 
 
+# The other half of #526. A filesystem failure on the SMART path is the local
+# data directory, not the shelf: it does not clear by waiting, and the operator
+# has to be told which of the two it is. Naming it here keeps the SMART batch
+# honest until #473 gives the whole app one data-directory report.
+SMART_BATCH_LOCAL_STORAGE_DETAIL = (
+    "SMART data could not be stored: the application data directory is not "
+    "usable. This is a local fault, not a shelf outage, and retrying will not "
+    "clear it; check the data directory's permissions, ownership and free space."
+)
+
+
 def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
     router = MainModuleAPIRouter(main_module, globals())
 
@@ -744,9 +755,21 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             # whole grid, whichever layer the transport failure escapes from.
             # #526: only the transport may say that. A filesystem failure shares
             # OSError's base but means the data directory is misconfigured, so
-            # it propagates unchanged to the handling that reports that instead.
+            # it is reported as the server fault it is, with the message and the
+            # log line an operator needs to find it, rather than as a shelf
+            # outage they are invited to wait out.
             if not _is_smart_batch_transport_failure(exc):
-                raise
+                logger.error(
+                    "SMART batch could not write the slot-detail cache for "
+                    "enclosure %s; the data directory is not usable: %s",
+                    enclosure_id,
+                    exc,
+                    exc_info=exc,
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail=SMART_BATCH_LOCAL_STORAGE_DETAIL,
+                ) from exc
             raise HTTPException(
                 status_code=503,
                 detail="SMART data is temporarily unavailable for this enclosure.",

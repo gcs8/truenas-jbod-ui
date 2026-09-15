@@ -60,6 +60,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   A disk that never answers now yields that slot's unavailable summary instead of
   holding the whole grid request open behind it (#524).
 
+- Reported an unusable data directory on the SMART grid as the local fault it is.
+  A filesystem failure while caching SMART results now answers 500 with a message
+  naming the data directory and logs one line, instead of a 503 that reads as a
+  passing enclosure outage (#TBD).
+
 - Retried failed release checks with bounded backoff instead of waiting a
   full normal interval, preserving the last successful result (#469).
 
