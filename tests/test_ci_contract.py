@@ -746,6 +746,20 @@ class CIRunsOncePerPullRequestTests(unittest.TestCase):
         self.assertIn('gh pr list --repo "$GH_REPO" --head "$BRANCH_NAME" --state open', script)
         self.assertIn('echo "run=false" >> "$GITHUB_OUTPUT"', script)
 
+    def test_push_runs_only_defer_to_pull_requests_this_workflow_runs(self) -> None:
+        workflow = yaml.safe_load(self.read(CI_WORKFLOW))
+        triggers = workflow.get("on", workflow.get(True, {}))
+        script = workflow["jobs"]["route"]["steps"][0]["run"]
+
+        # `pull_request` fires only for pull requests into main. A stacked
+        # branch whose open pull request targets another branch therefore gets
+        # no pull_request run, so its push run must not defer to it.
+        self.assertEqual(triggers["pull_request"]["branches"], ["main"])
+        self.assertIn(
+            'gh pr list --repo "$GH_REPO" --head "$BRANCH_NAME" --base main --state open',
+            script,
+        )
+
     def test_every_billable_job_is_gated_on_the_routing_decision(self) -> None:
         workflow = yaml.safe_load(self.read(CI_WORKFLOW))
 
