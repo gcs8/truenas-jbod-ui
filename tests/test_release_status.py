@@ -136,9 +136,27 @@ class ReleaseStatusTests(unittest.TestCase):
         self.assertIn('app_uid="${APP_UID:-10001}"', normalized)
         self.assertIn('app_gid="${APP_GID:-10001}"', normalized)
         # The published image has no ownership helper, so the note uses the
-        # host shell with the same configured identity (#TBD).
+        # host shell with the same configured identity (#541).
         self.assertIn('sudo chown -R "$app_uid:$app_gid"', normalized)
         self.assertNotIn("10001:10001", normalized)
+
+    def test_nonroot_upgrade_note_preserves_the_backup_identity(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        changelog = (repository / "CHANGELOG.md").read_text(encoding="utf-8")
+        unreleased = changelog.split("## v0.22.2", maxsplit=1)[0]
+        normalized = " ".join(unreleased.split())
+
+        # The recursive chown must not reach config/backup-secrets, which stays
+        # private to the backup user, and backup-status must be prepared as
+        # BACKUP_UID:APP_GID mode 2750 or the next scheduled backup aborts.
+        self.assertIn("-path ./config/backup-secrets -prune", normalized)
+        self.assertIn(
+            'sudo install -d -o "$backup_uid" -g "$app_gid" -m 2750 ./backup-status',
+            normalized,
+        )
+        self.assertNotIn('"$app_uid:$app_gid" ./config ', normalized)
+        self.assertNotIn('"$app_uid:$app_gid" ./config/backup-secrets', normalized)
+        self.assertNotIn('"$app_uid:$app_gid" ./data ./logs ./history ./backup-status', normalized)
 
     def test_network_mode_upgrade_note_names_every_write_control(self) -> None:
         repository = Path(__file__).resolve().parents[1]
@@ -553,6 +571,17 @@ class UpgradeNotesContractTests(unittest.TestCase):
     def test_released_upgrade_notes_never_require_the_repository_only_helper(self) -> None:
         self.assertNotIn(REPO_ONLY_HELPER, upgrade_release_section("v0.23.0"))
         self.assertNotIn(REPO_ONLY_HELPER, UPGRADE_RELEASE_NOTES.read_text(encoding="utf-8"))
+
+    def test_released_upgrade_notes_keep_backup_secrets_and_status_separate(self) -> None:
+        notes = UPGRADE_RELEASE_NOTES.read_text(encoding="utf-8")
+        normalized = " ".join(notes.split())
+
+        self.assertIn("except `config/backup-secrets`", normalized)
+        self.assertIn("`BACKUP_UID:APP_GID`", normalized)
+        self.assertNotIn(
+            "(`./config`, `./data`, `./logs`, `./history`, `./backup-status`)",
+            normalized,
+        )
 
     def test_released_upgrade_notes_carry_a_rollback_path(self) -> None:
         notes = upgrade_subsection(upgrade_release_section("v0.23.0"), "Upgrade notes")

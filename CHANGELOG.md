@@ -247,13 +247,20 @@ them before starting the new images.
 
   Skip this note entirely unless you add `-f docker-compose.nonroot.yml`. To
   adopt the overlay, stop the stack and give the bind mounts to the configured
-  app identity from the host shell. No repository checkout is needed:
+  app identity from the host shell. Leave the backup identity alone:
+  `config/backup-secrets` stays private to `BACKUP_UID`, and `backup-status`
+  is prepared as `BACKUP_UID:APP_GID` mode `2750`, which is what the scheduled
+  backup runner requires before it will write status. No repository checkout
+  is needed:
 
   ```bash
   docker compose down
   app_uid="${APP_UID:-10001}"
   app_gid="${APP_GID:-10001}"
-  sudo chown -R "$app_uid:$app_gid" ./config ./data ./logs ./history ./backup-status
+  backup_uid="${BACKUP_UID:-1000}"
+  sudo find ./config -path ./config/backup-secrets -prune -o -exec chown "$app_uid:$app_gid" {} +
+  sudo chown -R "$app_uid:$app_gid" ./data ./logs ./history
+  sudo install -d -o "$backup_uid" -g "$app_gid" -m 2750 ./backup-status
   docker compose -f docker-compose.yml -f docker-compose.nonroot.yml up -d
   ```
 
