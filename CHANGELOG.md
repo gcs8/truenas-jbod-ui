@@ -44,13 +44,13 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 - Made `--help` work on every script under `scripts/` off Linux, and described
   the arguments an operator has to fill in, including the segmented-history
-  source, segments directory, cutoff and key id (#TBD)
+  source, segments directory, cutoff and key id (#538)
 
 - Replaced the generic 500 a mapping or alias save returned when the data
   folder is not writable with a 503 and a plain sentence, and stopped the
   history service crash-looping on an unwritable history folder: it now retries
   with bounded backoff and then reports the path, the owner and the command to
-  run (#TBD)
+  run (#538)
 
 - Retried failed release checks with bounded backoff instead of waiting a
   full normal interval, preserving the last successful result (#469).
@@ -123,7 +123,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 - Documented which backups a deployment accepts (a newer app or schema
   version is refused before anything is replaced) and the unwritable data or
-  history folder symptom, with the command that fixes it (#TBD)
+  history folder symptom, with the command that fixes it (#538)
 
 - Reconciled the v0.23.0 release wrap and Wiki home page with the published
   GitHub release, GHCR package, and Pages demo while retaining the qualified
