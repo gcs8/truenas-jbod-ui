@@ -84,6 +84,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Performance
 
+- Served a slot history bundle from one SQLite connection instead of fifteen
+  and cached the history lock address per database identity instead of parsing
+  /proc/self/mountinfo on every lock (#TBD).
+
 - Reduced mapping revision work to one document read per batch while
   preserving conflict checks and calibration tokens. (#421)
 
