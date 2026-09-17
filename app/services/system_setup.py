@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from pydantic import ValidationError
 
 from app.config import (
     BMCConfig,
@@ -292,6 +293,68 @@ class SystemSetupService:
             self._write_config(config)
             return removed_system.label or removed_system.id, next_default_id
 
+    @staticmethod
+    def _clone_dialect_source(
+        raw_systems: list[object],
+        *,
+        platform: str | None,
+        host: str | None,
+        source_system_id: str | None,
+    ) -> SystemConfig | None:
+        """The saved system a new entry may inherit its API dialect from.
+
+        The named source system wins whenever it still serves the endpoint
+        being saved. Otherwise the saved entries for that endpoint only
+        answer for the dialect when they agree with each other. Anything
+        ambiguous returns None so the caller falls back to the config
+        defaults and the dialect is established again on the next connect.
+        """
+
+        requested_endpoint = _api_endpoint_identity(platform, host)
+        if requested_endpoint is None:
+            return None
+
+        matches: list[tuple[str, dict]] = []
+        for index, item in enumerate(raw_systems):
+            if not isinstance(item, dict):
+                continue
+            raw_truenas = item.get("truenas")
+            if not isinstance(raw_truenas, dict):
+                continue
+            candidate_endpoint = _api_endpoint_identity(
+                raw_truenas.get("platform"),
+                raw_truenas.get("host"),
+            )
+            if candidate_endpoint == requested_endpoint:
+                matches.append((_normalize_system_id(item.get("id"), index + 1), item))
+        if not matches:
+            return None
+
+        try:
+            candidates = [
+                (candidate_id, SystemConfig.model_validate(item))
+                for candidate_id, item in matches
+            ]
+        except ValidationError:
+            # A saved entry for this endpoint cannot be read, so nothing here
+            # can be trusted to answer for the dialect.
+            return None
+
+        if source_system_id:
+            for candidate_id, candidate in candidates:
+                if candidate_id == source_system_id:
+                    return candidate
+            # The clone names a source system that does not serve this
+            # endpoint; it cannot speak for the appliance being saved.
+
+        transports = {
+            (candidate.truenas.api_dialect, candidate.truenas.api_version)
+            for _, candidate in candidates
+        }
+        if len(transports) != 1:
+            return None
+        return candidates[0][1]
+
     def save_system(self, payload: SystemSetupRequest) -> tuple[SystemConfig, bool]:
         with _CONFIG_WRITE_LOCK:
             config = self._load_config()
@@ -317,25 +380,17 @@ class SystemSetupService:
 
             # The setup form still has no dialect control, so a clone (a saved
             # system re-saved under a new id) has no `existing_system` to read.
-            # Inherit the transport from any saved entry for the same API
-            # endpoint instead of silently downgrading a JSON-RPC host to DDP.
+            # The dialect must come from the system the clone was made FROM,
+            # never from an unrelated entry that merely shares the endpoint:
+            # two systems can point at one appliance with different dialects.
             dialect_source = existing_system
             if dialect_source is None:
-                requested_endpoint = _api_endpoint_identity(payload.platform, payload.truenas_host)
-                if requested_endpoint is not None:
-                    for item in raw_systems:
-                        if not isinstance(item, dict):
-                            continue
-                        raw_truenas = item.get("truenas")
-                        if not isinstance(raw_truenas, dict):
-                            continue
-                        candidate_endpoint = _api_endpoint_identity(
-                            raw_truenas.get("platform"),
-                            raw_truenas.get("host"),
-                        )
-                        if candidate_endpoint == requested_endpoint:
-                            dialect_source = SystemConfig.model_validate(item)
-                            break
+                dialect_source = self._clone_dialect_source(
+                    raw_systems,
+                    platform=payload.platform,
+                    host=payload.truenas_host,
+                    source_system_id=normalize_text(payload.ssh_commands_source_system_id),
+                )
 
             tls_ca_bundle_path = (
                 payload.tls_ca_bundle_path
