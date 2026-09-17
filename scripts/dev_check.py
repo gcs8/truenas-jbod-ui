@@ -133,6 +133,7 @@ WINDOWS_PORTABLE_TEST_MODULES = (
     "tests.test_release_status",
     "tests.test_release_wrap_validator",
     "tests.test_ssh_probe",
+    "tests.test_system_setup_api_dialect",
     "tests.test_tls_trust",
     "tests.test_truenas_ws",
     "tests.test_truenas_ws_jsonrpc",
