@@ -108,6 +108,24 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   apply the `no-changelog` label: it reports the missing entry and passes for
   authors without write access, and still blocks for maintainers (#541).
 
+- Backfilled a slot's serial, model and size from the cache when a live view drops
+  the serial while another strong identifier - a serial, logical unit id or gptid -
+  still agrees, instead of refusing the cache and overwriting it with the degraded
+  view (#524).
+- Stopped treating a bay's SAS address as disk identity. A live view carrying none
+  of the strong identifiers is now reported as `identity_state: "unknown"`: no
+  cached identity or SMART data is shown as current for it, the last-known cache
+  entry is kept as historical evidence instead of being overwritten by the degraded
+  row, and SMART reads taken during that window are isolated from the departed
+  disk's identity. A strong identifier that returns and disagrees is admitted as a
+  replacement (#524).
+- Kept one slow CORE disk from failing the whole SMART grid: a batch reply past the
+  call timeout now falls back to the per-slot path for that shelf and the batch route
+  answers 503 instead of 500 for every slot (#524).
+- Bounded every per-slot `disk.smartctl` call by the configured TrueNAS call timeout.
+  A disk that never answers now yields that slot's unavailable summary instead of
+  holding the whole grid request open behind it (#524).
+
 - Retried failed release checks with bounded backoff instead of waiting a
   full normal interval, preserving the last successful result (#469).
 
@@ -220,6 +238,19 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Normalized pointer hover and focus before public-demo screenshot capture so
   the exact-byte repeatability gate measures a settled page instead of a
   transient transformed control (#519).
+
+- Stopped the coverage tracer and `tracemalloc` from multiplying each other in
+  the peak-heap probes: probes now run through `tests/heap_probe.py`, which
+  detaches the active trace function while it measures. The 16 MiB
+  streaming-JSON preflight probe took 365.2s of the 535.2s Python 3.12 test
+  body on run 34815729312 and 4.2s on the untraced 3.14 job in the same run;
+  the probes now also report the product's heap instead of the product's plus
+  the tracer's. The same pull request also pinned the capture-workflow font
+  fallbacks in `docs/SCREENSHOT_CAPTURE.md` — the families pinned since #516,
+  the qualification run that recorded them, and the re-qualification a
+  maintainer owes before changing either — with `tests/test_ci_contract.py`
+  reading the pair out of the workflow so the doc cannot drift from the
+  enforced values again. (#536)
 
 ## v0.23.0 - 2026-09-08
 
