@@ -239,6 +239,19 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   the exact-byte repeatability gate measures a settled page instead of a
   transient transformed control (#519).
 
+- Stopped the coverage tracer and `tracemalloc` from multiplying each other in
+  the peak-heap probes: probes now run through `tests/heap_probe.py`, which
+  detaches the active trace function while it measures. The 16 MiB
+  streaming-JSON preflight probe took 365.2s of the 535.2s Python 3.12 test
+  body on run 34815729312 and 4.2s on the untraced 3.14 job in the same run;
+  the probes now also report the product's heap instead of the product's plus
+  the tracer's. The same pull request also pinned the capture-workflow font
+  fallbacks in `docs/SCREENSHOT_CAPTURE.md` — the families pinned since #516,
+  the qualification run that recorded them, and the re-qualification a
+  maintainer owes before changing either — with `tests/test_ci_contract.py`
+  reading the pair out of the workflow so the doc cannot drift from the
+  enforced values again. (#536)
+
 ## v0.23.0 - 2026-09-08
 
 This release includes every pull request merged after `v0.22.2` through the
