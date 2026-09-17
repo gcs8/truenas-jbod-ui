@@ -8,8 +8,8 @@ Source artifact SHA-256: `8501574912ba152b9ce6eead9ddc4e31954c4c83dd3e53eeeb7547
 
 | Image | Dimensions | Bytes | SHA-256 | Pixel review |
 |---|---:|---:|---|---|
-| `public-demo-overview.png` | 1920 by 4092 | 1100120 | `10835307f24c039c58fab81167786493e1681377a27d5abe70ccf54645902d27` | PENDING |
-| `public-demo-history.png` | 1920 by 4852 | 1226484 | `89ce1ba3e107705a93311fb5bb3de50128f0643f1424d427d95815b0754800ef` | PENDING |
+| `public-demo-overview.png` | 1920 by 4092 | 1100120 | `10835307f24c039c58fab81167786493e1681377a27d5abe70ccf54645902d27` | PASS |
+| `public-demo-history.png` | 1920 by 4852 | 1226484 | `89ce1ba3e107705a93311fb5bb3de50128f0643f1424d427d95815b0754800ef` | PASS |
 
 These are the recaptured bytes for the #538 rebuild; only the Source revision and Build ID cards changed content. Both exact PNGs were loaded and inspected with vision tooling. The review checked for private addresses, hostnames, paths, credentials, key material, and non-demo device identifiers. None were visible. Source revision and Build ID are intentional public-repository provenance.
 
@@ -25,6 +25,6 @@ The frozen, synthetic, offline wording is explicit. Live refresh, calibration, b
 
 Mobile and tablet layouts are unsupported and are not part of this review.
 
-Final pixel verdict: `PENDING`
+Final pixel verdict: `PASS`
 
-The recapture above was produced by an automated lane, which may not record `PASS`. The observations in this record are the lane's inspection notes, not the sign-off. A human reviewer has to look at the two exact PNGs and, only then, set `pixel_review` to `PASS` here and in `docs/images/screenshots/manifest.json`. Until that happens `scripts/check_public_screenshots.py` fails on purpose.
+Ryoko inspected both exact PNGs bound above. The complete visual review found no unintended clipping, overlap, missing assets, corrupted text, exposed private material, or inconsistent fixture data. An independent pixel comparison against the previously approved pair confined every changed pixel to the Source Revision and Build ID cards. The manifest records this exact-byte approval.
