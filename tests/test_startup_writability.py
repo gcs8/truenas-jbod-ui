@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import errno
 import os
+import re
 import sqlite3
 import tempfile
 import unittest
@@ -9,8 +10,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.services.storage_writability import (
+    CONTAINER_BIND_SOURCES,
     StorageDirectoryUnwritable,
     describe_unwritable_directory,
+    host_repair_path,
     is_unwritable_error,
     unwritable_directory_error,
 )
@@ -282,6 +285,73 @@ class AliasStoreUnwritableTests(unittest.TestCase):
             ):
                 with self.assertRaises(SasFabricAliasStorageUnwritable):
                     store._write({})
+
+
+class TroubleshootingHostPathTests(unittest.TestCase):
+    """The wiki must quote host paths; a container path there is an unrunnable command."""
+
+    ROOT = Path(__file__).resolve().parents[1]
+    COMPOSE_FILES = (
+        "docker-compose.yml",
+        "docker-compose.dev.yml",
+        "docker-compose.nonroot.yml",
+        "docker-compose.secrets.yml",
+    )
+    CHOWN = re.compile(r"chown\s+(?:-R\s+)?\d+:\d+\s+([^\n`]+)")
+    BIND = re.compile(r"-\s+(\./[^:\s]+):(/[^:\s]+)")
+
+    def _bind_sources(self) -> set[str]:
+        """Host sides of every `./host:/app/container` bind in the compose files."""
+        sources: set[str] = set()
+        for name in self.COMPOSE_FILES:
+            path = self.ROOT / name
+            if not path.is_file():
+                continue
+            for host, _container in self.BIND.findall(path.read_text(encoding="utf-8")):
+                sources.add(host)
+        self.assertTrue(sources, "no compose bind mounts found")
+        return sources
+
+    def _chown_targets(self, text: str) -> list[str]:
+        targets: list[str] = []
+        for match in self.CHOWN.finditer(text):
+            targets.extend(match.group(1).split())
+        return targets
+
+    def test_no_documented_chown_names_a_container_path(self) -> None:
+        offenders: list[str] = []
+        for page in sorted((self.ROOT / "wiki").glob("*.md")):
+            for target in self._chown_targets(page.read_text(encoding="utf-8")):
+                if target.startswith("/app/"):
+                    offenders.append(f"{page.name}: {target}")
+        self.assertEqual(offenders, [], "\n".join(offenders))
+
+    def test_the_quoted_log_line_is_the_line_the_code_emits(self) -> None:
+        quoted = " ".join(
+            (self.ROOT / "wiki" / "Troubleshooting.md").read_text(encoding="utf-8").split()
+        )
+        checked = 0
+        for container, host in CONTAINER_BIND_SOURCES:
+            self.assertEqual(host_repair_path(container), host)
+            if f"Cannot write to {container} " not in quoted:
+                continue
+            checked += 1
+            self.assertIn(
+                f"sudo chown -R 10001:10001 {host}",
+                quoted,
+                f"the quoted line for {container} does not name the host path {host}",
+            )
+        self.assertTrue(checked, "Troubleshooting.md no longer quotes the unwritable-directory line")
+
+    def test_every_documented_chown_target_is_a_compose_bind_source(self) -> None:
+        sources = self._bind_sources()
+        text = (self.ROOT / "wiki" / "Troubleshooting.md").read_text(encoding="utf-8")
+        unknown = [
+            target
+            for target in self._chown_targets(text)
+            if not target.startswith("$") and "./" + target.lstrip("./") not in sources
+        ]
+        self.assertEqual(unknown, [], "\n".join(unknown))
 
 
 if __name__ == "__main__":

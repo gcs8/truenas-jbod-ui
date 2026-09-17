@@ -124,15 +124,17 @@ uid. What you see:
   Troubleshooting.` (HTTP 503). Before v0.24 this was a generic HTTP 500.
 - The history service logs
   `Cannot write to /app/history (owned by uid 0, running as uid 10001). On the
-  Docker host run: sudo chown -R 10001:10001 /app/history`, retries a few times
+  Docker host run: sudo chown -R 10001:10001 ./history`, retries a few times
   with growing backoff, and then stops with that same line instead of looping a
   traceback.
 
-Run the command the log line names against the matching **host** directory, for
-example:
+The log line already names the host path: the container sees `/app/history`,
+but compose binds `./history` from the directory holding `docker-compose.yml`,
+so that is what you chown. Run it from that directory, for every bound
+directory at once:
 
 ```bash
-sudo chown -R 10001:10001 data history logs config
+sudo chown -R 10001:10001 ./config ./data ./history ./logs ./backup-status
 docker compose up -d
 ```
 

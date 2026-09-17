@@ -42,9 +42,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
-- Made `--help` work on every script under `scripts/` off Linux, and described
-  the arguments an operator has to fill in, including the segmented-history
-  source, segments directory, cutoff and key id (#538)
+- Made `--help` work on every script under `scripts/` off Linux without
+  writing anything into the checkout, and described the arguments an operator
+  has to fill in, including the segmented-history source, segments directory,
+  cutoff and key id (#538)
 
 - Replaced the generic 500 a mapping or alias save returned when the data
   folder is not writable with a 503 and a plain sentence, and stopped the

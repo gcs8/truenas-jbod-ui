@@ -8,10 +8,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = ROOT / "scripts"
 
-# `scripts/public_demo_source_parity.py` is a pinned public-demo source input
-# (`scripts/public_demo_inputs.py`); changing it changes the published artifact
-# digest, so its `--help` failure is tracked on #446 and excluded here by name.
-KNOWN_UNRUNNABLE = {"public_demo_source_parity.py"}
+# `scripts/public_demo_source_parity.py` is the one script whose `--help` still
+# exits 1. The fix is a two-line `sys.path` bootstrap, but the file is a pinned
+# public-demo source input (`scripts/public_demo_inputs.py`), so changing it
+# invalidates `public-demo/index.html` and the screenshot provenance manifest,
+# which is a demo republish, not a help fix. It is not silently skipped: the
+# exact failure is pinned below, so the day the demo is rebuilt this test fails
+# and the exclusion has to go. Tracked on #446.
+KNOWN_UNRUNNABLE = {"public_demo_source_parity.py": "No module named 'scripts'"}
 
 # Arguments an operator has to supply a value for, and a word the help text
 # must explain them with.
@@ -94,20 +98,68 @@ def _run_help(path: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _git(*arguments: str) -> str:
+    return subprocess.run(
+        ["git", *arguments],
+        capture_output=True,
+        text=True,
+        cwd=str(ROOT),
+        check=True,
+        timeout=120,
+    ).stdout
+
+
+def _tree_state() -> tuple[str, dict[str, tuple[int, int]]]:
+    """What git sees, to prove `--help` writes nothing an operator would keep.
+
+    Ignored runtime paths (`logs/*.log`) are out of scope on purpose: importing
+    the app configures file logging, which is the app's behaviour, not the help
+    path's. Anything git would report is in scope.
+    """
+    status = _git("status", "--porcelain")
+    tracked: dict[str, tuple[int, int]] = {}
+    for name in _git("ls-files", "-z").split("\x00"):
+        if not name:
+            continue
+        try:
+            stat = (ROOT / name).stat()
+        except OSError:
+            continue
+        tracked[name] = (stat.st_size, stat.st_mtime_ns)
+    return status, tracked
+
+
 class ScriptHelpTests(unittest.TestCase):
-    def test_every_script_prints_usage_on_help(self) -> None:
+    def test_every_script_prints_usage_on_help_without_side_effects(self) -> None:
         failures: list[str] = []
+        before = _tree_state()
         for path in _script_paths():
-            if path.name in KNOWN_UNRUNNABLE:
-                continue
             with self.subTest(script=path.name):
                 result = _run_help(path)
+                expected_failure = KNOWN_UNRUNNABLE.get(path.name)
+                if expected_failure is not None:
+                    # Pinned, not skipped: the reason has to stay exactly this one.
+                    if result.returncode == 0 or expected_failure not in result.stderr:
+                        failures.append(
+                            f"{path.name}: expected the known {expected_failure!r} failure, "
+                            f"got exit {result.returncode}; remove it from KNOWN_UNRUNNABLE"
+                        )
+                    continue
                 if result.returncode != 0:
                     failures.append(f"{path.name}: exit {result.returncode}: {result.stderr.strip()[-200:]}")
                     continue
                 if _is_command_line_entry_point(path) and "usage" not in result.stdout.lower():
                     failures.append(f"{path.name}: no usage line in stdout")
         self.assertEqual(failures, [], "\n".join(failures))
+        after_status, after_tracked = _tree_state()
+        before_status, before_tracked = before
+        self.assertEqual(after_status, before_status, "running --help changed what git reports")
+        touched = sorted(
+            name
+            for name in set(before_tracked) | set(after_tracked)
+            if before_tracked.get(name) != after_tracked.get(name)
+        )
+        self.assertEqual(touched, [], "running --help rewrote tracked files")
 
     def test_help_explains_the_arguments_operators_must_fill_in(self) -> None:
         missing: list[str] = []
