@@ -55,7 +55,7 @@ class _DialectConfigMixin:
     def _saved_entry(
         system_id: str,
         *,
-        host: str = "https://nas.example.test",
+        endpoint: str = "https://nas.example.test",
         dialect: str,
         version: str,
     ) -> dict:
@@ -63,7 +63,7 @@ class _DialectConfigMixin:
             "id": system_id,
             "label": system_id,
             "truenas": {
-                "host": host,
+                "host": endpoint,
                 "platform": "scale",
                 "api_dialect": dialect,
                 "api_version": version,
@@ -75,7 +75,7 @@ class _DialectConfigMixin:
         self,
         *,
         system_id: str,
-        host: str,
+        endpoint: str,
         source_system_id: str | None = None,
     ) -> SystemSetupRequest:
         extra: dict[str, object] = {}
@@ -88,7 +88,7 @@ class _DialectConfigMixin:
             system_id=system_id,
             label="Cloned Scale",
             platform="scale",
-            truenas_host=host,
+            truenas_host=endpoint,
             api_key="cloned-api-key",
             replace_existing=False,
             **extra,
@@ -99,19 +99,19 @@ class SystemSetupApiDialectTests(_DialectConfigMixin, unittest.TestCase):
     """The admin clone flow must not silently move a JSON-RPC host onto DDP."""
 
     def test_cloning_a_saved_system_keeps_the_jsonrpc_dialect(self) -> None:
-        self.service.save_system(self._request(system_id="scale-clone", host="https://nas.example.test"))
+        self.service.save_system(self._request(system_id="scale-clone", endpoint="https://nas.example.test"))
 
         saved = self._saved_truenas("scale-clone")
         self.assertEqual(saved.get("api_dialect"), "jsonrpc")
         self.assertEqual(saved.get("api_version"), "v25.10.0")
 
     def test_cloning_matches_the_host_regardless_of_url_spelling(self) -> None:
-        self.service.save_system(self._request(system_id="scale-clone", host="https://NAS.example.test/"))
+        self.service.save_system(self._request(system_id="scale-clone", endpoint="https://NAS.example.test/"))
 
         self.assertEqual(self._saved_truenas("scale-clone").get("api_dialect"), "jsonrpc")
 
     def test_a_new_unrelated_host_keeps_the_ddp_default(self) -> None:
-        self.service.save_system(self._request(system_id="other-scale", host="https://other.example.test"))
+        self.service.save_system(self._request(system_id="other-scale", endpoint="https://other.example.test"))
 
         saved = self._saved_truenas("other-scale")
         self.assertEqual(saved.get("api_dialect"), "ddp")
@@ -132,7 +132,7 @@ class SystemSetupMixedDialectEndpointTests(_DialectConfigMixin, unittest.TestCas
         self.service.save_system(
             self._request(
                 system_id="scale-clone",
-                host="https://nas.example.test",
+                endpoint="https://nas.example.test",
                 source_system_id="saved-jsonrpc",
             )
         )
@@ -152,7 +152,7 @@ class SystemSetupMixedDialectEndpointTests(_DialectConfigMixin, unittest.TestCas
         self.service.save_system(
             self._request(
                 system_id="scale-clone",
-                host="https://nas.example.test",
+                endpoint="https://nas.example.test",
                 source_system_id="saved-ddp",
             )
         )
@@ -170,7 +170,7 @@ class SystemSetupMixedDialectEndpointTests(_DialectConfigMixin, unittest.TestCas
         )
 
         self.service.save_system(
-            self._request(system_id="scale-clone", host="https://nas.example.test")
+            self._request(system_id="scale-clone", endpoint="https://nas.example.test")
         )
 
         saved = self._saved_truenas("scale-clone")
@@ -186,7 +186,7 @@ class SystemSetupMixedDialectEndpointTests(_DialectConfigMixin, unittest.TestCas
         )
 
         self.service.save_system(
-            self._request(system_id="scale-clone", host="https://nas.example.test")
+            self._request(system_id="scale-clone", endpoint="https://nas.example.test")
         )
 
         self.assertEqual(self._saved_truenas("scale-clone").get("api_dialect"), "jsonrpc")
@@ -196,7 +196,7 @@ class SystemSetupMixedDialectEndpointTests(_DialectConfigMixin, unittest.TestCas
             [
                 self._saved_entry(
                     "saved-elsewhere",
-                    host="https://other.example.test",
+                    endpoint="https://other.example.test",
                     dialect="jsonrpc",
                     version="v25.10.0",
                 ),
@@ -207,7 +207,7 @@ class SystemSetupMixedDialectEndpointTests(_DialectConfigMixin, unittest.TestCas
         self.service.save_system(
             self._request(
                 system_id="scale-clone",
-                host="https://nas.example.test",
+                endpoint="https://nas.example.test",
                 source_system_id="saved-elsewhere",
             )
         )

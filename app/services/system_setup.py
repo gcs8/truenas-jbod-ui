@@ -298,7 +298,7 @@ class SystemSetupService:
         raw_systems: list[object],
         *,
         platform: str | None,
-        host: str | None,
+        endpoint: str | None,
         source_system_id: str | None,
     ) -> SystemConfig | None:
         """The saved system a new entry may inherit its API dialect from.
@@ -310,7 +310,7 @@ class SystemSetupService:
         defaults and the dialect is established again on the next connect.
         """
 
-        requested_endpoint = _api_endpoint_identity(platform, host)
+        requested_endpoint = _api_endpoint_identity(platform, endpoint)
         if requested_endpoint is None:
             return None
 
@@ -388,7 +388,7 @@ class SystemSetupService:
                 dialect_source = self._clone_dialect_source(
                     raw_systems,
                     platform=payload.platform,
-                    host=payload.truenas_host,
+                    endpoint=payload.truenas_host,
                     source_system_id=normalize_text(payload.ssh_commands_source_system_id),
                 )
 
