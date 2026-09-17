@@ -78,9 +78,25 @@ def read_source_version(source_root: Path) -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Check that the deterministic checked-in public demo is publishable.")
-    parser.add_argument("demo_dir", nargs="?", type=Path, default=DEFAULT_DEMO_DIR)
-    parser.add_argument("--max-raw-bytes", type=int, default=DEFAULT_MAX_RAW_BYTES)
-    parser.add_argument("--max-gzip-bytes", type=int, default=DEFAULT_MAX_GZIP_BYTES)
+    parser.add_argument(
+        "demo_dir",
+        nargs="?",
+        type=Path,
+        default=DEFAULT_DEMO_DIR,
+        help="Directory holding the built public demo (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--max-raw-bytes",
+        type=int,
+        default=DEFAULT_MAX_RAW_BYTES,
+        help="Fail if the uncompressed page exceeds this many bytes (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--max-gzip-bytes",
+        type=int,
+        default=DEFAULT_MAX_GZIP_BYTES,
+        help="Fail if the gzipped page exceeds this many bytes (default: %(default)s).",
+    )
     parser.add_argument(
         "--source-root",
         type=Path,

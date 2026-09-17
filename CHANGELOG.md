@@ -36,11 +36,38 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Added
 
+- Added a JSON-RPC 2.0 websocket transport selectable per TrueNAS host with
+  `api_dialect` (and `api_version` to pin a documented API release), keeping the
+  DDP default for CORE and existing hosts; saving a system in the admin UI keeps
+  the saved dialect, and cloning one under a new id inherits the dialect of the
+  system it was cloned from instead of falling back to DDP; when several saved
+  systems share one API endpoint with different dialects the clone falls back to
+  the default so the transport is established again rather than guessed. The
+  admin UI now sends the loaded system's id with every save under a new id, so
+  the inherited dialect no longer depends on whether the SSH command list was
+  preserved, replaced or left at the platform defaults (#529).
 - Added a client-only, one-session SMART WebSocket batch API with bounded
   concurrency and DDP heartbeat handling; inventory integration remained
   separate (#503).
 
 ### Fixed
+
+- Made `--help` work on every script under `scripts/` off Linux without
+  writing anything into the checkout, with no exceptions left:
+  `public_demo_source_parity.py` now adds the repository root to `sys.path`
+  the way the builder that imports it already does, so running it directly no
+  longer fails with `No module named 'scripts'`. The help sweep also describes
+  the arguments an operator has to fill in, including the segmented-history
+  source, segments directory, cutoff and key id (#538)
+
+- Replaced the generic 500 a mapping or alias save returned when the data
+  folder is not writable with a 503 and a plain sentence, and stopped the
+  history service crash-looping on an unwritable history folder: it now retries
+  with bounded backoff, then stays up with an unhealthy `/healthz` and a 503 on
+  every other route, naming the path, the owner and the host command to run.
+  That command names the host bind source (`./history`) rather than the
+  container path, and a read-only SQLite database counts as unwritable even
+  though it carries no errno (#538)
 
 - Ran history retention on its own schedule instead of only after a successful
   hourly backup, bounded the wait for a failing backup with a deadline that is
@@ -124,6 +151,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   identity changes; normal timestamp-advancing inventory saves still write (#479).
 
 ### Docs
+
+- Documented which backups a deployment accepts (a newer app or schema
+  version is refused before anything is replaced) and the unwritable data or
+  history folder symptom, with the command that fixes it (#538)
 
 - Documented the history retention schedule, the bounded wait for a failing
   backup, the default backup footprint, and what each dashboard diagnostic cell
