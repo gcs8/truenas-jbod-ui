@@ -8,8 +8,8 @@ Source artifact SHA-256: `f5d4a54aaede6ab9867c8301bb81585f0326dbb885782df58e4379
 
 | Image | Dimensions | Bytes | SHA-256 | Pixel review |
 |---|---:|---:|---|---|
-| `public-demo-overview.png` | 1920 by 4092 | 1097758 | `ee3cffff77cd9e27bd6682eb8fab55b5e1e058bcae2f9733dbacd5dabf8e71ab` | PENDING |
-| `public-demo-history.png` | 1920 by 4852 | 1224675 | `675b9521eeabfb8d4a5219adcbaa2cd772d956ea98805cc65fe06ab8642e2d0d` | PENDING |
+| `public-demo-overview.png` | 1920 by 4092 | 1097758 | `ee3cffff77cd9e27bd6682eb8fab55b5e1e058bcae2f9733dbacd5dabf8e71ab` | PASS |
+| `public-demo-history.png` | 1920 by 4852 | 1224675 | `675b9521eeabfb8d4a5219adcbaa2cd772d956ea98805cc65fe06ab8642e2d0d` | PASS |
 
 These are the recaptured bytes for the #524 rebuild after merging main, which brought in #538, #529, #539, #540 and #541. `app/models/domain.py` gained `SlotView.identity_state`, so the embedded snapshot payloads carry one extra field per slot; no rendered card reads that field, so only the Source revision and Build ID cards changed visible content. Both exact PNGs were loaded and inspected by the lane that produced them. These are the lane's inspection notes, not the sign-off. The review checked for private addresses, hostnames, paths, credentials, key material, and non-demo device identifiers. None were visible. Source revision and Build ID are intentional public-repository provenance.
 
@@ -21,10 +21,10 @@ The checked-in fixture preserves the spare group at slots 42 and 43. Both bays a
 
 The history image shows five samples from January 8 through January 15, 2026. Its latest, minimum, and maximum temperatures match the chart. Read/write totals, seven-day deltas, rates, capture time, and selected identity agree with the overview. The one aggregate event does not claim to belong to the selected slot.
 
-The frozen, synthetic, offline wording is explicit. Live refresh, calibration, backup, and LED actions are unavailable as expected. The lane's inspection found no blocker in the pixels themselves; the sign-off below is still outstanding. This review does not authorize publication by itself; the exact-byte checker still verifies framing, dimensions, sizes, hashes, docs/Wiki byte identity, artifact identity, source revision, and the `PASS` fields.
+The frozen, synthetic, offline wording is explicit. Live refresh, calibration, backup, and LED actions are unavailable as expected. Ryoko inspected both exact PNGs with Hermes `vision_analyze`. The complete visual review found no unintended clipping, overlap, missing assets, corrupted text, exposed private material, or inconsistent fixture data. An independent RGB pixel comparison against the previously approved pair found 9,521 changed pixels in each image, all inside the provenance-card region at x=962..1819 and y=270..570; every pixel outside that region was identical. The Source revision and Build ID cards are fully visible, readable, contained, and non-overlapping.
 
 Mobile and tablet layouts are unsupported and are not part of this review.
 
-Final pixel verdict: `PENDING`
+Final pixel verdict: `PASS`
 
-These exact bytes have not been signed off. A recapture resets `pixel_review` to `PENDING`, and only a named human reviewer, or a reviewer who discloses the vision tool they used, may return it to `PASS` in both this record and `docs/images/screenshots/manifest.json`. Until then the exact-byte checker fails by design. The previous `PASS` on this record belonged to the earlier pair of images and does not carry over to different bytes.
+Ryoko signs off the two exact PNGs and hashes recorded above. This approval applies only to those bytes. Any recapture resets `pixel_review` to `PENDING` and requires a new named review.

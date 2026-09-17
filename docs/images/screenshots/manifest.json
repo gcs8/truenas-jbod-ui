@@ -6,7 +6,7 @@
         1920,
         4852
       ],
-      "pixel_review": "PENDING",
+      "pixel_review": "PASS",
       "sha256": "675b9521eeabfb8d4a5219adcbaa2cd772d956ea98805cc65fe06ab8642e2d0d"
     },
     "public-demo-overview.png": {
@@ -15,7 +15,7 @@
         1920,
         4092
       ],
-      "pixel_review": "PENDING",
+      "pixel_review": "PASS",
       "sha256": "ee3cffff77cd9e27bd6682eb8fab55b5e1e058bcae2f9733dbacd5dabf8e71ab"
     }
   },
