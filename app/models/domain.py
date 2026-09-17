@@ -234,6 +234,11 @@ class SlotView(BaseModel):
     enclosure_name: str | None = None
     present: bool = False
     state: SlotState = SlotState.unknown
+    # "unknown" marks an occupied bay whose live observation carries none of the
+    # strong disk identifiers (serial, logical_unit_id, gptid). The bay-scoped
+    # sas_address and the reusable device alias cannot tell one occupant from
+    # the next, so nothing about the previous disk may be shown as current.
+    identity_state: Literal["known", "unknown"] = "known"
     identify_active: bool = False
     device_name: str | None = None
     smart_device_names: list[str] = Field(default_factory=list)
