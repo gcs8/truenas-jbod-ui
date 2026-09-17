@@ -44,6 +44,22 @@ LINUX_NVME_LIST_SUBSYS_COMMAND = (
 )
 
 
+def _api_endpoint_identity(platform: str | None, host: str | None) -> tuple[object, ...] | None:
+    """Normalized (platform, endpoint) key for the middleware API of one host."""
+
+    authority = api_credential_authority(
+        platform=platform or "core",
+        host=host,
+        username="",
+        verify_tls=False,
+        tls_ca_bundle_path=None,
+        tls_server_name=None,
+    )
+    if authority is None:
+        return None
+    return (authority.platform, authority.endpoint)
+
+
 def resolve_preserved_secret(incoming: str | None, existing: str | None = None) -> str:
     if incoming == PRESERVE_SECRET_SENTINEL:
         if not existing:
@@ -299,6 +315,28 @@ class SystemSetupService:
             if existing_index is not None:
                 existing_system = SystemConfig.model_validate(raw_systems[existing_index])
 
+            # The setup form still has no dialect control, so a clone (a saved
+            # system re-saved under a new id) has no `existing_system` to read.
+            # Inherit the transport from any saved entry for the same API
+            # endpoint instead of silently downgrading a JSON-RPC host to DDP.
+            dialect_source = existing_system
+            if dialect_source is None:
+                requested_endpoint = _api_endpoint_identity(payload.platform, payload.truenas_host)
+                if requested_endpoint is not None:
+                    for item in raw_systems:
+                        if not isinstance(item, dict):
+                            continue
+                        raw_truenas = item.get("truenas")
+                        if not isinstance(raw_truenas, dict):
+                            continue
+                        candidate_endpoint = _api_endpoint_identity(
+                            raw_truenas.get("platform"),
+                            raw_truenas.get("host"),
+                        )
+                        if candidate_endpoint == requested_endpoint:
+                            dialect_source = SystemConfig.model_validate(item)
+                            break
+
             tls_ca_bundle_path = (
                 payload.tls_ca_bundle_path
                 if payload.tls_ca_bundle_path is not None
@@ -490,13 +528,13 @@ class SystemSetupService:
                     # The setup form does not carry the dialect yet, so a save
                     # must not silently move a JSON-RPC host back onto DDP.
                     api_dialect=(
-                        existing_system.truenas.api_dialect
-                        if existing_system is not None
+                        dialect_source.truenas.api_dialect
+                        if dialect_source is not None
                         else TrueNASConfig.model_fields["api_dialect"].default
                     ),
                     api_version=(
-                        existing_system.truenas.api_version
-                        if existing_system is not None
+                        dialect_source.truenas.api_version
+                        if dialect_source is not None
                         else TrueNASConfig.model_fields["api_version"].default
                     ),
                     verify_ssl=payload.verify_ssl,
