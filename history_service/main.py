@@ -5,10 +5,11 @@ import json
 import logging
 import math
 import os
+import time
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
-from typing import cast
+from typing import Callable, cast
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -44,6 +45,12 @@ from history_service.refresh_auth import (
     read_limited_request_body,
     read_refresh_document,
 )
+from history_service.startup import (
+    DEFAULT_ATTEMPTS,
+    DEFAULT_INITIAL_BACKOFF_SECONDS,
+    HistoryStartupError,
+    open_history_store_with_retries,
+)
 from history_service.store import HistoryStore
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -67,9 +74,61 @@ def build_history_store(settings: HistorySettings) -> HistoryStore:
     )
 
 
-settings = get_history_settings()
-store = build_history_store(settings)
-collector = HistoryCollector(settings, store)
+HISTORY_UNAVAILABLE_DETAIL = "History storage is unavailable; see the service logs."
+
+
+def _configured_history_directory() -> Path:
+    """Where history lives, resolved for the operator line without creating it."""
+    configured = os.getenv("HISTORY_SQLITE_PATH")
+    if configured:
+        return Path(configured).parent
+    return Path(HistorySettings().sqlite_path).parent
+
+
+def open_history_runtime(
+    *,
+    attempts: int = DEFAULT_ATTEMPTS,
+    initial_backoff_seconds: float = DEFAULT_INITIAL_BACKOFF_SECONDS,
+    sleep: Callable[[float], None] = time.sleep,
+) -> tuple[HistorySettings, HistoryStore]:
+    """Load settings and open the store as one guarded operation.
+
+    Settings loading creates the history directories, so a root-owned bind
+    mount fails there first; it has to sit inside the retry boundary or the
+    retries and the operator-facing explanation never run.
+    """
+
+    def factory() -> tuple[HistorySettings, HistoryStore]:
+        loaded = get_history_settings()
+        return loaded, build_history_store(loaded)
+
+    return open_history_store_with_retries(
+        factory,
+        directory=_configured_history_directory,
+        attempts=attempts,
+        initial_backoff_seconds=initial_backoff_seconds,
+        sleep=sleep,
+    )
+
+
+def load_history_runtime(
+    **kwargs: object,
+) -> tuple[HistorySettings, HistoryStore | None, str | None]:
+    """Open the runtime, or report why it is unavailable without re-raising.
+
+    Docker restarts this container forever, and a restart does not change a
+    directory's owner, so a terminal failure stays up and reports itself
+    instead of looping the retries and the traceback.
+    """
+    try:
+        loaded, opened = open_history_runtime(**kwargs)  # type: ignore[arg-type]
+    except HistoryStartupError as exc:
+        return HistorySettings(), None, exc.reason
+    return loaded, opened, None
+
+
+settings, store, startup_failure_reason = load_history_runtime()
+collector = HistoryCollector(settings, store) if store is not None else None
 logger = logging.getLogger(__name__)
 refresh_admission = ManualRefreshAdmission(
     cooldown_seconds=settings.full_refresh_cooldown_seconds,
@@ -294,6 +353,11 @@ def get_release_status_service() -> ReleaseStatusService:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    if collector is None:
+        # Storage is unavailable; /healthz reports the reason and every other
+        # route answers 503 rather than the service crash-looping.
+        yield
+        return
     release_task = asyncio.create_task(get_release_status_service().run_periodic_refresh())
     await collector.start()
     try:
@@ -311,6 +375,17 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title=settings.app_name, version=__version__, lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 install_metrics(app, service_name="enclosure-history", version=__version__)
+
+
+@app.middleware("http")
+async def _refuse_while_storage_is_unavailable(request: Request, call_next):
+    """Answer 503 everywhere but the probes while the store could not open."""
+    if store is None and request.url.path not in {"/healthz", "/livez", "/metrics"}:
+        return JSONResponse(
+            {"detail": HISTORY_UNAVAILABLE_DETAIL},
+            status_code=503,
+        )
+    return await call_next(request)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -339,6 +414,15 @@ async def index(request: Request, exact_counts: bool = Query(default=False)) -> 
 
 @app.get("/healthz")
 async def healthz() -> JSONResponse:
+    if startup_failure_reason is not None or collector is None or store is None:
+        return JSONResponse(
+            {
+                "status": "unavailable",
+                "detail": HISTORY_UNAVAILABLE_DETAIL,
+                "reason": startup_failure_reason,
+            },
+            status_code=503,
+        )
     collector_status = public_collector_status(collector.status())
     payload = {
         "status": "ok" if not collector.last_error else "degraded",

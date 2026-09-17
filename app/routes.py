@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import email.message
 import json
+import logging
 from types import ModuleType
 from typing import Any
 
@@ -17,6 +18,7 @@ from app.services.history_backend import (
     HistoryBackendBusyError,
 )
 from app.services.history_status import project_public_collector_status
+from app.services.storage_writability import StorageDirectoryUnwritable
 from history_service.operation_bounds import (
     HISTORY_READ_BUSY_DETAIL,
     HISTORY_READ_RETRY_AFTER_SECONDS,
@@ -25,6 +27,23 @@ from history_service.refresh_auth import read_limited_request_body
 
 
 MAX_HISTORY_SCOPES_REQUEST_BYTES = 64 * 1024
+
+# Not named `logger`: the main-module facade copies its own globals in here.
+_routes_logger = logging.getLogger(__name__)
+
+
+def _storage_unwritable_response(exc: StorageDirectoryUnwritable) -> JSONResponse:
+    """Answer a save that failed on directory permissions in words a user can act on."""
+    _routes_logger.error("%s", exc.operator_message)
+    return JSONResponse(
+        {
+            "ok": False,
+            "error": exc.error_code,
+            "detail": exc.public_detail,
+        },
+        status_code=503,
+        headers={"Retry-After": "5"},
+    )
 
 
 def _history_read_busy_response() -> JSONResponse:
@@ -268,6 +287,8 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
                 selected_enclosure_id=enclosure_id,
                 scope=payload.scope,
             )
+        except StorageDirectoryUnwritable as exc:
+            return _storage_unwritable_response(exc)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return JSONResponse(result)
@@ -402,6 +423,8 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             return mapping_revision_conflict_response(exc)
         except MappingScopeConflict:
             return mapping_scope_conflict_response()
+        except StorageDirectoryUnwritable as exc:
+            return _storage_unwritable_response(exc)
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -460,6 +483,8 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             return mapping_revision_conflict_response(exc)
         except MappingScopeConflict:
             return mapping_scope_conflict_response()
+        except StorageDirectoryUnwritable as exc:
+            return _storage_unwritable_response(exc)
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         if cleared:
