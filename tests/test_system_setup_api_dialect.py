@@ -77,13 +77,27 @@ class _DialectConfigMixin:
         system_id: str,
         endpoint: str,
         source_system_id: str | None = None,
+        ssh_handling: str = "preserve",
     ) -> SystemSetupRequest:
+        """A clone payload.
+
+        `source_system_id` is the dedicated clone handle the admin UI sends
+        whenever a loaded system is saved under a new id. `ssh_handling`
+        models what the operator did to the SSH command box independently:
+        `preserve` keeps the saved list (and is the only case that also
+        carries `ssh_commands_source_system_id`), `replace` types a new list,
+        and `default` leaves the box untouched on a fresh form.
+        """
+
         extra: dict[str, object] = {}
         if source_system_id is not None:
-            extra = {
-                "ssh_commands_action": "preserve",
-                "ssh_commands_source_system_id": source_system_id,
-            }
+            extra["clone_source_system_id"] = source_system_id
+        if ssh_handling == "preserve" and source_system_id is not None:
+            extra["ssh_commands_action"] = "preserve"
+            extra["ssh_commands_source_system_id"] = source_system_id
+        elif ssh_handling == "replace":
+            extra["ssh_commands_action"] = "replace"
+            extra["ssh_commands"] = ["echo replaced-by-the-operator"]
         return SystemSetupRequest(
             system_id=system_id,
             label="Cloned Scale",
@@ -215,6 +229,153 @@ class SystemSetupMixedDialectEndpointTests(_DialectConfigMixin, unittest.TestCas
         saved = self._saved_truenas("scale-clone")
         self.assertEqual(saved.get("api_dialect"), "ddp")
         self.assertEqual(saved.get("api_version"), "current")
+
+
+class CloneSourceWithoutSshPreservationTests(_DialectConfigMixin, unittest.TestCase):
+    """The clone handle is independent of what the operator did to SSH commands.
+
+    `ssh_commands_source_system_id` only exists while the redacted command
+    list is being preserved. Replacing or defaulting the commands used to
+    erase the clone's source identity, which silently persisted DDP on a
+    mixed-dialect endpoint instead of inheriting the loaded system.
+    """
+
+    MIXED = ("saved-jsonrpc", "saved-ddp")
+
+    def _write_mixed(self, first: str) -> None:
+        entries = {
+            "saved-jsonrpc": self._saved_entry("saved-jsonrpc", dialect="jsonrpc", version="v25.10.0"),
+            "saved-ddp": self._saved_entry("saved-ddp", dialect="ddp", version="current"),
+        }
+        order = [first] + [name for name in self.MIXED if name != first]
+        self._write_systems([entries[name] for name in order])
+
+    def test_a_clone_that_replaces_the_ssh_commands_still_inherits_its_source(self) -> None:
+        for stored_first in self.MIXED:
+            for source, dialect, version in (
+                ("saved-jsonrpc", "jsonrpc", "v25.10.0"),
+                ("saved-ddp", "ddp", "current"),
+            ):
+                with self.subTest(stored_first=stored_first, source=source):
+                    self._write_mixed(stored_first)
+                    self.service.save_system(
+                        self._request(
+                            system_id=f"clone-{stored_first}-{source}",
+                            endpoint="https://nas.example.test",
+                            source_system_id=source,
+                            ssh_handling="replace",
+                        )
+                    )
+                    saved = self._saved_truenas(f"clone-{stored_first}-{source}")
+                    self.assertEqual(saved.get("api_dialect"), dialect)
+                    self.assertEqual(saved.get("api_version"), version)
+
+    def test_a_clone_that_defaults_the_ssh_commands_still_inherits_its_source(self) -> None:
+        for stored_first in self.MIXED:
+            for source, dialect, version in (
+                ("saved-jsonrpc", "jsonrpc", "v25.10.0"),
+                ("saved-ddp", "ddp", "current"),
+            ):
+                with self.subTest(stored_first=stored_first, source=source):
+                    self._write_mixed(stored_first)
+                    self.service.save_system(
+                        self._request(
+                            system_id=f"default-{stored_first}-{source}",
+                            endpoint="https://nas.example.test",
+                            source_system_id=source,
+                            ssh_handling="default",
+                        )
+                    )
+                    saved = self._saved_truenas(f"default-{stored_first}-{source}")
+                    self.assertEqual(saved.get("api_dialect"), dialect)
+                    self.assertEqual(saved.get("api_version"), version)
+
+    def test_preserving_ssh_commands_no_longer_decides_the_dialect(self) -> None:
+        """Only the clone handle may speak; the SSH handle must not.
+
+        The payload preserves `saved-jsonrpc`'s command list but names
+        `saved-ddp` as the system it was cloned from. The dialect follows the
+        clone handle.
+        """
+
+        self._write_mixed("saved-jsonrpc")
+        request = SystemSetupRequest(
+            system_id="split-handles",
+            label="Cloned Scale",
+            platform="scale",
+            truenas_host="https://nas.example.test",
+            api_key="cloned-api-key",
+            replace_existing=False,
+            clone_source_system_id="saved-ddp",
+            ssh_commands_action="preserve",
+            ssh_commands_source_system_id="saved-jsonrpc",
+        )
+        self.service.save_system(request)
+
+        saved = self._saved_truenas("split-handles")
+        self.assertEqual(saved.get("api_dialect"), "ddp")
+        self.assertEqual(saved.get("api_version"), "current")
+
+    def test_an_unknown_clone_source_fails_closed_on_a_mixed_endpoint(self) -> None:
+        self._write_mixed("saved-jsonrpc")
+
+        self.service.save_system(
+            self._request(
+                system_id="ghost-source",
+                endpoint="https://nas.example.test",
+                source_system_id="no-such-system",
+                ssh_handling="default",
+            )
+        )
+
+        saved = self._saved_truenas("ghost-source")
+        self.assertEqual(saved.get("api_dialect"), "ddp")
+        self.assertEqual(saved.get("api_version"), "current")
+
+    def test_a_foreign_clone_source_fails_closed_on_a_mixed_endpoint(self) -> None:
+        self._write_systems(
+            [
+                self._saved_entry("saved-jsonrpc", dialect="jsonrpc", version="v25.10.0"),
+                self._saved_entry("saved-ddp", dialect="ddp", version="current"),
+                self._saved_entry(
+                    "saved-elsewhere",
+                    endpoint="https://other.example.test",
+                    dialect="jsonrpc",
+                    version="v25.10.0",
+                ),
+            ]
+        )
+
+        self.service.save_system(
+            self._request(
+                system_id="foreign-source",
+                endpoint="https://nas.example.test",
+                source_system_id="saved-elsewhere",
+                ssh_handling="default",
+            )
+        )
+
+        saved = self._saved_truenas("foreign-source")
+        self.assertEqual(saved.get("api_dialect"), "ddp")
+        self.assertEqual(saved.get("api_version"), "current")
+
+    def test_a_re_save_under_the_same_id_ignores_a_stale_clone_handle(self) -> None:
+        self._write_mixed("saved-jsonrpc")
+
+        request = SystemSetupRequest(
+            system_id="saved-jsonrpc",
+            label="Saved Scale",
+            platform="scale",
+            truenas_host="https://nas.example.test",
+            api_key="rotated-api-key",
+            replace_existing=True,
+            clone_source_system_id="saved-ddp",
+        )
+        self.service.save_system(request)
+
+        saved = self._saved_truenas("saved-jsonrpc")
+        self.assertEqual(saved.get("api_dialect"), "jsonrpc")
+        self.assertEqual(saved.get("api_version"), "v25.10.0")
 
 
 if __name__ == "__main__":

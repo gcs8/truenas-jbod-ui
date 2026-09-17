@@ -383,13 +383,16 @@ class SystemSetupService:
             # The dialect must come from the system the clone was made FROM,
             # never from an unrelated entry that merely shares the endpoint:
             # two systems can point at one appliance with different dialects.
+            # `clone_source_system_id` is that handle and nothing else is:
+            # `ssh_commands_source_system_id` is only present while a redacted
+            # command list is preserved, so it must stay out of this decision.
             dialect_source = existing_system
             if dialect_source is None:
                 dialect_source = self._clone_dialect_source(
                     raw_systems,
                     platform=payload.platform,
                     endpoint=payload.truenas_host,
-                    source_system_id=normalize_text(payload.ssh_commands_source_system_id),
+                    source_system_id=normalize_text(payload.clone_source_system_id),
                 )
 
             tls_ca_bundle_path = (
