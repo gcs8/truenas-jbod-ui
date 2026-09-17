@@ -861,6 +861,103 @@ class SmartDetailBatch:
 _smart_detail_batch: ContextVar[SmartDetailBatch | None] = ContextVar("smart_detail_batch", default=None)
 
 
+# What each SSH command is used for, reported beside a command failure in the
+# debug output. `criticality` says what breaks without it: `topology` and
+# `inventory` failures cost structure, `enrichment` failures only cost detail.
+SSH_FAILURE_CONTEXTS_BY_COMMAND: dict[str, dict[str, str]] = {
+    "dmesg mpr events": {
+        "context": "sas_fabric_kernel_events",
+        "context_label": "recent MPR/CAM event evidence",
+        "criticality": "enrichment",
+    },
+    "pciconf -lv": {
+        "context": "sas_fabric_pci_inventory",
+        "context_label": "HBA PCI inventory",
+        "criticality": "enrichment",
+    },
+    "dmidecode slot": {
+        "context": "sas_fabric_pcie_slots",
+        "context_label": "HBA slot labels",
+        "criticality": "enrichment",
+    },
+    "mpr sysctl pci locations": {
+        "context": "sas_fabric_pci_location",
+        "context_label": "HBA PCI location corroboration",
+        "criticality": "enrichment",
+    },
+    "lsscsi -g -t": {
+        "context": "storage_fabric_linux_scsi_transport",
+        "context_label": "Linux SCSI transport detail",
+        "criticality": "enrichment",
+    },
+    "lsscsi -g": {
+        "context": "storage_fabric_linux_scsi_sg",
+        "context_label": "Linux SG device discovery",
+        "criticality": "enrichment",
+    },
+    "lsblk -OJ": {
+        "context": "linux_block_inventory",
+        "context_label": "Linux block inventory",
+        "criticality": "inventory",
+    },
+    "nvme list-subsys -o json": {
+        "context": "storage_fabric_linux_nvme_subsystems",
+        "context_label": "Linux NVMe subsystem detail",
+        "criticality": "enrichment",
+    },
+    "enclosure sysfs map": {
+        "context": "storage_fabric_linux_enclosure_map",
+        "context_label": "Linux enclosure driver slot map",
+        "criticality": "enrichment",
+    },
+    # Exact, so it wins over the "mprutil " prefix below.
+    "mprutil show adapters": {
+        "context": "sas_fabric_adapter_discovery",
+        "context_label": "adapter discovery",
+        "criticality": "topology",
+    },
+}
+
+# Checked in order, after the exact commands and the mprutil unit pattern.
+SSH_FAILURE_CONTEXTS_BY_PREFIX: tuple[tuple[str, dict[str, str]], ...] = (
+    (
+        "sg_ses join ",
+        {
+            "context": "storage_fabric_sg_ses_join",
+            "context_label": "joined SG SES slot evidence",
+            "criticality": "enrichment",
+        },
+    ),
+    (
+        "mprutil ",
+        {
+            "context": "sas_fabric_mprutil",
+            "context_label": "mprutil topology evidence",
+            "criticality": "topology",
+        },
+    ),
+)
+
+MPRUTIL_UNIT_COMMAND_PATTERN = re.compile(
+    r"^mprutil -u (?P<unit>\d+) show (?P<subcommand>[a-z]+)$"
+)
+
+MPRUTIL_SUBCOMMAND_LABELS: dict[str, str] = {
+    "adapter": "controller adapter detail",
+    "devices": "MPR device rows",
+    "enclosures": "MPR enclosure rows",
+    "expanders": "MPR expander rows",
+    "iocfacts": "IOC facts",
+    "all": "MPR all-command detail",
+}
+
+DEFAULT_SSH_FAILURE_CONTEXT: dict[str, str] = {
+    "context": "ssh_command",
+    "context_label": "SSH command",
+    "criticality": "inventory",
+}
+
+
 class InventoryService:
     def __init__(
         self,
@@ -2425,100 +2522,32 @@ class InventoryService:
 
     @staticmethod
     def _ssh_command_failure_context(canonical_command: str) -> dict[str, str]:
-        if canonical_command == "dmesg mpr events":
-            return {
-                "context": "sas_fabric_kernel_events",
-                "context_label": "recent MPR/CAM event evidence",
-                "criticality": "enrichment",
-            }
-        if canonical_command == "pciconf -lv":
-            return {
-                "context": "sas_fabric_pci_inventory",
-                "context_label": "HBA PCI inventory",
-                "criticality": "enrichment",
-            }
-        if canonical_command == "dmidecode slot":
-            return {
-                "context": "sas_fabric_pcie_slots",
-                "context_label": "HBA slot labels",
-                "criticality": "enrichment",
-            }
-        if canonical_command == "mpr sysctl pci locations":
-            return {
-                "context": "sas_fabric_pci_location",
-                "context_label": "HBA PCI location corroboration",
-                "criticality": "enrichment",
-            }
-        if canonical_command == "lsscsi -g -t":
-            return {
-                "context": "storage_fabric_linux_scsi_transport",
-                "context_label": "Linux SCSI transport detail",
-                "criticality": "enrichment",
-            }
-        if canonical_command == "lsscsi -g":
-            return {
-                "context": "storage_fabric_linux_scsi_sg",
-                "context_label": "Linux SG device discovery",
-                "criticality": "enrichment",
-            }
-        if canonical_command == "lsblk -OJ":
-            return {
-                "context": "linux_block_inventory",
-                "context_label": "Linux block inventory",
-                "criticality": "inventory",
-            }
-        if canonical_command == "nvme list-subsys -o json":
-            return {
-                "context": "storage_fabric_linux_nvme_subsystems",
-                "context_label": "Linux NVMe subsystem detail",
-                "criticality": "enrichment",
-            }
-        if canonical_command == "enclosure sysfs map":
-            return {
-                "context": "storage_fabric_linux_enclosure_map",
-                "context_label": "Linux enclosure driver slot map",
-                "criticality": "enrichment",
-            }
-        if canonical_command.startswith("sg_ses join "):
-            return {
-                "context": "storage_fabric_sg_ses_join",
-                "context_label": "joined SG SES slot evidence",
-                "criticality": "enrichment",
-            }
-        unit_match = re.match(r"^mprutil -u (?P<unit>\d+) show (?P<subcommand>[a-z]+)$", canonical_command)
+        """What a failed command was being used for, for the debug output.
+
+        `criticality` says what breaks without it: `topology` and `inventory`
+        failures cost structure, `enrichment` failures only cost detail.
+        """
+        exact = SSH_FAILURE_CONTEXTS_BY_COMMAND.get(canonical_command)
+        if exact is not None:
+            return dict(exact)
+
+        unit_match = MPRUTIL_UNIT_COMMAND_PATTERN.match(canonical_command)
         if unit_match:
             subcommand = unit_match.group("subcommand")
-            context_labels = {
-                "adapter": "controller adapter detail",
-                "devices": "MPR device rows",
-                "enclosures": "MPR enclosure rows",
-                "expanders": "MPR expander rows",
-                "iocfacts": "IOC facts",
-                "all": "MPR all-command detail",
-            }
             return {
                 "context": f"sas_fabric_mprutil_{subcommand}",
-                "context_label": context_labels.get(subcommand, f"mprutil {subcommand}"),
+                "context_label": MPRUTIL_SUBCOMMAND_LABELS.get(
+                    subcommand, f"mprutil {subcommand}"
+                ),
                 "controller": f"mpr{unit_match.group('unit')}",
                 "criticality": "enrichment",
             }
-        if canonical_command == "mprutil show adapters":
-            return {
-                "context": "sas_fabric_adapter_discovery",
-                "context_label": "adapter discovery",
-                "criticality": "topology",
-            }
-        if canonical_command.startswith("mprutil "):
-            return {
-                "context": "sas_fabric_mprutil",
-                "context_label": "mprutil topology evidence",
-                "criticality": "topology",
-            }
-        return {
-            "context": "ssh_command",
-            "context_label": "SSH command",
-            "criticality": "inventory",
-        }
+
+        for prefix, context in SSH_FAILURE_CONTEXTS_BY_PREFIX:
+            if canonical_command.startswith(prefix):
+                return dict(context)
+
+        return dict(DEFAULT_SSH_FAILURE_CONTEXT)
 
     @staticmethod
     def _is_configured_sg_ses_page_probe_failure(message: str) -> bool:

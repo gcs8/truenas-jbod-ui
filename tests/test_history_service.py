@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import io
 import json
 import os
 import re
@@ -11,6 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -32,11 +34,17 @@ from history_service.collector import (
     ScopeSnapshot,
 )
 from history_service.config import HistorySettings, get_history_settings
+from history_service.diagnostics import HistorySourceError
 from history_service.domain import MetricSample, SlotStateRecord, build_slot_events, isoformat_utc
 from history_service.migration_lock import history_lock_path, history_write_lock
 from history_service.segment_catalog import MIGRATION_PENDING_MARKER, activation_pending_path
 from history_service.segment_reader import SegmentedHistoryReader
-from history_service.store import DISK_IDENTITY_BACKFILL_USER_VERSION, HistoryStore, SlotStateUpdate
+from history_service.store import (
+    DISK_IDENTITY_BACKFILL_USER_VERSION,
+    RETENTION_WAIT_STATE_NAME,
+    HistoryStore,
+    SlotStateUpdate,
+)
 
 
 @contextmanager
@@ -365,10 +373,22 @@ class HistoryConfigTests(unittest.TestCase):
         self.assertEqual(settings.failure_backoff_initial_seconds, 30)
         self.assertEqual(settings.failure_backoff_max_seconds, 900)
 
-    def test_history_settings_default_backup_interval_matches_slow_interval(self) -> None:
+    def test_history_settings_default_backup_footprint_is_documented(self) -> None:
         settings = HistorySettings()
 
-        self.assertEqual(settings.backup_interval_seconds, settings.slow_interval_seconds)
+        self.assertEqual(settings.backup_interval_seconds, 86400)
+        self.assertEqual(settings.backup_retention_count, 7)
+        self.assertEqual(settings.weekly_backup_retention_count, 4)
+        self.assertEqual(settings.monthly_backup_retention_count, 3)
+
+    def test_history_settings_reject_an_unusable_backup_copy_count(self) -> None:
+        with self.assertRaises(ValueError):
+            HistorySettings(backup_retention_count=0)
+
+    def test_history_settings_bound_the_retention_backup_skip_window(self) -> None:
+        self.assertEqual(HistorySettings().retention_backup_skip_max_seconds, 86400)
+        with self.assertRaises(ValueError):
+            HistorySettings(retention_backup_skip_max_seconds=-1)
 
     def test_history_settings_fast_collection_uses_cached_inventory_by_default(self) -> None:
         self.assertFalse(HistorySettings().force_inventory_on_fast_collection)
@@ -935,7 +955,14 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         self.assertEqual(payload["mode"], "full")
         self.assertEqual(payload["detail"], "History full refresh failed; see service logs.")
         fixture = Path(__file__).parent / "fixtures" / "history_refresh_failure.json"
+        refresh_block = payload.pop("refresh")
         self.assertEqual(payload, json.loads(fixture.read_text(encoding="utf-8")))
+        self.assertEqual(
+            refresh_block["full_refresh_cooldown_seconds"],
+            history_main.settings.full_refresh_cooldown_seconds,
+        )
+        self.assertGreater(refresh_block["full_refresh_cooldown_seconds_remaining"], 0)
+        self.assertIsInstance(refresh_block["full_refresh_available_at"], str)
         self.assertEqual(
             payload["collector"],
             {
@@ -1429,6 +1456,42 @@ class HistoryStoreTests(unittest.TestCase):
             self.assertTrue(restarted.claim_segmented_retention_backup(newer_backup_at))
             restarted.release_segmented_retention_backup(newer_backup_at)
             self.assertTrue(restarted.claim_segmented_retention_backup(newer_backup_at))
+
+    def test_the_retention_wait_anchor_survives_a_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "history.db"
+            first = HistoryStore(str(db_path))
+            anchor = datetime(2030, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+
+            self.assertIsNone(first.read_retention_wait_anchor())
+            self.assertEqual(first.start_retention_wait(anchor), anchor)
+
+            restarted = HistoryStore(str(db_path))
+            self.assertEqual(restarted.read_retention_wait_anchor(), anchor)
+            # First writer wins: a restart cannot push the deadline out.
+            self.assertEqual(
+                restarted.start_retention_wait(anchor + timedelta(days=5)),
+                anchor,
+            )
+
+            restarted.clear_retention_wait()
+            self.assertIsNone(HistoryStore(str(db_path)).read_retention_wait_anchor())
+
+    def test_a_corrupt_retention_wait_anchor_is_reported_not_repaired(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "history.db"
+            store = HistoryStore(str(db_path))
+            store.start_retention_wait(datetime(2030, 1, 2, tzinfo=timezone.utc))
+
+            with sqlite3.connect(str(db_path)) as connection:
+                connection.execute(
+                    "UPDATE history_maintenance_state SET backup_at = ? WHERE name = ?",
+                    ("not a timestamp", RETENTION_WAIT_STATE_NAME),
+                )
+                connection.commit()
+
+            with self.assertRaises(ValueError):
+                HistoryStore(str(db_path)).read_retention_wait_anchor()
 
     def test_segmented_retention_claim_respects_the_shared_history_lock(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5653,6 +5716,32 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertIn("history_table_counts", table_names)
 
 
+def _collector_store() -> MagicMock:
+    """A mock store whose retention wait anchor is durable, like the real one.
+
+    The anchor lives in the store, not the collector, so a collector rebuilt
+    from the same store is exactly what a service restart looks like (#455).
+    """
+
+    store = MagicMock()
+    recorded: dict[str, datetime] = {}
+
+    def read_anchor() -> datetime | None:
+        return recorded.get("anchor")
+
+    def start_wait(anchor: datetime) -> datetime:
+        return recorded.setdefault("anchor", anchor.astimezone(timezone.utc))
+
+    def clear_wait() -> None:
+        recorded.pop("anchor", None)
+
+    store.read_retention_wait_anchor.side_effect = read_anchor
+    store.start_retention_wait.side_effect = start_wait
+    store.clear_retention_wait.side_effect = clear_wait
+    return store
+
+
+
 class HistoryCollectorTests(unittest.TestCase):
     @staticmethod
     def _topology_history_fixture(
@@ -5988,7 +6077,7 @@ class HistoryCollectorTests(unittest.TestCase):
         )
 
     def test_retention_runs_when_due_and_reports_status(self) -> None:
-        store = MagicMock()
+        store = _collector_store()
         store.maintain_retention.return_value = {
             "metric_samples_removed": 12,
             "events_removed": 3,
@@ -6027,7 +6116,7 @@ class HistoryCollectorTests(unittest.TestCase):
         self.assertIsNone(status["last_retention_error"])
 
     def test_retention_catchup_runs_again_before_interval_when_more_rows_remain(self) -> None:
-        store = MagicMock()
+        store = _collector_store()
         store.maintain_retention.side_effect = [
             {
                 "metric_samples_removed": 10,
@@ -6062,8 +6151,8 @@ class HistoryCollectorTests(unittest.TestCase):
         self.assertEqual(store.maintain_retention.call_count, 2)
         self.assertFalse(collector.status()["last_retention_has_more"])
 
-    def test_retention_failure_reports_only_exception_class_and_does_not_raise(self) -> None:
-        store = MagicMock()
+    def test_retention_failure_reports_a_plain_sentence_and_does_not_raise(self) -> None:
+        store = _collector_store()
         store.maintain_retention.side_effect = RuntimeError("private database path")
         collector = HistoryCollector(HistorySettings(), store)
 
@@ -6073,11 +6162,29 @@ class HistoryCollectorTests(unittest.TestCase):
         )
 
         status = collector.status()
-        self.assertEqual(status["last_retention_error"], "RuntimeError")
+        self.assertEqual(
+            status["last_retention_error"],
+            "Unexpected retention error; see the service logs. (RuntimeError)",
+        )
+        self.assertEqual(status["last_retention_error_kind"], "unexpected")
         self.assertNotIn("private database path", str(status))
 
+    def test_retention_batch_overflow_names_the_setting_to_lower(self) -> None:
+        store = _collector_store()
+        store.maintain_retention.side_effect = sqlite3.OperationalError("too many SQL variables")
+        collector = HistoryCollector(HistorySettings(), store)
+
+        collector._run_retention_if_due(
+            datetime(2026, 7, 1, tzinfo=timezone.utc),
+            backup_succeeded=True,
+        )
+
+        status = collector.status()
+        self.assertEqual(status["last_retention_error_kind"], "retention_batch_too_large")
+        self.assertIn("HISTORY_RETENTION_BATCH_SIZE", str(status["last_retention_error"]))
+
     def test_retention_failure_reports_prior_commits_and_keeps_catchup_pending(self) -> None:
-        store = MagicMock()
+        store = _collector_store()
         failure = RuntimeError("private database path")
         setattr(failure, "retention_summary", {
             "metric_samples_removed": 1,
@@ -6114,9 +6221,202 @@ class HistoryCollectorTests(unittest.TestCase):
             },
         )
 
-    def test_retention_requires_a_successful_same_pass_backup(self) -> None:
-        store = MagicMock()
+    def test_retention_runs_on_a_failed_pass_when_a_recent_backup_exists(self) -> None:
+        now = datetime(2026, 7, 1, tzinfo=timezone.utc)
+        store = _collector_store()
+        store.latest_backup_snapshot_at.return_value = now - timedelta(hours=6)
         collector = HistoryCollector(HistorySettings(), store)
+
+        collector._run_retention_if_due(now, backup_succeeded=False)
+
+        store.maintain_retention.assert_called_once()
+        status = collector.status()
+        self.assertIsNone(status["last_retention_skip_reason"])
+        self.assertFalse(status["last_retention_ran_without_backup"])
+
+    def test_retention_skip_without_any_backup_is_bounded_and_records_a_reason(self) -> None:
+        now = datetime(2026, 7, 1, tzinfo=timezone.utc)
+        store = _collector_store()
+        store.latest_backup_snapshot_at.return_value = None
+        collector = HistoryCollector(
+            HistorySettings(retention_backup_skip_max_seconds=86400),
+            store,
+        )
+
+        collector._run_retention_if_due(now, backup_succeeded=False)
+
+        store.maintain_retention.assert_not_called()
+        skipped = collector.status()
+        self.assertEqual(
+            skipped["last_retention_skip_reason"],
+            "Waiting for a successful database backup before pruning.",
+        )
+        self.assertEqual(skipped["last_retention_skip_until"], "2026-07-02T00:00:00+00:00")
+        self.assertIsNone(skipped["last_retention_attempt_at"])
+
+        collector._run_retention_if_due(now + timedelta(hours=2), backup_succeeded=False)
+        store.maintain_retention.assert_not_called()
+
+        collector._run_retention_if_due(now + timedelta(hours=25), backup_succeeded=False)
+
+        store.maintain_retention.assert_called_once()
+        ran = collector.status()
+        self.assertTrue(ran["last_retention_ran_without_backup"])
+        self.assertEqual(
+            ran["last_retention_skip_reason"],
+            "Pruned without a recent database backup because backups are failing.",
+        )
+
+    def test_the_retention_skip_deadline_is_anchored_to_the_newest_backup(self) -> None:
+        # The deadline used to start at the pass that noticed the miss, so a
+        # container restarting more often than the window postponed pruning
+        # forever. The newest backup survives a restart, so anchor on it.
+        now = datetime(2026, 7, 1, tzinfo=timezone.utc)
+        store = _collector_store()
+        settings = HistorySettings(retention_backup_skip_max_seconds=86400)
+        stale_for = timedelta(hours=2)
+        usable_for = HistoryCollector(settings, store)._usable_backup_max_age()
+        store.latest_backup_snapshot_at.return_value = now - usable_for - stale_for
+
+        first = HistoryCollector(settings, store)
+        first._run_retention_if_due(now, backup_succeeded=False)
+        deadline = first.status()["last_retention_skip_until"]
+
+        store.maintain_retention.assert_not_called()
+        self.assertEqual(deadline, "2026-07-01T22:00:00+00:00")
+
+        restarted = HistoryCollector(settings, store)
+        restarted._run_retention_if_due(now + timedelta(hours=12), backup_succeeded=False)
+
+        store.maintain_retention.assert_not_called()
+        self.assertEqual(restarted.status()["last_retention_skip_until"], deadline)
+
+        after_the_deadline = HistoryCollector(settings, store)
+        after_the_deadline._run_retention_if_due(now + timedelta(hours=23), backup_succeeded=False)
+
+        store.maintain_retention.assert_called_once()
+        self.assertTrue(after_the_deadline.status()["last_retention_ran_without_backup"])
+
+    def test_retention_skip_window_clears_once_a_backup_succeeds(self) -> None:
+        now = datetime(2026, 7, 1, tzinfo=timezone.utc)
+        store = _collector_store()
+        store.latest_backup_snapshot_at.return_value = None
+        collector = HistoryCollector(HistorySettings(), store)
+
+        collector._run_retention_if_due(now, backup_succeeded=False)
+        collector._run_retention_if_due(now + timedelta(hours=1), backup_succeeded=True)
+
+        store.maintain_retention.assert_called_once()
+        status = collector.status()
+        self.assertIsNone(status["last_retention_skip_reason"])
+        self.assertIsNone(status["last_retention_skip_until"])
+        self.assertFalse(status["last_retention_ran_without_backup"])
+
+    def test_the_no_backup_wait_survives_restarts_and_still_prunes_on_time(self) -> None:
+        # With no backup ever taken the anchor used to live only in memory, so
+        # a service restarting inside the window restarted the wait and never
+        # pruned while backups kept failing (#455).
+        now = datetime(2026, 7, 1, tzinfo=timezone.utc)
+        store = _collector_store()
+        store.latest_backup_snapshot_at.return_value = None
+        settings = HistorySettings(retention_backup_skip_max_seconds=86400)
+
+        first = HistoryCollector(settings, store)
+        first._run_retention_if_due(now, backup_succeeded=False)
+        deadline = first.status()["last_retention_skip_until"]
+        self.assertEqual(deadline, "2026-07-02T00:00:00+00:00")
+        store.maintain_retention.assert_not_called()
+
+        for restart_after in (6, 12, 18):
+            restarted = HistoryCollector(settings, store)
+            restarted._run_retention_if_due(
+                now + timedelta(hours=restart_after),
+                backup_succeeded=False,
+            )
+            store.maintain_retention.assert_not_called()
+            self.assertEqual(restarted.status()["last_retention_skip_until"], deadline)
+
+        after_the_deadline = HistoryCollector(settings, store)
+        after_the_deadline._run_retention_if_due(now + timedelta(hours=25), backup_succeeded=False)
+
+        store.maintain_retention.assert_called_once()
+        self.assertTrue(after_the_deadline.status()["last_retention_ran_without_backup"])
+
+    def test_the_wait_anchor_is_forgotten_once_a_backup_succeeds(self) -> None:
+        now = datetime(2026, 7, 1, tzinfo=timezone.utc)
+        store = _collector_store()
+        store.latest_backup_snapshot_at.return_value = None
+        settings = HistorySettings(retention_backup_skip_max_seconds=86400)
+
+        HistoryCollector(settings, store)._run_retention_if_due(now, backup_succeeded=False)
+        HistoryCollector(settings, store)._run_retention_if_due(
+            now + timedelta(hours=1),
+            backup_succeeded=True,
+        )
+        store.clear_retention_wait.assert_called()
+
+        # Backups start failing again: the window starts over, it is not
+        # inherited from the wait that a backup already ended.
+        restarted = HistoryCollector(settings, store)
+        restarted._run_retention_if_due(now + timedelta(hours=2), backup_succeeded=False)
+
+        self.assertEqual(
+            restarted.status()["last_retention_skip_until"],
+            "2026-07-02T02:00:00+00:00",
+        )
+        store.maintain_retention.assert_called_once()
+
+    def test_an_unusable_wait_anchor_stops_pruning(self) -> None:
+        now = datetime(2026, 7, 1, tzinfo=timezone.utc)
+        for broken in ("read_retention_wait_anchor", "start_retention_wait"):
+            with self.subTest(method=broken):
+                store = _collector_store()
+                store.latest_backup_snapshot_at.return_value = None
+                getattr(store, broken).side_effect = sqlite3.OperationalError(
+                    "attempt to write a readonly database"
+                )
+                collector = HistoryCollector(
+                    HistorySettings(retention_backup_skip_max_seconds=0),
+                    store,
+                )
+
+                collector._run_retention_if_due(now, backup_succeeded=False)
+
+                store.maintain_retention.assert_not_called()
+                status = collector.status()
+                self.assertEqual(
+                    status["last_retention_skip_reason"],
+                    "Not pruning: the retention wait record could not be read or written.",
+                )
+                self.assertIsNone(status["last_retention_skip_until"])
+                self.assertFalse(status["last_retention_ran_without_backup"])
+
+    def test_a_wait_record_that_cannot_be_cleared_stops_pruning(self) -> None:
+        # A stale record would make the next missing backup prune immediately.
+        now = datetime(2026, 7, 1, tzinfo=timezone.utc)
+        store = _collector_store()
+        store.latest_backup_snapshot_at.return_value = None
+        store.clear_retention_wait.side_effect = sqlite3.OperationalError("disk I/O error")
+        collector = HistoryCollector(HistorySettings(), store)
+
+        collector._run_retention_if_due(now, backup_succeeded=True)
+
+        store.maintain_retention.assert_not_called()
+        self.assertEqual(
+            collector.status()["last_retention_skip_reason"],
+            "Not pruning: the retention wait record could not be read or written.",
+        )
+
+    def test_segmented_retention_still_requires_its_scheduled_backup(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = _collector_store()
+        collector = HistoryCollector(
+            HistorySettings(
+                sqlite_path=str(temp_dir / "history.db"),
+                segment_catalog_path=str(temp_dir / "segments" / "catalog.json"),
+            ),
+            store,
+        )
 
         collector._run_retention_if_due(
             datetime(2026, 7, 1, tzinfo=timezone.utc),
@@ -6125,6 +6425,43 @@ class HistoryCollectorTests(unittest.TestCase):
 
         store.maintain_retention.assert_not_called()
         self.assertIsNone(collector.status()["last_retention_attempt_at"])
+
+    def test_backup_failure_records_a_plain_reason_for_the_dashboard(self) -> None:
+        store = _collector_store()
+        store.latest_backup_snapshot_at.return_value = None
+        store.create_backup.side_effect = PermissionError(13, "Permission denied")
+        collector = HistoryCollector(
+            HistorySettings(startup_grace_seconds=0),
+            store,
+        )
+        collector.last_fast_metrics_at = collector.started_at
+        collector._enumerate_scopes = AsyncMock(return_value=[])  # type: ignore[method-assign]
+
+        asyncio.run(collector.run_once(force_slow=True))
+
+        status = collector.status()
+        self.assertEqual(status["last_backup_error_kind"], "permission_denied")
+        self.assertEqual(
+            status["last_backup_error"],
+            "The history service may not write the backup directory. (PermissionError)",
+        )
+        self.assertNotIn("Permission denied", str(status["last_backup_error"]))
+
+    def test_successful_backup_clears_the_recorded_backup_failure(self) -> None:
+        store = _collector_store()
+        store.latest_backup_snapshot_at.return_value = None
+        store.create_backup.return_value = Path("history-2026.sqlite3")
+        collector = HistoryCollector(HistorySettings(startup_grace_seconds=0), store)
+        collector.last_backup_error = "The disk holding the history backups is full. (OSError)"
+        collector.last_backup_error_kind = "disk_full"
+        collector.last_fast_metrics_at = collector.started_at
+        collector._enumerate_scopes = AsyncMock(return_value=[])  # type: ignore[method-assign]
+
+        asyncio.run(collector.run_once(force_slow=True))
+
+        status = collector.status()
+        self.assertIsNone(status["last_backup_error"])
+        self.assertIsNone(status["last_backup_error_kind"])
 
     def test_stop_waits_for_inflight_worker_before_returning(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
@@ -6169,7 +6506,7 @@ class HistoryCollectorTests(unittest.TestCase):
 
     def test_stop_request_prevents_later_scope_writes(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
-        store = MagicMock()
+        store = _collector_store()
         store.estimated_counts.return_value = {}
         collector = HistoryCollector(
             HistorySettings(
@@ -6333,7 +6670,7 @@ class HistoryCollectorTests(unittest.TestCase):
 
     def test_background_startup_collection_is_fast_only(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
-        store = MagicMock()
+        store = _collector_store()
         store.estimated_counts.return_value = {}
         collector = HistoryCollector(
             HistorySettings(
@@ -8424,3 +8761,299 @@ class HistoryCollectorTests(unittest.TestCase):
         self.assertIsNotNone(loaded)
         self.assertEqual(loaded.vdev_name, "mirror-0")
         self.assertEqual(loaded.topology_label, "HA-Pool-R10 > mirror-0 > data (Active on QSOSN-Right)")
+
+
+class HistoryCollectorDiagnosticsTests(unittest.TestCase):
+    @staticmethod
+    def _collector() -> HistoryCollector:
+        return HistoryCollector(HistorySettings(request_timeout_seconds=45), MagicMock())
+
+    def test_unreachable_source_is_raised_as_a_classified_error(self) -> None:
+        collector = self._collector()
+
+        with patch(
+            "history_service.collector.urllib.request.urlopen",
+            side_effect=urllib.error.URLError("Connection refused"),
+        ):
+            with self.assertRaises(HistorySourceError) as caught:
+                collector._fetch_json_sync("/api/slots", {}, "GET", None, {}, None)
+
+        self.assertEqual(caught.exception.kind, "source_unreachable")
+        self.assertEqual(caught.exception.summary, "Could not reach the main UI service.")
+        self.assertIn("/api/slots", str(caught.exception))
+
+    def test_timeout_and_http_rejection_carry_bounded_details(self) -> None:
+        collector = self._collector()
+
+        with patch(
+            "history_service.collector.urllib.request.urlopen",
+            side_effect=TimeoutError(),
+        ):
+            with self.assertRaises(HistorySourceError) as timed_out:
+                collector._fetch_json_sync("/api/slots", {}, "GET", None, {}, None)
+        self.assertEqual(timed_out.exception.kind, "source_timeout")
+        self.assertIn("timeout 45 s", timed_out.exception.summary)
+
+        rejection = urllib.error.HTTPError(
+            "http://enclosure-ui:8000/api/slots",
+            500,
+            "Server Error",
+            {},
+            io.BytesIO(b"secret-token=abc"),
+        )
+        with patch("history_service.collector.urllib.request.urlopen", side_effect=rejection):
+            with self.assertRaises(HistorySourceError) as rejected:
+                collector._fetch_json_sync("/api/slots", {}, "GET", None, {}, None)
+        self.assertEqual(rejected.exception.kind, "source_rejected")
+        self.assertEqual(
+            rejected.exception.summary,
+            "The main UI rejected the request. (HTTP 500)",
+        )
+        self.assertNotIn("secret-token", rejected.exception.summary)
+
+    def test_status_publishes_the_failure_kind_and_summary_and_clears_them(self) -> None:
+        collector = self._collector()
+
+        collector.record_failure_diagnostics(
+            HistorySourceError.unreachable("GET http://enclosure-ui:8000/api/slots failed")
+        )
+        collector.last_error = "GET http://enclosure-ui:8000/api/slots failed"
+
+        status = collector.status()
+        self.assertEqual(status["last_error_kind"], "source_unreachable")
+        self.assertEqual(status["last_error_summary"], "Could not reach the main UI service.")
+
+        collector.clear_failure_diagnostics()
+        cleared = collector.status()
+        self.assertIsNone(cleared["last_error_kind"])
+        self.assertIsNone(cleared["last_error_summary"])
+        self.assertIsNone(cleared["last_error"])
+
+
+class HistoryDashboardDiagnosticStatusTests(unittest.TestCase):
+    def setUp(self) -> None:
+        history_main.refresh_admission = history_main.ManualRefreshAdmission(
+            cooldown_seconds=history_main.settings.full_refresh_cooldown_seconds
+        )
+
+    def test_public_status_keeps_the_diagnostic_fields_the_dashboard_reads(self) -> None:
+        projected = history_main.public_collector_status(
+            {
+                "collector_running": True,
+                "last_error": "GET http://enclosure-ui:8000/api/slots failed",
+                "last_error_kind": "source_unreachable",
+                "last_error_summary": "Could not reach the main UI service.",
+                "last_retention_error": "The history database is read-only. (OperationalError)",
+                "last_retention_error_kind": "database_read_only",
+            }
+        )
+
+        self.assertEqual(projected["last_error"], history_main.HISTORY_COLLECTOR_ERROR_DETAIL)
+        self.assertEqual(projected["last_error_kind"], "source_unreachable")
+        self.assertEqual(
+            projected["last_error_summary"],
+            "Could not reach the main UI service.",
+        )
+        self.assertEqual(projected["last_retention_error_kind"], "database_read_only")
+
+    def test_refresh_cooldown_status_publishes_the_deadline_beside_the_collector(self) -> None:
+        idle = history_main.refresh_cooldown_status()
+        self.assertEqual(
+            idle["full_refresh_cooldown_seconds"],
+            history_main.settings.full_refresh_cooldown_seconds,
+        )
+        self.assertEqual(idle["full_refresh_cooldown_seconds_remaining"], 0)
+        self.assertIsNone(idle["full_refresh_available_at"])
+        self.assertNotIn(
+            "full_refresh_cooldown_seconds",
+            history_main.public_collector_status({"collector_running": True}),
+        )
+
+        asyncio.run(history_main.refresh_admission.try_acquire("full"))
+        asyncio.run(history_main.refresh_admission.release())
+
+        cooling = history_main.refresh_cooldown_status()
+        self.assertGreater(cooling["full_refresh_cooldown_seconds_remaining"], 0)
+        self.assertIsInstance(cooling["full_refresh_available_at"], str)
+
+    def test_public_status_of_a_non_mapping_stays_empty(self) -> None:
+        self.assertEqual(history_main.public_collector_status(None), {})
+
+
+class HistoryReadConnectionBudgetTests(unittest.TestCase):
+    """#457: one slot bundle must not cost fifteen SQLite connections."""
+
+    @staticmethod
+    def _seed_store(temp_dir: Path) -> HistoryStore:
+        store = HistoryStore(str(temp_dir / "history.db"))
+        record = SlotStateRecord(
+            system_id="archive-core",
+            system_label="Archive CORE",
+            enclosure_key="enc-a",
+            enclosure_id="enc-a",
+            enclosure_label="Front Shelf",
+            slot=5,
+            slot_label="05",
+            present=True,
+            state="healthy",
+            identify_active=False,
+            device_name="da5",
+            serial="SERIAL-5",
+            model="Drive 5",
+            gptid="eui.000000000000001000a075012b91c7cf",
+            pool_name="tank",
+            vdev_name="raidz2-0",
+            health="ONLINE",
+            persistent_id_label="EUI64",
+        )
+        store.upsert_slot_state(record, "2026-04-10T22:00:00+00:00")
+        store.insert_events(
+            build_slot_events(
+                record,
+                replace(record, health="DEGRADED"),
+                "2026-04-10T23:00:00+00:00",
+            )
+        )
+        store.insert_metric_samples(
+            [
+                MetricSample(
+                    observed_at="2026-04-10T23:00:00+00:00",
+                    system_id="archive-core",
+                    system_label="Archive CORE",
+                    enclosure_key="enc-a",
+                    enclosure_id="enc-a",
+                    enclosure_label="Front Shelf",
+                    slot=5,
+                    slot_label="05",
+                    metric_name=metric_name,
+                    value_integer=100,
+                    value_real=None,
+                    device_name="da5",
+                    serial="SERIAL-5",
+                    model="Drive 5",
+                    state="healthy",
+                    gptid="eui.000000000000001000a075012b91c7cf",
+                    persistent_id_label="EUI64",
+                )
+                for metric_name in ("temperature_c", "bytes_read", "bytes_written")
+            ]
+        )
+        return store
+
+    def test_slot_history_bundle_opens_one_connection(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = self._seed_store(temp_dir)
+        opened = 0
+        original_connect_locked = store._connect_locked
+
+        def counting_connect_locked():
+            nonlocal opened
+            opened += 1
+            return original_connect_locked()
+
+        store._connect_locked = counting_connect_locked  # type: ignore[method-assign]
+        payload = store.get_slot_history_bundle(
+            "archive-core",
+            "enc-a",
+            5,
+            metric_limits={"temperature_c": 10, "bytes_read": 10, "bytes_written": 10},
+        )
+
+        self.assertEqual(opened, 1)
+        self.assertEqual(len(payload["events"]), 1)
+        self.assertEqual(len(payload["metrics"]["temperature_c"]), 1)
+        self.assertTrue(payload["disk_history"]["identity_available"])
+
+    def test_bundle_result_is_unchanged_by_the_shared_connection(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = self._seed_store(temp_dir)
+
+        bundle = store.get_slot_history_bundle(
+            "archive-core",
+            "enc-a",
+            5,
+            metric_limits={"temperature_c": 10},
+        )
+        separately = {
+            "events": store.list_slot_events("archive-core", "enc-a", 5, limit=12),
+            "samples": store.list_metric_samples(
+                "archive-core",
+                "enc-a",
+                5,
+                metric_name="temperature_c",
+                limit=10,
+            ),
+        }
+
+        self.assertEqual(bundle["events"], separately["events"])
+        self.assertEqual(bundle["metrics"]["temperature_c"], separately["samples"])
+
+
+class HistoryLockAddressCacheTests(unittest.TestCase):
+    """#457: every write lock re-read and re-parsed /proc/self/mountinfo."""
+
+    def setUp(self) -> None:
+        migration_lock.clear_lock_address_cache()
+
+    def tearDown(self) -> None:
+        migration_lock.clear_lock_address_cache()
+
+    def test_mountinfo_is_parsed_once_per_database_identity(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        database_path = temp_dir / "history.db"
+        database_path.write_text("seed", encoding="utf-8")
+        calls = 0
+        original = migration_lock._database_path_is_mount_point
+
+        def counting_mount_point_check(path):
+            nonlocal calls
+            calls += 1
+            return original(path)
+
+        with patch.object(
+            migration_lock,
+            "_database_path_is_mount_point",
+            counting_mount_point_check,
+        ):
+            first = migration_lock._history_lock_address(database_path)
+            for _ in range(4):
+                self.assertEqual(migration_lock._history_lock_address(database_path), first)
+            self.assertEqual(calls, 1)
+
+            # Writes keep the inode, so the cached validation still holds.
+            database_path.write_text("more", encoding="utf-8")
+            self.assertEqual(migration_lock._history_lock_address(database_path), first)
+            self.assertEqual(calls, 1)
+
+            # A replaced file is a new identity and must be validated again.
+            # The replacement is created while the original still exists, so the
+            # two inodes cannot collide.
+            replacement = temp_dir / "history-replacement.db"
+            replacement.write_text("replaced", encoding="utf-8")
+            os.replace(replacement, database_path)
+            self.assertEqual(migration_lock._history_lock_address(database_path), first)
+            self.assertEqual(calls, 2)
+
+    def test_cached_addresses_do_not_grow_without_bound(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        for index in range(migration_lock.LOCK_ADDRESS_CACHE_MAX_ENTRIES + 8):
+            candidate = temp_dir / f"history-{index}.db"
+            candidate.write_text("seed", encoding="utf-8")
+            migration_lock._history_lock_address(candidate)
+
+        self.assertLessEqual(
+            migration_lock.lock_address_cache_size(),
+            migration_lock.LOCK_ADDRESS_CACHE_MAX_ENTRIES,
+        )
+
+    def test_rejected_paths_are_still_rejected_when_cached(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        database_path = temp_dir / "history.db"
+        database_path.write_text("seed", encoding="utf-8")
+        link_path = temp_dir / "history-link.db"
+        link_path.hardlink_to(database_path)
+
+        with self.assertRaises(ValueError):
+            migration_lock._history_lock_address(database_path)
+        with self.assertRaises(ValueError):
+            migration_lock._history_lock_address(database_path)

@@ -16,6 +16,10 @@ from pydantic import ValidationError
 
 from app.models.domain import ManualMapping
 from app.services.profile_registry import ENCLOSURE_SUB_VIEW_PROFILE_IDS
+from app.services.storage_writability import (
+    StorageDirectoryUnwritable,
+    is_unwritable_error,
+)
 
 _DRAWER_SUB_PROFILE_IDS = frozenset(
     sub_profile_id
@@ -64,6 +68,12 @@ class MappingScopeConflict(RuntimeError):
 
     def __init__(self) -> None:
         super().__init__(self.public_detail)
+
+
+class MappingStorageUnwritable(StorageDirectoryUnwritable):
+    """The mapping file could not be written because its directory is read-only."""
+
+    error_code = "data_directory_unwritable"
 
 
 class MappingDurabilityError(RuntimeError):
@@ -1439,6 +1449,8 @@ class MappingStore:
                 self._unlink_owned_temp_file(temp_path, temp_identity)
             if replaced:
                 raise MappingDurabilityError() from exc
+            if is_unwritable_error(exc):
+                raise MappingStorageUnwritable(self.file_path.parent) from exc
             raise
 
     def _write(self, mappings: dict[str, ManualMapping]) -> None:
