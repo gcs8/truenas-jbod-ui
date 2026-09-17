@@ -43,9 +43,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 ### Fixed
 
 - Made `--help` work on every script under `scripts/` off Linux without
-  writing anything into the checkout, and described the arguments an operator
-  has to fill in, including the segmented-history source, segments directory,
-  cutoff and key id (#538)
+  writing anything into the checkout, with no exceptions left:
+  `public_demo_source_parity.py` now adds the repository root to `sys.path`
+  the way the builder that imports it already does, so running it directly no
+  longer fails with `No module named 'scripts'`. The help sweep also describes
+  the arguments an operator has to fill in, including the segmented-history
+  source, segments directory, cutoff and key id (#538)
 
 - Replaced the generic 500 a mapping or alias save returned when the data
   folder is not writable with a 503 and a plain sentence, and stopped the

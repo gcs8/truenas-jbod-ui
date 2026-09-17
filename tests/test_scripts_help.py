@@ -8,14 +8,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = ROOT / "scripts"
 
-# `scripts/public_demo_source_parity.py` is the one script whose `--help` still
-# exits 1. The fix is a two-line `sys.path` bootstrap, but the file is a pinned
-# public-demo source input (`scripts/public_demo_inputs.py`), so changing it
-# invalidates `public-demo/index.html` and the screenshot provenance manifest,
-# which is a demo republish, not a help fix. It is not silently skipped: the
-# exact failure is pinned below, so the day the demo is rebuilt this test fails
-# and the exclusion has to go. Tracked on #446.
-KNOWN_UNRUNNABLE = {"public_demo_source_parity.py": "No module named 'scripts'"}
+# Every script in `scripts/` must survive `--help`, with no exclusions: #446.
+# `public_demo_source_parity.py` was the last exception; it now carries the same
+# repository-root `sys.path` bootstrap as `build_public_demo.py`, so the sweep
+# below covers all of them. Keep this mapping empty — an entry here is a gap in
+# the #446 claim, not a workaround.
+KNOWN_UNRUNNABLE: dict[str, str] = {}
 
 # Arguments an operator has to supply a value for, and a word the help text
 # must explain them with.
@@ -130,6 +128,15 @@ def _tree_state() -> tuple[str, dict[str, tuple[int, int]]]:
 
 
 class ScriptHelpTests(unittest.TestCase):
+    def test_the_help_sweep_excludes_nothing(self) -> None:
+        """#446 is "every script", so an exclusion list defeats the claim."""
+        self.assertEqual(KNOWN_UNRUNNABLE, {}, "the --help sweep must cover every script")
+
+    def test_the_public_demo_source_parity_module_is_importable_as_a_script(self) -> None:
+        """It is a library module, but running it directly must not explode."""
+        result = _run_help(SCRIPTS_DIR / "public_demo_source_parity.py")
+        self.assertEqual(result.returncode, 0, result.stderr.strip()[-400:])
+
     def test_every_script_prints_usage_on_help_without_side_effects(self) -> None:
         failures: list[str] = []
         before = _tree_state()
