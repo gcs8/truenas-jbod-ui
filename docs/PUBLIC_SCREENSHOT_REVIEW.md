@@ -1,17 +1,17 @@
 # Public screenshot exact-byte review
 
-This record covers the two desktop fixture screenshots generated from `public-demo/index.html`. The pinned Linux capture used `file://`, UTC, a 1920 by 1080 viewport, reduced motion, and no network request. GitHub Actions run `34737325999` captured each image twice and produced byte-identical copies.
+This record covers the two desktop fixture screenshots generated from `public-demo/index.html`. The pinned Linux capture used `file://`, UTC, a 1920 by 1080 viewport, reduced motion, and no network request. GitHub Actions run `35244766869` captured each image twice and produced byte-identical copies.
 
-Source revision: `0ea42a60616e0b987a3c7a73568abf7f57de01fe`
+Source revision: `d8b6913a869d5855a75271b2807882e33178a834`
 
-Source artifact SHA-256: `dd537fdb2d148e1755ec09bb6890a87242053ca7d15d6020adb6bb420bf954eb`
+Source artifact SHA-256: `8501574912ba152b9ce6eead9ddc4e31954c4c83dd3e53eeeb754709a149e28a`
 
 | Image | Dimensions | Bytes | SHA-256 | Pixel review |
 |---|---:|---:|---|---|
-| `public-demo-overview.png` | 1920 by 4092 | 1098831 | `fcc7adba57b5ae32f4c21c9204ab95d5db0cd5709eae5c075383ab34c0cc4eda` | PASS |
-| `public-demo-history.png` | 1920 by 4852 | 1225499 | `a5e8ea696081f530475845f0d2d26a2d1538955b7813f5c4998fcfd5d6a0881b` | PASS |
+| `public-demo-overview.png` | 1920 by 4092 | 1100120 | `10835307f24c039c58fab81167786493e1681377a27d5abe70ccf54645902d27` | PENDING |
+| `public-demo-history.png` | 1920 by 4852 | 1226484 | `89ce1ba3e107705a93311fb5bb3de50128f0643f1424d427d95815b0754800ef` | PENDING |
 
-Both exact PNGs were loaded and inspected with vision tooling before setting the manifest attestations. The review checked for private addresses, hostnames, paths, credentials, key material, and non-demo device identifiers. None were visible. Source revision and Build ID are intentional public-repository provenance.
+These are the recaptured bytes for the #538 rebuild; only the Source revision and Build ID cards changed content. Both exact PNGs were loaded and inspected with vision tooling. The review checked for private addresses, hostnames, paths, credentials, key material, and non-demo device identifiers. None were visible. Source revision and Build ID are intentional public-repository provenance.
 
 Neither image showed unintended overlap, clipping, missing assets, corrupted text, or canvas-edge artifacts. Narrow bay labels use intentional ellipses. Full selected-slot identifiers remain readable in Slot Details. Equal-height cards leave unused space but do not hide or collide with content.
 
@@ -25,4 +25,6 @@ The frozen, synthetic, offline wording is explicit. Live refresh, calibration, b
 
 Mobile and tablet layouts are unsupported and are not part of this review.
 
-Final pixel verdict: `PASS`
+Final pixel verdict: `PENDING`
+
+The recapture above was produced by an automated lane, which may not record `PASS`. The observations in this record are the lane's inspection notes, not the sign-off. A human reviewer has to look at the two exact PNGs and, only then, set `pixel_review` to `PASS` here and in `docs/images/screenshots/manifest.json`. Until that happens `scripts/check_public_screenshots.py` fails on purpose.
