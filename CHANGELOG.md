@@ -36,11 +36,77 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Added
 
+- Added a JSON-RPC 2.0 websocket transport selectable per TrueNAS host with
+  `api_dialect` (and `api_version` to pin a documented API release), keeping the
+  DDP default for CORE and existing hosts; saving a system in the admin UI keeps
+  the saved dialect, and cloning one under a new id inherits the dialect of the
+  system it was cloned from instead of falling back to DDP; when several saved
+  systems share one API endpoint with different dialects the clone falls back to
+  the default so the transport is established again rather than guessed. The
+  admin UI now sends the loaded system's id with every save under a new id, so
+  the inherited dialect no longer depends on whether the SSH command list was
+  preserved, replaced or left at the platform defaults (#529).
 - Added a client-only, one-session SMART WebSocket batch API with bounded
   concurrency and DDP heartbeat handling; inventory integration remained
   separate (#503).
 
+### Docs
+
+- Rewrote the released v0.23.0 upgrade notes so a published-image operator can
+  follow them: the ownership step is a plain `chown` that adopts the
+  `docker-compose.nonroot.yml` overlay rather than a helper the image does not
+  ship, the notes gained a rollback path, and the breaking-changes list no
+  longer asks for the authentication and public-origin settings #392 reversed
+  before release (#541).
+
+- Corrected the off-loopback history recipes: the deployment and operations
+  pages now set refresh-token mode, a token, and `HISTORY_PUBLIC_ORIGIN`
+  alongside `HISTORY_BIND_ADDRESS`, which is what the service requires to
+  start, and `.env.example` records that Compose derives
+  `HISTORY_PUBLISHED_BIND_ADDRESS` and never passes `RELEASE_CHECK_*` to the
+  history sidecar (#541).
+
+- Added a "Rolling back a release" section to the deployment page covering the
+  image pin, the data that a rollback does not revert, and the history restore
+  path, and pointed the operations page at it (#541).
+
 ### Fixed
+
+- Made `--help` work on every script under `scripts/` off Linux without
+  writing anything into the checkout, with no exceptions left:
+  `public_demo_source_parity.py` now adds the repository root to `sys.path`
+  the way the builder that imports it already does, so running it directly no
+  longer fails with `No module named 'scripts'`. The help sweep also describes
+  the arguments an operator has to fill in, including the segmented-history
+  source, segments directory, cutoff and key id (#538)
+
+- Replaced the generic 500 a mapping or alias save returned when the data
+  folder is not writable with a 503 and a plain sentence, and stopped the
+  history service crash-looping on an unwritable history folder: it now retries
+  with bounded backoff, then stays up with an unhealthy `/healthz` and a 503 on
+  every other route, naming the path, the owner and the host command to run.
+  That command names the host bind source (`./history`) rather than the
+  container path, and a read-only SQLite database counts as unwritable even
+  though it carries no errno (#538)
+
+- Ran history retention on its own schedule instead of only after a successful
+  hourly backup, bounded the wait for a failing backup with a deadline that is
+  recorded in the history database so a restart neither postpones nor
+  shortens it, and cut the default backup footprint to a daily copy kept for a
+  week (#539).
+
+- Replaced the generic history collector error, the retention class name, and
+  the invisible full-refresh cooldown with fixed, secret-free sentences and a
+  published cooldown deadline (#539).
+
+- Ran each CI job once per pull request: a branch push whose branch already
+  has an open pull request now defers to that pull request's run, CodeQL
+  analyses pushes to `main` only, and the pull request type labeller no
+  longer re-runs and cancels itself on every push (#541).
+
+- Stopped the `Changelog entry` gate from blocking contributors who cannot
+  apply the `no-changelog` label: it reports the missing entry and passes for
+  authors without write access, and still blocks for maintainers (#541).
 
 - Retried failed release checks with bounded backoff instead of waiting a
   full normal interval, preserving the last successful result (#469).
@@ -75,6 +141,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   bulk responses and offline exports. (#423)
 
 ### Performance
+
+- Served a slot history bundle from one SQLite connection instead of fifteen
+  and cached the history lock address per database identity instead of parsing
+  /proc/self/mountinfo on every lock (#539).
 
 - Reduced mapping revision work to one document read per batch while
   preserving conflict checks and calibration tokens. (#421)
@@ -111,6 +181,14 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Docs
 
+- Documented which backups a deployment accepts (a newer app or schema
+  version is refused before anything is replaced) and the unwritable data or
+  history folder symptom, with the command that fixes it (#538)
+
+- Documented the history retention schedule, the bounded wait for a failing
+  backup, the default backup footprint, and what each dashboard diagnostic cell
+  now says (#539).
+
 - Reconciled the v0.23.0 release wrap and Wiki home page with the published
   GitHub release, GHCR package, and Pages demo while retaining the qualified
   v0.22.2 beginner-installation pin. (#518)
@@ -125,6 +203,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   and a storage view; the unused `app.verify_ssl` line is gone. (#489)
 
 ### Internal
+
+- Replaced the chain of command comparisons behind the SSH command failure
+  contexts with a lookup table and pinned every answer with tests; the debug
+  output is unchanged (#540)
 
 - Added a dispatch-only workflow that recaptures the public-demo screenshots
   inside the pinned Playwright Linux container, captures twice to prove the
@@ -164,12 +246,13 @@ v0.23.0 release candidate.
 ### Breaking changes
 
 - Restored unauthenticated main and admin controls in default `network` mode
-  and made TLS certificate verification opt-in for new connections (#392)
-- Required local authentication for mutating main-UI requests and hardened the
-  default Compose runtime contract (#245 and #246).
-- Required a configured admin public origin for browser-initiated admin
-  mutations and moved bootstrap and ESXi host-prep onto runtime-owned
-  known-hosts paths with strict host-key handling (#201).
+  and made TLS certificate verification opt-in for new connections. Neither
+  application authentication nor a configured public origin is required after
+  upgrading; the mandatory local authentication of #245 and the mandatory
+  admin public origin of #201 were both reversed before this release, so there
+  is nothing to configure for them (#392, superseding #245 and #201).
+- Moved bootstrap and ESXi host preparation onto runtime-owned known-hosts
+  paths with strict host-key handling (#201).
 - Scoped legacy manual slot mappings to single-system, single-enclosure
   deployments, rejected exact rows whose stored system ownership conflicts, and
   removed both legacy aliases when a canonical scoped mapping is saved (#249).
@@ -211,13 +294,45 @@ them before starting the new images.
   a private `/tmp`, all capabilities dropped, and `no-new-privileges`. The
   admin service stays UID `0` for Docker control but runs as `0:${APP_GID}`
   with only `CHOWN` and `FOWNER` added back and without its app-log mount.
-  Before the first start on the new file, stop the stack and use the configured
-  app identity for the ownership preflight and apply step:
-  `docker compose down`; `app_uid="${APP_UID:-10001}"`;
-  `app_gid="${APP_GID:-10001}"`;
-  `sudo python scripts/prepare_nonroot_bind_mounts.py . --uid "$app_uid" --gid "$app_gid"`;
-  then repeat the helper command with `--apply`. Without that step the non-root
-  services cannot write their bind-mounted state (#246).
+  Hardening is opt-in: it lives in `docker-compose.nonroot.yml`, and a
+  deployment that does not add that overlay keeps root-owned bind mounts and
+  needs no ownership step (#246, and see #426 in the next release).
+
+  Skip this note entirely unless you add `-f docker-compose.nonroot.yml`. To
+  adopt the overlay, stop the stack and give the bind mounts to the configured
+  app identity from the host shell. Leave the backup identity alone:
+  `config/backup-secrets` stays private to `BACKUP_UID`, and `backup-status`
+  is prepared as `BACKUP_UID:APP_GID` mode `2750`, which is what the scheduled
+  backup runner requires before it will write status. No repository checkout
+  is needed:
+
+  ```bash
+  docker compose down
+  app_uid="${APP_UID:-10001}"
+  app_gid="${APP_GID:-10001}"
+  backup_uid="${BACKUP_UID:-1000}"
+  sudo find ./config -path ./config/backup-secrets -prune -o -exec chown "$app_uid:$app_gid" {} +
+  sudo chown -R "$app_uid:$app_gid" ./data ./logs ./history
+  sudo install -d -o "$backup_uid" -g "$app_gid" -m 2750 ./backup-status
+  docker compose -f docker-compose.yml -f docker-compose.nonroot.yml up -d
+  ```
+
+  Do not run a recursive ownership or mode change over an existing segmented
+  history tree; see the sealed-segment note below. Without the ownership step
+  the non-root services cannot write their bind-mounted state (#246).
+
+- **Rolling back to `v0.22.2`.** Set `JBOD_UI_IMAGE` in `.env` back to the tag
+  or digest you recorded before the update, then run `docker compose pull` and
+  `docker compose up -d` with the same ordered `-f` files and profiles you
+  start the stack with. Drop `-f docker-compose.nonroot.yml` from that chain
+  when rolling back past the hardening; bind mounts chowned to the app identity
+  stay readable and writable by the root-run services. An image rollback does
+  not revert durable state: configuration under `./config` and `./data` and the
+  history database under `./history` remain as the newer version left them. If
+  the older image cannot open the history database, stop the stack and restore
+  it from a scheduled backup as described in
+  [Backup, Restore, and Debug Bundles](wiki/Backup-Restore-and-Debug-Bundles.md#optional-scheduled-state-backups),
+  then start the older image again (#541).
 - Legacy manual slot mappings saved by older releases under the unscoped
   `default:{slot}` and `{enclosure}:{slot}` key shapes are only resolved when
   the deployment has exactly one configured system and exactly one detected
@@ -310,14 +425,12 @@ them before starting the new images.
   and duration metrics (#248).
 - Added TrueNAS disk inventory sync actions (`disk.multipath_sync` on CORE,
   `disk.sync_all` on CORE and SCALE) to the enclosure header behind the main-UI
-  write gate, with exact-argument sudo grants and a CORE multipath disk
-  replacement runbook (#357).
+  write gate, with exact-argument sudo grants, immutable target confirmation,
+  convergence polling, and a CORE multipath disk replacement runbook
+  (#357 and #359).
 - Added one bounded snapshot warning when CORE multipath attribution is
   backfilled from `gmultipath list`, directing operators to the existing disk
   inventory controls without exposing device identifiers (#385).
-- Added guarded disk inventory synchronization controls for supported TrueNAS
-  systems, including immutable target confirmation and convergence polling
-  (#359).
 - Added memory-only in-page Basic sign-in for live-UI writes while keeping
   anonymous reads and same-origin request boundaries (#358).
 - Added release-time changelog coverage and exact GitHub Wiki byte verification

@@ -50,6 +50,25 @@ For a migration:
 
 Run the first restore in a disposable stack with separate ports and state directories. Do not test import, restore, purge, adopt, delete, or runtime overrides against a long-running deployment unless you intend to change it.
 
+### Which backups this deployment accepts
+
+A backup carries the app version that wrote it. Restore compares that version
+with the running one **before it extracts or replaces anything**:
+
+- **Newer than this deployment**: refused, with
+  `This backup was made by v0.24.0; this deployment is v0.23.0. Upgrade before
+  restoring.` Upgrade the target first, then restore. Nothing on disk is
+  touched by the refused attempt.
+- **Same version**: accepted.
+- **Older**: accepted. Inspection shows a note that settings and history are
+  brought up to date during restore.
+- **No readable version in the manifest**: accepted, and the schema-version
+  check still applies.
+
+A backup whose *schema* is newer is refused the same way:
+`This backup was made by a newer version of the app (schema version 3). Upgrade
+first, then restore.`
+
 A hot-only deployment exports backup schema 1. A deployment with `HISTORY_SEGMENT_CATALOG_PATH` exports schema 2. Schema 2 includes the hot database, every immutable segment, and the complete catalog generation. Restore validates every member and stages the hot database and segment directory as one rollback-capable transaction. The target must configure `HISTORY_SEGMENT_CATALOG_PATH` before restoring schema 2.
 
 Each immutable segment is limited to 1.5 GiB. Allow temporary-disk and archive space for the hot database plus every active segment. Each 7z create, verify, list, or extract operation has a 10-minute limit and uses normal compression with one worker thread.
