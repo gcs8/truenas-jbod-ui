@@ -44,6 +44,10 @@ PRIVATE_REPLACEMENT_DIR_PREFIX = ".history-replacement-"
 DISK_IDENTITY_BACKFILL_USER_VERSION = 1
 SEGMENTED_RETENTION_STATE_NAME = "segmented_retention"
 SEGMENTED_RETENTION_STATES = frozenset({"ready", "claimed", "consumed"})
+# The no-backup retention wait anchor shares the maintenance-state table so it
+# survives a restart; it is a marker, so it only ever holds the 'ready' state.
+RETENTION_WAIT_STATE_NAME = "retention_backup_wait"
+RETENTION_WAIT_STATE = "ready"
 
 
 def history_write_lock(file_path: Path, *, blocking: bool):
@@ -644,6 +648,93 @@ class HistoryStore:
                 connection.rollback()
                 raise
 
+    def read_retention_wait_anchor(self) -> datetime | None:
+        """Return when the current no-backup retention wait started, or None.
+
+        The anchor lives in `history_maintenance_state` beside the segmented
+        claim, so it survives a restart. A row that cannot be read as a UTC
+        timestamp is not repaired here: the caller has to fail closed on it
+        rather than guess a wait that was never really served (#455).
+        """
+
+        with self._read_connection() as connection:
+            row = connection.execute(
+                """
+                SELECT backup_at, state
+                FROM history_maintenance_state
+                WHERE name = ?
+                """,
+                (RETENTION_WAIT_STATE_NAME,),
+            ).fetchone()
+        if row is None:
+            return None
+        if str(row["state"]) != RETENTION_WAIT_STATE:
+            raise ValueError("History retention wait anchor state is invalid.")
+        anchor, _ = self._normalize_retention_backup_at(str(row["backup_at"]))
+        return anchor
+
+    def start_retention_wait(
+        self,
+        anchor: datetime | str,
+        *,
+        migration_lock_held: bool = False,
+    ) -> datetime:
+        """Record `anchor` as the start of the wait, and return the effective one.
+
+        First writer wins: a restart inside the window reads back the anchor it
+        already stored instead of restarting the wait.
+        """
+
+        candidate, serialized = self._normalize_retention_backup_at(anchor)
+        with self._locked_write_connection(
+            migration_lock_held=migration_lock_held
+        ) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    """
+                    SELECT backup_at, state
+                    FROM history_maintenance_state
+                    WHERE name = ?
+                    """,
+                    (RETENTION_WAIT_STATE_NAME,),
+                ).fetchone()
+                if row is not None:
+                    if str(row["state"]) != RETENTION_WAIT_STATE:
+                        raise ValueError("History retention wait anchor state is invalid.")
+                    existing, _ = self._normalize_retention_backup_at(str(row["backup_at"]))
+                    connection.rollback()
+                    return existing
+                connection.execute(
+                    """
+                    INSERT INTO history_maintenance_state (name, backup_at, state)
+                    VALUES (?, ?, ?)
+                    """,
+                    (RETENTION_WAIT_STATE_NAME, serialized, RETENTION_WAIT_STATE),
+                )
+                connection.commit()
+                return candidate
+            except BaseException:
+                connection.rollback()
+                raise
+
+    def clear_retention_wait(self, *, migration_lock_held: bool = False) -> None:
+        """Forget the wait anchor, so the next missing backup starts a fresh window."""
+
+        with self._locked_write_connection(
+            migration_lock_held=migration_lock_held
+        ) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute(
+                    "DELETE FROM history_maintenance_state WHERE name = ?",
+                    (RETENTION_WAIT_STATE_NAME,),
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+
     def run_segmented_retention(
         self,
         backup_at: datetime | str,
@@ -681,6 +772,23 @@ class HistoryStore:
         )
         with lock_context:
             return self._connect_locked()
+
+    @contextmanager
+    def _read_connection(
+        self,
+        connection: sqlite3.Connection | None = None,
+    ) -> Iterator[sqlite3.Connection]:
+        """Reuse a caller's read connection, or open and close one.
+
+        A slot bundle used to open one connection per query - fifteen locks,
+        connects and PRAGMA rounds for a single request (#457).
+        """
+
+        if connection is not None:
+            yield connection
+            return
+        with closing(self._connect()) as owned_connection:
+            yield owned_connection
 
     def _connect_locked(self) -> sqlite3.Connection:
         """Open and fully configure a connection while the lifecycle lock is held."""
@@ -1136,9 +1244,16 @@ class HistoryStore:
         for stale_path in snapshots[retention_count:]:
             stale_path.unlink(missing_ok=True)
 
-    def get_slot_state(self, system_id: str, enclosure_id: str | None, slot: int) -> SlotStateRecord | None:
+    def get_slot_state(
+        self,
+        system_id: str,
+        enclosure_id: str | None,
+        slot: int,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> SlotStateRecord | None:
         enclosure_key = enclosure_id or ""
-        with closing(self._connect()) as connection:
+        with self._read_connection(connection) as connection:
             row = connection.execute(
                 """
                 SELECT *
@@ -1664,6 +1779,8 @@ class HistoryStore:
         enclosure_id: str | None,
         slot: int,
         limit: int = 100,
+        *,
+        connection: sqlite3.Connection | None = None,
     ) -> list[dict[str, Any]]:
         segmented_reader = self._segmented_reader()
         if segmented_reader is not None:
@@ -1674,7 +1791,7 @@ class HistoryStore:
                 limit=limit,
             )
         enclosure_key = enclosure_id or ""
-        with closing(self._connect()) as connection:
+        with self._read_connection(connection) as connection:
             rows = connection.execute(
                 """
                 SELECT *
@@ -1695,6 +1812,8 @@ class HistoryStore:
         metric_name: str | None = None,
         limit: int = 500,
         since: str | None = None,
+        *,
+        connection: sqlite3.Connection | None = None,
     ) -> list[dict[str, Any]]:
         segmented_reader = self._segmented_reader()
         if segmented_reader is not None:
@@ -1726,7 +1845,7 @@ class HistoryStore:
             ORDER BY observed_at DESC, id DESC
             LIMIT ?
         """
-        with closing(self._connect()) as connection:
+        with self._read_connection(connection) as connection:
             rows = connection.execute(query, parameters).fetchall()
             samples = self._metric_rows_to_payload(rows)
             return self._append_metric_rollups(
@@ -1745,6 +1864,7 @@ class HistoryStore:
         metric_name: str | None = None,
         limit: int = 500,
         since: str | None = None,
+        connection: sqlite3.Connection | None = None,
     ) -> list[dict[str, Any]]:
         segmented_reader = self._segmented_reader()
         if segmented_reader is not None:
@@ -1777,7 +1897,7 @@ class HistoryStore:
             ORDER BY observed_at DESC, id DESC
             LIMIT ?
         """
-        with closing(self._connect()) as connection:
+        with self._read_connection(connection) as connection:
             rows = connection.execute(query, parameters).fetchall()
             samples = self._metric_rows_to_payload(rows)
             return self._append_metric_rollups(
@@ -1848,6 +1968,7 @@ class HistoryStore:
         *,
         since: str | None = None,
         limit: int = MAX_HISTORY_QUERY_LIMIT,
+        connection: sqlite3.Connection | None = None,
     ) -> list[dict[str, Any]]:
         if type(limit) is not int or not 1 <= limit <= MAX_HISTORY_QUERY_LIMIT:
             raise ValueError("History query limit is invalid.")
@@ -1931,7 +2052,7 @@ class HistoryStore:
             ORDER BY first_seen_at ASC, last_seen_at ASC, system_id ASC, enclosure_key ASC, slot ASC
             LIMIT ?
         """
-        with closing(self._connect()) as connection:
+        with self._read_connection(connection) as connection:
             rows = connection.execute(query, [*parameters, limit]).fetchall()
         return [dict(row) for row in rows]
 
@@ -1945,6 +2066,7 @@ class HistoryStore:
         metric_name: str | None = None,
         limit: int = 500,
         since: str | None = None,
+        connection: sqlite3.Connection | None = None,
     ) -> list[dict[str, Any]]:
         segmented_reader = self._segmented_reader()
         if segmented_reader is not None:
@@ -1962,6 +2084,7 @@ class HistoryStore:
             metric_name=metric_name,
             limit=limit,
             since=since,
+            connection=connection,
         )
         local_samples = self.list_metric_samples(
             system_id,
@@ -1970,6 +2093,7 @@ class HistoryStore:
             metric_name=metric_name,
             limit=limit,
             since=since,
+            connection=connection,
         )
         merged_by_key: dict[Any, dict[str, Any]] = {}
         for item in [*disk_samples, *local_samples]:
@@ -2013,9 +2137,37 @@ class HistoryStore:
                 metric_limits=metric_limits,
                 since=since,
             )
-        current = self.get_slot_state(system_id, enclosure_id, slot)
-        events = self.list_slot_events(system_id, enclosure_id, slot, limit=event_limit)
         metric_limits = metric_limits or {}
+        with closing(self._connect()) as connection:
+            return self._build_slot_history_bundle(
+                connection,
+                system_id,
+                enclosure_id,
+                slot,
+                event_limit=event_limit,
+                metric_limits=metric_limits,
+                since=since,
+            )
+
+    def _build_slot_history_bundle(
+        self,
+        connection: sqlite3.Connection,
+        system_id: str,
+        enclosure_id: str | None,
+        slot: int,
+        *,
+        event_limit: int,
+        metric_limits: dict[str, int],
+        since: str | None,
+    ) -> dict[str, Any]:
+        current = self.get_slot_state(system_id, enclosure_id, slot, connection=connection)
+        events = self.list_slot_events(
+            system_id,
+            enclosure_id,
+            slot,
+            limit=event_limit,
+            connection=connection,
+        )
 
         metrics: dict[str, list[dict[str, Any]]] = {}
         latest_values: dict[str, Any] = {}
@@ -2045,6 +2197,7 @@ class HistoryStore:
                     metric_name=metric_name,
                     limit=limit,
                     since=since,
+                    connection=connection,
                 )
             else:
                 samples = self.list_metric_samples(
@@ -2054,13 +2207,18 @@ class HistoryStore:
                     metric_name=metric_name,
                     limit=limit,
                     since=since,
+                    connection=connection,
                 )
             metrics[metric_name] = samples
             latest_values[metric_name] = samples[0].get("value") if samples else None
             sample_counts[metric_name] = len(samples)
 
         if current and current.disk_identity_key:
-            homes = self.list_disk_metric_homes(current.disk_identity_key, since=since)
+            homes = self.list_disk_metric_homes(
+                current.disk_identity_key,
+                since=since,
+                connection=connection,
+            )
             disk_history["identity_available"] = True
             disk_history["homes"] = homes
             def home_scope_key(home: dict[str, Any]) -> tuple[str | None, str, int]:
