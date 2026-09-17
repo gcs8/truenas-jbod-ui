@@ -111,12 +111,6 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Docs
 
-- `docs/SCREENSHOT_CAPTURE.md` now records the font fallback families the
-  capture workflow has pinned since #516, the qualification run that recorded
-  them, and the re-qualification a maintainer owes before changing either;
-  `tests/test_ci_contract.py` reads the pair out of the workflow so the doc
-  cannot drift from the enforced values again. (#536)
-
 - Reconciled the v0.23.0 release wrap and Wiki home page with the published
   GitHub release, GHCR package, and Pages demo while retaining the qualified
   v0.22.2 beginner-installation pin. (#518)
@@ -151,7 +145,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   streaming-JSON preflight probe took 365.2s of the 535.2s Python 3.12 test
   body on run 34815729312 and 4.2s on the untraced 3.14 job in the same run;
   the probes now also report the product's heap instead of the product's plus
-  the tracer's (#536).
+  the tracer's. The same pull request also pinned the capture-workflow font
+  fallbacks in `docs/SCREENSHOT_CAPTURE.md` — the families pinned since #516,
+  the qualification run that recorded them, and the re-qualification a
+  maintainer owes before changing either — with `tests/test_ci_contract.py`
+  reading the pair out of the workflow so the doc cannot drift from the
+  enforced values again. (#536)
 
 ## v0.23.0 - 2026-09-08
 
