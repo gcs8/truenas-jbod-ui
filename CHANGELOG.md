@@ -43,8 +43,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 ### Fixed
 
 - Ran history retention on its own schedule instead of only after a successful
-  hourly backup, bounded the wait for a failing backup, and cut the default
-  backup footprint to a daily copy kept for a week (#539).
+  hourly backup, bounded the wait for a failing backup with a deadline that is
+  recorded in the history database so a restart neither postpones nor
+  shortens it, and cut the default backup footprint to a daily copy kept for a
+  week (#539).
 
 - Replaced the generic history collector error, the retention class name, and
   the invisible full-refresh cooldown with fixed, secret-free sentences and a

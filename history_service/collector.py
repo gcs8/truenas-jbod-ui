@@ -16,6 +16,7 @@ from typing import Any
 from history_service.config import HistorySettings
 from history_service.diagnostics import (
     RETENTION_RAN_WITHOUT_BACKUP,
+    RETENTION_SKIP_ANCHOR_UNAVAILABLE,
     RETENTION_SKIP_WAITING_FOR_BACKUP,
     HistorySourceError,
     classify_backup_failure,
@@ -133,7 +134,6 @@ class HistoryCollector:
         self.last_retention_ran_without_backup: bool = False
         self.last_backup_error: str | None = None
         self.last_backup_error_kind: str | None = None
-        self._retention_backup_missing_since: datetime | None = None
         self._retention_skip_warned_at: datetime | None = None
         self.last_error: str | None = None
         self.last_error_kind: str | None = None
@@ -960,7 +960,13 @@ class HistoryCollector:
             latest_backup_at is not None
             and timedelta(0) <= normalized_now - latest_backup_at <= self._usable_backup_max_age()
         ):
-            self._retention_backup_missing_since = None
+            try:
+                self.store.clear_retention_wait()
+            except Exception:
+                # The wait record outlives this process; a stale one would make
+                # the next missing backup prune immediately. Fail closed.
+                logger.exception("History retention wait record could not be cleared.")
+                return self._refuse_retention_without_anchor()
             self._retention_skip_warned_at = None
             self.last_retention_skip_reason = None
             self.last_retention_skip_until = None
@@ -970,12 +976,18 @@ class HistoryCollector:
         skip_window = timedelta(
             seconds=max(0, int(self.settings.retention_backup_skip_max_seconds))
         )
-        if self._retention_backup_missing_since is None:
-            self._retention_backup_missing_since = self._retention_wait_started_at(
-                normalized_now,
-                latest_backup_at,
-            )
-        deadline = self._retention_backup_missing_since + skip_window
+        try:
+            anchor = self.store.read_retention_wait_anchor()
+            if anchor is None:
+                anchor = self.store.start_retention_wait(
+                    self._retention_wait_started_at(normalized_now, latest_backup_at)
+                )
+        except Exception:
+            # A missing or unreadable anchor means the bound on this wait is
+            # unknown: pruning now could be far too early, so nothing is pruned.
+            logger.exception("History retention wait anchor is unusable.")
+            return self._refuse_retention_without_anchor()
+        deadline = anchor + skip_window
         if normalized_now < deadline:
             self.last_retention_skip_reason = RETENTION_SKIP_WAITING_FOR_BACKUP
             self.last_retention_skip_until = isoformat_utc(deadline)
@@ -999,6 +1011,19 @@ class HistoryCollector:
         )
         return True
 
+    def _refuse_retention_without_anchor(self) -> bool:
+        """Skip this pass because the durable wait record cannot be trusted."""
+
+        self.last_retention_skip_reason = RETENTION_SKIP_ANCHOR_UNAVAILABLE
+        self.last_retention_skip_until = None
+        self.last_retention_ran_without_backup = False
+        self._record_collection_stage(
+            "db.retention.skipped",
+            0.0,
+            reason="wait_anchor_unavailable",
+        )
+        return False
+
     def _retention_wait_started_at(
         self,
         now: datetime,
@@ -1010,7 +1035,8 @@ class HistoryCollector:
         restart, so a service that restarts more often than the skip window
         never pruned. The newest backup survives a restart, so derive the
         anchor from it and clamp it to now; with no backup at all there is
-        nothing durable to derive from and the wait starts here.
+        nothing to derive from, so the wait starts here and is written to the
+        maintenance-state table, which is what makes it survive the restart.
         """
         if latest_backup_at is None:
             return now

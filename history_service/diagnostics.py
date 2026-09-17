@@ -26,6 +26,11 @@ RETENTION_SKIP_WAITING_FOR_BACKUP = (
 RETENTION_RAN_WITHOUT_BACKUP = (
     "Pruned without a recent database backup because backups are failing."
 )
+# The wait anchor is durable state. If it cannot be read or written, the bound
+# on the wait cannot be honoured, so pruning stops rather than guessing.
+RETENTION_SKIP_ANCHOR_UNAVAILABLE = (
+    "Not pruning: the retention wait record could not be read or written."
+)
 
 SOURCE_FAILURE_SENTENCES: dict[str, str] = {
     "source_unreachable": "Could not reach the main UI service.",

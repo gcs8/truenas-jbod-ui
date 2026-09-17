@@ -78,6 +78,12 @@ that the backup directory is writable by the history service and has free
 space, then confirm that `Last backup` moves forward. Pruning resumes on its own
 once a snapshot succeeds, and no later than `Cleanup resumes by`.
 
+`Cleanup resumes by` is a real deadline across restarts: the moment the wait
+started is written into the history database, so restarting the service does
+not push it out and does not bring it forward. If that record cannot be read or
+written, `Cleanup waiting` says the retention wait record could not be read or
+written and nothing is pruned at all until the database is writable again.
+
 ## Common procedures
 
 ### Rename a system

@@ -44,6 +44,10 @@ PRIVATE_REPLACEMENT_DIR_PREFIX = ".history-replacement-"
 DISK_IDENTITY_BACKFILL_USER_VERSION = 1
 SEGMENTED_RETENTION_STATE_NAME = "segmented_retention"
 SEGMENTED_RETENTION_STATES = frozenset({"ready", "claimed", "consumed"})
+# The no-backup retention wait anchor shares the maintenance-state table so it
+# survives a restart; it is a marker, so it only ever holds the 'ready' state.
+RETENTION_WAIT_STATE_NAME = "retention_backup_wait"
+RETENTION_WAIT_STATE = "ready"
 
 
 def history_write_lock(file_path: Path, *, blocking: bool):
@@ -639,6 +643,93 @@ class HistoryStore:
                 )
                 if cursor.rowcount != 1:
                     raise ValueError("History retention authorization claim changed.")
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+
+    def read_retention_wait_anchor(self) -> datetime | None:
+        """Return when the current no-backup retention wait started, or None.
+
+        The anchor lives in `history_maintenance_state` beside the segmented
+        claim, so it survives a restart. A row that cannot be read as a UTC
+        timestamp is not repaired here: the caller has to fail closed on it
+        rather than guess a wait that was never really served (#455).
+        """
+
+        with self._read_connection() as connection:
+            row = connection.execute(
+                """
+                SELECT backup_at, state
+                FROM history_maintenance_state
+                WHERE name = ?
+                """,
+                (RETENTION_WAIT_STATE_NAME,),
+            ).fetchone()
+        if row is None:
+            return None
+        if str(row["state"]) != RETENTION_WAIT_STATE:
+            raise ValueError("History retention wait anchor state is invalid.")
+        anchor, _ = self._normalize_retention_backup_at(str(row["backup_at"]))
+        return anchor
+
+    def start_retention_wait(
+        self,
+        anchor: datetime | str,
+        *,
+        migration_lock_held: bool = False,
+    ) -> datetime:
+        """Record `anchor` as the start of the wait, and return the effective one.
+
+        First writer wins: a restart inside the window reads back the anchor it
+        already stored instead of restarting the wait.
+        """
+
+        candidate, serialized = self._normalize_retention_backup_at(anchor)
+        with self._locked_write_connection(
+            migration_lock_held=migration_lock_held
+        ) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    """
+                    SELECT backup_at, state
+                    FROM history_maintenance_state
+                    WHERE name = ?
+                    """,
+                    (RETENTION_WAIT_STATE_NAME,),
+                ).fetchone()
+                if row is not None:
+                    if str(row["state"]) != RETENTION_WAIT_STATE:
+                        raise ValueError("History retention wait anchor state is invalid.")
+                    existing, _ = self._normalize_retention_backup_at(str(row["backup_at"]))
+                    connection.rollback()
+                    return existing
+                connection.execute(
+                    """
+                    INSERT INTO history_maintenance_state (name, backup_at, state)
+                    VALUES (?, ?, ?)
+                    """,
+                    (RETENTION_WAIT_STATE_NAME, serialized, RETENTION_WAIT_STATE),
+                )
+                connection.commit()
+                return candidate
+            except BaseException:
+                connection.rollback()
+                raise
+
+    def clear_retention_wait(self, *, migration_lock_held: bool = False) -> None:
+        """Forget the wait anchor, so the next missing backup starts a fresh window."""
+
+        with self._locked_write_connection(
+            migration_lock_held=migration_lock_held
+        ) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute(
+                    "DELETE FROM history_maintenance_state WHERE name = ?",
+                    (RETENTION_WAIT_STATE_NAME,),
+                )
                 connection.commit()
             except BaseException:
                 connection.rollback()
