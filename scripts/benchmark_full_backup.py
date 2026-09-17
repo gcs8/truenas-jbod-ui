@@ -27,7 +27,6 @@ import multiprocessing
 import os
 from pathlib import Path
 import random
-import resource
 import secrets
 import shutil
 import signal
@@ -38,6 +37,13 @@ import sys
 import tempfile
 import threading
 import time
+
+try:
+    # Deferred so --help works off Linux; main() refuses a non-Linux platform
+    # before anything below reads this module.
+    import resource
+except ImportError:  # pragma: no cover - Linux-only harness
+    resource = None
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -519,11 +525,20 @@ def main(argv=None) -> int:
     choice.add_argument("--self-test", action="store_true", help="run a bounded 1 MiB synthetic sample")
     choice.add_argument("--size-gib", type=int, choices=(2, 4), help="2 GiB minimum or 4 GiB near-limit cell (ceiling minus 1 MiB); requires --allow-large")
     choice.add_argument("--worker-phase", choices=PHASES, help=argparse.SUPPRESS)
-    parser.add_argument("--allow-large", action="store_true")
+    parser.add_argument(
+        "--allow-large",
+        action="store_true",
+        help="permit the 2/4 GiB cells; also requires --output-root",
+    )
     parser.add_argument("--output-root", type=Path, help="existing private scratch parent; never a database input")
     parser.add_argument("--workers", type=int, choices=(1,), default=1, help="baseline fixed to one compressor worker")
     parser.add_argument("--timeout", type=float, default=120, help="per-phase wall/CPU budget, maximum 600 seconds")
-    parser.add_argument("--seed", type=int, default=397)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=397,
+        help="synthetic fixture seed; the same seed reproduces the same fixture (default: 397)",
+    )
     args = parser.parse_args(argv)
     if not sys.platform.startswith("linux"):
         parser.error("Linux resource/process accounting required")

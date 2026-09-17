@@ -238,6 +238,61 @@ class ChangelogEntryGateTests(unittest.TestCase):
         self.assertFalse(result.ok)
 
 
+    def test_advisory_mode_turns_a_missing_entry_into_a_pass_with_guidance(self) -> None:
+        self._write("app/service.py", "VALUE = 2\n")
+        self._commit("fix: bump value")
+
+        result = gate.evaluate(
+            self.repo,
+            base="main",
+            head="topic",
+            pr_number=42,
+            labels=set(),
+            advisory=True,
+        )
+
+        self.assertTrue(result.ok, result.messages)
+        joined = "\n".join(result.messages)
+        self.assertIn("Advisory", joined)
+        self.assertIn("CHANGELOG.md needs an entry for #42", joined)
+        self.assertIn("a maintainer", joined)
+
+    def test_advisory_mode_still_reports_a_satisfied_gate_as_a_plain_pass(self) -> None:
+        self._write("app/service.py", "VALUE = 2\n")
+        self._add_entry("Fixed", "- Bumped the value (#42).")
+        self._commit("fix: bump value")
+
+        result = gate.evaluate(
+            self.repo,
+            base="main",
+            head="topic",
+            pr_number=42,
+            labels=set(),
+            advisory=True,
+        )
+
+        self.assertTrue(result.ok, result.messages)
+        self.assertNotIn("Advisory", "\n".join(result.messages))
+
+    def test_advisory_mode_passes_a_tests_only_change_that_cannot_be_labelled(self) -> None:
+        self._write("tests/test_service.py", "def test_more() -> None:\n    pass\n")
+        self._commit("test: add a case")
+
+        blocking = self._evaluate()
+        advisory = gate.evaluate(
+            self.repo,
+            base="main",
+            head="topic",
+            pr_number=42,
+            labels=set(),
+            advisory=True,
+        )
+
+        self.assertFalse(blocking.ok)
+        self.assertTrue(advisory.ok, advisory.messages)
+        self.assertIn("no-changelog", "\n".join(advisory.messages))
+
+
 class ChangelogEntryParsingTests(unittest.TestCase):
     def test_release_heading_uses_strict_semver_core_and_identifier_grammar(self) -> None:
         for valid in (

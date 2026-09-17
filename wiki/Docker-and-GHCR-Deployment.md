@@ -193,10 +193,32 @@ to restart dormant admin or one-shot backup jobs. Preserve any existing secrets
 or non-root overlay rather than replacing it with the base file.
 
 Check `docker compose ps` and each enabled service's `/healthz` after startup.
-For rollback to a compatible predecessor, set `JBOD_UI_IMAGE` back to its
-recorded tag or digest and run the same pull and up commands with the same
-Compose files and profiles. Image rollback does not restore durable data.
 Review release compatibility notes and keep a verified backup before updating.
+
+### Rolling back a release
+
+Rolling back is the update procedure with the previous pin. Record the tag or
+digest you are on before every update: `docker compose images`.
+
+1. Stop the stack: `docker compose down` with the same ordered `-f` files and
+   profiles you start it with.
+2. Set `JBOD_UI_IMAGE` in `.env` back to the recorded tag or digest.
+3. `docker compose pull` and `docker compose up -d`, again with the same files
+   and profiles.
+4. Check `docker compose ps` and each enabled service's `/healthz`.
+
+Keep the Compose files, configuration, origins, and bind addresses you were
+running. An image rollback changes the running code only.
+
+Durable data is not rolled back with the image. Configuration and mappings
+under `./config` and `./data`, and the history database under `./history`, stay
+as the newer version left them; a newer on-disk history schema is not reverted
+by starting an older image. If the older release cannot open the newer
+database, stop the stack and restore the history database from a scheduled
+backup as described in
+[[Backup, Restore, and Debug Bundles|Backup-Restore-and-Debug-Bundles]] before
+starting it again. Ownership and modes applied to bind mounts by a hardening
+step are also left in place; root-compatible images still read them.
 
 ## Optional container hardening
 
@@ -305,8 +327,32 @@ http://127.0.0.1:8081
 ```
 
 If Docker is on another machine, leave it bound to localhost unless you have a
-reason to expose it. Use a tunnel, reverse proxy, or set
-`HISTORY_BIND_ADDRESS=0.0.0.0` intentionally.
+reason to expose it. A tunnel or reverse proxy needs no configuration change.
+
+Binding the sidecar off loopback is not a single setting. The history service
+refuses to start on a non-loopback address unless refresh requests are
+authenticated by token and one exact browser origin is configured, and it says
+so on stdout: `Non-loopback history exposure requires refresh token mode.`
+Set all four values in `.env` together, then recreate the service:
+
+```dotenv
+HISTORY_BIND_ADDRESS=0.0.0.0
+HISTORY_REFRESH_AUTH_MODE=token
+HISTORY_REFRESH_TOKEN=<a long random string>
+HISTORY_PUBLIC_ORIGIN=http://your-docker-host:8081
+```
+
+```bash
+docker compose --profile history up -d
+```
+
+Use `HISTORY_REFRESH_TOKEN_FILE` with the secrets overlay instead of an inline
+token where the file is available. `HISTORY_PUBLIC_ORIGIN` must be an absolute
+`http://` or `https://` origin: the scheme, host, and port a browser actually
+uses, with no path. Leaving any of the three companion values unset makes the
+container exit at startup and the history button disappears from the main UI.
+Binding a service to `0.0.0.0` makes it reachable on every interface unless
+host or network controls restrict it; review that exposure first.
 
 Use [[History and Snapshot Export|History-and-Snapshot-Export]] for the visual
 walkthrough.
