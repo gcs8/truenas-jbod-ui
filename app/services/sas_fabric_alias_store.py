@@ -9,6 +9,16 @@ from typing import Iterable
 from pydantic import ValidationError
 
 from app.models.domain import SasFabricAlias
+from app.services.storage_writability import (
+    StorageDirectoryUnwritable,
+    is_unwritable_error,
+)
+
+
+class SasFabricAliasStorageUnwritable(StorageDirectoryUnwritable):
+    """The alias file could not be written because its directory is read-only."""
+
+    error_code = "data_directory_unwritable"
 
 
 class SasFabricAliasStore:
@@ -102,6 +112,11 @@ class SasFabricAliasStore:
             "sas_fabric_aliases": {key: value.model_dump(mode="json") for key, value in aliases.items()},
         }
         temp_path = self.file_path.with_suffix(".tmp")
-        with temp_path.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2, sort_keys=True)
-        temp_path.replace(self.file_path)
+        try:
+            with temp_path.open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2, sort_keys=True)
+            temp_path.replace(self.file_path)
+        except OSError as exc:
+            if is_unwritable_error(exc):
+                raise SasFabricAliasStorageUnwritable(self.file_path.parent) from exc
+            raise

@@ -66,9 +66,24 @@ The families that decide the pixels come from Chromium itself.
 node and for a monospace node. It prints each family with its glyph count and
 writes `platform-fonts.json` into the artifact. `EXPECTED_SANS_FALLBACK` and
 `EXPECTED_MONO_FALLBACK` are compared against the family with the most glyphs in
-that report, not against `fc-match`. Both are empty until the first dispatched
-run records them; set them in the workflow `env` block afterwards, so a later
-image change fails the job instead of quietly changing the pixels.
+that report, not against `fc-match`.
+
+Both are pinned in the workflow `env` block, and the job fails when the family
+Chromium used no longer matches:
+
+| Variable | Pinned family |
+|---|---|
+| `EXPECTED_SANS_FALLBACK` | `Liberation Sans` |
+| `EXPECTED_MONO_FALLBACK` | `WenQuanYi Zen Hei Mono` |
+
+Qualification run `34734456858` recorded both under the container digest pinned
+above; #516 moved them into the workflow. Do not edit either value to make a red
+capture green: a mismatch means the image, its fonts, or the Chromium build
+changed, so the pixels changed too. Re-qualify instead - dispatch a
+`qualification_only` run against the new pin, read the dominant families out of
+its `platform-fonts.json`, and update the workflow `env` block, this table, and
+the container digest in one pull request. `tests/test_ci_contract.py` reads the
+families out of the workflow and fails if this table drifts from them.
 
 ## Running it before the workflow is merged
 

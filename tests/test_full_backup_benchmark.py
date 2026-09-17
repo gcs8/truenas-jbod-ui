@@ -353,16 +353,16 @@ class FullBackupBenchmarkTests(unittest.TestCase):
             self.assertNotIn("passphrase", json.dumps(result))
 
     def test_supervisor_capture_has_a_fixed_memory_budget(self):
-        import tracemalloc
-        tracemalloc.start()
+        from tests import heap_probe
+        heap_probe.start()
         try:
             result = self.b.measure_process(
                 [sys.executable, "-c", "import sys; sys.stdout.write('x' * (8 * 1024**2))"],
                 {}, self.root, timeout=5,
             )
-            _, peak = tracemalloc.get_traced_memory()
+            _, peak = heap_probe.get_traced_memory()
         finally:
-            tracemalloc.stop()
+            heap_probe.stop()
         self.assertEqual(result["state"], "failed")
         self.assertLess(peak, 2 * 1024**2)
 

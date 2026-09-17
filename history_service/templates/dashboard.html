@@ -80,11 +80,14 @@
           <dt>Last temperature collection attempt</dt><dd id="status-last-fast-metrics-at">{{ timestamp(status.get('last_fast_metrics_at'), 'never') }}</dd>
           <dt>Last full SMART collection attempt</dt><dd id="status-last-slow-metrics-at">{{ timestamp(status.get('last_slow_metrics_at'), 'never') }}</dd>
           <dt>Last backup</dt><dd id="status-last-backup-at">{{ timestamp(status.get('last_backup_at'), 'never') }}</dd>
+          <dt>Backup error</dt><dd id="status-last-backup-error">{{ status.get('last_backup_error') or 'none' }}</dd>
           <dt>Last cleanup</dt><dd id="status-last-retention-at">{{ timestamp(status.get('last_retention_at'), 'never') }}</dd>
           <dt>Cleanup took</dt><dd id="status-last-retention-duration">{{ last_retention_duration_label }}</dd>
           <dt>Rows removed</dt><dd id="status-last-retention-rows-removed">{{ count(status.get('last_retention_rows_removed')) }}</dd>
           <dt>More cleanup pending</dt><dd id="status-last-retention-has-more">{{ 'yes' if status.get('last_retention_has_more') else 'no' }}</dd>
           <dt>Cleanup error</dt><dd id="status-last-retention-error">{{ status.get('last_retention_error') or 'none' }}</dd>
+          <dt>Cleanup waiting</dt><dd id="status-last-retention-skip-reason">{{ status.get('last_retention_skip_reason') or 'no' }}</dd>
+          <dt>Cleanup resumes by</dt><dd id="status-last-retention-skip-until">{{ timestamp(status.get('last_retention_skip_until'), 'not waiting') }}</dd>
           <dt>Last run took</dt><dd id="status-last-collection-duration">{{ last_collection_duration_label }}</dd>
           <dt>Ran late by</dt><dd id="status-last-background-overrun">{{ 'no' if status.get('last_background_overrun_seconds') == 0 else last_background_overrun_label }}</dd>
           <dt>Last scan used</dt><dd id="status-last-collection-inventory">{{ 'fresh inventory' if status.get('last_collection_inventory_forced') is sameas true else 'cached inventory' if status.get('last_collection_inventory_forced') is sameas false else 'not recorded' }}</dd>
@@ -93,6 +96,8 @@
           <dt>Retry wait after errors</dt><dd id="status-background-backoff">{{ backoff_label }}</dd>
           <dt>Retry after</dt><dd id="status-background-backoff-until">{{ timestamp(status.get('background_backoff_until'), 'not active') }}</dd>
           <dt>Last error</dt><dd id="status-last-error">{{ status.get('last_error') or 'none' }}</dd>
+          <dt>What went wrong</dt><dd id="status-last-error-summary">{{ status.get('last_error_summary') or 'nothing recorded' }}</dd>
+          <dt>Full refresh available</dt><dd id="status-full-refresh-available">{{ timestamp(refresh.get('full_refresh_available_at'), 'now') }}</dd>
         </dl>
       </section>
 
