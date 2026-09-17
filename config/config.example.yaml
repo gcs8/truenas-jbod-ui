@@ -79,6 +79,13 @@ truenas:
   api_password: ""
   # core, scale, linux, quantastor, esxi, or ipmi. See the systems examples below.
   platform: core
+  # Middleware wire protocol. ddp is the legacy /websocket endpoint that every
+  # CORE and SCALE release exposes; jsonrpc is the JSON-RPC 2.0 API that SCALE
+  # 25.04 and newer document as supported and that CORE does not have.
+  api_dialect: ddp
+  # Read only when api_dialect is jsonrpc. current follows the appliance;
+  # a pinned value such as v25.10.0 targets one documented API version.
+  api_version: current
   # The beginner default accepts the appliance certificate without verification.
   # For verified HTTPS against a private CA, set verify_ssl to true, point
   # tls_ca_bundle_path at a PEM bundle mounted under /app/config (for example

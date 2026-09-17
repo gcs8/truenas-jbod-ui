@@ -4876,6 +4876,15 @@
               : null,
         })),
       replace_existing: Boolean(state.loadedSystemId && normalizedSystemId === state.loadedSystemId),
+      // The system this payload was cloned FROM. Sent whenever a loaded system
+      // is saved under a new id, whatever the operator did to the SSH command
+      // box, so the server can inherit the loaded system's API dialect instead
+      // of guessing from whoever else shares the endpoint. `resetSetupForm`
+      // (Start Fresh) clears `state.loadedSystemId`, which clears this too.
+      clone_source_system_id:
+        state.loadedSystemId && normalizedSystemId !== state.loadedSystemId
+          ? state.loadedSystemId
+          : null,
       make_default: Boolean(elements.setupMakeDefault?.checked),
     };
   }

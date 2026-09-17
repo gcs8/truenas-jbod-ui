@@ -111,11 +111,14 @@
     setText("status-last-fast-metrics-at", formatTimestamp(collector.last_fast_metrics_at));
     setText("status-last-slow-metrics-at", formatTimestamp(collector.last_slow_metrics_at));
     setText("status-last-backup-at", formatTimestamp(collector.last_backup_at));
+    setText("status-last-backup-error", statusValue(collector.last_backup_error, "none"));
     setText("status-last-retention-at", formatTimestamp(collector.last_retention_at));
     setText("status-last-retention-duration", collectionDurationLabel(collector.last_retention_duration_seconds));
     setCount("status-last-retention-rows-removed", collector.last_retention_rows_removed);
     setText("status-last-retention-has-more", collector.last_retention_has_more ? "yes" : "no");
     setText("status-last-retention-error", statusValue(collector.last_retention_error, "none"));
+    setText("status-last-retention-skip-reason", statusValue(collector.last_retention_skip_reason, "no"));
+    setText("status-last-retention-skip-until", formatTimestamp(collector.last_retention_skip_until, "not waiting"));
     setText("status-last-collection-duration", collectionDurationLabel(collector.last_collection_duration_seconds));
     setText("status-last-background-overrun", collector.last_background_overrun_seconds === 0 ? "no" : collectionDurationLabel(collector.last_background_overrun_seconds));
     setText("status-last-collection-inventory", collectionInventoryLabel(collector.last_collection_inventory_forced));
@@ -124,12 +127,15 @@
     setText("status-background-backoff", backoffLabel(collector.background_backoff_seconds_remaining));
     setText("status-background-backoff-until", formatTimestamp(collector.background_backoff_until, "not active"));
     setText("status-last-error", statusValue(collector.last_error, "none"));
+    setText("status-last-error-summary", statusValue(collector.last_error_summary, "nothing recorded"));
   }
 
   function renderOverview(payload) {
     if (!payload) {
       return;
     }
+    const refresh = payload.refresh || {};
+    setText("status-full-refresh-available", formatTimestamp(refresh.full_refresh_available_at, "now"));
     const counts = payload.counts || {};
     const countsExact = Boolean(payload.counts_exact);
     setCount("tracked-slots-value", counts.tracked_slots);

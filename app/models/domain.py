@@ -956,6 +956,12 @@ class SystemSetupRequest(BaseModel):
     ssh_commands: list[str] = Field(default_factory=list)
     ssh_commands_action: Literal["default", "preserve", "replace"] = "default"
     ssh_commands_source_system_id: str | None = None
+    # The saved system this payload was cloned FROM, sent whenever a loaded
+    # system is saved under a new id. It is deliberately separate from
+    # `ssh_commands_source_system_id`, which only exists while a redacted
+    # command list is being preserved: replacing or defaulting the commands
+    # must not erase the clone's source identity.
+    clone_source_system_id: str | None = None
     bmc_enabled: bool = False
     bmc_host: str | None = None
     bmc_username: str | None = None
@@ -980,6 +986,7 @@ class SystemSetupRequest(BaseModel):
         "ssh_user",
         "ssh_key_path",
         "ssh_commands_source_system_id",
+        "clone_source_system_id",
         "bmc_host",
         "bmc_username",
         "default_profile_id",

@@ -645,7 +645,7 @@ class CIWorkflowContractTests(unittest.TestCase):
 
         self.assertEqual(
             triggers["pull_request_target"]["types"],
-            ["opened", "edited", "synchronize", "reopened"],
+            ["opened", "edited", "reopened"],
         )
         self.assertEqual(workflow["permissions"], {"pull-requests": "write"})
         for job_name, job in workflow["jobs"].items():
@@ -748,6 +748,104 @@ class CIWorkflowContractTests(unittest.TestCase):
             self.assertIn(required_check, contributing)
         self.assertIn("Coverage is report-only", contributing)
         self.assertIn("CodeQL is report-only", contributing)
+
+
+class CIRunsOncePerPullRequestTests(unittest.TestCase):
+    """#541: one CI run per head commit, no CANCELLED required check."""
+
+    def read(self, path: Path) -> str:
+        return path.read_text(encoding="utf-8")
+
+    def test_push_runs_defer_to_the_pull_request_run_for_the_same_branch(self) -> None:
+        workflow = yaml.safe_load(self.read(CI_WORKFLOW))
+        route = workflow["jobs"]["route"]
+        script = route["steps"][0]["run"]
+
+        self.assertEqual(route["outputs"]["run"], "${{ steps.decide.outputs.run }}")
+        self.assertEqual(route["permissions"]["pull-requests"], "read")
+        self.assertIn('if [ "${EVENT_NAME}" != "push" ]', script)
+        self.assertIn(
+            'gh pr list --repo "$GH_REPO" --head "$BRANCH_NAME" --base main --state open',
+            script,
+        )
+        self.assertIn('echo "run=false" >> "$GITHUB_OUTPUT"', script)
+
+    def test_push_runs_only_defer_to_pull_requests_this_workflow_runs(self) -> None:
+        workflow = yaml.safe_load(self.read(CI_WORKFLOW))
+        triggers = workflow.get("on", workflow.get(True, {}))
+        script = workflow["jobs"]["route"]["steps"][0]["run"]
+
+        # `pull_request` fires only for pull requests into main. A stacked
+        # branch whose open pull request targets another branch therefore gets
+        # no pull_request run, so its push run must not defer to it.
+        self.assertEqual(triggers["pull_request"]["branches"], ["main"])
+        self.assertIn(
+            'gh pr list --repo "$GH_REPO" --head "$BRANCH_NAME" --base main --state open',
+            script,
+        )
+
+    def test_every_billable_job_is_gated_on_the_routing_decision(self) -> None:
+        workflow = yaml.safe_load(self.read(CI_WORKFLOW))
+
+        for name in (
+            "diff-hygiene",
+            "python-source",
+            "ruff-check",
+            "javascript-source",
+            "container-smoke",
+            "admin-browser-cleanroom",
+            "public-demo-artifact",
+        ):
+            job = workflow["jobs"][name]
+            needs = job["needs"]
+            needs = [needs] if isinstance(needs, str) else needs
+            self.assertIn("route", needs, name)
+            self.assertIn("needs.route.outputs.run == 'true'", job["if"], name)
+
+    def test_the_routing_gate_skips_rather_than_cancels(self) -> None:
+        workflow = yaml.safe_load(self.read(CI_WORKFLOW))
+        contributing = self.read(ROOT / "CONTRIBUTING.md")
+
+        self.assertEqual(workflow["concurrency"]["group"], "ci-preflight-${{ github.ref }}")
+        self.assertIn(
+            "A branch push whose branch already has an open pull request skips",
+            contributing,
+        )
+
+    def test_codeql_does_not_run_twice_for_branches_with_pull_requests(self) -> None:
+        workflow = yaml.safe_load(self.read(WORKFLOW_DIR / "codeql.yml"))
+        triggers = workflow.get("on", workflow.get(True, {}))
+
+        self.assertEqual(triggers["push"]["branches"], ["main"])
+        self.assertEqual(triggers["pull_request"]["branches"], ["main"])
+
+    def test_pr_label_job_does_not_cancel_itself_on_every_push(self) -> None:
+        workflow = yaml.safe_load(self.read(WORKFLOW_DIR / "pr-labels.yml"))
+        triggers = workflow.get("on", workflow.get(True, {}))
+
+        self.assertNotIn("synchronize", triggers["pull_request_target"]["types"])
+        self.assertEqual(triggers["pull_request_target"]["types"], ["opened", "edited", "reopened"])
+        self.assertIs(workflow["concurrency"]["cancel-in-progress"], False)
+
+    def test_changelog_gate_advises_outside_contributors_instead_of_blocking(self) -> None:
+        workflow = yaml.safe_load(self.read(CI_WORKFLOW))
+        step = workflow["jobs"]["changelog-entry"]["steps"][-1]
+
+        self.assertEqual(
+            step["env"]["PR_AUTHOR_ASSOCIATION"],
+            "${{ github.event.pull_request.author_association }}",
+        )
+        self.assertIn("OWNER|MEMBER|COLLABORATOR)", step["run"])
+        self.assertIn("--advisory", step["run"])
+
+    def test_contributing_documents_how_to_satisfy_the_changelog_check(self) -> None:
+        contributing = " ".join(self.read(ROOT / "CONTRIBUTING.md").split())
+
+        self.assertIn("How to satisfy the `Changelog entry` check", contributing)
+        self.assertIn(
+            "Outside contributors cannot apply labels, so the gate runs in advisory mode",
+            contributing,
+        )
 
 
 if __name__ == "__main__":

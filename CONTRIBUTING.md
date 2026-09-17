@@ -390,6 +390,14 @@ contributors may use descriptive prefixes such as `feat/`, `fix/`, `refactor/`,
 `docs/`, `perf/`, `test/`, `ci/`, `codex/`, or `claude/` without creating a CI
 coverage gap. Tag pushes are not part of this preflight workflow.
 
+A branch push whose branch already has an open pull request skips the preflight
+jobs, because that pull request's own run already covers the same commit. The
+`Run routing` job makes that decision and the gated jobs report `Skipped`,
+which satisfies a required check; superseding the duplicate by cancellation
+would report `Cancelled`, which does not. Before a pull request exists the
+branch push still runs every job. CodeQL follows the same rule: it analyses
+pushes to `main`, pull requests targeting `main`, and the weekly schedule.
+
 ## CI blocking policy
 
 The following pull-request checks are release-blocking and required for `main`:
@@ -637,6 +645,24 @@ labels plus that file. The rules:
   Dependencies. Pull requests with no operator-visible paths must still carry
   `no-changelog`; an unlabeled invisible pull request fails the entry gate so
   release coverage cannot discover an implicit escape later.
+
+### How to satisfy the `Changelog entry` check
+
+1. Open the pull request. The number does not exist before `gh pr create`, so
+   the first run fails; that is expected.
+2. Add one bullet to `CHANGELOG.md` under `## Unreleased`, in the subsection
+   that matches the change, ending with your pull request number:
+   `- Fixed the thing an operator sees (#123).`
+3. Push that as the next commit. The job re-runs and passes.
+4. If the change is invisible to operators (tests-only, CI-only, tooling),
+   apply the `no-changelog` label instead of a bullet and re-run the job; it
+   reads labels live, so no new commit is needed.
+
+Outside contributors cannot apply labels, so the gate runs in advisory mode for
+them: `scripts/check_changelog_entry.py --advisory` prints the same guidance and
+exits 0, and a maintainer applies the label or adds the bullet before merge. The
+workflow selects the mode from the pull request's `author_association`; `OWNER`,
+`MEMBER`, and `COLLABORATOR` remain blocking.
 
 Two scripts enforce this:
 
