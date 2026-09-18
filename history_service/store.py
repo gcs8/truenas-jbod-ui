@@ -476,20 +476,54 @@ class HistoryStore:
         reason = describe_unsupported_schema_version(self.file_path, found)
         raise HistorySchemaVersionError(reason)
 
+    @classmethod
+    def _read_on_disk_schema_version(cls, file_path: Path) -> int | None:
+        """The `user_version` a writer would see, without writing anything.
+
+        Two reads, because neither answers on its own:
+
+        * the main file's header, which needs no SQLite connection at all. The
+          gate must not publish `-wal`/`-shm` beside a database that has none,
+          because the lifecycle-marker check has not run yet and a rotation or
+          restore in flight refuses post-marker sidecars.
+        * the write-ahead log, but only when a `-wal` sidecar already exists.
+          `user_version` lives on page 1, and in WAL mode a committed change to
+          page 1 sits in the `-wal` until a checkpoint copies it back, so the
+          header alone reports the pre-commit value. A database a newer release
+          committed to and did not checkpoint would otherwise be admitted and
+          then written to, which is exactly what #416 forbids.
+
+        The WAL read is a `mode=ro` URI connection: it replays the log for
+        reading and leaves the database and the `-wal` byte-identical. It cannot
+        checkpoint and it cannot write. (SQLite may materialise the derived
+        `-shm` index, which holds no database content and only ever happens
+        where a `-wal` already exists, so it adds no sidecar state that the
+        existing `-wal` did not already imply.) `immutable=1` is not usable
+        here: it answers faster but deliberately ignores the WAL, which is the
+        value this gate needs.
+
+        The higher of the two wins, so a half-visible future version still fails
+        closed. A file that is absent, empty, too short, not a SQLite database,
+        or whose WAL cannot be read returns the header's answer (or no version
+        at all) and stays with the existing corrupt-state and locking handling.
+        """
+        header_version = cls._read_schema_version_from_header(file_path)
+        if not path_entry_exists(Path(f"{file_path}-wal")):
+            return header_version
+        wal_version = cls._read_schema_version_including_wal(file_path)
+        if wal_version is None:
+            return header_version
+        if header_version is None:
+            return wal_version
+        return max(header_version, wal_version)
+
     @staticmethod
-    def _read_on_disk_schema_version(file_path: Path) -> int | None:
+    def _read_schema_version_from_header(file_path: Path) -> int | None:
         """Read `user_version` straight out of the SQLite file header.
 
-        Deliberately not a SQLite connection: opening a WAL database even for
-        reading publishes `-wal` and `-shm` beside it, and the gate must not
-        create anything before the lifecycle-marker check has run. `user_version`
-        is a big-endian 32-bit field at offset 60 of the 100-byte header
-        (https://sqlite.org/fileformat.html), so a 64-byte read answers it.
-
-        A file that is absent, empty, too short or not a SQLite database returns
-        no version and stays with the existing corrupt-state handling. A version
-        that only exists in an unreplayed WAL is not visible here; a database a
-        newer release left mid-transaction is the one case this gate can miss.
+        `user_version` is a big-endian 32-bit field at offset 60 of the 100-byte
+        header (https://sqlite.org/fileformat.html), so a 64-byte read answers
+        it. No connection is opened, so nothing is created on disk.
         """
         try:
             with open(file_path, "rb") as handle:
@@ -504,6 +538,27 @@ class HistoryStore:
             header[SQLITE_USER_VERSION_OFFSET:SQLITE_HEADER_PREFIX_BYTES],
             "big",
         )
+
+    @staticmethod
+    def _read_schema_version_including_wal(file_path: Path) -> int | None:
+        """`user_version` as of the last commit, including unreplayed WAL frames.
+
+        Returns no version when the database or its WAL cannot be opened for
+        reading: an unreadable file is not a version problem, and a locked one
+        fails the same way a moment later on the real open.
+        """
+        try:
+            uri = f"{file_path.absolute().as_uri()}?mode=ro"
+        except ValueError:
+            return None
+        try:
+            with closing(sqlite3.connect(uri, uri=True, timeout=0)) as connection:
+                row = connection.execute("PRAGMA user_version").fetchone()
+        except (sqlite3.Error, OSError):
+            return None
+        if not row or row[0] is None:
+            return None
+        return int(row[0])
 
     def _ensure_database_parent(self) -> None:
         try:

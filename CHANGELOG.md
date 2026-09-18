@@ -53,8 +53,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 ### Fixed
 
 - The history service now declares the on-disk schema versions it supports and
-  checks `PRAGMA user_version` before the migration lock and before any write. A
-  database written by a newer release is refused with a plain-words reason and
+  checks `PRAGMA user_version` before the migration lock and before any write,
+  including a version a newer release committed to an unreplayed write-ahead log.
+  A database written by a newer release is refused with a plain-words reason and
   left byte-identical instead of gaining this build's tables, and the reason is
   reported on `/healthz` rather than crash-looping; supported older databases
   still migrate through the existing path (#546).
