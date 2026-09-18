@@ -40,7 +40,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   default `docker-compose.yml`, which lost its `:ro` when hardening moved to the
   opt-in non-root overlay. Default deployments no longer give the
   internet-facing UI write access to `config.yaml`; the admin service, which
-  does write configuration, keeps its read-write mount. (#550)
+  does write configuration, keeps its read-write mount. (#550, #552)
 
 ### Added
 
