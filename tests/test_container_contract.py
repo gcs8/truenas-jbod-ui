@@ -936,8 +936,7 @@ class ContainerResourceContractTests(unittest.TestCase):
                     services["enclosure-backup"]["group_add"],
                     ["${APP_GID:-10001}"],
                 )
-                config_mount = "./config:/app/config" + ("" if compose_name == "docker-compose.yml" else ":ro")
-                self.assertIn(config_mount, services["enclosure-ui"]["volumes"])
+                self.assertIn("./config:/app/config:ro", services["enclosure-ui"]["volumes"])
 
         overlay = yaml.safe_load((REPO_ROOT / "docker-compose.nonroot.yml").read_text(encoding="utf-8"))
         self.assertEqual(
@@ -1082,8 +1081,6 @@ class ContainerResourceContractTests(unittest.TestCase):
             services = yaml.safe_load((REPO_ROOT / compose_name).read_text(encoding="utf-8"))["services"]
             for service_name, expected in expected_targets.items():
                 with self.subTest(compose=compose_name, service=service_name):
-                    if compose_name == "docker-compose.yml" and service_name == "enclosure-ui":
-                        expected = expected | {"/app/config"}
                     self.assertEqual(writable_volume_targets(services[service_name]), expected)
             self.assertNotIn("./logs:/app/logs", services["enclosure-admin"]["volumes"])
 

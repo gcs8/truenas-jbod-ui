@@ -34,6 +34,14 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Image-only upgrades now preserve existing Compose files and wait for healthy
   containers; optional backup defaults match the selected ownership setup. (#426)
 
+### Security
+
+- Restored the read-only `./config:/app/config:ro` mount for the read UI in the
+  default `docker-compose.yml`, which lost its `:ro` when hardening moved to the
+  opt-in non-root overlay. Default deployments no longer give the
+  internet-facing UI write access to `config.yaml`; the admin service, which
+  does write configuration, keeps its read-write mount. (#550)
+
 ### Added
 
 - Added a JSON-RPC 2.0 websocket transport selectable per TrueNAS host with
