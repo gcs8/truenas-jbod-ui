@@ -186,7 +186,7 @@ class DiskRetentionAccountingUnitTests(unittest.TestCase):
             slot=0,
             present=True,
             identity_state="unknown",
-            sas_address="0x5000000000000000",
+            scsi_hctl="0:0:0:0",
             enclosure_id="enc-a",
         )
 
