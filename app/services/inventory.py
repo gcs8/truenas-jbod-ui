@@ -3347,16 +3347,16 @@ class InventoryService:
         smart_summary: SmartSummaryView | None,
         loaded_entries: Mapping[str, SlotDetailCacheEntry] | None = None,
     ) -> SlotDetailCacheEntry | None:
-        identifiers = sorted(self._slot_detail_identifiers(slot_view))
-        if not identifiers:
-            return None
         if self._slot_identity_state(slot_view) == "unknown":
             # Writing this row would overwrite the last-known entry with one
             # that cannot say which disk it describes, and would file any SMART
             # read taken during the window under the departed disk. Persist no
             # observation; the previous entry stays as historical evidence, with
             # only the withholding decision recorded on it so it survives a
-            # restart of this process (#525).
+            # restart of this process (#525). This comes before the identifier
+            # check below: a present bay that offers no identifier at all is
+            # the most unknown of the lot, and its decision has to be written
+            # down too, or a restart serves the departed disk's SMART for it.
             store = self.slot_detail_store
             if store is None:
                 return None
@@ -3367,6 +3367,10 @@ class InventoryService:
             if stored is None or stored.identity_unknown:
                 return None
             return stored.model_copy(update={"identity_unknown": True})
+
+        identifiers = sorted(self._slot_detail_identifiers(slot_view))
+        if not identifiers:
+            return None
 
         slot_fields: dict[str, Any] = {}
         for field_name in STABLE_SLOT_DETAIL_FIELDS:
