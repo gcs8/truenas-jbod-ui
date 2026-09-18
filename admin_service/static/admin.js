@@ -506,7 +506,9 @@
     const expiresAt = new Date(state.admin.expires_at).getTime();
     const remainingMs = expiresAt - Date.now();
     if (remainingMs <= 0) {
-      return "Stopping now";
+      // The browser clock cannot know the sidecar stopped; say only that the
+      // deadline passed, and leave the recovery step to the server's state.
+      return "Auto-stop time reached";
     }
     const totalSeconds = Math.floor(remainingMs / 1000);
     const hours = Math.floor(totalSeconds / 3600);
@@ -516,6 +518,18 @@
       return `${hours}h ${String(minutes).padStart(2, "0")}m ${String(seconds).padStart(2, "0")}s`;
     }
     return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
+  }
+
+  // The words come from the server's offline/stopped state, never from the
+  // browser clock, so the page never invents a shutdown it cannot observe.
+  function describeOfflineRecovery(recovery) {
+    if (!recovery || recovery.expired !== true) {
+      return "";
+    }
+    return [String(recovery.summary || ""), String(recovery.next_step || "")]
+      .map((part) => part.trim())
+      .filter(Boolean)
+      .join(" ");
   }
 
   function startCountdownTimer() {
@@ -529,6 +543,7 @@
   function updateAdminMeta() {
     if (elements.countdown) {
       elements.countdown.textContent = formatCountdown();
+      elements.countdown.title = describeOfflineRecovery(state.admin.offline_recovery);
     }
     if (elements.startedAt) {
       elements.startedAt.textContent = formatLocalTimestamp(state.admin.started_at);
@@ -5086,11 +5101,30 @@
     return String(detail);
   }
 
+  // Only a server-issued correlation id is ever shown: 32 lowercase hex digits,
+  // the shape app/request_context.py mints. Anything else (raw HTML, a value a
+  // caller invented) is dropped rather than rendered beside the error.
+  const SERVER_REQUEST_ID_PATTERN = /^[0-9a-f]{32}$/;
+
+  function validatedRequestId(value) {
+    const candidate = String(value ?? "").trim();
+    return SERVER_REQUEST_ID_PATTERN.test(candidate) ? candidate : "";
+  }
+
+  function describeRequestFailure(payload, response) {
+    const detail =
+      describeApiError(payload?.detail) || `Request failed with ${response?.status ?? "no status"}`;
+    const requestId =
+      validatedRequestId(payload?.request_id) ||
+      validatedRequestId(response?.headers?.get?.("X-Request-ID"));
+    return requestId ? `${detail} (request id ${requestId})` : detail;
+  }
+
   async function fetchJson(url, options = {}) {
     const response = await fetch(url, options);
     const payload = await readJsonResponse(response);
     if (!response.ok || (payload && payload.ok === false)) {
-      throw new Error(describeApiError(payload?.detail) || `Request failed with ${response.status}`);
+      throw new Error(describeRequestFailure(payload, response));
     }
     return payload || {};
   }
