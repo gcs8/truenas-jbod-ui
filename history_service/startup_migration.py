@@ -24,18 +24,22 @@ exactly as recovery found it.
 from __future__ import annotations
 
 import logging
+import sqlite3
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, TypeVar
 
 from history_service.segment_catalog import (
     MIGRATION_PENDING_MARKER,
     activation_pending_path,
     path_entry_exists,
 )
+from history_service.startup import HistoryStartupError
 
 __all__ = [
     "ACTIVATION_PENDING_REASON",
     "MIGRATION_RECOVERY_FAILED_REASON",
+    "open_history_store_after_recovery",
+    "pending_history_lifecycle_marker",
     "pending_migration_marker_path",
     "recover_pending_history_migration",
 ]
@@ -56,6 +60,7 @@ MIGRATION_RECOVERY_FAILED_REASON = (
 )
 
 RecoverCallable = Callable[[Path, Path], Any]
+StoreT = TypeVar("StoreT")
 
 
 def _default_recover(source: Path, segments_directory: Path) -> Any:
@@ -75,6 +80,69 @@ def pending_migration_marker_path(segment_catalog_path: str | Path | None) -> Pa
     if not segment_catalog_path:
         return None
     return Path(segment_catalog_path).absolute().parent / MIGRATION_PENDING_MARKER
+
+
+def pending_history_lifecycle_marker(
+    *,
+    sqlite_path: str | Path,
+    segment_catalog_path: str | Path | None,
+) -> bool:
+    """Whether a rotation, restore or migration marker is waiting on disk.
+
+    A pure existence check: it opens nothing and writes nothing.
+    """
+    if path_entry_exists(activation_pending_path(sqlite_path)):
+        return True
+    marker_path = pending_migration_marker_path(segment_catalog_path)
+    return marker_path is not None and path_entry_exists(marker_path)
+
+
+def open_history_store_after_recovery(
+    *,
+    sqlite_path: str | Path,
+    segment_catalog_path: str | Path | None,
+    build_store: Callable[[], StoreT],
+    recover: RecoverCallable | None = None,
+) -> StoreT:
+    """Open the history store, recovering a migration only if that is what blocks it.
+
+    Recovery is a write, and the store's admission checks are what decide
+    whether this build may write to this database at all -- most importantly the
+    on-disk schema-version gate, which refuses a database a newer release wrote
+    and leaves it byte-identical (#416). Running recovery first would mutate the
+    durable state of a database this build has already been told not to touch,
+    so the store is asked first and recovery only answers the one refusal it can
+    actually fix.
+
+    That refusal is the pending-lifecycle-marker check, which raises
+    ``sqlite3.OperationalError`` from inside the migration lock, before the store
+    reads or writes the database. Every other refusal -- an unsupported schema
+    version, an unwritable directory, a corrupt file -- propagates untouched and
+    recovery never runs. With no marker on disk there is nothing to recover, so
+    the store is simply opened.
+    """
+    if not pending_history_lifecycle_marker(
+        sqlite_path=sqlite_path,
+        segment_catalog_path=segment_catalog_path,
+    ):
+        return build_store()
+
+    try:
+        return build_store()
+    except sqlite3.OperationalError:
+        logger.warning(
+            "The history store refused a pending segmented history lifecycle marker; "
+            "attempting recovery before starting."
+        )
+
+    failure = recover_pending_history_migration(
+        sqlite_path=sqlite_path,
+        segment_catalog_path=segment_catalog_path,
+        recover=recover,
+    )
+    if failure is not None:
+        raise HistoryStartupError(failure)
+    return build_store()
 
 
 def recover_pending_history_migration(
