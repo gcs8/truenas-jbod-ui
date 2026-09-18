@@ -82,6 +82,7 @@ class HistorySchemaVersionGateTests(unittest.TestCase):
 
         self.assertEqual(self.database_path.read_bytes(), before)
         self.assertFalse(Path(f"{self.database_path}-wal").exists())
+        self.assertFalse(Path(f"{self.database_path}-shm").exists())
         # No application table was created against the foreign database.
         connection = sqlite3.connect(self.database_path)
         try:
@@ -128,6 +129,18 @@ class HistorySchemaVersionGateTests(unittest.TestCase):
         self.assertIn("slot_state_current", names)
         self.assertIn("legacy_marker", names)
         self.assertEqual(surviving, 1)
+
+    def test_a_file_that_is_not_a_sqlite_database_reports_no_version(self) -> None:
+        # Corrupt or foreign bytes are not a version problem; they belong to the
+        # existing quarantine/recovery path, so the gate must not claim them.
+        self.database_path.write_bytes(b"not a database at all")
+
+        self.assertIsNone(HistoryStore._read_on_disk_schema_version(self.database_path))
+
+    def test_a_missing_or_empty_file_reports_no_version(self) -> None:
+        self.assertIsNone(HistoryStore._read_on_disk_schema_version(self.database_path))
+        self.database_path.write_bytes(b"")
+        self.assertIsNone(HistoryStore._read_on_disk_schema_version(self.database_path))
 
     def test_startup_reports_a_schema_refusal_as_a_terminal_reason(self) -> None:
         _stamp_database(self.database_path, CURRENT_SCHEMA_VERSION + 998)

@@ -110,6 +110,7 @@ WINDOWS_PORTABLE_TEST_MODULES = (
     "tests.test_config_example",
     "tests.test_dev_check",
     "tests.test_ghcr_release_contract",
+    "tests.test_history_schema_version_gate",
     "tests.test_heap_probe",
     "tests.test_history_backend",
     "tests.test_history_backend_bounds",
