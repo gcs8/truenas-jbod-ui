@@ -50,6 +50,14 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   concurrency and DDP heartbeat handling; inventory integration remained
   separate (#503).
 
+### Changed
+
+- Admin failures now answer with the request's correlation id in the response
+  body and the `X-Request-ID` header, and the admin log records that id with the
+  HTTP status only; the admin state reports whether the sidecar's auto-stop time
+  has passed and names the restart command, so the page no longer claims a
+  shutdown from the browser clock (#545).
+
 ### Docs
 
 - Rewrote the released v0.23.0 upgrade notes so a published-image operator can
