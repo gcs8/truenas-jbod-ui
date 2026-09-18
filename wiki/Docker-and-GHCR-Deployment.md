@@ -195,6 +195,23 @@ or non-root overlay rather than replacing it with the base file.
 Check `docker compose ps` and each enabled service's `/healthz` after startup.
 Review release compatibility notes and keep a verified backup before updating.
 
+Required application migrations run by themselves. The UI and history services
+apply their own schema and durable-state migrations while they start, and
+repeating a start after a successful migration does no migration work again, so
+a normal update never needs a migration command, an ownership change, or any
+other manual repair step.
+
+If a migration is interrupted -- a host reboot, an out-of-memory kill, or an
+`up -d` during one -- the next start finishes it automatically before history
+opens the database. When that automatic recovery cannot complete, history stays
+up but stops serving, leaves the database exactly as recovery found it, and
+reports one line explaining why at `/healthz`; the service log carries the
+recovery error. Read that line before doing anything else, and restore from a
+verified backup as described in
+[[Backup, Restore, and Debug Bundles|Backup-Restore-and-Debug-Bundles]] if it
+asks you to. Do not run the advanced segmented-history maintenance scripts as
+part of a routine upgrade.
+
 ### Rolling back a release
 
 Rolling back is the update procedure with the previous pin. Record the tag or
