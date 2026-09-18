@@ -5019,6 +5019,55 @@ class HistoryStoreTests(unittest.TestCase):
             store.read_quarantine_recovery().isoformat(),
         )
 
+    def test_healthz_grades_a_required_recovery_as_degraded(self) -> None:
+        """An empty last_error must not make a recovery-required service look ok (#417)."""
+
+        status = {
+            "collector_running": True,
+            "last_error": None,
+            "history_recovery_required": True,
+            "history_quarantined_at": "2026-05-01T04:30:00+00:00",
+        }
+        with (
+            patch.object(history_main, "startup_failure_reason", None),
+            patch.object(history_main.collector, "status", return_value=status),
+            patch.object(
+                type(history_main.collector),
+                "last_error",
+                new_callable=PropertyMock,
+                return_value=None,
+            ),
+            patch.object(history_main.store, "database_size_bytes", return_value=4096),
+        ):
+            response = asyncio.run(history_main.healthz())
+
+        payload = json.loads(response.body)
+        self.assertNotEqual(payload["status"], "ok")
+        self.assertEqual(payload["status"], "degraded")
+        self.assertIs(payload["history_recovery_required"], True)
+
+    def test_healthz_reports_degraded_after_a_quarantine_activated_a_fresh_database(self) -> None:
+        """Quarantine must not activate a fresh database that reports itself healthy (#417)."""
+
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        db_path.write_text("not a sqlite database", encoding="utf-8")
+        store = HistoryStore(str(db_path))
+        collector = HistoryCollector(HistorySettings(sqlite_path=str(db_path)), store)
+
+        with (
+            patch.object(history_main, "startup_failure_reason", None),
+            patch.object(history_main, "store", store),
+            patch.object(history_main, "collector", collector),
+        ):
+            response = asyncio.run(history_main.healthz())
+
+        payload = json.loads(response.body)
+        self.assertIsNone(collector.last_error)
+        self.assertIs(payload["history_recovery_required"], True)
+        self.assertEqual(payload["status"], "degraded")
+        self.assertNotIn(".broken-", json.dumps(payload))
+
     def test_store_can_fail_closed_without_quarantining_unreadable_database(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         db_path = temp_dir / "history.db"
