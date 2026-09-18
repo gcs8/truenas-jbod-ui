@@ -340,6 +340,13 @@ class InventorySummary(BaseModel):
     mapped_slot_count: int = 0
     manual_mapping_count: int = 0
     ssh_slot_hint_count: int = 0
+    # Aggregate disk-retention totals. They carry no identifiers, so a release
+    # acceptance check can prove that every source disk became exactly one
+    # logical rendered disk across a physical-to-virtual inventory change.
+    source_disk_count: int = 0
+    rendered_unique_disk_count: int = 0
+    duplicate_disk_view_count: int = 0
+    unplaced_disk_count: int = 0
 
 
 class PlatformCapability(BaseModel):
