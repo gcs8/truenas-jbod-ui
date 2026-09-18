@@ -95,6 +95,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   physical location is unavailable rather than looking like a source fetch
   failure. The totals carry no disk identifiers (#547)
 
+- Rebased the disk-retention accounting onto current inventory behavior and
+  refreshed its deterministic public demo plus exact-byte screenshot review,
+  keeping all published totals identifier-free (#556).
+
 - The history service now declares the on-disk schema versions it supports and
   checks `PRAGMA user_version` before the migration lock and before any write,
   including a version a newer release committed to an unreplayed write-ahead log.
