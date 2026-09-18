@@ -61,6 +61,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   rejected, or a change whose result is unknown and has to be re-checked before
   a retry — instead of a single generic failure message (#545).
 
+- Kept a dispatched admin mutation with a lost response in the status-unknown
+  path even if the browser went offline afterward, and told container-action
+  operators to re-check current state before retrying (#553).
+
 ### Docs
 
 - Rewrote the released v0.23.0 upgrade notes so a published-image operator can
