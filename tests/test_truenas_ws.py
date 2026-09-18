@@ -799,6 +799,29 @@ class SmartctlBatchTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(peer.closes, 1)
                 self.assertTrue(all(t.done() for t in peer.send_tasks))
 
+    async def test_a_stalled_shelf_stops_at_the_phase_deadline(self):
+        # #537: 84 stalled disks at width 12 and a 15s per-call timeout used to
+        # hold the batch open for roughly 105s. The phase gets a deadline, and
+        # positions it never reaches are reported so the caller falls back.
+        self.client.config.timeout_seconds = 0.05
+        peer = SyntheticDDPPeer(mode="timeout")
+        with patch("app.services.truenas_ws.connect", peer.connect):
+            results = await asyncio.wait_for(
+                self.client.smartctl_batch(
+                    ["invented0"] * 20, max_concurrency=2, return_exceptions=True,
+                ),
+                5,
+            )
+
+        self.assertEqual(len(results), 20)
+        self.assertTrue(all(isinstance(result, TimeoutError) for result in results))
+        not_started = [result for result in results if "batch deadline" in str(result)]
+        self.assertGreaterEqual(
+            len(not_started),
+            16,
+            "positions past the phase deadline must not each cost a per-call timeout",
+        )
+
     async def test_cancellation_during_send_and_response_drains_workers(self):
         for mode in ("send", "response"):
             with self.subTest(mode=mode):

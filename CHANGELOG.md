@@ -126,6 +126,32 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   A disk that never answers now yields that slot's unavailable summary instead of
   holding the whole grid request open behind it (#524).
 
+- Bounded a slow CORE disk to its own slot inside the SMART batch. A reply past the
+  per-call timeout now degrades that one slot and leaves every other slot its batch
+  result, instead of sending the whole shelf back through the per-slot path (#537).
+
+- Kept the CORE SMART grid's partial batch results when middleware rejects one
+  disk, retrying only that slot through the per-slot path instead of discarding
+  every reply in the batch and re-fetching the whole shelf one disk at a time
+  (#537).
+
+- Kept last-good SMART data across inventory refreshes and restarts. Every snapshot
+  build used to replace a slot's cached entry with one that held no SMART fields, so
+  the persisted layer the SMART grid and exports serve was erased within one snapshot
+  TTL of being written. Carried-forward values keep the timestamp of the read that
+  produced them and are marked stale; only a successful read replaces them (#537).
+
+- Reported an unusable data directory on the SMART grid as the local fault it is.
+  A filesystem failure while caching SMART results now answers 500 with a message
+  naming the data directory and logs one line, instead of a 503 that reads as a
+  passing enclosure outage. An unreadable TLS CA bundle raises its own error and
+  names the bundle, instead of sending the operator to the data directory (#537).
+
+- Stopped a shelf where every disk stalls from holding a SMART batch open for one
+  per-call timeout per round. The batch carries a deadline measured from the last
+  disk that answered; positions it never reaches are reported so the grid falls
+  back for them (#537).
+
 - Retried failed release checks with bounded backoff instead of waiting a
   full normal interval, preserving the last successful result (#469).
 

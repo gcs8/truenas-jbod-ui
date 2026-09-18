@@ -244,8 +244,33 @@ class SlotBoundsFollowSelectedEnclosureTests(unittest.TestCase):
 
         self.assertEqual(service.get_snapshot.await_count, 2)
 
-    def _smart_batch_failure(self, error: Exception) -> Exception:
+    def _smart_batch_failure(self, error: Exception, *, logs: list[str] | None = None) -> Exception:
         """Drive the batch endpoint with a service that fails, return what escapes."""
+        route = _route("/api/slots/smart-batch", "POST")
+        service = _service(layout_slot_count=84, selected_enclosure_id="invented-shelf")
+        service.get_slot_smart_summaries = AsyncMock(side_effect=error)
+        registry = Mock()
+        registry.get_service.return_value = service
+        payload = Mock()
+        payload.slots = [5, 63]
+        payload.max_concurrency = 2
+
+        with (
+            patch.object(app_main, "get_inventory_registry", return_value=registry),
+            patch.object(app_main, "get_settings", return_value=self.settings),
+            patch.object(app_main, "add_perf_metadata"),
+            self.assertLogs("app.main", level="ERROR") as captured,
+            self.assertRaises(Exception) as raised,
+        ):
+            asyncio.run(route.endpoint(
+                payload=payload, system_id="system-a", enclosure_id="invented-shelf",
+            ))
+        if logs is not None:
+            logs.extend(captured.output)
+        return raised.exception
+
+    def _smart_batch_failure_quiet(self, error: Exception) -> Exception:
+        """Same drive, for failures that must not be reported as a local fault."""
         route = _route("/api/slots/smart-batch", "POST")
         service = _service(layout_slot_count=84, selected_enclosure_id="invented-shelf")
         service.get_slot_smart_summaries = AsyncMock(side_effect=error)
@@ -279,7 +304,7 @@ class SlotBoundsFollowSelectedEnclosureTests(unittest.TestCase):
             ConnectionClosedError(None, None),
         ):
             with self.subTest(error=type(error).__name__):
-                raised = self._smart_batch_failure(error)
+                raised = self._smart_batch_failure_quiet(error)
                 self.assertIsInstance(raised, HTTPException)
                 self.assertEqual(raised.status_code, 503)
 
@@ -298,9 +323,19 @@ class SlotBoundsFollowSelectedEnclosureTests(unittest.TestCase):
             IsADirectoryError(errno.EISDIR, "invented directory in the way"),
         ):
             with self.subTest(error=type(error).__name__):
-                raised = self._smart_batch_failure(error)
-                self.assertNotIsInstance(raised, HTTPException)
-                self.assertIs(type(raised), type(error))
+                logs: list[str] = []
+                raised = self._smart_batch_failure(error, logs=logs)
+                self.assertIsInstance(raised, HTTPException)
+                # A persistent local fault is a server fault, and it has to say
+                # so: 500 with a message that names the data directory, plus one
+                # log line an operator can find, instead of a bare 500 body or a
+                # 503 that invites waiting out a permissions problem.
+                self.assertEqual(raised.status_code, 500)
+                self.assertIn("data directory", raised.detail.lower())
+                self.assertNotIn("temporarily unavailable", raised.detail.lower())
+                self.assertIs(raised.__cause__, error)
+                self.assertTrue(logs, "no operator-visible log line was emitted")
+                self.assertIn("smart", " ".join(logs).lower())
 
 
 class SlotBoundsFollowRenderedSlotsTests(unittest.TestCase):
