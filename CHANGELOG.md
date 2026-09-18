@@ -50,6 +50,21 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   concurrency and DDP heartbeat handling; inventory integration remained
   separate (#503).
 
+### Changed
+
+- Admin failures now answer with the request's correlation id in the response
+  body and the `X-Request-ID` header, and the admin log records that id with the
+  HTTP status only; the admin state reports whether the sidecar's auto-stop time
+  has passed and names the restart command, so the page no longer claims a
+  shutdown from the browser clock. Admin request failures are also reported as
+  one of three outcomes — the sidecar could not be reached, the input was
+  rejected, or a change whose result is unknown and has to be re-checked before
+  a retry — instead of a single generic failure message (#545).
+
+- Kept a dispatched admin mutation with a lost response in the status-unknown
+  path even if the browser went offline afterward, and told container-action
+  operators to re-check current state before retrying (#553).
+
 ### Docs
 
 - Rewrote the released v0.23.0 upgrade notes so a published-image operator can

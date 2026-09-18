@@ -162,6 +162,7 @@ WINDOWS_EXCLUSIONS = (
         ),
         modules=(
             "tests.test_admin_auth",
+            "tests.test_admin_error_correlation",
             "tests.test_admin_runtime_routes",
             "tests.test_admin_service",
             "tests.test_admin_ttl",
