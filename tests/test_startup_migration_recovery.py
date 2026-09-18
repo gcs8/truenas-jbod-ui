@@ -214,6 +214,40 @@ class AdmissionBeforeRecoveryTests(unittest.TestCase):
             self.assertEqual(sqlite_path.read_bytes(), b"durable-state")
             self.assertTrue(marker.exists())
 
+    def test_lock_contention_with_a_pending_marker_remains_retryable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sqlite_path, catalog_path = self._layout(temp_dir)
+            marker = self._pending_marker(catalog_path)
+            holder = sqlite3.connect(sqlite_path)
+            holder.execute("CREATE TABLE lock_fixture (id INTEGER PRIMARY KEY)")
+            holder.commit()
+            holder.execute("BEGIN IMMEDIATE")
+            holder.execute("INSERT INTO lock_fixture VALUES (1)")
+            recoveries: list[str] = []
+
+            def build_store() -> str:
+                contender = sqlite3.connect(sqlite_path, timeout=0)
+                try:
+                    contender.execute("BEGIN IMMEDIATE")
+                finally:
+                    contender.close()
+                return "store"
+
+            try:
+                with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
+                    open_history_store_after_recovery(
+                        sqlite_path=sqlite_path,
+                        segment_catalog_path=catalog_path,
+                        build_store=build_store,
+                        recover=lambda source, segments: recoveries.append("recover"),
+                    )
+            finally:
+                holder.rollback()
+                holder.close()
+
+            self.assertEqual(recoveries, [])
+            self.assertTrue(marker.exists())
+
     def test_the_pending_marker_refusal_is_still_recovered_and_the_store_reopened(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             sqlite_path, catalog_path = self._layout(temp_dir)

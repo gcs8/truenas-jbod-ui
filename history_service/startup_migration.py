@@ -129,7 +129,12 @@ def open_history_store_after_recovery(
 
     try:
         return build_store()
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as exc:
+        # Only the store's explicit lifecycle-marker refusal authorizes
+        # recovery. Lock contention and every other operational error remain
+        # retryable/diagnostic and must propagate unchanged.
+        if "migration recovery is pending" not in str(exc).lower():
+            raise
         logger.warning(
             "The history store refused a pending segmented history lifecycle marker; "
             "attempting recovery before starting."
