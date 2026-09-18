@@ -1004,6 +1004,10 @@ class InventoryService:
             tuple[SmartSummaryView, datetime],
         ] = OrderedDict()
         self._smart_persistence_lock = threading.Lock()
+        # Bays whose most recently published view carried no strong identifier
+        # (#525). The layout-less SMART fallback has no slot view to gate on, so
+        # it reads this instead of serving the previous occupant's data.
+        self._identity_unknown_slots: set[tuple[str, int]] = set()
         self._smart_disk_identities: dict[tuple, tuple[tuple[str, str], int]] = {}
         self._smart_cache_global_generation = 0
         self._smart_cache_enclosure_generations: dict[str, int] = {}
@@ -3231,6 +3235,15 @@ class InventoryService:
         # what the flag has to describe.
         for slot_view in slots:
             slot_view.identity_state = self._slot_identity_state(slot_view)
+            enclosure_id = normalize_text(slot_view.enclosure_id)
+            if enclosure_id is None:
+                continue
+            # Remember the window for readers that get no slot view (#525).
+            bay = (enclosure_id, slot_view.slot)
+            if slot_view.identity_state == "unknown":
+                self._identity_unknown_slots.add(bay)
+            else:
+                self._identity_unknown_slots.discard(bay)
 
     def _apply_persisted_slot_details(
         self, slots: list[SlotView], *,
@@ -3895,6 +3908,19 @@ class InventoryService:
 
         summaries: dict[int, SmartSummaryView] = {}
         for slot in unique_slots:
+            if (
+                resolved_enclosure_id is not None
+                and (resolved_enclosure_id, slot) in self._identity_unknown_slots
+            ):
+                # The last published view of this bay had no serial, logical
+                # unit id or gptid, so everything on record for it describes a
+                # disk that may already be gone: a bay-scoped sas_address names
+                # the bay, not its occupant (#525). Serve nothing until a strong
+                # identifier returns; the entry stays as historical evidence.
+                add_perf_metadata(smart_cache="layout-unavailable-identity-unknown")
+                self._observe_smart_summary_request("layout-unavailable-identity-unknown")
+                continue
+
             cached = None
             if resolved_enclosure_id is not None:
                 cache_key = cache_candidates.get((resolved_enclosure_id, slot))
