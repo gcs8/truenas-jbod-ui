@@ -4902,6 +4902,94 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertEqual(restarted.read_quarantine_recovery(), quarantined_at)
         self.assertEqual(len(list(temp_dir.glob("history.db.broken-*"))), 1)
 
+    def test_store_fails_closed_when_quarantine_marker_write_fails(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        original = b"not a sqlite database"
+        db_path.write_bytes(original)
+
+        with (
+            patch.object(
+                HistoryStore,
+                "record_quarantine_recovery",
+                side_effect=OSError("synthetic marker write failure"),
+            ),
+            self.assertLogs("history_service.store", level="WARNING"),
+        ):
+            store = HistoryStore(str(db_path))
+
+        status = store.quarantine_recovery_status()
+        broken_files = list(temp_dir.glob("history.db.broken-*"))
+
+        self.assertIs(status["history_recovery_required"], True)
+        self.assertIsNotNone(status["history_quarantined_at"])
+        self.assertNotIn(".broken-", json.dumps(status))
+        self.assertEqual(len(broken_files), 1)
+        self.assertEqual(broken_files[0].read_bytes(), original)
+
+    def test_marker_write_failure_stays_degraded_after_restart(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        db_path.write_text("not a sqlite database", encoding="utf-8")
+
+        with patch.object(
+            HistoryStore,
+            "record_quarantine_recovery",
+            side_effect=sqlite3.OperationalError("synthetic marker write failure"),
+        ):
+            HistoryStore(str(db_path))
+
+        restarted = HistoryStore(str(db_path))
+        collector = HistoryCollector(HistorySettings(sqlite_path=str(db_path)), restarted)
+        with (
+            patch.object(history_main, "startup_failure_reason", None),
+            patch.object(history_main, "store", restarted),
+            patch.object(history_main, "collector", collector),
+        ):
+            response = asyncio.run(history_main.healthz())
+
+        payload = json.loads(response.body)
+        self.assertIs(restarted.quarantine_recovery_status()["history_recovery_required"], True)
+        self.assertIs(payload["history_recovery_required"], True)
+        self.assertEqual(payload["status"], "degraded")
+        self.assertNotIn(".broken-", json.dumps(payload))
+
+    def test_quarantine_evidence_without_a_marker_can_be_acknowledged(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        db_path.write_text("not a sqlite database", encoding="utf-8")
+
+        with patch.object(
+            HistoryStore,
+            "record_quarantine_recovery",
+            side_effect=OSError("synthetic marker write failure"),
+        ):
+            store = HistoryStore(str(db_path))
+
+        self.assertTrue(store.acknowledge_quarantine_recovery())
+        self.assertFalse(store.quarantine_recovery_status()["history_recovery_required"])
+        self.assertFalse(store.acknowledge_quarantine_recovery())
+
+    def test_quarantine_evidence_keeps_first_timestamp_when_marker_is_retried(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        db_path.write_text("not a sqlite database", encoding="utf-8")
+
+        with patch.object(
+            HistoryStore,
+            "record_quarantine_recovery",
+            side_effect=OSError("synthetic marker write failure"),
+        ):
+            store = HistoryStore(str(db_path))
+
+        first = store.read_quarantine_recovery()
+        self.assertIsInstance(first, datetime)
+        assert first is not None
+        later = first + timedelta(days=1)
+
+        self.assertEqual(store.record_quarantine_recovery(later), first)
+        self.assertEqual(store.read_quarantine_recovery(), first)
+
     def test_store_distinguishes_a_first_installation_from_a_recovery(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
 
@@ -4972,6 +5060,23 @@ class HistoryStoreTests(unittest.TestCase):
 
         self.assertEqual(store.read_quarantine_recovery(), later)
 
+    def test_later_quarantine_evidence_overrides_an_acknowledged_marker(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        store = HistoryStore(str(db_path))
+        first = datetime(2026, 5, 1, 4, 30, tzinfo=timezone.utc)
+        later = datetime(2026, 5, 2, 4, 30, tzinfo=timezone.utc)
+        store.record_quarantine_recovery(first)
+        store.acknowledge_quarantine_recovery()
+        evidence = temp_dir / "history.db.broken-20260502T043000Z"
+        evidence.write_bytes(b"retained original bytes")
+
+        self.assertEqual(store.read_quarantine_recovery(), later)
+        self.assertTrue(store.quarantine_recovery_status()["history_recovery_required"])
+        self.assertTrue(store.acknowledge_quarantine_recovery())
+        self.assertFalse(store.quarantine_recovery_status()["history_recovery_required"])
+        self.assertEqual(evidence.read_bytes(), b"retained original bytes")
+
     def test_store_fails_closed_on_an_unreadable_recovery_marker(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         store = HistoryStore(str(temp_dir / "history.db"))
@@ -4985,6 +5090,22 @@ class HistoryStoreTests(unittest.TestCase):
 
         self.assertEqual(
             store.quarantine_recovery_status(),
+            {"history_recovery_required": True, "history_quarantined_at": None},
+        )
+
+    def test_store_fails_closed_when_quarantine_evidence_cannot_be_inspected(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+
+        with patch.object(
+            store,
+            "_quarantine_evidence_timestamps",
+            side_effect=OSError("synthetic evidence scan failure"),
+        ):
+            status = store.quarantine_recovery_status()
+
+        self.assertEqual(
+            status,
             {"history_recovery_required": True, "history_quarantined_at": None},
         )
 

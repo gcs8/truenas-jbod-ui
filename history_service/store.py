@@ -872,14 +872,38 @@ class HistoryStore:
                 connection.rollback()
                 raise
 
+    def _quarantine_evidence_timestamps(self) -> list[datetime]:
+        """Return quarantine times encoded by retained broken database names.
+
+        The broken database itself is durable recovery evidence when writing the
+        fresh database's marker fails. Only the timestamp is returned; status
+        surfaces never receive the quarantine path.
+        """
+
+        prefix = f"{self.file_path.name}.broken-"
+        timestamps: list[datetime] = []
+        for candidate in self.file_path.parent.glob(f"{prefix}*"):
+            encoded = candidate.name.removeprefix(prefix)
+            if len(encoded) != len("YYYYMMDDTHHMMSSZ"):
+                continue
+            try:
+                timestamp = datetime.strptime(encoded, "%Y%m%dT%H%M%SZ").replace(
+                    tzinfo=timezone.utc
+                )
+            except ValueError:
+                continue
+            timestamps.append(timestamp)
+        return sorted(timestamps)
+
     def read_quarantine_recovery(self) -> datetime | None:
         """Return when history was quarantined, or None once it is acknowledged.
 
         The row lives in `history_maintenance_state` beside the retention
         markers, so a fresh database created by quarantine recovery keeps saying
         "recovery required" across restarts instead of presenting itself as a
-        first installation (#417). An unreadable marker is not repaired here;
-        the caller fails closed on it rather than reporting health.
+        first installation (#417). Retained broken database files are fallback
+        evidence if writing that row failed. An unreadable marker is not repaired
+        here; the caller fails closed on it rather than reporting health.
         """
 
         with self._read_connection() as connection:
@@ -891,15 +915,17 @@ class HistoryStore:
                 """,
                 (QUARANTINE_RECOVERY_STATE_NAME,),
             ).fetchone()
+        evidence = self._quarantine_evidence_timestamps()
         if row is None:
-            return None
+            return evidence[0] if evidence else None
         state = str(row["state"])
         if state not in QUARANTINE_RECOVERY_STATES:
             raise ValueError("History quarantine recovery state is invalid.")
-        if state == QUARANTINE_RECOVERY_ACKNOWLEDGED_STATE:
-            return None
-        quarantined_at, _ = self._normalize_retention_backup_at(str(row["backup_at"]))
-        return quarantined_at
+        marked_at, _ = self._normalize_retention_backup_at(str(row["backup_at"]))
+        if state == QUARANTINE_RECOVERY_REQUIRED_STATE:
+            return marked_at
+        later_evidence = [timestamp for timestamp in evidence if timestamp > marked_at]
+        return later_evidence[0] if later_evidence else None
 
     def quarantine_recovery_status(self) -> dict[str, Any]:
         """Report the recovery indication for status surfaces, failing closed.
@@ -911,7 +937,7 @@ class HistoryStore:
 
         try:
             quarantined_at = self.read_quarantine_recovery()
-        except (sqlite3.Error, ValueError):
+        except (sqlite3.Error, OSError, ValueError):
             logger.warning(
                 "History quarantine recovery marker for %s could not be read; reporting recovery required.",
                 self.file_path,
@@ -945,7 +971,7 @@ class HistoryStore:
         is a new loss and needs its own acknowledgement.
         """
 
-        candidate, serialized = self._normalize_retention_backup_at(quarantined_at)
+        candidate, _ = self._normalize_retention_backup_at(quarantined_at)
         with self._locked_write_connection(
             migration_lock_held=migration_lock_held
         ) as connection:
@@ -963,6 +989,21 @@ class HistoryStore:
                     existing, _ = self._normalize_retention_backup_at(str(row["backup_at"]))
                     connection.rollback()
                     return existing
+
+                evidence = self._quarantine_evidence_timestamps()
+                if row is None:
+                    pending_evidence = evidence
+                elif str(row["state"]) == QUARANTINE_RECOVERY_ACKNOWLEDGED_STATE:
+                    acknowledged_at, _ = self._normalize_retention_backup_at(
+                        str(row["backup_at"])
+                    )
+                    pending_evidence = [
+                        timestamp for timestamp in evidence if timestamp > acknowledged_at
+                    ]
+                else:
+                    pending_evidence = []
+                effective = min([candidate, *pending_evidence])
+                _, serialized = self._normalize_retention_backup_at(effective)
                 connection.execute(
                     """
                     INSERT INTO history_maintenance_state (name, backup_at, state)
@@ -978,7 +1019,7 @@ class HistoryStore:
                     ),
                 )
                 connection.commit()
-                return candidate
+                return effective
             except BaseException:
                 connection.rollback()
                 raise
@@ -987,7 +1028,9 @@ class HistoryStore:
         """Acknowledge the pending recovery; return whether one was pending.
 
         The row is kept rather than deleted so the acknowledged quarantine stays
-        distinguishable from a database that was never quarantined.
+        distinguishable from a database that was never quarantined. If the
+        original marker write failed, retained quarantine evidence supplies the
+        timestamp for the consumed row.
         """
 
         with self._locked_write_connection(
@@ -995,20 +1038,53 @@ class HistoryStore:
         ) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                cursor = connection.execute(
+                row = connection.execute(
                     """
-                    UPDATE history_maintenance_state
-                    SET state = ?
-                    WHERE name = ? AND state = ?
+                    SELECT backup_at, state
+                    FROM history_maintenance_state
+                    WHERE name = ?
+                    """,
+                    (QUARANTINE_RECOVERY_STATE_NAME,),
+                ).fetchone()
+                evidence = self._quarantine_evidence_timestamps()
+                if row is not None:
+                    state = str(row["state"])
+                    if state not in QUARANTINE_RECOVERY_STATES:
+                        raise ValueError("History quarantine recovery state is invalid.")
+                    marked_at, _ = self._normalize_retention_backup_at(str(row["backup_at"]))
+                    if state == QUARANTINE_RECOVERY_REQUIRED_STATE:
+                        acknowledged_at = marked_at
+                    else:
+                        later_evidence = [
+                            timestamp for timestamp in evidence if timestamp > marked_at
+                        ]
+                        if not later_evidence:
+                            connection.rollback()
+                            return False
+                        acknowledged_at = later_evidence[0]
+                elif evidence:
+                    acknowledged_at = evidence[0]
+                else:
+                    connection.rollback()
+                    return False
+
+                _, serialized = self._normalize_retention_backup_at(acknowledged_at)
+                connection.execute(
+                    """
+                    INSERT INTO history_maintenance_state (name, backup_at, state)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT (name) DO UPDATE SET
+                        backup_at = excluded.backup_at,
+                        state = excluded.state
                     """,
                     (
-                        QUARANTINE_RECOVERY_ACKNOWLEDGED_STATE,
                         QUARANTINE_RECOVERY_STATE_NAME,
-                        QUARANTINE_RECOVERY_REQUIRED_STATE,
+                        serialized,
+                        QUARANTINE_RECOVERY_ACKNOWLEDGED_STATE,
                     ),
                 )
                 connection.commit()
-                return cursor.rowcount == 1
+                return True
             except BaseException:
                 connection.rollback()
                 raise
