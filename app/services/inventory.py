@@ -1004,6 +1004,10 @@ class InventoryService:
             tuple[SmartSummaryView, datetime],
         ] = OrderedDict()
         self._smart_persistence_lock = threading.Lock()
+        # Bays whose most recently published view carried no strong identifier
+        # (#525). The layout-less SMART fallback has no slot view to gate on, so
+        # it reads this instead of serving the previous occupant's data.
+        self._identity_unknown_slots: set[tuple[str, int]] = set()
         self._smart_disk_identities: dict[tuple, tuple[tuple[str, str], int]] = {}
         self._smart_cache_global_generation = 0
         self._smart_cache_enclosure_generations: dict[str, int] = {}
@@ -3231,6 +3235,15 @@ class InventoryService:
         # what the flag has to describe.
         for slot_view in slots:
             slot_view.identity_state = self._slot_identity_state(slot_view)
+            enclosure_id = normalize_text(slot_view.enclosure_id)
+            if enclosure_id is None:
+                continue
+            # Remember the window for readers that get no slot view (#525).
+            bay = (enclosure_id, slot_view.slot)
+            if slot_view.identity_state == "unknown":
+                self._identity_unknown_slots.add(bay)
+            else:
+                self._identity_unknown_slots.discard(bay)
 
     def _apply_persisted_slot_details(
         self, slots: list[SlotView], *,
@@ -3334,14 +3347,29 @@ class InventoryService:
         smart_summary: SmartSummaryView | None,
         loaded_entries: Mapping[str, SlotDetailCacheEntry] | None = None,
     ) -> SlotDetailCacheEntry | None:
-        identifiers = sorted(self._slot_detail_identifiers(slot_view))
-        if not identifiers:
-            return None
         if self._slot_identity_state(slot_view) == "unknown":
             # Writing this row would overwrite the last-known entry with one
             # that cannot say which disk it describes, and would file any SMART
-            # read taken during the window under the departed disk. Persist
-            # nothing; the previous entry stays as historical evidence (#525).
+            # read taken during the window under the departed disk. Persist no
+            # observation; the previous entry stays as historical evidence, with
+            # only the withholding decision recorded on it so it survives a
+            # restart of this process (#525). This comes before the identifier
+            # check below: a present bay that offers no identifier at all is
+            # the most unknown of the lot, and its decision has to be written
+            # down too, or a restart serves the departed disk's SMART for it.
+            store = self.slot_detail_store
+            if store is None:
+                return None
+            stored = store.get_entry(
+                self.system.id, slot_view.enclosure_id, slot_view.slot,
+                loaded_entries=loaded_entries,
+            )
+            if stored is None or stored.identity_unknown:
+                return None
+            return stored.model_copy(update={"identity_unknown": True})
+
+        identifiers = sorted(self._slot_detail_identifiers(slot_view))
+        if not identifiers:
             return None
 
         slot_fields: dict[str, Any] = {}
@@ -3895,6 +3923,26 @@ class InventoryService:
 
         summaries: dict[int, SmartSummaryView] = {}
         for slot in unique_slots:
+            entry = (
+                persisted_candidates.get((resolved_enclosure_id, slot))
+                if resolved_enclosure_id is not None
+                else None
+            )
+            if resolved_enclosure_id is not None and (
+                (resolved_enclosure_id, slot) in self._identity_unknown_slots
+                or (entry is not None and entry.identity_unknown)
+            ):
+                # The last published view of this bay had no serial, logical
+                # unit id or gptid, so everything on record for it describes a
+                # disk that may already be gone: a bay-scoped sas_address names
+                # the bay, not its occupant (#525). Serve nothing until a strong
+                # identifier returns; the entry stays as historical evidence.
+                # The persisted flag is what answers after a restart, when this
+                # process has not yet observed the window itself.
+                add_perf_metadata(smart_cache="layout-unavailable-identity-unknown")
+                self._observe_smart_summary_request("layout-unavailable-identity-unknown")
+                continue
+
             cached = None
             if resolved_enclosure_id is not None:
                 cache_key = cache_candidates.get((resolved_enclosure_id, slot))
@@ -3906,11 +3954,6 @@ class InventoryService:
                 summaries[slot] = cached
                 continue
 
-            entry = (
-                persisted_candidates.get((resolved_enclosure_id, slot))
-                if resolved_enclosure_id is not None
-                else None
-            )
             persisted = None
             if entry is not None and entry.smart_fields:
                 try:

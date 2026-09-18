@@ -12365,6 +12365,240 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
             self.assertEqual(returned.model, "ST12000NM0008")
             self.assertEqual(returned.size_human, "12 TB")
 
+    def test_layout_unavailable_smart_withholds_the_departed_disk_during_the_unknown_window(
+        self,
+    ) -> None:
+        # #525, layout-less reader: the last-good SMART fallback is keyed on the
+        # bay alone, so during an identity-unknown window it served the departed
+        # disk's persisted SMART fields (logical unit id, sas_address, power-on
+        # hours, firmware) as the bay's last-good data. A bay-scoped sas_address
+        # is not identity, so nothing cached may be served for the bay until a
+        # strong identifier returns; when it does, the genuine carry-forward
+        # resumes.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = build_inventory_service(
+                Settings(),
+                SystemConfig(id="default", truenas=TrueNASConfig(platform="core")),
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+
+            def slot_view(**fields) -> SlotView:
+                return SlotView(
+                    slot=5, slot_label="05", row_index=0, column_index=5,
+                    enclosure_id="enc-1", present=True, state=SlotState.healthy,
+                    device_name="da5", **fields,
+                )
+
+            full = slot_view(
+                serial="SER-VERIFY-005",
+                sas_address="sas-invented-005",
+                model="ST12000NM0008",
+                size_human="12 TB",
+            )
+            asyncio.run(service._apply_and_persist_snapshot_slot_details([full]))
+            service._persist_slot_detail_cache(
+                full, smart_summary=SmartSummaryView(available=True, power_on_hours=321),
+            )
+            self.assertEqual(
+                service.get_cached_slot_smart_summary_without_layout(5, "enc-1").power_on_hours,
+                321,
+            )
+
+            # The swap window: SES still reports the bay, the API disk record
+            # carries no strong identifier yet.
+            degraded = slot_view(sas_address="sas-invented-005")
+            asyncio.run(service._apply_and_persist_snapshot_slot_details([degraded]))
+            self.assertEqual(degraded.identity_state, "unknown")
+
+            self.assertEqual(
+                service.get_cached_slot_smart_summaries_without_layout([5], "enc-1"), {},
+            )
+            self.assertIsNone(
+                service.get_cached_slot_smart_summary_without_layout(5, "enc-1"),
+            )
+            # The entry survives as historical evidence; it is only withheld.
+            self.assertEqual(
+                service.slot_detail_store.get_entry("default", "enc-1", 5)
+                .smart_fields.get("power_on_hours"),
+                321,
+            )
+
+            # The same disk comes back: the genuine carry-forward resumes.
+            returned = slot_view(
+                serial="SER-VERIFY-005", sas_address="sas-invented-005",
+            )
+            asyncio.run(service._apply_and_persist_snapshot_slot_details([returned]))
+            self.assertEqual(returned.identity_state, "known")
+            resumed = service.get_cached_slot_smart_summary_without_layout(5, "enc-1")
+            self.assertIsNotNone(resumed)
+            assert resumed is not None
+            self.assertEqual(resumed.power_on_hours, 321)
+
+    def test_layout_unavailable_smart_withholds_a_replacement_disks_bay(self) -> None:
+        # #525: after a replacement serial arrives the bay is identity-known
+        # again, but the persisted SMART on record still belongs to the disk
+        # that left, so the layout-less fallback must not serve it for the new
+        # occupant either.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = build_inventory_service(
+                Settings(),
+                SystemConfig(id="default", truenas=TrueNASConfig(platform="core")),
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+
+            def slot_view(**fields) -> SlotView:
+                return SlotView(
+                    slot=5, slot_label="05", row_index=0, column_index=5,
+                    enclosure_id="enc-1", present=True, state=SlotState.healthy,
+                    device_name="da5", **fields,
+                )
+
+            full = slot_view(serial="SER-VERIFY-005", sas_address="sas-invented-005")
+            asyncio.run(service._apply_and_persist_snapshot_slot_details([full]))
+            service._persist_slot_detail_cache(
+                full, smart_summary=SmartSummaryView(available=True, power_on_hours=321),
+            )
+
+            replacement = slot_view(
+                serial="SER-REPLACEMENT", sas_address="sas-invented-005",
+            )
+            asyncio.run(service._apply_and_persist_snapshot_slot_details([replacement]))
+            self.assertEqual(replacement.identity_state, "known")
+
+            self.assertIsNone(
+                service.get_cached_slot_smart_summary_without_layout(5, "enc-1"),
+            )
+
+    def test_layout_unavailable_smart_withholding_survives_a_service_restart(self) -> None:
+        # #525: the withholding decision has to outlive the process that made
+        # it. The SMART entry is persisted, so a service restarted during the
+        # identity-unknown window used to come up with an empty in-memory marker
+        # set and serve the departed disk's persisted SMART for the bay again.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            def make_service() -> InventoryService:
+                return build_inventory_service(
+                    Settings(),
+                    SystemConfig(id="default", truenas=TrueNASConfig(platform="core")),
+                    AsyncMock(),
+                    AsyncMock(),
+                    temp_dir,
+                )
+
+            def slot_view(**fields) -> SlotView:
+                return SlotView(
+                    slot=5, slot_label="05", row_index=0, column_index=5,
+                    enclosure_id="enc-1", present=True, state=SlotState.healthy,
+                    device_name="da5", **fields,
+                )
+
+            service = make_service()
+            full = slot_view(serial="SER-VERIFY-005", sas_address="sas-invented-005")
+            asyncio.run(service._apply_and_persist_snapshot_slot_details([full]))
+            service._persist_slot_detail_cache(
+                full, smart_summary=SmartSummaryView(available=True, power_on_hours=321),
+            )
+
+            degraded = slot_view(sas_address="sas-invented-005")
+            asyncio.run(service._apply_and_persist_snapshot_slot_details([degraded]))
+            self.assertEqual(degraded.identity_state, "unknown")
+            self.assertEqual(
+                service.get_cached_slot_smart_summaries_without_layout([5], "enc-1"), {},
+            )
+
+            # Restart: a fresh service over the same persisted store, which has
+            # never observed the bay and so knows only what was written down.
+            restarted = make_service()
+            self.assertEqual(
+                restarted.get_cached_slot_smart_summaries_without_layout([5], "enc-1"), {},
+            )
+            self.assertIsNone(
+                restarted.get_cached_slot_smart_summary_without_layout(5, "enc-1"),
+            )
+            # Still historical evidence, still withheld rather than deleted.
+            self.assertEqual(
+                restarted.slot_detail_store.get_entry("default", "enc-1", 5)
+                .smart_fields.get("power_on_hours"),
+                321,
+            )
+
+            # A strong identifier returns: the genuine carry-forward resumes,
+            # for the restarted process too.
+            returned = slot_view(serial="SER-VERIFY-005", sas_address="sas-invented-005")
+            asyncio.run(restarted._apply_and_persist_snapshot_slot_details([returned]))
+            self.assertEqual(returned.identity_state, "known")
+            resumed = restarted.get_cached_slot_smart_summary_without_layout(5, "enc-1")
+            self.assertIsNotNone(resumed)
+            assert resumed is not None
+            self.assertEqual(resumed.power_on_hours, 321)
+            # And the recorded decision is cleared, not left to withhold forever.
+            self.assertFalse(
+                restarted.slot_detail_store.get_entry("default", "enc-1", 5).identity_unknown,
+            )
+
+    def test_layout_unavailable_smart_withholding_persists_for_an_identifier_free_bay(self) -> None:
+        # #544 review: a present bay whose live view carries no identifier at
+        # all - no device name, serial, gptid, logical unit id or sas_address -
+        # is identity-unknown too, but the entry builder returned on "nothing
+        # to key this row on" before it reached the branch that records the
+        # withholding decision on the stored entry. The process that observed
+        # the window withheld from memory; a restarted one came up with the
+        # flag unset and served the departed disk's persisted SMART again.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            def make_service() -> InventoryService:
+                return build_inventory_service(
+                    Settings(),
+                    SystemConfig(id="default", truenas=TrueNASConfig(platform="core")),
+                    AsyncMock(),
+                    AsyncMock(),
+                    temp_dir,
+                )
+
+            def slot_view(**fields) -> SlotView:
+                return SlotView(
+                    slot=5, slot_label="05", row_index=0, column_index=5,
+                    enclosure_id="enc-1", present=True, state=SlotState.healthy,
+                    **fields,
+                )
+
+            service = make_service()
+            full = slot_view(
+                device_name="da5", serial="SER-VERIFY-005", sas_address="sas-invented-005",
+            )
+            asyncio.run(service._apply_and_persist_snapshot_slot_details([full]))
+            service._persist_slot_detail_cache(
+                full, smart_summary=SmartSummaryView(available=True, power_on_hours=321),
+            )
+
+            # SES still reports the bay occupied; nothing else names it.
+            degraded = slot_view()
+            asyncio.run(service._apply_and_persist_snapshot_slot_details([degraded]))
+            self.assertEqual(degraded.identity_state, "unknown")
+            self.assertEqual(
+                service.get_cached_slot_smart_summaries_without_layout([5], "enc-1"), {},
+            )
+            # The decision has to be written down, not just remembered.
+            self.assertTrue(
+                service.slot_detail_store.get_entry("default", "enc-1", 5).identity_unknown,
+            )
+
+            restarted = make_service()
+            self.assertEqual(
+                restarted.get_cached_slot_smart_summaries_without_layout([5], "enc-1"), {},
+            )
+            self.assertIsNone(
+                restarted.get_cached_slot_smart_summary_without_layout(5, "enc-1"),
+            )
+            # Still historical evidence, withheld rather than deleted.
+            self.assertEqual(
+                restarted.slot_detail_store.get_entry("default", "enc-1", 5)
+                .smart_fields.get("power_on_hours"),
+                321,
+            )
+
     def _assert_apply_loads_once(self, slot_count: int) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()

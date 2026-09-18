@@ -79,6 +79,7 @@ def _service_with_cached_smart(
     service._smart_negative_cache = OrderedDict()
     service._smart_cache_global_generation = 0
     service._smart_cache_enclosure_generations = {}
+    service._identity_unknown_slots = set()
     service._observe_inventory_cache_metrics = Mock()
     service._observe_smart_summary_request = Mock()
     for slot, summary in summaries.items():
