@@ -59,6 +59,32 @@ class SlotHistoryRouteTests(unittest.TestCase):
         )
         self.assertNotIn("status-leak-ZXQ9", response.body.decode())
 
+    def test_history_status_route_surfaces_quarantine_recovery(self) -> None:
+        """Recovery-required survives the public projection, so the UI can show it (#417)."""
+
+        route = self._route("/api/history/status")
+        backend_payload = {
+            "configured": True,
+            "available": True,
+            "detail": None,
+            "counts": {"tracked_slots": 0},
+            "scopes": [],
+            "collector": {
+                "collector_running": True,
+                "history_recovery_required": True,
+                "history_quarantined_at": "2026-05-01T04:30:00+00:00",
+            },
+        }
+        history_backend = Mock()
+        history_backend.get_status = AsyncMock(return_value=backend_payload)
+
+        with patch.object(app_main, "get_history_backend", return_value=history_backend):
+            response = asyncio.run(route.endpoint())
+
+        collector = json.loads(response.body)["collector"]
+        self.assertIs(collector["history_recovery_required"], True)
+        self.assertEqual(collector["history_quarantined_at"], "2026-05-01T04:30:00+00:00")
+
     def test_slot_history_resolves_the_default_system_when_system_id_is_omitted(self) -> None:
         route = self._route("/api/slots/{slot}/history")
         service = Mock()
