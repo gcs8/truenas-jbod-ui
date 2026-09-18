@@ -72,6 +72,14 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Stopped the last-good SMART fallback, the one used when the enclosure layout
+  cannot be resolved, from reporting a departed disk's SMART data for a bay
+  whose current occupant has no serial, logical unit id or gptid. An
+  expander-assigned SAS address names the bay rather than the disk in it, so
+  nothing on record for the bay is served until a strong identifier returns;
+  the stored entry is kept, and the usual carry-forward resumes when the same
+  disk reappears (#544)
+
 - Made `--help` work on every script under `scripts/` off Linux without
   writing anything into the checkout, with no exceptions left:
   `public_demo_source_parity.py` now adds the repository root to `sys.path`
