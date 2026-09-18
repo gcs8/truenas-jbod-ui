@@ -17,8 +17,6 @@ from datetime import timedelta
 from typing import Any
 from unittest.mock import patch
 
-from fastapi import HTTPException
-
 # Must precede admin_service.main, which builds its app at import time.
 from tests.admin_test_env import ADMIN_TEST_PUBLIC_ORIGIN
 from admin_service.config import AdminSettings

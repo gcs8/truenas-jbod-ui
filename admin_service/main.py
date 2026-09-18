@@ -609,7 +609,7 @@ def create_app() -> FastAPI:
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(_: Request, exc: Exception) -> JSONResponse:
         return admin_error_response(
-            "Unhandled admin service error; quote the request id below when reporting it.",
+            "Unhandled admin service error; see admin logs.",
             500,
             log_level=logging.ERROR,
             exc_info=(type(exc), exc, exc.__traceback__),
