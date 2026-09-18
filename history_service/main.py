@@ -474,8 +474,13 @@ async def healthz() -> JSONResponse:
             status_code=503,
         )
     collector_status = public_collector_status(collector.status())
+    # A quarantine replaces an unreadable database with a fresh empty one. That
+    # database works, so nothing sets last_error, but the service is running on
+    # history it lost: grade it degraded until the recovery is acknowledged so
+    # ordinary health cannot accept it as a healthy first installation (#417).
+    recovery_required = bool(collector_status.get("history_recovery_required"))
     payload = {
-        "status": "ok" if not collector.last_error else "degraded",
+        "status": "ok" if not (collector.last_error or recovery_required) else "degraded",
         "collector": collector_status,
         "database_size_bytes": await asyncio.to_thread(store.database_size_bytes),
         **collector_status,

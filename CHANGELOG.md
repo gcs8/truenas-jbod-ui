@@ -77,7 +77,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   service records the recovery in its maintenance state and reports that
   recovery is required, with the quarantine time, on the history dashboard,
   `/healthz` and the history status API until it is acknowledged, instead of
-  presenting the empty database as a first installation (#548)
+  presenting the empty database as a first installation. History `/healthz`
+  also grades that state as `degraded` rather than `ok`, even when the
+  collector recorded no error, so ordinary health cannot accept a database
+  that started empty after a quarantine (#548)
 
 - Made `--help` work on every script under `scripts/` off Linux without
   writing anything into the checkout, with no exceptions left:
