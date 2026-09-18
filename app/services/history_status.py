@@ -29,8 +29,6 @@ PUBLIC_COLLECTOR_STATUS_FIELDS = (
     "last_retention_has_more",
     "last_retention_error",
     "last_error",
-    "history_recovery_required",
-    "history_quarantined_at",
 )
 
 

@@ -145,6 +145,12 @@ HISTORY_COLLECTOR_ERROR_DETAIL = "History collector error; see service logs."
 # publish (no URLs, paths or appliance text), so the dashboard shows them next to
 # the redacted last_error, which stays generic for the main UI projection.
 HISTORY_DIAGNOSTIC_STATUS_FIELDS = (
+    # Durable quarantine-recovery state (#417). It rides beside the exact public
+    # allowlist rather than inside it: the allowlist lives in the demo source
+    # graph, and this service's own dashboard and /healthz are where the
+    # recovery indication has to be visible.
+    "history_recovery_required",
+    "history_quarantined_at",
     "last_error_kind",
     "last_error_summary",
     "last_retention_error_kind",

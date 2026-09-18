@@ -4988,6 +4988,37 @@ class HistoryStoreTests(unittest.TestCase):
             {"history_recovery_required": True, "history_quarantined_at": None},
         )
 
+    def test_public_collector_status_surfaces_quarantine_recovery(self) -> None:
+        """The recovery indication survives the public projection (#417)."""
+
+        projected = history_main.public_collector_status(
+            {
+                "collector_running": True,
+                "history_recovery_required": True,
+                "history_quarantined_at": "2026-05-01T04:30:00+00:00",
+                "sqlite_path": "/private/history.db",
+            }
+        )
+
+        self.assertIs(projected["history_recovery_required"], True)
+        self.assertEqual(projected["history_quarantined_at"], "2026-05-01T04:30:00+00:00")
+        self.assertNotIn("sqlite_path", projected)
+
+    def test_collector_status_reports_the_store_recovery_indication(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        db_path.write_text("not a sqlite database", encoding="utf-8")
+        store = HistoryStore(str(db_path))
+        collector = HistoryCollector(HistorySettings(sqlite_path=str(db_path)), store)
+
+        status = collector.status()
+
+        self.assertIs(status["history_recovery_required"], True)
+        self.assertEqual(
+            status["history_quarantined_at"],
+            store.read_quarantine_recovery().isoformat(),
+        )
+
     def test_store_can_fail_closed_without_quarantining_unreadable_database(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         db_path = temp_dir / "history.db"
