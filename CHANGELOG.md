@@ -65,6 +65,16 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   path even if the browser went offline afterward, and told container-action
   operators to re-check current state before retrying (#553).
 
+- The history service now declares the on-disk schema versions it supports and
+  checks `PRAGMA user_version` before the migration lock and before any write,
+  including a version a newer release committed to an unreplayed write-ahead log.
+  A database written by a newer release is refused with a plain-words reason and
+  left byte-identical instead of gaining this build's tables, and the reason is
+  reported on `/healthz` rather than crash-looping; a write-ahead log that exists
+  but cannot be read for the check fails closed instead of trusting the main
+  file's older header; supported older databases still migrate through the
+  existing path (#546).
+
 - Refused startup when an existing write-ahead log could not be read for schema
   admission, preserving the WAL and original retryable error instead of opening
   the stale main header and checkpointing away newer state (#555).
