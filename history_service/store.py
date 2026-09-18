@@ -24,6 +24,7 @@ from history_service.segment_catalog import (
     path_entry_exists,
 )
 from history_service.segment_reader import MAX_HISTORY_QUERY_LIMIT, SegmentedHistoryReader
+from history_service.startup import HistorySchemaVersionError
 
 logger = logging.getLogger(__name__)
 SQLITE_SHARED_DIR_MODE = 0o770
@@ -42,12 +43,37 @@ PRIVATE_REPLACEMENT_DIR_PREFIX = ".history-replacement-"
 # the full-table UPDATE scans. Writers populate disk_identity_key on insert, so the
 # backfill only ever has work to do for rows that predate the column.
 DISK_IDENTITY_BACKFILL_USER_VERSION = 1
+# Supported history-schema versions (#416). PRAGMA user_version is the on-disk
+# compatibility contract, not just a backfill marker: MIN_SUPPORTED_SCHEMA_VERSION
+# is the oldest released shape whose predecessor is still migrated by the startup
+# path below, and CURRENT_SCHEMA_VERSION is the newest shape this build writes.
+# A database numbered above CURRENT_SCHEMA_VERSION was written by a release this
+# one does not know, so startup refuses it before any CREATE/ALTER/backfill runs
+# rather than grafting this build's tables onto a foreign schema.
+MIN_SUPPORTED_SCHEMA_VERSION = 0
+CURRENT_SCHEMA_VERSION = DISK_IDENTITY_BACKFILL_USER_VERSION
+# SQLite file-header fields the gate reads directly (https://sqlite.org/fileformat.html).
+SQLITE_FILE_HEADER_MAGIC = b"SQLite format 3\x00"
+SQLITE_USER_VERSION_OFFSET = 60
+SQLITE_HEADER_PREFIX_BYTES = 64
 SEGMENTED_RETENTION_STATE_NAME = "segmented_retention"
 SEGMENTED_RETENTION_STATES = frozenset({"ready", "claimed", "consumed"})
 # The no-backup retention wait anchor shares the maintenance-state table so it
 # survives a restart; it is a marker, so it only ever holds the 'ready' state.
 RETENTION_WAIT_STATE_NAME = "retention_backup_wait"
 RETENTION_WAIT_STATE = "ready"
+
+
+def describe_unsupported_schema_version(file_path: Path | str, found_version: int) -> str:
+    """The operator line for a database this build must not write to."""
+    return (
+        f"History database {file_path} was written with schema version {found_version}, "
+        f"but this version of the application only supports up to schema version "
+        f"{CURRENT_SCHEMA_VERSION}. The file was almost certainly written by a newer "
+        "release, so the history service is not starting and has not written to it. "
+        "Run the newer release again, restore a backup taken with this release, "
+        "or point HISTORY_SQLITE_PATH at a different file."
+    )
 
 
 def history_write_lock(file_path: Path, *, blocking: bool):
@@ -431,9 +457,127 @@ class HistoryStore:
         self._segment_reader_identity: tuple[int, int, int, int] | None = None
         self._segment_reader_cache: SegmentedHistoryReader | None = None
         if self._initialize_enabled:
+            # Before the migration lock, and before any write: a database from a
+            # newer release is refused with its bytes untouched.
+            self._require_supported_schema_version()
             with history_write_lock(self.file_path, blocking=False):
                 self._require_no_pending_lifecycle_markers()
                 self._initialize(migration_lock_held=True)
+
+    def _require_supported_schema_version(self) -> None:
+        """Refuse a newer-than-supported database before startup writes anything.
+
+        An unreadable, absent or empty file returns no version; those are not
+        version problems and stay with the existing corrupt/recovery handling.
+        """
+        found = self._read_on_disk_schema_version(self.file_path)
+        if found is None or MIN_SUPPORTED_SCHEMA_VERSION <= found <= CURRENT_SCHEMA_VERSION:
+            return
+        reason = describe_unsupported_schema_version(self.file_path, found)
+        raise HistorySchemaVersionError(reason)
+
+    @classmethod
+    def _read_on_disk_schema_version(cls, file_path: Path) -> int | None:
+        """The `user_version` a writer would see, without writing anything.
+
+        Two reads, because neither answers on its own:
+
+        * the main file's header, which needs no SQLite connection at all. The
+          gate must not publish `-wal`/`-shm` beside a database that has none,
+          because the lifecycle-marker check has not run yet and a rotation or
+          restore in flight refuses post-marker sidecars.
+        * the write-ahead log, but only when a `-wal` sidecar already exists.
+          `user_version` lives on page 1, and in WAL mode a committed change to
+          page 1 sits in the `-wal` until a checkpoint copies it back, so the
+          header alone reports the pre-commit value. A database a newer release
+          committed to and did not checkpoint would otherwise be admitted and
+          then written to, which is exactly what #416 forbids.
+
+        The WAL read is a `mode=ro` URI connection: it replays the log for
+        reading and leaves the database and the `-wal` byte-identical. It cannot
+        checkpoint and it cannot write. It is not free of side effects on the
+        directory, though: SQLite may create the derived `-shm` index next to
+        the existing `-wal`. That file holds no database content and appears
+        only where a `-wal` already exists, so a refused database keeps its
+        bytes, but the directory listing can gain one entry. `immutable=1` is
+        not usable here: it answers faster but deliberately ignores the WAL,
+        which is the value this gate needs.
+
+        The higher of the two wins, so a half-visible future version still fails
+        closed. A file that is absent, empty, too short or not a SQLite database
+        returns no version and stays with the existing corrupt-state handling
+        (which moves the sidecars aside together with the file).
+
+        A `-wal` that exists but cannot be read is different: the header is
+        then known to be a stale answer, so falling back to it would admit a
+        database whose real version is unknown, after which startup writes to
+        it and the real open checkpoints the WAL away. That read failure is
+        re-raised unchanged, so a locked or unwritable file fails exactly as it
+        would a moment later on the real open, and startup's retry
+        classification still sees the original error.
+        """
+        header_version = cls._read_schema_version_from_header(file_path)
+        wal_path = Path(f"{file_path}-wal")
+        if not path_entry_exists(wal_path):
+            return header_version
+        try:
+            wal_version = cls._read_schema_version_including_wal(file_path)
+        except (sqlite3.Error, OSError) as exc:
+            if header_version is None:
+                return None
+            logger.warning(
+                "History database %s has a write-ahead log %s that could not be read to "
+                "check its schema version; refusing to open the database rather than "
+                "trust the main file's older header. Error: %s",
+                file_path,
+                wal_path,
+                exc,
+            )
+            exc.add_note(
+                f"The write-ahead log {wal_path} could not be read for the history "
+                "schema-version check; the database was not opened."
+            )
+            raise
+        if header_version is None:
+            return wal_version
+        return max(header_version, wal_version)
+
+    @staticmethod
+    def _read_schema_version_from_header(file_path: Path) -> int | None:
+        """Read `user_version` straight out of the SQLite file header.
+
+        `user_version` is a big-endian 32-bit field at offset 60 of the 100-byte
+        header (https://sqlite.org/fileformat.html), so a 64-byte read answers
+        it. No connection is opened, so nothing is created on disk.
+        """
+        try:
+            with open(file_path, "rb") as handle:
+                header = handle.read(SQLITE_HEADER_PREFIX_BYTES)
+        except OSError:
+            return None
+        if len(header) < SQLITE_HEADER_PREFIX_BYTES:
+            return None
+        if not header.startswith(SQLITE_FILE_HEADER_MAGIC):
+            return None
+        return int.from_bytes(
+            header[SQLITE_USER_VERSION_OFFSET:SQLITE_HEADER_PREFIX_BYTES],
+            "big",
+        )
+
+    @staticmethod
+    def _read_schema_version_including_wal(file_path: Path) -> int:
+        """`user_version` as of the last commit, including unreplayed WAL frames.
+
+        Either answers or raises: the underlying `sqlite3.Error`/`OSError`
+        propagates when the database or its WAL cannot be opened for reading,
+        and the caller decides whether that failure is a version question.
+        """
+        uri = f"{file_path.absolute().as_uri()}?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True, timeout=0)) as connection:
+            row = connection.execute("PRAGMA user_version").fetchone()
+        if not row or row[0] is None:
+            raise sqlite3.OperationalError("PRAGMA user_version returned no row")
+        return int(row[0])
 
     def _ensure_database_parent(self) -> None:
         try:
