@@ -936,8 +936,7 @@ class ContainerResourceContractTests(unittest.TestCase):
                     services["enclosure-backup"]["group_add"],
                     ["${APP_GID:-10001}"],
                 )
-                config_mount = "./config:/app/config" + ("" if compose_name == "docker-compose.yml" else ":ro")
-                self.assertIn(config_mount, services["enclosure-ui"]["volumes"])
+                self.assertIn("./config:/app/config:ro", services["enclosure-ui"]["volumes"])
 
         overlay = yaml.safe_load((REPO_ROOT / "docker-compose.nonroot.yml").read_text(encoding="utf-8"))
         self.assertEqual(
@@ -954,6 +953,54 @@ class ContainerResourceContractTests(unittest.TestCase):
         self.assertIn("ARG APP_UID=10001", dockerfile)
         self.assertIn("ARG APP_GID=10001", dockerfile)
         self.assertIn("USER app", dockerfile)
+
+    def test_read_ui_config_mount_is_read_only_in_every_compose_file(self) -> None:
+        """The read UI never needs to write /app/config; the base must say so too.
+
+        #426 moved hardening into the non-root overlay and dropped `:ro` from the
+        base mount, so a default deployment gave the internet-facing read UI
+        read-write access to config.yaml. The overlay is opt-in, so the base file
+        carries this on its own. The admin service does write config and keeps a
+        read-write mount.
+        """
+        checked_ui = []
+        for compose_path in sorted(REPO_ROOT.glob("docker-compose*.yml")):
+            services = yaml.safe_load(compose_path.read_text(encoding="utf-8"))["services"]
+            for service_name, service in services.items():
+                config_mounts = [
+                    volume
+                    for volume in service.get("volumes", [])
+                    if isinstance(volume, str)
+                    and volume.split(":")[:2] == ["./config", "/app/config"]
+                ]
+                if not config_mounts:
+                    continue
+                with self.subTest(compose=compose_path.name, service=service_name):
+                    if service_name in ("enclosure-ui", "enclosure-history", "enclosure-backup"):
+                        self.assertEqual(
+                            config_mounts,
+                            ["./config:/app/config:ro"],
+                            f"{service_name} in {compose_path.name} must mount ./config read-only",
+                        )
+                        if service_name == "enclosure-ui":
+                            checked_ui.append(compose_path.name)
+                    elif service_name == "enclosure-admin":
+                        self.assertEqual(
+                            config_mounts,
+                            ["./config:/app/config"],
+                            f"{service_name} in {compose_path.name} writes config and stays read-write",
+                        )
+
+        self.assertIn(
+            "docker-compose.yml",
+            checked_ui,
+            "the default base file must declare the read UI ./config mount",
+        )
+        self.assertIn(
+            "docker-compose.nonroot.yml",
+            checked_ui,
+            "the non-root overlay must keep redeclaring the read-only mount",
+        )
 
     def test_admin_public_origin_reaches_every_compose_admin_service(self) -> None:
         for compose_name in COMPOSE_FILES:
@@ -1034,8 +1081,6 @@ class ContainerResourceContractTests(unittest.TestCase):
             services = yaml.safe_load((REPO_ROOT / compose_name).read_text(encoding="utf-8"))["services"]
             for service_name, expected in expected_targets.items():
                 with self.subTest(compose=compose_name, service=service_name):
-                    if compose_name == "docker-compose.yml" and service_name == "enclosure-ui":
-                        expected = expected | {"/app/config"}
                     self.assertEqual(writable_volume_targets(services[service_name]), expected)
             self.assertNotIn("./logs:/app/logs", services["enclosure-admin"]["volumes"])
 

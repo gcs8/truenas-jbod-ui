@@ -212,7 +212,7 @@ class ImageUpgradeTests(unittest.TestCase):
             self.assertEqual(hardened['cap_drop'], ['ALL'])
             self.assertEqual(hardened['security_opt'], ['no-new-privileges:true'])
             self.assertEqual(hardened['tmpfs'], ['/tmp'])
-        self.assertIn('./config:/app/config', base['enclosure-ui']['volumes'])
+        self.assertIn('./config:/app/config:ro', base['enclosure-ui']['volumes'])
         self.assertIn('./config:/app/config:ro', overlay['enclosure-ui']['volumes'])
         self.assertEqual(overlay['enclosure-admin']['cap_add'], ['CHOWN', 'FOWNER'])
         self.assertEqual(base['enclosure-backup']['network_mode'], 'none')
