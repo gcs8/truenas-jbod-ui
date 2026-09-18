@@ -26,6 +26,13 @@ class SlotDetailCacheEntry(BaseModel):
     # to the pre-#521 shape so an existing file loads unchanged.
     smart_updated_at: str | None = None
     smart_stale: bool = False
+    # Whether the most recently published view of this bay carried no strong
+    # identifier (#525). The entry itself is kept as historical evidence, but a
+    # reader that has no slot view to gate on must not serve it while this is
+    # set: the process that observed the window may since have restarted, so an
+    # in-memory marker alone outlives nothing. Defaults to the pre-#525 shape so
+    # an existing file loads unchanged.
+    identity_unknown: bool = False
     updated_at: str = Field(default_factory=lambda: utcnow().isoformat())
 
 

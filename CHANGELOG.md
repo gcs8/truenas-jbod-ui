@@ -78,7 +78,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   expander-assigned SAS address names the bay rather than the disk in it, so
   nothing on record for the bay is served until a strong identifier returns;
   the stored entry is kept, and the usual carry-forward resumes when the same
-  disk reappears (#544)
+  disk reappears. The withholding decision is recorded on the stored entry, so
+  it survives a restart of the service rather than lapsing with the process
+  that observed the swap (#544)
 
 - Made `--help` work on every script under `scripts/` off Linux without
   writing anything into the checkout, with no exceptions left:

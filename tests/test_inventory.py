@@ -12473,6 +12473,72 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
                 service.get_cached_slot_smart_summary_without_layout(5, "enc-1"),
             )
 
+    def test_layout_unavailable_smart_withholding_survives_a_service_restart(self) -> None:
+        # #525: the withholding decision has to outlive the process that made
+        # it. The SMART entry is persisted, so a service restarted during the
+        # identity-unknown window used to come up with an empty in-memory marker
+        # set and serve the departed disk's persisted SMART for the bay again.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            def make_service() -> InventoryService:
+                return build_inventory_service(
+                    Settings(),
+                    SystemConfig(id="default", truenas=TrueNASConfig(platform="core")),
+                    AsyncMock(),
+                    AsyncMock(),
+                    temp_dir,
+                )
+
+            def slot_view(**fields) -> SlotView:
+                return SlotView(
+                    slot=5, slot_label="05", row_index=0, column_index=5,
+                    enclosure_id="enc-1", present=True, state=SlotState.healthy,
+                    device_name="da5", **fields,
+                )
+
+            service = make_service()
+            full = slot_view(serial="SER-VERIFY-005", sas_address="sas-invented-005")
+            asyncio.run(service._apply_and_persist_snapshot_slot_details([full]))
+            service._persist_slot_detail_cache(
+                full, smart_summary=SmartSummaryView(available=True, power_on_hours=321),
+            )
+
+            degraded = slot_view(sas_address="sas-invented-005")
+            asyncio.run(service._apply_and_persist_snapshot_slot_details([degraded]))
+            self.assertEqual(degraded.identity_state, "unknown")
+            self.assertEqual(
+                service.get_cached_slot_smart_summaries_without_layout([5], "enc-1"), {},
+            )
+
+            # Restart: a fresh service over the same persisted store, which has
+            # never observed the bay and so knows only what was written down.
+            restarted = make_service()
+            self.assertEqual(
+                restarted.get_cached_slot_smart_summaries_without_layout([5], "enc-1"), {},
+            )
+            self.assertIsNone(
+                restarted.get_cached_slot_smart_summary_without_layout(5, "enc-1"),
+            )
+            # Still historical evidence, still withheld rather than deleted.
+            self.assertEqual(
+                restarted.slot_detail_store.get_entry("default", "enc-1", 5)
+                .smart_fields.get("power_on_hours"),
+                321,
+            )
+
+            # A strong identifier returns: the genuine carry-forward resumes,
+            # for the restarted process too.
+            returned = slot_view(serial="SER-VERIFY-005", sas_address="sas-invented-005")
+            asyncio.run(restarted._apply_and_persist_snapshot_slot_details([returned]))
+            self.assertEqual(returned.identity_state, "known")
+            resumed = restarted.get_cached_slot_smart_summary_without_layout(5, "enc-1")
+            self.assertIsNotNone(resumed)
+            assert resumed is not None
+            self.assertEqual(resumed.power_on_hours, 321)
+            # And the recorded decision is cleared, not left to withhold forever.
+            self.assertFalse(
+                restarted.slot_detail_store.get_entry("default", "enc-1", 5).identity_unknown,
+            )
+
     def _assert_apply_loads_once(self, slot_count: int) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()
