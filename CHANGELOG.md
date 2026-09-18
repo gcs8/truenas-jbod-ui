@@ -115,6 +115,13 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   reports no disk identifier at all, instead of reviving the departed disk's
   cached SMART after a service restart (#551).
 
+- Finished an interrupted segmented-history migration automatically during an
+  ordinary `docker compose up -d`, so a restart in the middle of one no longer
+  leaves the history container crash-looping until an operator runs a recovery
+  command by hand. When automatic recovery cannot complete, startup fails
+  closed with one concise line at `/healthz` and leaves the database exactly as
+  recovery found it (#549)
+
 - Kept temporary SQLite lock contention retryable during pending-marker startup
   admission instead of misclassifying it as a terminal migration-recovery
   failure (#554).
