@@ -82,6 +82,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   it survives a restart of the service rather than lapsing with the process
   that observed the swap (#544)
 
+- Preserved that restart-safe SMART withholding decision when an occupied bay
+  reports no disk identifier at all, instead of reviving the departed disk's
+  cached SMART after a service restart (#551).
+
 - Made `--help` work on every script under `scripts/` off Linux without
   writing anything into the checkout, with no exceptions left:
   `public_demo_source_parity.py` now adds the repository root to `sys.path`
