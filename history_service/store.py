@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
+from urllib.parse import quote
 
 from history_service.domain import MetricSample, SlotEvent, SlotStateRecord
 from history_service.operation_bounds import validate_store_scope_request
@@ -24,6 +25,7 @@ from history_service.segment_catalog import (
     path_entry_exists,
 )
 from history_service.segment_reader import MAX_HISTORY_QUERY_LIMIT, SegmentedHistoryReader
+from history_service.startup import HistorySchemaVersionError
 
 logger = logging.getLogger(__name__)
 SQLITE_SHARED_DIR_MODE = 0o770
@@ -42,12 +44,33 @@ PRIVATE_REPLACEMENT_DIR_PREFIX = ".history-replacement-"
 # the full-table UPDATE scans. Writers populate disk_identity_key on insert, so the
 # backfill only ever has work to do for rows that predate the column.
 DISK_IDENTITY_BACKFILL_USER_VERSION = 1
+# Supported history-schema versions (#416). PRAGMA user_version is the on-disk
+# compatibility contract, not just a backfill marker: MIN_SUPPORTED_SCHEMA_VERSION
+# is the oldest released shape whose predecessor is still migrated by the startup
+# path below, and CURRENT_SCHEMA_VERSION is the newest shape this build writes.
+# A database numbered above CURRENT_SCHEMA_VERSION was written by a release this
+# one does not know, so startup refuses it before any CREATE/ALTER/backfill runs
+# rather than grafting this build's tables onto a foreign schema.
+MIN_SUPPORTED_SCHEMA_VERSION = 0
+CURRENT_SCHEMA_VERSION = DISK_IDENTITY_BACKFILL_USER_VERSION
 SEGMENTED_RETENTION_STATE_NAME = "segmented_retention"
 SEGMENTED_RETENTION_STATES = frozenset({"ready", "claimed", "consumed"})
 # The no-backup retention wait anchor shares the maintenance-state table so it
 # survives a restart; it is a marker, so it only ever holds the 'ready' state.
 RETENTION_WAIT_STATE_NAME = "retention_backup_wait"
 RETENTION_WAIT_STATE = "ready"
+
+
+def describe_unsupported_schema_version(file_path: Path | str, found_version: int) -> str:
+    """The operator line for a database this build must not write to."""
+    return (
+        f"History database {file_path} was written with schema version {found_version}, "
+        f"but this version of the application only supports up to schema version "
+        f"{CURRENT_SCHEMA_VERSION}. The file was almost certainly written by a newer "
+        "release, so the history service is not starting and has changed nothing on "
+        "disk. Run the newer release again, restore a backup taken with this release, "
+        "or point HISTORY_SQLITE_PATH at a different file."
+    )
 
 
 def history_write_lock(file_path: Path, *, blocking: bool):
@@ -431,9 +454,47 @@ class HistoryStore:
         self._segment_reader_identity: tuple[int, int, int, int] | None = None
         self._segment_reader_cache: SegmentedHistoryReader | None = None
         if self._initialize_enabled:
+            # Before the migration lock, and before any write: a database from a
+            # newer release is refused with its bytes untouched.
+            self._require_supported_schema_version()
             with history_write_lock(self.file_path, blocking=False):
                 self._require_no_pending_lifecycle_markers()
                 self._initialize(migration_lock_held=True)
+
+    def _require_supported_schema_version(self) -> None:
+        """Refuse a newer-than-supported database before startup writes anything.
+
+        An unreadable, absent or empty file returns no version; those are not
+        version problems and stay with the existing corrupt/recovery handling.
+        """
+        found = self._read_on_disk_schema_version(self.file_path)
+        if found is None or MIN_SUPPORTED_SCHEMA_VERSION <= found <= CURRENT_SCHEMA_VERSION:
+            return
+        reason = describe_unsupported_schema_version(self.file_path, found)
+        raise HistorySchemaVersionError(reason)
+
+    @staticmethod
+    def _read_on_disk_schema_version(file_path: Path) -> int | None:
+        """Read PRAGMA user_version without opening the file for writing."""
+        try:
+            if not file_path.is_file() or file_path.stat().st_size == 0:
+                return None
+        except OSError:
+            return None
+        uri = f"file:{quote(file_path.as_posix(), safe='/:')}?mode=ro"
+        try:
+            with closing(
+                sqlite3.connect(uri, uri=True, timeout=SQLITE_CONNECT_TIMEOUT_SECONDS)
+            ) as connection:
+                row = connection.execute("PRAGMA user_version").fetchone()
+        except sqlite3.Error:
+            return None
+        if not row or row[0] is None:
+            return None
+        try:
+            return int(row[0])
+        except (TypeError, ValueError):
+            return None
 
     def _ensure_database_parent(self) -> None:
         try:

@@ -42,6 +42,14 @@ class HistoryStartupError(RuntimeError):
         super().__init__(reason)
 
 
+class HistorySchemaVersionError(HistoryStartupError):
+    """The database on disk is outside the schema versions this build supports.
+
+    Raised before startup writes anything, so the file is left byte-identical.
+    Retrying cannot help: only a different build, or a different path, can.
+    """
+
+
 def recorded_startup_failure() -> str | None:
     """The reason the last startup attempt failed, or None if it succeeded."""
     return _startup_failure_reason
@@ -82,6 +90,12 @@ def open_history_store_with_retries(
     for attempt in range(1, attempts + 1):
         try:
             store = factory()
+        except HistoryStartupError as exc:
+            # Already a terminal operator line (an unsupported schema version, for
+            # example). Record it so /healthz reports the same words the log has.
+            _record(exc.reason)
+            logger.error("%s", exc.reason)
+            raise
         except Exception as exc:
             if not is_unwritable_error(exc):
                 _record(None)
