@@ -62,6 +62,16 @@ SEGMENTED_RETENTION_STATES = frozenset({"ready", "claimed", "consumed"})
 # survives a restart; it is a marker, so it only ever holds the 'ready' state.
 RETENTION_WAIT_STATE_NAME = "retention_backup_wait"
 RETENTION_WAIT_STATE = "ready"
+# Quarantining an unreadable database creates a fresh empty one, which otherwise
+# looks exactly like a first installation. The marker shares the maintenance-state
+# table so the recovery-required indication survives the restart that follows
+# (#417), and it holds only the timestamp - never the quarantine path.
+QUARANTINE_RECOVERY_STATE_NAME = "quarantine_recovery"
+QUARANTINE_RECOVERY_REQUIRED_STATE = "ready"
+QUARANTINE_RECOVERY_ACKNOWLEDGED_STATE = "consumed"
+QUARANTINE_RECOVERY_STATES = frozenset(
+    {QUARANTINE_RECOVERY_REQUIRED_STATE, QUARANTINE_RECOVERY_ACKNOWLEDGED_STATE}
+)
 
 
 def describe_unsupported_schema_version(file_path: Path | str, found_version: int) -> str:
@@ -862,6 +872,147 @@ class HistoryStore:
                 connection.rollback()
                 raise
 
+    def read_quarantine_recovery(self) -> datetime | None:
+        """Return when history was quarantined, or None once it is acknowledged.
+
+        The row lives in `history_maintenance_state` beside the retention
+        markers, so a fresh database created by quarantine recovery keeps saying
+        "recovery required" across restarts instead of presenting itself as a
+        first installation (#417). An unreadable marker is not repaired here;
+        the caller fails closed on it rather than reporting health.
+        """
+
+        with self._read_connection() as connection:
+            row = connection.execute(
+                """
+                SELECT backup_at, state
+                FROM history_maintenance_state
+                WHERE name = ?
+                """,
+                (QUARANTINE_RECOVERY_STATE_NAME,),
+            ).fetchone()
+        if row is None:
+            return None
+        state = str(row["state"])
+        if state not in QUARANTINE_RECOVERY_STATES:
+            raise ValueError("History quarantine recovery state is invalid.")
+        if state == QUARANTINE_RECOVERY_ACKNOWLEDGED_STATE:
+            return None
+        quarantined_at, _ = self._normalize_retention_backup_at(str(row["backup_at"]))
+        return quarantined_at
+
+    def quarantine_recovery_status(self) -> dict[str, Any]:
+        """Report the recovery indication for status surfaces, failing closed.
+
+        A marker that cannot be read is not evidence of a healthy database, so
+        an unreadable or invalid one still reports that recovery is required -
+        with no timestamp, because none is known.
+        """
+
+        try:
+            quarantined_at = self.read_quarantine_recovery()
+        except (sqlite3.Error, ValueError):
+            logger.warning(
+                "History quarantine recovery marker for %s could not be read; reporting recovery required.",
+                self.file_path,
+                exc_info=True,
+            )
+            return {
+                "history_recovery_required": True,
+                "history_quarantined_at": None,
+            }
+        if quarantined_at is None:
+            return {
+                "history_recovery_required": False,
+                "history_quarantined_at": None,
+            }
+        return {
+            "history_recovery_required": True,
+            "history_quarantined_at": quarantined_at.isoformat(),
+        }
+
+    def record_quarantine_recovery(
+        self,
+        quarantined_at: datetime | str,
+        *,
+        migration_lock_held: bool = False,
+    ) -> datetime:
+        """Record that a quarantine happened, and return the effective timestamp.
+
+        An unacknowledged marker wins: a second restart that finds the same
+        recovery pending keeps the original timestamp rather than moving it
+        forward. An acknowledged marker is replaced, because a later quarantine
+        is a new loss and needs its own acknowledgement.
+        """
+
+        candidate, serialized = self._normalize_retention_backup_at(quarantined_at)
+        with self._locked_write_connection(
+            migration_lock_held=migration_lock_held
+        ) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    """
+                    SELECT backup_at, state
+                    FROM history_maintenance_state
+                    WHERE name = ?
+                    """,
+                    (QUARANTINE_RECOVERY_STATE_NAME,),
+                ).fetchone()
+                if row is not None and str(row["state"]) == QUARANTINE_RECOVERY_REQUIRED_STATE:
+                    existing, _ = self._normalize_retention_backup_at(str(row["backup_at"]))
+                    connection.rollback()
+                    return existing
+                connection.execute(
+                    """
+                    INSERT INTO history_maintenance_state (name, backup_at, state)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT (name) DO UPDATE SET
+                        backup_at = excluded.backup_at,
+                        state = excluded.state
+                    """,
+                    (
+                        QUARANTINE_RECOVERY_STATE_NAME,
+                        serialized,
+                        QUARANTINE_RECOVERY_REQUIRED_STATE,
+                    ),
+                )
+                connection.commit()
+                return candidate
+            except BaseException:
+                connection.rollback()
+                raise
+
+    def acknowledge_quarantine_recovery(self, *, migration_lock_held: bool = False) -> bool:
+        """Acknowledge the pending recovery; return whether one was pending.
+
+        The row is kept rather than deleted so the acknowledged quarantine stays
+        distinguishable from a database that was never quarantined.
+        """
+
+        with self._locked_write_connection(
+            migration_lock_held=migration_lock_held
+        ) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = connection.execute(
+                    """
+                    UPDATE history_maintenance_state
+                    SET state = ?
+                    WHERE name = ? AND state = ?
+                    """,
+                    (
+                        QUARANTINE_RECOVERY_ACKNOWLEDGED_STATE,
+                        QUARANTINE_RECOVERY_STATE_NAME,
+                        QUARANTINE_RECOVERY_REQUIRED_STATE,
+                    ),
+                )
+                connection.commit()
+                return cursor.rowcount == 1
+            except BaseException:
+                connection.rollback()
+                raise
+
     def clear_retention_wait(self, *, migration_lock_held: bool = False) -> None:
         """Forget the wait anchor, so the next missing backup starts a fresh window."""
 
@@ -1003,7 +1154,7 @@ class HistoryStore:
                 or not self._should_recover_database(exc)
             ):
                 raise
-            broken_path = self._quarantine_database()
+            broken_path, quarantined_at = self._quarantine_database()
             logger.warning(
                 "History database %s was unreadable; moved it to %s and created a fresh database. Error: %s",
                 self.file_path,
@@ -1011,13 +1162,17 @@ class HistoryStore:
                 exc,
             )
             self._initialize_schema_and_permissions(migration_lock_held=migration_lock_held)
+            self._record_quarantine_recovery_after_initialize(
+                quarantined_at,
+                migration_lock_held=migration_lock_held,
+            )
         except sqlite3.Error as exc:
             if (
                 not self.recover_unreadable_database
                 or not self._should_recover_database(exc)
             ):
                 raise
-            broken_path = self._quarantine_database()
+            broken_path, quarantined_at = self._quarantine_database()
             logger.warning(
                 "History database %s was unreadable; moved it to %s and created a fresh database. Error: %s",
                 self.file_path,
@@ -1025,6 +1180,10 @@ class HistoryStore:
                 exc,
             )
             self._initialize_schema_and_permissions(migration_lock_held=migration_lock_held)
+            self._record_quarantine_recovery_after_initialize(
+                quarantined_at,
+                migration_lock_held=migration_lock_held,
+            )
 
     def _initialize_schema_and_permissions(self, *, migration_lock_held: bool = False) -> None:
         self._create_database_file_for_shared_access()
@@ -1163,8 +1322,33 @@ class HistoryStore:
             )
         )
 
-    def _quarantine_database(self) -> Path:
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    def _record_quarantine_recovery_after_initialize(
+        self,
+        quarantined_at: datetime,
+        *,
+        migration_lock_held: bool = False,
+    ) -> None:
+        """Persist the recovery-required marker into the fresh database.
+
+        Failing to write it must not turn a recovered service into a service
+        that will not start; the log keeps the quarantine evidence either way.
+        """
+
+        try:
+            self.record_quarantine_recovery(
+                quarantined_at,
+                migration_lock_held=migration_lock_held,
+            )
+        except (sqlite3.Error, OSError):
+            logger.warning(
+                "History database %s was quarantined but the recovery marker could not be recorded.",
+                self.file_path,
+                exc_info=True,
+            )
+
+    def _quarantine_database(self) -> tuple[Path, datetime]:
+        quarantined_at = datetime.now(timezone.utc)
+        timestamp = quarantined_at.strftime("%Y%m%dT%H%M%SZ")
         broken_path = self.file_path.with_name(f"{self.file_path.name}.broken-{timestamp}")
         self.file_path.replace(broken_path)
         for suffix in ("-shm", "-wal"):
@@ -1172,7 +1356,7 @@ class HistoryStore:
             if not sidecar_path.exists():
                 continue
             sidecar_path.replace(broken_path.with_name(f"{broken_path.name}{suffix}"))
-        return broken_path
+        return broken_path, quarantined_at
 
     def create_backup(
         self,

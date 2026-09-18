@@ -13,7 +13,7 @@ import threading
 import time
 import unittest
 import urllib.error
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -4884,6 +4884,184 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertEqual(counts["metric_sample_count"], 0)
         self.assertTrue(db_path.exists())
         self.assertEqual(len(broken_files), 1)
+
+    def test_store_persists_quarantine_recovery_across_restart(self) -> None:
+        """A recovered database keeps saying "recovery required" after a restart (#417)."""
+
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        db_path.write_text("not a sqlite database", encoding="utf-8")
+
+        recovered = HistoryStore(str(db_path))
+        quarantined_at = recovered.read_quarantine_recovery()
+        del recovered
+
+        restarted = HistoryStore(str(db_path))
+
+        self.assertIsNotNone(quarantined_at)
+        self.assertEqual(restarted.read_quarantine_recovery(), quarantined_at)
+        self.assertEqual(len(list(temp_dir.glob("history.db.broken-*"))), 1)
+
+    def test_store_distinguishes_a_first_installation_from_a_recovery(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+
+        fresh = HistoryStore(str(temp_dir / "history.db"))
+
+        self.assertIsNone(fresh.read_quarantine_recovery())
+        self.assertEqual(
+            fresh.quarantine_recovery_status(),
+            {"history_recovery_required": False, "history_quarantined_at": None},
+        )
+
+    def test_store_reports_quarantine_recovery_in_its_status(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        db_path.write_text("not a sqlite database", encoding="utf-8")
+
+        store = HistoryStore(str(db_path))
+        status = store.quarantine_recovery_status()
+
+        self.assertIs(status["history_recovery_required"], True)
+        self.assertEqual(
+            status["history_quarantined_at"],
+            store.read_quarantine_recovery().isoformat(),
+        )
+        self.assertNotIn(
+            ".broken-",
+            json.dumps(status),
+            "the recovery indication must not expose the quarantine path",
+        )
+
+    def test_store_keeps_the_first_quarantine_timestamp_until_acknowledged(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        first = datetime(2026, 5, 1, 4, 30, tzinfo=timezone.utc)
+        later = datetime(2026, 5, 2, 4, 30, tzinfo=timezone.utc)
+
+        store.record_quarantine_recovery(first)
+        store.record_quarantine_recovery(later)
+
+        self.assertEqual(store.read_quarantine_recovery(), first)
+
+    def test_store_clears_the_recovery_indication_only_on_acknowledgement(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        quarantined_at = datetime(2026, 5, 1, 4, 30, tzinfo=timezone.utc)
+        store.record_quarantine_recovery(quarantined_at)
+
+        acknowledged = store.acknowledge_quarantine_recovery()
+        again = store.acknowledge_quarantine_recovery()
+
+        self.assertTrue(acknowledged)
+        self.assertFalse(again)
+        self.assertIsNone(store.read_quarantine_recovery())
+        self.assertIs(
+            store.quarantine_recovery_status()["history_recovery_required"],
+            False,
+        )
+
+    def test_store_records_a_later_quarantine_after_an_acknowledgement(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        first = datetime(2026, 5, 1, 4, 30, tzinfo=timezone.utc)
+        later = datetime(2026, 5, 2, 4, 30, tzinfo=timezone.utc)
+        store.record_quarantine_recovery(first)
+        store.acknowledge_quarantine_recovery()
+
+        store.record_quarantine_recovery(later)
+
+        self.assertEqual(store.read_quarantine_recovery(), later)
+
+    def test_store_fails_closed_on_an_unreadable_recovery_marker(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        store.record_quarantine_recovery(datetime(2026, 5, 1, 4, 30, tzinfo=timezone.utc))
+        with closing(sqlite3.connect(temp_dir / "history.db")) as connection:
+            connection.execute(
+                "UPDATE history_maintenance_state SET backup_at = ? WHERE name = ?",
+                ("not a timestamp", history_store.QUARANTINE_RECOVERY_STATE_NAME),
+            )
+            connection.commit()
+
+        self.assertEqual(
+            store.quarantine_recovery_status(),
+            {"history_recovery_required": True, "history_quarantined_at": None},
+        )
+
+    def test_public_collector_status_surfaces_quarantine_recovery(self) -> None:
+        """The recovery indication survives the public projection (#417)."""
+
+        projected = history_main.public_collector_status(
+            {
+                "collector_running": True,
+                "history_recovery_required": True,
+                "history_quarantined_at": "2026-05-01T04:30:00+00:00",
+                "sqlite_path": "/private/history.db",
+            }
+        )
+
+        self.assertIs(projected["history_recovery_required"], True)
+        self.assertEqual(projected["history_quarantined_at"], "2026-05-01T04:30:00+00:00")
+        self.assertNotIn("sqlite_path", projected)
+
+    def test_collector_status_reports_the_store_recovery_indication(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        db_path.write_text("not a sqlite database", encoding="utf-8")
+        store = HistoryStore(str(db_path))
+        collector = HistoryCollector(HistorySettings(sqlite_path=str(db_path)), store)
+
+        status = collector.status()
+
+        self.assertIs(status["history_recovery_required"], True)
+        self.assertEqual(
+            status["history_quarantined_at"],
+            store.read_quarantine_recovery().isoformat(),
+        )
+
+    def test_healthz_grades_a_required_recovery_as_degraded(self) -> None:
+        """An empty last_error must not make a recovery-required service look ok (#417)."""
+
+        status = {
+            "collector_running": True,
+            "last_error": None,
+            "history_recovery_required": True,
+            "history_quarantined_at": "2026-05-01T04:30:00+00:00",
+        }
+        with (
+            patch.object(history_main, "startup_failure_reason", None),
+            patch.object(history_main.collector, "status", return_value=status),
+            patch.object(history_main.collector, "last_error", None),
+            patch.object(history_main.store, "database_size_bytes", return_value=4096),
+        ):
+            response = asyncio.run(history_main.healthz())
+
+        payload = json.loads(response.body)
+        self.assertNotEqual(payload["status"], "ok")
+        self.assertEqual(payload["status"], "degraded")
+        self.assertIs(payload["history_recovery_required"], True)
+
+    def test_healthz_reports_degraded_after_a_quarantine_activated_a_fresh_database(self) -> None:
+        """Quarantine must not activate a fresh database that reports itself healthy (#417)."""
+
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        db_path.write_text("not a sqlite database", encoding="utf-8")
+        store = HistoryStore(str(db_path))
+        collector = HistoryCollector(HistorySettings(sqlite_path=str(db_path)), store)
+
+        with (
+            patch.object(history_main, "startup_failure_reason", None),
+            patch.object(history_main, "store", store),
+            patch.object(history_main, "collector", collector),
+        ):
+            response = asyncio.run(history_main.healthz())
+
+        payload = json.loads(response.body)
+        self.assertIsNone(collector.last_error)
+        self.assertIs(payload["history_recovery_required"], True)
+        self.assertEqual(payload["status"], "degraded")
+        self.assertNotIn(".broken-", json.dumps(payload))
 
     def test_store_can_fail_closed_without_quarantining_unreadable_database(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
