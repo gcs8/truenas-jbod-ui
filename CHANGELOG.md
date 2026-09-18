@@ -65,6 +65,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   path even if the browser went offline afterward, and told container-action
   operators to re-check current state before retrying (#553).
 
+- Refused startup when an existing write-ahead log could not be read for schema
+  admission, preserving the WAL and original retryable error instead of opening
+  the stale main header and checkpointing away newer state (#555).
+
 ### Docs
 
 - Rewrote the released v0.23.0 upgrade notes so a published-image operator can
