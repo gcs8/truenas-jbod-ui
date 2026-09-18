@@ -125,6 +125,45 @@ test("an offline browser reports offline even for a mutation", async () => {
   assert.ok(/not sent/i.test(error.message), error.message);
 });
 
+test("a mutation dispatched online that fails once the browser is offline is an unknown outcome", async () => {
+  // navigator.onLine read at catch time cannot prove the request never left:
+  // the browser was online when fetch was invoked, so the sidecar may have
+  // received and applied the change before the link dropped.
+  const navigator = { onLine: true };
+  const { fetchJson } = loadFetchJson({
+    fetch: async () => {
+      navigator.onLine = false;
+      throw new TypeError("Failed to fetch");
+    },
+    navigator,
+  });
+
+  const error = await captureError(fetchJson("/api/admin/profiles", { method: "POST" }));
+
+  assert.equal(error.adminOutcome, "unknown");
+  assert.equal(error.outcomeUnknown, true);
+  assert.ok(/unknown whether the change was applied/i.test(error.message), error.message);
+  assert.ok(!/not sent/i.test(error.message), error.message);
+});
+
+test("a read dispatched online that fails once the browser is offline does not claim it was never sent", async () => {
+  const navigator = { onLine: true };
+  const { fetchJson } = loadFetchJson({
+    fetch: async () => {
+      navigator.onLine = false;
+      throw new TypeError("Failed to fetch");
+    },
+    navigator,
+  });
+
+  const error = await captureError(fetchJson("/api/admin/state"));
+
+  assert.equal(error.adminOutcome, "transport");
+  assert.equal(error.outcomeUnknown, false);
+  assert.ok(/could not be reached/i.test(error.message), error.message);
+  assert.ok(!/not sent/i.test(error.message), error.message);
+});
+
 test("a 422 is a validation outcome that names the input", async () => {
   const { fetchJson } = loadFetchJson({
     fetch: async () =>

@@ -5139,25 +5139,28 @@
   function adminRequestError(message, outcome) {
     const error = new Error(message);
     error.adminOutcome = outcome;
-    // The runtime action path already speaks this flag for its own timeout.
+    // Read by executeRuntimeAction alongside its own timeout flag,
+    // runtimeActionOutcomeUnknown, so both land on the "status unknown" path.
     error.outcomeUnknown = outcome === "unknown";
     return error;
   }
 
-  function classifyTransportFailure(mutating) {
-    // Offline is observable and means the request never left the browser, so
-    // even a mutation is known not to have been applied.
-    if (browserIsOffline()) {
+  function classifyTransportFailure(mutating, offlineBeforeDispatch) {
+    // Only the offline state observed *before* fetch was invoked proves the
+    // request never left the browser. Reading navigator.onLine at catch time
+    // cannot: the link may have dropped after the sidecar received the
+    // request, so a mutation that failed after dispatch stays unknown.
+    if (offlineBeforeDispatch) {
       return "transport";
     }
     return mutating ? "unknown" : "transport";
   }
 
-  function describeTransportFailure(outcome) {
+  function describeTransportFailure(outcome, offlineBeforeDispatch) {
     if (outcome === "unknown") {
       return "The admin sidecar could not be reached after the request was sent, so it is unknown whether the change was applied. Re-check the current state before retrying.";
     }
-    if (browserIsOffline()) {
+    if (offlineBeforeDispatch) {
       return "This browser is offline, so the request was not sent. Reconnect, then retry.";
     }
     return "The admin sidecar could not be reached, so nothing was changed. Check that it is running, then retry.";
@@ -5189,6 +5192,9 @@
 
   async function fetchJson(url, options = {}) {
     const mutating = isMutatingRequest(options);
+    // Sampled before dispatch: this is the only offline evidence that can
+    // show the request was never sent.
+    const offlineBeforeDispatch = browserIsOffline();
     let response;
     try {
       response = await fetch(url, options);
@@ -5198,8 +5204,8 @@
       if (error?.name === "AbortError") {
         throw error;
       }
-      const outcome = classifyTransportFailure(mutating);
-      throw adminRequestError(describeTransportFailure(outcome), outcome);
+      const outcome = classifyTransportFailure(mutating, offlineBeforeDispatch);
+      throw adminRequestError(describeTransportFailure(outcome, offlineBeforeDispatch), outcome);
     }
     const payload = await readJsonResponse(response);
     if (!response.ok || (payload && payload.ok === false)) {
@@ -5795,7 +5801,9 @@
     } catch (error) {
       if (error?.name === "AbortError" || signal?.aborted) {
         setBanner(`Container ${action} polling cancelled for ${containerKey}.`, "info");
-      } else if (error?.runtimeActionOutcomeUnknown) {
+      } else if (error?.runtimeActionOutcomeUnknown || error?.outcomeUnknown) {
+        // Either this path's own action timeout or fetchJson's unknown
+        // mutation outcome: the container state may have changed.
         setBanner(`Container ${action} status unknown for ${containerKey}: ${error.message}`, "error");
       } else {
         setBanner(`Container ${action} failed: ${error.message || error}`, "error");
