@@ -140,6 +140,9 @@ class CoreGridPeer:
         self.json_extra = {}
         # Devices whose disk.smartctl call is accepted and never answered.
         self.stall_devices: set[str] = set()
+        # Devices middleware rejects individually, as it does for a disk it
+        # cannot open or a name missing from its disk table (#522).
+        self.fail_devices: set[str] = set()
 
     def connect(self, url, **kwargs):
         from contextlib import asynccontextmanager
@@ -185,7 +188,9 @@ class CoreGridPeer:
                             index = int(device.removeprefix('/dev/').removeprefix('da'))
                             for _ in range(index % 3):
                                 await asyncio.sleep(0)
-                            if peer.fail_phase == 'invalid':
+                            if device.removeprefix('/dev/') in peer.fail_devices:
+                                reply['error'] = {'reason': 'synthetic per-disk rejection'}
+                            elif peer.fail_phase == 'invalid':
                                 reply['result'] = {'invalid': 'SMART payload'}
                             elif peer.fail_phase == phase:
                                 reply['error'] = {'reason': 'synthetic unavailable'}
@@ -344,6 +349,40 @@ class CoreGridWebsocketIntegrationTests(unittest.IsolatedAsyncioTestCase):
                         self.assertGreater(peer.connections, before)
                     self.assertFalse(s._smart_load_tasks)
 
+    async def test_one_rejected_disk_keeps_the_rest_of_the_batch(self):
+        # #522: the client batch is fail-fast, so one disk middleware rejects -
+        # a dead drive, or the multipath member name of #355 - discarded every
+        # successful reply in the same batch and sent all N slots back through
+        # the per-slot path. On a shelf with a failing drive, the case the grid
+        # exists for, #503/#504 then did strictly more work than v0.23.0: one
+        # batch session plus N individual ones. Keep the partial results and
+        # retry only the slot that failed.
+        with self.fixture(4) as (s, api, store, other):
+            peer = CoreGridPeer(await api.fetch_all())
+            peer.fail_devices = {'da2'}
+            with self.wire(s, peer):
+                await s.get_snapshot()
+                snapshot_sessions = peer.connections
+                result = await asyncio.wait_for(
+                    s.get_slot_smart_summaries([0, 1, 2, 3], max_concurrency=2), 20,
+                )
+                summaries = {item.slot: item.summary for item in result}
+                self.assertEqual([item.slot for item in result], [0, 1, 2, 3])
+                # The three healthy disks answered inside the batch and keep
+                # their values; the rejected one is the only degraded slot.
+                self.assertEqual(
+                    [summaries[slot].power_on_hours for slot in (0, 1, 3)], [321, 322, 324],
+                )
+                self.assertFalse(summaries[2].available)
+                # One batch session, and one per-slot retry for the failed slot
+                # only - not one per slot in the shelf.
+                grid_sessions = peer.connections - snapshot_sessions
+                print('PARTIAL_BATCH_SESSIONS', grid_sessions, dict(peer.methods))
+                self.assertEqual(grid_sessions, 2)
+                self.assertEqual(peer.methods['json'], 5)
+                self.assertEqual(peer.closes, peer.connections)
+                self.assertFalse(s._smart_load_tasks)
+
     async def test_slow_batch_reply_degrades_to_per_slot_fallbacks(self):
         # #523: smartctl_batch wraps every middleware call in the request timeout
         # and the builtin TimeoutError is not a TrueNASAPIError, so one disk that
@@ -378,6 +417,40 @@ class CoreGridWebsocketIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual([r.slot for r in result], [0, 1, 2, 3])
                 self.assertEqual([r.summary.available for r in result], [True] * 4)
                 self.assertEqual([r.summary.power_on_hours for r in result], [321, 322, 323, 324])
+                self.assertEqual(peer.closes, peer.connections)
+                self.assertFalse(s._smart_load_tasks)
+
+    async def test_one_slow_disk_costs_one_slot_not_the_batch(self):
+        # #523, the half #524 left open. #524 stopped a batch timeout from
+        # answering 500 for the shelf, but the degradation is still all-or-
+        # nothing: the builtin TimeoutError from one disk's per-call deadline
+        # fails the gather, so every slot loses its batch payload and re-fetches
+        # individually. Bound the slow disk to its own slot. `da2` is accepted
+        # and never answered, so only a deadline can end that call; the other
+        # three answer immediately and must keep what the batch already had.
+        with self.fixture(4) as (s, api, store, other):
+            peer = CoreGridPeer(await api.fetch_all())
+            peer.stall_devices = {'da2'}
+            with self.wire(s, peer):
+                s.truenas_client.config.timeout_seconds = 0.3
+                await s.get_snapshot()
+                snapshot_sessions = peer.connections
+                result = await asyncio.wait_for(
+                    s.get_slot_smart_summaries([0, 1, 2, 3], max_concurrency=2), 20,
+                )
+                summaries = {item.slot: item.summary for item in result}
+                self.assertEqual([item.slot for item in result], [0, 1, 2, 3])
+                self.assertEqual(
+                    [summaries[slot].power_on_hours for slot in (0, 1, 3)], [321, 322, 324],
+                )
+                self.assertFalse(summaries[2].available)
+                self.assertIn('timed out', (summaries[2].message or '').lower())
+                grid_sessions = peer.connections - snapshot_sessions
+                print('SLOW_DISK_SESSIONS', grid_sessions, dict(peer.methods))
+                # One batch, plus the one per-slot retry for the slow disk; the
+                # three healthy slots never reach the per-slot path.
+                self.assertEqual(grid_sessions, 2)
+                self.assertEqual(peer.methods['json'], 5)
                 self.assertEqual(peer.closes, peer.connections)
                 self.assertFalse(s._smart_load_tasks)
 
@@ -924,6 +997,77 @@ class SmartGridIOTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(before[key].identifiers, after[key].identifiers)
             self.assertNotEqual(before[key].updated_at, after[key].updated_at)
             self.assertEqual(trace.operations["write"], 1)
+            self.assert_other(store, other)
+
+    async def test_snapshot_refresh_keeps_last_good_smart_fields(self):
+        # #521: every snapshot build persisted an entry with smart_fields={} for
+        # every present slot, and save_entries replaces the whole entry, so the
+        # SMART half of the cache was erased at most one snapshot TTL (10 s by
+        # default) after it was written and never survived a restart. The
+        # "persistent-hit" path, the fallback merge and the export path all
+        # promise a last-good SMART layer that was empty on every deployment.
+        with self.fixture(2) as (service, api, store, other):
+            snapshot = await self.snapshot(service, 2)
+            slots = [s.slot for s in snapshot.slots]
+            result, _ = await self.grid(service, slots, "smart-persist")
+            self.assertTrue(all(r.summary.power_on_hours == api.hours for r in result))
+            keys = [store._slot_key(service.system.id, s.enclosure_id, s.slot) for s in snapshot.slots]
+            before = store.load_all()
+            for key in keys:
+                self.assertEqual(before[key].smart_fields.get("power_on_hours"), api.hours)
+                self.assertFalse(before[key].smart_stale, "a fresh read is not stale")
+                self.assertTrue(before[key].smart_updated_at)
+
+            await service.get_snapshot(force_refresh=True)
+
+            after = store.load_all()
+            for key in keys:
+                self.assertEqual(after[key].smart_fields, before[key].smart_fields)
+                # The values are last-good, not current: they keep the timestamp
+                # of the read that produced them and say so.
+                self.assertEqual(after[key].smart_updated_at, before[key].smart_updated_at)
+                self.assertTrue(after[key].smart_stale)
+            self.assert_other(store, other)
+
+    async def test_last_good_smart_survives_a_restart_and_a_failed_read(self):
+        # The other half of #521: the first snapshot after boot ran before any
+        # SMART request could read the cache, so a restart wiped the layer. A
+        # reopened store must still serve it, a failed read must not overwrite
+        # it, and the next successful read must clear the stale mark.
+        with self.fixture(1) as (service, api, store, other):
+            snapshot = await self.snapshot(service, 1)
+            slots = [s.slot for s in snapshot.slots]
+            await self.grid(service, slots, "smart-persist")
+            key = store._slot_key(service.system.id, snapshot.slots[0].enclosure_id, slots[0])
+            persisted = store.load_all()[key]
+
+            reopened = SlotDetailStore(str(store.file_path))
+            service.slot_detail_store = reopened
+            await service.get_snapshot(force_refresh=True)
+            self.assertEqual(reopened.load_all()[key].smart_fields, persisted.smart_fields)
+
+            # A failed read keeps the last-good values rather than clearing them.
+            api.available = False
+            service._smart_cache.clear()
+            service._smart_cache_until.clear()
+            service._smart_negative_cache.clear()
+            result, _ = await self.grid(service, slots, "smart-failed-read")
+            self.assertEqual(result[0].summary.power_on_hours, api.hours)
+            kept = reopened.load_all()[key]
+            self.assertEqual(kept.smart_fields, persisted.smart_fields)
+            self.assertEqual(kept.smart_updated_at, persisted.smart_updated_at)
+
+            # A successful read overwrites them and clears the stale mark.
+            api.available = True
+            api.hours = 999
+            service._smart_cache.clear()
+            service._smart_cache_until.clear()
+            service._smart_negative_cache.clear()
+            result, _ = await self.grid(service, slots, "smart-fresh-read")
+            refreshed = reopened.load_all()[key]
+            self.assertEqual(refreshed.smart_fields.get("power_on_hours"), 999)
+            self.assertFalse(refreshed.smart_stale)
+            self.assertNotEqual(refreshed.smart_updated_at, persisted.smart_updated_at)
             self.assert_other(store, other)
 
     async def test_allow_stale_returns_history_then_default_request_refreshes(self):
