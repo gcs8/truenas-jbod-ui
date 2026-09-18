@@ -87,6 +87,14 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Published aggregate disk-retention totals on the inventory summary
+  (`source_disk_count`, `rendered_unique_disk_count`,
+  `duplicate_disk_view_count`, `unplaced_disk_count`) so a release check can
+  prove every source disk became exactly one logical rendered disk across the
+  system-scoped virtual-inventory fallback, and made that fallback say that
+  physical location is unavailable rather than looking like a source fetch
+  failure. The totals carry no disk identifiers (#547)
+
 - The history service now declares the on-disk schema versions it supports and
   checks `PRAGMA user_version` before the migration lock and before any write,
   including a version a newer release committed to an unreplayed write-ahead log.
