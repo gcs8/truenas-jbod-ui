@@ -15,7 +15,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
-from urllib.parse import quote
 
 from history_service.domain import MetricSample, SlotEvent, SlotStateRecord
 from history_service.operation_bounds import validate_store_scope_request
@@ -53,6 +52,10 @@ DISK_IDENTITY_BACKFILL_USER_VERSION = 1
 # rather than grafting this build's tables onto a foreign schema.
 MIN_SUPPORTED_SCHEMA_VERSION = 0
 CURRENT_SCHEMA_VERSION = DISK_IDENTITY_BACKFILL_USER_VERSION
+# SQLite file-header fields the gate reads directly (https://sqlite.org/fileformat.html).
+SQLITE_FILE_HEADER_MAGIC = b"SQLite format 3\x00"
+SQLITE_USER_VERSION_OFFSET = 60
+SQLITE_HEADER_PREFIX_BYTES = 64
 SEGMENTED_RETENTION_STATE_NAME = "segmented_retention"
 SEGMENTED_RETENTION_STATES = frozenset({"ready", "claimed", "consumed"})
 # The no-backup retention wait anchor shares the maintenance-state table so it
@@ -475,26 +478,32 @@ class HistoryStore:
 
     @staticmethod
     def _read_on_disk_schema_version(file_path: Path) -> int | None:
-        """Read PRAGMA user_version without opening the file for writing."""
+        """Read `user_version` straight out of the SQLite file header.
+
+        Deliberately not a SQLite connection: opening a WAL database even for
+        reading publishes `-wal` and `-shm` beside it, and the gate must not
+        create anything before the lifecycle-marker check has run. `user_version`
+        is a big-endian 32-bit field at offset 60 of the 100-byte header
+        (https://sqlite.org/fileformat.html), so a 64-byte read answers it.
+
+        A file that is absent, empty, too short or not a SQLite database returns
+        no version and stays with the existing corrupt-state handling. A version
+        that only exists in an unreplayed WAL is not visible here; a database a
+        newer release left mid-transaction is the one case this gate can miss.
+        """
         try:
-            if not file_path.is_file() or file_path.stat().st_size == 0:
-                return None
+            with open(file_path, "rb") as handle:
+                header = handle.read(SQLITE_HEADER_PREFIX_BYTES)
         except OSError:
             return None
-        uri = f"file:{quote(file_path.as_posix(), safe='/:')}?mode=ro"
-        try:
-            with closing(
-                sqlite3.connect(uri, uri=True, timeout=SQLITE_CONNECT_TIMEOUT_SECONDS)
-            ) as connection:
-                row = connection.execute("PRAGMA user_version").fetchone()
-        except sqlite3.Error:
+        if len(header) < SQLITE_HEADER_PREFIX_BYTES:
             return None
-        if not row or row[0] is None:
+        if not header.startswith(SQLITE_FILE_HEADER_MAGIC):
             return None
-        try:
-            return int(row[0])
-        except (TypeError, ValueError):
-            return None
+        return int.from_bytes(
+            header[SQLITE_USER_VERSION_OFFSET:SQLITE_HEADER_PREFIX_BYTES],
+            "big",
+        )
 
     def _ensure_database_parent(self) -> None:
         try:
