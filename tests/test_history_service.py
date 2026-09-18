@@ -5031,12 +5031,7 @@ class HistoryStoreTests(unittest.TestCase):
         with (
             patch.object(history_main, "startup_failure_reason", None),
             patch.object(history_main.collector, "status", return_value=status),
-            patch.object(
-                type(history_main.collector),
-                "last_error",
-                new_callable=PropertyMock,
-                return_value=None,
-            ),
+            patch.object(history_main.collector, "last_error", None),
             patch.object(history_main.store, "database_size_bytes", return_value=4096),
         ):
             response = asyncio.run(history_main.healthz())
