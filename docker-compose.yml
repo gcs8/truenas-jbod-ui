@@ -21,7 +21,9 @@ services:
     ports:
       - "${APP_BIND_ADDRESS:-0.0.0.0}:${APP_PORT:-8080}:8000"
     volumes:
-      - ./config:/app/config
+      # The read UI never writes under /app/config; the admin service owns those
+      # writes. Keep this read-only even without the non-root overlay.
+      - ./config:/app/config:ro
       - ./data:/app/data
       - ./logs:/app/logs
       - ./config/ssh:/run/ssh:ro
