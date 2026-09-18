@@ -61,6 +61,7 @@ from app.services.credential_authority import (
     credential_authorities_are_approved,
     ssh_credential_authorities,
 )
+from app.services.inventory_accounting import build_disk_retention_accounting
 from app.services.mapping_store import MappingStore, resolve_physical_mapping_scope
 from app.services.profile_registry import (
     ENCLOSURE_SUB_VIEW_PROFILE_IDS,
@@ -154,6 +155,16 @@ SMART_NEGATIVE_CACHE_MAX_ENTRIES = 1024
 VIRTUAL_MAPPING_UNAVAILABLE_REASON = (
     "Mapping import is unavailable because this system disk inventory has no identified "
     "physical enclosure or stable physical slot identities."
+)
+# Rendering a system-scoped virtual inventory means physical location is
+# unavailable. It is not a source failure: the disks themselves were fetched.
+# Source failures are reported through SourceStatus and their own warnings, so
+# an operator (and a release gate) can tell "no bay locations" apart from
+# "the disk list is incomplete".
+VIRTUAL_INVENTORY_PHYSICAL_LOCATION_WARNING = (
+    "No physical enclosure could be identified on this system, so its disks are shown as a "
+    "system-scoped virtual inventory without physical bay locations. Disk data itself was "
+    "retrieved successfully; this warning does not indicate a source fetch failure."
 )
 
 logger = logging.getLogger(__name__)
@@ -5154,6 +5165,16 @@ class InventoryService:
         await self._apply_and_persist_snapshot_slot_details(slots)
 
         slots = self._attach_mapping_revisions(slots)
+        with perf_stage("inventory.disk_retention_accounting"):
+            retention = build_disk_retention_accounting(
+                source_disks=self._build_storage_view_candidate_records(
+                    raw_data,
+                    ssh_data,
+                    resolved_enclosure_id,
+                    bmc_inventory,
+                ),
+                slots=slots,
+            )
         summary = InventorySummary(
             disk_count=disk_count,
             pool_count=pool_count,
@@ -5165,6 +5186,10 @@ class InventoryService:
             ),
             manual_mapping_count=self.mapping_store.count_for_system(self.system.id),
             ssh_slot_hint_count=ssh_slot_hint_count,
+            source_disk_count=retention.source_disk_count,
+            rendered_unique_disk_count=retention.rendered_unique_disk_count,
+            duplicate_disk_view_count=retention.duplicate_disk_view_count,
+            unplaced_disk_count=retention.unplaced_disk_count,
         )
         capabilities = self._build_platform_capabilities(
             slots=slots,
@@ -5787,6 +5812,8 @@ class InventoryService:
             "label": virtual_label,
             "name": None,
         }
+        if VIRTUAL_INVENTORY_PHYSICAL_LOCATION_WARNING not in warnings:
+            warnings.append(VIRTUAL_INVENTORY_PHYSICAL_LOCATION_WARNING)
         loaded_mappings = self.mapping_store.load_all()
         self._warn_unapplied_legacy_mappings(
             warnings,

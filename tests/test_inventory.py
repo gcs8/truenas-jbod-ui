@@ -488,13 +488,17 @@ class InventoryHelpersTests(unittest.TestCase):
             self.assertTrue(all(slot.led_supported is False for slot in slots))
             self.assertTrue(all(slot.mapping_supported is False for slot in slots))
             self.assertTrue(all("physical enclosure" in slot.mapping_reason for slot in slots))
-            self.assertEqual(len(warnings), 1)
-            self.assertIn("1 manual mapping", warnings[0])
-            self.assertIn("no identified physical enclosure", warnings[0])
-            self.assertIn("system-scoped virtual inventory", warnings[0])
-            self.assertIn("Re-save", warnings[0])
-            self.assertNotIn("SYNTH", warnings[0])
-            self.assertNotIn("system-a", warnings[0])
+            # The virtual fallback states that physical location is unavailable
+            # separately from the legacy-mapping warning, and neither one claims
+            # a source fetch failure.
+            self.assertEqual(len(warnings), 2)
+            self.assertEqual(warnings[0], inventory_module.VIRTUAL_INVENTORY_PHYSICAL_LOCATION_WARNING)
+            self.assertIn("1 manual mapping", warnings[1])
+            self.assertIn("no identified physical enclosure", warnings[1])
+            self.assertIn("system-scoped virtual inventory", warnings[1])
+            self.assertIn("Re-save", warnings[1])
+            self.assertNotIn("SYNTH", warnings[1])
+            self.assertNotIn("system-a", warnings[1])
 
             capabilities = service._build_platform_capabilities(
                 slots=slots,
