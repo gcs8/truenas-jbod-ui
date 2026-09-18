@@ -5120,11 +5120,94 @@
     return requestId ? `${detail} (request id ${requestId})` : detail;
   }
 
+  // An admin failure is one of three things the operator has to act on
+  // differently (#418):
+  //   "transport"  - the request did not reach the sidecar, so nothing changed;
+  //   "validation" - the sidecar read the request and rejected the input;
+  //   "unknown"    - a mutation whose result the client cannot determine, so
+  //                  the current state has to be re-read before a retry.
+  // Anything else stays "error": a definite server-side refusal.
+  function isMutatingRequest(options) {
+    const method = String(options?.method || "GET").toUpperCase();
+    return method !== "GET" && method !== "HEAD" && method !== "OPTIONS";
+  }
+
+  function browserIsOffline() {
+    return typeof navigator !== "undefined" && navigator?.onLine === false;
+  }
+
+  function adminRequestError(message, outcome) {
+    const error = new Error(message);
+    error.adminOutcome = outcome;
+    // The runtime action path already speaks this flag for its own timeout.
+    error.outcomeUnknown = outcome === "unknown";
+    return error;
+  }
+
+  function classifyTransportFailure(mutating) {
+    // Offline is observable and means the request never left the browser, so
+    // even a mutation is known not to have been applied.
+    if (browserIsOffline()) {
+      return "transport";
+    }
+    return mutating ? "unknown" : "transport";
+  }
+
+  function describeTransportFailure(outcome) {
+    if (outcome === "unknown") {
+      return "The admin sidecar could not be reached after the request was sent, so it is unknown whether the change was applied. Re-check the current state before retrying.";
+    }
+    if (browserIsOffline()) {
+      return "This browser is offline, so the request was not sent. Reconnect, then retry.";
+    }
+    return "The admin sidecar could not be reached, so nothing was changed. Check that it is running, then retry.";
+  }
+
+  function classifyResponseFailure(status, mutating) {
+    // 400/422 are the sidecar's own input rejections: the request arrived and
+    // was understood, so the operator has to fix the input, not the transport.
+    if (status === 400 || status === 422) {
+      return "validation";
+    }
+    // A mutation that fails without a decided status leaves the change in
+    // doubt; a 4xx refusal other than the two above is decided.
+    if (mutating && (status >= 500 || status === 408 || !status)) {
+      return "unknown";
+    }
+    return "error";
+  }
+
+  function describeResponseFailure(detail, outcome) {
+    if (outcome === "unknown") {
+      return `${detail} The change may or may not have been applied; re-check the current state before retrying.`;
+    }
+    if (outcome === "validation") {
+      return `${detail} Correct the submitted values and try again.`;
+    }
+    return detail;
+  }
+
   async function fetchJson(url, options = {}) {
-    const response = await fetch(url, options);
+    const mutating = isMutatingRequest(options);
+    let response;
+    try {
+      response = await fetch(url, options);
+    } catch (error) {
+      // An abort is the caller's own cancellation or timeout contract, which
+      // already describes its outcome. Leave it exactly as it was thrown.
+      if (error?.name === "AbortError") {
+        throw error;
+      }
+      const outcome = classifyTransportFailure(mutating);
+      throw adminRequestError(describeTransportFailure(outcome), outcome);
+    }
     const payload = await readJsonResponse(response);
     if (!response.ok || (payload && payload.ok === false)) {
-      throw new Error(describeRequestFailure(payload, response));
+      const outcome = classifyResponseFailure(response?.status, mutating);
+      throw adminRequestError(
+        describeResponseFailure(describeRequestFailure(payload, response), outcome),
+        outcome
+      );
     }
     return payload || {};
   }
