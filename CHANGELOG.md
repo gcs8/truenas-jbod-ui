@@ -50,6 +50,15 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   concurrency and DDP heartbeat handling; inventory integration remained
   separate (#503).
 
+### Fixed
+
+- The history service now declares the on-disk schema versions it supports and
+  checks `PRAGMA user_version` before the migration lock and before any write. A
+  database written by a newer release is refused with a plain-words reason and
+  left byte-identical instead of gaining this build's tables, and the reason is
+  reported on `/healthz` rather than crash-looping; supported older databases
+  still migrate through the existing path (#546).
+
 ### Docs
 
 - Rewrote the released v0.23.0 upgrade notes so a published-image operator can
