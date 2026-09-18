@@ -70,8 +70,8 @@ def describe_unsupported_schema_version(file_path: Path | str, found_version: in
         f"History database {file_path} was written with schema version {found_version}, "
         f"but this version of the application only supports up to schema version "
         f"{CURRENT_SCHEMA_VERSION}. The file was almost certainly written by a newer "
-        "release, so the history service is not starting and has changed nothing on "
-        "disk. Run the newer release again, restore a backup taken with this release, "
+        "release, so the history service is not starting and has not written to it. "
+        "Run the newer release again, restore a backup taken with this release, "
         "or point HISTORY_SQLITE_PATH at a different file."
     )
 
@@ -495,24 +495,49 @@ class HistoryStore:
 
         The WAL read is a `mode=ro` URI connection: it replays the log for
         reading and leaves the database and the `-wal` byte-identical. It cannot
-        checkpoint and it cannot write. (SQLite may materialise the derived
-        `-shm` index, which holds no database content and only ever happens
-        where a `-wal` already exists, so it adds no sidecar state that the
-        existing `-wal` did not already imply.) `immutable=1` is not usable
-        here: it answers faster but deliberately ignores the WAL, which is the
-        value this gate needs.
+        checkpoint and it cannot write. It is not free of side effects on the
+        directory, though: SQLite may create the derived `-shm` index next to
+        the existing `-wal`. That file holds no database content and appears
+        only where a `-wal` already exists, so a refused database keeps its
+        bytes, but the directory listing can gain one entry. `immutable=1` is
+        not usable here: it answers faster but deliberately ignores the WAL,
+        which is the value this gate needs.
 
         The higher of the two wins, so a half-visible future version still fails
-        closed. A file that is absent, empty, too short, not a SQLite database,
-        or whose WAL cannot be read returns the header's answer (or no version
-        at all) and stays with the existing corrupt-state and locking handling.
+        closed. A file that is absent, empty, too short or not a SQLite database
+        returns no version and stays with the existing corrupt-state handling
+        (which moves the sidecars aside together with the file).
+
+        A `-wal` that exists but cannot be read is different: the header is
+        then known to be a stale answer, so falling back to it would admit a
+        database whose real version is unknown, after which startup writes to
+        it and the real open checkpoints the WAL away. That read failure is
+        re-raised unchanged, so a locked or unwritable file fails exactly as it
+        would a moment later on the real open, and startup's retry
+        classification still sees the original error.
         """
         header_version = cls._read_schema_version_from_header(file_path)
-        if not path_entry_exists(Path(f"{file_path}-wal")):
+        wal_path = Path(f"{file_path}-wal")
+        if not path_entry_exists(wal_path):
             return header_version
-        wal_version = cls._read_schema_version_including_wal(file_path)
-        if wal_version is None:
-            return header_version
+        try:
+            wal_version = cls._read_schema_version_including_wal(file_path)
+        except (sqlite3.Error, OSError) as exc:
+            if header_version is None:
+                return None
+            logger.warning(
+                "History database %s has a write-ahead log %s that could not be read to "
+                "check its schema version; refusing to open the database rather than "
+                "trust the main file's older header. Error: %s",
+                file_path,
+                wal_path,
+                exc,
+            )
+            exc.add_note(
+                f"The write-ahead log {wal_path} could not be read for the history "
+                "schema-version check; the database was not opened."
+            )
+            raise
         if header_version is None:
             return wal_version
         return max(header_version, wal_version)
@@ -540,24 +565,18 @@ class HistoryStore:
         )
 
     @staticmethod
-    def _read_schema_version_including_wal(file_path: Path) -> int | None:
+    def _read_schema_version_including_wal(file_path: Path) -> int:
         """`user_version` as of the last commit, including unreplayed WAL frames.
 
-        Returns no version when the database or its WAL cannot be opened for
-        reading: an unreadable file is not a version problem, and a locked one
-        fails the same way a moment later on the real open.
+        Either answers or raises: the underlying `sqlite3.Error`/`OSError`
+        propagates when the database or its WAL cannot be opened for reading,
+        and the caller decides whether that failure is a version question.
         """
-        try:
-            uri = f"{file_path.absolute().as_uri()}?mode=ro"
-        except ValueError:
-            return None
-        try:
-            with closing(sqlite3.connect(uri, uri=True, timeout=0)) as connection:
-                row = connection.execute("PRAGMA user_version").fetchone()
-        except (sqlite3.Error, OSError):
-            return None
+        uri = f"{file_path.absolute().as_uri()}?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True, timeout=0)) as connection:
+            row = connection.execute("PRAGMA user_version").fetchone()
         if not row or row[0] is None:
-            return None
+            raise sqlite3.OperationalError("PRAGMA user_version returned no row")
         return int(row[0])
 
     def _ensure_database_parent(self) -> None:

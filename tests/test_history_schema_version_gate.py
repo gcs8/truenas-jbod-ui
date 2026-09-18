@@ -14,9 +14,13 @@ import shutil
 import sqlite3
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
+from unittest import mock
 
 from history_service import startup as startup_module
+from history_service import store as store_module
 from history_service.startup import (
     HistorySchemaVersionError,
     HistoryStartupError,
@@ -69,6 +73,42 @@ def _digest(path: Path) -> tuple[int, str] | None:
     if not path.exists():
         return None
     return (path.stat().st_size, hashlib.sha256(path.read_bytes()).hexdigest())
+
+
+@contextmanager
+def _readonly_wal_open_fails(error: Exception) -> Iterator[None]:
+    """Make only the gate's `mode=ro` URI open fail, as a busy writer would.
+
+    Every other `sqlite3.connect` (the fixture, the assertions, and above all
+    the writable open that startup performs *if* the gate lets it through) is
+    left untouched, so a fail-open gate is observed doing real damage rather
+    than failing for an unrelated reason.
+    """
+    real_connect = sqlite3.connect
+
+    def connect(database, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if kwargs.get("uri") and "mode=ro" in str(database):
+            raise error
+        return real_connect(database, *args, **kwargs)
+
+    with mock.patch.object(store_module.sqlite3, "connect", connect):
+        yield
+
+
+def _readonly_tables_and_marker_rows(path: Path) -> tuple[set[str], int]:
+    """Inspect without checkpointing: a `mode=ro` open cannot delete the WAL."""
+    connection = sqlite3.connect(f"{path.absolute().as_uri()}?mode=ro", uri=True)
+    try:
+        names = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        rows = int(connection.execute("SELECT COUNT(*) FROM legacy_marker").fetchone()[0])
+    finally:
+        connection.close()
+    return names, rows
 
 
 class HistorySchemaVersionWalGateTests(unittest.TestCase):
@@ -188,6 +228,61 @@ class HistorySchemaVersionWalGateTests(unittest.TestCase):
         Path(f"{self.database_path}-wal").write_bytes(b"not a write-ahead log either")
 
         self.assertIsNone(HistoryStore._read_on_disk_schema_version(self.database_path))
+
+    def test_a_wal_that_cannot_be_read_fails_closed_instead_of_trusting_the_header(self) -> None:
+        """The WAL-aware read failing transiently must not admit the database.
+
+        The main header carries the pre-commit (admissible) version. Falling back
+        to it admits a database whose WAL holds a future version; startup then
+        grafts this build's tables onto it and the writable open checkpoints
+        and deletes the WAL, so the refusal can never happen on a later try.
+        """
+        self._crashed_wal_database(self.future_version)
+        wal_path = Path(f"{self.database_path}-wal")
+        before_database = _digest(self.database_path)
+        before_wal = _digest(wal_path)
+
+        with _readonly_wal_open_fails(sqlite3.OperationalError("database is locked")):
+            with self.assertRaises(sqlite3.OperationalError) as raised:
+                self._open()
+
+        # A transient read failure is not a version verdict, so it is not a
+        # terminal schema refusal. The original error is re-raised unchanged
+        # (startup classifies retryable failures by exact type and message)
+        # with the gate's context attached as a note.
+        self.assertNotIsInstance(raised.exception, HistorySchemaVersionError)
+        self.assertEqual(str(raised.exception), "database is locked")
+        self.assertIn(
+            "write-ahead log",
+            "\n".join(getattr(raised.exception, "__notes__", [])),
+        )
+        # Zero writable initialisation, zero checkpoint, zero data loss: both
+        # files are byte-identical, the WAL still exists, and once the fault
+        # clears the future version is still there to be refused.
+        self.assertEqual(_digest(self.database_path), before_database)
+        self.assertEqual(_digest(wal_path), before_wal)
+        self.assertTrue(wal_path.exists())
+        self.assertEqual(
+            HistoryStore._read_on_disk_schema_version(self.database_path),
+            self.future_version,
+        )
+        self.assertEqual(
+            _readonly_tables_and_marker_rows(self.database_path),
+            ({"legacy_marker"}, 1),
+        )
+
+    def test_a_wal_that_cannot_be_read_fails_closed_even_for_a_supported_version(self) -> None:
+        # The gate cannot tell a supported WAL from a future one it failed to
+        # read, so the rule is about the read failing, not about the answer.
+        self._crashed_wal_database(CURRENT_SCHEMA_VERSION)
+        wal_path = Path(f"{self.database_path}-wal")
+        before_wal = _digest(wal_path)
+
+        with _readonly_wal_open_fails(sqlite3.OperationalError("disk I/O error")):
+            with self.assertRaises(sqlite3.OperationalError):
+                self._open()
+
+        self.assertEqual(_digest(wal_path), before_wal)
 
 
 class HistorySchemaVersionGateTests(unittest.TestCase):
