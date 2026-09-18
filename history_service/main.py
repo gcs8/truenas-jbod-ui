@@ -54,6 +54,7 @@ from history_service.startup import (
     HistoryStartupError,
     open_history_store_with_retries,
 )
+from history_service.startup_migration import open_history_store_after_recovery
 from history_service.store import HistoryStore
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -103,7 +104,17 @@ def open_history_runtime(
 
     def factory() -> tuple[HistorySettings, HistoryStore]:
         loaded = get_history_settings()
-        return loaded, build_history_store(loaded)
+        # Required durable-state migrations complete inside an ordinary
+        # `docker compose up -d`, including one interrupted by a restart. The
+        # store's own admission runs first, so a database this build must not
+        # write to is refused before recovery mutates it; if recovery cannot
+        # complete, startup fails closed with one concise line instead of
+        # looping a traceback and demanding a manual repair.
+        return loaded, open_history_store_after_recovery(
+            sqlite_path=loaded.sqlite_path,
+            segment_catalog_path=loaded.segment_catalog_path,
+            build_store=lambda: build_history_store(loaded),
+        )
 
     return open_history_store_with_retries(
         factory,
