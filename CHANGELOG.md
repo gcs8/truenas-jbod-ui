@@ -75,9 +75,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Finished an interrupted segmented-history migration automatically during an
   ordinary `docker compose up -d`, so a restart in the middle of one no longer
   leaves the history container crash-looping until an operator runs a recovery
-  command by hand. When automatic recovery cannot complete, startup fails
-  closed with one concise line at `/healthz` and leaves the database exactly as
-  recovery found it (#549)
+  command by hand. Recovery is a write, so the store's own admission runs
+  first and only the pending marker is handed to recovery; when automatic
+  recovery cannot complete, startup fails closed with one concise line at
+  `/healthz` and leaves the database exactly as recovery found it (#549)
 
 - Made `--help` work on every script under `scripts/` off Linux without
   writing anything into the checkout, with no exceptions left:
