@@ -472,11 +472,12 @@ class HistoryStore:
         self._segment_reader_identity: tuple[int, int, int, int] | None = None
         self._segment_reader_cache: SegmentedHistoryReader | None = None
         if self._initialize_enabled:
-            # Before the migration lock, and before any write: a database from a
-            # newer release is refused with its bytes untouched.
-            self._require_no_pending_quarantine_intent()
-            self._require_supported_schema_version()
             with history_write_lock(self.file_path, blocking=False):
+                # Quarantine publishes its durable intent under this same lock.
+                # Check it before the WAL-aware schema inspection so no SQLite
+                # open can replay an interrupted quarantine's retained WAL.
+                self._require_no_pending_quarantine_intent()
+                self._require_supported_schema_version()
                 self._require_no_pending_lifecycle_markers()
                 self._initialize(migration_lock_held=True)
 
@@ -995,7 +996,7 @@ class HistoryStore:
 
         try:
             quarantined_at = self.read_quarantine_recovery()
-        except (sqlite3.Error, OSError, ValueError):
+        except (HistoryStartupError, sqlite3.Error, OSError, ValueError):
             logger.warning(
                 "History quarantine recovery marker for %s could not be read; reporting recovery required.",
                 self.file_path,
@@ -1222,6 +1223,7 @@ class HistoryStore:
     def _connect_locked(self) -> sqlite3.Connection:
         """Open and fully configure a connection while the lifecycle lock is held."""
 
+        self._require_no_pending_quarantine_intent()
         self._require_no_pending_lifecycle_markers()
         connection = sqlite3.connect(
             self.file_path,

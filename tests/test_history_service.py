@@ -5105,6 +5105,76 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertNotIn(str(temp_dir), failure.exception.reason)
         self.assertNotIn("private directory detail", failure.exception.reason)
 
+    def test_startup_refuses_intent_published_after_prelock_scan_before_sqlite_open(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        self._create_crashed_wal_fixture(db_path)
+        intent_owner = HistoryStore(str(db_path), initialize=False)
+        intent_path = temp_dir / "history.db.quarantine-20300102T030405.000000Z.pending"
+        publication_requested = threading.Event()
+        publication_complete = threading.Event()
+        publication_errors: list[BaseException] = []
+        sqlite_opens_after_publication: list[object] = []
+        real_connect = sqlite3.connect
+        real_intent_check = HistoryStore._require_no_pending_quarantine_intent
+
+        def publish_intent() -> None:
+            if not publication_requested.wait(timeout=5):
+                publication_errors.append(TimeoutError("startup never reached the publication seam"))
+                publication_complete.set()
+                return
+            try:
+                with history_write_lock(db_path, blocking=True):
+                    intent_owner._publish_quarantine_intent(intent_path)
+            except BaseException as exc:
+                publication_errors.append(exc)
+            finally:
+                publication_complete.set()
+
+        def scan_then_release_quarantiner(store: HistoryStore) -> None:
+            real_intent_check(store)
+            if not publication_requested.is_set():
+                publication_requested.set()
+                self.assertTrue(publication_complete.wait(timeout=5))
+
+        @contextmanager
+        def lifecycle_lock_after_quarantiner(*args: Any, **kwargs: Any):
+            if not publication_requested.is_set():
+                publication_requested.set()
+                self.assertTrue(publication_complete.wait(timeout=5))
+            with history_write_lock(*args, **kwargs):
+                yield
+
+        def tracking_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+            if publication_complete.is_set():
+                sqlite_opens_after_publication.append(args[0] if args else kwargs.get("database"))
+            return real_connect(*args, **kwargs)  # type: ignore[arg-type]
+
+        publisher = threading.Thread(target=publish_intent, name="history-quarantine-publisher")
+        publisher.start()
+        try:
+            with (
+                patch.object(
+                    HistoryStore,
+                    "_require_no_pending_quarantine_intent",
+                    autospec=True,
+                    side_effect=scan_then_release_quarantiner,
+                ),
+                patch("history_service.store.history_write_lock", lifecycle_lock_after_quarantiner),
+                patch("history_service.store.sqlite3.connect", side_effect=tracking_connect),
+            ):
+                with self.assertRaises(HistoryStartupError):
+                    HistoryStore(str(db_path))
+        finally:
+            publication_requested.set()
+            publisher.join(timeout=5)
+
+        self.assertFalse(publisher.is_alive())
+        self.assertEqual(publication_errors, [])
+        self.assertTrue(intent_path.is_file())
+        self.assertEqual(intent_path.read_bytes(), history_store.QUARANTINE_INTENT_BYTES)
+        self.assertEqual(sqlite_opens_after_publication, [])
+
     def test_quarantine_restart_fails_closed_after_each_rename_and_fsync_boundary(self) -> None:
         for operation, boundary in (
             ("rename", 1),
