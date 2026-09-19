@@ -72,6 +72,8 @@ QUARANTINE_RECOVERY_ACKNOWLEDGED_STATE = "consumed"
 QUARANTINE_RECOVERY_STATES = frozenset(
     {QUARANTINE_RECOVERY_REQUIRED_STATE, QUARANTINE_RECOVERY_ACKNOWLEDGED_STATE}
 )
+MAX_QUARANTINE_EVIDENCE_DIRECTORY_ENTRIES = 4096
+MAX_QUARANTINE_NAME_ALLOCATION_ATTEMPTS = 4096
 
 
 def describe_unsupported_schema_version(file_path: Path | str, found_version: int) -> str:
@@ -882,18 +884,34 @@ class HistoryStore:
 
         prefix = f"{self.file_path.name}.broken-"
         timestamps: list[datetime] = []
-        for candidate in self.file_path.parent.glob(f"{prefix}*"):
-            encoded = candidate.name.removeprefix(prefix)
-            if len(encoded) != len("YYYYMMDDTHHMMSSZ"):
+        with os.scandir(self.file_path.parent) as entries:
+            for entry_count, entry in enumerate(entries, start=1):
+                if entry_count > MAX_QUARANTINE_EVIDENCE_DIRECTORY_ENTRIES:
+                    raise OSError(
+                        errno.E2BIG,
+                        "History quarantine evidence directory exceeds the inspection bound.",
+                    )
+                if not entry.name.startswith(prefix) or not entry.is_file(follow_symlinks=False):
+                    continue
+                encoded = entry.name[len(prefix) :]
+                timestamp = self._parse_quarantine_evidence_timestamp(encoded)
+                if timestamp is not None:
+                    timestamps.append(timestamp)
+        return sorted(timestamps)
+
+    @staticmethod
+    def _parse_quarantine_evidence_timestamp(encoded: str) -> datetime | None:
+        for expected_length, timestamp_format in (
+            (len("YYYYMMDDTHHMMSSZ"), "%Y%m%dT%H%M%SZ"),
+            (len("YYYYMMDDTHHMMSS.ffffffZ"), "%Y%m%dT%H%M%S.%fZ"),
+        ):
+            if len(encoded) != expected_length:
                 continue
             try:
-                timestamp = datetime.strptime(encoded, "%Y%m%dT%H%M%SZ").replace(
-                    tzinfo=timezone.utc
-                )
+                return datetime.strptime(encoded, timestamp_format).replace(tzinfo=timezone.utc)
             except ValueError:
-                continue
-            timestamps.append(timestamp)
-        return sorted(timestamps)
+                return None
+        return None
 
     def read_quarantine_recovery(self) -> datetime | None:
         """Return when history was quarantined, or None once it is acknowledged.
@@ -1424,15 +1442,43 @@ class HistoryStore:
 
     def _quarantine_database(self) -> tuple[Path, datetime]:
         quarantined_at = datetime.now(timezone.utc)
-        timestamp = quarantined_at.strftime("%Y%m%dT%H%M%SZ")
-        broken_path = self.file_path.with_name(f"{self.file_path.name}.broken-{timestamp}")
-        self.file_path.replace(broken_path)
-        for suffix in ("-shm", "-wal"):
-            sidecar_path = Path(f"{self.file_path}{suffix}")
-            if not sidecar_path.exists():
+        evidence = self._quarantine_evidence_timestamps()
+        if evidence and quarantined_at <= evidence[-1]:
+            quarantined_at = evidence[-1] + timedelta(microseconds=1)
+
+        for _ in range(MAX_QUARANTINE_NAME_ALLOCATION_ATTEMPTS):
+            timestamp = quarantined_at.strftime("%Y%m%dT%H%M%S.%fZ")
+            broken_path = self.file_path.with_name(f"{self.file_path.name}.broken-{timestamp}")
+            sidecar_destinations = tuple(
+                broken_path.with_name(f"{broken_path.name}{suffix}")
+                for suffix in ("-shm", "-wal")
+            )
+            if path_entry_exists(broken_path) or any(
+                path_entry_exists(destination) for destination in sidecar_destinations
+            ):
+                quarantined_at += timedelta(microseconds=1)
                 continue
-            sidecar_path.replace(broken_path.with_name(f"{broken_path.name}{suffix}"))
-        return broken_path, quarantined_at
+            for suffix, destination in zip(("-shm", "-wal"), sidecar_destinations, strict=True):
+                sidecar_path = Path(f"{self.file_path}{suffix}")
+                if not path_entry_exists(sidecar_path):
+                    continue
+                self._rename_at2(sidecar_path, destination, flags=RENAME_NOREPLACE)
+                self._fsync_directory(self.file_path.parent)
+            self._rename_at2(self.file_path, broken_path, flags=RENAME_NOREPLACE)
+            self._fsync_directory(self.file_path.parent)
+            return broken_path, quarantined_at
+        raise FileExistsError("Could not allocate a unique history quarantine evidence name.")
+
+    @staticmethod
+    def _fsync_directory(directory: Path) -> None:
+        descriptor = os.open(
+            directory,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
     def create_backup(
         self,

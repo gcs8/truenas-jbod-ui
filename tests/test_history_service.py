@@ -58,6 +58,19 @@ def freeze_operation_bounds_now(now: datetime):
         yield
 
 
+@contextmanager
+def freeze_history_store_now(now: datetime):
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return cls.fromtimestamp(now.timestamp())
+            return cls.fromtimestamp(now.timestamp(), tz)
+
+    with patch("history_service.store.datetime", FrozenDateTime):
+        yield
+
+
 class HistoryDomainTests(unittest.TestCase):
     def test_build_slot_events_groups_state_and_identity_changes(self) -> None:
         previous = SlotStateRecord(
@@ -4926,6 +4939,143 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertNotIn(".broken-", json.dumps(status))
         self.assertEqual(len(broken_files), 1)
         self.assertEqual(broken_files[0].read_bytes(), original)
+
+    def test_literal_database_name_quarantine_evidence_survives_marker_failure_and_restart(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history[1].db"
+        original = b"literal metacharacter database bytes"
+        db_path.write_bytes(original)
+
+        with patch.object(
+            HistoryStore,
+            "record_quarantine_recovery",
+            side_effect=OSError("synthetic marker write failure"),
+        ):
+            HistoryStore(str(db_path))
+
+        restarted = HistoryStore(str(db_path))
+        status = restarted.quarantine_recovery_status()
+        retained = [
+            path
+            for path in temp_dir.iterdir()
+            if path.name.startswith("history[1].db.broken-")
+        ]
+
+        self.assertIs(status["history_recovery_required"], True)
+        self.assertIsNotNone(status["history_quarantined_at"])
+        self.assertNotIn(str(temp_dir), json.dumps(status))
+        self.assertEqual([path.read_bytes() for path in retained], [original])
+
+    def test_quarantine_evidence_scan_is_bounded_and_fails_closed(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        (temp_dir / "unrelated-one").write_bytes(b"one")
+        (temp_dir / "unrelated-two").write_bytes(b"two")
+
+        with patch.object(
+            history_store,
+            "MAX_QUARANTINE_EVIDENCE_DIRECTORY_ENTRIES",
+            1,
+            create=True,
+        ):
+            status = store.quarantine_recovery_status()
+
+        self.assertEqual(
+            status,
+            {"history_recovery_required": True, "history_quarantined_at": None},
+        )
+
+    def test_same_instant_quarantines_preserve_each_database_and_sidecar_byte_set(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        frozen = datetime(2026, 5, 1, 4, 30, 0, 123456, tzinfo=timezone.utc)
+        byte_sets = (
+            (b"first database", b"first wal", b"first shm"),
+            (b"second database", b"second wal", b"second shm"),
+        )
+
+        store = HistoryStore(str(db_path))
+        with freeze_history_store_now(frozen):
+            for database_bytes, wal_bytes, shm_bytes in byte_sets:
+                db_path.write_bytes(database_bytes)
+                Path(f"{db_path}-wal").write_bytes(wal_bytes)
+                Path(f"{db_path}-shm").write_bytes(shm_bytes)
+                store._quarantine_database()
+
+        retained = sorted(
+            path
+            for path in temp_dir.iterdir()
+            if path.name.startswith("history.db.broken-") and not path.name.endswith(("-wal", "-shm"))
+        )
+
+        self.assertEqual(len(retained), 2)
+        self.assertEqual({path.read_bytes() for path in retained}, {item[0] for item in byte_sets})
+        self.assertEqual(
+            {Path(f"{path}-wal").read_bytes() for path in retained},
+            {item[1] for item in byte_sets},
+        )
+        self.assertEqual(
+            {Path(f"{path}-shm").read_bytes() for path in retained},
+            {item[2] for item in byte_sets},
+        )
+
+    def test_quarantine_preserves_sidecars_if_publication_stops_before_database_move(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        store = HistoryStore(str(db_path))
+        db_path.write_bytes(b"database bytes")
+        Path(f"{db_path}-wal").write_bytes(b"wal bytes")
+        Path(f"{db_path}-shm").write_bytes(b"shm bytes")
+        real_rename = store._rename_at2
+
+        def stop_before_database_move(source: Path, target: Path, *, flags: int) -> None:
+            if source == db_path:
+                raise OSError(errno.EIO, "synthetic stop before database move")
+            real_rename(source, target, flags=flags)
+
+        with patch.object(store, "_rename_at2", side_effect=stop_before_database_move):
+            with self.assertRaisesRegex(OSError, "synthetic stop"):
+                store._quarantine_database()
+
+        retained_wal = list(temp_dir.glob("history.db.broken-*-wal"))
+        retained_shm = list(temp_dir.glob("history.db.broken-*-shm"))
+        self.assertEqual(db_path.read_bytes(), b"database bytes")
+        self.assertFalse(Path(f"{db_path}-wal").exists())
+        self.assertFalse(Path(f"{db_path}-shm").exists())
+        self.assertEqual([path.read_bytes() for path in retained_wal], [b"wal bytes"])
+        self.assertEqual([path.read_bytes() for path in retained_shm], [b"shm bytes"])
+
+    def test_same_instant_quarantine_after_acknowledgement_fails_closed_after_marker_failure(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        frozen = datetime(2026, 5, 1, 4, 30, 0, 123456, tzinfo=timezone.utc)
+
+        with freeze_history_store_now(frozen):
+            db_path.write_bytes(b"first unreadable database")
+            first = HistoryStore(str(db_path))
+            self.assertTrue(first.acknowledge_quarantine_recovery())
+            self.assertFalse(first.quarantine_recovery_status()["history_recovery_required"])
+
+            db_path.write_bytes(b"later unreadable database")
+            with patch.object(
+                HistoryStore,
+                "record_quarantine_recovery",
+                side_effect=OSError("synthetic marker write failure"),
+            ):
+                HistoryStore(str(db_path))
+
+        restarted = HistoryStore(str(db_path))
+        status = restarted.quarantine_recovery_status()
+        retained = [
+            path
+            for path in temp_dir.iterdir()
+            if path.name.startswith("history.db.broken-") and not path.name.endswith(("-wal", "-shm"))
+        ]
+
+        self.assertIs(status["history_recovery_required"], True)
+        self.assertIsNotNone(status["history_quarantined_at"])
+        self.assertNotIn(str(temp_dir), json.dumps(status))
+        self.assertEqual({path.read_bytes() for path in retained}, {b"first unreadable database", b"later unreadable database"})
 
     def test_marker_write_failure_stays_degraded_after_restart(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
