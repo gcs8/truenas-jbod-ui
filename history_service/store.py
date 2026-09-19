@@ -896,34 +896,135 @@ class HistoryStore:
                         errno.E2BIG,
                         "History quarantine evidence directory exceeds the inspection bound.",
                     )
-                if not entry.name.startswith(prefix) or not entry.is_file(follow_symlinks=False):
+                if not entry.name.startswith(prefix):
                     continue
                 encoded = entry.name[len(prefix) :]
                 timestamp = self._parse_quarantine_evidence_timestamp(encoded)
-                if timestamp is not None:
-                    timestamps.append(timestamp)
+                if timestamp is None:
+                    continue
+                metadata = entry.stat(follow_symlinks=False)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise OSError(
+                        errno.EINVAL,
+                        "History quarantine evidence entry is not a regular file.",
+                    )
+                timestamps.append(timestamp)
         return sorted(timestamps)
+
+    @staticmethod
+    def _quarantine_metadata_identity(metadata: os.stat_result) -> tuple[int, ...]:
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mode,
+            metadata.st_nlink,
+            metadata.st_uid,
+            metadata.st_gid,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+        )
+
+    def _inspect_quarantine_intent(
+        self,
+        directory_descriptor: int,
+        entry_name: str,
+    ) -> None:
+        """Validate one intent through a bounded, descriptor-relative no-follow read."""
+
+        invalid_message = "History quarantine intent entry is not a stable private regular file."
+        initial = os.stat(entry_name, dir_fd=directory_descriptor, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(initial.st_mode)
+            or initial.st_nlink != 1
+            or initial.st_uid != os.geteuid()
+        ):
+            raise OSError(errno.EINVAL, invalid_message)
+
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        descriptor = os.open(entry_name, flags, dir_fd=directory_descriptor)
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+                or opened.st_uid != os.geteuid()
+                or self._quarantine_metadata_identity(opened)
+                != self._quarantine_metadata_identity(initial)
+            ):
+                raise OSError(errno.EINVAL, invalid_message)
+
+            chunks: list[bytes] = []
+            remaining = len(QUARANTINE_INTENT_BYTES) + 1
+            while remaining:
+                chunk = os.read(descriptor, remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            content = b"".join(chunks)
+
+            final_descriptor_metadata = os.fstat(descriptor)
+            final_path_metadata = os.stat(
+                entry_name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+            expected_identity = self._quarantine_metadata_identity(opened)
+            if (
+                content != QUARANTINE_INTENT_BYTES
+                or self._quarantine_metadata_identity(final_descriptor_metadata) != expected_identity
+                or self._quarantine_metadata_identity(final_path_metadata) != expected_identity
+            ):
+                raise OSError(errno.EINVAL, invalid_message)
+        finally:
+            os.close(descriptor)
 
     def _quarantine_intent_paths(self) -> list[Path]:
         prefix = f"{self.file_path.name}{QUARANTINE_INTENT_PREFIX}"
-        intents: list[Path] = []
-        with os.scandir(self.file_path.parent) as entries:
-            for entry_count, entry in enumerate(entries, start=1):
-                if entry_count > MAX_QUARANTINE_EVIDENCE_DIRECTORY_ENTRIES:
-                    raise OSError(
-                        errno.E2BIG,
-                        "History quarantine evidence directory exceeds the inspection bound.",
-                    )
-                if (
-                    not entry.name.startswith(prefix)
-                    or not entry.name.endswith(QUARANTINE_INTENT_SUFFIX)
-                    or not entry.is_file(follow_symlinks=False)
-                ):
-                    continue
-                encoded = entry.name[len(prefix) : -len(QUARANTINE_INTENT_SUFFIX)]
-                if self._parse_quarantine_evidence_timestamp(encoded) is not None:
-                    intents.append(Path(entry.path))
-        return intents
+        parent = self.file_path.parent
+        initial_parent = parent.lstat()
+        if not stat.S_ISDIR(initial_parent.st_mode):
+            raise OSError(errno.ENOTDIR, "History quarantine parent is not a directory.")
+        directory_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+        )
+        directory_descriptor = os.open(parent, directory_flags)
+        try:
+            opened_parent = os.fstat(directory_descriptor)
+            if (
+                not stat.S_ISDIR(opened_parent.st_mode)
+                or (opened_parent.st_dev, opened_parent.st_ino)
+                != (initial_parent.st_dev, initial_parent.st_ino)
+            ):
+                raise OSError(errno.EINVAL, "History quarantine parent changed during inspection.")
+
+            intents: list[Path] = []
+            with os.scandir(directory_descriptor) as entries:
+                for entry_count, entry in enumerate(entries, start=1):
+                    if entry_count > MAX_QUARANTINE_EVIDENCE_DIRECTORY_ENTRIES:
+                        raise OSError(
+                            errno.E2BIG,
+                            "History quarantine evidence directory exceeds the inspection bound.",
+                        )
+                    if not entry.name.startswith(prefix) or not entry.name.endswith(QUARANTINE_INTENT_SUFFIX):
+                        continue
+                    encoded = entry.name[len(prefix) : -len(QUARANTINE_INTENT_SUFFIX)]
+                    if self._parse_quarantine_evidence_timestamp(encoded) is None:
+                        continue
+                    self._inspect_quarantine_intent(directory_descriptor, entry.name)
+                    intents.append(parent / entry.name)
+            return intents
+        finally:
+            os.close(directory_descriptor)
 
     def _require_no_pending_quarantine_intent(self) -> None:
         try:

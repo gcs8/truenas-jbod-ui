@@ -7,6 +7,7 @@ import io
 import json
 import os
 import re
+import socket
 import sqlite3
 import stat
 import tempfile
@@ -5105,6 +5106,141 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertNotIn(str(temp_dir), failure.exception.reason)
         self.assertNotIn("private directory detail", failure.exception.reason)
 
+    def test_startup_refuses_every_nonregular_matching_quarantine_intent_without_sqlite_open(self) -> None:
+        fixture_types = ("symlink", "fifo", "directory", "socket")
+
+        for fixture_type in fixture_types:
+            with self.subTest(fixture_type=fixture_type):
+                temp_dir = Path(tempfile.mkdtemp())
+                db_path = temp_dir / "history.db"
+                intent_path = temp_dir / "history.db.quarantine-20300102T030405.000000Z.pending"
+                socket_owner: socket.socket | None = None
+                if fixture_type == "symlink":
+                    target = temp_dir / "intent-target"
+                    target.write_bytes(history_store.QUARANTINE_INTENT_BYTES)
+                    intent_path.symlink_to(target)
+                elif fixture_type == "fifo":
+                    os.mkfifo(intent_path)
+                elif fixture_type == "directory":
+                    intent_path.mkdir()
+                else:
+                    socket_owner = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    socket_owner.bind(str(intent_path))
+
+                sqlite_opens: list[object] = []
+
+                def reject_sqlite_open(*args: object, **kwargs: object) -> sqlite3.Connection:
+                    sqlite_opens.append(args[0] if args else kwargs.get("database"))
+                    raise AssertionError("SQLite opened before quarantine intent refusal")
+
+                try:
+                    with patch("history_service.store.sqlite3.connect", side_effect=reject_sqlite_open):
+                        with self.assertRaises(HistoryStartupError) as failure:
+                            HistoryStore(str(db_path))
+                finally:
+                    if socket_owner is not None:
+                        socket_owner.close()
+
+                self.assertEqual(sqlite_opens, [])
+                self.assertNotIn(str(temp_dir), failure.exception.reason)
+
+    def test_startup_refuses_valid_malformed_and_multilink_regular_quarantine_intents(self) -> None:
+        fixture_types = ("valid", "malformed", "multilink")
+
+        for fixture_type in fixture_types:
+            with self.subTest(fixture_type=fixture_type):
+                temp_dir = Path(tempfile.mkdtemp())
+                db_path = temp_dir / "history.db"
+                intent_path = temp_dir / "history.db.quarantine-20300102T030405.000000Z.pending"
+                intent_path.write_bytes(
+                    history_store.QUARANTINE_INTENT_BYTES if fixture_type != "malformed" else b"not an intent"
+                )
+                if fixture_type == "multilink":
+                    (temp_dir / "second-link").hardlink_to(intent_path)
+
+                scanner = HistoryStore(str(db_path), initialize=False)
+                if fixture_type == "valid":
+                    self.assertEqual(scanner._quarantine_intent_paths(), [intent_path])
+                else:
+                    with self.assertRaises(OSError):
+                        scanner._quarantine_intent_paths()
+
+                with patch("history_service.store.sqlite3.connect") as connect:
+                    with self.assertRaises(HistoryStartupError) as failure:
+                        HistoryStore(str(db_path))
+
+                connect.assert_not_called()
+                self.assertNotIn(str(temp_dir), failure.exception.reason)
+
+    def test_quarantine_intent_scanner_rejects_an_inappropriate_owner(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        intent_path = temp_dir / "history.db.quarantine-20300102T030405.000000Z.pending"
+        intent_path.write_bytes(history_store.QUARANTINE_INTENT_BYTES)
+        scanner = HistoryStore(str(db_path), initialize=False)
+        actual_owner = os.geteuid()
+
+        with patch("history_service.store.os.geteuid", return_value=actual_owner + 1):
+            with self.assertRaises(OSError):
+                scanner._quarantine_intent_paths()
+
+    def test_quarantine_intent_type_race_is_nonblocking_and_refuses_before_sqlite_open(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        intent_name = "history.db.quarantine-20300102T030405.000000Z.pending"
+        intent_path = temp_dir / intent_name
+        intent_path.write_bytes(history_store.QUARANTINE_INTENT_BYTES)
+        real_open = os.open
+        swapped = False
+
+        def swap_to_fifo_before_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+            nonlocal swapped
+            if path == intent_name and kwargs.get("dir_fd") is not None and not swapped:
+                swapped = True
+                intent_path.unlink()
+                os.mkfifo(intent_path)
+                self.assertTrue(flags & getattr(os, "O_NONBLOCK", 0))
+            return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+        with (
+            patch("history_service.store.os.open", side_effect=swap_to_fifo_before_open),
+            patch("history_service.store.sqlite3.connect") as connect,
+        ):
+            with self.assertRaises(HistoryStartupError):
+                HistoryStore(str(db_path))
+
+        self.assertTrue(swapped)
+        connect.assert_not_called()
+
+    def test_quarantine_intent_identity_race_refuses_before_sqlite_open(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        intent_name = "history.db.quarantine-20300102T030405.000000Z.pending"
+        intent_path = temp_dir / intent_name
+        intent_path.write_bytes(history_store.QUARANTINE_INTENT_BYTES)
+        replacement = temp_dir / "replacement"
+        replacement.write_bytes(history_store.QUARANTINE_INTENT_BYTES)
+        real_open = os.open
+        swapped = False
+
+        def swap_after_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+            nonlocal swapped
+            descriptor = real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+            if path == intent_name and kwargs.get("dir_fd") is not None and not swapped:
+                swapped = True
+                os.replace(replacement, intent_path)
+            return descriptor
+
+        with (
+            patch("history_service.store.os.open", side_effect=swap_after_open),
+            patch("history_service.store.sqlite3.connect") as connect,
+        ):
+            with self.assertRaises(HistoryStartupError):
+                HistoryStore(str(db_path))
+
+        self.assertTrue(swapped)
+        connect.assert_not_called()
+
     def test_startup_refuses_intent_published_after_prelock_scan_before_sqlite_open(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         db_path = temp_dir / "history.db"
@@ -5336,6 +5472,41 @@ class HistoryStoreTests(unittest.TestCase):
             status,
             {"history_recovery_required": True, "history_quarantined_at": None},
         )
+
+    def test_nonregular_matching_quarantine_evidence_never_reports_healthy(self) -> None:
+        fixture_types = ("symlink", "fifo", "directory", "socket")
+
+        for fixture_type in fixture_types:
+            with self.subTest(fixture_type=fixture_type):
+                temp_dir = Path(tempfile.mkdtemp())
+                store = HistoryStore(str(temp_dir / "history.db"))
+                store.record_quarantine_recovery(datetime(2031, 1, 1, tzinfo=timezone.utc))
+                self.assertTrue(store.acknowledge_quarantine_recovery())
+                evidence_path = temp_dir / "history.db.broken-20300102T030405.000000Z"
+                socket_owner: socket.socket | None = None
+                if fixture_type == "symlink":
+                    target = temp_dir / "evidence-target"
+                    target.write_bytes(b"retained")
+                    evidence_path.symlink_to(target)
+                elif fixture_type == "fifo":
+                    os.mkfifo(evidence_path)
+                elif fixture_type == "directory":
+                    evidence_path.mkdir()
+                else:
+                    socket_owner = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    socket_owner.bind(str(evidence_path))
+
+                try:
+                    status = store.quarantine_recovery_status()
+                finally:
+                    if socket_owner is not None:
+                        socket_owner.close()
+
+                self.assertEqual(
+                    status,
+                    {"history_recovery_required": True, "history_quarantined_at": None},
+                )
+                self.assertNotIn(str(temp_dir), json.dumps(status))
 
     def test_same_instant_quarantines_preserve_each_database_and_sidecar_byte_set(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
