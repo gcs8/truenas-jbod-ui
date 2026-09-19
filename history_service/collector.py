@@ -9,6 +9,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -575,7 +576,25 @@ class HistoryCollector:
             "last_scope_count": self.last_scope_count,
             "source_base_url": self.settings.source_base_url,
             "sqlite_path": self.settings.sqlite_path,
+            # Quarantine recovery is durable state, not collector state: a fresh
+            # database created by recovery has to keep saying so after a restart
+            # instead of looking like a first installation (#417).
+            **self._quarantine_recovery_status(),
         }
+
+    def _quarantine_recovery_status(self) -> dict[str, Any]:
+        """Durable recovery fields from the store, tolerant of a store stub.
+
+        A store that does not implement the marker at all - a unit-test double,
+        or a future store shim - reports no pending recovery rather than
+        breaking every status surface.
+        """
+
+        reader = getattr(self.store, "quarantine_recovery_status", None)
+        status = reader() if callable(reader) else None
+        if isinstance(status, Mapping):
+            return dict(status)
+        return {"history_recovery_required": False, "history_quarantined_at": None}
 
     @property
     def collection_running(self) -> bool:

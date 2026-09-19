@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import hashlib
 import io
 import json
 import os
 import re
+import socket
 import sqlite3
 import stat
 import tempfile
@@ -13,7 +15,7 @@ import threading
 import time
 import unittest
 import urllib.error
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -45,6 +47,7 @@ from history_service.store import (
     HistoryStore,
     SlotStateUpdate,
 )
+from history_service.startup import HistoryStartupError, open_history_store_with_retries
 
 
 @contextmanager
@@ -55,6 +58,19 @@ def freeze_operation_bounds_now(now: datetime):
             return now.replace(tzinfo=None) if tz is None else now.astimezone(tz)
 
     with patch("history_service.operation_bounds.datetime", FrozenDateTime):
+        yield
+
+
+@contextmanager
+def freeze_history_store_now(now: datetime):
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return cls.fromtimestamp(now.timestamp())
+            return cls.fromtimestamp(now.timestamp(), tz)
+
+    with patch("history_service.store.datetime", FrozenDateTime):
         yield
 
 
@@ -1140,6 +1156,62 @@ class HistoryDashboardRouteTests(unittest.TestCase):
 
 
 class HistoryStoreTests(unittest.TestCase):
+    @staticmethod
+    def _create_crashed_wal_fixture(db_path: Path) -> dict[str, str]:
+        """Leave a real committed WAL/SHM pair as if its writer crashed."""
+
+        pid = os.fork()
+        if pid == 0:
+            connection = sqlite3.connect(db_path)
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA wal_autocheckpoint=0")
+            connection.execute("CREATE TABLE retained_wal_evidence (value TEXT NOT NULL)")
+            connection.execute(
+                "INSERT INTO retained_wal_evidence (value) VALUES ('committed WAL bytes')"
+            )
+            connection.commit()
+            os._exit(0)
+        waited_pid, status = os.waitpid(pid, 0)
+        if waited_pid != pid or status != 0:
+            raise AssertionError(f"WAL fixture child failed with wait status {status}")
+        paths = {
+            "database": db_path,
+            "wal": Path(f"{db_path}-wal"),
+            "shm": Path(f"{db_path}-shm"),
+        }
+        if not all(path.is_file() for path in paths.values()):
+            raise AssertionError("WAL fixture did not retain database, WAL, and SHM files")
+        return {
+            label: hashlib.sha256(path.read_bytes()).hexdigest()
+            for label, path in paths.items()
+        }
+
+    @staticmethod
+    def _assert_quarantine_component_hashes(
+        db_path: Path,
+        expected: dict[str, str],
+    ) -> None:
+        suffixes = {"database": "", "wal": "-wal", "shm": "-shm"}
+        entries = list(db_path.parent.iterdir())
+        for label, suffix in suffixes.items():
+            active = Path(f"{db_path}{suffix}")
+            retained = [
+                path
+                for path in entries
+                if path.name.startswith(f"{db_path.name}.broken-")
+                and path.name.endswith(suffix)
+                and not (
+                    label == "database"
+                    and path.name.endswith(("-wal", "-shm"))
+                )
+            ]
+            candidates = ([active] if active.is_file() else []) + retained
+            hashes = [hashlib.sha256(path.read_bytes()).hexdigest() for path in candidates]
+            if expected[label] not in hashes:
+                raise AssertionError(
+                    f"original {label} bytes were not retained; observed hashes: {hashes}"
+                )
+
     def test_slot_state_column_contract_matches_existing_schema_and_projections(self) -> None:
         expected_columns = (
             ("system_id", "TEXT NOT NULL", False),
@@ -4884,6 +4956,906 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertEqual(counts["metric_sample_count"], 0)
         self.assertTrue(db_path.exists())
         self.assertEqual(len(broken_files), 1)
+
+    def test_store_persists_quarantine_recovery_across_restart(self) -> None:
+        """A recovered database keeps saying "recovery required" after a restart (#417)."""
+
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        db_path.write_text("not a sqlite database", encoding="utf-8")
+
+        recovered = HistoryStore(str(db_path))
+        quarantined_at = recovered.read_quarantine_recovery()
+        del recovered
+
+        restarted = HistoryStore(str(db_path))
+
+        self.assertIsNotNone(quarantined_at)
+        self.assertEqual(restarted.read_quarantine_recovery(), quarantined_at)
+        self.assertEqual(len(list(temp_dir.glob("history.db.broken-*"))), 1)
+
+    def test_store_fails_closed_when_quarantine_marker_write_fails(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        original = b"not a sqlite database"
+        db_path.write_bytes(original)
+
+        with (
+            patch.object(
+                HistoryStore,
+                "record_quarantine_recovery",
+                side_effect=OSError("synthetic marker write failure"),
+            ),
+            self.assertLogs("history_service.store", level="WARNING"),
+        ):
+            store = HistoryStore(str(db_path))
+
+        status = store.quarantine_recovery_status()
+        broken_files = list(temp_dir.glob("history.db.broken-*"))
+
+        self.assertIs(status["history_recovery_required"], True)
+        self.assertIsNotNone(status["history_quarantined_at"])
+        self.assertNotIn(".broken-", json.dumps(status))
+        self.assertEqual(len(broken_files), 1)
+        self.assertEqual(broken_files[0].read_bytes(), original)
+
+    def test_literal_database_name_quarantine_evidence_survives_marker_failure_and_restart(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history[1].db"
+        original = b"literal metacharacter database bytes"
+        db_path.write_bytes(original)
+
+        with patch.object(
+            HistoryStore,
+            "record_quarantine_recovery",
+            side_effect=OSError("synthetic marker write failure"),
+        ):
+            HistoryStore(str(db_path))
+
+        restarted = HistoryStore(str(db_path))
+        status = restarted.quarantine_recovery_status()
+        retained = [
+            path
+            for path in temp_dir.iterdir()
+            if path.name.startswith("history[1].db.broken-")
+        ]
+
+        self.assertIs(status["history_recovery_required"], True)
+        self.assertIsNotNone(status["history_quarantined_at"])
+        self.assertNotIn(str(temp_dir), json.dumps(status))
+        self.assertEqual([path.read_bytes() for path in retained], [original])
+
+    def test_quarantine_first_sidecar_fsync_failure_refuses_restart_before_wal_replay(self) -> None:
+        """Reviewer reproduction: moved SHM must not leave the live WAL admissible."""
+
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        expected_hashes = self._create_crashed_wal_fixture(db_path)
+        store = HistoryStore(str(db_path), initialize=False)
+        real_fsync_directory = store._fsync_directory
+        injected = False
+
+        def fail_first_fsync_after_shm_move(directory: Path) -> None:
+            nonlocal injected
+            staged_shm = [
+                path
+                for path in directory.iterdir()
+                if path.name.startswith(f"{db_path.name}.broken-")
+                and path.name.endswith("-shm")
+            ]
+            if not injected and staged_shm and not Path(f"{db_path}-shm").exists():
+                injected = True
+                raise OSError(errno.EIO, "synthetic first post-SHM fsync failure")
+            real_fsync_directory(directory)
+
+        with patch.object(store, "_fsync_directory", side_effect=fail_first_fsync_after_shm_move):
+            with self.assertRaisesRegex(OSError, "post-SHM fsync failure"):
+                store._quarantine_database()
+
+        self.assertTrue(injected)
+        self._assert_quarantine_component_hashes(db_path, expected_hashes)
+        with self.assertRaises(HistoryStartupError) as restart_error:
+            open_history_store_with_retries(
+                lambda: HistoryStore(str(db_path)),
+                directory=temp_dir,
+                attempts=1,
+            )
+        self._assert_quarantine_component_hashes(db_path, expected_hashes)
+
+        with (
+            patch.object(history_main, "startup_failure_reason", restart_error.exception.reason),
+            patch.object(history_main, "store", None),
+            patch.object(history_main, "collector", None),
+        ):
+            response = asyncio.run(history_main.healthz())
+        payload = json.loads(response.body)
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(payload["status"], "unavailable")
+        self.assertNotIn(str(temp_dir), json.dumps(payload))
+
+    def test_quarantine_intent_write_failure_precedes_every_destructive_move(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        expected_hashes = self._create_crashed_wal_fixture(db_path)
+        store = HistoryStore(str(db_path), initialize=False)
+
+        with patch.object(
+            history_store.os,
+            "open",
+            side_effect=OSError(errno.EIO, "synthetic intent write failure"),
+        ):
+            with self.assertRaisesRegex(OSError, "intent write failure"):
+                store._quarantine_database()
+
+        self.assertTrue(db_path.is_file())
+        self.assertTrue(Path(f"{db_path}-wal").is_file())
+        self.assertTrue(Path(f"{db_path}-shm").is_file())
+        self._assert_quarantine_component_hashes(db_path, expected_hashes)
+
+    def test_quarantine_intent_scan_failure_is_a_bounded_startup_refusal(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        with patch.object(
+            history_store.os,
+            "scandir",
+            side_effect=OSError(errno.EIO, "synthetic private directory detail"),
+        ):
+            with self.assertRaises(HistoryStartupError) as failure:
+                HistoryStore(str(db_path))
+
+        self.assertNotIn(str(temp_dir), failure.exception.reason)
+        self.assertNotIn("private directory detail", failure.exception.reason)
+
+    def test_startup_refuses_every_nonregular_matching_quarantine_intent_without_sqlite_open(self) -> None:
+        fixture_types = ("symlink", "fifo", "directory", "socket")
+
+        for fixture_type in fixture_types:
+            with self.subTest(fixture_type=fixture_type):
+                temp_dir = Path(tempfile.mkdtemp())
+                db_path = temp_dir / "history.db"
+                intent_path = temp_dir / "history.db.quarantine-20300102T030405.000000Z.pending"
+                socket_owner: socket.socket | None = None
+                if fixture_type == "symlink":
+                    target = temp_dir / "intent-target"
+                    target.write_bytes(history_store.QUARANTINE_INTENT_BYTES)
+                    intent_path.symlink_to(target)
+                elif fixture_type == "fifo":
+                    os.mkfifo(intent_path)
+                elif fixture_type == "directory":
+                    intent_path.mkdir()
+                else:
+                    socket_owner = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    socket_owner.bind(str(intent_path))
+
+                sqlite_opens: list[object] = []
+
+                def reject_sqlite_open(*args: object, **kwargs: object) -> sqlite3.Connection:
+                    sqlite_opens.append(args[0] if args else kwargs.get("database"))
+                    raise AssertionError("SQLite opened before quarantine intent refusal")
+
+                try:
+                    with patch("history_service.store.sqlite3.connect", side_effect=reject_sqlite_open):
+                        with self.assertRaises(HistoryStartupError) as failure:
+                            HistoryStore(str(db_path))
+                finally:
+                    if socket_owner is not None:
+                        socket_owner.close()
+
+                self.assertEqual(sqlite_opens, [])
+                self.assertNotIn(str(temp_dir), failure.exception.reason)
+
+    def test_startup_refuses_valid_malformed_and_multilink_regular_quarantine_intents(self) -> None:
+        fixture_types = ("valid", "malformed", "multilink")
+
+        for fixture_type in fixture_types:
+            with self.subTest(fixture_type=fixture_type):
+                temp_dir = Path(tempfile.mkdtemp())
+                db_path = temp_dir / "history.db"
+                intent_path = temp_dir / "history.db.quarantine-20300102T030405.000000Z.pending"
+                intent_path.write_bytes(
+                    history_store.QUARANTINE_INTENT_BYTES if fixture_type != "malformed" else b"not an intent"
+                )
+                if fixture_type == "multilink":
+                    (temp_dir / "second-link").hardlink_to(intent_path)
+
+                scanner = HistoryStore(str(db_path), initialize=False)
+                if fixture_type == "valid":
+                    self.assertEqual(scanner._quarantine_intent_paths(), [intent_path])
+                else:
+                    with self.assertRaises(OSError):
+                        scanner._quarantine_intent_paths()
+
+                with patch("history_service.store.sqlite3.connect") as connect:
+                    with self.assertRaises(HistoryStartupError) as failure:
+                        HistoryStore(str(db_path))
+
+                connect.assert_not_called()
+                self.assertNotIn(str(temp_dir), failure.exception.reason)
+
+    def test_quarantine_intent_scanner_rejects_an_inappropriate_owner(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        intent_path = temp_dir / "history.db.quarantine-20300102T030405.000000Z.pending"
+        intent_path.write_bytes(history_store.QUARANTINE_INTENT_BYTES)
+        scanner = HistoryStore(str(db_path), initialize=False)
+        actual_owner = os.geteuid()
+
+        with patch("history_service.store.os.geteuid", return_value=actual_owner + 1):
+            with self.assertRaises(OSError):
+                scanner._quarantine_intent_paths()
+
+    def test_quarantine_intent_type_race_is_nonblocking_and_refuses_before_sqlite_open(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        intent_name = "history.db.quarantine-20300102T030405.000000Z.pending"
+        intent_path = temp_dir / intent_name
+        intent_path.write_bytes(history_store.QUARANTINE_INTENT_BYTES)
+        real_open = os.open
+        swapped = False
+
+        def swap_to_fifo_before_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+            nonlocal swapped
+            if path == intent_name and kwargs.get("dir_fd") is not None and not swapped:
+                swapped = True
+                intent_path.unlink()
+                os.mkfifo(intent_path)
+                self.assertTrue(flags & getattr(os, "O_NONBLOCK", 0))
+            return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+        with (
+            patch("history_service.store.os.open", side_effect=swap_to_fifo_before_open),
+            patch("history_service.store.sqlite3.connect") as connect,
+        ):
+            with self.assertRaises(HistoryStartupError):
+                HistoryStore(str(db_path))
+
+        self.assertTrue(swapped)
+        connect.assert_not_called()
+
+    def test_quarantine_intent_identity_race_refuses_before_sqlite_open(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        intent_name = "history.db.quarantine-20300102T030405.000000Z.pending"
+        intent_path = temp_dir / intent_name
+        intent_path.write_bytes(history_store.QUARANTINE_INTENT_BYTES)
+        replacement = temp_dir / "replacement"
+        replacement.write_bytes(history_store.QUARANTINE_INTENT_BYTES)
+        real_open = os.open
+        swapped = False
+
+        def swap_after_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+            nonlocal swapped
+            descriptor = real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+            if path == intent_name and kwargs.get("dir_fd") is not None and not swapped:
+                swapped = True
+                os.replace(replacement, intent_path)
+            return descriptor
+
+        with (
+            patch("history_service.store.os.open", side_effect=swap_after_open),
+            patch("history_service.store.sqlite3.connect") as connect,
+        ):
+            with self.assertRaises(HistoryStartupError):
+                HistoryStore(str(db_path))
+
+        self.assertTrue(swapped)
+        connect.assert_not_called()
+
+    def test_startup_refuses_intent_published_after_prelock_scan_before_sqlite_open(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        self._create_crashed_wal_fixture(db_path)
+        intent_owner = HistoryStore(str(db_path), initialize=False)
+        intent_path = temp_dir / "history.db.quarantine-20300102T030405.000000Z.pending"
+        publication_requested = threading.Event()
+        publication_complete = threading.Event()
+        publication_errors: list[BaseException] = []
+        sqlite_opens_after_publication: list[object] = []
+        real_connect = sqlite3.connect
+        real_intent_check = HistoryStore._require_no_pending_quarantine_intent
+
+        def publish_intent() -> None:
+            if not publication_requested.wait(timeout=5):
+                publication_errors.append(TimeoutError("startup never reached the publication seam"))
+                publication_complete.set()
+                return
+            try:
+                with history_write_lock(db_path, blocking=True):
+                    intent_owner._publish_quarantine_intent(intent_path)
+            except BaseException as exc:
+                publication_errors.append(exc)
+            finally:
+                publication_complete.set()
+
+        def scan_then_release_quarantiner(store: HistoryStore) -> None:
+            real_intent_check(store)
+            if not publication_requested.is_set():
+                publication_requested.set()
+                self.assertTrue(publication_complete.wait(timeout=5))
+
+        @contextmanager
+        def lifecycle_lock_after_quarantiner(*args: Any, **kwargs: Any):
+            if not publication_requested.is_set():
+                publication_requested.set()
+                self.assertTrue(publication_complete.wait(timeout=5))
+            with history_write_lock(*args, **kwargs):
+                yield
+
+        def tracking_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+            if publication_complete.is_set():
+                sqlite_opens_after_publication.append(args[0] if args else kwargs.get("database"))
+            return real_connect(*args, **kwargs)  # type: ignore[arg-type]
+
+        publisher = threading.Thread(target=publish_intent, name="history-quarantine-publisher")
+        publisher.start()
+        try:
+            with (
+                patch.object(
+                    HistoryStore,
+                    "_require_no_pending_quarantine_intent",
+                    autospec=True,
+                    side_effect=scan_then_release_quarantiner,
+                ),
+                patch("history_service.store.history_write_lock", lifecycle_lock_after_quarantiner),
+                patch("history_service.store.sqlite3.connect", side_effect=tracking_connect),
+            ):
+                with self.assertRaises(HistoryStartupError):
+                    HistoryStore(str(db_path))
+        finally:
+            publication_requested.set()
+            publisher.join(timeout=5)
+
+        self.assertFalse(publisher.is_alive())
+        self.assertEqual(publication_errors, [])
+        self.assertTrue(intent_path.is_file())
+        self.assertEqual(intent_path.read_bytes(), history_store.QUARANTINE_INTENT_BYTES)
+        self.assertEqual(sqlite_opens_after_publication, [])
+
+    def test_quarantine_restart_fails_closed_after_each_rename_and_fsync_boundary(self) -> None:
+        for operation, boundary in (
+            ("rename", 1),
+            ("rename", 2),
+            ("rename", 3),
+            ("fsync", 1),
+            ("fsync", 2),
+            ("fsync", 3),
+        ):
+            with self.subTest(operation=operation, boundary=boundary):
+                temp_dir = Path(tempfile.mkdtemp())
+                db_path = temp_dir / "history[1].db"
+                expected_hashes = self._create_crashed_wal_fixture(db_path)
+                store = HistoryStore(str(db_path), initialize=False)
+                real_rename = store._rename_at2
+                real_fsync_directory = store._fsync_directory
+                destinations: list[Path] = []
+                injected = False
+
+                def fail_after_rename(source: Path, target: Path, *, flags: int) -> None:
+                    nonlocal injected
+                    real_rename(source, target, flags=flags)
+                    destinations.append(target)
+                    if operation == "rename" and len(destinations) == boundary:
+                        injected = True
+                        raise OSError(errno.EIO, f"synthetic rename boundary {boundary}")
+
+                def fail_after_fsync(directory: Path) -> None:
+                    nonlocal injected
+                    real_fsync_directory(directory)
+                    moved = sum(path_entry.exists() for path_entry in destinations)
+                    if operation == "fsync" and moved == boundary:
+                        injected = True
+                        raise OSError(errno.EIO, f"synthetic fsync boundary {boundary}")
+
+                with (
+                    patch.object(store, "_rename_at2", side_effect=fail_after_rename),
+                    patch.object(store, "_fsync_directory", side_effect=fail_after_fsync),
+                ):
+                    with self.assertRaisesRegex(OSError, f"{operation} boundary {boundary}"):
+                        store._quarantine_database()
+
+                self.assertTrue(injected)
+                self._assert_quarantine_component_hashes(db_path, expected_hashes)
+                with self.assertRaises(HistoryStartupError):
+                    HistoryStore(str(db_path))
+                self._assert_quarantine_component_hashes(db_path, expected_hashes)
+
+    def test_quarantine_intent_publication_failures_move_no_database_bytes(self) -> None:
+        for boundary in ("write", "file-fsync", "directory-fsync"):
+            with self.subTest(boundary=boundary):
+                temp_dir = Path(tempfile.mkdtemp())
+                db_path = temp_dir / "history.db"
+                expected_hashes = self._create_crashed_wal_fixture(db_path)
+                store = HistoryStore(str(db_path), initialize=False)
+                real_write = history_store.os.write
+                real_fsync = history_store.os.fsync
+                real_fsync_directory = store._fsync_directory
+
+                def fail_write(descriptor: int, value: bytes) -> int:
+                    if boundary == "write":
+                        raise OSError(errno.EIO, "synthetic intent write boundary")
+                    return real_write(descriptor, value)
+
+                def fail_file_fsync(descriptor: int) -> None:
+                    if boundary == "file-fsync":
+                        raise OSError(errno.EIO, "synthetic intent file-fsync boundary")
+                    real_fsync(descriptor)
+
+                def fail_directory_fsync(directory: Path) -> None:
+                    if boundary == "directory-fsync":
+                        raise OSError(errno.EIO, "synthetic intent directory-fsync boundary")
+                    real_fsync_directory(directory)
+
+                with (
+                    patch.object(history_store.os, "write", side_effect=fail_write),
+                    patch.object(history_store.os, "fsync", side_effect=fail_file_fsync),
+                    patch.object(store, "_fsync_directory", side_effect=fail_directory_fsync),
+                ):
+                    with self.assertRaisesRegex(OSError, f"intent {boundary} boundary"):
+                        store._quarantine_database()
+
+                self.assertTrue(db_path.is_file())
+                self.assertTrue(Path(f"{db_path}-wal").is_file())
+                self.assertTrue(Path(f"{db_path}-shm").is_file())
+                self._assert_quarantine_component_hashes(db_path, expected_hashes)
+
+    def test_quarantine_intent_unlink_failure_refuses_restart_with_complete_evidence(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        expected_hashes = self._create_crashed_wal_fixture(db_path)
+        store = HistoryStore(str(db_path), initialize=False)
+
+        with patch.object(
+            Path,
+            "unlink",
+            side_effect=OSError(errno.EIO, "synthetic intent unlink boundary"),
+        ):
+            with self.assertRaisesRegex(OSError, "intent unlink boundary"):
+                store._quarantine_database()
+
+        self._assert_quarantine_component_hashes(db_path, expected_hashes)
+        with self.assertRaises(HistoryStartupError):
+            HistoryStore(str(db_path))
+        self._assert_quarantine_component_hashes(db_path, expected_hashes)
+
+    def test_quarantine_final_fsync_failure_restarts_degraded_from_complete_evidence(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        expected_hashes = self._create_crashed_wal_fixture(db_path)
+        store = HistoryStore(str(db_path), initialize=False)
+        real_fsync_directory = store._fsync_directory
+        injected = False
+
+        def fail_after_intent_removal(directory: Path) -> None:
+            nonlocal injected
+            intents = [
+                path
+                for path in directory.iterdir()
+                if path.name.startswith(f"{db_path.name}.quarantine-")
+                and path.name.endswith(".pending")
+            ]
+            retained_database = [
+                path
+                for path in directory.iterdir()
+                if path.name.startswith(f"{db_path.name}.broken-")
+                and not path.name.endswith(("-wal", "-shm"))
+            ]
+            if not injected and retained_database and not intents:
+                injected = True
+                raise OSError(errno.EIO, "synthetic final directory-fsync boundary")
+            real_fsync_directory(directory)
+
+        with patch.object(store, "_fsync_directory", side_effect=fail_after_intent_removal):
+            with self.assertRaisesRegex(OSError, "final directory-fsync boundary"):
+                store._quarantine_database()
+
+        self.assertTrue(injected)
+        self._assert_quarantine_component_hashes(db_path, expected_hashes)
+        restarted = HistoryStore(str(db_path))
+        self.assertIs(restarted.quarantine_recovery_status()["history_recovery_required"], True)
+        self._assert_quarantine_component_hashes(db_path, expected_hashes)
+
+    def test_quarantine_evidence_scan_is_bounded_and_fails_closed(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        (temp_dir / "unrelated-one").write_bytes(b"one")
+        (temp_dir / "unrelated-two").write_bytes(b"two")
+
+        with patch.object(
+            history_store,
+            "MAX_QUARANTINE_EVIDENCE_DIRECTORY_ENTRIES",
+            1,
+            create=True,
+        ):
+            status = store.quarantine_recovery_status()
+
+        self.assertEqual(
+            status,
+            {"history_recovery_required": True, "history_quarantined_at": None},
+        )
+
+    def test_nonregular_matching_quarantine_evidence_never_reports_healthy(self) -> None:
+        fixture_types = ("symlink", "fifo", "directory", "socket")
+
+        for fixture_type in fixture_types:
+            with self.subTest(fixture_type=fixture_type):
+                temp_dir = Path(tempfile.mkdtemp())
+                store = HistoryStore(str(temp_dir / "history.db"))
+                store.record_quarantine_recovery(datetime(2031, 1, 1, tzinfo=timezone.utc))
+                self.assertTrue(store.acknowledge_quarantine_recovery())
+                evidence_path = temp_dir / "history.db.broken-20300102T030405.000000Z"
+                socket_owner: socket.socket | None = None
+                if fixture_type == "symlink":
+                    target = temp_dir / "evidence-target"
+                    target.write_bytes(b"retained")
+                    evidence_path.symlink_to(target)
+                elif fixture_type == "fifo":
+                    os.mkfifo(evidence_path)
+                elif fixture_type == "directory":
+                    evidence_path.mkdir()
+                else:
+                    socket_owner = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    socket_owner.bind(str(evidence_path))
+
+                try:
+                    status = store.quarantine_recovery_status()
+                finally:
+                    if socket_owner is not None:
+                        socket_owner.close()
+
+                self.assertEqual(
+                    status,
+                    {"history_recovery_required": True, "history_quarantined_at": None},
+                )
+                self.assertNotIn(str(temp_dir), json.dumps(status))
+
+    def test_same_instant_quarantines_preserve_each_database_and_sidecar_byte_set(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        frozen = datetime(2026, 5, 1, 4, 30, 0, 123456, tzinfo=timezone.utc)
+        byte_sets = (
+            (b"first database", b"first wal", b"first shm"),
+            (b"second database", b"second wal", b"second shm"),
+        )
+
+        store = HistoryStore(str(db_path))
+        with freeze_history_store_now(frozen):
+            for database_bytes, wal_bytes, shm_bytes in byte_sets:
+                db_path.write_bytes(database_bytes)
+                Path(f"{db_path}-wal").write_bytes(wal_bytes)
+                Path(f"{db_path}-shm").write_bytes(shm_bytes)
+                store._quarantine_database()
+
+        retained = sorted(
+            path
+            for path in temp_dir.iterdir()
+            if path.name.startswith("history.db.broken-") and not path.name.endswith(("-wal", "-shm"))
+        )
+
+        self.assertEqual(len(retained), 2)
+        self.assertEqual({path.read_bytes() for path in retained}, {item[0] for item in byte_sets})
+        self.assertEqual(
+            {Path(f"{path}-wal").read_bytes() for path in retained},
+            {item[1] for item in byte_sets},
+        )
+        self.assertEqual(
+            {Path(f"{path}-shm").read_bytes() for path in retained},
+            {item[2] for item in byte_sets},
+        )
+
+    def test_quarantine_preserves_sidecars_if_publication_stops_before_database_move(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        store = HistoryStore(str(db_path))
+        db_path.write_bytes(b"database bytes")
+        Path(f"{db_path}-wal").write_bytes(b"wal bytes")
+        Path(f"{db_path}-shm").write_bytes(b"shm bytes")
+        real_rename = store._rename_at2
+
+        def stop_before_database_move(source: Path, target: Path, *, flags: int) -> None:
+            if source == db_path:
+                raise OSError(errno.EIO, "synthetic stop before database move")
+            real_rename(source, target, flags=flags)
+
+        with patch.object(store, "_rename_at2", side_effect=stop_before_database_move):
+            with self.assertRaisesRegex(OSError, "synthetic stop"):
+                store._quarantine_database()
+
+        retained_wal = list(temp_dir.glob("history.db.broken-*-wal"))
+        retained_shm = list(temp_dir.glob("history.db.broken-*-shm"))
+        self.assertEqual(db_path.read_bytes(), b"database bytes")
+        self.assertFalse(Path(f"{db_path}-wal").exists())
+        self.assertFalse(Path(f"{db_path}-shm").exists())
+        self.assertEqual([path.read_bytes() for path in retained_wal], [b"wal bytes"])
+        self.assertEqual([path.read_bytes() for path in retained_shm], [b"shm bytes"])
+
+    def test_same_instant_quarantine_after_acknowledgement_fails_closed_after_marker_failure(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        frozen = datetime(2026, 5, 1, 4, 30, 0, 123456, tzinfo=timezone.utc)
+
+        with freeze_history_store_now(frozen):
+            db_path.write_bytes(b"first unreadable database")
+            first = HistoryStore(str(db_path))
+            self.assertTrue(first.acknowledge_quarantine_recovery())
+            self.assertFalse(first.quarantine_recovery_status()["history_recovery_required"])
+
+            db_path.write_bytes(b"later unreadable database")
+            with patch.object(
+                HistoryStore,
+                "record_quarantine_recovery",
+                side_effect=OSError("synthetic marker write failure"),
+            ):
+                HistoryStore(str(db_path))
+
+        restarted = HistoryStore(str(db_path))
+        status = restarted.quarantine_recovery_status()
+        retained = [
+            path
+            for path in temp_dir.iterdir()
+            if path.name.startswith("history.db.broken-") and not path.name.endswith(("-wal", "-shm"))
+        ]
+
+        self.assertIs(status["history_recovery_required"], True)
+        self.assertIsNotNone(status["history_quarantined_at"])
+        self.assertNotIn(str(temp_dir), json.dumps(status))
+        self.assertEqual({path.read_bytes() for path in retained}, {b"first unreadable database", b"later unreadable database"})
+
+    def test_marker_write_failure_stays_degraded_after_restart(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        db_path.write_text("not a sqlite database", encoding="utf-8")
+
+        with patch.object(
+            HistoryStore,
+            "record_quarantine_recovery",
+            side_effect=sqlite3.OperationalError("synthetic marker write failure"),
+        ):
+            HistoryStore(str(db_path))
+
+        restarted = HistoryStore(str(db_path))
+        collector = HistoryCollector(HistorySettings(sqlite_path=str(db_path)), restarted)
+        with (
+            patch.object(history_main, "startup_failure_reason", None),
+            patch.object(history_main, "store", restarted),
+            patch.object(history_main, "collector", collector),
+        ):
+            response = asyncio.run(history_main.healthz())
+
+        payload = json.loads(response.body)
+        self.assertIs(restarted.quarantine_recovery_status()["history_recovery_required"], True)
+        self.assertIs(payload["history_recovery_required"], True)
+        self.assertEqual(payload["status"], "degraded")
+        self.assertNotIn(".broken-", json.dumps(payload))
+
+    def test_quarantine_evidence_without_a_marker_can_be_acknowledged(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        db_path.write_text("not a sqlite database", encoding="utf-8")
+
+        with patch.object(
+            HistoryStore,
+            "record_quarantine_recovery",
+            side_effect=OSError("synthetic marker write failure"),
+        ):
+            store = HistoryStore(str(db_path))
+
+        self.assertTrue(store.acknowledge_quarantine_recovery())
+        self.assertFalse(store.quarantine_recovery_status()["history_recovery_required"])
+        self.assertFalse(store.acknowledge_quarantine_recovery())
+
+    def test_quarantine_evidence_keeps_first_timestamp_when_marker_is_retried(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        db_path.write_text("not a sqlite database", encoding="utf-8")
+
+        with patch.object(
+            HistoryStore,
+            "record_quarantine_recovery",
+            side_effect=OSError("synthetic marker write failure"),
+        ):
+            store = HistoryStore(str(db_path))
+
+        first = store.read_quarantine_recovery()
+        self.assertIsInstance(first, datetime)
+        assert first is not None
+        later = first + timedelta(days=1)
+
+        self.assertEqual(store.record_quarantine_recovery(later), first)
+        self.assertEqual(store.read_quarantine_recovery(), first)
+
+    def test_store_distinguishes_a_first_installation_from_a_recovery(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+
+        fresh = HistoryStore(str(temp_dir / "history.db"))
+
+        self.assertIsNone(fresh.read_quarantine_recovery())
+        self.assertEqual(
+            fresh.quarantine_recovery_status(),
+            {"history_recovery_required": False, "history_quarantined_at": None},
+        )
+
+    def test_store_reports_quarantine_recovery_in_its_status(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        db_path.write_text("not a sqlite database", encoding="utf-8")
+
+        store = HistoryStore(str(db_path))
+        status = store.quarantine_recovery_status()
+
+        self.assertIs(status["history_recovery_required"], True)
+        self.assertEqual(
+            status["history_quarantined_at"],
+            store.read_quarantine_recovery().isoformat(),
+        )
+        self.assertNotIn(
+            ".broken-",
+            json.dumps(status),
+            "the recovery indication must not expose the quarantine path",
+        )
+
+    def test_store_keeps_the_first_quarantine_timestamp_until_acknowledged(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        first = datetime(2026, 5, 1, 4, 30, tzinfo=timezone.utc)
+        later = datetime(2026, 5, 2, 4, 30, tzinfo=timezone.utc)
+
+        store.record_quarantine_recovery(first)
+        store.record_quarantine_recovery(later)
+
+        self.assertEqual(store.read_quarantine_recovery(), first)
+
+    def test_store_clears_the_recovery_indication_only_on_acknowledgement(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        quarantined_at = datetime(2026, 5, 1, 4, 30, tzinfo=timezone.utc)
+        store.record_quarantine_recovery(quarantined_at)
+
+        acknowledged = store.acknowledge_quarantine_recovery()
+        again = store.acknowledge_quarantine_recovery()
+
+        self.assertTrue(acknowledged)
+        self.assertFalse(again)
+        self.assertIsNone(store.read_quarantine_recovery())
+        self.assertIs(
+            store.quarantine_recovery_status()["history_recovery_required"],
+            False,
+        )
+
+    def test_store_records_a_later_quarantine_after_an_acknowledgement(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        first = datetime(2026, 5, 1, 4, 30, tzinfo=timezone.utc)
+        later = datetime(2026, 5, 2, 4, 30, tzinfo=timezone.utc)
+        store.record_quarantine_recovery(first)
+        store.acknowledge_quarantine_recovery()
+
+        store.record_quarantine_recovery(later)
+
+        self.assertEqual(store.read_quarantine_recovery(), later)
+
+    def test_later_quarantine_evidence_overrides_an_acknowledged_marker(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        store = HistoryStore(str(db_path))
+        first = datetime(2026, 5, 1, 4, 30, tzinfo=timezone.utc)
+        later = datetime(2026, 5, 2, 4, 30, tzinfo=timezone.utc)
+        store.record_quarantine_recovery(first)
+        store.acknowledge_quarantine_recovery()
+        evidence = temp_dir / "history.db.broken-20260502T043000Z"
+        evidence.write_bytes(b"retained original bytes")
+
+        self.assertEqual(store.read_quarantine_recovery(), later)
+        self.assertTrue(store.quarantine_recovery_status()["history_recovery_required"])
+        self.assertTrue(store.acknowledge_quarantine_recovery())
+        self.assertFalse(store.quarantine_recovery_status()["history_recovery_required"])
+        self.assertEqual(evidence.read_bytes(), b"retained original bytes")
+
+    def test_store_fails_closed_on_an_unreadable_recovery_marker(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        store.record_quarantine_recovery(datetime(2026, 5, 1, 4, 30, tzinfo=timezone.utc))
+        with closing(sqlite3.connect(temp_dir / "history.db")) as connection:
+            connection.execute(
+                "UPDATE history_maintenance_state SET backup_at = ? WHERE name = ?",
+                ("not a timestamp", history_store.QUARANTINE_RECOVERY_STATE_NAME),
+            )
+            connection.commit()
+
+        self.assertEqual(
+            store.quarantine_recovery_status(),
+            {"history_recovery_required": True, "history_quarantined_at": None},
+        )
+
+    def test_store_fails_closed_when_quarantine_evidence_cannot_be_inspected(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+
+        with patch.object(
+            store,
+            "_quarantine_evidence_timestamps",
+            side_effect=OSError("synthetic evidence scan failure"),
+        ):
+            status = store.quarantine_recovery_status()
+
+        self.assertEqual(
+            status,
+            {"history_recovery_required": True, "history_quarantined_at": None},
+        )
+
+    def test_public_collector_status_surfaces_quarantine_recovery(self) -> None:
+        """The recovery indication survives the public projection (#417)."""
+
+        projected = history_main.public_collector_status(
+            {
+                "collector_running": True,
+                "history_recovery_required": True,
+                "history_quarantined_at": "2026-05-01T04:30:00+00:00",
+                "sqlite_path": "/private/history.db",
+            }
+        )
+
+        self.assertIs(projected["history_recovery_required"], True)
+        self.assertEqual(projected["history_quarantined_at"], "2026-05-01T04:30:00+00:00")
+        self.assertNotIn("sqlite_path", projected)
+
+    def test_collector_status_reports_the_store_recovery_indication(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        db_path.write_text("not a sqlite database", encoding="utf-8")
+        store = HistoryStore(str(db_path))
+        collector = HistoryCollector(HistorySettings(sqlite_path=str(db_path)), store)
+
+        status = collector.status()
+
+        self.assertIs(status["history_recovery_required"], True)
+        self.assertEqual(
+            status["history_quarantined_at"],
+            store.read_quarantine_recovery().isoformat(),
+        )
+
+    def test_healthz_grades_a_required_recovery_as_degraded(self) -> None:
+        """An empty last_error must not make a recovery-required service look ok (#417)."""
+
+        status = {
+            "collector_running": True,
+            "last_error": None,
+            "history_recovery_required": True,
+            "history_quarantined_at": "2026-05-01T04:30:00+00:00",
+        }
+        with (
+            patch.object(history_main, "startup_failure_reason", None),
+            patch.object(history_main.collector, "status", return_value=status),
+            patch.object(history_main.collector, "last_error", None),
+            patch.object(history_main.store, "database_size_bytes", return_value=4096),
+        ):
+            response = asyncio.run(history_main.healthz())
+
+        payload = json.loads(response.body)
+        self.assertNotEqual(payload["status"], "ok")
+        self.assertEqual(payload["status"], "degraded")
+        self.assertIs(payload["history_recovery_required"], True)
+
+    def test_healthz_reports_degraded_after_a_quarantine_activated_a_fresh_database(self) -> None:
+        """Quarantine must not activate a fresh database that reports itself healthy (#417)."""
+
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        db_path.write_text("not a sqlite database", encoding="utf-8")
+        store = HistoryStore(str(db_path))
+        collector = HistoryCollector(HistorySettings(sqlite_path=str(db_path)), store)
+
+        with (
+            patch.object(history_main, "startup_failure_reason", None),
+            patch.object(history_main, "store", store),
+            patch.object(history_main, "collector", collector),
+        ):
+            response = asyncio.run(history_main.healthz())
+
+        payload = json.loads(response.body)
+        self.assertIsNone(collector.last_error)
+        self.assertIs(payload["history_recovery_required"], True)
+        self.assertEqual(payload["status"], "degraded")
+        self.assertNotIn(".broken-", json.dumps(payload))
 
     def test_store_can_fail_closed_without_quarantining_unreadable_database(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
