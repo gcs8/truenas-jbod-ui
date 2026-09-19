@@ -24,7 +24,7 @@ from history_service.segment_catalog import (
     path_entry_exists,
 )
 from history_service.segment_reader import MAX_HISTORY_QUERY_LIMIT, SegmentedHistoryReader
-from history_service.startup import HistorySchemaVersionError
+from history_service.startup import HistorySchemaVersionError, HistoryStartupError
 
 logger = logging.getLogger(__name__)
 SQLITE_SHARED_DIR_MODE = 0o770
@@ -74,6 +74,9 @@ QUARANTINE_RECOVERY_STATES = frozenset(
 )
 MAX_QUARANTINE_EVIDENCE_DIRECTORY_ENTRIES = 4096
 MAX_QUARANTINE_NAME_ALLOCATION_ATTEMPTS = 4096
+QUARANTINE_INTENT_PREFIX = ".quarantine-"
+QUARANTINE_INTENT_SUFFIX = ".pending"
+QUARANTINE_INTENT_BYTES = b"history quarantine pending\n"
 
 
 def describe_unsupported_schema_version(file_path: Path | str, found_version: int) -> str:
@@ -471,6 +474,7 @@ class HistoryStore:
         if self._initialize_enabled:
             # Before the migration lock, and before any write: a database from a
             # newer release is refused with its bytes untouched.
+            self._require_no_pending_quarantine_intent()
             self._require_supported_schema_version()
             with history_write_lock(self.file_path, blocking=False):
                 self._require_no_pending_lifecycle_markers()
@@ -898,6 +902,42 @@ class HistoryStore:
                 if timestamp is not None:
                     timestamps.append(timestamp)
         return sorted(timestamps)
+
+    def _quarantine_intent_paths(self) -> list[Path]:
+        prefix = f"{self.file_path.name}{QUARANTINE_INTENT_PREFIX}"
+        intents: list[Path] = []
+        with os.scandir(self.file_path.parent) as entries:
+            for entry_count, entry in enumerate(entries, start=1):
+                if entry_count > MAX_QUARANTINE_EVIDENCE_DIRECTORY_ENTRIES:
+                    raise OSError(
+                        errno.E2BIG,
+                        "History quarantine evidence directory exceeds the inspection bound.",
+                    )
+                if (
+                    not entry.name.startswith(prefix)
+                    or not entry.name.endswith(QUARANTINE_INTENT_SUFFIX)
+                    or not entry.is_file(follow_symlinks=False)
+                ):
+                    continue
+                encoded = entry.name[len(prefix) : -len(QUARANTINE_INTENT_SUFFIX)]
+                if self._parse_quarantine_evidence_timestamp(encoded) is not None:
+                    intents.append(Path(entry.path))
+        return intents
+
+    def _require_no_pending_quarantine_intent(self) -> None:
+        try:
+            intents = self._quarantine_intent_paths()
+        except OSError as exc:
+            raise HistoryStartupError(
+                "History database quarantine state could not be inspected. History storage "
+                "is not starting because an interrupted quarantine cannot be ruled out."
+            ) from exc
+        if not intents:
+            return
+        raise HistoryStartupError(
+            "History database quarantine was interrupted. History storage is not starting "
+            "until the retained database, WAL, and SHM evidence is reviewed."
+        )
 
     @staticmethod
     def _parse_quarantine_evidence_timestamp(encoded: str) -> datetime | None:
@@ -1453,11 +1493,18 @@ class HistoryStore:
                 broken_path.with_name(f"{broken_path.name}{suffix}")
                 for suffix in ("-shm", "-wal")
             )
-            if path_entry_exists(broken_path) or any(
-                path_entry_exists(destination) for destination in sidecar_destinations
+            intent_path = self.file_path.with_name(
+                f"{self.file_path.name}{QUARANTINE_INTENT_PREFIX}"
+                f"{timestamp}{QUARANTINE_INTENT_SUFFIX}"
+            )
+            if (
+                path_entry_exists(broken_path)
+                or path_entry_exists(intent_path)
+                or any(path_entry_exists(destination) for destination in sidecar_destinations)
             ):
                 quarantined_at += timedelta(microseconds=1)
                 continue
+            self._publish_quarantine_intent(intent_path)
             for suffix, destination in zip(("-shm", "-wal"), sidecar_destinations, strict=True):
                 sidecar_path = Path(f"{self.file_path}{suffix}")
                 if not path_entry_exists(sidecar_path):
@@ -1466,8 +1513,28 @@ class HistoryStore:
                 self._fsync_directory(self.file_path.parent)
             self._rename_at2(self.file_path, broken_path, flags=RENAME_NOREPLACE)
             self._fsync_directory(self.file_path.parent)
+            intent_path.unlink()
+            self._fsync_directory(self.file_path.parent)
             return broken_path, quarantined_at
         raise FileExistsError("Could not allocate a unique history quarantine evidence name.")
+
+    def _publish_quarantine_intent(self, intent_path: Path) -> None:
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(intent_path, flags, 0o600)
+        try:
+            written = os.write(descriptor, QUARANTINE_INTENT_BYTES)
+            if written != len(QUARANTINE_INTENT_BYTES):
+                raise OSError(errno.EIO, "History quarantine intent write was incomplete.")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        self._fsync_directory(intent_path.parent)
 
     @staticmethod
     def _fsync_directory(directory: Path) -> None:

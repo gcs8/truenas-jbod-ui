@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import hashlib
 import io
 import json
 import os
@@ -45,6 +46,7 @@ from history_service.store import (
     HistoryStore,
     SlotStateUpdate,
 )
+from history_service.startup import HistoryStartupError, open_history_store_with_retries
 
 
 @contextmanager
@@ -1153,6 +1155,62 @@ class HistoryDashboardRouteTests(unittest.TestCase):
 
 
 class HistoryStoreTests(unittest.TestCase):
+    @staticmethod
+    def _create_crashed_wal_fixture(db_path: Path) -> dict[str, str]:
+        """Leave a real committed WAL/SHM pair as if its writer crashed."""
+
+        pid = os.fork()
+        if pid == 0:
+            connection = sqlite3.connect(db_path)
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA wal_autocheckpoint=0")
+            connection.execute("CREATE TABLE retained_wal_evidence (value TEXT NOT NULL)")
+            connection.execute(
+                "INSERT INTO retained_wal_evidence (value) VALUES ('committed WAL bytes')"
+            )
+            connection.commit()
+            os._exit(0)
+        waited_pid, status = os.waitpid(pid, 0)
+        if waited_pid != pid or status != 0:
+            raise AssertionError(f"WAL fixture child failed with wait status {status}")
+        paths = {
+            "database": db_path,
+            "wal": Path(f"{db_path}-wal"),
+            "shm": Path(f"{db_path}-shm"),
+        }
+        if not all(path.is_file() for path in paths.values()):
+            raise AssertionError("WAL fixture did not retain database, WAL, and SHM files")
+        return {
+            label: hashlib.sha256(path.read_bytes()).hexdigest()
+            for label, path in paths.items()
+        }
+
+    @staticmethod
+    def _assert_quarantine_component_hashes(
+        db_path: Path,
+        expected: dict[str, str],
+    ) -> None:
+        suffixes = {"database": "", "wal": "-wal", "shm": "-shm"}
+        entries = list(db_path.parent.iterdir())
+        for label, suffix in suffixes.items():
+            active = Path(f"{db_path}{suffix}")
+            retained = [
+                path
+                for path in entries
+                if path.name.startswith(f"{db_path.name}.broken-")
+                and path.name.endswith(suffix)
+                and not (
+                    label == "database"
+                    and path.name.endswith(("-wal", "-shm"))
+                )
+            ]
+            candidates = ([active] if active.is_file() else []) + retained
+            hashes = [hashlib.sha256(path.read_bytes()).hexdigest() for path in candidates]
+            if expected[label] not in hashes:
+                raise AssertionError(
+                    f"original {label} bytes were not retained; observed hashes: {hashes}"
+                )
+
     def test_slot_state_column_contract_matches_existing_schema_and_projections(self) -> None:
         expected_columns = (
             ("system_id", "TEXT NOT NULL", False),
@@ -4965,6 +5023,230 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertIsNotNone(status["history_quarantined_at"])
         self.assertNotIn(str(temp_dir), json.dumps(status))
         self.assertEqual([path.read_bytes() for path in retained], [original])
+
+    def test_quarantine_first_sidecar_fsync_failure_refuses_restart_before_wal_replay(self) -> None:
+        """Reviewer reproduction: moved SHM must not leave the live WAL admissible."""
+
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        expected_hashes = self._create_crashed_wal_fixture(db_path)
+        store = HistoryStore(str(db_path), initialize=False)
+        real_fsync_directory = store._fsync_directory
+        injected = False
+
+        def fail_first_fsync_after_shm_move(directory: Path) -> None:
+            nonlocal injected
+            staged_shm = [
+                path
+                for path in directory.iterdir()
+                if path.name.startswith(f"{db_path.name}.broken-")
+                and path.name.endswith("-shm")
+            ]
+            if not injected and staged_shm and not Path(f"{db_path}-shm").exists():
+                injected = True
+                raise OSError(errno.EIO, "synthetic first post-SHM fsync failure")
+            real_fsync_directory(directory)
+
+        with patch.object(store, "_fsync_directory", side_effect=fail_first_fsync_after_shm_move):
+            with self.assertRaisesRegex(OSError, "post-SHM fsync failure"):
+                store._quarantine_database()
+
+        self.assertTrue(injected)
+        self._assert_quarantine_component_hashes(db_path, expected_hashes)
+        with self.assertRaises(HistoryStartupError) as restart_error:
+            open_history_store_with_retries(
+                lambda: HistoryStore(str(db_path)),
+                directory=temp_dir,
+                attempts=1,
+            )
+        self._assert_quarantine_component_hashes(db_path, expected_hashes)
+
+        with (
+            patch.object(history_main, "startup_failure_reason", restart_error.exception.reason),
+            patch.object(history_main, "store", None),
+            patch.object(history_main, "collector", None),
+        ):
+            response = asyncio.run(history_main.healthz())
+        payload = json.loads(response.body)
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(payload["status"], "unavailable")
+        self.assertNotIn(str(temp_dir), json.dumps(payload))
+
+    def test_quarantine_intent_write_failure_precedes_every_destructive_move(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        expected_hashes = self._create_crashed_wal_fixture(db_path)
+        store = HistoryStore(str(db_path), initialize=False)
+
+        with patch.object(
+            history_store.os,
+            "open",
+            side_effect=OSError(errno.EIO, "synthetic intent write failure"),
+        ):
+            with self.assertRaisesRegex(OSError, "intent write failure"):
+                store._quarantine_database()
+
+        self.assertTrue(db_path.is_file())
+        self.assertTrue(Path(f"{db_path}-wal").is_file())
+        self.assertTrue(Path(f"{db_path}-shm").is_file())
+        self._assert_quarantine_component_hashes(db_path, expected_hashes)
+
+    def test_quarantine_intent_scan_failure_is_a_bounded_startup_refusal(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        with patch.object(
+            history_store.os,
+            "scandir",
+            side_effect=OSError(errno.EIO, "synthetic private directory detail"),
+        ):
+            with self.assertRaises(HistoryStartupError) as failure:
+                HistoryStore(str(db_path))
+
+        self.assertNotIn(str(temp_dir), failure.exception.reason)
+        self.assertNotIn("private directory detail", failure.exception.reason)
+
+    def test_quarantine_restart_fails_closed_after_each_rename_and_fsync_boundary(self) -> None:
+        for operation, boundary in (
+            ("rename", 1),
+            ("rename", 2),
+            ("rename", 3),
+            ("fsync", 1),
+            ("fsync", 2),
+            ("fsync", 3),
+        ):
+            with self.subTest(operation=operation, boundary=boundary):
+                temp_dir = Path(tempfile.mkdtemp())
+                db_path = temp_dir / "history[1].db"
+                expected_hashes = self._create_crashed_wal_fixture(db_path)
+                store = HistoryStore(str(db_path), initialize=False)
+                real_rename = store._rename_at2
+                real_fsync_directory = store._fsync_directory
+                destinations: list[Path] = []
+                injected = False
+
+                def fail_after_rename(source: Path, target: Path, *, flags: int) -> None:
+                    nonlocal injected
+                    real_rename(source, target, flags=flags)
+                    destinations.append(target)
+                    if operation == "rename" and len(destinations) == boundary:
+                        injected = True
+                        raise OSError(errno.EIO, f"synthetic rename boundary {boundary}")
+
+                def fail_after_fsync(directory: Path) -> None:
+                    nonlocal injected
+                    real_fsync_directory(directory)
+                    moved = sum(path_entry.exists() for path_entry in destinations)
+                    if operation == "fsync" and moved == boundary:
+                        injected = True
+                        raise OSError(errno.EIO, f"synthetic fsync boundary {boundary}")
+
+                with (
+                    patch.object(store, "_rename_at2", side_effect=fail_after_rename),
+                    patch.object(store, "_fsync_directory", side_effect=fail_after_fsync),
+                ):
+                    with self.assertRaisesRegex(OSError, f"{operation} boundary {boundary}"):
+                        store._quarantine_database()
+
+                self.assertTrue(injected)
+                self._assert_quarantine_component_hashes(db_path, expected_hashes)
+                with self.assertRaises(HistoryStartupError):
+                    HistoryStore(str(db_path))
+                self._assert_quarantine_component_hashes(db_path, expected_hashes)
+
+    def test_quarantine_intent_publication_failures_move_no_database_bytes(self) -> None:
+        for boundary in ("write", "file-fsync", "directory-fsync"):
+            with self.subTest(boundary=boundary):
+                temp_dir = Path(tempfile.mkdtemp())
+                db_path = temp_dir / "history.db"
+                expected_hashes = self._create_crashed_wal_fixture(db_path)
+                store = HistoryStore(str(db_path), initialize=False)
+                real_write = history_store.os.write
+                real_fsync = history_store.os.fsync
+                real_fsync_directory = store._fsync_directory
+
+                def fail_write(descriptor: int, value: bytes) -> int:
+                    if boundary == "write":
+                        raise OSError(errno.EIO, "synthetic intent write boundary")
+                    return real_write(descriptor, value)
+
+                def fail_file_fsync(descriptor: int) -> None:
+                    if boundary == "file-fsync":
+                        raise OSError(errno.EIO, "synthetic intent file-fsync boundary")
+                    real_fsync(descriptor)
+
+                def fail_directory_fsync(directory: Path) -> None:
+                    if boundary == "directory-fsync":
+                        raise OSError(errno.EIO, "synthetic intent directory-fsync boundary")
+                    real_fsync_directory(directory)
+
+                with (
+                    patch.object(history_store.os, "write", side_effect=fail_write),
+                    patch.object(history_store.os, "fsync", side_effect=fail_file_fsync),
+                    patch.object(store, "_fsync_directory", side_effect=fail_directory_fsync),
+                ):
+                    with self.assertRaisesRegex(OSError, f"intent {boundary} boundary"):
+                        store._quarantine_database()
+
+                self.assertTrue(db_path.is_file())
+                self.assertTrue(Path(f"{db_path}-wal").is_file())
+                self.assertTrue(Path(f"{db_path}-shm").is_file())
+                self._assert_quarantine_component_hashes(db_path, expected_hashes)
+
+    def test_quarantine_intent_unlink_failure_refuses_restart_with_complete_evidence(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        expected_hashes = self._create_crashed_wal_fixture(db_path)
+        store = HistoryStore(str(db_path), initialize=False)
+
+        with patch.object(
+            Path,
+            "unlink",
+            side_effect=OSError(errno.EIO, "synthetic intent unlink boundary"),
+        ):
+            with self.assertRaisesRegex(OSError, "intent unlink boundary"):
+                store._quarantine_database()
+
+        self._assert_quarantine_component_hashes(db_path, expected_hashes)
+        with self.assertRaises(HistoryStartupError):
+            HistoryStore(str(db_path))
+        self._assert_quarantine_component_hashes(db_path, expected_hashes)
+
+    def test_quarantine_final_fsync_failure_restarts_degraded_from_complete_evidence(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        expected_hashes = self._create_crashed_wal_fixture(db_path)
+        store = HistoryStore(str(db_path), initialize=False)
+        real_fsync_directory = store._fsync_directory
+        injected = False
+
+        def fail_after_intent_removal(directory: Path) -> None:
+            nonlocal injected
+            intents = [
+                path
+                for path in directory.iterdir()
+                if path.name.startswith(f"{db_path.name}.quarantine-")
+                and path.name.endswith(".pending")
+            ]
+            retained_database = [
+                path
+                for path in directory.iterdir()
+                if path.name.startswith(f"{db_path.name}.broken-")
+                and not path.name.endswith(("-wal", "-shm"))
+            ]
+            if not injected and retained_database and not intents:
+                injected = True
+                raise OSError(errno.EIO, "synthetic final directory-fsync boundary")
+            real_fsync_directory(directory)
+
+        with patch.object(store, "_fsync_directory", side_effect=fail_after_intent_removal):
+            with self.assertRaisesRegex(OSError, "final directory-fsync boundary"):
+                store._quarantine_database()
+
+        self.assertTrue(injected)
+        self._assert_quarantine_component_hashes(db_path, expected_hashes)
+        restarted = HistoryStore(str(db_path))
+        self.assertIs(restarted.quarantine_recovery_status()["history_recovery_required"], True)
+        self._assert_quarantine_component_hashes(db_path, expected_hashes)
 
     def test_quarantine_evidence_scan_is_bounded_and_fails_closed(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
