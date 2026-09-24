@@ -269,6 +269,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 - Preserved history availability, scope identity and outage errors across
   bulk responses and offline exports. (#423)
+- Removed invented physical backplanes and bay labels from virtual inventories.
+  Logical disk paths and known physical aliases were preserved. (#419)
 
 ### Performance
 
