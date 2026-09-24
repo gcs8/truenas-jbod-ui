@@ -75,7 +75,7 @@ async function signIn(page) {
   const response = page.waitForResponse((r) => r.url().endsWith("/api/read-ui/auth/verify"));
   await page.locator("#read-ui-auth-submit").click();
   expect((await response).status()).toBe(200);
-  await expect(page.locator("#read-ui-auth-status")).toContainText("Signed in for writes");
+  await expect(page.locator("#read-ui-auth-status")).toContainText("Signed in. You will be signed out when you reload this page.");
 }
 
 async function dismiss(page, status) {
