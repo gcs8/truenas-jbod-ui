@@ -35,6 +35,7 @@ function loadFunctions(names, bindings = {}, constants = []) {
     Date,
     setTimeout,
     clearTimeout,
+    AbortController,
     ...bindings,
   });
   const snippets = [...constants.map(constantSource), ...names.map(functionSource)];
@@ -149,9 +150,11 @@ const SESSION_FUNCTIONS = [
   "markAdminStopped",
   "syncSessionBanner",
   "fetchOrReportStopped",
+  "fetchWithTimeout",
+  "requestTimeoutError",
 ];
 
-const SESSION_CONSTANTS = ["SESSION_WARNING_MS", "ADMIN_START_COMMAND"];
+const SESSION_CONSTANTS = ["SESSION_WARNING_MS", "ADMIN_START_COMMAND", "DEFAULT_REQUEST_TIMEOUT_MS"];
 
 // Save results offer the restart in place.
 
@@ -541,7 +544,7 @@ test("a cross-origin rejection keeps the form draft and says so", async () => {
   const label = new FakeElement({ value: "Box" });
   const result = new FakeElement();
   const detail = "This page was opened at http://192.0.2.10:8082, but the admin service only accepts changes from http://nas.example.test:8082. Open the admin UI at http://nas.example.test:8082, or set ADMIN_PUBLIC_ORIGIN in .env to http://192.0.2.10:8082 and recreate the admin container.";
-  const { createSystem } = loadFunctions(["createSystem"], {
+  const { createSystem } = loadFunctions(["createSystem", "describeMutationFailure", "requireMutationResult", "validSystemSaveResult", "isNonEmptyString", "adminRequestError"], {
     state: {},
     elements: sparseElements({
       setupSystemLabel: label,

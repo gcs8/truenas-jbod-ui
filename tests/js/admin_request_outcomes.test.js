@@ -49,6 +49,8 @@ const REQUIRED_NAMES = [
   "validatedRequestId",
   "fetchOrReportStopped",
   "sessionRemainingMs",
+  "fetchWithTimeout",
+  "requestTimeoutError",
 ];
 
 const OUTCOME_NAMES = [
@@ -62,13 +64,13 @@ const OUTCOME_NAMES = [
 ];
 
 function loadFetchJson(bindings = {}) {
-  const context = vm.createContext({ state: { admin: {} }, ...bindings });
+  const context = vm.createContext({ state: { admin: {} }, AbortController, setTimeout, clearTimeout, ...bindings });
   const sources = [
     ...REQUIRED_NAMES.map((name) => functionSource(name)),
     ...OUTCOME_NAMES.map((name) => functionSource(name, { optional: true })),
   ].filter(Boolean);
   vm.runInContext(
-    `const SERVER_REQUEST_ID_PATTERN = /^[0-9a-f]{32}$/;\n` +
+    `const SERVER_REQUEST_ID_PATTERN = /^[0-9a-f]{32}$/;\nconst DEFAULT_REQUEST_TIMEOUT_MS = 60000;\n` +
       `${sources.join("\n")}\n` +
       `globalThis.__tested = { fetchJson };`,
     context,
