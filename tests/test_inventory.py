@@ -212,6 +212,48 @@ class InventoryOverlayStatusTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(bool(raw.cli_disks), cli_mode in {"success", "rows_failure"})
                 self.assertEqual(bool(bundle.quantastor_ses_data.ses_enclosures), ses_mode in {"success", "rows_failure"})
 
+    async def _scale_bundle_with_discovery(self, discovery_ok, stdout, *, api_enclosures):
+        service, raw, _ = self.make_service("scale")
+        if api_enclosures:
+            raw.enclosures = [{"id": "synthetic-api-enclosure", "elements": []}]
+        discovery_command = service._build_sg_ses_discovery_command()
+
+        async def run_planned(planner, *, initial_commands, host=None):
+            return [
+                SSHCommandResult(
+                    command=discovery_command,
+                    ok=discovery_ok,
+                    stdout=stdout,
+                    stderr="" if discovery_ok else "synthetic discovery failure",
+                    exit_code=0 if discovery_ok else 1,
+                )
+            ]
+
+        service._run_ssh_planned_commands = AsyncMock(side_effect=run_planned)
+        return await service._collect_inventory_source_bundle()
+
+    async def test_scale_successful_discovery_with_no_ses_devices_stays_healthy_without_api_enclosures(self):
+        bundle = await self._scale_bundle_with_discovery(True, "", api_enclosures=False)
+        self.assertTrue(bundle.sources["ssh"].ok)
+        self.assertEqual(bundle.warnings, [])
+
+    async def test_scale_no_ses_devices_is_degraded_when_the_api_reports_enclosures(self):
+        bundle = await self._scale_bundle_with_discovery(True, "", api_enclosures=True)
+        self.assertFalse(bundle.sources["ssh"].ok)
+        self.assertEqual(len(bundle.warnings), 1)
+        self.assertIn("No SES enclosure was found over SSH on 192.0.2.10", bundle.warnings[0])
+        self.assertIn("TrueNAS API reports enclosures", bundle.warnings[0])
+
+    async def test_scale_failed_ses_discovery_command_stays_degraded(self):
+        for api_enclosures in (False, True):
+            with self.subTest(api_enclosures=api_enclosures):
+                bundle = await self._scale_bundle_with_discovery(False, "", api_enclosures=api_enclosures)
+                self.assertFalse(bundle.sources["ssh"].ok)
+                self.assertTrue(
+                    any("discovery failed on 192.0.2.10" in warning for warning in bundle.warnings),
+                    bundle.warnings,
+                )
+
     async def test_successful_overlays_do_not_erase_unrelated_base_ssh_failures(self):
         for platform in ("scale", "quantastor"):
             with self.subTest(platform=platform):
