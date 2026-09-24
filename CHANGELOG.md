@@ -171,6 +171,13 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   file and a copy-pasteable recovery command (paths shell-quoted) instead of
   only saying the database is closed, and logs it once at startup. Four unused
   history lock and restore helpers were removed (#563).
+- The history `/healthz` now says why it is degraded (last background pass
+  failed, read-only database, cleanup failed twice in a row, or recovery
+  required) and no longer counts a failed manual refresh; collector fields are
+  returned once, under `collector`. The dashboard shows `Starting` during the
+  startup grace period, counts down the cooldown on the Full refresh button only,
+  never renders an uncounted value as "deferred", and names a scheduled backup
+  status file with unsafe permissions (#566).
 - Published aggregate disk-retention totals on the inventory summary
   (`source_disk_count`, `rendered_unique_disk_count`,
   `duplicate_disk_view_count`, `unplaced_disk_count`) so a release check can

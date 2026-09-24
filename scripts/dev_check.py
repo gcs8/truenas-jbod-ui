@@ -182,6 +182,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_app_history_bounds",
             "tests.test_history_bulk_bounds",
             "tests.test_history_refresh_bounds",
+            "tests.test_history_health_states",
             "tests.test_history_service",
             "tests.test_inventory",
             "tests.test_inventory_registry_routes",
