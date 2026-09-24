@@ -73,7 +73,7 @@ function functionSource(source, name) {
 }
 
 function loadFunction(source, name, context = {}) {
-  const sandbox = vm.createContext({ ...context });
+  const sandbox = vm.createContext({ inventoryScopeMatchesSelection: () => true, currentUiScopeKey: () => "scope", captureMutationContext: () => ({}), mutationContextIsCurrent: () => true, finishMutationContext() {}, renderStorageViewRuntimeStatus() {}, ...context });
   vm.runInContext(`${functionSource(source, name)}\nthis.__loaded = ${name};`, sandbox, {
     filename: `${name}.behavior.js`,
   });
@@ -81,7 +81,7 @@ function loadFunction(source, name, context = {}) {
 }
 
 function loadFunctions(source, names, context = {}) {
-  const sandbox = vm.createContext({ ...context });
+  const sandbox = vm.createContext({ inventoryScopeMatchesSelection: () => true, currentUiScopeKey: () => "scope", captureMutationContext: () => ({}), mutationContextIsCurrent: () => true, finishMutationContext() {}, renderStorageViewRuntimeStatus() {}, ...context });
   const declarations = names.map((name) => functionSource(source, name)).join("\n");
   vm.runInContext(
     `${declarations}\n${names.map((name) => `this.${name} = ${name};`).join("\n")}`,
@@ -222,7 +222,9 @@ test("successful inventory refresh invalidates history before render and a faile
 
   events.length = 0;
   shouldFail = true;
+  state.storageViewsRuntimeLoading = true;
   await refreshSnapshot(true);
+  assert.match(state.storageViewsRuntimeError, /freshness is unverified/);
   assert.equal(events.includes("invalidate"), false);
   assert.deepEqual(events, ["stale:inventory unavailable"]);
 });
@@ -230,13 +232,14 @@ test("successful inventory refresh invalidates history before render and a faile
 test("storage-view refresh updates the live selector before the completed main render", async () => {
   const state = {
     snapshotMode: false,
+    selectedSystemId: "system-a",
     storageViewsRuntimeRequestToken: 0,
     storageViewsRuntimeLoading: false,
   };
   const events = [];
   const { fn: fetchStorageViewRuntime } = loadFunction(APP_SOURCE, "fetchStorageViewRuntime", {
     state,
-    renderSelectors() { events.push("loading-selectors"); },
+    renderSelectors() { events.push(state.storageViewsRuntimeLoading ? "loading-selectors" : "complete-selectors"); },
     buildSelectionParams() { return new URLSearchParams(); },
     URLSearchParams,
     async fetchJson() { return { system_id: "system-a", views: [] }; },
@@ -247,7 +250,7 @@ test("storage-view refresh updates the live selector before the completed main r
 
   await fetchStorageViewRuntime();
 
-  assert.deepEqual(events, ["loading-selectors", "apply", "complete"]);
+  assert.deepEqual(events, ["loading-selectors", "apply", "complete-selectors"]);
   assert.equal(state.storageViewsRuntimeLoading, false);
 });
 
@@ -613,7 +616,7 @@ test("mapping import is disabled with a reason for the active virtual inventory"
 
   renderMappingImportControl();
 
-  assert.match(reason, /no identified physical enclosure/i);
+  assert.match(reason, /no physical enclosure/i);
   assert.equal(button.disabled, true);
   assert.equal(button.title, reason);
   assert.equal(reasonView.textContent, reason);
@@ -670,7 +673,8 @@ test("mapping import preview lists every exact scope and slot classification", (
   assert.match(message, /Update \(1\): enc-a slot 2.*serial: OLD → NEW/);
   assert.match(message, /Remove \(1\): enc-b slot 3.*serial=REMOVE/);
   assert.match(message, /Unchanged \(1\): default enclosure slot 4/);
-  assert.match(message, /rejected if the active mapping scope changes/i);
+  assert.match(message, /^Restore these bay assignments\?/);
+  assert.match(message, /inventory changes before you confirm/i);
 });
 
 test("mapping import previews and confirms the exact diff before rendering imported state", async () => {
@@ -969,7 +973,7 @@ test("storage-view SMART completion cannot mutate a different active view", asyn
       getLiveBackedStorageViewSlot: () => null,
       getStorageViewSmartSummaryEntry: () => state.smartSummaries[cacheKey]?.data || null,
       getSmartSummaryEntry: () => null,
-      slotTooltip: () => "live label",
+      slotAccessibleName: () => "live label",
       buildStorageViewRuntimeTooltip: (_slot, activeView) => `${activeView.id}:slot-5`,
       refreshGridTileAriaLabel(slotIndex, label) {
         presentationEvents.push(`aria:${slotIndex}:${label}:${state.selectedStorageViewRuntimeId}`);
@@ -1022,7 +1026,7 @@ test("storage-view SMART completion cannot mutate the same view ID in a differen
       getLiveBackedStorageViewSlot: () => null,
       getStorageViewSmartSummaryEntry: () => state.smartSummaries[cacheKey]?.data || null,
       getSmartSummaryEntry: () => null,
-      slotTooltip: () => "live label",
+      slotAccessibleName: () => "live label",
       buildStorageViewRuntimeTooltip: () => "stale system-a label",
       refreshGridTileAriaLabel() { presentationEvents.push("aria"); },
       refreshHeatmapTileOverlays() { presentationEvents.push("heatmap"); },
