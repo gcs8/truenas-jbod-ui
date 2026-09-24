@@ -59,8 +59,8 @@ docker compose pull
 docker compose up -d
 ```
 
-This path pairs the v0.22.2 Compose file and image. Keep the Compose file and
-image on the same version.
+This first-install example pairs the v0.22.2 Compose file and image. Later
+image-only updates preserve the existing compatible Compose file.
 
 Open:
 
@@ -169,6 +169,96 @@ The image is disposable. Your local folder is the part you keep.
 
 Back up this folder, not the container image.
 
+## Update
+
+In the deployment folder, change the existing `JBOD_UI_IMAGE` assignment in
+`.env` to the target release tag or immutable digest, then pull and recreate:
+
+```bash
+${EDITOR:-vi} .env
+docker compose pull
+docker compose up -d
+```
+
+Editing the pin is required when it names an older version or digest. Keep the
+existing Compose files, configuration, authentication, origins, and bind
+addresses. Do not download a replacement Compose file for a normal image update.
+
+Use the same ordered `-f` files and selected profiles for both commands. If you
+use history, for example, run `docker compose --profile history pull` followed
+by `docker compose --profile history up -d`. Alternatively, retain
+`COMPOSE_PROFILES=history` in `.env` so the three commands above include history.
+Include admin only when you intend it to be running; do not use `--profile '*'`
+to restart dormant admin or one-shot backup jobs. Preserve any existing secrets
+or non-root overlay rather than replacing it with the base file.
+
+Check `docker compose ps` and each enabled service's `/healthz` after startup.
+Review release compatibility notes and keep a verified backup before updating.
+
+Required application migrations run by themselves. The UI and history services
+apply their own schema and durable-state migrations while they start, and
+repeating a start after a successful migration does no migration work again, so
+a normal update never needs a migration command, an ownership change, or any
+other manual repair step.
+
+If a migration is interrupted -- a host reboot, an out-of-memory kill, or an
+`up -d` during one -- the next start finishes it automatically before history
+opens the database. When that automatic recovery cannot complete, history stays
+up but stops serving, leaves the database exactly as recovery found it, and
+reports one line explaining why at `/healthz`; the service log carries the
+recovery error. Read that line before doing anything else, and restore from a
+verified backup as described in
+[[Backup, Restore, and Debug Bundles|Backup-Restore-and-Debug-Bundles]] if it
+asks you to. Do not run the advanced segmented-history maintenance scripts as
+part of a routine upgrade.
+
+### Rolling back a release
+
+Rolling back is the update procedure with the previous pin. Record the tag or
+digest you are on before every update: `docker compose images`.
+
+1. Stop the stack: `docker compose down` with the same ordered `-f` files and
+   profiles you start it with.
+2. Set `JBOD_UI_IMAGE` in `.env` back to the recorded tag or digest.
+3. `docker compose pull` and `docker compose up -d`, again with the same files
+   and profiles.
+4. Check `docker compose ps` and each enabled service's `/healthz`.
+
+Keep the Compose files, configuration, origins, and bind addresses you were
+running. An image rollback changes the running code only.
+
+Durable data is not rolled back with the image. Configuration and mappings
+under `./config` and `./data`, and the history database under `./history`, stay
+as the newer version left them; a newer on-disk history schema is not reverted
+by starting an older image. If the older release cannot open the newer
+database, stop the stack and restore the history database from a scheduled
+backup as described in
+[[Backup, Restore, and Debug Bundles|Backup-Restore-and-Debug-Bundles]] before
+starting it again. Ownership and modes applied to bind mounts by a hardening
+step are also left in place; root-compatible images still read them.
+
+## Optional container hardening
+
+The production base is root-compatible for existing root-owned UI, history, and
+admin bind mounts. It does not require ownership migration during image updates.
+`docker-compose.nonroot.yml` opts into non-root UI/history, read-only root
+filesystems, a temporary `/tmp`, dropped capabilities, no-new-privileges, and
+read-only UI configuration. Admin retains only `CHOWN` and `FOWNER` capabilities
+with the configured application group. The optional backup job retains its
+separate identity, no-network mode, read-only filesystem, and scoped mounts.
+
+Adopt this overlay separately, after checking bind-mount ownership using the
+[non-root troubleshooting steps](Troubleshooting.md). Download the overlay from
+the reviewed release/source revision that supplies these safeguards, then keep
+it in every Compose command, for example:
+
+```bash
+docker compose -f compose.yaml -f docker-compose.nonroot.yml --profile history pull
+docker compose -f compose.yaml -f docker-compose.nonroot.yml --profile history up -d
+```
+
+Do not remove a currently active hardening or secrets overlay during an update.
+
 ## Pick an image reference
 
 For most home labs, start with:
@@ -254,12 +344,39 @@ http://127.0.0.1:8081
 ```
 
 If Docker is on another machine, leave it bound to localhost unless you have a
-reason to expose it. Use a tunnel, reverse proxy, or set
-`HISTORY_BIND_ADDRESS=0.0.0.0` intentionally.
+reason to expose it. A tunnel or reverse proxy needs no configuration change.
+
+Binding the sidecar off loopback is not a single setting. The history service
+refuses to start on a non-loopback address unless refresh requests are
+authenticated by token and one exact browser origin is configured, and it says
+so on stdout: `Non-loopback history exposure requires refresh token mode.`
+Set all four values in `.env` together, then recreate the service:
+
+```dotenv
+HISTORY_BIND_ADDRESS=0.0.0.0
+HISTORY_REFRESH_AUTH_MODE=token
+HISTORY_REFRESH_TOKEN=<a long random string>
+HISTORY_PUBLIC_ORIGIN=http://your-docker-host:8081
+```
+
+```bash
+docker compose --profile history up -d
+```
+
+Use `HISTORY_REFRESH_TOKEN_FILE` with the secrets overlay instead of an inline
+token where the file is available. `HISTORY_PUBLIC_ORIGIN` must be an absolute
+`http://` or `https://` origin: the scheme, host, and port a browser actually
+uses, with no path. Leaving any of the three companion values unset makes the
+container exit at startup and the history button disappears from the main UI.
+Binding a service to `0.0.0.0` makes it reachable on every interface unless
+host or network controls restrict it; review that exposure first.
 
 Use [[History and Snapshot Export|History-and-Snapshot-Export]] for the visual
 walkthrough.
 
+### Optional history permission repair
+
+This is a separate repair procedure, not an image-upgrade requirement.
 Automatic history permission repair is **disabled by default**. The sidecar
 does not silently widen `history/`, the SQLite database, or its WAL/SHM files.
 Prefer fixing the host directory's owner and group deliberately. Before a
@@ -289,7 +406,7 @@ stat -c '%U:%G %a %n' history history/history.db
 curl -fsS http://127.0.0.1:8081/healthz
 ```
 
-To **roll back**, stop the sidecar, disable repair, restore the owner/group and
+To **roll back the permission repair**, stop the sidecar, disable repair, restore the owner/group and
 modes recorded before migration, restore the previous image tag if needed, and
 recreate `enclosure-history`. Do not use `0777` or `0666` as a workaround.
 

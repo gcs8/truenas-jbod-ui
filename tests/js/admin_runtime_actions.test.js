@@ -271,6 +271,62 @@ test("a hung action request is aborted before convergence polling begins", async
   assert.equal(uiButton.disabled, false);
 });
 
+test("an unknown-outcome action failure from fetchJson is reported as status unknown", async () => {
+  // fetchJson marks a mutation whose result nobody can determine with
+  // outcomeUnknown; the runtime action path must read that flag rather than
+  // only its own timeout flag, or the operator is told the action "failed".
+  const uiButton = fakeButton("ui");
+  const banners = [];
+  const state = {
+    runtime: runtimePayload({ running: true, health: "healthy" }).runtime,
+    runtimeActionPromises: new Map(),
+    runtimeActionControllers: new Map(),
+  };
+  let getCalls = 0;
+  const functions = loadRuntimeFunctions({
+    state,
+    elements: { runtimeCards: { querySelectorAll: () => [uiButton] } },
+    async fetchJson(_url, options = {}) {
+      if (options.method !== "POST") {
+        getCalls += 1;
+        return runtimePayload({ running: true, health: "healthy" });
+      }
+      const error = new Error(
+        "The admin sidecar could not be reached after the request was sent, so it is unknown whether the change was applied. Re-check the current state before retrying."
+      );
+      error.adminOutcome = "unknown";
+      error.outcomeUnknown = true;
+      throw error;
+    },
+    renderRuntimeCards() {},
+    setBanner(message, tone) {
+      banners.push([message, tone]);
+    },
+    encodeURIComponent,
+  });
+
+  const succeeded = await functions.runRuntimeAction("ui", "restart", {
+    pollIntervalMs: 0,
+    sleep: noDelay,
+  });
+
+  assert.equal(succeeded, false);
+  assert.equal(getCalls, 0);
+  assert.ok(
+    banners.some(([message, tone]) =>
+      tone === "error"
+      && /of ui: status unknown/i.test(message)
+      && /unknown whether the change was applied/i.test(message)
+    ),
+    JSON.stringify(banners)
+  );
+  assert.ok(
+    !banners.some(([message]) => /^Container restart failed/i.test(message)),
+    JSON.stringify(banners)
+  );
+  assert.equal(uiButton.disabled, false);
+});
+
 test("stop is not reported successful until a follow-up observation has running false", async () => {
   const harness = runtimeHarness([
     { running: true, health: "healthy", status_text: "Up (healthy)" },
