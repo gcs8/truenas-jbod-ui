@@ -214,11 +214,11 @@ test("buttons are disabled with a title reason for SSH off, in-flight sync, and 
   const sshOff = harness({ platform: "core", sshEnabled: false });
   sshOff.fns.renderDiskInventorySyncControls();
   assert.equal(sshOff.buttons.full.disabled, true);
-  assert.match(sshOff.buttons.full.title, /SSH is disabled for this system/);
+  assert.match(sshOff.buttons.full.title, /SSH is off for this system/);
   sshOff.fns.handleDiskInventorySyncClick("full");
   assert.deepEqual(sshOff.confirms, []);
   assert.deepEqual(sshOff.runs, []);
-  assert.match(sshOff.statuses.at(-1).message, /SSH is disabled/);
+  assert.match(sshOff.statuses.at(-1).message, /SSH is off/);
 
   const busy = harness({ platform: "core" });
   busy.state.diskInventorySync.inFlight = true;
@@ -232,7 +232,7 @@ test("buttons are disabled with a title reason for SSH off, in-flight sync, and 
   assert.match(availability.reason, /only available on TrueNAS CORE/);
   scale.fns.renderDiskInventorySyncControls();
   assert.equal(scale.buttons.full.disabled, false);
-  assert.match(scale.buttons.full.title, /disk\.sync_all/);
+  assert.match(scale.buttons.full.title, /re-scan all of its disks/);
 });
 
 test("optional write-policy hooks disable the controls and click handler with the exact reason", () => {

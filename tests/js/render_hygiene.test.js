@@ -241,7 +241,7 @@ test("history state no longer carries the constant-null ternary", () => {
 });
 
 test("refresh countdown rendering does not rewrite unchanged text or bar width", () => {
-  const label = trackedTextNode("Next refresh pending");
+  const label = trackedTextNode("Auto refresh on");
   const bar = trackedBarNode("");
   const state = {
     snapshotMode: false,
@@ -277,7 +277,7 @@ test("refresh countdown rendering does not rewrite unchanged text or bar width",
 
   state.refreshesInFlight = 1;
   fns.renderRefreshTiming();
-  assert.equal(label.textContent, "Refresh running");
+  assert.equal(label.textContent, "Refreshing...");
   assert.equal(bar.style.width, "100%");
   assert.equal(label.writes, 2);
   assert.equal(bar.style.writes, 2);

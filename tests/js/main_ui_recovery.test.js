@@ -96,7 +96,7 @@ test("background refreshes leave the status line alone so an earlier error stays
   const source = functionSource("refreshSnapshot");
   assert.match(source, /const background = reason === "auto-refresh" \|\| String\(reason\)\.endsWith\("-led-verify"\)/);
   assert.match(source, /if \(!background\) \{\s*setStatus\(refreshStatusMessage\(force, reason\)\);/);
-  assert.match(source, /if \(!background\) \{\s*setStatus\("Inventory updated\."\);/);
+  assert.match(source, /if \(!background\) \{\s*setStatus\("Up to date\."\);/);
   assert.match(source, /setStatus\(`Refresh failed: \$\{error\.message \|\| error\}`, "error"\)/, "a failed refresh is still reported");
   assert.match(functionSource("setStatus"), /setTextIfChanged\(statusText, message\)/);
 });

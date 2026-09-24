@@ -325,7 +325,7 @@ test("a draft started during an automatic refresh blocks its response render", a
 
   assert.equal(events.includes("apply"), false);
   assert.equal(events.includes("render"), false);
-  assert.equal(events.some((event) => /deferred.*calibration/i.test(event)), true);
+  assert.equal(events.some((event) => /set aside.*editing a bay/i.test(event)), true);
   assert.equal(events.filter((event) => event === "schedule").length, 1);
 });
 
@@ -354,7 +354,7 @@ test("discard confirmation keeps or releases a dirty calibration draft explicitl
   assert.equal(state.mappingFormDirty, true);
   assert.equal(state.mappingFormScopeKey, "system-a|enclosure-a||1");
   assert.equal(schedules, 0);
-  assert.match(statuses.at(-1), /canceled.*edits were kept/i);
+  assert.match(statuses.at(-1), /canceled.*changes were kept/i);
 
   confirmed = true;
   assert.equal(confirmMappingDraftDiscard(), true);
