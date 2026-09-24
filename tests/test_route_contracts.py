@@ -371,7 +371,7 @@ class RouteContractTests(unittest.TestCase):
         registry.get_service.return_value = service
 
         with patch.object(app_main, "get_inventory_registry", return_value=registry) as getter:
-            response = asyncio.run(route.endpoint())
+            response = asyncio.run(route.endpoint(SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(startup_problems=())))))
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(json.loads(response.body)["cache_state"], "empty")

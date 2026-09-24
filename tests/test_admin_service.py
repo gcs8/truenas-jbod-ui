@@ -56,6 +56,8 @@ from app.config import (
     TrueNASConfig,
 )
 from app.main import app as main_app
+from app.main import ADMIN_PROBE_CACHE
+from app.main import AdminLaunchState
 from app.main import resolve_admin_launch_url
 from app.main import snapshot_state_busy_exception_handler
 from app.main import _clear_snapshot_export_source_cache_for_tests
@@ -471,10 +473,15 @@ class BackupImportRequestLimitTests(unittest.TestCase):
 class MainAppBoundaryTests(unittest.TestCase):
     def setUp(self) -> None:
         _clear_snapshot_export_source_cache_for_tests()
+        ADMIN_PROBE_CACHE.clear()
+        self.addCleanup(ADMIN_PROBE_CACHE.clear)
 
     @staticmethod
     def _call_main_route(path: str) -> object:
         route = next(route for route in main_app.routes if route.path == path)
+        if path == "/healthz":
+            request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(startup_problems=())))
+            return asyncio.run(route.endpoint(request))
         return asyncio.run(route.endpoint())
 
     def test_admin_sidecar_exposes_one_time_bootstrap_route(self) -> None:
@@ -1618,8 +1625,15 @@ class MainAppBoundaryTests(unittest.TestCase):
                     warnings=["cached warning", "synthetic warning: café"],
                 )
                 # Keep an exact oracle for the previous parent-serialization contract.
+                problems = (
+                    []
+                    if dependency_status == "ok"
+                    else [f"TrueNAS API unreachable: {sources.get('api', {}).get('message') or 'no details recorded'}"]
+                )
                 expected = {
-                    "status": "ok",
+                    "status": "ok" if not problems else "degraded",
+                    "summary": problems[0] if problems else "All sources OK",
+                    "problems": problems,
                     "dependency_status": dependency_status,
                     "last_updated": "2026-04-25T12:00:00+00:00",
                     "sources": snapshot.model_dump(mode="json")["sources"],
@@ -1662,6 +1676,8 @@ class MainAppBoundaryTests(unittest.TestCase):
             response.body,
             JSONResponse({
                 "status": "ok",
+                "summary": "Waiting for the first inventory",
+                "problems": [],
                 "dependency_status": "unknown",
                 "last_updated": None,
                 "sources": {},
@@ -1833,11 +1849,11 @@ class MainAppBoundaryTests(unittest.TestCase):
         ):
             launch_url = resolve_admin_launch_url(request, settings)
 
-        self.assertEqual(launch_url, "http://127.0.0.1:8082")
+        self.assertEqual(launch_url, AdminLaunchState(url="http://127.0.0.1:8082", stopped=False))
         outbound_request = urlopen.call_args.args[0]
         self.assertEqual(outbound_request.get_header("X-request-id"), "e" * 32)
 
-    def test_resolve_admin_launch_url_hides_button_when_sidecar_is_down(self) -> None:
+    def test_resolve_admin_launch_url_reports_stopped_when_sidecar_is_down(self) -> None:
         request = make_request(port=8080)
         settings = Settings(
             admin=AdminSurfaceConfig(
@@ -1854,9 +1870,9 @@ class MainAppBoundaryTests(unittest.TestCase):
         ):
             launch_url = resolve_admin_launch_url(request, settings)
 
-        self.assertIsNone(launch_url)
+        self.assertEqual(launch_url, AdminLaunchState(url=None, stopped=True))
 
-    def test_resolve_admin_launch_url_hides_button_when_sidecar_times_out(self) -> None:
+    def test_resolve_admin_launch_url_reports_stopped_when_sidecar_times_out(self) -> None:
         request = make_request(port=8080)
         settings = Settings(
             admin=AdminSurfaceConfig(
@@ -1873,7 +1889,7 @@ class MainAppBoundaryTests(unittest.TestCase):
         ):
             launch_url = resolve_admin_launch_url(request, settings)
 
-        self.assertIsNone(launch_url)
+        self.assertEqual(launch_url, AdminLaunchState(url=None, stopped=True))
 
     def test_admin_runtime_version_probe_propagates_current_server_request_id(self) -> None:
         service = DockerRuntimeService(AdminSettings(docker_socket_path="/nonexistent.sock"))

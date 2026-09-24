@@ -95,6 +95,16 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- The main UI now checks at startup that it can write its data, logs and
+  known-hosts directories, logs one plain line per refusal naming the fix,
+  and shows it first in the Warnings panel. `/healthz` gains a plain `summary`
+  and a `problems` list and reports `status: degraded` for an unwritable
+  directory or an unreachable TrueNAS API, still answering HTTP 200 so Compose
+  healthchecks keep working. The admin health probe is cached (30 s after
+  success, 10 s after failure) and runs alongside the inventory read, and a
+  stopped admin leaves a disabled System Setup button with the start command
+  instead of the button vanishing. (#560)
+
 - Published aggregate disk-retention totals on the inventory summary
   (`source_disk_count`, `rendered_unique_disk_count`,
   `duplicate_disk_view_count`, `unplaced_disk_count`) so a release check can
