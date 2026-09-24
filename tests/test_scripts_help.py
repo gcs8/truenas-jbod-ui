@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -51,6 +53,17 @@ runpy.run_path(target, run_name='__main__')
 
 def _script_paths() -> list[Path]:
     return sorted(path for path in SCRIPTS_DIR.glob("*.py"))
+
+
+# `--help` runs are independent interpreter processes, so the sweep runs them
+# concurrently. Bounded so the runner is not starved; the results are collected
+# and checked in path order, and the tree-state check still brackets the whole sweep.
+_HELP_WORKERS = max(1, min(8, os.cpu_count() or 1))
+
+
+def _run_help_all(paths: list[Path]) -> dict[Path, subprocess.CompletedProcess[str]]:
+    with ThreadPoolExecutor(max_workers=_HELP_WORKERS) as pool:
+        return dict(zip(paths, pool.map(_run_help, paths)))
 
 
 def _is_command_line_entry_point(path: Path) -> bool:
@@ -140,9 +153,11 @@ class ScriptHelpTests(unittest.TestCase):
     def test_every_script_prints_usage_on_help_without_side_effects(self) -> None:
         failures: list[str] = []
         before = _tree_state()
-        for path in _script_paths():
+        paths = _script_paths()
+        results = _run_help_all(paths)
+        for path in paths:
             with self.subTest(script=path.name):
-                result = _run_help(path)
+                result = results[path]
                 expected_failure = KNOWN_UNRUNNABLE.get(path.name)
                 if expected_failure is not None:
                     # Pinned, not skipped: the reason has to stay exactly this one.

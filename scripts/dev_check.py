@@ -84,7 +84,7 @@ CI_SOURCE_GATE_WORKFLOW_COMMANDS: Mapping[str, str] = {
         )
     ),
     "javascript-unit-tests": "npm run test:unit",
-    "performance-baseline": 'python -m unittest discover -s tests -p "test_*.py" -v',
+    "performance-baseline": 'python scripts/run_test_shard.py run --shard "${{ matrix.shard }}" --results-dir shard-results',
     "prometheus-rules": "\n".join(
         (
             "promtool check rules prometheus/rules/truenas-jbod-ui-alerts-v1.yml",
@@ -94,7 +94,7 @@ CI_SOURCE_GATE_WORKFLOW_COMMANDS: Mapping[str, str] = {
     "python-compileall": (
         "python -m compileall app admin_service history_service scripts tests"
     ),
-    "python-unittest": 'python -m unittest discover -s tests -p "test_*.py" -v',
+    "python-unittest": 'python scripts/run_test_shard.py run --shard "${{ matrix.shard }}" --results-dir shard-results',
 }
 CI_SOURCE_GATE_MARKER = re.compile(
     r"^(?P<indent> *)# dev-check-source-gate: (?P<gate>[a-z0-9-]+)\s*$",
@@ -111,25 +111,25 @@ WINDOWS_PORTABLE_TEST_MODULES = (
     "tests.test_dev_check",
     "tests.test_disk_retention_accounting",
     "tests.test_ghcr_release_contract",
-    "tests.test_history_schema_version_gate",
     "tests.test_heap_probe",
     "tests.test_history_backend",
     "tests.test_history_backend_bounds",
     "tests.test_history_config_contract",
     "tests.test_history_diagnostics",
     "tests.test_history_operation_bounds",
+    "tests.test_history_schema_version_gate",
     "tests.test_logging_config",
     "tests.test_nonroot_cli",
     "tests.test_parsers",
     "tests.test_profile_builder",
     "tests.test_profiles",
     "tests.test_prometheus_alert_rules",
-    "tests.test_public_doc_privacy",
     "tests.test_public_demo_deployment",
     "tests.test_public_demo_deterministic",
     "tests.test_public_demo_fixture",
     "tests.test_public_demo_history_consistency",
     "tests.test_public_demo_provenance",
+    "tests.test_public_doc_privacy",
     "tests.test_public_docs_contract",
     "tests.test_public_screenshots",
     "tests.test_quantastor_api",
@@ -148,6 +148,7 @@ WINDOWS_PORTABLE_TEST_MODULES = (
     "tests.test_truenas_ws",
     "tests.test_truenas_ws_jsonrpc",
     "tests.test_ui_health_and_admin_probe",
+    "tests.test_unittest_shards",
     "tests.test_upgrade_notice",
     "tests.test_wiki_drift_verifier",
 )
