@@ -68,8 +68,9 @@ curl http://your-docker-host:8080/healthz
   trip on this.
 
 The history probe is cached for 30 seconds after success and 10 seconds after a
-failure, and an unset `HISTORY_BACKEND_URL` or a history container that is not
-deployed is not reported. The Docker healthcheck for the main UI probes
+failure. An unset `HISTORY_BACKEND_URL` is not probed, and the default
+`enclosure-history` name not resolving (history profile off) is not reported; a
+custom history host that does not resolve is. The Docker healthcheck for the main UI probes
 `/livez`, not `/healthz`, so neither level restarts the container.
 
 The history and admin sidecars provide their own `/livez` and `/healthz`

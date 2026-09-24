@@ -370,9 +370,17 @@ class HistoryProbeTests(unittest.TestCase):
             "History service unavailable: no answer within 2 seconds.",
         )
 
-    def test_unresolvable_host_means_not_deployed(self) -> None:
+    def test_unresolvable_default_compose_host_means_not_deployed(self) -> None:
         error = urllib.error.URLError(socket.gaierror(-2, "Name or service not known"))
-        self.assertIsNone(self._probe(side_effect=error))
+        with patch.object(app_main.urllib.request, "urlopen", side_effect=error):
+            self.assertIsNone(app_main._probe_history_service("http://enclosure-history:8001", 2.0))
+
+    def test_unresolvable_custom_host_is_a_problem(self) -> None:
+        error = urllib.error.URLError(socket.gaierror(-2, "Name or service not known"))
+        self.assertEqual(
+            self._probe(side_effect=error),
+            "History service unavailable: its host name does not resolve.",
+        )
 
     def test_unreadable_answer_is_named(self) -> None:
         self.assertIn("unreadable", self._probe(return_value=_FakeResponse(b"not json")) or "")

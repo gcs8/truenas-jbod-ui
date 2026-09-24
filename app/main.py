@@ -10,6 +10,7 @@ import socket
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import OrderedDict
 from contextlib import asynccontextmanager
@@ -974,16 +975,19 @@ HISTORY_PROBE_FAILURE_TTL_SECONDS = 10.0
 HISTORY_PROBE_MAX_TIMEOUT_SECONDS = 2.0
 HISTORY_PROBE_CACHE: dict[str, HistoryProbeCacheEntry] = {}
 HISTORY_UNAVAILABLE_PROBLEM = "History service unavailable"
+HISTORY_COMPOSE_SERVICE_HOST = "enclosure-history"
 
 
 def _probe_history_service(service_url: str, timeout_seconds: float) -> str | None:
     """Return one plain problem line for the history sidecar, or None.
 
-    A host name that does not resolve means the optional history container is
-    not deployed (Docker only resolves service names of running containers), so
-    it is not reported: the default Compose file names the sidecar even when
-    its profile is off. Everything else that fails is outside this container,
-    so it can only ever degrade health, never take it down.
+    When the URL names the default Compose service (``enclosure-history``) and
+    that name does not resolve, the optional history container is simply not
+    deployed: Docker only resolves service names of running containers, and the
+    default Compose file sets the URL even when the history profile is off. That
+    case is not reported. Any other host that does not resolve is a problem.
+    Everything that fails is outside this container, so it can only ever
+    degrade health, never take it down.
     """
 
     health_url = f"{service_url.rstrip('/')}/healthz"
@@ -1000,7 +1004,10 @@ def _probe_history_service(service_url: str, timeout_seconds: float) -> str | No
         return f"{HISTORY_UNAVAILABLE_PROBLEM}: it answered HTTP {exc.code}."
     except urllib.error.URLError as exc:
         if isinstance(exc.reason, socket.gaierror):
-            return None
+            host = (urllib.parse.urlsplit(service_url).hostname or "").lower()
+            if host == HISTORY_COMPOSE_SERVICE_HOST:
+                return None
+            return f"{HISTORY_UNAVAILABLE_PROBLEM}: its host name does not resolve."
         if isinstance(exc.reason, ConnectionRefusedError):
             return f"{HISTORY_UNAVAILABLE_PROBLEM}: connection refused."
         if isinstance(exc.reason, (TimeoutError, socket.timeout)):
