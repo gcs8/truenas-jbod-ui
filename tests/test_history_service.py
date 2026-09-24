@@ -8,6 +8,7 @@ import json
 import os
 import re
 import socket
+import shutil
 import sqlite3
 import stat
 import tempfile
@@ -1983,6 +1984,39 @@ class HistoryStoreTests(unittest.TestCase):
                     "thread-lock:exit",
                     "lifecycle-lock:exit",
                 ],
+            )
+
+    def test_backup_discards_a_copy_when_the_database_is_replaced_mid_copy(self) -> None:
+        # The copy runs outside the lifecycle lock, so a restore or quarantine can
+        # swap the hot file under it. Publishing that copy would let retention
+        # prune rows it never contained (#560 review), so it must be discarded.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            database_path = root / "history.db"
+            store = HistoryStore(str(database_path))
+            store.insert_metric_samples([self._metric_sample("2026-06-30T00:00:00+00:00", 22)])
+            real_connect = HistoryStore._connect
+            replaced: list[bool] = []
+
+            def connect_then_replace(self_store: HistoryStore, *args: Any, **kwargs: Any) -> sqlite3.Connection:
+                connection = real_connect(self_store, *args, **kwargs)
+                if not replaced:
+                    replaced.append(True)
+                    staged = root / "restored.db"
+                    shutil.copyfile(database_path, staged)
+                    os.replace(staged, database_path)
+                return connection
+
+            with patch.object(HistoryStore, "_connect", connect_then_replace):
+                with self.assertRaises(history_store.HistoryBackupSourceReplacedError):
+                    store.create_backup(root / "backups", snapshot_label="2030-01-02T03:04:05+00:00")
+
+            self.assertEqual(replaced, [True])
+            published = [path.name for path in (root / "backups").glob("*.sqlite3")]
+            self.assertEqual(published, [], "a copy of the replaced file must not be published")
+            self.assertIsNotNone(
+                store.create_backup(root / "backups", snapshot_label="2030-01-02T04:04:05+00:00"),
+                "the next pass backs up the current file",
             )
 
     def test_store_rechecks_lifecycle_markers_after_acquiring_the_history_lock(self) -> None:

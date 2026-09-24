@@ -443,6 +443,10 @@ CREATE INDEX IF NOT EXISTS idx_metric_rollups_retention
 """
 
 
+class HistoryBackupSourceReplacedError(RuntimeError):
+    """The hot database changed identity during a backup copy; nothing was published."""
+
+
 class HistoryStore:
     def __init__(
         self,
@@ -1780,6 +1784,11 @@ class HistoryStore:
             # The copy is an ordinary WAL read: it needs neither the cross-process
             # lifecycle lock nor the in-process write lock, so readers in other
             # containers and this collector's own writes keep going while it runs.
+            # A restore, quarantine or segmented lifecycle step may replace the
+            # hot file meanwhile, so the source identity is recorded first and
+            # re-checked under the publication lock; a copy of a replaced file is
+            # discarded instead of published as a current backup.
+            source_identity = self._database_file_identity()
             with closing(self._connect()) as source_connection, closing(
                 sqlite3.connect(f"/proc/self/fd/{temp_fd}")
             ) as backup_connection:
@@ -1788,6 +1797,11 @@ class HistoryStore:
                 backup_connection.commit()
             with history_write_lock(self.file_path, blocking=True):
                 with self._lock:
+                    if source_identity is None or self._database_file_identity() != source_identity:
+                        raise HistoryBackupSourceReplacedError(
+                            "The history database was replaced while the backup copy ran; "
+                            "the copy was discarded and the next backup pass will retry."
+                        )
                     publish_descriptor = temp_fd
                     temp_fd = None
                     self._publish_replacement(
@@ -1812,6 +1826,13 @@ class HistoryStore:
             self._discard_owned_path(temp_path, temp_metadata)
 
         return final_path
+
+    def _database_file_identity(self) -> tuple[int, int] | None:
+        try:
+            metadata = os.lstat(self.file_path)
+        except FileNotFoundError:
+            return None
+        return (metadata.st_dev, metadata.st_ino)
 
     def latest_backup_snapshot_at(self, backup_dir: str | Path) -> datetime | None:
         backup_root = Path(backup_dir)
