@@ -60,6 +60,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Changed
 
+- Rewrote the warnings, bay-light and mapping reasons, SMART messages, HTTP error details, export banner labels and release-check summaries the main page shows, in plain words with no roadmap prose; the QuantaStor cluster master is shown in Platform Details instead of as a warning, and history backend log lines now say why a request failed (#496).
+
 - Admin failures now answer with the request's correlation id in the response
   body and the `X-Request-ID` header, and the admin log records that id with the
   HTTP status only; the admin state reports whether the sidecar's auto-stop time

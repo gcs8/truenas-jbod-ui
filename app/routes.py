@@ -134,7 +134,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
     ) -> Any:
         registry = get_inventory_registry()
         if exact_system_id and (system_id is None or not registry.has_system(system_id)):
-            raise HTTPException(status_code=404, detail=f"System {system_id!r} is not configured.")
+            raise HTTPException(status_code=404, detail=f'No system named "{system_id}" is configured.')
         service = registry.get_service(system_id)
         add_perf_metadata(
             system_id=service.system.id,
@@ -849,7 +849,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
         try:
             result = await history_backend.refresh(payload.mode)
         except HistoryBackendPolicyError as exc:
-            raise HTTPException(status_code=exc.status_code, detail="History refresh was rejected by policy.") from exc
+            raise HTTPException(status_code=exc.status_code, detail="The history service refused this request. Check the history service log.") from exc
         return JSONResponse(result)
 
     history_scopes_request_schema = HistoryScopesProxyRequest.model_json_schema()
@@ -875,12 +875,12 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
         if not _is_json_media_type(request.headers.get("content-type")):
             raise HTTPException(
                 status_code=415,
-                detail="History request Content-Type must be application/json or application/*+json.",
+                detail="Send this request with Content-Type: application/json.",
             )
         body = await read_limited_request_body(
             request,
             limit=MAX_HISTORY_SCOPES_REQUEST_BYTES,
-            detail=f"History request exceeds {MAX_HISTORY_SCOPES_REQUEST_BYTES} bytes.",
+            detail="History request is too large.",
         )
         try:
             document = json.loads(body)
@@ -902,7 +902,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
         except HistoryBackendBusyError:
             return _history_read_busy_response()
         except HistoryBackendPolicyError as exc:
-            raise HTTPException(status_code=exc.status_code, detail="History request was rejected by policy.") from exc
+            raise HTTPException(status_code=exc.status_code, detail="The history service refused this request. Check the history service log.") from exc
         except (HistoryRequestShapeError, HistoryBudgetExceeded, ValueError) as exc:
             raise HTTPException(
                 status_code=413 if isinstance(exc, HistoryBudgetExceeded) else 422,
@@ -951,12 +951,12 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
         if len(requested_slots) > MAX_TARGETS:
             raise HTTPException(
                 status_code=413,
-                detail=f"History request exceeds target_count limit ({MAX_TARGETS}).",
+                detail=f"History can be requested for at most {MAX_TARGETS} slots at a time.",
             )
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
         if not requested_slots or not isinstance(window_hours, int) or not 1 <= window_hours <= 8760:
-            raise HTTPException(status_code=422, detail="Bounded history slots and window_hours are required.")
+            raise HTTPException(status_code=422, detail="Choose at least one slot and a time range between 1 hour and 1 year.")
         selected_metrics = metrics or list(ALLOWED_HISTORY_METRICS)
         since = (datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat()
         try:
@@ -1022,7 +1022,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
         metric_limit: int = 60,
     ) -> JSONResponse:
         if not isinstance(window_hours, int) or not 1 <= window_hours <= 8760:
-            raise HTTPException(status_code=422, detail="A bounded window_hours is required.")
+            raise HTTPException(status_code=422, detail="Choose a time range between 1 hour and 1 year.")
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
         try:
@@ -1034,7 +1034,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         runtime_view = next((view for view in runtime.views if view.id == view_id), None)
         if not runtime_view:
-            raise HTTPException(status_code=404, detail=f"Storage view {view_id!r} is not present for this system.")
+            raise HTTPException(status_code=404, detail=f'The saved view "{view_id}" does not exist on this system.')
 
         display_slot_by_target: dict[tuple[str | None, int], list[int]] = {}
         slots_by_enclosure: dict[str | None, set[int]] = {}

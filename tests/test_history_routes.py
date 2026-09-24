@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from app import main as app_main
 from app.config import Settings
 from app.models.domain import InventorySnapshot
+from app.services.history_backend import HISTORY_BACKEND_DEGRADED_DETAIL
 
 
 class SlotHistoryRouteTests(unittest.TestCase):
@@ -53,7 +54,7 @@ class SlotHistoryRouteTests(unittest.TestCase):
                     "collector_running": True,
                     "last_success_at": "2026-09-06T10:00:00+00:00",
                     "last_completed_at": "2026-09-06T09:59:00+00:00",
-                    "last_error": "History backend is degraded; see history service logs.",
+                    "last_error": HISTORY_BACKEND_DEGRADED_DETAIL,
                 },
             },
         )

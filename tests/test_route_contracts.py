@@ -205,7 +205,7 @@ class RouteContractTests(unittest.TestCase):
         self.assertEqual(response.headers["retry-after"], "1")
         self.assertEqual(
             json.loads(response.body),
-            {"ok": False, "detail": "Snapshot state capacity is temporarily busy; retry later."},
+            {"ok": False, "detail": "The server is busy. Try again in a moment."},
         )
 
     def test_admin_route_matrix_is_frozen(self) -> None:

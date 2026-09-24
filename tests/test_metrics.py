@@ -266,7 +266,7 @@ class MetricsRouteTests(unittest.TestCase):
             error_payload,
             {
                 "ok": False,
-                "detail": "Unhandled application error; see application logs.",
+                "detail": "Something went wrong on the server. The application log has details.",
                 "request_id": request_id,
             },
         )
@@ -309,7 +309,7 @@ class MetricsRouteTests(unittest.TestCase):
             json.loads(response_body(messages)),
             {
                 "ok": False,
-                "detail": "Unhandled application error; see application logs.",
+                "detail": "Something went wrong on the server. The application log has details.",
                 "request_id": request_id,
             },
         )
