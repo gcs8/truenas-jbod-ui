@@ -103,7 +103,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   healthchecks keep working. The admin health probe is cached (30 s after
   success, 10 s after failure) and runs alongside the inventory read, and a
   stopped admin leaves a disabled System Setup button with the start command
-  instead of the button vanishing. (#560)
+  instead of the button vanishing. (#565)
 
 - Published aggregate disk-retention totals on the inventory summary
   (`source_disk_count`, `rendered_unique_disk_count`,
