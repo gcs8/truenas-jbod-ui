@@ -73,6 +73,15 @@ service logs.
 | `Cleanup resumes by` | The deadline after which retention prunes anyway. |
 | `Full refresh available` | When the next manual full refresh is allowed, instead of a refusal after the fact. |
 
+The history service `/healthz` always answers HTTP 200 while the process is up.
+Its `status` is `degraded`, with a plain `detail`, when the last background
+collection failed, the history database is read-only, cleanup failed twice in a
+row, or earlier history was quarantined and needs recovery. A failed manual
+refresh shows in `Last error` but does not make the service degraded. The
+Collector card reads `Starting` during the startup grace period, and a scheduled
+backup status file with group or world write permission is named in
+`Cleanup error` (expected mode `0640`).
+
 If `Cleanup waiting` stays set, fix the backup first: read `Backup error`, check
 that the backup directory is writable by the history service and has free
 space, then confirm that `Last backup` moves forward. Pruning resumes on its own
