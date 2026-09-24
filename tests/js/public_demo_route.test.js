@@ -9,7 +9,9 @@ const vm = require("node:vm");
 const ROOT = path.resolve(__dirname, "../..");
 const APP_SOURCE = fs.readFileSync(path.join(ROOT, "app/static/app.js"), "utf8");
 const BASE_TEMPLATE = fs.readFileSync(path.join(ROOT, "app/templates/base.html"), "utf8");
-const PUBLIC_DEMO = fs.readFileSync(path.join(ROOT, "public-demo/index.html"), "utf8");
+const { SKIP_REASON, currentSourceDemo } = require("./current_source_demo");
+
+const PUBLIC_DEMO = currentSourceDemo();
 
 function functionSource(name) {
   const patterns = [`async function ${name}(`, `function ${name}(`];
@@ -81,9 +83,10 @@ test("snapshot SSH status preserves disabled, success, and captured failure stat
   );
 });
 
-test("main page and checked public demo use an inline favicon", () => {
-  const inlineFavicon = /<link\s+rel="icon"\s+href="data:[^"]*">/;
+test("main page uses an inline favicon", () => {
+  assert.match(BASE_TEMPLATE, /<link\s+rel="icon"\s+href="data:[^"]*">/);
+});
 
-  assert.match(BASE_TEMPLATE, inlineFavicon);
-  assert.match(PUBLIC_DEMO, inlineFavicon);
+test("generated public demo uses an inline favicon", { skip: PUBLIC_DEMO === null && SKIP_REASON }, () => {
+  assert.match(PUBLIC_DEMO, /<link\s+rel="icon"\s+href="data:[^"]*">/);
 });

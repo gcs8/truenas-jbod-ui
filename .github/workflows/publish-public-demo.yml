@@ -116,9 +116,12 @@ jobs:
       - name: Use hosted Chrome for browser smoke tests
         run: google-chrome --version
 
-      - name: Smoke test checked-in artifact and current-source fixture
+      # A dispatch publishes the checked-in bytes, so it browser-tests exactly
+      # those. A pull request tests a throwaway build of its own source, since
+      # the checked-in demo is only rebuilt when a release is cut.
+      - name: Smoke test public demo and current-source fixture
         env:
-          PUBLIC_DEMO_ARTIFACT: public-demo/index.html
+          PUBLIC_DEMO_ARTIFACT: ${{ github.event_name == 'workflow_dispatch' && 'public-demo/index.html' || format('{0}/truenas-jbod-ui-current-source-browser/public-demo.html', runner.temp) }}
           SLOT_FOCUS_ARTIFACT: ${{ runner.temp }}/truenas-jbod-ui-current-source-browser/index.html
           PLAYWRIGHT_BROWSER_CHANNEL: chrome
         run: |
@@ -137,6 +140,9 @@ jobs:
           trap cleanup EXIT
           rm -rf "$fixture_root"
           mkdir -p "$fixture_root"
+          if [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]; then
+            python scripts/build_public_demo.py --output "$PUBLIC_DEMO_ARTIFACT" --source-revision "$(git rev-parse HEAD)"
+          fi
           python scripts/build_current_source_browser_fixture.py --output "$SLOT_FOCUS_ARTIFACT"
           npx playwright test qa/public-demo.spec.js --retries=0
 

@@ -42,7 +42,25 @@ jobs:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          fetch-depth: 0
           persist-credentials: false
+
+      - name: Set up Python for release gates
+        if: github.event_name == 'release'
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+
+      - name: Require a public demo rebuilt for this release
+        if: github.event_name == 'release'
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          # Pull requests do not rebuild the public demo; cutting a release
+          # does. Refuse to publish the image until the checked-in demo and
+          # screenshots were rebuilt and reviewed from this release source.
+          python scripts/validate_release_wrap.py "$RELEASE_TAG" --public-demo-only
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
