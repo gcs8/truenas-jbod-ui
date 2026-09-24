@@ -404,6 +404,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - `config/config.example.yaml` now lists every option with its default and
   shows one example system per platform, including ESXi, a BMC-only host,
   and a storage view; the unused `app.verify_ssl` line is gone. (#489)
+- The Storage Fabric page describes the hardware in plain words (HBAs, paths,
+  expanders, enclosures, bays), its warnings say what was not found and what
+  to check, and a new Storage Fabric wiki page explains the four views, the
+  status chip states and renaming. (#490)
 
 ### Internal
 
