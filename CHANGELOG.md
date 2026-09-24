@@ -276,7 +276,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   the history locks, recounts table sizes at startup only when a counter row is
   missing, and runs the one-time disk-identity upgrade in resumable batches with
   progress in the log. Existing databases keep reusing freed pages in place
-  (#N).
+  (#560).
 
 - Served a slot history bundle from one SQLite connection instead of fifteen
   and cached the history lock address per database identity instead of parsing
