@@ -95,6 +95,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Prevented destructive demo collisions and unconfirmed history purges,
+  preserved admin drafts and restart choices, and rejected false success. (#424)
 - Reported failed SCALE and QuantaStor enrichment without hiding source
   disks or leaving SSH status falsely healthy; a SCALE host whose SES
   discovery succeeds but finds no enclosure device stays healthy and quiet. (#422)
