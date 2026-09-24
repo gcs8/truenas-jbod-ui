@@ -443,6 +443,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   expanders, enclosures, bays), its warnings say what was not found and what
   to check, and a new Storage Fabric wiki page explains the four views, the
   status chip states and renaming. (#490)
+- Added an Upgrading wiki page, Troubleshooting entries for a restarting
+  container, an unwritable history database and the off-loopback history
+  refusal, and Quick Start notes on `COMPOSE_PROFILES` and admin auto-stop
+  (#564).
 
 ### Internal
 
