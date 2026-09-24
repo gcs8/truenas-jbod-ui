@@ -187,7 +187,8 @@ def report_screenshots(root: Path) -> dict[str, object]:
     """Describe the screenshots on disk as candidate manifest content.
 
     The report never reads the checked-in manifest and never writes a file. Pixel
-    review stays PENDING: only a human reviewer may record PASS.
+    review stays PENDING: only a named reviewer who inspected these exact bytes
+    may record PASS, by hand.
     """
     docs_root = root / "docs/images/screenshots"
     artifact_path = root / "public-demo/index.html"

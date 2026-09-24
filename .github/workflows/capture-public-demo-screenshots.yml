@@ -1,6 +1,7 @@
 name: Capture Public Demo Screenshots
 
-# Dispatch-only. The job produces a capture for a human to review and commit. It
+# Dispatch-only. The job produces a capture for a named reviewer to inspect and
+# commit. It
 # never commits, pushes, opens a pull request, or writes the screenshot manifest.
 #
 # The default run (qualification_only: true) qualifies the tooling against an
@@ -225,7 +226,7 @@ jobs:
             fi
           } 2>&1 | tee -a "$CANDIDATE_DIR/capture.log"
 
-      - name: Upload the capture for human review
+      - name: Upload the capture for review
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:

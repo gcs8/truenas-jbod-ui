@@ -212,8 +212,10 @@ The order inside such a pull request is fixed:
    --source-revision <full SHA of that source commit>` and commit the result.
 3. Dispatch the capture against the artifact commit, review, and commit the
    images, manifest and review record as described above.
-4. Merge with a merge commit. Any new commit after step 2, including a merge
-   from `main`, invalidates the capture and the review.
+4. Merge with a merge commit. A later commit that changes a declared demo input
+   or `public-demo/index.html` invalidates the capture and the review, and the
+   chain starts again from step 1. Committing the reviewed images and review
+   record in step 3, or merging a `main` that touches neither, does not.
 
 Only one demo-input pull request should run this chain at a time: two branches
 rebuilt from different sources cannot both merge without one of them starting
