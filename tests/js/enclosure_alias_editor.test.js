@@ -357,18 +357,38 @@ test("a rejected alias write reports the server detail and keeps the editor open
   assert.equal(writePolicyReason(), "Read UI authentication required.");
 });
 
-test("clear control clears the draft and submits the clear operation", async () => {
+test("remove-name control asks first, then clears the draft and submits the clear operation", async () => {
+  const input = { value: "Archive East" };
+  let submissions = 0;
+  const questions = [];
+  const { clearEnclosureAlias } = loadFunctions(["clearEnclosureAlias"], {
+    enclosureAliasInput: input,
+    async submitEnclosureAlias() { submissions += 1; },
+    window: { confirm(message) { questions.push(message); return true; } },
+  });
+
+  await clearEnclosureAlias();
+
+  assert.equal(questions.length, 1);
+  assert.match(questions[0], /Remove this enclosure name\?/);
+  assert.equal(input.value, "");
+  assert.equal(submissions, 1);
+  assert.match(TEMPLATE, /id="enclosure-alias-clear"[^>]*>Remove name</);
+});
+
+test("declining the remove-name question keeps the draft and saves nothing", async () => {
   const input = { value: "Archive East" };
   let submissions = 0;
   const { clearEnclosureAlias } = loadFunctions(["clearEnclosureAlias"], {
     enclosureAliasInput: input,
     async submitEnclosureAlias() { submissions += 1; },
+    window: { confirm() { return false; } },
   });
 
   await clearEnclosureAlias();
 
-  assert.equal(input.value, "");
-  assert.equal(submissions, 1);
+  assert.equal(input.value, "Archive East");
+  assert.equal(submissions, 0);
 });
 
 test("multi-enclosure live title prefers the selected option label", () => {

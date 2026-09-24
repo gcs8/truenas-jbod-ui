@@ -195,7 +195,7 @@ test("dynamic panels announce status nodes instead of rebuilt panel contents", (
   const fabricPanel = template.split("\n").find((line) => line.includes('id="sas-fabric-panel"'));
   const fabricStatus = template.split("\n").find((line) => line.includes('id="sas-fabric-status"'));
   assert.doesNotMatch(perfPanel, /aria-live/);
-  assert.match(perfSummary, /aria-live="polite"/);
+  assert.doesNotMatch(perfSummary, /aria-live/);
   assert.doesNotMatch(fabricPanel, /aria-live/);
   assert.match(fabricStatus, /aria-live="polite"/);
 });
