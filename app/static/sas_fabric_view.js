@@ -487,7 +487,7 @@
             ...modeCopy,
             lanes: {
               title: "Storage Lanes",
-              subtitle: "Quantastor HA nodes, SES paths, storage views, pool/vdev membership, and mapped bays grouped by HA node.",
+              subtitle: "Each Quantastor HA member in its own lane: SES paths, storage views, pool/vdev membership and mapped bays.",
             },
             trace: {
               title: "Physical Trace",
@@ -1622,6 +1622,12 @@
       && slots.every((slotNumber) => diskLocation(slotNumber).physical) ? "bay" : "disk";
   }
 
+  function hostDiskSummary(fabric) {
+    const slots = sortedSlots(list(fabric.traces).filter((trace) => trace.kind === "bay").flatMap((trace) => list(trace.slots)));
+    const noun = aggregateDiskNoun(slots);
+    return `${slots.length} ${noun}${slots.length === 1 ? "" : "s"}`;
+  }
+
   function renderPathButton(path, { compact = false } = {}) {
     const trace = traceById(path.id);
     const selected = state.selectedTraceId === path.id;
@@ -1739,7 +1745,7 @@
       <div class="fabric-host-strip">
         ${renderNodeButton(hostNode, {
           label: displayLabel(hostNode) || "Host",
-          meta: `${controllerRecords.length} ${copy.hostControllerNoun}${controllerRecords.length === 1 ? "" : "s"} / ${list(fabric.paths).length} path${list(fabric.paths).length === 1 ? "" : "s"} / ${list(fabric.traces).filter((trace) => trace.kind === "bay").length} bays`,
+          meta: `${controllerRecords.length} ${copy.hostControllerNoun}${controllerRecords.length === 1 ? "" : "s"} / ${list(fabric.paths).length} path${list(fabric.paths).length === 1 ? "" : "s"} / ${hostDiskSummary(fabric)}`,
           extra: "host",
         })}
       </div>
@@ -3160,7 +3166,7 @@
           `).join("")}
         </div>
         <div class="fabric-link-list">
-          <h3>Trace Links</h3>
+          <h3>Connections in this trace</h3>
           ${linkRows.length ? linkRows.map((link) => `
             <button type="button" class="fabric-link-row status-${classToken(link.status)}" data-fabric-node="${escapeHtml(link.target)}">
               <span>${escapeHtml(formatKind(link.kind))}</span>
@@ -3365,7 +3371,7 @@
         </section>
 
         <section class="fabric-inspector-section">
-          <h4>Trace Nodes</h4>
+          <h4>Items in this trace</h4>
           <div class="fabric-node-grid fabric-inspector-node-grid">${renderNodeGrid(list(trace.node_ids).map((nodeId) => nodes.get(nodeId)).filter(Boolean), 18)}</div>
         </section>
       </div>
@@ -3538,7 +3544,7 @@
           </section>
         ` : ""}
         <section class="fabric-inspector-section">
-          <h4>Trace Nodes</h4>
+          <h4>Items in this trace</h4>
           <div class="fabric-node-grid">${renderNodeGrid(list(trace.node_ids).map((nodeId) => nodes.get(nodeId)).filter(Boolean), 18)}</div>
         </section>
       `;
