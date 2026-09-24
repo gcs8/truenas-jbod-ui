@@ -47,6 +47,8 @@ const REQUIRED_NAMES = [
   "describeRequestFailure",
   "describeApiError",
   "validatedRequestId",
+  "fetchOrReportStopped",
+  "sessionRemainingMs",
   "fetchWithTimeout",
   "requestTimeoutError",
 ];
@@ -62,7 +64,7 @@ const OUTCOME_NAMES = [
 ];
 
 function loadFetchJson(bindings = {}) {
-  const context = vm.createContext({ AbortController, setTimeout, clearTimeout, ...bindings });
+  const context = vm.createContext({ state: { admin: {} }, AbortController, setTimeout, clearTimeout, ...bindings });
   const sources = [
     ...REQUIRED_NAMES.map((name) => functionSource(name)),
     ...OUTCOME_NAMES.map((name) => functionSource(name, { optional: true })),
