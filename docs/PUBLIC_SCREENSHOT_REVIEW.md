@@ -1,15 +1,17 @@
 # Public screenshot exact-byte review
 
-This record covers the two desktop fixture screenshots generated from `public-demo/index.html`. GitHub Actions run `36053296370` used the pinned Playwright `v1.63.0-jammy` container, `file://`, UTC, a 1920 by 1080 viewport, reduced motion, and no network request. The job captured each image twice and produced byte-identical copies; `sha256sums.txt` verified.
+This record covers the two desktop fixture screenshots generated from `public-demo/index.html`. GitHub Actions run `36060385480` used the pinned Playwright `v1.63.0-jammy` container, `file://`, UTC, a 1920 by 1080 viewport, reduced motion, and no network request. The job captured each image twice and produced byte-identical copies; `sha256sums.txt` verified.
 
-Source revision: `dea8386bad00003bbb5289a20f42f1cdcf1b8e77`
+Source revision: `2a7f11258083a4cd27b156fe4a073f83db2842a5`
 
-Source artifact SHA-256: `10b1ca7989804babc3e3b51dd0e46080314abd3ae28b4bd73e93d23a7d117ff5`
+Source artifact SHA-256: `a52fb93384f25902fe6668600101f82992560701d1a8528d51882b7429593446`
 
 | Image | Dimensions | Bytes | SHA-256 | Pixel review |
 |---|---:|---:|---|---|
 | `public-demo-overview.png` | 1920 by 3059 | 851100 | `1c6242674f8a661f0851d0bef9842f3f501fb6a392f3f1bc4f292488ba9d55d7` | PASS |
 | `public-demo-history.png` | 1920 by 3817 | 953927 | `66e61def4a0ca56ba68aae0bd95e1bc980be42d5f3c70ba1daf303475138de8d` | PASS |
+
+Backend-lane integration (#568, source `2a7f112`): run `36060385480` captured the rebuilt artifact twice; run-1, run-2 and the candidate are byte-identical and `sha256sums.txt` verified. Both PNGs are byte-identical to the previously approved pair (same SHA-256 and bytes; an RGB comparison found 0 changed pixels), so the checked-in images are unchanged and only the recorded source revision and artifact hash move. Both exact PNGs were re-inspected with the Hermes `vision_analyze` tool: no source revision, commit hash, private host, address or real serial is visible, and there is no clipping, overlap or malformed text beyond the intended ellipses.
 
 These exact images accompany the main-UI integration (#562, superseding #425, #508, #510, #477, #484, #485 and #491), which changes the declared demo inputs `app/static/app.js`, `app/static/style.css`, `app/templates/index.html`, `app/templates/base.html` and several services. The layout change is intended, so a pixel-for-pixel match with the previous pair is not expected: an RGB comparison differs from row 0 on (the header copy changed) and both pages are shorter (overview 4092 to 3059 px, history 4852 to 3817 px).
 

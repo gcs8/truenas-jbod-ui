@@ -79,6 +79,7 @@ from app.services.snapshot_export import (
     SnapshotExportTooLargeError,
     collect_configured_hostnames,
 )
+from app.services.storage_writability import probe_writable_directories
 from app.services.truenas_ws import TrueNASAPIError
 from app.services import upgrade_notice
 from history_service.operation_bounds import (
@@ -120,31 +121,60 @@ class HistoryScopesProxyRequest(BaseModel):
     metric_limit: int
 
 
-async def system_not_configured_exception_handler(
-    _: Request,
-    exc: Exception,
-) -> JSONResponse:
-    return JSONResponse(
-        {"ok": False, "detail": str(exc)},
-        status_code=404,
+@dataclass(frozen=True)
+class ErrorResponseSpec:
+    """How one service exception reaches the browser: status, wording, and retry hint."""
+
+    status_code: int
+    detail: str | None = None
+    retry_after_seconds: int | None = None
+
+    def headers(self) -> dict[str, str] | None:
+        if self.retry_after_seconds is None:
+            return None
+        return {"Retry-After": str(self.retry_after_seconds)}
+
+    def detail_for(self, exc: Exception) -> str:
+        return self.detail if self.detail is not None else str(exc)
+
+
+UNKNOWN_ENCLOSURE_DETAIL = "Requested enclosure is not available for this system."
+ENCLOSURE_LAYOUT_UNAVAILABLE_DETAIL = "Unable to resolve selected enclosure layout."
+
+EXCEPTION_RESPONSES: dict[type[Exception], ErrorResponseSpec] = {
+    SystemNotConfiguredError: ErrorResponseSpec(status_code=404),
+    UnknownEnclosureError: ErrorResponseSpec(status_code=404, detail=UNKNOWN_ENCLOSURE_DETAIL),
+    SnapshotStateBusyError: ErrorResponseSpec(status_code=503, retry_after_seconds=1),
+    SnapshotExportBusyError: ErrorResponseSpec(status_code=503, retry_after_seconds=5),
+}
+
+
+def error_response_spec(exc: Exception) -> ErrorResponseSpec:
+    for exc_type in type(exc).__mro__:
+        spec = EXCEPTION_RESPONSES.get(exc_type)
+        if spec is not None:
+            return spec
+    raise KeyError(type(exc).__name__)
+
+
+def http_exception_for(exc: Exception) -> HTTPException:
+    spec = error_response_spec(exc)
+    return HTTPException(
+        status_code=spec.status_code,
+        detail=spec.detail_for(exc),
+        headers=spec.headers(),
     )
 
 
-async def unknown_enclosure_exception_handler(
+async def mapped_exception_handler(
     _: Request,
     exc: Exception,
 ) -> JSONResponse:
-    return JSONResponse({"ok": False, "detail": str(exc)}, status_code=404)
-
-
-async def snapshot_state_busy_exception_handler(
-    _: Request,
-    exc: Exception,
-) -> JSONResponse:
+    spec = error_response_spec(exc)
     return JSONResponse(
-        {"ok": False, "detail": str(exc)},
-        status_code=503,
-        headers={"Retry-After": "1"},
+        {"ok": False, "detail": spec.detail_for(exc)},
+        status_code=spec.status_code,
+        headers=spec.headers(),
     )
 
 
@@ -454,12 +484,8 @@ async def _load_live_enclosure_export_sources(
     return snapshots_by_enclosure, smart_summaries_by_enclosure
 
 
-def _clear_snapshot_export_source_cache_for_tests() -> None:
-    SNAPSHOT_EXPORT_SOURCE_CACHE.clear()
-
-
-READ_UI_SIGN_IN_REQUIRED_REASON = "Sign in to enable mapping, LED, and alias changes."
-READ_UI_WRITE_POLICY_UNAVAILABLE_REASON = "Write controls are unavailable because the authorization mode is unknown."
+READ_UI_SIGN_IN_REQUIRED_REASON = "Sign in to make changes."
+READ_UI_WRITE_POLICY_UNAVAILABLE_REASON = "Changes are disabled because the sign-in settings could not be read."
 
 
 def build_read_ui_write_policy(auth_settings: Any | None) -> dict[str, object]:
@@ -502,7 +528,7 @@ def require_read_ui_basic_credentials(request: Request) -> None:
     if auth_settings.auth_mode != "basic":
         raise HTTPException(
             status_code=403,
-            detail="Read UI sign-in requires ADMIN_AUTH_MODE=basic.",
+            detail="Sign-in is not enabled on this server.",
         )
     if not basic_auth_matches(
         request.headers.get("authorization"),
@@ -526,19 +552,19 @@ def require_read_ui_mutation_authorization(request: Request) -> None:
         if not request_origin_allowed(request, public_origin):
             raise HTTPException(
                 status_code=403,
-                detail="Cross-origin Read UI mutation rejected.",
+                detail="This request came from a different site and was blocked.",
             )
         return
     if auth_settings.auth_mode != "basic":
         raise HTTPException(
             status_code=403,
-            detail="Read UI authorization mode is unavailable.",
+            detail="Changes are disabled because the sign-in settings could not be read.",
         )
     require_read_ui_basic_credentials(request)
     if not request_origin_allowed(request, request.app.state.read_ui_public_origin):
         raise HTTPException(
             status_code=403,
-            detail="Cross-origin Read UI mutation rejected.",
+            detail="This request came from a different site and was blocked.",
         )
 
 
@@ -591,6 +617,10 @@ def create_app() -> FastAPI:
     )
     app.state.operator_auth_settings = operator_auth_settings
     app.state.read_ui_public_origin = startup_settings.app.public_origin
+    startup_problems = probe_writable_directories(ui_writable_directories(startup_settings))
+    for problem in startup_problems:
+        logger.error("%s", problem)
+    app.state.startup_problems = tuple(startup_problems)
 
     app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
     install_metrics(app, service_name="enclosure-ui", version=__version__)
@@ -600,22 +630,8 @@ def create_app() -> FastAPI:
     from app.routes import build_router
 
     include_router_preserving_route_objects(app, build_router(sys.modules[__name__]))
-    app.add_exception_handler(
-        SystemNotConfiguredError,
-        system_not_configured_exception_handler,
-    )
-    app.add_exception_handler(
-        UnknownEnclosureError,
-        unknown_enclosure_exception_handler,
-    )
-    app.add_exception_handler(
-        SnapshotStateBusyError,
-        snapshot_state_busy_exception_handler,
-    )
-    app.add_exception_handler(
-        SnapshotExportBusyError,
-        snapshot_state_busy_exception_handler,
-    )
+    for mapped_exception_type in EXCEPTION_RESPONSES:
+        app.add_exception_handler(mapped_exception_type, mapped_exception_handler)
     app.add_exception_handler(
         MappingScopeConflict,
         mapping_scope_conflict_exception_handler,
@@ -637,7 +653,7 @@ def create_app() -> FastAPI:
     async def unhandled_exception_handler(_: Request, exc: Exception) -> JSONResponse:
         logger.error("Unhandled application error", exc_info=(type(exc), exc, exc.__traceback__))
         return JSONResponse(
-            {"ok": False, "detail": "Unhandled application error; see application logs."},
+            {"ok": False, "detail": "Something went wrong on the server. The application log has details."},
             status_code=500,
         )
 
@@ -658,6 +674,7 @@ def build_index_context(
     history_configured: bool,
     read_ui_mutation_auth_mode: str = "network",
     admin_launch_url: str | None = None,
+    admin_launch_stopped: bool = False,
     app_version: str = __version__,
     release_status: dict[str, object] | None = None,
     upgrade_notice_payload: dict[str, str] | None = None,
@@ -675,6 +692,7 @@ def build_index_context(
     initial_history_timeframe_hours_json: str = "24",
     initial_history_panel_open_json: str = "false",
     initial_history_io_chart_mode_json: str = '"total"',
+    system_notice: str | None = None,
 ) -> dict[str, object]:
     sas_fabric_view_url = (
         "#sas-fabric-panel"
@@ -710,6 +728,8 @@ def build_index_context(
         "initial_history_panel_open_json": initial_history_panel_open_json,
         "initial_history_io_chart_mode_json": initial_history_io_chart_mode_json,
         "admin_launch_url": admin_launch_url,
+        "system_notice": system_notice,
+        "admin_launch_stopped": admin_launch_stopped,
         "write_policy": write_policy,
         "write_policy_json": json.dumps(write_policy),
     }
@@ -717,7 +737,7 @@ def build_index_context(
 
 def check_slot_bounds(slot: int, layout_slots: Collection[int]) -> None:
     if slot < 0 or slot not in layout_slots:
-        raise HTTPException(status_code=404, detail=f"Slot {slot} is outside configured layout.")
+        raise HTTPException(status_code=404, detail=f"Slot {slot} is not part of this enclosure.")
 
 
 def snapshot_layout_slots(snapshot: Any) -> frozenset[int]:
@@ -754,34 +774,25 @@ async def resolve_layout_slots(
     permitting a mutation against an unrelated bound.
     """
     if service is None:
-        raise HTTPException(status_code=503, detail="Unable to resolve selected enclosure layout.")
+        raise HTTPException(status_code=503, detail=ENCLOSURE_LAYOUT_UNAVAILABLE_DETAIL)
     try:
         snapshot = await service.get_snapshot(
             selected_enclosure_id=selected_enclosure_id,
             allow_stale_cache=True,
         )
-    except UnknownEnclosureError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except SnapshotStateBusyError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=str(exc),
-            headers={"Retry-After": "1"},
-        ) from exc
+    except (UnknownEnclosureError, SnapshotStateBusyError) as exc:
+        raise http_exception_for(exc) from exc
     except Exception as exc:  # noqa: BLE001 - expose a stable route error, not source details
         logger.debug("Slot bounds: selected enclosure snapshot unavailable (%s)", exc)
         raise HTTPException(
             status_code=503,
-            detail="Unable to resolve selected enclosure layout.",
+            detail=ENCLOSURE_LAYOUT_UNAVAILABLE_DETAIL,
         ) from exc
     if selected_enclosure_id and snapshot.selected_enclosure_id != selected_enclosure_id:
-        raise HTTPException(
-            status_code=404,
-            detail="Requested enclosure is not available for this system.",
-        )
+        raise HTTPException(status_code=404, detail=UNKNOWN_ENCLOSURE_DETAIL)
     layout_slots = snapshot_layout_slots(snapshot)
     if not layout_slots:
-        raise HTTPException(status_code=503, detail="Unable to resolve selected enclosure layout.")
+        raise HTTPException(status_code=503, detail=ENCLOSURE_LAYOUT_UNAVAILABLE_DETAIL)
     return layout_slots
 
 
@@ -791,7 +802,7 @@ async def ensure_slot_bounds(
     selected_enclosure_id: str | None = None,
 ) -> None:
     if slot < 0:
-        raise HTTPException(status_code=404, detail=f"Slot {slot} is outside configured layout.")
+        raise HTTPException(status_code=404, detail=f"Slot {slot} is not part of this enclosure.")
     check_slot_bounds(slot, await resolve_layout_slots(service, selected_enclosure_id))
 
 
@@ -813,34 +824,167 @@ async def ensure_read_slot_bounds(
     selected_enclosure_id: str | None = None,
 ) -> str:
     if slot < 0:
-        raise HTTPException(status_code=404, detail=f"Slot {slot} is outside configured layout.")
+        raise HTTPException(status_code=404, detail=f"Slot {slot} is not part of this enclosure.")
     layout_slots, layout_bounds = await resolve_read_layout_slots(service, selected_enclosure_id)
     if layout_slots is not None:
         check_slot_bounds(slot, layout_slots)
     return layout_bounds
 
 
-def resolve_admin_launch_url(request: Request, settings: Settings) -> str | None:
-    service_url = str(settings.admin.service_url or "").strip()
-    if not service_url:
-        return None
+@dataclass(frozen=True, slots=True)
+class AdminLaunchState:
+    """What the System Setup button shows.
 
+    ``url`` is set when admin answered its health probe; ``stopped`` is set when
+    admin is configured but did not answer, the normal state once it has
+    stopped itself after its idle timeout.
+    """
+
+    url: str | None
+    stopped: bool
+
+
+@dataclass(slots=True)
+class AdminProbeCacheEntry:
+    reachable: bool
+    expires_at_monotonic: float
+
+
+ADMIN_PROBE_SUCCESS_TTL_SECONDS = 30.0
+ADMIN_PROBE_FAILURE_TTL_SECONDS = 10.0
+ADMIN_PROBE_CACHE: dict[str, AdminProbeCacheEntry] = {}
+
+
+def _probe_admin_service(service_url: str, timeout_seconds: float) -> bool:
     health_url = f"{service_url.rstrip('/')}/healthz"
     health_request = urllib.request.Request(
         health_url,
         headers=request_id_headers({"Accept": "application/json"}),
     )
     try:
-        with urllib.request.urlopen(health_request, timeout=settings.admin.timeout_seconds) as response:
-            if getattr(response, "status", 200) >= 400:
-                return None
+        with urllib.request.urlopen(health_request, timeout=timeout_seconds) as response:
+            return getattr(response, "status", 200) < 400
     except (TimeoutError, urllib.error.URLError, ValueError):
+        return False
+
+
+def admin_service_reachable(service_url: str, timeout_seconds: float) -> bool:
+    """Probe admin's health endpoint, remembering the answer briefly.
+
+    Admin is stopped by design most of the time, so without this every page
+    load would wait on a refused connection or a DNS miss.
+    """
+
+    now = time.monotonic()
+    cached = ADMIN_PROBE_CACHE.get(service_url)
+    if cached is not None and cached.expires_at_monotonic > now:
+        return cached.reachable
+    reachable = _probe_admin_service(service_url, timeout_seconds)
+    ttl_seconds = ADMIN_PROBE_SUCCESS_TTL_SECONDS if reachable else ADMIN_PROBE_FAILURE_TTL_SECONDS
+    ADMIN_PROBE_CACHE[service_url] = AdminProbeCacheEntry(
+        reachable=reachable,
+        expires_at_monotonic=now + ttl_seconds,
+    )
+    return reachable
+
+
+def resolve_admin_launch_url(request: Request, settings: Settings) -> AdminLaunchState | None:
+    service_url = str(settings.admin.service_url or "").strip()
+    if not service_url:
         return None
+    if not admin_service_reachable(service_url, settings.admin.timeout_seconds):
+        return AdminLaunchState(url=None, stopped=True)
 
     public_url = str(settings.admin.public_url or "").strip()
     if public_url:
-        return public_url.rstrip("/")
-    return f"{request.url.scheme}://{request.url.hostname}:{settings.admin.port}"
+        return AdminLaunchState(url=public_url.rstrip("/"), stopped=False)
+    return AdminLaunchState(
+        url=f"{request.url.scheme}://{request.url.hostname}:{settings.admin.port}",
+        stopped=False,
+    )
+
+
+def ui_writable_directories(settings: Settings) -> list[str]:
+    """Directories the main UI writes: data files, logs and the known-hosts file.
+
+    The config directory is left out on purpose: the UI only reads it, and the
+    default Compose file mounts it read-only.
+    """
+
+    paths = settings.paths
+    candidates = [
+        paths.mapping_file,
+        paths.sas_fabric_alias_file,
+        paths.slot_detail_cache_file,
+        paths.log_file,
+        settings.ssh.known_hosts_path,
+    ]
+    return [str(Path(candidate).parent) for candidate in candidates if candidate]
+
+
+def startup_problems_for(request: Request) -> list[str]:
+    app_state = getattr(getattr(request, "app", None), "state", None)
+    return [str(problem) for problem in (getattr(app_state, "startup_problems", None) or ())]
+
+
+HEALTH_SUMMARY_ALL_OK = "All sources OK"
+HEALTH_SUMMARY_WAITING = "Waiting for the first inventory"
+
+
+def build_health_payload(
+    snapshot: InventorySnapshot | None,
+    *,
+    startup_problems: Collection[str] = (),
+) -> dict[str, object]:
+    """Describe main-UI health in plain words.
+
+    ``summary`` is one sentence; ``problems`` lists what an operator must act
+    on: a directory the app cannot write, or a TrueNAS API that does not
+    answer. Waiting for the first inventory is not a problem. The route keeps
+    answering HTTP 200 because the Compose healthcheck and existing monitors
+    depend on it; ``status`` and ``problems`` carry the verdict.
+    """
+
+    unwritable = [str(problem) for problem in startup_problems]
+    api_problem: str | None = None
+    if snapshot is None:
+        dependency_status = "unknown"
+        last_updated = None
+        sources: dict[str, object] = {}
+        warnings: list[str] = []
+        cache_state = "empty"
+    else:
+        api_status = snapshot.sources.get("api")
+        dependency_status = "ok" if api_status and api_status.ok else "degraded"
+        last_updated = snapshot.last_updated.isoformat()
+        sources = {name: status.model_dump(mode="json") for name, status in snapshot.sources.items()}
+        warnings = list(snapshot.warnings)
+        cache_state = "cached"
+        if dependency_status == "degraded":
+            # ok=False covers both a failed API and one that answers with degraded
+            # enclosure data, so name the state neutrally and keep the recorded cause.
+            api_message = (api_status.message if api_status else None) or "no details recorded"
+            api_problem = f"TrueNAS API degraded: {api_message}"
+
+    problems = [*unwritable, *([api_problem] if api_problem else [])]
+    if unwritable:
+        summary = "Data folder not writable: " + "; ".join(unwritable)
+    elif api_problem:
+        summary = api_problem
+    elif snapshot is None:
+        summary = HEALTH_SUMMARY_WAITING
+    else:
+        summary = HEALTH_SUMMARY_ALL_OK
+    return {
+        "status": "ok" if not problems else "degraded",
+        "summary": summary,
+        "problems": problems,
+        "dependency_status": dependency_status,
+        "last_updated": last_updated,
+        "sources": sources,
+        "warnings": warnings,
+        "cache_state": cache_state,
+    }
 
 
 app = create_app()
