@@ -282,6 +282,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Performance
 
+- Coalesced admin storage-view renders into one paint per animation frame,
+  cached the HA row fields and SSH field lookups, timed out stuck admin
+  requests after 60 seconds with a retry message, painted the refreshed admin
+  state before the removed-system history scan, and removed dead admin code
+  (#474)
+
 - History cleanup now hands freed space back to the disk on new history
   databases (incremental auto-vacuum plus a WAL truncate after each cleanup that
   removed rows), selects each cleanup batch with a bounded subquery so any
