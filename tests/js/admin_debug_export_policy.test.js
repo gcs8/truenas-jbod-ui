@@ -206,7 +206,7 @@ test("encrypted full backup needs a passphrase and is otherwise exportable", () 
   elements.backupExportPassphrase.value = "synthetic-passphrase";
   functions.syncBackupControls();
   assert.equal(elements.backupExportButton.disabled, false);
-  assert.match(elements.backupExportResult.textContent, /Exports can stay live/);
+  assert.match(elements.backupExportResult.textContent, /export while the app is running/);
 });
 
 test("explicit plaintext policy permits an unencrypted full backup", () => {

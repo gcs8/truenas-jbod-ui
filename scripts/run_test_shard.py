@@ -57,6 +57,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_heap_probe",
         "test_history_config_contract",
         "test_history_diagnostics",
+        "test_history_health_states",
         "test_jbod_runner_trial",
         "test_mapping_store",
         "test_metrics",
@@ -95,6 +96,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_public_demo_history_consistency",
         "test_release_status",
         "test_script_json",
+        "test_script_platform_guards",
         "test_scripts_help",
         "test_segment_rotation",
         "test_segmented_history",
@@ -123,6 +125,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_scheduled_backup",
         "test_segment_migration",
         "test_slot_bounds_routes",
+        "test_startup_config",
         "test_startup_migration_recovery",
         "test_startup_writability",
         "test_tls_trust",
@@ -155,6 +158,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_smart_grid_io",
         "test_ssh_probe",
         "test_truenas_ws_jsonrpc",
+        "test_ui_health_and_admin_probe",
     ),
 }
 

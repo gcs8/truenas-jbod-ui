@@ -465,10 +465,6 @@ def _restore_paths(
     }
 
 
-def _existing_matches(path: Path, matcher: Callable[[Path, Any], bool], record: Any) -> bool:
-    return path_entry_exists(path) and matcher(path, record)
-
-
 def _require_known_location(
     path: Path,
     *,

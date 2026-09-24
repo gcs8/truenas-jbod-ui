@@ -4,7 +4,9 @@ import json
 import os
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, SecretStr, model_validator
+from pydantic import BaseModel, ConfigDict, SecretStr, ValidationError, model_validator
+
+from app.config_errors import ConfigurationError, describe_validation_error
 
 from app.secret_files import load_secret_environment_value
 
@@ -72,4 +74,16 @@ def load_read_ui_auth_settings() -> ReadUiAuthSettings:
                 if field_name in {"auth_username", "auth_password"}
                 else _parse_scalar(raw_value)
             )
-    return ReadUiAuthSettings.model_validate(payload)
+    field_to_env = {field_name: env_name for env_name, field_name in AUTH_ENV_OVERRIDES.items()}
+    try:
+        return ReadUiAuthSettings.model_validate(payload)
+    except ValidationError as exc:
+        raise ConfigurationError(
+            describe_validation_error(
+                exc,
+                resolve_location=lambda location: (
+                    (field_to_env[str(location[0])], ".env") if str(location[0]) in field_to_env else None
+                ),
+                default_source=".env",
+            )
+        ) from None
