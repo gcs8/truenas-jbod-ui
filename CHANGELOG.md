@@ -97,6 +97,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Reported an unknown `system_id` on the main page instead of silently
+  showing the default system, and mapped service errors to responses from one
+  table with a 5-second retry hint for busy exports. (#475)
+
 - Published aggregate disk-retention totals on the inventory summary
   (`source_disk_count`, `rendered_unique_disk_count`,
   `duplicate_disk_view_count`, `unplaced_disk_count`) so a release check can
