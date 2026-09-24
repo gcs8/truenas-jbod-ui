@@ -101,7 +101,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   returned once, under `collector`. The dashboard shows `Starting` during the
   startup grace period, counts down the cooldown on the Full refresh button only,
   never renders an uncounted value as "deferred", and names a scheduled backup
-  status file with unsafe permissions (#N).
+  status file with unsafe permissions (#566).
 
 - Published aggregate disk-retention totals on the inventory summary
   (`source_disk_count`, `rendered_unique_disk_count`,
