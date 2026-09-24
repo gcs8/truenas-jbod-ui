@@ -1,7 +1,8 @@
 (function () {
   const bootstrap = window.APP_BOOTSTRAP || {};
   const supportedRefreshIntervals = [15, 30, 60, 300];
-  const bootstrapRefreshInterval = Number(bootstrap.refreshIntervalSeconds) || 30;
+  const bootstrapRefreshInterval = Number(bootstrap.refreshIntervalSeconds) > 0 ? Number(bootstrap.refreshIntervalSeconds) : 30;
+  const refreshIntervalOptions = refreshIntervalOptionsFor(bootstrapRefreshInterval);
   const refreshTiming = bootstrap.refreshTiming || {};
   const SMART_BATCH_REQUEST_MAX_CONCURRENCY = Math.max(1, Number(bootstrap.smartBatchMaxConcurrency) || 12);
   const SMART_PREFETCH_DELAY_MS = Math.max(1, Number(bootstrap.smartPrefetchDelayMs) || 120);
@@ -40,6 +41,16 @@
   function positiveSeconds(value, fallbackSeconds) {
     const numeric = Number(value);
     return Number.isFinite(numeric) && numeric > 0 ? numeric : fallbackSeconds;
+  }
+
+  // The admin settings accept any interval; the dropdown lists the common
+  // ones and adds the configured value so it is used and visible as chosen.
+  function refreshIntervalOptionsFor(configuredSeconds) {
+    const seconds = Number(configuredSeconds);
+    if (!Number.isFinite(seconds) || seconds <= 0 || supportedRefreshIntervals.includes(seconds)) {
+      return [...supportedRefreshIntervals];
+    }
+    return [...supportedRefreshIntervals, seconds].sort((left, right) => left - right);
   }
 
   const persistedHistoryUi = snapshotMode ? null : loadStoredJson(HISTORY_UI_STORAGE_KEY);
@@ -95,14 +106,16 @@
     snapshotReuseCache: {},
     search: "",
     autoRefresh: snapshotMode ? false : true,
-    refreshIntervalSeconds: supportedRefreshIntervals.includes(bootstrapRefreshInterval) ? bootstrapRefreshInterval : 30,
+    refreshIntervalSeconds: bootstrapRefreshInterval,
+    appUpdated: false,
+    detailSmartExpanded: false,
     timerId: null,
     timerScheduledAt: 0,
     timerDueAt: 0,
     timerDelayMs: 0,
     timingTickId: null,
     identifyVerifyTimerId: null,
-    diskInventorySync: { armedMode: null, armedSystemId: null, armTimerId: null, inFlight: false },
+    diskInventorySync: { inFlight: false },
     refreshesInFlight: 0,
     latestRefreshToken: 0,
     storageViewsRuntimeRequestToken: 0,
@@ -122,8 +135,10 @@
       packaging: normalizePersistedPackaging(persistedExportUi?.packaging),
       allowOversize: Boolean(persistedExportUi?.allowOversize),
       includeLiveEnclosures: false,
+      enclosureSelectionExpanded: false,
       selectedEnclosureIds: [],
       includeStorageViews: false,
+      viewSelectionExpanded: false,
       selectedStorageViewIds: [],
       running: false,
       estimate: {
@@ -252,7 +267,9 @@
   const detailSecondary = document.getElementById("detail-secondary");
   const detailLedControls = document.getElementById("detail-led-controls");
   const diskInventorySyncControls = document.getElementById("disk-inventory-sync-controls");
-  const diskInventorySyncHint = document.getElementById("disk-inventory-sync-hint");
+  const searchClearButton = document.getElementById("search-clear");
+  const searchSummary = document.getElementById("search-summary");
+  const appVersionNote = document.getElementById("app-version-note");
   const detailSlotTitle = document.getElementById("detail-slot-title");
   const detailStatePill = document.getElementById("detail-state-pill");
   const detailKvGrid = document.getElementById("detail-kv-grid");
@@ -265,6 +282,9 @@
   const refreshButton = document.getElementById("refresh-button");
   const autoRefreshToggle = document.getElementById("auto-refresh-toggle");
   const refreshIntervalSelect = document.getElementById("refresh-interval-select");
+  const autoRefreshField = document.getElementById("auto-refresh-field");
+  const refreshIntervalField = document.getElementById("refresh-interval-field");
+  const inventoryEvidenceDisclosure = document.getElementById("inventory-evidence-disclosure");
   const refreshTimingStrip = document.getElementById("refresh-timing-strip");
   const refreshCountdownLabel = document.getElementById("refresh-countdown-label");
   const refreshCountdownBar = document.getElementById("refresh-countdown-bar");
@@ -274,6 +294,7 @@
   const timezoneLabel = document.getElementById("timezone-label");
   const snapshotGeneratedValue = document.getElementById("snapshot-generated-value");
   const snapshotGeneratedNote = document.getElementById("snapshot-generated-note");
+  const snapshotBannerCaptured = document.getElementById("snapshot-banner-captured");
   const snapshotStatusChip = document.getElementById("snapshot-status-chip");
   const apiStatusChip = document.getElementById("api-status-chip");
   const sshStatusChip = document.getElementById("ssh-status-chip");
@@ -281,6 +302,9 @@
   const cacheTimingChips = document.getElementById("cache-timing-chips");
   const statusText = document.getElementById("status-text");
   const writePolicyNotice = document.getElementById("write-policy-notice");
+  const upgradeNotice = document.getElementById("upgrade-notice");
+  const upgradeNoticeDismiss = document.getElementById("upgrade-notice-dismiss");
+  const upgradeNoticeText = document.getElementById("upgrade-notice-text");
   const readUiAuthPanel = document.getElementById("read-ui-auth-panel");
   const readUiAuthForm = document.getElementById("read-ui-auth-form");
   const readUiAuthUsername = document.getElementById("read-ui-auth-username");
@@ -344,8 +368,16 @@
   const ledButtons = Array.from(document.querySelectorAll("[data-led-action]"));
   const diskInventorySyncButtons = Array.from(document.querySelectorAll("[data-disk-inventory-sync-mode]"));
 
+  // Bay lookups run once per tile on every render, search keystroke and hover,
+  // so they index the current slot list instead of scanning it each time.
   function getSlotById(slotNumber) {
-    return state.snapshot.slots.find((slot) => slot.slot === slotNumber) || null;
+    const slots = state.snapshot.slots || [];
+    let lookup = getSlotById.lookup;
+    if (!lookup || lookup.slots !== slots) {
+      lookup = { slots, byNumber: new Map(slots.map((slot) => [slot.slot, slot])) };
+      getSlotById.lookup = lookup;
+    }
+    return lookup.byNumber.get(slotNumber) || null;
   }
 
   function formatSlotLabel(slotNumber) {
@@ -472,6 +504,7 @@
   }
 
   function storageViewRuntimeViews() {
+    if (state.storageViewsRuntime?.system_id && state.storageViewsRuntime.system_id !== state.selectedSystemId) return [];
     const views = Array.isArray(state.storageViewsRuntime?.views) ? state.storageViewsRuntime.views : [];
     return [...views].sort((left, right) => (Number(left.order) || 0) - (Number(right.order) || 0));
   }
@@ -550,11 +583,17 @@
     if (!Number.isInteger(normalizedSlotIndex)) {
       return null;
     }
-    const selectedView = getSelectedStorageViewRuntime();
-    if (!selectedView) {
-      return null;
+    return storageViewRuntimeSlotByIndex(getSelectedStorageViewRuntime(), normalizedSlotIndex);
+  }
+
+  function storageViewRuntimeSlotByIndex(view, slotIndex) {
+    const slots = Array.isArray(view?.slots) ? view.slots : [];
+    let lookup = storageViewRuntimeSlotByIndex.lookup;
+    if (!lookup || lookup.slots !== slots) {
+      lookup = { slots, byIndex: new Map(slots.map((slot) => [Number(slot.slot_index), slot])) };
+      storageViewRuntimeSlotByIndex.lookup = lookup;
     }
-    return (selectedView.slots || []).find((slot) => Number(slot.slot_index) === normalizedSlotIndex) || null;
+    return lookup.byIndex.get(slotIndex) || null;
   }
 
   function activeLayoutRows() {
@@ -573,7 +612,7 @@
   }
 
   function selectorLabelForEnclosureOption(enclosure) {
-    const kind = state.snapshotMode ? "Snapshot" : "Live Enclosure";
+    const kind = state.snapshotMode ? "Saved copy" : "Enclosure";
     return `${kind} · ${enclosure?.label || enclosure?.id || "Unknown enclosure"}`;
   }
 
@@ -582,7 +621,7 @@
   }
 
   function storageViewKindLabel(view) {
-    return isSavedChassisView(view) ? "Saved Chassis View" : "Virtual Storage View";
+    return isSavedChassisView(view) ? "Saved view" : "Storage view";
   }
 
   function selectorLabelForStorageViewOption(view) {
@@ -799,46 +838,6 @@
     };
   }
 
-  function bindStorageViewTileInteractions(tile, slot, selectedView) {
-    tile.addEventListener("mouseenter", (event) => {
-      state.hoveredSlot = slot.slot_index;
-      refreshHoveredTooltip(tile);
-      positionSlotTooltip(event.clientX, event.clientY);
-      void ensureStorageViewSmartSummary(selectedView, slot);
-    });
-    tile.addEventListener("mousemove", (event) => {
-      if (state.hoveredSlot === slot.slot_index) {
-        positionSlotTooltip(event.clientX, event.clientY);
-      }
-    });
-    tile.addEventListener("mouseleave", () => {
-      if (state.hoveredSlot === slot.slot_index) {
-        state.hoveredSlot = null;
-      }
-      hideSlotTooltip();
-    });
-    tile.addEventListener("focus", () => {
-      state.hoveredSlot = slot.slot_index;
-      refreshHoveredTooltip(tile);
-      positionSlotTooltipFromElement(tile);
-      void ensureStorageViewSmartSummary(selectedView, slot);
-    });
-    tile.addEventListener("blur", () => {
-      if (state.hoveredSlot === slot.slot_index) {
-        state.hoveredSlot = null;
-      }
-      hideSlotTooltip();
-    });
-    tile.addEventListener("click", (event) => {
-      event.stopPropagation();
-      if (state.selectedSlot === slot.slot_index) {
-        clearSelectedSlot();
-        return;
-      }
-      selectSlot(slot.slot_index);
-    });
-  }
-
   function storageViewRuntimeShortLabel(slot) {
     if (!slot || !slot.occupied) {
       return "Empty";
@@ -946,7 +945,6 @@
         tile.setAttribute("aria-label", buildStorageViewRuntimeTooltip(slot, selectedView));
         tile.innerHTML = buildNvmeRuntimeTileMarkup(slot, selectedView);
         applyHeatmapToTile(tile, heatmapContext, slot.slot_index);
-        bindStorageViewTileInteractions(tile, slot, selectedView);
         board.appendChild(tile);
       });
 
@@ -1013,10 +1011,11 @@
       }
       tile.setAttribute(
         "aria-label",
-        liveSlot
-          ? slotTooltip(liveSlot, getStorageViewSmartSummaryEntry(selectedView, slot) || getSmartSummaryEntry(liveSlot))
-          : buildStorageViewRuntimeTooltip(slot, selectedView)
+        liveSlot ? slotAccessibleName(liveSlot) : buildStorageViewRuntimeTooltip(slot, selectedView)
       );
+      if (liveSlot) {
+        tile.setAttribute("aria-describedby", "slot-tooltip");
+      }
       tile.innerHTML =
         selectedView.kind === "nvme_carrier"
           ? buildNvmeRuntimeTileMarkup(slot, selectedView)
@@ -1035,7 +1034,6 @@
             <span class="slot-latch" aria-hidden="true"></span>
           `;
       applyHeatmapToTile(tile, heatmapContext, slot.slot_index);
-      bindStorageViewTileInteractions(tile, slot, selectedView);
       container.appendChild(tile);
     };
 
@@ -1101,46 +1099,10 @@
       tile.style.top = metrics.top;
       tile.style.width = metrics.width;
       tile.style.minHeight = metrics.minHeight;
-      tile.setAttribute("aria-label", slotTooltip(liveSlot, getSmartSummaryEntry(liveSlot)));
+      tile.setAttribute("aria-label", slotAccessibleName(liveSlot));
+      tile.setAttribute("aria-describedby", "slot-tooltip");
       tile.innerHTML = buildNvmeRuntimeTileMarkup(displaySlot, { kind: "nvme_carrier" });
       applyHeatmapToTile(tile, heatmapContext, liveSlot.slot);
-      tile.addEventListener("mouseenter", (event) => {
-        state.hoveredSlot = liveSlot.slot;
-        refreshHoveredTooltip(tile);
-        positionSlotTooltip(event.clientX, event.clientY);
-        void ensureSmartSummary(liveSlot);
-      });
-      tile.addEventListener("mousemove", (event) => {
-        if (state.hoveredSlot === liveSlot.slot) {
-          positionSlotTooltip(event.clientX, event.clientY);
-        }
-      });
-      tile.addEventListener("mouseleave", () => {
-        if (state.hoveredSlot === liveSlot.slot) {
-          state.hoveredSlot = null;
-        }
-        hideSlotTooltip();
-      });
-      tile.addEventListener("focus", () => {
-        state.hoveredSlot = liveSlot.slot;
-        refreshHoveredTooltip(tile);
-        positionSlotTooltipFromElement(tile);
-        void ensureSmartSummary(liveSlot);
-      });
-      tile.addEventListener("blur", () => {
-        if (state.hoveredSlot === liveSlot.slot) {
-          state.hoveredSlot = null;
-        }
-        hideSlotTooltip();
-      });
-      tile.addEventListener("click", (event) => {
-        event.stopPropagation();
-        if (state.selectedSlot === liveSlot.slot) {
-          clearSelectedSlot();
-          return;
-        }
-        selectSlot(liveSlot.slot);
-      });
       board.appendChild(tile);
     });
 
@@ -1167,10 +1129,10 @@
       return {
         profileId: null,
         profileLabel: null,
-        eyebrow: `${systemLabel} / Virtual inventory`,
-        summary: "System-scoped disk inventory; no physical enclosure orientation or stable slot identity is claimed.",
+        eyebrow: `${systemLabel} / All disks`,
+        summary: "Disks on this system, numbered in the order TrueNAS lists them. Positions here are not physical bays.",
         enclosureTitle: enclosureLabel,
-        edgeLabel: "System-scoped disks",
+        edgeLabel: "Not a physical layout",
         faceStyle: "generic",
         latchEdge: "bottom",
         baySize: null,
@@ -1182,12 +1144,12 @@
     if (selectedStorageView) {
       const baseSummary =
         selectedStorageView.kind === "nvme_carrier"
-          ? "Runtime storage-view map for an internal 4x NVMe carrier card."
+          ? "Slots on the internal NVMe carrier card."
           : selectedStorageView.kind === "boot_devices"
-            ? "Runtime storage-view map for internal boot media."
+            ? "Boot drives."
             : selectedStorageView.backing_enclosure_label
-              ? `Saved chassis view layered on top of the live enclosure ${selectedStorageView.backing_enclosure_label}.`
-              : "Runtime storage-view map for the selected saved hardware view.";
+              ? `Saved layout for ${selectedStorageView.backing_enclosure_label}.`
+              : "Saved view.";
       return {
         profileId: profile?.id || selectedStorageView.profile_id || null,
         profileLabel: profile?.label || selectedStorageView.profile_label || null,
@@ -1231,7 +1193,7 @@
       profileId: profile?.id || null,
       profileLabel: profile?.label || null,
       eyebrow: profile?.eyebrow || systemLabel,
-      summary: profile?.summary || "Drive-bay map with API-or-SSH enrichment for the selected enclosure.",
+      summary: profile?.summary || "Front view of the selected enclosure. Click a bay for details.",
       enclosureTitle: (state.snapshot.enclosures || []).length > 1 ? enclosureLabel : (profile?.panel_title || enclosureLabel),
       edgeLabel: profile?.edge_label || "System front",
       faceStyle: profile?.face_style || "generic",
@@ -1275,7 +1237,7 @@
     enclosureAliasForm.classList.toggle("hidden", !available || !state.enclosureAliasEditorOpen);
     const enclosure = getSelectedEnclosureOption();
     if (enclosureAliasRawHint) {
-      enclosureAliasRawHint.textContent = enclosure?.raw_label ? `Raw: ${enclosure.raw_label}` : "";
+      enclosureAliasRawHint.textContent = enclosure?.raw_label ? `Reported name: ${enclosure.raw_label}` : "";
     }
   }
 
@@ -1288,7 +1250,7 @@
     state.enclosureAliasEditorScopeKey = currentEnclosureAliasScopeKey();
     enclosureAliasInput.value = enclosure?.alias || "";
     if (enclosureAliasRawHint) {
-      enclosureAliasRawHint.textContent = enclosure?.raw_label ? `Raw: ${enclosure.raw_label}` : "";
+      enclosureAliasRawHint.textContent = enclosure?.raw_label ? `Reported name: ${enclosure.raw_label}` : "";
     }
     enclosureAliasEditButton?.classList.add("hidden");
     enclosureAliasForm.classList.remove("hidden");
@@ -1360,6 +1322,9 @@
 
   async function clearEnclosureAlias() {
     if (!enclosureAliasInput) {
+      return;
+    }
+    if (!window.confirm("Remove this enclosure name? The name reported by the hardware will be shown instead.")) {
       return;
     }
     enclosureAliasInput.value = "";
@@ -1919,7 +1884,7 @@
     if (!expandKey || overflow <= 0) {
       return visibleText;
     }
-    return `${visibleText}, <span class="sas-fabric-slot-overflow" role="button" tabindex="0" data-sas-fabric-expand-slots="${escapeHtml(expandKey)}">+${overflow}</span>`;
+    return `${visibleText}, <button type="button" class="sas-fabric-slot-overflow" data-sas-fabric-expand-slots="${escapeHtml(expandKey)}">+${overflow}</button>`;
   }
 
   function toggleSasFabricSlotList(expandKey) {
@@ -2135,7 +2100,7 @@
     if (!controllerRecords.length) {
       return `
         <div class="sas-fabric-host-row">${renderSasFabricNodeButton(hostNode, { meta: storagePayload ? "No storage sources reported" : "No HBA controllers reported" })}</div>
-        <div class="warning-item muted compact">${storagePayload ? "No storage source rows are available yet." : "No controller rows are available yet. Check CORE SSH and mprutil permissions."}</div>
+        <div class="warning-item muted compact">${storagePayload ? "No storage source rows are available yet." : "No controllers were reported. Check the SSH setup for this system in the admin console."}</div>
       `;
     }
     return `
@@ -2178,7 +2143,7 @@
         ${kvRow("Type", formatSasFabricKind(trace.kind))}
         ${kvRow("Slots", formatSasFabricSlots(trace.slots, 999))}
         ${sasFabricMetricRows(trace.metrics, { state: "State", count: "Affected bays", device_name: "Device", pool_name: "Pool", vdev_name: "Vdev" })}
-        ${kvRow("Evidence", formatSasFabricValue(trace.evidence))}
+        ${kvRow("Source", formatSasFabricValue(trace.evidence))}
       </div>
       ${pathStateMarkup}
       <div class="sas-fabric-inspector-section">
@@ -2194,14 +2159,14 @@
         ${kvRow("Object", sasFabricDisplayLabel(node) || node.id)}
         ${kvRow("Type", formatSasFabricKind(node.kind))}
         ${kvRow("Status", node.status || "n/a")}
-        ${kvRow("Raw ID", node.raw_id || "n/a", Boolean(node.raw_id))}
+        ${kvRow("Reported ID", node.raw_id || "n/a", Boolean(node.raw_id))}
         ${kvRow("Slots", formatSasFabricSlots(node.related_slots, 999))}
         ${sasFabricMetricRows(node.metrics, { pcie_slot: "PCIe slot", pci_address: "PCI address", linked_phys: "Linked PHYs", num_phys: "PHYs", path_counts: "Path counts" })}
-        ${kvRow("Evidence", formatSasFabricValue(node.evidence))}
+        ${kvRow("Source", formatSasFabricValue(node.evidence))}
       </div>
       ${node.kind === "controller" && node.raw?.iocfacts ? `
         <div class="sas-fabric-inspector-section">
-          <h4>IOC Facts</h4>
+          <h4>Controller details</h4>
           <div class="kv-grid">
             ${kvRow("Max targets", node.raw.iocfacts.maxtargets)}
             ${kvRow("Max expanders", node.raw.iocfacts.maxsasexpanders)}
@@ -2220,8 +2185,8 @@
     if (!fabric) {
       sasFabricInspectorTitle.textContent = "Fabric Inspector";
       sasFabricInspectorBody.innerHTML = state.snapshotMode
-        ? "No Storage Fabric payload is included in this snapshot."
-        : "Open topology to load the current Storage Fabric.";
+        ? "This offline copy does not include the connection map."
+        : "Press Topology to load the connection map.";
       return;
     }
     const trace = selectedSasFabricTrace();
@@ -2237,7 +2202,7 @@
       return;
     }
     sasFabricInspectorTitle.textContent = "Fabric Inspector";
-    sasFabricInspectorBody.innerHTML = "Select a controller, path, expander, SES enclosure, or bay to inspect the trace chain.";
+    sasFabricInspectorBody.innerHTML = "Pick a controller, cable path, or bay.";
   }
 
   function renderSasFabric() {
@@ -2270,23 +2235,23 @@
         ].join(" / ");
       } else {
         sasFabricSummary.textContent = state.sasFabric.loading
-          ? "Loading read-only Storage Fabric."
-          : "Read-only storage source, path, enclosure, and bay topology.";
+          ? "Loading..."
+          : "Shows how disks connect to controllers.";
       }
     }
     if (sasFabricStatus) {
       if (state.snapshotMode) {
         sasFabricStatus.className = "warning-item muted compact";
-        sasFabricStatus.textContent = "This offline snapshot does not include Storage Fabric data or live refresh capability.";
+        sasFabricStatus.textContent = "This offline copy does not include the connection map.";
       } else if (state.sasFabric.error) {
         sasFabricStatus.className = "warning-item compact";
         sasFabricStatus.textContent = `Storage Fabric load failed: ${state.sasFabric.error}`;
       } else if (state.sasFabric.loading) {
         sasFabricStatus.className = "warning-item muted compact";
-        sasFabricStatus.textContent = fabric ? "Refreshing Storage Fabric in the background." : "Loading read-only Storage Fabric.";
+        sasFabricStatus.textContent = fabric ? "Refreshing..." : "Loading...";
       } else if (fabric?.available === false) {
         sasFabricStatus.className = "warning-item compact";
-        sasFabricStatus.textContent = sasFabricList(fabric.warnings)[0] || "Storage Fabric is not available for this system.";
+        sasFabricStatus.textContent = sasFabricList(fabric.warnings)[0] || "Not available on this system.";
       } else if (sasFabricList(fabric?.warnings).length) {
         const fabricWarnings = sasFabricList(fabric.warnings);
         const enrichmentOnly = fabricWarnings.every(isSasFabricEnrichmentWarning);
@@ -2294,19 +2259,19 @@
         sasFabricStatus.textContent = fabricWarnings.join(" ");
       } else if (fabric) {
         sasFabricStatus.className = "warning-item muted compact";
-        sasFabricStatus.textContent = `Storage Fabric data loaded for ${fabric.selected_enclosure_label || fabric.system_label || "current selection"}.`;
+        sasFabricStatus.textContent = `Connection map loaded for ${fabric.selected_enclosure_label || fabric.system_label || "the current selection"}.`;
       } else {
         sasFabricStatus.className = "warning-item muted compact";
-        sasFabricStatus.textContent = "Open topology to load the current Storage Fabric.";
+        sasFabricStatus.textContent = "Press Topology to load the connection map.";
       }
     }
     if (sasFabricLanes) {
       if (!fabric) {
         sasFabricLanes.innerHTML = state.snapshotMode
-          ? '<div class="warning-item muted compact">No Storage Fabric payload is included in this snapshot.</div>'
-          : '<div class="warning-item muted compact">No Storage Fabric payload has been loaded yet.</div>';
+          ? '<div class="warning-item muted compact">This offline copy does not include the connection map.</div>'
+          : '<div class="warning-item muted compact">Not loaded yet.</div>';
       } else if (fabric.available === false) {
-        sasFabricLanes.innerHTML = '<div class="warning-item muted compact">No Storage Fabric map is available for this platform yet.</div>';
+        sasFabricLanes.innerHTML = '<div class="warning-item muted compact">Not available on this system.</div>';
       } else {
         sasFabricLanes.innerHTML = renderSasFabricMap(fabric);
       }
@@ -2377,6 +2342,100 @@
 
 
 
+  function currentUiScopeKey() {
+    return JSON.stringify([state.selectedSystemId || null, state.selectedEnclosureId || null]);
+  }
+
+  function inventoryScopeMatchesSelection() {
+    return Boolean(state.snapshot
+      && state.snapshot.selected_system_id === state.selectedSystemId
+      && (!state.selectedEnclosureId || state.snapshot.selected_enclosure_id === state.selectedEnclosureId));
+  }
+
+  function captureMutationContext(action) {
+    if (!inventoryScopeMatchesSelection() || (state.selectedStorageViewRuntimeId
+      && (state.storageViewsRuntimeLoading || state.storageViewsRuntimeError))) {
+      setStatus("Inventory for this selection is not loaded. Refresh before making changes.", "error");
+      return null;
+    }
+    const scope = currentUiScopeKey();
+    const key = JSON.stringify([scope, action]);
+    state.mutationsInFlight ||= {};
+    if (state.mutationsInFlight[key]) return null;
+    const context = {
+      key, scope, systemId: state.selectedSystemId,
+      epoch: state.latestRefreshToken || 0,
+      selectionEpoch: state.selectionEpoch || 0,
+      slot: state.selectedSlot,
+      view: state.selectedStorageViewRuntimeId || "",
+      draft: state.mappingDraftRevision || 0,
+    };
+    state.mutationsInFlight[key] = context;
+    return context;
+  }
+
+  function mutationContextIsCurrent(context) {
+    return Boolean(context && context.scope === currentUiScopeKey()
+      && context.epoch === (state.latestRefreshToken || 0)
+      && context.selectionEpoch === (state.selectionEpoch || 0)
+      && context.slot === state.selectedSlot
+      && context.view === (state.selectedStorageViewRuntimeId || "")
+      && context.draft === (state.mappingDraftRevision || 0));
+  }
+
+  function finishMutationContext(context, succeeded = false) {
+    if (!context) return;
+    delete state.mutationsInFlight[context.key];
+    // A browser scope change does not cancel the appliance write. Keep its
+    // outcome without presenting it as the result of the newly selected scope.
+    state.mutationResults ||= {};
+    state.mutationResults[context.key] = { succeeded };
+    for (const [key, snapshot] of Object.entries(state.snapshotReuseCache || {})) {
+      if (snapshot.selected_system_id === context.systemId) delete state.snapshotReuseCache[key];
+    }
+  }
+
+  function renderScopeAvailability() {
+    const matched = inventoryScopeMatchesSelection();
+    const runtimeUnavailable = Boolean(state.selectedStorageViewRuntimeId
+      && (state.storageViewsRuntimeLoading || state.storageViewsRuntimeError));
+    const unavailable = !matched || runtimeUnavailable;
+    for (const element of [grid, detailContent, detailSecondary, mappingForm]) {
+      if (element) element.inert = unavailable;
+    }
+    grid?.setAttribute("aria-busy", String(unavailable));
+    const note = document.getElementById("inventory-scope-note");
+    if (note) {
+      note.classList.toggle("hidden", !unavailable);
+      note.textContent = !matched
+        ? "Previous inventory, not the selected scope. Slot actions are unavailable until matching inventory loads. Use Refresh to retry."
+        : "Previous storage view. Slot actions are unavailable until its refresh succeeds.";
+    }
+    if (exportSnapshotButton) exportSnapshotButton.disabled = unavailable || state.export.running;
+    if (mappingImportFile) mappingImportFile.disabled = !matched;
+    if (!matched) {
+      for (const element of [enclosureAliasEditButton, importMappingsButton]) {
+        if (element) element.disabled = true;
+      }
+    }
+  }
+
+  function renderStorageViewRuntimeStatus() {
+    const note = document.getElementById("storage-view-runtime-note");
+    const retry = document.getElementById("storage-view-runtime-retry");
+    if (note) {
+      note.classList.toggle("hidden", !state.storageViewsRuntimeError && !state.storageViewsRuntimeLoading);
+      note.textContent = state.storageViewsRuntimeError
+        ? "Storage views unavailable. Previous views are not actionable. Retry the refresh."
+        : state.storageViewsRuntimeLoading ? "Refreshing storage views. Previous views are not actionable." : "";
+    }
+    if (retry) {
+      retry.classList.toggle("hidden", !state.storageViewsRuntimeError);
+      retry.disabled = state.storageViewsRuntimeLoading;
+    }
+    renderScopeAvailability();
+  }
+
   function cloneJsonValue(value) {
     return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
   }
@@ -2414,22 +2473,13 @@
     if (exact) {
       return cloneJsonValue(exact);
     }
-    const fallback = state.snapshotReuseCache[snapshotReuseCacheKey(systemId, null)];
-    return fallback ? cloneJsonValue(fallback) : null;
+    return null;
   }
 
   function applyReusableSnapshot(systemId, enclosureId = null) {
     const reusableSnapshot = findReusableSnapshot(systemId, enclosureId);
     if (!reusableSnapshot) {
       return false;
-    }
-    if (enclosureId) {
-      reusableSnapshot.selected_enclosure_id = enclosureId;
-      const selectedOption = (reusableSnapshot.enclosures || []).find((option) => option.id === enclosureId);
-      if (selectedOption) {
-        reusableSnapshot.selected_enclosure_label = selectedOption.label || reusableSnapshot.selected_enclosure_label;
-        reusableSnapshot.selected_enclosure_name = selectedOption.name || reusableSnapshot.selected_enclosure_name;
-      }
     }
     applySnapshot(reusableSnapshot);
     renderAll();
@@ -2439,10 +2489,9 @@
   function applySnapshot(snapshot) {
     rememberReusableSnapshot(snapshot);
     const nextSystemId = snapshot.selected_system_id || state.selectedSystemId;
-    if (nextSystemId !== state.selectedSystemId) {
-      disarmDiskInventorySync();
-    }
     state.snapshot = snapshot;
+    syncWritePolicyFromSnapshot(snapshot);
+    noteServerAppVersion(snapshot.app_version);
     state.layoutRows = snapshot.layout_rows || state.layoutRows || [];
     state.selectedSystemId = nextSystemId;
     state.selectedEnclosureId = snapshot.selected_enclosure_id || null;
@@ -2487,21 +2536,82 @@
   }
 
   function setStatus(message, tone = "info") {
-    statusText.textContent = message;
+    setTextIfChanged(statusText, message);
     statusText.dataset.tone = tone;
   }
 
-  // Effective write policy for the main UI (#273). Offline snapshots have no
+  function noteServerAppVersion(serverVersion) {
+    const pageVersion = typeof bootstrap.appVersion === "string" ? bootstrap.appVersion : "";
+    if (!pageVersion || typeof serverVersion !== "string" || !serverVersion) {
+      return;
+    }
+    const updated = serverVersion !== pageVersion;
+    if (updated === Boolean(state.appUpdated)) {
+      return;
+    }
+    state.appUpdated = updated;
+    renderAppVersionNote();
+    if (updated) {
+      setStatus("The app was updated. Reload this page.", "error");
+    }
+  }
+
+  function renderAppVersionNote() {
+    if (!appVersionNote || !state.appUpdated) {
+      return;
+    }
+    setTextIfChanged(appVersionNote, "The app was updated. Reload this page.");
+    appVersionNote.className = "meta-note version-note version-note-update-available";
+  }
+
+  // Effective write policy for the main UI. Offline snapshots have no
   // policy. Basic-mode credentials exist only in this page's state.
   function normalizeWritePolicy(raw) {
     if (!raw || typeof raw !== "object") {
-      return { enabled: true, mode: "", reason: "" };
+      return { enabled: true, mode: "", reason: "", publicOrigin: "" };
     }
+    const publicOrigin = typeof raw.publicOrigin === "string"
+      ? raw.publicOrigin
+      : (typeof raw.public_origin === "string" ? raw.public_origin : "");
     return {
       enabled: raw.enabled !== false,
       mode: typeof raw.mode === "string" ? raw.mode : "",
       reason: typeof raw.reason === "string" ? raw.reason : "",
+      publicOrigin,
     };
+  }
+
+  // Every inventory refresh carries the server's current policy, so a page
+  // that was told "no" once follows the server again instead of staying
+  // locked until a reload. The server cannot see this page's sign-in, so a
+  // signed-in Basic-mode page keeps its own enabled state.
+  function syncWritePolicyFromSnapshot(snapshot) {
+    const raw = snapshot?.write_policy;
+    if (!raw || typeof raw !== "object") {
+      return false;
+    }
+    const policy = normalizeWritePolicy(raw);
+    if (policy.mode === "basic" && state.writeAuthorization) {
+      policy.enabled = true;
+      policy.reason = "";
+    }
+    applyWritePolicy(policy);
+    return true;
+  }
+
+  function describeWriteRejection(error) {
+    const originRefusals = [
+      "Cross-origin Read UI mutation rejected.",
+      "Read UI authorization mode is unavailable.",
+    ];
+    const detail = typeof error?.detail === "string" ? error.detail : "";
+    if (!originRefusals.includes(detail)) {
+      return detail || error?.message || `Request failed with ${Number(error?.status) || 403}`;
+    }
+    const origin = state.writePolicy?.publicOrigin || "";
+    return origin
+      ? `This server does not allow changes from this address. Open the UI at ${origin}.`
+      : "This server does not allow changes from this address.";
   }
 
   function writePolicyAllowsWrites() {
@@ -2509,7 +2619,7 @@
   }
 
   function writePolicyReason() {
-    return state.writePolicy?.reason || "Writes are disabled for this deployment.";
+    return state.writePolicy?.reason || "Changes are turned off on this server.";
   }
 
   function writePolicyControls() {
@@ -2583,7 +2693,7 @@
       return headers;
     }
     if (!state.writeAuthorization) {
-      const failure = new Error("Sign in to enable this write.");
+      const failure = new Error("Sign in to make changes.");
       failure.status = 401;
       throw failure;
     }
@@ -2624,14 +2734,18 @@
     if (readUiAuthPassword) readUiAuthPassword.disabled = state.writeAuthPending;
     if (readUiAuthSubmit) readUiAuthSubmit.disabled = state.writeAuthPending;
     if (readUiAuthStatus) {
+      let authStatusText;
       if (state.writeAuthPending) {
-        readUiAuthStatus.textContent = "Checking credentials...";
+        authStatusText = "Checking credentials...";
       } else if (signedIn && writePolicyAllowsWrites()) {
-        readUiAuthStatus.textContent = "Signed in for writes. Credentials clear on reload or sign-out.";
+        authStatusText = "Signed in. You will be signed out when you reload this page.";
       } else if (signedIn) {
-        readUiAuthStatus.textContent = `Signed in, but writes are blocked. ${writePolicyReason()}`;
+        authStatusText = `Signed in, but changes are blocked. ${writePolicyReason()}`;
       } else {
-        readUiAuthStatus.textContent = "Reads remain anonymous. Credentials stay in this page only.";
+        authStatusText = "You can look around without signing in.";
+      }
+      if (readUiAuthStatus.textContent !== authStatusText) {
+        readUiAuthStatus.textContent = authStatusText;
       }
     }
   }
@@ -2649,8 +2763,17 @@
     writePolicyNotice.classList.remove("hidden");
   }
 
+  // The configured public origin comes from the bootstrap and from inventory
+  // refreshes; sign-in, sign-out and 401 handling send policies that do not
+  // carry it. Keep the last known origin so wrong-origin guidance can still
+  // name the address to open. A payload that does carry one wins.
   function applyWritePolicy(policy) {
-    state.writePolicy = normalizeWritePolicy(policy);
+    const retainedOrigin = state.writePolicy?.publicOrigin || "";
+    const nextPolicy = normalizeWritePolicy(policy);
+    if (!nextPolicy.publicOrigin) {
+      nextPolicy.publicOrigin = retainedOrigin;
+    }
+    state.writePolicy = nextPolicy;
     renderWritePolicyNotice();
     syncWritePolicyControls();
     renderReadUiAuth();
@@ -2664,6 +2787,54 @@
     return true;
   }
 
+  const UPGRADE_NOTICE_STORAGE_KEY = "truenas-jbod-ui.upgrade-notice-dismissed";
+
+  function upgradeNoticeVersion() {
+    return upgradeNotice?.dataset?.noticeVersion || "";
+  }
+
+  function upgradeNoticeDismissedLocally() {
+    const stored = loadStoredJson(UPGRADE_NOTICE_STORAGE_KEY);
+    return Boolean(stored && stored.version && stored.version === upgradeNoticeVersion());
+  }
+
+  function renderUpgradeNotice() {
+    if (!upgradeNotice) {
+      return;
+    }
+    upgradeNotice.classList.toggle("hidden", state.snapshotMode);
+    if (upgradeNoticeDismissedLocally() || upgradeNotice.dataset.dismissedLocally === "true") {
+      // A server-rendered pending notice is not proof of install-wide dismissal.
+      if (upgradeNoticeText) {
+        upgradeNoticeText.textContent = "Notice acknowledged in this browser, but dismissal is not saved for this install. Sign in if required, then retry.";
+      }
+      if (upgradeNoticeDismiss) upgradeNoticeDismiss.textContent = "Retry saving dismissal";
+    }
+  }
+
+  async function dismissUpgradeNotice() {
+    if (!upgradeNotice || upgradeNoticeDismiss?.disabled || state.snapshotMode) {
+      return;
+    }
+    // Only this notice changes. Do not reload, reset drafts, or retry automatically.
+    storeJson(UPGRADE_NOTICE_STORAGE_KEY, { version: upgradeNoticeVersion() });
+    upgradeNotice.dataset.dismissedLocally = "true";
+    if (upgradeNoticeDismiss) {
+      upgradeNoticeDismiss.disabled = true;
+    }
+    try {
+      await fetchJson("/api/upgrade-notice/dismiss", {
+        method: "POST",
+        body: JSON.stringify({ version: upgradeNoticeVersion() }),
+        readUiAuth: true,
+      });
+      upgradeNotice.classList.add("hidden");
+    } catch (error) {
+      if (upgradeNoticeDismiss) upgradeNoticeDismiss.disabled = false;
+      renderUpgradeNotice();
+    }
+  }
+
   function handleWriteRejection(error) {
     const status = Number(error?.status);
     if (status !== 401 && status !== 403) {
@@ -2671,14 +2842,19 @@
     }
     if (status === 401) {
       clearReadUiAuthorization();
+      applyWritePolicy({
+        enabled: false,
+        mode: state.writePolicy?.mode || "",
+        publicOrigin: state.writePolicy?.publicOrigin || "",
+        reason: typeof error?.detail === "string" && error.detail
+          ? error.detail
+          : error?.message || `Request failed with ${status}`,
+      });
+      return true;
     }
-    applyWritePolicy({
-      enabled: false,
-      mode: state.writePolicy?.mode || "",
-      reason: typeof error?.detail === "string" && error.detail
-        ? error.detail
-        : error?.message || `Request failed with ${status}`,
-    });
+    // A 403 refuses one request. The controls stay usable; the message says
+    // what to do, and the next refresh re-syncs the policy from the server.
+    error.message = describeWriteRejection(error);
     return true;
   }
 
@@ -2731,9 +2907,9 @@
     applyWritePolicy({
       enabled: false,
       mode: "basic",
-      reason: "Sign in to enable mapping, LED, and alias changes.",
+      reason: "Sign in to make changes.",
     });
-    setStatus("Signed out. Reads remain available.");
+    setStatus("Signed out. You can still look around.");
   }
 
   function uiPerfNow() {
@@ -2774,16 +2950,13 @@
   }
 
   function refreshStatusMessage(force, reason) {
-    if (reason === "system-switch") {
-      return "Loading system view...";
-    }
-    if (reason === "enclosure-switch") {
-      return "Loading enclosure view...";
+    if (reason === "system-switch" || reason === "enclosure-switch") {
+      return "Loading...";
     }
     if (reason === "startup-led-verify" || reason === "system-switch-led-verify" || reason === "enclosure-switch-led-verify") {
-      return "Checking current identify LED state...";
+      return "Checking locate lights...";
     }
-    return force ? "Refreshing inventory..." : "Auto-refreshing inventory...";
+    return force ? "Refreshing..." : "Auto refreshing...";
   }
 
   function shouldQueueIdentifyVerify() {
@@ -2916,15 +3089,15 @@
     const currentSummary = state.uiPerf.currentRun ? buildUiPerfSummary(state.uiPerf.currentRun) : null;
     const latestSummary = currentSummary || state.uiPerf.recentRuns[0] || null;
     if (!latestSummary) {
-      uiPerfSummary.textContent = "Browser timing is idle.";
+      setTextIfChanged(uiPerfSummary, "Browser timing is idle.");
       uiPerfRecent.innerHTML = "";
       syncUiPerfGlobal();
       return;
     }
 
-    uiPerfSummary.textContent = currentSummary
+    setTextIfChanged(uiPerfSummary, currentSummary
       ? `Current ${currentSummary.reasonLabel.toLowerCase()} on ${uiPerfScopeLabel(currentSummary)}: request ${uiPerfMetricDisplay(currentSummary, "requestMs")}, paint ${uiPerfMetricDisplay(currentSummary, "paintMs")}, history ${uiPerfMetricDisplay(currentSummary, "historyReadyMs")}, SMART ${uiPerfMetricDisplay(currentSummary, "smartReadyMs")}, settled ${uiPerfMetricDisplay(currentSummary, "settledMs")}.`
-      : `Last ${latestSummary.reasonLabel.toLowerCase()} on ${uiPerfScopeLabel(latestSummary)}: request ${uiPerfMetricDisplay(latestSummary, "requestMs")}, paint ${uiPerfMetricDisplay(latestSummary, "paintMs")}, history ${uiPerfMetricDisplay(latestSummary, "historyReadyMs")}, SMART ${uiPerfMetricDisplay(latestSummary, "smartReadyMs")}, settled ${uiPerfMetricDisplay(latestSummary, "settledMs")}.`;
+      : `Last ${latestSummary.reasonLabel.toLowerCase()} on ${uiPerfScopeLabel(latestSummary)}: request ${uiPerfMetricDisplay(latestSummary, "requestMs")}, paint ${uiPerfMetricDisplay(latestSummary, "paintMs")}, history ${uiPerfMetricDisplay(latestSummary, "historyReadyMs")}, SMART ${uiPerfMetricDisplay(latestSummary, "smartReadyMs")}, settled ${uiPerfMetricDisplay(latestSummary, "settledMs")}.`);
 
     const recentCards = [];
     if (currentSummary) {
@@ -3066,7 +3239,7 @@
       return;
     }
     const timeZone = getBrowserTimeZone();
-    timezoneLabel.textContent = timeZone ? `Browser local time: ${timeZone}` : "Browser local time";
+    timezoneLabel.textContent = timeZone ? `Your local time (${timeZone})` : "Your local time";
   }
 
   function formatTimestamp(value) {
@@ -3085,13 +3258,18 @@
       return;
     }
     const generatedAt = state.snapshotExportMeta?.generated_at || state.snapshot?.last_updated || null;
-    snapshotGeneratedValue.textContent = generatedAt ? formatTimestamp(generatedAt) : "Unknown";
+    const generatedLabel = generatedAt ? formatTimestamp(generatedAt) : "Unknown";
+    snapshotGeneratedValue.textContent = generatedLabel;
     snapshotGeneratedValue.title = generatedAt || "";
+    if (snapshotBannerCaptured) {
+      snapshotBannerCaptured.textContent = generatedLabel;
+      snapshotBannerCaptured.title = generatedAt || "";
+    }
     if (snapshotGeneratedNote) {
       const browserTimeZone = getBrowserTimeZone();
       snapshotGeneratedNote.textContent = browserTimeZone
-        ? `Rendered in viewer local time (${browserTimeZone})`
-        : "Rendered in viewer local time";
+        ? `Times shown in your local time zone (${browserTimeZone})`
+        : "Times shown in your local time zone";
     }
   }
 
@@ -3466,7 +3644,9 @@
   }
 
   function isSmartEntryInFlight(entry) {
-    if (!entry || (!entry.loading && !entry.refreshing)) {
+    // A queued entry only carries tooltip feedback: no request owns it yet, so it
+    // must stay eligible for the batch it is waiting on.
+    if (!entry || entry.queued || (!entry.loading && !entry.refreshing)) {
       return false;
     }
     const requestedAt = Number(entry.requestedAt) || 0;
@@ -3694,6 +3874,45 @@
         }
       }
     }
+  }
+
+  function smartPrefetchPending() {
+    return Boolean(state.smartPrefetchTimerId) || Boolean(state.smartPrefetchRunning);
+  }
+
+  // Hovering or arrow-keying across bays used to send one SMART request per bay
+  // even while the batch prefetch for those same bays was queued or already
+  // running. When the batch covers the bay, the tooltip shows "Loading..." and
+  // waits for it instead of racing it with a second request.
+  function ensureSmartSummaryOnInteraction(slot) {
+    if (state.snapshotMode || !slot) {
+      return Promise.resolve();
+    }
+    const cacheKey = getSmartCacheKey(slot);
+    const entry = state.smartSummaries[cacheKey];
+    const settled = isSmartEntryCurrent(entry) && (entry?.data || isSmartEntryInFlight(entry));
+    const coveredByPrefetch = !settled
+      && smartPrefetchPending()
+      && candidateSlotsForSmartPrefetch().some((candidate) => candidate.slot === slot.slot);
+    if (!coveredByPrefetch) {
+      return ensureSmartSummary(slot);
+    }
+    if (!entry?.data && !entry?.queued && !isSmartEntryInFlight(entry)) {
+      // queued, not loading in flight: the tooltip formatters read loading, while
+      // candidateSlotsForSmartPrefetch keeps the bay in the batch that owns it.
+      state.smartSummaries[cacheKey] = {
+        loading: true,
+        refreshing: false,
+        queued: true,
+        data: null,
+        requestedAt: Date.now(),
+        generation: state.smartSummaryGeneration,
+      };
+    }
+    if (state.hoveredSlot === slot.slot) {
+      refreshHoveredTooltip();
+    }
+    return Promise.resolve();
   }
 
   function scheduleSmartPrefetch() {
@@ -4225,7 +4444,7 @@
     return [
       {
         id: "attention_score",
-        label: "Derived Attention Score",
+        label: "Attention Score",
         shortLabel: "Score",
         fixedRange: [0, 100],
         value: (entry, entries, evaluation) => computeAttentionScore(entry, entries, evaluation),
@@ -4233,7 +4452,7 @@
       },
       {
         id: "temperature_c",
-        label: "Temperature (C)",
+        label: "Temperature",
         shortLabel: "Temp",
         historyMetrics: ["temperature_c"],
         value: (entry, _entries, evaluation) => heatmapMetricNumber(entry, "temperature_c", entry.slot?.temperature_c, evaluation),
@@ -4241,7 +4460,7 @@
       },
       {
         id: "temperature_delta_c",
-        label: "Temperature vs View Average (C)",
+        label: "Temperature vs View Average",
         shortLabel: "Delta",
         historyMetrics: ["temperature_c"],
         value: (entry, entries, evaluation) => computeTemperatureDelta(entry, entries, evaluation),
@@ -4378,7 +4597,7 @@
 
   function heatmapMetricContextText(metricId) {
     if (metricId === "attention_score") {
-      return "Higher scores combine relative temperature, errors, and write load; inspect the selected bay before acting.";
+      return "Score 0-100: hotter than its neighbours, SMART errors, and heavy writes all add points. Hover a bay to see why.";
     }
     if (metricId === "temperature_c") {
       return "Degrees Celsius. Use the drive vendor's warning and critical thresholds when available.";
@@ -4386,7 +4605,7 @@
     if (metricId === "temperature_delta_c") {
       return "Degrees Celsius relative to the current view average. Compare peer bays, then use vendor thresholds before acting.";
     }
-    return "Values come from the selected snapshot and optional history window.";
+    return "";
   }
 
   function heatmapMetricDefinition(metricId = state.heatmap.metric) {
@@ -5330,7 +5549,7 @@
       heatmapMetricField.classList.toggle("hidden", !state.heatmap.enabled);
     }
     if (heatmapMetricContext) {
-      heatmapMetricContext.textContent = heatmapMetricContextText(metric.id);
+      setTextIfChanged(heatmapMetricContext, heatmapMetricContextText(metric.id));
       heatmapMetricContext.classList.toggle("hidden", !state.heatmap.enabled);
     }
     if (heatmapTimeframeField) {
@@ -5380,29 +5599,31 @@
       heatmapScrubValue.textContent = playbackLabel;
     }
     if (heatmapLegendMin) {
-      heatmapLegendMin.textContent = Number.isFinite(heatmapContext.min) ? activeMetric.format(heatmapContext.min) : "Low";
+      setTextIfChanged(heatmapLegendMin, Number.isFinite(heatmapContext.min) ? activeMetric.format(heatmapContext.min) : "Low");
     }
     if (heatmapLegendMax) {
-      heatmapLegendMax.textContent = Number.isFinite(heatmapContext.max) ? activeMetric.format(heatmapContext.max) : "High";
+      setTextIfChanged(heatmapLegendMax, Number.isFinite(heatmapContext.max) ? activeMetric.format(heatmapContext.max) : "High");
     }
     if (heatmapLegendStatus) {
+      let legendStatusText;
+      let legendStatusTitle = heatmapLegendStatus.title;
       if (state.heatmap.loading && state.heatmap.freshness === "refreshing") {
-        heatmapLegendStatus.textContent = "Refreshing cached history";
-        heatmapLegendStatus.title = "Cached heat map values remain visible while fresh history is requested.";
+        legendStatusText = "Refreshing cached history";
+        legendStatusTitle = "Cached heat map values remain visible while fresh history is requested.";
       } else if (state.heatmap.loading) {
-        heatmapLegendStatus.textContent = needsHistory ? `Loading ${formatHistoryWindowLabel(currentHeatmapWindowHours())}` : "Loading";
+        legendStatusText = needsHistory ? `Loading ${formatHistoryWindowLabel(currentHeatmapWindowHours())}` : "Loading";
       } else if (needsHistory && state.history.loading && !state.history.checked) {
-        heatmapLegendStatus.textContent = "Checking history";
-        heatmapLegendStatus.title = "";
+        legendStatusText = "Checking history";
+        legendStatusTitle = "";
       } else if (needsHistory && !isHistoryAvailable()) {
-        heatmapLegendStatus.textContent = "History unavailable";
-        heatmapLegendStatus.title = state.history.detail || "The history sidecar is not available.";
+        legendStatusText = "History unavailable";
+        legendStatusTitle = state.history.detail || "The history sidecar is not available.";
       } else if (state.heatmap.error && state.heatmap.freshness === "stale") {
-        heatmapLegendStatus.textContent = "Stale history - refresh failed";
-        heatmapLegendStatus.title = state.heatmap.error;
+        legendStatusText = "Stale history - refresh failed";
+        legendStatusTitle = state.heatmap.error;
       } else if (state.heatmap.error) {
-        heatmapLegendStatus.textContent = "History unavailable";
-        heatmapLegendStatus.title = state.heatmap.error;
+        legendStatusText = "History unavailable";
+        legendStatusTitle = state.heatmap.error;
       } else {
         const valueCount = heatmapContext.valueCount || 0;
         const windowLabel = needsHistory ? ` - ${formatHistoryWindowLabel(currentHeatmapWindowHours())}` : "";
@@ -5410,8 +5631,12 @@
         const scaleLabel = state.heatmap.sensitivity !== HEATMAP_DEFAULT_SCALE_SENSITIVITY
           ? ` - scale ${formatHeatmapScaleSensitivity(state.heatmap.sensitivity)}`
           : "";
-        heatmapLegendStatus.textContent = `${valueCount} value${valueCount === 1 ? "" : "s"}${windowLabel}${timelineLabel}${scaleLabel}`;
-        heatmapLegendStatus.title = "";
+        legendStatusText = `${valueCount} value${valueCount === 1 ? "" : "s"}${windowLabel}${timelineLabel}${scaleLabel}`;
+        legendStatusTitle = "";
+      }
+      setTextIfChanged(heatmapLegendStatus, legendStatusText);
+      if (heatmapLegendStatus.title !== legendStatusTitle) {
+        heatmapLegendStatus.title = legendStatusTitle;
       }
     }
   }
@@ -5597,8 +5822,57 @@
     return appendHeatmapTooltipLines(lines, slot.slot);
   }
 
-  function slotTooltip(slot, smartEntry) {
-    return buildTooltipLines(slot, smartEntry).join("\n");
+  // Short accessible name for a bay tile: "Slot 05, sda, pool tank, healthy".
+  // The full tooltip stays available through aria-describedby.
+  function slotAccessibleName(slot) {
+    const parts = [slotLocationLabel(slot)];
+    if (slot.device_name) {
+      parts.push(String(slot.device_name));
+    }
+    if (slot.pool_name) {
+      parts.push(`${currentPlatform() === "linux" ? "mount" : "pool"} ${slot.pool_name}`);
+    }
+    parts.push(slot.health ? String(slot.health).toLowerCase() : stateLabel(slot).toLowerCase());
+    return parts.join(", ");
+  }
+
+  function searchSummaryText(matched, total, term) {
+    if (!term) {
+      return "";
+    }
+    if (!matched) {
+      return `No bays match "${term}".`;
+    }
+    return `${matched} of ${total} bay${total === 1 ? "" : "s"} match`;
+  }
+
+  function renderSearchSummary({ autoSelect = false } = {}) {
+    const tiles = Array.from(grid.querySelectorAll(".slot-tile[data-slot]"));
+    const matches = tiles.filter((tile) => !tile.classList.contains("filtered-out"));
+    const term = state.search ? String(searchBox?.value || "").trim() : "";
+    if (searchSummary) {
+      setTextIfChanged(searchSummary, searchSummaryText(matches.length, tiles.length, term));
+      searchSummary.classList.toggle("hidden", !term);
+    }
+    if (searchClearButton) {
+      searchClearButton.classList.toggle("hidden", !term);
+    }
+    if (!autoSelect || !term || matches.length !== 1 || mappingEditorHasUnsavedChanges()) {
+      return;
+    }
+    const slotNumber = Number(matches[0].dataset.slot);
+    if (Number.isInteger(slotNumber) && state.selectedSlot !== slotNumber) {
+      selectSlot(slotNumber);
+    }
+  }
+
+  function clearSearch() {
+    if (searchBox) {
+      searchBox.value = "";
+    }
+    state.search = "";
+    refreshGridFilterState();
+    searchBox?.focus();
   }
 
   function passesFilter(slot) {
@@ -5625,10 +5899,11 @@
     return liveSlot ? passesFilter(liveSlot) : !state.search;
   }
 
-  function refreshGridFilterState() {
+  function refreshGridFilterState(options = {}) {
     grid.querySelectorAll(".slot-tile[data-slot]").forEach((tile) => {
       tile.classList.toggle("filtered-out", !gridTileMatchesFilter(tile));
     });
+    renderSearchSummary(options);
   }
 
   function refreshGridTileAriaLabel(slotNumber, label) {
@@ -5799,16 +6074,15 @@
     (matchingTile || fallbackTile || recoveryTarget)?.focus({ preventScroll: true });
   }
 
-  function fabricSlotNumberForGridTile(tile) {
+  function fabricSlotNumberForGridTile(tile, selectedStorageView = getSelectedStorageViewRuntime()) {
     const renderedSlotNumber = Number(tile?.dataset?.slot);
     if (!Number.isInteger(renderedSlotNumber)) {
       return null;
     }
-    const selectedStorageView = getSelectedStorageViewRuntime();
     if (!selectedStorageView) {
       return renderedSlotNumber;
     }
-    const storageViewSlot = getSelectedStorageViewRuntimeSlot(renderedSlotNumber);
+    const storageViewSlot = storageViewRuntimeSlotByIndex(selectedStorageView, renderedSlotNumber);
     const liveSlot = getLiveBackedStorageViewSlot(selectedStorageView, storageViewSlot);
     return Number.isInteger(liveSlot?.slot) ? liveSlot.slot : null;
   }
@@ -5816,6 +6090,7 @@
   function refreshGridSelectionState() {
     const peerContext = getSelectedPeerContext();
     const fabricSlots = sasFabricSelectedSlotSet();
+    const selectedStorageView = getSelectedStorageViewRuntime();
     grid.querySelectorAll(".slot-tile[data-slot]").forEach((tile) => {
       const slotNumber = Number(tile.dataset.slot);
       const selected = state.selectedSlot === slotNumber;
@@ -5826,7 +6101,7 @@
       tile.classList.toggle("peer-highlight", peerHighlighted);
       tile.classList.toggle("peer-dimmed", !selected && peerContext.active && !peerHighlighted);
 
-      const fabricSlotNumber = fabricSlotNumberForGridTile(tile);
+      const fabricSlotNumber = fabricSlotNumberForGridTile(tile, selectedStorageView);
       const fabricContextActive = fabricSlots.size > 0 && Number.isInteger(fabricSlotNumber);
       const fabricHighlighted = fabricContextActive && fabricSlots.has(fabricSlotNumber);
       tile.classList.toggle("fabric-highlight", fabricHighlighted);
@@ -5837,24 +6112,30 @@
     });
   }
 
-  function delegatedLiveSlot(tile) {
-    if (getSelectedStorageViewRuntime() || getSelectedProfile()?.face_style === "nvme-carrier") {
-      return null;
-    }
+  // Every tile kind resolves through the same delegated handlers on the grid:
+  // live bays, live NVMe carriers and saved storage views. Tiles carry no
+  // listeners of their own, so a re-render attaches nothing per bay.
+  function delegatedGridSlot(tile) {
     const slotNumber = Number(tile?.dataset?.slot);
     if (!Number.isInteger(slotNumber)) {
       return null;
     }
-    return getSlotById(slotNumber) || {
+    const view = getSelectedStorageViewRuntime();
+    if (view) {
+      const viewSlot = storageViewRuntimeSlotByIndex(view, slotNumber) || {
+        slot_index: slotNumber,
+        slot_label: `Slot ${slotNumber + 1}`,
+        occupied: false,
+        state: "empty",
+      };
+      return { key: slotNumber, view, viewSlot, liveSlot: null };
+    }
+    const liveSlot = getSlotById(slotNumber) || {
       slot: slotNumber,
       slot_label: formatSlotLabel(slotNumber),
       state: "unknown",
     };
-  }
-
-  function delegatedLiveTile(event) {
-    const tile = delegatedGridTile(event);
-    return tile && delegatedLiveSlot(tile) ? tile : null;
+    return { key: slotNumber, view: null, viewSlot: null, liveSlot };
   }
 
   function delegatedGridTile(event) {
@@ -5862,67 +6143,126 @@
     return tile && grid.contains(tile) ? tile : null;
   }
 
-  function bindDelegatedLiveGridInteractions() {
+  function requestDelegatedSlotSmartSummary(target) {
+    if (target.view) {
+      return ensureStorageViewSmartSummary(target.view, target.viewSlot);
+    }
+    return ensureSmartSummaryOnInteraction(target.liveSlot);
+  }
+
+  function endDelegatedTileHover(tile) {
+    if (state.hoveredSlot === Number(tile.dataset.slot)) {
+      state.hoveredSlot = null;
+    }
+    hideSlotTooltip();
+  }
+
+  function bindDelegatedGridInteractions() {
     grid.addEventListener("mouseover", (event) => {
-      const tile = delegatedLiveTile(event);
-      if (!tile || tile.contains(event.relatedTarget)) {
+      const tile = delegatedGridTile(event);
+      const target = tile ? delegatedGridSlot(tile) : null;
+      if (!target || tile.contains(event.relatedTarget)) {
         return;
       }
-      const slot = delegatedLiveSlot(tile);
-      state.hoveredSlot = slot.slot;
+      state.hoveredSlot = target.key;
       refreshHoveredTooltip(tile);
       positionSlotTooltip(event.clientX, event.clientY);
-      void ensureSmartSummary(slot);
+      void requestDelegatedSlotSmartSummary(target);
     });
     grid.addEventListener("mousemove", (event) => {
-      const tile = delegatedLiveTile(event);
+      const tile = delegatedGridTile(event);
       if (tile && state.hoveredSlot === Number(tile.dataset.slot)) {
         positionSlotTooltip(event.clientX, event.clientY);
       }
     });
     grid.addEventListener("mouseout", (event) => {
-      const tile = delegatedLiveTile(event);
+      const tile = delegatedGridTile(event);
       if (!tile || tile.contains(event.relatedTarget)) {
         return;
       }
-      if (state.hoveredSlot === Number(tile.dataset.slot)) {
-        state.hoveredSlot = null;
-      }
-      hideSlotTooltip();
+      endDelegatedTileHover(tile);
     });
     grid.addEventListener("focusin", (event) => {
-      const tile = delegatedLiveTile(event);
-      if (!tile) {
+      const tile = delegatedGridTile(event);
+      const target = tile ? delegatedGridSlot(tile) : null;
+      if (!target) {
         return;
       }
-      const slot = delegatedLiveSlot(tile);
-      state.hoveredSlot = slot.slot;
+      state.hoveredSlot = target.key;
       refreshHoveredTooltip(tile);
       positionSlotTooltipFromElement(tile);
-      void ensureSmartSummary(slot);
+      void requestDelegatedSlotSmartSummary(target);
     });
     grid.addEventListener("focusout", (event) => {
-      const tile = delegatedLiveTile(event);
+      const tile = delegatedGridTile(event);
       if (!tile || tile.contains(event.relatedTarget)) {
         return;
       }
-      if (state.hoveredSlot === Number(tile.dataset.slot)) {
-        state.hoveredSlot = null;
-      }
-      hideSlotTooltip();
+      endDelegatedTileHover(tile);
     });
     grid.addEventListener("click", (event) => {
-      const tile = delegatedLiveTile(event);
-      if (!tile) {
+      const tile = delegatedGridTile(event);
+      const target = tile ? delegatedGridSlot(tile) : null;
+      if (!target) {
         return;
       }
-      const slotNumber = Number(tile.dataset.slot);
-      if (state.selectedSlot === slotNumber) {
+      if (state.selectedSlot === target.key) {
         clearSelectedSlot();
       } else {
-        selectSlot(slotNumber);
+        selectSlot(target.key);
       }
     });
+  }
+
+  function gridSlotPosition(slotNumber) {
+    const rows = activeLayoutRows();
+    for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
+      const columnIndex = (rows[rowIndex] || []).indexOf(slotNumber);
+      if (columnIndex >= 0) {
+        return { rowIndex, columnIndex, rows };
+      }
+    }
+    return null;
+  }
+
+  // Up and Down move to the nearest visible bay in the row above or below,
+  // so a four-row shelf is walked like the physical chassis.
+  function adjacentRowTile(tile, step) {
+    const position = gridSlotPosition(Number(tile.dataset.slot));
+    if (!position) {
+      return null;
+    }
+    const visibleBySlot = new Map(visibleGridTiles().map((candidate) => [Number(candidate.dataset.slot), candidate]));
+    for (let rowIndex = position.rowIndex + step; rowIndex >= 0 && rowIndex < position.rows.length; rowIndex += step) {
+      let nearest = null;
+      let nearestDistance = Infinity;
+      (position.rows[rowIndex] || []).forEach((slotNumber, columnIndex) => {
+        const candidate = visibleBySlot.get(slotNumber);
+        const distance = Math.abs(columnIndex - position.columnIndex);
+        if (candidate && distance < nearestDistance) {
+          nearest = candidate;
+          nearestDistance = distance;
+        }
+      });
+      if (nearest) {
+        return nearest;
+      }
+    }
+    return null;
+  }
+
+  function nextGridTileForKey(tile, key) {
+    const vertical = key === "ArrowUp" || key === "ArrowDown";
+    if (vertical && gridSlotPosition(Number(tile.dataset.slot))) {
+      return adjacentRowTile(tile, key === "ArrowUp" ? -1 : 1);
+    }
+    const tiles = visibleGridTiles();
+    const currentIndex = tiles.indexOf(tile);
+    if (currentIndex < 0) {
+      return null;
+    }
+    const delta = key === "ArrowLeft" || key === "ArrowUp" ? -1 : 1;
+    return tiles[currentIndex + delta] || null;
   }
 
   function bindDelegatedGridKeyboardNavigation() {
@@ -5931,13 +6271,7 @@
       if (!tile || !["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) {
         return;
       }
-      const tiles = visibleGridTiles();
-      const currentIndex = tiles.indexOf(tile);
-      if (currentIndex < 0) {
-        return;
-      }
-      const delta = event.key === "ArrowLeft" || event.key === "ArrowUp" ? -1 : 1;
-      const nextTile = tiles[currentIndex + delta];
+      const nextTile = nextGridTileForKey(tile, event.key);
       if (!nextTile) {
         return;
       }
@@ -5950,6 +6284,7 @@
     const focusedSlotKeyBeforeRender = focusedGridSlotKey();
     const finishGridRender = () => {
       refreshGridSelectionState();
+      renderSearchSummary();
       restoreGridFocus(focusedSlotKeyBeforeRender);
     };
     const selectedStorageView = getSelectedStorageViewRuntime();
@@ -6014,7 +6349,8 @@
         tile.classList.add("group-divider-after");
       }
       tile.dataset.slot = String(slot.slot);
-      tile.setAttribute("aria-label", slotTooltip(slot, getSmartSummaryEntry(slot)));
+      tile.setAttribute("aria-label", slotAccessibleName(slot));
+      tile.setAttribute("aria-describedby", "slot-tooltip");
       tile.setAttribute("aria-pressed", state.selectedSlot === slot.slot ? "true" : "false");
       tile.innerHTML = buildLiveSlotTileMarkup(slot);
       applyHeatmapToTile(tile, heatmapContext, slot.slot);
@@ -6043,6 +6379,25 @@
       return "";
     }
     return kvRow(label, value, copyable);
+  }
+
+  function isEmptyBay(slot) {
+    return slot?.state === "empty" && !slot.device_name && !slot.serial;
+  }
+
+  // SMART counters and transport facts stay one click away so the panel
+  // leads with the disk, its pool and its health.
+  function smartDetailsDisclosure(rows) {
+    const content = rows.filter(Boolean).join("");
+    if (!content) {
+      return "";
+    }
+    return `
+      <details class="detail-smart-details"${state.detailSmartExpanded ? " open" : ""}>
+        <summary>SMART details</summary>
+        <div class="kv-grid">${content}</div>
+      </details>
+    `;
   }
 
   async function copyTextToClipboard(text) {
@@ -6398,35 +6753,35 @@
     }
     if (estimate.selected_packaging === "auto") {
       if (estimate.auto_packaging === "html") {
-        return "Auto -> HTML";
+        return "Automatic: HTML file";
       }
       if (estimate.auto_packaging === "zip") {
-        return "Auto -> ZIP";
+        return "Automatic: ZIP file";
       }
       if (estimate.allow_oversize) {
-        return "Auto -> Oversize ZIP";
+        return "Automatic: ZIP file over the limit";
       }
-      return "Auto -> Over target";
+      return "Automatic: too large";
     }
     return estimatePackagingLabel(estimate.effective_packaging || estimate.selected_packaging);
   }
 
   function estimateCurrentPackagingMeta(estimate) {
     if (!estimate) {
-      return "Needs adjustment";
+      return "Too large";
     }
     if (estimate.selected_size_label) {
       if (estimate.selected_within_limit) {
         return estimate.selected_size_label;
       }
       if (estimate.selected_allowed) {
-        return `${estimate.selected_size_label} (over target)`;
+        return `${estimate.selected_size_label} (over the limit)`;
       }
     }
     if (estimate.auto_packaging === "oversize") {
-      return `ZIP ${estimate.zip_size_label || "n/a"} (over target)`;
+      return `ZIP ${estimate.zip_size_label || "n/a"} (over the limit)`;
     }
-    return "Needs adjustment";
+    return "Too large";
   }
 
   function buildEstimateAdvice(estimate) {
@@ -6436,40 +6791,41 @@
     const targetLabel = estimate.size_limit_label || "24 MiB";
     const downsamplingPart =
       estimate.downsampling_label && estimate.downsampling_label !== "None"
-        ? ` ${estimate.downsampling_note || `Adaptive ${estimate.downsampling_label} will be applied.`}`
+        ? ` ${estimate.downsampling_note || `History will be thinned to fit (${estimate.downsampling_label}).`}`
         : "";
+    const tooLargeAdvice = "Shorten the history window, mask serial numbers, or allow a larger file.";
 
     if (estimate.selected_packaging === "auto") {
       if (estimate.auto_packaging === "html") {
-        return `Auto should stay in HTML and fit under ${targetLabel}.${downsamplingPart}`;
+        return `Estimated ${estimate.html_size_label || "n/a"}: an HTML file under ${targetLabel}.${downsamplingPart}`;
       }
       if (estimate.auto_packaging === "zip") {
-        return `Auto is expected to switch to ZIP to stay under ${targetLabel}.${downsamplingPart}`;
+        return `The HTML file would be over ${targetLabel}, so a ZIP file of about ${estimate.zip_size_label || "n/a"} will be saved instead.${downsamplingPart}`;
       }
       if (estimate.allow_oversize) {
-        return `Even after adaptive rollups, both HTML and ZIP are still over ${targetLabel}. Oversize export is enabled, so Auto will continue as ZIP at about ${estimate.zip_size_label || "n/a"}.${downsamplingPart}`;
+        return `Both HTML and ZIP are over ${targetLabel}. Larger files are allowed, so a ZIP file of about ${estimate.zip_size_label || "n/a"} will be saved.${downsamplingPart}`;
       }
-      return `Even after adaptive rollups, both HTML and ZIP are still over ${targetLabel}. Try a shorter history window, enable redaction, or allow oversize.`;
+      return `Too large: both HTML and ZIP are over ${targetLabel}. ${tooLargeAdvice}`;
     }
 
     if (estimate.selected_packaging === "html") {
       if (estimate.selected_within_limit) {
-        return `Plain HTML is estimated to fit under ${targetLabel}.${downsamplingPart}`;
+        return `Estimated ${estimate.selected_size_label || estimate.html_size_label || "n/a"}: an HTML file under ${targetLabel}.${downsamplingPart}`;
       }
       if (estimate.selected_allowed) {
-        return `Plain HTML is estimated at ${estimate.selected_size_label || estimate.html_size_label} and exceeds ${targetLabel}. Oversize export is enabled, so it can still continue.${downsamplingPart}`;
+        return `The HTML file is estimated at ${estimate.selected_size_label || estimate.html_size_label} and is over ${targetLabel}. Larger files are allowed, so it can still be saved.${downsamplingPart}`;
       }
-      return `Plain HTML is estimated at ${estimate.selected_size_label || estimate.html_size_label} and would exceed ${targetLabel}. Try Auto, Force ZIP, a shorter history window, or allow oversize.`;
+      return `Too large: the HTML file is estimated at ${estimate.selected_size_label || estimate.html_size_label}, over ${targetLabel}. Choose Automatic or ZIP file, shorten the history window, mask serial numbers, or allow a larger file.`;
     }
 
     if (estimate.selected_packaging === "zip") {
       if (estimate.selected_within_limit) {
-        return `ZIP is estimated to fit under ${targetLabel}.${downsamplingPart}`;
+        return `Estimated ${estimate.selected_size_label || estimate.zip_size_label || "n/a"}: a ZIP file under ${targetLabel}.${downsamplingPart}`;
       }
       if (estimate.selected_allowed) {
-        return `ZIP is estimated at ${estimate.selected_size_label || estimate.zip_size_label} and exceeds ${targetLabel}. Oversize export is enabled, so it can still continue.${downsamplingPart}`;
+        return `The ZIP file is estimated at ${estimate.selected_size_label || estimate.zip_size_label} and is over ${targetLabel}. Larger files are allowed, so it can still be saved.${downsamplingPart}`;
       }
-      return `ZIP is estimated at ${estimate.selected_size_label || estimate.zip_size_label} and still exceeds ${targetLabel}. Try a shorter history window, enable redaction, or allow oversize.`;
+      return `Too large: the ZIP file is estimated at ${estimate.selected_size_label || estimate.zip_size_label}, over ${targetLabel}. ${tooLargeAdvice}`;
     }
 
     return "Estimate ready.";
@@ -6563,12 +6919,12 @@
         <div class="snapshot-export-estimate-card">
           <span class="snapshot-export-estimate-label">HTML</span>
           <span class="snapshot-export-estimate-value">${escapeHtml(estimate.html_size_label || "n/a")}</span>
-          <span class="snapshot-export-estimate-meta">${escapeHtml(estimate.html_within_limit ? "Fits target" : "Over target")}</span>
+          <span class="snapshot-export-estimate-meta">${escapeHtml(estimate.html_within_limit ? "OK" : "Too large")}</span>
         </div>
         <div class="snapshot-export-estimate-card">
           <span class="snapshot-export-estimate-label">ZIP</span>
           <span class="snapshot-export-estimate-value">${escapeHtml(estimate.zip_size_label || "n/a")}</span>
-          <span class="snapshot-export-estimate-meta">${escapeHtml(estimate.zip_within_limit ? "Fits target" : "Over target")}</span>
+          <span class="snapshot-export-estimate-meta">${escapeHtml(estimate.zip_within_limit ? "OK" : "Too large")}</span>
         </div>
         <div class="snapshot-export-estimate-card ${selectedTone === "error" ? "error" : selectedTone === "warning" ? "warning" : ""}">
           <span class="snapshot-export-estimate-label">Current Choice</span>
@@ -6585,69 +6941,63 @@
     `;
   }
 
+  function syncExportCheckboxRows(container, attribute, items) {
+    const existing = new Map(Array.from(container.querySelectorAll(`input[${attribute}]`))
+      .map(input => [input.getAttribute(attribute), input.closest("label")]));
+    const retained = new Set();
+    items.forEach((item, index) => {
+      let row = existing.get(item.id);
+      if (!row) {
+        row = document.createElement("label");
+        row.className = "snapshot-export-view-option";
+        const input = document.createElement("input");
+        input.type = "checkbox";
+        input.setAttribute(attribute, item.id);
+        row.append(input, document.createElement("span"));
+      }
+      retained.add(row);
+      const input = row.querySelector("input");
+      input.checked = item.checked;
+      input.disabled = item.disabled;
+      const span = row.querySelector("span");
+      const label = `${escapeHtml(item.label)}${item.meta ? `<small>${escapeHtml(item.meta)}</small>` : ""}`;
+      if (span.innerHTML !== label) span.innerHTML = label;
+      // Do not detach/reinsert unchanged controls: native keyboard focus stays put.
+      if (container.children[index] !== row) container.insertBefore(row, container.children[index] || null);
+    });
+    Array.from(container.children).forEach(row => { if (!retained.has(row)) row.remove(); });
+  }
+
   function renderSnapshotExportScopeControls() {
     if (exportIncludeEnclosuresToggle && exportEnclosureSelection) {
       const enclosures = exportableLiveEnclosures();
       const currentId = currentLiveEnclosureId();
+      const selectedIds = new Set(selectedExportEnclosureIds());
       exportIncludeEnclosuresToggle.checked = state.export.includeLiveEnclosures;
-      exportIncludeEnclosuresToggle.disabled = enclosures.length <= 1 || state.export.running || state.export.estimate.loading;
-      exportEnclosureSelection.classList.toggle("hidden", !state.export.includeLiveEnclosures || enclosures.length <= 1);
-      if (!enclosures.length || enclosures.length <= 1) {
-        exportEnclosureSelection.innerHTML = "";
-      } else {
-        const selectedIds = new Set(selectedExportEnclosureIds());
-        exportEnclosureSelection.innerHTML = enclosures
-          .map((enclosure) => {
-            const isCurrent = enclosure.id === currentId;
-            const checked = selectedIds.has(enclosure.id) || isCurrent ? " checked" : "";
-            const disabled = isCurrent || state.export.running || state.export.estimate.loading ? " disabled" : "";
-            const shape = [
-              Number.isFinite(Number(enclosure.slot_count)) ? `${Number(enclosure.slot_count)} bays` : "",
-              enclosure.profile_id || "",
-            ].filter(Boolean).join(" / ");
-            const meta = isCurrent ? "Current enclosure, always included" : shape;
-            return `
-              <label class="snapshot-export-view-option">
-                <input type="checkbox" data-export-enclosure-id="${escapeHtml(enclosure.id)}"${checked}${disabled}>
-                <span>
-                  ${escapeHtml(enclosure.label || enclosure.id)}
-                  ${meta ? `<small>${escapeHtml(meta)}</small>` : ""}
-                </span>
-              </label>
-            `;
-          })
-          .join("");
-      }
+      exportIncludeEnclosuresToggle.disabled = enclosures.length <= 1 || state.export.running;
+      exportEnclosureSelection.classList.toggle("hidden", !(state.export.includeLiveEnclosures || state.export.enclosureSelectionExpanded) || enclosures.length <= 1);
+      syncExportCheckboxRows(exportEnclosureSelection, "data-export-enclosure-id", enclosures.length <= 1 ? [] : enclosures.map(enclosure => ({
+        id: enclosure.id,
+        label: enclosure.label || enclosure.id,
+        checked: selectedIds.has(enclosure.id) || enclosure.id === currentId,
+        disabled: enclosure.id === currentId || state.export.running,
+        meta: enclosure.id === currentId ? "Current enclosure, always included"
+          : [Number.isFinite(Number(enclosure.slot_count)) ? `${Number(enclosure.slot_count)} bays` : "", enclosure.profile_id || ""].filter(Boolean).join(" / "),
+      })));
     }
-    if (!exportIncludeViewsToggle || !exportViewSelection) {
-      return;
-    }
+    if (!exportIncludeViewsToggle || !exportViewSelection) return;
     const views = exportableStorageViews();
-    exportIncludeViewsToggle.checked = state.export.includeStorageViews;
-    exportIncludeViewsToggle.disabled = !views.length || state.export.running || state.export.estimate.loading;
-    exportViewSelection.classList.toggle("hidden", !state.export.includeStorageViews || !views.length);
-    if (!views.length) {
-      exportViewSelection.innerHTML = "";
-      return;
-    }
     const selectedIds = new Set(selectedExportStorageViewIds());
-    exportViewSelection.innerHTML = views
-      .map((view) => {
-        const checked = selectedIds.has(view.id) ? " checked" : "";
-        const meta = [storageViewKindLabel(view), view.template_label || view.template_id]
-          .filter(Boolean)
-          .join(" / ");
-        return `
-          <label class="snapshot-export-view-option">
-            <input type="checkbox" data-export-storage-view-id="${escapeHtml(view.id)}"${checked}>
-            <span>
-              ${escapeHtml(view.label || view.id)}
-              ${meta ? `<small>${escapeHtml(meta)}</small>` : ""}
-            </span>
-          </label>
-        `;
-      })
-      .join("");
+    exportIncludeViewsToggle.checked = state.export.includeStorageViews;
+    exportIncludeViewsToggle.disabled = !views.length || state.export.running;
+    exportViewSelection.classList.toggle("hidden", !(state.export.includeStorageViews || state.export.viewSelectionExpanded) || !views.length);
+    syncExportCheckboxRows(exportViewSelection, "data-export-storage-view-id", views.map(view => ({
+      id: view.id,
+      label: view.label || view.id,
+      checked: selectedIds.has(view.id),
+      disabled: state.export.running,
+      meta: [storageViewKindLabel(view), view.template_label || view.template_id].filter(Boolean).join(" / "),
+    })));
   }
 
   async function refreshSnapshotExportEstimate() {
@@ -6714,11 +7064,33 @@
     }
   }
 
+  function snapshotExportSelectionDescription() {
+    const payload = snapshotExportRequestPayload();
+    if (payload.selected_storage_view_id) {
+      const view = getStorageViewRuntimeById(payload.selected_storage_view_id);
+      const slot = view?.slots?.find(item => item.slot_index === payload.selected_slot);
+      const name = view?.label || "Selected storage view";
+      if (!payload.storage_view_ids.includes(payload.selected_storage_view_id)) {
+        return `${name} is not included. Its slot selection will be cleared in the snapshot.`;
+      }
+      return slot
+        ? `${name} slot ${slot.slot_label || slot.slot_index} will stay selected in the snapshot.`
+        : `${name} has no selected slot. The snapshot will open without a slot selection.`;
+    }
+    const slot = getSlotById(payload.selected_slot);
+    return slot
+      ? `Slot ${slot.slot_label} will stay selected in the snapshot.`
+      : "No slot is currently selected, so the snapshot will open with no bay preselected.";
+  }
+
   function syncSnapshotExportDialog() {
     if (!exportSnapshotNote) {
       return;
     }
     renderSnapshotExportScopeControls();
+    for (const control of [exportRedactToggle, exportPackagingSelect, exportAllowOversizeToggle]) {
+      if (control) control.disabled = state.export.running;
+    }
     const scopeLabel =
       getSelectedEnclosureOption()?.label ||
       state.snapshot.selected_enclosure_label ||
@@ -6734,7 +7106,7 @@
         ? `${selectedViewCount} saved or virtual view${selectedViewCount === 1 ? "" : "s"}`
         : "",
     ].filter(Boolean);
-    const slot = getSlotById(state.selectedSlot);
+
     const parts = [
       `Scope ${scopeParts.join(" plus ")}.`,
       `Window ${formatHistoryWindowDescription(currentHistoryWindowHours())}.`,
@@ -6750,18 +7122,8 @@
         ? "Host and enclosure aliases plus partial ID masking are enabled."
         : "Full identifiers will be included.",
     ];
-    if (slot) {
-      parts.push(`Slot ${slot.slot_label} is currently selected and will stay selected in the snapshot.`);
-      if (!isHistoryAvailable()) {
-        parts.push("History is currently unavailable, so the snapshot will omit history data and hide the History action.");
-      } else if (state.history.panelOpen) {
-        parts.push("The history drawer is open now and will open in the snapshot too.");
-      } else {
-        parts.push("The history drawer is closed now and will stay closed in the snapshot.");
-      }
-    } else {
-      parts.push("No slot is currently selected, so the snapshot will open with no bay preselected.");
-    }
+    parts.push(snapshotExportSelectionDescription());
+    if (!isHistoryAvailable()) parts.push("History is unavailable and will be omitted.");
     if (state.export.estimate.data?.downsampling_label && state.export.estimate.data.downsampling_label !== "None") {
       parts.push(`Adaptive ${state.export.estimate.data.downsampling_label.toLowerCase()} will be used to stay closer to the size target.`);
     }
@@ -6771,7 +7133,7 @@
     exportSnapshotNote.textContent = parts.join(" ");
     if (exportSnapshotWindowHint) {
       if (isHistoryAvailable()) {
-        exportSnapshotWindowHint.textContent = `Snapshot history uses the current History window (${formatHistoryWindowDescription(currentHistoryWindowHours())}). Change it in the History drawer first if you want a different export range. New sessions default to 24h.`;
+        exportSnapshotWindowHint.textContent = `Change the export range in the History drawer. Current range: ${formatHistoryWindowDescription(currentHistoryWindowHours())}.`;
       } else {
         exportSnapshotWindowHint.textContent = "History is currently unavailable, so this snapshot will be exported without historical samples or events.";
       }
@@ -6804,6 +7166,9 @@
     if (state.export.includeStorageViews && !state.export.selectedStorageViewIds.length) {
       state.export.selectedStorageViewIds = exportableStorageViews().map((view) => view.id).filter(Boolean);
     }
+    // Start each dialog from inclusion state; row deselection must not collapse a focused list.
+    state.export.enclosureSelectionExpanded = state.export.includeLiveEnclosures;
+    state.export.viewSelectionExpanded = state.export.includeStorageViews;
     syncSnapshotExportDialog();
     if (typeof exportSnapshotDialog.showModal === "function") {
       if (!exportSnapshotDialog.open) {
@@ -7090,7 +7455,7 @@
       smartEntry?.data?.transport_protocol === "ATA"
       && ((payload?.metrics?.bytes_read || []).length || (payload?.metrics?.bytes_written || []).length)
     )
-      ? "ATA read/write totals are lifetime SMART host counters. Lifetime shows the stored totals, while Rate converts them into per-hour movement between slower SMART samples."
+      ? "Read/write totals are lifetime counters from the disk. Lifetime shows the stored totals; Rate shows the change per hour between samples."
       : null;
     if (ataHistoryCounterNote) {
       notes.push(ataHistoryCounterNote);
@@ -7108,7 +7473,7 @@
     }
 
     const enduranceEstimateNote = Number.isInteger(smartEntry?.data?.estimated_remaining_bytes_written)
-      ? "Estimated write-endurance values extrapolate current writes against the NVMe percentage-used SMART field."
+      ? "Remaining write endurance is a projection from the current write rate and the NVMe percentage-used value."
       : null;
     if (enduranceEstimateNote) {
       notes.push(enduranceEstimateNote);
@@ -7123,14 +7488,14 @@
       && slowMetricCounts.length
       && slowMetricCounts.some((count) => count < temperatureSamples)
     ) {
-      notes.push("Read/write and power-on metrics are collected on the slower SMART cadence, so those samples can lag behind the latest temperature point.");
+      notes.push("Read/write totals update less often than temperature.");
     }
 
     const hasCounterScaleBreak =
       hasHistoryCounterScaleDiscontinuity("bytes_read", payload?.metrics?.bytes_read || [], windowHours, referenceTimestampMs)
       || hasHistoryCounterScaleDiscontinuity("bytes_written", payload?.metrics?.bytes_written || [], windowHours, referenceTimestampMs);
     if (hasCounterScaleBreak) {
-      notes.push("Read/write history includes an older low-scale sample, so Rate mode may need a few fresh slow samples to settle after the SMART counter-source correction.");
+      notes.push("Read/write history includes an older sample on a different scale, so Rate may take a few samples to settle.");
     }
 
     const diskHistory = payload?.disk_history;
@@ -7494,17 +7859,17 @@
       ? formatTimestamp(new Date(Number(freshness.fetchedAt)).toISOString())
       : "an unknown time";
     if (freshness.state === "fresh") {
-      return `History data is fresh. Fetched at ${fetchedAt}.`;
+      return "";
     }
     if (freshness.state === "refreshing") {
-      return `Refreshing cached history from ${fetchedAt}.`;
+      return `Refreshing history saved ${fetchedAt}.`;
     }
     if (freshness.state === "stale") {
       const errorDetail = freshness.error ? ` Refresh failed: ${freshness.error}.` : "";
-      return `Stale cached history from ${fetchedAt}.${errorDetail}`;
+      return `Showing history from ${fetchedAt}.${errorDetail}`;
     }
     if (freshness.state === "unavailable") {
-      return "History data is unavailable.";
+      return "History is unavailable.";
     }
     return "";
   }
@@ -7515,11 +7880,17 @@
     }
 
     const historyTarget = getSelectedHistoryTarget();
+    const retryButton = document.getElementById("history-retry-button");
+    if (retryButton) {
+      retryButton.classList.toggle("hidden", !state.history.panelError);
+      retryButton.disabled = state.history.panelLoading;
+    }
     const slot = historyTarget?.slot || null;
     const windowHours = currentHistoryWindowHours();
     const referenceTimestampMs = currentHistoryReferenceTimestampMs();
     historyIoModeButtons.forEach((button) => {
       button.classList.toggle("active", button.dataset.historyIoMode === state.history.ioChartMode);
+      button.setAttribute("aria-pressed", String(button.dataset.historyIoMode === state.history.ioChartMode));
     });
     if (historyTimeframeSelect) {
       historyTimeframeSelect.value = windowHours === null ? "all" : String(windowHours);
@@ -7528,6 +7899,7 @@
     const shouldShowButton = Boolean(slot) && isHistoryAvailable();
     historyToggleButton.classList.toggle("hidden", !shouldShowButton);
     historyToggleButton.textContent = state.history.panelOpen ? "Hide History" : "History";
+    historyToggleButton.setAttribute("aria-expanded", String(shouldShowButton && state.history.panelOpen));
     if (historyDrawerTitle) {
       historyDrawerTitle.textContent = slot ? `Slot ${slot.slot_label} History` : "Slot History";
     }
@@ -7566,7 +7938,7 @@
     if (state.history.panelError && !payload) {
       detailHistoryError.textContent = state.history.panelError;
       detailHistoryError.classList.remove("hidden");
-      detailHistorySummary.textContent = "History backend reachable, but this slot query failed.";
+      detailHistorySummary.textContent = "History query failed. Use Retry History to try again.";
       return;
     }
 
@@ -7784,7 +8156,7 @@
       smartEntry?.data?.transport_protocol === "ATA"
       && (Number.isInteger(smartEntry?.data?.bytes_read) || Number.isInteger(smartEntry?.data?.bytes_written))
     )
-      ? "ATA read/write totals are lifetime SMART host counters and can exceed current pool usage, especially after array initialization, parity build, or rebuild."
+      ? "Read/write totals are lifetime counters from the disk and can be higher than current pool usage, for example after a rebuild."
       : null;
     const lowHourAnnualizedNote = (
       Number.isInteger(smartEntry?.data?.power_on_hours)
@@ -7794,7 +8166,7 @@
       ? "Annualized read/write is hidden until the disk has at least about 30 days of power-on time."
       : null;
     const enduranceEstimateNote = Number.isInteger(smartEntry?.data?.estimated_remaining_bytes_written)
-      ? "Estimated write-endurance values extrapolate current writes against the NVMe percentage-used SMART field."
+      ? "Remaining write endurance is a projection from the current write rate and the NVMe percentage-used value."
       : null;
     return [smartMessage, ledControlNote, ataVolumeCounterNote, lowHourAnnualizedNote, enduranceEstimateNote].filter(Boolean).join(" ");
   }
@@ -7846,6 +8218,7 @@
   }
 
   function markMappingFormDirty() {
+    state.mappingDraftRevision = (state.mappingDraftRevision || 0) + 1;
     if (state.mappingFormDirty) {
       return;
     }
@@ -7858,8 +8231,8 @@
     if (!mappingEditorHasUnsavedChanges()) {
       return true;
     }
-    if (!window.confirm("Discard unsaved calibration edits and change selection?")) {
-      setStatus("Selection change canceled. Unsaved calibration edits were kept.");
+    if (!window.confirm("You have unsaved changes for this bay. Discard them?")) {
+      setStatus("Selection change canceled. Your unsaved changes were kept.");
       return false;
     }
     state.mappingFormScopeKey = null;
@@ -7892,9 +8265,9 @@
     const mappingSupported = slot?.mapping_supported !== false;
     if (mappingEmpty) {
       mappingEmpty.textContent = mappingSupported
-        ? "Select a slot to save or restore calibration details for that bay."
+        ? "Click a bay to save which disk sits in it."
         : (slot.mapping_reason
-          || "Manual mapping is unavailable because this disk has no stable physical location.");
+          || "This disk has no fixed bay, so it cannot be assigned.");
       mappingEmpty.classList.toggle("hidden", mappingSupported);
     }
     mappingForm.classList.toggle("hidden", !mappingSupported);
@@ -7906,21 +8279,22 @@
     if (enclosure?.kind !== "virtual" && !String(enclosure?.id || "").startsWith("virtual-system:")) {
       return null;
     }
-    return "Mapping import is unavailable because this system disk inventory has no identified physical enclosure or stable physical slot identities.";
+    return "Backups cannot be restored here because this system has no physical enclosure.";
   }
 
   function renderMappingImportControl() {
     const snapshotModeActive = typeof state !== "undefined" && Boolean(state.snapshotMode);
     const reason = snapshotModeActive
-      ? "Mapping backup actions are disabled in an offline snapshot export."
+      ? "Bay assignment backups cannot be changed in an offline copy."
       : mappingImportUnavailableReason();
     if (typeof exportMappingsButton !== "undefined" && exportMappingsButton) {
       exportMappingsButton.disabled = snapshotModeActive;
       exportMappingsButton.title = snapshotModeActive ? reason : "";
     }
+    const policyBlocked = typeof writePolicyAllowsWrites === "function" && !writePolicyAllowsWrites();
     if (importMappingsButton) {
-      importMappingsButton.disabled = Boolean(reason);
-      importMappingsButton.title = reason || "";
+      importMappingsButton.disabled = Boolean(reason) || policyBlocked;
+      importMappingsButton.title = reason || (policyBlocked ? writePolicyReason() : "");
     }
     if (mappingImportUnavailable) {
       mappingImportUnavailable.textContent = reason || "";
@@ -7944,71 +8318,78 @@
     detailSlotTitle.textContent = detailTitle;
     detailStatePill.textContent = stateLabel(slot);
     detailStatePill.className = `state-pill state-${slot.state}`;
-    detailKvGrid.innerHTML = [
-      kvRow("Device", slot.device_name),
-      kvRow("Serial", slot.serial, true),
-      kvRow("Model", slot.model),
-      kvRow("Size", slot.size_human),
-      kvRow(persistentIdLabel(slot), slot.gptid, true),
-      kvRowIfMeaningful("Namespace EUI64", formatNamespaceEui64Value(slot, smartEntry), true),
-      kvRowIfMeaningful("Namespace NGUID", formatNamespaceNguidValue(smartEntry), true),
-      kvRow(currentPlatform() === "linux" ? "Mount" : "Pool", slot.pool_name),
-      kvRow(currentPlatform() === "linux" ? "Array" : "Vdev", slot.vdev_name),
-      kvRow(currentPlatform() === "linux" ? "Role" : "Class", slot.vdev_class),
-      kvRow("Topology", slot.topology_label),
-      showQuantastorContext ? kvRowIfMeaningful("Presented By", formatQuantastorContextValue(slot, "presented_by_label")) : "",
-      showQuantastorContext ? kvRowIfMeaningful("Pool Active On", formatQuantastorContextValue(slot, "pool_owner_label")) : "",
-      showQuantastorContext ? kvRowIfMeaningful("I/O Fence On", formatQuantastorContextValue(slot, "fence_owner_label")) : "",
-      showQuantastorContext ? kvRowIfMeaningful("Visible On", formatVisibleOnValue(slot)) : "",
-      showQuantastorContext ? kvRowIfMeaningful("SES Host", formatSesHostValue(slot)) : "",
-      kvRow(state.snapshotMode ? "Health at capture" : "Health", slot.health),
-      kvRow("Temp", formatTemperatureValue(slot, smartEntry)),
-      kvRowIfMeaningful("Warning Temp", formatWarningTemperatureValue(smartEntry)),
-      kvRowIfMeaningful("Critical Temp", formatCriticalTemperatureValue(smartEntry)),
-      kvRowIfMeaningful(
-        state.snapshotMode ? "SMART Status at capture" : "SMART Status",
-        formatSmartHealthStatusValue(smartEntry),
-      ),
-      kvRow("Last SMART Test", formatLastSmartTestValue(slot, smartEntry)),
-      kvRow("Power On", formatPowerOnValue(smartEntry)),
-      kvRowIfMeaningful("Power Cycles", formatPowerCycleValue(smartEntry)),
-      kvRowIfMeaningful("Power-On Resets", formatPowerOnResetsValue(smartEntry)),
-      kvRow("Sector Size", formatSectorSizeValue(slot, smartEntry)),
-      kvRow("Rotation", formatRotationValue(smartEntry)),
-      kvRow("Form Factor", formatFormFactorValue(smartEntry)),
-      kvRowIfMeaningful("Firmware", formatFirmwareValue(smartEntry)),
-      kvRowIfMeaningful("Protocol Version", formatProtocolVersionValue(smartEntry)),
-      kvRowIfMeaningful("Endurance", formatEnduranceValue(smartEntry)),
-      kvRowIfMeaningful("Available Spare", formatAvailableSpareValue(smartEntry)),
-      kvRowIfMeaningful("TRIM", formatTrimSupportedValue(smartEntry)),
-      kvRowIfMeaningful("Bytes Read", formatBytesReadValue(smartEntry)),
-      kvRowIfMeaningful("Bytes Written", formatBytesWrittenValue(smartEntry)),
-      kvRowIfMeaningful("Annualized Read", formatAnnualizedReadValue(smartEntry)),
-      kvRowIfMeaningful("Annualized Write", formatAnnualizedWriteValue(smartEntry)),
-      kvRowIfMeaningful("Est. TBW Left", formatEstimatedRemainingWriteValue(smartEntry)),
-      kvRowIfMeaningful("Read Commands", formatReadCommandsValue(smartEntry)),
-      kvRowIfMeaningful("Write Commands", formatWriteCommandsValue(smartEntry)),
-      kvRowIfMeaningful("Media Errors", formatMediaErrorsValue(smartEntry)),
-      kvRowIfMeaningful("Predictive Errors", formatPredictiveErrorsValue(smartEntry)),
-      kvRowIfMeaningful("Non-Medium Errors", formatNonMediumErrorsValue(smartEntry)),
-      kvRowIfMeaningful(readErrorCountLabel(smartEntry), formatReadErrorCountValue(smartEntry)),
-      kvRowIfMeaningful(writeErrorCountLabel(smartEntry), formatWriteErrorCountValue(smartEntry)),
-      kvRowIfMeaningful("Unsafe Shutdowns", formatUnsafeShutdownsValue(smartEntry)),
-      kvRowIfMeaningful("Hardware Resets", formatHardwareResetsValue(smartEntry)),
-      kvRowIfMeaningful("Interface CRC Errors", formatInterfaceCrcErrorsValue(smartEntry)),
-      kvRow("Read Cache", formatReadCacheValue(smartEntry)),
-      kvRow("Writeback Cache", formatWritebackCacheValue(smartEntry)),
-      kvRow("Transport", formatTransportValue(smartEntry)),
-      showSasTransportFields ? kvRow("Logical Unit ID", formatLogicalUnitIdValue(slot, smartEntry)) : "",
-      showSasTransportFields ? kvRow("SAS Address", formatSasAddressValue(slot, smartEntry)) : "",
-      showSasTransportFields ? kvRow("Attached SAS", formatAttachedSasAddressValue(slot, smartEntry)) : "",
-      showLinkRate ? kvRow("Link Rate", formatLinkRateValue(smartEntry)) : "",
-      showQuantastorContext ? kvRowIfMeaningful("SES Flags", formatSesStateValue(slot)) : "",
-      kvRow("Enclosure", slot.enclosure_label || slot.enclosure_name || slot.enclosure_id),
-      kvRow("LED", ledStatusLabel(slot)),
-      kvRow("Mapping", slot.mapping_source),
-      kvRow("Notes", slot.notes),
-    ].filter(Boolean).join("");
+    detailKvGrid.innerHTML = isEmptyBay(slot)
+      ? '<p class="detail-empty-bay">This bay is empty.</p>'
+      : [
+        kvRow("Device", slot.device_name),
+        kvRow("Serial", slot.serial, true),
+        kvRowIfMeaningful("Model", slot.model),
+        kvRowIfMeaningful("Size", slot.size_human),
+        kvRowIfMeaningful(persistentIdLabel(slot), slot.gptid, true),
+        kvRowIfMeaningful("Namespace EUI64", formatNamespaceEui64Value(slot, smartEntry), true),
+        kvRowIfMeaningful("Namespace NGUID", formatNamespaceNguidValue(smartEntry), true),
+        kvRow(currentPlatform() === "linux" ? "Mount" : "Pool", slot.pool_name),
+        kvRowIfMeaningful(currentPlatform() === "linux" ? "Array" : "Vdev", slot.vdev_name),
+        kvRowIfMeaningful(currentPlatform() === "linux" ? "Role" : "Class", slot.vdev_class),
+        kvRowIfMeaningful("Topology", slot.topology_label),
+        showQuantastorContext ? kvRowIfMeaningful("Presented By", formatQuantastorContextValue(slot, "presented_by_label")) : "",
+        showQuantastorContext ? kvRowIfMeaningful("Pool Active On", formatQuantastorContextValue(slot, "pool_owner_label")) : "",
+        showQuantastorContext ? kvRowIfMeaningful("I/O Fence On", formatQuantastorContextValue(slot, "fence_owner_label")) : "",
+        showQuantastorContext ? kvRowIfMeaningful("Visible On", formatVisibleOnValue(slot)) : "",
+        showQuantastorContext ? kvRowIfMeaningful("SES Host", formatSesHostValue(slot)) : "",
+        kvRow(state.snapshotMode ? "Health at capture" : "Health", slot.health),
+        kvRowIfMeaningful("Temp", formatTemperatureValue(slot, smartEntry)),
+        kvRowIfMeaningful(
+          state.snapshotMode ? "SMART Status at capture" : "SMART Status",
+          formatSmartHealthStatusValue(smartEntry),
+        ),
+        kvRowIfMeaningful("Enclosure", slot.enclosure_label || slot.enclosure_name || slot.enclosure_id),
+        kvRowIfMeaningful("LED", ledStatusLabel(slot)),
+        kvRowIfMeaningful("Bay reported by", mappingSourceLabel(slot.mapping_source)),
+        kvRowIfMeaningful("Notes", slot.notes),
+        smartDetailsDisclosure([
+          kvRowIfMeaningful("Warning Temp", formatWarningTemperatureValue(smartEntry)),
+          kvRowIfMeaningful("Critical Temp", formatCriticalTemperatureValue(smartEntry)),
+          kvRowIfMeaningful("Last SMART Test", formatLastSmartTestValue(slot, smartEntry)),
+          kvRowIfMeaningful("Power On", formatPowerOnValue(smartEntry)),
+          kvRowIfMeaningful("Power Cycles", formatPowerCycleValue(smartEntry)),
+          kvRowIfMeaningful("Power-On Resets", formatPowerOnResetsValue(smartEntry)),
+          kvRowIfMeaningful("Sector Size", formatSectorSizeValue(slot, smartEntry)),
+          kvRowIfMeaningful("Rotation", formatRotationValue(smartEntry)),
+          kvRowIfMeaningful("Form Factor", formatFormFactorValue(smartEntry)),
+          kvRowIfMeaningful("Firmware", formatFirmwareValue(smartEntry)),
+          kvRowIfMeaningful("Protocol Version", formatProtocolVersionValue(smartEntry)),
+          kvRowIfMeaningful("Endurance", formatEnduranceValue(smartEntry)),
+          kvRowIfMeaningful("Available Spare", formatAvailableSpareValue(smartEntry)),
+          kvRowIfMeaningful("TRIM", formatTrimSupportedValue(smartEntry)),
+          kvRowIfMeaningful("Bytes Read", formatBytesReadValue(smartEntry)),
+          kvRowIfMeaningful("Bytes Written", formatBytesWrittenValue(smartEntry)),
+          kvRowIfMeaningful("Annualized Read", formatAnnualizedReadValue(smartEntry)),
+          kvRowIfMeaningful("Annualized Write", formatAnnualizedWriteValue(smartEntry)),
+          kvRowIfMeaningful("Est. TBW Left", formatEstimatedRemainingWriteValue(smartEntry)),
+          kvRowIfMeaningful("Read Commands", formatReadCommandsValue(smartEntry)),
+          kvRowIfMeaningful("Write Commands", formatWriteCommandsValue(smartEntry)),
+          kvRowIfMeaningful("Media Errors", formatMediaErrorsValue(smartEntry)),
+          kvRowIfMeaningful("Predictive Errors", formatPredictiveErrorsValue(smartEntry)),
+          kvRowIfMeaningful("Non-Medium Errors", formatNonMediumErrorsValue(smartEntry)),
+          kvRowIfMeaningful(readErrorCountLabel(smartEntry), formatReadErrorCountValue(smartEntry)),
+          kvRowIfMeaningful(writeErrorCountLabel(smartEntry), formatWriteErrorCountValue(smartEntry)),
+          kvRowIfMeaningful("Unsafe Shutdowns", formatUnsafeShutdownsValue(smartEntry)),
+          kvRowIfMeaningful("Hardware Resets", formatHardwareResetsValue(smartEntry)),
+          kvRowIfMeaningful("Interface CRC Errors", formatInterfaceCrcErrorsValue(smartEntry)),
+          kvRowIfMeaningful("Read Cache", formatReadCacheValue(smartEntry)),
+          kvRowIfMeaningful("Writeback Cache", formatWritebackCacheValue(smartEntry)),
+          kvRowIfMeaningful("Transport", formatTransportValue(smartEntry)),
+          showSasTransportFields ? kvRowIfMeaningful("Logical Unit ID", formatLogicalUnitIdValue(slot, smartEntry)) : "",
+          showSasTransportFields ? kvRowIfMeaningful("SAS Address", formatSasAddressValue(slot, smartEntry)) : "",
+          showSasTransportFields ? kvRowIfMeaningful("Attached SAS", formatAttachedSasAddressValue(slot, smartEntry)) : "",
+          showLinkRate ? kvRowIfMeaningful("Link Rate", formatLinkRateValue(smartEntry)) : "",
+          showQuantastorContext ? kvRowIfMeaningful("SES Flags", formatSesStateValue(slot)) : "",
+        ]),
+      ].filter(Boolean).join("");
+    detailKvGrid.querySelector(".detail-smart-details")?.addEventListener("toggle", (event) => {
+      state.detailSmartExpanded = Boolean(event.target.open);
+    });
 
     const smartNoteText = buildSmartNoteText(slot, smartEntry);
     if (smartNoteText) {
@@ -8046,8 +8427,8 @@
       if (!storageViewSlot) {
         renderEmptyDetailState(
           isLiveStyledStorageView(selectedStorageView)
-            ? "Select a slot tile to view disk, pool, and mapping details."
-            : "Select a storage-view slot to inspect how a live disk landed in this saved layout.",
+            ? "Click a bay to see its disk."
+            : "Click a slot to see its disk.",
           { showDetailSecondary: isLiveStyledStorageView(selectedStorageView) }
         );
         return;
@@ -8087,7 +8468,7 @@
           const showLinkRate = showSasTransportFields || formatLinkRateValue(smartEntry) !== "n/a";
           return [
         kvRow("Storage View", selectedStorageView.label),
-        kvRow("Template", selectedStorageView.template_label || selectedStorageView.template_id),
+        kvRow("Layout", selectedStorageView.template_label || selectedStorageView.template_id),
         kvRow("Slot", storageViewSlot.slot_label),
         kvRowIfMeaningful("Configured Size", storageViewSlot.slot_size),
         kvRow("State", stateLabel(storageViewSlot)),
@@ -8144,7 +8525,7 @@
         kvRowIfMeaningful("Transport Address", storageViewSlot.transport_address),
         kvRowIfMeaningful("Placement", storageViewSlot.placement_key),
         kvRowIfMeaningful("Matched By", Array.isArray(storageViewSlot.match_reasons) ? storageViewSlot.match_reasons.join(", ") : null),
-        kvRowIfMeaningful("Assignment Rank", storageViewSlot.assignment_rank),
+        kvRowIfMeaningful("Match order", storageViewSlot.assignment_rank),
         kvRowIfMeaningful("Source", storageViewSlot.source),
         kvRowIfMeaningful("Notes", storageViewRuntimeSecondaryLabel(storageViewSlot)),
           ].filter(Boolean).join("");
@@ -8198,8 +8579,8 @@
 
     if (!hasStoragePeerGroup(slot)) {
       topologyContext.innerHTML = currentPlatform() === "linux"
-        ? '<div class="warning-item muted">This slot is not currently tied to a mapped mdadm stack.</div>'
-        : '<div class="warning-item muted">This slot is not currently tied to a pool vdev.</div>';
+        ? '<div class="warning-item muted">This disk is not in a RAID array.</div>'
+        : '<div class="warning-item muted">This disk is not in a pool.</div>';
       return;
     }
 
@@ -8258,17 +8639,16 @@
 
     if (!slot) {
       multipathContext.innerHTML = currentPlatform() === "linux"
-        ? '<div class="warning-item muted">Select a slot to inspect transport and member-path details when available.</div>'
-        : '<div class="warning-item muted">Select a multipath-backed slot to inspect active and standby member paths.</div>';
+        ? '<div class="warning-item muted">Click a disk to see its transport and path details.</div>'
+        : '<div class="warning-item muted">Click a disk with more than one path to see its active and standby paths.</div>';
       return;
     }
 
     const multipath = slot.multipath;
     if (!multipath) {
-      const stack = currentPlatform() === "linux" ? "a multipath stack" : "gmultipath";
       const message = state.snapshotMode
-        ? `This slot was not presented through ${stack} at capture.`
-        : `This slot is not currently presented through ${stack}.`;
+        ? "This disk had a single path when the copy was saved."
+        : "This disk has a single path.";
       multipathContext.innerHTML = `<div class="warning-item muted">${escapeHtml(message)}</div>`;
       return;
     }
@@ -8497,12 +8877,12 @@
 
   function snapshotSshStatus(ssh) {
     if (!ssh.enabled) {
-      return { className: "status-chip snapshot", textContent: "SSH OFF AT CAPTURE" };
+      return { className: "status-chip snapshot", textContent: "SSH: off at capture" };
     }
     if (!ssh.ok) {
-      return { className: "status-chip error", textContent: "SSH ERROR AT CAPTURE" };
+      return { className: "status-chip error", textContent: "SSH: error at capture" };
     }
-    return { className: "status-chip snapshot", textContent: "SSH AT CAPTURE" };
+    return { className: "status-chip snapshot", textContent: "SSH: OK at capture" };
   }
 
   function renderStatus() {
@@ -8515,8 +8895,8 @@
         snapshotStatusChip.className = "status-chip snapshot";
         snapshotStatusChip.textContent = "SNAPSHOT";
         snapshotStatusChip.title = generatedAt
-          ? `Frozen offline artifact generated ${formatTimestamp(generatedAt)}.`
-          : "Frozen offline artifact.";
+          ? `Offline copy saved ${formatTimestamp(generatedAt)}.`
+          : "Offline copy.";
       } else {
         snapshotStatusChip.className = "status-chip hidden";
         snapshotStatusChip.textContent = "SNAPSHOT";
@@ -8526,42 +8906,45 @@
 
     if (state.snapshotMode) {
       apiStatusChip.className = "status-chip snapshot";
-      apiStatusChip.textContent = api.ok ? "API AT CAPTURE" : "API ERROR AT CAPTURE";
-      apiStatusChip.title = "Recorded source state. No API is connected to this artifact.";
+      apiStatusChip.textContent = api.ok ? "TrueNAS API: OK at capture" : "TrueNAS API: error at capture";
+      apiStatusChip.title = "Recorded when this copy was saved. No TrueNAS API is connected.";
       const snapshotSsh = snapshotSshStatus(ssh);
       sshStatusChip.className = snapshotSsh.className;
       sshStatusChip.textContent = snapshotSsh.textContent;
-      sshStatusChip.title = "Recorded source state. No SSH session is connected to this artifact.";
+      sshStatusChip.title = "Recorded when this copy was saved. No SSH session is connected.";
     } else {
       apiStatusChip.className = `status-chip ${api.ok ? "ok" : "error"}`;
-      apiStatusChip.textContent = api.ok ? "API OK" : "API ERR";
+      apiStatusChip.textContent = api.ok ? "TrueNAS API: OK" : "TrueNAS API: error";
+      apiStatusChip.title = typeof api.message === "string" ? api.message : "";
 
+      // SSH that was never turned on is a normal setup, so it keeps the neutral chip style.
       let sshClass = "ok";
       if (!ssh.enabled) {
-        sshClass = "partial";
+        sshClass = "";
       } else if (!ssh.ok) {
         sshClass = "error";
       }
-      sshStatusChip.className = `status-chip ${sshClass}`;
-      sshStatusChip.textContent = !ssh.enabled ? "SSH OFF" : ssh.ok ? "SSH OK" : "SSH ERR";
+      sshStatusChip.className = `status-chip ${sshClass}`.trim();
+      sshStatusChip.textContent = !ssh.enabled ? "SSH: off" : ssh.ok ? "SSH: OK" : "SSH: error";
+      sshStatusChip.title = typeof ssh.message === "string" ? ssh.message : "";
     }
 
     if (historyStatusChip) {
       if (!state.history.configured) {
         historyStatusChip.className = "status-chip hidden";
-        historyStatusChip.textContent = "HIST";
+        historyStatusChip.textContent = "History";
         historyStatusChip.title = "";
       } else {
         let historyClass = "partial";
-        let historyText = "HIST ...";
+        let historyText = "History: checking";
         if (state.snapshotMode) {
           historyClass = "snapshot";
-          historyText = state.history.available ? "HIST PRELOADED" : "HIST OMITTED";
+          historyText = state.history.available ? "History: included" : "History: not included";
         } else if (state.history.available) {
           historyClass = "ok";
-          historyText = "HIST OK";
+          historyText = "History: on";
         } else if (state.history.checked && !state.history.loading) {
-          historyText = "HIST OFF";
+          historyText = "History: off";
         }
 
         const trackedSlots = state.history.counts?.tracked_slots;
@@ -8581,7 +8964,7 @@
           detailParts.push(state.history.detail);
         }
         if (!detailParts.length && state.history.loading) {
-          detailParts.push("Checking optional history backend.");
+          detailParts.push("Checking the history service.");
         }
 
         historyStatusChip.className = `status-chip ${historyClass}`;
@@ -8591,7 +8974,7 @@
     }
 
     lastUpdated.textContent = formatTimestamp(state.snapshot.last_updated);
-    lastUpdated.title = "Rendered in your browser's local timezone.";
+    lastUpdated.title = "Shown in your local time zone.";
     renderTimezoneLabel();
     renderSnapshotBanner();
     syncLocation();
@@ -8642,35 +9025,47 @@
     const populated = counts.matched + counts.unmatched;
     let headline;
     if (counts.unmatched > 0) {
-      headline = `${counts.unmatched} populated bay${counts.unmatched === 1 ? "" : "s"} need${counts.unmatched === 1 ? "s" : ""} mapping.`;
+      headline = counts.unmatched === 1
+        ? "1 disk is not matched to a bay. Click it to assign one."
+        : `${counts.unmatched} disks are not matched to a bay. Click them to assign one.`;
     } else if (counts.unknown > 0) {
-      headline = `${counts.unknown} bay${counts.unknown === 1 ? " has" : "s have"} unknown mapping state.`;
+      headline = `${counts.unknown} bay${counts.unknown === 1 ? " has" : "s have"} an unknown state.`;
     } else if (populated > 0) {
-      headline = `All ${populated} populated bay${populated === 1 ? " is" : "s are"} matched.`;
+      headline = populated === 1 ? "The only disk is in a known bay." : `All ${populated} disks are in known bays.`;
     } else {
-      headline = "No populated bays are reported in this view.";
+      headline = "No disks are reported in this view.";
     }
     return { ...counts, populated, total, headline };
   }
 
-  function mappingHealthEvidenceNote(slots, lastUpdatedValue) {
+  function mappingSourceLabel(source) {
     const labels = {
-      api: "API",
-      ssh: "SSH/SES",
+      api: "TrueNAS API",
+      ssh: "SSH (enclosure)",
       bmc: "BMC",
-      manual: "saved mapping",
-      modeled: "modeled fixture",
+      manual: "saved assignment",
+      modeled: "modeled layout",
       inventory_candidate: "inventory match",
-      snapshot_slot: "enclosure snapshot",
-      scale_sg_ses: "SCALE SG/SES",
-      "live-derived-core-demo": "sanitized demo fixture",
+      snapshot_slot: "saved snapshot",
+      scale_sg_ses: "SSH (SES)",
+      "live-derived-core-demo": "demo data",
+      unknown: "unknown",
+      empty: "empty bay",
+      placeholder: "no disk",
     };
+    const key = String(source || "").trim();
+    if (!key) {
+      return "n/a";
+    }
+    return labels[key] || key.replaceAll("_", " ");
+  }
+
+  function mappingHealthSourceNote(slots) {
     const sources = Array.from(new Set((Array.isArray(slots) ? slots : [])
       .map((slot) => String(slot?.mapping_source || "").trim())
       .filter((source) => source && source !== "unknown" && source !== "empty" && source !== "placeholder")
-      .map((source) => labels[source] || source.replaceAll("_", " "))));
-    const sourceText = sources.length ? sources.join(" and ") : "unknown mapping source";
-    return `Evidence: ${sourceText}. Snapshot: ${lastUpdatedValue || "time unavailable"}.`;
+      .map((source) => mappingSourceLabel(source))));
+    return sources.length ? `Bay positions come from: ${sources.join(", ")}.` : "Bay positions: source unknown.";
   }
 
   function renderSummary() {
@@ -8684,11 +9079,11 @@
     const healthScope = mappingHealthScope(state.snapshot, getSelectedStorageViewRuntime());
     const health = summarizeMappingHealth(healthScope.slots, healthScope.layoutSlotCount);
     if (mappingHealthSummary) {
-      mappingHealthSummary.textContent = `${healthScope.label}: ${health.headline} ${health.matched} matched, ${health.empty} empty, ${health.unmatched} unmatched, ${health.unknown} unknown.`;
+      setTextIfChanged(mappingHealthSummary, `${healthScope.label}: ${health.headline}`);
       mappingHealthSummary.dataset.tone = health.unmatched > 0 ? "warning" : health.unknown > 0 ? "unknown" : "ok";
     }
     if (mappingHealthEvidence) {
-      mappingHealthEvidence.textContent = mappingHealthEvidenceNote(healthScope.slots, healthScope.lastUpdated);
+      setTextIfChanged(mappingHealthEvidence, mappingHealthSourceNote(healthScope.slots));
     }
   }
 
@@ -8801,7 +9196,7 @@
     platformDetailsToggleButton.textContent = state.platformDetails.open ? "Hide Platform Details" : "Platform Details";
     platformDetailsToggleButton.setAttribute("aria-expanded", state.platformDetails.open ? "true" : "false");
     platformDetailsTitle.textContent = details.title || "Platform Details";
-    platformDetailsSummary.textContent = details.summary || "Read-only platform context.";
+    platformDetailsSummary.textContent = details.summary || "";
 
     if (!state.platformDetails.open) {
       platformDetailsPanel.classList.add("hidden");
@@ -8824,12 +9219,33 @@
     wireCopyButtons(platformDetailsSections);
   }
 
+  function ensureRefreshIntervalOption() {
+    if (!refreshIntervalSelect) {
+      return;
+    }
+    const wanted = String(state.refreshIntervalSeconds);
+    const options = Array.from(refreshIntervalSelect.options || []);
+    if (options.some((option) => option.value === wanted)) {
+      return;
+    }
+    const option = document.createElement("option");
+    option.value = wanted;
+    option.textContent = `${formatRefreshInterval(state.refreshIntervalSeconds)} (server default)`;
+    const nextOption = options.find((candidate) => Number(candidate.value) > state.refreshIntervalSeconds) || null;
+    refreshIntervalSelect.insertBefore(option, nextOption);
+  }
+
   function renderRefreshControls() {
     autoRefreshToggle.checked = state.autoRefresh;
+    ensureRefreshIntervalOption();
     refreshIntervalSelect.value = String(state.refreshIntervalSeconds);
     refreshButton.disabled = state.snapshotMode;
     autoRefreshToggle.disabled = state.snapshotMode;
     refreshIntervalSelect.disabled = state.snapshotMode || !state.autoRefresh;
+    // A saved copy cannot refresh, so the controls are hidden rather than left greyed out.
+    for (const control of [refreshButton, autoRefreshField, refreshIntervalField, inventoryEvidenceDisclosure]) {
+      control?.classList?.toggle("hidden", state.snapshotMode);
+    }
     renderTimingSurfaces();
     ensureTimingTick();
   }
@@ -8888,14 +9304,14 @@
         label: "Snapshot",
         ttlSeconds: SNAPSHOT_CACHE_TTL_SECONDS,
         startMs: snapshotStartMs,
-        title: "Browser-side countdown from the last accepted inventory snapshot.",
+        title: "Time left before the inventory shown here is considered stale.",
       },
       {
         key: "sources",
         label: "Sources",
         ttlSeconds: SOURCE_BUNDLE_CACHE_TTL_SECONDS,
         startMs: snapshotStartMs,
-        title: "Approximate API/SSH/BMC source-bundle reuse window for this view.",
+        title: "Time left before TrueNAS, SSH, and BMC answers are read again.",
       },
       {
         key: "smart",
@@ -8903,15 +9319,15 @@
         ttlSeconds: SMART_CACHE_TTL_SECONDS,
         startMs: smartStartMs,
         title: smartStartMs
-          ? "Countdown from the latest loaded SMART summary."
-          : "SMART cache countdown starts after summaries load.",
+          ? "Time left before SMART details are read again."
+          : "Starts counting once SMART details have loaded.",
       },
       {
         key: "ses",
-        label: "SES Paths",
+        label: "Enclosure paths",
         ttlSeconds: SG_SES_DEVICE_CACHE_TTL_SECONDS,
         startMs: snapshotStartMs,
-        title: "Approximate validated sg_ses device-path reuse window for dynamic SES discovery.",
+        title: "Time left before enclosure device paths are discovered again.",
       },
     ];
   }
@@ -8978,8 +9394,10 @@
     if (!cacheTimingChips) {
       return;
     }
-    cacheTimingChips.classList.toggle("hidden", state.snapshotMode);
-    if (state.snapshotMode) {
+    // Cache countdowns are a tuning aid, so they only show with the UI Timing panel.
+    const showChips = !state.snapshotMode && Boolean(state.uiPerf?.enabled);
+    cacheTimingChips.classList.toggle("hidden", !showChips);
+    if (!showChips) {
       if (cacheTimingChips.childElementCount) {
         cacheTimingChips.innerHTML = "";
       }
@@ -9031,7 +9449,7 @@
       return;
     }
     if (state.refreshesInFlight > 0) {
-      setTextIfChanged(refreshCountdownLabel, "Refresh running");
+      setTextIfChanged(refreshCountdownLabel, "Refreshing...");
       setBarWidthIfChanged(refreshCountdownBar, 1);
       return;
     }
@@ -9042,12 +9460,12 @@
     }
     const pauseReason = autoRefreshPauseReason();
     if (pauseReason === "hidden") {
-      setTextIfChanged(refreshCountdownLabel, "Auto refresh paused while tab is hidden");
+      setTextIfChanged(refreshCountdownLabel, "Auto refresh paused while this tab is hidden");
       setBarWidthIfChanged(refreshCountdownBar, 0);
       return;
     }
     if (pauseReason === "mapping") {
-      setTextIfChanged(refreshCountdownLabel, "Auto refresh paused for unsaved calibration edits");
+      setTextIfChanged(refreshCountdownLabel, "Auto refresh paused while you edit");
       setBarWidthIfChanged(refreshCountdownBar, 0);
       return;
     }
@@ -9116,18 +9534,18 @@
     if (enclosureSelect) {
       let enclosureOptionsHtml;
       if (!visibleEnclosures.length && !storageViews.length) {
-        enclosureOptionsHtml = '<option value="">Auto-selected</option>';
+        enclosureOptionsHtml = '<option value="">No enclosures found</option>';
       } else {
         const enclosureOptions = visibleEnclosures
           .map((enclosure) => `<option value="enclosure:${escapeHtml(enclosure.id)}">${escapeHtml(selectorLabelForEnclosureOption(enclosure))}</option>`)
           .join("");
         const savedChassisViewOptions = storageViews
           .filter((view) => isSavedChassisView(view))
-          .map((view) => `<option value="view:${escapeHtml(view.id)}">${escapeHtml(selectorLabelForStorageViewOption(view))}</option>`)
+          .map((view) => `<option value="view:${escapeHtml(view.id)}"${state.storageViewsRuntimeLoading || state.storageViewsRuntimeError ? " disabled" : ""}>${escapeHtml(selectorLabelForStorageViewOption(view))}${state.storageViewsRuntimeLoading || state.storageViewsRuntimeError ? " (previous)" : ""}</option>`)
           .join("");
         const virtualStorageViewOptions = storageViews
           .filter((view) => !isSavedChassisView(view))
-          .map((view) => `<option value="view:${escapeHtml(view.id)}">${escapeHtml(selectorLabelForStorageViewOption(view))}</option>`)
+          .map((view) => `<option value="view:${escapeHtml(view.id)}"${state.storageViewsRuntimeLoading || state.storageViewsRuntimeError ? " disabled" : ""}>${escapeHtml(selectorLabelForStorageViewOption(view))}${state.storageViewsRuntimeLoading || state.storageViewsRuntimeError ? " (previous)" : ""}</option>`)
           .join("");
         enclosureOptionsHtml = [
           enclosureOptions ? `<optgroup label="Live Enclosures">${enclosureOptions}</optgroup>` : "",
@@ -9162,12 +9580,16 @@
     renderRefreshControls();
     renderSelectors();
     renderMappingImportControl();
+    renderStorageViewRuntimeStatus();
   }
 
   function selectSlot(slotNumber) {
+    if (!inventoryScopeMatchesSelection() || (state.selectedStorageViewRuntimeId
+      && (state.storageViewsRuntimeLoading || state.storageViewsRuntimeError))) return false;
     if (state.selectedSlot !== slotNumber && !confirmMappingDraftDiscard()) {
       return false;
     }
+    if (state.selectedSlot !== slotNumber) state.selectionEpoch = (state.selectionEpoch || 0) + 1;
     state.selectedSlot = slotNumber;
     state.history.panelError = null;
     syncSasFabricTraceToSlot(slotNumber);
@@ -9181,6 +9603,7 @@
     if (state.selectedSlot !== null && !confirmMappingDraftDiscard()) {
       return false;
     }
+    if (state.selectedSlot !== null) state.selectionEpoch = (state.selectionEpoch || 0) + 1;
     state.selectedSlot = null;
     state.history.panelError = null;
     clearSasFabricBaySelection();
@@ -9237,30 +9660,37 @@
       return;
     }
     const requestToken = ++state.storageViewsRuntimeRequestToken;
+    const scope = currentUiScopeKey();
+    const selectedViewAtStart = state.selectedStorageViewRuntimeId;
+    const isCurrent = () => requestToken === state.storageViewsRuntimeRequestToken && scope === currentUiScopeKey();
     try {
       state.storageViewsRuntimeLoading = true;
       renderSelectors();
+      renderStorageViewRuntimeStatus();
       const params = buildSelectionParams();
       params.set("force", force ? "true" : "false");
       const payload = await fetchJson(`/api/storage-views?${params.toString()}`);
-      if (requestToken !== state.storageViewsRuntimeRequestToken) {
+      if (!isCurrent()) {
         return;
       }
+      if (payload.system_id !== state.selectedSystemId) throw new Error("Storage view response did not match the selected system.");
+      state.storageViewsRuntimeError = null;
       applyStorageViewRuntime(payload);
       if (!quiet) {
         setStatus(`Loaded ${Array.isArray(payload.views) ? payload.views.length : 0} storage view${Array.isArray(payload.views) && payload.views.length === 1 ? "" : "s"} for ${payload.system_label || payload.system_id || "the selected system"}.`);
       }
     } catch (error) {
-      if (requestToken !== state.storageViewsRuntimeRequestToken) {
+      if (!isCurrent()) {
         return;
       }
-      if (!quiet) {
-        setStatus(`Storage view refresh failed: ${error.message || error}`, "error");
-      }
+      state.storageViewsRuntimeError = error.message || String(error);
+      setStatus(`Storage view refresh failed: ${state.storageViewsRuntimeError}. Retry storage views.`, "error");
     } finally {
-      if (requestToken === state.storageViewsRuntimeRequestToken) {
+      if (isCurrent()) {
         state.storageViewsRuntimeLoading = false;
-        renderAll();
+        if (selectedViewAtStart || state.selectedStorageViewRuntimeId) renderAll();
+        else renderSelectors();
+        renderStorageViewRuntimeStatus();
       }
     }
   }
@@ -9281,10 +9711,11 @@
     }
     try {
       state.export.running = true;
+      syncSnapshotExportDialog();
       if (exportSnapshotConfirm) {
         exportSnapshotConfirm.disabled = true;
       }
-      setStatus("Preparing enclosure snapshot export...");
+      setStatus("Preparing the offline copy...");
       const response = await fetch(buildScopedUrl("/api/export/enclosure-snapshot"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -9319,6 +9750,7 @@
       setStatus(`Snapshot export failed: ${error.message || error}`, "error");
     } finally {
       state.export.running = false;
+      syncSnapshotExportDialog();
       if (exportSnapshotConfirm) {
         exportSnapshotConfirm.disabled = false;
       }
@@ -9334,12 +9766,17 @@
     state.refreshesInFlight += 1;
     cancelAutoRefreshTimer();
     const mappingDraftAtStart = Boolean(state.mappingFormDirty);
+    // Background refreshes keep quiet: progress shows in the countdown strip
+    // and an earlier error stays on the status line until the user acts.
+    const background = reason === "auto-refresh" || String(reason).endsWith("-led-verify");
     const perfRun = beginUiPerfRun(reason, {
       systemId: state.selectedSystemId,
       enclosureId: state.selectedEnclosureId,
     });
     try {
-      setStatus(refreshStatusMessage(force, reason));
+      if (!background) {
+        setStatus(refreshStatusMessage(force, reason));
+      }
       const params = buildSelectionParams();
       params.set("force", force ? "true" : "false");
       const snapshot = await fetchJson(`/api/inventory?${params.toString()}`);
@@ -9353,7 +9790,7 @@
         if (perfRun && state.uiPerf.currentRun?.id === perfRun.id) {
           archiveUiPerfRun(perfRun, "mapping-draft");
         }
-        setStatus("Refresh response deferred because calibration edits started while it was running.");
+        setStatus("Refresh result set aside because you started editing a bay while it ran.");
         return;
       }
       if (perfRun && state.uiPerf.currentRun?.id === perfRun.id) {
@@ -9393,13 +9830,19 @@
       scheduleSmartPrefetch();
       ensureHeatmapData();
       maybeFinalizeUiPerfRun(perfRun);
-      setStatus("Inventory updated.");
+      if (!background) {
+        setStatus("Up to date.");
+      }
     } catch (error) {
       if (perfRun && state.uiPerf.currentRun?.id === perfRun.id) {
         archiveUiPerfRun(perfRun, "error", error.message || String(error));
       }
       if (refreshToken === state.latestRefreshToken) {
+        if (state.storageViewsRuntimeLoading) {
+          state.storageViewsRuntimeError = "Inventory refresh failed; storage view freshness is unverified.";
+        }
         state.storageViewsRuntimeLoading = false;
+        renderStorageViewRuntimeStatus();
         markHistoryCachesStale(error);
         renderHistoryPanel();
         renderHeatmapControls();
@@ -9415,7 +9858,7 @@
 
   async function sendLedAction(action) {
     if (state.snapshotMode) {
-      setStatus("LED actions are disabled in an offline snapshot export.", "error");
+      setStatus("Locate lights cannot be changed in an offline copy.", "error");
       return;
     }
     if (writeBlockedByPolicy()) {
@@ -9427,6 +9870,9 @@
       setStatus(slot.led_reason || `LED control is unavailable for slot ${slot.slot_label}.`, "error");
       return;
     }
+    const mutation = captureMutationContext("sendLedAction");
+    if (!mutation) return;
+    let succeeded = false;
     try {
       setStatus(`Sending ${action} for slot ${slot.slot_label}...`);
       const payload = await sendScopedRequest(`/api/slots/${slot.slot}/led`, {
@@ -9434,18 +9880,24 @@
         readUiAuth: true,
         body: JSON.stringify({ action }),
       });
+      succeeded = true;
+      if (!mutationContextIsCurrent(mutation)) return;
       applySnapshot(payload.snapshot);
       renderAll();
       scheduleSmartPrefetch();
       setStatus(`Slot ${slot.slot_label} LED action ${action} completed via ${ledBackendLabel(slot)}.`);
     } catch (error) {
+      if (!mutationContextIsCurrent(mutation)) return;
       handleWriteRejection(error);
       setStatus(`LED action failed: ${error.message || error}`, "error");
+    } finally {
+      finishMutationContext(mutation, succeeded);
     }
   }
 
-  // TrueNAS disk inventory sync (#357): per-system action group in the enclosure
-  // header. Two-step confirm; runs behind the same write gate as the LED route.
+  // TrueNAS disk inventory sync: per-system action group in the enclosure
+  // header. A confirm dialog guards it; it runs behind the same write gate as
+  // the LED route.
   function diskInventorySyncPlatformSupported(platform) {
     return platform === "core" || platform === "scale";
   }
@@ -9456,13 +9908,13 @@
         return {
           label: "Sync multipath table",
           progressLabel: "multipath table",
-          explanation: "Runs TrueNAS disk.multipath_sync so the middleware rebuilds its multipath table from the kernel's gmultipath geoms. Pools and data are not touched.",
+          explanation: "Asks TrueNAS to rebuild its multipath table. Pools and data are not touched.",
         };
       case "full":
         return {
           label: "Full disk sync",
           progressLabel: "disk inventory",
-          explanation: "Runs TrueNAS disk.sync_all so the middleware re-reads every disk into its inventory. Pools and data are not touched.",
+          explanation: "Asks TrueNAS to re-scan all of its disks. Pools and data are not touched.",
         };
       default:
         return null;
@@ -9474,13 +9926,13 @@
     if (!diskInventorySyncPlatformSupported(platform)) {
       return {
         available: false,
-        reason: "TrueNAS disk inventory sync is unsupported on this platform because it needs the TrueNAS middleware.",
+        reason: "Only available on TrueNAS.",
       };
     }
     if (typeof writePolicyAllowsWrites === "function" && !writePolicyAllowsWrites()) {
       const reason = typeof writePolicyReason === "function"
         ? writePolicyReason()
-        : "Writes are disabled for this deployment.";
+        : "Changes are turned off on this server.";
       return { available: false, reason };
     }
     if (mode === "multipath" && platform !== "core") {
@@ -9490,11 +9942,11 @@
     if (!ssh || ssh.enabled === false) {
       return {
         available: false,
-        reason: "SSH is disabled for this system, so the app cannot ask the TrueNAS middleware to re-read its disks.",
+        reason: "SSH is off for this system, so the app cannot ask TrueNAS to re-scan its disks.",
       };
     }
     if (state.diskInventorySync.inFlight) {
-      return { available: false, reason: "A TrueNAS disk inventory sync is already running for this system." };
+      return { available: false, reason: "A disk re-scan is already running for this system." };
     }
     return { available: true, reason: "" };
   }
@@ -9507,15 +9959,8 @@
     const showGroup = !state.snapshotMode && diskInventorySyncPlatformSupported(platform);
     diskInventorySyncControls.classList.toggle("hidden", !showGroup);
     if (!showGroup) {
-      if (state.diskInventorySync.armedMode) {
-        disarmDiskInventorySync();
-      }
       return;
     }
-    const currentSystemId = state.selectedSystemId || state.snapshot?.selected_system_id;
-    const armedMode = state.diskInventorySync.armedSystemId === currentSystemId
-      ? state.diskInventorySync.armedMode
-      : null;
     diskInventorySyncButtons.forEach((button) => {
       const mode = button.dataset.diskInventorySyncMode;
       const spec = diskInventorySyncModeSpec(mode);
@@ -9524,46 +9969,16 @@
       }
       button.classList.toggle("hidden", mode === "multipath" && platform !== "core");
       const availability = diskInventorySyncModeAvailability(mode);
-      const armed = armedMode === mode;
       button.disabled = !availability.available;
       button.title = availability.available ? spec.explanation : availability.reason;
-      button.textContent = armed ? "Confirm sync" : spec.label;
-      button.dataset.armed = armed ? "true" : "false";
+      button.textContent = spec.label;
     });
-    if (diskInventorySyncHint) {
-      const spec = armedMode ? diskInventorySyncModeSpec(armedMode) : null;
-      diskInventorySyncHint.textContent = spec
-        ? `${spec.explanation} Click Confirm sync within a few seconds to run it.`
-        : "";
-      diskInventorySyncHint.classList.toggle("hidden", !spec);
-    }
   }
 
-  function disarmDiskInventorySync() {
-    if (state.diskInventorySync.armTimerId) {
-      window.clearTimeout(state.diskInventorySync.armTimerId);
-      state.diskInventorySync.armTimerId = null;
-    }
-    if (!state.diskInventorySync.armedMode && !state.diskInventorySync.armedSystemId) {
-      return;
-    }
-    state.diskInventorySync.armedMode = null;
-    state.diskInventorySync.armedSystemId = null;
-    renderDiskInventorySyncControls();
-  }
-
-  function armDiskInventorySync(mode) {
-    if (state.diskInventorySync.armTimerId) {
-      window.clearTimeout(state.diskInventorySync.armTimerId);
-    }
-    state.diskInventorySync.armedMode = mode;
-    state.diskInventorySync.armedSystemId = state.selectedSystemId || state.snapshot?.selected_system_id || null;
-    // Confirm window: the second click has to land within 6 s or the button disarms.
-    state.diskInventorySync.armTimerId = window.setTimeout(() => {
-      state.diskInventorySync.armTimerId = null;
-      disarmDiskInventorySync();
-    }, 6000);
-    renderDiskInventorySyncControls();
+  function diskInventorySyncConfirmText(mode) {
+    return mode === "multipath"
+      ? "Ask TrueNAS to rebuild its multipath table? Pools and data are not touched. This takes about a minute."
+      : "Ask TrueNAS to re-scan its disks? Pools and data are not touched. This takes about a minute.";
   }
 
   function handleDiskInventorySyncClick(mode) {
@@ -9573,21 +9988,15 @@
     }
     const availability = diskInventorySyncModeAvailability(mode);
     if (!availability.available) {
-      disarmDiskInventorySync();
       renderDiskInventorySyncControls();
       setStatus(availability.reason, "error");
       return;
     }
     const systemId = state.selectedSystemId || state.snapshot?.selected_system_id || null;
-    if (
-      state.diskInventorySync.armedMode === mode
-      && state.diskInventorySync.armedSystemId === systemId
-    ) {
-      disarmDiskInventorySync();
-      void runDiskInventorySync(mode, systemId);
+    if (!window.confirm(diskInventorySyncConfirmText(mode))) {
       return;
     }
-    armDiskInventorySync(mode);
+    void runDiskInventorySync(mode, systemId);
   }
 
   function formatDiskInventorySyncResult(result) {
@@ -9603,7 +10012,7 @@
     }
     const summary = parts.length ? ` (${parts.join(", ")})` : "";
     const error = typeof result?.error === "string" && result.error ? ` ${result.error}` : "";
-    return `${result?.message || "TrueNAS disk inventory sync finished."}${summary}${error}`;
+    return `${result?.message || "Disk re-scan finished."}${summary}${error}`;
   }
 
   async function runDiskInventorySync(
@@ -9659,7 +10068,7 @@
     if (slot.mapping_supported === false) {
       setStatus(
         slot.mapping_reason
-          || "Manual mapping is unavailable because this disk has no stable physical location.",
+          || "This disk has no fixed bay, so it cannot be assigned.",
         "error",
       );
       return;
@@ -9678,13 +10087,18 @@
       clear_identify_after_save: Boolean(formData.get("clear_identify_after_save")),
     };
 
+    const mutation = captureMutationContext("saveMapping");
+    if (!mutation) return;
+    let succeeded = false;
     try {
-      setStatus(`Saving calibration for slot ${slot.slot_label}...`);
+      setStatus(`Saving bay assignment for bay ${slot.slot_label}...`);
       const result = await sendScopedRequest(`/api/slots/${slot.slot}/mapping`, {
         method: "POST",
         readUiAuth: true,
         body: JSON.stringify(payload),
       });
+      succeeded = true;
+      if (!mutationContextIsCurrent(mutation)) return;
       applySnapshot(result.snapshot);
       invalidateHistoryCaches();
       state.mappingFormScopeKey = null;
@@ -9692,8 +10106,11 @@
       scheduleSmartPrefetch();
       setStatus(result.warning || `Saved mapping for slot ${slot.slot_label}.`);
     } catch (error) {
+      if (!mutationContextIsCurrent(mutation)) return;
       handleWriteRejection(error);
       setStatus(`Save mapping failed: ${error.message || error}`, "error");
+    } finally {
+      finishMutationContext(mutation, succeeded);
     }
   }
 
@@ -9723,6 +10140,9 @@
       return;
     }
 
+    const mutation = captureMutationContext("clearMapping");
+    if (!mutation) return;
+    let succeeded = false;
     try {
       setStatus(`Clearing mapping for slot ${slot.slot_label}...`);
       const queryParams = new URLSearchParams();
@@ -9732,6 +10152,8 @@
         { method: "DELETE", readUiAuth: true },
         queryParams,
       );
+      succeeded = true;
+      if (!mutationContextIsCurrent(mutation)) return;
       applySnapshot(result.snapshot);
       invalidateHistoryCaches();
       state.mappingFormScopeKey = null;
@@ -9739,8 +10161,11 @@
       scheduleSmartPrefetch();
       setStatus(`Cleared mapping for slot ${slot.slot_label}.`);
     } catch (error) {
+      if (!mutationContextIsCurrent(mutation)) return;
       handleWriteRejection(error);
       setStatus(`Clear mapping failed: ${error.message || error}`, "error");
+    } finally {
+      finishMutationContext(mutation, succeeded);
     }
   }
 
@@ -9792,12 +10217,12 @@
     const removals = preview?.removals || [];
     const unchanged = preview?.unchanged || [];
     return [
-      "Confirm this exact mapping import diff:",
+      "Restore these bay assignments?",
       `Add (${additions.length}): ${formatEntries(additions, (entry) => formatRecord(entry.incoming))}`,
       `Update (${updates.length}): ${formatEntries(updates, (entry) => formatChanges(entry.changes))}`,
       `Remove (${removals.length}): ${formatEntries(removals, (entry) => formatRecord(entry.current))}`,
       `Unchanged (${unchanged.length}): ${formatEntries(unchanged, () => "")}`,
-      "The import will be rejected if the active mapping scope changes before confirmation.",
+      "If the inventory changes before you confirm, the restore is canceled.",
     ].join("\n");
   }
 
@@ -9821,14 +10246,21 @@
       }
       return;
     }
+    const mutation = captureMutationContext("importMappingsFromFile");
+    if (!mutation) return;
+    state.mappingImportFileOwner = mutation;
+    const selectedFile = mappingImportFile?.files?.[0];
+    let succeeded = false;
     try {
       setStatus(`Previewing mappings from ${file.name}...`);
       const rawText = await file.text();
+      if (!mutationContextIsCurrent(mutation)) return;
       const bundle = JSON.parse(rawText);
       const preview = await sendScopedRequest("/api/mappings/import/preview", {
         method: "POST",
         body: JSON.stringify(bundle),
       });
+      if (!mutationContextIsCurrent(mutation)) return;
       if (!window.confirm(mappingImportPreviewMessage(preview))) {
         setStatus("Mapping import canceled after preview.");
         return;
@@ -9844,6 +10276,8 @@
           confirmed: true,
         }),
       });
+      succeeded = true;
+      if (!mutationContextIsCurrent(mutation)) return;
       applySnapshot(result.snapshot);
       invalidateHistoryCaches();
       state.mappingFormScopeKey = null;
@@ -9851,11 +10285,18 @@
       scheduleSmartPrefetch();
       setStatus(`Imported ${result.imported} mappings into the active scope.`);
     } catch (error) {
+      if (!mutationContextIsCurrent(mutation)) return;
       handleWriteRejection(error);
       setStatus(`Import failed: ${error.message || error}`, "error");
     } finally {
-      if (mappingImportFile) {
-        mappingImportFile.value = "";
+      finishMutationContext(mutation, succeeded);
+      // File cleanup belongs to this operation, even after its UI scope expires.
+      // Compare File identity, not its name, and never retire a newer operation.
+      if (state.mappingImportFileOwner === mutation) {
+        if (mappingImportFile && mappingImportFile.files?.[0] === selectedFile) {
+          mappingImportFile.value = "";
+        }
+        state.mappingImportFileOwner = null;
       }
     }
   }
@@ -9946,7 +10387,6 @@
     if (state.hoveredSlot === slot.slot) {
       refreshHoveredTooltip();
     }
-    refreshGridTileAriaLabel(slot.slot, slotTooltip(slot, getSmartSummaryEntry(slot)));
     if (state.heatmap.enabled) {
       refreshHeatmapTileOverlays();
     }
@@ -10012,10 +10452,9 @@
       refreshHoveredTooltip();
     }
     const liveSlot = getLiveBackedStorageViewSlot(view, slot);
-    const smartEntry = getStorageViewSmartSummaryEntry(view, slot) || (liveSlot ? getSmartSummaryEntry(liveSlot) : null);
     refreshGridTileAriaLabel(
       slot.slot_index,
-      liveSlot ? slotTooltip(liveSlot, smartEntry) : buildStorageViewRuntimeTooltip(slot, view)
+      liveSlot ? slotAccessibleName(liveSlot) : buildStorageViewRuntimeTooltip(slot, view)
     );
     if (state.heatmap.enabled) {
       refreshHeatmapTileOverlays();
@@ -10033,7 +10472,7 @@
       case 300:
         return "5 min";
       default:
-        return `${seconds} sec`;
+        return seconds > 0 && seconds % 60 === 0 ? `${seconds / 60} min` : `${seconds} sec`;
     }
   }
 
@@ -10059,9 +10498,9 @@
   async function requestManualRefresh() {
     if (
       mappingEditorHasUnsavedChanges()
-      && !window.confirm("Refresh now? Unsaved calibration edits may be replaced if the selected slot changes.")
+      && !window.confirm("Refresh now? Unsaved changes for this bay may be lost if its disk changes.")
     ) {
-      setStatus("Manual refresh canceled. Unsaved calibration edits were kept.");
+      setStatus("Refresh canceled. Your unsaved changes were kept.");
       return false;
     }
     await refreshSnapshot(true, "manual-refresh");
@@ -10117,13 +10556,26 @@
     scheduleAutoRefresh();
   }
 
-  bindDelegatedLiveGridInteractions();
+  document.getElementById("storage-view-runtime-retry")?.addEventListener("click", () => {
+    void fetchStorageViewRuntime(true, false);
+  });
+
+  bindDelegatedGridInteractions();
   bindDelegatedGridKeyboardNavigation();
 
   searchBox.addEventListener("input", (event) => {
     state.search = event.target.value.trim().toLowerCase();
-    refreshGridFilterState();
+    refreshGridFilterState({ autoSelect: true });
   });
+  searchBox.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && state.search) {
+      event.preventDefault();
+      clearSearch();
+    }
+  });
+  if (searchClearButton) {
+    searchClearButton.addEventListener("click", clearSearch);
+  }
 
   refreshButton.addEventListener("click", () => {
     void requestManualRefresh();
@@ -10137,9 +10589,10 @@
       }
       const previousEstimateBasisKey = snapshotExportEstimateBasisKey();
       closeEnclosureAliasEditor(false);
-      if (nextSystemId !== state.selectedSystemId) {
-        disarmDiskInventorySync();
-      }
+      if (nextSystemId === state.selectedSystemId) return;
+      state.selectionEpoch = (state.selectionEpoch || 0) + 1;
+      state.storageViewsRuntimeRequestToken += 1;
+      state.storageViewsRuntimeError = null;
       state.selectedSystemId = nextSystemId;
       state.selectedEnclosureId = null;
       state.storageViewsRuntime = {
@@ -10154,6 +10607,7 @@
       resetSasFabricData();
       clearSelectedSlot();
       applyReusableSnapshot(state.selectedSystemId, null);
+      renderAll();
       await refreshSnapshot(false, "system-switch");
       queueIdentifyVerify("system-switch");
     });
@@ -10168,6 +10622,12 @@
         renderSelectors();
         return;
       }
+      if (rawValue.startsWith("view:") && (state.storageViewsRuntimeLoading || state.storageViewsRuntimeError)) {
+        renderSelectors();
+        return;
+      }
+      if (rawValue === currentValue) return;
+      state.selectionEpoch = (state.selectionEpoch || 0) + 1;
       const previousEstimateBasisKey = snapshotExportEstimateBasisKey();
       closeEnclosureAliasEditor(false);
       clearSelectedSlot();
@@ -10198,9 +10658,12 @@
       state.selectedStorageViewRuntimeId = "";
       state.selectedEnclosureId = rawValue.startsWith("enclosure:") ? rawValue.slice("enclosure:".length) : (rawValue || null);
       invalidateSnapshotExportEstimateIfBasisChanged(previousEstimateBasisKey);
+      state.storageViewsRuntimeRequestToken += 1;
+      state.storageViewsRuntimeError = null;
       state.storageViewsRuntimeLoading = true;
       resetSasFabricData();
       applyReusableSnapshot(state.selectedSystemId, state.selectedEnclosureId);
+      renderAll();
       await refreshSnapshot(false, "enclosure-switch");
       queueIdentifyVerify("enclosure-switch");
     });
@@ -10245,11 +10708,16 @@
   });
   refreshIntervalSelect.addEventListener("change", (event) => {
     const selected = Number(event.target.value);
-    state.refreshIntervalSeconds = supportedRefreshIntervals.includes(selected) ? selected : 30;
+    state.refreshIntervalSeconds = refreshIntervalOptions.includes(selected) ? selected : 30;
     resetTimer();
     renderRefreshControls();
     setStatus(`Auto-refresh interval set to ${formatRefreshInterval(state.refreshIntervalSeconds)}.`);
   });
+  if (upgradeNoticeDismiss) {
+    upgradeNoticeDismiss.addEventListener("click", () => {
+      void dismissUpgradeNotice();
+    });
+  }
   mappingForm.addEventListener("submit", saveMapping);
   mappingForm.addEventListener("input", markMappingFormDirty);
   mappingForm.addEventListener("change", markMappingFormDirty);
@@ -10319,6 +10787,7 @@
     exportIncludeEnclosuresToggle.addEventListener("change", (event) => {
       const previousEstimateBasisKey = snapshotExportEstimateBasisKey();
       state.export.includeLiveEnclosures = Boolean(event.target.checked);
+      state.export.enclosureSelectionExpanded = state.export.includeLiveEnclosures;
       if (state.export.includeLiveEnclosures && selectedExportEnclosureIds().length <= 1) {
         state.export.selectedEnclosureIds = exportableLiveEnclosures().map((enclosure) => enclosure.id).filter(Boolean);
       }
@@ -10356,6 +10825,7 @@
     exportIncludeViewsToggle.addEventListener("change", (event) => {
       const previousEstimateBasisKey = snapshotExportEstimateBasisKey();
       state.export.includeStorageViews = Boolean(event.target.checked);
+      state.export.viewSelectionExpanded = state.export.includeStorageViews;
       if (state.export.includeStorageViews && !state.export.selectedStorageViewIds.length) {
         state.export.selectedStorageViewIds = exportableStorageViews().map((view) => view.id).filter(Boolean);
       }
@@ -10458,17 +10928,6 @@
         selectSasFabricNode(nodeButton.dataset.sasFabricNode || "");
       }
     });
-    sasFabricPanel.addEventListener("keydown", (event) => {
-      if (event.key !== "Enter" && event.key !== " ") {
-        return;
-      }
-      const expandButton = event.target.closest("[data-sas-fabric-expand-slots]");
-      if (!expandButton) {
-        return;
-      }
-      event.preventDefault();
-      toggleSasFabricSlotList(expandButton.dataset.sasFabricExpandSlots || "");
-    });
   }
   if (heatmapMetricSelect) {
     heatmapMetricSelect.addEventListener("change", () => {
@@ -10513,10 +10972,14 @@
       scheduleHeatmapTileOverlayRefresh();
     });
   }
+  document.getElementById("history-retry-button")?.addEventListener("click", () => {
+    void loadHistoryForSelectedSlot(true);
+  });
   if (historyCloseButton) {
     historyCloseButton.addEventListener("click", () => {
       state.history.panelOpen = false;
       renderHistoryPanel();
+      if (historyToggleButton?.isConnected) historyToggleButton.focus({ preventScroll: true });
     });
   }
   if (historyToggleButton) {
@@ -10564,21 +11027,13 @@
   diskInventorySyncButtons.forEach((button) => {
     button.addEventListener("click", () => handleDiskInventorySyncClick(button.dataset.diskInventorySyncMode));
   });
-  document.addEventListener("click", (event) => {
-    if (!state.diskInventorySync.armedMode) {
-      return;
-    }
-    if (diskInventorySyncControls && diskInventorySyncControls.contains(event.target)) {
-      return;
-    }
-    disarmDiskInventorySync();
-  });
 
   rememberReusableSnapshot(state.snapshot);
   renderAll();
   renderWritePolicyNotice();
   syncWritePolicyControls();
   renderReadUiAuth();
+  renderUpgradeNotice();
   renderHeatmapControls();
   ensureHeatmapData();
   renderUiPerfPanel();

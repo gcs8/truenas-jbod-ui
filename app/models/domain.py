@@ -381,6 +381,24 @@ class InventorySnapshot(BaseModel):
     summary: InventorySummary = Field(default_factory=InventorySummary)
 
 
+class InventoryWritePolicy(BaseModel):
+    enabled: bool
+    mode: str
+    reason: str = ""
+    public_origin: str | None = None
+
+
+class InventoryReadResponse(InventorySnapshot):
+    """`GET /api/inventory` payload: the snapshot plus live per-request fields.
+
+    `write_policy` and `app_version` are computed per request so the browser
+    can re-sync write controls and notice a container upgrade. Saved copies
+    embed a plain `InventorySnapshot`, so both stay optional here.
+    """
+
+    write_policy: InventoryWritePolicy | None = None
+    app_version: str | None = None
+
 class SasFabricNode(BaseModel):
     id: str
     kind: str

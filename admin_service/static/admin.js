@@ -68,17 +68,21 @@
     selectedEsxiHostPrepToken:
       (Array.isArray(bootstrap.esxi_host_prep?.staged_packages) && bootstrap.esxi_host_prep.staged_packages[0]?.token)
       || "",
-    refreshInFlight: false,
+    operationPromises: {},
+    runtimeBehaviorSaving: false,
     refreshPromise: null,
     refreshQueued: null,
     refreshQueuedQuiet: true,
     runtimeActionPromises: new Map(),
     runtimeActionControllers: new Map(),
     countdownTimerId: null,
+    sessionStopped: false,
     sudoersPreviewTimerId: null,
     sudoersPreviewRequestSeq: 0,
     liveEnclosuresRequestSeq: 0,
     storageViewCandidatesRequestSeq: 0,
+    storageViewRenderFrameId: null,
+    storageViewRenderFull: false,
     haNodes: [],
     haNodesLoading: false,
     orphanedHistory: [],
@@ -92,6 +96,7 @@
 
   const elements = {
     banner: document.getElementById("admin-status-banner"),
+    sessionBanner: document.getElementById("admin-session-banner"),
     configurationWarnings: document.getElementById("admin-configuration-warnings"),
     configurationWarningList: document.getElementById("admin-configuration-warning-list"),
     refreshStateButton: document.getElementById("refresh-state-button"),
@@ -100,8 +105,6 @@
     adminViewPanels: Array.from(document.querySelectorAll("[data-admin-view-panel]")),
     adminViewSwitches: Array.from(document.querySelectorAll("[data-admin-view-switch]")),
     countdown: document.getElementById("admin-countdown"),
-    startedAt: document.getElementById("admin-started-at"),
-    expiresAt: document.getElementById("admin-expires-at"),
     systemCount: document.getElementById("admin-system-count"),
     profileCount: document.getElementById("admin-profile-count"),
     appVersion: document.getElementById("admin-app-version"),
@@ -111,6 +114,7 @@
     runtimeBehaviorDetail: document.getElementById("runtime-behavior-detail"),
     runtimeBehaviorFields: document.getElementById("runtime-behavior-fields"),
     runtimeBehaviorSaveButton: document.getElementById("runtime-behavior-save-button"),
+    runtimeBehaviorDiscardButton: document.getElementById("runtime-behavior-discard-button"),
     runtimeBehaviorResult: document.getElementById("runtime-behavior-result"),
     backupPathList: document.getElementById("backup-path-list"),
     backupPathSummary: document.getElementById("backup-path-summary"),
@@ -222,6 +226,7 @@
     setupBootstrapSudoersName: document.getElementById("setup-bootstrap-sudoers-name"),
     setupBootstrapSudoersDetail: document.getElementById("setup-bootstrap-sudoers-detail"),
     setupBootstrapSudoersPreview: document.getElementById("setup-bootstrap-sudoers-preview"),
+    setupBootstrapSudoersPanel: document.getElementById("setup-bootstrap-sudoers-panel"),
     setupEsxiHostPrepPanel: document.getElementById("setup-esxi-host-prep-panel"),
     setupEsxiHostPrepCopy: document.getElementById("setup-esxi-host-prep-copy"),
     setupEsxiHostPrepTempDir: document.getElementById("setup-esxi-host-prep-temp-dir"),
@@ -500,12 +505,33 @@
     elements.setupTlsTrustDetail.textContent = trustStatus.detail || defaultTlsTrustDetail();
   }
 
-  function formatCountdown() {
+  const SESSION_WARNING_MS = 5 * 60 * 1000;
+  const ADMIN_START_COMMAND = "docker compose --profile admin up -d enclosure-admin";
+
+  function sessionRemainingMs() {
     if (!state.admin.expires_at) {
-      return "No auto-stop";
+      return null;
     }
     const expiresAt = new Date(state.admin.expires_at).getTime();
-    const remainingMs = expiresAt - Date.now();
+    if (Number.isNaN(expiresAt)) {
+      return null;
+    }
+    return expiresAt - Date.now();
+  }
+
+  function formatClockTime(value) {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) {
+      return "";
+    }
+    return date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  }
+
+  function formatCountdown() {
+    const remainingMs = sessionRemainingMs();
+    if (remainingMs === null) {
+      return "Stays running";
+    }
     if (remainingMs <= 0) {
       // The browser clock cannot know the sidecar stopped; say only that the
       // deadline passed, and leave the recovery step to the server's state.
@@ -515,10 +541,91 @@
     const hours = Math.floor(totalSeconds / 3600);
     const minutes = Math.floor((totalSeconds % 3600) / 60);
     const seconds = totalSeconds % 60;
-    if (hours > 0) {
-      return `${hours}h ${String(minutes).padStart(2, "0")}m ${String(seconds).padStart(2, "0")}s`;
+    const remaining = hours > 0
+      ? `${hours}h ${String(minutes).padStart(2, "0")}m ${String(seconds).padStart(2, "0")}s`
+      : `${minutes}m ${String(seconds).padStart(2, "0")}s`;
+    const clock = formatClockTime(state.admin.expires_at);
+    return clock ? `Auto-stops in ${remaining} (${clock})` : `Auto-stops in ${remaining}`;
+  }
+
+  function describeAutoStopDuration() {
+    const seconds = Number(state.admin.auto_stop_seconds) > 0 ? Number(state.admin.auto_stop_seconds) : 3600;
+    if (seconds % 3600 === 0) {
+      const hours = seconds / 3600;
+      return hours === 1 ? "1 hour" : `${hours} hours`;
     }
-    return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
+    const minutes = Math.max(1, Math.round(seconds / 60));
+    return minutes === 1 ? "1 minute" : `${minutes} minutes`;
+  }
+
+  function markAdminStopped() {
+    if (state.sessionStopped) {
+      return;
+    }
+    state.sessionStopped = true;
+    if (state.countdownTimerId) {
+      window.clearInterval(state.countdownTimerId);
+      state.countdownTimerId = null;
+    }
+    if (elements.countdown) {
+      elements.countdown.textContent = "Stopped";
+    }
+    if (elements.sessionBanner) {
+      const command = document.createElement("code");
+      command.textContent = ADMIN_START_COMMAND;
+      elements.sessionBanner.replaceChildren(
+        `Admin has stopped (it stops itself after ${describeAutoStopDuration()}). To start it again run `,
+        command,
+        ", then reload this page."
+      );
+      elements.sessionBanner.classList.remove("hidden", "is-warning");
+      elements.sessionBanner.classList.add("is-error");
+    }
+    document.querySelectorAll("button:not(.admin-view-button)").forEach((button) => {
+      button.disabled = true;
+    });
+  }
+
+  function syncSessionBanner() {
+    if (!elements.sessionBanner || state.sessionStopped) {
+      return;
+    }
+    const remainingMs = sessionRemainingMs();
+    if (remainingMs !== null && remainingMs <= 0) {
+      // The browser clock alone cannot prove the sidecar stopped (#418): say the
+      // deadline passed and keep the page usable until a request actually fails.
+      const command = document.createElement("code");
+      command.textContent = ADMIN_START_COMMAND;
+      elements.sessionBanner.replaceChildren(
+        "The auto-stop time has passed. If saving stops working, run ",
+        command,
+        ", then reload this page."
+      );
+      elements.sessionBanner.classList.remove("hidden", "is-error");
+      elements.sessionBanner.classList.add("is-warning");
+      return;
+    }
+    if (remainingMs === null || remainingMs > SESSION_WARNING_MS) {
+      elements.sessionBanner.classList.add("hidden");
+      return;
+    }
+    const minutes = Math.max(1, Math.ceil(remainingMs / 60000));
+    elements.sessionBanner.textContent =
+      `This admin session stops in ${minutes} ${minutes === 1 ? "minute" : "minutes"}. Save your work.`;
+    elements.sessionBanner.classList.remove("hidden", "is-error");
+    elements.sessionBanner.classList.add("is-warning");
+  }
+
+  async function fetchOrReportStopped(url, options) {
+    try {
+      return await fetchWithTimeout(url, options);
+    } catch (error) {
+      const remainingMs = sessionRemainingMs();
+      if (error?.name === "TypeError" && remainingMs !== null && remainingMs <= 0) {
+        markAdminStopped();
+      }
+      throw error;
+    }
   }
 
   // The words come from the server's offline/stopped state, never from the
@@ -538,7 +645,18 @@
       window.clearInterval(state.countdownTimerId);
     }
     updateAdminMeta();
-    state.countdownTimerId = window.setInterval(updateAdminMeta, 1000);
+    state.countdownTimerId = window.setInterval(tickCountdown, 1000);
+  }
+
+  function tickCountdown() {
+    // Only the countdown changes between ticks; the rest of the hero is rendered by refreshes.
+    if (!elements.countdown) {
+      return;
+    }
+    const text = formatCountdown();
+    if (elements.countdown.textContent !== text) {
+      elements.countdown.textContent = text;
+    }
   }
 
   function updateAdminMeta() {
@@ -546,12 +664,7 @@
       elements.countdown.textContent = formatCountdown();
       elements.countdown.title = describeOfflineRecovery(state.admin.offline_recovery);
     }
-    if (elements.startedAt) {
-      elements.startedAt.textContent = formatLocalTimestamp(state.admin.started_at);
-    }
-    if (elements.expiresAt) {
-      elements.expiresAt.textContent = state.admin.expires_at ? formatLocalTimestamp(state.admin.expires_at) : "Manual stop only";
-    }
+    syncSessionBanner();
     if (elements.systemCount) {
       elements.systemCount.textContent = String(state.systems.length);
     }
@@ -581,15 +694,23 @@
       }
     }
     if (elements.adminOriginLink) {
-      const origin = String(state.admin.public_origin || "").trim();
-      const originUrl = new URL(origin || window.location.href, window.location.href);
-      if (state.currentAdminView === "builder") {
-        originUrl.searchParams.set("view", "builder");
-      } else {
-        originUrl.searchParams.delete("view");
+      const configured = String(state.admin.public_origin || "").trim();
+      let configuredOrigin = "";
+      try {
+        configuredOrigin = configured ? new URL(configured).origin : "";
+      } catch (error) {
+        configuredOrigin = "";
       }
-      elements.adminOriginLink.href = originUrl.toString();
-      elements.adminOriginLink.classList.toggle("hidden", !origin);
+      const showLink = Boolean(configuredOrigin) && configuredOrigin !== String(window.location.origin || "");
+      if (showLink) {
+        const originUrl = new URL(window.location.pathname || "/", configuredOrigin);
+        if (state.currentAdminView === "builder") {
+          originUrl.searchParams.set("view", "builder");
+        }
+        elements.adminOriginLink.href = originUrl.toString();
+        elements.adminOriginLink.textContent = `Open at ${configuredOrigin}`;
+      }
+      elements.adminOriginLink.classList.toggle("hidden", !showLink);
     }
   }
 
@@ -633,8 +754,22 @@
     return groups.filter((group) => Array.isArray(group.bundle_types) && group.bundle_types.includes(bundleType));
   }
 
+  const bundlePathGroupIndex = { source: null, byKey: new Map() };
+
   function bundlePathGroupByKey(key) {
-    return bundlePathGroups("backup").concat(bundlePathGroups("debug")).find((group) => group.key === key) || null;
+    const groups = Array.isArray(state.backupDefaults?.path_groups) ? state.backupDefaults.path_groups : [];
+    if (bundlePathGroupIndex.source !== groups) {
+      // Index once per path_groups list (backup groups first, then debug) and reuse it
+      // until a refresh replaces the list.
+      bundlePathGroupIndex.source = groups;
+      bundlePathGroupIndex.byKey = new Map();
+      bundlePathGroups("backup").concat(bundlePathGroups("debug")).forEach((group) => {
+        if (!bundlePathGroupIndex.byKey.has(group.key)) {
+          bundlePathGroupIndex.byKey.set(group.key, group);
+        }
+      });
+    }
+    return bundlePathGroupIndex.byKey.get(key) || null;
   }
 
   function selectedBundlePathKeys(bundleType) {
@@ -866,12 +1001,20 @@
     return labels[field?.owner] || field?.owner || "Admin";
   }
 
-  function renderRuntimeBehaviorSettings() {
+  function renderRuntimeBehaviorSettings({ discardDraft = false } = {}) {
     if (!elements.runtimeBehaviorFields || !elements.runtimeBehaviorDetail) {
       return;
     }
     const behavior = state.runtimeBehavior || {};
     const fields = Array.isArray(behavior.fields) ? behavior.fields : [];
+    // Preserve the actual DOM nodes, focus and drafts during unrelated refreshes.
+    const inputs = Array.from(elements.runtimeBehaviorFields.querySelectorAll("input[data-runtime-behavior-key]"));
+    const dirty = inputs.some((input) => {
+      const baseline = (state.runtimeBehaviorBaseline || fields).find((field) => field.key === input.dataset.runtimeBehaviorKey);
+      return baseline && input.value !== String(baseline.value ?? "");
+    });
+    if (state.runtimeBehaviorSaving || (dirty && !discardDraft)) return;
+    state.runtimeBehaviorBaseline = fields;
     elements.runtimeBehaviorDetail.textContent = behavior.override_file
       ? `Override file: ${behavior.override_file}`
       : "";
@@ -911,6 +1054,16 @@
     }
   }
 
+  // An explicit discard is the only path that drops a timing draft; a failed
+  // save or an unrelated refresh keeps it (#409).
+  function discardRuntimeBehaviorDraft() {
+    if (state.runtimeBehaviorSaving) return;
+    renderRuntimeBehaviorSettings({ discardDraft: true });
+    if (elements.runtimeBehaviorResult) {
+      elements.runtimeBehaviorResult.textContent = "Unsaved timing changes discarded.";
+    }
+  }
+
   function collectRuntimeBehaviorValues() {
     const values = {};
     elements.runtimeBehaviorFields
@@ -926,7 +1079,9 @@
     if (!elements.runtimeBehaviorSaveButton) {
       return;
     }
+    if (state.runtimeBehaviorSaving) return;
     const values = collectRuntimeBehaviorValues();
+    state.runtimeBehaviorSaving = true;
     elements.runtimeBehaviorSaveButton.disabled = true;
     if (elements.runtimeBehaviorResult) {
       elements.runtimeBehaviorResult.textContent = "Saving runtime behavior overrides...";
@@ -937,22 +1092,40 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ values }),
       });
-      state.runtimeBehavior = payload.runtime_behavior || state.runtimeBehavior;
+      const fields = payload.runtime_behavior?.fields;
+      // The backend returns all loaded timing keys, integer effective values,
+      // and boolean ownership flags. Env-owned values need not fit write limits.
+      const expectedKeys = new Set((state.runtimeBehavior?.fields || []).map((field) => field.key));
+      if (!Array.isArray(fields) || !fields.length || fields.length !== expectedKeys.size
+          || new Set(fields.map((field) => field?.key)).size !== expectedKeys.size
+          || !fields.every((field) => field && typeof field.key === "string"
+            && expectedKeys.has(field.key) && Number.isInteger(field.value)
+            && typeof field.writable === "boolean")) {
+        throw new Error("Invalid timing save response.");
+      }
+      state.runtimeBehavior = payload.runtime_behavior;
       state.runtime = payload.runtime || state.runtime;
+      state.runtimeBehaviorBaseline = state.runtimeBehavior.fields;
+      state.runtimeBehaviorSaving = false;
       renderRuntimeBehaviorSettings();
       renderRuntimeCards();
       const detail = payload.detail || "Runtime behavior overrides saved.";
       if (elements.runtimeBehaviorResult) {
-        elements.runtimeBehaviorResult.textContent = detail;
+        renderSaveResult(elements.runtimeBehaviorResult, detail, payload);
       }
       setBanner(detail, "success");
     } catch (error) {
-      const message = `Runtime behavior save failed: ${error.message || error}`;
+      const message = [400, 422].includes(error.status)
+        ? `Runtime behavior save rejected: ${error.message}. Draft retained.`
+        : "Runtime behavior save outcome is unknown. Changes may already have been saved. Draft retained; check the saved runtime settings before saving again."
+          + (error.requestId || "");
       if (elements.runtimeBehaviorResult) {
         elements.runtimeBehaviorResult.textContent = message;
       }
       setBanner(message, "error");
-      renderRuntimeBehaviorSettings();
+    } finally {
+      state.runtimeBehaviorSaving = false;
+      elements.runtimeBehaviorSaveButton.disabled = false;
     }
   }
 
@@ -994,7 +1167,9 @@
     if (sourceSelect) {
       sourceSelect.innerHTML = "";
       if (!orphanedSystems.length) {
-        sourceSelect.innerHTML = '<option value="">No removed-system history found</option>';
+        sourceSelect.innerHTML = state.orphanedHistoryError
+          ? '<option value="">History scan unavailable</option>'
+          : '<option value="">No removed-system history found</option>';
         sourceSelect.value = "";
         state.selectedHistoryAdoptSourceId = "";
       } else {
@@ -1032,13 +1207,15 @@
     }
 
     if (adoptButton) {
-      adoptButton.disabled = state.orphanedHistoryLoading || !orphanedSystems.length || !savedSystems.length;
+      adoptButton.disabled = state.orphanedHistoryLoading || Boolean(state.orphanedHistoryError) || !orphanedSystems.length || !savedSystems.length;
     }
   }
 
   function currentSetupPlatform() {
     return String(elements.setupPlatform?.value || "core").toLowerCase();
   }
+
+  const BMC_ONLY_BOOTSTRAP_NOTE = "This system is managed through its BMC. No host login is needed.";
 
   function platformSupportsBootstrap(platform = currentSetupPlatform()) {
     return !["esxi", "ipmi"].includes(String(platform || "").toLowerCase());
@@ -1099,8 +1276,20 @@
       .slice(0, 3);
   }
 
+  const haNodeFieldCache = new Map();
+
   function haNodeFieldValue(index, kind) {
-    return document.querySelector(`[data-ha-node-${kind}="${index}"]`);
+    // The three HA node rows are static template markup, so look each field up once.
+    const cacheKey = `${kind}:${index}`;
+    const cached = haNodeFieldCache.get(cacheKey);
+    if (cached && cached.isConnected !== false) {
+      return cached;
+    }
+    const field = document.querySelector(`[data-ha-node-${kind}="${index}"]`);
+    if (field) {
+      haNodeFieldCache.set(cacheKey, field);
+    }
+    return field;
   }
 
   function readHaNodesFromInputs() {
@@ -1144,8 +1333,9 @@
     if (elements.setupHaPanel) {
       elements.setupHaPanel.classList.toggle("hidden", !haEnabled);
     }
+    const nodes = currentQuantastorHaNodes();
     [0, 1, 2].forEach((index) => {
-      const node = currentQuantastorHaNodes()[index] || { system_id: "", label: "", host: "" };
+      const node = nodes[index] || { system_id: "", label: "", host: "" };
       const systemIdField = haNodeFieldValue(index, "system-id");
       const labelField = haNodeFieldValue(index, "label");
       const hostField = haNodeFieldValue(index, "host");
@@ -1174,9 +1364,9 @@
         elements.setupHaNodesResult.textContent = "Turn this on if two QuantaStor nodes share the same disk shelf.";
       } else if (state.haNodesLoading) {
         elements.setupHaNodesResult.textContent = "Loading nodes from QuantaStor...";
-      } else if (currentQuantastorHaNodes().length) {
-        const nodeCount = currentQuantastorHaNodes().length;
-        const nodesMissingHosts = currentQuantastorHaNodes().filter((node) => !node.host).length;
+      } else if (nodes.length) {
+        const nodeCount = nodes.length;
+        const nodesMissingHosts = nodes.filter((node) => !node.host).length;
         elements.setupHaNodesResult.textContent = nodesMissingHosts
           ? `Loaded ${nodeCount} node${nodeCount === 1 ? "" : "s"}. ${nodesMissingHosts} of them ${nodesMissingHosts === 1 ? "has" : "have"} no address yet; fill it in or leave it blank and the app will find it once one node answers.`
           : `Loaded ${nodeCount} node${nodeCount === 1 ? "" : "s"}.`;
@@ -1602,11 +1792,11 @@
     return BUILDER_ORDERING_LABELS[ordering] || BUILDER_ORDERING_LABELS["row-major-bottom"];
   }
 
-  function layoutSlotCount(layout) {
-    return (Array.isArray(layout) ? layout : [])
-      .flat()
-      .filter((value) => Number.isInteger(value))
-      .length;
+  function countSlots(layout) {
+    return (Array.isArray(layout) ? layout : []).reduce(
+      (total, row) => total + (Array.isArray(row) ? row.filter((value) => Number.isInteger(value)).length : 0),
+      0
+    );
   }
 
   function buildRectangularProfileLayout(rows, columns, slotCount, ordering = "row-major-bottom") {
@@ -1751,13 +1941,6 @@
     return Array.isArray(rows) ? rows.filter((row) => Array.isArray(row)) : [];
   }
 
-  function countProfilePreviewSlots(rows) {
-    return normalizeProfilePreviewRows(rows).reduce(
-      (total, row) => total + row.filter((slotValue) => Number.isInteger(slotValue)).length,
-      0
-    );
-  }
-
   function normalizeProfilePreviewRowGroups(profile) {
     return (Array.isArray(profile?.row_groups) ? profile.row_groups : [])
       .map((value) => Number(value))
@@ -1811,7 +1994,7 @@
 
   function buildProfilePreviewGeometry(profile, previewRows, columnCount) {
     const rows = normalizeProfilePreviewRows(previewRows);
-    const slotCount = Number(profile?.slot_count) || countProfilePreviewSlots(rows);
+    const slotCount = Number(profile?.slot_count) || countSlots(rows);
     const driveScale = inferProfilePreviewDriveScale(profile, slotCount);
     return {
       faceStyle: profile?.face_style || "generic",
@@ -2080,7 +2263,7 @@
     if (!draft || !sourceProfile) {
       return false;
     }
-    const sourceSlotCount = Number(sourceProfile.slot_count) || buildProfileRows(sourceProfile).flat().filter((value) => Number.isInteger(value)).length;
+    const sourceSlotCount = Number(sourceProfile.slot_count) || countSlots(buildProfileRows(sourceProfile));
     return Number(draft.rows) === Number(sourceProfile.rows)
       && Number(draft.columns) === Number(sourceProfile.columns)
       && Number(draft.slot_count) === Number(sourceSlotCount);
@@ -2179,11 +2362,11 @@
       elements.profileBuilderColumns.value = String(Number(profile.columns) || 1);
     }
     if (elements.profileBuilderSlotCount) {
-      const slotCount = Number(profile.slot_count) || layoutSlotCount(buildProfileRows(profile));
+      const slotCount = Number(profile.slot_count) || countSlots(buildProfileRows(profile));
       elements.profileBuilderSlotCount.value = String(slotCount || 1);
     }
     const profileRows = buildProfileRows(profile);
-    const profileSlotCount = Number(profile.slot_count) || layoutSlotCount(profileRows);
+    const profileSlotCount = Number(profile.slot_count) || countSlots(profileRows);
     const detectedOrdering = detectGeneratedLayoutOrdering(profileRows, Number(profile.rows) || 1, Number(profile.columns) || 1, profileSlotCount);
     if (elements.profileBuilderOrdering) {
       elements.profileBuilderOrdering.value = detectedOrdering || "source-layout";
@@ -2266,7 +2449,17 @@
     const loadedProfile = state.loadedBuilderProfileId
       ? getProfileById(state.loadedBuilderProfileId)
       : null;
-    elements.profileBuilderDeleteButton.disabled = !(loadedProfile && loadedProfile.is_custom);
+    const referenceCount = profileReferenceCount(loadedProfile);
+    elements.profileBuilderDeleteButton.disabled = !(loadedProfile && loadedProfile.is_custom) || referenceCount > 0;
+    elements.profileBuilderDeleteButton.title = referenceCount > 0 ? describeProfileReferences(referenceCount) : "";
+  }
+
+  function profileReferenceCount(profile) {
+    return Math.max(0, Number(profile?.reference_count) || 0);
+  }
+
+  function describeProfileReferences(count) {
+    return `Used by ${count} ${count === 1 ? "system" : "systems"}`;
   }
 
   function renderProfilePreview() {
@@ -2297,7 +2490,7 @@
       buildProfilePreviewGeometry(profile, previewRows, columnCount)
     );
     elements.profilePreviewGrid.innerHTML = renderProfilePreviewCells(previewRows, columnCount, { profile });
-    const slotCount = Number(profile.slot_count) || previewRows.flat().filter((value) => Number.isInteger(value)).length;
+    const slotCount = Number(profile.slot_count) || countSlots(previewRows);
     const chips = [
       `${profile.rows} rows`,
       `${profile.columns} columns`,
@@ -2389,14 +2582,15 @@
     return normalized;
   }
 
+  const ALLOWED_M2_SIZES = new Set(["2230", "2242", "2260", "2280", "22110"]);
+
   function normalizeSlotSizeMap(rawMap) {
     const source = rawMap && typeof rawMap === "object" ? rawMap : {};
     const normalized = {};
-    const allowedSizes = new Set(["2230", "2242", "2260", "2280", "22110"]);
     Object.entries(source).forEach(([rawKey, rawValue]) => {
       const slotNumber = Number.parseInt(rawKey, 10);
       const sizeLabel = String(rawValue || "").trim();
-      if (!Number.isNaN(slotNumber) && slotNumber >= 0 && allowedSizes.has(sizeLabel)) {
+      if (!Number.isNaN(slotNumber) && slotNumber >= 0 && ALLOWED_M2_SIZES.has(sizeLabel)) {
         normalized[slotNumber] = sizeLabel;
       }
     });
@@ -2432,7 +2626,6 @@
 
   function parseSlotSizesText(value) {
     const parsed = {};
-    const allowedSizes = new Set(["2230", "2242", "2260", "2280", "22110"]);
     String(value || "")
       .split(/\r?\n/)
       .map((line) => line.trim())
@@ -2444,7 +2637,7 @@
         }
         const slotNumber = Number.parseInt(match[1], 10);
         const sizeLabel = String(match[2] || "").trim();
-        if (!Number.isNaN(slotNumber) && slotNumber >= 0 && allowedSizes.has(sizeLabel)) {
+        if (!Number.isNaN(slotNumber) && slotNumber >= 0 && ALLOWED_M2_SIZES.has(sizeLabel)) {
           parsed[slotNumber] = sizeLabel;
         }
       });
@@ -2770,24 +2963,11 @@
   }
 
   function buildSequentialLayout(rows, columns, slotCount) {
-    const safeRows = Math.max(1, Number(rows) || 1);
+    // Top-down, left-to-right numbering with every row padded to the full width.
     const safeColumns = Math.max(1, Number(columns) || 1);
-    const safeSlotCount = Math.max(1, Number(slotCount) || safeRows * safeColumns);
-    const layout = [];
-    let slotNumber = 0;
-    for (let rowIndex = 0; rowIndex < safeRows; rowIndex += 1) {
-      const row = [];
-      for (let columnIndex = 0; columnIndex < safeColumns; columnIndex += 1) {
-        if (slotNumber < safeSlotCount) {
-          row.push(slotNumber);
-          slotNumber += 1;
-        } else {
-          row.push(null);
-        }
-      }
-      layout.push(row);
-    }
-    return layout;
+    return buildRectangularProfileLayout(rows, safeColumns, slotCount, "row-major-top").map((row) =>
+      row.concat(Array.from({ length: safeColumns - row.length }, () => null))
+    );
   }
 
   function storageViewProfile(storageView, { fallbackToPinned = true } = {}) {
@@ -2876,7 +3056,7 @@
     const template = getStorageViewTemplate(storageView?.template_id);
     const selectedProfile = storageViewProfile(storageView);
     const previewRows = buildStorageViewRows(storageView);
-    const visibleSlots = previewRows.flat().filter((slotValue) => Number.isInteger(slotValue)).length;
+    const visibleSlots = countSlots(previewRows);
     const profileChip = storageView?.kind === "ses_enclosure" && selectedProfile
       ? `profile: ${selectedProfile.label}${storageView?.profile_id ? "" : " (live fallback)"}`
       : null;
@@ -3193,7 +3373,48 @@
       .join("");
   }
 
+  function requestRenderFrame(callback) {
+    return typeof requestAnimationFrame === "function" ? requestAnimationFrame(callback) : setTimeout(callback, 0);
+  }
+
+  function cancelRenderFrame(frameId) {
+    if (typeof cancelAnimationFrame === "function") {
+      cancelAnimationFrame(frameId);
+    } else {
+      clearTimeout(frameId);
+    }
+  }
+
+  function scheduleStorageViewRender({ full = true } = {}) {
+    // Loading a system, switching views, and both inventory fetches all ask for a render;
+    // collapse them into one paint per animation frame instead of rebuilding the panel each time.
+    state.storageViewRenderFull = Boolean(state.storageViewRenderFull) || full;
+    if (state.storageViewRenderFrameId != null) {
+      return;
+    }
+    state.storageViewRenderFrameId = requestRenderFrame(flushStorageViewRender);
+  }
+
+  function flushStorageViewRender() {
+    if (state.storageViewRenderFrameId == null) {
+      return;
+    }
+    cancelRenderFrame(state.storageViewRenderFrameId);
+    state.storageViewRenderFrameId = null;
+    const full = Boolean(state.storageViewRenderFull);
+    state.storageViewRenderFull = false;
+    if (full) {
+      renderStorageViewsNow();
+    } else {
+      renderStorageViewCandidates();
+    }
+  }
+
   function renderStorageViews() {
+    scheduleStorageViewRender({ full: true });
+  }
+
+  function renderStorageViewsNow() {
     renderStorageViewTemplateOptions();
     renderStorageViewList();
     syncStorageViewEditorFromState();
@@ -3225,6 +3446,8 @@
   }
 
   function saveStorageViewEditorToState() {
+    // Make sure the editor shows the selected view before reading it back.
+    flushStorageViewRender();
     updateSelectedStorageView((storageView) => {
       const previousId = storageView.id;
       const editedLabel = String(elements.setupStorageViewLabel?.value || "");
@@ -3477,13 +3700,13 @@
     const targetSystemId = currentStorageViewTargetSystemId();
     if (!systemId) {
       resetStorageViewCandidateState();
-      renderStorageViewCandidates();
+      scheduleStorageViewRender({ full: false });
       return;
     }
     const requestSeq = (state.storageViewCandidatesRequestSeq || 0) + 1;
     state.storageViewCandidatesRequestSeq = requestSeq;
     state.storageViewCandidatesLoading = true;
-    renderStorageViewCandidates();
+    scheduleStorageViewRender({ full: false });
     try {
       const params = new URLSearchParams({ system_id: systemId });
       if (targetSystemId) {
@@ -3515,7 +3738,7 @@
     } finally {
       if (requestSeq === state.storageViewCandidatesRequestSeq) {
         state.storageViewCandidatesLoading = false;
-        renderStorageViewCandidates();
+        scheduleStorageViewRender({ full: false });
       }
     }
   }
@@ -3604,6 +3827,7 @@
   }
 
   function platformSetupCopy(platform) {
+    // The admin service sends a summary for every platform, so there is no client-side fallback.
     return String(platformRequirements(platform)?.summary || "");
   }
 
@@ -3910,13 +4134,26 @@
       return;
     }
     const payload = collectSudoersPreviewPayload();
+    const bmcOnly = setupPlatformUsesBmcOnlyHost(payload.platform);
+    if (elements.setupBootstrapSudoersPanel) {
+      elements.setupBootstrapSudoersPanel.classList.toggle("hidden", bmcOnly);
+    }
     if (!platformSupportsBootstrap(payload.platform)) {
-      renderSudoersPreview({
-        service_user: payload.service_user,
-        enabled: false,
-        detail: "VMware ESXi does not use the Linux sudoers/bootstrap path. Save the SSH host, root or key-based auth, and read-only runtime commands directly instead.",
-        content: "# VMware ESXi does not use the Linux sudoers/bootstrap flow.\n# Keep the saved SSH credentials or key directly on the system entry instead.\n",
-      });
+      renderSudoersPreview(
+        bmcOnly
+          ? {
+            service_user: payload.service_user,
+            enabled: false,
+            detail: BMC_ONLY_BOOTSTRAP_NOTE,
+            content: `# ${BMC_ONLY_BOOTSTRAP_NOTE}\n`,
+          }
+          : {
+            service_user: payload.service_user,
+            enabled: false,
+            detail: "VMware ESXi does not use the Linux sudoers/bootstrap path. Save the SSH host, root or key-based auth, and read-only runtime commands directly instead.",
+            content: "# VMware ESXi does not use the Linux sudoers/bootstrap flow.\n# Keep the saved SSH credentials or key directly on the system entry instead.\n",
+          }
+      );
       return;
     }
     if (!bootstrapEnabledForSession()) {
@@ -4014,6 +4251,10 @@
     return value === "generate" || value === "manual" || value === "none" ? value : "reuse";
   }
 
+  function defaultKeyMode() {
+    return state.sshKeys.length ? "reuse" : "generate";
+  }
+
   function normalizeKeyName(value) {
     return String(value || "")
       .trim()
@@ -4072,6 +4313,7 @@
     }
     const selectedKey = getSshKeyByName(elements.setupSshExistingKey?.value);
     if (!selectedKey) {
+      elements.setupSshKeyPath.value = "";
       return;
     }
     elements.setupSshKeyPath.value = selectedKey.runtime_private_path || selectedKey.private_path || elements.setupSshKeyPath.value;
@@ -4141,9 +4383,16 @@
     syncKeyHelp();
   }
 
+  let sshFieldNodes = null;
+
   function syncSshFields() {
     const enabled = Boolean(elements.setupSshEnabled?.checked);
-    document.querySelectorAll("[data-ssh-field]").forEach((field) => {
+    if (!sshFieldNodes) {
+      // The SSH fields are static template markup; this runs on every platform change
+      // and SSH toggle, so look them up once instead of walking the document each time.
+      sshFieldNodes = Array.from(document.querySelectorAll("[data-ssh-field]"));
+    }
+    sshFieldNodes.forEach((field) => {
       field.disabled = !enabled;
     });
     if (elements.setupRefreshKeysButton) {
@@ -4168,7 +4417,6 @@
     syncBootstrapFields();
     syncEsxiHostPrepFields();
     syncKeyMode();
-    syncKeyHelp();
   }
 
   function bootstrapEnabledForSession() {
@@ -4199,10 +4447,14 @@
       elements.setupBootstrapFields.classList.toggle("is-disabled", sshEnabled && !bootstrapEnabled);
     }
     if (elements.setupBootstrapResult) {
-      if (!sshEnabled) {
+      if (currentSetupPlatform() === "ipmi") {
+        elements.setupBootstrapResult.textContent = "This system is managed through its BMC. No host login is needed.";
+      } else if (!sshEnabled) {
         elements.setupBootstrapResult.textContent = "Enable SSH enrichment first if you want to use one-time bootstrap.";
       } else if (!bootstrapSupported) {
-        elements.setupBootstrapResult.textContent = "VMware ESXi does not use the one-time Linux service-account bootstrap. Save the SSH host, root or key-based auth, and read-only runtime commands directly instead.";
+        elements.setupBootstrapResult.textContent = setupPlatformUsesBmcOnlyHost()
+          ? BMC_ONLY_BOOTSTRAP_NOTE
+          : "VMware ESXi does not use the one-time Linux service-account bootstrap. Save the SSH host, root or key-based auth, and read-only runtime commands directly instead.";
       } else if (!bootstrapEnabled) {
         elements.setupBootstrapResult.textContent = "Bootstrap is off by default for saved systems. Enable it only when you intend to run one-time service-account setup.";
       }
@@ -4469,8 +4721,11 @@
     });
     const debugPolicy = getDebugExportPolicy();
     const backupPolicy = getBackupExportPolicy();
+    if (elements.backupImportButton) {
+      elements.backupImportButton.disabled = Boolean(state.operationPromises?.importBackup);
+    }
     if (elements.backupExportButton) {
-      elements.backupExportButton.disabled = !state.selectedBackupPaths.length || !backupPolicy.allowed;
+      elements.backupExportButton.disabled = Boolean(state.operationPromises?.exportBackup) || !state.selectedBackupPaths.length || !backupPolicy.allowed;
     }
     if (elements.backupExportResult) {
       if (!backupPolicy.allowed) {
@@ -4484,35 +4739,29 @@
     if (elements.backupExportRestartToggle) {
       const stopEnabled = Boolean(elements.backupExportStopToggle?.checked);
       elements.backupExportRestartToggle.disabled = !stopEnabled;
-      if (!stopEnabled) {
-        elements.backupExportRestartToggle.checked = false;
-      }
+
     }
     if (elements.backupImportRestartToggle) {
       const stopEnabled = Boolean(elements.backupImportStopToggle?.checked);
       elements.backupImportRestartToggle.disabled = !stopEnabled;
-      if (!stopEnabled) {
-        elements.backupImportRestartToggle.checked = false;
-      }
+
     }
     if (elements.debugExportButton) {
-      elements.debugExportButton.disabled = !state.selectedDebugPaths.length || !debugPolicy.allowed;
+      elements.debugExportButton.disabled = Boolean(state.operationPromises?.exportDebugBundle) || !state.selectedDebugPaths.length || !debugPolicy.allowed;
     }
     if (elements.debugExportResult) {
       if (!debugPolicy.allowed) {
         elements.debugExportResult.textContent = debugPolicy.guidance;
         state.debugExportPolicyGuidanceActive = true;
       } else if (state.debugExportPolicyGuidanceActive) {
-        elements.debugExportResult.textContent = "Use this when you want a frozen local support snapshot without pretending it is the same thing as a restore-grade full backup.";
+        elements.debugExportResult.textContent = "Export a local support snapshot.";
         state.debugExportPolicyGuidanceActive = false;
       }
     }
     if (elements.debugExportRestartToggle) {
       const stopEnabled = Boolean(elements.debugExportStopToggle?.checked);
       elements.debugExportRestartToggle.disabled = !stopEnabled;
-      if (!stopEnabled) {
-        elements.debugExportRestartToggle.checked = false;
-      }
+
     }
   }
 
@@ -4599,16 +4848,13 @@
       elements.setupSshPort.value = "22";
     }
     if (elements.setupSshKeyMode) {
-      elements.setupSshKeyMode.value = "reuse";
+      elements.setupSshKeyMode.value = defaultKeyMode();
     }
     if (elements.setupSshKeyPath) {
-      elements.setupSshKeyPath.value = "/run/ssh/id_truenas";
+      elements.setupSshKeyPath.value = state.sshKeys.length ? "/run/ssh/id_truenas" : "";
     }
     setRedactedSecretField(elements.setupSshPassword, false);
     setRedactedSecretField(elements.setupSshSudoPassword, false);
-    if (elements.setupSshKnownHosts) {
-      elements.setupSshKnownHosts.value = "/app/data/known_hosts";
-    }
     if (elements.setupSshStrictHostKey) {
       elements.setupSshStrictHostKey.checked = true;
     }
@@ -4663,7 +4909,7 @@
     }
     state.setupDirty = false;
     if (elements.setupResult) {
-      elements.setupResult.textContent = "Saving here updates the mounted config file; restart the read UI after a new system is added so it picks the new list up cleanly.";
+      elements.setupResult.textContent = "Saved systems appear in the main UI after a restart.";
     }
     syncPlatformHelp();
     syncVerifySslHelp();
@@ -4853,7 +5099,6 @@
     renderProfilePreview();
     renderProfileCatalog();
     renderQuantastorHaSection();
-    renderStorageViews();
     renderTlsInspection();
     syncBmcFields();
     syncSshFields();
@@ -5064,7 +5309,11 @@
     }
     const setupPayload = collectSetupPayload();
     if (!platformSupportsBootstrap(setupPayload.platform)) {
-      throw new Error("VMware ESXi does not use the one-time Linux service-account bootstrap path.");
+      throw new Error(
+        setupPlatformUsesBmcOnlyHost(setupPayload.platform)
+          ? BMC_ONLY_BOOTSTRAP_NOTE
+          : "VMware ESXi does not use the one-time Linux service-account bootstrap path."
+      );
     }
     if (!setupPayload.ssh_enabled) {
       throw new Error("Turn on SSH first so the new user has a host and login to go with it.");
@@ -5131,11 +5380,20 @@
   }
 
   async function readJsonResponse(response) {
+    let payload;
     try {
-      return await response.json();
-    } catch (error) {
-      return null;
+      payload = await response.json();
+    } catch (_) {
+      payload = null;
     }
+    if (!payload || typeof payload !== "object" || Array.isArray(payload) || !Object.keys(payload).length) {
+      const rawId = validatedRequestId(response.headers?.get?.("X-Request-ID"));
+      const requestId = rawId ? ` (request id ${rawId})` : "";
+      const error = new Error(`Invalid JSON response (${response.status || "unknown status"}). Retry or check the admin connection.${requestId}`);
+      error.requestId = requestId;
+      throw error;
+    }
+    return payload;
   }
 
   function restartFailureKeys(failures) {
@@ -5145,37 +5403,109 @@
     return Object.keys(failures).filter(Boolean).join(",");
   }
 
-  function runtimeContainerLabel(containerKey) {
+  function maintenanceKeys(value) {
+    const items = Array.isArray(value) ? value : String(value || "").split(",");
+    return items.map((item) => String(item || "").trim()).filter((item) => item && item !== "none");
+  }
+
+  function serviceName(key) {
+    const normalized = String(key || "").trim();
+    if (normalized === "ui") {
+      return "main UI";
+    }
+    if (normalized === "history") {
+      return "history collector";
+    }
     const containers = Array.isArray(state.runtime?.containers) ? state.runtime.containers : [];
-    return containers.find((container) => container?.key === containerKey)?.label || containerKey;
+    const container = containers.find((item) => String(item?.key || "") === normalized);
+    return String(container?.label || normalized || "service");
   }
 
-  function describeContainerKeys(keys) {
-    return String(keys || "")
-      .split(",")
-      .map((key) => key.trim())
-      .filter(Boolean)
-      .map((key) => runtimeContainerLabel(key));
+  function describeServices(keys) {
+    const names = keys.map((key) => `the ${serviceName(key)}`);
+    if (names.length <= 1) {
+      return names.join("");
+    }
+    return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
   }
 
-  function describeRestartFailures(failureKeys) {
-    const labels = describeContainerKeys(failureKeys);
-    return labels.length ? ` ${labels.join(", ")} did not start again.` : "";
+  function createServiceActionButton(containerKey, action, label) {
+    const button = document.createElement("button");
+    button.className = "button secondary small";
+    button.type = "button";
+    button.textContent = label;
+    button.addEventListener("click", () => {
+      button.disabled = true;
+      void runRuntimeAction(containerKey, action).finally(() => {
+        button.disabled = false;
+      });
+    });
+    return button;
   }
 
-  function describePauseOutcome(stoppedKeys, restartedKeys, restartFailures) {
-    const stopped = describeContainerKeys(stoppedKeys === "none" ? "" : stoppedKeys);
-    const restarted = describeContainerKeys(restartedKeys === "none" ? "" : restartedKeys);
-    if (!stopped.length) {
-      return "";
+  function describeMaintenanceOutcome({ stopped, restarted, failures } = {}) {
+    const failedKeys = maintenanceKeys(failures);
+    const restartedKeys = maintenanceKeys(restarted);
+    const stoppedKeys = maintenanceKeys(stopped);
+    const stillPausedKeys = stoppedKeys.filter((key) => !restartedKeys.includes(key) && !failedKeys.includes(key));
+    if (failedKeys.length) {
+      return {
+        ok: false,
+        sentence: `${describeServices(failedKeys)} did not start again.`,
+        startKeys: failedKeys,
+      };
     }
-    if (restartFailures) {
-      return ` The app was paused.${describeRestartFailures(restartFailures)}`;
+    if (stillPausedKeys.length) {
+      return {
+        ok: false,
+        sentence: `${describeServices(stillPausedKeys)} ${stillPausedKeys.length === 1 ? "is" : "are"} still paused.`,
+        startKeys: stillPausedKeys,
+      };
     }
-    if (restarted.length) {
-      return " The app was paused and is running again.";
+    if (restartedKeys.length) {
+      return {
+        ok: true,
+        sentence: `${describeServices(restartedKeys)} ${restartedKeys.length === 1 ? "was" : "were"} paused and started again.`,
+        startKeys: [],
+      };
     }
-    return ` ${stopped.join(", ")} ${stopped.length === 1 ? "is" : "are"} still stopped.`;
+    return { ok: true, sentence: "", startKeys: [] };
+  }
+
+  function renderMaintenanceResult(element, lead, outcome) {
+    if (!element) {
+      return;
+    }
+    if (outcome.ok) {
+      element.textContent = outcome.sentence
+        ? `${lead}. ${capitalize(outcome.sentence)}`
+        : `${lead}.`;
+      return;
+    }
+    element.textContent = `${lead}, but ${outcome.sentence}`;
+    outcome.startKeys.forEach((key) => {
+      element.append(" ", createServiceActionButton(key, "start", `Start ${serviceName(key)}`));
+    });
+  }
+
+  function capitalize(text) {
+    const value = String(text || "");
+    return value ? value[0].toUpperCase() + value.slice(1) : value;
+  }
+
+  function renderSaveResult(element, detail, payload = {}) {
+    if (payload?.runtime) {
+      state.runtime = payload.runtime;
+      renderRuntimeCards();
+    }
+    if (!element) {
+      return;
+    }
+    element.textContent = String(detail || "Saved.");
+    const restartKeys = maintenanceKeys(payload?.restart_required);
+    if (restartKeys.includes("ui")) {
+      element.append(" ", createServiceActionButton("ui", "restart", "Restart main UI now"));
+    }
   }
 
   function describeApiError(detail) {
@@ -5342,6 +5672,48 @@
     return detail;
   }
 
+  // A 2xx mutation response is only a success when it carries the result the
+  // route promises. Anything else leaves the write in doubt (#411): the change
+  // may already be applied, so it is reported as unknown, never as success.
+  function requireMutationResult(valid, what) {
+    if (!valid) {
+      throw adminRequestError(
+        `The ${what} response was incomplete. The change may or may not have been applied; re-check the current state before retrying.`,
+        "unknown"
+      );
+    }
+  }
+
+  function isNonEmptyString(value) {
+    return typeof value === "string" && value.trim() !== "";
+  }
+
+  function validSystemSaveResult(result) {
+    return Boolean(result && result.ok === true && result.system
+      && isNonEmptyString(result.system.id) && typeof result.system.label === "string"
+      && Array.isArray(result.systems));
+  }
+
+  function validDemoSystemResult(result) {
+    return validSystemSaveResult(result) && Boolean(result.profile
+      && isNonEmptyString(result.profile.id) && Array.isArray(result.profiles));
+  }
+
+  function validProfileSaveResult(result) {
+    return Boolean(result && result.ok === true && result.profile
+      && isNonEmptyString(result.profile.id) && Array.isArray(result.profiles));
+  }
+
+  // Confirmed refusals say "failed"; an unknown outcome says so and keeps the
+  // draft so the operator re-checks instead of saving the same change twice.
+  function describeMutationFailure(action, error) {
+    const message = error?.message || String(error);
+    if (error?.adminOutcome === "unknown" || error?.outcomeUnknown) {
+      return `${action} outcome is unknown. ${message} Draft retained.`;
+    }
+    return `${action} failed: ${message}`;
+  }
+
   async function fetchJson(url, options = {}) {
     const mutating = isMutatingRequest(options);
     // Sampled before dispatch: this is the only offline evidence that can
@@ -5349,25 +5721,92 @@
     const offlineBeforeDispatch = browserIsOffline();
     let response;
     try {
-      response = await fetch(url, options);
+      response = await fetchOrReportStopped(url, options);
     } catch (error) {
       // An abort is the caller's own cancellation or timeout contract, which
       // already describes its outcome. Leave it exactly as it was thrown.
       if (error?.name === "AbortError") {
         throw error;
       }
+      // A client timeout on a mutation fires after dispatch, so the sidecar may
+      // still apply the change; a timed-out read changed nothing.
+      if (error?.timedOut) {
+        if (mutating) {
+          const unknown = adminRequestError(`${error.message} The change may or may not have been applied; re-check the current state before retrying.`, "unknown");
+          unknown.timedOut = true;
+          throw unknown;
+        }
+        error.adminOutcome = "transport";
+        throw error;
+      }
       const outcome = classifyTransportFailure(mutating, offlineBeforeDispatch);
       throw adminRequestError(describeTransportFailure(outcome, offlineBeforeDispatch), outcome);
     }
-    const payload = await readJsonResponse(response);
+    let payload;
+    try {
+      payload = await readJsonResponse(response);
+    } catch (protocolError) {
+      // A malformed or empty body carries no decided result. For a mutation
+      // that reached the sidecar the change may already be applied (#411).
+      const outcome = response?.ok
+        ? (mutating ? "unknown" : "error")
+        : classifyResponseFailure(response?.status, mutating);
+      const error = adminRequestError(describeResponseFailure(protocolError.message, outcome), outcome);
+      error.status = response?.status;
+      error.requestId = protocolError.requestId;
+      error.protocolError = true;
+      throw error;
+    }
     if (!response.ok || (payload && payload.ok === false)) {
       const outcome = classifyResponseFailure(response?.status, mutating);
-      throw adminRequestError(
+      const error = adminRequestError(
         describeResponseFailure(describeRequestFailure(payload, response), outcome),
         outcome
       );
+      error.status = response.status;
+      throw error;
     }
     return payload || {};
+  }
+
+  const DEFAULT_REQUEST_TIMEOUT_MS = 60000;
+
+  function requestTimeoutError(timeoutMs) {
+    const seconds = Math.max(1, Math.round(timeoutMs / 1000));
+    const error = new Error(`Timed out after ${seconds} second${seconds === 1 ? "" : "s"}. Check that the host is reachable and try again.`);
+    error.name = "TimeoutError";
+    error.timedOut = true;
+    return error;
+  }
+
+  async function fetchWithTimeout(url, options = {}) {
+    // Every ordinary request gives up after timeoutMs so a stalled SSH or API hop
+    // cannot leave a panel on "Inspecting..." forever. Callers may pass their own
+    // signal (runtime actions do) and still get the timeout on top of it.
+    const { timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, signal: callerSignal, ...fetchOptions } = options;
+    const controller = new AbortController();
+    const cancel = () => controller.abort();
+    let timedOut = false;
+    const timerId = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, Math.max(1, Number(timeoutMs) || DEFAULT_REQUEST_TIMEOUT_MS));
+    if (callerSignal?.aborted) {
+      controller.abort();
+    } else {
+      callerSignal?.addEventListener("abort", cancel, { once: true });
+    }
+    try {
+      return await fetch(url, { ...fetchOptions, signal: controller.signal });
+    } catch (error) {
+      if (timedOut && !callerSignal?.aborted) {
+        throw requestTimeoutError(timeoutMs);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timerId);
+      callerSignal?.removeEventListener("abort", cancel);
+    }
   }
 
   function readOptionalSecretValue(field) {
@@ -5708,7 +6147,6 @@
   }
 
   async function runRefreshState({ quiet = false } = {}) {
-    state.refreshInFlight = true;
     if (elements.refreshStateButton) {
       elements.refreshStateButton.disabled = true;
     }
@@ -5717,6 +6155,9 @@
     }
     try {
       const payload = await fetchJson("/api/admin/state");
+      if (!Array.isArray(payload.systems) || !Array.isArray(payload.profiles)) {
+        throw new Error("Invalid admin state response. Last known state retained; retry the refresh.");
+      }
       state.admin = payload.admin || {};
       state.appVersion = payload.app_version || state.appVersion;
       state.releaseStatus = payload.release_status || state.releaseStatus;
@@ -5742,20 +6183,20 @@
       if (!state.selectedDebugPaths.length && Array.isArray(state.backupDefaults?.debug_included_paths)) {
         state.selectedDebugPaths = [...state.backupDefaults.debug_included_paths];
       }
-      state.paths = payload.paths || state.paths;
-      await loadOrphanedHistory({ quiet: true, render: false });
+      // Paint the fresh admin state first; the removed-system history scan hits SQLite
+      // and must not hold up container status or the saved-system lists.
       renderAll();
       if (state.loadedSystemId) {
         void fetchLiveEnclosures({ quiet: true });
         void fetchStorageViewCandidates({ quiet: true });
       }
+      await loadOrphanedHistory({ quiet: true });
       if (!quiet) {
         setBanner("Refreshed.", "success");
       }
     } catch (error) {
       setBanner(`Unable to refresh admin state: ${error.message || error}`, "error");
     } finally {
-      state.refreshInFlight = false;
       if (elements.refreshStateButton) {
         elements.refreshStateButton.disabled = false;
       }
@@ -5986,7 +6427,23 @@
     state.runtimeActionControllers.forEach((controller) => controller.abort());
   }
 
-  async function exportBackup() {
+  function runBackupOperation(key, operation) {
+    state.operationPromises ||= {};
+    if (state.operationPromises[key]) return state.operationPromises[key];
+    const pending = Promise.resolve().then(operation).finally(() => {
+      delete state.operationPromises[key];
+      syncBackupControls();
+    });
+    state.operationPromises[key] = pending;
+    syncBackupControls();
+    return pending;
+  }
+
+  function exportBackup() {
+    return runBackupOperation("exportBackup", runExportBackup);
+  }
+
+  async function runExportBackup() {
     const encrypt = Boolean(elements.backupEncryptToggle?.checked);
     const passphrase = readOptionalSecretValue(elements.backupExportPassphrase);
     const packaging = elements.backupPackaging?.value || "tar.zst";
@@ -6004,7 +6461,7 @@
     }
     try {
       const stopServices = Boolean(elements.backupExportStopToggle?.checked);
-      const restartServices = Boolean(elements.backupExportRestartToggle?.checked);
+      const restartServices = stopServices && Boolean(elements.backupExportRestartToggle?.checked);
       const response = await fetch(
         `/api/admin/backup/export?stop_services=${String(stopServices)}&restart_services=${String(restartServices)}`,
         {
@@ -6035,17 +6492,16 @@
       anchor.click();
       anchor.remove();
       window.URL.revokeObjectURL(objectUrl);
-      const stopped = response.headers.get("X-Admin-Stopped-Containers") || "none";
-      const restarted = response.headers.get("X-Admin-Restarted-Containers") || "none";
-      const restartFailures = response.headers.get("X-Admin-Restart-Failures") || "";
-      const exportSummary = `Backup saved (${formatBytes(blob.size)}, ${actualPackaging}).${describePauseOutcome(stopped, restarted, restartFailures)}`;
-      if (elements.backupExportResult) {
-        elements.backupExportResult.textContent = exportSummary;
-      }
-      if (restartFailures) {
-        setBanner(`${exportSummary} Use the Start buttons at the top of this page.`, "error");
+      const outcome = describeMaintenanceOutcome({
+        stopped: response.headers.get("X-Admin-Stopped-Containers"),
+        restarted: response.headers.get("X-Admin-Restarted-Containers"),
+        failures: response.headers.get("X-Admin-Restart-Failures"),
+      });
+      renderMaintenanceResult(elements.backupExportResult, `Backup saved as ${actualPackaging}`, outcome);
+      if (outcome.ok) {
+        setBanner(`Full backup exported as ${actualPackaging}.`, "success");
       } else {
-        setBanner(exportSummary, "success");
+        setBanner(`Full backup exported as ${actualPackaging}, but ${outcome.sentence} Use the Start button in the export result.`, "error");
       }
       await refreshState({ quiet: true });
     } catch (error) {
@@ -6058,7 +6514,11 @@
     }
   }
 
-  async function exportDebugBundle() {
+  function exportDebugBundle() {
+    return runBackupOperation("exportDebugBundle", runExportDebugBundle);
+  }
+
+  async function runExportDebugBundle() {
     const encrypt = Boolean(elements.debugEncryptToggle?.checked);
     const passphrase = readOptionalSecretValue(elements.debugExportPassphrase);
     const packaging = elements.debugPackaging?.value || "tar.zst";
@@ -6078,7 +6538,7 @@
     }
     try {
       const stopServices = Boolean(elements.debugExportStopToggle?.checked);
-      const restartServices = Boolean(elements.debugExportRestartToggle?.checked);
+      const restartServices = stopServices && Boolean(elements.debugExportRestartToggle?.checked);
       const response = await fetch(
         `/api/admin/debug/export?stop_services=${String(stopServices)}&restart_services=${String(restartServices)}`,
         {
@@ -6111,9 +6571,11 @@
       anchor.click();
       anchor.remove();
       window.URL.revokeObjectURL(objectUrl);
-      const stopped = response.headers.get("X-Admin-Stopped-Containers") || "none";
-      const restarted = response.headers.get("X-Admin-Restarted-Containers") || "none";
-      const restartFailures = response.headers.get("X-Admin-Restart-Failures") || "";
+      const outcome = describeMaintenanceOutcome({
+        stopped: response.headers.get("X-Admin-Stopped-Containers"),
+        restarted: response.headers.get("X-Admin-Restarted-Containers"),
+        failures: response.headers.get("X-Admin-Restart-Failures"),
+      });
       const scrubbed = [];
       if (response.headers.get("X-Debug-Scrub-Secrets") === "true") {
         scrubbed.push("secrets");
@@ -6122,13 +6584,11 @@
         scrubbed.push("disk identifiers");
       }
       const scrubLabel = scrubbed.length ? `Scrubbed ${scrubbed.join(" + ")}` : "Raw";
-      if (elements.debugExportResult) {
-        elements.debugExportResult.textContent = `${scrubLabel} ${actualPackaging} debug bundle exported. Stopped: ${stopped}. Restarted: ${restarted}.${describeRestartFailures(restartFailures)}`;
-      }
-      if (restartFailures) {
-        setBanner(`${scrubLabel} debug bundle exported as ${actualPackaging}, but these containers did not restart: ${restartFailures}. Use the runtime cards to start them.`, "error");
-      } else {
+      renderMaintenanceResult(elements.debugExportResult, `${scrubLabel} ${actualPackaging} debug bundle exported`, outcome);
+      if (outcome.ok) {
         setBanner(`${scrubLabel} debug bundle exported as ${actualPackaging}.`, "success");
+      } else {
+        setBanner(`${scrubLabel} debug bundle exported as ${actualPackaging}, but ${outcome.sentence} Use the Start button in the export result.`, "error");
       }
       await refreshState({ quiet: true });
     } catch (error) {
@@ -6170,7 +6630,11 @@
       "Restoring replaces all current settings, mappings and history with this backup. Continue?";
   }
 
-  async function importBackup() {
+  function importBackup() {
+    return runBackupOperation("importBackup", runImportBackup);
+  }
+
+  async function runImportBackup() {
     const file = readSelectedImportFile();
     const passphrase = readOptionalSecretValue(elements.backupImportPassphrase);
     if (!file) {
@@ -6185,7 +6649,7 @@
     }
     try {
       const stopServices = Boolean(elements.backupImportStopToggle?.checked);
-      const restartServices = Boolean(elements.backupImportRestartToggle?.checked);
+      const restartServices = stopServices && Boolean(elements.backupImportRestartToggle?.checked);
       const archiveBytes = await file.arrayBuffer();
       const secretHeaders = passphrase !== null
         ? { "X-Backup-Passphrase-Base64": encodeUtf8Base64(passphrase) }
@@ -6237,21 +6701,23 @@
       }
       state.systems = Array.isArray(payload.systems) ? payload.systems : state.systems;
       state.defaultSystemId = payload.default_system_id || state.defaultSystemId;
-      const importRestartFailures = restartFailureKeys(payload.restart_failures);
+      const outcome = describeMaintenanceOutcome({
+        stopped: payload.stopped_containers,
+        restarted: payload.restarted_containers,
+        failures: restartFailureKeys(payload.restart_failures),
+      });
       const preservedAbsentGroups = Array.isArray(payload.preserved_absent_groups)
         ? payload.preserved_absent_groups.filter(Boolean)
         : [];
       const preservedAbsentDetail = preservedAbsentGroups.length
         ? ` Preserved live data for source-absent groups: ${preservedAbsentGroups.join(", ")}.`
         : "";
-      const stopped = Array.isArray(payload.stopped_containers) ? payload.stopped_containers.join(",") : "";
-      const restarted = Array.isArray(payload.restarted_containers) ? payload.restarted_containers.join(",") : "";
-      const importSummary = `Restored ${file.name}.${describePauseOutcome(stopped, restarted, importRestartFailures)}${preservedAbsentDetail}`;
-      if (elements.backupImportResult) {
-        elements.backupImportResult.textContent = importSummary;
+      renderMaintenanceResult(elements.backupImportResult, `Imported ${file.name}`, outcome);
+      if (elements.backupImportResult && preservedAbsentDetail) {
+        elements.backupImportResult.append(preservedAbsentDetail);
       }
-      if (importRestartFailures) {
-        setBanner(`${importSummary} Use the Start buttons at the top of this page.`, "error");
+      if (!outcome.ok) {
+        setBanner(`Full backup imported from ${file.name}, but ${outcome.sentence} Use the Start button in the import result.${preservedAbsentDetail}`, "error");
       } else if (preservedAbsentGroups.length) {
         setBanner(`Full backup imported from ${file.name}.${preservedAbsentDetail}`, "info");
       } else {
@@ -6278,18 +6744,24 @@
       elements.setupResult.textContent = "Creating demo builder system...";
     }
     try {
-      const systemId = elements.setupSystemId?.value?.trim() || "";
-      const label = elements.setupSystemLabel?.value?.trim() || "";
+      let systemId = "demo-builder-lab";
+      let suffix = 2;
+      while (state.systems.some((system) => system.id === systemId) ||
+             state.profiles.some((profile) => profile.id === `${systemId}-chassis`)) {
+        systemId = `demo-builder-lab-${suffix++}`;
+      }
+      const label = "Demo Builder Lab";
       const payload = await fetchJson("/api/admin/system-setup/demo", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           ...(systemId ? { system_id: systemId } : {}),
           ...(label ? { label } : {}),
-          make_default: Boolean(elements.setupMakeDefault?.checked),
-          replace_existing: true,
+          make_default: false,
+          replace_existing: false,
         }),
       });
+      requireMutationResult(validDemoSystemResult(payload), "demo system");
       await refreshState({ quiet: true });
       state.selectedExistingSystemId = payload.system?.id || state.selectedExistingSystemId;
       const createdSystem = getSystemById(payload.system?.id || "");
@@ -6298,15 +6770,14 @@
       } else {
         renderAll();
       }
-      if (elements.setupResult) {
-        elements.setupResult.textContent = payload.detail || "Demo builder system created.";
-      }
+      renderSaveResult(elements.setupResult, payload.detail || "Demo builder system created.", payload);
       setBanner(`Demo builder system ${payload.system?.label || "saved"}.`, "success");
     } catch (error) {
+      const message = describeMutationFailure("Demo builder system creation", error);
       if (elements.setupResult) {
-        elements.setupResult.textContent = `Demo builder system creation failed: ${error.message || error}`;
+        elements.setupResult.textContent = message;
       }
-      setBanner(`Demo builder system creation failed: ${error.message || error}`, "error");
+      setBanner(message, "error");
     } finally {
       if (elements.setupCreateDemoButton) {
         elements.setupCreateDemoButton.disabled = false;
@@ -6315,6 +6786,9 @@
   }
 
   async function purgeOrphanedHistory() {
+    if (state.historyPurgePending) return;
+    state.historyPurgePending = true;
+    let emptyPreview = false;
     if (elements.historyPurgeOrphanedButton) {
       elements.historyPurgeOrphanedButton.disabled = true;
     }
@@ -6322,8 +6796,23 @@
       elements.historyPurgeOrphanedResult.textContent = "Scanning for orphaned history rows...";
     }
     try {
+      const preview = await fetchJson("/api/admin/history/orphaned");
+      if (!Array.isArray(preview.orphaned_systems) || !preview.purge_preview_token) {
+        throw new Error("History preview is unavailable. Retry before purging.");
+      }
+      const candidates = preview.orphaned_systems;
+      if (!candidates.length) {
+        emptyPreview = true;
+        elements.historyPurgeOrphanedResult.textContent = "No orphaned history rows are available to purge.";
+        return;
+      }
+      const description = candidates.map((item) => `${item.system_id}: ${item.total_rows} rows`).join("\n");
+      elements.historyPurgeOrphanedResult.textContent = description;
+      if (!window.confirm(`Permanently delete this removed-system history? This is irreversible.\n\n${description}\n\nUse adoption instead to preserve history after a rename. Continue?`)) return;
       const payload = await fetchJson("/api/admin/history/purge-orphaned", {
         method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ preview_token: preview.purge_preview_token, confirm_irreversible: true }),
       });
       await loadOrphanedHistory({ quiet: true });
       if (elements.historyPurgeOrphanedResult) {
@@ -6340,8 +6829,9 @@
       }
       setBanner(`Orphaned history purge failed: ${error.message || error}`, "error");
     } finally {
+      state.historyPurgePending = false;
       if (elements.historyPurgeOrphanedButton) {
-        elements.historyPurgeOrphanedButton.disabled = false;
+        elements.historyPurgeOrphanedButton.disabled = emptyPreview;
       }
     }
   }
@@ -6356,7 +6846,12 @@
     }
     try {
       const payload = await fetchJson("/api/admin/history/orphaned");
-      state.orphanedHistory = Array.isArray(payload.orphaned_systems) ? payload.orphaned_systems : [];
+      if (!Array.isArray(payload.orphaned_systems)) throw new Error("Invalid history source response. Retry the scan.");
+      state.orphanedHistory = payload.orphaned_systems;
+      state.orphanedHistoryError = false;
+      if (elements.historyPurgeOrphanedButton) {
+        elements.historyPurgeOrphanedButton.disabled = Boolean(state.historyPurgePending) || !state.orphanedHistory.length;
+      }
       if (elements.historyAdoptResult) {
         elements.historyAdoptResult.textContent = state.orphanedHistory.length
           ? "Pick one removed system id and one current saved system id to rewrite the saved history ownership."
@@ -6366,7 +6861,7 @@
         renderHistoryMaintenance();
       }
     } catch (error) {
-      state.orphanedHistory = [];
+      state.orphanedHistoryError = true;
       if (elements.historyAdoptResult) {
         elements.historyAdoptResult.textContent = `Unable to inspect removed-system history: ${error.message || error}`;
       }
@@ -6577,6 +7072,14 @@
       setBanner("System label and host are required before saving.", "error");
       return;
     }
+    if (
+      payload.ssh_enabled
+      && normalizeKeyMode(elements.setupSshKeyMode?.value) === "reuse"
+      && !getSshKeyByName(elements.setupSshExistingKey?.value)
+    ) {
+      setBanner("Choose or create an SSH key first.", "error");
+      return;
+    }
     if (elements.setupCreateButton) {
       elements.setupCreateButton.disabled = true;
     }
@@ -6589,22 +7092,29 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
+      requireMutationResult(validSystemSaveResult(result), "system save");
       state.setupDirty = false;
       state.loadedSystemId = result.system?.id || state.loadedSystemId;
       state.selectedExistingSystemId = result.system?.id || state.selectedExistingSystemId;
       state.defaultSystemId = result.default_system_id || state.defaultSystemId;
-      if (elements.setupResult) {
-        elements.setupResult.textContent = result.detail || `${result.updated_existing ? "Updated" : "Created"} ${result.system?.label || payload.label}. Restart the read UI to load the updated config cleanly.`;
-      }
+      renderSaveResult(
+        elements.setupResult,
+        result.detail || `${result.updated_existing ? "Updated" : "Created"} ${result.system?.label || payload.label}. Restart the main UI to show it.`,
+        result
+      );
       updateCreateButton();
       setBanner(`${result.updated_existing ? "Updated" : "Created"} system ${result.system?.label || payload.label}.`, "success");
       await refreshState({ quiet: true });
       void fetchStorageViewCandidates({ quiet: true });
     } catch (error) {
+      // The form draft is left untouched so a rejected save can be fixed and retried.
+      const reason = error?.message || String(error);
+      const keptDraftNote = /only accepts changes from/.test(reason) ? " Your entries are still in the form." : "";
+      const message = `${describeMutationFailure("System setup", error)}${keptDraftNote}`;
       if (elements.setupResult) {
-        elements.setupResult.textContent = `System setup failed: ${error.message || error}`;
+        elements.setupResult.textContent = message;
       }
-      setBanner(`System setup failed: ${error.message || error}`, "error");
+      setBanner(message, "error");
     } finally {
       if (elements.setupCreateButton) {
         elements.setupCreateButton.disabled = false;
@@ -6680,9 +7190,11 @@
         renderAll();
       }
 
-      if (elements.setupResult) {
-        elements.setupResult.textContent = payload.detail || `Removed ${payload.deleted_label || selectedSystem.label || selectedSystem.id}. Restart the read UI when you are ready to drop it from the live runtime list too.`;
-      }
+      renderSaveResult(
+        elements.setupResult,
+        payload.detail || `Removed ${payload.deleted_label || selectedSystem.label || selectedSystem.id}. Restart the main UI to remove it there too.`,
+        payload
+      );
       if (elements.existingSystemDeleteHistoryToggle) {
         elements.existingSystemDeleteHistoryToggle.checked = false;
       }
@@ -6777,7 +7289,8 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payloadBody),
       });
-      const savedProfileId = payload.profile?.id || draft.id;
+      requireMutationResult(validProfileSaveResult(payload), "custom profile save");
+      const savedProfileId = payload.profile.id;
       state.loadedBuilderProfileId = savedProfileId;
       state.selectedProfileId = savedProfileId;
       if (elements.setupProfile) {
@@ -6790,9 +7303,7 @@
       } else {
         renderProfileBuilder();
       }
-      if (elements.profileBuilderResult) {
-        elements.profileBuilderResult.textContent = payload.detail || `Saved custom profile ${savedProfileId}.`;
-      }
+      renderSaveResult(elements.profileBuilderResult, payload.detail || `Saved custom profile ${savedProfileId}.`, payload);
       setBanner(
         payload.updated_existing
           ? `Updated custom profile ${payload.profile?.label || savedProfileId}.`
@@ -6800,10 +7311,11 @@
         "success"
       );
     } catch (error) {
+      const message = describeMutationFailure("Custom profile save", error);
       if (elements.profileBuilderResult) {
-        elements.profileBuilderResult.textContent = `Custom profile save failed: ${error.message || error}`;
+        elements.profileBuilderResult.textContent = message;
       }
-      setBanner(`Custom profile save failed: ${error.message || error}`, "error");
+      setBanner(message, "error");
     } finally {
       if (elements.profileBuilderSaveButton) {
         elements.profileBuilderSaveButton.disabled = false;
@@ -6818,9 +7330,18 @@
       setBanner("Load a saved custom profile into the builder first if you want to delete it.", "error");
       return;
     }
+    const referenceCount = profileReferenceCount(profile);
+    if (referenceCount > 0) {
+      const message = `${profile.label || profile.id} is ${describeProfileReferences(referenceCount).toLowerCase()}. Move them to another profile before deleting it.`;
+      if (elements.profileBuilderResult) {
+        elements.profileBuilderResult.textContent = message;
+      }
+      setBanner(message, "error");
+      return;
+    }
 
     const confirmation = window.confirm(
-      `Delete custom profile ${profile.label || profile.id}?\n\nThis removes it from profiles.yaml. Any saved systems or storage views still using it will block deletion until they are moved to another profile.`
+      `Delete custom profile ${profile.label || profile.id}?\n\nThis removes it from profiles.yaml.`
     );
     if (!confirmation) {
       return;
@@ -6840,9 +7361,7 @@
       state.loadedBuilderProfileId = "";
       await refreshState({ quiet: true });
       resetProfileBuilder({ keepResult: true });
-      if (elements.profileBuilderResult) {
-        elements.profileBuilderResult.textContent = payload.detail || `Deleted custom profile ${profile.label || profile.id}.`;
-      }
+      renderSaveResult(elements.profileBuilderResult, payload.detail || `Deleted custom profile ${profile.label || profile.id}.`, payload);
       setBanner(`Deleted custom profile ${profile.label || profile.id}.`, "success");
     } catch (error) {
       if (elements.profileBuilderResult) {
@@ -6910,6 +7429,9 @@
     });
     elements.runtimeBehaviorSaveButton?.addEventListener("click", () => {
       void saveRuntimeBehaviorSettings();
+    });
+    elements.runtimeBehaviorDiscardButton?.addEventListener("click", () => {
+      discardRuntimeBehaviorDraft();
     });
 
     elements.backupPathList?.addEventListener("click", (event) => {
@@ -7378,7 +7900,7 @@
     elements.debugScrubIdentifiersToggle.checked = state.backupDefaults.debug_scrub_disk_identifiers !== false;
   }
   if (elements.debugExportStopToggle) {
-    elements.debugExportStopToggle.checked = state.backupDefaults.debug_stop_services !== false;
+    elements.debugExportStopToggle.checked = Boolean(state.backupDefaults.debug_stop_services);
   }
   if (elements.debugExportRestartToggle) {
     elements.debugExportRestartToggle.checked = Boolean(state.backupDefaults.debug_restart_services);
@@ -7387,7 +7909,10 @@
     elements.setupPlatform.value = "core";
   }
   if (elements.setupSshKeyMode) {
-    elements.setupSshKeyMode.value = "reuse";
+    elements.setupSshKeyMode.value = defaultKeyMode();
+  }
+  if (elements.setupSshKeyPath && !state.sshKeys.length) {
+    elements.setupSshKeyPath.value = "";
   }
   if (elements.setupGenerateKeyName) {
     elements.setupGenerateKeyName.value = suggestedKeyName();

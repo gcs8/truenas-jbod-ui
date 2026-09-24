@@ -73,7 +73,7 @@ function functionSource(source, name) {
 }
 
 function loadFunction(name, context) {
-  const sandbox = vm.createContext({ ...context });
+  const sandbox = vm.createContext({ inventoryScopeMatchesSelection: () => true, ...context });
   vm.runInContext(`${functionSource(APP_SOURCE, name)}\nthis.__loaded = ${name};`, sandbox, {
     filename: `${name}.behavior.js`,
   });
@@ -153,6 +153,7 @@ test("saved chassis fabric highlights use the backing live slot identity", () =>
     grid: { querySelectorAll() { return [backed.tile, unbacked.tile]; } },
     getSelectedPeerContext() { return { active: false, peerSlots: new Set() }; },
     sasFabricSelectedSlotSet() { return new Set([42]); },
+    getSelectedStorageViewRuntime() { return null; },
     fabricSlotNumberForGridTile(tile) { return tile.dataset.slot === "0" ? 42 : null; },
   });
 
@@ -202,6 +203,7 @@ test("search filtering toggles existing tiles without rebuilding the grid", () =
   const refreshGridFilterState = loadFunction("refreshGridFilterState", {
     grid: { querySelectorAll() { return [first, second]; } },
     gridTileMatchesFilter(tile) { return tile.dataset.slot === "2"; },
+    renderSearchSummary() {},
   });
 
   refreshGridFilterState();
@@ -212,7 +214,7 @@ test("search filtering toggles existing tiles without rebuilding the grid", () =
     APP_SOURCE.indexOf('searchBox.addEventListener("input"'),
     APP_SOURCE.indexOf('refreshButton.addEventListener("click"'),
   );
-  assert.match(inputHandler, /refreshGridFilterState\(\)/);
+  assert.match(inputHandler, /refreshGridFilterState\(\{ autoSelect: true \}\)/);
   assert.doesNotMatch(inputHandler, /renderGrid\(\)/);
   assert.equal(state.search, "archive");
 });
@@ -229,8 +231,12 @@ test("live slot search compares normalized text case-insensitively", () => {
 test("SMART completion refreshes heatmap overlays without rebuilding tiles", () => {
   for (const name of ["ensureSmartSummary", "ensureStorageViewSmartSummary"]) {
     const source = functionSource(APP_SOURCE, name);
-    assert.match(source, /refreshGridTileAriaLabel\(/, `${name} must update the existing tile label`);
     assert.match(source, /refreshHeatmapTileOverlays\(\)/, `${name} must refresh overlays in place`);
     assert.doesNotMatch(source, /renderGrid\(\)/, `${name} must preserve tile identity`);
   }
+  assert.match(
+    functionSource(APP_SOURCE, "ensureStorageViewSmartSummary"),
+    /refreshGridTileAriaLabel\(/,
+    "storage-view tile labels are refreshed in place once SMART arrives",
+  );
 });
