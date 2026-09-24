@@ -195,8 +195,16 @@ class HealthzTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body["status"], "degraded")
         self.assertEqual(body["dependency_status"], "degraded")
-        self.assertEqual(body["summary"], "TrueNAS API unreachable: connection refused")
-        self.assertEqual(body["problems"], ["TrueNAS API unreachable: connection refused"])
+        self.assertEqual(body["summary"], "TrueNAS API degraded: connection refused")
+        self.assertEqual(body["problems"], ["TrueNAS API degraded: connection refused"])
+
+    def test_reachable_api_with_degraded_enclosure_data_is_not_called_unreachable(self) -> None:
+        message = "TrueNAS API reachable with degraded enclosure data."
+        status, body = self.call_healthz(_snapshot(api_ok=False, api_message=message))
+        self.assertEqual(status, 200)
+        self.assertEqual(body["status"], "degraded")
+        self.assertEqual(body["problems"], [f"TrueNAS API degraded: {message}"])
+        self.assertNotIn("unreachable", body["summary"])
 
     def test_unwritable_data_folder_is_degraded_even_before_the_first_inventory(self) -> None:
         status, body = self.call_healthz(None, problems=(CHOWN_SENTENCE,))
@@ -212,7 +220,7 @@ class HealthzTests(unittest.TestCase):
         self.assertEqual(body["summary"], f"Data folder not writable: {CHOWN_SENTENCE}")
         self.assertEqual(
             body["problems"],
-            [CHOWN_SENTENCE, "TrueNAS API unreachable: no details recorded"],
+            [CHOWN_SENTENCE, "TrueNAS API degraded: no details recorded"],
         )
 
     def test_livez_is_unchanged(self) -> None:

@@ -961,8 +961,10 @@ def build_health_payload(
         warnings = list(snapshot.warnings)
         cache_state = "cached"
         if dependency_status == "degraded":
+            # ok=False covers both a failed API and one that answers with degraded
+            # enclosure data, so name the state neutrally and keep the recorded cause.
             api_message = (api_status.message if api_status else None) or "no details recorded"
-            api_problem = f"TrueNAS API unreachable: {api_message}"
+            api_problem = f"TrueNAS API degraded: {api_message}"
 
     problems = [*unwritable, *([api_problem] if api_problem else [])]
     if unwritable:

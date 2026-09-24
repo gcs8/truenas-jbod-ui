@@ -1632,7 +1632,7 @@ class MainAppBoundaryTests(unittest.TestCase):
                 problems = (
                     []
                     if dependency_status == "ok"
-                    else [f"TrueNAS API unreachable: {sources.get('api', {}).get('message') or 'no details recorded'}"]
+                    else [f"TrueNAS API degraded: {sources.get('api', {}).get('message') or 'no details recorded'}"]
                 )
                 expected = {
                     "status": "ok" if not problems else "degraded",
