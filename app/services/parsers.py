@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from app.config import normalize_text  # noqa: F401 - re-exported for parser callers
 from app.services.profile_registry import (
     DELL_MD1280_PROFILE_ID,
     SCALE_SSG_FRONT_24_PROFILE_ID,
@@ -52,9 +53,7 @@ MAX_SES_ELEMENTS = 2 * 4096
 MAX_SES_OUTPUT_CHARS = 4 * 1024 * 1024
 MAX_SES_DEVICE_NAMES_PER_SLOT = 16
 MAX_SES_DEVICE_NAME_LENGTH = 128
-# Backward-compatible names for the AES parser's original bounds.
 MAX_SES_AES_DESCRIPTORS = MAX_SES_ELEMENTS
-MAX_SES_AES_OUTPUT_CHARS = MAX_SES_OUTPUT_CHARS
 
 
 @dataclass(slots=True)
@@ -216,11 +215,6 @@ class CamcontrolInfo:
     peer_devices: dict[str, list[str]] = field(default_factory=dict)
 
 
-def normalize_text(value: str | None) -> str | None:
-    if value is None:
-        return None
-    normalized = value.strip()
-    return normalized or None
 
 
 def normalize_device_name(value: str | None) -> str | None:
@@ -2711,6 +2705,39 @@ def _extract_slot_number(candidate: dict[str, Any]) -> int | None:
             return int(match.group("slot"))
 
     return None
+
+
+def extract_enclosure_slot_count(enclosure: dict[str, Any], api_slot_number_base: int) -> int | None:
+    """Return how many drive bays one `enclosure.query` row reports, or None."""
+
+    declared = 0
+    for key in ("front_slots", "rear_slots", "top_slots", "internal_slots"):
+        value = enclosure.get(key)
+        if isinstance(value, int) and value > 0:
+            declared += value
+    if declared:
+        return declared
+
+    drive_slots: set[int] = set()
+    other_slots: set[int] = set()
+    for ancestry, candidate in _flatten_candidates(enclosure):
+        raw_slot = _extract_slot_number(candidate)
+        if raw_slot is None:
+            continue
+        slot = raw_slot - api_slot_number_base
+        if slot < 0:
+            continue
+        group_text = " ".join([*ancestry, str(candidate.get("name") or "")]).lower()
+        if any(keyword in group_text for keyword in ("array device", "drive", "disk", "slot")) or any(
+            key in candidate for key in ("dev", "device")
+        ):
+            drive_slots.add(slot)
+        else:
+            other_slots.add(slot)
+    slots = drive_slots or other_slots
+    if not slots:
+        return None
+    return max(slots) + 1
 
 
 def extract_enclosure_slot_candidates(
