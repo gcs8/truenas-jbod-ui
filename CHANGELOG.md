@@ -44,6 +44,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Added
 
+- Showed a one-time dismissible notice in the main UI after the app is
+  updated, kept until dismissed and stored per install; v0.23.0 says that
+  network mode lets anyone who can reach the port change bay assignments and
+  lights, and where to add a sign-in. (#491, #562)
+
 - Added a JSON-RPC 2.0 websocket transport selectable per TrueNAS host with
   `api_dialect` (and `api_version` to pin a documented API release), keeping the
   DDP default for CORE and existing hosts; saving a system in the admin UI keeps
@@ -59,6 +64,13 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   separate (#503).
 
 ### Changed
+
+- Rewrote the main page copy in plain words: header and profile subtitles,
+  the bay status line and Summary panel, the Bay assignment panel, status
+  chips with the source message as tooltip and a neutral SSH-off style,
+  cache countdown chips shown only with UI Timing, plain "Bay reported by"
+  labels in Slot Details, and heat-map metric names that match the wiki
+  (#484, #562).
 
 - Admin failures now answer with the request's correlation id in the response
   body and the `X-Request-ID` header, and the admin log records that id with the
@@ -94,6 +106,24 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   path, and pointed the operations page at it (#541).
 
 ### Fixed
+
+- Kept inventory and action results in their selected scope, preserved
+  export keyboard focus, and improved history controls and failure text.
+  (#425, #562)
+- Kept main-UI error messages visible across background refreshes, recovered
+  write controls after a rejected write, honoured the configured refresh
+  interval, added search results and a real empty-bay state, and asked for a
+  reload after a container upgrade; `/api/inventory` now documents the
+  `write_policy` and `app_version` fields it returns (#508, #562).
+- Raised the smallest Storage Fabric, disk-path and bay text to 12px, stopped
+  forcing the diagnostic chips to uppercase, let card labels wrap instead of
+  clipping device names, added a print stylesheet that keeps bay colours on a
+  white page, and darkened the empty NVMe bay size chip to AA contrast
+  (#477, #562).
+- Led the public demo and saved copies with what the app does, moved
+  version, source revision and build ID into a collapsed block, and hid the
+  refresh controls and inventory evidence counters in saved copies.
+  (#485, #562)
 
 - Published aggregate disk-retention totals on the inventory summary
   (`source_disk_count`, `rendered_unique_disk_count`,
@@ -268,6 +298,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   bulk responses and offline exports. (#423)
 
 ### Performance
+
+- Delegated every bay-tile interaction to the grid, deferred hover SMART
+  fetches to the batch prefetch that already covers the bay, and indexed bay
+  lookups instead of scanning the slot list on every call (#510, #562).
 
 - Served a slot history bundle from one SQLite connection instead of fifteen
   and cached the history lock address per database identity instead of parsing
