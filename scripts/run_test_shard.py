@@ -33,6 +33,11 @@ from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+# Run as a script, sys.path[0] is scripts/; discovery under `python -m unittest`
+# had the working directory (the repository root) there instead, which is what
+# `from app ...` and `from tests import heap_probe` in the test modules rely on.
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 TESTS_DIR = ROOT / "tests"
 TEST_MODULE_PATTERN = "test_*.py"
 RESULT_PREFIX = "shard-"
