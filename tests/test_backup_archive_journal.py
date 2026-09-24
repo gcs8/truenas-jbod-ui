@@ -397,6 +397,18 @@ class CoalescerTests(JournalTestCase):
         self.assertEqual(co.tick().status, "failed")
         self.assertEqual(ChangeJournal(self.path).last_backup(), (None, None))
 
+    def test_oversized_or_unsafe_artifact_id_is_a_failure_not_a_poisoned_commit(self) -> None:
+        for bad in ("x" * 70000, "a" * 129, "../cfg", "cfg\nid"):
+            with self.subTest(length=len(bad)):
+                co = self.coalescer(make_backup=lambda ids, bad=bad: {"artifact_id": bad})
+                co.record_change("mapping.save", "slot-1")
+                self.clock.advance(30)
+                self.assertEqual(co.run().status, "failed")
+                self.assertTrue(all(len(line) < 64 * 1024 for line in self.path.read_bytes().splitlines()))
+                self.assertEqual(ChangeJournal(self.path).last_backup(), (None, None))
+        with self.assertRaises(ValueError):
+            ChangeJournal(self.path).commit(["chg_x"], outcome="backup", config_hash="a" * 64, backup_id="b" * 200)
+
     def test_concurrent_triggers_make_a_single_backup(self) -> None:
         started = threading.Event()
         release = threading.Event()

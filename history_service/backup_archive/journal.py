@@ -87,6 +87,9 @@ DEFAULT_VOLATILE_KEYS: frozenset[str] = frozenset(
 _ACTION_PATTERN = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _CHANGE_ID_PATTERN = re.compile(r"^chg_[0-9a-z_]{8,64}$")
+# Artifact ids are opaque and server-issued (catalog); bound them so a commit
+# record always fits the parser's line limit.
+_BACKUP_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 CommitOutcome = Literal["backup", "noop"]
 
@@ -344,8 +347,8 @@ class ChangeJournal:
 
         if outcome not in ("backup", "noop"):
             raise ValueError("outcome must be 'backup' or 'noop'")
-        if outcome == "backup" and not backup_id:
-            raise ValueError("a backup commit needs a backup_id")
+        if outcome == "backup" and (not isinstance(backup_id, str) or not _BACKUP_ID_PATTERN.fullmatch(backup_id)):
+            raise ValueError("a backup commit needs a backup_id of at most 128 safe characters")
         if outcome == "noop" and backup_id is not None:
             raise ValueError("a noop commit has no backup_id")
         _validate_hash(config_hash, "config_hash")
@@ -451,7 +454,11 @@ class ChangeJournal:
             return handle.read()
 
     def _append_records_locked(self, records: list[dict[str, Any]]) -> None:
-        payload = b"".join(_stable_json(record).encode("utf-8") + b"\n" for record in records)
+        lines = [_stable_json(record).encode("utf-8") for record in records]
+        if any(len(line) > MAX_LINE_BYTES for line in lines):
+            # Never write a record the parser would later reject as corruption.
+            raise ValueError("journal record exceeds the line limit")
+        payload = b"".join(line + b"\n" for line in lines)
         created = not os.path.lexists(self.path)
         fd = self._open_journal(os.O_RDWR | os.O_CREAT | os.O_APPEND)
         try:
@@ -548,7 +555,7 @@ class ChangeJournal:
                 backup_id = record.get("backup_id")
                 if outcome not in ("backup", "noop") or not isinstance(ids, list):
                     return False
-                if outcome == "backup" and (not isinstance(backup_id, str) or not backup_id):
+                if outcome == "backup" and (not isinstance(backup_id, str) or not _BACKUP_ID_PATTERN.fullmatch(backup_id)):
                     return False
                 for change_id in ids:
                     if isinstance(change_id, str):
@@ -737,8 +744,8 @@ class CoalescerResult:
 
 def _artifact_id(record: Any) -> str:
     value = record.get("artifact_id") if isinstance(record, Mapping) else getattr(record, "artifact_id", None)
-    if not isinstance(value, str) or not value:
-        raise ValueError("make_backup must return a record with a non-empty artifact_id")
+    if not isinstance(value, str) or not _BACKUP_ID_PATTERN.fullmatch(value):
+        raise ValueError("make_backup must return a record with an artifact_id of at most 128 safe characters")
     return value
 
 
