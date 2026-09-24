@@ -330,6 +330,16 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   requests after 60 seconds with a retry message, painted the refreshed admin
   state before the removed-system history scan, and removed dead admin code
   (#474)
+
+- History cleanup now hands freed space back to the disk on new history
+  databases (incremental auto-vacuum plus a WAL truncate after each cleanup that
+  removed rows), selects each cleanup batch with a bounded subquery so any
+  `HISTORY_RETENTION_BATCH_SIZE` works, copies the local backup without holding
+  the history locks, recounts table sizes at startup only when a counter row is
+  missing, and runs the one-time disk-identity upgrade in resumable batches with
+  progress in the log. Existing databases keep reusing freed pages in place
+  (#560).
+
 - Served a slot history bundle from one SQLite connection instead of fifteen
   and cached the history lock address per database identity instead of parsing
   /proc/self/mountinfo on every lock (#539).
