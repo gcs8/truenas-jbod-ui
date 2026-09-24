@@ -414,7 +414,7 @@ The following pull-request checks are release-blocking and required for `main`:
 - `Changelog entry` (pull requests only; see "Changelog And Release Notes")
 
 Each `Python compile and unittest (<version>)` check is a gate job over
-three parallel shard jobs (`Python unittest shard (<version>, <shard>)`). The
+four parallel shard jobs (`Python unittest shard (<version>, <shard>)`). The
 shards split the test modules by the `SHARDS` table in
 `scripts/run_test_shard.py`; the gate downloads every shard's result and fails
 unless each one ran and passed on that Python version, so a shard that failed,

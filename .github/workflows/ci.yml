@@ -179,7 +179,7 @@ jobs:
         # One shard per entry of SHARDS in scripts/run_test_shard.py. The
         # required checks are the `python-source` gate jobs below, which fail
         # unless every shard of their Python version uploaded a green result.
-        shard: ["1", "2", "3"]
+        shard: ["1", "2", "3", "4"]
     env:
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
