@@ -50,8 +50,8 @@ function fixture(platform, { ssh = true, enabled = true, forceEnabled = false } 
       return { detail: "Synthetic permission preview", content: "# synthetic permissions" };
     },
   });
-  const names = ["platformSupportsBootstrap", "bootstrapEnabledForSession", "collectSudoersPreviewPayload", "renderSudoersPreview", "refreshSudoersPreview", "syncBootstrapFields", "collectBootstrapPayload"];
-  vm.runInContext(names.map(declaration).join("\n"), context);
+  const names = ["setupPlatformUsesBmcOnlyHost", "platformSupportsBootstrap", "bootstrapEnabledForSession", "collectSudoersPreviewPayload", "renderSudoersPreview", "refreshSudoersPreview", "syncBootstrapFields", "collectBootstrapPayload"];
+  vm.runInContext(`const BMC_ONLY_BOOTSTRAP_NOTE = ${JSON.stringify(BMC_GUIDANCE)};\n` + names.map(declaration).join("\n"), context);
   // Reach the second defensive payload gate independently of the session gate.
   if (forceEnabled) vm.runInContext("bootstrapEnabledForSession = () => true;", context);
   return { context, elements, fields, requests };
