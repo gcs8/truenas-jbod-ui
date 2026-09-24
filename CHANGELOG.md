@@ -101,6 +101,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   showing the default system, and mapped service errors to responses from one
   table with a 5-second retry hint for busy exports. (#475)
 
+- Drew TrueNAS CORE bays from the count the enclosure reports instead of
+  always using the 60-bay CSE-946 face, listed small SES enclosures on CORE,
+  stopped the false SES warning on SCALE hosts without an expander, and kept
+  descriptor text from marking empty bays present or faulty. (#482)
+
 - Published aggregate disk-retention totals on the inventory summary
   (`source_disk_count`, `rendered_unique_disk_count`,
   `duplicate_disk_view_count`, `unplaced_disk_count`) so a release check can
