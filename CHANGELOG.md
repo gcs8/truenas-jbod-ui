@@ -328,6 +328,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - `config/config.example.yaml` now lists every option with its default and
   shows one example system per platform, including ESXi, a BMC-only host,
   and a storage view; the unused `app.verify_ssl` line is gone. (#489)
+- Added an Upgrading wiki page, Troubleshooting entries for a restarting
+  container, an unwritable history database and the off-loopback history
+  refusal, and Quick Start notes on `COMPOSE_PROFILES` and admin auto-stop
+  (#564).
 
 ### Internal
 
