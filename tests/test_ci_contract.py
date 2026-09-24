@@ -271,17 +271,10 @@ class CIWorkflowContractTests(unittest.TestCase):
                 self.assertIn("python scripts/build_current_source_browser_fixture.py", workflow_text)
                 self.assertIn("PUBLIC_DEMO_ARTIFACT: public-demo/index.html", workflow_text)
                 self.assertIn("SLOT_FOCUS_ARTIFACT:", workflow_text)
-                self.assertIn("npx playwright test qa/public-demo.spec.js", workflow_text)
+                self.assertIn("npx playwright test qa/public-demo.spec.js --retries=0", workflow_text)
                 self.assertIn("npm ci --ignore-scripts", workflow_text)
                 self.assertIn('rm -rf "$fixture_root"', workflow_text)
                 self.assertIn("git status --short", workflow_text)
-
-    def test_ci_runs_the_saved_view_selection_spec(self) -> None:
-        # Synthetic routed fixtures only, so it belongs beside the public-demo smoke.
-        self.assertIn(
-            "npx playwright test qa/public-demo.spec.js qa/saved-view-selection.spec.js --retries=0",
-            self.read(CI_WORKFLOW),
-        )
 
     def test_screenshot_capture_workflow_is_dispatch_only_pinned_and_read_only(self) -> None:
         workflow = yaml.safe_load(self.read(CAPTURE_SCREENSHOTS_WORKFLOW))

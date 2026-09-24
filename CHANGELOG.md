@@ -445,8 +445,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   images or leaving a stale receipt directory behind; the changelog gate now
   fails with the fix when `## Unreleased` is missing rather than accepting a
   bullet in a shipped release; `dev_check.py` prints one line per skipped group
-  (`--verbose` lists the suites); and admin maintenance cleanup and the
-  public-demo determinism test work on Windows (#561).
+  (`--verbose` lists the suites); and admin maintenance cleanup works on
+  Windows (#561).
 
 ### Performance
 
