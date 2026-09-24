@@ -1,24 +1,24 @@
 # Public screenshot exact-byte review
 
-This record covers the two desktop fixture screenshots generated from `public-demo/index.html`. The capture script used `file://`, UTC, fixed desktop viewports, reduced motion, and no network request.
+This record covers the two desktop fixture screenshots generated from `public-demo/index.html`. GitHub Actions run `36049972945` used the pinned Playwright `v1.63.0-jammy` container, `file://`, UTC, a 1920 by 1080 viewport, reduced motion, and no network request. The job captured each image twice and produced byte-identical copies.
 
-Source revision: `76d0c06814b3245fcb6e5509ada05d8be794c151`
+Source revision: `2288c324d3df1baf2cfeeb4d60d60c816e837cb8`
 
-Source artifact SHA-256: `364a3bfe1f85609efeeef6ff2682c8d19eed3a3b818602557f8bc3d2db68ab16`
+Source artifact SHA-256: `505568b3660bef9baa2f1fb144d615b761f9edb0bec7b64b47d08de79c9d646a`
 
 | Image | Dimensions | Bytes | SHA-256 | Pixel review |
 |---|---:|---:|---|---|
-| `public-demo-overview.png` | 1920 by 4237 | 978403 | `5cabffaadc0cc2b4dabf55f6edddd460318acb5f66b4862168e59fde021c9dad` | PASS |
-| `public-demo-history.png` | 1920 by 5015 | 1094061 | `3f9d78519f804371852d904ae905aaf7214fa4a40b0e6c8519cbfe22ac5eec16` | PASS |
+| `public-demo-overview.png` | 1920 by 4092 | 1099132 | `a5b71d60b647717f4d03b6788de7f17a0f5125f84b25482b3578ba0618f628ca` | PASS |
+| `public-demo-history.png` | 1920 by 4852 | 1226115 | `5d4bd72304218b3680ee787a22cf77ac6862f641afb5012b9d9e6602720422f2` | PASS |
 
-The exact pixels were checked for private addresses, hostnames, paths, credentials, key material, and non-demo device identifiers. The review also covered snapshot/live wording, selector clipping, panel overlap, page overflow, canvas-edge artifacts, count grammar, and the consistency of current, history, rate, power-on, and annualized values.
+These exact images accompany the provenance-only public-demo refresh that rebinds the artifact to main commit `2288c32`; the previously recorded revision was a #552 branch commit the squash merge did not carry onto main. Every declared demo input has the same blob as the previously approved source revision. The generated artifact changes only its source-parity manifest, visible Source revision, and visible Build ID.
 
-The overview image selects slot 57's special-class mirror. It does not depict the spare group. The fixture and browser gates separately verify that slots 42 and 43 render in the single `demo-capacity > spares > spare` group.
+Both PNGs were loaded and inspected with Hermes `vision_analyze`. The review checked the changed provenance area for complete values, private data, clipping, overlap, corruption, and malformed text. The Source revision is the complete 40-character public Git commit. The Build ID is the complete 64-character deterministic input-manifest fingerprint. Neither value contains a credential, private path, private address, or personal identifier.
 
-Mobile and tablet layouts are unsupported and are not part of this screenshot review.
+An RGB comparison against the previously approved pair found exactly 9,338 changed pixels and 27,968 changed color channels in each image. Both difference bounding boxes were `x=962..1819, y=270..570`. Every pixel outside that box is unchanged. Visual inspection found the changed pixels confined to the intentional Source revision and Build ID text. No new layout, asset, selected-slot, history, or content change appears in either image.
 
-No publication blocker remained. Source revision and Build ID are intentionally visible public-repository provenance, not fixture data or credentials.
-
-The byte checker independently verifies PNG framing, dimensions, sizes, hashes, docs/Wiki byte equality, artifact identity, source revision, and the `PASS` fields recorded here.
+The selected slot remains 57. Its device, serial, persistent ID, health, temperature, pool, vdev, and special-class topology remain consistent across the enclosure, Slot Details, Topology Context, Calibration Mapping, and history panel. The map still contains every bay from 00 through 59 exactly once, with 47 populated and 13 empty bays. The frozen, synthetic, offline wording remains explicit.
 
 Final pixel verdict: `PASS`
+
+Ryoko signs off the two exact PNGs and hashes recorded above. This approval applies only to those bytes. Any recapture resets `pixel_review` to `PENDING` and requires a new named review.

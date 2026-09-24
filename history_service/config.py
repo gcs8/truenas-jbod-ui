@@ -12,6 +12,10 @@ from app.http_auth import configured_origin_identity
 from app.secret_files import load_secret_environment_value
 
 
+DEFAULT_BACKUP_RETENTION_COUNT = 7
+DEFAULT_BACKUP_INTERVAL_SECONDS = 86400
+
+
 def _history_runtime_root() -> Path:
     return Path(__file__).resolve().parents[1] / "history"
 
@@ -45,8 +49,10 @@ class HistorySettings(BaseModel):
     shared_dir_mode: int = Field(default=0o770, ge=0, le=0o777)
     shared_file_mode: int = Field(default=0o660, ge=0, le=0o777)
     backup_dir: str = Field(default_factory=_default_history_backup_dir)
-    backup_retention_count: int = 28
-    backup_interval_seconds: int = 3600
+    # Default footprint: one daily copy kept for a week, plus the promoted
+    # long-term copies below, so at most 14 database-sized files on disk.
+    backup_retention_count: int = Field(default=DEFAULT_BACKUP_RETENTION_COUNT, ge=1, le=365)
+    backup_interval_seconds: int = Field(default=DEFAULT_BACKUP_INTERVAL_SECONDS, ge=0)
     scheduled_backup_status_file: str | None = None
     segmented_backup_max_age_seconds: int = Field(default=36 * 3600, ge=1)
     long_term_backup_dir: str | None = Field(default_factory=_default_history_long_term_backup_dir)
@@ -66,6 +72,8 @@ class HistorySettings(BaseModel):
     hourly_rollup_retention_days: int = Field(default=365, ge=0)
     daily_rollup_retention_days: int = Field(default=1825, ge=0)
     retention_interval_seconds: int = Field(default=3600, ge=1)
+    # How long retention may wait for a usable backup before pruning anyway.
+    retention_backup_skip_max_seconds: int = Field(default=86400, ge=0)
     retention_batch_size: int = Field(default=5000, ge=1)
     retention_max_batches_per_run: int = Field(default=20, ge=1)
     published_bind_address: str = "127.0.0.1"
@@ -170,6 +178,7 @@ ENV_OVERRIDES: dict[str, str] = {
     "HISTORY_HOURLY_ROLLUP_RETENTION_DAYS": "hourly_rollup_retention_days",
     "HISTORY_DAILY_ROLLUP_RETENTION_DAYS": "daily_rollup_retention_days",
     "HISTORY_RETENTION_INTERVAL_SECONDS": "retention_interval_seconds",
+    "HISTORY_RETENTION_BACKUP_SKIP_MAX_SECONDS": "retention_backup_skip_max_seconds",
     "HISTORY_RETENTION_BATCH_SIZE": "retention_batch_size",
     "HISTORY_RETENTION_MAX_BATCHES_PER_RUN": "retention_max_batches_per_run",
     "HISTORY_PUBLISHED_BIND_ADDRESS": "published_bind_address",

@@ -118,6 +118,12 @@ class PerfConfig(BaseModel):
     slow_stage_ms: int = 250
 
 
+# The documented TrueNAS JSON-RPC endpoint paths: /api/current follows the
+# appliance, /api/v25.10.0 pins one release. Anything else is refused rather
+# than concatenated into a request URL.
+TRUENAS_API_VERSION_PATTERN = re.compile(r"(current|v\d+\.\d+\.\d+)")
+
+
 class TrueNASConfig(BaseModel):
     model_config = ConfigDict(hide_input_in_errors=True)
 
@@ -126,11 +132,26 @@ class TrueNASConfig(BaseModel):
     api_user: str = ""
     api_password: str = ""
     platform: Literal["core", "scale", "linux", "quantastor", "esxi", "ipmi"] = "core"
+    # Wire protocol for the middleware websocket. "ddp" is the legacy
+    # /websocket endpoint every CORE and SCALE release exposes; "jsonrpc" is
+    # the JSON-RPC 2.0 API that SCALE 25.04+ documents as supported and that
+    # CORE does not have. The default keeps existing hosts on DDP.
+    api_dialect: Literal["ddp", "jsonrpc"] = "ddp"
+    # Only the jsonrpc dialect reads this: "current" follows the appliance,
+    # "v25.10.0" pins one documented API version.
+    api_version: str = "current"
     verify_ssl: bool = False
     tls_ca_bundle_path: str | None = None
     tls_server_name: str | None = None
     timeout_seconds: int = 15
     enclosure_filter: str | None = None
+
+    @field_validator("api_version", mode="after")
+    @classmethod
+    def _validate_api_version(cls, value: str) -> str:
+        if not TRUENAS_API_VERSION_PATTERN.fullmatch(value):
+            raise ValueError('api_version must be "current" or a pinned version such as "v25.10.0"')
+        return value
 
 
 class HANodeConfig(BaseModel):
@@ -503,6 +524,8 @@ ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
     "TRUENAS_API_USER": ("truenas", "api_user"),
     "TRUENAS_API_PASSWORD": ("truenas", "api_password"),
     "TRUENAS_PLATFORM": ("truenas", "platform"),
+    "TRUENAS_API_DIALECT": ("truenas", "api_dialect"),
+    "TRUENAS_API_VERSION": ("truenas", "api_version"),
     "TRUENAS_VERIFY_SSL": ("truenas", "verify_ssl"),
     "TRUENAS_TLS_CA_BUNDLE_PATH": ("truenas", "tls_ca_bundle_path"),
     "TRUENAS_TLS_SERVER_NAME": ("truenas", "tls_server_name"),
@@ -514,7 +537,6 @@ ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
     "SSH_PORT": ("ssh", "port"),
     "SSH_USER": ("ssh", "user"),
     "SSH_KEY_PATH": ("ssh", "key_path"),
-    "SSH_KNOWN_HOSTS_PATH": ("ssh", "known_hosts_path"),
     "SSH_PASSWORD": ("ssh", "password"),
     "SSH_SUDO_PASSWORD": ("ssh", "sudo_password"),
     "SSH_STRICT_HOST_KEY_CHECKING": ("ssh", "strict_host_key_checking"),
@@ -619,9 +641,7 @@ def _parse_scalar(value: str) -> Any:
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
-    # Copy nested mappings too: later in-place writes to the result (environment
-    # overrides) must not leak back into the defaults they are compared against.
-    merged = {key: _deep_merge(value, {}) if isinstance(value, dict) else value for key, value in base.items()}
+    merged = dict(base)
     for key, value in override.items():
         if isinstance(value, dict) and isinstance(merged.get(key), dict):
             merged[key] = _deep_merge(merged[key], value)
@@ -878,18 +898,14 @@ def _apply_config_path_relative_defaults(
         if key not in merged_paths or merged_paths.get(key) in {defaults["paths"][key], legacy[key]}:
             merged_paths[key] = derived[key]
 
-    # A known-hosts path chosen at the top level (config file or SSH_KNOWN_HOSTS_PATH)
-    # wins; unset, default and legacy container values fall back to the runtime layout.
     merged_ssh = merged.setdefault("ssh", {})
-    if merged_ssh.get("known_hosts_path") in {None, defaults["ssh"]["known_hosts_path"], legacy["known_hosts_path"]}:
-        merged_ssh["known_hosts_path"] = derived["known_hosts_path"]
+    merged_ssh["known_hosts_path"] = derived["known_hosts_path"]
 
-    # Every system pins keys in that one shared file. Older admin versions wrote a
-    # per-system path that was never populated, so a per-system value is not a choice.
     for system_payload in merged.get("systems") or []:
         if not isinstance(system_payload, dict):
             continue
-        system_payload.setdefault("ssh", {})["known_hosts_path"] = merged_ssh["known_hosts_path"]
+        ssh_payload = system_payload.setdefault("ssh", {})
+        ssh_payload["known_hosts_path"] = derived["known_hosts_path"]
 
     return merged
 
