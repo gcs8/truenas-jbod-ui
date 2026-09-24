@@ -3032,10 +3032,8 @@ sys.stdout.flush()
                 {"member": member_path},
             )
 
-    def test_file_backed_large_mapping_preflight_stays_below_eight_mib_heap(self) -> None:
-        member_path = self.temp_dir / "large-valid-mapping.json"
-        payload_bytes = 16_777_353
-        mapping_entries = 106_862
+    def _write_padded_mapping_member(self, member_path: Path, payload_bytes: int, mapping_entries: int) -> None:
+        """A `payload_bytes` JSON member: one padding string, then `mapping_entries` mappings."""
         entry_value = b'{"slot":0}'
         fixed_bytes = (
             len(b'{"padding":"')
@@ -3067,19 +3065,35 @@ sys.stdout.flush()
             output.write(b'}}')
         self.assertEqual(member_path.stat().st_size, payload_bytes)
 
-        heap_probe.start()
-        try:
-            accepted_entries = self.backup_service._validate_streaming_json_member(
-                member_path,
-                "slot_mappings",
-                ManualMapping,
-            )
-            _, peak_bytes = heap_probe.get_traced_memory()
-        finally:
-            heap_probe.stop()
+    def test_file_backed_large_mapping_preflight_heap_is_flat_from_one_to_four_mib(self) -> None:
+        # The preflight streams the member: the padding string is skipped
+        # without being held, and each mapping is validated and dropped. A
+        # reader that materialized either would grow with the member, so the
+        # peak must stay under the 8 MiB budget at both sizes *and* move by
+        # less than 1 MiB while the member grows by 3 MiB and the mapping
+        # count quadruples. (Sixteen MiB with 107k entries proved the same
+        # bound but spent most of the suite's time tracing the padding skip.)
+        peaks: list[int] = []
+        for payload_bytes, mapping_entries in ((1 * 1024 * 1024 + 776, 6_700), (4 * 1024 * 1024 + 200, 26_700)):
+            member_path = self.temp_dir / f"large-valid-mapping-{payload_bytes}.json"
+            self._write_padded_mapping_member(member_path, payload_bytes, mapping_entries)
 
-        self.assertEqual(accepted_entries, mapping_entries)
-        self.assertLess(peak_bytes, 8 * 1024 * 1024)
+            heap_probe.start()
+            try:
+                accepted_entries = self.backup_service._validate_streaming_json_member(
+                    member_path,
+                    "slot_mappings",
+                    ManualMapping,
+                )
+                _, peak_bytes = heap_probe.get_traced_memory()
+            finally:
+                heap_probe.stop()
+
+            self.assertEqual(accepted_entries, mapping_entries)
+            self.assertLess(peak_bytes, 8 * 1024 * 1024)
+            peaks.append(peak_bytes)
+
+        self.assertLess(abs(peaks[1] - peaks[0]), 1024 * 1024)
 
     def test_file_backed_json_rejects_duplicate_mapping_key_across_read_chunks(self) -> None:
         member_path = self.temp_dir / "cross-chunk-duplicate-mapping.json"
