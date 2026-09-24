@@ -70,7 +70,6 @@
       || "",
     operationPromises: {},
     runtimeBehaviorSaving: false,
-    refreshInFlight: false,
     refreshPromise: null,
     refreshQueued: null,
     refreshQueuedQuiet: true,
@@ -5781,7 +5780,6 @@
   }
 
   async function runRefreshState({ quiet = false } = {}) {
-    state.refreshInFlight = true;
     if (elements.refreshStateButton) {
       elements.refreshStateButton.disabled = true;
     }
@@ -5832,7 +5830,6 @@
     } catch (error) {
       setBanner(`Unable to refresh admin state: ${error.message || error}`, "error");
     } finally {
-      state.refreshInFlight = false;
       if (elements.refreshStateButton) {
         elements.refreshStateButton.disabled = false;
       }

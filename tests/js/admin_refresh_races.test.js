@@ -98,7 +98,6 @@ async function flushPromises() {
 
 function baseRefreshState() {
   return {
-    refreshInFlight: false,
     refreshPromise: null,
     refreshQueued: null,
     refreshQueuedQuiet: true,
@@ -183,7 +182,6 @@ test("refreshState coalesces overlapping calls into one queued follow-up instead
   assert.deepEqual(state.systems, [{ id: "new" }], "post-save callers observe the newer state");
   assert.equal(state.refreshPromise, null);
   assert.equal(state.refreshQueued, null);
-  assert.equal(state.refreshInFlight, false);
   assert.ok(
     banners.some(([message, tone]) => tone === "success" && /refreshed/i.test(message)),
     "a non-quiet queued caller still gets the completion banner"
