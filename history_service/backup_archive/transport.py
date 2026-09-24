@@ -560,7 +560,7 @@ def _open_ftp(settings: ArchiveTargetSettings) -> Iterator[FtpTarget]:
     else:
         ftp = ftplib.FTP(timeout=settings.timeout_seconds)
     try:
-        ftp.connect(settings.host, settings.effective_port or 21, timeout=settings.timeout_seconds)
+        ftp.connect(settings.hostname, settings.effective_port or 21, timeout=settings.timeout_seconds)
         ftp.login(settings.username or "anonymous", password)
         if isinstance(ftp, ftplib.FTP_TLS):
             ftp.prot_p()
@@ -736,7 +736,7 @@ def _open_sftp(settings: ArchiveTargetSettings) -> Iterator[SftpTarget]:
     try:
         _sftp_host_key_policy(client, settings)
         client.connect(
-            hostname=settings.host,
+            hostname=settings.hostname,
             port=settings.effective_port or 22,
             username=settings.username,
             password=password,
@@ -863,7 +863,7 @@ def _open_smb(settings: ArchiveTargetSettings) -> Iterator[SmbTarget]:
         username = f"{settings.domain}\\{username}"
     port = settings.effective_port or 445
     client.register_session(
-        settings.host,
+        settings.hostname,
         username=username,
         password=password,
         port=port,
@@ -871,13 +871,13 @@ def _open_smb(settings: ArchiveTargetSettings) -> Iterator[SmbTarget]:
         connection_timeout=settings.timeout_seconds,
     )
     try:
-        base = "\\".join((f"\\\\{settings.host}\\{settings.share}", *normalized_root_parts(settings.root)))
+        base = "\\".join((f"\\\\{settings.hostname}\\{settings.share}", *normalized_root_parts(settings.root)))
         target = SmbTarget(client, base, encrypted=settings.smb_encrypt)
         target._ensure_dir(base)
         yield target
     finally:
         try:
-            client.delete_session(settings.host, port=port)
+            client.delete_session(settings.hostname, port=port)
         except Exception:  # best-effort disconnect; the session cache is per process
             logger.warning("SMB archive session could not be closed cleanly.")
 
@@ -960,7 +960,7 @@ def _open_nfs(settings: ArchiveTargetSettings) -> Iterator[LocalDirectoryTarget]
     options = _nfs_mount_options(settings)
     if options:
         command.extend(["-o", options])
-    command.extend([f"{settings.host}:{settings.export_path}", mount_dir])
+    command.extend([f"{settings.hostname}:{settings.export_path}", mount_dir])
     try:
         _run_mount_command(command, "mount NFS archive")
     except BaseException:

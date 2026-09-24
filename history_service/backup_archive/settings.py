@@ -51,7 +51,7 @@ class ArchiveTargetSettings:
     # App-owned directory (filesystem: absolute local path; ftp/sftp/smb/nfs:
     # path on the server/share/export; s3: key prefix). Never the bare root.
     root: str
-    host: str = ""
+    hostname: str = ""
     port: int | None = None
     username: str = ""
     password_file: str = ""
@@ -85,7 +85,7 @@ class ArchiveTargetSettings:
     def __repr__(self) -> str:  # never render host credentials or paths in bulk logs
         return (
             f"ArchiveTargetSettings(target_id={self.target_id!r}, provider={self.provider!r}, "
-            f"root={self.root!r}, host={self.host!r})"
+            f"root={self.root!r}, hostname={self.hostname!r})"
         )
 
     @property
@@ -140,7 +140,7 @@ def validate_settings(settings: ArchiveTargetSettings) -> None:
     if provider == "filesystem":
         _require(settings.root.startswith("/"), "Filesystem archive root must be an absolute path.")
     if provider in {"ftp", "sftp", "smb", "nfs"}:
-        _require(bool(_HOST_RE.match(settings.host or "")), f"{provider} archive host is required.")
+        _require(bool(_HOST_RE.match(settings.hostname or "")), f"{provider} archive host is required.")
     if provider == "sftp":
         _require(bool(settings.username), "SFTP archive username is required.")
         _require(bool(settings.known_hosts_path), "SFTP archive requires known_hosts_path.")
@@ -152,7 +152,7 @@ def validate_settings(settings: ArchiveTargetSettings) -> None:
         _require(bool(_SHARE_RE.match(settings.share or "")), "SMB archive share is required.")
     if provider == "nfs":
         export_path = settings.export_path or ""
-        _require(export_path.startswith("/"), "NFS archive export path must be absolute, such as /mnt/backups.")
+        _require(export_path.startswith("/"), "NFS archive export path must be absolute, such as /export/backups.")
         _require(
             ".." not in PurePosixPath(export_path).parts and not re.search(r"[\s,\x00]", export_path),
             "NFS archive export path is not allowed.",

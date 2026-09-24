@@ -100,7 +100,7 @@ class SettingsTests(_TempCase):
         for key in ["password", "secret_access_key", "access_key_id"]:
             with self.subTest(key=key), self.assertRaisesRegex(ArchiveConfigError, "_file"):
                 ArchiveTargetSettings.from_mapping(
-                    {"target_id": "t1", "provider": "ftp", "root": "backups", "host": "ftp.example.test", key: "x"}
+                    {"target_id": "t1", "provider": "ftp", "root": "backups", "hostname": "ftp.example.test", key: "x"}
                 )
 
     def test_unknown_setting_is_rejected(self) -> None:
@@ -115,27 +115,27 @@ class SettingsTests(_TempCase):
     def test_provider_specific_requirements(self) -> None:
         with self.assertRaisesRegex(ArchiveConfigError, "known_hosts"):
             ArchiveTargetSettings(
-                target_id="t", provider="sftp", root="b", host="h.example.test", username="u", password_file="/p"
+                target_id="t", provider="sftp", root="b", hostname="h.example.test", username="u", password_file="/p"
             )
         with self.assertRaisesRegex(ArchiveConfigError, "export path"):
-            ArchiveTargetSettings(target_id="t", provider="nfs", root="b", host="h.example.test", export_path="rel")
+            ArchiveTargetSettings(target_id="t", provider="nfs", root="b", hostname="h.example.test", export_path="rel")
         with self.assertRaisesRegex(ArchiveConfigError, "mount options"):
             ArchiveTargetSettings(
                 target_id="t",
                 provider="nfs",
                 root="b",
-                host="h.example.test",
+                hostname="h.example.test",
                 export_path="/export",
                 mount_options="vers=4; rm -rf /",
             )
         with self.assertRaisesRegex(ArchiveConfigError, "S3"):
             ArchiveTargetSettings(target_id="t", provider="s3", root="b", bucket="bucket-one")
         with self.assertRaisesRegex(ArchiveConfigError, "Unsupported"):
-            ArchiveTargetSettings(target_id="t", provider="scp", root="b", host="h.example.test")
+            ArchiveTargetSettings(target_id="t", provider="scp", root="b", hostname="h.example.test")
 
     def test_repr_omits_secret_paths(self) -> None:
         settings = ArchiveTargetSettings(
-            target_id="t", provider="ftp", root="b", host="ftp.example.test", password_file="/run/secrets/ftp-pass"
+            target_id="t", provider="ftp", root="b", hostname="ftp.example.test", password_file="/run/secrets/ftp-pass"
         )
         self.assertNotIn("ftp-pass", repr(settings))
 
@@ -165,19 +165,19 @@ class SettingsTests(_TempCase):
         def make(**kw):
             return ArchiveTargetSettings(target_id="t", root="b", **kw)
 
-        self.assertFalse(transport_encrypted(make(provider="ftp", host="h.example.test")))
-        self.assertTrue(transport_encrypted(make(provider="ftp", host="h.example.test", use_tls=True)))
+        self.assertFalse(transport_encrypted(make(provider="ftp", hostname="h.example.test")))
+        self.assertTrue(transport_encrypted(make(provider="ftp", hostname="h.example.test", use_tls=True)))
         self.assertTrue(
             transport_encrypted(
-                make(provider="sftp", host="h.example.test", username="u", password_file="/p", known_hosts_path="/k")
+                make(provider="sftp", hostname="h.example.test", username="u", password_file="/p", known_hosts_path="/k")
             )
         )
-        self.assertFalse(transport_encrypted(make(provider="smb", host="h.example.test", share="s")))
-        self.assertTrue(transport_encrypted(make(provider="smb", host="h.example.test", share="s", smb_encrypt=True)))
-        self.assertFalse(transport_encrypted(make(provider="nfs", host="h.example.test", export_path="/e")))
+        self.assertFalse(transport_encrypted(make(provider="smb", hostname="h.example.test", share="s")))
+        self.assertTrue(transport_encrypted(make(provider="smb", hostname="h.example.test", share="s", smb_encrypt=True)))
+        self.assertFalse(transport_encrypted(make(provider="nfs", hostname="h.example.test", export_path="/e")))
         self.assertTrue(
             transport_encrypted(
-                make(provider="nfs", host="h.example.test", export_path="/e", mount_options="vers=4.2,sec=krb5p")
+                make(provider="nfs", hostname="h.example.test", export_path="/e", mount_options="vers=4.2,sec=krb5p")
             )
         )
         s3 = {"bucket": "bucket-one", "access_key_id_file": "/a", "secret_access_key_file": "/b"}
@@ -391,7 +391,7 @@ class FtpTargetTests(_TempCase):
             target_id="ftp1",
             provider="ftp",
             root="/pub/jbod-ui",
-            host="ftp.example.test",
+            hostname="ftp.example.test",
             username="backup",
             password_file=self.secret("ftp-pass", "pw"),
             **kw,
@@ -616,7 +616,7 @@ class SftpTargetTests(_TempCase):
             "target_id": "sftp1",
             "provider": "sftp",
             "root": "/srv/backups/jbod-ui",
-            "host": "sftp.example.test",
+            "hostname": "sftp.example.test",
             "username": "backup",
             "password_file": self.secret("sftp-pass", "pw"),
             "known_hosts_path": str(self.known_hosts),
@@ -774,7 +774,7 @@ class SmbTargetTests(_TempCase):
             target_id="smb1",
             provider="smb",
             root="jbod-ui/archive",
-            host="nas.example.test",
+            hostname="nas.example.test",
             share="backups",
             username="backup",
             domain="EXAMPLE",
@@ -872,7 +872,7 @@ class NfsTargetTests(_TempCase):
             target_id="nfs1",
             provider="nfs",
             root="jbod-ui",
-            host="nfs.example.test",
+            hostname="nfs.example.test",
             export_path="/export/backups",
             mount_options="vers=4.2",
             mount_parent=str(self.mount_parent),
