@@ -5287,7 +5287,7 @@ class HistoryStoreTests(unittest.TestCase):
             response = asyncio.run(history_main.healthz())
         payload = json.loads(response.body)
         self.assertEqual(response.status_code, 503)
-        self.assertEqual(payload["status"], "unavailable")
+        self.assertEqual(payload["status"], "down")
         self.assertNotIn(str(temp_dir), json.dumps(payload))
 
     def test_quarantine_intent_write_failure_precedes_every_destructive_move(self) -> None:

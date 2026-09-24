@@ -30,6 +30,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Upgrade notes
 
+- `/healthz` on the main UI answers HTTP 503 (`status: down`) when its data,
+  logs or known-hosts folder is not writable; remote failures stay HTTP 200
+  (`status: degraded`). Compose healthchecks probe `/livez` and are unchanged,
+  but an external monitor using `curl -f /healthz` will now alert on an
+  unwritable folder. History `/healthz` reports `status: down` instead of
+  `unavailable`. (#578)
 - docker-compose.nonroot.yml: Keep this overlay for hardened deployments.
   Image-only upgrades now preserve existing Compose files and wait for healthy
   containers; optional backup defaults match the selected ownership setup. (#426)
@@ -90,6 +96,13 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Kept a dispatched admin mutation with a lost response in the status-unknown
   path even if the browser went offline afterward, and told container-action
   operators to re-check current state before retrying (#553).
+- `/healthz` now has three levels. `ok` and `degraded` answer HTTP 200;
+  `degraded` now also covers SSH and BMC failures and an unavailable or
+  degraded history service, besides the TrueNAS API. `down` answers HTTP 503
+  only for a local fault the container cannot work through: an unwritable data,
+  logs or known-hosts folder, re-checked every 30 seconds so a `chown` clears
+  it without a restart. The history service reports `down` instead of
+  `unavailable` when its database cannot be opened. (#578)
 
 ### Docs
 

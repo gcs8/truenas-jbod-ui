@@ -324,9 +324,13 @@ curl http://your-docker-host:8080/livez
 curl http://your-docker-host:8080/healthz
 ```
 
-`/livez` should answer quickly when the container is alive. `/healthz` is the
-better operator view when the UI is up but a backend, host, cache, or sidecar
-looks suspicious.
+`/livez` should answer quickly when the container is alive; the image
+healthcheck probes it. `/healthz` is the better operator view when the UI is up
+but a backend, host, cache, or sidecar looks suspicious. It answers HTTP 200
+with `status: ok` or `status: degraded` (a remote TrueNAS API, SSH, BMC, or the
+history service is unhealthy), and HTTP 503 with `status: down` only for a local
+fault such as an unwritable data, logs or known-hosts folder. See
+[[Troubleshooting]] for the full table.
 
 ## Optional history sidecar
 

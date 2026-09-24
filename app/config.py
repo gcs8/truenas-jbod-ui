@@ -98,6 +98,33 @@ def known_hosts_placeholder_paths(config_path: str | Path) -> set[str]:
     }
 
 
+def known_hosts_path_for_target(
+    settings: "Settings",
+    *,
+    system_id: str | None = None,
+    target_host: str | None = None,
+) -> str | None:
+    """The known-hosts file a connection to a saved system should use.
+
+    A system may set its own ``ssh.known_hosts_path``; the default system's
+    value is only right for systems that do not. Match the saved system by id
+    first, then by the target host (primary, extra or HA node host), and fall
+    back to the top-level file for unsaved targets.
+    """
+    wanted_id = normalize_text(system_id)
+    wanted_host = (normalize_text(target_host) or "").lower()
+    if wanted_id:
+        for system in settings.systems:
+            if system.id == wanted_id:
+                return system.ssh.known_hosts_path
+    if wanted_host:
+        for system in settings.systems:
+            hosts = [system.ssh.host, *system.ssh.extra_hosts, *(node.host for node in system.ssh.ha_nodes)]
+            if any((normalize_text(candidate) or "").lower() == wanted_host for candidate in hosts):
+                return system.ssh.known_hosts_path
+    return settings.ssh.known_hosts_path
+
+
 def is_placeholder_known_hosts_path(value: Any, placeholders: set[str]) -> bool:
     """True when ``value`` is unset, blank or one of ``placeholders``."""
     if value is None or (isinstance(value, str) and not value.strip()):

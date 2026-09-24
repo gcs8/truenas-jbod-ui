@@ -809,6 +809,31 @@ class KnownHostsPathSettingsTests(unittest.TestCase):
             ["/srv/env/known_hosts"],
         )
 
+    def test_admin_ssh_targets_resolve_the_saved_systems_own_file(self) -> None:
+        from app.config import known_hosts_path_for_target
+
+        temp_root, settings = self._load_settings(
+            [
+                "ssh:",
+                "  known_hosts_path: /srv/default/known_hosts",
+                "systems:",
+                "  - id: primary",
+                "    ssh:",
+                "      host: primary.example.test",
+                "  - id: secondary",
+                "    ssh:",
+                "      host: secondary.example.test",
+                "      extra_hosts: [peer.example.test]",
+                "      known_hosts_path: /srv/secondary/known_hosts",
+            ],
+            {},
+        )
+
+        self.assertEqual(known_hosts_path_for_target(settings, system_id="secondary"), "/srv/secondary/known_hosts")
+        self.assertEqual(known_hosts_path_for_target(settings, target_host="PEER.example.test"), "/srv/secondary/known_hosts")
+        self.assertEqual(known_hosts_path_for_target(settings, system_id="primary"), "/srv/default/known_hosts")
+        self.assertEqual(known_hosts_path_for_target(settings, target_host="new.example.test"), settings.ssh.known_hosts_path)
+
     def test_documentation_advertises_the_override(self) -> None:
         root = Path(__file__).resolve().parents[1]
         for relative in (".env.example", "docs/SSH_READ_ONLY_SETUP.md"):
