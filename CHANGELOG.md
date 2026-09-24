@@ -124,7 +124,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   version, source revision and build ID into a collapsed block, and hid the
   refresh controls and inventory evidence counters in saved copies.
   (#485, #562)
-
+- Reported failed SCALE and QuantaStor enrichment without hiding source
+  disks or leaving SSH status falsely healthy; a SCALE host whose SES
+  discovery succeeds but finds no enclosure device stays healthy and quiet. (#422)
 - Published aggregate disk-retention totals on the inventory summary
   (`source_disk_count`, `rendered_unique_disk_count`,
   `duplicate_disk_view_count`, `unplaced_disk_count`) so a release check can
