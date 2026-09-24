@@ -324,7 +324,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             },
         )
 
-    @router.get("/api/inventory", response_model=InventorySnapshot)
+    @router.get("/api/inventory", response_model=InventoryReadResponse)
     async def get_inventory(
         request: Request,
         force: bool = False,

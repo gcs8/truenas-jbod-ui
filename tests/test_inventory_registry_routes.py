@@ -192,6 +192,20 @@ class UnknownSystemRouteTests(unittest.TestCase):
         self.assertIn("mode", payload["write_policy"])
         self.assertIn("reason", payload["write_policy"])
 
+    def test_inventory_read_schema_describes_write_policy_and_app_version(self) -> None:
+        route = _route(app_main.app, "/api/inventory")
+        self.assertIs(route.response_model, app_main.InventoryReadResponse)
+        fields = app_main.InventoryReadResponse.model_fields
+        self.assertIn("write_policy", fields)
+        self.assertIn("app_version", fields)
+        self.assertFalse(fields["write_policy"].is_required())
+        self.assertFalse(fields["app_version"].is_required())
+        # Saved copies embed a plain snapshot; the live-only fields stay off it.
+        self.assertNotIn("write_policy", app_main.InventorySnapshot.model_fields)
+        properties = app_main.InventoryReadResponse.model_json_schema()["properties"]
+        self.assertIn("write_policy", properties)
+        self.assertIn("app_version", properties)
+
     def test_index_write_policy_names_the_public_origin_only_when_configured(self) -> None:
         request = _request("/")
         previous_origin = getattr(app_main.app.state, "read_ui_public_origin", None)

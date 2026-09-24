@@ -28,7 +28,7 @@ APP_ROUTE_MATRIX = [
     ("/", ("GET",), "index", "starlette.responses.HTMLResponse", None),
     ("/api/upgrade-notice/dismiss", ("POST",), "dismiss_upgrade_notice", "starlette.responses.JSONResponse", None),
     ("/sas-fabric", ("GET",), "sas_fabric_view", "starlette.responses.HTMLResponse", None),
-    ("/api/inventory", ("GET",), "get_inventory", "starlette.responses.JSONResponse", "app.models.domain.InventorySnapshot"),
+    ("/api/inventory", ("GET",), "get_inventory", "starlette.responses.JSONResponse", "app.models.domain.InventoryReadResponse"),
     ("/api/read-ui/auth/verify", ("GET",), "verify_read_ui_credentials", "starlette.responses.JSONResponse", None),
     ("/api/sas-fabric", ("GET",), "get_sas_fabric", "starlette.responses.JSONResponse", "app.models.domain.SasFabricSnapshot"),
     ("/api/sas-fabric/aliases", ("POST",), "save_sas_fabric_alias", "starlette.responses.JSONResponse", None),
