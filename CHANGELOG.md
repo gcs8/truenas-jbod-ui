@@ -488,6 +488,13 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   maintainer owes before changing either — with `tests/test_ci_contract.py`
   reading the pair out of the workflow so the doc cannot drift from the
   enforced values again. (#536)
+- `scripts/update_immutable_deployment.py` and the two Docker-host QA harnesses
+  now refuse on a non-Linux host before doing any work, instead of pulling
+  images or leaving a stale receipt directory behind; the changelog gate now
+  fails with the fix when `## Unreleased` is missing rather than accepting a
+  bullet in a shipped release; `dev_check.py` prints one line per skipped group
+  (`--verbose` lists the suites); and admin maintenance cleanup works on
+  Windows (#561).
 
 ### Performance
 
