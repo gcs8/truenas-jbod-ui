@@ -132,27 +132,50 @@ def _finding_fingerprint(category: str, values: Counter[str]) -> str:
     return f"sha256:{digest}"
 
 
+# Exact pre-filters for the whole-text patterns. Each pattern below can only
+# match when the text contains one of these literals (PRIVATE_POSIX_PATH needs
+# a `/home/`-style prefix, LOCAL_WINDOWS_PATH a drive separator, and
+# INTERNAL_HOST_SUFFIX one of its suffixes), so skipping a text without them
+# changes nothing about the findings, only the time spent. The tracked corpus
+# is over 10 MB and the regex passes dominated this suite's time.
+_PRIVATE_POSIX_PATH_LITERALS = ("/home/", "/Users/", "/mnt/", "/media/", "/Volumes/")
+_LOCAL_WINDOWS_PATH_LITERALS = (":/", ":\\")
+_INTERNAL_HOST_SUFFIX_LITERALS = (".local", ".lan", ".internal")
+
+
+def _may_match(text: str, literals: tuple[str, ...]) -> bool:
+    return any(literal in text for literal in literals)
+
+
 def _scan_text(text: str) -> Counter[tuple[str, str]]:
     values_by_category: dict[str, Counter[str]] = {}
 
     def add(category: str, value: str) -> None:
         values_by_category.setdefault(category, Counter())[value] += 1
 
+    lowered = text.lower()
     for match in IPV4_CANDIDATE.finditer(text):
         if _is_rfc1918(match.group()):
             add("rfc1918_ipv4", match.group())
-    for category, pattern in (
-        ("private_posix_host_path", PRIVATE_POSIX_PATH),
-        ("local_windows_drive_path", LOCAL_WINDOWS_PATH),
-        ("internal_hostname", INTERNAL_HOST_SUFFIX),
-        ("compact_lab_host_id", COMPACT_LAB_HOST_ID),
-        ("sas_wwn_identifier", SAS_WWN_IDENTIFIER),
+    for category, pattern, applicable in (
+        ("private_posix_host_path", PRIVATE_POSIX_PATH, _may_match(text, _PRIVATE_POSIX_PATH_LITERALS)),
+        ("local_windows_drive_path", LOCAL_WINDOWS_PATH, _may_match(text, _LOCAL_WINDOWS_PATH_LITERALS)),
+        ("internal_hostname", INTERNAL_HOST_SUFFIX, _may_match(lowered, _INTERNAL_HOST_SUFFIX_LITERALS)),
+        ("compact_lab_host_id", COMPACT_LAB_HOST_ID, True),
+        ("sas_wwn_identifier", SAS_WWN_IDENTIFIER, True),
     ):
+        if not applicable:
+            continue
         for match in pattern.finditer(text):
             add(category, match.group())
 
     serial_list_indent: int | None = None
     for line in text.splitlines():
+        # The host and serial patterns all need the word "host" or "serial" on
+        # the line; a serial list body is only read while one is open.
+        lowered_line = line.lower()
+        if serial_list_indent is None and "host" not in lowered_line and "serial" not in lowered_line:
+            continue
         host_matches = [match.group(1) for match in HOST_FIELD.finditer(line)]
         yaml_host = YAML_HOST_FIELD.match(line)
         if yaml_host:
