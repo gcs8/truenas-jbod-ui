@@ -477,10 +477,17 @@ async def index(request: Request, exact_counts: bool = Query(default=False)) -> 
 
 @app.get("/healthz")
 async def healthz() -> JSONResponse:
+    """Three-level history health (#429), matching the main UI.
+
+    ``ok`` and ``degraded`` answer HTTP 200: a failed collection pass usually
+    means a monitored system is unreachable, which is outside this container.
+    ``down`` answers HTTP 503 only when the history database could not be
+    opened, a local fault the service cannot operate through.
+    """
     if startup_failure_reason is not None or collector is None or store is None:
         return JSONResponse(
             {
-                "status": "unavailable",
+                "status": "down",
                 "detail": HISTORY_UNAVAILABLE_DETAIL,
                 "reason": startup_failure_reason,
             },
