@@ -817,4 +817,3 @@ class KnownHostsPathSettingsTests(unittest.TestCase):
                     "SSH_KNOWN_HOSTS_PATH" in (root / relative).read_text(encoding="utf-8"),
                     f"{relative} must document SSH_KNOWN_HOSTS_PATH",
                 )
-
