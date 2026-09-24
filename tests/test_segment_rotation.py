@@ -33,7 +33,8 @@ class SimulatedRotationCrash(BaseException):
 # still holds WAL frames only reports that refusal after the full wait. The tests
 # below prove the refusal, not the wait, so they shorten the wait while the reader
 # is deliberately held open. The product default is untouched.
-_SHORT_CHECKPOINT_BUSY_WAIT = patch.object(system_backup, "SQLITE_CONNECT_TIMEOUT_SECONDS", 0.05)
+def _short_checkpoint_busy_wait():
+    return patch.object(system_backup, "SQLITE_CONNECT_TIMEOUT_SECONDS", 0.05)
 
 
 class LaterGenerationRotationRedTests(unittest.TestCase):
@@ -1832,7 +1833,7 @@ class LaterGenerationRotationRedTests(unittest.TestCase):
                 writer.commit()
                 self.assertGreater(wal_path.stat().st_size, 0)
 
-                with _SHORT_CHECKPOINT_BUSY_WAIT, self.assertRaisesRegex(ValueError, "cannot be checkpointed"):
+                with _short_checkpoint_busy_wait(), self.assertRaisesRegex(ValueError, "cannot be checkpointed"):
                     _ImportActivationTransaction._checkpoint_hot_database(hot_path)
                 self.assertGreater(wal_path.stat().st_size, 0)
 
@@ -1937,7 +1938,7 @@ class LaterGenerationRotationRedTests(unittest.TestCase):
                     )
                     self.assertGreater(wal_path.stat().st_size, 0)
 
-                    with _SHORT_CHECKPOINT_BUSY_WAIT, self.assertRaisesRegex(ValueError, "cannot be checkpointed"):
+                    with _short_checkpoint_busy_wait(), self.assertRaisesRegex(ValueError, "cannot be checkpointed"):
                         target_service.import_bundle(artifact.path.read_bytes())
 
                     self.assertGreater(wal_path.stat().st_size, 0)
