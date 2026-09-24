@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import http.client
 import os
+import shutil
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -195,6 +197,27 @@ class MaintenanceQuiesceTests(unittest.TestCase):
 
         self.assertLess(events.index("preflight"), events.index("stop:ui"))
         self.assertLess(events.index("stop:history"), events.index("import"))
+
+    def test_file_import_cleanup_makes_the_staged_snapshot_writable_before_removing_it(self) -> None:
+        observed: dict[str, bool] = {}
+        real_rmtree = shutil.rmtree
+
+        def rmtree(path: str | Path, *args: Any, **kwargs: Any) -> None:
+            snapshot = Path(path) / "bundle.archive"
+            observed["writable"] = bool(snapshot.stat().st_mode & stat.S_IWUSR)
+            real_rmtree(path, *args, **kwargs)
+
+        backup = FakeBackupService()
+        backup.inspect_bundle_file = lambda *_args, **_kwargs: None  # type: ignore[attr-defined]
+        backup.import_bundle_from_file = lambda *_args, **_kwargs: {"ok": True}  # type: ignore[attr-defined]
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            archive_path = Path(temporary_directory) / "synthetic.archive"
+            archive_path.write_bytes(b"synthetic")
+            with patch("admin_service.services.maintenance.shutil.rmtree", side_effect=rmtree):
+                build_service(FakeRuntimeService(["ui", "history"]), backup).import_bundle_from_file(archive_path)
+
+        self.assertIs(observed.get("writable"), True)
 
     def test_stop_error_after_effect_recovers_complete_initial_running_state(self) -> None:
         class EffectThenErrorRuntime(FakeRuntimeService):

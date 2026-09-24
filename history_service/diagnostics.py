@@ -50,6 +50,10 @@ RETENTION_FAILURE_SENTENCES: dict[str, str] = {
     "database_locked": "The history database was locked by another writer.",
     "permission_denied": "The history service may not write its database directory.",
     "missing_database": "The history database file is missing.",
+    "backup_status_mode": (
+        "The scheduled backup status file has unsafe permissions (expected 0640); "
+        "segmented cleanup waits until it is fixed."
+    ),
 }
 
 # Ordered most specific first; matched against the lowercased exception text.

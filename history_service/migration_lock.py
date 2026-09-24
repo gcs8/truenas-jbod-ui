@@ -41,11 +41,6 @@ def lock_address_cache_size() -> int:
         return len(_lock_address_cache)
 
 
-def history_lock_path(database_path: Path) -> Path:
-    """Return the retired filesystem lock path for cleanup and compatibility checks."""
-    return Path(f"{database_path}.migration.lock")
-
-
 def _decode_mountinfo_path(value: str) -> str:
     return (
         value.replace("\\040", " ")

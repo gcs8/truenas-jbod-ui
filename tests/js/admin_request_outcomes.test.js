@@ -181,7 +181,8 @@ test("a 422 is a validation outcome that names the input", async () => {
 
   assert.equal(error.adminOutcome, "validation");
   assert.equal(error.outcomeUnknown, false);
-  assert.ok(error.message.includes("body.label: field required"), error.message);
+  // #487 maps pydantic locations to the form label the user sees.
+  assert.ok(error.message.includes("Name: field required"), error.message);
   assert.ok(/correct the submitted values/i.test(error.message), error.message);
 });
 
