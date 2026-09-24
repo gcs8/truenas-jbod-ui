@@ -100,12 +100,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Reported an unknown `system_id` on the main page instead of silently
   showing the default system, and mapped service errors to responses from one
   table with a 5-second retry hint for busy exports. (#475)
-
 - Drew TrueNAS CORE bays from the count the enclosure reports instead of
   always using the 60-bay CSE-946 face, listed small SES enclosures on CORE,
   stopped the false SES warning on SCALE hosts without an expander, and kept
   descriptor text from marking empty bays present or faulty. (#482)
-
 - The main UI now checks at startup that it can write its data, logs and
   known-hosts directories, logs one plain line per refusal naming the fix,
   and shows it first in the Warnings panel. `/healthz` gains a plain `summary`
@@ -116,6 +114,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   stopped admin leaves a disabled System Setup button with the start command
   instead of the button vanishing. (#565)
 
+- Reported failed SCALE and QuantaStor enrichment without hiding source
+  disks or leaving SSH status falsely healthy; a SCALE host whose SES
+  discovery succeeds but finds no enclosure device stays healthy and quiet. (#422)
 - Published aggregate disk-retention totals on the inventory summary
   (`source_disk_count`, `rendered_unique_disk_count`,
   `duplicate_disk_view_count`, `unplaced_disk_count`) so a release check can
@@ -287,6 +288,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 - Preserved history availability, scope identity and outage errors across
   bulk responses and offline exports. (#423)
+- Removed invented physical backplanes and bay labels from virtual inventories.
+  Logical disk paths and known physical aliases were preserved. (#419)
 
 ### Performance
 

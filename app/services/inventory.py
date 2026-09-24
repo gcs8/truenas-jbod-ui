@@ -2982,10 +2982,15 @@ class InventoryService:
                 )
             else:
                 scale_ses_loaded = bool(scale_ses_data.ses_enclosures)
-                warnings.extend(scale_ses_failures)
+                if not scale_ses_loaded and not scale_ses_failures and raw_data.enclosures:
+                    # SES was expected: the TrueNAS API reports enclosures but
+                    # SSH found none. Absence without that evidence stays quiet.
+                    scale_ses_failures.append(self._scale_expected_ses_missing_failure())
+            warnings.extend(scale_ses_failures)
 
             if scale_ses_loaded:
                 warnings, ssh_failures = self._suppress_scale_configured_sg_ses_failures(warnings, ssh_failures)
+            if scale_ses_loaded or scale_ses_failures:
                 sources["ssh"] = SourceStatus(
                     enabled=True,
                     ok=not ssh_failures and not scale_ses_failures,
@@ -2995,11 +3000,6 @@ class InventoryService:
                         else "SCALE SES rediscovery completed with some failures."
                     ),
                 )
-            elif not scale_ses_failures and raw_data.enclosures:
-                # Finding no SES expander is the normal outcome on a plain
-                # HBA or SATA build. It is only worth a note when the API
-                # reported enclosures, so SES bay positions were expected.
-                warnings.append(self._scale_no_ses_over_ssh_note())
 
         if self.system.truenas.platform == "quantastor" and ssh_collected:
             try:
@@ -3023,7 +3023,7 @@ class InventoryService:
                         raw_data.cli_network_ports,
                     )
                 )
-                warnings.extend(quantastor_cli_failures)
+            warnings.extend(quantastor_cli_failures)
 
             try:
                 with perf_stage("inventory.quantastor.fetch_ses_overlay"):
@@ -3031,13 +3031,20 @@ class InventoryService:
             except Exception:
                 logger.exception("Failed to collect Quantastor SES diagnostics")
                 quantastor_ses_failures.append(
-                    "Quantastor SSH SES enrichment failed unexpectedly. REST and CLI slot truth is still being used."
+                    "Quantastor SSH SES enrichment failed unexpectedly. Available REST and CLI data is still being used."
                 )
             else:
                 quantastor_ses_loaded = bool(quantastor_ses_data.ses_enclosures)
-                warnings.extend(quantastor_ses_failures)
+            warnings.extend(quantastor_ses_failures)
 
-            if quantastor_cli_loaded:
+            # Failed attempts matter even when they contributed no overlay rows.
+            if quantastor_cli_failures or quantastor_ses_failures:
+                sources["ssh"] = SourceStatus(
+                    enabled=True,
+                    ok=False,
+                    message="Quantastor CLI/SES enrichment completed with some failures.",
+                )
+            elif quantastor_cli_loaded:
                 sources["ssh"] = SourceStatus(
                     enabled=True,
                     ok=not ssh_failures and not quantastor_cli_failures and not quantastor_ses_failures,
@@ -8835,6 +8842,7 @@ class InventoryService:
         overlay, failures, best_host = await self._fetch_sg_ses_overlay(
             self._build_scale_ssh_hosts(),
             failure_prefix="TrueNAS SCALE SSH SES",
+            report_empty_discovery=False,
         )
         if best_host:
             self._scale_preferred_ses_host = best_host
@@ -8891,6 +8899,7 @@ class InventoryService:
         host: str,
         *,
         failure_prefix: str,
+        report_empty_discovery: bool = True,
     ) -> tuple[list[str], ParsedSSHData, list[str]]:
         discovery_command = self._build_sg_ses_discovery_command()
 
@@ -8935,8 +8944,17 @@ class InventoryService:
 
         devices = self._parse_sg_ses_discovery_devices(discovery_result.stdout)
         if not devices:
-            logger.info("%s discovery found no sg_ses devices on %s.", failure_prefix, host)
-            return [], ParsedSSHData(), []
+            if not report_empty_discovery:
+                # Discovery ran and found no SES device. On a host with a
+                # plain HBA that is the normal answer, not a failure; the
+                # caller decides whether enclosure evidence was expected.
+                logger.info("%s discovery found no sg_ses devices on %s.", failure_prefix, host)
+                return [], ParsedSSHData(), []
+            return (
+                [],
+                ParsedSSHData(),
+                [f"{failure_prefix} discovery found no usable sg_ses devices on {host}."],
+            )
         page_results = [result for result in results if result.command != discovery_command]
         overlay, failures = await self._fetch_sg_ses_host_overlay(
             host,
@@ -9012,6 +9030,7 @@ class InventoryService:
         *,
         failure_prefix: str,
         merge_hosts: bool = False,
+        report_empty_discovery: bool = True,
     ) -> tuple[ParsedSSHData, list[str], str | None]:
         best_overlay = ParsedSSHData()
         best_score = 0
@@ -9044,6 +9063,7 @@ class InventoryService:
             devices, host_overlay, host_failures = await self._discover_and_fetch_sg_ses_host_overlay(
                 host,
                 failure_prefix=failure_prefix,
+                report_empty_discovery=report_empty_discovery,
             )
             if not devices:
                 failures.extend(host_failures)
@@ -9070,10 +9090,11 @@ class InventoryService:
             best_overlay = self._augment_ses_targets_from_redundant_hosts(best_overlay, successful_overlays)
         return best_overlay, best_failures, best_host
 
-    def _scale_no_ses_over_ssh_note(self) -> str:
+    def _scale_expected_ses_missing_failure(self) -> str:
         hosts = ", ".join(self._build_scale_ssh_hosts()) or "this system"
         return (
-            f"No SES enclosure was found over SSH on {hosts}, so bay positions come from the TrueNAS API only."
+            f"No SES enclosure was found over SSH on {hosts}, although the TrueNAS API reports "
+            "enclosures, so bay positions come from the TrueNAS API only."
         )
 
     def _build_scale_ssh_hosts(self) -> list[str]:

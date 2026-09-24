@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
+import itertools
 import inspect
 import json
 import tempfile
@@ -104,6 +106,169 @@ def build_inventory_service(
         ProfileRegistry(settings),
         SlotDetailStore(str(Path(temp_dir) / "slot_detail_cache.json")),
     )
+
+
+OVERLAY_STATUS_MODES = ("throw", "empty_failure", "rows_failure", "success", "empty_success")
+
+
+class InventoryOverlayStatusTests(unittest.IsolatedAsyncioTestCase):
+    def make_service(self, platform):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        raw = TrueNASRawData(
+            enclosures=[],
+            disks=[{"name": "sda", "serial": "SYNTHETIC-DISK"}],
+            pools=[{"name": "synthetic-pool"}],
+            disk_temperatures={"sda": 30},
+            smart_test_results=[],
+        )
+        system = SystemConfig(
+            id="synthetic-overlay",
+            truenas=TrueNASConfig(platform=platform),
+            ssh=SSHConfig(enabled=True, host="192.0.2.10", commands=[]),
+            bmc=BMCConfig(enabled=True, host="192.0.2.11"),
+        )
+        api = AsyncMock()
+        api.fetch_all.return_value = raw
+        ssh = AsyncMock()
+        ssh.run_planned_commands.return_value = [
+            SSHCommandResult(command="synthetic-base", ok=True, stdout="base-output", exit_code=0)
+        ]
+        bmc = MagicMock()
+        bmc.fetch_inventory.return_value = BMCInventory(system_model="Synthetic model")
+        service = build_inventory_service(Settings(), system, api, ssh, directory.name, bmc)
+        return service, raw, bmc.fetch_inventory.return_value
+
+    def overlay(self, mode, label, *, cli=False):
+        loaded = mode in {"success", "rows_failure"}
+        data = (
+            {"cli_disks": [{"id": "synthetic-cli-disk"}] if loaded else []}
+            if cli else ParsedSSHData(
+                ses_enclosures=[SESMapEnclosure(enclosure_id="synthetic-ses", slots={})] if loaded else []
+            )
+        )
+        if mode == "throw":
+            return AsyncMock(side_effect=RuntimeError("SYNTHETIC-SECRET\n" * 1000))
+        failures = [f"{label} returned a synthetic failure."] if mode.endswith("failure") else []
+        return AsyncMock(return_value=(data, failures))
+
+    def assert_preserved(self, bundle, raw, original, bmc):
+        self.assertIs(bundle.raw_data, raw)
+        for field in ("disks", "pools", "disk_temperatures", "smart_test_results", "enclosures"):
+            self.assertEqual(getattr(bundle.raw_data, field), getattr(original, field))
+        self.assertTrue(bundle.sources["api"].ok)
+        self.assertTrue(bundle.sources["bmc"].ok)
+        self.assertEqual(bundle.sources["bmc"].message, "BMC / IPMI inventory reachable.")
+        self.assertIs(bundle.bmc_inventory, bmc)
+        self.assertTrue(bundle.ssh_collected)
+        self.assertEqual(bundle.ssh_outputs, {"synthetic-base": "base-output"})
+        for text in [bundle.sources["ssh"].message or "", *bundle.warnings]:
+            self.assertNotIn("SYNTHETIC-SECRET", text)
+            self.assertNotIn("\n", text)
+            self.assertLessEqual(len(text), 400)
+
+    async def test_scale_overlay_health_does_not_depend_on_rows(self):
+        for mode in OVERLAY_STATUS_MODES:
+            with self.subTest(mode=mode):
+                service, raw, bmc = self.make_service("scale")
+                original = copy.deepcopy(raw)
+                service._fetch_scale_ses_overlay = self.overlay(mode, "SCALE SES")
+                with patch("app.services.inventory.logger.exception"):
+                    bundle = await service._collect_inventory_source_bundle()
+                self.assert_preserved(bundle, raw, original, bmc)
+                failed = mode in {"throw", "empty_failure", "rows_failure"}
+                with self.subTest(check="status"):
+                    self.assertEqual(bundle.sources["ssh"].ok, not failed)
+                    if failed:
+                        self.assertIn("failures", bundle.sources["ssh"].message)
+                with self.subTest(check="warnings"):
+                    self.assertEqual(len(bundle.warnings), int(failed))
+                    if mode.endswith("failure"):
+                        self.assertIn("SCALE SES returned a synthetic failure.", bundle.warnings)
+                self.assertEqual(bool(bundle.scale_ses_data.ses_enclosures), mode in {"success", "rows_failure"})
+
+    async def test_quantastor_overlay_health_combines_cli_and_ses_outcomes(self):
+        for cli_mode, ses_mode in itertools.product(OVERLAY_STATUS_MODES, repeat=2):
+            with self.subTest(cli=cli_mode, ses=ses_mode):
+                service, raw, bmc = self.make_service("quantastor")
+                original = copy.deepcopy(raw)
+                service._fetch_quantastor_cli_overlay = self.overlay(cli_mode, "Quantastor CLI", cli=True)
+                service._fetch_quantastor_ses_overlay = self.overlay(ses_mode, "Quantastor SES")
+                with patch("app.services.inventory.logger.exception"):
+                    bundle = await service._collect_inventory_source_bundle()
+                self.assert_preserved(bundle, raw, original, bmc)
+                failures = [mode in {"throw", "empty_failure", "rows_failure"} for mode in (cli_mode, ses_mode)]
+                with self.subTest(check="status"):
+                    self.assertEqual(bundle.sources["ssh"].ok, not any(failures))
+                    if any(failures):
+                        self.assertIn("failures", bundle.sources["ssh"].message)
+                with self.subTest(check="warnings"):
+                    self.assertEqual(len(bundle.warnings), sum(failures))
+                    for mode, label in ((cli_mode, "Quantastor CLI"), (ses_mode, "Quantastor SES")):
+                        if mode.endswith("failure"):
+                            self.assertIn(f"{label} returned a synthetic failure.", bundle.warnings)
+                if ses_mode == "throw" and cli_mode in {"throw", "empty_failure", "empty_success"}:
+                    self.assertFalse(any("CLI slot truth" in warning for warning in bundle.warnings))
+                self.assertEqual(bool(raw.cli_disks), cli_mode in {"success", "rows_failure"})
+                self.assertEqual(bool(bundle.quantastor_ses_data.ses_enclosures), ses_mode in {"success", "rows_failure"})
+
+    async def _scale_bundle_with_discovery(self, discovery_ok, stdout, *, api_enclosures):
+        service, raw, _ = self.make_service("scale")
+        if api_enclosures:
+            raw.enclosures = [{"id": "synthetic-api-enclosure", "elements": []}]
+        discovery_command = service._build_sg_ses_discovery_command()
+
+        async def run_planned(planner, *, initial_commands, host=None):
+            return [
+                SSHCommandResult(
+                    command=discovery_command,
+                    ok=discovery_ok,
+                    stdout=stdout,
+                    stderr="" if discovery_ok else "synthetic discovery failure",
+                    exit_code=0 if discovery_ok else 1,
+                )
+            ]
+
+        service._run_ssh_planned_commands = AsyncMock(side_effect=run_planned)
+        return await service._collect_inventory_source_bundle()
+
+    async def test_scale_successful_discovery_with_no_ses_devices_stays_healthy_without_api_enclosures(self):
+        bundle = await self._scale_bundle_with_discovery(True, "", api_enclosures=False)
+        self.assertTrue(bundle.sources["ssh"].ok)
+        self.assertEqual(bundle.warnings, [])
+
+    async def test_scale_no_ses_devices_is_degraded_when_the_api_reports_enclosures(self):
+        bundle = await self._scale_bundle_with_discovery(True, "", api_enclosures=True)
+        self.assertFalse(bundle.sources["ssh"].ok)
+        self.assertEqual(len(bundle.warnings), 1)
+        self.assertIn("No SES enclosure was found over SSH on 192.0.2.10", bundle.warnings[0])
+        self.assertIn("TrueNAS API reports enclosures", bundle.warnings[0])
+
+    async def test_scale_failed_ses_discovery_command_stays_degraded(self):
+        for api_enclosures in (False, True):
+            with self.subTest(api_enclosures=api_enclosures):
+                bundle = await self._scale_bundle_with_discovery(False, "", api_enclosures=api_enclosures)
+                self.assertFalse(bundle.sources["ssh"].ok)
+                self.assertTrue(
+                    any("discovery failed on 192.0.2.10" in warning for warning in bundle.warnings),
+                    bundle.warnings,
+                )
+
+    async def test_successful_overlays_do_not_erase_unrelated_base_ssh_failures(self):
+        for platform in ("scale", "quantastor"):
+            with self.subTest(platform=platform):
+                service, _, _ = self.make_service(platform)
+                service.ssh_probe.run_planned_commands.return_value.append(
+                    SSHCommandResult(command="synthetic-failed-base", ok=False, stdout="", exit_code=1)
+                )
+                service._fetch_scale_ses_overlay = self.overlay("success", "SCALE SES")
+                service._fetch_quantastor_cli_overlay = self.overlay("success", "Quantastor CLI", cli=True)
+                service._fetch_quantastor_ses_overlay = self.overlay("success", "Quantastor SES")
+                bundle = await service._collect_inventory_source_bundle()
+                self.assertFalse(bundle.sources["ssh"].ok)
+                self.assertTrue(any("synthetic-failed-base" in warning for warning in bundle.warnings))
+                self.assertTrue(bundle.sources["api"].ok)
+                self.assertTrue(bundle.sources["bmc"].ok)
 
 
 class InventoryHelpersTests(unittest.TestCase):
@@ -17132,16 +17297,20 @@ class InventoryDefaultRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(bundle.sources["ssh"].ok)
         self.assertFalse(bundle.scale_ses_data.ses_enclosures)
 
-    async def test_scale_with_api_enclosures_but_no_ses_over_ssh_gets_a_plain_note(self) -> None:
+    async def test_scale_with_api_enclosures_but_no_ses_over_ssh_is_degraded_with_a_plain_note(self) -> None:
+        # Expected enclosure evidence that SSH cannot find stays degraded (#422, #449).
         with tempfile.TemporaryDirectory() as temp_dir:
             service = self._scale_service(temp_dir, enclosures=[{"id": "enc-1", "name": "Shelf", "elements": []}])
             bundle = await service._collect_inventory_source_bundle()
 
         self.assertEqual(
             bundle.warnings,
-            ["No SES enclosure was found over SSH on 192.0.2.10, so bay positions come from the TrueNAS API only."],
+            [
+                "No SES enclosure was found over SSH on 192.0.2.10, although the TrueNAS API reports "
+                "enclosures, so bay positions come from the TrueNAS API only."
+            ],
         )
-        self.assertTrue(bundle.sources["ssh"].ok)
+        self.assertFalse(bundle.sources["ssh"].ok)
 
     def test_descriptor_text_cannot_flip_an_empty_bay_to_fault(self) -> None:
         service = self._bare_service()
