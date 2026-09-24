@@ -10,6 +10,13 @@ Storage is a small SQLite database in a private directory (WAL journal, a
 ``tombstones`` with the time, reason and actor, and pin/unpin actions are kept
 in ``preserve_events``, so the history of what was removed and why stays
 auditable after the artifact itself is gone.
+
+Deleting a stored object is a three-step protocol so a pin can never race a
+deletion: ``claim_deletion`` atomically re-checks the record and marks it as
+being deleted (``set_preserve`` refuses while a claim is held), the caller
+removes the object, then ``record_deletion`` tombstones it or
+``release_deletion`` drops the claim. A claim left by a crash stays visible in
+``claimed_deletions()`` and keeps the artifact out of later plans.
 """
 
 from __future__ import annotations
@@ -62,6 +69,8 @@ _SCHEMA = (
         preserve_reason TEXT NOT NULL DEFAULT '',
         preserved_by TEXT NOT NULL DEFAULT '',
         preserved_at TEXT,
+        deletion_claimed_at TEXT,
+        deletion_claimed_by TEXT NOT NULL DEFAULT '',
         cataloged_at TEXT NOT NULL,
         UNIQUE (location, name)
     )
@@ -101,6 +110,15 @@ _SCHEMA = (
 
 class CatalogError(ValueError):
     """The catalog refused an operation (bad input, unknown or duplicate id)."""
+
+
+def _newest_verified_id(connection: sqlite3.Connection, backup_class: str, location: str) -> str | None:
+    row = connection.execute(
+        "SELECT artifact_id FROM artifacts WHERE backup_class = ? AND location = ? AND verified = 1 "
+        "ORDER BY created_at DESC, artifact_id DESC LIMIT 1",
+        (backup_class, location),
+    ).fetchone()
+    return None if row is None else row[0]
 
 
 @dataclass(frozen=True, slots=True)
@@ -435,6 +453,10 @@ class ArtifactCatalog:
         stamp = _timestamp_text(now or datetime.now(timezone.utc))
         with self._write() as connection:
             self._require_live(connection, artifact_id)
+            if connection.execute(
+                "SELECT deletion_claimed_at FROM artifacts WHERE artifact_id = ?", (artifact_id,)
+            ).fetchone()[0] is not None:
+                raise CatalogError("Artifact is being deleted and can no longer be preserved.")
             connection.execute(
                 "UPDATE artifacts SET preserved = 1, preserve_reason = ?, preserved_by = ?, "
                 "preserved_at = ? WHERE artifact_id = ?",
@@ -508,6 +530,74 @@ class ArtifactCatalog:
             )
         return self.get(artifact_id)  # type: ignore[return-value]
 
+    def claim_deletion(
+        self,
+        expected: ArtifactRecord,
+        *,
+        actor: str,
+        now: datetime | None = None,
+        protect_newest_verified: bool = True,
+    ) -> None:
+        """Atomically check ``expected`` is still current and deletable, and claim it.
+
+        Refused when the record changed (for example it was pinned), is
+        preserved, is already claimed, or (by default) is the newest verified
+        copy of its class at its location.
+        """
+
+        actor = _require_text(actor, label="Actor", required=True)
+        stamp = _timestamp_text(now or datetime.now(timezone.utc))
+        with self._write() as connection:
+            row = connection.execute(
+                f"SELECT {self._COLUMNS}, deletion_claimed_at FROM artifacts WHERE artifact_id = ?",
+                (expected.artifact_id,),
+            ).fetchone()
+            if row is None:
+                raise CatalogError("Artifact is no longer catalogued.")
+            if row[-1] is not None:
+                raise CatalogError("Artifact deletion is already claimed.")
+            current = self._record_from_row(row[:-1])
+            if current != expected:
+                raise CatalogError("Artifact changed since the plan was made.")
+            if current.preserved:
+                raise CatalogError("Artifact is preserved.")
+            if protect_newest_verified and _newest_verified_id(
+                connection, current.backup_class, current.location
+            ) == current.artifact_id:
+                raise CatalogError("Artifact is the newest verified copy.")
+            connection.execute(
+                "UPDATE artifacts SET deletion_claimed_at = ?, deletion_claimed_by = ? "
+                "WHERE artifact_id = ?",
+                (stamp, actor, current.artifact_id),
+            )
+
+    def release_deletion(self, artifact_id: str) -> None:
+        """Drop a deletion claim after the object could not be removed."""
+
+        with self._write() as connection:
+            connection.execute(
+                "UPDATE artifacts SET deletion_claimed_at = NULL, deletion_claimed_by = '' "
+                "WHERE artifact_id = ?",
+                (artifact_id,),
+            )
+
+    def claimed_deletions(self) -> list[tuple[ArtifactRecord, datetime, str]]:
+        """Records whose deletion was claimed but not finished (e.g. after a crash)."""
+
+        with self._lock:
+            rows = self._connection.execute(
+                f"SELECT {self._COLUMNS}, deletion_claimed_at, deletion_claimed_by FROM artifacts "
+                "WHERE deletion_claimed_at IS NOT NULL ORDER BY created_at, artifact_id"
+            ).fetchall()
+        return [(self._record_from_row(row[:-2]), _timestamp_value(row[-2]), row[-1]) for row in rows]
+
+    def is_deletion_claimed(self, artifact_id: str) -> bool:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT deletion_claimed_at FROM artifacts WHERE artifact_id = ?", (artifact_id,)
+            ).fetchone()
+        return row is not None and row[0] is not None
+
     def record_deletion(
         self,
         artifact_id: str,
@@ -531,6 +621,9 @@ class ArtifactCatalog:
             record = self._record_from_row(row)
             if expected is not None and record != expected:
                 raise CatalogError("Artifact changed since it was planned for deletion.")
+            if record.preserved:
+                # Tombstones never hold pinned copies: unpin first, which is audited.
+                raise CatalogError("Artifact is preserved; clear the preserve flag before deleting it.")
             connection.execute(
                 "INSERT INTO tombstones (artifact_id, backup_class, location, name, created_at, "
                 "size, sha256, verified, change_ids, deleted_at, reason, actor) "

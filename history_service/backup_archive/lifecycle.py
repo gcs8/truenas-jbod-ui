@@ -188,7 +188,7 @@ class LifecycleManager:
                     f"older than max_age {_describe(rule.max_age)} "
                     f"(age {_describe(now - record.created_at)})"
                 )
-            if not reasons:
+            if not reasons or self.catalog.is_deletion_claimed(record.artifact_id):
                 continue
             item = PlanItem(record=record, reason="; ".join(reasons), kind="retention")
             if newest_verified is not None and record.artifact_id == newest_verified.artifact_id:
@@ -196,7 +196,7 @@ class LifecycleManager:
             else:
                 items.append(item)
         for record in records:
-            if record.verified or record.preserved:
+            if record.verified or record.preserved or self.catalog.is_deletion_claimed(record.artifact_id):
                 continue
             age = now - record.created_at
             if age > self.unverified_grace:
@@ -230,15 +230,6 @@ class LifecycleManager:
 
     # -- applying ------------------------------------------------------------
 
-    def _is_newest_verified(self, record: ArtifactRecord) -> bool:
-        verified = [
-            candidate
-            for candidate in self.catalog.list(backup_class=record.backup_class, location=record.location)
-            if candidate.verified
-        ]
-        newest = max(verified, key=lambda candidate: (candidate.created_at, candidate.artifact_id), default=None)
-        return newest is not None and newest.artifact_id == record.artifact_id
-
     def apply(
         self,
         plan: GroomingPlan,
@@ -249,10 +240,12 @@ class LifecycleManager:
     ) -> ApplyResult:
         """Delete exactly ``plan.items`` in order, tombstoning each one.
 
-        Before each deletion the catalog record must still equal the planned
-        record (so a copy pinned after planning is not deleted) and must not
-        have become the newest verified copy. An object already gone from its
-        location is tombstoned as missing. Any other failure stops the run.
+        Before each deletion the catalog atomically claims the record: it must
+        still equal the planned record (so a copy pinned after planning is not
+        deleted) and must not have become the newest verified copy, and while
+        the claim is held it cannot be pinned. An object already gone from its
+        location is tombstoned as missing. Any other failure releases the claim
+        and stops the run.
         """
 
         clock = now or (lambda: datetime.now(timezone.utc))
@@ -273,21 +266,21 @@ class LifecycleManager:
                 )
 
             try:
-                current = self.catalog.get(record.artifact_id)
-                if current is None:
-                    return stop("Artifact is no longer catalogued.")
-                if current != record:
-                    return stop("Artifact changed since the plan was made.")
-                if self._is_newest_verified(current):
-                    return stop("Artifact is now the newest verified copy.")
                 if record.location not in targets:
                     targets[record.location] = target_resolver(record.location)
                 target = targets[record.location]
-                gone = False
-                try:
-                    target.delete(record.name)
-                except FileNotFoundError:
-                    gone = True
+                self.catalog.claim_deletion(record, actor=actor, now=clock())
+            except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+                return stop(f"{type(exc).__name__}: {exc}")
+            gone = False
+            try:
+                target.delete(record.name)
+            except FileNotFoundError:
+                gone = True
+            except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+                self.catalog.release_deletion(record.artifact_id)
+                return stop(f"{type(exc).__name__}: {exc}")
+            try:
                 reason = f"{item.kind}: {item.reason}"
                 if gone:
                     reason += "; object was already missing"

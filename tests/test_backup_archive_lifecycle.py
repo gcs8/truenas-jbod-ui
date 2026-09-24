@@ -406,7 +406,7 @@ class LifecycleApplyTests(CatalogCase):
         self.catalog.set_preserve(first.artifact_id, reason="late pin", actor="admin")
         result = self.manager.apply(plan, self.resolver)
         self.assertEqual(result.failed.record.artifact_id, first.artifact_id)
-        self.assertIn("changed", result.error)
+        self.assertIn("changed", str(result.error))
         self.assertEqual(result.deleted, ())
         self.assertEqual(self.catalog.tombstones(), [])
 
@@ -418,8 +418,66 @@ class LifecycleApplyTests(CatalogCase):
         self.assertEqual([i.record.artifact_id for i in plan.items], [record.artifact_id])
         self.catalog.record_deletion("config-solo-0001", reason="manual", actor="op")
         result = manager.apply(plan, lambda _location: FakeTarget({record.name: record.size}))
-        self.assertIn("newest verified", result.error)
+        self.assertIn("newest verified", str(result.error))
         self.assertIsNotNone(self.catalog.get(record.artifact_id))
+
+    def test_pin_during_delete_is_refused_and_object_state_stays_consistent(self) -> None:
+        plan = self.manager.plan(NOW)
+        first = plan.items[0].record
+        catalog = self.catalog
+        remote = self.remote
+
+        class PinningTarget:
+            def list(self, prefix: str = ""):
+                return remote.list(prefix)
+
+            def delete(self, name: str) -> None:
+                # Another admin pins the copy while it is being removed.
+                with self_test.assertRaisesRegex(CatalogError, "being deleted"):
+                    catalog.set_preserve(first.artifact_id, reason="too late", actor="admin")
+                remote.delete(name)
+
+        self_test = self
+        pinning = PinningTarget()
+        result = self.manager.apply(
+            GroomingPlan(generated_at=NOW, items=plan.items[:1]),
+            lambda loc: pinning if loc == first.location else self.resolver(loc),
+        )
+        self.assertTrue(result.complete)
+        [tombstone] = self.catalog.tombstones()
+        self.assertEqual(tombstone.record.artifact_id, first.artifact_id)
+        self.assertFalse(tombstone.record.preserved)
+        self.assertEqual(self.catalog.claimed_deletions(), [])
+
+    def test_failed_delete_releases_claim(self) -> None:
+        plan = self.manager.plan(NOW)
+        failing = self.remote_records[6]
+        self.remote.fail_on.add(failing.name)
+        self.manager.apply(plan, self.resolver)
+        self.assertFalse(self.catalog.is_deletion_claimed(failing.artifact_id))
+        pinned = self.catalog.set_preserve(failing.artifact_id, reason="keep", actor="admin")
+        self.assertTrue(pinned.preserved)
+
+    def test_claim_left_by_crash_is_visible_and_excluded_from_plans(self) -> None:
+        plan = self.manager.plan(NOW)
+        stuck = plan.items[0].record
+        self.catalog.claim_deletion(stuck, actor="scheduler", now=NOW)
+        [(record, claimed_at, actor)] = self.catalog.claimed_deletions()
+        self.assertEqual((record, claimed_at, actor), (stuck, NOW, "scheduler"))
+        self.assertNotIn(stuck.artifact_id, [i.record.artifact_id for i in self.manager.plan(NOW).items])
+        with self.assertRaisesRegex(CatalogError, "already claimed"):
+            self.catalog.claim_deletion(stuck, actor="scheduler")
+
+    def test_claim_refuses_preserved_and_newest_verified(self) -> None:
+        newest = self.local_records[0]
+        with self.assertRaisesRegex(CatalogError, "newest verified"):
+            self.catalog.claim_deletion(newest, actor="op")
+        pinned = self.catalog.set_preserve(self.local_records[7].artifact_id, reason="hold", actor="admin")
+        with self.assertRaisesRegex(CatalogError, "preserved"):
+            self.catalog.claim_deletion(pinned, actor="op")
+        with self.assertRaisesRegex(CatalogError, "preserved"):
+            self.catalog.record_deletion(pinned.artifact_id, reason="manual", actor="op")
+        self.assertIsNotNone(self.catalog.get(pinned.artifact_id))
 
     def test_apply_unknown_location_stops(self) -> None:
         self.catalog.add(make_record(20, location="gone-target"), now=NOW)
