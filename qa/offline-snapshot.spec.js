@@ -391,7 +391,7 @@ test("offline snapshot renders preloaded slot history without a live backend", a
 
   await page.goto(pathToFileURL(snapshotPath).href, { waitUntil: "load" });
 
-  await expect(page.locator(".snapshot-banner-badge")).toContainText("Frozen Offline Artifact");
+  await expect(page.locator(".snapshot-banner-badge")).toContainText("Offline copy");
   await expect(page.locator("#detail-history-panel")).toBeVisible();
   await expect(page.locator("#detail-history-empty")).toBeHidden();
   await expect(page.locator("#detail-history-content")).toBeVisible();
@@ -528,7 +528,7 @@ test("offline top-loader snapshot keeps exported row geometry", async ({ page })
   await page.goto(pathToFileURL(snapshotPath).href, { waitUntil: "load" });
 
   const shell = page.locator("#chassis-shell");
-  await expect(page.locator(".snapshot-banner-badge")).toContainText("Frozen Offline Artifact");
+  await expect(page.locator(".snapshot-banner-badge")).toContainText("Offline copy");
   await expect(shell).toHaveAttribute("data-face-style", "top-loader");
   await expect(shell).toHaveAttribute("data-layout-mode", /top-loader/);
   await expect(shell).toHaveAttribute("data-layout-rows", "4");
@@ -587,7 +587,7 @@ test("offline snapshot can navigate preloaded storage views without a live backe
   await page.goto(pathToFileURL(snapshotPath).href, { waitUntil: "load" });
 
   const selector = page.locator("#enclosure-select");
-  await expect(page.locator(".snapshot-banner-badge")).toContainText("Frozen Offline Artifact");
+  await expect(page.locator(".snapshot-banner-badge")).toContainText("Offline copy");
   await expect(selector).toBeEnabled();
   await selector.selectOption("view:boot-doms");
   await expect(page.locator("#enclosure-panel-title")).toContainText("Boot SATADOMs");
@@ -668,8 +668,8 @@ test("offline snapshot can navigate preloaded live enclosures without a live bac
   await page.goto(pathToFileURL(snapshotPath).href, { waitUntil: "load" });
 
   const selector = page.locator("#enclosure-select");
-  await expect(page.locator(".snapshot-banner-badge")).toContainText("Frozen Offline Artifact");
-  await expect(page.locator(".snapshot-banner-facts")).toContainText("2 live enclosures");
+  await expect(page.locator(".snapshot-banner-badge")).toContainText("Offline copy");
+  await expect(page.locator(".snapshot-banner-meta")).toContainText("2 enclosures");
   await expect(selector).toBeEnabled();
   await selector.selectOption("enclosure:rear");
   await expect(page.locator("#enclosure-panel-title")).toContainText("Rear Shelf");

@@ -96,16 +96,21 @@ test("public demo static artifact is explorable without a live backend", async (
   await page.goto(pathToFileURL(demoPath).href, { waitUntil: "load" });
 
   const selector = page.locator("#enclosure-select");
-  await expect(page.locator(".snapshot-banner-badge")).toContainText("Frozen Sanitized Snapshot");
-  await expect(page.locator(".snapshot-banner-facts")).toContainText("Artifact app v");
-  await expect(page.locator(".snapshot-banner-meta")).toContainText("Capture time");
-  await expect(page.locator(".snapshot-banner-facts")).toContainText("60 bays in artifact");
-  await expect(page.locator(".snapshot-banner-facts")).toContainText("2 saved/virtual views");
-  await expect(page.locator(".snapshot-banner-facts")).toContainText("1 event");
-  await expect(page.locator(".snapshot-banner-facts")).not.toContainText("1 events");
-  await expect(page.locator(".snapshot-banner-meta")).toContainText("Synthetic IDs");
-  await expect(page.locator(".snapshot-banner-meta")).toContainText("Source revision");
-  await expect(page.locator(".snapshot-banner-meta")).toContainText("Build ID");
+  await expect(page.locator(".snapshot-banner-badge")).toContainText("Demo data");
+  await expect(page.locator("#header-summary")).toContainText("A 60-bay JBOD with made-up disks.");
+  await expect(page.locator(".snapshot-banner-meta")).toContainText("Captured");
+  await expect(page.locator(".snapshot-banner-meta")).toContainText("60 bays, 2 views");
+  await expect(page.locator(".snapshot-banner-about")).toContainText("1 event");
+  await expect(page.locator(".snapshot-banner-about")).not.toContainText("1 events");
+  await expect(page.locator(".snapshot-banner-about")).toContainText("Synthetic IDs");
+  await expect(page.locator(".snapshot-banner-about")).toContainText("Source revision");
+  await expect(page.locator(".snapshot-banner-about")).toContainText("Build ID");
+  await expect(page.locator(".snapshot-banner-about > summary")).toContainText("About this demo");
+  await expect(page.locator(".snapshot-banner-about")).not.toHaveAttribute("open", "");
+  await expect(page.locator("#refresh-button")).toBeHidden();
+  await expect(page.locator("#auto-refresh-field")).toBeHidden();
+  await expect(page.locator("#refresh-interval-field")).toBeHidden();
+  await expect(page.locator("#inventory-evidence-disclosure")).toBeHidden();
   await expect(page.locator(".public-demo-identity")).toHaveCount(2);
   const identities = await page.locator(".public-demo-identity").allTextContents();
   expect(identities[0]).toMatch(/^[0-9a-f]{40}$/);
@@ -195,7 +200,7 @@ test("public demo works from a Pages subpath through reload and history navigati
   });
   try {
     await page.goto(fixture.baseURL, { waitUntil: "load" });
-    await expect(page.locator(".snapshot-banner-badge")).toContainText("Frozen Sanitized Snapshot");
+    await expect(page.locator(".snapshot-banner-badge")).toContainText("Demo data");
     const probeResponse = await page.request.get(
       new URL(CHROME_LOCALHOST_DEVTOOLS_PROBE, fixture.baseURL).href,
     );
@@ -371,9 +376,9 @@ if (process.env.PUBLIC_DEMO_URL) {
       }
     });
     await page.goto(publishedURL, { waitUntil: "load" });
-    await expect(page.locator(".snapshot-banner-badge")).toContainText("Frozen Sanitized Snapshot");
-    await expect(page.locator(".snapshot-banner-meta")).toContainText("Source revision");
-    await expect(page.locator(".snapshot-banner-meta")).toContainText("Build ID");
+    await expect(page.locator(".snapshot-banner-badge")).toContainText("Demo data");
+    await expect(page.locator(".snapshot-banner-about")).toContainText("Source revision");
+    await expect(page.locator(".snapshot-banner-about")).toContainText("Build ID");
     await page.reload({ waitUntil: "load" });
     await expect(page.locator("#slot-grid .slot-tile")).toHaveCount(60);
     expect(unexpected).toEqual([]);
