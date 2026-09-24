@@ -58,6 +58,23 @@ class ManualRefreshAdmission:
         async with self._state_lock:
             self._running = False
 
+    def cooldown_state(self) -> dict[str, object]:
+        """Report the full-refresh cooldown without consuming or moving it.
+
+        The dashboard polls this so it can show the deadline instead of
+        discovering the cooldown by being refused with a 429.
+        """
+
+        remaining = 0
+        if self.cooldown_seconds > 0 and self._last_full_started_at is not None:
+            elapsed = self.monotonic() - self._last_full_started_at
+            remaining = max(0, math.ceil(self.cooldown_seconds - elapsed))
+        return {
+            "cooldown_seconds": int(self.cooldown_seconds),
+            "seconds_remaining": int(remaining),
+            "active": remaining > 0,
+        }
+
 
 def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result: dict[str, object] = {}
