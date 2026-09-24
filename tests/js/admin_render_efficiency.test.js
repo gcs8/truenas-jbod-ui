@@ -82,6 +82,12 @@ function functionSource(name) {
   assert.fail(`function ${name} must have a complete body`);
 }
 
+const FETCH_JSON_NAMES = [
+  "fetchJson", "fetchWithTimeout", "requestTimeoutError", "readJsonResponse", "describeApiError",
+  "validatedRequestId", "describeRequestFailure", "isMutatingRequest", "browserIsOffline", "adminRequestError",
+  "classifyTransportFailure", "describeTransportFailure", "classifyResponseFailure", "describeResponseFailure",
+];
+
 function loadFunctions(names, bindings = {}) {
   const context = vm.createContext({ URLSearchParams, console, setTimeout, clearTimeout, Array, Boolean, Number, String, Math, ...bindings });
   vm.runInContext(
@@ -309,9 +315,10 @@ test("rendering the Quantastor HA rows normalizes the node list once and caches 
 test("fetchJson gives up on a stalled request with a plain timeout message", async () => {
   let abortedSignal = null;
   const functions = loadFunctions(
-    ["fetchJson", "fetchWithTimeout", "requestTimeoutError", "readJsonResponse", "describeApiError"],
+    FETCH_JSON_NAMES,
     {
       DEFAULT_REQUEST_TIMEOUT_MS: 60000,
+      SERVER_REQUEST_ID_PATTERN: /^[0-9a-f]{32}$/,
       AbortController,
       DOMException,
       fetch(url, options) {
@@ -336,11 +343,39 @@ test("fetchJson gives up on a stalled request with a plain timeout message", asy
   assert.ok(abortedSignal?.aborted, "the underlying fetch was aborted");
 });
 
+test("a timed-out mutation is an unknown outcome, a timed-out read is transport", async () => {
+  for (const [method, outcome] of [["POST", "unknown"], ["GET", "transport"]]) {
+    const functions = loadFunctions(FETCH_JSON_NAMES, {
+      DEFAULT_REQUEST_TIMEOUT_MS: 60000,
+      SERVER_REQUEST_ID_PATTERN: /^[0-9a-f]{32}$/,
+      AbortController,
+      DOMException,
+      navigator: { onLine: true },
+      fetch(url, options) {
+        return new Promise((resolve, reject) => {
+          options.signal.addEventListener("abort", () => reject(new DOMException("The operation was aborted.", "AbortError")));
+        });
+      },
+    });
+    await assert.rejects(
+      () => functions.fetchJson("/api/admin/system-setup", { method, timeoutMs: 5 }),
+      (error) => {
+        assert.equal(error.timedOut, true);
+        assert.equal(error.adminOutcome, outcome);
+        assert.match(error.message, /^Timed out after 1 second\./);
+        if (outcome === "unknown") assert.match(error.message, /may or may not have been applied/);
+        return true;
+      }
+    );
+  }
+});
+
 test("fetchJson keeps a caller's own cancellation distinct from a timeout", async () => {
   const functions = loadFunctions(
-    ["fetchJson", "fetchWithTimeout", "requestTimeoutError", "readJsonResponse", "describeApiError"],
+    FETCH_JSON_NAMES,
     {
       DEFAULT_REQUEST_TIMEOUT_MS: 60000,
+      SERVER_REQUEST_ID_PATTERN: /^[0-9a-f]{32}$/,
       AbortController,
       DOMException,
       fetch(url, options) {
@@ -360,9 +395,10 @@ test("fetchJson keeps a caller's own cancellation distinct from a timeout", asyn
 
 test("fetchJson returns normally when the response arrives in time", async () => {
   const functions = loadFunctions(
-    ["fetchJson", "fetchWithTimeout", "requestTimeoutError", "readJsonResponse", "describeApiError"],
+    FETCH_JSON_NAMES,
     {
       DEFAULT_REQUEST_TIMEOUT_MS: 60000,
+      SERVER_REQUEST_ID_PATTERN: /^[0-9a-f]{32}$/,
       AbortController,
       fetch: async () => ({ ok: true, status: 200, json: async () => ({ enclosures: [] }) }),
     }

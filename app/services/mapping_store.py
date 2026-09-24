@@ -16,6 +16,10 @@ from pydantic import ValidationError
 
 from app.models.domain import ManualMapping
 from app.services.profile_registry import ENCLOSURE_SUB_VIEW_PROFILE_IDS
+from app.services.storage_writability import (
+    StorageDirectoryUnwritable,
+    is_unwritable_error,
+)
 
 _DRAWER_SUB_PROFILE_IDS = frozenset(
     sub_profile_id
@@ -66,6 +70,12 @@ class MappingScopeConflict(RuntimeError):
         super().__init__(self.public_detail)
 
 
+class MappingStorageUnwritable(StorageDirectoryUnwritable):
+    """The mapping file could not be written because its directory is read-only."""
+
+    error_code = "data_directory_unwritable"
+
+
 class MappingDurabilityError(RuntimeError):
     """A complete replacement is visible but its durability is indeterminate."""
 
@@ -89,6 +99,13 @@ class _ClassifiedStore:
     entries: dict[str, ManualMapping]
     rows: tuple[_ClassifiedRow, ...]
     mappings: dict[Identity, ManualMapping]
+
+
+@dataclass(frozen=True)
+class _ScopedStoreSnapshot:
+    state: _ClassifiedStore
+    invalid_rows: tuple[tuple[str, ManualMapping], ...]
+    conflicting_identities: frozenset[Identity]
 
 
 @dataclass(frozen=True)
@@ -480,52 +497,70 @@ class MappingStore:
             and (enclosure_id is None or key_identity[1] in {None, enclosure_id})
         )
 
+    def _load_scoped_snapshot(self) -> _ScopedStoreSnapshot:
+        """Classify once; defer conflict rejection to each exact requested target.
+
+        Revision batches hold the store lock and keep this snapshot local to
+        one call. Unlike mutation validation, unrelated bad rows must not
+        prevent scoped revision issuance.
+        """
+        version, entries = self._read_document()
+        rows: list[_ClassifiedRow] = []
+        invalid_rows: list[tuple[str, ManualMapping]] = []
+        for key, mapping in entries.items():
+            try:
+                rows.append(self._classify_row(version, key, mapping))
+            except MappingScopeConflict:
+                invalid_rows.append((key, mapping))
+
+        grouped: dict[Identity, list[_ClassifiedRow]] = {}
+        for row in rows:
+            grouped.setdefault(row.identity, []).append(row)
+        mappings: dict[Identity, ManualMapping] = {}
+        conflicting_identities: set[Identity] = set()
+        for identity, identity_rows in grouped.items():
+            semantic_rows = {
+                self._digest(self._semantic_mapping(row.canonical))
+                for row in identity_rows
+            }
+            if len(semantic_rows) != 1:
+                conflicting_identities.add(identity)
+            winner = max(identity_rows, key=lambda row: row.key)
+            mappings[identity] = winner.canonical
+        return _ScopedStoreSnapshot(
+            _ClassifiedStore(version, entries, tuple(rows), mappings),
+            tuple(invalid_rows),
+            frozenset(conflicting_identities),
+        )
+
     def _load_state_for_scope(
         self,
         system_id: str | None,
         enclosure_id: str | None,
         *,
         slot: int | None = None,
+        snapshot: _ScopedStoreSnapshot | None = None,
     ) -> _ClassifiedStore:
-        version, entries = self._read_document()
+        if snapshot is None:
+            snapshot = self._load_scoped_snapshot()
+        state = snapshot.state
         enclosure_id = resolve_physical_mapping_scope(enclosure_id)
-        rows: list[_ClassifiedRow] = []
-        for key, mapping in entries.items():
-            try:
-                rows.append(self._classify_row(version, key, mapping))
-            except MappingScopeConflict:
-                if self._invalid_row_is_relevant(
-                    version,
-                    key,
-                    mapping,
-                    system_id,
-                    enclosure_id,
-                    slot,
-                ):
-                    raise
-
-        grouped: dict[Identity, list[_ClassifiedRow]] = {}
-        for row in rows:
-            grouped.setdefault(row.identity, []).append(row)
-        mappings: dict[Identity, ManualMapping] = {}
-        for identity, identity_rows in grouped.items():
-            semantic_rows = {
-                self._digest(self._semantic_mapping(row.canonical))
-                for row in identity_rows
-            }
-            relevant = (
+        for key, mapping in snapshot.invalid_rows:
+            if self._invalid_row_is_relevant(
+                state.version, key, mapping, system_id, enclosure_id, slot
+            ):
+                raise MappingScopeConflict()
+        for identity in snapshot.conflicting_identities:
+            if (
                 self._identity_matches_system(identity, system_id)
                 and (slot is None or identity[2] == slot)
                 and (enclosure_id is None or identity[1] in {None, enclosure_id})
-            )
-            if len(semantic_rows) != 1 and relevant:
+            ):
                 raise MappingScopeConflict()
-            winner = max(identity_rows, key=lambda row: row.key)
-            mappings[identity] = winner.canonical
 
         selected_rows = [
             row
-            for row in rows
+            for row in state.rows
             if row.identity[0] in {None, system_id}
             and (slot is None or row.identity[2] == slot)
             and (enclosure_id is None or row.identity[1] == enclosure_id)
@@ -544,7 +579,7 @@ class MappingStore:
                     legacy_row.canonical
                 ):
                     raise MappingScopeConflict()
-        return _ClassifiedStore(version, entries, tuple(rows), mappings)
+        return state
 
     def _state_from_entries(
         self,
@@ -1024,6 +1059,9 @@ class MappingStore:
         targets: list[tuple[str | None, int]],
     ) -> dict[tuple[str | None, int], str]:
         with self._lock:
+            if not targets:
+                return {}
+            snapshot = self._load_scoped_snapshot()
             canonical_targets = {
                 target: (resolve_physical_mapping_scope(target[0]), target[1])
                 for target in targets
@@ -1031,7 +1069,7 @@ class MappingStore:
             return {
                 target: self._save_revision_from_state(
                     state := self._load_state_for_scope(
-                        system_id, canonical[0], slot=canonical[1]
+                        system_id, canonical[0], slot=canonical[1], snapshot=snapshot
                     ),
                     system_id,
                     canonical[0],
@@ -1049,12 +1087,16 @@ class MappingStore:
         targets: list[tuple[str | None, int]],
     ) -> dict[tuple[str | None, int], str]:
         with self._lock:
+            if not targets:
+                return {}
+            snapshot = self._load_scoped_snapshot()
             return {
                 target: self._clear_revision_from_state(
                     self._load_state_for_scope(
                         system_id,
                         resolve_physical_mapping_scope(target[0]),
                         slot=target[1],
+                        snapshot=snapshot,
                     ),
                     system_id,
                     resolve_physical_mapping_scope(target[0]),
@@ -1407,6 +1449,8 @@ class MappingStore:
                 self._unlink_owned_temp_file(temp_path, temp_identity)
             if replaced:
                 raise MappingDurabilityError() from exc
+            if is_unwritable_error(exc):
+                raise MappingStorageUnwritable(self.file_path.parent) from exc
             raise
 
     def _write(self, mappings: dict[str, ManualMapping]) -> None:

@@ -21,6 +21,7 @@ from typing import Any, Callable
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.templating import Jinja2Templates
 
 from admin_service.config import AdminSettings, get_admin_settings
@@ -50,6 +51,7 @@ from app.config import (
 from app.logging_config import configure_service_logging
 from app.http_auth import basic_auth_matches, configured_origin_identity, request_origin_allowed
 from app.metrics import install_metrics, metrics_path, observe_backup_operation
+from app.request_context import REQUEST_ID_HEADER, current_request_id, generate_request_id
 from app.script_json import register_script_json_filters
 from app.models.domain import (
     DebugBundleExportRequest,
@@ -155,14 +157,79 @@ configure_service_logging(
 logger = logging.getLogger(__name__)
 
 
+def admin_request_id() -> str:
+    """The correlation id for the request being served (#418).
+
+    `install_metrics` already mints one per request and logs it, so admin error
+    responses publish that id rather than a second, unrelated one. A client
+    cannot choose it: the middleware generates it and keeps any inbound
+    `X-Request-ID` as the parent only. The fallback covers a failure raised
+    outside the request context (a startup probe, or a direct handler call).
+    """
+    return current_request_id() or generate_request_id()
+
+
+def admin_error_response(
+    detail: str,
+    status_code: int,
+    *,
+    headers: dict[str, str] | None = None,
+    log_level: int = logging.WARNING,
+    exc_info: Any = None,
+) -> JSONResponse:
+    """One admin error surface: the correlation id in the body, header and log.
+
+    The log line carries the id and the status only. Paths, hosts, request
+    bodies and exception text stay out of it, so an operator can quote the id in
+    a support thread without carrying appliance data along with it.
+    """
+    request_id = admin_request_id()
+    logger.log(
+        log_level,
+        "Admin request failed (request id %s, status %s).",
+        request_id,
+        status_code,
+        exc_info=exc_info,
+    )
+    response_headers = {REQUEST_ID_HEADER: request_id}
+    if headers:
+        response_headers.update(headers)
+    return JSONResponse(
+        {"ok": False, "detail": detail, "request_id": request_id},
+        status_code=status_code,
+        headers=response_headers,
+    )
+
+
+def build_offline_recovery_state(
+    *,
+    expires_at: datetime | None,
+    now: datetime | None,
+) -> dict[str, Any]:
+    """What the operator should do once the sidecar's auto-stop time has passed.
+
+    The browser clock must not be the thing that declares a shutdown, so the
+    server states whether the deadline has passed and what to do about it. The
+    guidance never offers to extend the TTL: only restarting the sidecar does.
+    """
+    if expires_at is None or now is None or now < expires_at:
+        return {"expired": False, "summary": "", "next_step": ""}
+    return {
+        "expired": True,
+        "summary": "The admin sidecar's auto-stop time has passed.",
+        "next_step": (
+            "The sidecar stops on its own and does not come back by itself. If this "
+            "page stops responding, run `docker compose up -d enclosure-admin` on the "
+            "Docker host and reload it. This page cannot keep the sidecar running."
+        ),
+    }
+
+
 async def system_not_configured_exception_handler(
     _: Request,
     exc: Exception,
 ) -> JSONResponse:
-    return JSONResponse(
-        {"ok": False, "detail": str(exc)},
-        status_code=404,
-    )
+    return admin_error_response(str(exc), 404)
 
 
 def observe_backup_route(operation: str):
@@ -503,19 +570,16 @@ def create_app() -> FastAPI:
             request.method.upper() in {"POST", "PUT", "PATCH", "DELETE"}
             and not _request_origin_allowed(request, admin_settings)
         ):
-            return JSONResponse(
-                {"detail": "Cross-origin admin mutation rejected."},
-                status_code=403,
-            )
+            return admin_error_response("Cross-origin admin mutation rejected.", 403)
         if (
             admin_settings.auth_mode != "basic"
             or request.url.path in public_paths
             or _basic_auth_matches(request.headers.get("authorization"), admin_settings)
         ):
             return await call_next(request)
-        return JSONResponse(
-            {"detail": "Admin authentication required."},
-            status_code=401,
+        return admin_error_response(
+            "Admin authentication required.",
+            401,
             headers={"WWW-Authenticate": 'Basic realm="truenas-jbod-admin"'},
         )
 
@@ -531,16 +595,24 @@ def create_app() -> FastAPI:
     )
     app.add_exception_handler(SystemNotConfiguredError, system_not_configured_exception_handler)
 
-    @app.exception_handler(HTTPException)
+    # Registered on Starlette's HTTPException so router-raised failures (404 for an
+    # unknown admin path, 405 for a wrong method) carry a correlation id too;
+    # fastapi.HTTPException is a subclass, so one handler covers both.
+    @app.exception_handler(StarletteHTTPException)
     async def http_exception_handler(_: Request, exc: HTTPException) -> JSONResponse:
-        return JSONResponse({"ok": False, "detail": exc.detail}, status_code=exc.status_code)
+        return admin_error_response(
+            exc.detail,
+            exc.status_code,
+            headers=dict(exc.headers) if exc.headers else None,
+        )
 
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(_: Request, exc: Exception) -> JSONResponse:
-        logger.error("Unhandled admin service error", exc_info=(type(exc), exc, exc.__traceback__))
-        return JSONResponse(
-            {"ok": False, "detail": "Unhandled admin service error; see admin logs."},
-            status_code=500,
+        return admin_error_response(
+            "Unhandled admin service error; see admin logs.",
+            500,
+            log_level=logging.ERROR,
+            exc_info=(type(exc), exc, exc.__traceback__),
         )
 
     return app
@@ -566,6 +638,10 @@ async def build_admin_state_payload(request: Request) -> dict[str, Any]:
             "expires_at": expires_at.isoformat() if expires_at else None,
             "auto_stop_seconds": admin_settings.auto_stop_seconds,
             "public_origin": resolve_public_origin(admin_settings, request),
+            "offline_recovery": build_offline_recovery_state(
+                expires_at=expires_at,
+                now=datetime.now(timezone.utc),
+            ),
         },
         "systems": serialize_systems(settings),
         "default_system_id": settings.default_system_id,
@@ -588,7 +664,7 @@ async def build_admin_state_payload(request: Request) -> dict[str, Any]:
             "import_restart_services": True,
             "included_paths": default_backup_included_paths(),
             "debug_packaging": "tar.zst",
-            "debug_stop_services": True,
+            "debug_stop_services": False,
             "debug_restart_services": True,
             "debug_included_paths": default_debug_included_paths(),
             "debug_scrub_secrets": True,
