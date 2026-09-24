@@ -330,6 +330,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - `config/config.example.yaml` now lists every option with its default and
   shows one example system per platform, including ESXi, a BMC-only host,
   and a storage view; the unused `app.verify_ssl` line is gone. (#489)
+- Documented how to dispatch the pinned screenshot capture, what a named
+  `pixel_review: PASS` means, and why a pull request that rebuilds the public
+  demo must be merged with a merge commit rather than squashed (#567).
 
 ### Internal
 
