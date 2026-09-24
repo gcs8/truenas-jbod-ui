@@ -165,8 +165,8 @@ WINDOWS_EXCLUSIONS = (
     WindowsExclusion(
         category="fcntl-dependent history/backup import graph",
         reason=(
-            "history_service.scheduled_backup imports fcntl and its transitive history, "
-            "backup, app, and route suites require POSIX locking"
+            "scheduled_backup and backup_archive.journal import fcntl and their "
+            "transitive history, backup, app, and route suites require POSIX locking"
         ),
         modules=(
             "tests.test_admin_auth",
@@ -182,6 +182,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_history_routes",
             "tests.test_app_history_body_bound",
             "tests.test_app_history_bounds",
+            "tests.test_backup_archive_journal",
             "tests.test_history_bulk_bounds",
             "tests.test_history_refresh_bounds",
             "tests.test_history_health_states",
