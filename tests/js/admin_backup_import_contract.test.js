@@ -37,7 +37,7 @@ function functionSource(name) {
 }
 
 test("backup import inspects, confirms observed mode, then imports with the single-use receipt", () => {
-  const source = functionSource("importBackup");
+  const source = functionSource("runImportBackup");
   const inspect = source.indexOf("/api/admin/backup/inspect");
   const confirm = source.indexOf("window.confirm");
   const importRequest = source.indexOf("/api/admin/backup/import");
@@ -54,5 +54,9 @@ test("backup import inspects, confirms observed mode, then imports with the sing
 
 test("restore form explains mandatory inspection and observed encryption confirmation", () => {
   assert.match(TEMPLATE, /inspect[^.]+observed encryption mode/i);
-  assert.match(TEMPLATE, /single-use inspection receipt/i);
+  assert.match(TEMPLATE, /confirm the archive before replacing/i);
+  assert.doesNotMatch(TEMPLATE, /single-use inspection receipt|without pretending/i);
+  assert.match(TEMPLATE, /<h1>Admin<\/h1>/);
+  assert.match(TEMPLATE, /Support archive for offline inspection, not restorable/i);
+  assert.match(TEMPLATE, /LAN.*auto-stops/i);
 });
