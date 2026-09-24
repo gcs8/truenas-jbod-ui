@@ -163,22 +163,42 @@ mkdir -p config/ssh data history logs backup-status
 
 ## A non-root container gets permission denied
 
-If a source-built non-root UI or history container reports `permission denied`,
-stop the stack and run the bounded ownership helper from the matching source
-checkout:
+The default `docker-compose.yml` runs the UI and history as root, so a normal
+image update needs no ownership change. Non-root services come only from the
+optional `docker-compose.nonroot.yml` overlay. If you added that overlay and a
+service now reports `permission denied`, the bind mounts are still owned by
+root. From the folder that holds your Compose files, with a published image and
+no repository checkout:
 
 ```bash
+docker compose down
 app_uid="${APP_UID:-10001}"
 app_gid="${APP_GID:-10001}"
+backup_uid="${BACKUP_UID:-1000}"
+sudo find ./config -path ./config/backup-secrets -prune -o -exec chown "$app_uid:$app_gid" {} +
+sudo chown -R "$app_uid:$app_gid" ./data ./logs ./history
+sudo install -d -o "$backup_uid" -g "$app_gid" -m 2750 ./backup-status
+docker compose -f docker-compose.yml -f docker-compose.nonroot.yml up -d
+```
+
+If `.env` sets `APP_UID`, `APP_GID` or `BACKUP_UID`, set the same values above;
+shell variables do not read `.env`. If `HISTORY_SEGMENT_CATALOG_PATH` is set, do
+not run a recursive change over the segmented history tree; follow
+[[Backup, Restore, and Debug Bundles|Backup-Restore-and-Debug-Bundles]] instead.
+To undo, drop the overlay from the `-f` chain; root-run services still read
+files owned by the app identity.
+
+From a source checkout you can use the bounded helper instead, which also sets
+modes and refuses symlinks and unexpected paths:
+
+```bash
 sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid "$app_uid" --gid "$app_gid"
 sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid "$app_uid" --gid "$app_gid" --apply
 ```
 
-Run the dry check first. If `.env` overrides `APP_UID` or `APP_GID`, export the
-same values before running the block. Do not use recursive `chmod 777`, and do
-not run this source-build migration against the published v0.22.2 Compose/image
-pair. If SSH then fails to load `known_hosts`, verify that
-`data/known_hosts` is owned by the configured app UID/GID and uses mode `0660`.
+Run the dry check first. Do not use recursive `chmod 777`. If SSH then fails to
+load `known_hosts`, verify that `data/known_hosts` is owned by the configured
+app UID/GID and uses mode `0660`.
 
 ## SCALE shows a generic runtime profile
 
