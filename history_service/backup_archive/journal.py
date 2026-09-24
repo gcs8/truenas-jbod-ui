@@ -409,8 +409,18 @@ class ChangeJournal:
 
     def _ensure_directory(self) -> None:
         parent = self.path.parent
-        if not parent.exists():
-            parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        missing: list[Path] = []
+        probe = parent
+        while not os.path.lexists(probe) and probe != probe.parent:
+            missing.append(probe)
+            probe = probe.parent
+        for directory in reversed(missing):
+            try:
+                directory.mkdir(mode=0o700)
+            except FileExistsError:
+                continue
+            # A new directory entry is durable only once its parent is fsync'd.
+            _fsync_directory(directory.parent)
         if not parent.is_dir():
             raise JournalError("journal directory is not a directory")
 
@@ -595,6 +605,40 @@ class ChangeJournal:
 
     # -- compaction ---------------------------------------------------------------------
 
+    def _committed_within_budget(self, state: _JournalState, committed: list[str]) -> list[str]:
+        """Newest committed entries, capped by count and by a quarter of ``max_bytes``.
+
+        Pending entries may use up to half the budget (see the overflow merge), so
+        after compaction the file sits well under ``max_bytes`` and is not
+        rewritten on every following append.
+        """
+
+        if not self.retain_committed_entries:
+            return []
+        record_of: dict[str, int] = {}
+        for index, commit in enumerate(state.commit_records):
+            for cid in commit.get("change_ids", []):
+                record_of[cid] = index
+        budget = self.max_bytes // 4
+        counted_records: set[int] = set()
+        kept: list[str] = []
+        for cid in reversed(committed):
+            if len(kept) >= self.retain_committed_entries:
+                break
+            cost = self._pending_bytes(state, [cid]) + len(cid) + 3
+            index = record_of.get(cid)
+            if index is not None and index not in counted_records:
+                commit = state.commit_records[index]
+                cost += len(_stable_json({**commit, "change_ids": []})) + 1
+            if cost > budget:
+                break
+            budget -= cost
+            if index is not None:
+                counted_records.add(index)
+            kept.append(cid)
+        kept.reverse()
+        return kept
+
     @staticmethod
     def _pending_bytes(state: _JournalState, ids: list[str]) -> int:
         return sum(len(_stable_json(state.changes[cid].as_dict())) + 1 for cid in ids)
@@ -603,7 +647,7 @@ class ChangeJournal:
         state = self._load_locked()
         pending = [cid for cid in state.order if state.changes[cid].status == "pending"]
         committed = [cid for cid in state.order if state.changes[cid].status != "pending" and not state.changes[cid].recovered]
-        kept_committed = committed[-self.retain_committed_entries :] if self.retain_committed_entries else []
+        kept_committed = self._committed_within_budget(state, committed)
         records: list[dict[str, Any]] = []
         pending_budget = self.max_bytes // 2
         if len(pending) > 1 and self._pending_bytes(state, pending) > pending_budget:

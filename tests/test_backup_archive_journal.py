@@ -180,7 +180,8 @@ class ChangeJournalTests(JournalTestCase):
             journal.append("mapping.save")
         finally:
             journal_module._fsync_directory = original
-        self.assertEqual(calls, [self.path.parent])
+        # Directory creation fsyncs root; the first append fsyncs the journal dir once.
+        self.assertEqual(calls, [self.root, self.path.parent])
 
     def test_large_commit_is_split_below_the_line_limit(self) -> None:
         journal = ChangeJournal(self.path, max_bytes=16 * 1024 * 1024)
@@ -216,6 +217,32 @@ class ChangeJournalTests(JournalTestCase):
         self.assertEqual(len(committed), 5)
         self.assertTrue(all(e.backup_id == "cfg-19" for e in committed))
         self.assertEqual(list(self.path.parent.glob("*.tmp")), [])
+
+    def test_small_budget_bounds_retained_commits_by_bytes(self) -> None:
+        journal = ChangeJournal(self.path, max_bytes=4096)  # default count retention (256)
+        sizes = []
+        for n in range(100):
+            entry = journal.append("mapping.save", f"slot-{n}")
+            journal.commit([entry.change_id], outcome="backup", config_hash=f"{n:064x}", backup_id=f"cfg-{n}")
+            sizes.append(self.path.stat().st_size)
+        self.assertLessEqual(max(sizes), 4096)
+        reread = ChangeJournal(self.path)
+        self.assertEqual(reread.last_backup(), (f"{99:064x}", "cfg-99"))
+        self.assertGreater(len(reread.entries()), 0)
+        self.assertEqual(reread.pending(), [])
+
+    def test_new_journal_directories_are_fsynced_into_their_parents(self) -> None:
+        from history_service.backup_archive import journal as journal_module
+
+        calls = []
+        original = journal_module._fsync_directory
+        journal_module._fsync_directory = lambda path: calls.append(path)
+        try:
+            ChangeJournal(self.root / "a" / "b" / "journal.jsonl")
+        finally:
+            journal_module._fsync_directory = original
+        self.assertEqual(calls, [self.root, self.root / "a"])
+        self.assertEqual((self.root / "a" / "b").stat().st_mode & 0o777, 0o700)
 
     def test_commit_triggers_compaction_past_the_budget(self) -> None:
         journal = ChangeJournal(self.path, max_bytes=4096, retain_committed_entries=2)
