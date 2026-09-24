@@ -282,6 +282,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Performance
 
+- Coalesced admin storage-view renders into one paint per animation frame,
+  cached the HA row fields and SSH field lookups, timed out stuck admin
+  requests after 60 seconds with a retry message, painted the refreshed admin
+  state before the removed-system history scan, and removed dead admin code
+  (#474)
 - Served a slot history bundle from one SQLite connection instead of fifteen
   and cached the history lock address per database identity instead of parsing
   /proc/self/mountinfo on every lock (#539).
