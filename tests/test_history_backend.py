@@ -7,7 +7,7 @@ import urllib.error
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.config import ENV_OVERRIDES, HistoryConfig
+from app.config import HistoryConfig
 from app.request_context import request_context
 from app.services.history_backend import (
     HISTORY_BACKEND_DEGRADED_DETAIL,
@@ -633,10 +633,3 @@ class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
                 client._request_bytes_sync("/healthz")
         self.assertIn("HTTP 503", str(raised.exception))
         self.assertNotIsInstance(raised.exception, HistoryBackendUnavailableError)
-
-    def test_history_config_exposes_fallback_concurrency_env(self) -> None:
-        self.assertEqual(HistoryConfig().fallback_max_concurrency, 4)
-        self.assertEqual(
-            ENV_OVERRIDES["HISTORY_BACKEND_FALLBACK_CONCURRENCY"],
-            ("history", "fallback_max_concurrency"),
-        )

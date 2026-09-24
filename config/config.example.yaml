@@ -142,8 +142,6 @@ history:
   # service is enabled; leave empty to run without history.
   service_url: ""
   timeout_seconds: 10
-  # Concurrent per-disk history requests when the batched read fails.
-  fallback_max_concurrency: 4
   # Token that lets the main UI ask the history service for a refresh. Set it
   # with HISTORY_REFRESH_TOKEN in .env rather than here.
   refresh_token: ""

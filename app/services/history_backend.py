@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 import socket
 from datetime import timedelta
 import urllib.error
@@ -39,15 +38,9 @@ class HistoryBackendUnavailableError(HistoryBackendError):
 class HistoryBackendResponseError(HistoryBackendError):
     """The backend answered, but with an HTTP error or an unusable body."""
 
-    def __init__(self, status_code: int | str, detail: str | None = None) -> None:
-        if isinstance(status_code, str):
-            match = re.search(r"HTTP (\d{3})", status_code)
-            self.status_code = int(match.group(1)) if match else 0
-            message = detail or status_code
-        else:
-            self.status_code = status_code
-            message = detail or f"History backend returned HTTP {self.status_code}."
-        super().__init__(message)
+    def __init__(self, status_code: int, detail: str | None = None) -> None:
+        self.status_code = status_code
+        super().__init__(detail or f"History backend returned HTTP {self.status_code}.")
 
 
 class HistoryBackendBusyError(HistoryBackendResponseError):
@@ -407,34 +400,20 @@ class HistoryBackendClient:
         }
 
     @staticmethod
-    def _failed_slot_payload(
+    def _slot_payload(
         slot: int,
         system_id: str | None,
         enclosure_id: str | None,
+        *,
+        configured: bool,
+        available: bool,
+        detail: str | None,
     ) -> dict[str, Any]:
+        """The one empty slot history shape every unavailable answer uses."""
         return {
-            "configured": True,
-            "available": False,
-            "detail": HISTORY_BACKEND_FAILURE_DETAIL,
-            "slot": slot,
-            "system_id": system_id,
-            "enclosure_id": enclosure_id,
-            "metrics": {},
-            "events": [],
-            "sample_counts": {},
-            "latest_values": {},
-        }
-
-    @staticmethod
-    def _unconfigured_slot_payload(
-        slot: int,
-        system_id: str | None,
-        enclosure_id: str | None,
-    ) -> dict[str, Any]:
-        return {
-            "configured": False,
-            "available": False,
-            "detail": "History backend is not configured.",
+            "configured": configured,
+            "available": available,
+            "detail": detail,
             "slot": slot,
             "system_id": system_id,
             "enclosure_id": enclosure_id,
@@ -444,6 +423,38 @@ class HistoryBackendClient:
             "latest_values": {},
             "disk_history": {},
         }
+
+    @classmethod
+    def _failed_slot_payload(
+        cls,
+        slot: int,
+        system_id: str | None,
+        enclosure_id: str | None,
+    ) -> dict[str, Any]:
+        return cls._slot_payload(
+            slot,
+            system_id,
+            enclosure_id,
+            configured=True,
+            available=False,
+            detail=HISTORY_BACKEND_FAILURE_DETAIL,
+        )
+
+    @classmethod
+    def _unconfigured_slot_payload(
+        cls,
+        slot: int,
+        system_id: str | None,
+        enclosure_id: str | None,
+    ) -> dict[str, Any]:
+        return cls._slot_payload(
+            slot,
+            system_id,
+            enclosure_id,
+            configured=False,
+            available=False,
+            detail="History backend is not configured.",
+        )
 
     async def _fetch_json(
         self,
@@ -495,9 +506,9 @@ class HistoryBackendClient:
         try:
             payload = json.loads(payload_bytes)
         except json.JSONDecodeError as exc:
-            raise HistoryBackendResponseError("History backend returned invalid JSON.") from exc
+            raise HistoryBackendResponseError(0, "History backend returned invalid JSON.") from exc
         if not isinstance(payload, dict):
-            raise HistoryBackendResponseError("History backend returned a non-object JSON payload.")
+            raise HistoryBackendResponseError(0, "History backend returned a non-object JSON payload.")
         return payload
 
     def _request_bytes_sync(

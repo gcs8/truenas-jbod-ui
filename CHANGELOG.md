@@ -331,6 +331,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Internal
 
+- Removed the unreachable per-slot history fallback and its concurrency
+  setting, unified the unavailable slot-history payload shape, and deleted
+  duplicated and caller-less helpers (#509).
+
 - Replaced the chain of command comparisons behind the SSH command failure
   contexts with a lookup table and pinned every answer with tests; the debug
   output is unchanged (#540)
