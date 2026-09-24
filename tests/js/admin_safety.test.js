@@ -290,3 +290,17 @@ test("fetchJson turns a malformed 2xx mutation body into an unknown outcome and 
     await assert.rejects(fetchJson("/synthetic", {method}), (error) => error.adminOutcome === outcome && error.protocolError === true && !/proxy/.test(error.message));
   }
 });
+
+test("explicit discard drops the timing draft; failure does not", async () => {
+  const field = {value: "99", dataset: {runtimeBehaviorKey: "interval"}};
+  const holder = {querySelectorAll: () => [field], set innerHTML(value) {field.value = value.match(/value="([^"]*)"/)[1];}};
+  const state = {runtimeBehavior: {fields: [{key: "interval", value: 15, writable: true}]}};
+  const elements = {runtimeBehaviorFields: holder, runtimeBehaviorDetail: {}, runtimeBehaviorSaveButton: {}, runtimeBehaviorResult: {}};
+  const api = load(["saveRuntimeBehaviorSettings", "collectRuntimeBehaviorValues", "renderRuntimeBehaviorSettings", "discardRuntimeBehaviorDraft"], {state, elements, fetchJson: async () => {throw new Error("temporary network failure");}, setBanner() {}, escapeHtml: String, runtimeBehaviorOwnerLabel: () => "", renderRuntimeCards() {}});
+  await api.saveRuntimeBehaviorSettings();
+  assert.equal(field.value, "99");
+  assert.doesNotMatch(elements.runtimeBehaviorResult.textContent, /discarded/);
+  api.discardRuntimeBehaviorDraft();
+  assert.equal(field.value, "15");
+  assert.match(elements.runtimeBehaviorResult.textContent, /discarded/);
+});
