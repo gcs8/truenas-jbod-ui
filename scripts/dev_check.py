@@ -147,6 +147,7 @@ WINDOWS_PORTABLE_TEST_MODULES = (
     "tests.test_truenas_ws",
     "tests.test_truenas_ws_jsonrpc",
     "tests.test_ui_health_and_admin_probe",
+    "tests.test_upgrade_notice",
     "tests.test_wiki_drift_verifier",
 )
 
@@ -170,6 +171,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_admin_error_correlation",
             "tests.test_admin_runtime_routes",
             "tests.test_admin_service",
+            "tests.test_admin_safety",
             "tests.test_admin_ttl",
             "tests.test_disk_inventory_sync",
             "tests.test_disk_inventory_sync_grants",

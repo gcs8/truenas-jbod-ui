@@ -1386,6 +1386,7 @@ class SnapshotExportService:
                 "snapshot": snapshot_for_export,
                 "storage_view_runtime": storage_view_runtime_for_context,
                 "settings": self.settings,
+                "app_version": __version__,
                 "initial_snapshot_json": json.dumps(snapshot_for_export.model_dump(mode="json")),
                 "initial_storage_view_runtime_json": json.dumps(storage_view_runtime_for_context.model_dump(mode="json")),
                 "snapshot_mode": True,
@@ -2726,8 +2727,8 @@ class SnapshotExportService:
         """
         inline_css = self._static_text("style.css")
         inline_js = self._static_text("app.js")
-        stylesheet_href = str(request.url_for("static", path="style.css"))
-        script_src = str(request.url_for("static", path="app.js"))
+        stylesheet_href = f"{request.url_for('static', path='style.css')}?v={__version__}"
+        script_src = f"{request.url_for('static', path='app.js')}?v={__version__}"
 
         html = self._replace_once(
             html,

@@ -1509,7 +1509,8 @@ class MainAppBoundaryTests(unittest.TestCase):
         self.assertIn("relatedTracesForNode", script_text)
         self.assertIn("traceIsInSelectionTrail", script_text)
         self.assertIn("data-fabric-breadcrumb", script_text)
-        self.assertIn("data-fabric-trace-disabled", script_text)
+        self.assertNotIn("data-fabric-trace-disabled", script_text)
+        self.assertIn("(visited)", script_text)
         self.assertIn("data-fabric-trace-home", script_text)
         self.assertIn('<span class="fabric-trace-index">1</span>', script_text)
         self.assertIn("renderDiagnosticTableControls", script_text)
@@ -3149,6 +3150,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             default_system_id="archive-core",
         )
         history_store = MagicMock()
+        history_store.list_history_system_summaries.return_value = [{"system_id": "qs-cryostorage", "total_rows": 8}]
         history_store.purge_orphaned_history.return_value = {
             "tracked_slots": 1,
             "event_count": 2,
@@ -3159,7 +3161,9 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
 
         with patch("admin_service.main.reload_app_settings", return_value=settings):
             with patch("admin_service.main.get_history_store", return_value=history_store):
-                response = asyncio.run(route.endpoint())
+                preview_route = next(item for item in admin_app.routes if item.path == "/api/admin/history/orphaned")
+                preview = json.loads(asyncio.run(preview_route.endpoint()).body)
+                response = asyncio.run(route.endpoint({"preview_token": preview["purge_preview_token"], "confirm_irreversible": True}))
 
         payload = json.loads(response.body.decode("utf-8"))
 
@@ -3167,7 +3171,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["summary"]["removed_system_ids"], ["qs-cryostorage"])
         self.assertEqual(payload["valid_system_ids"], ["archive-core"])
-        history_store.purge_orphaned_history.assert_called_once_with(["archive-core"])
+        history_store.purge_orphaned_history.assert_called_once_with(["archive-core"], expected_summaries=history_store.list_history_system_summaries.return_value)
 
     def test_list_orphaned_history_route_returns_history_sources(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/history/orphaned")

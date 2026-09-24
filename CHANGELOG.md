@@ -44,6 +44,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Added
 
+- Showed a one-time dismissible notice in the main UI after the app is
+  updated, kept until dismissed and stored per install; v0.23.0 says that
+  network mode lets anyone who can reach the port change bay assignments and
+  lights, and where to add a sign-in. (#491, #562)
+
 - Added a JSON-RPC 2.0 websocket transport selectable per TrueNAS host with
   `api_dialect` (and `api_version` to pin a documented API release), keeping the
   DDP default for CORE and existing hosts; saving a system in the admin UI keeps
@@ -61,6 +66,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 ### Changed
 
 - Rewrote the warnings, bay-light and mapping reasons, SMART messages, HTTP error details, export banner labels and release-check summaries the main page shows, in plain words with no roadmap prose; the QuantaStor cluster master is shown in Platform Details instead of as a warning, and history backend log lines now say why a request failed (#496).
+- Rewrote the main page copy in plain words: header and profile subtitles,
+  the bay status line and Summary panel, the Bay assignment panel, status
+  chips with the source message as tooltip and a neutral SSH-off style,
+  cache countdown chips shown only with UI Timing, plain "Bay reported by"
+  labels in Slot Details, and heat-map metric names that match the wiki
+  (#484, #562).
 
 - Admin failures now answer with the request's correlation id in the response
   body and the `X-Request-ID` header, and the admin log records that id with the
@@ -121,7 +132,27 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   `config.yaml` keys are logged once and listed in the admin
   configuration-warnings banner, and the unused `app.verify_ssl` setting is
   removed. The history bind error names the variables to set. (#568)
-
+- Kept inventory and action results in their selected scope, preserved
+  export keyboard focus, and improved history controls and failure text.
+  (#425, #562)
+- Kept main-UI error messages visible across background refreshes, recovered
+  write controls after a rejected write, honoured the configured refresh
+  interval, added search results and a real empty-bay state, and asked for a
+  reload after a container upgrade; `/api/inventory` now documents the
+  `write_policy` and `app_version` fields it returns (#508, #562).
+- Raised the smallest Storage Fabric, disk-path and bay text to 12px, stopped
+  forcing the diagnostic chips to uppercase, let card labels wrap instead of
+  clipping device names, added a print stylesheet that keeps bay colours on a
+  white page, and darkened the empty NVMe bay size chip to AA contrast
+  (#477, #562).
+- Led the public demo and saved copies with what the app does, moved
+  version, source revision and build ID into a collapsed block, and hid the
+  refresh controls and inventory evidence counters in saved copies.
+  (#485, #562)
+- Distinguished BMC-managed systems from ESXi in unsupported bootstrap
+  guidance without enabling host provisioning (#480).
+- Prevented destructive demo collisions and unconfirmed history purges,
+  preserved admin drafts and restart choices, and rejected false success. (#424)
 - Reported failed SCALE and QuantaStor enrichment without hiding source
   disks or leaving SSH status falsely healthy; a SCALE host whose SES
   discovery succeeds but finds no enclosure device stays healthy and quiet. (#422)
@@ -298,13 +329,25 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   bulk responses and offline exports. (#423)
 - Removed invented physical backplanes and bay labels from virtual inventories.
   Logical disk paths and known physical aliases were preserved. (#419)
+- The Storage Fabric page keeps keyboard focus, scroll position, open
+  kernel-error panels and a half-typed friendly name across renders, expands
+  long bay lists in place, keeps visited related traces clickable, and fetches
+  inventory and fabric together on refresh. (#478)
 
 ### Performance
 
 - Offline exports embed a card photo only when a view or enclosure can draw
   it, and read the static files once per export instead of once per
   downsampling pass. (#493)
+- Delegated every bay-tile interaction to the grid, deferred hover SMART
+  fetches to the batch prefetch that already covers the bay, and indexed bay
+  lookups instead of scanning the slot list on every call (#510, #562).
 
+- Coalesced admin storage-view renders into one paint per animation frame,
+  cached the HA row fields and SSH field lookups, timed out stuck admin
+  requests after 60 seconds with a retry message, painted the refreshed admin
+  state before the removed-system history scan, and removed dead admin code
+  (#474)
 - Served a slot history bundle from one SQLite connection instead of fifteen
   and cached the history lock address per database identity instead of parsing
   /proc/self/mountinfo on every lock (#539).
@@ -400,6 +443,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   maintainer owes before changing either — with `tests/test_ci_contract.py`
   reading the pair out of the workflow so the doc cannot drift from the
   enforced values again. (#536)
+
+### Performance
+
+- Delegated every bay-tile interaction to the grid, deferred hover SMART
+  fetches to the batch prefetch that already covers the bay, and indexed bay
+  lookups instead of scanning the slot list on every call (#510)
 
 ## v0.23.0 - 2026-09-08
 

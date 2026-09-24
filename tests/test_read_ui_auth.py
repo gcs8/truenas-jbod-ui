@@ -132,6 +132,7 @@ MUTATION_ROUTES = (
     ("POST", "/api/slots/0/mapping"),
     ("DELETE", "/api/slots/0/mapping"),
     ("POST", "/api/mappings/import"),
+    ("POST", "/api/upgrade-notice/dismiss"),
 )
 MUTATION_ROUTE_TEMPLATES = {
     ("POST", "/api/sas-fabric/aliases"),
@@ -142,6 +143,7 @@ MUTATION_ROUTE_TEMPLATES = {
     ("DELETE", "/api/slots/{slot}/mapping"),
     ("POST", "/api/mappings/import"),
     ("POST", "/api/history/refresh"),
+    ("POST", "/api/upgrade-notice/dismiss"),
 }
 READ_ONLY_NON_GET_ROUTES = {
     ("POST", "/api/mappings/import/preview"),
@@ -263,6 +265,14 @@ def index_request(app) -> Request:
 
 
 class ReadUIAuthorizationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # The upgrade-notice dismiss route writes a version record; keep it out of the checkout.
+        data_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(data_dir.cleanup)
+        patcher = patch.object(app_main, "upgrade_notice_data_dir", return_value=Path(data_dir.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def make_app(
         self,
         *,

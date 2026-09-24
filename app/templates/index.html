@@ -4,7 +4,8 @@
 {% set profile = snapshot.selected_profile %}
 {% set release_status_payload = release_status if release_status is defined and release_status else {} %}
 {% set release_note = release_status_payload.summary if release_status_payload and release_status_payload.summary else "Checking for updates..." %}
-{% set snapshot_is_sanitized = snapshot_mode and (snapshot_export_meta.redaction == "partial" or snapshot_export_meta.redaction_label == "Synthetic IDs") %}
+{% if release_status_payload and release_status_payload.status == "disabled" %}{% set release_note = "" %}{% endif %}
+{% set snapshot_is_sanitized = snapshot_mode and (snapshot_export_meta.redaction == "partial" or snapshot_export_meta.redaction_label in ["Scrambled IDs", "Synthetic IDs"]) %}
 <div class="app-shell">
   <header class="topbar">
     <div>
@@ -13,7 +14,7 @@
       </p>
       <h1>JBOD Enclosure UI</h1>
       <p class="subtle" id="header-summary">
-        {{ profile.summary if profile and profile.summary else "Drive-bay map with API-or-SSH enrichment for the selected enclosure." }}
+        {{ profile.summary if profile and profile.summary else "Front view of the selected enclosure. Click a bay for details." }}
       </p>
     </div>
     <div class="topbar-meta">
@@ -37,14 +38,14 @@
               </option>
             {% endfor %}
           {% else %}
-            <option value="">Auto-selected</option>
+            <option value="">No enclosures found</option>
           {% endif %}
         </select>
       </div>
       <div class="meta-card">
         <span class="meta-label">{% if snapshot_mode %}Snapshot time{% else %}Last Updated{% endif %}</span>
         <span class="meta-value" id="last-updated">{{ snapshot.last_updated }}</span>
-        <span class="meta-note" id="timezone-label">Browser local time</span>
+        <span class="meta-note" id="timezone-label">Your local time</span>
       </div>
       <div class="meta-card">
         <span class="meta-label">Version</span>
@@ -52,7 +53,7 @@
         {% if not snapshot_mode and release_status_payload and release_status_payload.latest_url %}
           <a class="meta-note version-note version-note-{{ release_status_payload.status or 'unknown' }}" id="app-version-note" href="{{ release_status_payload.latest_url }}" target="_blank" rel="noopener">{{ release_note }}</a>
         {% else %}
-          <span class="meta-note version-note version-note-{{ release_status_payload.status or 'unknown' }}" id="app-version-note">{% if snapshot_mode %}Snapshot artifact{% else %}{{ release_note }}{% endif %}</span>
+          <span class="meta-note version-note version-note-{{ release_status_payload.status or 'unknown' }}" id="app-version-note">{% if snapshot_mode %}Saved copy{% else %}{{ release_note }}{% endif %}</span>
         {% endif %}
       </div>
     </div>
@@ -63,59 +64,69 @@
   {% endif %}
 
   {% if snapshot_mode %}
+  {% set snapshot_is_demo = snapshot_export_meta.redaction_label in ["Scrambled IDs", "Synthetic IDs"] %}
+  {% set snapshot_bay_count = snapshot_export_meta.visible_bay_count or snapshot.layout_slot_count or (snapshot.slots | length) %}
+  {% set snapshot_event_count = snapshot_export_meta.event_count or 0 %}
   <section class="panel snapshot-banner">
     <div class="snapshot-banner-copy">
-      <div class="snapshot-banner-badge">{% if snapshot_is_sanitized %}Frozen Sanitized Snapshot{% else %}Frozen Offline Artifact{% endif %}</div>
-      <p class="eyebrow">{% if snapshot_export_meta.redaction_label == "Synthetic IDs" %}Public Demo Artifact{% else %}Offline Snapshot{% endif %}</p>
-      <h2>Explorable Enclosure Snapshot</h2>
+      <div class="snapshot-banner-badge">{% if snapshot_is_demo %}Demo data{% else %}Offline copy{% endif %}</div>
+      <h2 id="snapshot-banner-title">{{ snapshot_export_meta.scope_label or snapshot.selected_enclosure_label or "Enclosure" }} - captured <span id="snapshot-banner-captured">{{ snapshot_export_meta.generated_at or snapshot.last_updated }}</span></h2>
       <p class="subtle">
-        {% if snapshot_is_sanitized %}Frozen, sanitized point-in-time snapshot. This is not live data. You can search, click slots, and inspect preloaded history offline.{% else %}Frozen point-in-time enclosure snapshot. Live actions are disabled, but you can still search, click slots, and inspect preloaded history offline.{% endif %}
+        {% if snapshot_is_demo %}Nothing here is live. Click bays, open history, try the heat map.{% else %}This is a saved copy, not live data. Live actions are off; search, bay details and history still work.{% endif %}
       </p>
-      <div class="snapshot-banner-facts">
-        <span class="snapshot-banner-fact">Artifact app v{{ snapshot_export_meta.app_version or "unknown" }}</span>
-        <span class="snapshot-banner-fact">{{ snapshot_export_meta.visible_bay_count or snapshot.layout_slot_count or (snapshot.slots | length) }} bays in artifact</span>
-        {% if snapshot_export_meta.enclosure_count and snapshot_export_meta.enclosure_count > 1 %}
-        <span class="snapshot-banner-fact">{{ snapshot_export_meta.enclosure_count }} live enclosures</span>
-        {% endif %}
-        {% if snapshot_export_meta.storage_view_count %}
-        <span class="snapshot-banner-fact">{{ snapshot_export_meta.storage_view_count }} saved/virtual views</span>
-        {% endif %}
-        <span class="snapshot-banner-fact">{{ snapshot_export_meta.metric_sample_count or 0 }} metric samples</span>
-        <span class="snapshot-banner-fact">{{ snapshot_export_meta.smart_summary_count or 0 }} slot/view SMART summaries</span>
-        <span class="snapshot-banner-fact">{{ snapshot_export_meta.event_count or 0 }} event{% if (snapshot_export_meta.event_count or 0) != 1 %}s{% endif %}</span>
-        <span class="snapshot-banner-fact">Downsampling {{ snapshot_export_meta.downsampling_label or "None" }}</span>
-      </div>
     </div>
     <div class="snapshot-banner-meta">
       <div class="summary-card compact">
         <span class="summary-label">Scope</span>
-        <span class="summary-value">{{ snapshot_export_meta.scope_label or "Current Enclosure" }}</span>
+        <span class="summary-value">{{ snapshot_bay_count }} bays{% if snapshot_export_meta.enclosure_count and snapshot_export_meta.enclosure_count > 1 %}, {{ snapshot_export_meta.enclosure_count }} enclosures{% endif %}{% if snapshot_export_meta.storage_view_count %}, {{ snapshot_export_meta.storage_view_count }} views{% endif %}</span>
         <span class="summary-note">{{ snapshot_export_meta.system_label or "Selected system" }}</span>
       </div>
       <div class="summary-card compact">
-        <span class="summary-label">Window</span>
+        <span class="summary-label">History window</span>
         <span class="summary-value">{{ snapshot_export_meta.history_window_label or "24h" }}</span>
-        <span class="summary-note">history view preserved</span>
+        <span class="summary-note">of history saved in this copy</span>
       </div>
       <div class="summary-card compact">
-        <span class="summary-label">Capture time</span>
+        <span class="summary-label">Captured</span>
         <span class="summary-value" id="snapshot-generated-value">{{ snapshot_export_meta.generated_at or snapshot.last_updated }}</span>
-        <span class="summary-note" id="snapshot-generated-note">re-rendered in viewer local time</span>
+        <span class="summary-note" id="snapshot-generated-note">Times shown in your local time zone</span>
+      </div>
+      <div class="summary-card compact">
+        <span class="summary-label">Identifiers</span>
+        <span class="summary-value">{% if snapshot_export_meta.redaction == "partial" %}Masked{% elif snapshot_is_demo %}Made up{% else %}Included{% endif %}</span>
+        <span class="summary-note">{% if snapshot_export_meta.redaction == "partial" %}serials and hosts partly hidden{% elif snapshot_is_demo %}no real disks or hosts{% else %}real serials and hosts{% endif %}</span>
+      </div>
+    </div>
+    <details class="summary-disclosure snapshot-banner-about">
+      <summary>{% if snapshot_is_demo %}About this demo{% else %}About this copy{% endif %}</summary>
+      <section class="summary-strip">
+      <div class="summary-card compact">
+        <span class="summary-label">App version</span>
+        <span class="summary-value" id="snapshot-app-version">v{{ snapshot_export_meta.app_version or "unknown" }}</span>
+        <span class="summary-note">app that saved this copy</span>
       </div>
       <div class="summary-card compact">
         <span class="summary-label">Redaction</span>
         <span class="summary-value">{{ snapshot_export_meta.redaction_label or "None" }}</span>
         <span class="summary-note">{{ snapshot_export_meta.redaction_note or "Real host names and serial numbers included" }}</span>
       </div>
-    </div>
+      <div class="summary-card compact">
+        <span class="summary-label">Contents</span>
+        <span class="summary-value">{{ snapshot_export_meta.metric_sample_count or 0 }} samples, {{ snapshot_export_meta.smart_summary_count or 0 }} SMART summaries, {{ snapshot_event_count }} event{% if snapshot_event_count != 1 %}s{% endif %}</span>
+        <span class="summary-note">{% if snapshot_export_meta.downsampling_label and snapshot_export_meta.downsampling_label != "None" %}history thinned: {{ snapshot_export_meta.downsampling_label }}{% else %}full history detail{% endif %}</span>
+      </div>
+      </section>
+    </details>
   </section>
   {% endif %}
 
   <section class="toolbar">
     <label class="field grow">
       <span>Search</span>
-      <input id="search-box" type="search" placeholder="serial, disk, persistent id, pool, vdev">
+      <input id="search-box" type="search" placeholder="Search serial, disk, pool...">
     </label>
+    <button id="search-clear" class="button secondary small hidden" type="button" aria-controls="search-box">Clear search</button>
+    <span id="search-summary" class="search-summary hidden" role="status"></span>
     {% if not snapshot_mode %}
     {% if admin_launch_url %}
     <a class="button secondary" href="{{ admin_launch_url }}" target="_blank" rel="noopener">System Setup</a>
@@ -127,12 +138,12 @@
     {% endif %}
     <button id="export-snapshot-button" class="button secondary">Export Snapshot</button>
     {% endif %}
-    <button id="refresh-button" class="button">Refresh Now</button>
-    <label class="toggle">
+    <button id="refresh-button" class="button{% if snapshot_mode %} hidden{% endif %}">Refresh Now</button>
+    <label class="toggle{% if snapshot_mode %} hidden{% endif %}" id="auto-refresh-field">
       <input id="auto-refresh-toggle" type="checkbox" checked>
       <span>Auto-refresh</span>
     </label>
-    <label class="field refresh-interval-field">
+    <label class="field refresh-interval-field{% if snapshot_mode %} hidden{% endif %}" id="refresh-interval-field">
       <span>Refresh Every</span>
       <select id="refresh-interval-select">
         <option value="15">15 sec</option>
@@ -142,7 +153,7 @@
       </select>
     </label>
     <div id="refresh-timing-strip" class="refresh-timing-strip">
-      <span id="refresh-countdown-label" class="refresh-countdown-label">Next refresh pending</span>
+      <span id="refresh-countdown-label" class="refresh-countdown-label">Auto refresh on</span>
       <div class="refresh-progress" aria-hidden="true">
         <span id="refresh-countdown-bar"></span>
       </div>
@@ -150,30 +161,30 @@
   </section>
 
   {% if not snapshot_mode %}
-  <dialog id="export-snapshot-dialog" class="snapshot-export-dialog">
+  <dialog id="export-snapshot-dialog" class="snapshot-export-dialog" aria-labelledby="export-snapshot-title">
     <form method="dialog" class="snapshot-export-form">
       <div class="panel-header compact">
         <div>
-          <h2>Export Enclosure Snapshot</h2>
-          <p class="subtle">Current enclosure, offline HTML by default, with optional redaction and ZIP packaging.</p>
+          <h2 id="export-snapshot-title">Export Enclosure Snapshot</h2>
+          <p class="subtle">Frozen, offline inventory. Review scope and identifiers before sharing.</p>
         </div>
       </div>
       <div class="snapshot-export-grid">
         <label class="toggle snapshot-export-toggle">
           <input id="export-redact-toggle" type="checkbox">
-          <span>Redact sensitive IDs</span>
+          <span>Mask serial numbers and names</span>
         </label>
         <label class="field">
           <span>Packaging</span>
           <select id="export-packaging-select">
-            <option value="auto" selected>Auto (Recommended)</option>
-            <option value="html">Plain HTML</option>
-            <option value="zip">Force ZIP</option>
+            <option value="auto" selected>Automatic</option>
+            <option value="html">HTML file</option>
+            <option value="zip">ZIP file</option>
           </select>
         </label>
         <label class="toggle snapshot-export-toggle">
           <input id="export-allow-oversize-toggle" type="checkbox">
-          <span>Allow oversize export</span>
+          <span>Allow files over the size limit</span>
         </label>
       </div>
       <div class="snapshot-export-scope">
@@ -189,7 +200,7 @@
         <div id="export-view-selection" class="snapshot-export-view-selection hidden"></div>
       </div>
       <p id="export-snapshot-note" class="subtle snapshot-export-note">
-        Default target stays under about 24 MiB. Auto will prefer HTML, then fall back to ZIP if needed.
+        Review the selected scope and estimated size.
       </p>
       <p id="export-snapshot-window-hint" class="snapshot-export-tip">
         Snapshot history uses the current History window. Change it in the History drawer first if you want a different export range.
@@ -203,11 +214,20 @@
   </dialog>
   {% endif %}
 
+  {% if not snapshot_mode and upgrade_notice %}
+  <section class="upgrade-notice" id="upgrade-notice" role="status" data-notice-version="{{ upgrade_notice.version }}">
+    <p class="upgrade-notice-text" id="upgrade-notice-text">{{ upgrade_notice.text }}</p>
+    <button class="button secondary small" id="upgrade-notice-dismiss" type="button">Got it</button>
+  </section>
+  {% endif %}
+  <p id="inventory-scope-note" class="subtle hidden" role="status"></p>
+  <p id="storage-view-runtime-note" class="subtle hidden" role="status"></p>
+  <button id="storage-view-runtime-retry" type="button" class="button secondary small hidden">Retry storage views</button>
   <section class="status-strip" id="status-strip">
     <div class="status-chip hidden" id="snapshot-status-chip">SNAPSHOT</div>
-    <div class="status-chip" id="api-status-chip">API</div>
+    <div class="status-chip" id="api-status-chip">TrueNAS API</div>
     <div class="status-chip" id="ssh-status-chip">SSH</div>
-    <div class="status-chip hidden" id="history-status-chip">HIST</div>
+    <div class="status-chip hidden" id="history-status-chip">History</div>
     <div class="cache-timing-chips" id="cache-timing-chips" aria-label="Cache timing"></div>
     <div class="status-text" id="status-text" role="status" aria-live="polite">Ready.</div>
   </section>
@@ -216,13 +236,13 @@
     <form class="read-ui-auth-form" id="read-ui-auth-form" autocomplete="off">
       <label>
         <span>Username</span>
-        <input id="read-ui-auth-username" autocomplete="off" type="text" required>
+        <input id="read-ui-auth-username" autocomplete="username" type="text" required>
       </label>
       <label>
         <span>Password</span>
-        <input id="read-ui-auth-password" type="password" autocomplete="off" required>
+        <input id="read-ui-auth-password" type="password" autocomplete="current-password" required>
       </label>
-      <button class="button small" id="read-ui-auth-submit" type="submit">Sign in for writes</button>
+      <button class="button small" id="read-ui-auth-submit" type="submit">Sign in</button>
     </form>
     <button class="button secondary small hidden" id="read-ui-auth-sign-out" type="button">Sign out</button>
     <span class="subtle" id="read-ui-auth-status" role="status" aria-live="polite"></span>
@@ -237,50 +257,49 @@
         <p class="subtle">Browser-side switch and render timing for the current page.</p>
       </div>
     </div>
-    <div id="ui-perf-summary" class="ui-perf-summary muted" aria-live="polite">Browser timing is idle.</div>
+    <div id="ui-perf-summary" class="ui-perf-summary muted">Browser timing is idle.</div>
     <div id="ui-perf-recent" class="ui-perf-recent"></div>
   </section>
 
   <section class="panel mapping-health-panel" aria-labelledby="mapping-health-title">
     <div class="mapping-health-copy">
-      <span class="summary-label" id="mapping-health-title">Mapping health</span>
-      <strong id="mapping-health-summary" role="status" aria-live="polite">Calculating mapping health...</strong>
-      <span class="summary-note" id="mapping-health-evidence">Evidence source and snapshot freshness will appear here.</span>
+      <span class="summary-label" id="mapping-health-title">Bays</span>
+      <strong id="mapping-health-summary">Checking bays...</strong>
+      <span class="summary-note" id="mapping-health-evidence"></span>
     </div>
   </section>
 
-  <details class="summary-disclosure">
-    <summary>Inventory evidence counters</summary>
+  <details class="summary-disclosure{% if snapshot_mode %} hidden{% endif %}" id="inventory-evidence-disclosure">
+    <summary>Summary</summary>
     <section class="summary-strip" id="summary-strip">
       <div class="summary-card">
         <span class="summary-label">Disks</span>
         <span class="summary-value" id="summary-disk-count">{{ snapshot.summary.disk_count }}</span>
-        <span class="summary-note">discovered from inventory</span>
+        <span class="summary-note">on this system</span>
       </div>
       <div class="summary-card">
         <span class="summary-label">Pools</span>
         <span class="summary-value" id="summary-pool-count">{{ snapshot.summary.pool_count }}</span>
-        <span class="summary-note">discovered from storage topology</span>
+        <span class="summary-note">on this system</span>
       </div>
       <div class="summary-card">
-        <span class="summary-label">Enclosure Rows</span>
+        <span class="summary-label">Enclosures</span>
         <span class="summary-value" id="summary-enclosure-count">{{ snapshot.summary.enclosure_count }}</span>
-        <span class="summary-note">returned by API</span>
+        <span class="summary-note">reported by TrueNAS</span>
       </div>
       <div class="summary-card">
-        <span class="summary-label">Slot Matches</span>
+        <span class="summary-label">Bays with a disk</span>
         <span class="summary-value" id="summary-mapped-slot-count">{{ snapshot.summary.mapped_slot_count }}</span>
-        <span class="summary-note">slots tied to disks</span>
+        <span class="summary-note">matched to a disk</span>
       </div>
       <div class="summary-card">
-        <span class="summary-label">Saved Mappings</span>
+        <span class="summary-label">Saved bay assignments</span>
         <span class="summary-value" id="summary-manual-mapping-count">{{ snapshot.summary.manual_mapping_count }}</span>
-        <span class="summary-note">manual calibration entries</span>
+        <span class="summary-note">set by hand</span>
       </div>
-      <div class="summary-card">
-        <span class="summary-label">SSH Slot Hints</span>
+      <div class="summary-card hidden">
+        <span class="summary-label">Bays reported over SSH</span>
         <span class="summary-value" id="summary-ssh-slot-hint-count">{{ snapshot.summary.ssh_slot_hint_count }}</span>
-        <span class="summary-note">from SSH enclosure parsing</span>
       </div>
     </section>
   </details>
@@ -301,7 +320,7 @@
                 type="button"
                 aria-label="Edit enclosure name"
                 title="Edit enclosure name"
-              >✎</button>
+              ><span aria-hidden="true">✎</span><span class="enclosure-alias-edit-text">Rename</span></button>
               {% endif %}
             </div>
             {% if not snapshot_mode %}
@@ -310,10 +329,10 @@
               <div class="enclosure-alias-editor-row">
                 <input id="enclosure-alias-input" type="text" maxlength="256" autocomplete="off" aria-describedby="enclosure-alias-raw-hint">
                 <button class="button small" type="submit">Save</button>
-                <button class="button secondary small" id="enclosure-alias-clear" type="button">Clear</button>
+                <button class="button secondary small" id="enclosure-alias-clear" type="button">Remove name</button>
                 <button class="button secondary small" id="enclosure-alias-cancel" type="button">Cancel</button>
               </div>
-              <span class="subtle" id="enclosure-alias-raw-hint">{% for enclosure in snapshot.enclosures %}{% if enclosure.id == snapshot.selected_enclosure_id and enclosure.raw_label %}Raw: {{ enclosure.raw_label }}{% endif %}{% endfor %}</span>
+              <span class="subtle" id="enclosure-alias-raw-hint">{% for enclosure in snapshot.enclosures %}{% if enclosure.id == snapshot.selected_enclosure_id and enclosure.raw_label %}Reported name: {{ enclosure.raw_label }}{% endif %}{% endfor %}</span>
             </form>
             {% endif %}
           </div>
@@ -324,14 +343,9 @@
             <button class="button secondary small" id="heatmap-toggle-button" type="button" aria-pressed="false">
               Heat Map
             </button>
-            <button class="button secondary small" id="sas-fabric-toggle-button" type="button" aria-expanded="false">
-              Topology
+            <button class="button secondary small" id="sas-fabric-toggle-button" type="button" aria-expanded="false" aria-controls="sas-fabric-panel">
+              Connections
             </button>
-            {% if not snapshot_mode %}
-            <a class="button secondary small" id="sas-fabric-view-link" href="{{ sas_fabric_view_url }}">
-              Storage Fabric
-            </a>
-            {% endif %}
             <div id="disk-inventory-sync-controls" class="disk-inventory-sync-controls hidden" role="group" aria-label="TrueNAS disk inventory">
               <span class="disk-inventory-sync-label">TrueNAS disk inventory</span>
               <button class="button secondary small" id="disk-inventory-sync-multipath-button" type="button" data-disk-inventory-sync-mode="multipath">
@@ -340,7 +354,6 @@
               <button class="button secondary small" id="disk-inventory-sync-full-button" type="button" data-disk-inventory-sync-mode="full">
                 Full disk sync
               </button>
-              <span id="disk-inventory-sync-hint" class="disk-inventory-sync-hint hidden" role="note"></span>
             </div>
             <div id="heatmap-controls" class="heatmap-controls hidden">
               <label class="field heatmap-control-field heatmap-metric-field" id="heatmap-metric-field">
@@ -380,9 +393,9 @@
                 <span>Scale <output id="heatmap-scale-value">100%</output></span>
                 <input id="heatmap-scale-slider" type="range" min="0.5" max="2" step="0.25" value="1">
               </label>
-              <p id="heatmap-metric-context" class="heatmap-metric-context" aria-live="polite"></p>
+              <p id="heatmap-metric-context" class="heatmap-metric-context"></p>
             </div>
-            <div id="heatmap-legend" class="heatmap-legend hidden" aria-live="polite">
+            <div id="heatmap-legend" class="heatmap-legend hidden">
               <span id="heatmap-legend-min">Low</span>
               <span class="heatmap-legend-bar" aria-hidden="true"></span>
               <span id="heatmap-legend-max">High</span>
@@ -423,24 +436,29 @@
       <section id="sas-fabric-panel" class="panel sas-fabric-panel hidden">
         <div class="panel-header compact">
           <div>
-            <h2>Storage Fabric</h2>
-            <p id="sas-fabric-summary" class="subtle">Read-only storage source, path, enclosure, and bay topology.</p>
+            <h2>Connections</h2>
+            <p id="sas-fabric-summary" class="subtle">Shows how disks connect to controllers.</p>
           </div>
           <div class="panel-header-actions">
             <button class="button secondary small" id="sas-fabric-refresh-button" type="button">
               Refresh Storage Fabric
             </button>
+            {% if not snapshot_mode %}
+            <a class="button secondary small" id="sas-fabric-view-link" href="{{ sas_fabric_view_url }}">
+              Open full page
+            </a>
+            {% endif %}
           </div>
         </div>
         <div id="sas-fabric-status" class="warning-item muted compact" aria-live="polite">
-          Open topology to load the current Storage Fabric.
+          Press Topology to load the connection map.
         </div>
         <div class="sas-fabric-layout">
           <div class="sas-fabric-map" id="sas-fabric-lanes"></div>
           <aside class="sas-fabric-inspector">
             <h3 id="sas-fabric-inspector-title">Fabric Inspector</h3>
             <div id="sas-fabric-inspector-body" class="sas-fabric-inspector-body">
-              Select a controller, path, or bay to trace connectivity.
+              Pick a controller, cable path, or bay.
             </div>
           </aside>
         </div>
@@ -450,7 +468,7 @@
         <div class="panel-header compact">
           <div>
             <h2 id="platform-details-title">Platform Details</h2>
-            <p id="platform-details-summary" class="subtle">Read-only platform context.</p>
+            <p id="platform-details-summary" class="subtle"></p>
           </div>
         </div>
         <div id="platform-details-sections" class="platform-details-sections"></div>
@@ -464,7 +482,7 @@
           <p class="subtle">Select a bay to inspect metadata or calibrate mapping.</p>
         </div>
         <div class="detail-panel-actions">
-          <button class="button secondary small hidden" id="history-toggle-button" type="button">History</button>
+          <button class="button secondary small hidden" id="history-toggle-button" aria-controls="detail-history-panel" aria-expanded="false" type="button">History</button>
           <div id="detail-led-controls" class="detail-led-controls hidden">
             <button class="button small" data-led-action="IDENTIFY">Identify On</button>
             <button class="button secondary small" data-led-action="CLEAR">Identify Off / Clear</button>
@@ -473,7 +491,7 @@
       </div>
 
       <div id="detail-empty" class="detail-empty">
-        Select a slot tile to view disk, pool, and mapping details.
+        Click a bay to see its disk.
       </div>
 
       <div id="detail-content" class="detail-content hidden">
@@ -520,6 +538,7 @@
               <option value="all">All</option>
             </select>
           </label>
+          <button class="button secondary small hidden" id="history-retry-button" type="button">Retry History</button>
           <button class="button secondary small" id="history-close-button" type="button">Hide History</button>
         </div>
       </div>
@@ -554,7 +573,7 @@
               <span id="history-io-label" class="subtle"></span>
             </div>
             <div id="history-io-chart" class="history-chart-empty">
-              Read and write lifetime counters will appear here when those slower SMART samples are collected.
+              Read and write totals appear once a few samples are collected.
             </div>
           </section>
         </div>
@@ -563,7 +582,7 @@
         <section class="history-card history-events-card">
           <div class="history-card-header">
             <h4>Recent Events</h4>
-            <span class="subtle">Change-only timeline</span>
+            <span class="subtle">Events</span>
           </div>
           <div id="history-event-list" class="history-event-list"></div>
         </section>
@@ -578,7 +597,7 @@
           <h2>Topology Context</h2>
         </div>
         <div id="topology-context" class="topology-context">
-          <div class="warning-item muted">Select a mapped slot to inspect its vdev peers.</div>
+          <div class="warning-item muted">Click a bay in a pool to see the other disks in its vdev.</div>
         </div>
       </section>
 
@@ -587,21 +606,21 @@
           <h2 id="secondary-context-title">Multipath Presentation</h2>
         </div>
         <div id="multipath-context" class="topology-context">
-          <div class="warning-item muted">Select a multipath-backed slot to inspect active and standby member paths.</div>
+          <div class="warning-item muted">Click a disk with more than one path to see its active and standby paths.</div>
         </div>
       </section>
 
       <section class="panel detail-secondary-card">
         <div class="panel-header compact">
-          <h2>Calibration Mapping</h2>
-          <button class="button secondary small" id="prefill-mapping-button" type="button">Prefill From Slot</button>
+          <h2>Bay assignment</h2>
+          <button class="button secondary small" id="prefill-mapping-button" type="button">Use the disk shown in this bay</button>
         </div>
         <div class="action-group compact">
           <div id="mapping-empty" class="detail-empty compact">
-            Select a slot to save or restore calibration details for that bay.
+            Click a bay to save which disk sits in it.
           </div>
           <p class="subtle">
-            Save the observed serial, device, or persistent ID so this slot can be recovered quickly later.
+            If the app shows the wrong disk in this bay, type the disk's serial or device name here and save.
           </p>
           <form id="mapping-form" class="mapping-form-compact hidden">
             <label class="field">
@@ -618,28 +637,28 @@
             </label>
             <label class="field">
               <span>Notes</span>
-              <textarea name="notes" rows="3" maxlength="256" placeholder="Optional calibration note"></textarea>
+              <textarea name="notes" rows="3" maxlength="256" placeholder="Note (optional)"></textarea>
             </label>
             <label class="toggle compact">
               <input type="checkbox" name="clear_identify_after_save" checked>
-              <span>Clear identify LED after saving</span>
+              <span>Turn off the locate light after saving</span>
             </label>
             <div class="button-row">
-              <button class="button" type="submit">Save Mapping</button>
-              <button class="button danger" id="clear-mapping-button" type="button">Clear Mapping</button>
+              <button class="button" type="submit">Save assignment</button>
+              <button class="button danger" id="clear-mapping-button" type="button">Remove assignment</button>
             </div>
           </form>
           <div class="compact-subsection">
             <div class="action-header">
-              <h4>Mapping Backup</h4>
+              <h4>Back up bay assignments</h4>
               <input id="mapping-import-file" type="file" accept="application/json" class="hidden">
             </div>
             <p class="subtle">
-              Export the current system or enclosure mapping scope as JSON, or import a previously exported backup into the active selection.
+              Download all bay assignments for this system or enclosure as a file, or restore them from a file.
             </p>
             <div class="button-row">
-              <button class="button secondary" id="export-mappings-button" type="button">Export Mappings</button>
-              <button class="button secondary" id="import-mappings-button" type="button">Import Mappings</button>
+              <button class="button secondary" id="export-mappings-button" type="button">Download backup</button>
+              <button class="button secondary" id="import-mappings-button" type="button">Restore backup</button>
             </div>
             <p class="subtle hidden" id="mapping-import-unavailable"></p>
           </div>
@@ -671,6 +690,7 @@
     storageViewsRuntime: {{ initial_storage_view_runtime_json | script_json_text }},
     layoutRows: {{ snapshot.layout_rows | tojson }},
     refreshIntervalSeconds: {{ snapshot.refresh_interval_seconds }},
+    appVersion: {{ app_version | tojson }},
     smartBatchMaxConcurrency: {{ settings.app.smart_batch_max_concurrency }},
     smartPrefetchDelayMs: {{ settings.app.smart_prefetch_delay_ms }},
     smartPrefetchStrategy: {{ settings.app.smart_prefetch_strategy | tojson }},
