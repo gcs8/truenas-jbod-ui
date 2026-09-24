@@ -96,7 +96,7 @@ test("dashboard formatters preserve count, byte, duration, and status labels", (
   assert.equal(functions.formatTimestamp("", "not scheduled"), "not scheduled");
   assert.equal(functions.formatTimestamp("2026-09-09T12:00:00Z"), new Date("2026-09-09T12:00:00Z").toLocaleString());
   assert.equal(functions.collectionDurationLabel(null), "not recorded");
-  assert.equal(functions.formatCount(12, true), "~12");
+  assert.equal(functions.formatCount(12), "12");
   assert.equal(functions.formatBytes(1536), "1.5 KiB");
   assert.equal(functions.statusValue("", "unknown"), "unknown");
   assert.equal(functions.collectionInventoryLabel(true), "fresh inventory");
@@ -104,6 +104,31 @@ test("dashboard formatters preserve count, byte, duration, and status labels", (
   assert.equal(functions.collectionInventoryLabel(null), "not recorded");
   assert.equal(functions.collectionDurationLabel(1.25), "1.3s");
   assert.equal(functions.backoffLabel(1.2), "2s remaining");
+});
+
+test("collector state says Starting during the grace period (#441)", () => {
+  const { collectorStateLabel } = loadFunctions(["collectorStateLabel"]);
+
+  assert.equal(collectorStateLabel({ collector_running: true, collector_starting: true }), "Starting");
+  assert.equal(collectorStateLabel({ collector_running: true, collector_starting: false }), "Running");
+  assert.equal(collectorStateLabel({ collector_running: false }), "Stopped");
+});
+
+test("only the Full button counts down the refresh cooldown (#456)", () => {
+  const source = functionSource("fullRefreshLabel");
+  const context = vm.createContext({ Math, Number, FULL_REFRESH_LABEL: "Full refresh" });
+  vm.runInContext(
+    `${functionSource("formatDuration")}\n${source}\nglobalThis.__tested = { fullRefreshLabel };`,
+    context
+  );
+  const { fullRefreshLabel } = context.__tested;
+
+  assert.equal(fullRefreshLabel(0), "Full refresh");
+  assert.equal(fullRefreshLabel(null), "Full refresh");
+  assert.equal(fullRefreshLabel(125), "Full refresh (in 2m 5s)");
+  assert.match(functionSource("renderFullRefreshCooldown"), /fullButton\.disabled/);
+  assert.doesNotMatch(functionSource("renderFullRefreshCooldown"), /fastButton/);
+  assert.match(TEMPLATE_SOURCE, /data-cooldown-seconds-remaining=/);
 });
 
 test("dashboard reads the script-safe JSON bootstrap block", () => {

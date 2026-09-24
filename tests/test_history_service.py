@@ -586,7 +586,7 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         self.assertEqual(health_payload["collector"], expected)
         self.assertEqual(
             set(health_payload),
-            {"status", "collector", "database_size_bytes", *expected},
+            {"status", "detail", "collector", "database_size_bytes"},
         )
         self.assertEqual(overview["collector"], expected)
         for serialized in (dashboard_bytes, health.body, json.dumps(overview).encode()):
@@ -5623,7 +5623,7 @@ class HistoryStoreTests(unittest.TestCase):
 
         payload = json.loads(response.body)
         self.assertIs(restarted.quarantine_recovery_status()["history_recovery_required"], True)
-        self.assertIs(payload["history_recovery_required"], True)
+        self.assertIs(payload["collector"]["history_recovery_required"], True)
         self.assertEqual(payload["status"], "degraded")
         self.assertNotIn(".broken-", json.dumps(payload))
 
@@ -5833,7 +5833,7 @@ class HistoryStoreTests(unittest.TestCase):
         payload = json.loads(response.body)
         self.assertNotEqual(payload["status"], "ok")
         self.assertEqual(payload["status"], "degraded")
-        self.assertIs(payload["history_recovery_required"], True)
+        self.assertIs(payload["collector"]["history_recovery_required"], True)
 
     def test_healthz_reports_degraded_after_a_quarantine_activated_a_fresh_database(self) -> None:
         """Quarantine must not activate a fresh database that reports itself healthy (#417)."""
@@ -5853,7 +5853,7 @@ class HistoryStoreTests(unittest.TestCase):
 
         payload = json.loads(response.body)
         self.assertIsNone(collector.last_error)
-        self.assertIs(payload["history_recovery_required"], True)
+        self.assertIs(payload["collector"]["history_recovery_required"], True)
         self.assertEqual(payload["status"], "degraded")
         self.assertNotIn(".broken-", json.dumps(payload))
 

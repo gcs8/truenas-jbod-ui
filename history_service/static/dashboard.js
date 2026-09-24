@@ -25,17 +25,17 @@
     return `${minutes}m ${remainder}s`;
   }
 
-  function formatCount(value, estimated = false) {
+  function formatCount(value) {
     if (value === null || value === undefined) {
       return "-";
     }
-    return `${estimated ? "~" : ""}${value}`;
+    return `${value}`;
   }
 
-  function setCount(id, value, estimated = false) {
+  function setCount(id, value) {
     const element = document.getElementById(id);
     if (!element) return;
-    element.textContent = formatCount(value, estimated);
+    element.textContent = formatCount(value);
     if (value === null || value === undefined) {
       element.setAttribute("title", "not counted yet");
       element.setAttribute("aria-label", "not counted yet");
@@ -95,11 +95,48 @@
     return remaining > 0 ? `${Math.ceil(remaining)}s remaining` : "inactive";
   }
 
+  function collectorStateLabel(collector) {
+    if (!collector.collector_running) return "Stopped";
+    return collector.collector_starting ? "Starting" : "Running";
+  }
+
+  // Only the Full button waits out the cooldown; Quick refresh stays usable.
+  const FULL_REFRESH_LABEL = fullButton ? fullButton.textContent : "Full refresh";
+  let fullCooldownUntil = 0;
+  let fullCooldownTimer = null;
+
+  function fullRefreshLabel(secondsRemaining) {
+    const remaining = Math.ceil(Number(secondsRemaining) || 0);
+    if (remaining <= 0) return FULL_REFRESH_LABEL;
+    return `${FULL_REFRESH_LABEL} (in ${formatDuration(remaining)})`;
+  }
+
+  function renderFullRefreshCooldown() {
+    if (!fullButton) return;
+    const remaining = Math.max(0, Math.ceil((fullCooldownUntil - Date.now()) / 1000));
+    fullButton.textContent = fullRefreshLabel(remaining);
+    fullButton.disabled = refreshRunning || refreshUnknown || remaining > 0;
+    if (remaining <= 0 && fullCooldownTimer !== null) {
+      clearInterval(fullCooldownTimer);
+      fullCooldownTimer = null;
+    }
+  }
+
+  function updateFullRefreshCooldown(secondsRemaining) {
+    const remaining = Number(secondsRemaining);
+    if (!Number.isFinite(remaining)) return;
+    fullCooldownUntil = Date.now() + Math.max(0, remaining) * 1000;
+    if (remaining > 0 && fullCooldownTimer === null) {
+      fullCooldownTimer = setInterval(renderFullRefreshCooldown, 1000);
+    }
+    renderFullRefreshCooldown();
+  }
+
   function renderCollectorStatus(payload) {
     const collector = payload?.collector || payload || {};
     const stateValue = document.getElementById("collector-state-value");
     if (stateValue) {
-      stateValue.textContent = collector.collector_running ? "Running" : "Stopped";
+      stateValue.textContent = collectorStateLabel(collector);
       stateValue.classList.toggle("status-ok", Boolean(collector.collector_running));
       stateValue.classList.toggle("status-error", !collector.collector_running);
     }
@@ -137,11 +174,11 @@
     const refresh = payload.refresh || {};
     setText("status-full-refresh-available", formatTimestamp(refresh.full_refresh_available_at, "now"));
     const counts = payload.counts || {};
-    const countsExact = Boolean(payload.counts_exact);
     setCount("tracked-slots-value", counts.tracked_slots);
-    setCount("slot-events-value", counts.event_count, !countsExact);
-    setCount("metric-samples-value", counts.metric_sample_count, !countsExact);
-    setCount("metric-rollups-value", counts.metric_rollup_count, !countsExact);
+    setCount("slot-events-value", counts.event_count);
+    setCount("metric-samples-value", counts.metric_sample_count);
+    setCount("metric-rollups-value", counts.metric_rollup_count);
+    updateFullRefreshCooldown(refresh.full_refresh_cooldown_seconds_remaining);
     setText("db-size-value", formatBytes(payload.database?.size_bytes ?? payload.database_size_bytes));
     renderScopes(payload.scopes || []);
   }
@@ -370,6 +407,9 @@
         }
         if (!response.ok || payload?.ok === false) {
           const error = new Error(payload?.detail || `Refresh failed with ${response.status}`);
+          if (response.status === 429 && Number.isFinite(Number(payload?.retry_after_seconds))) {
+            error.retryAfterSeconds = Number(payload.retry_after_seconds);
+          }
           // Only the refresh handler's mode-bound failure envelope confirms
           // a completed collection failure. Generic 5xx/gateway errors do not.
           const applicationFailure = response.status === 500
@@ -395,6 +435,7 @@
       }
     } catch (error) {
       refreshUnknown = !error.confirmedFailure;
+      if (error.retryAfterSeconds !== undefined) updateFullRefreshCooldown(error.retryAfterSeconds);
       if (status) {
         status.textContent = refreshUnknown
           ? "Refresh outcome unknown: collection may still be running. Verify collector status before reloading this page to enable another refresh. No automatic retry was sent."
@@ -403,10 +444,14 @@
     } finally {
       refreshRunning = false;
       buttons.forEach((button) => button.disabled = refreshUnknown);
+      renderFullRefreshCooldown();
       resumeReads();
     }
   }
 
+  if (typeof fullButton?.getAttribute === "function") {
+    updateFullRefreshCooldown(fullButton.getAttribute("data-cooldown-seconds-remaining"));
+  }
   const initialCollectorStatus = readInitialOverview();
   renderCollectorStatus(initialCollectorStatus);
   renderCollectorBanner(initialCollectorStatus);
