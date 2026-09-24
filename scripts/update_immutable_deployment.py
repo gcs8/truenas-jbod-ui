@@ -59,6 +59,7 @@ class DeploymentSpec:
     profiles: tuple[str, ...]
     services: tuple[str, ...]
     health_urls: tuple[str, ...]
+    replace_compose: bool = False
 
 
 def _sha256(data: bytes) -> str:
@@ -439,6 +440,7 @@ def _receipt_payload(
         "source_revision": spec.source_revision,
         "expected_image": spec.expected_image,
         "candidate_tag": spec.candidate_tag,
+        "replace_compose": spec.replace_compose,
         "compose_files": [item.__dict__ for item in spec.compose_files],
         "profiles": list(spec.profiles),
         "services": list(spec.services),
@@ -522,6 +524,11 @@ def _validate_receipt_shape(receipt: object) -> JsonObject:
         "modes",
         "result",
     }
+    # Receipts from the original helper always replaced Compose.
+    if "replace_compose" in receipt:
+        expected_keys.add("replace_compose")
+        if type(receipt["replace_compose"]) is not bool:
+            raise DeploymentError("receipt replace_compose must be boolean")
     if set(receipt) != expected_keys:
         raise DeploymentError("receipt key set does not match the schema")
     if type(receipt["schema"]) is not int or receipt["schema"] != RECEIPT_SCHEMA:
@@ -738,28 +745,53 @@ def _verify_runtime(
     services = [str(value) for value in receipt["services"]]
     prefix = _compose_prefix(root, str(receipt["project_name"]), compose_names, profiles)
     run([*prefix, "config", "--quiet"], cwd=root)
-    running = sorted(_parse_lines(run([*prefix, "ps", "--services", "--status", "running"], cwd=root)))
-    if running != sorted(services):
-        raise DeploymentError(f"running service set does not match the recorded service set: {running!r}")
     expected_image_id = _image_id(run, root, image)
-    runtime_rows: list[JsonObject] = []
-    for service in services:
-        containers = _parse_lines(run([*prefix, "ps", "-q", service], cwd=root))
-        if len(containers) != 1:
-            raise DeploymentError(f"service must resolve to exactly one container: {service}")
-        row = {"service": service, **_inspect_container(run, root, containers[0])}
-        _validate_container_compose_contract(row, root, str(receipt["project_name"]), compose_names)
-        if row["status"] != "running":
-            raise DeploymentError(f"expected service is not running: {service}")
-        if row["image_id"] != expected_image_id:
-            raise DeploymentError(f"service image ID did not converge: {service}")
-        if row["health"] and row["health"] != "healthy":
-            raise DeploymentError(f"service health did not converge: {service}")
-        if row["restart_count"] != 0:
-            raise DeploymentError(f"service restart count is nonzero after activation: {service}")
-        runtime_rows.append(row)
+    # A fresh Docker healthcheck normally starts as 'starting'. Only that
+    # transient state is retryable; identity drift and terminal failures are not.
+    deadline = time.monotonic() + 120
+    container_ids: dict[str, str] = {}
+
+    def inspect_runtime() -> list[JsonObject]:
+        running = sorted(_parse_lines(run([*prefix, "ps", "--services", "--status", "running"], cwd=root)))
+        if running != sorted(services):
+            raise DeploymentError(f"running service set does not match the recorded service set: {running!r}")
+        rows: list[JsonObject] = []
+        for service in services:
+            containers = _parse_lines(run([*prefix, "ps", "-q", service], cwd=root))
+            if len(containers) != 1:
+                raise DeploymentError(f"service must resolve to exactly one container: {service}")
+            container = containers[0]
+            if container_ids.setdefault(service, container) != container:
+                raise DeploymentError(f"service container identity changed during readiness: {service}")
+            row = {"service": service, **_inspect_container(run, root, container)}
+            _validate_container_compose_contract(row, root, str(receipt["project_name"]), compose_names)
+            if row["status"] != "running":
+                raise DeploymentError(f"expected service is not running: {service}")
+            if row["image_id"] != expected_image_id:
+                raise DeploymentError(f"service image ID did not converge: {service}")
+            if row["health"] not in {"", "starting", "healthy"}:
+                raise DeploymentError(f"service health did not converge: {service}")
+            if row["restart_count"] != 0:
+                raise DeploymentError(f"service restart count is nonzero after activation: {service}")
+            rows.append(row)
+        return rows
+
+    while True:
+        runtime_rows = inspect_runtime()
+        starting = [row["service"] for row in runtime_rows if row["health"] == "starting"]
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            detail = f"still starting: {', '.join(starting)}" if starting else "inspection exceeded deadline"
+            raise DeploymentError(f"service health timed out after 120 seconds, {detail}")
+        if not starting:
+            break
+        time.sleep(min(2, remaining))
     for url in receipt["health_urls"]:
         probe(str(url))
+    # HTTP readiness must not hide a restart, replacement, or image/state drift.
+    runtime_rows = inspect_runtime()
+    if any(row["health"] == "starting" for row in runtime_rows):
+        raise DeploymentError("service health regressed to starting after readiness")
     return {"image": image, "image_id": expected_image_id, "services": runtime_rows, "health_urls": receipt["health_urls"]}
 
 
@@ -773,8 +805,16 @@ def _restore_previous(
 ) -> JsonObject:
     compose_names = [str(item["live"]) for item in receipt["compose_files"]]
     modes = receipt["modes"]
+    # Invalidate any old success before mutating a manual rollback.
+    receipt["status"] = "prepared"
+    receipt["result"] = None
+    _write_receipt(receipt_dir, receipt)
     for name in compose_names:
-        _atomic_write_live(root / name, (receipt_dir / "previous" / name).read_bytes(), int(modes[name]))
+        previous = (receipt_dir / "previous" / name).read_bytes()
+        if receipt.get("replace_compose", True):
+            _atomic_write_live(root / name, previous, int(modes[name]))
+        elif (root / name).is_symlink() or (root / name).read_bytes() != previous:
+            raise DeploymentError(f"image-only rollback Compose changed: {name}")
     previous_env = (receipt_dir / "previous" / ".env").read_bytes()
     rollback_env = _replace_image_reference(previous_env, str(receipt["previous_image"]))
     _atomic_write_live(root / ".env", rollback_env, int(modes[".env"]))
@@ -813,6 +853,9 @@ def update_deployment(
         raise DeploymentError("candidate tag does not match the selected workflow receipt")
     candidate_files: dict[str, bytes] = {}
     for item in spec.compose_files:
+        if not spec.replace_compose:
+            candidate_files[item.live] = (root / item.live).read_bytes()
+            continue
         url = (
             f"https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/"
             f"{spec.source_revision}/{item.source}"
@@ -821,21 +864,27 @@ def update_deployment(
         if not data or len(data) > MAX_COMPOSE_BYTES:
             raise DeploymentError(f"candidate Compose download is empty or too large: {item.source}")
         candidate_files[item.live] = data
-    staging = Path(tempfile.mkdtemp(prefix=".jbod-ui-compose-check-", dir=root))
-    os.chmod(staging, 0o700)
-    try:
-        _write_private_file(staging / ".env", (root / ".env").read_bytes())
-        for item in spec.compose_files:
-            _write_private_file(staging / item.live, candidate_files[item.live])
+    if spec.replace_compose:
+        staging = Path(tempfile.mkdtemp(prefix=".jbod-ui-compose-check-", dir=root))
+        os.chmod(staging, 0o700)
+        try:
+            _write_private_file(staging / ".env", (root / ".env").read_bytes())
+            for item in spec.compose_files:
+                _write_private_file(staging / item.live, candidate_files[item.live])
+            candidate_prefix = _compose_prefix(
+                staging,
+                spec.project_name,
+                [item.live for item in spec.compose_files],
+                list(spec.profiles),
+            )
+            run([*candidate_prefix, "config", "--quiet"], cwd=root, env={"JBOD_UI_IMAGE": spec.expected_image})
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+    else:
         candidate_prefix = _compose_prefix(
-            staging,
-            spec.project_name,
-            [item.live for item in spec.compose_files],
-            list(spec.profiles),
+            root, spec.project_name, [item.live for item in spec.compose_files], list(spec.profiles),
         )
         run([*candidate_prefix, "config", "--quiet"], cwd=root, env={"JBOD_UI_IMAGE": spec.expected_image})
-    finally:
-        shutil.rmtree(staging, ignore_errors=True)
     receipt_dir, receipt = _prepare_receipt(
         spec,
         root,
@@ -844,7 +893,7 @@ def update_deployment(
         candidate_files,
     )
     try:
-        for item in spec.compose_files:
+        for item in spec.compose_files if spec.replace_compose else ():
             _atomic_write_live(
                 root / item.live,
                 (receipt_dir / "candidate" / item.live).read_bytes(),
@@ -918,6 +967,8 @@ def _build_parser() -> argparse.ArgumentParser:
     update.add_argument("--expected-image", required=True)
     update.add_argument("--candidate-tag", required=True)
     update.add_argument("--compose", action="append", type=_parse_compose, required=True)
+    update.add_argument("--replace-compose", action="store_true",
+                        help="explicitly replace live Compose with source-revision files")
     update.add_argument("--profile", action="append", default=[])
     update.add_argument("--service", action="append", required=True)
     update.add_argument("--health-url", action="append", required=True)
@@ -942,6 +993,7 @@ def main(argv: list[str] | None = None) -> int:
                     profiles=tuple(args.profile),
                     services=tuple(args.service),
                     health_urls=tuple(args.health_url),
+                    replace_compose=args.replace_compose,
                 )
             )
         elif args.action == "verify":

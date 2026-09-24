@@ -24,6 +24,7 @@ from history_service.segment_catalog import (
     path_entry_exists,
 )
 from history_service.segment_reader import MAX_HISTORY_QUERY_LIMIT, SegmentedHistoryReader
+from history_service.startup import HistorySchemaVersionError, HistoryStartupError
 
 logger = logging.getLogger(__name__)
 SQLITE_SHARED_DIR_MODE = 0o770
@@ -42,8 +43,52 @@ PRIVATE_REPLACEMENT_DIR_PREFIX = ".history-replacement-"
 # the full-table UPDATE scans. Writers populate disk_identity_key on insert, so the
 # backfill only ever has work to do for rows that predate the column.
 DISK_IDENTITY_BACKFILL_USER_VERSION = 1
+# Supported history-schema versions (#416). PRAGMA user_version is the on-disk
+# compatibility contract, not just a backfill marker: MIN_SUPPORTED_SCHEMA_VERSION
+# is the oldest released shape whose predecessor is still migrated by the startup
+# path below, and CURRENT_SCHEMA_VERSION is the newest shape this build writes.
+# A database numbered above CURRENT_SCHEMA_VERSION was written by a release this
+# one does not know, so startup refuses it before any CREATE/ALTER/backfill runs
+# rather than grafting this build's tables onto a foreign schema.
+MIN_SUPPORTED_SCHEMA_VERSION = 0
+CURRENT_SCHEMA_VERSION = DISK_IDENTITY_BACKFILL_USER_VERSION
+# SQLite file-header fields the gate reads directly (https://sqlite.org/fileformat.html).
+SQLITE_FILE_HEADER_MAGIC = b"SQLite format 3\x00"
+SQLITE_USER_VERSION_OFFSET = 60
+SQLITE_HEADER_PREFIX_BYTES = 64
 SEGMENTED_RETENTION_STATE_NAME = "segmented_retention"
 SEGMENTED_RETENTION_STATES = frozenset({"ready", "claimed", "consumed"})
+# The no-backup retention wait anchor shares the maintenance-state table so it
+# survives a restart; it is a marker, so it only ever holds the 'ready' state.
+RETENTION_WAIT_STATE_NAME = "retention_backup_wait"
+RETENTION_WAIT_STATE = "ready"
+# Quarantining an unreadable database creates a fresh empty one, which otherwise
+# looks exactly like a first installation. The marker shares the maintenance-state
+# table so the recovery-required indication survives the restart that follows
+# (#417), and it holds only the timestamp - never the quarantine path.
+QUARANTINE_RECOVERY_STATE_NAME = "quarantine_recovery"
+QUARANTINE_RECOVERY_REQUIRED_STATE = "ready"
+QUARANTINE_RECOVERY_ACKNOWLEDGED_STATE = "consumed"
+QUARANTINE_RECOVERY_STATES = frozenset(
+    {QUARANTINE_RECOVERY_REQUIRED_STATE, QUARANTINE_RECOVERY_ACKNOWLEDGED_STATE}
+)
+MAX_QUARANTINE_EVIDENCE_DIRECTORY_ENTRIES = 4096
+MAX_QUARANTINE_NAME_ALLOCATION_ATTEMPTS = 4096
+QUARANTINE_INTENT_PREFIX = ".quarantine-"
+QUARANTINE_INTENT_SUFFIX = ".pending"
+QUARANTINE_INTENT_BYTES = b"history quarantine pending\n"
+
+
+def describe_unsupported_schema_version(file_path: Path | str, found_version: int) -> str:
+    """The operator line for a database this build must not write to."""
+    return (
+        f"History database {file_path} was written with schema version {found_version}, "
+        f"but this version of the application only supports up to schema version "
+        f"{CURRENT_SCHEMA_VERSION}. The file was almost certainly written by a newer "
+        "release, so the history service is not starting and has not written to it. "
+        "Run the newer release again, restore a backup taken with this release, "
+        "or point HISTORY_SQLITE_PATH at a different file."
+    )
 
 
 def history_write_lock(file_path: Path, *, blocking: bool):
@@ -428,8 +473,128 @@ class HistoryStore:
         self._segment_reader_cache: SegmentedHistoryReader | None = None
         if self._initialize_enabled:
             with history_write_lock(self.file_path, blocking=False):
+                # Quarantine publishes its durable intent under this same lock.
+                # Check it before the WAL-aware schema inspection so no SQLite
+                # open can replay an interrupted quarantine's retained WAL.
+                self._require_no_pending_quarantine_intent()
+                self._require_supported_schema_version()
                 self._require_no_pending_lifecycle_markers()
                 self._initialize(migration_lock_held=True)
+
+    def _require_supported_schema_version(self) -> None:
+        """Refuse a newer-than-supported database before startup writes anything.
+
+        An unreadable, absent or empty file returns no version; those are not
+        version problems and stay with the existing corrupt/recovery handling.
+        """
+        found = self._read_on_disk_schema_version(self.file_path)
+        if found is None or MIN_SUPPORTED_SCHEMA_VERSION <= found <= CURRENT_SCHEMA_VERSION:
+            return
+        reason = describe_unsupported_schema_version(self.file_path, found)
+        raise HistorySchemaVersionError(reason)
+
+    @classmethod
+    def _read_on_disk_schema_version(cls, file_path: Path) -> int | None:
+        """The `user_version` a writer would see, without writing anything.
+
+        Two reads, because neither answers on its own:
+
+        * the main file's header, which needs no SQLite connection at all. The
+          gate must not publish `-wal`/`-shm` beside a database that has none,
+          because the lifecycle-marker check has not run yet and a rotation or
+          restore in flight refuses post-marker sidecars.
+        * the write-ahead log, but only when a `-wal` sidecar already exists.
+          `user_version` lives on page 1, and in WAL mode a committed change to
+          page 1 sits in the `-wal` until a checkpoint copies it back, so the
+          header alone reports the pre-commit value. A database a newer release
+          committed to and did not checkpoint would otherwise be admitted and
+          then written to, which is exactly what #416 forbids.
+
+        The WAL read is a `mode=ro` URI connection: it replays the log for
+        reading and leaves the database and the `-wal` byte-identical. It cannot
+        checkpoint and it cannot write. It is not free of side effects on the
+        directory, though: SQLite may create the derived `-shm` index next to
+        the existing `-wal`. That file holds no database content and appears
+        only where a `-wal` already exists, so a refused database keeps its
+        bytes, but the directory listing can gain one entry. `immutable=1` is
+        not usable here: it answers faster but deliberately ignores the WAL,
+        which is the value this gate needs.
+
+        The higher of the two wins, so a half-visible future version still fails
+        closed. A file that is absent, empty, too short or not a SQLite database
+        returns no version and stays with the existing corrupt-state handling
+        (which moves the sidecars aside together with the file).
+
+        A `-wal` that exists but cannot be read is different: the header is
+        then known to be a stale answer, so falling back to it would admit a
+        database whose real version is unknown, after which startup writes to
+        it and the real open checkpoints the WAL away. That read failure is
+        re-raised unchanged, so a locked or unwritable file fails exactly as it
+        would a moment later on the real open, and startup's retry
+        classification still sees the original error.
+        """
+        header_version = cls._read_schema_version_from_header(file_path)
+        wal_path = Path(f"{file_path}-wal")
+        if not path_entry_exists(wal_path):
+            return header_version
+        try:
+            wal_version = cls._read_schema_version_including_wal(file_path)
+        except (sqlite3.Error, OSError) as exc:
+            if header_version is None:
+                return None
+            logger.warning(
+                "History database %s has a write-ahead log %s that could not be read to "
+                "check its schema version; refusing to open the database rather than "
+                "trust the main file's older header. Error: %s",
+                file_path,
+                wal_path,
+                exc,
+            )
+            exc.add_note(
+                f"The write-ahead log {wal_path} could not be read for the history "
+                "schema-version check; the database was not opened."
+            )
+            raise
+        if header_version is None:
+            return wal_version
+        return max(header_version, wal_version)
+
+    @staticmethod
+    def _read_schema_version_from_header(file_path: Path) -> int | None:
+        """Read `user_version` straight out of the SQLite file header.
+
+        `user_version` is a big-endian 32-bit field at offset 60 of the 100-byte
+        header (https://sqlite.org/fileformat.html), so a 64-byte read answers
+        it. No connection is opened, so nothing is created on disk.
+        """
+        try:
+            with open(file_path, "rb") as handle:
+                header = handle.read(SQLITE_HEADER_PREFIX_BYTES)
+        except OSError:
+            return None
+        if len(header) < SQLITE_HEADER_PREFIX_BYTES:
+            return None
+        if not header.startswith(SQLITE_FILE_HEADER_MAGIC):
+            return None
+        return int.from_bytes(
+            header[SQLITE_USER_VERSION_OFFSET:SQLITE_HEADER_PREFIX_BYTES],
+            "big",
+        )
+
+    @staticmethod
+    def _read_schema_version_including_wal(file_path: Path) -> int:
+        """`user_version` as of the last commit, including unreplayed WAL frames.
+
+        Either answers or raises: the underlying `sqlite3.Error`/`OSError`
+        propagates when the database or its WAL cannot be opened for reading,
+        and the caller decides whether that failure is a version question.
+        """
+        uri = f"{file_path.absolute().as_uri()}?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True, timeout=0)) as connection:
+            row = connection.execute("PRAGMA user_version").fetchone()
+        if not row or row[0] is None:
+            raise sqlite3.OperationalError("PRAGMA user_version returned no row")
+        return int(row[0])
 
     def _ensure_database_parent(self) -> None:
         try:
@@ -644,6 +809,463 @@ class HistoryStore:
                 connection.rollback()
                 raise
 
+    def read_retention_wait_anchor(self) -> datetime | None:
+        """Return when the current no-backup retention wait started, or None.
+
+        The anchor lives in `history_maintenance_state` beside the segmented
+        claim, so it survives a restart. A row that cannot be read as a UTC
+        timestamp is not repaired here: the caller has to fail closed on it
+        rather than guess a wait that was never really served (#455).
+        """
+
+        with self._read_connection() as connection:
+            row = connection.execute(
+                """
+                SELECT backup_at, state
+                FROM history_maintenance_state
+                WHERE name = ?
+                """,
+                (RETENTION_WAIT_STATE_NAME,),
+            ).fetchone()
+        if row is None:
+            return None
+        if str(row["state"]) != RETENTION_WAIT_STATE:
+            raise ValueError("History retention wait anchor state is invalid.")
+        anchor, _ = self._normalize_retention_backup_at(str(row["backup_at"]))
+        return anchor
+
+    def start_retention_wait(
+        self,
+        anchor: datetime | str,
+        *,
+        migration_lock_held: bool = False,
+    ) -> datetime:
+        """Record `anchor` as the start of the wait, and return the effective one.
+
+        First writer wins: a restart inside the window reads back the anchor it
+        already stored instead of restarting the wait.
+        """
+
+        candidate, serialized = self._normalize_retention_backup_at(anchor)
+        with self._locked_write_connection(
+            migration_lock_held=migration_lock_held
+        ) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    """
+                    SELECT backup_at, state
+                    FROM history_maintenance_state
+                    WHERE name = ?
+                    """,
+                    (RETENTION_WAIT_STATE_NAME,),
+                ).fetchone()
+                if row is not None:
+                    if str(row["state"]) != RETENTION_WAIT_STATE:
+                        raise ValueError("History retention wait anchor state is invalid.")
+                    existing, _ = self._normalize_retention_backup_at(str(row["backup_at"]))
+                    connection.rollback()
+                    return existing
+                connection.execute(
+                    """
+                    INSERT INTO history_maintenance_state (name, backup_at, state)
+                    VALUES (?, ?, ?)
+                    """,
+                    (RETENTION_WAIT_STATE_NAME, serialized, RETENTION_WAIT_STATE),
+                )
+                connection.commit()
+                return candidate
+            except BaseException:
+                connection.rollback()
+                raise
+
+    def _quarantine_evidence_timestamps(self) -> list[datetime]:
+        """Return quarantine times encoded by retained broken database names.
+
+        The broken database itself is durable recovery evidence when writing the
+        fresh database's marker fails. Only the timestamp is returned; status
+        surfaces never receive the quarantine path.
+        """
+
+        prefix = f"{self.file_path.name}.broken-"
+        timestamps: list[datetime] = []
+        with os.scandir(self.file_path.parent) as entries:
+            for entry_count, entry in enumerate(entries, start=1):
+                if entry_count > MAX_QUARANTINE_EVIDENCE_DIRECTORY_ENTRIES:
+                    raise OSError(
+                        errno.E2BIG,
+                        "History quarantine evidence directory exceeds the inspection bound.",
+                    )
+                if not entry.name.startswith(prefix):
+                    continue
+                encoded = entry.name[len(prefix) :]
+                timestamp = self._parse_quarantine_evidence_timestamp(encoded)
+                if timestamp is None:
+                    continue
+                metadata = entry.stat(follow_symlinks=False)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise OSError(
+                        errno.EINVAL,
+                        "History quarantine evidence entry is not a regular file.",
+                    )
+                timestamps.append(timestamp)
+        return sorted(timestamps)
+
+    @staticmethod
+    def _quarantine_metadata_identity(metadata: os.stat_result) -> tuple[int, ...]:
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mode,
+            metadata.st_nlink,
+            metadata.st_uid,
+            metadata.st_gid,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+        )
+
+    def _inspect_quarantine_intent(
+        self,
+        directory_descriptor: int,
+        entry_name: str,
+    ) -> None:
+        """Validate one intent through a bounded, descriptor-relative no-follow read."""
+
+        invalid_message = "History quarantine intent entry is not a stable private regular file."
+        initial = os.stat(entry_name, dir_fd=directory_descriptor, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(initial.st_mode)
+            or initial.st_nlink != 1
+            or initial.st_uid != os.geteuid()
+        ):
+            raise OSError(errno.EINVAL, invalid_message)
+
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        descriptor = os.open(entry_name, flags, dir_fd=directory_descriptor)
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+                or opened.st_uid != os.geteuid()
+                or self._quarantine_metadata_identity(opened)
+                != self._quarantine_metadata_identity(initial)
+            ):
+                raise OSError(errno.EINVAL, invalid_message)
+
+            chunks: list[bytes] = []
+            remaining = len(QUARANTINE_INTENT_BYTES) + 1
+            while remaining:
+                chunk = os.read(descriptor, remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            content = b"".join(chunks)
+
+            final_descriptor_metadata = os.fstat(descriptor)
+            final_path_metadata = os.stat(
+                entry_name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+            expected_identity = self._quarantine_metadata_identity(opened)
+            if (
+                content != QUARANTINE_INTENT_BYTES
+                or self._quarantine_metadata_identity(final_descriptor_metadata) != expected_identity
+                or self._quarantine_metadata_identity(final_path_metadata) != expected_identity
+            ):
+                raise OSError(errno.EINVAL, invalid_message)
+        finally:
+            os.close(descriptor)
+
+    def _quarantine_intent_paths(self) -> list[Path]:
+        prefix = f"{self.file_path.name}{QUARANTINE_INTENT_PREFIX}"
+        parent = self.file_path.parent
+        initial_parent = parent.lstat()
+        if not stat.S_ISDIR(initial_parent.st_mode):
+            raise OSError(errno.ENOTDIR, "History quarantine parent is not a directory.")
+        directory_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+        )
+        directory_descriptor = os.open(parent, directory_flags)
+        try:
+            opened_parent = os.fstat(directory_descriptor)
+            if (
+                not stat.S_ISDIR(opened_parent.st_mode)
+                or (opened_parent.st_dev, opened_parent.st_ino)
+                != (initial_parent.st_dev, initial_parent.st_ino)
+            ):
+                raise OSError(errno.EINVAL, "History quarantine parent changed during inspection.")
+
+            intents: list[Path] = []
+            with os.scandir(directory_descriptor) as entries:
+                for entry_count, entry in enumerate(entries, start=1):
+                    if entry_count > MAX_QUARANTINE_EVIDENCE_DIRECTORY_ENTRIES:
+                        raise OSError(
+                            errno.E2BIG,
+                            "History quarantine evidence directory exceeds the inspection bound.",
+                        )
+                    if not entry.name.startswith(prefix) or not entry.name.endswith(QUARANTINE_INTENT_SUFFIX):
+                        continue
+                    encoded = entry.name[len(prefix) : -len(QUARANTINE_INTENT_SUFFIX)]
+                    if self._parse_quarantine_evidence_timestamp(encoded) is None:
+                        continue
+                    self._inspect_quarantine_intent(directory_descriptor, entry.name)
+                    intents.append(parent / entry.name)
+            return intents
+        finally:
+            os.close(directory_descriptor)
+
+    def _require_no_pending_quarantine_intent(self) -> None:
+        try:
+            intents = self._quarantine_intent_paths()
+        except OSError as exc:
+            raise HistoryStartupError(
+                "History database quarantine state could not be inspected. History storage "
+                "is not starting because an interrupted quarantine cannot be ruled out."
+            ) from exc
+        if not intents:
+            return
+        raise HistoryStartupError(
+            "History database quarantine was interrupted. History storage is not starting "
+            "until the retained database, WAL, and SHM evidence is reviewed."
+        )
+
+    @staticmethod
+    def _parse_quarantine_evidence_timestamp(encoded: str) -> datetime | None:
+        for expected_length, timestamp_format in (
+            (len("YYYYMMDDTHHMMSSZ"), "%Y%m%dT%H%M%SZ"),
+            (len("YYYYMMDDTHHMMSS.ffffffZ"), "%Y%m%dT%H%M%S.%fZ"),
+        ):
+            if len(encoded) != expected_length:
+                continue
+            try:
+                return datetime.strptime(encoded, timestamp_format).replace(tzinfo=timezone.utc)
+            except ValueError:
+                return None
+        return None
+
+    def read_quarantine_recovery(self) -> datetime | None:
+        """Return when history was quarantined, or None once it is acknowledged.
+
+        The row lives in `history_maintenance_state` beside the retention
+        markers, so a fresh database created by quarantine recovery keeps saying
+        "recovery required" across restarts instead of presenting itself as a
+        first installation (#417). Retained broken database files are fallback
+        evidence if writing that row failed. An unreadable marker is not repaired
+        here; the caller fails closed on it rather than reporting health.
+        """
+
+        with self._read_connection() as connection:
+            row = connection.execute(
+                """
+                SELECT backup_at, state
+                FROM history_maintenance_state
+                WHERE name = ?
+                """,
+                (QUARANTINE_RECOVERY_STATE_NAME,),
+            ).fetchone()
+        evidence = self._quarantine_evidence_timestamps()
+        if row is None:
+            return evidence[0] if evidence else None
+        state = str(row["state"])
+        if state not in QUARANTINE_RECOVERY_STATES:
+            raise ValueError("History quarantine recovery state is invalid.")
+        marked_at, _ = self._normalize_retention_backup_at(str(row["backup_at"]))
+        if state == QUARANTINE_RECOVERY_REQUIRED_STATE:
+            return marked_at
+        later_evidence = [timestamp for timestamp in evidence if timestamp > marked_at]
+        return later_evidence[0] if later_evidence else None
+
+    def quarantine_recovery_status(self) -> dict[str, Any]:
+        """Report the recovery indication for status surfaces, failing closed.
+
+        A marker that cannot be read is not evidence of a healthy database, so
+        an unreadable or invalid one still reports that recovery is required -
+        with no timestamp, because none is known.
+        """
+
+        try:
+            quarantined_at = self.read_quarantine_recovery()
+        except (HistoryStartupError, sqlite3.Error, OSError, ValueError):
+            logger.warning(
+                "History quarantine recovery marker for %s could not be read; reporting recovery required.",
+                self.file_path,
+                exc_info=True,
+            )
+            return {
+                "history_recovery_required": True,
+                "history_quarantined_at": None,
+            }
+        if quarantined_at is None:
+            return {
+                "history_recovery_required": False,
+                "history_quarantined_at": None,
+            }
+        return {
+            "history_recovery_required": True,
+            "history_quarantined_at": quarantined_at.isoformat(),
+        }
+
+    def record_quarantine_recovery(
+        self,
+        quarantined_at: datetime | str,
+        *,
+        migration_lock_held: bool = False,
+    ) -> datetime:
+        """Record that a quarantine happened, and return the effective timestamp.
+
+        An unacknowledged marker wins: a second restart that finds the same
+        recovery pending keeps the original timestamp rather than moving it
+        forward. An acknowledged marker is replaced, because a later quarantine
+        is a new loss and needs its own acknowledgement.
+        """
+
+        candidate, _ = self._normalize_retention_backup_at(quarantined_at)
+        with self._locked_write_connection(
+            migration_lock_held=migration_lock_held
+        ) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    """
+                    SELECT backup_at, state
+                    FROM history_maintenance_state
+                    WHERE name = ?
+                    """,
+                    (QUARANTINE_RECOVERY_STATE_NAME,),
+                ).fetchone()
+                if row is not None and str(row["state"]) == QUARANTINE_RECOVERY_REQUIRED_STATE:
+                    existing, _ = self._normalize_retention_backup_at(str(row["backup_at"]))
+                    connection.rollback()
+                    return existing
+
+                evidence = self._quarantine_evidence_timestamps()
+                if row is None:
+                    pending_evidence = evidence
+                elif str(row["state"]) == QUARANTINE_RECOVERY_ACKNOWLEDGED_STATE:
+                    acknowledged_at, _ = self._normalize_retention_backup_at(
+                        str(row["backup_at"])
+                    )
+                    pending_evidence = [
+                        timestamp for timestamp in evidence if timestamp > acknowledged_at
+                    ]
+                else:
+                    pending_evidence = []
+                effective = min([candidate, *pending_evidence])
+                _, serialized = self._normalize_retention_backup_at(effective)
+                connection.execute(
+                    """
+                    INSERT INTO history_maintenance_state (name, backup_at, state)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT (name) DO UPDATE SET
+                        backup_at = excluded.backup_at,
+                        state = excluded.state
+                    """,
+                    (
+                        QUARANTINE_RECOVERY_STATE_NAME,
+                        serialized,
+                        QUARANTINE_RECOVERY_REQUIRED_STATE,
+                    ),
+                )
+                connection.commit()
+                return effective
+            except BaseException:
+                connection.rollback()
+                raise
+
+    def acknowledge_quarantine_recovery(self, *, migration_lock_held: bool = False) -> bool:
+        """Acknowledge the pending recovery; return whether one was pending.
+
+        The row is kept rather than deleted so the acknowledged quarantine stays
+        distinguishable from a database that was never quarantined. If the
+        original marker write failed, retained quarantine evidence supplies the
+        timestamp for the consumed row.
+        """
+
+        with self._locked_write_connection(
+            migration_lock_held=migration_lock_held
+        ) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    """
+                    SELECT backup_at, state
+                    FROM history_maintenance_state
+                    WHERE name = ?
+                    """,
+                    (QUARANTINE_RECOVERY_STATE_NAME,),
+                ).fetchone()
+                evidence = self._quarantine_evidence_timestamps()
+                if row is not None:
+                    state = str(row["state"])
+                    if state not in QUARANTINE_RECOVERY_STATES:
+                        raise ValueError("History quarantine recovery state is invalid.")
+                    marked_at, _ = self._normalize_retention_backup_at(str(row["backup_at"]))
+                    if state == QUARANTINE_RECOVERY_REQUIRED_STATE:
+                        acknowledged_at = marked_at
+                    else:
+                        later_evidence = [
+                            timestamp for timestamp in evidence if timestamp > marked_at
+                        ]
+                        if not later_evidence:
+                            connection.rollback()
+                            return False
+                        acknowledged_at = later_evidence[0]
+                elif evidence:
+                    acknowledged_at = evidence[0]
+                else:
+                    connection.rollback()
+                    return False
+
+                _, serialized = self._normalize_retention_backup_at(acknowledged_at)
+                connection.execute(
+                    """
+                    INSERT INTO history_maintenance_state (name, backup_at, state)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT (name) DO UPDATE SET
+                        backup_at = excluded.backup_at,
+                        state = excluded.state
+                    """,
+                    (
+                        QUARANTINE_RECOVERY_STATE_NAME,
+                        serialized,
+                        QUARANTINE_RECOVERY_ACKNOWLEDGED_STATE,
+                    ),
+                )
+                connection.commit()
+                return True
+            except BaseException:
+                connection.rollback()
+                raise
+
+    def clear_retention_wait(self, *, migration_lock_held: bool = False) -> None:
+        """Forget the wait anchor, so the next missing backup starts a fresh window."""
+
+        with self._locked_write_connection(
+            migration_lock_held=migration_lock_held
+        ) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute(
+                    "DELETE FROM history_maintenance_state WHERE name = ?",
+                    (RETENTION_WAIT_STATE_NAME,),
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+
     def run_segmented_retention(
         self,
         backup_at: datetime | str,
@@ -682,9 +1304,27 @@ class HistoryStore:
         with lock_context:
             return self._connect_locked()
 
+    @contextmanager
+    def _read_connection(
+        self,
+        connection: sqlite3.Connection | None = None,
+    ) -> Iterator[sqlite3.Connection]:
+        """Reuse a caller's read connection, or open and close one.
+
+        A slot bundle used to open one connection per query - fifteen locks,
+        connects and PRAGMA rounds for a single request (#457).
+        """
+
+        if connection is not None:
+            yield connection
+            return
+        with closing(self._connect()) as owned_connection:
+            yield owned_connection
+
     def _connect_locked(self) -> sqlite3.Connection:
         """Open and fully configure a connection while the lifecycle lock is held."""
 
+        self._require_no_pending_quarantine_intent()
         self._require_no_pending_lifecycle_markers()
         connection = sqlite3.connect(
             self.file_path,
@@ -751,7 +1391,7 @@ class HistoryStore:
                 or not self._should_recover_database(exc)
             ):
                 raise
-            broken_path = self._quarantine_database()
+            broken_path, quarantined_at = self._quarantine_database()
             logger.warning(
                 "History database %s was unreadable; moved it to %s and created a fresh database. Error: %s",
                 self.file_path,
@@ -759,13 +1399,17 @@ class HistoryStore:
                 exc,
             )
             self._initialize_schema_and_permissions(migration_lock_held=migration_lock_held)
+            self._record_quarantine_recovery_after_initialize(
+                quarantined_at,
+                migration_lock_held=migration_lock_held,
+            )
         except sqlite3.Error as exc:
             if (
                 not self.recover_unreadable_database
                 or not self._should_recover_database(exc)
             ):
                 raise
-            broken_path = self._quarantine_database()
+            broken_path, quarantined_at = self._quarantine_database()
             logger.warning(
                 "History database %s was unreadable; moved it to %s and created a fresh database. Error: %s",
                 self.file_path,
@@ -773,6 +1417,10 @@ class HistoryStore:
                 exc,
             )
             self._initialize_schema_and_permissions(migration_lock_held=migration_lock_held)
+            self._record_quarantine_recovery_after_initialize(
+                quarantined_at,
+                migration_lock_held=migration_lock_held,
+            )
 
     def _initialize_schema_and_permissions(self, *, migration_lock_held: bool = False) -> None:
         self._create_database_file_for_shared_access()
@@ -911,16 +1559,96 @@ class HistoryStore:
             )
         )
 
-    def _quarantine_database(self) -> Path:
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        broken_path = self.file_path.with_name(f"{self.file_path.name}.broken-{timestamp}")
-        self.file_path.replace(broken_path)
-        for suffix in ("-shm", "-wal"):
-            sidecar_path = Path(f"{self.file_path}{suffix}")
-            if not sidecar_path.exists():
+    def _record_quarantine_recovery_after_initialize(
+        self,
+        quarantined_at: datetime,
+        *,
+        migration_lock_held: bool = False,
+    ) -> None:
+        """Persist the recovery-required marker into the fresh database.
+
+        Failing to write it must not turn a recovered service into a service
+        that will not start; the log keeps the quarantine evidence either way.
+        """
+
+        try:
+            self.record_quarantine_recovery(
+                quarantined_at,
+                migration_lock_held=migration_lock_held,
+            )
+        except (sqlite3.Error, OSError):
+            logger.warning(
+                "History database %s was quarantined but the recovery marker could not be recorded.",
+                self.file_path,
+                exc_info=True,
+            )
+
+    def _quarantine_database(self) -> tuple[Path, datetime]:
+        quarantined_at = datetime.now(timezone.utc)
+        evidence = self._quarantine_evidence_timestamps()
+        if evidence and quarantined_at <= evidence[-1]:
+            quarantined_at = evidence[-1] + timedelta(microseconds=1)
+
+        for _ in range(MAX_QUARANTINE_NAME_ALLOCATION_ATTEMPTS):
+            timestamp = quarantined_at.strftime("%Y%m%dT%H%M%S.%fZ")
+            broken_path = self.file_path.with_name(f"{self.file_path.name}.broken-{timestamp}")
+            sidecar_destinations = tuple(
+                broken_path.with_name(f"{broken_path.name}{suffix}")
+                for suffix in ("-shm", "-wal")
+            )
+            intent_path = self.file_path.with_name(
+                f"{self.file_path.name}{QUARANTINE_INTENT_PREFIX}"
+                f"{timestamp}{QUARANTINE_INTENT_SUFFIX}"
+            )
+            if (
+                path_entry_exists(broken_path)
+                or path_entry_exists(intent_path)
+                or any(path_entry_exists(destination) for destination in sidecar_destinations)
+            ):
+                quarantined_at += timedelta(microseconds=1)
                 continue
-            sidecar_path.replace(broken_path.with_name(f"{broken_path.name}{suffix}"))
-        return broken_path
+            self._publish_quarantine_intent(intent_path)
+            for suffix, destination in zip(("-shm", "-wal"), sidecar_destinations, strict=True):
+                sidecar_path = Path(f"{self.file_path}{suffix}")
+                if not path_entry_exists(sidecar_path):
+                    continue
+                self._rename_at2(sidecar_path, destination, flags=RENAME_NOREPLACE)
+                self._fsync_directory(self.file_path.parent)
+            self._rename_at2(self.file_path, broken_path, flags=RENAME_NOREPLACE)
+            self._fsync_directory(self.file_path.parent)
+            intent_path.unlink()
+            self._fsync_directory(self.file_path.parent)
+            return broken_path, quarantined_at
+        raise FileExistsError("Could not allocate a unique history quarantine evidence name.")
+
+    def _publish_quarantine_intent(self, intent_path: Path) -> None:
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(intent_path, flags, 0o600)
+        try:
+            written = os.write(descriptor, QUARANTINE_INTENT_BYTES)
+            if written != len(QUARANTINE_INTENT_BYTES):
+                raise OSError(errno.EIO, "History quarantine intent write was incomplete.")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        self._fsync_directory(intent_path.parent)
+
+    @staticmethod
+    def _fsync_directory(directory: Path) -> None:
+        descriptor = os.open(
+            directory,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
     def create_backup(
         self,
@@ -1136,9 +1864,16 @@ class HistoryStore:
         for stale_path in snapshots[retention_count:]:
             stale_path.unlink(missing_ok=True)
 
-    def get_slot_state(self, system_id: str, enclosure_id: str | None, slot: int) -> SlotStateRecord | None:
+    def get_slot_state(
+        self,
+        system_id: str,
+        enclosure_id: str | None,
+        slot: int,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> SlotStateRecord | None:
         enclosure_key = enclosure_id or ""
-        with closing(self._connect()) as connection:
+        with self._read_connection(connection) as connection:
             row = connection.execute(
                 """
                 SELECT *
@@ -1664,6 +2399,8 @@ class HistoryStore:
         enclosure_id: str | None,
         slot: int,
         limit: int = 100,
+        *,
+        connection: sqlite3.Connection | None = None,
     ) -> list[dict[str, Any]]:
         segmented_reader = self._segmented_reader()
         if segmented_reader is not None:
@@ -1674,7 +2411,7 @@ class HistoryStore:
                 limit=limit,
             )
         enclosure_key = enclosure_id or ""
-        with closing(self._connect()) as connection:
+        with self._read_connection(connection) as connection:
             rows = connection.execute(
                 """
                 SELECT *
@@ -1695,6 +2432,8 @@ class HistoryStore:
         metric_name: str | None = None,
         limit: int = 500,
         since: str | None = None,
+        *,
+        connection: sqlite3.Connection | None = None,
     ) -> list[dict[str, Any]]:
         segmented_reader = self._segmented_reader()
         if segmented_reader is not None:
@@ -1726,7 +2465,7 @@ class HistoryStore:
             ORDER BY observed_at DESC, id DESC
             LIMIT ?
         """
-        with closing(self._connect()) as connection:
+        with self._read_connection(connection) as connection:
             rows = connection.execute(query, parameters).fetchall()
             samples = self._metric_rows_to_payload(rows)
             return self._append_metric_rollups(
@@ -1745,6 +2484,7 @@ class HistoryStore:
         metric_name: str | None = None,
         limit: int = 500,
         since: str | None = None,
+        connection: sqlite3.Connection | None = None,
     ) -> list[dict[str, Any]]:
         segmented_reader = self._segmented_reader()
         if segmented_reader is not None:
@@ -1777,7 +2517,7 @@ class HistoryStore:
             ORDER BY observed_at DESC, id DESC
             LIMIT ?
         """
-        with closing(self._connect()) as connection:
+        with self._read_connection(connection) as connection:
             rows = connection.execute(query, parameters).fetchall()
             samples = self._metric_rows_to_payload(rows)
             return self._append_metric_rollups(
@@ -1848,6 +2588,7 @@ class HistoryStore:
         *,
         since: str | None = None,
         limit: int = MAX_HISTORY_QUERY_LIMIT,
+        connection: sqlite3.Connection | None = None,
     ) -> list[dict[str, Any]]:
         if type(limit) is not int or not 1 <= limit <= MAX_HISTORY_QUERY_LIMIT:
             raise ValueError("History query limit is invalid.")
@@ -1931,7 +2672,7 @@ class HistoryStore:
             ORDER BY first_seen_at ASC, last_seen_at ASC, system_id ASC, enclosure_key ASC, slot ASC
             LIMIT ?
         """
-        with closing(self._connect()) as connection:
+        with self._read_connection(connection) as connection:
             rows = connection.execute(query, [*parameters, limit]).fetchall()
         return [dict(row) for row in rows]
 
@@ -1945,6 +2686,7 @@ class HistoryStore:
         metric_name: str | None = None,
         limit: int = 500,
         since: str | None = None,
+        connection: sqlite3.Connection | None = None,
     ) -> list[dict[str, Any]]:
         segmented_reader = self._segmented_reader()
         if segmented_reader is not None:
@@ -1962,6 +2704,7 @@ class HistoryStore:
             metric_name=metric_name,
             limit=limit,
             since=since,
+            connection=connection,
         )
         local_samples = self.list_metric_samples(
             system_id,
@@ -1970,6 +2713,7 @@ class HistoryStore:
             metric_name=metric_name,
             limit=limit,
             since=since,
+            connection=connection,
         )
         merged_by_key: dict[Any, dict[str, Any]] = {}
         for item in [*disk_samples, *local_samples]:
@@ -2013,9 +2757,37 @@ class HistoryStore:
                 metric_limits=metric_limits,
                 since=since,
             )
-        current = self.get_slot_state(system_id, enclosure_id, slot)
-        events = self.list_slot_events(system_id, enclosure_id, slot, limit=event_limit)
         metric_limits = metric_limits or {}
+        with closing(self._connect()) as connection:
+            return self._build_slot_history_bundle(
+                connection,
+                system_id,
+                enclosure_id,
+                slot,
+                event_limit=event_limit,
+                metric_limits=metric_limits,
+                since=since,
+            )
+
+    def _build_slot_history_bundle(
+        self,
+        connection: sqlite3.Connection,
+        system_id: str,
+        enclosure_id: str | None,
+        slot: int,
+        *,
+        event_limit: int,
+        metric_limits: dict[str, int],
+        since: str | None,
+    ) -> dict[str, Any]:
+        current = self.get_slot_state(system_id, enclosure_id, slot, connection=connection)
+        events = self.list_slot_events(
+            system_id,
+            enclosure_id,
+            slot,
+            limit=event_limit,
+            connection=connection,
+        )
 
         metrics: dict[str, list[dict[str, Any]]] = {}
         latest_values: dict[str, Any] = {}
@@ -2045,6 +2817,7 @@ class HistoryStore:
                     metric_name=metric_name,
                     limit=limit,
                     since=since,
+                    connection=connection,
                 )
             else:
                 samples = self.list_metric_samples(
@@ -2054,13 +2827,18 @@ class HistoryStore:
                     metric_name=metric_name,
                     limit=limit,
                     since=since,
+                    connection=connection,
                 )
             metrics[metric_name] = samples
             latest_values[metric_name] = samples[0].get("value") if samples else None
             sample_counts[metric_name] = len(samples)
 
         if current and current.disk_identity_key:
-            homes = self.list_disk_metric_homes(current.disk_identity_key, since=since)
+            homes = self.list_disk_metric_homes(
+                current.disk_identity_key,
+                since=since,
+                connection=connection,
+            )
             disk_history["identity_available"] = True
             disk_history["homes"] = homes
             def home_scope_key(home: dict[str, Any]) -> tuple[str | None, str, int]:

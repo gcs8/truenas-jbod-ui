@@ -253,7 +253,43 @@ test("five minutes before auto-stop a sticky warning banner asks the user to sav
   assert.equal(state.sessionStopped, false);
 });
 
-test("at auto-stop the banner explains how to start admin again and every action button is disabled", () => {
+test("at the auto-stop time the banner warns but the clock alone does not declare admin stopped", () => {
+  // #418: the browser clock cannot observe the sidecar stopping, so buttons stay
+  // live until a request actually fails after the deadline.
+  const banner = new FakeElement({ classes: ["hidden"] });
+  const countdown = new FakeElement();
+  const buttons = [new FakeElement(), new FakeElement()];
+  const state = {
+    admin: { expires_at: new Date(Date.now() - 1000).toISOString(), auto_stop_seconds: 3600 },
+    sessionStopped: false,
+    countdownTimerId: 7,
+  };
+  const { syncSessionBanner } = loadFunctions(
+    SESSION_FUNCTIONS,
+    {
+      state,
+      elements: sparseElements({ sessionBanner: banner, countdown }),
+      document: fakeDocument(buttons),
+      window: { clearInterval() {} },
+    },
+    SESSION_CONSTANTS
+  );
+
+  syncSessionBanner();
+
+  assert.equal(
+    banner.textContent,
+    "The auto-stop time has passed. If saving stops working, run docker compose --profile admin up -d enclosure-admin, then reload this page."
+  );
+  assert.equal(banner.children[0].tagName, "CODE");
+  assert.ok(banner.classList.contains("is-warning"));
+  assert.ok(!banner.classList.contains("hidden"));
+  assert.equal(state.sessionStopped, false);
+  assert.equal(state.countdownTimerId, 7);
+  assert.ok(buttons.every((button) => !button.disabled));
+});
+
+test("once a request fails after the expiry the banner explains how to start admin again and every action button is disabled", () => {
   const banner = new FakeElement({ classes: ["hidden"] });
   const countdown = new FakeElement();
   const buttons = [new FakeElement(), new FakeElement()];
@@ -263,7 +299,7 @@ test("at auto-stop the banner explains how to start admin again and every action
     countdownTimerId: 7,
   };
   let cleared = null;
-  const { syncSessionBanner } = loadFunctions(
+  const { markAdminStopped } = loadFunctions(
     SESSION_FUNCTIONS,
     {
       state,
@@ -274,7 +310,7 @@ test("at auto-stop the banner explains how to start admin again and every action
     SESSION_CONSTANTS
   );
 
-  syncSessionBanner();
+  markAdminStopped();
 
   assert.equal(
     banner.textContent,
@@ -282,10 +318,8 @@ test("at auto-stop the banner explains how to start admin again and every action
   );
   assert.equal(banner.children[0].tagName, "CODE");
   assert.ok(banner.classList.contains("is-error"));
-  assert.ok(!banner.classList.contains("hidden"));
   assert.equal(countdown.textContent, "Stopped");
   assert.equal(state.sessionStopped, true);
-  assert.equal(state.countdownTimerId, null);
   assert.equal(cleared, 7);
   assert.ok(buttons.every((button) => button.disabled));
 });

@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from pydantic import ValidationError
 
 from app.config import (
     BMCConfig,
@@ -42,6 +43,22 @@ LINUX_NVME_LIST_SUBSYS_COMMAND = (
     "/usr/sbin/nvme list-subsys -o json 2>/dev/null || "
     "/usr/bin/nvme list-subsys -o json 2>/dev/null || true"
 )
+
+
+def _api_endpoint_identity(platform: str | None, host: str | None) -> tuple[object, ...] | None:
+    """Normalized (platform, endpoint) key for the middleware API of one host."""
+
+    authority = api_credential_authority(
+        platform=platform or "core",
+        host=host,
+        username="",
+        verify_tls=False,
+        tls_ca_bundle_path=None,
+        tls_server_name=None,
+    )
+    if authority is None:
+        return None
+    return (authority.platform, authority.endpoint)
 
 
 def resolve_preserved_secret(incoming: str | None, existing: str | None = None) -> str:
@@ -282,6 +299,68 @@ class SystemSetupService:
             self._write_config(config)
             return removed_system.label or removed_system.id, next_default_id
 
+    @staticmethod
+    def _clone_dialect_source(
+        raw_systems: list[object],
+        *,
+        platform: str | None,
+        endpoint: str | None,
+        source_system_id: str | None,
+    ) -> SystemConfig | None:
+        """The saved system a new entry may inherit its API dialect from.
+
+        The named source system wins whenever it still serves the endpoint
+        being saved. Otherwise the saved entries for that endpoint only
+        answer for the dialect when they agree with each other. Anything
+        ambiguous returns None so the caller falls back to the config
+        defaults and the dialect is established again on the next connect.
+        """
+
+        requested_endpoint = _api_endpoint_identity(platform, endpoint)
+        if requested_endpoint is None:
+            return None
+
+        matches: list[tuple[str, dict]] = []
+        for index, item in enumerate(raw_systems):
+            if not isinstance(item, dict):
+                continue
+            raw_truenas = item.get("truenas")
+            if not isinstance(raw_truenas, dict):
+                continue
+            candidate_endpoint = _api_endpoint_identity(
+                raw_truenas.get("platform"),
+                raw_truenas.get("host"),
+            )
+            if candidate_endpoint == requested_endpoint:
+                matches.append((_normalize_system_id(item.get("id"), index + 1), item))
+        if not matches:
+            return None
+
+        try:
+            candidates = [
+                (candidate_id, SystemConfig.model_validate(item))
+                for candidate_id, item in matches
+            ]
+        except ValidationError:
+            # A saved entry for this endpoint cannot be read, so nothing here
+            # can be trusted to answer for the dialect.
+            return None
+
+        if source_system_id:
+            for candidate_id, candidate in candidates:
+                if candidate_id == source_system_id:
+                    return candidate
+            # The clone names a source system that does not serve this
+            # endpoint; it cannot speak for the appliance being saved.
+
+        transports = {
+            (candidate.truenas.api_dialect, candidate.truenas.api_version)
+            for _, candidate in candidates
+        }
+        if len(transports) != 1:
+            return None
+        return candidates[0][1]
+
     def save_system(self, payload: SystemSetupRequest) -> tuple[SystemConfig, bool]:
         with _CONFIG_WRITE_LOCK:
             config = self._load_config()
@@ -304,6 +383,23 @@ class SystemSetupService:
             existing_system = None
             if existing_index is not None:
                 existing_system = SystemConfig.model_validate(raw_systems[existing_index])
+
+            # The setup form still has no dialect control, so a clone (a saved
+            # system re-saved under a new id) has no `existing_system` to read.
+            # The dialect must come from the system the clone was made FROM,
+            # never from an unrelated entry that merely shares the endpoint:
+            # two systems can point at one appliance with different dialects.
+            # `clone_source_system_id` is that handle and nothing else is:
+            # `ssh_commands_source_system_id` is only present while a redacted
+            # command list is preserved, so it must stay out of this decision.
+            dialect_source = existing_system
+            if dialect_source is None:
+                dialect_source = self._clone_dialect_source(
+                    raw_systems,
+                    platform=payload.platform,
+                    endpoint=payload.truenas_host,
+                    source_system_id=normalize_text(payload.clone_source_system_id),
+                )
 
             tls_ca_bundle_path = (
                 payload.tls_ca_bundle_path
@@ -487,6 +583,18 @@ class SystemSetupService:
                         existing_system.truenas.api_password if existing_system is not None else None,
                     ),
                     platform=payload.platform,
+                    # The setup form does not carry the dialect yet, so a save
+                    # must not silently move a JSON-RPC host back onto DDP.
+                    api_dialect=(
+                        dialect_source.truenas.api_dialect
+                        if dialect_source is not None
+                        else TrueNASConfig.model_fields["api_dialect"].default
+                    ),
+                    api_version=(
+                        dialect_source.truenas.api_version
+                        if dialect_source is not None
+                        else TrueNASConfig.model_fields["api_version"].default
+                    ),
                     verify_ssl=payload.verify_ssl,
                     tls_ca_bundle_path=tls_ca_bundle_path,
                     tls_server_name=tls_server_name,

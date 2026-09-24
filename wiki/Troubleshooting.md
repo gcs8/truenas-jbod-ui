@@ -99,8 +99,9 @@ the browser address bar.
 
 ## Admin mutations return 403
 
-`Cross-origin admin mutation rejected.` means the browser origin does not match
-the admin address. Without `ADMIN_PUBLIC_ORIGIN`, the service compares it with
+`This page was opened at ..., but the admin service only accepts changes from
+...` means the browser origin does not match the admin address. The message
+names both addresses. Without `ADMIN_PUBLIC_ORIGIN`, the service compares it with
 the request's own scheme, host, and port. Reverse-proxy deployments can set
 `ADMIN_PUBLIC_ORIGIN` to the exact public address shown in the browser, with no
 path. Basic mode requires that setting and refuses to start if it is empty or
@@ -112,6 +113,38 @@ malformed.
 without encryption. Enable encryption. Set
 `ADMIN_ALLOW_PLAINTEXT_BACKUP_EXPORT=true` only for an intentional,
 access-restricted workflow; the override does not make the archive safe to share.
+
+## Saves fail and the history service keeps restarting
+
+Docker creates a missing bind mount as `root:root`. The containers run as uid
+10001, so nothing can be written until the host directories are owned by that
+uid. What you see:
+
+- Every mapping or alias save fails with
+  `Could not save: the data folder is not writable by the app. See
+  Troubleshooting.` (HTTP 503). Before v0.24 this was a generic HTTP 500.
+- The history service logs
+  `Cannot write to /app/history (owned by uid 0, running as uid 10001). On the
+  Docker host run: sudo chown -R 10001:10001 ./history`, retries a few times
+  with growing backoff, and then stops with that same line instead of looping a
+  traceback.
+
+The log line already names the host path: the container sees `/app/history`,
+but compose binds `./history` from the directory holding `docker-compose.yml`,
+so that is what you chown. Run it from that directory, for every bound
+directory at once:
+
+```bash
+sudo chown -R 10001:10001 ./config ./data ./history ./logs ./backup-status
+docker compose up -d
+```
+
+Create the directories before the first `docker compose up -d` to avoid this
+entirely:
+
+```bash
+mkdir -p config/ssh data history logs backup-status
+```
 
 ## A non-root container gets permission denied
 
