@@ -70,6 +70,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   needed, showed only the storage-view fields that apply, and made system pills,
   delete confirmations, restore inspections and validation errors read as
   sentences instead of developer strings. (#487)
+- Rewrote the warnings, bay-light and mapping reasons, SMART messages, HTTP error details, export banner labels and release-check summaries the main page shows, in plain words with no roadmap prose; the QuantaStor cluster master is shown in Platform Details instead of as a warning, and history backend log lines now say why a request failed (#496).
 - Rewrote the main page copy in plain words: header and profile subtitles,
   the bay status line and Summary panel, the Bay assignment panel, status
   chips with the source message as tooltip and a neutral SSH-off style,
@@ -112,6 +113,30 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Reported an unknown `system_id` on the main page instead of silently
+  showing the default system, and mapped service errors to responses from one
+  table with a 5-second retry hint for busy exports. (#475)
+- Drew TrueNAS CORE bays from the count the enclosure reports instead of
+  always using the 60-bay CSE-946 face, listed small SES enclosures on CORE,
+  stopped the false SES warning on SCALE hosts without an expander, and kept
+  descriptor text from marking empty bays present or faulty. (#482)
+- The main UI now checks at startup that it can write its data, logs and
+  known-hosts directories, logs one plain line per refusal naming the fix,
+  and shows it first in the Warnings panel. `/healthz` gains a plain `summary`
+  and a `problems` list and reports `status: degraded` for an unwritable
+  directory or a degraded TrueNAS API, still answering HTTP 200 so Compose
+  healthchecks keep working. The admin health probe is cached (30 s after
+  success, 10 s after failure) and runs alongside the inventory read, and a
+  stopped admin leaves a disabled System Setup button with the start command
+  instead of the button vanishing. (#565)
+
+- A bad setting now stops the service with one plain line per problem that
+  names the `.env` variable or the `config.yaml` key path and what it must be,
+  instead of a pydantic report with documentation links. Text settings stay
+  text (`TRUENAS_HOST=1234`), blank main-UI values count as unset, unknown
+  `config.yaml` keys are logged once and listed in the admin
+  configuration-warnings banner, and the unused `app.verify_ssl` setting is
+  removed. The history bind error names the variables to set. (#568)
 - Admin save results now offer a "Restart main UI now" button and say "main UI"
   instead of "read UI"; the admin page warns five minutes before it stops
   itself, explains how to start it again once it has, and folds the three
@@ -338,6 +363,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Performance
 
+- Offline exports embed a card photo only when a view or enclosure can draw
+  it, and read the static files once per export instead of once per
+  downsampling pass. (#493)
 - Delegated every bay-tile interaction to the grid, deferred hover SMART
   fetches to the batch prefetch that already covers the bay, and indexed bay
   lookups instead of scanning the slot list on every call (#510, #562).
@@ -422,6 +450,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   status chip states and renaming. (#490)
 
 ### Internal
+
+- Removed the unreachable per-slot history fallback and its concurrency
+  setting, unified the unavailable slot-history payload shape, and deleted
+  duplicated and caller-less helpers (#509).
 
 - Replaced the chain of command comparisons behind the SSH command failure
   contexts with a lookup table and pinned every answer with tests; the debug

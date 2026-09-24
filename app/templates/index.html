@@ -3,7 +3,7 @@
 {% block body %}
 {% set profile = snapshot.selected_profile %}
 {% set release_status_payload = release_status if release_status is defined and release_status else {} %}
-{% set release_note = release_status_payload.summary if release_status_payload and release_status_payload.summary else "Checking releases..." %}
+{% set release_note = release_status_payload.summary if release_status_payload and release_status_payload.summary else "Checking for updates..." %}
 {% if release_status_payload and release_status_payload.status == "disabled" %}{% set release_note = "" %}{% endif %}
 {% set snapshot_is_sanitized = snapshot_mode and (snapshot_export_meta.redaction == "partial" or snapshot_export_meta.redaction_label in ["Scrambled IDs", "Synthetic IDs"]) %}
 <div class="app-shell">
@@ -59,6 +59,10 @@
     </div>
   </header>
 
+  {% if system_notice %}
+  <p class="status-text" id="system-notice" role="status" data-tone="info">{{ system_notice }}</p>
+  {% endif %}
+
   {% if snapshot_mode %}
   {% set snapshot_is_demo = snapshot_export_meta.redaction_label in ["Scrambled IDs", "Synthetic IDs"] %}
   {% set snapshot_bay_count = snapshot_export_meta.visible_bay_count or snapshot.layout_slot_count or (snapshot.slots | length) %}
@@ -104,7 +108,7 @@
       <div class="summary-card compact">
         <span class="summary-label">Redaction</span>
         <span class="summary-value">{{ snapshot_export_meta.redaction_label or "None" }}</span>
-        <span class="summary-note">{{ snapshot_export_meta.redaction_note or "Original identifiers included" }}</span>
+        <span class="summary-note">{{ snapshot_export_meta.redaction_note or "Real host names and serial numbers included" }}</span>
       </div>
       <div class="summary-card compact">
         <span class="summary-label">Contents</span>
@@ -126,6 +130,11 @@
     {% if not snapshot_mode %}
     {% if admin_launch_url %}
     <a class="button secondary" href="{{ admin_launch_url }}" target="_blank" rel="noopener">System Setup</a>
+    {% elif admin_launch_stopped %}
+    <div class="field" id="admin-launch-stopped">
+      <button class="button secondary" type="button" disabled aria-describedby="admin-launch-stopped-note">System Setup</button>
+      <span class="summary-note" id="admin-launch-stopped-note">Admin is stopped (it stops itself when idle). Start it on the Docker host: <code>docker compose --profile admin up -d enclosure-admin</code></span>
+    </div>
     {% endif %}
     <button id="export-snapshot-button" class="button secondary">Export Snapshot</button>
     {% endif %}

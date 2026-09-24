@@ -7,7 +7,7 @@ import urllib.error
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.config import ENV_OVERRIDES, HistoryConfig
+from app.config import HistoryConfig
 from app.request_context import request_context
 from app.services.history_backend import (
     HISTORY_BACKEND_DEGRADED_DETAIL,
@@ -312,11 +312,37 @@ class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(payload["configured"])
         self.assertTrue(payload["available"])
-        self.assertEqual(payload["detail"], "History backend is degraded; see history service logs.")
+        self.assertEqual(payload["detail"], "History is running with errors. Check the history service log.")
         self.assertEqual(payload["counts"], {})
         self.assertEqual(payload["collector"]["last_success_at"], "2026-05-14T23:10:00+00:00")
         self.assertEqual(payload["scopes"], [])
         fetch_json.assert_awaited_once_with("/healthz")
+
+    async def test_get_status_logs_the_failure_reason_while_keeping_the_detail_generic(self) -> None:
+        client = HistoryBackendClient(
+            HistoryConfig(service_url="http://history-backend:8001", timeout_seconds=10)
+        )
+
+        with (
+            patch.object(
+                client,
+                "_fetch_json",
+                AsyncMock(
+                    side_effect=HistoryBackendUnavailableError(
+                        "History backend request failed: [Errno 111] Connection refused",
+                        reason="[Errno 111] Connection refused",
+                    )
+                ),
+            ),
+            self.assertLogs("app.services.history_backend", level="WARNING") as logs,
+        ):
+            payload = await client.get_status()
+
+        self.assertEqual(payload["detail"], "History is temporarily unavailable.")
+        self.assertEqual(
+            logs.output,
+            ["WARNING:app.services.history_backend:History backend status request failed ([Errno 111] Connection refused)."],
+        )
 
     async def test_get_status_redacts_backend_exception_details(self) -> None:
         client = HistoryBackendClient(
@@ -331,7 +357,7 @@ class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
             payload = await client.get_status()
 
         self.assertFalse(payload["available"])
-        self.assertEqual(payload["detail"], "History backend request failed; see application logs.")
+        self.assertEqual(payload["detail"], "History is temporarily unavailable.")
         self.assertNotIn("secret", str(payload))
         self.assertNotIn("Traceback", str(payload))
 
@@ -348,7 +374,7 @@ class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
             payload = await client.get_slot_history(5, "archive-core", "front", window_hours=24)
 
         self.assertFalse(payload["available"])
-        self.assertEqual(payload["detail"], "History backend request failed; see application logs.")
+        self.assertEqual(payload["detail"], "History is temporarily unavailable.")
         self.assertNotIn("secret", str(payload))
         self.assertNotIn("Traceback", str(payload))
 
@@ -366,7 +392,7 @@ class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(payload["available"])
         self.assertEqual(payload["detail"], HISTORY_BACKEND_FAILURE_DETAIL)
-        self.assert_single_safe_warning(captured, "History backend status request failed.")
+        self.assert_single_safe_warning(captured, "History backend status request failed (RuntimeError).")
 
     async def test_get_slot_history_warning_omits_backend_exception_details(self) -> None:
         client = HistoryBackendClient(
@@ -382,7 +408,7 @@ class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(payload["available"])
         self.assertEqual(payload["detail"], HISTORY_BACKEND_FAILURE_DETAIL)
-        self.assert_single_safe_warning(captured, "History backend slot history request failed.")
+        self.assert_single_safe_warning(captured, "History backend slot history request failed (RuntimeError).")
 
     async def test_multi_scope_warning_omits_backend_exception_details(self) -> None:
         client = HistoryBackendClient(
@@ -404,7 +430,9 @@ class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(payload["available"])
         self.assertEqual(payload["detail"], HISTORY_BACKEND_FAILURE_DETAIL)
-        self.assert_single_safe_warning(captured, "History backend multi-scope request failed.")
+        self.assert_single_safe_warning(
+            captured, "History backend multi-scope request failed (HistoryBackendUnavailableError)."
+        )
 
     async def test_get_scope_history_warning_omits_backend_exception_details(self) -> None:
         client = HistoryBackendClient(
@@ -426,7 +454,9 @@ class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(payload[5]["available"])
         self.assertEqual(payload[5]["detail"], HISTORY_BACKEND_FAILURE_DETAIL)
-        self.assert_single_safe_warning(captured, "History backend scope history request failed.")
+        self.assert_single_safe_warning(
+            captured, "History backend scope history request failed (HistoryBackendUnavailableError)."
+        )
 
     async def test_get_slot_history_shapes_metric_and_event_payloads(self) -> None:
         client = HistoryBackendClient(
@@ -633,10 +663,3 @@ class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
                 client._request_bytes_sync("/healthz")
         self.assertIn("HTTP 503", str(raised.exception))
         self.assertNotIsInstance(raised.exception, HistoryBackendUnavailableError)
-
-    def test_history_config_exposes_fallback_concurrency_env(self) -> None:
-        self.assertEqual(HistoryConfig().fallback_max_concurrency, 4)
-        self.assertEqual(
-            ENV_OVERRIDES["HISTORY_BACKEND_FALLBACK_CONCURRENCY"],
-            ("history", "fallback_max_concurrency"),
-        )

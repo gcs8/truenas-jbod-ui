@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from typing import Iterable
 
 from app.config import EnclosureProfileConfig, Settings, SystemConfig
 from app.models.domain import EnclosureOption, EnclosureProfileView
@@ -9,6 +8,7 @@ MAX_PROFILE_REFERENCE_WARNINGS = 50
 MAX_PROFILE_REFERENCE_IDENTIFIER_LENGTH = 128
 
 CORE_CSE_946_PROFILE_ID = "supermicro-cse-946-top-60"
+CORE_CSE_946_SLOT_COUNT = 60
 DELL_MD1280_PROFILE_ID = "dell-md1280-drawer-84"
 DELL_MD1280_DRAWER_TOP_PROFILE_ID = "dell-md1280-drawer-top-42"
 DELL_MD1280_DRAWER_BOTTOM_PROFILE_ID = "dell-md1280-drawer-bottom-42"
@@ -568,13 +568,13 @@ def build_profile_reference_warnings(settings: Settings) -> list[dict[str, str]]
             bounded_enclosure_id = _bounded_profile_reference_identifier(enclosure_id)
             warning["enclosure_id"] = bounded_enclosure_id
             warning["message"] = (
-                f"System {bounded_system_id} enclosure {bounded_enclosure_id} references unknown profile "
-                f"{bounded_profile_id}. Runtime geometry fallback will be used."
+                f"Layout '{bounded_profile_id}' for enclosure {bounded_enclosure_id} on system "
+                f"{bounded_system_id} was not found; using fallback bay geometry."
             )
         else:
             warning["message"] = (
-                f"System {bounded_system_id} references unknown default profile {bounded_profile_id}. "
-                "Runtime geometry fallback will be used."
+                f"Default layout '{bounded_profile_id}' for system {bounded_system_id} was not found; "
+                "using fallback bay geometry."
             )
         warnings.append(warning)
 
@@ -623,7 +623,11 @@ class ProfileRegistry:
         system: SystemConfig,
         enclosure: EnclosureOption | None = None,
     ) -> str | None:
-        return self._select_profile_id(system, enclosure)
+        return self._select_profile_id(
+            system,
+            enclosure,
+            slot_count=enclosure.slot_count if enclosure and enclosure.slot_count else None,
+        )
 
     def resolve_for_enclosure(
         self,
@@ -636,16 +640,27 @@ class ProfileRegistry:
         fallback_slot_count: int | None = None,
         fallback_slot_layout: list[list[int | None]] | None = None,
     ) -> EnclosureProfileView | None:
-        profile_id = self._select_profile_id(system, enclosure)
+        slot_count = fallback_slot_count or (enclosure.slot_count if enclosure else None)
+        profile_id = self._select_profile_id(system, enclosure, slot_count=slot_count)
         resolved = self.get(profile_id)
         if resolved is not None:
             return resolved
 
         rows = fallback_rows or (enclosure.rows if enclosure else None)
         columns = fallback_columns or (enclosure.columns if enclosure else None)
-        slot_count = fallback_slot_count or (enclosure.slot_count if enclosure else None)
         slot_layout = fallback_slot_layout or (enclosure.slot_layout if enclosure else None)
         label = fallback_label or (enclosure.label if enclosure else None)
+        if (
+            slot_count
+            and rows
+            and columns
+            and not slot_layout
+            and (rows * columns < slot_count or columns > slot_count)
+        ):
+            # The fallback grid comes from the layout settings, not from this
+            # enclosure; size it so every reported bay gets a cell.
+            columns = min(columns, slot_count)
+            rows = -(-slot_count // columns)
         if rows and columns:
             runtime_id = f"runtime-{(enclosure.id if enclosure else 'enclosure')}"
             return EnclosureProfileView(
@@ -666,7 +681,13 @@ class ProfileRegistry:
             )
         return None
 
-    def _select_profile_id(self, system: SystemConfig, enclosure: EnclosureOption | None) -> str | None:
+    def _select_profile_id(
+        self,
+        system: SystemConfig,
+        enclosure: EnclosureOption | None,
+        *,
+        slot_count: int | None = None,
+    ) -> str | None:
         if enclosure:
             enclosure_override = (system.enclosure_profiles or {}).get(enclosure.id)
             if enclosure_override:
@@ -678,7 +699,12 @@ class ProfileRegistry:
             return system.default_profile_id
 
         if system.truenas.platform == "core":
-            return CORE_CSE_946_PROFILE_ID
+            # The CSE-946 stays the CORE default only while the enclosure
+            # reports its 60 bays; any other bay count is drawn from the
+            # reported geometry instead of being cut to or padded out to 60.
+            if slot_count is None or slot_count == CORE_CSE_946_SLOT_COUNT:
+                return CORE_CSE_946_PROFILE_ID
+            return None
         if system.truenas.platform == "linux":
             return LINUX_GPU_SERVER_NVME_PROFILE_ID
         if system.truenas.platform == "quantastor":
@@ -689,10 +715,3 @@ class ProfileRegistry:
             return None
 
         return None
-
-
-def summarize_row_groups(row_groups: Iterable[int], total_columns: int) -> list[int]:
-    normalized = [group for group in row_groups if isinstance(group, int) and group > 0]
-    if not normalized or sum(normalized) != total_columns:
-        return [total_columns]
-    return normalized
