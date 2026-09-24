@@ -103,6 +103,11 @@ python3 scripts/check_public_docs.py
 
 Do not set screenshot pixel review to `PASS` before reviewing the exact PNG hashes.
 
+A capture on a host workstation is not byte-reproducible: the demo page falls
+back to the platform fonts, so a Windows or macOS capture produces a different
+page height and different PNG bytes. Recapture only through the pinned Linux
+path in [`SCREENSHOT_CAPTURE.md`](SCREENSHOT_CAPTURE.md).
+
 ## Publication and readback
 
 A pull request and a push to `main` verify bytes but do not publish Pages. A maintainer must run `.github/workflows/publish-public-demo.yml` with `workflow_dispatch` after the reviewed commit merges.
