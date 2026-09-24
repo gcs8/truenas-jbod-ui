@@ -16,6 +16,7 @@ Platform Guides
 Feature Guides
 
 - [[Live Enclosures and Storage Views|Live-Enclosures-and-Storage-Views]]
+- [[Storage Fabric|Storage-Fabric]]
 - [[Heat Map Mode|Heat-Map-Mode]]
 - [[History and Snapshot Export|History-and-Snapshot-Export]]
 - [[Admin UI and System Setup|Admin-UI-and-System-Setup]]
