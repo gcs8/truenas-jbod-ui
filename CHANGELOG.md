@@ -266,6 +266,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 - Preserved history availability, scope identity and outage errors across
   bulk responses and offline exports. (#423)
+- Removed invented physical backplanes and bay labels from virtual inventories.
+  Logical disk paths and known physical aliases were preserved. (#419)
 - The Storage Fabric page keeps keyboard focus, scroll position, open
   kernel-error panels and a half-typed friendly name across renders, expands
   long bay lists in place, keeps visited related traces clickable, and fetches
