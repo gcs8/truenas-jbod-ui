@@ -28,7 +28,12 @@ from pydantic import BaseModel, ConfigDict
 
 from app.read_ui_auth_config import load_read_ui_auth_settings
 from app import __version__
-from app.config import Settings, get_settings
+from app.config import (
+    Settings,
+    get_settings,
+    is_placeholder_known_hosts_path,
+    known_hosts_placeholder_paths,
+)
 from app.http_auth import (
     basic_auth_matches,
     configured_origin_identity,
@@ -81,7 +86,7 @@ from app.services.snapshot_export import (
     SnapshotExportTooLargeError,
     collect_configured_hostnames,
 )
-from app.services.storage_writability import probe_writable_directories
+from app.services.storage_writability import probe_known_hosts_files, probe_writable_directories
 from app.services.truenas_ws import TrueNASAPIError
 from app.services import upgrade_notice
 from history_service.operation_bounds import (
@@ -620,11 +625,17 @@ def create_app() -> FastAPI:
     app.state.operator_auth_settings = operator_auth_settings
     app.state.read_ui_public_origin = startup_settings.app.public_origin
     writable_directories = tuple(ui_writable_directories(startup_settings))
-    startup_problems = probe_writable_directories(writable_directories)
+    _, configured_known_hosts = split_known_hosts_paths(startup_settings)
+    known_hosts_files = tuple(configured_known_hosts)
+    startup_problems = [
+        *probe_writable_directories(writable_directories),
+        *probe_known_hosts_files(known_hosts_files),
+    ]
     for problem in startup_problems:
         logger.error("%s", problem)
     app.state.startup_problems = tuple(startup_problems)
     app.state.writable_directories = writable_directories
+    app.state.known_hosts_files = known_hosts_files
     app.state.storage_checked_at_monotonic = time.monotonic()
 
     app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
@@ -917,14 +928,42 @@ def ui_writable_directories(settings: Settings) -> list[str]:
     """
 
     paths = settings.paths
+    derived_known_hosts, _ = split_known_hosts_paths(settings)
     candidates = [
         paths.mapping_file,
         paths.sas_fabric_alias_file,
         paths.slot_detail_cache_file,
         paths.log_file,
-        settings.ssh.known_hosts_path,
+        *derived_known_hosts,
     ]
     return [str(Path(candidate).parent) for candidate in candidates if candidate]
+
+
+def split_known_hosts_paths(settings: Settings) -> tuple[list[str], list[str]]:
+    """Known-hosts files in use, split into (derived default, operator-configured).
+
+    The derived ``<data>/known_hosts`` lives in the data folder and is probed
+    with it. A configured path (e.g. a host bind mount) gets its own check,
+    which reports a missing folder instead of creating one.
+    """
+    placeholders = known_hosts_placeholder_paths(settings.config_file)
+    derived: list[str] = []
+    configured: list[str] = []
+    for candidate in (settings.ssh.known_hosts_path, *(system.ssh.known_hosts_path for system in settings.systems)):
+        if not candidate:
+            continue
+        bucket = derived if is_placeholder_known_hosts_path(candidate, placeholders) else configured
+        if candidate not in bucket:
+            bucket.append(candidate)
+    return derived, configured
+
+
+def startup_storage_problems(settings: Settings) -> list[str]:
+    _, configured_known_hosts = split_known_hosts_paths(settings)
+    return [
+        *probe_writable_directories(ui_writable_directories(settings)),
+        *probe_known_hosts_files(configured_known_hosts),
+    ]
 
 
 def startup_problems_for(request: Request) -> list[str]:
@@ -953,7 +992,8 @@ def refresh_storage_problems(request: Request) -> list[str]:
     checked_at = getattr(app_state, "storage_checked_at_monotonic", None)
     if isinstance(checked_at, (int, float)) and now - checked_at < STORAGE_REPROBE_SECONDS:
         return list(previous)
-    current = tuple(probe_writable_directories(directories))
+    known_hosts_files = tuple(getattr(app_state, "known_hosts_files", None) or ())
+    current = tuple([*probe_writable_directories(directories), *probe_known_hosts_files(known_hosts_files)])
     for problem in current:
         if problem not in previous:
             logger.error("%s", problem)

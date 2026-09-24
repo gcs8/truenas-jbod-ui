@@ -212,8 +212,9 @@ sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid "$app_uid" --gid "$a
 ```
 
 Run the dry check first. Do not use recursive `chmod 777`. If SSH then fails to
-load `known_hosts`, verify that `data/known_hosts` is owned by the configured
-app UID/GID and uses mode `0660`.
+load `known_hosts`, verify that `data/known_hosts` (or the file named by
+`ssh.known_hosts_path` / `SSH_KNOWN_HOSTS_PATH`, if set) is owned by the
+configured app UID/GID and uses mode `0660`.
 
 ## SCALE shows a generic runtime profile
 

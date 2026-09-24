@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import threading
 import time
 import tempfile
@@ -690,67 +691,154 @@ class SSHProbeTests(unittest.TestCase):
         ssh_client.connect.assert_called_once()
 
 
-class KnownHostsPathContractTests(unittest.TestCase):
-    """The known-hosts file location is derived, not operator-configurable.
+class KnownHostsPathSettingsTests(unittest.TestCase):
+    """A configured known-hosts path is honoured; placeholders derive.
 
-    PR #201 made ``_apply_config_path_relative_defaults`` reassign
-    ``ssh.known_hosts_path`` after every other layer is merged, so any
-    configured value is discarded. These tests pin that contract so the
-    setting is not re-advertised as configurable without also honouring it.
+    Owner decision on #454 (supersedes the #318 fixed-path contract): an
+    ``ssh.known_hosts_path`` set at the top level, per system, or through
+    ``SSH_KNOWN_HOSTS_PATH`` is used as written, e.g. a host bind mount instead
+    of the data volume. Unset, blank, the shipped default and the legacy
+    ``/app/data/known_hosts`` container path still derive ``<data>/known_hosts``.
     """
 
-    def test_known_hosts_path_is_not_an_environment_override(self) -> None:
-        self.assertFalse(
-            "SSH_KNOWN_HOSTS_PATH" in ENV_OVERRIDES,
-            "SSH_KNOWN_HOSTS_PATH is discarded after merge; it must not be advertised",
-        )
-        self.assertFalse(
-            ("ssh", "known_hosts_path") in set(ENV_OVERRIDES.values()),
-            "no environment variable may target ssh.known_hosts_path",
-        )
-
-    def test_environment_variable_cannot_move_the_known_hosts_file(self) -> None:
+    def _load_settings(self, config_lines: list[str], environment: dict[str, str]) -> tuple[Path, object]:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = Path(temp_dir)
             config_path = temp_root / "config.yaml"
-            config_path.write_text(
-                "\n".join(
-                    [
-                        "ssh:",
-                        "  known_hosts_path: /operator/chosen/known_hosts",
-                        "systems:",
-                        "  - id: primary",
-                        "    ssh:",
-                        "      known_hosts_path: /operator/chosen/known_hosts",
-                    ]
-                ),
-                encoding="utf-8",
-            )
+            config_path.write_text("\n".join(config_lines), encoding="utf-8")
 
             with patch.dict(
                 "os.environ",
-                {
-                    "APP_CONFIG_PATH": config_path.as_posix(),
-                    "SSH_KNOWN_HOSTS_PATH": "/operator/chosen/known_hosts",
-                },
+                {"APP_CONFIG_PATH": config_path.as_posix(), **environment},
                 clear=False,
             ):
+                if "SSH_KNOWN_HOSTS_PATH" not in environment:
+                    os.environ.pop("SSH_KNOWN_HOSTS_PATH", None)
                 get_settings.cache_clear()
                 settings = get_settings()
                 get_settings.cache_clear()
+        return temp_root, settings
 
-            derived = temp_root / "known_hosts"
-            self.assertEqual(Path(settings.ssh.known_hosts_path), derived)
-            self.assertEqual(
-                [Path(system.ssh.known_hosts_path) for system in settings.systems],
-                [derived],
-            )
+    def test_known_hosts_path_is_an_environment_override(self) -> None:
+        self.assertEqual(ENV_OVERRIDES.get("SSH_KNOWN_HOSTS_PATH"), ("ssh", "known_hosts_path"))
 
-    def test_documentation_does_not_advertise_the_removed_override(self) -> None:
+    def test_unset_known_hosts_path_derives_from_the_runtime_layout(self) -> None:
+        temp_root, settings = self._load_settings(
+            ["systems:", "  - id: primary", "    ssh:", "      enabled: true"],
+            {},
+        )
+
+        derived = temp_root / "known_hosts"
+        self.assertEqual(Path(settings.ssh.known_hosts_path), derived)
+        self.assertEqual([Path(system.ssh.known_hosts_path) for system in settings.systems], [derived])
+
+    def test_placeholder_values_derive_from_the_runtime_layout(self) -> None:
+        for placeholder in ("/app/data/known_hosts", '""'):
+            with self.subTest(placeholder=placeholder):
+                temp_root, settings = self._load_settings(
+                    [
+                        "ssh:",
+                        f"  known_hosts_path: {placeholder}",
+                        "systems:",
+                        "  - id: primary",
+                        "    ssh:",
+                        f"      known_hosts_path: {placeholder}",
+                    ],
+                    {},
+                )
+
+                derived = temp_root / "known_hosts"
+                self.assertEqual(Path(settings.ssh.known_hosts_path), derived)
+                self.assertEqual([Path(system.ssh.known_hosts_path) for system in settings.systems], [derived])
+
+    def test_configured_top_level_path_is_honoured_and_inherited_by_systems(self) -> None:
+        temp_root, settings = self._load_settings(
+            [
+                "ssh:",
+                "  known_hosts_path: /srv/operator/known_hosts",
+                "systems:",
+                "  - id: primary",
+                "    ssh:",
+                "      enabled: true",
+                "  - id: legacy",
+                "    ssh:",
+                "      known_hosts_path: /app/data/known_hosts",
+            ],
+            {},
+        )
+
+        self.assertEqual(settings.ssh.known_hosts_path, "/srv/operator/known_hosts")
+        self.assertEqual(
+            [system.ssh.known_hosts_path for system in settings.systems],
+            ["/srv/operator/known_hosts", "/srv/operator/known_hosts"],
+        )
+        self.assertNotEqual(Path(settings.ssh.known_hosts_path), temp_root / "known_hosts")
+
+    def test_configured_per_system_path_is_honoured(self) -> None:
+        temp_root, settings = self._load_settings(
+            [
+                "systems:",
+                "  - id: primary",
+                "    ssh:",
+                "      enabled: true",
+                "  - id: secondary",
+                "    ssh:",
+                "      known_hosts_path: /srv/secondary/known_hosts",
+            ],
+            {},
+        )
+
+        derived = str(temp_root / "known_hosts")
+        self.assertEqual(settings.ssh.known_hosts_path, derived)
+        self.assertEqual(
+            [system.ssh.known_hosts_path for system in settings.systems],
+            [derived, "/srv/secondary/known_hosts"],
+        )
+
+    def test_environment_variable_moves_the_known_hosts_file(self) -> None:
+        # Also pins the _deep_merge copy: the env write must not leak into the
+        # defaults it is compared against, or it would be read as a placeholder.
+        _, settings = self._load_settings(
+            ["systems:", "  - id: primary", "    ssh:", "      enabled: true"],
+            {"SSH_KNOWN_HOSTS_PATH": "/srv/env/known_hosts"},
+        )
+
+        self.assertEqual(settings.ssh.known_hosts_path, "/srv/env/known_hosts")
+        self.assertEqual(
+            [system.ssh.known_hosts_path for system in settings.systems],
+            ["/srv/env/known_hosts"],
+        )
+
+    def test_admin_ssh_targets_resolve_the_saved_systems_own_file(self) -> None:
+        from app.config import known_hosts_path_for_target
+
+        temp_root, settings = self._load_settings(
+            [
+                "ssh:",
+                "  known_hosts_path: /srv/default/known_hosts",
+                "systems:",
+                "  - id: primary",
+                "    ssh:",
+                "      host: primary.example.test",
+                "  - id: secondary",
+                "    ssh:",
+                "      host: secondary.example.test",
+                "      extra_hosts: [peer.example.test]",
+                "      known_hosts_path: /srv/secondary/known_hosts",
+            ],
+            {},
+        )
+
+        self.assertEqual(known_hosts_path_for_target(settings, system_id="secondary"), "/srv/secondary/known_hosts")
+        self.assertEqual(known_hosts_path_for_target(settings, target_host="PEER.example.test"), "/srv/secondary/known_hosts")
+        self.assertEqual(known_hosts_path_for_target(settings, system_id="primary"), "/srv/default/known_hosts")
+        self.assertEqual(known_hosts_path_for_target(settings, target_host="new.example.test"), settings.ssh.known_hosts_path)
+
+    def test_documentation_advertises_the_override(self) -> None:
         root = Path(__file__).resolve().parents[1]
         for relative in (".env.example", "docs/SSH_READ_ONLY_SETUP.md"):
             with self.subTest(document=relative):
-                self.assertFalse(
+                self.assertTrue(
                     "SSH_KNOWN_HOSTS_PATH" in (root / relative).read_text(encoding="utf-8"),
-                    f"{relative} must not document SSH_KNOWN_HOSTS_PATH; it is ignored",
+                    f"{relative} must document SSH_KNOWN_HOSTS_PATH",
                 )

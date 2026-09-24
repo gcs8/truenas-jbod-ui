@@ -4043,8 +4043,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
                     exit_code=0,
                 )
 
-        def make_service(config_path: str) -> ServiceAccountBootstrapService:
-            return ServiceAccountBootstrapService(config_path, probe_factory=RecordingProbe)
+        def make_service(config_path: str, **kwargs: object) -> ServiceAccountBootstrapService:
+            return ServiceAccountBootstrapService(config_path, probe_factory=RecordingProbe, **kwargs)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             config_file = Path(temp_dir) / "config" / "config.yaml"
@@ -4136,8 +4136,9 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         received: list[SystemSetupBootstrapRequest] = []
 
         class RecordingBootstrapService:
-            def __init__(self, config_path: str) -> None:
+            def __init__(self, config_path: str, *, known_hosts_path: str | None = None) -> None:
                 self.config_path = config_path
+                self.known_hosts_path = known_hosts_path
 
             def bootstrap_service_account(self, payload: SystemSetupBootstrapRequest) -> dict[str, object]:
                 received.append(payload)

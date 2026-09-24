@@ -483,7 +483,11 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
             result = await asyncio.to_thread(
                 service.install_package,
                 payload,
-                known_hosts_path=settings.ssh.known_hosts_path,
+                known_hosts_path=known_hosts_path_for_target(
+                    settings,
+                    system_id=payload.system_id,
+                    target_host=payload.host,
+                ),
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -693,7 +697,11 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
             payload,
             raw_data,
             nodes,
-            known_hosts_path=settings.ssh.known_hosts_path,
+            known_hosts_path=known_hosts_path_for_target(
+                settings,
+                system_id=payload.system_id,
+                target_host=payload.ssh_host,
+            ),
         )
         return JSONResponse({"ok": True, "nodes": nodes, "host_discovery": host_discovery})
 
@@ -991,7 +999,14 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
     @router.post("/api/admin/system-setup/bootstrap")
     async def bootstrap_service_account(payload: SystemSetupBootstrapRequest) -> JSONResponse:
         settings = reload_app_settings()
-        bootstrap_service = ServiceAccountBootstrapService(settings.config_file)
+        bootstrap_service = ServiceAccountBootstrapService(
+            settings.config_file,
+            known_hosts_path=known_hosts_path_for_target(
+                settings,
+                system_id=payload.ssh_commands_source_system_id,
+                target_host=payload.host,
+            ),
+        )
         try:
             if not payload.sudo_commands and payload.ssh_commands_source_system_id:
                 # Re-validate so saved commands pass the same request-model sanitizer
