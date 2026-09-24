@@ -71,6 +71,7 @@ MAX_NAME_DEPTH = 8
 S3_REGET_LIMIT = 16 * 1024 * 1024
 S3_MULTIPART_THRESHOLD = 64 * 1024 * 1024
 S3_MULTIPART_CHUNKSIZE = 64 * 1024 * 1024
+SFTP_PREFETCH_MAX_REQUESTS = 64
 NFS_UMOUNT_ATTEMPTS = 3
 NFS_UMOUNT_RETRY_DELAY_SECONDS = 2.0
 MOUNT_COMMAND_TIMEOUT_SECONDS = 45
@@ -544,12 +545,15 @@ class FtpTarget(_TargetBase):
         try:
             self._ftp.delete(path)
         except ftplib.error_perm as exc:
+            # Only a listing of the parent that succeeds and lacks the name
+            # proves the object is gone; anything ambiguous propagates.
+            parent, leaf = posixpath.split(path)
             try:
-                self._ftp.voidcmd("TYPE I")
-                self._ftp.size(path)
-            except ftplib.error_perm:
-                return  # already gone
-            raise ArchiveTransportError(f"FTP archive delete failed: {exc}") from exc
+                present = any(entry == leaf for entry, _facts in self._ftp.mlsd(parent, facts=["type"]))
+            except ftplib.all_errors as list_error:
+                raise ArchiveTransportError(f"FTP archive delete failed: {exc}") from list_error
+            if present:
+                raise ArchiveTransportError(f"FTP archive delete failed: {exc}") from exc
 
 
 @contextmanager
@@ -645,24 +649,26 @@ class SftpTarget(_TargetBase):
             current = posixpath.join(current, part) if current else part
             if current in self._known_dirs:
                 continue
+            # lstat, never stat: a symlinked component could lead outside the
+            # app-owned root, so only real directories are accepted.
             try:
-                attributes = self._sftp.stat(current)
+                attributes = self._sftp.lstat(current)
             except OSError as exc:
                 if not _is_missing(exc):
                     raise
                 try:
                     self._sftp.mkdir(current)
                 except OSError as mkdir_error:
-                    # Lost a creation race, or a real error: re-stat decides,
+                    # Lost a creation race, or a real error: re-check decides,
                     # and a still-missing directory surfaces the mkdir error.
                     try:
-                        attributes = self._sftp.stat(current)
+                        attributes = self._sftp.lstat(current)
                     except OSError:
                         raise mkdir_error from None
                 else:
-                    attributes = self._sftp.stat(current)
+                    attributes = self._sftp.lstat(current)
             if not stat.S_ISDIR(attributes.st_mode or 0):
-                raise ArchiveTransportError(f"SFTP archive path {current!r} is not a directory.")
+                raise ArchiveTransportError(f"SFTP archive path {current!r} is not a plain directory.")
             self._known_dirs.add(current)
 
     def put(self, local_path: Path, name: str) -> StoredObject:
@@ -676,7 +682,7 @@ class SftpTarget(_TargetBase):
                     remote.set_pipelined(True)
                     size, sha = _copy_stream(source, remote.write)
                 with self._sftp.open(partial, "rb") as readback:
-                    readback.prefetch(size)
+                    readback.prefetch(size, max_concurrent_requests=SFTP_PREFETCH_MAX_REQUESTS)
                     back_size, back_sha = _hash_stream(readback)
                 _check_readback("SFTP", size, sha, back_size, back_sha)
                 try:
@@ -963,9 +969,17 @@ def _open_nfs(settings: ArchiveTargetSettings) -> Iterator[LocalDirectoryTarget]
     command.extend([f"{settings.hostname}:{settings.export_path}", mount_dir])
     try:
         _run_mount_command(command, "mount NFS archive")
-    except BaseException:
+    except BaseException as mount_error:
         # Fail closed: never fall back to writing into the local directory.
-        if not _is_mounted(mount_dir):
+        # A mount that timed out or failed may still have attached; unmount
+        # it so the export is not left mounted after the job.
+        if _is_mounted(mount_dir):
+            try:
+                _unmount_nfs(umount_bin, mount_dir)
+            except NfsUnmountError as unmount_error:
+                mount_error.add_note(str(unmount_error))
+                logger.error("%s", unmount_error)
+        else:
             try:
                 os.rmdir(mount_dir)
             except OSError:
@@ -1021,8 +1035,10 @@ def _import_boto3() -> tuple[Any, Any, Any]:
     return boto3, TransferConfig, Config
 
 
-def _s3_expected_etag(md5_parts: list[bytes], whole_md5: str) -> str:
-    if len(md5_parts) <= 1:
+def _s3_expected_etag(md5_parts: list[bytes], whole_md5: str, *, multipart: bool) -> str:
+    # boto3 switches to multipart at the threshold, so a file of exactly one
+    # part still gets the "<md5-of-md5s>-1" form.
+    if not multipart:
         return whole_md5
     combined = hashlib.md5(b"".join(md5_parts), usedforsecurity=False).hexdigest()
     return f"{combined}-{len(md5_parts)}"
@@ -1090,7 +1106,7 @@ class S3Target(_TargetBase):
                 Config=self._transfer_config,
             )
         try:
-            verified = self._verify(key, size, sha_hex, _s3_expected_etag(part_md5s, whole_md5.hexdigest()))
+            verified = self._verify(key, size, sha_hex, _s3_expected_etag(part_md5s, whole_md5.hexdigest(), multipart=multipart))
         except ArchiveVerificationError:
             self._delete_quietly(key)
             raise

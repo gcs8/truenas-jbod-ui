@@ -430,6 +430,18 @@ class FtpTargetTests(_TempCase):
                 target.put(self.source(b"data"), "a.bin")
         self.assertEqual(FakeFTP.instances[0].files, {})
 
+    def test_denied_delete_of_existing_file_is_not_reported_as_success(self) -> None:
+        with open_target(self.settings()) as target:
+            target.put(self.source(b"x"), "a.bin")
+            ftp = FakeFTP.instances[0]
+            with mock.patch.object(ftp, "delete", side_effect=ftplib.error_perm("550 permission denied")):
+                with self.assertRaisesRegex(transport.ArchiveTransportError, "delete failed"):
+                    target.delete("a.bin")
+                with mock.patch.object(ftp, "mlsd", side_effect=ftplib.error_perm("500 MLSD not understood")):
+                    with self.assertRaisesRegex(transport.ArchiveTransportError, "delete failed"):
+                        target.delete("a.bin")
+        self.assertIn("/pub/jbod-ui/a.bin", FakeFTP.instances[0].files)
+
     def test_interrupted_transfer_removes_partial(self) -> None:
         with open_target(self.settings()) as target:
             ftp = FakeFTP.instances[0]
@@ -471,8 +483,8 @@ class _FakeSftpFile(io.BytesIO):
     def set_pipelined(self, value=True):
         pass
 
-    def prefetch(self, size=None):
-        pass
+    def prefetch(self, size=None, max_concurrent_requests=None):
+        self._store.prefetch_limits.append(max_concurrent_requests)
 
     def write(self, data):
         self.write_calls += 1
@@ -496,9 +508,16 @@ class FakeSFTP:
         self.write_sizes: list[int] = []
         self.corrupt = False
         self.mkdir_error: OSError | None = None
+        self.symlinks: set[str] = set()
+        self.prefetch_limits: list[int | None] = []
         self.closed = False
 
     def stat(self, path):
+        raise AssertionError("directory checks must use lstat so symlinks are not followed")
+
+    def lstat(self, path):
+        if path in self.symlinks:
+            return paramiko.SFTPAttributes.from_stat(os.stat_result((stat.S_IFLNK | 0o777,) + (0,) * 9))
         if path in self.dirs:
             return paramiko.SFTPAttributes.from_stat(os.stat_result((stat.S_IFDIR | 0o755,) + (0,) * 9))
         if path in self.files:
@@ -673,9 +692,19 @@ class SftpTargetTests(_TempCase):
             ["posix_rename /srv/backups/jbod-ui/full/b1.tar.zst.partial -> /srv/backups/jbod-ui/full/b1.tar.zst"],
         )
         self.assertLessEqual(max(client.sftp.write_sizes), transport.CHUNK_SIZE)
+        self.assertEqual(client.sftp.prefetch_limits, [transport.SFTP_PREFETCH_MAX_REQUESTS])
         self.assertEqual([item.name for item in listed], ["full/b1.tar.zst"])
         self.assertEqual(client.sftp.files, {})
         self.assertTrue(client.sftp.closed and client.closed)
+
+    def test_symlinked_parent_is_refused(self) -> None:
+        self.pin_key()
+        with open_target(self.settings()) as target:
+            sftp = FakeSSHClient.instances[0].sftp
+            sftp.symlinks.add("/srv/backups/jbod-ui/full")
+            with self.assertRaisesRegex(transport.ArchiveTransportError, "not a plain directory"):
+                target.put(self.source(b"x"), "full/b1.tar")
+        self.assertEqual(sftp.files, {})
 
     def test_corrupt_readback_removes_partial(self) -> None:
         self.pin_key()
@@ -971,6 +1000,24 @@ class NfsTargetTests(_TempCase):
                 self.fail("body must not run when the mount fails")
         self.assertEqual(list(self.mount_parent.iterdir()), [])
 
+    def test_failed_mount_that_still_attached_is_unmounted(self) -> None:
+        mounts = FakeMounts(self.mount_parent)
+        real_run = mounts.run
+
+        def mount_then_time_out(command, label):
+            real_run(command, label)
+            if os.path.basename(command[0]) == "mount":
+                raise transport.ArchiveTransportError(f"{label} timed out.")
+
+        mock.patch.object(transport, "_run_mount_command", side_effect=mount_then_time_out).start()
+        mock.patch.object(transport, "_is_mounted", side_effect=mounts.ismount).start()
+        with self.assertRaisesRegex(transport.ArchiveTransportError, "timed out"):
+            with open_target(self.settings()):
+                self.fail("body must not run when the mount command fails")
+        self.assertEqual(mounts.mounted, set())
+        self.assertTrue(any(cmd[0].endswith("umount") for cmd in mounts.commands))
+        self.assertEqual(list(self.mount_parent.iterdir()), [])
+
     def test_mount_reporting_success_without_a_mount_is_refused(self) -> None:
         mounts = FakeMounts(self.mount_parent)
         self.use(mounts)
@@ -1174,6 +1221,16 @@ class S3TargetTests(_TempCase):
         self.assertTrue(stored.verified)
         self.assertEqual(self.clients[0].get_calls, 0)
         self.assertTrue(self.clients[0].objects["jbod-ui/archive/full/big.bin"]["etag"].endswith("-2"))
+
+    def test_single_part_multipart_upload_at_threshold_verifies(self) -> None:
+        src = self.tmp / "threshold.bin"
+        with open(src, "wb") as handle:
+            handle.truncate(transport.S3_MULTIPART_THRESHOLD)
+        with open_target(self.settings()) as target:
+            stored = target.put(src, "full/threshold.bin")
+        self.assertTrue(stored.verified)
+        self.assertEqual(self.clients[0].get_calls, 0)
+        self.assertTrue(self.clients[0].objects["jbod-ui/archive/full/threshold.bin"]["etag"].endswith("-1"))
 
     def test_large_opaque_etag_is_size_checked_but_unverified(self) -> None:
         with mock.patch.object(transport, "S3_REGET_LIMIT", 4), open_target(self.settings()) as target:
