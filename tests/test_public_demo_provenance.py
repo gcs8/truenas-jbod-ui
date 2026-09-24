@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import sys
 from pathlib import Path
 import tempfile
 import unittest
@@ -121,6 +122,88 @@ class PublicDemoProvenanceTests(unittest.TestCase):
                 recorded_source_revision_errors(source_root=repository, source_revision=revision),
                 ["declared public demo inputs changed after the recorded source revision"],
             )
+
+
+def run_artifact_checker(repository: Path, *extra: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "scripts/check_public_demo_artifact.py", "public-demo", *extra],
+        cwd=repository,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+class ReleaseOnlyRebuildTests(unittest.TestCase):
+    """Pull requests check integrity; only a release requires a fresh demo."""
+
+    def clone_with_later_input_change(self, temp_dir: str) -> Path:
+        repository = Path(temp_dir) / "repo"
+        subprocess.run(
+            ["git", "clone", "-q", "--shared", "--no-checkout", str(ROOT), str(repository)],
+            check=True,
+        )
+        subprocess.run(["git", "checkout", "-q", "--detach", SOURCE_REVISION], cwd=repository, check=True)
+        # Carry the working-tree checker under test into the clone, so the test
+        # exercises this change even before it is committed.
+        for relative in (
+            "scripts/check_public_demo_artifact.py",
+            "scripts/public_demo_source_parity.py",
+            "scripts/public_demo_inputs.py",
+            "public-demo/index.html",
+        ):
+            (repository / relative).write_bytes((ROOT / relative).read_bytes())
+        subprocess.run(["git", "config", "user.name", "Fixture Test"], cwd=repository, check=True)
+        subprocess.run(["git", "config", "user.email", "fixture@example.test"], cwd=repository, check=True)
+        subprocess.run(["git", "commit", "-q", "--allow-empty", "-am", "checker under test"], cwd=repository, check=True)
+        style = repository / "app/static/style.css"
+        style.write_bytes(style.read_bytes() + b"\n/* a later pull request */\n")
+        subprocess.run(["git", "commit", "-q", "-am", "later input change"], cwd=repository, check=True)
+        return repository
+
+    def test_pull_request_check_accepts_a_demo_older_than_the_current_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = self.clone_with_later_input_change(temp_dir)
+            result = run_artifact_checker(repository)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Public demo artifact is publishable", result.stdout)
+
+    def test_release_check_requires_a_demo_rebuilt_from_the_current_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = self.clone_with_later_input_change(temp_dir)
+            result = run_artifact_checker(repository, "--require-current")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("source fingerprint mismatch: app/static/style.css", result.stderr)
+        self.assertIn("declared public demo inputs changed after the recorded source revision", result.stderr)
+
+    def test_pull_request_check_still_rejects_edited_artifact_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = self.clone_with_later_input_change(temp_dir)
+            artifact = repository / "public-demo/index.html"
+            artifact.write_text(
+                artifact.read_text(encoding="utf-8").replace("Demo 60-Bay Top Loader", "Demo 61-Bay Top Loader", 1),
+                encoding="utf-8",
+            )
+            result = run_artifact_checker(repository)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("public demo embedded output fingerprint mismatch", result.stderr)
+
+    def test_pull_request_check_rejects_an_unreachable_source_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = self.clone_with_later_input_change(temp_dir)
+            artifact = repository / "public-demo/index.html"
+            manifest, _html, _errors = parse_manifest(artifact.read_text(encoding="utf-8"))
+            artifact.write_text(
+                artifact.read_text(encoding="utf-8").replace(manifest["source_revision"], "1" * 40),
+                encoding="utf-8",
+            )
+            result = run_artifact_checker(repository)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("recorded public demo source revision is not a local commit", result.stderr)
 
 
 if __name__ == "__main__":

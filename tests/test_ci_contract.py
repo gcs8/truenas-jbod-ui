@@ -179,8 +179,9 @@ class CIWorkflowContractTests(unittest.TestCase):
                     uncommented.append(f"{workflow_path.name}: {action}")
 
         # Existing actions plus the trial's pinned checkout and the dispatch-only
-        # screenshot capture workflow's checkout and upload.
-        self.assertEqual(action_count, 35)
+        # screenshot capture workflow's checkout and upload, plus the GHCR
+        # release workflow's Python setup for the public-demo release gate.
+        self.assertEqual(action_count, 36)
         self.assertEqual(unpinned, [])
         self.assertEqual(uncommented, [])
 

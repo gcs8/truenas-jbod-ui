@@ -484,7 +484,7 @@ that comment yet; the table below is the authoritative list either way.
 
 | If you change | Also change | Why |
 | --- | --- | --- |
-| Any file listed in `PUBLIC_DEMO_INPUT_PATHS` (`scripts/public_demo_inputs.py`): `app/main.py`, `app/config.py`, `app/static/app.js`, `app/static/style.css`, `app/templates/*.html`, the services and images it names | Rebuild `public-demo/index.html` with `scripts/build_public_demo.py --source-revision <the commit that changed the input>` in a following commit, then recapture the two screenshots on Linux and record the review (see below) | `tests.test_public_demo_fixture` and `tests.test_public_demo_provenance` fingerprint every declared input; `scripts/check_public_demo_artifact.py` refuses a stale artifact |
+| Any file listed in `PUBLIC_DEMO_INPUT_PATHS` (`scripts/public_demo_inputs.py`): `app/main.py`, `app/config.py`, `app/static/app.js`, `app/static/style.css`, `app/templates/*.html`, the services and images it names | Nothing in the pull request. Do not rebuild the public demo or recapture screenshots. The demo is rebuilt once per release (see "Public Demo And Fixture Policy") | Pull-request CI checks that the checked-in demo is an exact build of the commit it records. `scripts/validate_release_wrap.py` and the GHCR release workflow refuse a release whose demo was not rebuilt from the release source |
 | A Python module that a declared demo input imports (for example a new helper imported by `app/config.py`) | Add it to `PUBLIC_DEMO_INPUT_PATHS`, to the `paths:` list in `.github/workflows/publish-public-demo.yml`, and to the mirrored list in `tests/test_public_demo_deterministic.py` | `test_shared_input_graph_covers_recursive_local_python_imports` and `test_publish_workflow_watches_every_declared_input` compare the three lists |
 | `public-demo/index.html` | `docs/images/screenshots/manifest.json`, the two PNGs under `docs/images/screenshots/` and their byte-identical copies under `wiki/images/`, and the review record `docs/PUBLIC_SCREENSHOT_REVIEW.md` (revision, artifact hash, per-image hash, `PASS`) | `tests.test_public_screenshots` and `scripts/check_public_screenshots.py` bind the manifest to the exact artifact bytes; a Windows capture produces different bytes, so capture on Linux |
 | Any user-visible string the snapshot page shows | `qa/public-demo.spec.js` (Playwright assertions on the demo page) and the `tests/js` assertions that pin it | The CI job named `Checked-in public demo artifact` runs those specs, and only the first mismatch is reported per run |
@@ -517,21 +517,30 @@ Rules:
 3. Generated public-demo artifacts are produced by the builder, never by manual
    edits.
 4. The builder and checker share one centrally declared semantic input graph.
-   Any declared input change must make the old artifact fail closed.
-5. Any future local-history conversion must be an explicit maintainer-only tool
+   The checked-in artifact must always be an exact build of the reachable
+   commit it records.
+5. The public demo is rebuilt when a release is cut, not in ordinary pull
+   requests. A pull request that changes a declared input leaves
+   `public-demo/**`, the screenshots, and the review record alone. Release
+   preparation rebuilds the demo from the release source, recaptures the
+   screenshots on Linux, and records the pixel review. The release checks
+   (`check_public_demo_artifact.py --require-current`,
+   `validate_release_wrap.py --public-demo-only`, and the same check in
+   `.github/workflows/publish-ghcr.yml`) fail until that is done.
+6. Any future local-history conversion must be an explicit maintainer-only tool
    that writes the bounded public fixture. Fixture review, artifact regeneration,
    and publication remain separate later steps.
-6. Public-demo output must not contain real hostnames, private IPs, serials,
+7. Public-demo output must not contain real hostnames, private IPs, serials,
    WWNs/SAS addresses, keys, configured system names, credentials, or secrets.
 
-Regenerate and verify from a clean checkout:
+At release time, regenerate and verify from a clean checkout of the release commit:
 
 ```bash
 python -m unittest tests.test_public_demo_fixture tests.test_public_demo_deterministic -v
 SOURCE_COMMIT="$(git rev-parse HEAD)"
 python scripts/build_public_demo.py --output public-demo/index.html --source-revision "$SOURCE_COMMIT"
 python scripts/build_public_demo.py --output public-demo/index.html --check
-python scripts/check_public_demo_artifact.py public-demo
+python scripts/check_public_demo_artifact.py public-demo --require-current
 python scripts/check_public_docs.py
 python scripts/check_public_screenshots.py
 slot_focus_artifact="$(mktemp "${TMPDIR:-/tmp}/truenas-jbod-ui-slot-focus-XXXXXX.html")"
