@@ -139,10 +139,13 @@ class UnknownSystemRouteTests(unittest.TestCase):
                 self.assertIs(application.exception_handlers[SystemNotConfiguredError], handler)
                 response = asyncio.run(handler(Mock(), error))
                 self.assertEqual(response.status_code, 404)
+                payload = json.loads(bytes(response.body))
+                # The admin handler also publishes the request correlation id (#418).
                 self.assertEqual(
-                    json.loads(bytes(response.body)),
+                    {key: payload[key] for key in ("ok", "detail")},
                     {"ok": False, "detail": UNKNOWN_SYSTEM_DETAIL},
                 )
+                self.assertLessEqual(set(payload), {"ok", "detail", "request_id"})
 
     def test_explicit_unknown_inventory_read_returns_404_without_calling_default_service(self) -> None:
         default_service = _default_service()

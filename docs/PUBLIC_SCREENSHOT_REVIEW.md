@@ -1,28 +1,24 @@
 # Public screenshot exact-byte review
 
-This record covers the two desktop fixture screenshots generated from `public-demo/index.html`. The pinned Linux capture used `file://`, UTC, a 1920 by 1080 viewport, reduced motion, and no network request. GitHub Actions run `34737325999` captured each image twice and produced byte-identical copies.
+This record covers the two desktop fixture screenshots generated from `public-demo/index.html`. GitHub Actions run `36049972945` used the pinned Playwright `v1.63.0-jammy` container, `file://`, UTC, a 1920 by 1080 viewport, reduced motion, and no network request. The job captured each image twice and produced byte-identical copies.
 
-Source revision: `0ea42a60616e0b987a3c7a73568abf7f57de01fe`
+Source revision: `2288c324d3df1baf2cfeeb4d60d60c816e837cb8`
 
-Source artifact SHA-256: `dd537fdb2d148e1755ec09bb6890a87242053ca7d15d6020adb6bb420bf954eb`
+Source artifact SHA-256: `505568b3660bef9baa2f1fb144d615b761f9edb0bec7b64b47d08de79c9d646a`
 
 | Image | Dimensions | Bytes | SHA-256 | Pixel review |
 |---|---:|---:|---|---|
-| `public-demo-overview.png` | 1920 by 4092 | 1098831 | `fcc7adba57b5ae32f4c21c9204ab95d5db0cd5709eae5c075383ab34c0cc4eda` | PASS |
-| `public-demo-history.png` | 1920 by 4852 | 1225499 | `a5e8ea696081f530475845f0d2d26a2d1538955b7813f5c4998fcfd5d6a0881b` | PASS |
+| `public-demo-overview.png` | 1920 by 4092 | 1099132 | `a5b71d60b647717f4d03b6788de7f17a0f5125f84b25482b3578ba0618f628ca` | PASS |
+| `public-demo-history.png` | 1920 by 4852 | 1226115 | `5d4bd72304218b3680ee787a22cf77ac6862f641afb5012b9d9e6602720422f2` | PASS |
 
-Both exact PNGs were loaded and inspected with vision tooling before setting the manifest attestations. The review checked for private addresses, hostnames, paths, credentials, key material, and non-demo device identifiers. None were visible. Source revision and Build ID are intentional public-repository provenance.
+These exact images accompany the provenance-only public-demo refresh that rebinds the artifact to main commit `2288c32`; the previously recorded revision was a #552 branch commit the squash merge did not carry onto main. Every declared demo input has the same blob as the previously approved source revision. The generated artifact changes only its source-parity manifest, visible Source revision, and visible Build ID.
 
-Neither image showed unintended overlap, clipping, missing assets, corrupted text, or canvas-edge artifacts. Narrow bay labels use intentional ellipses. Full selected-slot identifiers remain readable in Slot Details. Equal-height cards leave unused space but do not hide or collide with content.
+Both PNGs were loaded and inspected with Hermes `vision_analyze`. The review checked the changed provenance area for complete values, private data, clipping, overlap, corruption, and malformed text. The Source revision is the complete 40-character public Git commit. The Build ID is the complete 64-character deterministic input-manifest fingerprint. Neither value contains a credential, private path, private address, or personal identifier.
 
-The selected slot is 57. Its device, serial, persistent ID, health, temperature, pool, vdev, and special-class topology agree across the enclosure, Slot Details, Topology Context, Calibration Mapping, and history panel. The map contains every bay from 00 through 59 exactly once. Its 47 populated and 13 empty bays match Mapping Health.
+An RGB comparison against the previously approved pair found exactly 9,338 changed pixels and 27,968 changed color channels in each image. Both difference bounding boxes were `x=962..1819, y=270..570`. Every pixel outside that box is unchanged. Visual inspection found the changed pixels confined to the intentional Source revision and Build ID text. No new layout, asset, selected-slot, history, or content change appears in either image.
 
-The checked-in fixture preserves the spare group at slots 42 and 43. Both bays appear populated in the images. Their narrow tile labels are ellipsized, so the spare class is not readable from the screenshot alone; the fixture and public-demo contract tests establish that grouping. The selected special-class peer group at slots 57 through 59 is visibly consistent.
-
-The history image shows five samples from January 8 through January 15, 2026. Its latest, minimum, and maximum temperatures match the chart. Read/write totals, seven-day deltas, rates, capture time, and selected identity agree with the overview. The one aggregate event does not claim to belong to the selected slot.
-
-The frozen, synthetic, offline wording is explicit. Live refresh, calibration, backup, and LED actions are unavailable as expected. No pixel-review blocker remained. This review does not authorize publication by itself; the exact-byte checker still verifies framing, dimensions, sizes, hashes, docs/Wiki byte identity, artifact identity, source revision, and the `PASS` fields.
-
-Mobile and tablet layouts are unsupported and are not part of this review.
+The selected slot remains 57. Its device, serial, persistent ID, health, temperature, pool, vdev, and special-class topology remain consistent across the enclosure, Slot Details, Topology Context, Calibration Mapping, and history panel. The map still contains every bay from 00 through 59 exactly once, with 47 populated and 13 empty bays. The frozen, synthetic, offline wording remains explicit.
 
 Final pixel verdict: `PASS`
+
+Ryoko signs off the two exact PNGs and hashes recorded above. This approval applies only to those bytes. Any recapture resets `pixel_review` to `PENDING` and requires a new named review.

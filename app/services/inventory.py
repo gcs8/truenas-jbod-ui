@@ -61,6 +61,7 @@ from app.services.credential_authority import (
     credential_authorities_are_approved,
     ssh_credential_authorities,
 )
+from app.services.inventory_accounting import build_disk_retention_accounting
 from app.services.mapping_store import MappingStore, resolve_physical_mapping_scope
 from app.services.profile_registry import (
     ENCLOSURE_SUB_VIEW_PROFILE_IDS,
@@ -130,6 +131,14 @@ from app.services.truenas_ws import (
     TrueNASWebsocketClient,
     normalize_disk_inventory_rows,
 )
+from websockets.exceptions import ConnectionClosed
+
+# Transport-class failures of the CORE SMART batch mean "priming unavailable".
+# The batch is an optimisation over the bounded per-slot path, so a call that
+# outlasts the request timeout, a dropped socket or a closed connection must
+# degrade one shelf to that path instead of failing every slot in it (#523).
+# `TimeoutError` in particular is not a `TrueNASAPIError`.
+SMART_BATCH_TRANSPORT_ERRORS = (TrueNASAPIError, TimeoutError, OSError, ConnectionClosed)
 
 SmartCacheKey = tuple[str, str, str, int, tuple[str, ...], tuple[str, str]]
 SmartCacheGenerationToken = tuple[int, int, int]
@@ -146,6 +155,16 @@ SMART_NEGATIVE_CACHE_MAX_ENTRIES = 1024
 VIRTUAL_MAPPING_UNAVAILABLE_REASON = (
     "Mapping import is unavailable because this system disk inventory has no identified "
     "physical enclosure or stable physical slot identities."
+)
+# Rendering a system-scoped virtual inventory means physical location is
+# unavailable. It is not a source failure: the disks themselves were fetched.
+# Source failures are reported through SourceStatus and their own warnings, so
+# an operator (and a release gate) can tell "no bay locations" apart from
+# "the disk list is incomplete".
+VIRTUAL_INVENTORY_PHYSICAL_LOCATION_WARNING = (
+    "No physical enclosure could be identified on this system, so its disks are shown as a "
+    "system-scoped virtual inventory without physical bay locations. Disk data itself was "
+    "retrieved successfully; this warning does not indicate a source fetch failure."
 )
 
 logger = logging.getLogger(__name__)
@@ -317,6 +336,13 @@ STABLE_SLOT_DETAIL_FIELDS = (
     "notes",
     "operator_context",
 )
+# Only the strong tier proves which disk occupies a bay: a serial, a logical
+# unit id and a gptid all belong to the disk and travel with it. sas_address is
+# bay-scoped - the expander reports the same address for whatever is plugged in
+# - so it may contradict a cached entry but must never authorize restoring one
+# (#525). device_name is likewise a reusable alias.
+STRONG_SLOT_IDENTITY_FIELDS = ("serial", "logical_unit_id", "gptid")
+SLOT_IDENTITY_FIELDS = (*STRONG_SLOT_IDENTITY_FIELDS, "sas_address")
 STABLE_SMART_DETAIL_FIELDS = (
     "logical_block_size",
     "physical_block_size",
@@ -861,6 +887,103 @@ class SmartDetailBatch:
 _smart_detail_batch: ContextVar[SmartDetailBatch | None] = ContextVar("smart_detail_batch", default=None)
 
 
+# What each SSH command is used for, reported beside a command failure in the
+# debug output. `criticality` says what breaks without it: `topology` and
+# `inventory` failures cost structure, `enrichment` failures only cost detail.
+SSH_FAILURE_CONTEXTS_BY_COMMAND: dict[str, dict[str, str]] = {
+    "dmesg mpr events": {
+        "context": "sas_fabric_kernel_events",
+        "context_label": "recent MPR/CAM event evidence",
+        "criticality": "enrichment",
+    },
+    "pciconf -lv": {
+        "context": "sas_fabric_pci_inventory",
+        "context_label": "HBA PCI inventory",
+        "criticality": "enrichment",
+    },
+    "dmidecode slot": {
+        "context": "sas_fabric_pcie_slots",
+        "context_label": "HBA slot labels",
+        "criticality": "enrichment",
+    },
+    "mpr sysctl pci locations": {
+        "context": "sas_fabric_pci_location",
+        "context_label": "HBA PCI location corroboration",
+        "criticality": "enrichment",
+    },
+    "lsscsi -g -t": {
+        "context": "storage_fabric_linux_scsi_transport",
+        "context_label": "Linux SCSI transport detail",
+        "criticality": "enrichment",
+    },
+    "lsscsi -g": {
+        "context": "storage_fabric_linux_scsi_sg",
+        "context_label": "Linux SG device discovery",
+        "criticality": "enrichment",
+    },
+    "lsblk -OJ": {
+        "context": "linux_block_inventory",
+        "context_label": "Linux block inventory",
+        "criticality": "inventory",
+    },
+    "nvme list-subsys -o json": {
+        "context": "storage_fabric_linux_nvme_subsystems",
+        "context_label": "Linux NVMe subsystem detail",
+        "criticality": "enrichment",
+    },
+    "enclosure sysfs map": {
+        "context": "storage_fabric_linux_enclosure_map",
+        "context_label": "Linux enclosure driver slot map",
+        "criticality": "enrichment",
+    },
+    # Exact, so it wins over the "mprutil " prefix below.
+    "mprutil show adapters": {
+        "context": "sas_fabric_adapter_discovery",
+        "context_label": "adapter discovery",
+        "criticality": "topology",
+    },
+}
+
+# Checked in order, after the exact commands and the mprutil unit pattern.
+SSH_FAILURE_CONTEXTS_BY_PREFIX: tuple[tuple[str, dict[str, str]], ...] = (
+    (
+        "sg_ses join ",
+        {
+            "context": "storage_fabric_sg_ses_join",
+            "context_label": "joined SG SES slot evidence",
+            "criticality": "enrichment",
+        },
+    ),
+    (
+        "mprutil ",
+        {
+            "context": "sas_fabric_mprutil",
+            "context_label": "mprutil topology evidence",
+            "criticality": "topology",
+        },
+    ),
+)
+
+MPRUTIL_UNIT_COMMAND_PATTERN = re.compile(
+    r"^mprutil -u (?P<unit>\d+) show (?P<subcommand>[a-z]+)$"
+)
+
+MPRUTIL_SUBCOMMAND_LABELS: dict[str, str] = {
+    "adapter": "controller adapter detail",
+    "devices": "MPR device rows",
+    "enclosures": "MPR enclosure rows",
+    "expanders": "MPR expander rows",
+    "iocfacts": "IOC facts",
+    "all": "MPR all-command detail",
+}
+
+DEFAULT_SSH_FAILURE_CONTEXT: dict[str, str] = {
+    "context": "ssh_command",
+    "context_label": "SSH command",
+    "criticality": "inventory",
+}
+
+
 class InventoryService:
     def __init__(
         self,
@@ -892,6 +1015,10 @@ class InventoryService:
             tuple[SmartSummaryView, datetime],
         ] = OrderedDict()
         self._smart_persistence_lock = threading.Lock()
+        # Bays whose most recently published view carried no strong identifier
+        # (#525). The layout-less SMART fallback has no slot view to gate on, so
+        # it reads this instead of serving the previous occupant's data.
+        self._identity_unknown_slots: set[tuple[str, int]] = set()
         self._smart_disk_identities: dict[tuple, tuple[tuple[str, str], int]] = {}
         self._smart_cache_global_generation = 0
         self._smart_cache_enclosure_generations: dict[str, int] = {}
@@ -2425,100 +2552,32 @@ class InventoryService:
 
     @staticmethod
     def _ssh_command_failure_context(canonical_command: str) -> dict[str, str]:
-        if canonical_command == "dmesg mpr events":
-            return {
-                "context": "sas_fabric_kernel_events",
-                "context_label": "recent MPR/CAM event evidence",
-                "criticality": "enrichment",
-            }
-        if canonical_command == "pciconf -lv":
-            return {
-                "context": "sas_fabric_pci_inventory",
-                "context_label": "HBA PCI inventory",
-                "criticality": "enrichment",
-            }
-        if canonical_command == "dmidecode slot":
-            return {
-                "context": "sas_fabric_pcie_slots",
-                "context_label": "HBA slot labels",
-                "criticality": "enrichment",
-            }
-        if canonical_command == "mpr sysctl pci locations":
-            return {
-                "context": "sas_fabric_pci_location",
-                "context_label": "HBA PCI location corroboration",
-                "criticality": "enrichment",
-            }
-        if canonical_command == "lsscsi -g -t":
-            return {
-                "context": "storage_fabric_linux_scsi_transport",
-                "context_label": "Linux SCSI transport detail",
-                "criticality": "enrichment",
-            }
-        if canonical_command == "lsscsi -g":
-            return {
-                "context": "storage_fabric_linux_scsi_sg",
-                "context_label": "Linux SG device discovery",
-                "criticality": "enrichment",
-            }
-        if canonical_command == "lsblk -OJ":
-            return {
-                "context": "linux_block_inventory",
-                "context_label": "Linux block inventory",
-                "criticality": "inventory",
-            }
-        if canonical_command == "nvme list-subsys -o json":
-            return {
-                "context": "storage_fabric_linux_nvme_subsystems",
-                "context_label": "Linux NVMe subsystem detail",
-                "criticality": "enrichment",
-            }
-        if canonical_command == "enclosure sysfs map":
-            return {
-                "context": "storage_fabric_linux_enclosure_map",
-                "context_label": "Linux enclosure driver slot map",
-                "criticality": "enrichment",
-            }
-        if canonical_command.startswith("sg_ses join "):
-            return {
-                "context": "storage_fabric_sg_ses_join",
-                "context_label": "joined SG SES slot evidence",
-                "criticality": "enrichment",
-            }
-        unit_match = re.match(r"^mprutil -u (?P<unit>\d+) show (?P<subcommand>[a-z]+)$", canonical_command)
+        """What a failed command was being used for, for the debug output.
+
+        `criticality` says what breaks without it: `topology` and `inventory`
+        failures cost structure, `enrichment` failures only cost detail.
+        """
+        exact = SSH_FAILURE_CONTEXTS_BY_COMMAND.get(canonical_command)
+        if exact is not None:
+            return dict(exact)
+
+        unit_match = MPRUTIL_UNIT_COMMAND_PATTERN.match(canonical_command)
         if unit_match:
             subcommand = unit_match.group("subcommand")
-            context_labels = {
-                "adapter": "controller adapter detail",
-                "devices": "MPR device rows",
-                "enclosures": "MPR enclosure rows",
-                "expanders": "MPR expander rows",
-                "iocfacts": "IOC facts",
-                "all": "MPR all-command detail",
-            }
             return {
                 "context": f"sas_fabric_mprutil_{subcommand}",
-                "context_label": context_labels.get(subcommand, f"mprutil {subcommand}"),
+                "context_label": MPRUTIL_SUBCOMMAND_LABELS.get(
+                    subcommand, f"mprutil {subcommand}"
+                ),
                 "controller": f"mpr{unit_match.group('unit')}",
                 "criticality": "enrichment",
             }
-        if canonical_command == "mprutil show adapters":
-            return {
-                "context": "sas_fabric_adapter_discovery",
-                "context_label": "adapter discovery",
-                "criticality": "topology",
-            }
-        if canonical_command.startswith("mprutil "):
-            return {
-                "context": "sas_fabric_mprutil",
-                "context_label": "mprutil topology evidence",
-                "criticality": "topology",
-            }
-        return {
-            "context": "ssh_command",
-            "context_label": "SSH command",
-            "criticality": "inventory",
-        }
+
+        for prefix, context in SSH_FAILURE_CONTEXTS_BY_PREFIX:
+            if canonical_command.startswith(prefix):
+                return dict(context)
+
+        return dict(DEFAULT_SSH_FAILURE_CONTEXT)
 
     @staticmethod
     def _is_configured_sg_ses_page_probe_failure(message: str) -> bool:
@@ -3105,35 +3164,58 @@ class InventoryService:
             _smart_detail_batch.reset(token)
 
     async def _apply_and_persist_snapshot_slot_details(self, slots: list[SlotView]) -> None:
-        self._observe_smart_disk_identities(slots)
         store = self.slot_detail_store
         if store is None or not slots:
+            self._mark_slot_identity_states(slots)
+            self._observe_smart_disk_identities(slots)
             return
-        generations = [
-            (key, self._smart_cache_generation_token(key))
-            for key in (self._smart_cache_key(slot) for slot in slots)
-        ]
+        loaded: Mapping[str, SlotDetailCacheEntry] = {}
+        generations: list[tuple[SmartCacheKey, SmartCacheGenerationToken]] = []
 
         @contextmanager
         def commit_guard():
             with self._smart_persistence_lock:
                 yield all(self._smart_request_is_current(key, generation) for key, generation in generations)
 
-        def apply_and_save():
+        def apply():
+            nonlocal loaded
             with perf_stage("inventory.slot_detail_cache.apply", slot_count=len(slots)):
                 loaded = store.load_all()
                 self._apply_persisted_slot_details(slots, loaded_entries=loaded)
+
+        def save():
             with perf_stage("inventory.slot_detail_cache.persist", slot_count=len(slots)):
-                entries = [self._build_slot_detail_entry(slot, smart_summary=None) for slot in slots]
+                # `loaded` is the same read the apply step used; reuse it so the
+                # last-good SMART carry-forward costs no extra file I/O (#521).
+                entries = [
+                    self._build_slot_detail_entry(slot, smart_summary=None, loaded_entries=loaded)
+                    for slot in slots
+                ]
                 store.save_entries(
                     [entry for entry in entries if entry is not None],
                     expected_entries=loaded, commit_guard=commit_guard,
                 )
 
+        async def apply_observe_and_save():
+            await asyncio.to_thread(apply)
+            self._mark_slot_identity_states(slots)
+            # Record identity from the published view, the same view every later
+            # SMART request keys off. Observing the pre-backfill view instead
+            # makes every slot whose serial came from the cache read as
+            # identity-changed for the rest of its life. Still on the loop, so
+            # the final-write fence is shared with retained SMART writers without
+            # being held over disk I/O.
+            self._observe_smart_disk_identities(slots)
+            generations.extend(
+                (key, self._smart_cache_generation_token(key))
+                for key in (self._smart_cache_key(slot) for slot in slots)
+            )
+            await asyncio.to_thread(save)
+
         # The worker owns these request-local slots until it finishes. Retain the
         # caller's snapshot lock/activity through repeated cancellation, including
         # late failures, rather than letting a successor race a detached writer.
-        worker = asyncio.create_task(asyncio.to_thread(apply_and_save))
+        worker = asyncio.create_task(apply_observe_and_save())
         cancelled = False
         while not worker.done():
             try:
@@ -3149,6 +3231,30 @@ class InventoryService:
                 worker.exception()
             raise asyncio.CancelledError
         worker.result()
+
+    @staticmethod
+    def _slot_identity_state(slot_view: SlotView) -> Literal["known", "unknown"]:
+        # An empty bay has nothing to identify, so its state is known.
+        if not slot_view.present or slot_view.state == SlotState.empty:
+            return "known"
+        if any(normalize_text(getattr(slot_view, field_name)) for field_name in STRONG_SLOT_IDENTITY_FIELDS):
+            return "known"
+        return "unknown"
+
+    def _mark_slot_identity_states(self, slots: list[SlotView]) -> None:
+        # Mark the published view, after any backfill: what the operator sees is
+        # what the flag has to describe.
+        for slot_view in slots:
+            slot_view.identity_state = self._slot_identity_state(slot_view)
+            enclosure_id = normalize_text(slot_view.enclosure_id)
+            if enclosure_id is None:
+                continue
+            # Remember the window for readers that get no slot view (#525).
+            bay = (enclosure_id, slot_view.slot)
+            if slot_view.identity_state == "unknown":
+                self._identity_unknown_slots.add(bay)
+            else:
+                self._identity_unknown_slots.discard(bay)
 
     def _apply_persisted_slot_details(
         self, slots: list[SlotView], *,
@@ -3250,7 +3356,29 @@ class InventoryService:
         slot_view: SlotView,
         *,
         smart_summary: SmartSummaryView | None,
+        loaded_entries: Mapping[str, SlotDetailCacheEntry] | None = None,
     ) -> SlotDetailCacheEntry | None:
+        if self._slot_identity_state(slot_view) == "unknown":
+            # Writing this row would overwrite the last-known entry with one
+            # that cannot say which disk it describes, and would file any SMART
+            # read taken during the window under the departed disk. Persist no
+            # observation; the previous entry stays as historical evidence, with
+            # only the withholding decision recorded on it so it survives a
+            # restart of this process (#525). This comes before the identifier
+            # check below: a present bay that offers no identifier at all is
+            # the most unknown of the lot, and its decision has to be written
+            # down too, or a restart serves the departed disk's SMART for it.
+            store = self.slot_detail_store
+            if store is None:
+                return None
+            stored = store.get_entry(
+                self.system.id, slot_view.enclosure_id, slot_view.slot,
+                loaded_entries=loaded_entries,
+            )
+            if stored is None or stored.identity_unknown:
+                return None
+            return stored.model_copy(update={"identity_unknown": True})
+
         identifiers = sorted(self._slot_detail_identifiers(slot_view))
         if not identifiers:
             return None
@@ -3266,6 +3394,8 @@ class InventoryService:
                 slot_fields[field_name] = value
 
         smart_fields: dict[str, Any] = {}
+        smart_updated_at: str | None = None
+        smart_stale = False
         if smart_summary is not None:
             for field_name in STABLE_SMART_DETAIL_FIELDS:
                 value = getattr(smart_summary, field_name)
@@ -3274,6 +3404,21 @@ class InventoryService:
                 smart_fields[field_name] = value
             if smart_fields:
                 smart_fields["available"] = smart_summary.available
+                smart_updated_at = utcnow().isoformat()
+        if not smart_fields:
+            # No SMART read produced this entry, so it must not speak for the
+            # SMART half. Carry the last-good fields forward for the same disk
+            # instead of replacing them with nothing: the snapshot path rebuilds
+            # an entry for every present slot on every refresh, and a whole-entry
+            # replace there erased the layer the persistent-hit path, the
+            # fallback merge and the exports all claim to serve (#521). The
+            # values keep the timestamp of the read that produced them and are
+            # marked stale, so nothing reads them as current.
+            previous = self._previous_slot_detail_entry(slot_view, loaded_entries=loaded_entries)
+            if previous is not None and previous.smart_fields:
+                smart_fields = dict(previous.smart_fields)
+                smart_updated_at = previous.smart_updated_at or previous.updated_at
+                smart_stale = True
 
         if not slot_fields and not smart_fields:
             return None
@@ -3285,29 +3430,51 @@ class InventoryService:
             identifiers=identifiers,
             slot_fields=slot_fields,
             smart_fields=smart_fields,
+            smart_updated_at=smart_updated_at,
+            smart_stale=smart_stale,
         )
+
+    def _previous_slot_detail_entry(
+        self, slot_view: SlotView, *,
+        loaded_entries: Mapping[str, SlotDetailCacheEntry] | None = None,
+    ) -> SlotDetailCacheEntry | None:
+        """The stored entry for this bay, only when it describes this same disk."""
+        store = self.slot_detail_store
+        if store is None:
+            return None
+        entry = store.get_entry(
+            self.system.id, slot_view.enclosure_id, slot_view.slot, loaded_entries=loaded_entries,
+        )
+        if entry is None or not self._slot_detail_entry_matches(slot_view, entry):
+            return None
+        return entry
 
     def _slot_detail_entry_matches(self, slot_view: SlotView, entry: SlotDetailCacheEntry) -> bool:
         if slot_view.state == SlotState.empty or not slot_view.present:
             return False
-        # Match the observed primary identity before historical enrichment.
-        # Loss/return of a serial is a new observation, not proof that a reused
-        # device alias still belongs to the historical disk. Reject that cache
-        # entry rather than restoring an ID that disagrees with SMART admission.
-        current_identity = previous_identity = None
-        for field_name in ("serial", "logical_unit_id", "sas_address", "gptid"):
+        # Admit the entry when the two observations agree on hardware identity,
+        # not when they happen to rank the same field first. Identity is the
+        # strong tier only: a live view that has lost every strong identifier
+        # cannot say which disk is in the bay, and a bay-scoped sas_address
+        # agreeing proves only that the bay is the same one (#525). Such a view
+        # is identity-unknown, so nothing cached may be restored onto it.
+        if self._slot_identity_state(slot_view) == "unknown":
+            return False
+        shared_identity = False
+        for field_name in SLOT_IDENTITY_FIELDS:
             current = normalize_text(getattr(slot_view, field_name))
             previous = normalize_text(entry.slot_fields.get(field_name)) or normalize_text(entry.smart_fields.get(field_name))
-            if current and current_identity is None:
-                current_identity = (field_name, current.lower())
-            if previous and previous_identity is None:
-                previous_identity = (field_name, previous.lower())
-            if current and previous and current.lower() != previous.lower():
-                return False
-        if current_identity != previous_identity:
+            if current and previous:
+                # A disagreement on any identity field, sas_address included,
+                # still rejects the entry: contradiction is cheap to trust.
+                if current.lower() != previous.lower():
+                    return False
+                shared_identity = shared_identity or field_name in STRONG_SLOT_IDENTITY_FIELDS
+        # The remembered disk must be the one now observed, so a strong
+        # identifier has to be present on both sides and equal. An entry that
+        # offers none is historical evidence about a different observation.
+        if not shared_identity:
             return False
-        # Both identity-poor entries retain device-scoped matching. This cannot
-        # detect a physical swap that inventory never observes.
         current_identifiers = self._slot_detail_identifiers(slot_view)
         if not current_identifiers:
             return False
@@ -3767,6 +3934,26 @@ class InventoryService:
 
         summaries: dict[int, SmartSummaryView] = {}
         for slot in unique_slots:
+            entry = (
+                persisted_candidates.get((resolved_enclosure_id, slot))
+                if resolved_enclosure_id is not None
+                else None
+            )
+            if resolved_enclosure_id is not None and (
+                (resolved_enclosure_id, slot) in self._identity_unknown_slots
+                or (entry is not None and entry.identity_unknown)
+            ):
+                # The last published view of this bay had no serial, logical
+                # unit id or gptid, so everything on record for it describes a
+                # disk that may already be gone: a bay-scoped sas_address names
+                # the bay, not its occupant (#525). Serve nothing until a strong
+                # identifier returns; the entry stays as historical evidence.
+                # The persisted flag is what answers after a restart, when this
+                # process has not yet observed the window itself.
+                add_perf_metadata(smart_cache="layout-unavailable-identity-unknown")
+                self._observe_smart_summary_request("layout-unavailable-identity-unknown")
+                continue
+
             cached = None
             if resolved_enclosure_id is not None:
                 cache_key = cache_candidates.get((resolved_enclosure_id, slot))
@@ -3778,11 +3965,6 @@ class InventoryService:
                 summaries[slot] = cached
                 continue
 
-            entry = (
-                persisted_candidates.get((resolved_enclosure_id, slot))
-                if resolved_enclosure_id is not None
-                else None
-            )
             persisted = None
             if entry is not None and entry.smart_fields:
                 try:
@@ -3838,13 +4020,17 @@ class InventoryService:
     def _smart_disk_identity(slot_view: SlotView) -> tuple[str, str]:
         if not slot_view.present or slot_view.state == SlotState.empty:
             return ("empty", "")
-        for field_name in ("serial", "logical_unit_id", "sas_address", "gptid"):
+        for field_name in STRONG_SLOT_IDENTITY_FIELDS:
             value = normalize_text(getattr(slot_view, field_name))
             if value:
                 return (field_name, value.lower())
-        # Identity-poor inventory retains device-scoped behavior; no claim of
-        # detecting an unobservable physical replacement is possible.
-        return ("device", normalize_text(slot_view.device_name) or "")
+        # No strong identifier: the bay's sas_address and the device alias are
+        # both reusable, so the occupant is unknown. Keying the window under an
+        # explicit unknown identity isolates it - entering and leaving the
+        # window each bump the bay's identity generation, so no SMART read taken
+        # while the disk is unidentifiable is served from, or stored under, the
+        # serial that was there before (#525).
+        return ("unknown", normalize_text(slot_view.device_name) or "")
 
     def _observe_smart_disk_identities(self, slots: list[SlotView]) -> None:
         # Observe before snapshot persistence can yield. Share the final-write
@@ -4076,7 +4262,14 @@ class InventoryService:
         request_semaphore: asyncio.Semaphore | None = None,
     ) -> SmartSummaryView:
         # Never rendezvous behind the operation semaphore: budget one must work.
-        payloads = await core_payload if core_payload is not None else None
+        payloads = None
+        if core_payload is not None:
+            try:
+                payloads = await core_payload
+            except SMART_BATCH_TRANSPORT_ERRORS:
+                # A prime that could not finish leaves this slot on the per-slot
+                # path; only a programming error is allowed to fail the request.
+                payloads = None
         async with (request_semaphore or nullcontext()), self._smart_operation_semaphore:
             summary = await self._load_uncached_smart_summary(
                 slot_view,
@@ -4115,7 +4308,9 @@ class InventoryService:
         await batch.entries()
 
         async def persist(summary: SmartSummaryView) -> None:
-            entry = self._build_slot_detail_entry(slot_view, smart_summary=summary)
+            entry = self._build_slot_detail_entry(
+                slot_view, smart_summary=summary, loaded_entries=await batch.entries(),
+            )
             if entry is not None:
                 batch.pending.append(entry)
                 batch.generations.append((self, cache_key, generation_token))
@@ -4235,7 +4430,7 @@ class InventoryService:
                     if core_payloads is not None and candidate == candidates[0]:
                         payload = core_payloads[0]
                     else:
-                        payload = await self.truenas_client.fetch_disk_smartctl(candidate, ["-a", "-j"])
+                        payload = await self._fetch_disk_smartctl_bounded(candidate, ["-a", "-j"])
             except TrueNASAPIError as exc:
                 last_error = str(exc)
                 continue
@@ -4255,7 +4450,7 @@ class InventoryService:
                         if core_payloads is not None and core_payloads[1] is not None:
                             enrichment_payload = core_payloads[1]
                         else:
-                            enrichment_payload = await self.truenas_client.fetch_disk_smartctl(api_candidate, ["-x"])
+                            enrichment_payload = await self._fetch_disk_smartctl_bounded(api_candidate, ["-x"])
                 except TrueNASAPIError as exc:
                     last_error = str(exc)
                 else:
@@ -4317,6 +4512,31 @@ class InventoryService:
         self._observe_smart_summary_request("fallback")
         return cached_fallback or fallback
 
+    def _smart_call_timeout_seconds(self) -> float:
+        # One budget for every SMART middleware call. `smartctl_batch` already
+        # wraps each `disk.smartctl` in `TrueNASConfig.timeout_seconds`
+        # (TRUENAS_TIMEOUT); the per-slot path is the fallback for that same
+        # call and gets the same deadline rather than a number of its own.
+        timeout = float(self.system.truenas.timeout_seconds)
+        return timeout if timeout > 0 else 1.0
+
+    async def _fetch_disk_smartctl_bounded(self, candidate: str, args: list[str]) -> str:
+        # Fail closed on a disk that never answers. Without a deadline here, a
+        # batch that timed out on one slow disk degraded to a per-slot path
+        # that waited forever, so `complete_batch()` held every other slot in
+        # the grid open too: a bounded failure became an unbounded request
+        # (#524). Expiry is reported through the same channel as any other
+        # failed call, so it becomes this slot's unavailable summary with a
+        # fixed reason and leaves the rest of the grid intact.
+        timeout = self._smart_call_timeout_seconds()
+        try:
+            async with asyncio.timeout(timeout):
+                return await self.truenas_client.fetch_disk_smartctl(candidate, args)
+        except TimeoutError as exc:
+            raise TrueNASAPIError(
+                f"SMART lookup for {candidate} timed out after {timeout:g}s; the disk did not answer."
+            ) from exc
+
     async def _prime_core_grid(
         self, cohort: list, detail_batch: SmartDetailBatch, width: int, allow_stale_cache: bool,
     ) -> None:
@@ -4342,16 +4562,25 @@ class InventoryService:
                         try:
                             json_payloads = await self.truenas_client.smartctl_batch(
                                 [candidates[0] for _slot, candidates, _future in selected],
-                                ["-a", "-j"], max_concurrency=permits,
+                                ["-a", "-j"], max_concurrency=permits, return_exceptions=True,
                             )
-                        except TrueNASAPIError:
-                            # The accepted client is fail-fast: retry the affected
-                            # phase through the existing bounded per-slot path.
+                        except SMART_BATCH_TRANSPORT_ERRORS:
+                            # The session itself failed, so nothing in it can be
+                            # kept: retry the affected phase through the existing
+                            # bounded per-slot path.
                             json_payloads = None
                         if json_payloads is not None:
                             text_selected = []
                             for item, payload in zip(selected, json_payloads):
                                 slot, candidates, future = item
+                                if isinstance(payload, BaseException):
+                                    # One disk's failure is one slot's fallback.
+                                    # Discarding the batch here sent every slot
+                                    # back through the per-slot path, so a shelf
+                                    # with one failing drive - the shelf the grid
+                                    # is opened for - cost more than v0.23.0 did
+                                    # (#522).
+                                    continue
                                 payloads[future] = (payload, None)
                                 summary = self._merge_smart_summary(
                                     slot, SmartSummaryView.model_validate(parse_smartctl_summary(payload)),
@@ -4362,20 +4591,29 @@ class InventoryService:
                                 try:
                                     text_payloads = await self.truenas_client.smartctl_batch(
                                         [candidates[0] for _slot, candidates, _future in text_selected],
-                                        ["-x"], max_concurrency=permits,
+                                        ["-x"], max_concurrency=permits, return_exceptions=True,
                                     )
-                                except TrueNASAPIError:
+                                except SMART_BATCH_TRANSPORT_ERRORS:
                                     pass
                                 else:
                                     for item, text in zip(text_selected, text_payloads):
+                                        if isinstance(text, BaseException):
+                                            # The JSON half of this slot stands;
+                                            # only its enrichment is missing.
+                                            continue
                                         future = item[2]
                                         payloads[future] = (payloads[future][0], text)
                     finally:
                         for _ in range(permits):
                             self._smart_operation_semaphore.release()
+        except SMART_BATCH_TRANSPORT_ERRORS:
+            # Priming is unavailable, not broken: loaders keep whatever the
+            # phase did publish and the rest fall back to the per-slot path,
+            # rather than every slot inheriting one shelf-wide failure.
+            pass
         except BaseException as exc:
             # Settle every registered loader even when disk loading, parsing or a
-            # non-API transport failure prevents the phase from finishing.
+            # genuine programming error prevents the phase from finishing.
             error = exc
         for _slot, _candidates, future in cohort:
             if not future.done():
@@ -4970,6 +5208,16 @@ class InventoryService:
         await self._apply_and_persist_snapshot_slot_details(slots)
 
         slots = self._attach_mapping_revisions(slots)
+        with perf_stage("inventory.disk_retention_accounting"):
+            retention = build_disk_retention_accounting(
+                source_disks=self._build_storage_view_candidate_records(
+                    raw_data,
+                    ssh_data,
+                    resolved_enclosure_id,
+                    bmc_inventory,
+                ),
+                slots=slots,
+            )
         summary = InventorySummary(
             disk_count=disk_count,
             pool_count=pool_count,
@@ -4981,6 +5229,10 @@ class InventoryService:
             ),
             manual_mapping_count=self.mapping_store.count_for_system(self.system.id),
             ssh_slot_hint_count=ssh_slot_hint_count,
+            source_disk_count=retention.source_disk_count,
+            rendered_unique_disk_count=retention.rendered_unique_disk_count,
+            duplicate_disk_view_count=retention.duplicate_disk_view_count,
+            unplaced_disk_count=retention.unplaced_disk_count,
         )
         capabilities = self._build_platform_capabilities(
             slots=slots,
@@ -5603,6 +5855,8 @@ class InventoryService:
             "label": virtual_label,
             "name": None,
         }
+        if VIRTUAL_INVENTORY_PHYSICAL_LOCATION_WARNING not in warnings:
+            warnings.append(VIRTUAL_INVENTORY_PHYSICAL_LOCATION_WARNING)
         loaded_mappings = self.mapping_store.load_all()
         self._warn_unapplied_legacy_mappings(
             warnings,

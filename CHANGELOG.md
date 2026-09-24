@@ -34,19 +34,206 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Image-only upgrades now preserve existing Compose files and wait for healthy
   containers; optional backup defaults match the selected ownership setup. (#426)
 
+### Security
+
+- Restored the read-only `./config:/app/config:ro` mount for the read UI in the
+  default `docker-compose.yml`, which lost its `:ro` when hardening moved to the
+  opt-in non-root overlay. Default deployments no longer give the
+  internet-facing UI write access to `config.yaml`; the admin service, which
+  does write configuration, keeps its read-write mount. (#550, #552)
+
 ### Added
 
+- Added a JSON-RPC 2.0 websocket transport selectable per TrueNAS host with
+  `api_dialect` (and `api_version` to pin a documented API release), keeping the
+  DDP default for CORE and existing hosts; saving a system in the admin UI keeps
+  the saved dialect, and cloning one under a new id inherits the dialect of the
+  system it was cloned from instead of falling back to DDP; when several saved
+  systems share one API endpoint with different dialects the clone falls back to
+  the default so the transport is established again rather than guessed. The
+  admin UI now sends the loaded system's id with every save under a new id, so
+  the inherited dialect no longer depends on whether the SSH command list was
+  preserved, replaced or left at the platform defaults (#529).
 - Added a client-only, one-session SMART WebSocket batch API with bounded
   concurrency and DDP heartbeat handling; inventory integration remained
   separate (#503).
 
+### Changed
+
+- Admin failures now answer with the request's correlation id in the response
+  body and the `X-Request-ID` header, and the admin log records that id with the
+  HTTP status only; the admin state reports whether the sidecar's auto-stop time
+  has passed and names the restart command, so the page no longer claims a
+  shutdown from the browser clock. Admin request failures are also reported as
+  one of three outcomes — the sidecar could not be reached, the input was
+  rejected, or a change whose result is unknown and has to be re-checked before
+  a retry — instead of a single generic failure message (#545).
+
+- Kept a dispatched admin mutation with a lost response in the status-unknown
+  path even if the browser went offline afterward, and told container-action
+  operators to re-check current state before retrying (#553).
+
+### Docs
+
+- Rewrote the released v0.23.0 upgrade notes so a published-image operator can
+  follow them: the ownership step is a plain `chown` that adopts the
+  `docker-compose.nonroot.yml` overlay rather than a helper the image does not
+  ship, the notes gained a rollback path, and the breaking-changes list no
+  longer asks for the authentication and public-origin settings #392 reversed
+  before release (#541).
+
+- Corrected the off-loopback history recipes: the deployment and operations
+  pages now set refresh-token mode, a token, and `HISTORY_PUBLIC_ORIGIN`
+  alongside `HISTORY_BIND_ADDRESS`, which is what the service requires to
+  start, and `.env.example` records that Compose derives
+  `HISTORY_PUBLISHED_BIND_ADDRESS` and never passes `RELEASE_CHECK_*` to the
+  history sidecar (#541).
+
+- Added a "Rolling back a release" section to the deployment page covering the
+  image pin, the data that a rollback does not revert, and the history restore
+  path, and pointed the operations page at it (#541).
+
 ### Fixed
 
-- Drew the Storage Fabric impacted/mapped bay grid in the active enclosure's
-  physical layout instead of a flat sorted chip list, so a bay number sits in
-  the same place there as on the Enclosure tab, with un-impacted and empty
-  bays shown as placeholders and the chassis edge label repeated underneath
-  (#532).
+- Published aggregate disk-retention totals on the inventory summary
+  (`source_disk_count`, `rendered_unique_disk_count`,
+  `duplicate_disk_view_count`, `unplaced_disk_count`) so a release check can
+  prove every source disk became exactly one logical rendered disk across the
+  system-scoped virtual-inventory fallback, and made that fallback say that
+  physical location is unavailable rather than looking like a source fetch
+  failure. The totals carry no disk identifiers (#547)
+
+- Rebased the disk-retention accounting onto current inventory behavior and
+  refreshed its deterministic public demo plus exact-byte screenshot review,
+  keeping all published totals identifier-free (#556).
+
+- The history service now declares the on-disk schema versions it supports and
+  checks `PRAGMA user_version` before the migration lock and before any write,
+  including a version a newer release committed to an unreplayed write-ahead log.
+  A database written by a newer release is refused with a plain-words reason and
+  left byte-identical instead of gaining this build's tables, and the reason is
+  reported on `/healthz` rather than crash-looping; a write-ahead log that exists
+  but cannot be read for the check fails closed instead of trusting the main
+  file's older header; supported older databases still migrate through the
+  existing path (#546).
+
+- Refused startup when an existing write-ahead log could not be read for schema
+  admission, preserving the WAL and original retryable error instead of opening
+  the stale main header and checkpointing away newer state (#555).
+
+- Stopped the last-good SMART fallback, the one used when the enclosure layout
+  cannot be resolved, from reporting a departed disk's SMART data for a bay
+  whose current occupant has no serial, logical unit id or gptid. An
+  expander-assigned SAS address names the bay rather than the disk in it, so
+  nothing on record for the bay is served until a strong identifier returns;
+  the stored entry is kept, and the usual carry-forward resumes when the same
+  disk reappears. The withholding decision is recorded on the stored entry, so
+  it survives a restart of the service rather than lapsing with the process
+  that observed the swap (#544)
+
+- Preserved that restart-safe SMART withholding decision when an occupied bay
+  reports no disk identifier at all, instead of reviving the departed disk's
+  cached SMART after a service restart (#551).
+
+- Finished an interrupted segmented-history migration automatically during an
+  ordinary `docker compose up -d`, so a restart in the middle of one no longer
+  leaves the history container crash-looping until an operator runs a recovery
+  command by hand. When automatic recovery cannot complete, startup fails
+  closed with one concise line at `/healthz` and leaves the database exactly as
+  recovery found it (#549)
+
+- Kept temporary SQLite lock contention retryable during pending-marker startup
+  admission instead of misclassifying it as a terminal migration-recovery
+  failure (#554).
+- Quarantined history recovery is now visible and survives a restart: when an
+  unreadable history database is quarantined and replaced with a fresh one, the
+  service records the recovery in its maintenance state and reports that
+  recovery is required, with the quarantine time, on the history dashboard,
+  `/healthz` and the history status API until it is acknowledged, instead of
+  presenting the empty database as a first installation. History `/healthz`
+  also grades that state as `degraded` rather than `ok`, even when the
+  collector recorded no error, so ordinary health cannot accept a database
+  that started empty after a quarantine (#548)
+
+- Made `--help` work on every script under `scripts/` off Linux without
+  writing anything into the checkout, with no exceptions left:
+  `public_demo_source_parity.py` now adds the repository root to `sys.path`
+  the way the builder that imports it already does, so running it directly no
+  longer fails with `No module named 'scripts'`. The help sweep also describes
+  the arguments an operator has to fill in, including the segmented-history
+  source, segments directory, cutoff and key id (#538)
+
+- Replaced the generic 500 a mapping or alias save returned when the data
+  folder is not writable with a 503 and a plain sentence, and stopped the
+  history service crash-looping on an unwritable history folder: it now retries
+  with bounded backoff, then stays up with an unhealthy `/healthz` and a 503 on
+  every other route, naming the path, the owner and the host command to run.
+  That command names the host bind source (`./history`) rather than the
+  container path, and a read-only SQLite database counts as unwritable even
+  though it carries no errno (#538)
+
+- Ran history retention on its own schedule instead of only after a successful
+  hourly backup, bounded the wait for a failing backup with a deadline that is
+  recorded in the history database so a restart neither postpones nor
+  shortens it, and cut the default backup footprint to a daily copy kept for a
+  week (#539).
+
+- Replaced the generic history collector error, the retention class name, and
+  the invisible full-refresh cooldown with fixed, secret-free sentences and a
+  published cooldown deadline (#539).
+
+- Ran each CI job once per pull request: a branch push whose branch already
+  has an open pull request now defers to that pull request's run, CodeQL
+  analyses pushes to `main` only, and the pull request type labeller no
+  longer re-runs and cancels itself on every push (#541).
+
+- Stopped the `Changelog entry` gate from blocking contributors who cannot
+  apply the `no-changelog` label: it reports the missing entry and passes for
+  authors without write access, and still blocks for maintainers (#541).
+
+- Backfilled a slot's serial, model and size from the cache when a live view drops
+  the serial while another strong identifier - a serial, logical unit id or gptid -
+  still agrees, instead of refusing the cache and overwriting it with the degraded
+  view (#524).
+- Stopped treating a bay's SAS address as disk identity. A live view carrying none
+  of the strong identifiers is now reported as `identity_state: "unknown"`: no
+  cached identity or SMART data is shown as current for it, the last-known cache
+  entry is kept as historical evidence instead of being overwritten by the degraded
+  row, and SMART reads taken during that window are isolated from the departed
+  disk's identity. A strong identifier that returns and disagrees is admitted as a
+  replacement (#524).
+- Kept one slow CORE disk from failing the whole SMART grid: a batch reply past the
+  call timeout now falls back to the per-slot path for that shelf and the batch route
+  answers 503 instead of 500 for every slot (#524).
+- Bounded every per-slot `disk.smartctl` call by the configured TrueNAS call timeout.
+  A disk that never answers now yields that slot's unavailable summary instead of
+  holding the whole grid request open behind it (#524).
+
+- Bounded a slow CORE disk to its own slot inside the SMART batch. A reply past the
+  per-call timeout now degrades that one slot and leaves every other slot its batch
+  result, instead of sending the whole shelf back through the per-slot path (#537).
+
+- Kept the CORE SMART grid's partial batch results when middleware rejects one
+  disk, retrying only that slot through the per-slot path instead of discarding
+  every reply in the batch and re-fetching the whole shelf one disk at a time
+  (#537).
+
+- Kept last-good SMART data across inventory refreshes and restarts. Every snapshot
+  build used to replace a slot's cached entry with one that held no SMART fields, so
+  the persisted layer the SMART grid and exports serve was erased within one snapshot
+  TTL of being written. Carried-forward values keep the timestamp of the read that
+  produced them and are marked stale; only a successful read replaces them (#537).
+
+- Reported an unusable data directory on the SMART grid as the local fault it is.
+  A filesystem failure while caching SMART results now answers 500 with a message
+  naming the data directory and logs one line, instead of a 503 that reads as a
+  passing enclosure outage. An unreadable TLS CA bundle raises its own error and
+  names the bundle, instead of sending the operator to the data directory (#537).
+
+- Stopped a shelf where every disk stalls from holding a SMART batch open for one
+  per-call timeout per round. The batch carries a deadline measured from the last
+  disk that answered; positions it never reaches are reported so the grid falls
+  back for them (#537).
 
 - Retried failed release checks with bounded backoff instead of waiting a
   full normal interval, preserving the last successful result (#469).
@@ -79,8 +266,17 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 - Preserved history availability, scope identity and outage errors across
   bulk responses and offline exports. (#423)
+- Drew the Storage Fabric impacted/mapped bay grid in the active enclosure's
+  physical layout instead of a flat sorted chip list, so a bay number sits in
+  the same place there as on the Enclosure tab, with un-impacted and empty
+  bays shown as placeholders and the chassis edge label repeated underneath
+  (#532).
 
 ### Performance
+
+- Served a slot history bundle from one SQLite connection instead of fifteen
+  and cached the history lock address per database identity instead of parsing
+  /proc/self/mountinfo on every lock (#539).
 
 - Reduced mapping revision work to one document read per batch while
   preserving conflict checks and calibration tokens. (#421)
@@ -117,6 +313,14 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Docs
 
+- Documented which backups a deployment accepts (a newer app or schema
+  version is refused before anything is replaced) and the unwritable data or
+  history folder symptom, with the command that fixes it (#538)
+
+- Documented the history retention schedule, the bounded wait for a failing
+  backup, the default backup footprint, and what each dashboard diagnostic cell
+  now says (#539).
+
 - Reconciled the v0.23.0 release wrap and Wiki home page with the published
   GitHub release, GHCR package, and Pages demo while retaining the qualified
   v0.22.2 beginner-installation pin. (#518)
@@ -132,11 +336,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Internal
 
-- Gave the checked-in public demo a frozen synthetic Storage Fabric payload so
-  the published overview screenshot exercises the enclosure-shaped bay grid;
-  the snapshot renderer accepts the payload through one optional argument that
-  operator exports leave unset, so no live fabric identifier can reach an
-  exported file by that route (#532).
+- Replaced the chain of command comparisons behind the SSH command failure
+  contexts with a lookup table and pinned every answer with tests; the debug
+  output is unchanged (#540)
 
 - Added a dispatch-only workflow that recaptures the public-demo screenshots
   inside the pinned Playwright Linux container, captures twice to prove the
@@ -150,6 +352,24 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Normalized pointer hover and focus before public-demo screenshot capture so
   the exact-byte repeatability gate measures a settled page instead of a
   transient transformed control (#519).
+
+- Stopped the coverage tracer and `tracemalloc` from multiplying each other in
+  the peak-heap probes: probes now run through `tests/heap_probe.py`, which
+  detaches the active trace function while it measures. The 16 MiB
+  streaming-JSON preflight probe took 365.2s of the 535.2s Python 3.12 test
+  body on run 34815729312 and 4.2s on the untraced 3.14 job in the same run;
+  the probes now also report the product's heap instead of the product's plus
+  the tracer's. The same pull request also pinned the capture-workflow font
+  fallbacks in `docs/SCREENSHOT_CAPTURE.md` — the families pinned since #516,
+  the qualification run that recorded them, and the re-qualification a
+  maintainer owes before changing either — with `tests/test_ci_contract.py`
+  reading the pair out of the workflow so the doc cannot drift from the
+  enforced values again. (#536)
+- Gave the checked-in public demo a frozen synthetic Storage Fabric payload so
+  the published overview screenshot exercises the enclosure-shaped bay grid;
+  the snapshot renderer accepts the payload through one optional argument that
+  operator exports leave unset, so no live fabric identifier can reach an
+  exported file by that route (#532).
 
 ## v0.23.0 - 2026-09-08
 
@@ -176,12 +396,13 @@ v0.23.0 release candidate.
 ### Breaking changes
 
 - Restored unauthenticated main and admin controls in default `network` mode
-  and made TLS certificate verification opt-in for new connections (#392)
-- Required local authentication for mutating main-UI requests and hardened the
-  default Compose runtime contract (#245 and #246).
-- Required a configured admin public origin for browser-initiated admin
-  mutations and moved bootstrap and ESXi host-prep onto runtime-owned
-  known-hosts paths with strict host-key handling (#201).
+  and made TLS certificate verification opt-in for new connections. Neither
+  application authentication nor a configured public origin is required after
+  upgrading; the mandatory local authentication of #245 and the mandatory
+  admin public origin of #201 were both reversed before this release, so there
+  is nothing to configure for them (#392, superseding #245 and #201).
+- Moved bootstrap and ESXi host preparation onto runtime-owned known-hosts
+  paths with strict host-key handling (#201).
 - Scoped legacy manual slot mappings to single-system, single-enclosure
   deployments, rejected exact rows whose stored system ownership conflicts, and
   removed both legacy aliases when a canonical scoped mapping is saved (#249).
@@ -223,13 +444,45 @@ them before starting the new images.
   a private `/tmp`, all capabilities dropped, and `no-new-privileges`. The
   admin service stays UID `0` for Docker control but runs as `0:${APP_GID}`
   with only `CHOWN` and `FOWNER` added back and without its app-log mount.
-  Before the first start on the new file, stop the stack and use the configured
-  app identity for the ownership preflight and apply step:
-  `docker compose down`; `app_uid="${APP_UID:-10001}"`;
-  `app_gid="${APP_GID:-10001}"`;
-  `sudo python scripts/prepare_nonroot_bind_mounts.py . --uid "$app_uid" --gid "$app_gid"`;
-  then repeat the helper command with `--apply`. Without that step the non-root
-  services cannot write their bind-mounted state (#246).
+  Hardening is opt-in: it lives in `docker-compose.nonroot.yml`, and a
+  deployment that does not add that overlay keeps root-owned bind mounts and
+  needs no ownership step (#246, and see #426 in the next release).
+
+  Skip this note entirely unless you add `-f docker-compose.nonroot.yml`. To
+  adopt the overlay, stop the stack and give the bind mounts to the configured
+  app identity from the host shell. Leave the backup identity alone:
+  `config/backup-secrets` stays private to `BACKUP_UID`, and `backup-status`
+  is prepared as `BACKUP_UID:APP_GID` mode `2750`, which is what the scheduled
+  backup runner requires before it will write status. No repository checkout
+  is needed:
+
+  ```bash
+  docker compose down
+  app_uid="${APP_UID:-10001}"
+  app_gid="${APP_GID:-10001}"
+  backup_uid="${BACKUP_UID:-1000}"
+  sudo find ./config -path ./config/backup-secrets -prune -o -exec chown "$app_uid:$app_gid" {} +
+  sudo chown -R "$app_uid:$app_gid" ./data ./logs ./history
+  sudo install -d -o "$backup_uid" -g "$app_gid" -m 2750 ./backup-status
+  docker compose -f docker-compose.yml -f docker-compose.nonroot.yml up -d
+  ```
+
+  Do not run a recursive ownership or mode change over an existing segmented
+  history tree; see the sealed-segment note below. Without the ownership step
+  the non-root services cannot write their bind-mounted state (#246).
+
+- **Rolling back to `v0.22.2`.** Set `JBOD_UI_IMAGE` in `.env` back to the tag
+  or digest you recorded before the update, then run `docker compose pull` and
+  `docker compose up -d` with the same ordered `-f` files and profiles you
+  start the stack with. Drop `-f docker-compose.nonroot.yml` from that chain
+  when rolling back past the hardening; bind mounts chowned to the app identity
+  stay readable and writable by the root-run services. An image rollback does
+  not revert durable state: configuration under `./config` and `./data` and the
+  history database under `./history` remain as the newer version left them. If
+  the older image cannot open the history database, stop the stack and restore
+  it from a scheduled backup as described in
+  [Backup, Restore, and Debug Bundles](wiki/Backup-Restore-and-Debug-Bundles.md#optional-scheduled-state-backups),
+  then start the older image again (#541).
 - Legacy manual slot mappings saved by older releases under the unscoped
   `default:{slot}` and `{enclosure}:{slot}` key shapes are only resolved when
   the deployment has exactly one configured system and exactly one detected
@@ -322,14 +575,12 @@ them before starting the new images.
   and duration metrics (#248).
 - Added TrueNAS disk inventory sync actions (`disk.multipath_sync` on CORE,
   `disk.sync_all` on CORE and SCALE) to the enclosure header behind the main-UI
-  write gate, with exact-argument sudo grants and a CORE multipath disk
-  replacement runbook (#357).
+  write gate, with exact-argument sudo grants, immutable target confirmation,
+  convergence polling, and a CORE multipath disk replacement runbook
+  (#357 and #359).
 - Added one bounded snapshot warning when CORE multipath attribution is
   backfilled from `gmultipath list`, directing operators to the existing disk
   inventory controls without exposing device identifiers (#385).
-- Added guarded disk inventory synchronization controls for supported TrueNAS
-  systems, including immutable target confirmation and convergence polling
-  (#359).
 - Added memory-only in-page Basic sign-in for live-UI writes while keeping
   anonymous reads and same-origin request boundaries (#358).
 - Added release-time changelog coverage and exact GitHub Wiki byte verification

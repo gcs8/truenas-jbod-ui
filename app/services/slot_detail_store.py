@@ -19,6 +19,20 @@ class SlotDetailCacheEntry(BaseModel):
     identifiers: list[str] = Field(default_factory=list)
     slot_fields: dict[str, Any] = Field(default_factory=dict)
     smart_fields: dict[str, Any] = Field(default_factory=dict)
+    # When the SMART half was last read successfully, and whether it has been
+    # carried forward since. ``updated_at`` moves on every snapshot build, so it
+    # cannot date the SMART fields; without a separate stamp a carried-forward
+    # value is indistinguishable from one read this second (#521). Both default
+    # to the pre-#521 shape so an existing file loads unchanged.
+    smart_updated_at: str | None = None
+    smart_stale: bool = False
+    # Whether the most recently published view of this bay carried no strong
+    # identifier (#525). The entry itself is kept as historical evidence, but a
+    # reader that has no slot view to gate on must not serve it while this is
+    # set: the process that observed the window may since have restarted, so an
+    # in-memory marker alone outlives nothing. Defaults to the pre-#525 shape so
+    # an existing file loads unchanged.
+    identity_unknown: bool = False
     updated_at: str = Field(default_factory=lambda: utcnow().isoformat())
 
 

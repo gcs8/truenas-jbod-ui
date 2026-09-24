@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
+import json
 import re
 import tempfile
 import unittest
@@ -89,6 +90,15 @@ async def invoke_asgi(
 def basic_header(username: str, password: str) -> str:
     token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
     return f"Basic {token}"
+
+
+def assert_cross_origin_rejection_body(test_case, body: bytes) -> None:
+    """The rejection detail, plus the request correlation id admin errors carry (#418)."""
+    payload = json.loads(body)
+    test_case.assertIs(payload["ok"], False)
+    test_case.assertEqual(payload["detail"], "Cross-origin admin mutation rejected.")
+    test_case.assertRegex(payload["request_id"], r"^[0-9a-f]{32}$")
+    test_case.assertEqual(set(payload), {"ok", "detail", "request_id"})
 
 
 class AdminAuthenticationTests(unittest.TestCase):
@@ -324,10 +334,7 @@ class AdminAuthenticationTests(unittest.TestCase):
                     )
                 )
                 self.assertEqual(status, 403)
-                self.assertEqual(
-                    body,
-                    b'{"detail":"Cross-origin admin mutation rejected."}',
-                )
+                assert_cross_origin_rejection_body(self, body)
 
     def test_network_boundary_mode_preserves_remote_unauthenticated_contract(self) -> None:
         settings = AdminSettings(
@@ -352,10 +359,7 @@ class AdminAuthenticationTests(unittest.TestCase):
         self.assertEqual(status, 404)
         self.assertEqual(write_status, 404)
         self.assertEqual(cross_site_write_status, 403)
-        self.assertEqual(
-            cross_site_body,
-            b'{"detail":"Cross-origin admin mutation rejected."}',
-        )
+        assert_cross_origin_rejection_body(self, cross_site_body)
 
     def test_default_admin_app_starts_without_an_origin_or_authentication(self) -> None:
         inherited = dict(os.environ)
@@ -430,7 +434,7 @@ class AdminAuthenticationTests(unittest.TestCase):
         # The empty request body reaches the handler and fails validation instead of the origin gate.
         self.assertEqual(same_origin_status, 422)
         self.assertEqual(foreign_origin_status, 403)
-        self.assertEqual(foreign_body, b'{"detail":"Cross-origin admin mutation rejected."}')
+        assert_cross_origin_rejection_body(self, foreign_body)
 
     def test_basic_mode_browser_mutations_require_same_origin(self) -> None:
         settings = AdminSettings(

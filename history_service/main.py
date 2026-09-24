@@ -5,10 +5,13 @@ import json
 import logging
 import math
 import os
+import time
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from functools import lru_cache
 from pathlib import Path
-from typing import cast
+from typing import Callable, cast
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -24,6 +27,7 @@ from app.services.history_status import project_public_collector_status
 from app.services.release_status import ReleaseStatusService
 from history_service.collector import HistoryCollectionAlreadyRunning, HistoryCollector
 from history_service.config import HistorySettings, get_history_settings
+from history_service.domain import isoformat_utc, utcnow
 from history_service.operation_bounds import (
     HISTORY_READ_BUSY_DETAIL,
     HISTORY_READ_RETRY_AFTER_SECONDS,
@@ -44,6 +48,13 @@ from history_service.refresh_auth import (
     read_limited_request_body,
     read_refresh_document,
 )
+from history_service.startup import (
+    DEFAULT_ATTEMPTS,
+    DEFAULT_INITIAL_BACKOFF_SECONDS,
+    HistoryStartupError,
+    open_history_store_with_retries,
+)
+from history_service.startup_migration import open_history_store_after_recovery
 from history_service.store import HistoryStore
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -67,9 +78,71 @@ def build_history_store(settings: HistorySettings) -> HistoryStore:
     )
 
 
-settings = get_history_settings()
-store = build_history_store(settings)
-collector = HistoryCollector(settings, store)
+HISTORY_UNAVAILABLE_DETAIL = "History storage is unavailable; see the service logs."
+
+
+def _configured_history_directory() -> Path:
+    """Where history lives, resolved for the operator line without creating it."""
+    configured = os.getenv("HISTORY_SQLITE_PATH")
+    if configured:
+        return Path(configured).parent
+    return Path(HistorySettings().sqlite_path).parent
+
+
+def open_history_runtime(
+    *,
+    attempts: int = DEFAULT_ATTEMPTS,
+    initial_backoff_seconds: float = DEFAULT_INITIAL_BACKOFF_SECONDS,
+    sleep: Callable[[float], None] = time.sleep,
+) -> tuple[HistorySettings, HistoryStore]:
+    """Load settings and open the store as one guarded operation.
+
+    Settings loading creates the history directories, so a root-owned bind
+    mount fails there first; it has to sit inside the retry boundary or the
+    retries and the operator-facing explanation never run.
+    """
+
+    def factory() -> tuple[HistorySettings, HistoryStore]:
+        loaded = get_history_settings()
+        # Required durable-state migrations complete inside an ordinary
+        # `docker compose up -d`, including one interrupted by a restart. The
+        # store's own admission runs first, so a database this build must not
+        # write to is refused before recovery mutates it; if recovery cannot
+        # complete, startup fails closed with one concise line instead of
+        # looping a traceback and demanding a manual repair.
+        return loaded, open_history_store_after_recovery(
+            sqlite_path=loaded.sqlite_path,
+            segment_catalog_path=loaded.segment_catalog_path,
+            build_store=lambda: build_history_store(loaded),
+        )
+
+    return open_history_store_with_retries(
+        factory,
+        directory=_configured_history_directory,
+        attempts=attempts,
+        initial_backoff_seconds=initial_backoff_seconds,
+        sleep=sleep,
+    )
+
+
+def load_history_runtime(
+    **kwargs: object,
+) -> tuple[HistorySettings, HistoryStore | None, str | None]:
+    """Open the runtime, or report why it is unavailable without re-raising.
+
+    Docker restarts this container forever, and a restart does not change a
+    directory's owner, so a terminal failure stays up and reports itself
+    instead of looping the retries and the traceback.
+    """
+    try:
+        loaded, opened = open_history_runtime(**kwargs)  # type: ignore[arg-type]
+    except HistoryStartupError as exc:
+        return HistorySettings(), None, exc.reason
+    return loaded, opened, None
+
+
+settings, store, startup_failure_reason = load_history_runtime()
+collector = HistoryCollector(settings, store) if store is not None else None
 logger = logging.getLogger(__name__)
 refresh_admission = ManualRefreshAdmission(
     cooldown_seconds=settings.full_refresh_cooldown_seconds,
@@ -79,6 +152,25 @@ bulk_history_read_admission = BulkHistoryReadAdmission(
 )
 bulk_history_read_operations: set[asyncio.Task[tuple[list[dict[str, object]], int]]] = set()
 HISTORY_COLLECTOR_ERROR_DETAIL = "History collector error; see service logs."
+# Fixed-vocabulary diagnostics from history_service.diagnostics. They are safe to
+# publish (no URLs, paths or appliance text), so the dashboard shows them next to
+# the redacted last_error, which stays generic for the main UI projection.
+HISTORY_DIAGNOSTIC_STATUS_FIELDS = (
+    # Durable quarantine-recovery state (#417). It rides beside the exact public
+    # allowlist rather than inside it: the allowlist lives in the demo source
+    # graph, and this service's own dashboard and /healthz are where the
+    # recovery indication has to be visible.
+    "history_recovery_required",
+    "history_quarantined_at",
+    "last_error_kind",
+    "last_error_summary",
+    "last_retention_error_kind",
+    "last_retention_skip_reason",
+    "last_retention_skip_until",
+    "last_retention_ran_without_backup",
+    "last_backup_error",
+    "last_backup_error_kind",
+)
 SLOT_HISTORY_METRIC_LIMITS: dict[str, int] = {
     "temperature_c": 96,
     "bytes_read": 60,
@@ -267,10 +359,37 @@ def public_collector_status(
     *,
     last_error_detail: str = HISTORY_COLLECTOR_ERROR_DETAIL,
 ) -> dict[str, object]:
-    return project_public_collector_status(
+    projected = project_public_collector_status(
         status,
         last_error_detail=last_error_detail,
     )
+    if not projected:
+        return projected
+    if isinstance(status, Mapping):
+        for field in HISTORY_DIAGNOSTIC_STATUS_FIELDS:
+            if field in status:
+                projected[field] = status[field]
+    return projected
+
+
+def refresh_cooldown_status() -> dict[str, object]:
+    """Publish the full-refresh cooldown deadline the dashboard renders.
+
+    It sits beside the collector status rather than inside it: the collector
+    status is an exact allowlist (app/services/history_status.py), and the
+    cooldown belongs to this service's manual refresh admission, not to a
+    collection pass.
+    """
+
+    cooldown = refresh_admission.cooldown_state()
+    remaining = int(cooldown["seconds_remaining"])
+    return {
+        "full_refresh_cooldown_seconds": int(cooldown["cooldown_seconds"]),
+        "full_refresh_cooldown_seconds_remaining": remaining,
+        "full_refresh_available_at": (
+            isoformat_utc(utcnow() + timedelta(seconds=remaining)) if remaining > 0 else None
+        ),
+    }
 
 
 def safe_http_url(value: object) -> str:
@@ -294,6 +413,11 @@ def get_release_status_service() -> ReleaseStatusService:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    if collector is None:
+        # Storage is unavailable; /healthz reports the reason and every other
+        # route answers 503 rather than the service crash-looping.
+        yield
+        return
     release_task = asyncio.create_task(get_release_status_service().run_periodic_refresh())
     await collector.start()
     try:
@@ -311,6 +435,17 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title=settings.app_name, version=__version__, lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 install_metrics(app, service_name="enclosure-history", version=__version__)
+
+
+@app.middleware("http")
+async def _refuse_while_storage_is_unavailable(request: Request, call_next):
+    """Answer 503 everywhere but the probes while the store could not open."""
+    if store is None and request.url.path not in {"/healthz", "/livez", "/metrics"}:
+        return JSONResponse(
+            {"detail": HISTORY_UNAVAILABLE_DETAIL},
+            status_code=503,
+        )
+    return await call_next(request)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -333,15 +468,30 @@ async def index(request: Request, exact_counts: bool = Query(default=False)) -> 
             app_version=__version__,
             release_status=get_release_status_service().snapshot(),
             database_size_bytes=database_size_bytes,
+            refresh=refresh_cooldown_status(),
         ),
     )
 
 
 @app.get("/healthz")
 async def healthz() -> JSONResponse:
+    if startup_failure_reason is not None or collector is None or store is None:
+        return JSONResponse(
+            {
+                "status": "unavailable",
+                "detail": HISTORY_UNAVAILABLE_DETAIL,
+                "reason": startup_failure_reason,
+            },
+            status_code=503,
+        )
     collector_status = public_collector_status(collector.status())
+    # A quarantine replaces an unreadable database with a fresh empty one. That
+    # database works, so nothing sets last_error, but the service is running on
+    # history it lost: grade it degraded until the recovery is acknowledged so
+    # ordinary health cannot accept it as a healthy first installation (#417).
+    recovery_required = bool(collector_status.get("history_recovery_required"))
     payload = {
-        "status": "ok" if not collector.last_error else "degraded",
+        "status": "ok" if not (collector.last_error or recovery_required) else "degraded",
         "collector": collector_status,
         "database_size_bytes": await asyncio.to_thread(store.database_size_bytes),
         **collector_status,
@@ -365,6 +515,7 @@ async def overview(exact_counts: bool = Query(default=False)) -> dict[str, objec
     counts = await asyncio.to_thread(store.counts if exact_counts else store.estimated_counts)
     return {
         "collector": public_collector_status(collector.status()),
+        "refresh": refresh_cooldown_status(),
         "counts": counts,
         "counts_exact": exact_counts or counts.get("estimated") is False,
         "database": {
@@ -424,10 +575,11 @@ async def refresh_history(request: Request) -> dict[str, object] | JSONResponse:
             },
             status_code=409,
         )
-    except Exception:  # noqa: BLE001 - report manual collection failures as structured API errors.
+    except Exception as exc:  # noqa: BLE001 - report manual collection failures as structured API errors.
         logger.exception("Manual history %s refresh failed", normalized_mode)
         failure_detail = f"History {normalized_mode} refresh failed; see service logs."
         collector.last_error = failure_detail
+        collector.record_failure_diagnostics(exc)
         try:
             payload = await overview(exact_counts=False)
             collector_payload = payload.get("collector")
@@ -698,6 +850,7 @@ def build_dashboard_context(
     app_version: str,
     release_status: dict[str, object] | None = None,
     database_size_bytes: int = 0,
+    refresh: dict[str, object] | None = None,
 ) -> dict[str, object]:
     counts_are_estimated = bool(counts.get("estimated"))
     release_payload = release_status or {}
@@ -731,5 +884,6 @@ def build_dashboard_context(
             status.get("last_collection_inventory_forced")
         ),
         "format_count": format_count,
+        "refresh": refresh or {},
         "status_json": json.dumps(status),
     }

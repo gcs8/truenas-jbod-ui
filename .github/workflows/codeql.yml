@@ -1,11 +1,11 @@
 name: CodeQL
 
 on:
+  # Branch pushes are covered by the pull_request analysis for the same
+  # commit; listing branch prefixes here only doubled every run (#TBD).
   push:
     branches:
       - main
-      - "codex/**"
-      - "ci/**"
   pull_request:
     branches:
       - main
@@ -41,9 +41,9 @@ jobs:
           persist-credentials: false
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4
+        uses: github/codeql-action/init@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4
         with:
           languages: ${{ matrix.language }}
 
       - name: Perform CodeQL analysis
-        uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4
+        uses: github/codeql-action/analyze@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4
