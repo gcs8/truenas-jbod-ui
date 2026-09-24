@@ -107,13 +107,19 @@ WINDOWS_PORTABLE_TEST_MODULES = (
     "tests.test_admin_secret_models",
     "tests.test_changelog_entry_gate",
     "tests.test_ci_contract",
+    "tests.test_config_example",
     "tests.test_dev_check",
+    "tests.test_disk_retention_accounting",
     "tests.test_ghcr_release_contract",
+    "tests.test_history_schema_version_gate",
+    "tests.test_heap_probe",
     "tests.test_history_backend",
     "tests.test_history_backend_bounds",
     "tests.test_history_config_contract",
+    "tests.test_history_diagnostics",
     "tests.test_history_operation_bounds",
     "tests.test_logging_config",
+    "tests.test_nonroot_cli",
     "tests.test_parsers",
     "tests.test_profile_builder",
     "tests.test_profiles",
@@ -130,9 +136,15 @@ WINDOWS_PORTABLE_TEST_MODULES = (
     "tests.test_release_changelog_coverage",
     "tests.test_release_status",
     "tests.test_release_wrap_validator",
+    "tests.test_scripts_help",
+    "tests.test_ssh_failure_contexts",
     "tests.test_ssh_probe",
+    "tests.test_startup_migration_recovery",
+    "tests.test_startup_writability",
+    "tests.test_system_setup_api_dialect",
     "tests.test_tls_trust",
     "tests.test_truenas_ws",
+    "tests.test_truenas_ws_jsonrpc",
     "tests.test_wiki_drift_verifier",
 )
 
@@ -153,6 +165,7 @@ WINDOWS_EXCLUSIONS = (
         ),
         modules=(
             "tests.test_admin_auth",
+            "tests.test_admin_error_correlation",
             "tests.test_admin_runtime_routes",
             "tests.test_admin_service",
             "tests.test_admin_safety",
@@ -187,6 +200,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_segmented_restore_recovery",
             "tests.test_slot_bounds_routes",
             "tests.test_slot_detail_store",
+            "tests.test_smart_grid_io",
             "tests.test_snapshot_export",
             "tests.test_system_backup",
         ),
@@ -202,7 +216,9 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_compose_runtime_matrix",
             "tests.test_container_contract",
             "tests.test_esxi_host_prep",
+            "tests.test_full_backup_benchmark",
             "tests.test_immutable_deployment",
+            "tests.test_image_upgrade_contract",
             "tests.test_mapping_store",
             "tests.test_nonroot_migration",
             "tests.test_perf_harness",
@@ -217,6 +233,11 @@ WINDOWS_EXCLUSIONS = (
             "without an installed Bash runtime"
         ),
         modules=("tests.test_bash_ci_contract",),
+    ),
+    WindowsExclusion(
+        category="Linux singleton runner trial",
+        reason="the trial contract invokes Bash and targets hardened Linux runner pods",
+        modules=("tests.test_jbod_runner_trial",),
     ),
 )
 
@@ -739,8 +760,23 @@ def build_parser() -> argparse.ArgumentParser:
         description="Run the authoritative platform-aware source validation gates."
     )
     mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--safe", dest="mode", action="store_const", const="safe")
-    mode.add_argument("--full", dest="mode", action="store_const", const="full")
+    mode.add_argument(
+        "--safe",
+        dest="mode",
+        action="store_const",
+        const="safe",
+        help=(
+            "Run the source gates that need no Docker, network or live data: unit tests, "
+            "compileall, ruff, JS syntax, JS unit tests, diff hygiene and the perf baseline."
+        ),
+    )
+    mode.add_argument(
+        "--full",
+        dest="mode",
+        action="store_const",
+        const="full",
+        help="Everything in --safe plus the checked-in public-demo artifact check.",
+    )
     return parser
 
 

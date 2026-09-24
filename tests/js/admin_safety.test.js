@@ -11,6 +11,9 @@ function extract(name) {
   const next = source.slice(start + 3).search(/^  (?:async )?function /m);
   return source.slice(start, next < 0 ? undefined : start + 3 + next);
 }
+const FETCH_JSON_HELPERS = ["fetchJson", "readJsonResponse", "describeApiError", "validatedRequestId", "describeRequestFailure", "isMutatingRequest", "browserIsOffline", "adminRequestError", "classifyTransportFailure", "describeTransportFailure", "classifyResponseFailure", "describeResponseFailure"];
+const MUTATION_RESULT_HELPERS = ["requireMutationResult", "isNonEmptyString", "validSystemSaveResult", "validDemoSystemResult", "validProfileSaveResult", "describeMutationFailure", "adminRequestError"];
+const SYNTHETIC_REQUEST_ID = "0123456789abcdef0123456789abcdef";
 function load(names, bindings = {}) {
   const context = vm.createContext({console, URLSearchParams, setTimeout, ...bindings});
   vm.runInContext(names.map(extract).join("\n") + `\nglobalThis.tested = {${names.join(",")}}`, context);
@@ -56,7 +59,7 @@ async function timingSaveProbe(response) {
   const holder = {querySelectorAll: () => [input], set innerHTML(_value) {renders++;}};
   const elements = {runtimeBehaviorFields: holder, runtimeBehaviorDetail: {}, runtimeBehaviorSaveButton: {}, runtimeBehaviorResult: {}};
   const banners = [];
-  const api = load(["saveRuntimeBehaviorSettings", "collectRuntimeBehaviorValues", "renderRuntimeBehaviorSettings", "fetchJson", "readJsonResponse", "describeApiError"], {
+  const api = load(["saveRuntimeBehaviorSettings", "collectRuntimeBehaviorValues", "renderRuntimeBehaviorSettings", ...FETCH_JSON_HELPERS], {
     state, elements, fetch: async () => {posts++; if (response instanceof Error) throw response; return {ok: true, status: 200, ...response};},
     setBanner(text, kind) {banners.push({text, kind});}, renderRuntimeCards() {}, escapeHtml: String, runtimeBehaviorOwnerLabel: () => "",
   });
@@ -94,7 +97,7 @@ for (const [name, fields] of [
 }
 for (const [name, response] of [
   ["lost response", new Error("Failed to fetch")],
-  ["HTML response", {headers: {get: () => "synthetic-request"}, json: async () => {throw new SyntaxError("private raw body");}}],
+  ["HTML response", {headers: {get: () => SYNTHETIC_REQUEST_ID}, json: async () => {throw new SyntaxError("private raw body");}}],
   ["empty object", {json: async () => ({})}],
   ["missing behavior", {json: async () => ({ok: true})}],
   ["server error after possible write", {ok: false, status: 500, json: async () => ({detail: "internal failure"})}],
@@ -103,7 +106,7 @@ for (const [name, response] of [
     const probe = await timingSaveProbe(response);
     assertUnknownTimingSave(probe);
     assert.doesNotMatch(probe.banners[0].text, /private raw body/);
-    if (name === "HTML response") assert.match(probe.banners[0].text, /synthetic-request/);
+    if (name === "HTML response") assert.ok(probe.banners[0].text.includes(SYNTHETIC_REQUEST_ID));
   });
 }
 for (const status of [400, 422]) {
@@ -147,16 +150,16 @@ test("restart preference survives stop toggles, including explicit opt-out", () 
 });
 test("JSON responses reject HTML, empty, null, array and scalar without exposing body", async () => {
   for (const value of [undefined, null, [], {}, "secret html", 5, false]) {
-    const {fetchJson} = load(["fetchJson", "readJsonResponse", "describeApiError"], {fetch: async () => ({ok: true, status: 200, headers: {get: () => "synthetic-request"}, json: async () => {if (value === undefined) throw new SyntaxError("secret html"); return value;}})});
-    await assert.rejects(fetchJson("/synthetic"), error => /Invalid JSON response/.test(error.message) && !/secret html/.test(error.message) && /synthetic-request/.test(error.message));
+    const {fetchJson} = load([...FETCH_JSON_HELPERS], {fetch: async () => ({ok: true, status: 200, headers: {get: () => SYNTHETIC_REQUEST_ID}, json: async () => {if (value === undefined) throw new SyntaxError("secret html"); return value;}})});
+    await assert.rejects(fetchJson("/synthetic"), error => /Invalid JSON response/.test(error.message) && !/secret html/.test(error.message) && error.message.includes(SYNTHETIC_REQUEST_ID));
   }
-  const {fetchJson} = load(["fetchJson", "readJsonResponse", "describeApiError"], {fetch: async () => ({ok: true, json: async () => ({ok: true})})});
+  const {fetchJson} = load([...FETCH_JSON_HELPERS], {fetch: async () => ({ok: true, json: async () => ({ok: true})})});
   assert.equal((await fetchJson("/synthetic")).ok, true);
 });
 test("demo creation ignores loaded editor ID and avoids both ID namespaces", async () => {
   let body;
   const state = {systems: [{id: "demo-builder-lab"}, {id: "real-system"}], profiles: [{id: "demo-builder-lab-2-chassis"}]};
-  await load(["createDemoSystem"], {state, elements: {setupSystemId: {value: "real-system"}, setupSystemLabel: {value: "Keep original"}}, fetchJson: async (_url, options) => {body = JSON.parse(options.body); return {system: {id: body.system_id}};}, refreshState: async () => {}, getSystemById: () => null, renderAll() {}, setBanner() {}}).createDemoSystem();
+  await load(["createDemoSystem", ...MUTATION_RESULT_HELPERS], {state, elements: {setupSystemId: {value: "real-system"}, setupSystemLabel: {value: "Keep original"}}, fetchJson: async (_url, options) => {body = JSON.parse(options.body); return {ok: true, system: {id: body.system_id, label: "Demo Builder Lab"}, systems: [], profile: {id: `${body.system_id}-chassis`}, profiles: []};}, refreshState: async () => {}, getSystemById: () => null, renderAll() {}, setBanner() {}}).createDemoSystem();
   assert.equal(body.system_id, "demo-builder-lab-3"); assert.equal(body.replace_existing, false); assert.notEqual(body.label, "Keep original");
 });
 test("purge cancel sends no delete and confirmation names exact preview", async () => {
@@ -203,5 +206,87 @@ test("busy backup and debug exports coalesce and stay disabled through control s
     const button = bindings.elements[operation === "exportBackup" ? "backupExportButton" : "debugExportButton"];
     assert.equal(button.disabled, true);
     reject(new Error("synthetic failure")); await first; api.syncBackupControls(); assert.equal(button.disabled, false);
+  }
+});
+
+// #411 caller-level contract: a 2xx body that is a nonempty object but not the
+// route's result must never show success, apply result state, or claim a
+// definite failure; a confirmed refusal still says "failed".
+function mutationProbe(name, fetchResult, extra = {}) {
+  const banners = [];
+  const elements = {setupResult: {}, setupCreateButton: {}, setupCreateDemoButton: {}, profileBuilderResult: {}, profileBuilderSaveButton: {}, setupProfile: {value: "keep-profile"}};
+  const state = {systems: [{id: "existing"}], profiles: [{id: "source"}], loadedSystemId: "existing", selectedExistingSystemId: "existing", defaultSystemId: "existing", loadedBuilderProfileId: "source", selectedProfileId: "source"};
+  let refreshes = 0, fetches = 0;
+  const bindings = {
+    state, elements,
+    fetchJson: async () => {fetches++; if (fetchResult instanceof Error) throw fetchResult; return fetchResult;},
+    refreshState: async () => {refreshes++;},
+    setBanner(text, kind) {banners.push({text, kind});},
+    collectSetupPayload: () => ({label: "Synthetic", truenas_host: "https://nas.example.test"}),
+    updateCreateButton() {}, fetchStorageViewCandidates: async () => {}, getSystemById: () => null, renderAll() {},
+    currentBuilderSourceProfile: () => ({id: "source"}),
+    readProfileBuilderDraft: () => ({id: "custom-draft", label: "Custom Draft", source_profile_id: "source", rows: 1, columns: 2, slot_count: 2}),
+    resolveBuilderDraftLayout: () => ({slotLayoutForSave: [[0, 1]]}),
+    getProfileById: () => null, loadProfileIntoBuilder() {}, renderProfileBuilder() {},
+    ...extra,
+  };
+  const api = load([name, ...MUTATION_RESULT_HELPERS], bindings);
+  return {api, state, elements, banners, counts: () => ({refreshes, fetches})};
+}
+function outcomeError(message, outcome, status) {
+  const error = new Error(message); error.adminOutcome = outcome; error.outcomeUnknown = outcome === "unknown"; error.status = status; return error;
+}
+const MUTATIONS = [
+  ["createSystem", "setupResult", {ok: true, system: {id: "new-system", label: "New"}, systems: []}],
+  ["createDemoSystem", "setupResult", {ok: true, system: {id: "demo-builder-lab", label: "Demo"}, systems: [], profile: {id: "demo-builder-lab-chassis"}, profiles: []}],
+  ["saveCustomProfile", "profileBuilderResult", {ok: true, profile: {id: "custom-draft", label: "Custom Draft"}, profiles: []}],
+];
+for (const [name, resultKey, valid] of MUTATIONS) {
+  for (const [label, body] of [
+    ["unexpected object", {unexpected: true}],
+    ["ok without result", {ok: true}],
+    ["non-boolean ok", {...valid, ok: "yes"}],
+    ["result with blank id", JSON.parse(JSON.stringify(valid).replace(/"id":"[^"]+"/g, '"id":""'))],
+  ]) {
+    test(`${name} treats a 2xx ${label} as an unknown outcome, not success`, async () => {
+      const probe = mutationProbe(name, body);
+      const before = JSON.stringify(probe.state);
+      await probe.api[name]();
+      assert.equal(JSON.stringify(probe.state), before, "no result state applied");
+      assert.equal(probe.counts().refreshes, 0);
+      assert.equal(probe.counts().fetches, 1, "no automatic retry");
+      assert.ok(probe.banners.every((banner) => banner.kind !== "success"));
+      const last = probe.banners.at(-1);
+      assert.equal(last.kind, "error");
+      assert.match(last.text, /outcome is unknown/);
+      assert.match(last.text, /may or may not have been applied/);
+      assert.doesNotMatch(last.text, / failed:/);
+      assert.equal(probe.elements[resultKey].textContent, last.text);
+    });
+  }
+  test(`${name} reports an ambiguous fetch outcome as unknown and keeps the draft`, async () => {
+    const probe = mutationProbe(name, outcomeError("Invalid JSON response (200). The change may or may not have been applied.", "unknown", 200));
+    await probe.api[name]();
+    assert.match(probe.banners.at(-1).text, /outcome is unknown.*Draft retained/);
+    assert.doesNotMatch(probe.banners.at(-1).text, / failed:/);
+    assert.equal(probe.counts().fetches, 1);
+  });
+  test(`${name} reports a confirmed refusal as a definite failure`, async () => {
+    const probe = mutationProbe(name, outcomeError("Label already used.", "error", 409));
+    await probe.api[name]();
+    assert.match(probe.banners.at(-1).text, / failed: Label already used\./);
+    assert.doesNotMatch(probe.banners.at(-1).text, /unknown/);
+  });
+  test(`${name} accepts the route's valid result`, async () => {
+    const probe = mutationProbe(name, valid);
+    await probe.api[name]();
+    assert.equal(probe.banners.at(-1).kind, "success");
+    assert.equal(probe.counts().refreshes, 1);
+  });
+}
+test("fetchJson turns a malformed 2xx mutation body into an unknown outcome and a GET into an error", async () => {
+  for (const [method, outcome] of [["POST", "unknown"], ["GET", "error"]]) {
+    const {fetchJson} = load([...FETCH_JSON_HELPERS], {fetch: async () => ({ok: true, status: 200, headers: {get: () => ""}, json: async () => {throw new SyntaxError("<html>proxy</html>");}})});
+    await assert.rejects(fetchJson("/synthetic", {method}), (error) => error.adminOutcome === outcome && error.protocolError === true && !/proxy/.test(error.message));
   }
 });

@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
+import tempfile
 import unittest
 from pathlib import Path
 from typing import Any, Literal
@@ -12,7 +14,7 @@ import yaml
 from pydantic import SecretStr
 from starlette.requests import Request
 
-from admin_service.config import AdminSettings
+from app.read_ui_auth_config import ReadUiAuthSettings
 from app import main as app_main
 from app.config import AppConfig, Settings
 from app.models.domain import (
@@ -21,6 +23,105 @@ from app.models.domain import (
     InventorySnapshot,
     StorageViewRuntimePayload,
 )
+
+
+class ReadUiAuthIsolationTests(unittest.TestCase):
+    def create_ui(self):
+        with (
+            patch.object(app_main, "get_settings", return_value=Settings()),
+            patch.object(app_main, "configure_logging"),
+        ):
+            return app_main.create_app()
+
+    def test_loader_preserves_shared_values_and_file_precedence_without_mkdir(self):
+        from app.read_ui_auth_config import ReadUiAuthSettings, load_read_ui_auth_settings
+        from admin_service.config import get_admin_settings
+
+        self.assertEqual(set(ReadUiAuthSettings.model_fields), {
+            "auth_mode", "auth_username", "auth_password", "public_origin",
+        })
+        with tempfile.TemporaryDirectory() as temporary:
+            password_file = Path(temporary) / "password"
+            password_file.write_text("  synthetic-file-password  \n", encoding="utf-8")
+            password_file.chmod(0o600)
+            environment = {
+                "ADMIN_AUTH_MODE": "basic",
+                "ADMIN_AUTH_USERNAME": "  1234  ",
+                "ADMIN_AUTH_PASSWORD": "synthetic-direct-password",
+                "ADMIN_AUTH_PASSWORD_FILE": str(password_file),
+                "ADMIN_PUBLIC_ORIGIN": "https://admin.example.test",
+                "ADMIN_HOST_PREP_TEMP_DIR": str(Path(temporary) / "host-prep"),
+            }
+            with patch.dict(os.environ, environment, clear=True):
+                with patch.object(Path, "mkdir", side_effect=AssertionError("loader wrote directories")):
+                    shared = load_read_ui_auth_settings()
+                get_admin_settings.cache_clear()
+                self.addCleanup(get_admin_settings.cache_clear)
+                admin = get_admin_settings()
+                for field in ReadUiAuthSettings.model_fields:
+                    self.assertEqual(getattr(shared, field), getattr(admin, field))
+                self.assertEqual(shared.auth_username, "1234")
+                assert shared.auth_password is not None
+                self.assertEqual(shared.auth_password.get_secret_value(), "  synthetic-file-password  ")
+                self.assertTrue(Path(admin.host_prep_temp_dir).is_dir())
+
+    def test_invalid_shared_auth_still_rejects_ui(self):
+        cases = (
+            {"ADMIN_AUTH_MODE": "invalid"},
+            {"ADMIN_AUTH_MODE": ""},
+            {"ADMIN_AUTH_MODE": "basic"},
+            {"ADMIN_AUTH_MODE": "basic", "ADMIN_AUTH_USERNAME": " ", "ADMIN_AUTH_PASSWORD": "synthetic"},
+            {"ADMIN_AUTH_MODE": "basic", "ADMIN_AUTH_USERNAME": "operator", "ADMIN_AUTH_PASSWORD": ""},
+            {"ADMIN_AUTH_PASSWORD": "synthetic", "ADMIN_AUTH_PASSWORD_FILE": ""},
+        )
+        for environment in cases:
+            with self.subTest(keys=sorted(environment)), patch.dict(os.environ, environment, clear=True):
+                with self.assertRaises(ValueError):
+                    self.create_ui()
+
+    def test_blank_password_file_never_falls_back_to_direct_password(self):
+        from app.read_ui_auth_config import load_read_ui_auth_settings
+
+        with tempfile.TemporaryDirectory() as temporary:
+            password_file = Path(temporary) / "password"
+            password_file.write_text("\n", encoding="utf-8")
+            password_file.chmod(0o600)
+            with patch.dict(os.environ, {
+                "ADMIN_AUTH_MODE": "basic",
+                "ADMIN_AUTH_USERNAME": "operator",
+                "ADMIN_AUTH_PASSWORD": "synthetic-direct-password",
+                "ADMIN_AUTH_PASSWORD_FILE": str(password_file),
+            }, clear=True):
+                with self.assertRaises(ValueError):
+                    load_read_ui_auth_settings()
+
+    def test_invalid_admin_integer_does_not_break_ui_but_admin_rejects(self):
+        from admin_service.config import get_admin_settings
+
+        for value in ("3600.0", "1e3", "true", "abc", ""):
+            with self.subTest(value=value), patch.dict(os.environ, {
+                "ADMIN_AUTO_STOP_SECONDS": value,
+            }, clear=True):
+                get_admin_settings.cache_clear()
+                self.addCleanup(get_admin_settings.cache_clear)
+                self.assertEqual(self.create_ui().state.operator_auth_settings.auth_mode, "network")
+                with self.assertRaises(ValueError):
+                    get_admin_settings()
+
+    def test_unwritable_admin_directory_does_not_break_ui_but_admin_rejects(self):
+        from admin_service.config import get_admin_settings
+
+        with tempfile.TemporaryDirectory() as temporary:
+            blocked = Path(temporary) / "not-a-directory"
+            blocked.write_text("synthetic fixture", encoding="utf-8")
+            with patch.dict(os.environ, {
+                "ADMIN_HOST_PREP_TEMP_DIR": str(blocked / "host-prep"),
+            }, clear=True):
+                get_admin_settings.cache_clear()
+                self.addCleanup(get_admin_settings.cache_clear)
+                self.assertEqual(self.create_ui().state.operator_auth_settings.auth_mode, "network")
+                with self.assertRaises(OSError):
+                    get_admin_settings()
 
 
 MUTATION_ROUTES = (
@@ -127,16 +228,15 @@ def build_app(
     public_origin: str | None = None,
 ):
     settings = Settings(app=AppConfig(public_origin=public_origin))
-    auth_settings = AdminSettings(
+    auth_settings = ReadUiAuthSettings(
         auth_mode=auth_mode,
         auth_username="operator" if auth_mode == "basic" else None,
         auth_password=SecretStr("synthetic-passphrase") if auth_mode == "basic" else None,
-        auto_stop_seconds=0,
     )
     with patch.object(app_main, "get_settings", return_value=settings):
         with patch.object(
             app_main,
-            "get_admin_settings",
+            "load_read_ui_auth_settings",
             return_value=auth_settings,
             create=True,
         ):

@@ -508,7 +508,9 @@
     const expiresAt = new Date(state.admin.expires_at).getTime();
     const remainingMs = expiresAt - Date.now();
     if (remainingMs <= 0) {
-      return "Stopping now";
+      // The browser clock cannot know the sidecar stopped; say only that the
+      // deadline passed, and leave the recovery step to the server's state.
+      return "Auto-stop time reached";
     }
     const totalSeconds = Math.floor(remainingMs / 1000);
     const hours = Math.floor(totalSeconds / 3600);
@@ -518,6 +520,18 @@
       return `${hours}h ${String(minutes).padStart(2, "0")}m ${String(seconds).padStart(2, "0")}s`;
     }
     return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
+  }
+
+  // The words come from the server's offline/stopped state, never from the
+  // browser clock, so the page never invents a shutdown it cannot observe.
+  function describeOfflineRecovery(recovery) {
+    if (!recovery || recovery.expired !== true) {
+      return "";
+    }
+    return [String(recovery.summary || ""), String(recovery.next_step || "")]
+      .map((part) => part.trim())
+      .filter(Boolean)
+      .join(" ");
   }
 
   function startCountdownTimer() {
@@ -531,6 +545,7 @@
   function updateAdminMeta() {
     if (elements.countdown) {
       elements.countdown.textContent = formatCountdown();
+      elements.countdown.title = describeOfflineRecovery(state.admin.offline_recovery);
     }
     if (elements.startedAt) {
       elements.startedAt.textContent = formatLocalTimestamp(state.admin.started_at);
@@ -4911,6 +4926,15 @@
               : null,
         })),
       replace_existing: Boolean(state.loadedSystemId && normalizedSystemId === state.loadedSystemId),
+      // The system this payload was cloned FROM. Sent whenever a loaded system
+      // is saved under a new id, whatever the operator did to the SSH command
+      // box, so the server can inherit the loaded system's API dialect instead
+      // of guessing from whoever else shares the endpoint. `resetSetupForm`
+      // (Start Fresh) clears `state.loadedSystemId`, which clears this too.
+      clone_source_system_id:
+        state.loadedSystemId && normalizedSystemId !== state.loadedSystemId
+          ? state.loadedSystemId
+          : null,
       make_default: Boolean(elements.setupMakeDefault?.checked),
     };
   }
@@ -5077,8 +5101,8 @@
       payload = null;
     }
     if (!payload || typeof payload !== "object" || Array.isArray(payload) || !Object.keys(payload).length) {
-      const rawId = response.headers?.get("X-Request-ID") || "";
-      const requestId = /^[A-Za-z0-9._-]{1,128}$/.test(rawId) ? ` Request ID: ${rawId}.` : "";
+      const rawId = validatedRequestId(response.headers?.get?.("X-Request-ID"));
+      const requestId = rawId ? ` (request id ${rawId})` : "";
       const error = new Error(`Invalid JSON response (${response.status || "unknown status"}). Retry or check the admin connection.${requestId}`);
       error.requestId = requestId;
       throw error;
@@ -5123,11 +5147,175 @@
     return String(detail);
   }
 
+  // Only a server-issued correlation id is ever shown: 32 lowercase hex digits,
+  // the shape app/request_context.py mints. Anything else (raw HTML, a value a
+  // caller invented) is dropped rather than rendered beside the error.
+  const SERVER_REQUEST_ID_PATTERN = /^[0-9a-f]{32}$/;
+
+  function validatedRequestId(value) {
+    const candidate = String(value ?? "").trim();
+    return SERVER_REQUEST_ID_PATTERN.test(candidate) ? candidate : "";
+  }
+
+  function describeRequestFailure(payload, response) {
+    const detail =
+      describeApiError(payload?.detail) || `Request failed with ${response?.status ?? "no status"}`;
+    const requestId =
+      validatedRequestId(payload?.request_id) ||
+      validatedRequestId(response?.headers?.get?.("X-Request-ID"));
+    return requestId ? `${detail} (request id ${requestId})` : detail;
+  }
+
+  // An admin failure is one of three things the operator has to act on
+  // differently (#418):
+  //   "transport"  - the request did not reach the sidecar, so nothing changed;
+  //   "validation" - the sidecar read the request and rejected the input;
+  //   "unknown"    - a mutation whose result the client cannot determine, so
+  //                  the current state has to be re-read before a retry.
+  // Anything else stays "error": a definite server-side refusal.
+  function isMutatingRequest(options) {
+    const method = String(options?.method || "GET").toUpperCase();
+    return method !== "GET" && method !== "HEAD" && method !== "OPTIONS";
+  }
+
+  function browserIsOffline() {
+    return typeof navigator !== "undefined" && navigator?.onLine === false;
+  }
+
+  function adminRequestError(message, outcome) {
+    const error = new Error(message);
+    error.adminOutcome = outcome;
+    // Read by executeRuntimeAction alongside its own timeout flag,
+    // runtimeActionOutcomeUnknown, so both land on the "status unknown" path.
+    error.outcomeUnknown = outcome === "unknown";
+    return error;
+  }
+
+  function classifyTransportFailure(mutating, offlineBeforeDispatch) {
+    // Only the offline state observed *before* fetch was invoked proves the
+    // request never left the browser. Reading navigator.onLine at catch time
+    // cannot: the link may have dropped after the sidecar received the
+    // request, so a mutation that failed after dispatch stays unknown.
+    if (offlineBeforeDispatch) {
+      return "transport";
+    }
+    return mutating ? "unknown" : "transport";
+  }
+
+  function describeTransportFailure(outcome, offlineBeforeDispatch) {
+    if (outcome === "unknown") {
+      return "The admin sidecar could not be reached after the request was sent, so it is unknown whether the change was applied. Re-check the current state before retrying.";
+    }
+    if (offlineBeforeDispatch) {
+      return "This browser is offline, so the request was not sent. Reconnect, then retry.";
+    }
+    return "The admin sidecar could not be reached, so nothing was changed. Check that it is running, then retry.";
+  }
+
+  function classifyResponseFailure(status, mutating) {
+    // 400/422 are the sidecar's own input rejections: the request arrived and
+    // was understood, so the operator has to fix the input, not the transport.
+    if (status === 400 || status === 422) {
+      return "validation";
+    }
+    // A mutation that fails without a decided status leaves the change in
+    // doubt; a 4xx refusal other than the two above is decided.
+    if (mutating && (status >= 500 || status === 408 || !status)) {
+      return "unknown";
+    }
+    return "error";
+  }
+
+  function describeResponseFailure(detail, outcome) {
+    if (outcome === "unknown") {
+      return `${detail} The change may or may not have been applied; re-check the current state before retrying.`;
+    }
+    if (outcome === "validation") {
+      return `${detail} Correct the submitted values and try again.`;
+    }
+    return detail;
+  }
+
+  // A 2xx mutation response is only a success when it carries the result the
+  // route promises. Anything else leaves the write in doubt (#411): the change
+  // may already be applied, so it is reported as unknown, never as success.
+  function requireMutationResult(valid, what) {
+    if (!valid) {
+      throw adminRequestError(
+        `The ${what} response was incomplete. The change may or may not have been applied; re-check the current state before retrying.`,
+        "unknown"
+      );
+    }
+  }
+
+  function isNonEmptyString(value) {
+    return typeof value === "string" && value.trim() !== "";
+  }
+
+  function validSystemSaveResult(result) {
+    return Boolean(result && result.ok === true && result.system
+      && isNonEmptyString(result.system.id) && typeof result.system.label === "string"
+      && Array.isArray(result.systems));
+  }
+
+  function validDemoSystemResult(result) {
+    return validSystemSaveResult(result) && Boolean(result.profile
+      && isNonEmptyString(result.profile.id) && Array.isArray(result.profiles));
+  }
+
+  function validProfileSaveResult(result) {
+    return Boolean(result && result.ok === true && result.profile
+      && isNonEmptyString(result.profile.id) && Array.isArray(result.profiles));
+  }
+
+  // Confirmed refusals say "failed"; an unknown outcome says so and keeps the
+  // draft so the operator re-checks instead of saving the same change twice.
+  function describeMutationFailure(action, error) {
+    const message = error?.message || String(error);
+    if (error?.adminOutcome === "unknown" || error?.outcomeUnknown) {
+      return `${action} outcome is unknown. ${message} Draft retained.`;
+    }
+    return `${action} failed: ${message}`;
+  }
+
   async function fetchJson(url, options = {}) {
-    const response = await fetch(url, options);
-    const payload = await readJsonResponse(response);
+    const mutating = isMutatingRequest(options);
+    // Sampled before dispatch: this is the only offline evidence that can
+    // show the request was never sent.
+    const offlineBeforeDispatch = browserIsOffline();
+    let response;
+    try {
+      response = await fetch(url, options);
+    } catch (error) {
+      // An abort is the caller's own cancellation or timeout contract, which
+      // already describes its outcome. Leave it exactly as it was thrown.
+      if (error?.name === "AbortError") {
+        throw error;
+      }
+      const outcome = classifyTransportFailure(mutating, offlineBeforeDispatch);
+      throw adminRequestError(describeTransportFailure(outcome, offlineBeforeDispatch), outcome);
+    }
+    let payload;
+    try {
+      payload = await readJsonResponse(response);
+    } catch (protocolError) {
+      // A malformed or empty body carries no decided result. For a mutation
+      // that reached the sidecar the change may already be applied (#411).
+      const outcome = response?.ok
+        ? (mutating ? "unknown" : "error")
+        : classifyResponseFailure(response?.status, mutating);
+      const error = adminRequestError(describeResponseFailure(protocolError.message, outcome), outcome);
+      error.status = response?.status;
+      error.requestId = protocolError.requestId;
+      error.protocolError = true;
+      throw error;
+    }
     if (!response.ok || (payload && payload.ok === false)) {
-      const error = new Error(describeApiError(payload?.detail) || `Request failed with ${response.status}`);
+      const outcome = classifyResponseFailure(response?.status, mutating);
+      const error = adminRequestError(
+        describeResponseFailure(describeRequestFailure(payload, response), outcome),
+        outcome
+      );
       error.status = response.status;
       throw error;
     }
@@ -5720,7 +5908,9 @@
     } catch (error) {
       if (error?.name === "AbortError" || signal?.aborted) {
         setBanner(`Container ${action} polling cancelled for ${containerKey}.`, "info");
-      } else if (error?.runtimeActionOutcomeUnknown) {
+      } else if (error?.runtimeActionOutcomeUnknown || error?.outcomeUnknown) {
+        // Either this path's own action timeout or fetchJson's unknown
+        // mutation outcome: the container state may have changed.
         setBanner(`Container ${action} status unknown for ${containerKey}: ${error.message}`, "error");
       } else {
         setBanner(`Container ${action} failed: ${error.message || error}`, "error");
@@ -6064,6 +6254,7 @@
           replace_existing: false,
         }),
       });
+      requireMutationResult(validDemoSystemResult(payload), "demo system");
       await refreshState({ quiet: true });
       state.selectedExistingSystemId = payload.system?.id || state.selectedExistingSystemId;
       const createdSystem = getSystemById(payload.system?.id || "");
@@ -6077,10 +6268,11 @@
       }
       setBanner(`Demo builder system ${payload.system?.label || "saved"}.`, "success");
     } catch (error) {
+      const message = describeMutationFailure("Demo builder system creation", error);
       if (elements.setupResult) {
-        elements.setupResult.textContent = `Demo builder system creation failed: ${error.message || error}`;
+        elements.setupResult.textContent = message;
       }
-      setBanner(`Demo builder system creation failed: ${error.message || error}`, "error");
+      setBanner(message, "error");
     } finally {
       if (elements.setupCreateDemoButton) {
         elements.setupCreateDemoButton.disabled = false;
@@ -6387,6 +6579,7 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
+      requireMutationResult(validSystemSaveResult(result), "system save");
       state.loadedSystemId = result.system?.id || state.loadedSystemId;
       state.selectedExistingSystemId = result.system?.id || state.selectedExistingSystemId;
       state.defaultSystemId = result.default_system_id || state.defaultSystemId;
@@ -6398,10 +6591,11 @@
       await refreshState({ quiet: true });
       void fetchStorageViewCandidates({ quiet: true });
     } catch (error) {
+      const message = describeMutationFailure("System setup", error);
       if (elements.setupResult) {
-        elements.setupResult.textContent = `System setup failed: ${error.message || error}`;
+        elements.setupResult.textContent = message;
       }
-      setBanner(`System setup failed: ${error.message || error}`, "error");
+      setBanner(message, "error");
     } finally {
       if (elements.setupCreateButton) {
         elements.setupCreateButton.disabled = false;
@@ -6561,7 +6755,8 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payloadBody),
       });
-      const savedProfileId = payload.profile?.id || draft.id;
+      requireMutationResult(validProfileSaveResult(payload), "custom profile save");
+      const savedProfileId = payload.profile.id;
       state.loadedBuilderProfileId = savedProfileId;
       state.selectedProfileId = savedProfileId;
       if (elements.setupProfile) {
@@ -6584,10 +6779,11 @@
         "success"
       );
     } catch (error) {
+      const message = describeMutationFailure("Custom profile save", error);
       if (elements.profileBuilderResult) {
-        elements.profileBuilderResult.textContent = `Custom profile save failed: ${error.message || error}`;
+        elements.profileBuilderResult.textContent = message;
       }
-      setBanner(`Custom profile save failed: ${error.message || error}`, "error");
+      setBanner(message, "error");
     } finally {
       if (elements.profileBuilderSaveButton) {
         elements.profileBuilderSaveButton.disabled = false;
