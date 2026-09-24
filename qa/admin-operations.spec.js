@@ -225,7 +225,7 @@ test.describe("admin sidecar smoke", () => {
     await expect(field).toHaveValue("99");
     await field.focus();
     await page.locator("#refresh-state-button").evaluate(button => button.click());
-    await expect(page.locator("#admin-status-banner")).toContainText("state refreshed");
+    await expect(page.locator("#admin-status-banner")).toContainText("Refreshed.");
     await expect(field).toHaveValue("99");
     await expect(field).toBeFocused();
   });
