@@ -152,6 +152,11 @@ class DeterministicPublicDemoContractTests(unittest.TestCase):
                 "APP_CONFIG_PATH": str(materialized / "absent-config.yaml"),
                 "PYTHONHASHSEED": "random",
             }
+            # Windows cannot initialise sockets or locate system DLLs without
+            # these two; they carry no operator state.
+            for name in ("SYSTEMROOT", "SystemDrive"):
+                if name in os.environ:
+                    env[name] = os.environ[name]
             result = subprocess.run(
                 [
                     sys.executable,

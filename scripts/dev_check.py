@@ -138,6 +138,7 @@ WINDOWS_PORTABLE_TEST_MODULES = (
     "tests.test_release_wrap_validator",
     "tests.test_scripts_help",
     "tests.test_ssh_failure_contexts",
+    "tests.test_script_platform_guards",
     "tests.test_ssh_probe",
     "tests.test_startup_migration_recovery",
     "tests.test_startup_writability",
@@ -254,6 +255,8 @@ class Skip:
     name: str
     reason: str
     ci_gate: str | None = None
+    # Individual items behind the one-line reason; printed only with --verbose.
+    details: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -303,7 +306,8 @@ def _windows_test_check(root: Path, python_executable: str) -> tuple[Check, tupl
     skips = tuple(
         Skip(
             f"Windows exclusion: {exclusion.category}",
-            f"{exclusion.reason}; excluded suites: {', '.join(exclusion.modules)}",
+            f"{len(exclusion.modules)} suites skipped; {exclusion.reason}",
+            details=exclusion.modules,
         )
         for exclusion in WINDOWS_EXCLUSIONS
     )
@@ -718,6 +722,7 @@ def run_plan(
     root: Path = ROOT,
     runner: Runner = subprocess.run,
     output: TextIO = sys.stdout,
+    verbose: bool = False,
 ) -> int:
     results: list[tuple[str, str]] = []
     for check in plan.checks:
@@ -748,6 +753,11 @@ def run_plan(
         print(result, file=output)
     for skip in plan.skips:
         print(f"SKIP  {skip.name}: {skip.reason}", file=output)
+        if verbose:
+            for detail in skip.details:
+                print(f"        {detail}", file=output)
+    if not verbose and any(skip.details for skip in plan.skips):
+        print("      (--verbose lists the skipped suites)", file=output)
 
     failed = any(result.startswith("FAIL") for _name, result in results)
     print(f"FINAL: {'FAIL' if failed else 'PASS'}", file=output)
@@ -776,6 +786,11 @@ def build_parser() -> argparse.ArgumentParser:
         const="full",
         help="Everything in --safe plus the checked-in public-demo artifact check.",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="List the individual test suites behind each SKIP line in the summary.",
+    )
     return parser
 
 
@@ -789,7 +804,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"FAIL  validation plan: {exc}")
         print("FINAL: FAIL")
         return 1
-    return run_plan(plan)
+    return run_plan(plan, verbose=args.verbose)
 
 
 if __name__ == "__main__":

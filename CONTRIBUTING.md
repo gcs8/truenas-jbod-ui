@@ -343,8 +343,12 @@ npx playwright test qa/public-demo.spec.js
 PLAYWRIGHT_ADMIN_BASE_URL=http://127.0.0.1:8082 npx playwright test qa/admin-operations.spec.js
 ```
 
-The switching and ESXi suites are live-appliance contracts, not portable fixture
-tests. Run them only against an intentionally configured stack:
+CI runs `qa/public-demo.spec.js` and `qa/saved-view-selection.spec.js` against
+synthetic fixtures in the public-demo job and `qa/admin-operations.spec.js` in
+the admin clean-room job. `qa/offline-snapshot.spec.js` and
+`qa/private-restore.spec.js` belong to the release checklist and the private QA
+restore drill. The switching and ESXi suites are live-appliance contracts, not
+portable fixture tests. Run them only against an intentionally configured stack:
 
 ```bash
 PLAYWRIGHT_LIVE_APPLIANCE_QA=1 npx playwright test qa/ui-switching.spec.js qa/esxi-smoke.spec.js
