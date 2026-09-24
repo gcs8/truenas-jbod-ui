@@ -275,6 +275,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Performance
 
+- Offline exports embed a card photo only when a view or enclosure can draw
+  it, and read the static files once per export instead of once per
+  downsampling pass. (#493)
+
 - Served a slot history bundle from one SQLite connection instead of fifteen
   and cached the history lock address per database identity instead of parsing
   /proc/self/mountinfo on every lock (#539).
