@@ -1,3 +1,4 @@
+import asyncio
 import importlib
 import inspect
 import json
@@ -6,9 +7,9 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
-from app.config import SystemConfig, TrueNASConfig
+from app.config import Settings, SystemConfig, TrueNASConfig
 from app.models.domain import (
     InventorySnapshot,
     MultipathMember,
@@ -18,8 +19,8 @@ from app.models.domain import (
     SlotState,
     SlotView,
 )
-from app.services.inventory import InventoryService
-from app.services.parsers import canonicalize_ssh_command
+from app.services.inventory import InventoryService, InventorySourceBundle
+from app.services.parsers import ParsedSSHData, canonicalize_ssh_command
 from app.services.sas_diagnostics.decoder import (
     MAX_DIAGNOSTIC_COLLECTION_ITEMS,
     MAX_DIAGNOSTIC_NUMERIC_TOKEN_LENGTH,
@@ -71,6 +72,8 @@ from app.services.sas_fabric import (
     parse_pciconf_sas_controllers,
 )
 from app.services.ssh_probe import SSHCommandResult
+from app.services.truenas_ws import TrueNASRawData
+from tests.test_inventory import build_inventory_service
 
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "sas_fabric"
@@ -1354,6 +1357,95 @@ class SasFabricAliasStoreTests(unittest.TestCase):
                 )
                 self.assertTrue(cleared["cleared"])
                 self.assertEqual(store.list_aliases("synthetic-system"), [])
+
+
+class VirtualFabricTests(unittest.TestCase):
+    def snapshot(self, platform):
+        system = SystemConfig(id="synthetic-virtual", truenas=TrueNASConfig(platform=platform))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = build_inventory_service(Settings(systems=[system]), system, AsyncMock(), AsyncMock(), temp_dir)
+            prefix = "da" if platform == "core" else "sd"
+            service._get_inventory_source_bundle = AsyncMock(return_value=InventorySourceBundle(
+                raw_data=TrueNASRawData(
+                    enclosures=[],
+                    disks=[{"name": f"{prefix}{i}", "serial": f"SYNTH-{i}"} for i in range(4)],
+                    pools=[], disk_temperatures={}, smart_test_results=[],
+                ),
+                ssh_outputs={}, ssh_collected=False, warnings=[],
+                sources={"api": SourceStatus(enabled=True, ok=True)},
+                scale_ses_data=ParsedSSHData(), quantastor_ses_data=ParsedSSHData(),
+            ))
+            snapshot = asyncio.run(service._build_snapshot())
+        self.assertIsNone(snapshot.selected_profile)
+        self.assertEqual(len(snapshot.slots), 4)
+        self.assertTrue(all(not slot.physical_location_known for slot in snapshot.slots))
+        return system, snapshot
+
+    def test_real_virtual_payload_has_no_profile_backplanes(self):
+        for platform in ("core", "scale"):
+            with self.subTest(platform=platform):
+                system, snapshot = self.snapshot(platform)
+                payload = build_sas_fabric_snapshot(system=system, snapshot=snapshot, ssh_outputs={}).model_dump(mode="json")
+                self.assertFalse([node for node in payload["nodes"] if node["kind"] == "backplane"])
+                self.assertFalse([link for link in payload["links"] if link["kind"] == "backplane-bay"])
+                self.assertNotIn("profile slot layout", str(payload))
+                self.assertNotIn("profile/storage view", str(payload))
+
+    def test_real_virtual_payload_retains_disk_labels_and_location_provenance(self):
+        for platform in ("core", "scale"):
+            with self.subTest(platform=platform):
+                system, snapshot = self.snapshot(platform)
+                fabric = build_sas_fabric_snapshot(system=system, snapshot=snapshot, ssh_outputs={})
+                nodes = {node.id: node for node in fabric.nodes}
+                traces = {trace.id: trace for trace in fabric.traces}
+                self.assertTrue(fabric.available)
+                for slot in snapshot.slots:
+                    node, trace = nodes[f"bay:{slot.slot}"], traces[f"bay:{slot.slot}"]
+                    self.assertEqual(node.label, slot.slot_label)
+                    self.assertEqual(trace.label, slot.slot_label)
+                    self.assertFalse(node.metrics["physical_location_known"])
+                    self.assertFalse(trace.metrics["physical_location_known"])
+                    self.assertTrue(node.raw["virtual_enclosure"])
+                    self.assertIn("physical location unavailable", node.evidence)
+                    self.assertIn("physical location unavailable", trace.evidence)
+                self.assertTrue(any("virtual" in warning and "physical location unavailable" in warning for warning in fabric.warnings))
+                self.assertNotIn("controller:mpr-1", nodes)
+
+    def test_virtual_disks_keep_observed_paths_pools_and_aliases(self):
+        for platform in ("core", "scale"):
+            with self.subTest(platform=platform):
+                system, snapshot = self.snapshot(platform)
+                slot = snapshot.slots[0]
+                slot.pool_name = "Synthetic pool"
+                slot.vdev_name = "mirror-0"
+                outputs = {}
+                if platform == "core":
+                    assert slot.device_name is not None
+                    slot.multipath = MultipathView(name="synthetic", device_name="multipath/synthetic", members=[
+                        MultipathMember(device_name=slot.device_name, controller_label="mpr0", state="ACTIVE"),
+                    ])
+                    outputs = {"mprutil show adapters": MPR_ADAPTERS}
+                alias = SasFabricAlias(system_id=system.id, object_id="bay:0", object_kind="bay", label="Logical data disk")
+                fabric = build_sas_fabric_snapshot(system=system, snapshot=snapshot, ssh_outputs=outputs, aliases=[alias])
+                nodes = {node.id: node for node in fabric.nodes}
+                trace = next(trace for trace in fabric.traces if trace.id == "bay:0")
+                self.assertEqual(nodes["bay:0"].label, "Disk 1")
+                self.assertEqual(nodes["bay:0"].display_label, alias.label)
+                self.assertEqual(trace.display_label, alias.label)
+                self.assertIn("pool:Synthetic%20pool", trace.node_ids)
+                self.assertIn("vdev:Synthetic%20pool/mirror-0", trace.node_ids)
+                if platform == "core":
+                    self.assertIn("path:mpr0:active", trace.node_ids)
+                    self.assertIn("controller:mpr0", trace.node_ids)
+                node_ids = set(nodes)
+                link_ids = {link.id for link in fabric.links}
+                for link in fabric.links:
+                    self.assertIn(link.source, node_ids)
+                    self.assertIn(link.target, node_ids)
+                for trace in fabric.traces:
+                    self.assertTrue(set(trace.node_ids) <= node_ids)
+                    self.assertTrue(set(trace.link_ids) <= link_ids)
+
 
 
 class SasFabricSnapshotTests(unittest.TestCase):
