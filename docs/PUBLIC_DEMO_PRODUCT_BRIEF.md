@@ -46,9 +46,9 @@ The banner shows two different identities:
 - `Source revision` is the full Git commit that contains the declared demo inputs.
 - `Build ID` is a deterministic SHA-256 fingerprint of that revision and the declared input hashes.
 
-The leading source-parity manifest also records the artifact hash and the combined source/output hash. `scripts/check_public_demo_artifact.py` checks every field, requires the recorded source revision to be an ancestor of the current checkout, and rejects any declared input changed after that revision.
+The leading source-parity manifest also records the artifact hash and the combined source/output hash. `scripts/check_public_demo_artifact.py` checks every field and requires the recorded source revision to be an ancestor of the current checkout. By default it reads the declared inputs at that recorded revision, so a pull request that changes a demo input still passes as long as the artifact is an exact build of the commit it records. With `--require-current`, used when a release is cut, it also rejects any declared input changed after that revision.
 
-The repository uses two commits when generator inputs change. The first commit freezes the source graph. The next commit adds the artifact generated with `--source-revision` set to that first commit. This avoids claiming that a file contains the Git commit that already contains the same file.
+The demo is rebuilt when a release is cut, not in every pull request, so between releases it trails `main`. The release uses two commits: the first freezes the source graph, and the next adds the artifact generated with `--source-revision` set to that first commit. This avoids claiming that a file contains the Git commit that already contains the same file. `docs/RELEASE_CHECKLIST.md` ("Public demo rebuild") has the steps, and `scripts/validate_release_wrap.py <version> --public-demo-only` refuses a release until they are done.
 
 ## Screenshot provenance
 
@@ -83,7 +83,7 @@ before publication.
 
 ## Build and local verification
 
-Use a committed source revision when generator inputs changed:
+At release time, build from the committed release source:
 
 ```bash
 SOURCE_COMMIT="$(git rev-parse HEAD)"

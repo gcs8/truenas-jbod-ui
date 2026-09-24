@@ -30,6 +30,13 @@ The goal is to make releases boring, repeatable, and easy to audit later.
   release that documents the gap, remediation, and full gate evidence.
 - If this checklist changes during release prep, rerun or re-evaluate the
   affected gates and update the release wrap before cutting the tag.
+- Every release rebuilds the public demo from the release source. Pull requests
+  do not, so the checked-in demo is normally older than `main`. Follow
+  "Public demo rebuild" below before tagging. The pre-tag and final validators
+  and the GHCR release workflow run
+  `python scripts/validate_release_wrap.py <version> --public-demo-only` and
+  refuse the release until the demo, screenshots, and pixel review match the
+  release source and version.
 
 ## Required Release Wrap Evidence
 
@@ -99,7 +106,10 @@ python scripts/validate_release_wrap.py "$version" \
    local handoff before doing release work.
 2. Confirm scope, release branch, version, and whether the release is a normal
    feature release, patch, hotfix, docs-only correction, or process correction.
-3. Draft or update the release notes and release wrap before tagging.
+3. Draft or update the release notes and release wrap before tagging. Bump
+   `app/__init__.py` to the release version, then do the "Public demo rebuild"
+   below from that commit. `validate_release_wrap.py <version>
+   --public-demo-only` must pass before the next step.
 4. Run local unit, syntax, hygiene, Docker health, optional-sidecar, browser,
    feature-specific, public-demo, perf, docs/wiki source-diff, and privacy gates.
 5. Run the Linux QA Docker restore gate and restored-stack perf/browser gates.
@@ -356,6 +366,39 @@ python scripts/validate_release_wrap.py "$version" \
   - if the docs still call out the older `AOC-SLG4-2H8M2` path, confirm that
     saved system still renders the board image and its two matched member slots
 
+## Public demo rebuild
+
+Required for every release. Ordinary pull requests leave the demo alone, so
+this is the only place it catches up with the source.
+
+1. On the release branch, after the version bump and the last source change,
+   commit, then build from that exact commit:
+
+   ```bash
+   release_source_commit="$(git rev-parse HEAD)"
+   python scripts/build_public_demo.py --output public-demo/index.html \
+     --source-revision "$release_source_commit"
+   python scripts/check_public_demo_artifact.py public-demo --require-current
+   ```
+
+2. Commit the rebuilt artifact, push, and recapture the screenshots from that
+   commit with the pinned Linux workflow in "Screenshots" below.
+3. Review the exact PNG bytes, set `pixel_review` to `PASS`, and update
+   `docs/PUBLIC_SCREENSHOT_REVIEW.md`.
+4. Run the release gate. It must print `Public demo is current for release`:
+
+   ```bash
+   python scripts/validate_release_wrap.py "$version" --public-demo-only
+   ```
+
+5. Merge the release pull request with a merge commit, not a squash, so the
+   recorded source commit stays reachable from `main` and the tag.
+
+The same check runs in `.github/workflows/publish-ghcr.yml` when the GitHub
+release is published, and fails before any image is pushed if a step was
+missed. Publishing the rebuilt demo to Pages is still a separate
+owner-approved `workflow_dispatch`.
+
 ## Screenshots
 
 - follow [`SCREENSHOT_CAPTURE.md`](SCREENSHOT_CAPTURE.md); do not run the
@@ -391,7 +434,7 @@ python scripts/validate_release_wrap.py "$version" \
   `public-demo-history.png` at the exact hashes in `sha256sums.txt`, then copy
   the reviewed bytes into both docs and Wiki locations
 - after pixel review, set each manifest review field to `PASS` and run:
-  - `python3 scripts/check_public_demo_artifact.py public-demo`
+  - `python3 scripts/check_public_demo_artifact.py public-demo --require-current`
   - `python3 scripts/check_public_screenshots.py`
   - `python3 scripts/check_public_docs.py`
 - require the docs and Wiki PNG copies to be byte-identical; remove obsolete

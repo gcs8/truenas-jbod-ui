@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,10 +9,13 @@ from pathlib import Path
 from scripts.validate_release_wrap import (
     REQUIRED_GATES,
     changelog_coverage_required,
+    public_demo_freshness_required,
     release_wrap_path,
     validate_release_wrap_text,
 )
 from scripts.verify_wiki_drift import ChangedFile, WikiVerificationResult
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _wrap_with_rows(
@@ -451,6 +456,34 @@ class ReleaseWrapValidatorTests(unittest.TestCase):
             "Linux QA restore gate: Blocked gates cannot ship",
             [issue.message for issue in issues],
         )
+
+    def test_public_demo_rebuild_is_required_from_the_first_release_after_v0230(self) -> None:
+        self.assertFalse(public_demo_freshness_required("v0.23.0"))
+        self.assertTrue(public_demo_freshness_required("0.23.1"))
+        self.assertTrue(public_demo_freshness_required("v0.24.0"))
+        self.assertTrue(public_demo_freshness_required("1.0.0"))
+
+    def test_release_refuses_a_public_demo_that_was_not_rebuilt_for_it(self) -> None:
+        # The checked-in demo carries its own app version. Asking for any other
+        # version must fail before any tag, image, or Pages publication.
+        result = subprocess.run(
+            [sys.executable, "scripts/validate_release_wrap.py", "v99.0.0", "--public-demo-only"],
+            cwd=REPOSITORY_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Docs/wiki/public-demo gate", result.stdout)
+        self.assertIn("not the release version 99.0.0", result.stdout)
+        self.assertIn("Public demo rebuild", result.stdout)
+
+    def test_public_demo_release_issues_run_the_strict_current_source_check(self) -> None:
+        source = (REPOSITORY_ROOT / "scripts" / "validate_release_wrap.py").read_text(encoding="utf-8")
+
+        self.assertIn('"--require-current"', source)
+        self.assertIn('"scripts/check_public_screenshots.py"', source)
 
     def test_final_validation_rejects_post_publish_blockers(self) -> None:
         text = _wrap_with_rows(
