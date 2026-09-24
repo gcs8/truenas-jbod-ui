@@ -131,9 +131,9 @@ class HistoryEnvDocumentationDriftTests(unittest.TestCase):
     def test_settings_model_still_enforces_what_the_documents_promise(self) -> None:
         source = (ROOT / "history_service" / "config.py").read_text(encoding="utf-8")
 
-        self.assertIn("Non-loopback history exposure requires refresh token mode.", source)
-        self.assertIn("History refresh token mode requires a non-empty token.", source)
-        self.assertIn("Non-loopback history exposure requires a valid HISTORY_PUBLIC_ORIGIN.", source)
+        self.assertIn('"HISTORY_BIND_ADDRESS is not loopback. Set HISTORY_REFRESH_AUTH_MODE=token, "', source)
+        self.assertIn('"HISTORY_REFRESH_AUTH_MODE=token needs a token. Set HISTORY_REFRESH_TOKEN "', source)
+        self.assertIn('"HISTORY_BIND_ADDRESS is not loopback, so HISTORY_PUBLIC_ORIGIN must be set to the "', source)
 
 
 if __name__ == "__main__":

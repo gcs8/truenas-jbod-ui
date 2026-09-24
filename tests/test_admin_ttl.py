@@ -6,6 +6,8 @@ from unittest.mock import patch
 
 from pydantic import ValidationError
 
+from app.config_errors import ConfigurationError
+
 # Must precede admin_service.main, which builds its app at import time.
 from tests.admin_test_env import ADMIN_TEST_PUBLIC_ORIGIN
 from admin_service.config import AdminSettings, get_admin_settings
@@ -40,7 +42,7 @@ class AdminAutoStopContractTests(unittest.TestCase):
                 get_admin_settings.cache_clear()
                 with (
                     patch.dict("os.environ", {"ADMIN_AUTO_STOP_SECONDS": raw_value}, clear=True),
-                    self.assertRaises(ValidationError),
+                    self.assertRaises(ConfigurationError),
                 ):
                     get_admin_settings()
         get_admin_settings.cache_clear()

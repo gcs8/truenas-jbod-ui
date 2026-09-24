@@ -114,6 +114,14 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   stopped admin leaves a disabled System Setup button with the start command
   instead of the button vanishing. (#565)
 
+- A bad setting now stops the service with one plain line per problem that
+  names the `.env` variable or the `config.yaml` key path and what it must be,
+  instead of a pydantic report with documentation links. Text settings stay
+  text (`TRUENAS_HOST=1234`), blank main-UI values count as unset, unknown
+  `config.yaml` keys are logged once and listed in the admin
+  configuration-warnings banner, and the unused `app.verify_ssl` setting is
+  removed. The history bind error names the variables to set. (#568)
+
 - Reported failed SCALE and QuantaStor enrichment without hiding source
   disks or leaving SSH status falsely healthy; a SCALE host whose SES
   discovery succeeds but finds no enclosure device stays healthy and quiet. (#422)
