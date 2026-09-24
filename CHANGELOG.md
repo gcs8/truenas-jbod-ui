@@ -166,6 +166,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Reported failed SCALE and QuantaStor enrichment without hiding source
   disks or leaving SSH status falsely healthy; a SCALE host whose SES
   discovery succeeds but finds no enclosure device stays healthy and quiet. (#422)
+
+- A pending history rotation, migration or restore marker now names the marker
+  file and a copy-pasteable recovery command (paths shell-quoted) instead of
+  only saying the database is closed, and logs it once at startup. Four unused
+  history lock and restore helpers were removed (#563).
 - Published aggregate disk-retention totals on the inventory summary
   (`source_disk_count`, `rendered_unique_disk_count`,
   `duplicate_disk_view_count`, `unplaced_disk_count`) so a release check can
