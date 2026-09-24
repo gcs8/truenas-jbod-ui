@@ -30,6 +30,22 @@ If `livez` is not `ok`, fix the container/runtime problem first. If `livez` is
 healthy but `healthz` reports a warning or degraded dependency, read that
 payload before chasing layout bugs.
 
+## A container keeps restarting
+
+`docker compose up -d` reports success even when a container fails as soon as
+it starts. Check:
+
+```bash
+docker compose ps
+docker compose logs --tail=50 enclosure-ui
+```
+
+A container that shows `Restarting` in `docker compose ps` has a startup
+error. Read the last line of its log: it names the setting or folder that
+stopped it. Use `enclosure-history` or `enclosure-admin` in place of
+`enclosure-ui` for the other services. The admin container does not restart
+on its own; it shows `Exited` instead.
+
 ## The app starts but the UI looks empty
 
 Common causes:
@@ -148,22 +164,42 @@ mkdir -p config/ssh data history logs backup-status
 
 ## A non-root container gets permission denied
 
-If a source-built non-root UI or history container reports `permission denied`,
-stop the stack and run the bounded ownership helper from the matching source
-checkout:
+The default `docker-compose.yml` runs the UI and history as root, so a normal
+image update needs no ownership change. Non-root services come only from the
+optional `docker-compose.nonroot.yml` overlay. If you added that overlay and a
+service now reports `permission denied`, the bind mounts are still owned by
+root. From the folder that holds your Compose files, with a published image and
+no repository checkout:
 
 ```bash
+docker compose down
 app_uid="${APP_UID:-10001}"
 app_gid="${APP_GID:-10001}"
+backup_uid="${BACKUP_UID:-1000}"
+sudo find ./config -path ./config/backup-secrets -prune -o -exec chown "$app_uid:$app_gid" {} +
+sudo chown -R "$app_uid:$app_gid" ./data ./logs ./history
+sudo install -d -o "$backup_uid" -g "$app_gid" -m 2750 ./backup-status
+docker compose -f docker-compose.yml -f docker-compose.nonroot.yml up -d
+```
+
+If `.env` sets `APP_UID`, `APP_GID` or `BACKUP_UID`, set the same values above;
+shell variables do not read `.env`. If `HISTORY_SEGMENT_CATALOG_PATH` is set, do
+not run a recursive change over the segmented history tree; follow
+[[Backup, Restore, and Debug Bundles|Backup-Restore-and-Debug-Bundles]] instead.
+To undo, drop the overlay from the `-f` chain; root-run services still read
+files owned by the app identity.
+
+From a source checkout you can use the bounded helper instead, which also sets
+modes and refuses symlinks and unexpected paths:
+
+```bash
 sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid "$app_uid" --gid "$app_gid"
 sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid "$app_uid" --gid "$app_gid" --apply
 ```
 
-Run the dry check first. If `.env` overrides `APP_UID` or `APP_GID`, export the
-same values before running the block. Do not use recursive `chmod 777`, and do
-not run this source-build migration against the published v0.22.2 Compose/image
-pair. If SSH then fails to load `known_hosts`, verify that
-`data/known_hosts` is owned by the configured app UID/GID and uses mode `0660`.
+Run the dry check first. Do not use recursive `chmod 777`. If SSH then fails to
+load `known_hosts`, verify that `data/known_hosts` is owned by the configured
+app UID/GID and uses mode `0660`.
 
 ## SCALE shows a generic runtime profile
 
@@ -222,6 +258,31 @@ Start or update it with:
 docker compose --profile history pull
 docker compose --profile history up -d
 ```
+
+## History says permission denied or readonly database
+
+`Permission denied: '/app/history/history.db'` or `attempt to write a readonly
+database` in the history log means the `history` folder or the database file is
+not writable by the user the container runs as. With the default Compose file
+that is root, so check for a read-only mount or file system first. With the
+non-root overlay it is `APP_UID:APP_GID`; fix ownership as described in
+[A non-root container gets permission denied](#a-non-root-container-gets-permission-denied).
+Do not use `chmod 777`.
+
+## History refuses to start after changing HISTORY_BIND_ADDRESS
+
+`Non-loopback history exposure requires refresh token mode.` in the history log
+means `HISTORY_BIND_ADDRESS` is no longer loopback but the token settings are
+missing. Set token mode, a token and `HISTORY_PUBLIC_ORIGIN` together as shown in
+[[Docker and GHCR Deployment|Docker-and-GHCR-Deployment]], then recreate the
+container:
+
+```bash
+docker compose --profile history up -d --force-recreate enclosure-history
+```
+
+To go back to localhost only, remove `HISTORY_BIND_ADDRESS` from `.env` and
+recreate the container the same way.
 
 ## The admin page is missing
 
