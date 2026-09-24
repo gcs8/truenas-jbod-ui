@@ -5,11 +5,16 @@ from __future__ import annotations
 # ruff: noqa: F821
 
 import email.message
+import errno
 import json
+import logging
+import socket
 from types import ModuleType
 from typing import Any
 
 from pydantic import ValidationError
+
+from websockets.exceptions import ConnectionClosed
 
 from app.route_compat import MainModuleAPIRouter
 from app.services.history_backend import (
@@ -17,6 +22,8 @@ from app.services.history_backend import (
     HistoryBackendBusyError,
 )
 from app.services.history_status import project_public_collector_status
+from app.services.storage_writability import StorageDirectoryUnwritable
+from app.services.tls_context import TlsTrustConfigurationError
 from history_service.operation_bounds import (
     HISTORY_READ_BUSY_DETAIL,
     HISTORY_READ_RETRY_AFTER_SECONDS,
@@ -26,6 +33,23 @@ from history_service.refresh_auth import read_limited_request_body
 
 
 MAX_HISTORY_SCOPES_REQUEST_BYTES = 64 * 1024
+
+# Not named `logger`: the main-module facade copies its own globals in here.
+_routes_logger = logging.getLogger(__name__)
+
+
+def _storage_unwritable_response(exc: StorageDirectoryUnwritable) -> JSONResponse:
+    """Answer a save that failed on directory permissions in words a user can act on."""
+    _routes_logger.error("%s", exc.operator_message)
+    return JSONResponse(
+        {
+            "ok": False,
+            "error": exc.error_code,
+            "detail": exc.public_detail,
+        },
+        status_code=503,
+        headers={"Retry-After": "5"},
+    )
 
 
 def _history_read_busy_response() -> JSONResponse:
@@ -45,6 +69,58 @@ def _is_json_media_type(content_type: str | None) -> bool:
         return False
     subtype = message.get_content_subtype()
     return subtype == "json" or subtype.endswith("+json")
+
+
+SMART_BATCH_TRANSPORT_EXCEPTIONS = (
+    TimeoutError,
+    ConnectionClosed,
+    ConnectionError,
+    socket.gaierror,
+    socket.herror,
+)
+# Socket-class errno values a bare `OSError` can carry. `OSError` itself is NOT
+# transport: it is equally the base of PermissionError, ENOSPC, EROFS and every
+# other filesystem failure, and the slot-detail store raises those unwrapped
+# through the SMART batch (#526). Those must keep reaching the data-directory
+# handling with its own message instead of being relabelled as a shelf outage.
+SMART_BATCH_TRANSPORT_ERRNOS = frozenset(
+    number
+    for number in (
+        getattr(errno, name, None)
+        for name in (
+            "EADDRNOTAVAIL", "ECONNABORTED", "ECONNREFUSED", "ECONNRESET",
+            "EHOSTDOWN", "EHOSTUNREACH", "ENETDOWN", "ENETRESET", "ENETUNREACH",
+            "ENOTCONN", "ENOTSOCK", "EPROTO", "ESHUTDOWN", "ETIMEDOUT",
+        )
+    )
+    if number is not None
+)
+
+
+def _is_smart_batch_transport_failure(exc: BaseException) -> bool:
+    if isinstance(exc, SMART_BATCH_TRANSPORT_EXCEPTIONS):
+        return True
+    return isinstance(exc, OSError) and exc.errno in SMART_BATCH_TRANSPORT_ERRNOS
+
+
+# The other half of #526. A filesystem failure on the SMART path is the local
+# data directory, not the shelf: it does not clear by waiting, and the operator
+# has to be told which of the two it is. Naming it here keeps the SMART batch
+# honest until #473 gives the whole app one data-directory report.
+SMART_BATCH_LOCAL_STORAGE_DETAIL = (
+    "SMART data could not be stored: the application data directory is not "
+    "usable. This is a local fault, not a shelf outage, and retrying will not "
+    "clear it; check the data directory's permissions, ownership and free space."
+)
+
+# #537: a configured CA bundle that cannot be read is also a local fault that
+# retrying will not clear, but it lives on the TLS path, so it gets its own
+# sentence instead of sending the operator to the data directory.
+SMART_BATCH_TLS_TRUST_DETAIL = (
+    "SMART data could not be fetched: the configured TLS CA bundle for this "
+    "system could not be loaded. This is a local configuration fault, not a "
+    "shelf outage; check the CA bundle path and its permissions."
+)
 
 
 def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
@@ -269,6 +345,8 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
                 selected_enclosure_id=enclosure_id,
                 scope=payload.scope,
             )
+        except StorageDirectoryUnwritable as exc:
+            return _storage_unwritable_response(exc)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return JSONResponse(result)
@@ -403,6 +481,8 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             return mapping_revision_conflict_response(exc)
         except MappingScopeConflict:
             return mapping_scope_conflict_response()
+        except StorageDirectoryUnwritable as exc:
+            return _storage_unwritable_response(exc)
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -461,6 +541,8 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             return mapping_revision_conflict_response(exc)
         except MappingScopeConflict:
             return mapping_scope_conflict_response()
+        except StorageDirectoryUnwritable as exc:
+            return _storage_unwritable_response(exc)
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         if cleared:
@@ -702,6 +784,46 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
                 )
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except TlsTrustConfigurationError as exc:
+            # #537: classified before the broad OSError branch below, which
+            # would otherwise report a missing CA bundle's ENOENT as a
+            # slot-detail-cache write failure and name the wrong path.
+            logger.error(
+                "SMART batch could not load the TLS CA bundle for enclosure %s: %s",
+                enclosure_id,
+                exc,
+                exc_info=exc,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=SMART_BATCH_TLS_TRUST_DETAIL,
+            ) from exc
+        except (OSError, ConnectionClosed) as exc:
+            # #523: a call that outlasts the timeout, or a dropped socket, is a
+            # temporary unavailability of this shelf's SMART data and not a
+            # server fault. One slow disk must never render as a 500 for the
+            # whole grid, whichever layer the transport failure escapes from.
+            # #526: only the transport may say that. A filesystem failure shares
+            # OSError's base but means the data directory is misconfigured, so
+            # it is reported as the server fault it is, with the message and the
+            # log line an operator needs to find it, rather than as a shelf
+            # outage they are invited to wait out.
+            if not _is_smart_batch_transport_failure(exc):
+                logger.error(
+                    "SMART batch could not write the slot-detail cache for "
+                    "enclosure %s; the data directory is not usable: %s",
+                    enclosure_id,
+                    exc,
+                    exc_info=exc,
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail=SMART_BATCH_LOCAL_STORAGE_DETAIL,
+                ) from exc
+            raise HTTPException(
+                status_code=503,
+                detail="SMART data is temporarily unavailable for this enclosure.",
+            ) from exc
         return SmartBatchResponse(summaries=summaries, layout_bounds=layout_bounds)
 
     @router.get("/api/history/status")
@@ -1118,7 +1240,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
                 "status": "ok",
                 "dependency_status": "ok" if api_status and api_status.ok else "degraded",
                 "last_updated": snapshot.last_updated.isoformat(),
-                "sources": snapshot.model_dump(mode="json").get("sources", {}),
+                "sources": {name: status.model_dump(mode="json") for name, status in snapshot.sources.items()},
                 "warnings": snapshot.warnings,
                 "cache_state": "cached",
             },

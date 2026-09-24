@@ -9,11 +9,21 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from history_service.config import HistorySettings
+from history_service.diagnostics import (
+    RETENTION_RAN_WITHOUT_BACKUP,
+    RETENTION_SKIP_ANCHOR_UNAVAILABLE,
+    RETENTION_SKIP_WAITING_FOR_BACKUP,
+    HistorySourceError,
+    classify_backup_failure,
+    classify_collection_failure,
+    classify_retention_failure,
+)
 from app.request_context import request_id_headers
 from app.metrics import (
     observe_history_collection_run,
@@ -119,7 +129,16 @@ class HistoryCollector:
         self.last_retention_daily_rollups_removed: int = 0
         self.last_retention_has_more: bool = False
         self.last_retention_error: str | None = None
+        self.last_retention_error_kind: str | None = None
+        self.last_retention_skip_reason: str | None = None
+        self.last_retention_skip_until: str | None = None
+        self.last_retention_ran_without_backup: bool = False
+        self.last_backup_error: str | None = None
+        self.last_backup_error_kind: str | None = None
+        self._retention_skip_warned_at: datetime | None = None
         self.last_error: str | None = None
+        self.last_error_kind: str | None = None
+        self.last_error_summary: str | None = None
         self.last_scope_count: int = 0
         self.current_collection_started_at: str | None = None
         self.current_collection_kind: str | None = None
@@ -476,8 +495,17 @@ class HistoryCollector:
                             self.last_backup_at = observed_at
                             retention_backup_at = run_started
                             backup_succeeded = True
+                            self.last_backup_error = None
+                            self.last_backup_error_kind = None
                 except Exception as exc:  # noqa: BLE001 - collection continues after backup failure.
-                    logger.warning("History backup snapshot failed: %s", exc)
+                    backup_kind, backup_summary = classify_backup_failure(exc)
+                    self.last_backup_error_kind = backup_kind
+                    self.last_backup_error = backup_summary
+                    logger.warning(
+                        "History backup snapshot failed: %s Cause: %s",
+                        backup_summary,
+                        exc,
+                    )
         self._raise_if_stopping()
         self._run_retention_if_due(
             run_started,
@@ -485,7 +513,7 @@ class HistoryCollector:
             backup_at=retention_backup_at,
         )
         self.last_success_at = observed_at
-        self.last_error = None
+        self.clear_failure_diagnostics()
         self._set_collection_activity("collection completed")
         self._clear_background_failure_backoff()
 
@@ -536,11 +564,37 @@ class HistoryCollector:
             "last_retention_daily_rollups_removed": self.last_retention_daily_rollups_removed,
             "last_retention_has_more": self.last_retention_has_more,
             "last_retention_error": self.last_retention_error,
+            "last_retention_error_kind": self.last_retention_error_kind,
+            "last_retention_skip_reason": self.last_retention_skip_reason,
+            "last_retention_skip_until": self.last_retention_skip_until,
+            "last_retention_ran_without_backup": self.last_retention_ran_without_backup,
+            "last_backup_error": self.last_backup_error,
+            "last_backup_error_kind": self.last_backup_error_kind,
             "last_error": self.last_error,
+            "last_error_kind": self.last_error_kind,
+            "last_error_summary": self.last_error_summary,
             "last_scope_count": self.last_scope_count,
             "source_base_url": self.settings.source_base_url,
             "sqlite_path": self.settings.sqlite_path,
+            # Quarantine recovery is durable state, not collector state: a fresh
+            # database created by recovery has to keep saying so after a restart
+            # instead of looking like a first installation (#417).
+            **self._quarantine_recovery_status(),
         }
+
+    def _quarantine_recovery_status(self) -> dict[str, Any]:
+        """Durable recovery fields from the store, tolerant of a store stub.
+
+        A store that does not implement the marker at all - a unit-test double,
+        or a future store shim - reports no pending recovery rather than
+        breaking every status surface.
+        """
+
+        reader = getattr(self.store, "quarantine_recovery_status", None)
+        status = reader() if callable(reader) else None
+        if isinstance(status, Mapping):
+            return dict(status)
+        return {"history_recovery_required": False, "history_quarantined_at": None}
 
     @property
     def collection_running(self) -> bool:
@@ -623,6 +677,7 @@ class HistoryCollector:
             except Exception as exc:  # noqa: BLE001 - keep the collector alive across transient appliance errors.
                 logger.exception("History collection pass failed")
                 self.last_error = str(exc)
+                self.record_failure_diagnostics(exc)
                 self._record_background_failure(utcnow())
                 observe_history_collection_run(
                     service_name=HISTORY_METRICS_SERVICE_NAME,
@@ -782,10 +837,18 @@ class HistoryCollector:
         backup_succeeded: bool,
         backup_at: datetime | None = None,
     ) -> None:
-        if not backup_succeeded or not self._retention_due(now):
+        if not self._retention_due(now):
             return
         segmented = self.settings.segment_catalog_path is not None
-        if segmented and backup_at is None:
+        if segmented:
+            # Segmented retention consumes a sealed scheduled backup; without one
+            # there is nothing to claim, so that gate stays.
+            if not backup_succeeded or backup_at is None:
+                return
+            self.last_retention_skip_reason = None
+            self.last_retention_skip_until = None
+            self.last_retention_ran_without_backup = False
+        elif not self._retention_backup_guard_allows(now, backup_succeeded=backup_succeeded):
             return
         started = time.perf_counter()
         attempted_at = isoformat_utc(now)
@@ -821,7 +884,9 @@ class HistoryCollector:
         except Exception as exc:  # noqa: BLE001 - retention failure must not stop collection.
             duration = time.perf_counter() - started
             self.last_retention_duration_seconds = round(duration, 3)
-            self.last_retention_error = type(exc).__name__
+            retention_kind, retention_summary = classify_retention_failure(exc)
+            self.last_retention_error_kind = retention_kind
+            self.last_retention_error = retention_summary
             partial_result = getattr(exc, "retention_summary", None)
             if not isinstance(partial_result, dict):
                 partial_result = {}
@@ -829,8 +894,9 @@ class HistoryCollector:
                 {**partial_result, "has_more": True}
             )
             logger.warning(
-                "History retention pass failed with %s; collection will continue.",
-                type(exc).__name__,
+                "History retention pass failed: %s; collection will continue. Cause: %s",
+                retention_summary,
+                exc,
             )
             observe_history_retention_run(
                 service_name=HISTORY_METRICS_SERVICE_NAME,
@@ -843,6 +909,7 @@ class HistoryCollector:
                 "db.retention.failed",
                 duration,
                 error_type=type(exc).__name__,
+                error_kind=retention_kind,
             )
             return
 
@@ -850,6 +917,7 @@ class HistoryCollector:
         self.last_retention_at = attempted_at
         self.last_retention_duration_seconds = round(duration, 3)
         self.last_retention_error = None
+        self.last_retention_error_kind = None
         removed_rows = self._apply_retention_result(result)
         observe_history_retention_run(
             service_name=HISTORY_METRICS_SERVICE_NAME,
@@ -888,6 +956,135 @@ class HistoryCollector:
             "daily_rollups": self.last_retention_daily_rollups_removed,
         }
 
+    def _usable_backup_max_age(self) -> timedelta:
+        """Return how old a backup may be and still cover what retention prunes."""
+
+        retention_days = max(0, int(self.settings.raw_metric_retention_days))
+        return timedelta(days=retention_days) if retention_days > 0 else timedelta(days=1)
+
+    def _retention_backup_guard_allows(self, now: datetime, *, backup_succeeded: bool) -> bool:
+        """Decide whether unsegmented retention may run in this pass.
+
+        Retention is not part of the backup: gating it on the hourly snapshot
+        means one unwritable backup directory stops pruning forever and the
+        database grows until the disk is full (#455). A usable backup lets
+        retention run silently; an absent one delays it for a bounded window
+        with a published deadline, after which retention runs anyway and says
+        so.
+        """
+
+        normalized_now = now.astimezone(timezone.utc)
+        latest_backup_at = None if backup_succeeded else self._latest_backup_at()
+        if backup_succeeded or (
+            latest_backup_at is not None
+            and timedelta(0) <= normalized_now - latest_backup_at <= self._usable_backup_max_age()
+        ):
+            try:
+                self.store.clear_retention_wait()
+            except Exception:
+                # The wait record outlives this process; a stale one would make
+                # the next missing backup prune immediately. Fail closed.
+                logger.exception("History retention wait record could not be cleared.")
+                return self._refuse_retention_without_anchor()
+            self._retention_skip_warned_at = None
+            self.last_retention_skip_reason = None
+            self.last_retention_skip_until = None
+            self.last_retention_ran_without_backup = False
+            return True
+
+        skip_window = timedelta(
+            seconds=max(0, int(self.settings.retention_backup_skip_max_seconds))
+        )
+        try:
+            anchor = self.store.read_retention_wait_anchor()
+            if anchor is None:
+                anchor = self.store.start_retention_wait(
+                    self._retention_wait_started_at(normalized_now, latest_backup_at)
+                )
+        except Exception:
+            # A missing or unreadable anchor means the bound on this wait is
+            # unknown: pruning now could be far too early, so nothing is pruned.
+            logger.exception("History retention wait anchor is unusable.")
+            return self._refuse_retention_without_anchor()
+        deadline = anchor + skip_window
+        if normalized_now < deadline:
+            self.last_retention_skip_reason = RETENTION_SKIP_WAITING_FOR_BACKUP
+            self.last_retention_skip_until = isoformat_utc(deadline)
+            self.last_retention_ran_without_backup = False
+            self._warn_retention_skipped(normalized_now, deadline)
+            self._record_collection_stage(
+                "db.retention.skipped",
+                0.0,
+                reason="waiting_for_backup",
+                retry_after=isoformat_utc(deadline),
+            )
+            return False
+
+        self.last_retention_skip_reason = RETENTION_RAN_WITHOUT_BACKUP
+        self.last_retention_skip_until = None
+        self.last_retention_ran_without_backup = True
+        logger.warning(
+            "History retention is pruning without a usable database backup after %s seconds: %s",
+            int(skip_window.total_seconds()),
+            self.last_backup_error or "no backup snapshot was found",
+        )
+        return True
+
+    def _refuse_retention_without_anchor(self) -> bool:
+        """Skip this pass because the durable wait record cannot be trusted."""
+
+        self.last_retention_skip_reason = RETENTION_SKIP_ANCHOR_UNAVAILABLE
+        self.last_retention_skip_until = None
+        self.last_retention_ran_without_backup = False
+        self._record_collection_stage(
+            "db.retention.skipped",
+            0.0,
+            reason="wait_anchor_unavailable",
+        )
+        return False
+
+    def _retention_wait_started_at(
+        self,
+        now: datetime,
+        latest_backup_at: datetime | None,
+    ) -> datetime:
+        """Return when the usable-backup window closed.
+
+        Anchoring on the current pass restarted the wait on every container
+        restart, so a service that restarts more often than the skip window
+        never pruned. The newest backup survives a restart, so derive the
+        anchor from it and clamp it to now; with no backup at all there is
+        nothing to derive from, so the wait starts here and is written to the
+        maintenance-state table, which is what makes it survive the restart.
+        """
+        if latest_backup_at is None:
+            return now
+        went_stale_at = latest_backup_at + self._usable_backup_max_age()
+        return min(went_stale_at, now)
+
+    def _warn_retention_skipped(self, now: datetime, deadline: datetime) -> None:
+        if (
+            self._retention_skip_warned_at is not None
+            and now - self._retention_skip_warned_at < timedelta(hours=1)
+        ):
+            return
+        self._retention_skip_warned_at = now
+        logger.warning(
+            "History retention is waiting for a usable database backup until %s: %s",
+            isoformat_utc(deadline),
+            self.last_backup_error or "no backup snapshot was found",
+        )
+
+    def record_failure_diagnostics(self, exc: BaseException) -> None:
+        """Record the fixed kind and sentence for a failed collection pass."""
+
+        self.last_error_kind, self.last_error_summary = classify_collection_failure(exc)
+
+    def clear_failure_diagnostics(self) -> None:
+        self.last_error = None
+        self.last_error_kind = None
+        self.last_error_summary = None
+
     def _retention_due(self, now: datetime) -> bool:
         if self.last_retention_has_more:
             return True
@@ -913,7 +1110,10 @@ class HistoryCollector:
                 return latest.astimezone(timezone.utc)
             except ValueError:
                 pass
-        return self.store.latest_backup_snapshot_at(self.settings.backup_dir)
+        latest = self.store.latest_backup_snapshot_at(self.settings.backup_dir)
+        if not isinstance(latest, datetime):
+            return None
+        return latest if latest.tzinfo else latest.replace(tzinfo=timezone.utc)
 
     def _backup_due(self, now: datetime, *, latest_backup_at: datetime | None = None) -> bool:
         interval_seconds = max(0, int(self.settings.backup_interval_seconds or 0))
@@ -1679,18 +1879,28 @@ class HistoryCollector:
                 payload = json.load(response)
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"{method} {url} failed with HTTP {exc.code}: {detail}") from exc
+            raise HistorySourceError.rejected(
+                f"{method} {url} failed with HTTP {exc.code}: {detail}",
+                status_code=exc.code,
+            ) from exc
         except urllib.error.URLError as exc:
-            raise RuntimeError(f"{method} {url} failed: {exc.reason}") from exc
+            raise HistorySourceError.unreachable(f"{method} {url} failed: {exc.reason}") from exc
         except TimeoutError as exc:
-            raise RuntimeError(f"{method} {url} timed out after {request_timeout_seconds}s") from exc
+            raise HistorySourceError.timeout(
+                f"{method} {url} timed out after {request_timeout_seconds}s",
+                timeout_seconds=request_timeout_seconds,
+            ) from exc
         except json.JSONDecodeError as exc:
-            raise RuntimeError(f"{method} {url} returned invalid JSON: {exc}") from exc
+            raise HistorySourceError.bad_payload(
+                f"{method} {url} returned invalid JSON: {exc}"
+            ) from exc
 
         if isinstance(payload, dict) and payload.get("ok") is False:
-            raise RuntimeError(str(payload.get("detail") or f"{method} {url} returned an application error."))
+            raise HistorySourceError.error_reply(
+                str(payload.get("detail") or f"{method} {url} returned an application error.")
+            )
         if not isinstance(payload, dict):
-            raise RuntimeError(f"{method} {url} returned a non-object JSON payload.")
+            raise HistorySourceError.bad_payload(f"{method} {url} returned a non-object JSON payload.")
         return payload
 
     @staticmethod

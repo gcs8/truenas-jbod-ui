@@ -590,7 +590,7 @@ class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(
             client,
             "_send_json",
-            AsyncMock(return_value={"scopes": [{"histories": {"5": {"slot": 5, "metrics": {"bytes_written": []}}}}]}),
+            AsyncMock(return_value={"scopes": [{"system_id": "archive-core", "enclosure_id": "front", "histories": {"5": {"slot": 5, "metrics": {"bytes_written": []}}}}]}),
         ) as send_json:
             with patch.object(
                 client,

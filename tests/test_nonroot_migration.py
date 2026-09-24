@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import resource
 import stat
 import tempfile
 import unittest
@@ -66,18 +67,18 @@ class NonRootMigrationTests(unittest.TestCase):
                 current.mkdir()
             (current / "runtime.db").write_bytes(b"runtime")
 
-            soft_limit, hard_limit = MODULE.resource.getrlimit(MODULE.resource.RLIMIT_NOFILE)
+            soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
             open_count = len(tuple(Path("/proc/self/fd").iterdir()))
             test_limit = max(open_count + 16, 48)
-            if hard_limit != MODULE.resource.RLIM_INFINITY and hard_limit < test_limit:
+            if hard_limit != resource.RLIM_INFINITY and hard_limit < test_limit:
                 self.skipTest("descriptor hard limit is too small for the bounded fixture")
 
-            MODULE.resource.setrlimit(MODULE.resource.RLIMIT_NOFILE, (test_limit, hard_limit))
+            resource.setrlimit(resource.RLIMIT_NOFILE, (test_limit, hard_limit))
             try:
                 entries = MODULE.inventory(root)
             finally:
-                MODULE.resource.setrlimit(
-                    MODULE.resource.RLIMIT_NOFILE,
+                resource.setrlimit(
+                    resource.RLIMIT_NOFILE,
                     (soft_limit, hard_limit),
                 )
 
