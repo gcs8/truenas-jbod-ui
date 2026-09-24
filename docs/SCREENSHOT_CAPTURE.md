@@ -85,45 +85,18 @@ its `platform-fonts.json`, and update the workflow `env` block, this table, and
 the container digest in one pull request. `tests/test_ci_contract.py` reads the
 families out of the workflow and fails if this table drifts from them.
 
-## Running it before the workflow is merged
+## Dispatching the workflow
 
-A `workflow_dispatch` workflow cannot be dispatched while it exists only on a
-pull request branch. GitHub's documentation is explicit:
+The workflow is on `main` (#512), so it can be dispatched against any ref:
 
-- "This event will only trigger a workflow run if the workflow file exists on
-  the default branch."
-- "To trigger the `workflow_dispatch` event, your workflow must be in the
-  default branch."
-- "On the GitHub UI, the "Run workflow" button will be present if the workflow
-  file exists on the default branch. Once a workflow has run at least once, you
-  can dispatch it against any branch or tag via the GitHub API or GitHub CLI."
+```bash
+gh workflow run capture-public-demo-screenshots.yml -R gcs8/truenas-jbod-ui \
+  --ref main -f ref=<full commit SHA> -f qualification_only=false
+```
 
-So `gh workflow run capture-public-demo-screenshots.yml --ref <branch>` does not
-work from this pull request branch alone: `--ref` chooses which ref is checked
-out and which version of the workflow file runs, but the trigger itself is only
-registered from the copy on the default branch, and the "Run workflow" button
-does not appear at all. While the file lives only on the branch, GitHub has no
-registered `workflow_dispatch` trigger for it and rejects the dispatch; the same
-applies to the REST endpoint `POST
-/repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches`, whose docs say
-"You must configure your GitHub Actions workflow to run when the
-workflow_dispatch webhook event occurs."
-
-This has not been tested by dispatching, and there is no way to test it without
-first putting the file on a default branch somewhere. Two ways to get a first
-run, for the owners to choose between:
-
-1. **Fork.** Push the branch to a fork and make it the fork's default branch.
-   The workflow is then dispatchable there, against any ref of that fork, and
-   nothing lands in this repository until the owners are satisfied.
-2. **Merge the workflow first as a no-op tooling change.** The workflow is
-   dispatch-only, has `permissions: contents: read`, and no `push`,
-   `pull_request`, or `schedule` trigger, so merging it changes no gate and
-   starts no run. Dispatch comes afterwards, deliberately.
-
-Neither option should be read as a recommendation to merge in order to find out
-whether the workflow works. Option 2 is a decision to accept the file on main
-before its first run; option 1 keeps that decision open.
+`--ref main` picks the workflow definition; the `ref` input picks the commit
+that is checked out and captured. Always pass a full commit SHA as `ref`, never
+a branch name.
 
 ## The first run is a tooling qualification
 
@@ -182,7 +155,7 @@ producing images to commit, is the workflow run with `qualification_only` set to
 The job builds no artifact, commits nothing, pushes nothing, and opens no pull
 request. It runs with `permissions: contents: read`.
 
-## What the human still approves
+## What the reviewer approves
 
 Everything that decides publication:
 
@@ -190,9 +163,13 @@ Everything that decides publication:
   [`PUBLIC_SCREENSHOT_REVIEW.md`](PUBLIC_SCREENSHOT_REVIEW.md): private
   addresses, hostnames, paths, key material, non-demo identifiers, clipping,
   overlap, overflow, wording, and value consistency.
-- Only then change `pixel_review` from `PENDING` to `PASS`. No script and no
-  workflow may write `PASS`, and nobody may edit a hash in `manifest.json` by
-  hand to make a gate green.
+- Only then change `pixel_review` from `PENDING` to `PASS`. `PASS` means a
+  named reviewer inspected the exact hash-bound PNG bytes. The reviewer may be
+  a person or disclosed vision tooling; a tool review is recorded as a tool
+  review in `PUBLIC_SCREENSHOT_REVIEW.md` and never described as a human one.
+  Two-run byte reproducibility is required but does not replace looking at the
+  images. No script and no workflow may write `PASS`, and nobody may edit a
+  hash in `manifest.json` by hand to make a gate green.
 
 ## How the result is committed
 
@@ -212,3 +189,32 @@ Everything that decides publication:
 
 5. Commit the images, the manifest, and the review record together, on the same
    branch as the artifact rebuild.
+
+## Merging a pull request that rebuilt the artifact
+
+`public-demo/index.html` records the commit it was built from, and
+`scripts/check_public_demo_artifact.py` requires that commit to be an ancestor
+of `HEAD`. A squash merge copies the branch's content onto `main` as one new
+commit and leaves the branch commits behind, so the recorded revision is no
+longer reachable and the check fails on `main` with `recorded public demo
+source revision is not a local commit` (the failure #559 repaired).
+
+So a pull request that changes `public-demo/**`, `docs/images/screenshots/**`,
+`wiki/images/**` or any path in `scripts/public_demo_inputs.py` is merged with a
+**merge commit**, never squash or rebase. Every other pull request may be
+squashed. If a squash happens anyway, rebuild with `--source-revision` set to a
+commit on `main` whose declared inputs match the artifact, as #559 did.
+
+The order inside such a pull request is fixed:
+
+1. Merge current `main` into the branch and commit the source change.
+2. `python scripts/build_public_demo.py --output public-demo/index.html
+   --source-revision <full SHA of that source commit>` and commit the result.
+3. Dispatch the capture against the artifact commit, review, and commit the
+   images, manifest and review record as described above.
+4. Merge with a merge commit. Any new commit after step 2, including a merge
+   from `main`, invalidates the capture and the review.
+
+Only one demo-input pull request should run this chain at a time: two branches
+rebuilt from different sources cannot both merge without one of them starting
+again.
