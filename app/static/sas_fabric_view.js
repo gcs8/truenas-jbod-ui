@@ -762,7 +762,7 @@
   function renderSlotList(slots, { limit = 28, expandKey = "" } = {}) {
     const sorted = sortedSlots(slots);
     if (!sorted.length) {
-      return '<span class="fabric-empty-note">No mapped bays</span>';
+      return '<span class="fabric-empty-note">No mapped disks</span>';
     }
     const expanded = expandKey && state.expandedSlotLists[expandKey];
     const visible = expanded ? sorted : sorted.slice(0, limit);
@@ -935,8 +935,16 @@
     return new Map(list(fabric?.links).map((link) => [link.id, link]));
   }
 
+  const traceLookupCache = new WeakMap();
+
   function traceMap(fabric = state.fabric) {
-    return new Map(list(fabric?.traces).map((trace) => [trace.id, trace]));
+    if (!fabric) return new Map();
+    let cached = traceLookupCache.get(fabric);
+    if (!cached || cached.source !== fabric.traces) {
+      cached = { source: fabric.traces, map: new Map(list(fabric.traces).map((trace) => [trace.id, trace])) };
+      traceLookupCache.set(fabric, cached);
+    }
+    return cached.map;
   }
 
   function aliasMap(fabric = state.fabric) {
@@ -1278,8 +1286,34 @@
     return node?.kind === "ses-enclosure" && sortedSlots(node.related_slots).includes(Number(slotNumber));
   }
 
+  const slotLookupCache = new WeakMap();
+
   function slotByNumber(slotNumber) {
-    return list(state.snapshot?.slots).find((slot) => Number(slot.slot) === Number(slotNumber)) || null;
+    const snapshot = state.snapshot;
+    if (!snapshot) return null;
+    let cached = slotLookupCache.get(snapshot);
+    if (!cached || cached.source !== snapshot.slots) {
+      const map = new Map();
+      for (const slot of list(snapshot.slots)) {
+        const number = Number(slot.slot);
+        // Preserve the first-match behavior of the previous snapshot scan.
+        if (!map.has(number)) map.set(number, slot);
+      }
+      cached = { source: snapshot.slots, map };
+      slotLookupCache.set(snapshot, cached);
+    }
+    return cached.map.get(Number(slotNumber)) || null;
+  }
+
+  // The bay kind/ID is a compatibility key, not physical-location evidence.
+  function diskLocation(slotNumber, trace = traceById(`bay:${slotNumber}`, state.fabric)) {
+    const slot = slotByNumber(slotNumber);
+    const provenance = [trace?.metrics, slot, slot?.raw_status].filter(Boolean);
+    const denied = provenance.some((item) => item.physical_location_known === false || item.virtual_enclosure === true);
+    const physical = !denied && provenance.some((item) => item.physical_location_known === true);
+    const kind = physical ? "Bay" : "Disk";
+    const number = Number.isInteger(slotNumber) ? (physical ? formatSlotLabel(slotNumber) : String(slotNumber + 1)) : "";
+    return { physical, kind, label: `${kind} ${number}`.trim() };
   }
 
   function smartCacheKey(slotNumber) {
@@ -1448,7 +1482,7 @@
     const related = selectionTouchesNode(node.id) || selectionTouchesSlots(node.related_slots);
     return `
       <button type="button" class="fabric-node-card status-${classToken(node.status)}${selected ? " is-selected" : ""}${related ? " is-related" : ""} ${extra}" data-fabric-node="${escapeHtml(node.id)}">
-        <span class="fabric-node-kind">${escapeHtml(formatKind(node.kind))}</span>
+        <span class="fabric-node-kind">${escapeHtml(node.kind === "bay" ? diskLocation(sortedSlots(node.related_slots)[0], node).kind : formatKind(node.kind))}</span>
         <strong>${escapeHtml(label || displayLabel(node) || node.id)}</strong>
         <span>${escapeHtml(meta || nodeMeta(node))}</span>
       </button>
@@ -1463,9 +1497,15 @@
       metrics.temperature ? `temp ${metrics.temperature}` : null,
       metrics.firmware ? `fw ${metrics.firmware}` : null,
       metrics.linked_phys ? `${metrics.linked_phys}/${metrics.num_phys || "?"} phys` : null,
-      sortedSlots(node?.related_slots).length ? `${sortedSlots(node.related_slots).length} bays` : null,
+      sortedSlots(node?.related_slots).length ? `${sortedSlots(node.related_slots).length} ${sortedSlots(node.related_slots).every((slotNumber) => diskLocation(slotNumber, node.kind === "bay" ? node : undefined).physical) ? "bays" : "disks"}` : null,
       node?.raw_id,
     ].filter(Boolean).join(" / ") || "n/a";
+  }
+
+  // A count without complete, affirmative member evidence is not a location.
+  function aggregateDiskNoun(slots, count = slots.length) {
+    return slots.length > 0 && Number(count) === slots.length
+      && slots.every((slotNumber) => diskLocation(slotNumber).physical) ? "bay" : "disk";
   }
 
   function renderPathButton(path, { compact = false } = {}) {
@@ -1478,7 +1518,7 @@
       <button type="button" class="fabric-path-card status-${classToken(stateName)}${selected ? " is-selected" : ""}${related ? " is-related" : ""}${compact ? " compact" : ""}" data-fabric-trace="${escapeHtml(path.id)}">
         <span>${escapeHtml(path.controller || "path")}</span>
         <strong>${escapeHtml(displayLabel(path) || stateName)}</strong>
-        <small>${escapeHtml(`${path.count || slots.length || 0} bay${(path.count || slots.length) === 1 ? "" : "s"}`)}</small>
+        <small>${escapeHtml(`${path.count || slots.length || 0} ${aggregateDiskNoun(slots, path.count || slots.length)}${(path.count || slots.length) === 1 ? "" : "s"}`)}</small>
         <em>${renderSlotList(slots, { limit: compact ? 16 : 28, expandKey: `path:${path.id}` })}</em>
       </button>
     `;
@@ -1496,7 +1536,7 @@
   function renderBayChips(slots, limit = 96, { modeTarget = "" } = {}) {
     const sorted = sortedSlots(slots);
     if (!sorted.length) {
-      return '<span class="fabric-empty-note">No mapped bays</span>';
+      return '<span class="fabric-empty-note">No mapped disks</span>';
     }
     const activeSlots = selectedSlots();
     const chips = sorted.slice(0, limit).map((slotNumber) => {
@@ -1507,12 +1547,12 @@
         ? ` data-fabric-mode-target="${escapeHtml(modeTarget)}"`
         : "";
       return `
-        <button type="button" class="fabric-bay-chip${selected ? " is-selected" : ""}" data-fabric-trace="bay:${slotNumber}"${modeTargetAttribute} title="${escapeHtml(title || `Bay ${formatSlotLabel(slotNumber)}`)}">
+        <button type="button" class="fabric-bay-chip${selected ? " is-selected" : ""}" data-fabric-trace="bay:${slotNumber}"${modeTargetAttribute} title="${escapeHtml(title || diskLocation(slotNumber).label)}">
           ${escapeHtml(formatSlotLabel(slotNumber))}
         </button>
       `;
     }).join("");
-    const overflow = sorted.length > limit ? `<span class="fabric-empty-note">+${sorted.length - limit} bays</span>` : "";
+    const overflow = sorted.length > limit ? `<span class="fabric-empty-note">+${sorted.length - limit} ${aggregateDiskNoun(sorted)}s</span>` : "";
     return `${chips}${overflow}`;
   }
 
@@ -1571,7 +1611,7 @@
             <div class="fabric-node-grid">${renderNodeGrid(enclosures, 8)}</div>
           </div>
           <div class="fabric-stage">
-            <span class="fabric-stage-title">${escapeHtml(copy.laneStages.bays)}</span>
+            <span class="fabric-stage-title">${escapeHtml(aggregateDiskNoun(slots) === "bay" ? copy.laneStages.bays : copy.laneStages.bays.replace("Bays", "Disks"))}</span>
             <div class="fabric-bay-grid">${renderBayChips(slots, 120)}</div>
           </div>
         </section>
@@ -1625,7 +1665,7 @@
             <article class="fabric-impact-card status-${classToken(path.state)}${selected ? " is-selected" : ""}" data-fabric-trace="${escapeHtml(path.id)}" role="button" tabindex="0">
               <span class="fabric-node-kind">${escapeHtml(path.controller || "path")}</span>
               <strong>${escapeHtml(path.state || "unknown")}</strong>
-              <span>${escapeHtml(`${slots.length} affected bay${slots.length === 1 ? "" : "s"}`)}</span>
+              <span>${escapeHtml(`${slots.length} affected ${aggregateDiskNoun(slots)}${slots.length === 1 ? "" : "s"}`)}</span>
               <div class="fabric-impact-facts">
                 <span>Pools: ${escapeHtml(summary.pools.join(", ") || "n/a")}</span>
                 <span>Vdevs: ${escapeHtml(summary.vdevs.join(", ") || "n/a")}</span>
@@ -2581,7 +2621,7 @@
     const enabled = slotSet.has(slotNumber);
     const title = [slot?.device_name, slot?.serial, slot?.pool_name, slot?.vdev_name].filter(Boolean).join(" / ");
     return `
-      <button type="button" class="fabric-bay-chip${selected ? " is-selected" : ""}${enabled ? "" : " is-unavailable"}" data-fabric-trace="bay:${slotNumber}" title="${escapeHtml(title || `Bay ${formatSlotLabel(slotNumber)}`)}"${enabled ? "" : " disabled"}>
+      <button type="button" class="fabric-bay-chip${selected ? " is-selected" : ""}${enabled ? "" : " is-unavailable"}" data-fabric-trace="bay:${slotNumber}" title="${escapeHtml(title || diskLocation(slotNumber).label)}"${enabled ? "" : " disabled"}>
         ${escapeHtml(formatSlotLabel(slotNumber))}
       </button>
     `;
@@ -2684,7 +2724,8 @@
       slot?.physical_block_size || trace.metrics?.physical_block_size || seed.pathState?.physical_block_size,
     ].filter(Boolean).join(" / ");
     const diskSmartDevices = list(slot?.smart_device_names || trace.metrics?.smart_device_names || seed.pathState?.smart_device_names).join(", ");
-    const diskTitle = diskModel || compactDeviceLabel(fullDeviceName, 36) || `Bay ${formatSlotLabel(slotNumber)}`;
+    const location = diskLocation(slotNumber, trace);
+    const diskTitle = diskModel || compactDeviceLabel(fullDeviceName, 36) || location.label;
     const serialAlreadyShown = diskSerial && compactDiskDevice.includes(diskSerial);
     const diskSubtitle = [
       compactDiskDevice,
@@ -2710,7 +2751,7 @@
         title: displayLabel(hostNode) || "Host",
         subtitle: fabric.selected_enclosure_label || fabric.system_id || "",
         facts: [
-          ["Bay", `Bay ${formatSlotLabel(slotNumber)}`],
+          [location.kind, location.label],
           [linuxSes || storageFabric ? "Sources" : "Controllers", list(fabric.controllers).length],
         ],
         hoverFacts: [
@@ -2827,16 +2868,16 @@
         nodeId: expanderNode?.id || enclosureNode?.id || "",
       }),
       renderDiskPathCard({
-        kind: labels.backplane,
-        title: displayLabel(backplaneNode) || zone.label,
-        subtitle: zone.range,
+        kind: location.physical ? labels.backplane : "Location",
+        title: location.physical ? displayLabel(backplaneNode) || zone.label : "Physical location unavailable",
+        subtitle: location.physical ? zone.range : "Disk number is an inventory ordinal",
         facts: [
-          ["Selected", `Bay ${formatSlotLabel(slotNumber)}`],
+          ["Selected", location.label],
           ["SES element", slot?.ssh_ses_element_id],
           ["Enclosure", slot?.enclosure_name],
         ],
         hoverFacts: [
-          ["Zone slots", formatSlots(zone.slots, 999)],
+          ["Zone slots", location.physical ? formatSlots(zone.slots, 999) : null],
           ["SES targets", list(slot?.ssh_ses_targets).map((target) => `${target.ses_device}:${target.ses_element_id}`).join(", ")],
           ["SES device", slot?.ssh_ses_device],
           ["Mapping source", slot?.mapping_source],
@@ -2844,7 +2885,7 @@
           ["Descriptor", slot?.raw_status?.descriptor],
         ],
         status: slot?.state || trace.status || "online",
-        nodeId: backplaneNode?.id || zone.id || "",
+        nodeId: location.physical ? backplaneNode?.id || zone.id || "" : "",
       }),
       poolTitle && (storageFabric || linuxSes) ? renderDiskPathCard({
         kind: labels.pool,
@@ -2941,7 +2982,7 @@
         <div class="disk-path-picker">
           <div class="disk-path-selected">
             <span class="fabric-stage-title">Selected disk</span>
-            <strong>Bay ${escapeHtml(formatSlotLabel(slotNumber))}</strong>
+            <strong>${escapeHtml(diskLocation(slotNumber, trace).label)}</strong>
             <small>${escapeHtml([
               selectedModel,
               compactDeviceLabel(selectedDevice, 44),
@@ -3059,7 +3100,7 @@
     const trailText = visited ? `${slotText} / already in trace` : slotText;
     return `
       <button type="button" class="fabric-trace-summary${selected ? " is-selected" : ""}${visited ? " is-visited" : ""}" ${attributes}>
-        <span>${escapeHtml(formatKind(trace.kind))}</span>
+        <span>${escapeHtml(trace.kind === "bay" ? diskLocation(sortedSlots(trace.slots)[0], trace).kind : formatKind(trace.kind))}</span>
         <strong>${escapeHtml(displayLabel(trace) || trace.id)}</strong>
         <small>${escapeHtml(trailText)}</small>
       </button>
@@ -3109,7 +3150,8 @@
     const deviceName = trace.metrics?.device_name || slot?.device_name || "";
     const compactDevice = compactDeviceLabel(deviceName, 56);
     const stateName = slot?.health || slot?.state || pathStates[0]?.state || trace.status || "unknown";
-    const bayLabel = `Bay ${formatSlotLabel(slotNumber)}`;
+    const location = diskLocation(slotNumber, trace);
+    const bayLabel = location.label;
     const bayModel = slot?.model || trace.metrics?.model;
     const baySerial = slot?.serial || trace.metrics?.serial;
     const baySize = slot?.size_human || trace.metrics?.size_human;
@@ -3127,7 +3169,7 @@
       <div class="fabric-selected-bay">
         <section class="fabric-selected-bay-hero status-${classToken(stateName)}">
           <div>
-            <span class="fabric-stage-title">Selected Bay</span>
+            <span class="fabric-stage-title">Selected ${escapeHtml(location.kind)}</span>
             <strong>${escapeHtml(bayLabel)}</strong>
             <small>${escapeHtml(modelLine || compactDevice || "No disk metadata")}</small>
           </div>
@@ -3144,7 +3186,7 @@
           ${inspectorFact("Source", sourceLabel)}
           ${inspectorFact("Path", pathLabel)}
           ${inspectorFact("View", displayLabel(enclosureNode) || slot?.enclosure_name)}
-          ${inspectorFact("Bay Group", displayLabel(backplaneNode))}
+          ${location.physical ? inspectorFact("Bay Group", displayLabel(backplaneNode)) : inspectorFact("Location", "Physical location unavailable")}
           ${inspectorFact("Fabric", trace.metrics?.fabric_kind)}
         </div>
 
@@ -3185,7 +3227,7 @@
         <section class="fabric-inspector-section">
           <h4>Friendly Label</h4>
           <div class="kv-grid">
-            ${renderAliasRow("Bay", { objectId: trace.id, objectKind: trace.kind, item: trace })}
+            ${renderAliasRow(location.kind, { objectId: trace.id, objectKind: trace.kind, item: trace })}
           </div>
         </section>
 
@@ -3319,7 +3361,7 @@
       const pathStates = list(trace.metrics?.path_states);
       if (trace.kind === "bay") {
         const slotNumber = sortedSlots(trace.slots)[0];
-        elements.inspectorTitle.textContent = `Selected Bay ${Number.isInteger(slotNumber) ? formatSlotLabel(slotNumber) : ""}`.trim();
+        elements.inspectorTitle.textContent = `Selected ${diskLocation(slotNumber, trace).label}`;
         elements.inspectorBody.innerHTML = renderSelectedBayInspector(trace, fabric);
         return;
       }
@@ -3355,11 +3397,12 @@
     }
     if (node) {
       const relatedTraces = relatedTracesForNode(node, fabric);
-      elements.inspectorTitle.textContent = `Selected ${formatKind(node.kind)}`;
+      const kindLabel = node.kind === "bay" ? diskLocation(sortedSlots(node.related_slots)[0], node).kind : formatKind(node.kind);
+      elements.inspectorTitle.textContent = `Selected ${kindLabel}`;
       elements.inspectorBody.innerHTML = `
         <div class="kv-grid">
           ${renderAliasRow("Object", { objectId: node.id, objectKind: node.kind, item: node })}
-          ${kvRow("Type", formatKind(node.kind))}
+          ${kvRow("Type", kindLabel)}
           ${kvRow("Status", node.status || "n/a")}
           ${kvRow("Raw ID", node.raw_id || "n/a")}
           ${kvRow("Slots", formatSlots(node.related_slots, 999))}
@@ -3584,7 +3627,7 @@
       }) : "",
       diskTrace ? focusButton({
         label: "Disk path",
-        title: `Bay ${formatSlotLabel(diskSlot)}`,
+        title: diskLocation(diskSlot, diskTrace).label,
         meta: [diskSlotRecord?.device_name || diskTrace.metrics?.device_name, diskSlotRecord?.vdev_name || diskTrace.metrics?.vdev_name].filter(Boolean).join(" / ") || "Open disk path",
         ref: { kind: "trace", id: diskTrace.id },
         mode: "disk",
