@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 import subprocess
 import sys
@@ -7,6 +8,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
+from app.services.public_demo_fixture import build_public_demo_html
+from scripts.build_public_demo import normalize_artifact_html
 from scripts.public_demo_inputs import PUBLIC_DEMO_INPUT_PATHS
 from scripts.public_demo_source_parity import (
     add_source_parity_manifest,
@@ -24,11 +27,17 @@ SOURCE_REVISION = subprocess.check_output(
 
 
 class PublicDemoProvenanceTests(unittest.TestCase):
+    _current_source_html: str | None = None
+
     def artifact_html(self) -> str:
-        checked = (ROOT / "public-demo/index.html").read_text(encoding="utf-8")
-        _manifest, artifact_html, errors = parse_manifest(checked)
-        self.assertEqual(errors, [])
-        return artifact_html
+        # A fresh build of the current source, not the checked-in bytes: the
+        # checked-in demo is only rebuilt at release time, so between releases
+        # its embedded sources may be older than the working tree.
+        if PublicDemoProvenanceTests._current_source_html is None:
+            PublicDemoProvenanceTests._current_source_html = normalize_artifact_html(
+                asyncio.run(build_public_demo_html())
+            )
+        return PublicDemoProvenanceTests._current_source_html
 
     def test_manifest_records_visible_source_revision_and_separate_build_id(self) -> None:
         rendered = add_source_parity_manifest(
