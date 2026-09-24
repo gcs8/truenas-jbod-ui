@@ -141,3 +141,42 @@ def probe_writable_directories(directories: Iterable[Path | str | None]) -> list
             if is_unwritable_error(exc):
                 problems.append(describe_unwritable_directory(directory))
     return problems
+
+
+def probe_known_hosts_files(paths: Iterable[Path | str | None]) -> list[str]:
+    """Check operator-chosen known-hosts files; one operator line per problem.
+
+    Unlike `probe_writable_directories`, a missing parent is reported rather
+    than created: a configured path usually names a host bind mount, and
+    creating the folder inside the container would pin keys where they vanish
+    on the next restart. The app keeps running either way; SSH reports its own
+    host-key errors until the path is fixed.
+    """
+    problems: list[str] = []
+    seen: set[str] = set()
+    for raw in paths:
+        if not raw:
+            continue
+        path = Path(raw)
+        key = os.path.normcase(os.path.abspath(path))
+        if key in seen:
+            continue
+        seen.add(key)
+        parent = path.parent
+        if not parent.is_dir():
+            problems.append(
+                f"The known-hosts file {path} is set in ssh.known_hosts_path, but its folder {parent} "
+                "does not exist. Create or mount that folder, or remove the setting to use the "
+                "data folder's known_hosts."
+            )
+            continue
+        target = path if path.exists() else parent
+        if not os.access(target, os.W_OK):
+            if target == parent:
+                problems.append(describe_unwritable_directory(parent))
+            else:
+                problems.append(
+                    f"The known-hosts file {path} is not writable by the app, so new host keys "
+                    f"cannot be saved. {describe_unwritable_directory(parent)}"
+                )
+    return problems

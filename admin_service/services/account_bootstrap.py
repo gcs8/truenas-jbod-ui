@@ -182,8 +182,12 @@ class ServiceAccountBootstrapService:
         config_path: str,
         *,
         probe_factory: Callable[[SSHConfig], SSHProbe] = SSHProbe,
+        known_hosts_path: str | None = None,
     ) -> None:
         self.config_path = config_path
+        # The operator's configured trust file (settings.ssh.known_hosts_path);
+        # never taken from the request. Falls back to the runtime layout.
+        self.known_hosts_path = known_hosts_path or _derive_runtime_layout_paths(config_path)["known_hosts_path"]
         self.key_manager = SSHKeyManager(config_path)
         self.probe_factory = probe_factory
 
@@ -199,7 +203,7 @@ class ServiceAccountBootstrapService:
             key_path=payload.bootstrap_key_path or "",
             password=payload.bootstrap_password or "",
             sudo_password=payload.bootstrap_sudo_password or "",
-            known_hosts_path=_derive_runtime_layout_paths(self.config_path)["known_hosts_path"],
+            known_hosts_path=self.known_hosts_path,
             strict_host_key_checking=payload.bootstrap_strict_host_key_checking,
             timeout_seconds=payload.timeout_seconds,
             commands=[],

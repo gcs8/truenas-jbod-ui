@@ -15,7 +15,7 @@ from fastapi.routing import APIRoute
 # Must precede admin_service.main, which builds its app at import time.
 import tests.admin_test_env  # noqa: F401  (must precede admin_service.main)
 from app import main as app_main
-from app.config import PathConfig, Settings, SystemConfig
+from app.config import PathConfig, Settings, SSHConfig, SystemConfig
 from app.models.domain import (
     InventorySnapshot,
     SourceStatus,
@@ -144,6 +144,83 @@ class StartupProbeTests(unittest.TestCase):
         self.assertIn("/app/data", directories)
         self.assertIn("/app/logs", directories)
         self.assertNotIn("/app/config", directories)
+
+
+class ConfiguredKnownHostsStartupTests(unittest.TestCase):
+    def settings_with_known_hosts(self, temp_root: Path, known_hosts_path: str) -> Settings:
+        data = temp_root / "data"
+        data.mkdir(exist_ok=True)
+        return Settings(
+            config_file=str(temp_root / "config" / "config.yaml"),
+            paths=PathConfig(
+                mapping_file=str(data / "slot_mappings.json"),
+                sas_fabric_alias_file=str(data / "sas_fabric_aliases.json"),
+                slot_detail_cache_file=str(data / "slot_detail_cache.json"),
+                log_file=str(temp_root / "logs" / "app.log"),
+            ),
+            ssh=SSHConfig(known_hosts_path=known_hosts_path),
+        )
+
+    def test_derived_known_hosts_is_probed_with_the_data_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            settings = self.settings_with_known_hosts(root, str(root / "data" / "known_hosts"))
+            derived, configured = app_main.split_known_hosts_paths(settings)
+            self.assertEqual(derived, [str(root / "data" / "known_hosts")])
+            self.assertEqual(configured, [])
+            self.assertIn(str(root / "data"), app_main.ui_writable_directories(settings))
+
+    def test_missing_configured_folder_is_reported_not_created(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            missing = root / "host-trust"
+            settings = self.settings_with_known_hosts(root, str(missing / "known_hosts"))
+            problems = app_main.startup_storage_problems(settings)
+            self.assertEqual(len(problems), 1)
+            self.assertIn("ssh.known_hosts_path", problems[0])
+            self.assertIn("does not exist", problems[0])
+            self.assertFalse(missing.exists(), "a configured folder must not be created in the container")
+            self.assertNotIn(str(missing), app_main.ui_writable_directories(settings))
+
+    def test_configured_writable_folder_reports_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "host-trust").mkdir()
+            settings = self.settings_with_known_hosts(root, str(root / "host-trust" / "known_hosts"))
+            self.assertEqual(app_main.startup_storage_problems(settings), [])
+
+    def test_unwritable_configured_folder_is_reported_with_the_chown_line(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "host-trust").mkdir()
+            settings = self.settings_with_known_hosts(root, str(root / "host-trust" / "known_hosts"))
+            with patch("app.services.storage_writability.os.access", return_value=False):
+                problems = app_main.startup_storage_problems(settings)
+            self.assertEqual(len(problems), 1)
+            self.assertIn(f"Cannot write to {root / 'host-trust'}", problems[0])
+
+    def test_unwritable_configured_file_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "host-trust").mkdir()
+            known_hosts = root / "host-trust" / "known_hosts"
+            known_hosts.write_text("", encoding="utf-8")
+            settings = self.settings_with_known_hosts(root, str(known_hosts))
+            with patch("app.services.storage_writability.os.access", return_value=False):
+                problems = app_main.startup_storage_problems(settings)
+            self.assertEqual(len(problems), 1)
+            self.assertIn("new host keys cannot be saved", problems[0])
+
+    def test_per_system_configured_path_is_checked(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            settings = self.settings_with_known_hosts(root, str(root / "data" / "known_hosts"))
+            settings.systems = [
+                SystemConfig(id="secondary", ssh=SSHConfig(known_hosts_path=str(root / "absent" / "known_hosts")))
+            ]
+            problems = app_main.startup_storage_problems(settings)
+            self.assertEqual(len(problems), 1)
+            self.assertIn(str(root / "absent"), problems[0])
 
 
 class HealthzTests(unittest.TestCase):

@@ -991,7 +991,10 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
     @router.post("/api/admin/system-setup/bootstrap")
     async def bootstrap_service_account(payload: SystemSetupBootstrapRequest) -> JSONResponse:
         settings = reload_app_settings()
-        bootstrap_service = ServiceAccountBootstrapService(settings.config_file)
+        bootstrap_service = ServiceAccountBootstrapService(
+            settings.config_file,
+            known_hosts_path=settings.ssh.known_hosts_path,
+        )
         try:
             if not payload.sudo_commands and payload.ssh_commands_source_system_id:
                 # Re-validate so saved commands pass the same request-model sanitizer
