@@ -745,9 +745,12 @@ jobs:
       - name: Use hosted Chrome for browser smoke tests
         run: google-chrome --version
 
-      - name: Smoke test checked-in artifact and current-source fixture
+      # The checked-in demo is only rebuilt when a release is cut, so the
+      # browser QA runs against a throwaway build of this commit's source. The
+      # checked-in bytes are covered by the integrity check above.
+      - name: Smoke test current-source public demo and browser fixture
         env:
-          PUBLIC_DEMO_ARTIFACT: public-demo/index.html
+          PUBLIC_DEMO_ARTIFACT: ${{ runner.temp }}/truenas-jbod-ui-current-source-browser/public-demo.html
           SLOT_FOCUS_ARTIFACT: ${{ runner.temp }}/truenas-jbod-ui-current-source-browser/index.html
           PLAYWRIGHT_BROWSER_CHANNEL: chrome
         run: |
@@ -766,8 +769,12 @@ jobs:
           trap cleanup EXIT
           rm -rf "$fixture_root"
           mkdir -p "$fixture_root"
+          python scripts/build_public_demo.py --output "$PUBLIC_DEMO_ARTIFACT" --source-revision "$(git rev-parse HEAD)"
           python scripts/build_current_source_browser_fixture.py --output "$SLOT_FOCUS_ARTIFACT"
           npx playwright test qa/public-demo.spec.js --retries=0
+          # The JS tests that assert generated-demo behaviour skip without an
+          # artifact; run the whole unit suite once more with this build.
+          node --test tests/js/*.test.js
           status="$(git status --short)"
           if [ -n "$status" ]; then
             printf '%s\n' "$status"

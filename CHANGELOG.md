@@ -468,6 +468,15 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   setting, unified the unavailable slot-history payload shape, and deleted
   duplicated and caller-less helpers (#509).
 
+- Moved the public-demo rebuild from every pull request to release cutting.
+  Pull-request CI now only checks that the checked-in demo is an exact build
+  of the reachable commit it records, so a change to a demo input no longer
+  needs a rebuild, screenshot recapture, and pixel review in the same pull
+  request. `check_public_demo_artifact.py --require-current`,
+  `validate_release_wrap.py --public-demo-only`, and a new step in the GHCR
+  release workflow refuse a release until the demo, screenshots, and pixel
+  review were rebuilt from the release source (#572).
+
 - Replaced the chain of command comparisons behind the SSH command failure
   contexts with a lookup table and pinned every answer with tests; the debug
   output is unchanged (#540)
