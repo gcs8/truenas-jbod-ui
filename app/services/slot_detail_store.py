@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,20 @@ class SlotDetailCacheEntry(BaseModel):
     identifiers: list[str] = Field(default_factory=list)
     slot_fields: dict[str, Any] = Field(default_factory=dict)
     smart_fields: dict[str, Any] = Field(default_factory=dict)
+    # When the SMART half was last read successfully, and whether it has been
+    # carried forward since. ``updated_at`` moves on every snapshot build, so it
+    # cannot date the SMART fields; without a separate stamp a carried-forward
+    # value is indistinguishable from one read this second (#521). Both default
+    # to the pre-#521 shape so an existing file loads unchanged.
+    smart_updated_at: str | None = None
+    smart_stale: bool = False
+    # Whether the most recently published view of this bay carried no strong
+    # identifier (#525). The entry itself is kept as historical evidence, but a
+    # reader that has no slot view to gate on must not serve it while this is
+    # set: the process that observed the window may since have restarted, so an
+    # in-memory marker alone outlives nothing. Defaults to the pre-#525 shape so
+    # an existing file loads unchanged.
+    identity_unknown: bool = False
     updated_at: str = Field(default_factory=lambda: utcnow().isoformat())
 
 
@@ -67,15 +82,48 @@ class SlotDetailStore:
         current = self.load_all() if loaded_entries is None else loaded_entries
         return current.get(self._slot_key(system_id, enclosure_id, slot))
 
-    def save_entries(self, entries: list[SlotDetailCacheEntry]) -> None:
+    def save_entries(
+        self, entries: list[SlotDetailCacheEntry], *,
+        expected_entries: Mapping[str, SlotDetailCacheEntry] | None = None,
+        commit_guard: Callable[[], AbstractContextManager[bool]] | None = None,
+    ) -> None:
         if not entries:
             return
+        if commit_guard is not None:
+            with commit_guard() as valid:
+                if not valid:
+                    return
 
         with self._lock:
             current = self.load_all()
+            merged = current.copy()
             for entry in entries:
-                current[self._slot_key(entry.system_id, entry.enclosure_id, entry.slot)] = entry
-            self._write(current)
+                key = self._slot_key(entry.system_id, entry.enclosure_id, entry.slot)
+                if expected_entries is not None:
+                    expected = expected_entries.get(key)
+                    actual = current.get(key)
+                    # A batch may span remote awaits. Do not replace a slot that
+                    # another writer changed or removed since that batch read it.
+                    expected_json = None if expected is None else json.dumps(expected.model_dump(mode="json"), sort_keys=True)
+                    actual_json = None if actual is None else json.dumps(actual.model_dump(mode="json"), sort_keys=True)
+                    if expected_json != actual_json:
+                        continue
+                merged[key] = entry
+            # Compare final full JSON payloads, including freshness and identity.
+            # Model equality alone conflates JSON booleans, integers and floats.
+            if all(
+                key in current and (
+                    entry is current[key]
+                    or json.dumps(entry.model_dump(mode="json"), sort_keys=True)
+                    == json.dumps(current[key].model_dump(mode="json"), sort_keys=True)
+                )
+                for key, entry in merged.items()
+            ):
+                return
+            if commit_guard is None:
+                self._write(merged)
+            else:
+                self._write(merged, commit_guard=commit_guard)
 
     def prune_unknown_systems(self, valid_system_ids: set[str]) -> int:
         with self._lock:
@@ -93,7 +141,10 @@ class SlotDetailStore:
                 self._write(retained)
             return removed
 
-    def _write(self, entries: dict[str, SlotDetailCacheEntry]) -> None:
+    def _write(
+        self, entries: dict[str, SlotDetailCacheEntry], *,
+        commit_guard: Callable[[], AbstractContextManager[bool]] | None = None,
+    ) -> None:
         payload = {
             "version": 1,
             "updated_at": utcnow().isoformat(),
@@ -102,4 +153,10 @@ class SlotDetailStore:
         temp_path = self.file_path.with_suffix(".tmp")
         with temp_path.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2, sort_keys=True)
-        temp_path.replace(self.file_path)
+        # The store lock still owns the reload/merge/write. A caller's generation
+        # guard serializes just publication with invalidation, not JSON I/O.
+        with commit_guard() if commit_guard is not None else nullcontext(True) as valid:
+            if valid:
+                temp_path.replace(self.file_path)
+                return
+        temp_path.unlink()
