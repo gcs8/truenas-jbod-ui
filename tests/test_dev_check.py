@@ -404,7 +404,7 @@ class DevCheckPlanTests(unittest.TestCase):
                 "python -m compileall app",
             ),
             "performance-baseline/python-unittest": (
-                'python -m unittest discover -s tests -p "test_*.py" -v',
+                'python scripts/run_test_shard.py run --shard "${{ matrix.shard }}" --results-dir shard-results',
                 "python -m unittest tests.test_perf_budgets -v",
             ),
             "bounded-ruff": (

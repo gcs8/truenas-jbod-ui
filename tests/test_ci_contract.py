@@ -55,6 +55,10 @@ class CIWorkflowContractTests(unittest.TestCase):
         self.assertIn("${{ matrix.python-version }}", job["name"])
         setup_step = next(step for step in job["steps"] if step.get("uses", "").startswith("actions/setup-python@"))
         self.assertEqual(setup_step["with"]["python-version"], "${{ matrix.python-version }}")
+        shard_job = workflow["jobs"]["python-unittest"]
+        self.assertEqual(shard_job["strategy"]["matrix"]["python-version"], ["3.12", "3.14"])
+        shard_setup = next(step for step in shard_job["steps"] if step.get("uses", "").startswith("actions/setup-python@"))
+        self.assertEqual(shard_setup["with"]["python-version"], "${{ matrix.python-version }}")
 
     def test_bounded_ruff_gate_and_config_are_present(self) -> None:
         workflow_text = self.read(CI_WORKFLOW)
@@ -178,9 +182,10 @@ class CIWorkflowContractTests(unittest.TestCase):
                 if match.group("version") is None:
                     uncommented.append(f"{workflow_path.name}: {action}")
 
-        # Existing actions plus the trial's pinned checkout and the dispatch-only
-        # screenshot capture workflow's checkout and upload.
-        self.assertEqual(action_count, 35)
+        # Existing actions plus the trial's pinned checkout, the dispatch-only
+        # screenshot capture workflow's checkout and upload, and the unittest
+        # gate job's checkout, Python setup, shard-result download and coverage upload.
+        self.assertEqual(action_count, 39)
         self.assertEqual(unpinned, [])
         self.assertEqual(uncommented, [])
 
@@ -520,7 +525,7 @@ class CIWorkflowContractTests(unittest.TestCase):
 
     def test_public_demo_source_revision_jobs_checkout_full_history(self) -> None:
         expected_jobs = {
-            CI_WORKFLOW: ("python-source", "public-demo-artifact"),
+            CI_WORKFLOW: ("python-unittest", "python-source", "public-demo-artifact"),
             PUBLISH_PUBLIC_DEMO_WORKFLOW: ("verify",),
         }
 
@@ -794,6 +799,7 @@ class CIRunsOncePerPullRequestTests(unittest.TestCase):
 
         for name in (
             "diff-hygiene",
+            "python-unittest",
             "python-source",
             "ruff-check",
             "javascript-source",

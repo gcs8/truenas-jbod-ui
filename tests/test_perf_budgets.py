@@ -575,7 +575,11 @@ print("history-store-posix-lock: PASS")
 
     def test_python_ci_does_not_repeat_baseline_check_outside_unittest(self) -> None:
         workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8"))
-        python_steps = workflow["jobs"]["python-source"]["steps"]
+        python_steps = [
+            step
+            for job in ("python-unittest", "python-source")
+            for step in workflow["jobs"][job]["steps"]
+        ]
         run_commands = "\n".join(str(step.get("run") or "") for step in python_steps)
 
         self.assertNotIn("python scripts/build_perf_baseline.py --check", run_commands)
