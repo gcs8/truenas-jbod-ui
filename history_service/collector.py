@@ -695,7 +695,7 @@ class HistoryCollector:
                     result="success",
                     duration_seconds=time.perf_counter() - started_monotonic,
                     status=self.status(),
-                    counts=self.store.estimated_counts(),
+                    counts=await asyncio.to_thread(self.store.estimated_counts),
                 )
             except HistoryCollectionAlreadyRunning:
                 logger.info("Skipping scheduled history collection because another collection pass is already running.")

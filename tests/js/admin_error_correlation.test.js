@@ -118,7 +118,7 @@ test("a failure with no payload still reports the status", () => {
 });
 
 test("an elapsed auto-stop is not reported as a shutdown the page observed", () => {
-  const { formatCountdown } = loadFunctions(["formatCountdown"], {
+  const { formatCountdown } = loadFunctions(["formatCountdown", "sessionRemainingMs", "formatClockTime"], {
     state: { admin: { expires_at: "2000-01-01T00:00:00+00:00" } },
   });
 

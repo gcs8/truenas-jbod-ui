@@ -68,7 +68,7 @@ service logs.
 | `Last error` | A collection pass failed. The text stays generic on purpose. |
 | `What went wrong` | The classified reason for that failure, such as not reaching the main UI, a request timeout, or a rejected request with its status code. |
 | `Backup error` | The last snapshot attempt failed, named in plain words: a full disk, an unwritable backup directory, or a read-only database. |
-| `Cleanup error` | The last retention pass failed. A batch size above the SQLite variable limit names `HISTORY_RETENTION_BATCH_SIZE` as the setting to lower. |
+| `Cleanup error` | The last retention pass failed, named in plain words (read-only database, full disk, missing permission). Retention selects each batch with a bounded subquery, so any `HISTORY_RETENTION_BATCH_SIZE` works; a very large value only makes each cleanup transaction longer. |
 | `Cleanup waiting` | Retention is holding off because no recent backup exists. |
 | `Cleanup resumes by` | The deadline after which retention prunes anyway. |
 | `Full refresh available` | When the next manual full refresh is allowed, instead of a refusal after the fact. |

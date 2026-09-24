@@ -8,6 +8,7 @@ import json
 import os
 import re
 import socket
+import shutil
 import sqlite3
 import stat
 import tempfile
@@ -1925,6 +1926,96 @@ class HistoryStoreTests(unittest.TestCase):
             self.assertIsInstance(writer_errors[0], sqlite3.OperationalError)
             self.assertRegex(str(writer_errors[0]), "migration lock")
 
+    def test_backup_copies_outside_the_locks_and_publishes_under_them(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = HistoryStore(str(root / "history.db"))
+            store.insert_metric_samples([self._metric_sample("2026-06-30T00:00:00+00:00", 22)])
+            events: list[str] = []
+            real_publish = HistoryStore._publish_replacement
+            real_thread_lock = store._lock
+
+            @contextmanager
+            def recording_history_write_lock(*args: Any, **kwargs: Any):
+                events.append("lifecycle-lock:enter")
+                with history_write_lock(*args, **kwargs):
+                    try:
+                        yield
+                    finally:
+                        events.append("lifecycle-lock:exit")
+
+            class RecordingThreadLock:
+                def __enter__(self) -> RecordingThreadLock:
+                    real_thread_lock.acquire()
+                    events.append("thread-lock:enter")
+                    return self
+
+                def __exit__(self, *args: object) -> None:
+                    events.append("thread-lock:exit")
+                    real_thread_lock.release()
+
+            def recording_publish(self_store: HistoryStore, *args: Any, **kwargs: Any) -> None:
+                events.append("publish")
+                real_publish(self_store, *args, **kwargs)
+
+            store._lock = RecordingThreadLock()  # type: ignore[assignment]
+            with patch("history_service.store.history_write_lock", recording_history_write_lock), patch.object(
+                HistoryStore, "_publish_replacement", recording_publish
+            ):
+                backup_path = store.create_backup(root / "backups", snapshot_label="2030-01-02T03:04:05+00:00")
+
+            self.assertIsNotNone(backup_path)
+            assert backup_path is not None
+            with sqlite3.connect(backup_path) as connection:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM metric_samples").fetchone()[0], 1)
+            # The copy borrows the lifecycle lock only to open its read connection;
+            # both locks are held together only while the finished file is published.
+            self.assertEqual(
+                events,
+                [
+                    "lifecycle-lock:enter",
+                    "lifecycle-lock:exit",
+                    "lifecycle-lock:enter",
+                    "thread-lock:enter",
+                    "publish",
+                    "thread-lock:exit",
+                    "lifecycle-lock:exit",
+                ],
+            )
+
+    def test_backup_discards_a_copy_when_the_database_is_replaced_mid_copy(self) -> None:
+        # The copy runs outside the lifecycle lock, so a restore or quarantine can
+        # swap the hot file under it. Publishing that copy would let retention
+        # prune rows it never contained (#560 review), so it must be discarded.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            database_path = root / "history.db"
+            store = HistoryStore(str(database_path))
+            store.insert_metric_samples([self._metric_sample("2026-06-30T00:00:00+00:00", 22)])
+            real_connect = HistoryStore._connect
+            replaced: list[bool] = []
+
+            def connect_then_replace(self_store: HistoryStore, *args: Any, **kwargs: Any) -> sqlite3.Connection:
+                connection = real_connect(self_store, *args, **kwargs)
+                if not replaced:
+                    replaced.append(True)
+                    staged = root / "restored.db"
+                    shutil.copyfile(database_path, staged)
+                    os.replace(staged, database_path)
+                return connection
+
+            with patch.object(HistoryStore, "_connect", connect_then_replace):
+                with self.assertRaises(history_store.HistoryBackupSourceReplacedError):
+                    store.create_backup(root / "backups", snapshot_label="2030-01-02T03:04:05+00:00")
+
+            self.assertEqual(replaced, [True])
+            published = [path.name for path in (root / "backups").glob("*.sqlite3")]
+            self.assertEqual(published, [], "a copy of the replaced file must not be published")
+            self.assertIsNotNone(
+                store.create_backup(root / "backups", snapshot_label="2030-01-02T04:04:05+00:00"),
+                "the next pass backs up the current file",
+            )
+
     def test_store_rechecks_lifecycle_markers_after_acquiring_the_history_lock(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database_path = Path(temp_dir) / "history.db"
@@ -3761,6 +3852,127 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertEqual(fast_counts["metric_rollup_count"], 0)
         self.assertFalse(fast_counts["estimated"])
         self.assertEqual(fast_counts["count_mode"], "tracked")
+
+    def test_retention_batch_size_is_not_limited_by_sqlite_variable_count(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        store.insert_metric_samples(
+            [
+                self._metric_sample(f"2020-01-01T{index // 60:02d}:{index % 60:02d}:00+00:00", index)
+                for index in range(60)
+            ]
+        )
+        real_connect_locked = HistoryStore._connect_locked
+
+        def connect_with_small_variable_limit(self_store: HistoryStore) -> sqlite3.Connection:
+            connection = real_connect_locked(self_store)
+            connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 32)
+            return connection
+
+        with patch.object(HistoryStore, "_connect_locked", connect_with_small_variable_limit):
+            result = store.maintain_retention(
+                now=datetime(2026, 7, 1, tzinfo=timezone.utc),
+                raw_metric_retention_days=30,
+                event_retention_days=0,
+                hourly_rollup_retention_days=0,
+                daily_rollup_retention_days=0,
+                batch_size=100,
+                max_batches=1,
+            )
+
+        self.assertEqual(result["metric_samples_removed"], 60)
+        self.assertFalse(result["has_more"])
+        with sqlite3.connect(store.file_path) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM metric_samples").fetchone()[0], 0)
+            self.assertEqual(
+                connection.execute("SELECT SUM(sample_count) FROM metric_rollups WHERE bucket_seconds = 3600").fetchone()[0],
+                60,
+            )
+
+    def test_retention_returns_freed_pages_to_the_filesystem(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        store.insert_metric_samples(
+            [
+                self._metric_sample(f"2020-01-{1 + index // 1440:02d}T{(index // 60) % 24:02d}:{index % 60:02d}:00+00:00", index)
+                for index in range(3000)
+            ]
+        )
+        with sqlite3.connect(store.file_path) as connection:
+            self.assertEqual(connection.execute("PRAGMA auto_vacuum").fetchone()[0], 2)
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+        size_before = store.file_path.stat().st_size
+
+        result = store.maintain_retention(
+            now=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            raw_metric_retention_days=30,
+            event_retention_days=0,
+            hourly_rollup_retention_days=365,
+            daily_rollup_retention_days=1825,
+            batch_size=1000,
+            max_batches=3,
+        )
+
+        self.assertEqual(result["metric_samples_removed"], 3000)
+        self.assertGreater(result["pages_reclaimed"], 0)
+        with sqlite3.connect(store.file_path) as connection:
+            self.assertEqual(connection.execute("PRAGMA freelist_count").fetchone()[0], 0)
+        self.assertLess(store.file_path.stat().st_size, size_before)
+        wal_path = Path(f"{store.file_path}-wal")
+        if wal_path.exists():
+            self.assertEqual(wal_path.stat().st_size, 0)
+
+    def test_retention_keeps_reusing_pages_on_databases_created_without_incremental_vacuum(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        with sqlite3.connect(db_path) as connection:
+            # A database that already holds objects cannot switch vacuum modes without
+            # a full VACUUM, which the service never runs on a user's data by itself.
+            connection.execute("CREATE TABLE placeholder (value INTEGER)")
+        store = HistoryStore(str(db_path))
+        store.insert_metric_samples(
+            [self._metric_sample(f"2020-01-01T00:{index % 60:02d}:00+00:00", index) for index in range(50)]
+        )
+
+        result = store.maintain_retention(
+            now=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            raw_metric_retention_days=30,
+            event_retention_days=0,
+            hourly_rollup_retention_days=365,
+            daily_rollup_retention_days=1825,
+            batch_size=100,
+            max_batches=1,
+        )
+
+        self.assertEqual(result["metric_samples_removed"], 50)
+        self.assertEqual(result["pages_reclaimed"], 0)
+        with sqlite3.connect(db_path) as connection:
+            self.assertEqual(connection.execute("PRAGMA auto_vacuum").fetchone()[0], 0)
+
+    def test_startup_counts_only_tables_whose_counter_row_is_missing(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        counted_per_open: list[list[str]] = []
+        real_synchronize = HistoryStore._synchronize_table_counts
+
+        def recording_synchronize(connection: sqlite3.Connection) -> list[str]:
+            counted = real_synchronize(connection)
+            counted_per_open.append(counted)
+            return counted
+
+        with patch.object(HistoryStore, "_synchronize_table_counts", staticmethod(recording_synchronize)):
+            store = HistoryStore(str(db_path))
+            store.insert_metric_samples([self._metric_sample("2026-06-30T00:00:00+00:00", 22)])
+            HistoryStore(str(db_path))
+            with sqlite3.connect(db_path) as connection:
+                connection.execute("DELETE FROM history_table_counts WHERE table_name = 'metric_samples'")
+            HistoryStore(str(db_path))
+
+        self.assertEqual(
+            counted_per_open,
+            [["slot_events", "metric_samples", "metric_rollups"], [], ["metric_samples"]],
+        )
+        self.assertEqual(store.estimated_counts()["metric_sample_count"], 1)
 
     def test_retention_rollups_remain_visible_in_batched_scope_and_disk_history(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
@@ -6374,6 +6586,58 @@ class HistoryStoreTests(unittest.TestCase):
         with sqlite3.connect(db_path) as connection:
             row = connection.execute("SELECT disk_identity_key FROM metric_samples WHERE slot = 5").fetchone()
             self.assertEqual(row[0], "serial-5|gptid|gptid/5")
+            self.assertEqual(
+                connection.execute("PRAGMA user_version").fetchone()[0],
+                DISK_IDENTITY_BACKFILL_USER_VERSION,
+            )
+
+    def test_disk_identity_backfill_commits_batches_and_resumes_after_an_interruption(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        HistoryStore(str(db_path))
+        with sqlite3.connect(db_path) as connection:
+            for slot in range(25):
+                self._legacy_metric_row_without_identity_key(connection, slot)
+            connection.execute("PRAGMA user_version = 0")
+
+        real_batch = HistoryStore._backfill_disk_identity_batch
+        batch_calls: list[str] = []
+
+        def interrupted_batch(connection: sqlite3.Connection, table_name: str, *, batch_size: int) -> int:
+            batch_calls.append(table_name)
+            if len(batch_calls) == 2:
+                raise sqlite3.OperationalError("simulated restart during the upgrade")
+            return real_batch(connection, table_name, batch_size=batch_size)
+
+        with patch.object(history_store, "DISK_IDENTITY_BACKFILL_BATCH_SIZE", 10), patch.object(
+            HistoryStore, "_backfill_disk_identity_batch", staticmethod(interrupted_batch)
+        ), self.assertLogs("history_service.store", level="INFO") as logs:
+            with self.assertRaises(sqlite3.OperationalError):
+                HistoryStore(str(db_path), recover_unreadable_database=False)
+
+        self.assertEqual(batch_calls, ["metric_samples", "metric_samples"])
+        self.assertTrue(
+            any("Upgrading history database: 25 rows to backfill" in line for line in logs.output),
+            logs.output,
+        )
+        with sqlite3.connect(db_path) as connection:
+            keyed = connection.execute(
+                "SELECT COUNT(*) FROM metric_samples WHERE disk_identity_key IS NOT NULL"
+            ).fetchone()[0]
+            self.assertEqual(keyed, 10, "the first batch stays committed after the interruption")
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 0)
+
+        with patch.object(history_store, "DISK_IDENTITY_BACKFILL_BATCH_SIZE", 10), patch.object(
+            HistoryStore, "_backfill_disk_identity_batch", wraps=real_batch
+        ) as resumed_batch:
+            HistoryStore(str(db_path))
+
+        self.assertEqual(resumed_batch.call_count, 2, "only the remaining 15 rows are scanned after a restart")
+        with sqlite3.connect(db_path) as connection:
+            keyed = connection.execute(
+                "SELECT COUNT(*) FROM metric_samples WHERE disk_identity_key IS NOT NULL"
+            ).fetchone()[0]
+            self.assertEqual(keyed, 25)
             self.assertEqual(
                 connection.execute("PRAGMA user_version").fetchone()[0],
                 DISK_IDENTITY_BACKFILL_USER_VERSION,
