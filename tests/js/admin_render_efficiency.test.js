@@ -83,13 +83,13 @@ function functionSource(name) {
 }
 
 const FETCH_JSON_NAMES = [
-  "fetchJson", "fetchWithTimeout", "requestTimeoutError", "readJsonResponse", "describeApiError",
+  "fetchJson", "fetchOrReportStopped", "sessionRemainingMs", "fetchWithTimeout", "requestTimeoutError", "readJsonResponse", "describeApiError",
   "validatedRequestId", "describeRequestFailure", "isMutatingRequest", "browserIsOffline", "adminRequestError",
   "classifyTransportFailure", "describeTransportFailure", "classifyResponseFailure", "describeResponseFailure",
 ];
 
 function loadFunctions(names, bindings = {}) {
-  const context = vm.createContext({ URLSearchParams, console, setTimeout, clearTimeout, Array, Boolean, Number, String, Math, ...bindings });
+  const context = vm.createContext({ state: { admin: {} }, URLSearchParams, console, setTimeout, clearTimeout, Array, Boolean, Number, String, Math, ...bindings });
   vm.runInContext(
     `${names.map(functionSource).join("\n")}\nglobalThis.__tested = { ${names.join(", ")} };`,
     context,

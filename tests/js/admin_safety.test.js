@@ -11,11 +11,11 @@ function extract(name) {
   const next = source.slice(start + 3).search(/^  (?:async )?function /m);
   return source.slice(start, next < 0 ? undefined : start + 3 + next);
 }
-const FETCH_JSON_HELPERS = ["fetchJson", "fetchWithTimeout", "requestTimeoutError", "readJsonResponse", "describeApiError", "validatedRequestId", "describeRequestFailure", "isMutatingRequest", "browserIsOffline", "adminRequestError", "classifyTransportFailure", "describeTransportFailure", "classifyResponseFailure", "describeResponseFailure"];
+const FETCH_JSON_HELPERS = ["fetchJson", "fetchOrReportStopped", "sessionRemainingMs", "fetchWithTimeout", "requestTimeoutError", "readJsonResponse", "describeApiError", "validatedRequestId", "describeRequestFailure", "isMutatingRequest", "browserIsOffline", "adminRequestError", "classifyTransportFailure", "describeTransportFailure", "classifyResponseFailure", "describeResponseFailure"];
 const MUTATION_RESULT_HELPERS = ["requireMutationResult", "isNonEmptyString", "validSystemSaveResult", "validDemoSystemResult", "validProfileSaveResult", "describeMutationFailure", "adminRequestError"];
 const SYNTHETIC_REQUEST_ID = "0123456789abcdef0123456789abcdef";
 function load(names, bindings = {}) {
-  const context = vm.createContext({console, URLSearchParams, setTimeout, clearTimeout, AbortController, DEFAULT_REQUEST_TIMEOUT_MS: 60000, ...bindings});
+  const context = vm.createContext({console, URLSearchParams, setTimeout, clearTimeout, state: {admin: {}}, renderSaveResult(target, detail) {if (target) target.textContent = detail;}, AbortController, DEFAULT_REQUEST_TIMEOUT_MS: 60000, ...bindings});
   vm.runInContext(names.map(extract).join("\n") + `\nglobalThis.tested = {${names.join(",")}}`, context);
   return context.tested;
 }

@@ -132,6 +132,16 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   `config.yaml` keys are logged once and listed in the admin
   configuration-warnings banner, and the unused `app.verify_ssl` setting is
   removed. The history bind error names the variables to set. (#568)
+- Admin save results now offer a "Restart main UI now" button and say "main UI"
+  instead of "read UI"; the admin page warns five minutes before it stops
+  itself, explains how to start it again once it has, and folds the three
+  session stats into one line; debug bundle exports no longer pause the main
+  UI and history by default; and the setup form gets BMC-only wording for
+  IPMI systems, a safe key-mode default when no SSH keys exist, an
+  actionable cross-origin message that keeps the draft, a clearer
+  secret-reuse error, an up-front disabled profile delete when systems still
+  use the profile, and an origin link only when a configured address
+  differs from the current one (#481)
 - Kept inventory and action results in their selected scope, preserved
   export keyboard focus, and improved history controls and failure text.
   (#425, #562)
