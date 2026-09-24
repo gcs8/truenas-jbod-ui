@@ -170,6 +170,8 @@ HISTORY_DIAGNOSTIC_STATUS_FIELDS = (
     "last_retention_ran_without_backup",
     "last_backup_error",
     "last_backup_error_kind",
+    "collector_starting",
+    "retention_consecutive_failures",
 )
 SLOT_HISTORY_METRIC_LIMITS: dict[str, int] = {
     "temperature_c": 96,
@@ -489,12 +491,20 @@ async def healthz() -> JSONResponse:
     # database works, so nothing sets last_error, but the service is running on
     # history it lost: grade it degraded until the recovery is acknowledged so
     # ordinary health cannot accept it as a healthy first installation (#417).
+    # Degraded is defined (#456): the last background pass failed, the database
+    # is read-only, cleanup failed twice in a row, or history needs recovery. A
+    # failed manual refresh alone is shown in "Last error" but is not degraded.
     recovery_required = bool(collector_status.get("history_recovery_required"))
+    degraded_reason = (
+        "Earlier history was quarantined; recovery is required."
+        if recovery_required
+        else collector.degraded_reason()
+    )
     payload = {
-        "status": "ok" if not (collector.last_error or recovery_required) else "degraded",
+        "status": "degraded" if degraded_reason else "ok",
+        "detail": degraded_reason,
         "collector": collector_status,
         "database_size_bytes": await asyncio.to_thread(store.database_size_bytes),
-        **collector_status,
     }
     return JSONResponse(payload, status_code=200)
 
@@ -594,6 +604,7 @@ async def refresh_history(request: Request) -> dict[str, object] | JSONResponse:
                 "counts": {},
                 "counts_exact": False,
                 "scopes": [],
+                "refresh": refresh_cooldown_status(),
             }
         return JSONResponse(
             {
@@ -763,11 +774,16 @@ async def scopes_history_bundle(request: Request) -> JSONResponse:
     return bounded_history_json_response({"scopes": scope_payloads, "budget": budget})
 
 
-def format_count(value: object, *, estimated: bool = False) -> str:
+def collector_state_label(status: dict[str, object]) -> str:
+    if not status.get("collector_running"):
+        return "Stopped"
+    return "Starting" if status.get("collector_starting") else "Running"
+
+
+def format_count(value: object) -> str:
     if value is None:
-        return "deferred"
-    prefix = "~" if estimated else ""
-    return f"{prefix}{value}"
+        return "-"
+    return f"{value}"
 
 
 def format_bytes(value: int) -> str:
@@ -852,7 +868,6 @@ def build_dashboard_context(
     database_size_bytes: int = 0,
     refresh: dict[str, object] | None = None,
 ) -> dict[str, object]:
-    counts_are_estimated = bool(counts.get("estimated"))
     release_payload = release_status or {}
     backoff_seconds = int(status.get("background_backoff_seconds_remaining") or 0)
     current_collection_label, collector_banner_text = dashboard_activity_labels(status)
@@ -863,11 +878,11 @@ def build_dashboard_context(
         "status": status,
         "counts": counts,
         "scopes": scopes,
-        "counts_are_estimated": counts_are_estimated,
         "database_size_label": format_bytes(database_size_bytes),
         "release_summary": str(release_payload.get("summary") or "Checking releases..."),
         "latest_url": safe_http_url(release_payload.get("latest_url")),
         "backoff_label": f"{backoff_seconds}s remaining" if backoff_seconds > 0 else "inactive",
+        "collector_state_label": collector_state_label(status),
         "current_collection_label": current_collection_label,
         "collector_banner_text": collector_banner_text,
         "direct_refresh_enabled": settings.refresh_auth_mode == "network",
