@@ -1292,10 +1292,15 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
     async def healthz(request: Request) -> JSONResponse:
         registry = get_inventory_registry()
         service = registry.get_service(None)
+        storage_problems, history_problem = await asyncio.gather(
+            asyncio.to_thread(refresh_storage_problems, request),
+            asyncio.to_thread(history_service_problem, get_settings()),
+        )
         payload = build_health_payload(
             service.peek_cached_snapshot(),
-            startup_problems=startup_problems_for(request),
+            startup_problems=storage_problems,
+            remote_problems=[history_problem] if history_problem else [],
         )
-        return JSONResponse(payload, status_code=200)
+        return JSONResponse(payload, status_code=health_status_code(payload))
 
     return router
