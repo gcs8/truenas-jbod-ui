@@ -604,6 +604,7 @@ async def refresh_history(request: Request) -> dict[str, object] | JSONResponse:
                 "counts": {},
                 "counts_exact": False,
                 "scopes": [],
+                "refresh": refresh_cooldown_status(),
             }
         return JSONResponse(
             {

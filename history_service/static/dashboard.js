@@ -122,6 +122,20 @@
     }
   }
 
+  // A 429 names the wait directly. An admitted full refresh that then failed
+  // (500) has already started the cooldown, and its failure envelope carries the
+  // current refresh state, so the Full button must stay held after it too.
+  function refreshCooldownFromFailure(statusCode, payload) {
+    if (statusCode === 429 && Number.isFinite(Number(payload?.retry_after_seconds))) {
+      return Number(payload.retry_after_seconds);
+    }
+    const remaining = payload?.refresh?.full_refresh_cooldown_seconds_remaining;
+    if (remaining !== null && remaining !== undefined && Number.isFinite(Number(remaining))) {
+      return Number(remaining);
+    }
+    return undefined;
+  }
+
   function updateFullRefreshCooldown(secondsRemaining) {
     const remaining = Number(secondsRemaining);
     if (!Number.isFinite(remaining)) return;
@@ -407,9 +421,7 @@
         }
         if (!response.ok || payload?.ok === false) {
           const error = new Error(payload?.detail || `Refresh failed with ${response.status}`);
-          if (response.status === 429 && Number.isFinite(Number(payload?.retry_after_seconds))) {
-            error.retryAfterSeconds = Number(payload.retry_after_seconds);
-          }
+          error.retryAfterSeconds = refreshCooldownFromFailure(response.status, payload);
           // Only the refresh handler's mode-bound failure envelope confirms
           // a completed collection failure. Generic 5xx/gateway errors do not.
           const applicationFailure = response.status === 500

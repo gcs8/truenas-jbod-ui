@@ -131,6 +131,18 @@ test("only the Full button counts down the refresh cooldown (#456)", () => {
   assert.match(TEMPLATE_SOURCE, /data-cooldown-seconds-remaining=/);
 });
 
+test("a failed full refresh keeps the cooldown its admission already started", () => {
+  const { refreshCooldownFromFailure } = loadFunctions(["refreshCooldownFromFailure"]);
+
+  assert.equal(refreshCooldownFromFailure(429, { retry_after_seconds: 42 }), 42);
+  assert.equal(
+    refreshCooldownFromFailure(500, { ok: false, refresh: { full_refresh_cooldown_seconds_remaining: 900 } }),
+    900
+  );
+  assert.equal(refreshCooldownFromFailure(500, { ok: false }), undefined);
+  assert.equal(refreshCooldownFromFailure(502, { detail: "Bad gateway" }), undefined);
+});
+
 test("dashboard reads the script-safe JSON bootstrap block", () => {
   const payload = { collector: { collection_activity: "</script>" }, counts: { tracked_slots: 1 } };
   const { readInitialOverview } = loadFunctions(["readInitialOverview"], {
