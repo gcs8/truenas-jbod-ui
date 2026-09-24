@@ -185,7 +185,7 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
     @router.post("/api/admin/debug/export")
     async def export_debug_bundle(
         payload: DebugBundleExportRequest,
-        stop_services: bool = Query(default=True),
+        stop_services: bool = Query(default=False),
         restart_services: bool = Query(default=True),
     ) -> Response:
         try:
