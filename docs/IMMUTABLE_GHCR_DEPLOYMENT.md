@@ -1,6 +1,6 @@
 # Immutable GHCR deployment
 
-This maintainer and controlled-operations runbook pins an image, Compose files, and the deployment helper to one source revision. For a normal installation, use the [Docker and GHCR deployment](../wiki/Docker-and-GHCR-Deployment.md) guide instead.
+This maintainer and controlled-operations runbook pins an image and deployment helper to one source revision while preserving the live Compose chain by default. For a normal installation, use the [Docker and GHCR deployment](../wiki/Docker-and-GHCR-Deployment.md) guide instead.
 
 ## Pick an image reference
 
@@ -36,7 +36,7 @@ mv -f "$helper_tmp" scripts/update_immutable_deployment.py
 trap - EXIT
 ```
 
-The helper and every Compose source must come from the same exact 40-hex source revision.
+The helper must come from the image workflow's exact 40-hex source revision. Live Compose bytes are preserved, including operator customizations. Only explicit `--replace-compose` downloads Compose sources from that revision.
 
 The update command takes the complete ordered Compose chain, active profiles, expected running services, and local health endpoints. This example uses the base file plus the non-root overlay with history active:
 
@@ -77,11 +77,29 @@ The helper then performs one bounded transaction. It:
 2. records each service's container image ID, immutable GHCR digest, health, and restart count;
 3. requires all declared app services to share one rollback digest;
 4. pulls the moving candidate tag and requires its sole GHCR `RepoDigest` to equal the full immutable image from the workflow receipt;
-5. downloads every declared Compose source from the same exact 40-hex source revision and validates the candidate chain;
+5. validates the existing Compose chain with the candidate image pin; only `--replace-compose` downloads and validates replacement sources from the selected revision;
 6. writes a private `0700` `.jbod-ui-image-update` directory containing a strict `0600` JSON receipt plus hashed previous and candidate Compose and `.env` bytes;
-7. activates the candidate bytes and digest, then requires the exact service set, image IDs, health, zero restart counts, and health URLs to converge.
+7. activates the digest without rewriting live Compose files by default, then requires the exact service set, image IDs, health, zero restart counts, and health URLs to converge.
+
+The receipt records `replace_compose` and hashes both Compose snapshots. In image-only mode the snapshots are identical, and rollback refuses later Compose drift rather than overwriting operator edits. Old receipts without the mode field retain their original replacement semantics.
+
+Use `--replace-compose` only for a separately reviewed Compose migration. It replaces every declared file, including overlays, so compare local customizations and retain configured auth, origins, network choices, and optional services before authorizing it. It is not a data migration or a permission-repair tool.
 
 The receipt is JSON data, not shell code. The helper rejects symlinks, wrong owners or modes, duplicate or extra keys, missing or extra files, hash changes, and cardinality mismatches before verify or rollback touches Docker. An existing receipt blocks another update so a rerun cannot erase rollback evidence.
+
+Activation and rollback allow up to 120 seconds of Docker `starting` health,
+polling every two seconds. Docker commands have separate bounded subprocess
+timeouts; HTTP probes retain their bounded retry budget. Unhealthy or exited
+containers, wrong images, changed Compose identity, and nonzero restarts fail
+immediately. After HTTP readiness the helper inspects the exact service and
+container identities, images, health, and restart counts again before recording
+success. Cancellation or failed rollback leaves no new success receipt.
+
+Image rollback does not revert database, catalog, configuration, or inventory
+writes. Pin-only rollback is safe only across predecessor-compatible durable
+formats. This helper does not establish the full automatic migration and
+recovery contract tracked in #399. Keep verified backups and check release
+compatibility evidence separately.
 
 ### Verify Runtime Convergence
 
@@ -97,7 +115,7 @@ Keep `.env` pinned to the full `name@sha256` value. Record the helper's source r
 
 ### Rollback To The Previous Digest
 
-Any failure after receipt publication triggers automatic rollback. The helper restores every prior Compose file, pins `.env` to the recorded previous digest, recreates the exact recorded profiles and services, and verifies image IDs, health, restart counts, and health URLs before reporting rollback complete.
+Any failure after receipt publication triggers automatic rollback. The helper preserves Compose in image-only mode, or restores prior Compose in replacement mode, pins `.env` to the recorded previous digest, recreates the exact recorded profiles and services, and verifies image IDs, health, restart counts, and health URLs before reporting rollback complete.
 
 You can request the same receipt-validated rollback later:
 

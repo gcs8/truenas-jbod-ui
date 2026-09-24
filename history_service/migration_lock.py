@@ -6,6 +6,7 @@ import os
 import socket
 import sqlite3
 import stat
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -15,6 +16,30 @@ try:
     import fcntl
 except ImportError as exc:  # pragma: no cover - production containers are Linux
     raise RuntimeError("Segmented history migration locking requires POSIX flock support.") from exc
+
+# Every history write lock used to resolve the path, stat it, and read and parse
+# /proc/self/mountinfo again, which a slot bundle paid fifteen times over (#457).
+# The validated address is cached on the file identity (device, inode, link
+# count, mode) rather than on mtime: the live database is written constantly, so
+# an mtime key would never hit, while every rejection this function raises
+# depends on the identity, which changes when the file is replaced or mounted
+# over.
+LOCK_ADDRESS_CACHE_MAX_ENTRIES = 64
+_lock_address_cache: dict[tuple[str, int, int, int, int], bytes] = {}
+_lock_address_cache_lock = threading.Lock()
+
+
+def clear_lock_address_cache() -> None:
+    """Drop every cached lock address (used by tests and lifecycle changes)."""
+
+    with _lock_address_cache_lock:
+        _lock_address_cache.clear()
+
+
+def lock_address_cache_size() -> int:
+    with _lock_address_cache_lock:
+        return len(_lock_address_cache)
+
 
 def history_lock_path(database_path: Path) -> Path:
     """Return the retired filesystem lock path for cleanup and compatibility checks."""
@@ -45,12 +70,25 @@ def _database_path_is_mount_point(database_path: Path) -> bool:
 
 def _history_lock_address(database_path: Path) -> bytes:
     database_path = Path(database_path).absolute()
-    canonical_parent = database_path.parent.resolve(strict=True)
-    canonical_path = canonical_parent / database_path.name
     try:
         metadata = os.stat(database_path, follow_symlinks=False)
     except FileNotFoundError:
         metadata = None
+    cache_key: tuple[str, int, int, int, int] | None = None
+    if metadata is not None:
+        cache_key = (
+            str(database_path),
+            int(metadata.st_dev),
+            int(metadata.st_ino),
+            int(metadata.st_nlink),
+            int(metadata.st_mode),
+        )
+        with _lock_address_cache_lock:
+            cached = _lock_address_cache.get(cache_key)
+        if cached is not None:
+            return cached
+    canonical_parent = database_path.parent.resolve(strict=True)
+    canonical_path = canonical_parent / database_path.name
     if metadata is not None:
         if _database_path_is_mount_point(canonical_path):
             raise ValueError("History database file mount points are not supported; mount its parent directory.")
@@ -61,7 +99,13 @@ def _history_lock_address(database_path: Path) -> bytes:
         if metadata.st_nlink != 1:
             raise ValueError("History database hard-link aliases are not supported.")
     digest = hashlib.sha256(os.fsencode(canonical_path)).hexdigest()[:40]
-    return f"\0truenas-jbod-history-{digest}".encode("ascii")
+    address = f"\0truenas-jbod-history-{digest}".encode("ascii")
+    if cache_key is not None:
+        with _lock_address_cache_lock:
+            if len(_lock_address_cache) >= LOCK_ADDRESS_CACHE_MAX_ENTRIES:
+                _lock_address_cache.clear()
+            _lock_address_cache[cache_key] = address
+    return address
 
 
 def _history_lock_directory(database_path: Path) -> Path:

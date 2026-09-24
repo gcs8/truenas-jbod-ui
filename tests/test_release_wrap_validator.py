@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
 from pathlib import Path
 
 from scripts.validate_release_wrap import (
     REQUIRED_GATES,
     changelog_coverage_required,
+    release_wrap_path,
     validate_release_wrap_text,
 )
 from scripts.verify_wiki_drift import ChangedFile, WikiVerificationResult
@@ -60,9 +62,35 @@ class ReleaseWrapValidatorTests(unittest.TestCase):
         self.assertIn("| Docs/wiki/public-demo publication |", text)
         self.assertIn("Pending owner publication: external wiki, public demo", text)
 
+    def test_release_wrap_path_prefers_current_then_archived_wrap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repository = Path(raw)
+            current = repository / "docs" / "RELEASE_WRAP_0.1.0.md"
+            archived = repository / "docs" / "archive" / "RELEASE_WRAP_0.1.0.md"
+
+            self.assertEqual(release_wrap_path(repository, "0.1.0"), current)
+
+            archived.parent.mkdir(parents=True)
+            archived.write_text("wrap\n", encoding="utf-8")
+            self.assertEqual(release_wrap_path(repository, "0.1.0"), archived)
+
+            current.write_text("wrap\n", encoding="utf-8")
+            self.assertEqual(release_wrap_path(repository, "0.1.0"), current)
+
+    def test_every_archived_release_wrap_is_readable_by_version(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        archived = sorted((repository / "docs" / "archive").glob("RELEASE_WRAP_*.md"))
+
+        self.assertGreater(len(archived), 0)
+        self.assertFalse(list((repository / "docs").glob("RELEASE_WRAP_0.22.*.md")))
+        for path in archived:
+            version = path.stem.removeprefix("RELEASE_WRAP_")
+            with self.subTest(version=version):
+                self.assertEqual(release_wrap_path(repository, version), path)
+
     def test_v0222_final_release_wrap_is_complete(self) -> None:
         repository = Path(__file__).resolve().parents[1]
-        text = (repository / "docs" / "RELEASE_WRAP_0.22.2.md").read_text(encoding="utf-8")
+        text = (repository / "docs" / "archive" / "RELEASE_WRAP_0.22.2.md").read_text(encoding="utf-8")
 
         self.assertFalse(changelog_coverage_required("0.22.2"))
         self.assertEqual(validate_release_wrap_text(text, require_changelog_coverage=False), [])
@@ -81,7 +109,7 @@ class ReleaseWrapValidatorTests(unittest.TestCase):
 
     def test_v0222_release_wrap_reconciles_pr121_after_release(self) -> None:
         repository = Path(__file__).resolve().parents[1]
-        text = (repository / "docs" / "RELEASE_WRAP_0.22.2.md").read_text(encoding="utf-8")
+        text = (repository / "docs" / "archive" / "RELEASE_WRAP_0.22.2.md").read_text(encoding="utf-8")
 
         self.assertIn("Post-release reconciliation", text)
         self.assertIn("PR #121 merged", text)
@@ -90,7 +118,7 @@ class ReleaseWrapValidatorTests(unittest.TestCase):
 
     def test_v0222_deployment_gate_records_private_receipt_validation(self) -> None:
         repository = Path(__file__).resolve().parents[1]
-        text = (repository / "docs" / "RELEASE_WRAP_0.22.2.md").read_text(encoding="utf-8")
+        text = (repository / "docs" / "archive" / "RELEASE_WRAP_0.22.2.md").read_text(encoding="utf-8")
         deployment_row = next(
             line for line in text.splitlines() if line.startswith("| Deployment refresh/sniff tests |")
         )
@@ -99,7 +127,7 @@ class ReleaseWrapValidatorTests(unittest.TestCase):
         self.assertIn("runtime convergence was reverified", deployment_row)
         self.assertIn("Private deployment identifiers are not retained", deployment_row)
 
-    def test_v0230_pretag_wrap_is_complete_with_postpublish_hold(self) -> None:
+    def test_v0230_wrap_records_publication_and_remaining_holds(self) -> None:
         repository = Path(__file__).resolve().parents[1]
         text = (repository / "docs" / "RELEASE_WRAP_0.23.0.md").read_text(encoding="utf-8")
 
@@ -120,8 +148,18 @@ class ReleaseWrapValidatorTests(unittest.TestCase):
             ),
             [],
         )
-        self.assertIn("Pending owner publication: external wiki, public demo", text)
-        self.assertIn("GHCR publication, deployment, external Wiki/public-demo publication", text)
+        self.assertIn("Tag: `v0.23.0`, published 2026-09-09", text)
+        self.assertIn("https://github.com/gcs8/truenas-jbod-ui/actions/runs/34293966354", text)
+        self.assertIn(
+            "ghcr.io/gcs8/truenas-jbod-ui@sha256:567d42025850a048186cf35adb2c97c071d27fa93f3071ec0eb3ddd71dd9df17",
+            text,
+        )
+        self.assertIn("Pending owner publication: external wiki", text)
+        self.assertIn("Private deployment qualification remains unverified", text)
+        self.assertIn("app version remains `0.23.0`", text)
+        self.assertIn("Development reopened before private deployment qualification completed", text)
+        self.assertNotIn("Tag: `v0.23.0` pending", text)
+        self.assertNotIn("Do not tag or publish v0.23.0", text)
 
     def test_accepts_complete_release_wrap_evidence_table(self) -> None:
         issues = validate_release_wrap_text(_wrap_with_rows({}))

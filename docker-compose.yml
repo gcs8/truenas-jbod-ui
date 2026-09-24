@@ -2,14 +2,7 @@ services:
   enclosure-ui:
     image: ${JBOD_UI_IMAGE:-ghcr.io/gcs8/truenas-jbod-ui:latest}
     container_name: truenas-jbod-ui
-    user: "${APP_UID:-10001}:${APP_GID:-10001}"
-    read_only: true
-    tmpfs:
-      - /tmp
-    cap_drop:
-      - ALL
-    security_opt:
-      - "no-new-privileges:true"
+    user: "0:0"
     env_file:
       - .env
     environment:
@@ -28,6 +21,8 @@ services:
     ports:
       - "${APP_BIND_ADDRESS:-0.0.0.0}:${APP_PORT:-8080}:8000"
     volumes:
+      # The read UI never writes under /app/config; the admin service owns those
+      # writes. Keep this read-only even without the non-root overlay.
       - ./config:/app/config:ro
       - ./data:/app/data
       - ./logs:/app/logs
@@ -41,14 +36,7 @@ services:
       - history
     image: ${JBOD_UI_IMAGE:-ghcr.io/gcs8/truenas-jbod-ui:latest}
     container_name: truenas-jbod-history
-    user: "${APP_UID:-10001}:${APP_GID:-10001}"
-    read_only: true
-    tmpfs:
-      - /tmp
-    cap_drop:
-      - ALL
-    security_opt:
-      - "no-new-privileges:true"
+    user: "0:0"
     command: ["uvicorn", "history_service.main:app", "--host", "0.0.0.0", "--port", "8001"]
     environment:
       TMPDIR: /app/history
@@ -63,8 +51,8 @@ services:
       HISTORY_SHARED_DIR_MODE: ${HISTORY_SHARED_DIR_MODE:-0770}
       HISTORY_SHARED_FILE_MODE: ${HISTORY_SHARED_FILE_MODE:-0660}
       HISTORY_BACKUP_DIR: ${HISTORY_BACKUP_DIR:-/app/history/backups}
-      HISTORY_BACKUP_RETENTION_COUNT: ${HISTORY_BACKUP_RETENTION_COUNT:-28}
-      HISTORY_BACKUP_INTERVAL_SECONDS: ${HISTORY_BACKUP_INTERVAL_SECONDS:-3600}
+      HISTORY_BACKUP_RETENTION_COUNT: ${HISTORY_BACKUP_RETENTION_COUNT:-7}
+      HISTORY_BACKUP_INTERVAL_SECONDS: ${HISTORY_BACKUP_INTERVAL_SECONDS:-86400}
       SCHEDULED_BACKUP_STATUS_FILE: ${SCHEDULED_BACKUP_STATUS_FILE:-}
       HISTORY_SEGMENTED_BACKUP_MAX_AGE_SECONDS: ${HISTORY_SEGMENTED_BACKUP_MAX_AGE_SECONDS:-129600}
       HISTORY_LONG_TERM_BACKUP_DIR: ${HISTORY_LONG_TERM_BACKUP_DIR:-/app/history/backups/long-term}
@@ -84,6 +72,7 @@ services:
       HISTORY_HOURLY_ROLLUP_RETENTION_DAYS: ${HISTORY_HOURLY_ROLLUP_RETENTION_DAYS:-365}
       HISTORY_DAILY_ROLLUP_RETENTION_DAYS: ${HISTORY_DAILY_ROLLUP_RETENTION_DAYS:-1825}
       HISTORY_RETENTION_INTERVAL_SECONDS: ${HISTORY_RETENTION_INTERVAL_SECONDS:-3600}
+      HISTORY_RETENTION_BACKUP_SKIP_MAX_SECONDS: ${HISTORY_RETENTION_BACKUP_SKIP_MAX_SECONDS:-86400}
       HISTORY_RETENTION_BATCH_SIZE: ${HISTORY_RETENTION_BATCH_SIZE:-5000}
       HISTORY_RETENTION_MAX_BATCHES_PER_RUN: ${HISTORY_RETENTION_MAX_BATCHES_PER_RUN:-20}
       HISTORY_PUBLISHED_BIND_ADDRESS: ${HISTORY_BIND_ADDRESS:-127.0.0.1}
@@ -113,17 +102,7 @@ services:
       - admin
     image: ${JBOD_UI_IMAGE:-ghcr.io/gcs8/truenas-jbod-ui:latest}
     container_name: truenas-jbod-admin
-    user: "0:${APP_GID:-10001}"
-    read_only: true
-    tmpfs:
-      - /tmp
-    cap_drop:
-      - ALL
-    cap_add:
-      - CHOWN
-      - FOWNER
-    security_opt:
-      - "no-new-privileges:true"
+    user: "0:0"
     command: ["uvicorn", "admin_service.main:app", "--host", "0.0.0.0", "--port", "8002"]
     env_file:
       - .env
@@ -173,7 +152,9 @@ services:
       - backup
     image: ${JBOD_UI_IMAGE:-ghcr.io/gcs8/truenas-jbod-ui:latest}
     command: ["python", "-m", "history_service.scheduled_backup_main"]
-    user: "${BACKUP_UID:-1000}:${BACKUP_GID:-1000}"
+    # Match root-owned legacy and fresh history without repairing host ownership.
+    # A separate non-root backup identity requires the prepared nonroot overlay.
+    user: "${BACKUP_UID:-0}:${BACKUP_GID:-0}"
     read_only: true
     tmpfs:
       - /tmp
