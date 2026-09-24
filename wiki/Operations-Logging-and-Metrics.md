@@ -54,7 +54,29 @@ Use `/healthz` to inspect cached application readiness and dependency state:
 curl http://your-docker-host:8080/healthz
 ```
 
-`/healthz` does not force a full inventory refresh. The history and admin sidecars provide their own `/livez` and `/healthz` endpoints while running.
+`/healthz` does not force a full inventory refresh. It reports three levels in
+`status`, with a one-line `summary` and a `problems` list:
+
+- `ok` (HTTP 200): nothing to act on.
+- `degraded` (HTTP 200): a system outside the container is unhealthy: the
+  TrueNAS API is unreachable or partial, SSH or BMC collection failed, or the
+  history service is unavailable or degraded. An uptime monitor that only
+  checks the HTTP code stays green; alert on `status` if you want to hear about
+  these.
+- `down` (HTTP 503): a local fault the container cannot operate through: its
+  data, logs or known-hosts folder is not writable. `curl -f` and uptime checks
+  trip on this.
+
+The history probe is cached for 30 seconds after success and 10 seconds after a
+failure, and an unset `HISTORY_BACKEND_URL` or a history container that is not
+deployed is not reported. The Docker healthcheck for the main UI probes
+`/livez`, not `/healthz`, so neither level restarts the container.
+
+The history and admin sidecars provide their own `/livez` and `/healthz`
+endpoints while running. History `/healthz` answers HTTP 503 with
+`status: down` only when its database could not be opened; collection and
+cleanup failures are `degraded` with HTTP 200. Admin `/healthz` is `ok` while
+the process runs.
 
 ## Read local logs
 

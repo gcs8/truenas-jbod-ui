@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import io
 import json
+import socket
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -206,27 +209,196 @@ class HealthzTests(unittest.TestCase):
         self.assertEqual(body["problems"], [f"TrueNAS API degraded: {message}"])
         self.assertNotIn("unreachable", body["summary"])
 
-    def test_unwritable_data_folder_is_degraded_even_before_the_first_inventory(self) -> None:
+    def test_unwritable_data_folder_is_down_even_before_the_first_inventory(self) -> None:
         status, body = self.call_healthz(None, problems=(CHOWN_SENTENCE,))
-        self.assertEqual(status, 200)
-        self.assertEqual(body["status"], "degraded")
+        self.assertEqual(status, 503)
+        self.assertEqual(body["status"], "down")
         self.assertEqual(body["dependency_status"], "unknown")
         self.assertEqual(body["summary"], f"Data folder not writable: {CHOWN_SENTENCE}")
         self.assertEqual(body["problems"], [CHOWN_SENTENCE])
 
     def test_unwritable_folder_and_unreachable_api_are_both_listed(self) -> None:
         status, body = self.call_healthz(_snapshot(api_ok=False, api_message=None), problems=(CHOWN_SENTENCE,))
-        self.assertEqual(status, 200)
+        self.assertEqual(status, 503)
+        self.assertEqual(body["status"], "down")
         self.assertEqual(body["summary"], f"Data folder not writable: {CHOWN_SENTENCE}")
         self.assertEqual(
             body["problems"],
             [CHOWN_SENTENCE, "TrueNAS API degraded: no details recorded"],
         )
 
+    def test_ssh_and_bmc_failures_are_degraded_not_down(self) -> None:
+        snapshot = _snapshot()
+        snapshot.sources["ssh"] = SourceStatus(enabled=True, ok=False, message="Authentication failed.")
+        snapshot.sources["bmc"] = SourceStatus(enabled=True, ok=False, message=None)
+        status, body = self.call_healthz(snapshot)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["status"], "degraded")
+        self.assertEqual(body["dependency_status"], "ok")
+        self.assertEqual(
+            body["problems"],
+            ["SSH degraded: Authentication failed.", "BMC/IPMI degraded: no details recorded"],
+        )
+        self.assertEqual(body["summary"], "SSH degraded: Authentication failed. (and 1 more)")
+
+    def test_disabled_ssh_is_not_a_problem(self) -> None:
+        # _snapshot() carries ssh enabled=False ok=False: turned off, not failing.
+        status, body = self.call_healthz(_snapshot())
+        self.assertEqual((status, body["status"], body["problems"]), (200, "ok", []))
+
+    def test_unavailable_history_service_is_degraded_not_down(self) -> None:
+        problem = "History service unavailable: connection refused."
+        with patch.object(app_main, "history_service_problem", return_value=problem):
+            status, body = self.call_healthz(_snapshot())
+        self.assertEqual(status, 200)
+        self.assertEqual(body["status"], "degraded")
+        self.assertEqual(body["summary"], problem)
+        self.assertEqual(body["problems"], [problem])
+
+    def test_every_remote_failure_together_is_still_200(self) -> None:
+        snapshot = _snapshot(api_ok=False, api_message="connection refused")
+        snapshot.sources["ssh"] = SourceStatus(enabled=True, ok=False, message="timed out")
+        with patch.object(app_main, "history_service_problem", return_value="History service unavailable: x"):
+            status, body = self.call_healthz(snapshot)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["status"], "degraded")
+        self.assertEqual(len(body["problems"]), 3)
+
     def test_livez_is_unchanged(self) -> None:
         response = asyncio.run(_route("/livez").endpoint())
         self.assertEqual(response.status_code, 200)
         self.assertEqual(json.loads(response.body)["status"], "ok")
+
+
+class StorageReprobeTests(unittest.TestCase):
+    def _request(self, directories: tuple[str, ...], problems: tuple[str, ...], checked_at: float) -> SimpleNamespace:
+        state = SimpleNamespace(
+            startup_problems=problems,
+            writable_directories=directories,
+            storage_checked_at_monotonic=checked_at,
+        )
+        return SimpleNamespace(app=SimpleNamespace(state=state))
+
+    def test_recent_probe_is_reused(self) -> None:
+        request = self._request(("/app/data",), (CHOWN_SENTENCE,), checked_at=1000.0)
+        with (
+            patch.object(app_main.time, "monotonic", return_value=1010.0),
+            patch.object(app_main, "probe_writable_directories") as probe,
+        ):
+            self.assertEqual(app_main.refresh_storage_problems(request), [CHOWN_SENTENCE])
+        probe.assert_not_called()
+
+    def test_a_fixed_folder_clears_the_down_state_without_a_restart(self) -> None:
+        request = self._request(("/app/data",), (CHOWN_SENTENCE,), checked_at=1000.0)
+        with (
+            patch.object(app_main.time, "monotonic", return_value=1031.0),
+            patch.object(app_main, "probe_writable_directories", return_value=[]) as probe,
+        ):
+            self.assertEqual(app_main.refresh_storage_problems(request), [])
+        probe.assert_called_once_with(("/app/data",))
+        self.assertEqual(request.app.state.startup_problems, ())
+        self.assertEqual(request.app.state.storage_checked_at_monotonic, 1031.0)
+
+    def test_a_folder_that_turns_read_only_is_noticed_and_logged_once(self) -> None:
+        request = self._request(("/app/data",), (), checked_at=1000.0)
+        with (
+            patch.object(app_main.time, "monotonic", return_value=1031.0),
+            patch.object(app_main, "probe_writable_directories", return_value=[CHOWN_SENTENCE]),
+            self.assertLogs(app_main.logger, level="ERROR") as logs,
+        ):
+            self.assertEqual(app_main.refresh_storage_problems(request), [CHOWN_SENTENCE])
+        self.assertEqual(len(logs.records), 1)
+
+    def test_real_probe_round_trip_on_a_writable_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            request = self._request((temp_dir,), (CHOWN_SENTENCE,), checked_at=0.0)
+            self.assertEqual(app_main.refresh_storage_problems(request), [])
+            self.assertEqual(list(Path(temp_dir).iterdir()), [])
+
+    def test_create_app_records_the_probe_directories(self) -> None:
+        application = app_main.create_app()
+        self.assertTrue(application.state.writable_directories)
+        self.assertIsInstance(application.state.storage_checked_at_monotonic, float)
+
+
+class _FakeResponse:
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def __enter__(self) -> "_FakeResponse":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+    def read(self, _limit: int = -1) -> bytes:
+        return self._body
+
+
+class HistoryProbeTests(unittest.TestCase):
+    URL = "http://history.example.test:8001"
+
+    def setUp(self) -> None:
+        app_main.HISTORY_PROBE_CACHE.clear()
+        self.addCleanup(app_main.HISTORY_PROBE_CACHE.clear)
+
+    def _probe(self, **urlopen: object) -> str | None:
+        with patch.object(app_main.urllib.request, "urlopen", **urlopen):
+            return app_main._probe_history_service(self.URL, 2.0)
+
+    def test_healthy_history_is_not_a_problem(self) -> None:
+        self.assertIsNone(self._probe(return_value=_FakeResponse(b'{"status": "ok"}')))
+
+    def test_degraded_history_carries_its_detail(self) -> None:
+        body = b'{"status": "degraded", "detail": "The last background collection failed."}'
+        self.assertEqual(
+            self._probe(return_value=_FakeResponse(body)),
+            "History service degraded: The last background collection failed.",
+        )
+
+    def test_history_storage_fault_is_named(self) -> None:
+        error = urllib.error.HTTPError(f"{self.URL}/healthz", 503, "down", {}, io.BytesIO(b"{}"))
+        self.assertIn("local storage fault", self._probe(side_effect=error) or "")
+
+    def test_refused_connection_is_named(self) -> None:
+        error = urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+        self.assertEqual(self._probe(side_effect=error), "History service unavailable: connection refused.")
+
+    def test_timeout_is_named(self) -> None:
+        self.assertEqual(
+            self._probe(side_effect=TimeoutError()),
+            "History service unavailable: no answer within 2 seconds.",
+        )
+
+    def test_unresolvable_host_means_not_deployed(self) -> None:
+        error = urllib.error.URLError(socket.gaierror(-2, "Name or service not known"))
+        self.assertIsNone(self._probe(side_effect=error))
+
+    def test_unreadable_answer_is_named(self) -> None:
+        self.assertIn("unreadable", self._probe(return_value=_FakeResponse(b"not json")) or "")
+
+    def test_unconfigured_history_is_not_probed(self) -> None:
+        with patch.object(app_main, "_probe_history_service") as probe:
+            self.assertIsNone(app_main.history_service_problem(Settings()))
+        probe.assert_not_called()
+
+    def test_answers_are_cached_and_the_timeout_is_capped(self) -> None:
+        settings = Settings()
+        settings.history.service_url = self.URL
+        settings.history.timeout_seconds = 10
+        clock = [1000.0]
+        with (
+            patch.object(app_main, "_probe_history_service", return_value="History service unavailable: x") as probe,
+            patch.object(app_main.time, "monotonic", side_effect=lambda: clock[0]),
+        ):
+            app_main.history_service_problem(settings)
+            clock[0] += 9.0
+            app_main.history_service_problem(settings)
+            self.assertEqual(probe.call_count, 1)
+            clock[0] += 2.0
+            app_main.history_service_problem(settings)
+            self.assertEqual(probe.call_count, 2)
+        probe.assert_called_with(self.URL, app_main.HISTORY_PROBE_MAX_TIMEOUT_SECONDS)
 
 
 class AdminProbeCacheTests(unittest.TestCase):
