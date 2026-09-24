@@ -23,6 +23,20 @@ class GHCRReleaseContractTests(unittest.TestCase):
         self.assertIn("Immutable manifest digest", workflow)
         self.assertRegex(workflow, r"sha256:\[0-9a-f\]\{64\}")
 
+    def test_release_publish_refuses_a_public_demo_not_rebuilt_for_the_release(self) -> None:
+        workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
+        gate = workflow.index("Require a public demo rebuilt for this release")
+        push = workflow.index("Build and push image")
+
+        # The gate runs on every release event, before anything is pushed.
+        self.assertLess(gate, push)
+        gate_step = workflow[gate:push]
+        self.assertIn("if: github.event_name == 'release'", gate_step)
+        self.assertIn('python scripts/validate_release_wrap.py "$RELEASE_TAG" --public-demo-only', gate_step)
+        self.assertIn("RELEASE_TAG: ${{ github.event.release.tag_name }}", gate_step)
+        self.assertNotIn("continue-on-error", gate_step)
+        self.assertIn("fetch-depth: 0", workflow[: gate])
+
     def test_runbook_distinguishes_mutable_tags_from_immutable_digests(self) -> None:
         runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
 
