@@ -44,8 +44,9 @@ RESULT_PREFIX = "shard-"
 RESULT_SUFFIX = ".json"
 
 # Balanced from a per-test timing run on ubuntu-latest (2026-09-24, Python 3.12
-# and 3.14 averaged, after the slow-test fixes of the same effort). Keep each
-# tuple sorted; the guard test rejects a module listed twice or not at all.
+# and 3.14 averaged; shard 1 carries the backup and rotation suites, so it is
+# the lightest by module count). Keep each tuple sorted; the guard test rejects
+# a module listed twice or not at all.
 SHARDS: dict[str, tuple[str, ...]] = {
     "1": (
         "test_admin_auth",
@@ -67,7 +68,6 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_private_qa_restore",
         "test_process_secrets",
         "test_profile_builder",
-        "test_public_demo_fixture",
         "test_public_doc_privacy",
         "test_public_docs_contract",
         "test_release_wrap_validator",
@@ -107,6 +107,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_perf_budgets",
         "test_prometheus_alert_rules",
         "test_public_demo_deployment",
+        "test_public_demo_fixture",
         "test_public_demo_history_consistency",
         "test_public_demo_provenance",
         "test_public_screenshots",
