@@ -92,6 +92,7 @@ function refreshHarness(snapshotMode) {
     state: { snapshotMode, autoRefresh: true, refreshIntervalSeconds: 30 },
     renderTimingSurfaces() {},
     ensureTimingTick() {},
+    ensureRefreshIntervalOption() {},
   });
   renderRefreshControls();
   return controls;
@@ -127,6 +128,7 @@ test("renderRefreshControls tolerates a template without the optional wrappers",
     state: { snapshotMode: true, autoRefresh: true, refreshIntervalSeconds: 30 },
     renderTimingSurfaces() {},
     ensureTimingTick() {},
+    ensureRefreshIntervalOption() {},
   });
 
   assert.doesNotThrow(() => renderRefreshControls());
