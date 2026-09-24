@@ -63,6 +63,9 @@ DEFAULT_MAX_JOURNAL_BYTES = 1024 * 1024
 DEFAULT_RETAIN_COMMITTED_ENTRIES = 256
 MAX_LINE_BYTES = 64 * 1024
 MAX_SUBJECT_CHARS = 256
+# Change ids per commit record: 256 ids of <= 68 bytes stay far below MAX_LINE_BYTES.
+COMMIT_IDS_PER_RECORD = 256
+MAX_RETRY_EXPONENT = 16
 
 # Dict keys whose values change on every save without changing what the operator
 # configured. Matched by exact key name at any depth of a config document.
@@ -347,17 +350,23 @@ class ChangeJournal:
             raise ValueError("a noop commit has no backup_id")
         _validate_hash(config_hash, "config_hash")
         ids = [str(cid) for cid in change_ids]
-        record = {
-            "v": JOURNAL_FORMAT_VERSION,
-            "type": "commit",
-            "at": _format_time(self._utcnow()),
-            "change_ids": ids,
-            "outcome": outcome,
-            "backup_id": backup_id,
-            "config_hash": config_hash,
-        }
+        at = _format_time(self._utcnow())
+        # Large runs are split so no line reaches the parser's MAX_LINE_BYTES; all
+        # chunks go out in one write and one fsync.
+        records = [
+            {
+                "v": JOURNAL_FORMAT_VERSION,
+                "type": "commit",
+                "at": at,
+                "change_ids": ids[start : start + COMMIT_IDS_PER_RECORD],
+                "outcome": outcome,
+                "backup_id": backup_id,
+                "config_hash": config_hash,
+            }
+            for start in range(0, max(len(ids), 1), COMMIT_IDS_PER_RECORD)
+        ]
         with self._locked():
-            self._append_records_locked([record])
+            self._append_records_locked(records)
             if self._size_locked() > self.max_bytes:
                 self._compact_locked()
 
@@ -442,12 +451,17 @@ class ChangeJournal:
             return handle.read()
 
     def _append_records_locked(self, records: list[dict[str, Any]]) -> None:
+        payload = b"".join(_stable_json(record).encode("utf-8") + b"\n" for record in records)
+        created = not os.path.lexists(self.path)
         fd = self._open_journal(os.O_RDWR | os.O_CREAT | os.O_APPEND)
         try:
-            recovered = self._repair_torn_tail(fd)
-            if recovered is not None:
-                records = [recovered, *records]
-            payload = b"".join(_stable_json(record).encode("utf-8") + b"\n" for record in records)
+            if self._has_torn_tail(fd):
+                # Terminate the torn line in the same write instead of truncating
+                # it: the damaged line stays on disk as evidence and parses as a
+                # pending ``journal.recovered`` change with the same id readers
+                # already showed for it, so no crash point loses that change.
+                logger.warning("Config change journal: terminating a torn last line")
+                payload = b"\n" + payload
             view = memoryview(payload)
             while view:
                 written = os.write(fd, view)
@@ -455,39 +469,13 @@ class ChangeJournal:
             os.fsync(fd)
         finally:
             os.close(fd)
+        if created:
+            _fsync_directory(self.path.parent)
 
-    def _repair_torn_tail(self, fd: int) -> dict[str, Any] | None:
-        """Truncate an unterminated last line left by a crash mid-write.
-
-        The torn line may have been a change record whose mutation already hit
-        disk, so it is replaced by a durable ``journal.recovered`` change that
-        keeps a config backup pending. Its id matches the placeholder readers
-        showed for the torn line, so nothing already committed is reopened.
-        """
-
+    @staticmethod
+    def _has_torn_tail(fd: int) -> bool:
         size = os.fstat(fd).st_size
-        if size == 0 or os.pread(fd, 1, size - 1) == b"\n":
-            return None
-        data = os.pread(fd, size, 0)
-        newline = data.rfind(b"\n")
-        keep = newline + 1
-        tail = data[keep:]
-        line_number = data.count(b"\n", 0, keep) + 1
-        logger.warning("Config change journal: replacing a %d-byte torn last line", len(tail))
-        os.ftruncate(fd, keep)
-        os.fsync(fd)
-        placeholder = _recovered_entry(line_number, tail, torn=True)
-        return {
-            "v": JOURNAL_FORMAT_VERSION,
-            "type": "change",
-            "change_id": placeholder.change_id,
-            "at": _format_time(self._utcnow()),
-            "action": placeholder.action,
-            "subject": placeholder.subject,
-            "before": None,
-            "after": None,
-            "recovered": True,
-        }
+        return size > 0 and os.pread(fd, 1, size - 1) != b"\n"
 
     # -- parsing ----------------------------------------------------------------------
 
@@ -510,7 +498,18 @@ class ChangeJournal:
             if not isinstance(record, dict) or not self._apply_record(state, record):
                 self._add_recovered_placeholder(state, number, raw)
         if tail:
-            self._add_recovered_placeholder(state, len(lines) + 1, tail, torn=True)
+            # A record missing only its newline is complete and counts; anything
+            # else is a torn write that keeps a backup pending.
+            record = None
+            if len(tail) <= MAX_LINE_BYTES:
+                try:
+                    record = json.loads(tail)
+                except (ValueError, UnicodeDecodeError):
+                    record = None
+            if isinstance(record, dict) and self._apply_record(state, record):
+                state.torn_tail_bytes = len(tail)
+            else:
+                self._add_recovered_placeholder(state, len(lines) + 1, tail, torn=True)
         for change_id, (outcome, backup_id) in state.commits.items():
             entry = state.changes.get(change_id)
             if entry is not None:
@@ -960,7 +959,8 @@ class ConfigBackupCoalescer:
         with self._state_lock:
             self.last_error = error
             self._failures += 1
-            delay = min(self.max_delay, max(self.quiet_period, 1.0) * (2 ** (self._failures - 1)))
+            exponent = min(self._failures - 1, MAX_RETRY_EXPONENT)
+            delay = min(self.max_delay, max(self.quiet_period, 1.0) * (2**exponent))
             self._retry_at = self._clock() + delay
         return CoalescerResult(status="failed", change_ids=change_ids, error=error)
 

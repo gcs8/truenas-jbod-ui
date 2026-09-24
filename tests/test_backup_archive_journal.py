@@ -131,12 +131,13 @@ class ChangeJournalTests(JournalTestCase):
         with self.assertRaises(JournalError):
             ChangeJournal(link).append("mapping.save")
 
-    def test_torn_last_line_is_ignored_then_replaced_by_a_pending_recovered_change(self) -> None:
+    def test_torn_last_line_stays_pending_as_recovered_change_across_repair(self) -> None:
         journal = ChangeJournal(self.path)
         first = journal.append("mapping.save", "slot-1")
         journal.commit([first.change_id], outcome="backup", config_hash="c" * 64, backup_id="cfg-1")
         with self.path.open("ab") as handle:
             handle.write(b'{"v":1,"type":"change","change_id":"chg_')  # crash mid-write
+        size_before = self.path.stat().st_size
         reopened = ChangeJournal(self.path)
         pending = reopened.pending()
         self.assertEqual(len(pending), 1)
@@ -144,13 +145,52 @@ class ChangeJournalTests(JournalTestCase):
         self.assertEqual(reopened.last_backup(), ("c" * 64, "cfg-1"))
         self.assertGreater(reopened.stats().torn_tail_bytes, 0)
         second = reopened.append("mapping.save", "slot-2")
-        text = self.path.read_bytes()
-        self.assertTrue(text.endswith(b"\n"))
-        for line in text.splitlines():
-            json.loads(line)  # every line parses after the repair
+        data = self.path.read_bytes()
+        self.assertTrue(data.endswith(b"\n"))
+        self.assertGreater(len(data), size_before)  # the torn bytes were never truncated away
         ids = [e.change_id for e in reopened.pending()]
+        # The terminated line keeps the placeholder id readers already saw.
         self.assertEqual(ids, [pending[0].change_id, second.change_id])
         self.assertEqual(reopened.stats().torn_tail_bytes, 0)
+        self.assertEqual(reopened.stats().corrupt_lines, 1)
+        reopened.commit(ids, outcome="noop", config_hash="c" * 64)
+        self.assertEqual(ChangeJournal(self.path).pending(), [])
+        reopened.compact()
+        self.assertNotIn(b'"change_id":"chg_\n', self.path.read_bytes())
+        self.assertEqual(ChangeJournal(self.path).pending(), [])
+
+    def test_complete_record_missing_only_its_newline_is_kept(self) -> None:
+        journal = ChangeJournal(self.path)
+        entry = journal.append("mapping.save", "slot-1")
+        self.path.write_bytes(self.path.read_bytes().rstrip(b"\n"))
+        self.assertEqual([e.change_id for e in journal.pending()], [entry.change_id])
+        journal.append("mapping.save", "slot-2")
+        self.assertEqual(len(journal.pending()), 2)
+        self.assertEqual(journal.stats().corrupt_lines, 0)
+
+    def test_first_append_fsyncs_the_directory(self) -> None:
+        from history_service.backup_archive import journal as journal_module
+
+        calls = []
+        original = journal_module._fsync_directory
+        journal_module._fsync_directory = lambda path: calls.append(path)
+        try:
+            journal = ChangeJournal(self.path)
+            journal.append("mapping.save")
+            journal.append("mapping.save")
+        finally:
+            journal_module._fsync_directory = original
+        self.assertEqual(calls, [self.path.parent])
+
+    def test_large_commit_is_split_below_the_line_limit(self) -> None:
+        journal = ChangeJournal(self.path, max_bytes=16 * 1024 * 1024)
+        ids = [journal.append("mapping.save", f"s{n}").change_id for n in range(1700)]
+        journal.commit(ids, outcome="backup", config_hash="e" * 64, backup_id="cfg-big")
+        self.assertTrue(all(len(line) < 64 * 1024 for line in self.path.read_bytes().splitlines()))
+        reread = ChangeJournal(self.path)
+        self.assertEqual(reread.pending(), [])
+        self.assertEqual(reread.last_backup(), ("e" * 64, "cfg-big"))
+        self.assertEqual(reread.stats().corrupt_lines, 0)
 
     def test_corrupt_complete_line_keeps_a_backup_pending(self) -> None:
         journal = ChangeJournal(self.path)
@@ -338,6 +378,17 @@ class CoalescerTests(JournalTestCase):
         self.assertEqual(ok.status, "backup")
         self.assertEqual(ok.backup_id, "cfg-ok")
         self.assertIsNone(co.last_error)
+
+    def test_retry_delay_does_not_overflow_after_many_failures(self) -> None:
+        def always_fail(change_ids):
+            raise OSError("target down")
+
+        co = self.coalescer(make_backup=always_fail)
+        co.record_change("mapping.save", "slot-1")
+        co._failures = 5000  # a week-plus of failures
+        self.clock.advance(30)
+        self.assertEqual(co.run().status, "failed")
+        self.assertEqual(co.seconds_until_due(), 600)
 
     def test_backup_without_artifact_id_is_a_failure(self) -> None:
         co = self.coalescer(make_backup=lambda ids: {"name": "x"})
