@@ -1831,7 +1831,7 @@ class HistoryStoreTests(unittest.TestCase):
             store = HistoryStore(str(root / "history.db"))
             backup_has_thread_lock = threading.Event()
             backup_has_lifecycle_lock = threading.Event()
-            writer_attempted_lifecycle_lock = threading.Event()
+            writer_completed = threading.Event()
             writer_waits_for_thread_lock = threading.Event()
             backup_errors: list[BaseException] = []
             writer_errors: list[BaseException] = []
@@ -1846,9 +1846,11 @@ class HistoryStoreTests(unittest.TestCase):
                     real_thread_lock.acquire()
                     if current_thread is backup_thread:
                         backup_has_thread_lock.set()
-                        if backup_has_lifecycle_lock.is_set() and not writer_attempted_lifecycle_lock.wait(5):
+                        # Hold the lifecycle lock through the real writer attempt,
+                        # not merely its announcement before lock acquisition.
+                        if backup_has_lifecycle_lock.is_set() and not writer_completed.wait(5):
                             real_thread_lock.release()
-                            raise TimeoutError("ordinary writer did not attempt the lifecycle lock")
+                            raise TimeoutError("ordinary writer did not complete the lifecycle lock attempt")
                     return self
 
                 def __exit__(self, *args: object) -> None:
@@ -1878,6 +1880,8 @@ class HistoryStoreTests(unittest.TestCase):
                     )
                 except BaseException as exc:
                     writer_errors.append(exc)
+                finally:
+                    writer_completed.set()
 
             backup_thread = threading.Thread(target=run_backup, name="history-backup")
             writer_thread = threading.Thread(target=run_writer, name="ordinary-history-writer")
@@ -1893,21 +1897,14 @@ class HistoryStoreTests(unittest.TestCase):
                         "lifecycle lock, and ordinary writer holds the lifecycle lock while waiting "
                         "for the thread lock"
                     )
-                # The writer reports its attempt only after the bind itself, so the
-                # backup keeps both locks until the writer has really tried; the
-                # publish step it now guards is too short to race against otherwise.
-                try:
-                    with history_write_lock(*args, **kwargs):
+                with history_write_lock(*args, **kwargs):
+                    if current_thread is backup_thread:
+                        backup_has_lifecycle_lock.set()
+                    try:
+                        yield
+                    finally:
                         if current_thread is backup_thread:
-                            backup_has_lifecycle_lock.set()
-                        try:
-                            yield
-                        finally:
-                            if current_thread is backup_thread:
-                                backup_has_lifecycle_lock.clear()
-                finally:
-                    if current_thread is writer_thread:
-                        writer_attempted_lifecycle_lock.set()
+                            backup_has_lifecycle_lock.clear()
 
             store._lock = TrackingThreadLock()  # type: ignore[assignment]
             with patch("history_service.store.history_write_lock", tracking_history_write_lock):

@@ -125,8 +125,8 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
         EnclosureProfileConfig(
             id=CORE_CSE_946_PROFILE_ID,
             label="Supermicro CSE-946 Top",
-            eyebrow="TrueNAS CORE / Supermicro CSE-946 Top View",
-            summary="Top-loading bay map with API-or-SSH LED control and optional SSH enrichment.",
+            eyebrow="Supermicro CSE-946",
+            summary="Top of the chassis, 60 bays, seen from above with the front at the bottom.",
             panel_title="Enclosure Top",
             edge_label="System front / latch edge",
             face_style="top-loader",
@@ -145,14 +145,12 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
         EnclosureProfileConfig(
             id=DELL_MD1280_PROFILE_ID,
             label="Dell MD1280 84 Bay",
-            eyebrow="TrueNAS SCALE / Dell MD1280 (Xyratex 5U84) Drawer View",
+            eyebrow="Dell MD1280 (Xyratex 5U84)",
+            # Slot mapping comes from the Linux enclosure driver because this
+            # shelf's AES pages cannot identify SATA drives per bay.
             summary=(
-                "Both pull-out drawers stacked as in the chassis: the top drawer "
-                "holds bays 1-42 and the bottom drawer 43-84, each three rows of "
-                "fourteen with the front row at the drawer-pull edge. Bay labels "
-                "match the 1-based chassis silk-screen; slot mapping comes from "
-                "the Linux enclosure driver because this shelf's AES pages cannot "
-                "identify SATA drives per bay."
+                "Both drawers, bays 1-84; the top drawer holds 1-42 and the "
+                "bottom drawer 43-84. Bay numbers match the chassis labels."
             ),
             panel_title="Both Drawers (Top View)",
             edge_label="Drawer fronts / pull edge",
@@ -168,12 +166,8 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
         EnclosureProfileConfig(
             id=DELL_MD1280_DRAWER_TOP_PROFILE_ID,
             label="Dell MD1280 Drawer 1-42 (Top)",
-            eyebrow="TrueNAS SCALE / Dell MD1280 Top Drawer",
-            summary=(
-                "Top drive drawer only: chassis bays 1-42 as three rows of fourteen "
-                "with the front row at the drawer-pull edge. Bay labels match the "
-                "1-based chassis silk-screen."
-            ),
+            eyebrow="Dell MD1280",
+            summary="Top drawer, bays 1-42. Bay numbers match the chassis labels.",
             panel_title="Top Drawer",
             edge_label="Drawer front / pull edge",
             face_style="drawer",
@@ -187,12 +181,8 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
         EnclosureProfileConfig(
             id=DELL_MD1280_DRAWER_BOTTOM_PROFILE_ID,
             label="Dell MD1280 Drawer 43-84 (Bottom)",
-            eyebrow="TrueNAS SCALE / Dell MD1280 Bottom Drawer",
-            summary=(
-                "Bottom drive drawer only: chassis bays 43-84 as three rows of "
-                "fourteen with the front row at the drawer-pull edge. Bay labels "
-                "match the 1-based chassis silk-screen."
-            ),
+            eyebrow="Dell MD1280",
+            summary="Bottom drawer, bays 43-84. Bay numbers match the chassis labels.",
             panel_title="Bottom Drawer",
             edge_label="Drawer front / pull edge",
             face_style="drawer",
@@ -206,8 +196,8 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
         EnclosureProfileConfig(
             id=SCALE_SSG_FRONT_24_PROFILE_ID,
             label="Supermicro SSG-6048R Front 24",
-            eyebrow="TrueNAS SCALE / Supermicro SSG-6048R Front View",
-            summary="Front-drive map with Linux SES AES slot mapping and SSH smartctl enrichment.",
+            eyebrow="Supermicro SSG-6048R",
+            summary="Front of the chassis, 24 bays.",
             panel_title="Front 24 Bay",
             edge_label="Front of chassis",
             face_style="front-drive",
@@ -227,8 +217,8 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
         EnclosureProfileConfig(
             id=SCALE_SSG_REAR_12_PROFILE_ID,
             label="Supermicro SSG-6048R Rear 12",
-            eyebrow="TrueNAS SCALE / Supermicro SSG-6048R Rear View",
-            summary="Rear-drive map with Linux SES AES slot mapping and SSH smartctl enrichment.",
+            eyebrow="Supermicro SSG-6048R",
+            summary="Rear of the chassis, 12 bays.",
             panel_title="Rear 12 Bay",
             edge_label="Rear of chassis",
             face_style="rear-drive",
@@ -245,8 +235,8 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
         EnclosureProfileConfig(
             id=LINUX_GPU_SERVER_NVME_PROFILE_ID,
             label="Supermicro SYS-2029GP-TR Right NVMe 2",
-            eyebrow="Generic Linux / Supermicro SYS-2029GP-TR NVMe View",
-            summary="SSH-only Linux profile for the two right-side NVMe bays on a SYS-2029GP-TR host.",
+            eyebrow="Supermicro SYS-2029GP-TR",
+            summary="The two NVMe bays on the right side of the chassis.",
             panel_title="Right NVMe 2",
             edge_label="Rear of chassis",
             face_style="rear-drive",
@@ -265,8 +255,8 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
         EnclosureProfileConfig(
             id=UNIFI_UNVR_FRONT_4_PROFILE_ID,
             label="Ubiquiti UniFi UNVR Front 4",
-            eyebrow="Generic Linux / Ubiquiti UniFi UNVR Front View",
-            summary="First-pass 4-bay front-drive profile for UniFi UNVR and similar password-SSH Linux appliances.",
+            eyebrow="Ubiquiti UniFi UNVR",
+            summary="Front of the chassis, 4 bays.",
             panel_title="Front 4 Bay",
             edge_label="Front of chassis",
             face_style="unifi-drive",
@@ -287,8 +277,8 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
         EnclosureProfileConfig(
             id=UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID,
             label="Ubiquiti UniFi UNVR Pro Front 7",
-            eyebrow="Generic Linux / Ubiquiti UniFi UNVR Pro Front View",
-            summary="First-pass 7-bay front-drive profile for UniFi UNVR Pro appliances, using the validated 3-over-4 physical face layout.",
+            eyebrow="Ubiquiti UniFi UNVR Pro",
+            summary="Front of the chassis, 7 bays: 3 on the top row and 4 below.",
             panel_title="Front 7 Bay",
             edge_label="Front of chassis",
             face_style="unifi-drive",
@@ -311,8 +301,8 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
         EnclosureProfileConfig(
             id=QUANTASTOR_SSG_SHARED_24_PROFILE_ID,
             label="Supermicro SSG-2028R Shared Front 24",
-            eyebrow="OSNexus Quantastor / Supermicro SSG-2028R Front View",
-            summary="First-pass shared 24-slot front-drive profile for Quantastor dual-node chassis validation.",
+            eyebrow="Supermicro SSG-2028R",
+            summary="Front of the chassis, 24 bays shared by both nodes.",
             panel_title="Shared Front 24",
             edge_label="Front of chassis",
             face_style="front-drive",
@@ -327,8 +317,8 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
         EnclosureProfileConfig(
             id=ESXI_AOC_SLG4_2H8M2_PROFILE_ID,
             label="Supermicro AOC-SLG4-2H8M2",
-            eyebrow="VMware ESXi / Supermicro AOC-SLG4-2H8M2",
-            summary="Read-only ESXi StorCLI profile for the two M.2 members behind the SAS3808 hardware RAID adapter.",
+            eyebrow="Supermicro AOC-SLG4-2H8M2",
+            summary="The two M.2 slots on the RAID card. View only; no locate lights.",
             panel_title="AOC-SLG4-2H8M2",
             edge_label="PCIe edge / M.2 RAID card",
             face_style="nvme-carrier",
@@ -348,12 +338,10 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
         EnclosureProfileConfig(
             id=SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID,
             label="Supermicro FatTwin Front 6",
-            eyebrow="Supermicro FatTwin / Front 6 Bay",
-            summary=(
-                "First-pass front six-bay profile for Supermicro FatTwin nodes, using the usual "
-                "Supermicro bottom-up then left-to-right front-bay numbering with validated BMC "
-                "slot-hint bindings for the onboard Broadcom 3108 storage path."
-            ),
+            eyebrow="Supermicro FatTwin",
+            # Bays are matched through BMC slot numbers on the onboard Broadcom
+            # 3108 storage path; numbering runs bottom-up, then left to right.
+            summary="Front of the node, 6 bays, numbered bottom to top, then left to right.",
             panel_title="Front 6 Bay",
             edge_label="Front of node",
             face_style="front-drive",
@@ -383,12 +371,10 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
         EnclosureProfileConfig(
             id=SUPERMICRO_FATTWIN_REAR_2_PROFILE_ID,
             label="Supermicro FatTwin Rear 2",
-            eyebrow="Supermicro FatTwin / Rear 2 Bay",
-            summary=(
-                "First-pass rear two-bay profile for Supermicro FatTwin nodes, using the validated "
-                "stacked rear-carrier orientation with independent BMC slot numbers outside the "
-                "front six-bay range."
-            ),
+            eyebrow="Supermicro FatTwin",
+            # The rear carrier uses its own BMC slot numbers outside the front
+            # six-bay range; bay 1 sits above bay 0.
+            summary="Rear of the node, 2 stacked bays.",
             panel_title="Rear 2 Bay",
             edge_label="Rear of node",
             face_style="rear-drive",
@@ -408,8 +394,8 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
         EnclosureProfileConfig(
             id=GENERIC_FRONT_24_1X24_PROFILE_ID,
             label="Generic Front 24",
-            eyebrow="Generic / 1 x 24 Front View",
-            summary="Reusable 1-by-24 front-drive profile for common 24-bay SFF and NVMe chassis.",
+            eyebrow="Generic 24-bay chassis",
+            summary="Front of the chassis, 24 bays in one row, left to right.",
             panel_title="Front 24 Bay",
             edge_label="Front of chassis",
             face_style="front-drive",
@@ -422,8 +408,8 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
         EnclosureProfileConfig(
             id=GENERIC_FRONT_12_3X4_PROFILE_ID,
             label="Generic Front 12",
-            eyebrow="Generic / 3 x 4 Front View",
-            summary="Reusable 3-by-4 front-drive profile for common 12-bay LFF chassis and JBOD faces.",
+            eyebrow="Generic 12-bay chassis",
+            summary="Front of the chassis, 12 bays in 3 rows of 4.",
             panel_title="Front 12 Bay",
             edge_label="Front of chassis",
             face_style="front-drive",
@@ -436,8 +422,8 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
         EnclosureProfileConfig(
             id=GENERIC_TOP_60_4X15_PROFILE_ID,
             label="Generic Top 60",
-            eyebrow="Generic / 4 x 15 Top View",
-            summary="Reusable 4-by-15 top-loading profile for common 60-bay chassis with a full top face.",
+            eyebrow="Generic 60-bay top loader",
+            summary="Top of the chassis, 60 bays in 4 rows of 15.",
             panel_title="Top 60 Bay",
             edge_label="System front / latch edge",
             face_style="top-loader",
@@ -450,8 +436,8 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
         EnclosureProfileConfig(
             id=GENERIC_FRONT_60_5X12_PROFILE_ID,
             label="Generic Front 60",
-            eyebrow="Generic / 5 x 12 Front View",
-            summary="Reusable 5-by-12 front-drive profile for common 60-bay front-loading shelves.",
+            eyebrow="Generic 60-bay shelf",
+            summary="Front of the shelf, 60 bays in 5 rows of 12.",
             panel_title="Front 60 Bay",
             edge_label="Front of chassis",
             face_style="front-drive",
@@ -464,8 +450,8 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
         EnclosureProfileConfig(
             id=GENERIC_FRONT_84_6X14_PROFILE_ID,
             label="Generic Front 84",
-            eyebrow="Generic / 6 x 14 Front View",
-            summary="Reusable 6-by-14 front-drive profile for common 84-bay dense shelves.",
+            eyebrow="Generic 84-bay shelf",
+            summary="Front of the shelf, 84 bays in 6 rows of 14.",
             panel_title="Front 84 Bay",
             edge_label="Front of chassis",
             face_style="front-drive",
@@ -478,8 +464,8 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
         EnclosureProfileConfig(
             id=GENERIC_FRONT_102_8X14_PROFILE_ID,
             label="Generic Front 102",
-            eyebrow="Generic / 8 x 14 Front View",
-            summary="Reusable 8-by-14 front-drive profile for 102-bay shelves with an internal center beam or airflow gap.",
+            eyebrow="Generic 102-bay shelf",
+            summary="Front of the shelf, 102 bays in 8 rows with a gap in the middle.",
             panel_title="Front 102 Bay",
             edge_label="Front of chassis",
             face_style="front-drive",
@@ -502,8 +488,8 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
         EnclosureProfileConfig(
             id=GENERIC_FRONT_106_8X14_PROFILE_ID,
             label="Generic Front 106",
-            eyebrow="Generic / 8 x 14 Front View",
-            summary="Reusable 8-by-14 front-drive profile for 106-bay shelves with a 96-drive main field and a 10-drive sidecar section.",
+            eyebrow="Generic 106-bay shelf",
+            summary="Front of the shelf, 106 bays: 96 in the main field and 10 in the side section.",
             panel_title="Front 106 Bay",
             edge_label="Front of chassis",
             face_style="front-drive",
