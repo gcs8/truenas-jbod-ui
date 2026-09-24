@@ -64,9 +64,12 @@ class PublicDemoArtifactTests(unittest.TestCase):
         html = (ROOT / "public-demo/index.html").read_text(encoding="utf-8")
 
         for marker in (
-            "Frozen Sanitized Snapshot",
-            f"Artifact app v{__version__}",
+            "Demo data",
+            f'id="snapshot-app-version">v{__version__}<',
             PUBLIC_DEMO_GENERATED_AT.isoformat(),
+            "A 60-bay JBOD with made-up disks.",
+            "About this demo",
+            "Everything on this page is made-up demo data.",
             "Synthetic IDs",
             "Demo Storage Host",
             "Demo 60-Bay Top Loader",
@@ -86,8 +89,8 @@ class PublicDemoArtifactTests(unittest.TestCase):
             artifact = self.copy_artifact(demo_dir)
             artifact.write_text(
                 artifact.read_text(encoding="utf-8").replace(
-                    f"Artifact app v{__version__}",
-                    "Artifact app v0.0.0-stale",
+                    f'id="snapshot-app-version">v{__version__}<',
+                    'id="snapshot-app-version">v0.0.0-stale<',
                 ),
                 encoding="utf-8",
             )

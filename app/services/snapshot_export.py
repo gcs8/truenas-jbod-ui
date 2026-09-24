@@ -1408,6 +1408,7 @@ class SnapshotExportService:
                     views=[],
                 ),
                 "settings": self.settings,
+                "app_version": __version__,
                 "initial_snapshot_json": json.dumps(snapshot_for_export.model_dump(mode="json")),
                 "initial_storage_view_runtime_json": json.dumps(
                     (
@@ -2655,8 +2656,8 @@ class SnapshotExportService:
     def _inline_static_assets(self, request: Request, html: str) -> str:
         inline_css = (STATIC_DIR / "style.css").read_text(encoding="utf-8")
         inline_js = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
-        stylesheet_href = str(request.url_for("static", path="style.css"))
-        script_src = str(request.url_for("static", path="app.js"))
+        stylesheet_href = f"{request.url_for('static', path='style.css')}?v={__version__}"
+        script_src = f"{request.url_for('static', path='app.js')}?v={__version__}"
 
         html = self._replace_once(
             html,
