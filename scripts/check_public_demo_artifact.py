@@ -37,9 +37,9 @@ SENSITIVE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("non-demo serial", re.compile(r"(?i)\bserial(?:_number)?[\"']?\s*[:=]\s*[\"'](?!DEMO-|null)[^\"']+")),
 )
 REQUIRED_MARKERS: tuple[str, ...] = (
-    "Frozen Sanitized Snapshot",
-    "Artifact app v",
-    "Capture time",
+    "Demo data",
+    'id="snapshot-app-version">v',
+    "Captured",
     "Synthetic IDs",
     "Source revision",
     "Build ID",
@@ -53,7 +53,7 @@ FORBIDDEN_MARKERS: tuple[tuple[str, str], ...] = (
     ("live-derived provenance claim", "Live-derived"),
     ("local history dependency", "history/history.db"),
 )
-ARTIFACT_VERSION_PATTERN = re.compile(r"\bArtifact app v(?P<version>[0-9A-Za-z][0-9A-Za-z.+-]*)\b")
+ARTIFACT_VERSION_PATTERN = re.compile(r'id="snapshot-app-version">v(?P<version>[0-9A-Za-z][0-9A-Za-z.+-]*)<')
 RESOURCE_REFERENCE_PATTERN = re.compile(
     r"<(?:script|img|link|source|video|audio|iframe)\b[^>]*\b(?:src|href|poster)\s*=\s*[\"'](?!data:|#)[^\"']+",
     re.IGNORECASE,

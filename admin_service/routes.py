@@ -4,6 +4,10 @@ from __future__ import annotations
 # pyright: reportUndefinedVariable=false
 # ruff: noqa: F821
 
+import secrets
+import time
+from app.services.system_setup import _CONFIG_WRITE_LOCK
+
 from types import ModuleType
 from typing import Any
 
@@ -12,6 +16,8 @@ from app.route_compat import MainModuleAPIRouter
 
 def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIRouter:
     router = MainModuleAPIRouter(main_module, globals())
+    # Bounded, short-lived, one-use proof of the exact preview shown to the operator.
+    purge_previews: dict[str, tuple[float, list[str], list[dict[str, Any]]]] = {}
 
     async def container_action_response(
         container_key: str,
@@ -817,12 +823,26 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
         )
 
     @router.post("/api/admin/history/purge-orphaned")
-    async def purge_orphaned_history() -> JSONResponse:
-        settings = reload_app_settings()
-        valid_system_ids = [system.id for system in settings.systems]
-        history_store = get_history_store()
+    async def purge_orphaned_history(payload: dict[str, Any]) -> JSONResponse:
+        token = payload.get("preview_token")
+        proof = purge_previews.pop(token, None) if isinstance(token, str) else None
+        if payload.get("confirm_irreversible") is not True or proof is None or proof[0] < time.monotonic():
+            raise HTTPException(status_code=409, detail="Preview orphaned history again and confirm irreversible deletion.")
+
+        def purge_confirmed() -> tuple[dict[str, Any], list[str]]:
+            # Keep config writers out until the history transaction has committed.
+            with _CONFIG_WRITE_LOCK:
+                settings = reload_app_settings()
+                valid_ids = sorted(system.id for system in settings.systems)
+                if valid_ids != proof[1]:
+                    raise ValueError("Saved systems changed. Preview again before purging.")
+                summary = get_history_store().purge_orphaned_history(valid_ids, expected_summaries=proof[2])
+                return summary, valid_ids
+
         try:
-            summary = await asyncio.to_thread(history_store.purge_orphaned_history, valid_system_ids)
+            summary, valid_system_ids = await run_retained_thread_worker(purge_confirmed)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail="Orphaned history or saved systems changed. Preview again before purging.") from exc
         except Exception as exc:  # noqa: BLE001 - surface maintenance failures directly in admin.
             logger.exception("Unable to purge orphaned history")
             raise HTTPException(status_code=500, detail="Unable to purge orphaned history; see admin logs.") from exc
@@ -860,11 +880,20 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
             logger.exception("Unable to inspect orphaned history")
             raise HTTPException(status_code=500, detail="Unable to inspect orphaned history; see admin logs.") from exc
 
+        now = time.monotonic()
+        for token, proof in list(purge_previews.items()):
+            if proof[0] < now:
+                del purge_previews[token]
+        while len(purge_previews) >= 128:
+            del purge_previews[next(iter(purge_previews))]
+        token = secrets.token_urlsafe(32)
+        purge_previews[token] = (now + 300, sorted(valid_system_ids), orphaned_systems)
         return JSONResponse(
             {
                 "ok": True,
                 "orphaned_systems": orphaned_systems,
                 "valid_system_ids": valid_system_ids,
+                "purge_preview_token": token,
             }
         )
 
