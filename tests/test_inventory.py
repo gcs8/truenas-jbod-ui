@@ -13922,7 +13922,14 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             returned = await service.get_snapshot(allow_stale_cache=True)
 
             self.assertIs(returned, stale_snapshot)
-            await asyncio.sleep(0.05)
+            # Poll instead of one fixed sleep: slow coverage runners can take
+            # longer than 50 ms to finish the background refresh.
+            deadline = asyncio.get_running_loop().time() + 5
+            while asyncio.get_running_loop().time() < deadline:
+                cached = service._cache.get(inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY)
+                if cached is not None and cached.slots[0].device_name == "da1":
+                    break
+                await asyncio.sleep(0.01)
             self.assertEqual(
                 service._cache[inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY].slots[0].device_name,
                 "da1",
