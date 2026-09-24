@@ -17,7 +17,9 @@ Usage from a checkout that has both refs::
 
 In GitHub Actions ``--event "$GITHUB_EVENT_PATH"`` supplies the pull request
 number and labels from the event payload; ``--pr`` and ``--labels`` override
-those values when given.
+those values when given. ``--advisory`` keeps every message but exits 0; the
+workflow passes it for pull requests whose author has no write access and so
+cannot apply the ``no-changelog`` label the failure text asks for.
 """
 
 from __future__ import annotations
@@ -78,6 +80,7 @@ EXCLUDED_PATTERNS = (
     re.compile(r"^CHANGELOG\.md$"),
     re.compile(r"^docs/RELEASE_WRAP_[^/]*$"),
     re.compile(r"^docs/RELEASE_NOTES_[^/]*$"),
+    re.compile(r"^docs/archive/"),
 )
 
 HUNK_HEADER = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
@@ -223,7 +226,37 @@ def current_entries(lines: list[str]) -> tuple[str, list[Entry]]:
     return selected_heading, entries
 
 
+ADVISORY_PREFIX = (
+    "Advisory only: this pull request's author cannot apply repository labels, "
+    "so the changelog gate reports instead of blocking. Before merge a "
+    "maintainer either applies the label named below or adds the bullet."
+)
+
+
 def evaluate(
+    repo: Path,
+    *,
+    base: str,
+    head: str,
+    pr_number: int,
+    labels: set[str],
+    advisory: bool = False,
+) -> GateResult:
+    """Decide the gate for one pull request.
+
+    ``advisory`` keeps every message but turns a failure into a pass. It is
+    used for contributors without write access, who cannot apply the
+    ``no-changelog`` label the failure text asks for; a maintainer resolves the
+    reported item before merge.
+    """
+
+    result = _evaluate(repo, base=base, head=head, pr_number=pr_number, labels=labels)
+    if result.ok or not advisory:
+        return result
+    return GateResult(True, [ADVISORY_PREFIX, *result.messages])
+
+
+def _evaluate(
     repo: Path,
     *,
     base: str,
@@ -342,6 +375,14 @@ def main(argv: list[str] | None = None) -> int:
         help="GitHub event payload JSON (GITHUB_EVENT_PATH) supplying number and labels.",
     )
     parser.add_argument(
+        "--advisory",
+        action="store_true",
+        help=(
+            "Report a missing entry without failing. Used for pull requests whose "
+            "author cannot apply the 'no-changelog' label."
+        ),
+    )
+    parser.add_argument(
         "--repo",
         type=Path,
         default=Path.cwd(),
@@ -373,6 +414,7 @@ def main(argv: list[str] | None = None) -> int:
             head=args.head,
             pr_number=pr_number,
             labels=labels,
+            advisory=args.advisory,
         )
     except GateError as exc:
         print(str(exc))

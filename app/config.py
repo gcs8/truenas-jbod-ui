@@ -118,6 +118,12 @@ class PerfConfig(BaseModel):
     slow_stage_ms: int = 250
 
 
+# The documented TrueNAS JSON-RPC endpoint paths: /api/current follows the
+# appliance, /api/v25.10.0 pins one release. Anything else is refused rather
+# than concatenated into a request URL.
+TRUENAS_API_VERSION_PATTERN = re.compile(r"(current|v\d+\.\d+\.\d+)")
+
+
 class TrueNASConfig(BaseModel):
     model_config = ConfigDict(hide_input_in_errors=True)
 
@@ -126,11 +132,26 @@ class TrueNASConfig(BaseModel):
     api_user: str = ""
     api_password: str = ""
     platform: Literal["core", "scale", "linux", "quantastor", "esxi", "ipmi"] = "core"
+    # Wire protocol for the middleware websocket. "ddp" is the legacy
+    # /websocket endpoint every CORE and SCALE release exposes; "jsonrpc" is
+    # the JSON-RPC 2.0 API that SCALE 25.04+ documents as supported and that
+    # CORE does not have. The default keeps existing hosts on DDP.
+    api_dialect: Literal["ddp", "jsonrpc"] = "ddp"
+    # Only the jsonrpc dialect reads this: "current" follows the appliance,
+    # "v25.10.0" pins one documented API version.
+    api_version: str = "current"
     verify_ssl: bool = False
     tls_ca_bundle_path: str | None = None
     tls_server_name: str | None = None
     timeout_seconds: int = 15
     enclosure_filter: str | None = None
+
+    @field_validator("api_version", mode="after")
+    @classmethod
+    def _validate_api_version(cls, value: str) -> str:
+        if not TRUENAS_API_VERSION_PATTERN.fullmatch(value):
+            raise ValueError('api_version must be "current" or a pinned version such as "v25.10.0"')
+        return value
 
 
 class HANodeConfig(BaseModel):
@@ -503,6 +524,8 @@ ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
     "TRUENAS_API_USER": ("truenas", "api_user"),
     "TRUENAS_API_PASSWORD": ("truenas", "api_password"),
     "TRUENAS_PLATFORM": ("truenas", "platform"),
+    "TRUENAS_API_DIALECT": ("truenas", "api_dialect"),
+    "TRUENAS_API_VERSION": ("truenas", "api_version"),
     "TRUENAS_VERIFY_SSL": ("truenas", "verify_ssl"),
     "TRUENAS_TLS_CA_BUNDLE_PATH": ("truenas", "tls_ca_bundle_path"),
     "TRUENAS_TLS_SERVER_NAME": ("truenas", "tls_server_name"),

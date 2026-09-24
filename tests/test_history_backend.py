@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import io
 import json
 import unittest
@@ -385,51 +384,6 @@ class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["detail"], HISTORY_BACKEND_FAILURE_DETAIL)
         self.assert_single_safe_warning(captured, "History backend slot history request failed.")
 
-    async def test_per_slot_fallback_unreachable_warning_omits_backend_exception_details(self) -> None:
-        client = HistoryBackendClient(
-            HistoryConfig(service_url="http://history-backend:8001", timeout_seconds=10)
-        )
-        error = HistoryBackendUnavailableError(self.LEAKING_EXCEPTION_TEXT)
-
-        with (
-            patch.object(client, "_fetch_slot_history", AsyncMock(side_effect=error)),
-            self.assertLogs("app.services.history_backend", level="WARNING") as captured,
-        ):
-            payload = await client._fallback_scope_history(
-                [5],
-                "archive-core",
-                "front",
-                window_hours=24,
-            )
-
-        self.assertFalse(payload[5]["available"])
-        self.assertEqual(payload[5]["detail"], HISTORY_BACKEND_FAILURE_DETAIL)
-        self.assert_single_safe_warning(
-            captured,
-            "History backend unreachable during per-slot fallback; skipping remaining slots.",
-        )
-
-    async def test_per_slot_fallback_response_warning_omits_backend_exception_details(self) -> None:
-        client = HistoryBackendClient(
-            HistoryConfig(service_url="http://history-backend:8001", timeout_seconds=10)
-        )
-        error = HistoryBackendResponseError(503, self.LEAKING_EXCEPTION_TEXT)
-
-        with (
-            patch.object(client, "_fetch_slot_history", AsyncMock(side_effect=error)),
-            self.assertLogs("app.services.history_backend", level="WARNING") as captured,
-        ):
-            payload = await client._fallback_scope_history(
-                [5],
-                "archive-core",
-                "front",
-                window_hours=24,
-            )
-
-        self.assertFalse(payload[5]["available"])
-        self.assertEqual(payload[5]["detail"], HISTORY_BACKEND_FAILURE_DETAIL)
-        self.assert_single_safe_warning(captured, "History backend slot history request failed.")
-
     async def test_multi_scope_warning_omits_backend_exception_details(self) -> None:
         client = HistoryBackendClient(
             HistoryConfig(service_url="http://history-backend:8001", timeout_seconds=10)
@@ -636,7 +590,7 @@ class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(
             client,
             "_send_json",
-            AsyncMock(return_value={"scopes": [{"histories": {"5": {"slot": 5, "metrics": {"bytes_written": []}}}}]}),
+            AsyncMock(return_value={"scopes": [{"system_id": "archive-core", "enclosure_id": "front", "histories": {"5": {"slot": 5, "metrics": {"bytes_written": []}}}}]}),
         ) as send_json:
             with patch.object(
                 client,
@@ -656,96 +610,6 @@ class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
         document = send_json.await_args.args[1]
         self.assertEqual(document["metrics"], ["bytes_written"])
         self.assertEqual(document["event_limit"], 0)
-
-    async def test_get_scope_history_fallback_dedupes_slots_and_bounds_concurrency(self) -> None:
-        client = HistoryBackendClient(
-            HistoryConfig(service_url="http://history-backend:8001", timeout_seconds=10, fallback_max_concurrency=2)
-        )
-        in_flight = 0
-        max_in_flight = 0
-        per_slot_paths: list[str] = []
-
-        async def fake_fetch_json(path: str, *, params: dict[str, Any] | None = None) -> dict[str, Any]:
-            nonlocal in_flight, max_in_flight
-            if path == "/api/history/scopes/slots":
-                raise HistoryBackendResponseError("History backend returned HTTP 503: busy")
-            per_slot_paths.append(path)
-            in_flight += 1
-            max_in_flight = max(max_in_flight, in_flight)
-            await asyncio.sleep(0.01)
-            in_flight -= 1
-            return {"metrics": {}, "events": [], "sample_counts": {}, "latest_values": {}}
-
-        with patch.object(client, "_fetch_json", fake_fetch_json):
-            payload = await client._fallback_scope_history(
-                [0, 1, 2, 1, 3, 0, 4, 5],
-                "archive-core",
-                "front",
-                window_hours=24,
-            )
-
-        self.assertEqual(sorted(payload), [0, 1, 2, 3, 4, 5])
-        self.assertEqual(len(per_slot_paths), 6, "duplicate slot ids must not issue duplicate requests")
-        self.assertEqual(sorted(per_slot_paths), sorted(f"/api/history/slots/{slot}/bundle" for slot in range(6)))
-        self.assertLessEqual(max_in_flight, 2)
-        self.assertTrue(all(entry["available"] for entry in payload.values()))
-
-    async def test_get_scope_history_fallback_stops_fanning_out_once_backend_is_unreachable(self) -> None:
-        client = HistoryBackendClient(
-            HistoryConfig(service_url="http://history-backend:8001", timeout_seconds=10, fallback_max_concurrency=3)
-        )
-        per_slot_calls = 0
-
-        async def fake_fetch_json(path: str, *, params: dict[str, Any] | None = None) -> dict[str, Any]:
-            nonlocal per_slot_calls
-            if path == "/api/history/scopes/slots":
-                raise HistoryBackendUnavailableError("History backend request failed: [Errno 111] Connection refused")
-            per_slot_calls += 1
-            raise HistoryBackendUnavailableError("History backend request failed: [Errno 111] Connection refused")
-
-        slots = list(range(60))
-        with patch.object(client, "_fetch_json", fake_fetch_json):
-            payload = await client._fallback_scope_history(
-                slots,
-                "archive-core",
-                "front",
-                window_hours=24,
-            )
-
-        self.assertEqual(sorted(payload), slots)
-        self.assertLessEqual(
-            per_slot_calls,
-            3,
-            "an unreachable backend must cost at most one timeout per concurrency slot, not one per bay",
-        )
-        for slot in slots:
-            self.assertFalse(payload[slot]["available"])
-            self.assertEqual(payload[slot]["detail"], HISTORY_BACKEND_FAILURE_DETAIL)
-            self.assertEqual(payload[slot]["slot"], slot)
-
-    async def test_get_scope_history_fallback_keeps_going_after_http_errors(self) -> None:
-        client = HistoryBackendClient(
-            HistoryConfig(service_url="http://history-backend:8001", timeout_seconds=10, fallback_max_concurrency=2)
-        )
-
-        async def fake_fetch_json(path: str, *, params: dict[str, Any] | None = None) -> dict[str, Any]:
-            if path == "/api/history/scopes/slots":
-                return {"histories": "not-a-dict"}
-            if path.endswith("/1/bundle"):
-                raise HistoryBackendResponseError("History backend returned HTTP 404: unknown slot")
-            return {"metrics": {}, "events": [], "sample_counts": {}, "latest_values": {}}
-
-        with patch.object(client, "_fetch_json", fake_fetch_json):
-            payload = await client._fallback_scope_history(
-                [0, 1, 2],
-                "archive-core",
-                "front",
-                window_hours=24,
-            )
-
-        self.assertTrue(payload[0]["available"])
-        self.assertFalse(payload[1]["available"])
-        self.assertTrue(payload[2]["available"])
 
     def test_request_bytes_sync_maps_transport_failures_to_typed_errors(self) -> None:
         client = HistoryBackendClient(

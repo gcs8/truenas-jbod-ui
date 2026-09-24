@@ -15,6 +15,12 @@ WINDOWS_NPM_SHIM = r"C:\Program Files\nodejs\npm.cmd"
 
 
 class DevCheckPlanTests(unittest.TestCase):
+    def test_nonroot_cli_is_portable_without_posix_ownership_suite(self) -> None:
+        check, skips = dev_check._windows_test_check(ROOT, "python")
+        self.assertIn("tests.test_nonroot_cli", check.argv)
+        self.assertNotIn("tests.test_nonroot_migration", check.argv)
+        self.assertTrue(any("tests.test_nonroot_migration" in skip.reason for skip in skips))
+
     @staticmethod
     def _copy_ci_contract(root: Path) -> None:
         workflow = root / ".github" / "workflows" / "ci.yml"
@@ -214,6 +220,14 @@ class DevCheckPlanTests(unittest.TestCase):
             for module in exclusion.modules:
                 self.assertIn(module, rendered)
         self.assertIn("tests.test_esxi_host_prep", rendered)
+
+    def test_smart_grid_io_is_classified_by_inventory_import_graph(self) -> None:
+        exclusion = next(
+            item for item in dev_check.WINDOWS_EXCLUSIONS
+            if item.category == "fcntl-dependent history/backup import graph"
+        )
+        self.assertNotIn("tests.test_smart_grid_io", dev_check.WINDOWS_PORTABLE_TEST_MODULES)
+        self.assertIn("tests.test_smart_grid_io", exclusion.modules)
 
     def test_mapping_store_suite_is_classified_as_posix_filesystem_semantics(
         self,
