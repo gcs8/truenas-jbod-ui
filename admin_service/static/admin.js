@@ -113,6 +113,7 @@
     runtimeBehaviorDetail: document.getElementById("runtime-behavior-detail"),
     runtimeBehaviorFields: document.getElementById("runtime-behavior-fields"),
     runtimeBehaviorSaveButton: document.getElementById("runtime-behavior-save-button"),
+    runtimeBehaviorDiscardButton: document.getElementById("runtime-behavior-discard-button"),
     runtimeBehaviorResult: document.getElementById("runtime-behavior-result"),
     backupPathList: document.getElementById("backup-path-list"),
     backupPathSummary: document.getElementById("backup-path-summary"),
@@ -867,7 +868,7 @@
     return labels[field?.owner] || field?.owner || "Admin";
   }
 
-  function renderRuntimeBehaviorSettings() {
+  function renderRuntimeBehaviorSettings({ discardDraft = false } = {}) {
     if (!elements.runtimeBehaviorFields || !elements.runtimeBehaviorDetail) {
       return;
     }
@@ -879,7 +880,7 @@
       const baseline = (state.runtimeBehaviorBaseline || fields).find((field) => field.key === input.dataset.runtimeBehaviorKey);
       return baseline && input.value !== String(baseline.value ?? "");
     });
-    if (state.runtimeBehaviorSaving || dirty) return;
+    if (state.runtimeBehaviorSaving || (dirty && !discardDraft)) return;
     state.runtimeBehaviorBaseline = fields;
     elements.runtimeBehaviorDetail.textContent = behavior.override_file
       ? `Override file: ${behavior.override_file}`
@@ -920,6 +921,16 @@
       .join("");
     if (elements.runtimeBehaviorSaveButton) {
       elements.runtimeBehaviorSaveButton.disabled = !fields.some((field) => field.writable);
+    }
+  }
+
+  // An explicit discard is the only path that drops a timing draft; a failed
+  // save or an unrelated refresh keeps it (#409).
+  function discardRuntimeBehaviorDraft() {
+    if (state.runtimeBehaviorSaving) return;
+    renderRuntimeBehaviorSettings({ discardDraft: true });
+    if (elements.runtimeBehaviorResult) {
+      elements.runtimeBehaviorResult.textContent = "Unsaved timing changes discarded.";
     }
   }
 
@@ -6890,6 +6901,9 @@
     });
     elements.runtimeBehaviorSaveButton?.addEventListener("click", () => {
       void saveRuntimeBehaviorSettings();
+    });
+    elements.runtimeBehaviorDiscardButton?.addEventListener("click", () => {
+      discardRuntimeBehaviorDraft();
     });
 
     elements.backupPathList?.addEventListener("click", (event) => {
