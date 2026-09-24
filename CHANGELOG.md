@@ -466,7 +466,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   request. `check_public_demo_artifact.py --require-current`,
   `validate_release_wrap.py --public-demo-only`, and a new step in the GHCR
   release workflow refuse a release until the demo, screenshots, and pixel
-  review were rebuilt from the release source (#505).
+  review were rebuilt from the release source (#572).
 
 - Replaced the chain of command comparisons behind the SSH command failure
   contexts with a lookup table and pinned every answer with tests; the debug
