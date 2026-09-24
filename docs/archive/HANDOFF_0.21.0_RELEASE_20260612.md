@@ -7,4 +7,4 @@ unchanged.
 
 For the shipped release summary, see
 [`RELEASE_NOTES_0.21.0.md`](./RELEASE_NOTES_0.21.0.md). For the current release
-process, use [`RELEASE_CHECKLIST.md`](./RELEASE_CHECKLIST.md).
+process, use [`RELEASE_CHECKLIST.md`](../RELEASE_CHECKLIST.md).

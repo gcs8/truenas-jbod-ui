@@ -234,6 +234,11 @@ class SlotView(BaseModel):
     enclosure_name: str | None = None
     present: bool = False
     state: SlotState = SlotState.unknown
+    # "unknown" marks an occupied bay whose live observation carries none of the
+    # strong disk identifiers (serial, logical_unit_id, gptid). The bay-scoped
+    # sas_address and the reusable device alias cannot tell one occupant from
+    # the next, so nothing about the previous disk may be shown as current.
+    identity_state: Literal["known", "unknown"] = "known"
     identify_active: bool = False
     device_name: str | None = None
     smart_device_names: list[str] = Field(default_factory=list)
@@ -335,6 +340,13 @@ class InventorySummary(BaseModel):
     mapped_slot_count: int = 0
     manual_mapping_count: int = 0
     ssh_slot_hint_count: int = 0
+    # Aggregate disk-retention totals. They carry no identifiers, so a release
+    # acceptance check can prove that every source disk became exactly one
+    # logical rendered disk across a physical-to-virtual inventory change.
+    source_disk_count: int = 0
+    rendered_unique_disk_count: int = 0
+    duplicate_disk_view_count: int = 0
+    unplaced_disk_count: int = 0
 
 
 class PlatformCapability(BaseModel):
@@ -956,6 +968,12 @@ class SystemSetupRequest(BaseModel):
     ssh_commands: list[str] = Field(default_factory=list)
     ssh_commands_action: Literal["default", "preserve", "replace"] = "default"
     ssh_commands_source_system_id: str | None = None
+    # The saved system this payload was cloned FROM, sent whenever a loaded
+    # system is saved under a new id. It is deliberately separate from
+    # `ssh_commands_source_system_id`, which only exists while a redacted
+    # command list is being preserved: replacing or defaulting the commands
+    # must not erase the clone's source identity.
+    clone_source_system_id: str | None = None
     bmc_enabled: bool = False
     bmc_host: str | None = None
     bmc_username: str | None = None
@@ -980,6 +998,7 @@ class SystemSetupRequest(BaseModel):
         "ssh_user",
         "ssh_key_path",
         "ssh_commands_source_system_id",
+        "clone_source_system_id",
         "bmc_host",
         "bmc_username",
         "default_profile_id",

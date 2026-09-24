@@ -1,0 +1,14 @@
+{
+  "ok": false,
+  "mode": "full",
+  "detail": "History full refresh failed; see service logs.",
+  "collector": {
+    "collector_running": true,
+    "collection_running": false,
+    "last_error": "History full refresh failed; see service logs."
+  },
+  "counts": {"tracked_slots": 0},
+  "counts_exact": false,
+  "database": {"size_bytes": 0},
+  "scopes": []
+}
