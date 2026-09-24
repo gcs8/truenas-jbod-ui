@@ -361,6 +361,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   reading the pair out of the workflow so the doc cannot drift from the
   enforced values again. (#536)
 
+### Performance
+
+- Delegated every bay-tile interaction to the grid, deferred hover SMART
+  fetches to the batch prefetch that already covers the bay, and indexed bay
+  lookups instead of scanning the slot list on every call (#510)
+
 ## v0.23.0 - 2026-09-08
 
 This release includes every pull request merged after `v0.22.2` through the

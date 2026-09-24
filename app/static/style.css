@@ -497,14 +497,6 @@ textarea {
   color: #ffadad;
 }
 
-.system-setup-dialog {
-  width: min(920px, calc(100vw - 32px));
-}
-
-.field input.is-readonly {
-  background: rgba(255, 255, 255, 0.04);
-}
-
 .meta-select {
   width: 100%;
   min-width: 0;
@@ -5561,12 +5553,6 @@ button.fabric-trace-crumb:hover {
   line-height: 1.35;
 }
 
-.history-chart-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 14px;
-}
-
 .history-main-grid {
   display: grid;
   gap: 14px;
@@ -6040,7 +6026,6 @@ button.fabric-trace-crumb:hover {
   }
 
   .history-metric-grid,
-  .history-chart-grid,
   .history-main-grid,
   .history-chart-column {
     grid-template-columns: 1fr;
@@ -6171,10 +6156,6 @@ button.fabric-trace-crumb:hover {
 
   .history-drawer-controls {
     justify-content: flex-start;
-  }
-
-  .system-setup-dialog {
-    width: min(100vw - 16px, 920px);
   }
 
 }

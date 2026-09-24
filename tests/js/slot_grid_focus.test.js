@@ -153,6 +153,7 @@ test("saved chassis fabric highlights use the backing live slot identity", () =>
     grid: { querySelectorAll() { return [backed.tile, unbacked.tile]; } },
     getSelectedPeerContext() { return { active: false, peerSlots: new Set() }; },
     sasFabricSelectedSlotSet() { return new Set([42]); },
+    getSelectedStorageViewRuntime() { return null; },
     fabricSlotNumberForGridTile(tile) { return tile.dataset.slot === "0" ? 42 : null; },
   });
 
