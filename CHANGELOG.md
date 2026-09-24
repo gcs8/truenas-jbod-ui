@@ -35,7 +35,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   (`status: degraded`). Compose healthchecks probe `/livez` and are unchanged,
   but an external monitor using `curl -f /healthz` will now alert on an
   unwritable folder. History `/healthz` reports `status: down` instead of
-  `unavailable`. (#PRNUM)
+  `unavailable`. (#578)
 - docker-compose.nonroot.yml: Keep this overlay for hardened deployments.
   Image-only upgrades now preserve existing Compose files and wait for healthy
   containers; optional backup defaults match the selected ownership setup. (#426)
@@ -102,7 +102,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   only for a local fault the container cannot work through: an unwritable data,
   logs or known-hosts folder, re-checked every 30 seconds so a `chown` clears
   it without a restart. The history service reports `down` instead of
-  `unavailable` when its database cannot be opened. (#PRNUM)
+  `unavailable` when its database cannot be opened. (#578)
 
 ### Docs
 
