@@ -16,7 +16,7 @@ from pathlib import Path
 from types import ModuleType
 from unittest.mock import patch
 
-from history_service import segment_migration, segment_sealer
+from history_service import segment_migration, segment_sealer, system_backup
 from history_service.config import HistorySettings
 from history_service.segment_catalog import activation_pending_path
 from history_service.segment_reader import SegmentedHistoryReader
@@ -26,6 +26,15 @@ from history_service.system_backup import HISTORY_DB_KEY, SystemBackupService, _
 
 class SimulatedRotationCrash(BaseException):
     pass
+
+
+# `_checkpoint_hot_database` opens the hot file with the production busy timeout
+# (`SQLITE_CONNECT_TIMEOUT_SECONDS`, 5 s), so a checkpoint refused because a reader
+# still holds WAL frames only reports that refusal after the full wait. The tests
+# below prove the refusal, not the wait, so they shorten the wait while the reader
+# is deliberately held open. The product default is untouched.
+def _short_checkpoint_busy_wait():
+    return patch.object(system_backup, "SQLITE_CONNECT_TIMEOUT_SECONDS", 0.05)
 
 
 class LaterGenerationRotationRedTests(unittest.TestCase):
@@ -1824,7 +1833,7 @@ class LaterGenerationRotationRedTests(unittest.TestCase):
                 writer.commit()
                 self.assertGreater(wal_path.stat().st_size, 0)
 
-                with self.assertRaisesRegex(ValueError, "cannot be checkpointed"):
+                with _short_checkpoint_busy_wait(), self.assertRaisesRegex(ValueError, "cannot be checkpointed"):
                     _ImportActivationTransaction._checkpoint_hot_database(hot_path)
                 self.assertGreater(wal_path.stat().st_size, 0)
 
@@ -1929,7 +1938,7 @@ class LaterGenerationRotationRedTests(unittest.TestCase):
                     )
                     self.assertGreater(wal_path.stat().st_size, 0)
 
-                    with self.assertRaisesRegex(ValueError, "cannot be checkpointed"):
+                    with _short_checkpoint_busy_wait(), self.assertRaisesRegex(ValueError, "cannot be checkpointed"):
                         target_service.import_bundle(artifact.path.read_bytes())
 
                     self.assertGreater(wal_path.stat().st_size, 0)
