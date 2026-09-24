@@ -558,7 +558,7 @@ class ContainerResourceContractTests(unittest.TestCase):
         guide = (REPO_ROOT / "wiki/Troubleshooting.md").read_text(encoding="utf-8")
         for expected in (
             "Read UI authentication required.",
-            "Cross-origin admin mutation rejected.",
+            "but the admin service only accepts changes from",
             "Plaintext backup export is disabled.",
             "permission denied",
             "prepare_nonroot_bind_mounts.py",

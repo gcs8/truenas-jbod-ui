@@ -1,19 +1,17 @@
 {% extends "base.html" %}
-{% block title %}System Setup And Recovery{% endblock %}
+{% block title %}Admin{% endblock %}
 {% block body %}
 <div class="admin-shell">
   <header class="hero panel">
     <div class="hero-copy">
-      <p class="eyebrow">Optional Maintenance Sidecar</p>
-      <h1>System Setup And Recovery</h1>
+      <h1>Admin</h1>
       <p class="hero-summary">
-        Keep the main enclosure UI read-mostly. This sidecar handles full backup/import,
-        guided system setup, SSH key prep, profile previewing, and runtime stop/start work
-        when you want a cleaner maintenance window.
+        Setup, backups and runtime control for your local stack.
+        For trusted LAN use only, not public Internet exposure. Starts explicitly; with the published Compose files it auto-stops after one hour.
       </p>
       <div class="hero-actions">
         <button id="refresh-state-button" class="button secondary" type="button">Refresh State</button>
-        <a id="admin-origin-link" class="button ghost" href="#" target="_blank" rel="noopener">Open Another Admin Tab</a>
+        <a id="admin-origin-link" class="button ghost hidden" href="#" target="_blank" rel="noopener">Open at the configured address</a>
         <div class="hero-view-switcher" role="group" aria-label="Admin sections">
           <button class="button secondary small admin-view-button is-active" data-admin-view-button="operations" type="button">Setup + Maintenance</button>
           <button class="button secondary small admin-view-button" data-admin-view-button="builder" type="button">Enclosure / Profile Builder</button>
@@ -22,16 +20,8 @@
     </div>
     <div class="hero-meta">
       <div class="hero-stat">
-        <span class="hero-stat-label">Session Countdown</span>
+        <span class="hero-stat-label">Auto-stop</span>
         <span id="admin-countdown" class="hero-stat-value">Calculating...</span>
-      </div>
-      <div class="hero-stat">
-        <span class="hero-stat-label">Started</span>
-        <span id="admin-started-at" class="hero-stat-value">-</span>
-      </div>
-      <div class="hero-stat">
-        <span class="hero-stat-label">Expires</span>
-        <span id="admin-expires-at" class="hero-stat-value">-</span>
       </div>
       <div class="hero-stat">
         <span class="hero-stat-label">Configured Systems</span>
@@ -48,6 +38,8 @@
       </div>
     </div>
   </header>
+
+  <div id="admin-session-banner" class="status-banner hidden" role="alert" aria-live="assertive"></div>
 
   <div id="admin-status-banner" class="status-banner" role="status" aria-live="polite">
     Admin sidecar ready.
@@ -67,7 +59,7 @@
           <p class="eyebrow">Runtime Control</p>
           <h2>Containers</h2>
           <p class="panel-copy">
-            Stop the read UI or history sidecar here before a maintenance action, or let the
+            Stop the main UI or history collector here before a maintenance action, or let the
             backup actions below do it automatically for a cleaner snapshot.
           </p>
         </div>
@@ -90,6 +82,7 @@
       <div id="runtime-behavior-fields" class="runtime-behavior-grid"></div>
       <div class="button-row runtime-behavior-actions">
         <button id="runtime-behavior-save-button" class="button" type="button">Save Behavior Overrides</button>
+        <button id="runtime-behavior-discard-button" class="button ghost" type="button">Discard Changes</button>
         <p id="runtime-behavior-result" class="subtle action-note"></p>
       </div>
     </section>
@@ -134,17 +127,17 @@
               <span>Export Passphrase</span>
               <input id="backup-export-passphrase" type="password" placeholder="Required when export encryption is enabled">
             </label>
-            <p class="subtle action-note field-span">Passphrases are used exactly as entered, including spaces in the middle or trailing padding. When encryption is on, export locks to a portable <code>.7z</code> bundle.</p>
+            <p class="subtle action-note field-span">Passphrases preserve all spaces. Encrypted exports use <code>.7z</code>.</p>
           </div>
 
           <div class="toggle-group">
             <label class="toggle">
               <input id="backup-export-stop-toggle" type="checkbox">
-              <span>Stop read UI and history before export</span>
+              <span>Pause the main UI and history while exporting (usually not needed)</span>
             </label>
             <label class="toggle">
               <input id="backup-export-restart-toggle" type="checkbox" checked>
-              <span>Restart anything stopped after export</span>
+              <span>Start them again afterwards</span>
             </label>
           </div>
 
@@ -161,7 +154,7 @@
               <span class="badge">Frozen Support Snapshot</span>
             </div>
             <p class="subtle action-note">
-              Builds a temp-space support bundle from the current local stack. This exports a normal archive for offline inspection, not a standalone HTML and not an importable restore path.
+              Support archive for offline inspection, not restorable.
             </p>
             <ul id="debug-path-list" class="path-list"></ul>
             <p id="debug-path-summary" class="subtle action-note"></p>
@@ -193,18 +186,18 @@
                 <input id="debug-export-passphrase" type="password" placeholder="Required when debug export encryption is enabled">
               </label>
               <p class="subtle action-note field-span">
-                Secret scrubbing disables locked secret-path pills. Disk-identifier scrubbing keeps the bundle share-friendlier without changing the fact that this is still just an offline archive.
+                Secret scrubbing excludes locked secret paths. Review the archive for sensitive data before sharing, even with scrubbing enabled.
               </p>
             </div>
 
             <div class="toggle-group">
               <label class="toggle">
                 <input id="debug-export-stop-toggle" type="checkbox">
-                <span>Stop read UI and history before debug export</span>
+                <span>Pause the main UI and history while exporting (usually not needed)</span>
               </label>
               <label class="toggle">
                 <input id="debug-export-restart-toggle" type="checkbox" checked>
-                <span>Restart anything stopped after debug export</span>
+                <span>Start them again afterwards</span>
               </label>
             </div>
 
@@ -212,7 +205,7 @@
               <button id="debug-export-button" class="button secondary" type="button">Export Debug Bundle</button>
             </div>
             <p id="debug-export-result" class="subtle action-note">
-              Use this when you want a frozen local support snapshot without pretending it is the same thing as a restore-grade full backup.
+              Export a local support snapshot.
             </p>
           </div>
         </div>
@@ -230,17 +223,17 @@
               <span>Import Passphrase</span>
               <input id="backup-import-passphrase" type="password" placeholder="Only needed for encrypted bundles">
             </label>
-            <p class="subtle action-note field-span">Trailing spaces are preserved on import too, so padded passphrases round-trip cleanly. Import first inspects the archive and shows the observed encryption mode and aggregate counts for confirmation. Confirmation carries a short-lived, single-use inspection receipt bound to those exact archive bytes.</p>
+            <p class="subtle action-note field-span">Import inspects the archive and shows the observed encryption mode and counts. Confirm the archive before replacing local data. Passphrases preserve all spaces.</p>
           </div>
 
           <div class="toggle-group">
             <label class="toggle">
               <input id="backup-import-stop-toggle" type="checkbox" checked>
-              <span>Stop read UI and history before import</span>
+              <span>Pause the main UI and history while importing (recommended)</span>
             </label>
             <label class="toggle">
               <input id="backup-import-restart-toggle" type="checkbox" checked>
-              <span>Restart anything stopped after import</span>
+              <span>Start them again afterwards</span>
             </label>
           </div>
 
@@ -251,13 +244,13 @@
             Import replaces the mounted config/data/history state with the contents of the selected bundle.
           </p>
           <p class="subtle action-note">
-            Maintenance: use orphan cleanup after deleting or renaming a saved system when you want to remove leftover history rows that no longer belong to anything in `config.yaml`.
+            Renamed a system? Adopt its history below to preserve it. Purge only when you intend to permanently delete removed-system history.
           </p>
           <div class="button-row">
-            <button id="history-purge-orphaned-button" class="button secondary" type="button">Purge Orphaned Data</button>
+            <button id="history-purge-orphaned-button" class="button danger" type="button">Preview Orphan Purge</button>
           </div>
           <p id="history-purge-orphaned-result" class="subtle action-note">
-            This only removes history rows whose `system_id` no longer exists in the saved config.
+            Preview the removed-system IDs and row counts before confirming irreversible deletion.
           </p>
           <p class="subtle action-note">
             Adoption is the rename/remap path: move saved history from a removed system id into a current saved system id without wiping the old samples first.
@@ -683,7 +676,7 @@
               <p id="setup-bootstrap-result" class="subtle action-note">
                 Bootstrap is off by default for saved systems. Enable it only when you intend to run one-time service-account setup.
               </p>
-              <div class="sudoers-preview-panel">
+              <div id="setup-bootstrap-sudoers-panel" class="sudoers-preview-panel">
                 <div class="preview-card-header">
                   <h4>Proposed Permission Update</h4>
                   <span id="setup-bootstrap-sudoers-name" class="badge">truenas-jbod-ui-jbodmap</span>
@@ -825,7 +818,7 @@
                     </label>
                     <label class="toggle">
                       <input id="setup-storage-view-show-main" type="checkbox" checked>
-                      <span>Show in main read UI</span>
+                      <span>Show in the main UI</span>
                     </label>
                     <label class="toggle">
                       <input id="setup-storage-view-show-admin" type="checkbox" checked>
@@ -907,7 +900,7 @@
             <button id="setup-create-demo-button" class="button secondary" type="button">Add Demo Builder System</button>
           </div>
           <p id="setup-result" class="subtle action-note">
-            Saving here updates the mounted config file; restart the read UI after a new system is added so it picks the new list up cleanly.
+            Saved systems appear in the main UI after a restart.
           </p>
         </div>
 
