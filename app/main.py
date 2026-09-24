@@ -79,6 +79,7 @@ from app.services.snapshot_export import (
     collect_configured_hostnames,
 )
 from app.services.truenas_ws import TrueNASAPIError
+from app.services import upgrade_notice
 from history_service.operation_bounds import (
     ALLOWED_HISTORY_METRICS,
     HistoryBudgetExceeded,
@@ -642,6 +643,11 @@ def create_app() -> FastAPI:
     return app
 
 
+def upgrade_notice_data_dir(settings: Settings) -> Path:
+    """The data directory that holds the saved bay assignments and the version record."""
+    return Path(settings.paths.mapping_file).parent
+
+
 def build_index_context(
     *,
     request: Request,
@@ -653,6 +659,7 @@ def build_index_context(
     admin_launch_url: str | None = None,
     app_version: str = __version__,
     release_status: dict[str, object] | None = None,
+    upgrade_notice_payload: dict[str, str] | None = None,
     snapshot_mode: bool = False,
     snapshot_export_meta: dict[str, object] | None = None,
     snapshot_export_meta_json: str = "null",
@@ -685,6 +692,7 @@ def build_index_context(
         "read_ui_mutation_auth_mode": read_ui_mutation_auth_mode,
         "app_version": app_version,
         "release_status": release_status or {},
+        "upgrade_notice": upgrade_notice_payload if not snapshot_mode else None,
         "snapshot_mode": snapshot_mode,
         "sas_fabric_view_url": sas_fabric_view_url,
         "snapshot_export_meta": snapshot_export_meta or {},

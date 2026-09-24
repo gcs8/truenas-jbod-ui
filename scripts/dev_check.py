@@ -145,6 +145,7 @@ WINDOWS_PORTABLE_TEST_MODULES = (
     "tests.test_tls_trust",
     "tests.test_truenas_ws",
     "tests.test_truenas_ws_jsonrpc",
+    "tests.test_upgrade_notice",
     "tests.test_wiki_drift_verifier",
 )
 

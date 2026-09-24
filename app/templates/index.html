@@ -205,6 +205,12 @@
   </dialog>
   {% endif %}
 
+  {% if not snapshot_mode and upgrade_notice %}
+  <section class="upgrade-notice" id="upgrade-notice" role="status" data-notice-version="{{ upgrade_notice.version }}">
+    <p class="upgrade-notice-text" id="upgrade-notice-text">{{ upgrade_notice.text }}</p>
+    <button class="button secondary small" id="upgrade-notice-dismiss" type="button">Got it</button>
+  </section>
+  {% endif %}
   <p id="inventory-scope-note" class="subtle hidden" role="status"></p>
   <p id="storage-view-runtime-note" class="subtle hidden" role="status"></p>
   <button id="storage-view-runtime-retry" type="button" class="button secondary small hidden">Retry storage views</button>
