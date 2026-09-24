@@ -73,8 +73,10 @@ service logs.
 | `Cleanup resumes by` | The deadline after which retention prunes anyway. |
 | `Full refresh available` | When the next manual full refresh is allowed, instead of a refusal after the fact. |
 
-The history service `/healthz` always answers HTTP 200 while the process is up.
-Its `status` is `degraded`, with a plain `detail`, when the last background
+The history service `/healthz` answers HTTP 503 with `status: down` only when
+the history database could not be opened at startup (for example an unwritable
+`./history` folder); `reason` carries the plain line from the log. Otherwise it
+answers HTTP 200. Its `status` is `degraded`, with a plain `detail`, when the last background
 collection failed, the history database is read-only, cleanup failed twice in a
 row, or earlier history was quarantined and needs recovery. A failed manual
 refresh shows in `Last error` but does not make the service degraded. The

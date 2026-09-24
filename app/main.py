@@ -6,9 +6,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import socket
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import OrderedDict
 from contextlib import asynccontextmanager
@@ -26,7 +28,12 @@ from pydantic import BaseModel, ConfigDict
 
 from app.read_ui_auth_config import load_read_ui_auth_settings
 from app import __version__
-from app.config import Settings, get_settings
+from app.config import (
+    Settings,
+    get_settings,
+    is_placeholder_known_hosts_path,
+    known_hosts_placeholder_paths,
+)
 from app.http_auth import (
     basic_auth_matches,
     configured_origin_identity,
@@ -79,7 +86,7 @@ from app.services.snapshot_export import (
     SnapshotExportTooLargeError,
     collect_configured_hostnames,
 )
-from app.services.storage_writability import probe_writable_directories
+from app.services.storage_writability import probe_known_hosts_files, probe_writable_directories
 from app.services.truenas_ws import TrueNASAPIError
 from app.services import upgrade_notice
 from history_service.operation_bounds import (
@@ -617,10 +624,19 @@ def create_app() -> FastAPI:
     )
     app.state.operator_auth_settings = operator_auth_settings
     app.state.read_ui_public_origin = startup_settings.app.public_origin
-    startup_problems = probe_writable_directories(ui_writable_directories(startup_settings))
+    writable_directories = tuple(ui_writable_directories(startup_settings))
+    _, configured_known_hosts = split_known_hosts_paths(startup_settings)
+    known_hosts_files = tuple(configured_known_hosts)
+    startup_problems = [
+        *probe_writable_directories(writable_directories),
+        *probe_known_hosts_files(known_hosts_files),
+    ]
     for problem in startup_problems:
         logger.error("%s", problem)
     app.state.startup_problems = tuple(startup_problems)
+    app.state.writable_directories = writable_directories
+    app.state.known_hosts_files = known_hosts_files
+    app.state.storage_checked_at_monotonic = time.monotonic()
 
     app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
     install_metrics(app, service_name="enclosure-ui", version=__version__)
@@ -912,14 +928,42 @@ def ui_writable_directories(settings: Settings) -> list[str]:
     """
 
     paths = settings.paths
+    derived_known_hosts, _ = split_known_hosts_paths(settings)
     candidates = [
         paths.mapping_file,
         paths.sas_fabric_alias_file,
         paths.slot_detail_cache_file,
         paths.log_file,
-        settings.ssh.known_hosts_path,
+        *derived_known_hosts,
     ]
     return [str(Path(candidate).parent) for candidate in candidates if candidate]
+
+
+def split_known_hosts_paths(settings: Settings) -> tuple[list[str], list[str]]:
+    """Known-hosts files in use, split into (derived default, operator-configured).
+
+    The derived ``<data>/known_hosts`` lives in the data folder and is probed
+    with it. A configured path (e.g. a host bind mount) gets its own check,
+    which reports a missing folder instead of creating one.
+    """
+    placeholders = known_hosts_placeholder_paths(settings.config_file)
+    derived: list[str] = []
+    configured: list[str] = []
+    for candidate in (settings.ssh.known_hosts_path, *(system.ssh.known_hosts_path for system in settings.systems)):
+        if not candidate:
+            continue
+        bucket = derived if is_placeholder_known_hosts_path(candidate, placeholders) else configured
+        if candidate not in bucket:
+            bucket.append(candidate)
+    return derived, configured
+
+
+def startup_storage_problems(settings: Settings) -> list[str]:
+    _, configured_known_hosts = split_known_hosts_paths(settings)
+    return [
+        *probe_writable_directories(ui_writable_directories(settings)),
+        *probe_known_hosts_files(configured_known_hosts),
+    ]
 
 
 def startup_problems_for(request: Request) -> list[str]:
@@ -927,26 +971,146 @@ def startup_problems_for(request: Request) -> list[str]:
     return [str(problem) for problem in (getattr(app_state, "startup_problems", None) or ())]
 
 
+STORAGE_REPROBE_SECONDS = 30.0
+
+
+def refresh_storage_problems(request: Request) -> list[str]:
+    """Re-run the writability probe at most every 30 seconds and return its lines.
+
+    A chown on the Docker host then clears the red health state without a
+    container restart, and a bind mount that turns read-only while the app runs
+    is noticed. Only the startup lines are returned when the app state carries
+    no probe directories (tests, or an app built without ``create_app``).
+    """
+
+    app_state = getattr(getattr(request, "app", None), "state", None)
+    directories = tuple(getattr(app_state, "writable_directories", None) or ())
+    previous = tuple(str(problem) for problem in (getattr(app_state, "startup_problems", None) or ()))
+    if app_state is None or not directories:
+        return list(previous)
+    now = time.monotonic()
+    checked_at = getattr(app_state, "storage_checked_at_monotonic", None)
+    if isinstance(checked_at, (int, float)) and now - checked_at < STORAGE_REPROBE_SECONDS:
+        return list(previous)
+    known_hosts_files = tuple(getattr(app_state, "known_hosts_files", None) or ())
+    current = tuple([*probe_writable_directories(directories), *probe_known_hosts_files(known_hosts_files)])
+    for problem in current:
+        if problem not in previous:
+            logger.error("%s", problem)
+    if previous and not current:
+        logger.info("Data, log and known-hosts folders are writable again.")
+    app_state.startup_problems = current
+    app_state.storage_checked_at_monotonic = now
+    return list(current)
+
+
+@dataclass(slots=True)
+class HistoryProbeCacheEntry:
+    problem: str | None
+    expires_at_monotonic: float
+
+
+HISTORY_PROBE_SUCCESS_TTL_SECONDS = 30.0
+HISTORY_PROBE_FAILURE_TTL_SECONDS = 10.0
+HISTORY_PROBE_MAX_TIMEOUT_SECONDS = 2.0
+HISTORY_PROBE_CACHE: dict[str, HistoryProbeCacheEntry] = {}
+HISTORY_UNAVAILABLE_PROBLEM = "History service unavailable"
+HISTORY_COMPOSE_SERVICE_HOST = "enclosure-history"
+
+
+def _probe_history_service(service_url: str, timeout_seconds: float) -> str | None:
+    """Return one plain problem line for the history sidecar, or None.
+
+    When the URL names the default Compose service (``enclosure-history``) and
+    that name does not resolve, the optional history container is simply not
+    deployed: Docker only resolves service names of running containers, and the
+    default Compose file sets the URL even when the history profile is off. That
+    case is not reported. Any other host that does not resolve is a problem.
+    Everything that fails is outside this container, so it can only ever
+    degrade health, never take it down.
+    """
+
+    health_url = f"{service_url.rstrip('/')}/healthz"
+    health_request = urllib.request.Request(
+        health_url,
+        headers=request_id_headers({"Accept": "application/json"}),
+    )
+    try:
+        with urllib.request.urlopen(health_request, timeout=timeout_seconds) as response:
+            payload = json.loads(response.read(64 * 1024) or b"{}")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 503:
+            return f"{HISTORY_UNAVAILABLE_PROBLEM}: it reports a local storage fault; see the history service log."
+        return f"{HISTORY_UNAVAILABLE_PROBLEM}: it answered HTTP {exc.code}."
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, socket.gaierror):
+            host = (urllib.parse.urlsplit(service_url).hostname or "").lower()
+            if host == HISTORY_COMPOSE_SERVICE_HOST:
+                return None
+            return f"{HISTORY_UNAVAILABLE_PROBLEM}: its host name does not resolve."
+        if isinstance(exc.reason, ConnectionRefusedError):
+            return f"{HISTORY_UNAVAILABLE_PROBLEM}: connection refused."
+        if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+            return f"{HISTORY_UNAVAILABLE_PROBLEM}: no answer within {timeout_seconds:g} seconds."
+        return f"{HISTORY_UNAVAILABLE_PROBLEM}: it could not be reached."
+    except (TimeoutError, socket.timeout):
+        return f"{HISTORY_UNAVAILABLE_PROBLEM}: no answer within {timeout_seconds:g} seconds."
+    except (OSError, ValueError):
+        return f"{HISTORY_UNAVAILABLE_PROBLEM}: it returned an unreadable answer."
+    if not isinstance(payload, dict):
+        return f"{HISTORY_UNAVAILABLE_PROBLEM}: it returned an unreadable answer."
+    if payload.get("status") == "degraded":
+        detail = str(payload.get("detail") or "").strip() or "see the history service log."
+        return f"History service degraded: {detail}"
+    return None
+
+
+def history_service_problem(settings: Settings) -> str | None:
+    """Probe the configured history sidecar, remembering the answer briefly."""
+
+    service_url = str(settings.history.service_url or "").strip()
+    if not service_url:
+        return None
+    now = time.monotonic()
+    cached = HISTORY_PROBE_CACHE.get(service_url)
+    if cached is not None and cached.expires_at_monotonic > now:
+        return cached.problem
+    timeout_seconds = min(float(settings.history.timeout_seconds), HISTORY_PROBE_MAX_TIMEOUT_SECONDS)
+    problem = _probe_history_service(service_url, timeout_seconds)
+    ttl_seconds = HISTORY_PROBE_FAILURE_TTL_SECONDS if problem else HISTORY_PROBE_SUCCESS_TTL_SECONDS
+    HISTORY_PROBE_CACHE[service_url] = HistoryProbeCacheEntry(
+        problem=problem,
+        expires_at_monotonic=now + ttl_seconds,
+    )
+    return problem
+
+
 HEALTH_SUMMARY_ALL_OK = "All sources OK"
 HEALTH_SUMMARY_WAITING = "Waiting for the first inventory"
+HEALTH_SOURCE_LABELS = {"api": "TrueNAS API", "ssh": "SSH", "bmc": "BMC/IPMI"}
 
 
 def build_health_payload(
     snapshot: InventorySnapshot | None,
     *,
     startup_problems: Collection[str] = (),
+    remote_problems: Collection[str] = (),
 ) -> dict[str, object]:
-    """Describe main-UI health in plain words.
+    """Describe main-UI health in three levels (#429).
 
-    ``summary`` is one sentence; ``problems`` lists what an operator must act
-    on: a directory the app cannot write, or a TrueNAS API that does not
-    answer. Waiting for the first inventory is not a problem. The route keeps
-    answering HTTP 200 because the Compose healthcheck and existing monitors
-    depend on it; ``status`` and ``problems`` carry the verdict.
+    - ``ok``: nothing to act on. Waiting for the first inventory is not a problem.
+    - ``degraded``: something outside this container is unhealthy: the TrueNAS
+      API, SSH, the BMC, or the history sidecar. The app keeps serving what it
+      has, so the route still answers HTTP 200.
+    - ``down``: a local fault the container cannot operate through: a data,
+      log or known-hosts folder it cannot write (``startup_problems``). The
+      route answers HTTP 503.
+
+    ``summary`` is one sentence; ``problems`` lists every reason, local first.
     """
 
     unwritable = [str(problem) for problem in startup_problems]
-    api_problem: str | None = None
+    remote: list[str] = []
     if snapshot is None:
         dependency_status = "unknown"
         last_updated = None
@@ -964,19 +1128,26 @@ def build_health_payload(
             # ok=False covers both a failed API and one that answers with degraded
             # enclosure data, so name the state neutrally and keep the recorded cause.
             api_message = (api_status.message if api_status else None) or "no details recorded"
-            api_problem = f"TrueNAS API degraded: {api_message}"
+            remote.append(f"TrueNAS API degraded: {api_message}")
+        for name in ("ssh", "bmc"):
+            status = snapshot.sources.get(name)
+            if status is not None and status.enabled and not status.ok:
+                message = status.message or "no details recorded"
+                remote.append(f"{HEALTH_SOURCE_LABELS[name]} degraded: {message}")
+    remote.extend(str(problem) for problem in remote_problems if problem)
 
-    problems = [*unwritable, *([api_problem] if api_problem else [])]
+    problems = [*unwritable, *remote]
     if unwritable:
+        status_text = "down"
         summary = "Data folder not writable: " + "; ".join(unwritable)
-    elif api_problem:
-        summary = api_problem
-    elif snapshot is None:
-        summary = HEALTH_SUMMARY_WAITING
+    elif remote:
+        status_text = "degraded"
+        summary = remote[0] if len(remote) == 1 else f"{remote[0]} (and {len(remote) - 1} more)"
     else:
-        summary = HEALTH_SUMMARY_ALL_OK
+        status_text = "ok"
+        summary = HEALTH_SUMMARY_WAITING if snapshot is None else HEALTH_SUMMARY_ALL_OK
     return {
-        "status": "ok" if not problems else "degraded",
+        "status": status_text,
         "summary": summary,
         "problems": problems,
         "dependency_status": dependency_status,
@@ -986,5 +1157,10 @@ def build_health_payload(
         "cache_state": cache_state,
     }
 
+
+def health_status_code(payload: dict[str, object]) -> int:
+    """HTTP status for a health payload: 503 only when the container itself is down."""
+
+    return 503 if payload.get("status") == "down" else 200
 
 app = create_app()

@@ -26,9 +26,20 @@ Follow recent logs:
 docker compose logs --tail=150 -f
 ```
 
-If `livez` is not `ok`, fix the container/runtime problem first. If `livez` is
-healthy but `healthz` reports a warning or degraded dependency, read that
-payload before chasing layout bugs.
+If `livez` is not `ok`, fix the container/runtime problem first. Then read the
+`status`, `summary` and `problems` fields of `healthz`:
+
+| `status` | HTTP | Meaning |
+| --- | --- | --- |
+| `ok` | 200 | Nothing to act on. Before the first inventory the summary says `Waiting for the first inventory`. |
+| `degraded` | 200 | Something outside the container is unhealthy: the TrueNAS API is unreachable or partial, SSH or the BMC failed, or the history service is unavailable or degraded. The app keeps serving what it has. |
+| `down` | 503 | A local fault the container cannot work through: its data, logs or known-hosts folder is not writable. See [Saves fail and the history service keeps restarting](#saves-fail-and-the-history-service-keeps-restarting). |
+
+A remote system being down never makes `healthz` return 503. The UI re-checks
+its folders at most every 30 seconds, so after a `chown` on the Docker host the
+status returns to `ok` without a restart. The history service `/healthz` uses
+the same words: `down` (HTTP 503) when its database could not be opened,
+`degraded` (HTTP 200) for collection or cleanup failures.
 
 ## A container keeps restarting
 
@@ -139,6 +150,9 @@ uid. What you see:
 - Every mapping or alias save fails with
   `Could not save: the data folder is not writable by the app. See
   Troubleshooting.` (HTTP 503). Before v0.24 this was a generic HTTP 500.
+- The main UI `/healthz` answers HTTP 503 with `status: down` and the same
+  `Cannot write to ...` line in `problems`. The container healthcheck probes
+  `/livez`, so Docker does not restart it or mark it unhealthy for this.
 - The history service logs
   `Cannot write to /app/history (owned by uid 0, running as uid 10001). On the
   Docker host run: sudo chown -R 10001:10001 ./history`, retries a few times
@@ -198,8 +212,9 @@ sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid "$app_uid" --gid "$a
 ```
 
 Run the dry check first. Do not use recursive `chmod 777`. If SSH then fails to
-load `known_hosts`, verify that `data/known_hosts` is owned by the configured
-app UID/GID and uses mode `0660`.
+load `known_hosts`, verify that `data/known_hosts` (or the file named by
+`ssh.known_hosts_path` / `SSH_KNOWN_HOSTS_PATH`, if set) is owned by the
+configured app UID/GID and uses mode `0660`.
 
 ## SCALE shows a generic runtime profile
 

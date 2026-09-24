@@ -5908,27 +5908,53 @@ class SystemSetupServiceTests(unittest.TestCase):
 
         self.assertEqual(saved["systems"][0]["ssh"]["known_hosts_path"], str(temp_dir / "known_hosts"))
 
-    def test_settings_normalizes_legacy_system_known_hosts_path(self) -> None:
+    def test_settings_honours_a_configured_system_known_hosts_path(self) -> None:
+        # #454 owner decision: a per-system value that is not a placeholder is honoured.
         temp_dir = Path(tempfile.mkdtemp())
         config_path = temp_dir / "config.yaml"
         write_yaml(
             config_path,
             {
                 "systems": [
-                    {
-                        "id": "legacy-core",
-                        "ssh": {"known_hosts_path": str(temp_dir / "legacy-request-selected")},
-                    }
+                    {"id": "configured-core", "ssh": {"known_hosts_path": str(temp_dir / "host-trust")}},
+                    {"id": "legacy-core", "ssh": {"known_hosts_path": "/app/data/known_hosts"}},
                 ]
             },
         )
 
         with patch.dict(os.environ, {"APP_CONFIG_PATH": str(config_path)}, clear=False):
+            os.environ.pop("SSH_KNOWN_HOSTS_PATH", None)
             get_settings.cache_clear()
             settings = get_settings()
             get_settings.cache_clear()
 
-        self.assertEqual(settings.systems[0].ssh.known_hosts_path, str(temp_dir / "known_hosts"))
+        self.assertEqual(settings.systems[0].ssh.known_hosts_path, str(temp_dir / "host-trust"))
+        self.assertEqual(settings.systems[1].ssh.known_hosts_path, str(temp_dir / "known_hosts"))
+
+    def test_resaving_a_system_keeps_its_configured_known_hosts_path(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        config_path = temp_dir / "config.yaml"
+        write_yaml(
+            config_path,
+            {"systems": [{"id": "example-core", "ssh": {"known_hosts_path": "/srv/host-trust/known_hosts"}}]},
+        )
+
+        service = SystemSetupService(str(config_path))
+        service.create_system(
+            SystemSetupRequest(
+                system_id="example-core",
+                label="Example CORE",
+                platform="core",
+                truenas_host="https://core.example.test",
+                ssh_enabled=True,
+                ssh_user="jbodmap",
+                ssh_known_hosts_path=str(temp_dir / "request-selected-known-hosts"),
+                replace_existing=True,
+            )
+        )
+
+        saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["systems"][0]["ssh"]["known_hosts_path"], "/srv/host-trust/known_hosts")
 
     def test_create_system_can_persist_password_only_ssh_without_key_path(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
