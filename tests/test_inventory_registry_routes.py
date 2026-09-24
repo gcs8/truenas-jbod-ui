@@ -26,7 +26,7 @@ from app.services.inventory_registry import InventoryRegistry, SystemNotConfigur
 
 
 UNKNOWN_SYSTEM_ID = "retired-nas"
-UNKNOWN_SYSTEM_DETAIL = f"System '{UNKNOWN_SYSTEM_ID}' is not configured."
+UNKNOWN_SYSTEM_DETAIL = f'No system named "{UNKNOWN_SYSTEM_ID}" is configured.'
 
 
 def _registry_with_default_service(default_service: Mock) -> InventoryRegistry:
@@ -105,7 +105,7 @@ class InventoryRegistrySelectionTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             SystemNotConfiguredError,
-            "^System 'retired-nas' is not configured\\.$",
+            '^No system named "retired-nas" is configured\\.$',
         ):
             registry.get_system(UNKNOWN_SYSTEM_ID)
 
@@ -115,7 +115,7 @@ class InventoryRegistrySelectionTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             SystemNotConfiguredError,
-            "^System 'retired-nas' is not configured\\.$",
+            '^No system named "retired-nas" is configured\\.$',
         ):
             registry.get_service(UNKNOWN_SYSTEM_ID)
 
@@ -126,14 +126,14 @@ class UnknownSystemRouteTests(unittest.TestCase):
     def assert_unknown_system(self, callback) -> None:
         with self.assertRaisesRegex(
             SystemNotConfiguredError,
-            "^System 'retired-nas' is not configured\\.$",
+            '^No system named "retired-nas" is configured\\.$',
         ):
             asyncio.run(callback())
 
     def test_registered_handlers_map_unknown_system_errors_to_404(self) -> None:
         error = SystemNotConfiguredError(UNKNOWN_SYSTEM_ID)
         for application, handler in (
-            (app_main.app, app_main.system_not_configured_exception_handler),
+            (app_main.app, app_main.mapped_exception_handler),
             (admin_main.app, admin_main.system_not_configured_exception_handler),
         ):
             with self.subTest(application=application.title):
@@ -333,7 +333,42 @@ class UnknownSystemRouteTests(unittest.TestCase):
         registry.get_service.assert_called_once_with("system-a")
         response_text = response.body.decode("utf-8")
         self.assertIn('value="system-a" selected', response_text)
-        self.assertNotIn(UNKNOWN_SYSTEM_ID, response_text)
+        self.assertNotIn(f'value="{UNKNOWN_SYSTEM_ID}"', response_text)
+        self.assertIn(
+            f'<p class="status-text" id="system-notice" role="status" data-tone="info">'
+            f'System &#34;{UNKNOWN_SYSTEM_ID}&#34; is not configured. Showing System A instead.</p>',
+            response_text,
+        )
+
+    def test_index_with_configured_system_renders_no_system_notice(self) -> None:
+        settings = Settings(
+            systems=[SystemConfig(id="system-a", label="System A")],
+            default_system_id="system-a",
+        )
+        service = _default_service()
+        registry = Mock()
+        registry.get_service.return_value = service
+        release_service = Mock()
+        release_service.snapshot.return_value = {}
+        route = _route(app_main.app, "/")
+
+        with (
+            patch.object(app_main, "get_settings", return_value=settings),
+            patch.object(app_main, "get_inventory_registry", return_value=registry),
+            patch.object(app_main, "get_release_status_service", return_value=release_service),
+            patch.object(app_main, "resolve_admin_launch_url", return_value=None),
+        ):
+            for requested_system_id in ("system-a", None):
+                with self.subTest(system_id=requested_system_id):
+                    response = asyncio.run(
+                        route.endpoint(
+                            request=_request(),
+                            system_id=requested_system_id,
+                            enclosure_id=None,
+                        )
+                    )
+                    self.assertEqual(response.status_code, 200)
+                    self.assertNotIn('id="system-notice"', response.body.decode("utf-8"))
 
 
 if __name__ == "__main__":
