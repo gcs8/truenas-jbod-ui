@@ -217,13 +217,16 @@ def run_shard(
         return 2
 
     modules = shards[shard_id]
+    if results_dir is not None:
+        # Created before the run so a coverage data file pointed here by
+        # COVERAGE_FILE has somewhere to land even when the run aborts early.
+        results_dir.mkdir(parents=True, exist_ok=True)
     # `python -m unittest` enables "default" warnings unless -W was given.
     warnings = None if sys.warnoptions else "default"
     runner = unittest.TextTestRunner(stream=stream, verbosity=2, warnings=warnings)
     result = runner.run(build_suite(modules, tests_dir))
 
     if results_dir is not None:
-        results_dir.mkdir(parents=True, exist_ok=True)
         payload = {
             "shard": shard_id,
             "python_version": python_version_label(),
