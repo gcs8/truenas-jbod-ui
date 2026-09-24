@@ -44,6 +44,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Added
 
+- Added a catalog of backup artifacts and a retention manager for the coming
+  remote backup archive: per-class, per-location keep-N and max-age rules, a
+  preserve flag that pins a backup, a dry-run preview, and deletion only of
+  catalogued copies, never the newest verified one. Not wired in yet. (#574)
+
 - Showed a one-time dismissible notice in the main UI after the app is
   updated, kept until dismissed and stored per install; v0.23.0 says that
   network mode lets anyone who can reach the port change bay assignments and
