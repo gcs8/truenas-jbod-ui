@@ -305,7 +305,7 @@ test("rendering the Quantastor HA rows normalizes the node list once and caches 
   functions.renderQuantastorHaSection();
   assert.equal(normalizeCalls, 1, "one normalizeHaNodes per HA render");
   assert.equal(queries, 9, "three rows times three fields are looked up on the first render");
-  assert.match(elements.setupHaNodesResult.textContent, /Loaded 2 Quantastor HA node rows/);
+  assert.match(elements.setupHaNodesResult.textContent, /Loaded 2 nodes\. 1 of them has no address yet/);
 
   functions.renderQuantastorHaSection();
   assert.equal(normalizeCalls, 2);

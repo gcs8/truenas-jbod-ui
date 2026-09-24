@@ -65,6 +65,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Changed
 
+- Rewrote the admin setup, backup and maintenance copy in plain words, hid the
+  one-time bootstrap, SSH command list and QuantaStor HA controls until they are
+  needed, showed only the storage-view fields that apply, and made system pills,
+  delete confirmations, restore inspections and validation errors read as
+  sentences instead of developer strings. (#487)
 - Rewrote the warnings, bay-light and mapping reasons, SMART messages, HTTP error details, export banner labels and release-check summaries the main page shows, in plain words with no roadmap prose; the QuantaStor cluster master is shown in Platform Details instead of as a warning, and history backend log lines now say why a request failed (#496).
 - Rewrote the main page copy in plain words: header and profile subtitles,
   the bay status line and Summary panel, the Bay assignment panel, status
