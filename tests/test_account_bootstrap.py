@@ -144,6 +144,35 @@ class ServiceAccountBootstrapServiceTests(unittest.TestCase):
                 str(Path(temp_dir) / "data" / "known_hosts"),
             )
 
+    def test_bootstrap_uses_the_configured_known_hosts_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_file = Path(temp_dir) / "config" / "config.yaml"
+            config_file.parent.mkdir(parents=True, exist_ok=True)
+            key_manager = SSHKeyManager(str(config_file))
+            generated_key = key_manager.generate_keypair("id_truenas")
+            configured = str(Path(temp_dir) / "host-trust" / "known_hosts")
+            service = ServiceAccountBootstrapService(
+                str(config_file),
+                probe_factory=FakeProbe,
+                known_hosts_path=configured,
+            )
+
+            result = service.bootstrap_service_account(
+                SystemSetupBootstrapRequest(
+                    platform="core",
+                    host="nas.example.test",
+                    bootstrap_user="root",
+                    bootstrap_password="bootstrap-secret",
+                    bootstrap_known_hosts_path=str(Path(temp_dir) / "request-selected-known-hosts"),
+                    bootstrap_strict_host_key_checking=False,
+                    service_user="jbodmap",
+                    service_key_name=generated_key["name"],
+                )
+            )
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(FakeProbe.last_config.known_hosts_path, configured)
+
     def test_bootstrap_uses_sudo_and_private_key_path_for_non_root_user(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config_file = Path(temp_dir) / "config" / "config.yaml"

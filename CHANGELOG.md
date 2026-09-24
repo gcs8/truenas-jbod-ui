@@ -126,6 +126,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Honoured a configured `ssh.known_hosts_path` (top level, per system, or the
+  restored `SSH_KNOWN_HOSTS_PATH`) instead of always replacing it with
+  `<data>/known_hosts`, so pinned host keys can live in a host bind mount;
+  unset and default values still use the data folder, and a missing or
+  unwritable folder is reported at startup (#576).
+
 - Added an explicit legacy Compose migration that forwarded history's published
   bind address without replacing deployment customizations and aligned optional
   UI/history refresh-token forwarding across CLI and shell inputs. (#571)
