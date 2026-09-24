@@ -95,6 +95,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Reported failed SCALE and QuantaStor enrichment without hiding source
+  disks or leaving SSH status falsely healthy; a SCALE host whose SES
+  discovery succeeds but finds no enclosure device stays healthy and quiet. (#422)
+
 - The history `/healthz` now says why it is degraded (last background pass
   failed, read-only database, cleanup failed twice in a row, or recovery
   required) and no longer counts a failed manual refresh; collector fields are
@@ -102,7 +106,6 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   startup grace period, counts down the cooldown on the Full refresh button only,
   never renders an uncounted value as "deferred", and names a scheduled backup
   status file with unsafe permissions (#566).
-
 - Published aggregate disk-retention totals on the inventory summary
   (`source_disk_count`, `rendered_unique_disk_count`,
   `duplicate_disk_view_count`, `unplaced_disk_count`) so a release check can
@@ -274,6 +277,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 - Preserved history availability, scope identity and outage errors across
   bulk responses and offline exports. (#423)
+- Removed invented physical backplanes and bay labels from virtual inventories.
+  Logical disk paths and known physical aliases were preserved. (#419)
 
 ### Performance
 
