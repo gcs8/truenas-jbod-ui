@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import tempfile
 import unittest
@@ -165,6 +166,82 @@ class HistoryRefreshRequestTests(unittest.IsolatedAsyncioTestCase):
         clock.return_value = 1900.0
         boundary = await admission.try_acquire("full")
         self.assertTrue(boundary.accepted)
+        await admission.release()
+
+    async def test_cooldown_reply_reports_remaining_wait_without_extending_cooldown(self) -> None:
+        clock = Mock(return_value=1000.0)
+        admission = ManualRefreshAdmission(cooldown_seconds=900, monotonic=clock)
+        self.assertTrue((await admission.try_acquire("full")).accepted)
+        await admission.release()
+        with (
+            patch.object(history_main, "settings", HistorySettings()),
+            patch.object(history_main, "refresh_admission", admission),
+            patch.object(history_main.collector, "run_once", AsyncMock()) as run_once,
+            patch.object(type(history_main.collector), "collection_running", new_callable=PropertyMock, return_value=False),
+            patch.object(history_main, "overview", AsyncMock(return_value={})) as overview,
+        ):
+            for now, remaining in ((1000.0, 900), (1000.1, 900), (1600.0, 300), (1899.999, 1)):
+                with self.subTest(now=now):
+                    clock.return_value = now
+                    response = await history_main.refresh_history(self._request(b'{"mode":"full"}'))
+                    self.assertEqual(response.status_code, 429)
+                    self.assertEqual(response.headers["retry-after"], str(remaining))
+                    self.assertEqual(json.loads(response.body), {
+                        "ok": False,
+                        "mode": "full",
+                        "detail": f"History full refresh is cooling down. Try again in {remaining} s.",
+                        "retry_after_seconds": remaining,
+                    })
+                    run_once.assert_not_awaited()
+                    overview.assert_not_awaited()
+
+            # A refusal must not block fast refresh or move the original deadline.
+            fast = await history_main.refresh_history(self._request(b'{"mode":"fast"}'))
+            self.assertTrue(fast["ok"])
+            run_once.assert_awaited_once_with(
+                force_fast=True, force_slow=False, include_due_intervals=False, cached_root_only=True,
+            )
+            clock.return_value = 1900.0
+            full = await history_main.refresh_history(self._request(b'{"mode":"full"}'))
+            self.assertTrue(full["ok"])
+            self.assertEqual(run_once.await_count, 2)
+            run_once.assert_awaited_with(
+                force_fast=True, force_slow=True, include_due_intervals=False, cached_root_only=False,
+            )
+
+    async def test_unauthorized_refresh_does_not_read_or_change_cooldown_state(self) -> None:
+        clock = Mock(return_value=1000.0)
+        admission = ManualRefreshAdmission(cooldown_seconds=900, monotonic=clock)
+        self.assertTrue((await admission.try_acquire("full")).accepted)
+        await admission.release()
+        clock.reset_mock()
+        settings = HistorySettings(
+            refresh_auth_mode="token", refresh_token="synthetic-token",
+            public_origin="https://history.example.test",
+        )
+        with (
+            patch.object(history_main, "settings", settings),
+            patch.object(history_main, "refresh_admission", admission),
+            patch.object(history_main.collector, "run_once", AsyncMock()) as run_once,
+            patch.object(history_main, "overview", AsyncMock()) as overview,
+            patch.object(admission, "try_acquire", wraps=admission.try_acquire) as acquire,
+        ):
+            cases = (
+                ([], 401),
+                ([(b"authorization", b"Bearer wrong")], 401),
+                ([(b"authorization", b"Bearer synthetic-token"), (b"origin", b"https://foreign.example.test")], 403),
+            )
+            for headers, status in cases:
+                with self.subTest(status=status, headers=headers), self.assertRaises(HTTPException) as raised:
+                    await history_main.refresh_history(self._request(b'{"mode":"full"}', headers=headers))
+                self.assertEqual(raised.exception.status_code, status)
+                self.assertNotIn("cooling", raised.exception.detail)
+            acquire.assert_not_awaited()
+            clock.assert_not_called()
+            run_once.assert_not_awaited()
+            overview.assert_not_awaited()
+        clock.return_value = 1900.0
+        self.assertTrue((await admission.try_acquire("full")).accepted)
         await admission.release()
 
     async def test_concurrent_refresh_calls_run_collector_once_and_skip_overview_on_rejection(self) -> None:

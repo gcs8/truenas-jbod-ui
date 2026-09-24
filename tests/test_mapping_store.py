@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
 import unittest
 from contextlib import ExitStack
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-from app.models.domain import ManualMapping
+from app.models.domain import ManualMapping, SlotView
 from app.services.mapping_store import (
     MappingRevisionConflict,
     MappingScopeConflict,
@@ -3589,6 +3591,159 @@ class MappingStoreIdentityBoundTempCleanupTests(unittest.TestCase):
                     {mapping.serial for mapping in store.load_all().values()},
                     {"OLD", "NEW"},
                 )
+
+
+BATCH_SYSTEM = "synthetic-system-a"
+BATCH_SHELF = "synthetic-shelf-a"
+BATCH_DRAWER = f"{BATCH_SHELF}::dell-md1280-drawer-top-42"
+
+
+def batch_mapping(
+    system: str | None = BATCH_SYSTEM, enclosure: str | None = BATCH_SHELF,
+    slot: int = 0, serial: str = "SYNTHETIC",
+) -> ManualMapping:
+    return ManualMapping(
+        system_id=system, enclosure_id=enclosure, slot=slot, serial=serial,
+        updated_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+
+
+def write_batch_document(store, version, rows):
+    store.file_path.write_text(json.dumps({
+        "version": version,
+        "slot_mappings": {key: row.model_dump(mode="json") for key, row in rows.items()},
+    }), encoding="utf-8")
+
+
+def batch_parity_rows(store, version):
+    models = [
+        batch_mapping(), batch_mapping(enclosure=BATCH_DRAWER, slot=1),
+        batch_mapping(system=None, slot=2), batch_mapping(enclosure=None, slot=3),
+        batch_mapping(system=None, enclosure=None, slot=4),
+        batch_mapping(system="synthetic-system-b", slot=0),
+        batch_mapping(enclosure=f"{BATCH_SHELF}:neighbor", slot=0),
+    ]
+    if version == 2:
+        models = [store._canonical_mapping(row) for row in models]
+        return {store._encode_v2_key(row.system_id, row.enclosure_id, row.slot): row
+                for row in models}
+    return {(f"{row.enclosure_id or 'default'}:{row.slot}" if row.system_id is None
+             else store._slot_key(row.system_id, row.enclosure_id, row.slot)): row
+            for row in models}
+
+
+class MappingRevisionBatchTests(unittest.TestCase):
+    def test_attachment_reads_and_classifies_once_per_batch(self):
+        from app.config import SystemConfig
+        from app.services.inventory import InventoryService
+
+        for count in (60, 347):
+            with self.subTest(count=count), tempfile.TemporaryDirectory() as root:
+                store = MappingStore(str(Path(root) / "mapping.json"))
+                rows = batch_parity_rows(store, 1)
+                write_batch_document(store, 1, rows)
+                before = store.file_path.read_bytes()
+                service = InventoryService.__new__(InventoryService)
+                service.mapping_store = store
+                service.system = SystemConfig(id=BATCH_SYSTEM)
+                slots = [SlotView(slot=i, slot_label=f"Bay {i}", row_index=0,
+                                  column_index=i, enclosure_id=BATCH_DRAWER) for i in range(count)]
+                expected_save = store.save_revisions(BATCH_SYSTEM, [(BATCH_SHELF, i) for i in range(count)])
+                expected_clear = store.clear_revisions(BATCH_SYSTEM, [(BATCH_SHELF, i) for i in range(count)])
+                with patch.object(store, "_read_document", wraps=store._read_document) as reads, \
+                     patch.object(store, "_classify_row", wraps=store._classify_row) as classifications:
+                    result = InventoryService._attach_mapping_revisions(service, slots)
+                self.assertEqual(len(result), count)
+                self.assertEqual([s.mapping_revision for s in result], list(expected_save.values()))
+                self.assertEqual([s.mapping_clear_revision for s in result], list(expected_clear.values()))
+                self.assertEqual(store.file_path.read_bytes(), before)
+                self.assertLessEqual(reads.call_count, 2)
+                self.assertLessEqual(classifications.call_count, 2 * len(rows))
+
+    def test_batch_tokens_match_pre_optimization_bytes(self):
+        # Fingerprints captured on a98917a before changing production code.
+        expected = {
+            1: "899bcb814d7d8b198dd331f29c479b2db4f8f7bf5415df75d9f2f4b6d8d6016e",
+            2: "84f6ec1948baea449762f584009e149c27c2dc0f7ecadb792659f5b910e81e35",
+        }
+        for version in (1, 2):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as root:
+                store = MappingStore(str(Path(root) / "mapping.json"))
+                write_batch_document(store, version, batch_parity_rows(store, version))
+                before = store.file_path.read_bytes()
+                targets = [(scope, slot) for scope in (BATCH_SHELF, BATCH_DRAWER, None, f"{BATCH_SHELF}:neighbor")
+                           for slot in range(6)]
+                tokens = []
+                for system in (BATCH_SYSTEM, None, "synthetic-system-b"):
+                    for operation in ("save", "clear"):
+                        batch = getattr(store, f"{operation}_revisions")(system, targets + targets[:1])
+                        self.assertEqual(list(batch), targets)
+                        singles = {target: getattr(store, f"{operation}_revision")(system, *target)
+                                   for target in targets}
+                        self.assertEqual(batch, singles)
+                        tokens.extend(batch.values())
+                fingerprint = hashlib.sha256(json.dumps(tokens).encode()).hexdigest()
+                self.assertEqual(fingerprint, expected[version])
+                self.assertEqual(store.file_path.read_bytes(), before)
+
+    def test_conflict_relevance_is_target_specific(self):
+        for kind in ("invalid-v1", "invalid-v2", "duplicate", "legacy-drawer"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as root:
+                store = MappingStore(str(Path(root) / "mapping.json"))
+                version = 2 if kind == "invalid-v2" else 1
+                if kind.startswith("invalid"):
+                    key = (store._encode_v2_key(BATCH_SYSTEM, BATCH_SHELF, 7) if version == 2
+                           else store._slot_key(BATCH_SYSTEM, BATCH_SHELF, 7))
+                    rows = {key: batch_mapping(enclosure=f"{BATCH_SHELF}:neighbor", slot=7)}
+                else:
+                    rows = {store._slot_key(BATCH_SYSTEM, BATCH_SHELF, 7): batch_mapping(slot=7),
+                            (f"{BATCH_DRAWER}:7" if kind == "legacy-drawer"
+                             else f"{BATCH_SYSTEM}:{BATCH_DRAWER}:7"):
+                            batch_mapping(system=None if kind == "legacy-drawer" else BATCH_SYSTEM,
+                                    enclosure=BATCH_DRAWER, slot=7, serial="DIVERGENT")}
+                write_batch_document(store, version, rows)
+                before = store.file_path.read_bytes()
+                for operation in ("save", "clear"):
+                    batch = getattr(store, f"{operation}_revisions")
+                    single = getattr(store, f"{operation}_revision")
+                    unrelated = [(BATCH_SHELF, 0), (f"{BATCH_SHELF}:other", 7), (BATCH_DRAWER, 8)]
+                    self.assertEqual(batch(BATCH_SYSTEM, unrelated),
+                                     {target: single(BATCH_SYSTEM, *target) for target in unrelated})
+                    for targets in ([(BATCH_DRAWER, 7)], unrelated + [(BATCH_SHELF, 7)], [(BATCH_SHELF, 7)] + unrelated):
+                        with self.assertRaises(MappingScopeConflict):
+                            batch(BATCH_SYSTEM, targets)
+                    self.assertEqual(batch("synthetic-system-c", [(BATCH_SHELF, 0)]),
+                                     {(BATCH_SHELF, 0): single("synthetic-system-c", BATCH_SHELF, 0)})
+                self.assertEqual(store.file_path.read_bytes(), before)
+
+    def test_batches_refresh_after_mutation_and_preserve_cas_migration(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = MappingStore(str(Path(root) / "mapping.json"))
+            write_batch_document(store, 1, batch_parity_rows(store, 1))
+            target = (BATCH_DRAWER, 1)
+            save = store.save_revisions(BATCH_SYSTEM, [target])[target]
+            clear = store.clear_revisions(BATCH_SYSTEM, [target])[target]
+            store.save_mapping(batch_mapping(enclosure=BATCH_DRAWER, slot=1, serial="REPLACEMENT"),
+                               expected_revision=save)
+            self.assertEqual(json.loads(store.file_path.read_text())["version"], 2)
+            fresh_save = store.save_revisions(BATCH_SYSTEM, [target])[target]
+            fresh_clear = store.clear_revisions(BATCH_SYSTEM, [target])[target]
+            self.assertNotEqual(save, fresh_save)
+            self.assertNotEqual(clear, fresh_clear)
+            with self.assertRaises(MappingRevisionConflict):
+                store.save_mapping(batch_mapping(enclosure=BATCH_DRAWER, slot=1), expected_revision=save)
+            with self.assertRaises(MappingRevisionConflict):
+                store.clear_mapping(BATCH_SYSTEM, *target, expected_revision=clear)
+            self.assertTrue(store.clear_mapping(BATCH_SYSTEM, *target, expected_revision=fresh_clear))
+
+    def test_empty_batches_do_not_read_or_validate_document(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = MappingStore(str(Path(root) / "mapping.json"))
+            store.file_path.write_text("invalid JSON", encoding="utf-8")
+            with patch.object(store, "_read_document", wraps=store._read_document) as reads:
+                self.assertEqual(store.save_revisions(BATCH_SYSTEM, []), {})
+                self.assertEqual(store.clear_revisions(BATCH_SYSTEM, []), {})
+            self.assertEqual(reads.call_count, 0)
 
 
 if __name__ == "__main__":

@@ -24,7 +24,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict
 
-from admin_service.config import get_admin_settings
+from app.read_ui_auth_config import load_read_ui_auth_settings
 from app import __version__
 from app.config import Settings, get_settings
 from app.http_auth import (
@@ -542,7 +542,7 @@ def require_read_ui_mutation_authorization(request: Request) -> None:
 
 def create_app() -> FastAPI:
     startup_settings = get_settings()
-    operator_auth_settings = get_admin_settings()
+    operator_auth_settings = load_read_ui_auth_settings()
     if (
         operator_auth_settings.auth_mode == "basic"
         and configured_origin_identity(startup_settings.app.public_origin) is None
