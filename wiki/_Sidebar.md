@@ -7,6 +7,7 @@ Getting Started
 - [[TrueNAS CORE Setup|TrueNAS-CORE-Setup]]
 - [[TrueNAS SCALE Setup|TrueNAS-SCALE-Setup]]
 - [[Troubleshooting]]
+- [[Upgrading]]
 
 Platform Guides
 

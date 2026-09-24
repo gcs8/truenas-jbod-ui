@@ -30,6 +30,22 @@ If `livez` is not `ok`, fix the container/runtime problem first. If `livez` is
 healthy but `healthz` reports a warning or degraded dependency, read that
 payload before chasing layout bugs.
 
+## A container keeps restarting
+
+`docker compose up -d` reports success even when a container fails as soon as
+it starts. Check:
+
+```bash
+docker compose ps
+docker compose logs --tail=50 enclosure-ui
+```
+
+A container that shows `Restarting` in `docker compose ps` has a startup
+error. Read the last line of its log: it names the setting or folder that
+stopped it. Use `enclosure-history` or `enclosure-admin` in place of
+`enclosure-ui` for the other services. The admin container does not restart
+on its own; it shows `Exited` instead.
+
 ## The app starts but the UI looks empty
 
 Common causes:
@@ -221,6 +237,31 @@ Start or update it with:
 docker compose --profile history pull
 docker compose --profile history up -d
 ```
+
+## History says permission denied or readonly database
+
+`Permission denied: '/app/history/history.db'` or `attempt to write a readonly
+database` in the history log means the `history` folder or the database file is
+not writable by the user the container runs as. With the default Compose file
+that is root, so check for a read-only mount or file system first. With the
+non-root overlay it is `APP_UID:APP_GID`; fix ownership as described in
+[A non-root container gets permission denied](#a-non-root-container-gets-permission-denied).
+Do not use `chmod 777`.
+
+## History refuses to start after changing HISTORY_BIND_ADDRESS
+
+`Non-loopback history exposure requires refresh token mode.` in the history log
+means `HISTORY_BIND_ADDRESS` is no longer loopback but the token settings are
+missing. Set token mode, a token and `HISTORY_PUBLIC_ORIGIN` together as shown in
+[[Docker and GHCR Deployment|Docker-and-GHCR-Deployment]], then recreate the
+container:
+
+```bash
+docker compose --profile history up -d --force-recreate enclosure-history
+```
+
+To go back to localhost only, remove `HISTORY_BIND_ADDRESS` from `.env` and
+recreate the container the same way.
 
 ## The admin page is missing
 
