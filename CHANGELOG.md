@@ -95,6 +95,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Distinguished BMC-managed systems from ESXi in unsupported bootstrap
+  guidance without enabling host provisioning (#480).
 - Prevented destructive demo collisions and unconfirmed history purges,
   preserved admin drafts and restart choices, and rejected false success. (#424)
 - Reported failed SCALE and QuantaStor enrichment without hiding source
