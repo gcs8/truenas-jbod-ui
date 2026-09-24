@@ -115,7 +115,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 - Added an explicit legacy Compose migration that forwarded history's published
   bind address without replacing deployment customizations and aligned optional
-  UI/history refresh-token forwarding across CLI and shell inputs. (#497)
+  UI/history refresh-token forwarding across CLI and shell inputs. (#571)
 - Reported an unknown `system_id` on the main page instead of silently
   showing the default system, and mapped service errors to responses from one
   table with a 5-second retry hint for busy exports. (#475)
