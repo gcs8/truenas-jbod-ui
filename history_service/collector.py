@@ -863,9 +863,27 @@ class HistoryCollector:
 
     def _segmented_backup_at_for_retention(self, now: datetime) -> datetime | None:
         status_path = self.settings.scheduled_backup_status_file
+        if status_path:
+            # Segmented cleanup depends on this file alone, so an unsafe mode is
+            # reported there; on a v1 install an untrusted file simply does not
+            # count as a backup and the ordinary bounded wait applies.
+            self._report_unsafe_backup_status_mode(status_path)
+        return self._scheduled_full_backup_at(
+            now,
+            max_age=timedelta(seconds=self.settings.segmented_backup_max_age_seconds),
+        )
+
+    def _scheduled_full_backup_at(self, now: datetime, *, max_age: timedelta) -> datetime | None:
+        """When the scheduled full backup last saved the history database, if recent.
+
+        Reads the secret-free status the scheduled full backup (and the #580
+        backup scheduler's full class) writes to SCHEDULED_BACKUP_STATUS_FILE.
+        Only a successful run that included the history database counts.
+        """
+
+        status_path = self.settings.scheduled_backup_status_file
         if not status_path:
             return None
-        self._report_unsafe_backup_status_mode(status_path)
         status = read_scheduled_backup_status(status_path)
         if (
             status is None
@@ -886,9 +904,7 @@ class HistoryCollector:
         success_at = success_at.astimezone(timezone.utc)
         normalized_now = now.astimezone(timezone.utc)
         age = normalized_now - success_at
-        if age < timedelta(0) or age > timedelta(
-            seconds=self.settings.segmented_backup_max_age_seconds
-        ):
+        if age < timedelta(0) or age > max_age:
             return None
         return success_at
 
@@ -1039,10 +1055,23 @@ class HistoryCollector:
 
         normalized_now = now.astimezone(timezone.utc)
         latest_backup_at = None if backup_succeeded else self._latest_backup_at()
-        if backup_succeeded or (
-            latest_backup_at is not None
-            and timedelta(0) <= normalized_now - latest_backup_at <= self._usable_backup_max_age()
-        ):
+        sidecar_backup_usable = latest_backup_at is not None and (
+            timedelta(0) <= normalized_now - latest_backup_at <= self._usable_backup_max_age()
+        )
+        # A full backup from the backup scheduler (#580) or the scheduled full
+        # backup also holds the history database. When the sidecar's own
+        # snapshot directory fails but those backups work, pruning must not
+        # wait on the sidecar copy.
+        full_backup_usable = (
+            not backup_succeeded
+            and not sidecar_backup_usable
+            and self._scheduled_full_backup_at(
+                normalized_now,
+                max_age=self._usable_backup_max_age(),
+            )
+            is not None
+        )
+        if backup_succeeded or sidecar_backup_usable or full_backup_usable:
             try:
                 self.store.clear_retention_wait()
             except Exception:

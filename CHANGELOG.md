@@ -104,6 +104,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Changed
 
+- The admin now says an SSH key file "was not found in the admin container"
+  instead of naming the "admin sidecar". (#601)
 - The main page reuses bay tiles when a refresh brings the same layout,
   evaluates the heat map once per render instead of once per saved-view bay,
   and stops its one-second timer when nothing is counting down. (#596)
@@ -185,6 +187,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   documented every operator environment variable in `.env.example` (#589).
 - Hid the SSH settings in admin setup step 3 until SSH is turned on, so a
   new system no longer scrolls past a block of disabled fields (#585)
+- History cleanup on a standard install also accepts a recent successful full
+  backup that included the history database (the backup scheduler's full
+  class), so a failing history backup folder no longer delays pruning while
+  full backups work. The history dashboard now shows the backup copies on disk
+  and the free space inside the database file. (#597)
 - Renamed the admin container cards to Main UI, History and Admin, removed
   sidecar and runtime wording from admin messages, and corrected the docs that
   said admin auto-stops by default (only the published Compose files set

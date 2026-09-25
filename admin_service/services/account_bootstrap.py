@@ -244,7 +244,7 @@ class ServiceAccountBootstrapService:
         if payload.service_key_path:
             key_path = Path(payload.service_key_path)
             if not key_path.exists():
-                raise ValueError(f"SSH key path '{payload.service_key_path}' does not exist inside the admin sidecar.")
+                raise ValueError(f"SSH key file '{payload.service_key_path}' was not found in the admin container.")
             public_path = Path(f"{key_path}.pub")
             if public_path.exists():
                 return self._load_public_key_text(public_path.read_text(encoding="utf-8")), str(public_path)

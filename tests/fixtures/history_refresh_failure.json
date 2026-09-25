@@ -9,6 +9,13 @@
   },
   "counts": {"tracked_slots": 0},
   "counts_exact": false,
-  "database": {"size_bytes": 0},
+  "database": {
+    "size_bytes": 0,
+    "reclaimable_bytes": 0,
+    "main_file_size_bytes": 0,
+    "reclaimable_label": "0 B",
+    "backup_footprint": {"copies": 0, "bytes": 0},
+    "backup_footprint_label": "no copies"
+  },
   "scopes": []
 }
