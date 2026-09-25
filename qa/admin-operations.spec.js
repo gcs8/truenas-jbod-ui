@@ -40,7 +40,7 @@ test.describe("admin sidecar smoke", () => {
     await expect(page.locator("#debug-scrub-identifiers-toggle")).toBeVisible();
     await expect(page.locator("#setup-create-demo-button")).toBeVisible();
     await expect(page.locator("#setup-result")).toContainText(
-      "Saved systems appear in the main UI within a few seconds."
+      "Saved systems appear after the main UI next handles a page or API request."
     );
   });
 
@@ -254,7 +254,7 @@ test.describe("admin sidecar smoke", () => {
     // A timing change is applied by the main UI itself: no restart button.
     await field.fill(String(Number(await field.inputValue()) + 1));
     await page.locator("#runtime-behavior-save-button").click();
-    await expect(result).toContainText("The main UI applies it within a few seconds; no restart needed.");
+    await expect(result).toContainText("The main UI applies it when it next handles a page or API request; no restart needed.");
     await expect(result.getByRole("button", { name: "Restart main UI now" })).toHaveCount(0);
 
     // A save that touched a restart-only setting: the server says so, and the

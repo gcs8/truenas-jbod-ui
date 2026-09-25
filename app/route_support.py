@@ -180,12 +180,14 @@ async def mapping_durability_exception_handler(
 
 @dataclass(slots=True)
 class SnapshotExportSourceCacheEntry:
+    generation: SettingsGeneration
     stored_at_monotonic: float
     snapshot: InventorySnapshot
     smart_summary_cache: dict[str, dict[str, Any]]
 
 
 SNAPSHOT_EXPORT_SOURCE_CACHE: OrderedDict[str, SnapshotExportSourceCacheEntry] = OrderedDict()
+SNAPSHOT_EXPORT_SOURCE_CACHE_LOCK = threading.RLock()
 
 
 # One settings generation per validated load of the config files (#432). A
@@ -240,7 +242,8 @@ def after_config_reload(app: Any, _before: Settings, after: Settings) -> None:
     Drop export sources built from the old names and re-probe the folders and
     known-hosts files the new settings name on the next health check.
     """
-    SNAPSHOT_EXPORT_SOURCE_CACHE.clear()
+    with SNAPSHOT_EXPORT_SOURCE_CACHE_LOCK:
+        SNAPSHOT_EXPORT_SOURCE_CACHE.clear()
     app.state.writable_directories = tuple(ui_writable_directories(after))
     app.state.known_hosts_files = tuple(split_known_hosts_paths(after)[1])
     app.state.storage_checked_at_monotonic = 0.0
@@ -278,18 +281,30 @@ def _snapshot_export_source_cache_key(
 def _get_snapshot_export_source_cache_entry(
     cache_key: str,
     settings: Settings,
+    generation: SettingsGeneration,
 ) -> SnapshotExportSourceCacheEntry | None:
     ttl_seconds = max(0, int(settings.app.export_cache_ttl_seconds))
     if ttl_seconds <= 0:
         return None
-    entry = SNAPSHOT_EXPORT_SOURCE_CACHE.get(cache_key)
-    if entry is None:
-        return None
-    if time.monotonic() - entry.stored_at_monotonic > ttl_seconds:
-        SNAPSHOT_EXPORT_SOURCE_CACHE.pop(cache_key, None)
-        return None
-    SNAPSHOT_EXPORT_SOURCE_CACHE.move_to_end(cache_key)
-    return entry
+    with SNAPSHOT_EXPORT_SOURCE_CACHE_LOCK:
+        # A request pinned before a reload may keep running, but it must not
+        # consume or publish process-global cache state after its generation is
+        # no longer current. The reload clear uses this same lock, so either an
+        # old write lands first and is cleared, or it observes the successor and
+        # is refused.
+        if SETTINGS_RUNTIME.current() is not generation:
+            return None
+        entry = SNAPSHOT_EXPORT_SOURCE_CACHE.get(cache_key)
+        if entry is None:
+            return None
+        if entry.generation is not generation:
+            SNAPSHOT_EXPORT_SOURCE_CACHE.pop(cache_key, None)
+            return None
+        if time.monotonic() - entry.stored_at_monotonic > ttl_seconds:
+            SNAPSHOT_EXPORT_SOURCE_CACHE.pop(cache_key, None)
+            return None
+        SNAPSHOT_EXPORT_SOURCE_CACHE.move_to_end(cache_key)
+        return entry
 
 
 def _store_snapshot_export_source_cache_entry(
@@ -298,19 +313,24 @@ def _store_snapshot_export_source_cache_entry(
     snapshot: InventorySnapshot,
     smart_summary_cache: dict[str, dict[str, Any]],
     settings: Settings,
+    generation: SettingsGeneration,
 ) -> None:
     ttl_seconds = max(0, int(settings.app.export_cache_ttl_seconds))
     max_entries = max(0, int(settings.app.export_cache_max_entries))
     if ttl_seconds <= 0 or max_entries <= 0:
         return
-    SNAPSHOT_EXPORT_SOURCE_CACHE[cache_key] = SnapshotExportSourceCacheEntry(
-        stored_at_monotonic=time.monotonic(),
-        snapshot=snapshot,
-        smart_summary_cache=smart_summary_cache,
-    )
-    SNAPSHOT_EXPORT_SOURCE_CACHE.move_to_end(cache_key)
-    while len(SNAPSHOT_EXPORT_SOURCE_CACHE) > max_entries:
-        SNAPSHOT_EXPORT_SOURCE_CACHE.popitem(last=False)
+    with SNAPSHOT_EXPORT_SOURCE_CACHE_LOCK:
+        if SETTINGS_RUNTIME.current() is not generation:
+            return
+        SNAPSHOT_EXPORT_SOURCE_CACHE[cache_key] = SnapshotExportSourceCacheEntry(
+            generation=generation,
+            stored_at_monotonic=time.monotonic(),
+            snapshot=snapshot,
+            smart_summary_cache=smart_summary_cache,
+        )
+        SNAPSHOT_EXPORT_SOURCE_CACHE.move_to_end(cache_key)
+        while len(SNAPSHOT_EXPORT_SOURCE_CACHE) > max_entries:
+            SNAPSHOT_EXPORT_SOURCE_CACHE.popitem(last=False)
 
 
 async def _load_snapshot_export_source(
@@ -321,12 +341,13 @@ async def _load_snapshot_export_source(
     stage_prefix: str,
     settings: Settings,
 ) -> tuple[InventorySnapshot, dict[str, dict[str, Any]]]:
+    generation = SETTINGS_RUNTIME.active()
     cache_key = _snapshot_export_source_cache_key(
         system_id=service.system.id,
         enclosure_id=enclosure_id,
         payload=payload,
     )
-    cached_entry = _get_snapshot_export_source_cache_entry(cache_key, settings)
+    cached_entry = _get_snapshot_export_source_cache_entry(cache_key, settings, generation)
     if cached_entry is not None:
         add_perf_metadata(snapshot_export_source_cache="hit")
         return cached_entry.snapshot, cached_entry.smart_summary_cache
@@ -349,6 +370,7 @@ async def _load_snapshot_export_source(
         snapshot=snapshot,
         smart_summary_cache=smart_summary_cache,
         settings=settings,
+        generation=generation,
     )
     return snapshot, smart_summary_cache
 

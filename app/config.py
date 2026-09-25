@@ -1369,8 +1369,14 @@ def replace_settings(settings: Settings) -> None:
 get_settings.cache_clear = _clear_settings_cache  # type: ignore[attr-defined]
 
 
-def load_settings() -> Settings:
-    """Read and validate config.yaml, runtime-overrides.yaml, profiles.yaml and .env."""
+def load_settings(*, running_restart_only: Settings | None = None) -> Settings:
+    """Read and validate config.yaml, runtime-overrides.yaml, profiles.yaml and .env.
+
+    During live reload, dependent profile content stays on the running
+    restart-only path. The pending path is still validated and reported as a
+    restart-only change, but its content is not combined with the old process's
+    open stores and paths.
+    """
     defaults = Settings().model_dump()
     config_path = Path(os.getenv("APP_CONFIG_PATH", defaults["config_file"]))
     yaml_config = _load_yaml_config(config_path)
@@ -1406,7 +1412,12 @@ def load_settings() -> Settings:
         defaults=defaults,
     )
 
-    profile_path = Path(merged.get("paths", {}).get("profile_file", defaults["paths"]["profile_file"]))
+    configured_profile_path = merged.get("paths", {}).get("profile_file", defaults["paths"]["profile_file"])
+    profile_path = Path(
+        running_restart_only.paths.profile_file
+        if running_restart_only is not None
+        else configured_profile_path
+    )
     if profile_path.exists():
         profile_config = _load_profile_yaml(profile_path)
         merged["profiles"] = [*(merged.get("profiles") or []), *(profile_config.get("profiles") or [])]

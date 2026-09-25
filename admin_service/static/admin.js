@@ -4930,7 +4930,7 @@
     }
     state.setupDirty = false;
     if (elements.setupResult) {
-      elements.setupResult.textContent = "Saved systems appear in the main UI within a few seconds.";
+      elements.setupResult.textContent = "Saved systems appear after the main UI next handles a page or API request.";
     }
     syncPlatformHelp();
     syncVerifySslHelp();

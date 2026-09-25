@@ -128,10 +128,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   readback, while a separate explicit `7z` round trip preserves backward-format
   coverage and records source/candidate provenance. (#643)
 - The main UI applies edits to config.yaml, runtime-overrides.yaml and
-  profiles.yaml (admin saves and hand edits) within a few seconds, without a
-  restart. An invalid edit keeps the old settings with a warning in the log,
-  `/healthz` and the page. Only public origin, debug, start-up warm-up,
-  release check, perf and paths still need a restart; admin
+  profiles.yaml (admin saves and hand edits) when it next handles a non-static
+  page or API request, without a restart. An invalid edit keeps the old settings
+  with a warning in the log, `/healthz` and the page. Only public origin, debug,
+  start-up warm-up, release check, perf and paths still need a restart; admin
   offers Restart main UI now for those. (#614)
 - In network mode, the one-time notice after an update now says that anyone
   who can reach the port can change bay assignments and lights, on every
@@ -246,6 +246,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   14 copies during cutover, stale verification receipts are cleared on restart,
   custom history backup paths are shared by both services, and preserved
   archives plus unrelated/newer files remain untouched. (#628)
+- Kept config reloads generation-consistent: old snapshot exports cannot refill a
+  newer cache, pending restart-only profile paths do not supply live profiles,
+  temporary `config.yaml` deletion retains the last valid settings, and a disk
+  sync in flight remains visible after reload. Admin and docs now describe the
+  request-triggered timing instead of promising an autonomous delay. (#634)
 - History collection now pauses when SQLite reports the database damaged
   while the service is running, instead of retrying writes every pass. The
   pause survives restarts, shows on the dashboard and as `degraded` in
