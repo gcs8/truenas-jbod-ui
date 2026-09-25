@@ -104,9 +104,19 @@ def _with_detail(sentence: str, detail: str | None) -> str:
 class HistorySourceError(RuntimeError):
     """A main-UI request failure that already knows how to describe itself."""
 
-    def __init__(self, message: str, *, kind: str, detail: str | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        kind: str,
+        detail: str | None = None,
+        status_code: int | None = None,
+    ) -> None:
         super().__init__(message)
         self.kind = kind
+        # The HTTP status of a rejected request, so callers can tell a route
+        # the main UI does not have (404/405) from a real failure.
+        self.status_code = status_code
         self.summary = _with_detail(
             SOURCE_FAILURE_SENTENCES.get(kind, UNEXPECTED_COLLECTION_SUMMARY),
             detail,
@@ -122,7 +132,12 @@ class HistorySourceError(RuntimeError):
 
     @classmethod
     def rejected(cls, message: str, *, status_code: int) -> "HistorySourceError":
-        return cls(message, kind="source_rejected", detail=f"HTTP {int(status_code)}")
+        return cls(
+            message,
+            kind="source_rejected",
+            detail=f"HTTP {int(status_code)}",
+            status_code=int(status_code),
+        )
 
     @classmethod
     def bad_payload(cls, message: str) -> "HistorySourceError":
