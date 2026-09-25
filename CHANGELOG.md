@@ -569,6 +569,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Internal
 
+- The production container smoke now starts the main UI under
+  `docker-compose.yml` plus `docker-compose.nonroot.yml` with an unedited copy
+  of `.env.example`, checks `/livez` and `/healthz`, and checks that the
+  container is not restarting (#602).
+
 - CI now upgrades the public v0.22.2 image to each pull request's build by
   changing only `JBOD_UI_IMAGE` on root-owned mounts, checks that the
   containers are healthy, that mappings and history survive and that the
