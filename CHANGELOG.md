@@ -104,6 +104,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Changed
 
+- In network mode, the one-time notice after an update now says that anyone
+  who can reach the port can change bay assignments and lights, on every
+  release rather than only v0.23.0, so installs that skipped it are told
+  too. (#609)
 - The admin now says an SSH key file "was not found in the admin container"
   instead of naming the "admin sidecar". (#601)
 - The main page reuses bay tiles when a refresh brings the same layout,
@@ -147,6 +151,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Docs
 
+- The history recovery page and CONTRIBUTING now state the rollback policy
+  for a history change an older release cannot read: restore the backup taken
+  before the upgrade and lose later writes, with no down-migrations. Upgrading
+  asks for that backup, says Windows (including Docker Desktop) is
+  best-effort and untested in CI, and points old-Compose history installs to
+  the bind-address overlay. (#610)
 - The Upgrading wiki page has a "What is tested" table: the Docker host,
   storage, services, upgrade path, rollback and recovery cases that CI's
   image-only upgrade check covers, and the ones not tested yet (#590).
@@ -474,6 +484,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Performance
 
+- A snapshot refresh no longer rewrites the slot-detail cache file when
+  nothing but the row timestamps changed. SMART freshness still comes from
+  its own read time and stale flag, which still count as changes. (#607)
 - SSH SMART reads that overlap on a host now share one connection and run
   on up to 8 channels, so `smart_batch_max_concurrency` speeds up SSH grids
   (60 bays: 60 connections to 5, 13.9 s to 1.6 s in the modeled benchmark).

@@ -139,10 +139,30 @@ class UpgradeNoticeServiceTests(unittest.TestCase):
             data_dir = Path(temp_dir)
             upgrade_notice.current_notice(data_dir, version="0.23.0")
 
-            notice = upgrade_notice.current_notice(data_dir, version="0.24.0")
+            notice = upgrade_notice.current_notice(data_dir, version="0.24.0", auth_mode="basic")
 
         self.assertEqual(notice["text"], "Updated to v0.24.0.")
         self.assertEqual(notice["previous"], "0.23.0")
+
+    def test_network_mode_write_exposure_is_said_after_every_update(self) -> None:
+        # #447: an install that skips v0.23.0, or starts fresh on a later
+        # release, must still be told that network mode takes writes from
+        # anyone who can reach the port.
+        for previous in ("0.22.2", "0.23.0", None):
+            with self.subTest(previous=previous), tempfile.TemporaryDirectory() as temp_dir:
+                data_dir = Path(temp_dir)
+                if previous:
+                    upgrade_notice.current_notice(data_dir, version=previous)
+                notice = upgrade_notice.current_notice(data_dir, version="0.24.0", auth_mode="network")
+                self.assertIn(
+                    "anyone who can reach this port can change bay assignments and lights",
+                    notice["text"],
+                )
+                self.assertIn("Optional authentication", notice["text"])
+        for mode in ("basic", ""):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp_dir:
+                notice = upgrade_notice.current_notice(Path(temp_dir), version="0.24.0", auth_mode=mode)
+                self.assertNotIn("anyone who can reach", notice["text"])
 
     def test_stale_notice_for_another_version_is_replaced(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
