@@ -338,23 +338,6 @@ class AdminMaintenanceService:
             restart_services=restart_services,
         )
 
-    def import_bundle(
-        self,
-        content: bytes,
-        *,
-        passphrase: str | None = None,
-        stop_services: bool = False,
-        restart_services: bool = True,
-    ) -> tuple[dict[str, Any], MaintenanceOutcome]:
-        def operation(_stopped: list[str]) -> dict[str, Any]:
-            return self.backup_service.import_bundle(content, passphrase=passphrase)
-
-        return self._run_with_quiesced_services(
-            operation,
-            stop_services=stop_services,
-            restart_services=restart_services,
-        )
-
     def import_bundle_from_file(
         self,
         archive_path: Path,
@@ -373,18 +356,22 @@ class AdminMaintenanceService:
                 "preflight_import_bundle_file",
                 self.backup_service.inspect_bundle_file,
             )
-            preflight(
+            preflighted = preflight(
                 snapshot,
                 passphrase=passphrase,
                 expected_encrypted=expected_encrypted,
                 identity_callback=admission_callback,
             )
+            # The staged snapshot is read-only, so a matching digest at import time
+            # means the history integrity check already covered these bytes.
+            preflighted_digest = preflighted if isinstance(preflighted, str) else None
 
             def operation(_stopped: list[str]) -> dict[str, Any]:
                 return self.backup_service.import_bundle_from_file(
                     snapshot,
                     passphrase=passphrase,
                     expected_encrypted=expected_encrypted,
+                    preflighted_archive_sha256=preflighted_digest,
                 )
 
             return self._run_with_quiesced_services(

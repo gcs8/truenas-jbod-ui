@@ -758,9 +758,6 @@ class HistoryCollector:
         exponent = min(max(0, self.background_consecutive_failures - 1), 20)
         return min(maximum, initial * (2**exponent))
 
-    def _schedule_next_collection_after(self, seconds: float) -> None:
-        self.next_collection_at = utcnow() + timedelta(seconds=max(1.0, seconds))
-
     def _raise_if_stopping(self) -> None:
         if self._stopping.is_set():
             raise HistoryCollectionStopping("History collection is stopping.")
