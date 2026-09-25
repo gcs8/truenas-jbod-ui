@@ -254,3 +254,126 @@ test.describe("admin sidecar smoke", () => {
     expect(after.systems.length).toBe(before.systems.length + 1);
   });
 });
+
+// Backups library (#398). The /api/admin/backups* responses are a synthetic
+// fake served by page.route, so the page is exercised without real archives.
+test.describe("admin backups library", () => {
+  const SHA = "b".repeat(64);
+  function library() {
+    return {
+      classes: {
+        config: { enabled: true, trigger: "on change", local_keep_count: 10, targets: ["offsite", "plain-ftp"] },
+        full: { enabled: true, schedule: "0 3 * * *", local_keep_count: 3 },
+      },
+      targets: [
+        { id: "offsite", label: "Offsite SFTP", provider: "sftp", transport_encrypted: true, enabled: true, last_run: { at: "2026-09-20T03:00:00Z", ok: true, detail: "" } },
+        { id: "plain-ftp", label: "Lab FTP", provider: "ftp", transport_encrypted: false, enabled: true, last_run: null },
+      ],
+      artifacts: [
+        { id: "cfg-1", backup_class: "config", location: "local", created_at: "2026-09-21T10:00:00Z", size: 2048, sha256: SHA, verified: true, restorable: true, state: "ok", preserved: false, preserve_reason: null, preserved_by: null, change_count: 1, app_version: "0.23.0" },
+        { id: "full-1", backup_class: "full", location: "local", created_at: "2026-09-21T03:00:00Z", size: 1048576, sha256: SHA, verified: true, restorable: true, state: "ok", preserved: true, preserve_reason: "before upgrade", preserved_by: "admin", change_count: 0, app_version: "0.23.0" },
+        { id: "full-2", backup_class: "full", location: "offsite", created_at: "2026-09-22T03:00:00Z", size: 4096, sha256: null, verified: false, restorable: false, state: "incomplete", preserved: false, change_count: 0, app_version: null },
+      ],
+      storage: { local: { config_bytes: 2048, full_bytes: 1048576, count: 2 }, offsite: { config_bytes: 0, full_bytes: 4096, count: 1 } },
+    };
+  }
+
+  async function fakeBackupApi(page) {
+    const seen = [];
+    await page.route(/\/api\/admin\/backups(\/|$|\?)/, async (route) => {
+      const request = route.request();
+      const url = new URL(request.url());
+      const key = `${request.method()} ${url.pathname}`;
+      seen.push({ key, headers: request.headers(), body: request.postData() });
+      const json = (body, status = 200) => route.fulfill({ status, contentType: "application/json", body: JSON.stringify(body) });
+      switch (key) {
+        case "GET /api/admin/backups": return json(library());
+        case "GET /api/admin/backups/cfg-1": return json({ ...library().artifacts[0], changes: [{ change_id: "c1", at: "2026-09-21T09:59:00Z", action: "system saved", subject: "nas-a.example.test" }] });
+        case "POST /api/admin/backups/full-1/restore/inspect": return json({ ok: true, encryption_mode: "plaintext", inspection_receipt: "synthetic-receipt", aggregate_counts: { systems: 1 } });
+        case "POST /api/admin/backups/full-1/restore/import": return json({ ok: true, systems: [], stopped_containers: [], restarted_containers: [], restart_failures: {} });
+        case "GET /api/admin/backups/lifecycle/plan": return json({ plan_token: "synthetic-plan", items: [{ id: "full-2", location: "offsite", reason: "unverified: unverified for longer than grace 1d (age 2d)" }] });
+        case "POST /api/admin/backups/lifecycle/apply": return json({ ok: true, complete: true, deleted: ["full-2"] });
+        case "POST /api/admin/backups/targets/plain-ftp/test": return json({ ok: true, detail: "writable", duration_ms: 12 });
+        default: return json({ detail: `synthetic fake has no ${key}` }, 404);
+      }
+    });
+    return seen;
+  }
+
+  async function openBackups(page) {
+    await gotoAdmin(page);
+    const tab = page.locator('[data-admin-view-button="backups"]');
+    await tab.focus();
+    await page.keyboard.press("Enter");
+    await expect(page.locator('[data-admin-view-panel="backups"]')).toBeVisible();
+    await expect(tab).toHaveAttribute("aria-pressed", "true");
+    await expect(page).toHaveURL(/view=backups/);
+    await expect(page.locator("#backup-library-status")).toHaveText("3 backup copies.");
+  }
+
+  test("lists copies by type with state, kept reason and unencrypted label", async ({ page }) => {
+    await fakeBackupApi(page);
+    await openBackups(page);
+
+    await expect(page.locator("#backup-library-policies")).toContainText("Settings backups");
+    await expect(page.locator("#backup-library-policies")).toContainText("Offsite SFTP, Lab FTP");
+    const ftp = page.locator('#backup-library-targets tr[data-target-id="plain-ftp"]');
+    await expect(ftp.locator(".backup-plain-badge")).toHaveText("Unencrypted");
+    await expect(ftp).toContainText("Not used yet");
+    await ftp.getByRole("button", { name: "Test" }).click();
+    await expect(ftp).toContainText("Works (12 ms).");
+
+    const incomplete = page.locator('tr[data-artifact-id="full-2"]');
+    await expect(incomplete).toContainText("Incomplete, can't restore");
+    await expect(incomplete.getByRole("button", { name: "Restore" })).toBeDisabled();
+    await expect(page.locator('tr[data-artifact-id="full-1"]')).toContainText("Kept before upgrade");
+    await expect(page.locator('tr[data-artifact-id="cfg-1"] a[data-backup-action="download"]'))
+      .toHaveAttribute("href", "/api/admin/backups/cfg-1/download");
+    await expect(page.locator("#backup-library-storage")).toContainText("This server");
+    await expect(page.locator('[data-admin-view-panel="backups"]')).not.toContainText(/\/(?:srv|data|run|home)\//);
+  });
+
+  test("details dialog shows changes and Escape returns focus", async ({ page }) => {
+    await fakeBackupApi(page);
+    await openBackups(page);
+    const details = page.locator('tr[data-artifact-id="cfg-1"]').getByRole("button", { name: "Details" });
+    await details.focus();
+    await page.keyboard.press("Enter");
+    const dialog = page.getByRole("dialog", { name: "Backup details" });
+    await expect(dialog).toBeVisible();
+    await expect(dialog).toContainText("system saved: nas-a.example.test");
+    await page.keyboard.press("Escape");
+    await expect(dialog).toBeHidden();
+    await expect(details).toBeFocused();
+  });
+
+  test("restore from the server inspects, confirms, then imports without an upload", async ({ page }) => {
+    const seen = await fakeBackupApi(page);
+    await openBackups(page);
+    await page.locator('tr[data-artifact-id="full-1"]').getByRole("button", { name: "Restore" }).click();
+    const dialog = page.getByRole("dialog", { name: "Restore from this backup" });
+    await expect(dialog.locator("#backup-restore-passphrase")).toBeFocused();
+    await dialog.getByRole("button", { name: "Check backup" }).click();
+    await expect(dialog).toContainText("Restoring replaces all current settings, mappings and history with this backup. Continue?");
+    expect(seen.some((call) => call.key.endsWith("/restore/import"))).toBe(false);
+    await dialog.getByRole("button", { name: "Restore", exact: true }).click();
+    await expect(dialog).toContainText("Restored.");
+    const imported = seen.find((call) => call.key.endsWith("/restore/import"));
+    expect(imported.headers["x-backup-inspection-receipt"]).toBe("synthetic-receipt");
+    expect(imported.headers["x-backup-expected-encryption"]).toBe("plaintext");
+    expect(imported.body).toBe("{}");
+    await expect(page.locator("#admin-status-banner")).toContainText("Backup restored.");
+  });
+
+  test("clean up previews the plan and applies exactly its token", async ({ page }) => {
+    const seen = await fakeBackupApi(page);
+    await openBackups(page);
+    await page.locator("#backup-library-cleanup-button").click();
+    const dialog = page.getByRole("dialog", { name: "Clean up old backups" });
+    await expect(dialog).toContainText("never verified, and older than 1 day (it is 2 days old)");
+    await dialog.getByRole("button", { name: "Delete 1" }).click();
+    await expect(dialog).toContainText("Deleted 1 copy.");
+    const applied = seen.find((call) => call.key === "POST /api/admin/backups/lifecycle/apply");
+    expect(JSON.parse(applied.body)).toEqual({ plan_token: "synthetic-plan" });
+  });
+});

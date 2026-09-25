@@ -14,6 +14,7 @@
         <a id="admin-origin-link" class="button ghost hidden" href="#" target="_blank" rel="noopener">Open at the configured address</a>
         <div class="hero-view-switcher" role="group" aria-label="Admin sections">
           <button class="button secondary small admin-view-button is-active" data-admin-view-button="operations" type="button">Setup + Maintenance</button>
+          <button class="button secondary small admin-view-button" data-admin-view-button="backups" type="button">Backups</button>
           <button class="button secondary small admin-view-button" data-admin-view-button="builder" type="button">Enclosure / Profile Builder</button>
         </div>
       </div>
@@ -944,6 +945,39 @@
         </section>
       </div>
     </div>
+
+    <section id="backup-library" class="panel backup-library-panel admin-view hidden" data-admin-view-panel="backups" aria-labelledby="backup-library-heading">
+      <div class="panel-header">
+        <div>
+          <p class="eyebrow">Backup</p>
+          <h2 id="backup-library-heading" tabindex="-1">Backups</h2>
+          <p class="panel-copy">
+            Copies this server keeps, here and on remote targets. Restore one without uploading it.
+            Settings for these backups live in <code>config.yaml</code> and <code>.env</code>; they are shown here read-only.
+          </p>
+        </div>
+        <div class="button-row">
+          <button id="backup-library-refresh-button" class="button secondary small" type="button">Reload list</button>
+          <button id="backup-library-cleanup-button" class="button secondary small" type="button">Clean up</button>
+        </div>
+      </div>
+      <p id="backup-library-status" class="subtle action-note" role="status" aria-live="polite">Open this page to load backups.</p>
+
+      <div id="backup-library-policies" class="backup-library-policies"></div>
+
+      <h3>Where backups go</h3>
+      <div id="backup-library-targets" class="backup-library-section"></div>
+
+      <h3>Space used</h3>
+      <div id="backup-library-storage" class="backup-library-section"></div>
+
+      <div id="backup-library-artifacts" class="backup-library-artifacts"></div>
+
+      <p class="subtle action-note">
+        Have a backup file that isn't listed? Use Restore on the Setup + Maintenance page to upload it.
+      </p>
+      <dialog id="backup-library-dialog" class="backup-dialog" aria-modal="true"></dialog>
+    </section>
 
     <section class="panel builder-panel admin-view hidden" data-admin-view-panel="builder">
       <div class="panel-header builder-panel-header">

@@ -49,10 +49,7 @@
     liveEnclosuresLoading: false,
     liveEnclosuresSystemId: null,
     liveEnclosuresError: null,
-    currentAdminView:
-      new URLSearchParams(window.location.search).get("view") === "builder"
-        ? "builder"
-        : "operations",
+    currentAdminView: normalizeAdminView(new URLSearchParams(window.location.search).get("view")),
     loadedBuilderProfileId: "",
     selectedStorageViewId: "",
     selectedProfileId: "",
@@ -704,8 +701,8 @@
       const showLink = Boolean(configuredOrigin) && configuredOrigin !== String(window.location.origin || "");
       if (showLink) {
         const originUrl = new URL(window.location.pathname || "/", configuredOrigin);
-        if (state.currentAdminView === "builder") {
-          originUrl.searchParams.set("view", "builder");
+        if (state.currentAdminView !== "operations") {
+          originUrl.searchParams.set("view", state.currentAdminView);
         }
         elements.adminOriginLink.href = originUrl.toString();
         elements.adminOriginLink.textContent = `Open at ${configuredOrigin}`;
@@ -715,7 +712,7 @@
   }
 
   function normalizeAdminView(value) {
-    return value === "builder" ? "builder" : "operations";
+    return value === "builder" || value === "backups" ? value : "operations";
   }
 
   function renderAdminView() {
@@ -739,14 +736,17 @@
     renderAdminView();
     if (updateUrl) {
       const nextUrl = new URL(window.location.href);
-      if (nextView === "builder") {
-        nextUrl.searchParams.set("view", "builder");
+      if (nextView !== "operations") {
+        nextUrl.searchParams.set("view", nextView);
       } else {
         nextUrl.searchParams.delete("view");
       }
       window.history[changed ? "pushState" : "replaceState"]({}, "", nextUrl);
     }
     updateAdminMeta();
+    if (nextView === "backups") {
+      void backupLibrary?.load({ quiet: !changed });
+    }
   }
 
   function bundlePathGroups(bundleType) {
@@ -7948,9 +7948,43 @@
     elements.profileBuilderLayoutText.value = "";
   }
 
+  // Backups library (#398): its own module, given this page's request and
+  // restore-wording helpers so it reports errors and confirms restores the
+  // same way the upload path does.
+  const backupLibrary = window.AdminBackupLibrary?.createBackupLibrary({
+    document,
+    elements: {
+      root: document.getElementById("backup-library"),
+      heading: document.getElementById("backup-library-heading"),
+      status: document.getElementById("backup-library-status"),
+      policies: document.getElementById("backup-library-policies"),
+      targets: document.getElementById("backup-library-targets"),
+      storage: document.getElementById("backup-library-storage"),
+      artifacts: document.getElementById("backup-library-artifacts"),
+      dialog: document.getElementById("backup-library-dialog"),
+      refreshButton: document.getElementById("backup-library-refresh-button"),
+      cleanupButton: document.getElementById("backup-library-cleanup-button"),
+    },
+    fetchJson,
+    formatBytes,
+    formatLocalTimestamp,
+    setBanner,
+    confirm: (message) => window.confirm(message),
+    encodeUtf8Base64,
+    describeBackupRestoreConfirmation,
+    describeMaintenanceOutcome,
+    renderMaintenanceResult,
+    refreshAdminState: () => refreshState({ quiet: true }),
+    isStopped: () => state.sessionStopped,
+  }) || null;
+  backupLibrary?.bind();
+
   bindEvents();
   renderAll();
   void loadOrphanedHistory({ quiet: true });
   maybeLoadRecommendedCommands();
   startCountdownTimer();
+  if (state.currentAdminView === "backups") {
+    void backupLibrary?.load();
+  }
 })();
