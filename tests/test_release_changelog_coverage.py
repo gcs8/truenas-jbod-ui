@@ -438,12 +438,13 @@ class CoverageParsingTests(unittest.TestCase):
 
 class CurrentChangelogConsistencyTests(unittest.TestCase):
     def test_integrated_backup_libraries_name_their_later_integration(self) -> None:
+        # Scan the whole file: the entries stay valid after the Unreleased
+        # section rolls over into a versioned heading at release time.
         repository = Path(__file__).resolve().parents[1]
         text = (repository / "CHANGELOG.md").read_text(encoding="utf-8")
-        unreleased = coverage.changelog_section(text, "## Unreleased")
         bullets: list[str] = []
         current: list[str] = []
-        for line in unreleased.splitlines():
+        for line in text.splitlines():
             if line.startswith("- "):
                 if current:
                     bullets.append("\n".join(current))
