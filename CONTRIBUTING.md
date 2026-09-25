@@ -233,6 +233,10 @@ semantics. Do not replace that honest result with full unittest discovery or
 claim those POSIX contracts were validated on Windows. Run the POSIX CI/Linux
 gate for their coverage.
 
+Windows, including running the app under Docker Desktop, is best-effort. CI has
+no Windows runner and no native Windows `dev_check.py --safe` run is recorded,
+so a Windows failure is a bug to fix, not a regression CI would have caught.
+
 Raw command reference (the wrapper remains authoritative):
 
 ```bash
@@ -492,6 +496,29 @@ Additional notes by area:
   - Treat backup import/export as sensitive.
   - Validate archive member paths and restore targets defensively.
   - Do not imply public-facing/cloud exposure is supported.
+
+## History schema changes
+
+`CURRENT_SCHEMA_VERSION` and `MIN_SUPPORTED_SCHEMA_VERSION` in
+`history_service/store.py` are the on-disk contract. A build refuses a database
+stamped newer than it knows, before writing anything.
+
+- An additive change (new table, column or index, a resumable backfill) must
+  stay readable by the previous release. Prove it with a fixture test such as
+  `tests/test_history_released_schema_upgrades.py`, and add the new release's
+  `SCHEMA` under `tests/fixtures/history_released_schemas/`.
+- A change the previous release cannot read has one rollback policy: restore
+  the backup taken before the upgrade and accept losing writes made after it.
+  Do not write down-migrations. The pull request must:
+  1. bump `CURRENT_SCHEMA_VERSION`;
+  2. make startup copy the database next to it, as a verified pre-upgrade
+     snapshot, before the first write of the migration, and fail closed if the
+     copy fails;
+  3. add an interrupted-migration test for every new phase, as the existing
+     ones do;
+  4. add a `Breaking changes` or `Upgrade notes` changelog bullet that says
+     rollback means restoring the pre-upgrade backup and losing later writes;
+  5. update the rollback rows of the table in `wiki/Upgrading.md`.
 
 ## Things that must move together
 
