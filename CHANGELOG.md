@@ -142,6 +142,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Saved copies and the public demo hide the bay assignment editor, the
+  Storage Fabric refresh button and selectors with nothing to switch to,
+  instead of showing them disabled. (#587)
 - Honoured a configured `ssh.known_hosts_path` (top level, per system, or the
   restored `SSH_KNOWN_HOSTS_PATH`) instead of always replacing it with
   `<data>/known_hosts`, so pinned host keys can live in a host bind mount;
