@@ -22,14 +22,25 @@ function extract(startMarker, endMarker) {
 
 const SOURCE = extract("  const RELEASE_NOTE_POLL_DELAYS_MS", "  function renderAppVersionNote()");
 
-function harness({ initialClass, responses, snapshotMode = false }) {
-  const classes = new Set(initialClass.split(" "));
-  const note = {
-    textContent: "Checking for updates...",
+function makeElement(tagName, initialClass = "") {
+  const classes = new Set(initialClass.split(" ").filter(Boolean));
+  const element = {
+    tagName,
+    id: "",
+    textContent: "",
+    replacedWith: null,
     get className() { return [...classes].join(" "); },
-    set className(value) { classes.clear(); value.split(" ").forEach((name) => classes.add(name)); },
+    set className(value) { classes.clear(); value.split(" ").filter(Boolean).forEach((name) => classes.add(name)); },
     classList: { contains: (name) => classes.has(name) },
+    replaceWith(other) { element.replacedWith = other; },
   };
+  return element;
+}
+
+function harness({ initialClass, responses, snapshotMode = false }) {
+  const note = makeElement("SPAN", initialClass);
+  note.id = "app-version-note";
+  note.textContent = "Checking for updates...";
   const timers = [];
   const fetched = [];
   const context = {
@@ -43,11 +54,13 @@ function harness({ initialClass, responses, snapshotMode = false }) {
       return next;
     },
     setTextIfChanged: (element, text) => { element.textContent = text; },
+    document: { createElement: (tag) => makeElement(tag.toUpperCase()) },
+    URL,
     String,
   };
   vm.createContext(context);
   vm.runInContext(`${SOURCE}\nthis.scheduleReleaseNoteRefresh = scheduleReleaseNoteRefresh;`, context);
-  return { context, note, timers, fetched };
+  return { context, note, timers, fetched, current: () => context.appVersionNote };
 }
 
 async function runNextTimer(timers) {
@@ -70,6 +83,32 @@ test("a boot-time failure recovers without a reload", async () => {
   assert.equal(note.textContent, "Up to date");
   assert.equal(note.className, "meta-note version-note version-note-current");
   assert.equal(timers.length, 0, "stop polling once the check succeeded");
+});
+
+test("a refreshed note gains the release link only for an https URL", async () => {
+  const linked = harness({
+    initialClass: "meta-note version-note version-note-error",
+    responses: [{ status: "update-available", summary: "Update available: v9.9.9", latest_url: "https://github.com/gcs8/truenas-jbod-ui/releases/tag/v9.9.9" }],
+  });
+  linked.context.scheduleReleaseNoteRefresh();
+  await runNextTimer(linked.timers);
+  const link = linked.current();
+  assert.equal(linked.note.replacedWith, link);
+  assert.equal(link.tagName, "A");
+  assert.equal(link.id, "app-version-note");
+  assert.equal(link.href, "https://github.com/gcs8/truenas-jbod-ui/releases/tag/v9.9.9");
+  assert.equal(link.rel, "noopener");
+  assert.equal(link.textContent, "Update available: v9.9.9");
+  assert.equal(link.className, "meta-note version-note version-note-update-available");
+
+  const unsafe = harness({
+    initialClass: "meta-note version-note version-note-error",
+    responses: [{ status: "current", summary: "Up to date", latest_url: "javascript:alert(1)" }],
+  });
+  unsafe.context.scheduleReleaseNoteRefresh();
+  await runNextTimer(unsafe.timers);
+  assert.equal(unsafe.current(), unsafe.note, "a non-https URL never becomes a link");
+  assert.equal(unsafe.note.textContent, "Up to date");
 });
 
 test("a note that is already settled is never polled", () => {

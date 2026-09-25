@@ -645,7 +645,7 @@ RUNTIME_BEHAVIOR_APP_FIELDS: dict[str, dict[str, Any]] = {
     },
     "source_bundle_cache_ttl_seconds": {
         "label": "Appliance query reuse",
-        "description": "How long raw TrueNAS, SSH, and BMC answers are reused.",
+        "description": "How long raw appliance API, SSH, and BMC answers are reused, on every platform.",
         "env": ("APP_SOURCE_BUNDLE_CACHE_TTL_SECONDS", "APP_CACHE_TTL"),
         "minimum": 0,
         "maximum": 3600,

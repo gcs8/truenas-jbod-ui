@@ -270,7 +270,8 @@
   const diskInventorySyncControls = document.getElementById("disk-inventory-sync-controls");
   const searchClearButton = document.getElementById("search-clear");
   const searchSummary = document.getElementById("search-summary");
-  const appVersionNote = document.getElementById("app-version-note");
+  // Reassigned when a refreshed release note gains its release link.
+  let appVersionNote = document.getElementById("app-version-note");
   const detailSlotTitle = document.getElementById("detail-slot-title");
   const detailStatePill = document.getElementById("detail-state-pill");
   const detailKvGrid = document.getElementById("detail-kv-grid");
@@ -2655,12 +2656,38 @@
     const status = String(payload?.status || "unknown");
     const summary = String(payload?.summary || "").trim();
     if (!state.appUpdated && status !== "disabled" && summary) {
+      applyReleaseNoteLink(payload?.latest_url);
       setTextIfChanged(appVersionNote, summary);
       appVersionNote.className = `meta-note version-note version-note-${status.replace(/[^a-z-]/g, "") || "unknown"}`;
     }
     if (releaseNoteNeedsRefresh(status)) {
       scheduleReleaseNoteRefresh(attempt + 1);
     }
+  }
+
+  // The server renders a link only when it already knows the release URL; a
+  // note that started as checking/error is a <span>. Swap in an https link.
+  function applyReleaseNoteLink(rawUrl) {
+    let url;
+    try {
+      url = new URL(String(rawUrl || ""));
+    } catch (_error) {
+      return;
+    }
+    if (url.protocol !== "https:") {
+      return;
+    }
+    if (String(appVersionNote.tagName || "").toUpperCase() !== "A") {
+      const link = document.createElement("a");
+      link.id = appVersionNote.id;
+      link.target = "_blank";
+      link.rel = "noopener";
+      link.textContent = appVersionNote.textContent;
+      link.className = appVersionNote.className;
+      appVersionNote.replaceWith(link);
+      appVersionNote = link;
+    }
+    appVersionNote.href = url.href;
   }
 
   function renderAppVersionNote() {
