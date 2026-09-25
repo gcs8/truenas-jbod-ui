@@ -425,7 +425,15 @@ class ContainerResourceContractTests(unittest.TestCase):
 
         self.assertRegex(guide, r"(?i)full backup exports?[^.]+encrypted by default")
         self.assertIn("ADMIN_ALLOW_PLAINTEXT_BACKUP_EXPORT=true", guide)
-        self.assertRegex(guide, r"(?i)includes? `history_db`[^.]+`.7z`")
+        # #397: FULL backups with history default to the tar.zst stream format;
+        # 7z stays readable and selectable with BACKUP_FULL_ARCHIVE_FORMAT=7z.
+        self.assertRegex(
+            guide,
+            r"(?i)includes? `history_db` uses the encrypted `\.tar\.zst\.enc` stream format by default",
+        )
+        self.assertRegex(guide, r"(?i)or encrypted `\.7z` when `BACKUP_FULL_ARCHIVE_FORMAT=7z`")
+        self.assertRegex(guide, r"(?i)including `\.7z` backups made by earlier versions")
+        self.assertRegex(guide, r"(?i)older app\s+(?:>\s*)?version cannot restore them")
         self.assertRegex(guide, r"(?i)without `history_db`[^.]+`.tar.zst.enc`")
         self.assertNotIn("It publishes `.tar.zst.enc` bundles.", guide)
 
