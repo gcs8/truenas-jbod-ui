@@ -34,7 +34,6 @@
         ? bootstrap.backup_defaults.debug_packaging
         : "tar.zst",
     debugForced7z: false,
-    paths: bootstrap.paths || {},
     tlsInspection: null,
     tlsTrustStatus: {
       level: "untrusted",
@@ -1084,7 +1083,7 @@
     state.runtimeBehaviorSaving = true;
     elements.runtimeBehaviorSaveButton.disabled = true;
     if (elements.runtimeBehaviorResult) {
-      elements.runtimeBehaviorResult.textContent = "Saving runtime behavior overrides...";
+      elements.runtimeBehaviorResult.textContent = "Saving timing...";
     }
     try {
       const payload = await fetchJson("/api/admin/runtime-behavior", {
@@ -1109,15 +1108,15 @@
       state.runtimeBehaviorSaving = false;
       renderRuntimeBehaviorSettings();
       renderRuntimeCards();
-      const detail = payload.detail || "Runtime behavior overrides saved.";
+      const detail = payload.detail || "Timing saved.";
       if (elements.runtimeBehaviorResult) {
         renderSaveResult(elements.runtimeBehaviorResult, detail, payload);
       }
       setBanner(detail, "success");
     } catch (error) {
       const message = [400, 422].includes(error.status)
-        ? `Runtime behavior save rejected: ${error.message}. Draft retained.`
-        : "Runtime behavior save outcome is unknown. Changes may already have been saved. Draft retained; check the saved runtime settings before saving again."
+        ? `Timing rejected: ${error.message} Your changes are still in the form.`
+        : "Timing save outcome is unknown. It may already have been saved. Your changes are still in the form; check the saved timing before saving again."
           + (error.requestId || "");
       if (elements.runtimeBehaviorResult) {
         elements.runtimeBehaviorResult.textContent = message;
@@ -5640,12 +5639,12 @@
 
   function describeTransportFailure(outcome, offlineBeforeDispatch) {
     if (outcome === "unknown") {
-      return "The admin sidecar could not be reached after the request was sent, so it is unknown whether the change was applied. Re-check the current state before retrying.";
+      return "Admin could not be reached after the request was sent, so it is unknown whether the change was applied. Refresh to check before retrying.";
     }
     if (offlineBeforeDispatch) {
       return "This browser is offline, so the request was not sent. Reconnect, then retry.";
     }
-    return "The admin sidecar could not be reached, so nothing was changed. Check that it is running, then retry.";
+    return "Admin could not be reached, so nothing was changed. Check that it is running, then retry.";
   }
 
   function classifyResponseFailure(status, mutating) {
@@ -5770,10 +5769,16 @@
   }
 
   const DEFAULT_REQUEST_TIMEOUT_MS = 60000;
+  // Backup and debug downloads and restore uploads move whole archives and may
+  // stop and restart containers, so they get a long limit instead of 60 s.
+  const BACKUP_TRANSFER_TIMEOUT_MS = 30 * 60 * 1000;
 
   function requestTimeoutError(timeoutMs) {
     const seconds = Math.max(1, Math.round(timeoutMs / 1000));
-    const error = new Error(`Timed out after ${seconds} second${seconds === 1 ? "" : "s"}. Check that the host is reachable and try again.`);
+    const length = seconds >= 120
+      ? `${Math.round(seconds / 60)} minutes`
+      : `${seconds} second${seconds === 1 ? "" : "s"}`;
+    const error = new Error(`Timed out after ${length}. Check that the host is reachable and try again.`);
     error.name = "TimeoutError";
     error.timedOut = true;
     return error;
@@ -5783,7 +5788,9 @@
     // Every ordinary request gives up after timeoutMs so a stalled SSH or API hop
     // cannot leave a panel on "Inspecting..." forever. Callers may pass their own
     // signal (runtime actions do) and still get the timeout on top of it.
-    const { timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, signal: callerSignal, ...fetchOptions } = options;
+    // With readBody the timer also covers reading the body (fetch resolves once
+    // headers arrive), and the call resolves to { response, body }.
+    const { timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, signal: callerSignal, readBody, ...fetchOptions } = options;
     const controller = new AbortController();
     const cancel = () => controller.abort();
     let timedOut = false;
@@ -5797,7 +5804,8 @@
       callerSignal?.addEventListener("abort", cancel, { once: true });
     }
     try {
-      return await fetch(url, { ...fetchOptions, signal: controller.signal });
+      const response = await fetch(url, { ...fetchOptions, signal: controller.signal });
+      return readBody ? { response, body: await readBody(response) } : response;
     } catch (error) {
       if (timedOut && !callerSignal?.aborted) {
         throw requestTimeoutError(timeoutMs);
@@ -5807,6 +5815,11 @@
       clearTimeout(timerId);
       callerSignal?.removeEventListener("abort", cancel);
     }
+  }
+
+  // Export responses: the archive on success, the JSON error body otherwise.
+  function readDownloadOrError(response) {
+    return response.ok ? response.blob() : readJsonResponse(response);
   }
 
   function readOptionalSecretValue(field) {
@@ -6229,10 +6242,10 @@
   function describeRuntimeObservation(observation) {
     const container = observation?.container;
     if (!observation?.runtimeAvailable) {
-      return `runtime unavailable${observation?.runtime?.detail ? ` (${observation.runtime.detail})` : ""}`;
+      return `container control unavailable${observation?.runtime?.detail ? ` (${observation.runtime.detail})` : ""}`;
     }
     if (!container) {
-      return "container absent from runtime status";
+      return "container not found";
     }
     const health = String(container.health || "").trim() || "unavailable";
     const statusText = String(container.status_text || container.status || "unknown").trim();
@@ -6250,7 +6263,7 @@
 
   function sleepForRuntimePoll(delayMs, signal) {
     if (signal?.aborted) {
-      return Promise.reject(new DOMException("Runtime action polling was cancelled.", "AbortError"));
+      return Promise.reject(new DOMException("Stopped waiting for the container.", "AbortError"));
     }
     return new Promise((resolve, reject) => {
       const cleanup = () => signal?.removeEventListener("abort", cancelDelay);
@@ -6262,7 +6275,7 @@
       const cancelDelay = () => {
         clearTimeout(timerId);
         cleanup();
-        reject(new DOMException("Runtime action polling was cancelled.", "AbortError"));
+        reject(new DOMException("Stopped waiting for the container.", "AbortError"));
       };
       signal?.addEventListener("abort", cancelDelay, { once: true });
     });
@@ -6282,7 +6295,7 @@
         await sleep(pollIntervalMs, signal);
       }
       if (signal?.aborted) {
-        throw new DOMException("Runtime action polling was cancelled.", "AbortError");
+        throw new DOMException("Stopped waiting for the container.", "AbortError");
       }
       const pollController = new AbortController();
       let pollTimedOut = false;
@@ -6303,7 +6316,7 @@
         }
       } catch (error) {
         if (signal?.aborted) {
-          throw new DOMException("Runtime action polling was cancelled.", "AbortError");
+          throw new DOMException("Stopped waiting for the container.", "AbortError");
         }
         if (pollTimedOut && error?.name === "AbortError") {
           lastPollError = `Status request timed out after ${pollTimeoutMs} ms`;
@@ -6340,7 +6353,7 @@
     setBanner(`${verb} ${label}...`);
     try {
       if (signal?.aborted) {
-        throw new DOMException("Runtime action was cancelled.", "AbortError");
+        throw new DOMException("Container action cancelled.", "AbortError");
       }
       const actionController = new AbortController();
       let actionTimedOut = false;
@@ -6358,7 +6371,7 @@
         });
       } catch (error) {
         if (signal?.aborted) {
-          throw new DOMException("Runtime action was cancelled.", "AbortError");
+          throw new DOMException("Container action cancelled.", "AbortError");
         }
         if (actionTimedOut && error?.name === "AbortError") {
           const timeoutError = new Error(
@@ -6462,9 +6475,11 @@
     try {
       const stopServices = Boolean(elements.backupExportStopToggle?.checked);
       const restartServices = stopServices && Boolean(elements.backupExportRestartToggle?.checked);
-      const response = await fetch(
+      const { response, body: download } = await fetchWithTimeout(
         `/api/admin/backup/export?stop_services=${String(stopServices)}&restart_services=${String(restartServices)}`,
         {
+          timeoutMs: BACKUP_TRANSFER_TIMEOUT_MS,
+          readBody: readDownloadOrError,
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -6476,10 +6491,9 @@
         }
       );
       if (!response.ok) {
-        const payload = await readJsonResponse(response);
-        throw new Error(describeApiError(payload?.detail) || `Request failed with ${response.status}`);
+        throw new Error(describeApiError(download?.detail) || `Request failed with ${response.status}`);
       }
-      const blob = await response.blob();
+      const blob = download;
       const objectUrl = window.URL.createObjectURL(blob);
       const anchor = document.createElement("a");
       anchor.href = objectUrl;
@@ -6539,9 +6553,11 @@
     try {
       const stopServices = Boolean(elements.debugExportStopToggle?.checked);
       const restartServices = stopServices && Boolean(elements.debugExportRestartToggle?.checked);
-      const response = await fetch(
+      const { response, body: download } = await fetchWithTimeout(
         `/api/admin/debug/export?stop_services=${String(stopServices)}&restart_services=${String(restartServices)}`,
         {
+          timeoutMs: BACKUP_TRANSFER_TIMEOUT_MS,
+          readBody: readDownloadOrError,
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -6555,10 +6571,9 @@
         }
       );
       if (!response.ok) {
-        const payload = await readJsonResponse(response);
-        throw new Error(describeApiError(payload?.detail) || `Request failed with ${response.status}`);
+        throw new Error(describeApiError(download?.detail) || `Request failed with ${response.status}`);
       }
-      const blob = await response.blob();
+      const blob = download;
       const objectUrl = window.URL.createObjectURL(blob);
       const anchor = document.createElement("a");
       anchor.href = objectUrl;
@@ -6635,6 +6650,7 @@
   }
 
   async function runImportBackup() {
+    let importDispatched = false;
     const file = readSelectedImportFile();
     const passphrase = readOptionalSecretValue(elements.backupImportPassphrase);
     if (!file) {
@@ -6654,7 +6670,9 @@
       const secretHeaders = passphrase !== null
         ? { "X-Backup-Passphrase-Base64": encodeUtf8Base64(passphrase) }
         : {};
-      const inspectionResponse = await fetch("/api/admin/backup/inspect", {
+      const { response: inspectionResponse, body: inspection } = await fetchWithTimeout("/api/admin/backup/inspect", {
+        timeoutMs: BACKUP_TRANSFER_TIMEOUT_MS,
+        readBody: readJsonResponse,
         method: "POST",
         headers: {
           "Content-Type": "application/octet-stream",
@@ -6662,7 +6680,6 @@
         },
         body: archiveBytes,
       });
-      const inspection = await readJsonResponse(inspectionResponse);
       if (!inspectionResponse.ok || inspection?.ok === false) {
         throw new Error(
           describeApiError(inspection?.detail) ||
@@ -6673,7 +6690,7 @@
         !["encrypted", "plaintext"].includes(inspection?.encryption_mode) ||
         !inspection?.inspection_receipt
       ) {
-        throw new Error("Inspection did not return an observed encryption mode and receipt.");
+        throw new Error("The backup check did not finish. Try the restore again.");
       }
       const confirmed = window.confirm(describeBackupRestoreConfirmation(inspection));
       if (!confirmed) {
@@ -6682,9 +6699,12 @@
       if (elements.backupImportResult) {
         elements.backupImportResult.textContent = `Importing inspected ${file.name}...`;
       }
-      const response = await fetch(
+      importDispatched = true;
+      const { response, body: payload } = await fetchWithTimeout(
         `/api/admin/backup/import?stop_services=${String(stopServices)}&restart_services=${String(restartServices)}`,
         {
+          timeoutMs: BACKUP_TRANSFER_TIMEOUT_MS,
+          readBody: readJsonResponse,
           method: "POST",
           headers: {
             "Content-Type": "application/octet-stream",
@@ -6695,7 +6715,6 @@
           body: archiveBytes,
         }
       );
-      const payload = await readJsonResponse(response);
       if (!response.ok || payload?.ok === false) {
         throw new Error(describeApiError(payload?.detail) || `Request failed with ${response.status}`);
       }
@@ -6725,6 +6744,17 @@
       }
       await refreshState({ quiet: true });
     } catch (error) {
+      if (importDispatched && error?.timedOut) {
+        // The restore runs on the server after the upload, so a browser timeout
+        // does not stop it. Say the outcome is unknown instead of "failed" so
+        // nobody repeats a restore that may already have been applied.
+        const message = `It is unknown whether the restore from ${file.name} finished. ${error.message} Refresh the page to check the current settings before restoring again.`;
+        if (elements.backupImportResult) {
+          elements.backupImportResult.textContent = message;
+        }
+        setBanner(message, "error");
+        return;
+      }
       if (elements.backupImportResult) {
         elements.backupImportResult.textContent = `Import failed: ${error.message || error}`;
       }
