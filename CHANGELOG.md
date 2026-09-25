@@ -56,7 +56,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   in memory and damage is caught chunk by chunk. On a 2 GiB synthetic database it
   took 17 s instead of 541 s to create. 7z stays the default because older app versions
   can't read the new format. `scripts/benchmark_full_backup.py --format` measures both.
-  (#PRNUM)
+  (#600)
 - `scripts/update_immutable_deployment.py update --inventory-url` checks disk
   retention: it reads only the aggregate inventory totals before and after the
   update, and rolls back when a source disk is unplaced or the source count
