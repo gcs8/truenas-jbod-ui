@@ -13,7 +13,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import HTTPCookieProcessor, HTTPSHandler, Request, build_opener
 
-from app.config import BMCConfig, normalize_text
+from app.config import BMCConfig, normalize_text, normalize_value_text
 from app.services.truenas_ws import TrueNASAPIError
 
 logger = logging.getLogger(__name__)
@@ -85,7 +85,7 @@ def _normalize_bmc_host(host: str) -> str:
 
 
 def _int_from_hex(value: Any) -> int | None:
-    text = normalize_text(str(value) if value is not None else None)
+    text = normalize_value_text(value)
     if not text or text == "0":
         return 0 if text == "0" else None
     try:
@@ -95,17 +95,13 @@ def _int_from_hex(value: Any) -> int | None:
 
 
 def _int_from_decimal(value: Any) -> int | None:
-    text = normalize_text(str(value) if value is not None else None)
+    text = normalize_value_text(value)
     if not text:
         return None
     try:
         return int(text, 10)
     except ValueError:
         return None
-
-
-def _bool_from_indicator_led(value: Any) -> bool:
-    return (normalize_text(str(value) if value is not None else None) or "").lower() not in {"", "off"}
 
 
 class SupermicroBMCService:

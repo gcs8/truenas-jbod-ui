@@ -9,6 +9,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from app.config import normalize_text  # noqa: F401 - re-exported for parser callers
+from app.config import normalize_value_text
 from app.services.profile_registry import (
     DELL_MD1280_PROFILE_ID,
     SCALE_SSG_FRONT_24_PROFILE_ID,
@@ -24,7 +25,7 @@ DEVICE_REGEX = re.compile(
 # Same token set as DEVICE_REGEX, but the device may not start inside a longer
 # name. Used only for identity normalization: without the guard the FreeBSD
 # `da<N>` alternative matches the tail of the Linux partition name `sda1` and
-# turns it into the bogus disk key `da1` (issue #173). Free-text scanners keep
+# turns it into the bogus disk key `da1`. Free-text scanners keep
 # the unanchored DEVICE_REGEX.
 DEVICE_NAME_REGEX = re.compile(
     r"(?<![A-Za-z0-9])"
@@ -185,7 +186,7 @@ class SESMapEnclosure:
     )
     _unmapped_slot_index_ready: bool = field(default=False, repr=False, compare=False)
     # Kernel enclosure-driver bindings that found no bay keyed by a device slot
-    # number, counted by contributing SES path (issue #276).
+    # number, counted by contributing SES path.
     unplaced_sysfs_bindings_by_ses_device: dict[str, int] = field(default_factory=dict)
 
 
@@ -396,7 +397,7 @@ def _format_nvme_version(value: Any) -> str | None:
 
 
 def _format_nvme_eui64(value: Any) -> str | None:
-    text = normalize_text(str(value) if value is not None else None)
+    text = normalize_value_text(value)
     if not text:
         return None
     lowered = text.lower()
@@ -404,7 +405,7 @@ def _format_nvme_eui64(value: Any) -> str | None:
 
 
 def _format_nvme_nguid(value: Any) -> str | None:
-    text = normalize_text(str(value) if value is not None else None)
+    text = normalize_value_text(value)
     return text.lower() if text else None
 
 
@@ -1051,7 +1052,8 @@ def _finalize_ses_device_slot_evidence(
                 and existing.sas_address != slot.sas_address
             ):
                 # Two descriptors for one bay are a supported dual-path shape.
-                # Keep the first nonzero path address as required by #129.
+                # Keep the first nonzero path address; a later path must not
+                # overwrite it.
                 slot.sas_address = None
                 slot.sas_address_source = None
             if (
@@ -1532,11 +1534,11 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
 
         if stripped.startswith("flagged as invalid"):
             # SES sets the INVALID bit on additional-element descriptors that
-            # carry no valid device data — issue #119's Dell EN-8435A shelf
-            # does this for every empty bay, so the descriptor has no device
+            # carry no valid device data. A Dell EN-8435A shelf does this for
+            # every empty bay, so the descriptor has no device
             # slot number at all. Keep it out of the device-slot keyed map
             # until the complete AES page proves one consistent translation
-            # from element indexes to device slot numbers (issue #277).
+            # from element indexes to device slot numbers.
             current_slot.description = f"Element {current_slot.element_id} (invalid AES descriptor)"
             descriptor_presence_evidence.append(False)
             _apply_resolved_ses_descriptor_presence(
@@ -1872,8 +1874,8 @@ def _apply_sg_ses_status_line(
         elif lowered.startswith("ok") or "installed" in lowered or "ready" in lowered:
             presence = True
         # Condition codes such as Critical/Noncritical/Unknown/Unsupported say
-        # nothing about occupancy by themselves — issue #119's shelf latches
-        # Critical onto every EMPTY bay (documented minimum-drive-count rule),
+        # nothing about occupancy by themselves. Some shelves (Dell EN-8435A)
+        # latch Critical onto every EMPTY bay (documented minimum-drive-count rule),
         # so treating "anything but not installed" as present invented drives.
         # Those statuses leave presence undecided for stronger evidence.
     for field_name, attribute in (
@@ -1991,8 +1993,8 @@ def _infer_scale_enclosure_profile(
             ],
         )
     if "en-8435" in name:
-        # Dell EN-8435A enclosure module = MD1280, the Xyratex 5U84 platform
-        # (issue #119). Two pull-out drawers of 3x14 stacked in the chassis;
+        # Dell EN-8435A enclosure module = MD1280, the Xyratex 5U84 platform.
+        # Two pull-out drawers of 3x14 stacked in the chassis;
         # SES element index is the 0-based bay number and chassis labels are
         # 1-based. Verified against the Dell manuals: bays 1-42 are the top
         # drawer and 43-84 the bottom drawer (deployment manual Figure 6),
@@ -4139,15 +4141,15 @@ def parse_storcli_controller_info(output: str) -> dict[str, Any]:
 
 
 def _storcli_slot_key(enclosure_id: Any, slot: Any) -> str | None:
-    enclosure_text = normalize_text(str(enclosure_id) if enclosure_id is not None else None)
-    slot_text = normalize_text(str(slot) if slot is not None else None)
+    enclosure_text = normalize_value_text(enclosure_id)
+    slot_text = normalize_value_text(slot)
     if not enclosure_text or not slot_text:
         return None
     return f"{enclosure_text}:{slot_text}"
 
 
 def _parse_storcli_eid_slot(value: Any) -> tuple[str | None, int | None, str | None]:
-    text = normalize_text(str(value) if value is not None else None)
+    text = normalize_value_text(value)
     if not text or ":" not in text:
         return None, None, None
     enclosure_text, slot_text = text.split(":", 1)

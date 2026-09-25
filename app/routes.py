@@ -103,7 +103,7 @@ SMART_BATCH_TRANSPORT_EXCEPTIONS = (
 # Socket-class errno values a bare `OSError` can carry. `OSError` itself is NOT
 # transport: it is equally the base of PermissionError, ENOSPC, EROFS and every
 # other filesystem failure, and the slot-detail store raises those unwrapped
-# through the SMART batch (#526). Those must keep reaching the data-directory
+# through the SMART batch. Those must keep reaching the data-directory
 # handling with its own message instead of being relabelled as a shelf outage.
 SMART_BATCH_TRANSPORT_ERRNOS = frozenset(
     number
@@ -125,17 +125,16 @@ def _is_smart_batch_transport_failure(exc: BaseException) -> bool:
     return isinstance(exc, OSError) and exc.errno in SMART_BATCH_TRANSPORT_ERRNOS
 
 
-# The other half of #526. A filesystem failure on the SMART path is the local
-# data directory, not the shelf: it does not clear by waiting, and the operator
-# has to be told which of the two it is. Naming it here keeps the SMART batch
-# honest until #473 gives the whole app one data-directory report.
+# The other half of that split: a filesystem failure on the SMART path is the
+# local data directory, not the shelf. It does not clear by waiting, and the
+# operator has to be told which of the two it is.
 SMART_BATCH_LOCAL_STORAGE_DETAIL = (
     "SMART data could not be stored: the application data directory is not "
     "usable. This is a local fault, not a shelf outage, and retrying will not "
     "clear it; check the data directory's permissions, ownership and free space."
 )
 
-# #537: a configured CA bundle that cannot be read is also a local fault that
+# A configured CA bundle that cannot be read is also a local fault that
 # retrying will not clear, but it lives on the TLS path, so it gets its own
 # sentence instead of sending the operator to the data directory.
 SMART_BATCH_TLS_TRUST_DETAIL = (
@@ -864,7 +863,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except TlsTrustConfigurationError as exc:
-            # #537: classified before the broad OSError branch below, which
+            # Classified before the broad OSError branch below, which
             # would otherwise report a missing CA bundle's ENOENT as a
             # slot-detail-cache write failure and name the wrong path.
             logger.error(
@@ -878,11 +877,11 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
                 detail=SMART_BATCH_TLS_TRUST_DETAIL,
             ) from exc
         except (OSError, ConnectionClosed) as exc:
-            # #523: a call that outlasts the timeout, or a dropped socket, is a
+            # A call that outlasts the timeout, or a dropped socket, is a
             # temporary unavailability of this shelf's SMART data and not a
             # server fault. One slow disk must never render as a 500 for the
             # whole grid, whichever layer the transport failure escapes from.
-            # #526: only the transport may say that. A filesystem failure shares
+            # Only the transport may say that. A filesystem failure shares
             # OSError's base but means the data directory is misconfigured, so
             # it is reported as the server fault it is, with the message and the
             # log line an operator needs to find it, rather than as a shelf
@@ -913,7 +912,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
         enclosure_id: str | None = None,
         fresh: bool = False,
     ) -> SmartBatchResponse:
-        # #457: the storage-view twin of /api/slots/smart-batch, so the history
+        # The storage-view twin of /api/slots/smart-batch, so the history
         # collector asks for a view in chunks instead of one request per slot.
         # Slots are storage-view slot indexes; unknown ones are skipped, and
         # failures map to the same statuses as the enclosure batch.

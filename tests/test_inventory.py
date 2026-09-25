@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from tests.mapping_fixtures import write_v1_mappings
 from app.config import (
     BMCConfig,
     EnclosureProfileConfig,
@@ -272,20 +273,6 @@ class InventoryOverlayStatusTests(unittest.IsolatedAsyncioTestCase):
 
 
 class InventoryHelpersTests(unittest.TestCase):
-    def test_enclosure_meta_merge_delegates_through_inventory_module_binding(self) -> None:
-        delegated = {"delegated": True}
-        with patch("app.services.inventory.merge_enclosure_meta", return_value=delegated) as merge:
-            result = InventoryService._merge_enclosure_meta(
-                {"enclosure_id": "base"},
-                {"enclosure_name": "overlay"},
-            )
-
-        self.assertIs(result, delegated)
-        merge.assert_called_once_with(
-            {"enclosure_id": "base"},
-            {"enclosure_name": "overlay"},
-        )
-
     def test_first_ses_overlay_preserves_secondary_path_unplaced_binding_warning(self) -> None:
         overlay = ParsedSSHData(
             ses_enclosures=[
@@ -556,7 +543,7 @@ class InventoryHelpersTests(unittest.TestCase):
     def test_single_system_without_detected_enclosures_denies_legacy_mappings(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = self._legacy_fallback_service(temp_dir, [SystemConfig(id="system-a")])
-            service.mapping_store._write({
+            write_v1_mappings(service.mapping_store, {
                 "default:5": ManualMapping(slot=5, serial="SYNTH-LEGACY-5"),
             })
 
@@ -600,7 +587,7 @@ class InventoryHelpersTests(unittest.TestCase):
                 AsyncMock(),
                 temp_dir,
             )
-            service.mapping_store._write({
+            write_v1_mappings(service.mapping_store, {
                 "default:0": ManualMapping(slot=0, serial="SYNTH-DISK-B"),
             })
             raw_data = TrueNASRawData(
@@ -743,7 +730,7 @@ class InventoryHelpersTests(unittest.TestCase):
     def test_multi_enclosure_snapshot_warns_once_about_unapplied_legacy_mappings(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = self._legacy_fallback_service(temp_dir, [SystemConfig(id="system-a")])
-            service.mapping_store._write({
+            write_v1_mappings(service.mapping_store, {
                 "default:1": ManualMapping(slot=1, serial="SYNTH-LEGACY-1"),
                 "default:2": ManualMapping(slot=2, serial="SYNTH-LEGACY-2"),
                 service.mapping_store._slot_key("system-a", "enc-a", 3): ManualMapping(
@@ -776,7 +763,7 @@ class InventoryHelpersTests(unittest.TestCase):
     def test_legacy_mapping_warning_scopes_drawer_sub_views_to_the_base_enclosure(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = self._legacy_fallback_service(temp_dir, [SystemConfig(id="system-a")])
-            service.mapping_store._write({
+            write_v1_mappings(service.mapping_store, {
                 "default:1": ManualMapping(slot=1, serial="SYNTH-LEGACY-1"),
                 "default:2": ManualMapping(slot=2, serial="SYNTH-LEGACY-2"),
                 service.mapping_store._slot_key("system-a", "enc-a", 1): ManualMapping(
@@ -825,7 +812,7 @@ class InventoryHelpersTests(unittest.TestCase):
     def test_legacy_mapping_warning_checks_the_selected_drawer_slot_ids(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = self._legacy_fallback_service(temp_dir, [SystemConfig(id="system-a")])
-            service.mapping_store._write({
+            write_v1_mappings(service.mapping_store, {
                 "default:42": ManualMapping(slot=42, serial="SYNTH-LEGACY-42"),
             })
             bottom_layout: list[list[int | None]] = [
@@ -3520,7 +3507,7 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
                 temp_dir,
             )
 
-            hosts = service._build_quantastor_ssh_hosts()
+            hosts = service._build_configured_quantastor_hosts()
 
         self.assertEqual(hosts, ["192.0.2.30", "192.0.2.31"])
 
@@ -3589,7 +3576,7 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
                 smart_test_results=[],
             )
 
-            hosts = service._build_quantastor_ssh_hosts(raw_data)
+            hosts = service._build_configured_quantastor_hosts(raw_data=raw_data)
 
         self.assertEqual(hosts, ["192.0.2.30", "192.0.2.31"])
 
@@ -3668,7 +3655,7 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
                 smart_test_results=[],
             )
 
-            hosts = service._build_quantastor_ssh_hosts(raw_data)
+            hosts = service._build_configured_quantastor_hosts(raw_data=raw_data)
 
         self.assertEqual(hosts, ["192.0.2.30", "192.0.2.31"])
 
@@ -8010,7 +7997,9 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
             settings = Settings()
             system = SystemConfig(id="cache-host", truenas=TrueNASConfig(platform="core"))
             service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
-            service._cache["__default__"] = InventorySnapshot(
+            # What the removed legacy-key migration did: an unscoped snapshot means no enclosures.
+            service._canonical_enclosure_options = service._canonical_enclosure_options or {}
+            service._cache[inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY] = InventorySnapshot(
                 slots=[],
                 selected_enclosure_id="enc-a",
                 refresh_interval_seconds=30,
@@ -8036,7 +8025,9 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
             settings = Settings()
             system = SystemConfig(id="cache-host", truenas=TrueNASConfig(platform="core"))
             service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
-            service._cache["__default__"] = InventorySnapshot(
+            # What the removed legacy-key migration did: an unscoped snapshot means no enclosures.
+            service._canonical_enclosure_options = service._canonical_enclosure_options or {}
+            service._cache[inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY] = InventorySnapshot(
                 slots=[],
                 selected_enclosure_id="enc-a",
                 refresh_interval_seconds=30,
@@ -8457,7 +8448,7 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
                 ssh=SSHConfig(enabled=True, host="192.0.2.40", user="operator"),
             )
             service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
-            service._build_quantastor_ssh_hosts = MagicMock(return_value=["192.0.2.40"])
+            service._build_configured_quantastor_hosts = MagicMock(return_value=["192.0.2.40"])
 
             async def run_commands(commands, _host):
                 results = [
@@ -8495,7 +8486,7 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
                 ssh=SSHConfig(enabled=True, host="192.0.2.41", user="operator"),
             )
             service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
-            service._build_quantastor_ssh_hosts = MagicMock(return_value=["192.0.2.41"])
+            service._build_configured_quantastor_hosts = MagicMock(return_value=["192.0.2.41"])
             captured: dict[str, object] = {}
 
             async def run_commands(commands, _host, *, stdin_data=None):
@@ -12426,9 +12417,9 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
                 size_human="12 TB",
             )
             asyncio.run(service._apply_and_persist_snapshot_slot_details([full]))
-            service._persist_slot_detail_cache(
+            service._persist_slot_detail_entries([service._build_slot_detail_entry(
                 full, smart_summary=SmartSummaryView(available=True, power_on_hours=321),
-            )
+            )])
             self.assertEqual(full.identity_state, "known")
             self.assertEqual(
                 store.get_entry("default", "enc-1", 5).slot_fields.get("serial"),
@@ -12462,9 +12453,9 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
             self.assertEqual(degraded_key[-1][0], "unknown")
             self.assertNotEqual(degraded_key[-1], first_key[-1])
             self.assertFalse(service._smart_request_is_current(first_key, first_generation))
-            service._persist_slot_detail_cache(
+            service._persist_slot_detail_entries([service._build_slot_detail_entry(
                 degraded, smart_summary=SmartSummaryView(available=True, power_on_hours=999),
-            )
+            )])
             entry = store.get_entry("default", "enc-1", 5)
             self.assertEqual(entry.slot_fields.get("serial"), "SER-VERIFY-005")
             self.assertEqual(entry.smart_fields.get("power_on_hours"), 321)
@@ -12555,9 +12546,9 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
                 size_human="12 TB",
             )
             asyncio.run(service._apply_and_persist_snapshot_slot_details([full]))
-            service._persist_slot_detail_cache(
+            service._persist_slot_detail_entries([service._build_slot_detail_entry(
                 full, smart_summary=SmartSummaryView(available=True, power_on_hours=321),
-            )
+            )])
             self.assertEqual(
                 service.get_cached_slot_smart_summary_without_layout(5, "enc-1").power_on_hours,
                 321,
@@ -12616,9 +12607,9 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
 
             full = slot_view(serial="SER-VERIFY-005", sas_address="sas-invented-005")
             asyncio.run(service._apply_and_persist_snapshot_slot_details([full]))
-            service._persist_slot_detail_cache(
+            service._persist_slot_detail_entries([service._build_slot_detail_entry(
                 full, smart_summary=SmartSummaryView(available=True, power_on_hours=321),
-            )
+            )])
 
             replacement = slot_view(
                 serial="SER-REPLACEMENT", sas_address="sas-invented-005",
@@ -12655,9 +12646,9 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
             service = make_service()
             full = slot_view(serial="SER-VERIFY-005", sas_address="sas-invented-005")
             asyncio.run(service._apply_and_persist_snapshot_slot_details([full]))
-            service._persist_slot_detail_cache(
+            service._persist_slot_detail_entries([service._build_slot_detail_entry(
                 full, smart_summary=SmartSummaryView(available=True, power_on_hours=321),
-            )
+            )])
 
             degraded = slot_view(sas_address="sas-invented-005")
             asyncio.run(service._apply_and_persist_snapshot_slot_details([degraded]))
@@ -12726,9 +12717,9 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
                 device_name="da5", serial="SER-VERIFY-005", sas_address="sas-invented-005",
             )
             asyncio.run(service._apply_and_persist_snapshot_slot_details([full]))
-            service._persist_slot_detail_cache(
+            service._persist_slot_detail_entries([service._build_slot_detail_entry(
                 full, smart_summary=SmartSummaryView(available=True, power_on_hours=321),
-            )
+            )])
 
             # SES still reports the bay occupied; nothing else names it.
             degraded = slot_view()
@@ -12983,7 +12974,9 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
                 assert store is not None
                 store._write = MagicMock(wraps=store._write)  # type: ignore[method-assign]
 
-                service._persist_slot_details(slots)
+                service._persist_slot_detail_entries(
+                    service._build_slot_detail_entry(slot, smart_summary=None) for slot in slots
+                )
 
                 self.assertEqual(store._write.call_count, 1)
                 self.assertEqual(len(store.load_all()), slot_count)
@@ -13048,7 +13041,7 @@ class InventoryServiceSnapshotStateBoundsTests(unittest.IsolatedAsyncioTestCase)
             self.assertIs(omitted, default_snapshot)
             self.assertIs(explicit, default_snapshot)
             self.assertEqual(set(service._cache), {"enc-a"})
-            self.assertNotIn("__default__", service._cache)
+            self.assertNotIn(inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY, service._cache)
             self.assertEqual(service._build_snapshot.await_count, 1)
             for alias in ("Shelf A", "enc", "ENC-A", "drawer-top", "enc-a:drawer"):
                 with self.assertRaisesRegex(Exception, "Requested enclosure is not available"):
@@ -13780,8 +13773,10 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
                 scale_ses_data=ParsedSSHData(),
                 quantastor_ses_data=ParsedSSHData(),
             )
-            service._cache["__default__"] = stale_snapshot
-            service._cache_until["__default__"] = datetime.now(timezone.utc) - timedelta(seconds=1)
+            # What the removed legacy-key migration did: an unscoped snapshot means no enclosures.
+            service._canonical_enclosure_options = service._canonical_enclosure_options or {}
+            service._cache[inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY] = stale_snapshot
+            service._cache_until[inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY] = datetime.now(timezone.utc) - timedelta(seconds=1)
             service._source_bundle = stale_bundle
             service._source_bundle_until = datetime.now(timezone.utc) - timedelta(seconds=1)
             service._schedule_background_snapshot_refresh = MagicMock()
@@ -13894,8 +13889,10 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
                 slots=[SlotView(slot=1, slot_label="01", row_index=0, column_index=1, device_name="da1")],
                 refresh_interval_seconds=30,
             )
-            service._cache["__default__"] = stale_snapshot
-            service._cache_until["__default__"] = datetime.now(timezone.utc) - timedelta(seconds=1)
+            # What the removed legacy-key migration did: an unscoped snapshot means no enclosures.
+            service._canonical_enclosure_options = service._canonical_enclosure_options or {}
+            service._cache[inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY] = stale_snapshot
+            service._cache_until[inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY] = datetime.now(timezone.utc) - timedelta(seconds=1)
 
             async def build_snapshot(
                 *,
@@ -13942,8 +13939,10 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             )
             stale_bundle = self._empty_source_bundle(warning="stale source bundle")
             refreshed_bundle = self._empty_source_bundle(warning="refreshed source bundle")
-            service._cache["__default__"] = stale_snapshot
-            service._cache_until["__default__"] = datetime.now(timezone.utc) - timedelta(seconds=1)
+            # What the removed legacy-key migration did: an unscoped snapshot means no enclosures.
+            service._canonical_enclosure_options = service._canonical_enclosure_options or {}
+            service._cache[inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY] = stale_snapshot
+            service._cache_until[inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY] = datetime.now(timezone.utc) - timedelta(seconds=1)
             service._source_bundle = stale_bundle
             service._source_bundle_until = datetime.now(timezone.utc) + timedelta(minutes=5)
             valid_sg_cache = (
@@ -13998,8 +13997,10 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             stale_bundle = self._empty_source_bundle(warning="stale source bundle")
             stale_snapshot_until = datetime.now(timezone.utc) - timedelta(seconds=1)
             stale_source_until = datetime.now(timezone.utc) - timedelta(seconds=1)
-            service._cache["__default__"] = stale_snapshot
-            service._cache_until["__default__"] = stale_snapshot_until
+            # What the removed legacy-key migration did: an unscoped snapshot means no enclosures.
+            service._canonical_enclosure_options = service._canonical_enclosure_options or {}
+            service._cache[inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY] = stale_snapshot
+            service._cache_until[inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY] = stale_snapshot_until
             service._source_bundle = stale_bundle
             service._source_bundle_until = stale_source_until
             valid_sg_cache = (
@@ -14016,8 +14017,8 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
 
             service._build_snapshot.assert_not_awaited()
-            self.assertIs(service._cache["__default__"], stale_snapshot)
-            self.assertEqual(service._cache_until["__default__"], stale_snapshot_until)
+            self.assertIs(service._cache[inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY], stale_snapshot)
+            self.assertEqual(service._cache_until[inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY], stale_snapshot_until)
             self.assertIs(service._source_bundle, stale_bundle)
             self.assertEqual(service._source_bundle_until, stale_source_until)
             self.assertEqual(service._sg_ses_device_cache["10.0.0.10"], valid_sg_cache)
@@ -14578,20 +14579,22 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             enclosure_a_snapshot = InventorySnapshot(slots=[], refresh_interval_seconds=30)
             enclosure_b_snapshot = InventorySnapshot(slots=[], refresh_interval_seconds=30)
             cache_until = datetime.now(timezone.utc) + timedelta(seconds=30)
-            service._cache["__default__"] = default_snapshot
+            # What the removed legacy-key migration did: an unscoped snapshot means no enclosures.
+            service._canonical_enclosure_options = service._canonical_enclosure_options or {}
+            service._cache[inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY] = default_snapshot
             service._cache["enc-a"] = enclosure_a_snapshot
             service._cache["enc-b"] = enclosure_b_snapshot
-            service._cache_until["__default__"] = cache_until
+            service._cache_until[inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY] = cache_until
             service._cache_until["enc-a"] = cache_until
             service._cache_until["enc-b"] = cache_until
 
             service.invalidate_snapshot_cache(reason="test.invalidate.scope", cache_keys=["enc-a", None])
 
-            self.assertNotIn("__default__", service._cache)
+            self.assertNotIn(inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY, service._cache)
             self.assertNotIn("enc-a", service._cache)
             self.assertIn("enc-b", service._cache)
 
-    async def test_peek_cached_snapshot_prefers_requested_scope_then_default_then_latest(self) -> None:
+    async def test_peek_cached_snapshot_prefers_requested_scope_then_latest(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()
             system = SystemConfig(id="default", truenas=TrueNASConfig(platform="core"))
@@ -14617,16 +14620,16 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
                 refresh_interval_seconds=30,
                 last_updated=datetime(2026, 4, 25, 12, 10, tzinfo=timezone.utc),
             )
-            service._cache["__default__"] = default_snapshot
+            service._cache[inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY] = default_snapshot
             service._cache["enc-a"] = enclosure_snapshot
             service._cache["enc-b"] = newest_snapshot
 
             self.assertIs(service.peek_cached_snapshot(selected_enclosure_id="enc-a"), enclosure_snapshot)
 
-            service._cache.pop("enc-a")
-            self.assertIs(service.peek_cached_snapshot(selected_enclosure_id="enc-a"), default_snapshot)
+            # With no requested scope, the default scope wins over a newer one.
+            self.assertIs(service.peek_cached_snapshot(), default_snapshot)
 
-            service._cache.pop("__default__")
+            service._cache.pop("enc-a")
             self.assertIs(service.peek_cached_snapshot(selected_enclosure_id="enc-a"), newest_snapshot)
 
     async def test_get_slot_smart_summary_can_use_persisted_stable_fields(self) -> None:
@@ -14707,13 +14710,15 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             )
             snapshot = InventorySnapshot(slots=[slot], refresh_interval_seconds=30)
             service.get_snapshot = AsyncMock(return_value=snapshot)
-            service._cache["__default__"] = snapshot
-            service._cache_until["__default__"] = datetime.now(timezone.utc) + timedelta(seconds=30)
+            # What the removed legacy-key migration did: an unscoped snapshot means no enclosures.
+            service._canonical_enclosure_options = service._canonical_enclosure_options or {}
+            service._cache[inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY] = snapshot
+            service._cache_until[inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY] = datetime.now(timezone.utc) + timedelta(seconds=30)
 
             await service.set_slot_led(0, LedAction.identify, invalidate_snapshot=False)
 
             self.assertEqual(service.get_snapshot.await_count, 1)
-            self.assertIn("__default__", service._cache)
+            self.assertIn(inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY, service._cache)
             self.assertEqual(truenas_client.calls, [("enc-1", 1, LedAction.identify.value)])
 
     async def test_set_slot_led_default_invalidation_clears_source_bundle(self) -> None:
@@ -14746,8 +14751,8 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             )
             snapshot = InventorySnapshot(slots=[slot], refresh_interval_seconds=30)
             service.get_snapshot = AsyncMock(return_value=snapshot)
-            service._cache["__default__"] = snapshot
-            service._cache_until["__default__"] = datetime.now(timezone.utc) + timedelta(seconds=30)
+            service._cache["enc-1"] = snapshot
+            service._cache_until["enc-1"] = datetime.now(timezone.utc) + timedelta(seconds=30)
             service._cache["enc-2"] = InventorySnapshot(
                 slots=[SlotView(slot=1, slot_label="01", row_index=0, column_index=1, enclosure_id="enc-2")],
                 refresh_interval_seconds=30,
@@ -14760,7 +14765,7 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(truenas_client.calls, [("enc-1", 1, LedAction.identify.value)])
             self.assertIsNone(service._source_bundle)
-            self.assertNotIn("__default__", service._cache)
+            self.assertNotIn("enc-1", service._cache)
             self.assertNotIn("enc-1", service._cache)
             self.assertIn("enc-2", service._cache)
 
@@ -14864,8 +14869,8 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             )
             snapshot = InventorySnapshot(slots=[slot], refresh_interval_seconds=30)
             service.get_snapshot = AsyncMock(return_value=snapshot)
-            service._cache["__default__"] = snapshot
-            service._cache_until["__default__"] = datetime.now(timezone.utc) + timedelta(seconds=30)
+            service._cache["enc-1"] = snapshot
+            service._cache_until["enc-1"] = datetime.now(timezone.utc) + timedelta(seconds=30)
             service._cache["enc-2"] = InventorySnapshot(
                 slots=[SlotView(slot=1, slot_label="01", row_index=0, column_index=1, enclosure_id="enc-2")],
                 refresh_interval_seconds=30,
@@ -14880,7 +14885,7 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
                 service.mapping_store.get_mapping(system.id, "enc-1", 0).serial,
                 "SER123",
             )
-            self.assertNotIn("__default__", service._cache)
+            self.assertNotIn("enc-1", service._cache)
             self.assertNotIn("enc-1", service._cache)
             self.assertIn("enc-2", service._cache)
 
@@ -14904,8 +14909,10 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             )
             snapshot = InventorySnapshot(slots=[slot], refresh_interval_seconds=30)
             service.get_snapshot = AsyncMock(return_value=snapshot)
-            service._cache["__default__"] = snapshot
-            service._cache_until["__default__"] = datetime.now(timezone.utc) + timedelta(seconds=30)
+            # What the removed legacy-key migration did: an unscoped snapshot means no enclosures.
+            service._canonical_enclosure_options = service._canonical_enclosure_options or {}
+            service._cache[inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY] = snapshot
+            service._cache_until[inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY] = datetime.now(timezone.utc) + timedelta(seconds=30)
             service.mapping_store.save_mapping(
                 ManualMapping(system_id=system.id, enclosure_id="enc-1", slot=0, serial="SER123")
             )
@@ -14915,7 +14922,7 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(cleared)
             self.assertEqual(service.get_snapshot.await_count, 1)
             self.assertIsNone(service.mapping_store.get_mapping(system.id, "enc-1", 0))
-            self.assertIn("__default__", service._cache)
+            self.assertIn(inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY, service._cache)
 
     async def test_import_mapping_bundle_can_defer_invalidation_without_snapshot_refresh(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -14929,8 +14936,10 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
                 temp_dir,
             )
             service.get_snapshot = AsyncMock()
-            service._cache["__default__"] = InventorySnapshot(slots=[], refresh_interval_seconds=30)
-            service._cache_until["__default__"] = datetime.now(timezone.utc) + timedelta(seconds=30)
+            # What the removed legacy-key migration did: an unscoped snapshot means no enclosures.
+            service._canonical_enclosure_options = service._canonical_enclosure_options or {}
+            service._cache[inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY] = InventorySnapshot(slots=[], refresh_interval_seconds=30)
+            service._cache_until[inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY] = datetime.now(timezone.utc) + timedelta(seconds=30)
 
             bundle = MappingBundle(
                 mappings=[
@@ -14949,7 +14958,7 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["previous_revision"], preview["revision"])
             self.assertNotEqual(result["revision"], preview["revision"])
             self.assertEqual(service.get_snapshot.await_count, 0)
-            self.assertIn("__default__", service._cache)
+            self.assertIn(inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY, service._cache)
 
     async def test_preview_mapping_bundle_rejects_unscoped_virtual_mapping_before_store_preview(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -15986,8 +15995,10 @@ Enclosure Status diagnostic page:
                 temp_dir,
                 bmc_service=bmc_service,
             )
-            service._cache["__default__"] = InventorySnapshot(slots=[], refresh_interval_seconds=30)
-            service._cache_until["__default__"] = datetime.now(timezone.utc) + timedelta(seconds=30)
+            # What the removed legacy-key migration did: an unscoped snapshot means no enclosures.
+            service._canonical_enclosure_options = service._canonical_enclosure_options or {}
+            service._cache[inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY] = InventorySnapshot(slots=[], refresh_interval_seconds=30)
+            service._cache_until[inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY] = datetime.now(timezone.utc) + timedelta(seconds=30)
 
             status = await service.get_system_locator_status()
             cleared = await service.set_system_locator(False)
@@ -16003,7 +16014,7 @@ Enclosure Status diagnostic page:
             )
             self.assertEqual(cleared.backend, "supermicro_bmc")
             self.assertFalse(cleared.active)
-            self.assertNotIn("__default__", service._cache)
+            self.assertNotIn(inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY, service._cache)
 
 
 class ReviewRegressionTests(unittest.TestCase):

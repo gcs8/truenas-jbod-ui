@@ -20,7 +20,7 @@ from typing import Any, Generic, Iterable, Literal, TypeVar
 from urllib.parse import urlsplit
 
 from app import __version__
-from app.config import Settings, StorageViewConfig, SystemConfig
+from app.config import Settings, StorageViewConfig, SystemConfig, normalize_value_text
 from app.models.domain import (
     CacheState,
     DiskInventorySyncMode,
@@ -143,7 +143,7 @@ from websockets.exceptions import ConnectionClosed
 # Transport-class failures of the CORE SMART batch mean "priming unavailable".
 # The batch is an optimisation over the bounded per-slot path, so a call that
 # outlasts the request timeout, a dropped socket or a closed connection must
-# degrade one shelf to that path instead of failing every slot in it (#523).
+# degrade one shelf to that path instead of failing every slot in it.
 # `TimeoutError` in particular is not a `TrueNASAPIError`.
 SMART_BATCH_TRANSPORT_ERRORS = (TrueNASAPIError, TimeoutError, OSError, ConnectionClosed)
 
@@ -229,7 +229,7 @@ UNIFI_BOOT_MEDIA_PROFILE_IDS = {
     UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID,
 }
 # TrueNAS middleware CLI the disk inventory sync action drives over the system's
-# existing SSH channel (issue #357). CORE installs midclt under /usr/local/bin,
+# existing SSH channel. CORE installs midclt under /usr/local/bin,
 # SCALE under /usr/bin; other platforms have no TrueNAS middleware to ask.
 DISK_INVENTORY_SYNC_MIDCLT_BY_PLATFORM: dict[str, str] = {
     "core": "/usr/local/bin/midclt",
@@ -305,12 +305,12 @@ LINUX_NVME_LIST_SUBSYS_COMMAND = (
 )
 # smartctl device type the generic-Linux path forces for UniFi boot media, which
 # turns the sudo-run SMART probes into `smartctl -d <type> -x ...` forms. The
-# admin bootstrap has to grant those shapes too (issue #332).
+# admin bootstrap has to grant those shapes too.
 LINUX_BOOT_MEDIA_SMARTCTL_DEVICE_TYPE = "scsi"
 # Reads the kernel enclosure-driver slot bindings without sudo. Every line is
 # `<enclosure scsi id>|<sg name>|<slot attr>|<component name>|<block devices>`,
 # which parse_enclosure_sysfs_map turns into per-bay device hints that keep
-# working when AES pages cannot provide per-bay SAS addresses (issue #119).
+# working when AES pages cannot provide per-bay SAS addresses.
 LINUX_ENCLOSURE_SYSFS_MAP_COMMAND = (
     "for c in /sys/class/enclosure/*/*; do "
     '[ -f "$c/slot" ] || continue; '
@@ -349,8 +349,8 @@ STABLE_SLOT_DETAIL_FIELDS = (
 # Only the strong tier proves which disk occupies a bay: a serial, a logical
 # unit id and a gptid all belong to the disk and travel with it. sas_address is
 # bay-scoped - the expander reports the same address for whatever is plugged in
-# - so it may contradict a cached entry but must never authorize restoring one
-# (#525). device_name is likewise a reusable alias.
+# - so it may contradict a cached entry but must never authorize restoring one.
+# device_name is likewise a reusable alias.
 STRONG_SLOT_IDENTITY_FIELDS = ("serial", "logical_unit_id", "gptid")
 SLOT_IDENTITY_FIELDS = (*STRONG_SLOT_IDENTITY_FIELDS, "sas_address")
 STABLE_SMART_DETAIL_FIELDS = (
@@ -383,6 +383,17 @@ PARSED_SSH_BUNDLE_CACHE_MAX_ENTRIES = 64
 QUANTASTOR_ENCLOSURE_OPTIONS_MAX_ENTRIES = 64
 SNAPSHOT_STATE_MAX_ENTRIES = 64
 SNAPSHOT_NO_ENCLOSURE_KEY = "__service_no_enclosure__"
+# Storage-view bays are numbered from here so they never collide with a real
+# enclosure slot number in the same snapshot.
+STORAGE_VIEW_SLOT_NUMBER_BASE = 10_000
+# Layout used when a QuantaStor system matches no profile: one row of 24 bays.
+QUANTASTOR_FALLBACK_LAYOUT = (1, 24)
+# Layout used when an ESXi host matches no profile: two boot/datastore bays
+# stacked in one column.
+ESXI_FALLBACK_LAYOUT = (2, 1)
+# Scope for a SMART cache key or SSH host key when there is no enclosure id or
+# host to name. It never names a snapshot cache entry.
+UNSCOPED_KEY = "__default__"
 SSH_CONNECTION_FAILURE_MARKERS = (
     "error reading ssh protocol banner",
     "no existing session",
@@ -556,7 +567,7 @@ def infer_slot_count_from_layout(layout_rows: list[list[int | None]], fallback: 
 def parse_size_to_bytes(value: Any) -> int | None:
     if isinstance(value, int):
         return value
-    text = normalize_text(str(value) if value is not None else None)
+    text = normalize_value_text(value)
     if not text:
         return None
     match = re.match(r"^(?P<number>\d+(?:\.\d+)?)\s*(?P<unit>[KMGTPE]?)(?P<binary>i)?B?$", text, re.IGNORECASE)
@@ -1030,8 +1041,8 @@ class InventoryService:
             tuple[SmartSummaryView, datetime],
         ] = OrderedDict()
         self._smart_persistence_lock = threading.Lock()
-        # Bays whose most recently published view carried no strong identifier
-        # (#525). The layout-less SMART fallback has no slot view to gate on, so
+        # Bays whose most recently published view carried no strong identifier.
+        # The layout-less SMART fallback has no slot view to gate on, so
         # it reads this instead of serving the previous occupant's data.
         self._identity_unknown_slots: set[tuple[str, int]] = set()
         self._smart_disk_identities: dict[tuple, tuple[tuple[str, str], int]] = {}
@@ -1348,7 +1359,6 @@ class InventoryService:
         *,
         force_source_refresh: bool,
     ) -> tuple[str, InventorySnapshot | None]:
-        self._migrate_legacy_default_snapshot()
         self._learn_canonical_options_from_cache()
         options = self._canonical_enclosure_options
         discovered_snapshot: InventorySnapshot | None = None
@@ -1386,22 +1396,6 @@ class InventoryService:
             and discovered_snapshot.selected_enclosure_id == selected_enclosure_id
             else None
         )
-
-    def _migrate_legacy_default_snapshot(self) -> None:
-        legacy_key = "__default__"
-        if legacy_key not in self._cache:
-            return
-        snapshot = self._cache.pop(legacy_key)
-        target_key = snapshot.selected_enclosure_id or SNAPSHOT_NO_ENCLOSURE_KEY
-        self._cache[target_key] = snapshot
-        if legacy_key in self._cache_until:
-            self._cache_until[target_key] = self._cache_until.pop(legacy_key)
-        self._snapshot_locks.pop(legacy_key, None)
-        self._snapshot_lru.pop(legacy_key, None)
-        self._touch_snapshot_key(target_key)
-        if target_key == SNAPSHOT_NO_ENCLOSURE_KEY and self._canonical_enclosure_options is None:
-            self._canonical_enclosure_options = {}
-            self._canonical_default_enclosure_id = None
 
     def _learn_canonical_options_from_cache(self) -> None:
         if self._canonical_enclosure_options is not None:
@@ -1790,7 +1784,7 @@ class InventoryService:
         runtime_view: StorageViewRuntimeView,
         runtime_slot: StorageViewRuntimeSlot,
     ) -> SlotView:
-        synthetic_slot_number = 10_000 + int(runtime_slot.slot_index)
+        synthetic_slot_number = STORAGE_VIEW_SLOT_NUMBER_BASE + int(runtime_slot.slot_index)
         search_text = " ".join(
             filter(
                 None,
@@ -2306,7 +2300,7 @@ class InventoryService:
                 for key in requested_keys
             }
             if any(key is None for key in requested_keys):
-                normalized_keys.add("__default__")
+                normalized_keys.add(UNSCOPED_KEY)
             snapshot_keys_to_remove = set(normalized_keys)
             with self._smart_persistence_lock:
                 for key in snapshot_keys_to_remove:
@@ -2367,7 +2361,7 @@ class InventoryService:
                 if key != SNAPSHOT_NO_ENCLOSURE_KEY
                 and resolve_physical_mapping_scope(key) == base_enclosure_id
             }
-            cache_keys.update({base_enclosure_id, enclosure_id, "__default__"})
+            cache_keys.update({base_enclosure_id, enclosure_id, UNSCOPED_KEY})
         self.invalidate_snapshot_cache(
             reason=reason,
             cache_keys=cache_keys,
@@ -2380,7 +2374,6 @@ class InventoryService:
             preferred_keys.append(selected_enclosure_id)
         else:
             preferred_keys.append(self._canonical_default_enclosure_id or SNAPSHOT_NO_ENCLOSURE_KEY)
-        preferred_keys.append("__default__")
         for key in preferred_keys:
             snapshot = self._cache.get(key)
             if snapshot is not None:
@@ -3301,7 +3294,7 @@ class InventoryService:
         def save():
             with perf_stage("inventory.slot_detail_cache.persist", slot_count=len(slots)):
                 # `loaded` is the same read the apply step used; reuse it so the
-                # last-good SMART carry-forward costs no extra file I/O (#521).
+                # last-good SMART carry-forward costs no extra file I/O.
                 entries = [
                     self._build_slot_detail_entry(slot, smart_summary=None, loaded_entries=loaded)
                     for slot in slots
@@ -3364,7 +3357,7 @@ class InventoryService:
             enclosure_id = normalize_text(slot_view.enclosure_id)
             if enclosure_id is None:
                 continue
-            # Remember the window for readers that get no slot view (#525).
+            # Remember the window for readers that get no slot view.
             bay = (enclosure_id, slot_view.slot)
             if slot_view.identity_state == "unknown":
                 self._identity_unknown_slots.add(bay)
@@ -3418,17 +3411,6 @@ class InventoryService:
                 )
             ).lower()
 
-    def _persist_slot_details(self, slots: list[SlotView]) -> None:
-        self._persist_slot_detail_entries((self._build_slot_detail_entry(slot_view, smart_summary=None) for slot_view in slots))
-
-    def _persist_slot_detail_cache(
-        self,
-        slot_view: SlotView,
-        *,
-        smart_summary: SmartSummaryView | None,
-    ) -> None:
-        self._persist_slot_detail_entries([self._build_slot_detail_entry(slot_view, smart_summary=smart_summary)])
-
     def _persist_slot_detail_entries(self, entries: Any) -> None:
         if not self.slot_detail_store:
             return
@@ -3456,16 +3438,6 @@ class InventoryService:
             SmartSummaryView.model_validate(entry.smart_fields),
         )
 
-    def _merge_cached_smart_summary(
-        self,
-        slot_view: SlotView,
-        fallback: SmartSummaryView,
-    ) -> SmartSummaryView | None:
-        cached = self._build_persisted_smart_summary(slot_view)
-        if cached is None:
-            return None
-        return self._merge_missing_smart_fields(fallback, cached)
-
     def _build_slot_detail_entry(
         self,
         slot_view: SlotView,
@@ -3479,7 +3451,7 @@ class InventoryService:
             # read taken during the window under the departed disk. Persist no
             # observation; the previous entry stays as historical evidence, with
             # only the withholding decision recorded on it so it survives a
-            # restart of this process (#525). This comes before the identifier
+            # restart of this process. This comes before the identifier
             # check below: a present bay that offers no identifier at all is
             # the most unknown of the lot, and its decision has to be written
             # down too, or a restart serves the departed disk's SMART for it.
@@ -3526,7 +3498,7 @@ class InventoryService:
             # instead of replacing them with nothing: the snapshot path rebuilds
             # an entry for every present slot on every refresh, and a whole-entry
             # replace there erased the layer the persistent-hit path, the
-            # fallback merge and the exports all claim to serve (#521). The
+            # fallback merge and the exports all claim to serve. The
             # values keep the timestamp of the read that produced them and are
             # marked stale, so nothing reads them as current.
             previous = self._previous_slot_detail_entry(
@@ -3582,7 +3554,7 @@ class InventoryService:
         # not when they happen to rank the same field first. Identity is the
         # strong tier only: a live view that has lost every strong identifier
         # cannot say which disk is in the bay, and a bay-scoped sas_address
-        # agreeing proves only that the bay is the same one (#525). Such a view
+        # agreeing proves only that the bay is the same one. Such a view
         # is identity-unknown, so nothing cached may be restored onto it.
         if self._slot_identity_state(slot_view) == "unknown":
             return False
@@ -3809,7 +3781,7 @@ class InventoryService:
     async def _run_full_disk_inventory_sync(self, midclt: str, started: float) -> DiskInventorySyncResult:
         # Start and poll over one connection instead of logging in again for
         # every poll: up to 90 logins per sync filled the NAS auth log and
-        # tripped sshd MaxStartups (#448). The per-host lock is still taken per
+        # tripped sshd MaxStartups. The per-host lock is still taken per
         # command, so LED actions can run between polls as before.
         session = self.ssh_probe.open_session() if isinstance(self.ssh_probe, SSHProbe) else None
         session_token = _ssh_command_session.set(session)
@@ -4039,7 +4011,8 @@ class InventoryService:
         # Route tests build this service without __init__, so the snapshot
         # cache may be absent here.
         snapshots = getattr(self, "_cache", {})
-        default_snapshot = snapshots.get("__default__")
+        default_key = getattr(self, "_canonical_default_enclosure_id", None) or SNAPSHOT_NO_ENCLOSURE_KEY
+        default_snapshot = snapshots.get(default_key)
         if resolved_enclosure_id is None and default_snapshot is not None:
             resolved_enclosure_id = normalize_text(default_snapshot.selected_enclosure_id)
 
@@ -4053,7 +4026,7 @@ class InventoryService:
             if cache_key[0] != self.system.id or cache_key[1] != self.system.truenas.platform:
                 continue
             enclosure_id = normalize_text(cache_key[2])
-            if enclosure_id is None or enclosure_id == "__default__":
+            if enclosure_id is None or enclosure_id == UNSCOPED_KEY:
                 continue
             candidate_enclosure_ids.add(enclosure_id)
             slot = cache_key[3]
@@ -4075,7 +4048,7 @@ class InventoryService:
             if entry.system_id != self.system.id:
                 continue
             enclosure_id = normalize_text(entry.enclosure_id)
-            if enclosure_id is None or enclosure_id == "__default__":
+            if enclosure_id is None or enclosure_id == UNSCOPED_KEY:
                 continue
             candidate_enclosure_ids.add(enclosure_id)
             if entry.slot in requested_slots:
@@ -4098,7 +4071,7 @@ class InventoryService:
                 # The last published view of this bay had no serial, logical
                 # unit id or gptid, so everything on record for it describes a
                 # disk that may already be gone: a bay-scoped sas_address names
-                # the bay, not its occupant (#525). Serve nothing until a strong
+                # the bay, not its occupant. Serve nothing until a strong
                 # identifier returns; the entry stays as historical evidence.
                 # The persisted flag is what answers after a restart, when this
                 # process has not yet observed the window itself.
@@ -4156,9 +4129,6 @@ class InventoryService:
                 bypass_negative_cache=bypass_negative_cache,
             )
 
-    def _smart_cache_expiry(self) -> datetime:
-        return utcnow() + timedelta(seconds=max(0, int(self.settings.app.smart_cache_ttl_seconds)))
-
     def _smart_cache_stale_retention(self) -> timedelta:
         ttl_seconds = max(0, int(self.settings.app.smart_cache_ttl_seconds))
         return timedelta(
@@ -4181,7 +4151,7 @@ class InventoryService:
         # explicit unknown identity isolates it - entering and leaving the
         # window each bump the bay's identity generation, so no SMART read taken
         # while the disk is unidentifiable is served from, or stored under, the
-        # serial that was there before (#525).
+        # serial that was there before.
         return ("unknown", normalize_text(slot_view.device_name) or "")
 
     def _observe_smart_disk_identities(self, slots: list[SlotView]) -> None:
@@ -4219,7 +4189,7 @@ class InventoryService:
         return (
             self.system.id,
             self.system.truenas.platform,
-            normalize_text(slot_view.enclosure_id) or "__default__",
+            normalize_text(slot_view.enclosure_id) or UNSCOPED_KEY,
             slot_view.slot,
             tuple(self._smart_candidate_devices(slot_view)),
             self._smart_disk_identity(slot_view),
@@ -4254,8 +4224,8 @@ class InventoryService:
         #
         # The full scan runs only when an entry has actually passed the
         # horizon. Checking that is one C-level min() over the expiry values;
-        # the scan itself used to run on every lookup and store in a warm grid
-        # (#448). No cached bound is kept, so an expiry changed in place is
+        # the scan itself used to run on every lookup and store in a warm grid.
+        # No cached bound is kept, so an expiry changed in place is
         # still seen on the next call.
         now = utcnow()
         eviction_horizon = now - self._smart_cache_stale_retention()
@@ -4287,7 +4257,7 @@ class InventoryService:
         cache_key: SmartCacheKey | None = None,
     ) -> bool:
         # Callers that already hold the lookup's key pass it in, so one SMART
-        # lookup derives its candidate devices once, not per store (#448).
+        # lookup derives its candidate devices once, not per store.
         if cache_key is None:
             cache_key = self._smart_cache_key(slot_view)
         if summary.available is False or not self._smart_disk_is_current(cache_key):
@@ -4299,7 +4269,9 @@ class InventoryService:
             return False
         self._evict_expired_smart_cache_entries()
         self._smart_cache[cache_key] = summary
-        self._smart_cache_until[cache_key] = expires_at or self._smart_cache_expiry()
+        self._smart_cache_until[cache_key] = expires_at or (
+            utcnow() + timedelta(seconds=max(0, int(self.settings.app.smart_cache_ttl_seconds)))
+        )
         self._smart_negative_cache.pop(cache_key, None)
         return True
 
@@ -4698,8 +4670,8 @@ class InventoryService:
         # Fail closed on a disk that never answers. Without a deadline here, a
         # batch that timed out on one slow disk degraded to a per-slot path
         # that waited forever, so `complete_batch()` held every other slot in
-        # the grid open too: a bounded failure became an unbounded request
-        # (#524). Expiry is reported through the same channel as any other
+        # the grid open too: a bounded failure became an unbounded request.
+        # Expiry is reported through the same channel as any other
         # failed call, so it becomes this slot's unavailable summary with a
         # fixed reason and leaves the rest of the grid intact.
         timeout = self._smart_call_timeout_seconds()
@@ -4752,8 +4724,7 @@ class InventoryService:
                                     # Discarding the batch here sent every slot
                                     # back through the per-slot path, so a shelf
                                     # with one failing drive - the shelf the grid
-                                    # is opened for - cost more than v0.23.0 did
-                                    # (#522).
+                                    # is opened for - cost more than v0.23.0 did.
                                     continue
                                 payloads[future] = (payload, None)
                                 summary = self._merge_smart_summary(
@@ -5812,7 +5783,7 @@ class InventoryService:
                 f"This enclosure reports {reported_slot_count} bays but the selected layout draws "
                 f"{layout_slot_count}, so the extra bays are not shown. Choose a matching layout in System Setup."
             )
-        # #260 pins one mapping load per correlation pass, so the entries are
+        # One mapping load per correlation pass: the entries are
         # loaded here and read back off the frame by every caller.
         loaded_mappings = self.mapping_store.load_all()
         if not allow_legacy_mapping_fallback:
@@ -5872,7 +5843,7 @@ class InventoryService:
             self.settings.layout.api_slot_number_base,
             selected_enclosure_id,
         )
-        selected_meta = self._merge_enclosure_meta(ssh_data.ses_selected_meta, api_selected_meta)
+        selected_meta = merge_enclosure_meta(ssh_data.ses_selected_meta, api_selected_meta)
         available_enclosures = self._build_enclosure_options(raw_data, ssh_data, selected_meta)
         selected_option = self._resolve_selected_enclosure_option(
             available_enclosures,
@@ -6779,7 +6750,7 @@ class InventoryService:
         # they are given. A drawer sub-view (or any profile whose bay ids are
         # not zero-based) renders fewer bays than its highest bay id, so bound
         # the builders by the highest rendered id while the visible count
-        # keeps feeding the option label and layout_slot_count (issue #274).
+        # keeps feeding the option label and layout_slot_count.
         candidate_slot_bound = frame.exclusive_slot_bound()
         ssh_candidates, ssh_meta = build_slot_candidates_from_ses_enclosures(
             ssh_data.ses_enclosures,
@@ -6798,8 +6769,8 @@ class InventoryService:
             self.settings.layout.api_slot_number_base,
             resolve_physical_mapping_scope(selected_option.id),
         )
-        selected_meta = self._merge_enclosure_meta(self._enclosure_option_meta(selected_option), api_selected_meta)
-        selected_meta = self._merge_enclosure_meta(selected_meta, ssh_meta)
+        selected_meta = merge_enclosure_meta(self._enclosure_option_meta(selected_option), api_selected_meta)
+        selected_meta = merge_enclosure_meta(selected_meta, ssh_meta)
         selected_meta.update(self._enclosure_option_meta(selected_option))
         if selected_profile is not None and selected_profile.slot_number_base is not None:
             # Chassis such as the Dell MD1280 silk-screen their bays 1-based
@@ -7043,9 +7014,9 @@ class InventoryService:
             self.system,
             None,
             fallback_label=self.system.label or "Quantastor Enclosure",
-            fallback_rows=1,
-            fallback_columns=24,
-            fallback_slot_count=24,
+            fallback_rows=QUANTASTOR_FALLBACK_LAYOUT[0],
+            fallback_columns=QUANTASTOR_FALLBACK_LAYOUT[1],
+            fallback_slot_count=QUANTASTOR_FALLBACK_LAYOUT[0] * QUANTASTOR_FALLBACK_LAYOUT[1],
         )
         slot_layout = copy_layout_rows(profile.slot_layout) if profile else None
         rows = profile.rows if profile else None
@@ -7064,7 +7035,7 @@ class InventoryService:
         hardware_system_ids.update(
             system_id
             for system_id in (
-                normalize_text(str(item.get("storageSystemId")) if item.get("storageSystemId") is not None else None)
+                normalize_value_text(item.get("storageSystemId"))
                 for item in hw_disks
             )
             if system_id
@@ -7072,7 +7043,7 @@ class InventoryService:
 
         system_rows_by_id: dict[str, dict[str, Any]] = {}
         for system_row in raw_data.systems:
-            system_id = normalize_text(str(system_row.get("id")) if system_row.get("id") is not None else None)
+            system_id = normalize_value_text(system_row.get("id"))
             if not system_id:
                 continue
             if hardware_system_ids and system_id not in hardware_system_ids:
@@ -7138,7 +7109,7 @@ class InventoryService:
             (
                 value
                 for key in ("id", "enclosureId", "enclosure_id", "sasAddress", "sas_address", "wwn", "wwid")
-                if (value := normalize_text(str(row.get(key)) if row.get(key) is not None else None))
+                if (value := normalize_value_text(row.get(key)))
             ),
             None,
         )
@@ -7199,7 +7170,7 @@ class InventoryService:
             if selected_enclosure_id and row_id != selected_enclosure_id:
                 continue
             for key in ("id", "enclosureId", "enclosure_id", "sasAddress", "sas_address", "wwn", "wwid"):
-                value = normalize_text(str(row.get(key)) if row.get(key) is not None else None)
+                value = normalize_value_text(row.get(key))
                 if not value:
                     continue
                 selected_enclosure_aliases.add(value)
@@ -7253,13 +7224,13 @@ class InventoryService:
         cli_disk_hints = self._build_quantastor_cli_disk_hints(raw_data.cli_disks, selected_system_id)
         pool_slot_hints = self._build_quantastor_pool_slot_hints(raw_data, selected_system_id)
         pool_names = {
-            normalize_text(str(pool.get("id")) if pool.get("id") is not None else None): normalize_text(
+            normalize_value_text(pool.get("id")): normalize_text(
                 str(pool.get("name") or pool.get("description") or pool.get("id"))
                 if (pool.get("name") or pool.get("description") or pool.get("id")) is not None
                 else None
             )
             for pool in raw_data.pools
-            if normalize_text(str(pool.get("id")) if pool.get("id") is not None else None)
+            if normalize_value_text(pool.get("id"))
         }
 
         records: list[DiskRecord] = []
@@ -7296,7 +7267,7 @@ class InventoryService:
                 if isinstance(disk.get("sizeBytes"), int)
                 else parse_size_to_bytes(disk.get("size"))
             )
-            disk_id = normalize_text(str(disk.get("id")) if disk.get("id") is not None else None)
+            disk_id = normalize_value_text(disk.get("id"))
             identifier, _ = resolve_persistent_id(
                 normalize_text(disk.get("wwn")),
                 normalize_text(disk.get("eui64")),
@@ -7439,9 +7410,9 @@ class InventoryService:
         for pool in raw_data.pools:
             owner_id = next(
                 (
-                    normalize_text(str(pool.get(key)) if pool.get(key) is not None else None)
+                    normalize_value_text(pool.get(key))
                     for key in ("activeStorageSystemId", "primaryStorageSystemId", "storageSystemId")
-                    if normalize_text(str(pool.get(key)) if pool.get(key) is not None else None) in owner_rank
+                    if normalize_value_text(pool.get(key)) in owner_rank
                 ),
                 None,
             )
@@ -7458,7 +7429,7 @@ class InventoryService:
         for system_row in raw_data.systems:
             if not self._quantastor_bool(system_row.get("isMaster")):
                 continue
-            system_id = normalize_text(str(system_row.get("id")) if system_row.get("id") is not None else None)
+            system_id = normalize_value_text(system_row.get("id"))
             if system_id in owner_option_ids:
                 return owner_option_ids[system_id][0]
 
@@ -7478,7 +7449,7 @@ class InventoryService:
         seen: set[str] = set()
 
         def add_candidate(value: Any) -> None:
-            text = normalize_text(str(value) if value is not None else None)
+            text = normalize_value_text(value)
             if not text:
                 return
             normalized = normalize_device_name(text)
@@ -7543,8 +7514,8 @@ class InventoryService:
             group_key = (
                 normalize_hex_identifier(row.get("sasAddress"))
                 or normalize_text(row.get("serialNum") or row.get("serialNumber"))
-                or normalize_text(str(row.get("physicalDiskId")) if row.get("physicalDiskId") is not None else None)
-                or normalize_text(str(row.get("id")) if row.get("id") is not None else None)
+                or normalize_value_text(row.get("physicalDiskId"))
+                or normalize_value_text(row.get("id"))
             )
             if not group_key:
                 continue
@@ -7557,7 +7528,7 @@ class InventoryService:
                 (
                     row
                     for row in rows
-                    if normalize_text(str(row.get("storageSystemId")) if row.get("storageSystemId") is not None else None)
+                    if normalize_value_text(row.get("storageSystemId"))
                     == selected_system_id
                     and self._extract_quantastor_slot(row) == canonical_slot
                 ),
@@ -7578,7 +7549,7 @@ class InventoryService:
                     (
                         row
                         for row in rows
-                        if normalize_text(str(row.get("storageSystemId")) if row.get("storageSystemId") is not None else None)
+                        if normalize_value_text(row.get("storageSystemId"))
                         == selected_system_id
                     ),
                     None,
@@ -7689,18 +7660,18 @@ class InventoryService:
         raw_data: TrueNASRawData,
     ) -> dict[str, ZpoolMember]:
         pool_index = {
-            normalize_text(str(pool.get("id")) if pool.get("id") is not None else None): pool
+            normalize_value_text(pool.get("id")): pool
             for pool in raw_data.pools
-            if normalize_text(str(pool.get("id")) if pool.get("id") is not None else None)
+            if normalize_value_text(pool.get("id"))
         }
         system_index = {
-            normalize_text(str(system_row.get("id")) if system_row.get("id") is not None else None): normalize_text(
+            normalize_value_text(system_row.get("id")): normalize_text(
                 str(system_row.get("name") or system_row.get("hostname") or system_row.get("id"))
                 if (system_row.get("name") or system_row.get("hostname") or system_row.get("id")) is not None
                 else None
             )
             for system_row in raw_data.systems
-            if normalize_text(str(system_row.get("id")) if system_row.get("id") is not None else None)
+            if normalize_value_text(system_row.get("id"))
         }
 
         members: dict[str, ZpoolMember] = {}
@@ -7786,7 +7757,7 @@ class InventoryService:
                 if system_row.get("storageSystemClusterId") is not None
                 else None
             )
-            system_id = normalize_text(str(system_row.get("id")) if system_row.get("id") is not None else None)
+            system_id = normalize_value_text(system_row.get("id"))
             if cluster_id and system_id:
                 cluster_members.setdefault(cluster_id, set()).add(system_id)
         return any(len(members) > 1 for members in cluster_members.values())
@@ -7800,14 +7771,14 @@ class InventoryService:
             return []
 
         systems_by_id = {
-            normalize_text(str(system_row.get("id")) if system_row.get("id") is not None else None): system_row
+            normalize_value_text(system_row.get("id")): system_row
             for system_row in raw_data.systems
-            if normalize_text(str(system_row.get("id")) if system_row.get("id") is not None else None)
+            if normalize_value_text(system_row.get("id"))
         }
         hardware_system_ids = {
             system_id
             for system_id in (
-                normalize_text(str(item.get("storageSystemId")) if item.get("storageSystemId") is not None else None)
+                normalize_value_text(item.get("storageSystemId"))
                 for item in [*self._quantastor_hw_disk_rows(raw_data), *self._quantastor_hw_enclosure_rows(raw_data)]
             )
             if system_id
@@ -7834,7 +7805,7 @@ class InventoryService:
         node_rows = [
             row
             for row in cluster_rows
-            if normalize_text(str(row.get("id")) if row.get("id") is not None else None) in hardware_system_ids
+            if normalize_value_text(row.get("id")) in hardware_system_ids
         ] or cluster_rows
 
         master_row = next((row for row in node_rows if self._quantastor_bool(row.get("isMaster"))), None)
@@ -7862,9 +7833,9 @@ class InventoryService:
     ) -> dict[str, Any]:
         topology_complete = bool(raw_data.pool_devices)
         systems_by_id = {
-            normalize_text(str(system_row.get("id")) if system_row.get("id") is not None else None): system_row
+            normalize_value_text(system_row.get("id")): system_row
             for system_row in raw_data.systems
-            if normalize_text(str(system_row.get("id")) if system_row.get("id") is not None else None)
+            if normalize_value_text(system_row.get("id"))
         }
         system_labels = self._quantastor_system_label_index(raw_data)
         selected_row = systems_by_id.get(selected_system_id)
@@ -7892,7 +7863,7 @@ class InventoryService:
         hardware_system_ids = {
             system_id
             for system_id in (
-                normalize_text(str(item.get("storageSystemId")) if item.get("storageSystemId") is not None else None)
+                normalize_value_text(item.get("storageSystemId"))
                 for item in [*self._quantastor_hw_disk_rows(raw_data), *self._quantastor_hw_enclosure_rows(raw_data)]
             )
             if system_id
@@ -7900,7 +7871,7 @@ class InventoryService:
         node_rows = [
             row
             for row in cluster_rows
-            if normalize_text(str(row.get("id")) if row.get("id") is not None else None) in hardware_system_ids
+            if normalize_value_text(row.get("id")) in hardware_system_ids
         ] or cluster_rows
         master_row = next((row for row in node_rows if self._quantastor_bool(row.get("isMaster"))), None)
         io_fencing_rows = node_rows or cluster_rows
@@ -7908,7 +7879,7 @@ class InventoryService:
         peer_labels = [
             system_labels.get(system_id) or system_id
             for system_id in (
-                normalize_text(str(row.get("id")) if row.get("id") is not None else None)
+                normalize_value_text(row.get("id"))
                 for row in node_rows
             )
             if system_id and system_id != selected_system_id
@@ -7924,7 +7895,7 @@ class InventoryService:
             "cluster_node_labels": [
                 system_labels.get(system_id) or system_id
                 for system_id in (
-                    normalize_text(str(row.get("id")) if row.get("id") is not None else None)
+                    normalize_value_text(row.get("id"))
                     for row in node_rows
                 )
                 if system_id
@@ -7932,7 +7903,7 @@ class InventoryService:
             "cluster_node_ids": [
                 system_id
                 for system_id in (
-                    normalize_text(str(row.get("id")) if row.get("id") is not None else None)
+                    normalize_value_text(row.get("id"))
                     for row in node_rows
                 )
                 if system_id
@@ -7952,7 +7923,7 @@ class InventoryService:
     def _quantastor_system_label_index(raw_data: TrueNASRawData) -> dict[str, str]:
         labels: dict[str, str] = {}
         for system_row in raw_data.systems:
-            system_id = normalize_text(str(system_row.get("id")) if system_row.get("id") is not None else None)
+            system_id = normalize_value_text(system_row.get("id"))
             if not system_id:
                 continue
             labels[system_id] = (
@@ -8022,8 +7993,8 @@ class InventoryService:
         hosts_by_system = {
             system_id: host
             for system_id in (
-                normalize_text(str(row.get("id")) if row.get("id") is not None else None)
-                for row in self._quantastor_cluster_node_rows(raw_data)
+                normalize_value_text(row.get("id"))
+                for row in self._quantastor_cluster_node_rows_from_raw(raw_data)
             )
             if system_id
             for host in [self._auto_quantastor_host_for_system(system_id, raw_data)]
@@ -8032,7 +8003,7 @@ class InventoryService:
         allowed_presence_system_ids = {
             system_id
             for system_id in (
-                normalize_text(str(item) if item is not None else None)
+                normalize_value_text(item)
                 for item in (platform_context.get("cluster_node_ids") or [])
             )
             if system_id
@@ -8044,9 +8015,9 @@ class InventoryService:
             allowed_presence_system_ids or None,
         )
         pool_index = {
-            normalize_text(str(pool.get("id")) if pool.get("id") is not None else None): pool
+            normalize_value_text(pool.get("id")): pool
             for pool in raw_data.pools
-            if normalize_text(str(pool.get("id")) if pool.get("id") is not None else None)
+            if normalize_value_text(pool.get("id"))
         }
 
         for slot_view in slot_views:
@@ -8227,7 +8198,7 @@ class InventoryService:
 
     @staticmethod
     def _storcli_display_state(value: Any) -> str | None:
-        text = normalize_text(str(value) if value is not None else None)
+        text = normalize_value_text(value)
         if not text:
             return None
         lowered = text.lower()
@@ -8245,7 +8216,7 @@ class InventoryService:
             return value
         if isinstance(value, int):
             return value != 0
-        text = normalize_text(str(value) if value is not None else None)
+        text = normalize_value_text(value)
         if not text:
             return None
         lowered = text.lower()
@@ -8280,7 +8251,7 @@ class InventoryService:
             device.get("display_name"),
             device.get("devfs_path"),
         ):
-            text = normalize_text(str(value) if value is not None else None)
+            text = normalize_value_text(value)
             if not text:
                 continue
             lowered = text.lower()
@@ -8305,7 +8276,7 @@ class InventoryService:
         devices_by_key: dict[str, dict[str, Any]],
         identifier: Any,
     ) -> dict[str, Any] | None:
-        text = normalize_text(str(identifier) if identifier is not None else None)
+        text = normalize_value_text(identifier)
         if not text:
             return None
         lowered = text.lower()
@@ -8317,7 +8288,7 @@ class InventoryService:
             return value
         if isinstance(value, float) and value.is_integer():
             return int(value)
-        text = normalize_text(str(value) if value is not None else None)
+        text = normalize_value_text(value)
         if not text:
             return None
         match = re.search(r"-?\d+", text)
@@ -8921,7 +8892,7 @@ class InventoryService:
             ("hw-enclosure-list", "hardware enclosure inventory", "cli_hw_enclosures"),
             ("network-port-list", "network port inventory", "cli_network_ports"),
         )
-        hosts = self._build_quantastor_ssh_hosts(raw_data)
+        hosts = self._build_configured_quantastor_hosts(raw_data=raw_data)
         if not hosts:
             return overlay, self._quantastor_no_node_ssh_host_failures(raw_data)
 
@@ -8990,7 +8961,7 @@ class InventoryService:
         self,
         raw_data: TrueNASRawData | None = None,
     ) -> tuple[ParsedSSHData, list[str]]:
-        hosts = self._build_quantastor_ssh_hosts(raw_data)
+        hosts = self._build_configured_quantastor_hosts(raw_data=raw_data)
         if not hosts:
             return ParsedSSHData(), self._quantastor_no_node_ssh_host_failures(raw_data)
         overlay, failures, best_host = await self._fetch_sg_ses_overlay(
@@ -9269,9 +9240,6 @@ class InventoryService:
                 hosts.append(host)
         return hosts
 
-    def _build_quantastor_ssh_hosts(self, raw_data: TrueNASRawData | None = None) -> list[str]:
-        return self._build_configured_quantastor_hosts(raw_data=raw_data)
-
     def _build_quantastor_preferred_hosts(
         self,
         slot_view: SlotView | None = None,
@@ -9288,7 +9256,7 @@ class InventoryService:
                 "quantastor_fence_owner_system_id",
             ):
                 raw_system_id = slot_view.raw_status.get(key)
-                system_id = normalize_text(str(raw_system_id) if raw_system_id is not None else None)
+                system_id = normalize_value_text(raw_system_id)
                 if system_id and system_id not in preferred_system_ids:
                     preferred_system_ids.append(system_id)
         for system_id in preferred_system_ids:
@@ -9382,7 +9350,7 @@ class InventoryService:
                     continue
                 if host not in hosts:
                     hosts.append(host)
-        for system_row in self._quantastor_cluster_node_rows(raw_data):
+        for system_row in self._quantastor_cluster_node_rows_from_raw(raw_data):
             for host in self._extract_quantastor_system_hosts(system_row):
                 if self._quantastor_hosts_match(host, api_host):
                     continue
@@ -9403,8 +9371,8 @@ class InventoryService:
             if self._quantastor_hosts_match(host, api_host):
                 continue
             return host
-        for system_row in self._quantastor_cluster_node_rows(raw_data):
-            row_system_id = normalize_text(str(system_row.get("id")) if system_row.get("id") is not None else None)
+        for system_row in self._quantastor_cluster_node_rows_from_raw(raw_data):
+            row_system_id = normalize_value_text(system_row.get("id"))
             if row_system_id != normalized_system_id:
                 continue
             for host in self._extract_quantastor_system_hosts(system_row):
@@ -9421,10 +9389,7 @@ class InventoryService:
         if not isinstance(hosts_by_system, dict):
             return None
         host = hosts_by_system.get(normalized_system_id)
-        return normalize_text(str(host) if host is not None else None)
-
-    def _quantastor_cluster_node_rows(self, raw_data: TrueNASRawData | None = None) -> list[dict[str, Any]]:
-        return self._quantastor_cluster_node_rows_from_raw(raw_data)
+        return normalize_value_text(host)
 
     @classmethod
     def _quantastor_gateway_hosts_by_system(
@@ -9435,7 +9400,7 @@ class InventoryService:
             return {}
         result: dict[str, list[str]] = {}
         cluster_node_ids = {
-            normalize_text(str(row.get("id")) if row.get("id") is not None else None)
+            normalize_value_text(row.get("id"))
             for row in cls._quantastor_cluster_node_rows_from_raw(raw_data)
         }
         for row in getattr(raw_data, "cli_network_ports", []) or []:
@@ -9478,16 +9443,16 @@ class InventoryService:
         hardware_system_ids = {
             system_id
             for system_id in (
-                normalize_text(str(item.get("storageSystemId")) if item.get("storageSystemId") is not None else None)
+                normalize_value_text(item.get("storageSystemId"))
                 for item in [*(raw_data.cli_hw_disks or raw_data.hw_disks), *(raw_data.cli_hw_enclosures or raw_data.hw_enclosures)]
                 if isinstance(item, dict)
             )
             if system_id
         }
         hardware_cluster_ids = {
-            normalize_text(str(row.get("storageSystemClusterId")) if row.get("storageSystemClusterId") is not None else None)
+            normalize_value_text(row.get("storageSystemClusterId"))
             for row in system_rows
-            if normalize_text(str(row.get("id")) if row.get("id") is not None else None) in hardware_system_ids
+            if normalize_value_text(row.get("id")) in hardware_system_ids
         }
         hardware_cluster_ids.discard(None)
 
@@ -9495,13 +9460,13 @@ class InventoryService:
             cluster_rows = [
                 row
                 for row in system_rows
-                if normalize_text(str(row.get("storageSystemClusterId")) if row.get("storageSystemClusterId") is not None else None)
+                if normalize_value_text(row.get("storageSystemClusterId"))
                 in hardware_cluster_ids
             ]
             node_rows = [
                 row
                 for row in cluster_rows
-                if normalize_text(str(row.get("id")) if row.get("id") is not None else None) in hardware_system_ids
+                if normalize_value_text(row.get("id")) in hardware_system_ids
             ]
             return node_rows or cluster_rows
 
@@ -9545,7 +9510,7 @@ class InventoryService:
             "gatewayIpAddress",
             "gatewayIPAddress",
         ):
-            value = normalize_text(str(row.get(key)) if row.get(key) is not None else None)
+            value = normalize_value_text(row.get(key))
             if value and value not in {"0.0.0.0", "::"}:
                 return True
         for key in ("isDefaultGateway", "defaultRoute", "isDefaultRoute", "isGateway"):
@@ -9554,7 +9519,7 @@ class InventoryService:
                 return value
             if isinstance(value, (int, float)):
                 return value != 0
-            text = normalize_text(str(value) if value is not None else None)
+            text = normalize_value_text(value)
             if text and text.lower() in {"1", "true", "yes", "y", "default"}:
                 return True
         return False
@@ -9781,7 +9746,7 @@ class InventoryService:
             camcontrol_controllers=dict(base.camcontrol_controllers),
             camcontrol_peer_devices=dict(base.camcontrol_peer_devices),
             ses_slot_candidates=merge_slot_candidate_maps(base.ses_slot_candidates, overlay.ses_slot_candidates),
-            ses_selected_meta=InventoryService._merge_enclosure_meta(base.ses_selected_meta, overlay.ses_selected_meta),
+            ses_selected_meta=merge_enclosure_meta(base.ses_selected_meta, overlay.ses_selected_meta),
             ses_enclosures=_merge_ses_enclosures([*base.ses_enclosures, *overlay.ses_enclosures]),
             linux_blockdevices=list(base.linux_blockdevices),
             linux_scsi_devices=list(base.linux_scsi_devices) + list(overlay.linux_scsi_devices),
@@ -9866,11 +9831,11 @@ class InventoryService:
         )
         if selected_system_id and owner_id == selected_system_id:
             score += 8
-        if normalize_text(str(row.get("storagePoolId")) if row.get("storagePoolId") is not None else None):
+        if normalize_value_text(row.get("storagePoolId")):
             score += 4
-        if normalize_text(str(row.get("hwDiskId")) if row.get("hwDiskId") is not None else None):
+        if normalize_value_text(row.get("hwDiskId")):
             score += 3
-        if normalize_text(str(row.get("multipathParentDiskId")) if row.get("multipathParentDiskId") is not None else None):
+        if normalize_value_text(row.get("multipathParentDiskId")):
             score += 2
         device_path = normalize_text(row.get("devicePath"))
         if device_path and "/dev/disk/by-dmuuid/" not in device_path:
@@ -9979,9 +9944,9 @@ class InventoryService:
             self.system,
             None,
             fallback_label=self.system.label or "ESXi Storage",
-            fallback_rows=2,
-            fallback_columns=1,
-            fallback_slot_count=2,
+            fallback_rows=ESXI_FALLBACK_LAYOUT[0],
+            fallback_columns=ESXI_FALLBACK_LAYOUT[1],
+            fallback_slot_count=ESXI_FALLBACK_LAYOUT[0] * ESXI_FALLBACK_LAYOUT[1],
         )
         if profile is None:
             return []
@@ -10430,7 +10395,7 @@ class InventoryService:
         finalize: bool = True,
     ) -> list[EnclosureOption]:
         # `finalize=False` leaves alias labels to a caller that finalizes the
-        # merged list, so the alias file is read once per build (#448).
+        # merged list, so the alias file is read once per build.
         options: list[EnclosureOption] = []
         for enclosure in ssh_data.ses_enclosures:
             option = self._ses_enclosure_to_option(enclosure)
@@ -10660,7 +10625,7 @@ class InventoryService:
                 "reported_size": (
                     format_bytes(size_value)
                     if isinstance(size_value, int)
-                    else normalize_text(str(size_value) if size_value is not None else None)
+                    else normalize_value_text(size_value)
                 ),
                 "enclosure_id": selected_option.id,
                 "enclosure_label": selected_option.label,
@@ -10696,7 +10661,7 @@ class InventoryService:
 
     @staticmethod
     def _storcli_bool(value: Any) -> bool | None:
-        text = normalize_text(str(value) if value is not None else None)
+        text = normalize_value_text(value)
         if text is None:
             return None
         lowered = text.lower()
@@ -11057,8 +11022,8 @@ class InventoryService:
                 (
                     normalized
                     for normalized in (
-                        normalize_text(str(blockdevice.get("wwn")) if blockdevice.get("wwn") is not None else None),
-                        normalize_text(str(blockdevice.get("ptuuid")) if blockdevice.get("ptuuid") is not None else None),
+                        normalize_value_text(blockdevice.get("wwn")),
+                        normalize_value_text(blockdevice.get("ptuuid")),
                     )
                     if normalized
                 ),
@@ -11068,7 +11033,7 @@ class InventoryService:
                 blockdevice.get("wwn"),
                 blockdevice.get("ptuuid"),
             ):
-                normalized_identifier = normalize_text(str(identifier_candidate) if identifier_candidate is not None else None)
+                normalized_identifier = normalize_value_text(identifier_candidate)
                 if normalized_identifier:
                     controller["identifier"] = controller["identifier"] or normalized_identifier
 
@@ -11503,7 +11468,7 @@ class InventoryService:
                 raid_levels = [
                     level
                     for level in dict.fromkeys(
-                        normalize_text(str(value) if value is not None else None)
+                        normalize_value_text(value)
                         for value in (
                             raw_raid_levels
                             if isinstance(raw_raid_levels, list)
@@ -11600,7 +11565,7 @@ class InventoryService:
                         True,
                     )
             if not multipath_name and multipath_consumer_index:
-                # Issue #355: the API disk record can lag gmultipath (a hot-added
+                # The API disk record can lag gmultipath (a hot-added
                 # spare whose disk table row is not yet synced) and the passive
                 # member may be absent from the API list entirely. The parsed
                 # `gmultipath list` consumers are then the only evidence tying
@@ -12080,7 +12045,7 @@ class InventoryService:
         # The bare (None, slot) bucket is last-writer-wins across every
         # enclosure on the system (TrueNAS disk.query carries no enclosure id
         # the extractor recognises), so it may only break ties after the SES
-        # device name observed in this bay has had its say (issue #164).
+        # device name observed in this bay has had its say.
         direct = disks_by_slot.get((None, slot))
         if direct:
             return DiskResolution(disk=direct, source="api-slot-fallback")
@@ -12214,14 +12179,14 @@ class InventoryService:
         )
         # When SES explicitly reports the bay empty, only a resolved disk may
         # override it. Status keywords, identify LEDs, and fault codes can all
-        # legitimately fire on an empty bay (issue #119's shelf latches
+        # legitimately fire on an empty bay (a Dell EN-8435A shelf latches
         # Critical onto every empty slot), and used to fabricate a present
         # drive out of them.
         ses_says_empty_without_disk = raw_present is False and disk is None
         # `_status_contains` is a substring scan, so the positive presence
         # keywords must not fire on a negated status: "Not installed" contains
         # "installed" and used to mark an API-only empty bay present=True while
-        # its state was already empty (issue #169).
+        # its state was already empty.
         status_says_populated = self._haystack_contains(
             status_haystack, "ok", "installed", "ready", "present"
         ) and not self._haystack_contains(status_haystack, "not installed", "empty", "absent")
@@ -12715,7 +12680,7 @@ class InventoryService:
         ]
 
     def _optional_ssh_backoff_key(self, host: str | None = None) -> str:
-        return normalize_text(host) or normalize_text(self.system.ssh.host) or "__default__"
+        return normalize_text(host) or normalize_text(self.system.ssh.host) or UNSCOPED_KEY
 
     def _ssh_session_lock_for_host(self, host: str | None = None) -> asyncio.Lock:
         key = self._optional_ssh_backoff_key(host)
@@ -12988,13 +12953,6 @@ class InventoryService:
                 for command in command_list
             ]
         return [await self._run_ssh_command(command, host) for command in command_list]
-
-    @staticmethod
-    def _merge_enclosure_meta(
-        base: dict[str, Any],
-        overlay: dict[str, Any],
-    ) -> dict[str, Any]:
-        return merge_enclosure_meta(base, overlay)
 
     def _lookup_zpool_member(
         self,
@@ -13478,7 +13436,7 @@ class InventoryService:
             if not value:
                 continue
             # SES reports "Noncritical" as a distinct informational code; the
-            # bare substring scan used to read it as critical (issue #119's
+            # bare substring scan used to read it as critical (a Dell EN-8435A
             # shelf reports Noncritical on every populated bay).
             lowered = value.lower().replace("noncritical", "non-crit-code")
             if any(keyword in lowered for keyword in bad_keywords):

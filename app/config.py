@@ -216,7 +216,7 @@ class HANodeConfig(BaseModel):
     @field_validator("system_id", "label", "host", mode="before")
     @classmethod
     def _normalize_text_fields(cls, value: Any) -> str | None:
-        normalized = normalize_text(str(value) if value is not None else None)
+        normalized = normalize_value_text(value)
         return normalized or None
 
 
@@ -280,7 +280,7 @@ class BMCConfig(BaseModel):
     @field_validator("host", "username", mode="before")
     @classmethod
     def _normalize_text_fields(cls, value: Any) -> str:
-        return normalize_text(str(value) if value is not None else None) or ""
+        return normalize_value_text(value) or ""
 
     @field_validator("password", mode="before")
     @classmethod
@@ -379,7 +379,7 @@ class StorageViewLayoutOverridesConfig(BaseModel):
                 raise ValueError("slot label keys must be integers") from exc
             if slot_number < 0:
                 continue
-            label = normalize_text(str(raw_label) if raw_label is not None else None)
+            label = normalize_value_text(raw_label)
             if label:
                 normalized[slot_number] = label[:128]
         return normalized
@@ -401,7 +401,7 @@ class StorageViewLayoutOverridesConfig(BaseModel):
                 raise ValueError("slot size keys must be integers") from exc
             if slot_number < 0:
                 continue
-            size_label = normalize_text(str(raw_size) if raw_size is not None else None)
+            size_label = normalize_value_text(raw_size)
             if size_label in allowed_sizes:
                 normalized[slot_number] = size_label
         return normalized
@@ -422,13 +422,13 @@ class StorageViewConfig(BaseModel):
     @field_validator("id", "label", "template_id", mode="before")
     @classmethod
     def _normalize_text_fields(cls, value: Any) -> str:
-        normalized = normalize_text(str(value) if value is not None else None)
+        normalized = normalize_value_text(value)
         return normalized or ""
 
     @field_validator("profile_id", mode="before")
     @classmethod
     def _normalize_optional_profile_id(cls, value: Any) -> str | None:
-        return normalize_text(str(value) if value is not None else None)
+        return normalize_value_text(value)
 
     @field_validator("order", mode="before")
     @classmethod
@@ -447,7 +447,7 @@ class StorageViewConfig(BaseModel):
             cleaned: list[str] = []
             seen: set[str] = set()
             for item in values or []:
-                normalized = normalize_text(str(item) if item is not None else None)
+                normalized = normalize_value_text(item)
                 if normalized and normalized not in seen:
                     seen.add(normalized)
                     cleaned.append(normalized)
@@ -1149,6 +1149,11 @@ def normalize_text(value: str | None) -> str | None:
         return None
     normalized = value.strip()
     return normalized or None
+
+
+def normalize_value_text(value: object) -> str | None:
+    """`normalize_text` for any value: None stays None, anything else is str()-ed first."""
+    return normalize_text(str(value)) if value is not None else None
 
 
 def _normalize_storage_view_id(value: str | None, fallback_index: int) -> str:
