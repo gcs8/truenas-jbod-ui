@@ -221,3 +221,116 @@ class ImageUpgradeTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ImmutableRetentionCheckTests(unittest.TestCase):
+    """#400: the immutable update consumes only aggregate disk-retention totals."""
+
+    make_root = fixtures.ImmutableDeploymentTests.make_root
+    make_spec = fixtures.ImmutableDeploymentTests.make_spec
+    INVENTORY_URL = "http://127.0.0.1:8080/api/inventory"
+
+    @staticmethod
+    def inventory(source, rendered, duplicate, unplaced):
+        return {
+            "summary": {
+                "disk_count": source,
+                "source_disk_count": source,
+                "rendered_unique_disk_count": rendered,
+                "duplicate_disk_view_count": duplicate,
+                "unplaced_disk_count": unplaced,
+            },
+            # Identifiers the check must never copy into the receipt.
+            "slots": [{"serial": "SYNTH-SERIAL-0001", "device_name": "da0"}],
+        }
+
+    def update(self, root, responses):
+        runtime = FakeRuntime(root)
+        answers = list(responses)
+        spec = replace(self.make_spec(root), inventory_url=self.INVENTORY_URL)
+
+        def fetch_json(url):
+            self.assertEqual(url, self.INVENTORY_URL)
+            answer = answers.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        return runtime, lambda: deployment.update_deployment(
+            spec, run=runtime.run, download=runtime.download, probe=runtime.probe, fetch_json=fetch_json)
+
+    def test_healthy_totals_activate_and_record_counts_only(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self.make_root(temp)
+            _, update = self.update(root, [self.inventory(6, 6, 2, 0), self.inventory(6, 6, 0, 0)])
+            result = update()
+            receipt = deployment.validate_receipt(root)
+            self.assertEqual(receipt["status"], "active")
+            self.assertEqual(receipt["retention"]["before"]["source_disk_count"], 6)
+            self.assertEqual(receipt["retention"]["after"]["unplaced_disk_count"], 0)
+            self.assertEqual(result["retention"], receipt["retention"])
+            receipt_text = (root / deployment.RECEIPT_DIR_NAME / "receipt.json").read_text(encoding="utf-8")
+            self.assertNotIn("SYNTH-SERIAL", receipt_text)
+            self.assertNotIn("da0", receipt_text)
+
+    def test_unplaced_disk_rolls_back_automatically(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self.make_root(temp)
+            runtime, update = self.update(root, [self.inventory(6, 6, 0, 0), self.inventory(6, 5, 0, 1)])
+            with self.assertRaisesRegex(deployment.DeploymentError, "automatic rollback completed") as caught:
+                update()
+            self.assertIn("1 of 6 source disks", str(caught.exception.__cause__))
+            receipt = deployment.validate_receipt(root)
+            self.assertEqual(receipt["status"], "rolled_back")
+            self.assertEqual(receipt["retention"]["after"]["unplaced_disk_count"], 1)
+            self.assertEqual(runtime.active_image_id, fixtures.OLD_IMAGE_ID)
+
+    def test_source_disk_loss_across_update_rolls_back(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self.make_root(temp)
+            _, update = self.update(root, [self.inventory(6, 6, 0, 0), self.inventory(5, 5, 0, 0)])
+            with self.assertRaises(deployment.DeploymentError) as caught:
+                update()
+            self.assertIn("source disks fell from 6 to 5", str(caught.exception.__cause__))
+
+    def test_predecessor_without_totals_still_gates_the_candidate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self.make_root(temp)
+            _, update = self.update(root, [{"summary": {"disk_count": 6}}, self.inventory(6, 6, 0, 0)])
+            update()
+            receipt = deployment.validate_receipt(root)
+            self.assertIsNone(receipt["retention"]["before"])
+            self.assertEqual(receipt["status"], "active")
+
+    def test_candidate_without_totals_is_refused(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self.make_root(temp)
+            _, update = self.update(root, [self.inventory(6, 6, 0, 0), {"summary": {"disk_count": 6}}])
+            with self.assertRaises(deployment.DeploymentError) as caught:
+                update()
+            self.assertIn("predates retention totals", str(caught.exception.__cause__))
+
+    def test_inventory_url_must_be_loopback(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self.make_root(temp)
+            spec = replace(self.make_spec(root), inventory_url="http://192.0.2.10:8080/api/inventory")
+            with self.assertRaisesRegex(deployment.DeploymentError, "inventory URL must use an explicit loopback"):
+                deployment.update_deployment(spec, run=FakeRuntime(root).run)
+
+    def test_receipts_without_retention_remain_valid(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self.make_root(temp)
+            runtime = FakeRuntime(root)
+            deployment.update_deployment(self.make_spec(root), run=runtime.run,
+                                         download=runtime.download, probe=runtime.probe)
+            self.assertNotIn("retention", deployment.validate_receipt(root))
+
+    def test_cli_forwards_inventory_url(self):
+        args = deployment._build_parser().parse_args([
+            "update", "/srv/jbod", "--project-name=jbod", "--source-revision=" + "0" * 40,
+            "--expected-image=ghcr.io/gcs8/truenas-jbod-ui@sha256:" + "0" * 64,
+            "--candidate-tag=ghcr.io/gcs8/truenas-jbod-ui:v1", "--compose=docker-compose.yml=live.yml",
+            "--service=app", "--health-url=http://127.0.0.1/healthz",
+            "--inventory-url=http://127.0.0.1:8080/api/inventory",
+        ])
+        self.assertEqual(args.inventory_url, "http://127.0.0.1:8080/api/inventory")

@@ -50,6 +50,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Added
 
+- `scripts/update_immutable_deployment.py update --inventory-url` checks disk
+  retention: it reads only the aggregate inventory totals before and after the
+  update, and rolls back when a source disk is unplaced or the source count
+  drops. The receipt records counts, never identifiers (#PRNUM).
+
 - Added jump links to the sections of the admin Setup + Maintenance view (#582)
 - Added an optional backup scheduler sidecar (`--profile backup-scheduler`):
   config-only backups shortly after configuration changes, full backups on a
