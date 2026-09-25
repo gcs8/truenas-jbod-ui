@@ -436,6 +436,34 @@ class CoverageParsingTests(unittest.TestCase):
         self.assertNotIn(5, numbers)
 
 
+class CurrentChangelogConsistencyTests(unittest.TestCase):
+    def test_integrated_backup_libraries_name_their_later_integration(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        text = (repository / "CHANGELOG.md").read_text(encoding="utf-8")
+        unreleased = coverage.changelog_section(text, "## Unreleased")
+        bullets: list[str] = []
+        current: list[str] = []
+        for line in unreleased.splitlines():
+            if line.startswith("- "):
+                if current:
+                    bullets.append("\n".join(current))
+                current = [line]
+            elif current and line.startswith("  "):
+                current.append(line)
+            elif current:
+                bullets.append("\n".join(current))
+                current = []
+        if current:
+            bullets.append("\n".join(current))
+
+        for pull_request in (575, 577):
+            with self.subTest(pull_request=pull_request):
+                matching = [bullet for bullet in bullets if f"(#{pull_request})" in bullet]
+                self.assertEqual(len(matching), 1)
+                self.assertIn("#580", matching[0])
+                self.assertNotRegex(matching[0].lower(), r"\b(?:not wired(?: up)?|unwired)\b")
+
+
 class RenderReleaseNotesTests(unittest.TestCase):
     def test_render_prints_highlights_then_upgrade_notes(self) -> None:
         rendered = render_release_notes.render(CHANGELOG_TEMPLATE, "## Unreleased")

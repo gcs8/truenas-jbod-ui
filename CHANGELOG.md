@@ -647,12 +647,15 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Added the backup archive transport library for the history sidecar: remote
   targets for a local directory, FTP/FTPS, SFTP (host key checked against
   known_hosts), SMB, a job-scoped NFS mount, and S3. Uploads are atomic and
-  read back to verify, and credentials come from secret files. The library is
-  not wired into the app yet (#577).
+  read back to verify, and credentials come from secret files. The library
+  landed first; #580 subsequently integrated it into the backup scheduler and
+  remote-target workflow (#577).
 
 - Added a change journal library for the backup sidecar that records config
   edits and coalesces a burst of them into one config-only backup, skipped when
-  the config content hash has not changed; it is not wired up yet. (#575)
+  the config content hash has not changed. The library landed first; #580
+  subsequently integrated it with app config-change hooks and scheduler
+  coalescing. (#575)
 
 - Removed the unreachable per-slot history fallback and its concurrency
   setting, unified the unavailable slot-history payload shape, and deleted
