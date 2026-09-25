@@ -595,10 +595,10 @@ class SmartctlBatchTests(unittest.IsolatedAsyncioTestCase):
             if t is not asyncio.current_task() and not t.done()
         ], [])
 
-    async def run_peer(self, peer, disks, *, budget=2, args=None):
+    async def run_peer(self, peer, disks, *, budget=2, args=None, test_timeout=5):
         with patch("app.services.truenas_ws.connect", peer.connect):
             return await asyncio.wait_for(
-                self.client.smartctl_batch(disks, args, max_concurrency=budget), 5,
+                self.client.smartctl_batch(disks, args, max_concurrency=budget), test_timeout,
             )
 
     async def test_single_call_answers_ddp_ping_control(self):
@@ -746,12 +746,18 @@ class SmartctlBatchTests(unittest.IsolatedAsyncioTestCase):
     async def test_exact_limit_duplicates_and_explicit_args(self):
         peer = SyntheticDDPPeer()
         disks = ["invented0"] * 4096
-        self.assertEqual(await self.run_peer(peer, disks, budget=1, args=["-x", "-j"]), disks)
+        # This is a cardinality/concurrency contract, not a throughput benchmark.
+        # Keep a generous deadlock guard and prove the exact structure below.
+        self.assertEqual(
+            await self.run_peer(peer, disks, budget=1, args=["-x", "-j"], test_timeout=60),
+            disks,
+        )
+        self.assertEqual((peer.connections, peer.logins, peer.closes, peer.peak), (1, 1, 1, 1))
         self.assertEqual(len(peer.requests), 4096)
         self.assertTrue(all(r == ["invented0", ["-x", "-j"]] for r in peer.requests))
         peer = SyntheticDDPPeer(width=2)
         self.assertEqual(await self.run_peer(peer, ["same", "same"], budget=12, args=[]), ["same", "same"])
-        self.assertEqual(peer.peak, 2)
+        self.assertEqual((len(peer.requests), peer.peak), (2, 2))
         self.assertTrue(all(r[1] == ["-a", "-j"] for r in peer.requests))
 
     async def test_invalid_middleware_and_reader_failures_close_session(self):
