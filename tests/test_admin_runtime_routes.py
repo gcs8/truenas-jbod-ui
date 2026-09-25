@@ -84,7 +84,7 @@ class AdminRuntimeRouteTests(unittest.TestCase):
                 {
                     "key": "ui",
                     "name": "truenas-jbod-ui",
-                    "label": "Read UI",
+                    "label": "Main UI",
                     "description": "Primary read-mostly enclosure UI.",
                     "status": "running",
                     "status_text": "Up (healthy)",

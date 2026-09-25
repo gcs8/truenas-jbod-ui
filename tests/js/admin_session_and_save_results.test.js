@@ -214,7 +214,7 @@ test("every save, delete, and timing result goes through renderSaveResult and no
     assert.doesNotMatch(text, /read ui/i, `${label} must say main UI`);
   }
   assert.match(TEMPLATE, /Saved systems appear in the main UI after a restart\./);
-  assert.match(ROUTES, /"restart_required": \["ui"\],\n\s+"detail": "Runtime behavior overrides saved\. Restart the main UI to apply them\."/);
+  assert.match(ROUTES, /"restart_required": \["ui"\],\n\s+"detail": "Timing saved\. Restart the main UI to apply it\."/);
 });
 
 // Auto-stop is announced before and after it happens.
