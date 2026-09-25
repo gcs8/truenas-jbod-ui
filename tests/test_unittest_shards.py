@@ -72,6 +72,18 @@ class Failing(unittest.TestCase):
         self.fail("synthetic failure")
 """
 
+TWO_PASSING_TESTS_MODULE = """
+import unittest
+
+
+class Passing(unittest.TestCase):
+    def test_one(self):
+        self.assertTrue(True)
+
+    def test_two(self):
+        self.assertTrue(True)
+"""
+
 
 class ShardTableTests(unittest.TestCase):
     def test_every_test_module_is_assigned_to_exactly_one_shard(self) -> None:
@@ -136,6 +148,8 @@ class ShardRunTests(unittest.TestCase):
             second = json.loads(run_test_shard.result_path(results_dir, "2").read_text(encoding="utf-8"))
 
         self.assertEqual(first["modules"], ["test_outcome_pass"])
+        self.assertEqual(first["test_counts"], {"test_outcome_pass": 1})
+        self.assertEqual(second["test_counts"], {"test_outcome_fail": 1})
         self.assertEqual((first["tests_run"], first["was_successful"]), (1, True))
         self.assertEqual((second["tests_run"], second["failures"], second["was_successful"]), (1, 1, False))
         self.assertEqual(first["python_version"], run_test_shard.python_version_label())
@@ -157,6 +171,7 @@ class ShardVerifyTests(unittest.TestCase):
                 "shard": shard_id,
                 "python_version": "3.14",
                 "modules": list(modules),
+                "test_counts": {module: 3 for module in modules},
                 "tests_run": 3,
                 "failures": 0,
                 "errors": 0,
@@ -176,7 +191,17 @@ class ShardVerifyTests(unittest.TestCase):
             results_dir = tests_dir / "results"
 
             self._results(results_dir, shards)
-            self.assertEqual(run_test_shard.verify_results(results_dir, "3.14", shards=shards, tests_dir=tests_dir), [])
+            expected_counts = {"test_a": 3, "test_b": 3}
+            self.assertEqual(
+                run_test_shard.verify_results(
+                    results_dir,
+                    "3.14",
+                    shards=shards,
+                    tests_dir=tests_dir,
+                    expected_counts=expected_counts,
+                ),
+                [],
+            )
 
             cases = {
                 "missing": ({"1": shards["1"]}, {}, "shard 2: no result"),
@@ -184,19 +209,131 @@ class ShardVerifyTests(unittest.TestCase):
                 "empty": (shards, {"1": {"tests_run": 0}}, "shard 1: ran no tests"),
                 "wrong-python": (shards, {"1": {"python_version": "3.12"}}, "expected '3.14'"),
                 "drifted-modules": (shards, {"2": {"modules": ["test_a"]}}, "module list differs"),
+                "missing-counts": (shards, {"1": {"test_counts": None}}, "test_counts is not an object"),
             }
             for label, (present, overrides, expected) in cases.items():
                 with self.subTest(case=label):
                     for path in results_dir.glob("*.json"):
                         path.unlink()
                     self._results(results_dir, present, **overrides)
-                    problems = run_test_shard.verify_results(results_dir, "3.14", shards=shards, tests_dir=tests_dir)
+                    problems = run_test_shard.verify_results(
+                        results_dir,
+                        "3.14",
+                        shards=shards,
+                        tests_dir=tests_dir,
+                        expected_counts=expected_counts,
+                    )
                     self.assertTrue(any(expected in problem for problem in problems), problems)
 
             self.assertIn(
                 "results directory is missing",
-                run_test_shard.verify_results(tests_dir / "absent", "3.14", shards=shards, tests_dir=tests_dir)[0],
+                run_test_shard.verify_results(
+                    tests_dir / "absent",
+                    "3.14",
+                    shards=shards,
+                    tests_dir=tests_dir,
+                    expected_counts=expected_counts,
+                )[0],
             )
+
+    def test_verify_rejects_a_removed_test_method_while_the_module_remains(self) -> None:
+        with _SyntheticTestsDir(self) as synthetic:
+            results_dir = synthetic.path / "results"
+            synthetic.write("test_mutation", PASSING_MODULE)
+            shards = {"1": ("test_mutation",)}
+            self.assertEqual(
+                run_test_shard.run_shard(
+                    "1",
+                    shards=shards,
+                    tests_dir=synthetic.path,
+                    results_dir=results_dir,
+                    stream=io.StringIO(),
+                ),
+                0,
+            )
+
+            problems = run_test_shard.verify_results(
+                results_dir,
+                run_test_shard.python_version_label(),
+                shards=shards,
+                tests_dir=synthetic.path,
+                expected_counts={"test_mutation": 2},
+            )
+
+        self.assertEqual(
+            problems,
+            ["test-count manifest: test_mutation lost 1 test (expected 2, found 1)"],
+        )
+
+    def test_verify_requires_additions_to_update_the_manifest(self) -> None:
+        with _SyntheticTestsDir(self) as synthetic:
+            results_dir = synthetic.path / "results"
+            synthetic.write("test_addition", TWO_PASSING_TESTS_MODULE)
+            shards = {"1": ("test_addition",)}
+            self.assertEqual(
+                run_test_shard.run_shard(
+                    "1",
+                    shards=shards,
+                    tests_dir=synthetic.path,
+                    results_dir=results_dir,
+                    stream=io.StringIO(),
+                ),
+                0,
+            )
+
+            problems = run_test_shard.verify_results(
+                results_dir,
+                run_test_shard.python_version_label(),
+                shards=shards,
+                tests_dir=synthetic.path,
+                expected_counts={"test_addition": 1},
+            )
+
+        self.assertEqual(
+            problems,
+            ["test-count manifest: test_addition gained 1 test (expected 1, found 2); update the manifest"],
+        )
+
+
+class TestCountManifestTests(unittest.TestCase):
+    def test_generator_writes_stable_sorted_module_counts(self) -> None:
+        with _SyntheticTestsDir(self) as synthetic:
+            synthetic.write("test_z", PASSING_MODULE)
+            synthetic.write("test_a", TWO_PASSING_TESTS_MODULE)
+            manifest_path = synthetic.path / "counts.json"
+
+            counts = run_test_shard.write_test_count_manifest(
+                manifest_path,
+                modules=("test_z", "test_a"),
+                tests_dir=synthetic.path,
+            )
+
+            self.assertEqual(counts, {"test_a": 2, "test_z": 1})
+            self.assertEqual(
+                json.loads(manifest_path.read_text(encoding="utf-8")),
+                {"schema": 1, "modules": {"test_a": 2, "test_z": 1}},
+            )
+            self.assertTrue(manifest_path.read_text(encoding="utf-8").endswith("\n"))
+
+    def test_generator_refuses_import_failures_instead_of_recording_failed_tests(self) -> None:
+        with _SyntheticTestsDir(self) as synthetic:
+            synthetic.write("test_broken", "import dependency_that_does_not_exist\n")
+            manifest_path = synthetic.path / "counts.json"
+
+            with self.assertRaisesRegex(ValueError, "test_broken failed discovery"):
+                run_test_shard.write_test_count_manifest(
+                    manifest_path,
+                    modules=("test_broken",),
+                    tests_dir=synthetic.path,
+                )
+
+            self.assertFalse(manifest_path.exists())
+
+    def test_checked_in_manifest_matches_full_discovery(self) -> None:
+        expected = run_test_shard.load_test_count_manifest()
+        actual = run_test_shard.discovered_test_counts(run_test_shard.discovered_modules())
+
+        self.assertEqual(run_test_shard.test_count_problems(expected, actual), [])
 
 
 class CIShardContractTests(unittest.TestCase):
