@@ -52,12 +52,9 @@ also provide SMART data, path details, or LED control. See the
 You need Docker Compose, the URL of your TrueNAS system, and a TrueNAS API key.
 
 ```bash
-mkdir -p /docker-local/truenas-jbod-ui
-cd /docker-local/truenas-jbod-ui
+mkdir -p /docker-local/truenas-jbod-ui && cd /docker-local/truenas-jbod-ui
 
-curl -fsSL \
-  -o compose.yaml \
-  https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/v0.22.2/docker-compose.yml
+curl -fsSL -o compose.yaml https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/v0.22.2/docker-compose.yml
 
 cat > .env <<'EOF'
 JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.22.2
@@ -101,25 +98,32 @@ hardening is separate from an image update; retain any hardening already chosen.
 
 ## Optional services
 
-The main UI works by itself. Start history when you want charts and saved disk
-events:
+The main UI works by itself. Start history for charts and saved disk events:
 
 ```bash
 docker compose --profile history up -d
 ```
 
-Start the admin UI when you want guided setup, profile editing, backup and
-restore, or container controls:
+Start the admin UI for guided setup, profile editing, backup and restore, or container controls:
 
 ```bash
 docker compose --profile admin up -d enclosure-admin
 ```
 
-The default ports are:
+The backup scheduler and Backups page are not in a released deployment yet. In a
+current-source checkout using its matching image and Compose file, the [`backup-scheduler` profile](wiki/Backup-Restore-and-Debug-Bundles.md#automatic-backup-archive-and-remote-targets)
+is off by default; start it with `--profile backup-scheduler`. It creates encrypted config
+backups after changes and scheduled full backups only after you enable those two classes in the backup policy; it can then copy them to filesystem,
+FTP/FTPS, SFTP, SMB, NFS, or S3. The admin
+[Backups page](wiki/Backup-Restore-and-Debug-Bundles.md#editing-from-the-admin-backups-page)
+can run and manage backups. A restore inspects the exact archive and asks for
+confirmation before import. Local and remote retention are configured independently.
+New full backups use encrypted `tar.zst` by default, and existing `.7z` backups remain readable.
 
-- Main UI: `8080`
-- History service: `8081`
-- Admin UI: `8082`
+- Add [`docker-compose.backup-nfs.yml`](wiki/Backup-Restore-and-Debug-Bundles.md#nfs-targets) only for NFS targets.
+- Add [`docker-compose.history-bind.yml`](wiki/Upgrading.md#history) when a v0.22.2 deployment publishes history on a non-loopback address during an image-only update.
+
+Default ports are Main UI `8080`, history service `8081`, and admin UI `8082`.
 
 ## Documentation
 
@@ -129,6 +133,8 @@ The default ports are:
 - [TrueNAS SCALE setup](wiki/TrueNAS-SCALE-Setup.md)
 - [SSH setup](wiki/SSH-Setup-and-Sudo.md)
 - [Admin UI](wiki/Admin-UI-and-System-Setup.md)
+- [Backup, restore, and debug bundles](wiki/Backup-Restore-and-Debug-Bundles.md)
+- [Upgrading](wiki/Upgrading.md)
 - [Troubleshooting](wiki/Troubleshooting.md)
 - [All documentation](wiki/Home.md)
 

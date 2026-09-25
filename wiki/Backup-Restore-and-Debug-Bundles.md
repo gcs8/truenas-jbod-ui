@@ -406,7 +406,7 @@ journal. Restart the scheduler to apply a save:
 | `sftp` | Yes | Needs `known_hosts_path` and a key or password file. Use SFTP for "SCP" |
 | `ftp` | Only with `use_tls: true` | Plain FTP is allowed and labelled unencrypted. The archive itself is always encrypted |
 | `smb` | With `smb_encrypt: true` | Needs `share` |
-| `s3` | Yes (HTTPS) | S3 and compatible stores: `bucket`, `region`, optional `endpoint_url` |
+| `s3` | By default (HTTPS); no with an `http://` custom endpoint | S3 and compatible stores: `bucket`, `region`, optional `endpoint_url` |
 | `nfs` | No | Needs the NFS overlay below |
 | `filesystem` | n/a | An absolute path, for example a mounted USB disk |
 
@@ -497,7 +497,9 @@ library, show one backup and the changes it captured, verify (re-read and
 re-hash), download, preserve and unpreserve, restore (the same inspect-then-
 import flow and passphrase headers as an uploaded backup), run a backup now,
 preview and apply grooming with a one-time plan token, and test a target.
-Backup ids are opaque. No route accepts or returns a file path or a credential.
+Artifact and library routes use opaque backup ids; they do not accept or return
+an artifact file path. Policy routes accept target paths and secret-file paths,
+but secret-file paths and credential contents are never returned.
 
 ## Create a debug bundle
 

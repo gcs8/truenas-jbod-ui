@@ -116,6 +116,35 @@ class PublicDocsContractTests(unittest.TestCase):
             with self.subTest(internal_note=internal_note):
                 self.assertNotIn(internal_note, readme)
 
+    def test_readme_discovers_backup_scheduler_and_admin_backup_workflows(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        normalized = " ".join(readme.split())
+
+        for required in (
+            "--profile backup-scheduler",
+            "The backup scheduler and Backups page are not in a released deployment yet",
+            "current-source checkout using its matching image and Compose file",
+            "only after you enable those two classes in the backup policy",
+            "[Backups page](wiki/Backup-Restore-and-Debug-Bundles.md#editing-from-the-admin-backups-page)",
+            "[`docker-compose.backup-nfs.yml`](wiki/Backup-Restore-and-Debug-Bundles.md#nfs-targets)",
+            "[`docker-compose.history-bind.yml`](wiki/Upgrading.md#history)",
+            "filesystem, FTP/FTPS, SFTP, SMB, NFS, or S3",
+            "encrypted `tar.zst`",
+            "existing `.7z` backups remain readable",
+            "inspects the exact archive and asks for confirmation before import",
+            "Local and remote retention are configured independently",
+            "[Backup, restore, and debug bundles](wiki/Backup-Restore-and-Debug-Bundles.md)",
+            "[Upgrading](wiki/Upgrading.md)",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, normalized)
+
+        backup_guide = (ROOT / "wiki/Backup-Restore-and-Debug-Bundles.md").read_text(encoding="utf-8")
+        self.assertIn("no with an `http://` custom endpoint", backup_guide)
+        self.assertIn("Artifact and library routes use opaque backup ids", backup_guide)
+        self.assertIn("secret-file paths and credential contents are never returned", backup_guide)
+        self.assertNotIn("No route accepts or returns a file path or a credential", backup_guide)
+
     def test_repository_has_exact_readme_and_wiki_document_set(self) -> None:
         actual = {path.relative_to(ROOT).as_posix() for path in (ROOT / "wiki").glob("*.md")}
 
@@ -170,6 +199,23 @@ class PublicDocsContractTests(unittest.TestCase):
         self.assertIn("TRUENAS_TLS_SERVER_NAME=truenas.example.test", advanced)
         self.assertIn("trusted, isolated logging network", operations)
         self.assertIn("authenticated and encrypted", operations)
+
+    def test_retired_app_bind_keys_are_not_described_as_restart_only(self) -> None:
+        advanced = (ROOT / "wiki/Advanced-Configuration.md").read_text(encoding="utf-8")
+        changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        browser_qa = (ROOT / "qa/admin-operations.spec.js").read_text(encoding="utf-8")
+
+        restart_table = advanced.split("A few settings are only read", 1)[1].split("When you change one", 1)[0]
+        reload_entry = changelog.split("- The main UI applies edits", 1)[1].split("(#614)", 1)[0]
+
+        self.assertNotRegex(restart_table, r"\bapp\.(?:host|port)\b")
+        self.assertNotRegex(reload_entry.lower(), r"\b(?:bind address|port)\b")
+        self.assertNotRegex(
+            browser_qa,
+            r'restart_settings:\s*\[[^\]]*"app\.(?:host|port)"',
+        )
+        self.assertIn("`app.public_origin`", restart_table)
+        self.assertIn('restart_settings: ["app.public_origin"]', browser_qa)
 
     def test_all_yaml_examples_parse(self) -> None:
         count = 0
