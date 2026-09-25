@@ -84,7 +84,7 @@ class PurgeProofTests(unittest.TestCase):
             connection.execute("INSERT INTO slot_events (observed_at, system_id, enclosure_key, slot, slot_label, event_type, details_json) VALUES ('2026-01-01T00:00:00Z', ?, 'synthetic', 1, 'Bay 1', 'inserted', '{}')", (system_id,))
 
     def run_with_store(self, coroutine):
-        with patch("admin_service.main.reload_app_settings", return_value=self.settings), patch("admin_service.main.get_history_store", return_value=self.store):
+        with patch("admin_service.routes.reload_app_settings", return_value=self.settings), patch("admin_service.routes.get_history_store", return_value=self.store):
             return asyncio.run(coroutine)
 
     def test_purge_requires_preview_proof(self):

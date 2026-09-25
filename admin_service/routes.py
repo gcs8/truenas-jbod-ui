@@ -1,22 +1,120 @@
 from __future__ import annotations
 
-# Handler globals are populated from admin_service.main by MainModuleAPIRouter.
-# pyright: reportUndefinedVariable=false
-# ruff: noqa: F821
-
+import asyncio
+import json
 import os
 import secrets
+import tempfile
 import time
-from app.services.system_setup import _CONFIG_WRITE_LOCK
-
-from types import ModuleType
+from pathlib import Path
 from typing import Any
 
-from app.route_compat import MainModuleAPIRouter
+from fastapi import (
+    APIRouter,
+    HTTPException,
+    Query,
+    Request,
+)
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    Response,
+    StreamingResponse,
+)
+from starlette.concurrency import iterate_in_threadpool
+
+from admin_service.config import get_admin_settings
+from admin_service.route_support import (
+    SERVICE_STARTED_AT,
+    TemporaryFileResponse,
+    _format_count,
+    build_admin_state_payload,
+    build_runtime_payload,
+    compute_expires_at,
+    decode_optional_secret_header,
+    enrich_quantastor_nodes_from_ssh,
+    format_history_cleanup_summary,
+    format_history_system_summary,
+    get_backup_receipt_store,
+    get_backup_scheduler_client,
+    get_backup_service,
+    get_esxi_host_prep_service,
+    get_history_store,
+    get_maintenance_service,
+    get_runtime_service,
+    limited_request_content_length,
+    logger,
+    merge_quantastor_node_hosts,
+    observe_backup_route,
+    project_runtime_observation,
+    quantastor_node_discovery_seed_hosts,
+    quantastor_request_node_host_map,
+    reload_app_settings,
+    resolve_saved_secondary_secret,
+    run_file_export_worker,
+    serialize_live_enclosures,
+    serialize_profiles,
+    serialize_quantastor_nodes,
+    serialize_systems,
+    stream_limited_request_body_to_file,
+    templates,
+    validate_admin_export_policy,
+)
+from admin_service.services.account_bootstrap import (
+    ServiceAccountBootstrapService,
+    saved_sudo_commands_for_system,
+)
+from admin_service.services.backup_scheduler_client import SchedulerUnavailableError
+from admin_service.services.esxi_host_prep import (
+    MAX_UPLOAD_BYTES as MAX_ESXI_HOST_PREP_UPLOAD_BYTES,
+)
+from admin_service.services.esxi_host_prep import (
+    STAGING_QUOTA_ERROR,
+    HostPrepStagingQuotaError,
+)
+from admin_service.services.runtime_control import DockerRuntimeError
+from admin_service.services.tls_trust import TLSTrustStoreService
+from app import __version__
+from app.config import (
+    TrueNASConfig,
+    known_hosts_path_for_target,
+    restart_only_changes,
+    save_runtime_behavior_overrides,
+)
+from app.models.domain import (
+    DebugBundleExportRequest,
+    DemoSystemRequest,
+    EnclosureProfileRequest,
+    ESXiHostPrepInstallRequest,
+    HistoryAdoptRequest,
+    QuantastorNodeDiscoveryRequest,
+    SSHKeyGenerateRequest,
+    SystemBackupExportRequest,
+    SystemSetupBootstrapRequest,
+    SystemSetupRequest,
+    SystemSetupSudoPreviewRequest,
+    TLSCertificateImportRequest,
+    TLSCertificateInspectRequest,
+    TLSRemoteCertificateTrustRequest,
+)
+from app.services.config_change_journal import record_config_change
+from app.services.credential_authority import (
+    api_credential_authority,
+    credential_authorities_are_approved,
+    same_credential_authority,
+    ssh_credential_authorities,
+)
+from app.services.demo_system_factory import DemoSystemFactory
+from app.services.inventory_registry import InventoryRegistry
+from app.services.parsers import normalize_text
+from app.services.profile_builder import ProfileBuilderService
+from app.services.quantastor_api import QuantastorRESTClient
+from app.services.ssh_key_manager import SSHKeyManager
+from app.services.system_setup import _CONFIG_WRITE_LOCK, SystemSetupService
 
 
-def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIRouter:
-    router = MainModuleAPIRouter(main_module, globals())
+def build_router(admin_settings: Any) -> APIRouter:
+    router = APIRouter()
     # Bounded, short-lived, one-use proof of the exact preview shown to the operator.
     purge_previews: dict[str, tuple[float, list[str], list[dict[str, Any]]]] = {}
 
@@ -1235,7 +1333,10 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
     # present/missing per *_file setting and never returns the path itself.
     @router.get("/api/admin/backups/policy")
     async def get_backup_policy() -> JSONResponse:
-        from history_service.backup_archive.editor import PolicyEditError, load_editor_view
+        from history_service.backup_archive.editor import (
+            PolicyEditError,
+            load_editor_view,
+        )
 
         settings = reload_app_settings()
         try:
@@ -1246,7 +1347,10 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
 
     @router.put("/api/admin/backups/policy")
     async def save_backup_policy(payload: dict[str, Any]) -> JSONResponse:
-        from history_service.backup_archive.editor import PolicyEditError, apply_editor_change
+        from history_service.backup_archive.editor import (
+            PolicyEditError,
+            apply_editor_change,
+        )
 
         settings = reload_app_settings()
         try:

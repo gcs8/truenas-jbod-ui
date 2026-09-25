@@ -116,8 +116,8 @@ class AdminRuntimeRouteTests(unittest.TestCase):
         )
         with (
             patch("admin_service.main.get_admin_settings", return_value=settings),
-            patch("admin_service.main.get_runtime_service", return_value=runtime_service),
-            patch("admin_service.main.get_release_status_service", return_value=release_service),
+            patch("admin_service.route_support.get_runtime_service", return_value=runtime_service),
+            patch("admin_service.route_support.get_release_status_service", return_value=release_service),
         ):
             app = create_app()
             status, _headers, body = asyncio.run(invoke_asgi(app, "/api/admin/runtime"))
@@ -176,8 +176,8 @@ class AdminRuntimeRouteTests(unittest.TestCase):
         release_service = SimpleNamespace(snapshot=lambda: {})
         with (
             patch("admin_service.main.get_admin_settings", return_value=settings),
-            patch("admin_service.main.get_runtime_service", return_value=runtime_service),
-            patch("admin_service.main.get_release_status_service", return_value=release_service),
+            patch("admin_service.route_support.get_runtime_service", return_value=runtime_service),
+            patch("admin_service.route_support.get_release_status_service", return_value=release_service),
         ):
             app = create_app()
             unauthenticated, headers, _body = asyncio.run(
@@ -212,8 +212,8 @@ class AdminRuntimeRouteTests(unittest.TestCase):
         release_service = SimpleNamespace(snapshot=lambda: {})
         with (
             patch("admin_service.main.get_admin_settings", return_value=settings),
-            patch("admin_service.main.get_runtime_service", return_value=runtime_service),
-            patch("admin_service.main.get_release_status_service", return_value=release_service),
+            patch("admin_service.route_support.get_runtime_service", return_value=runtime_service),
+            patch("admin_service.route_support.get_release_status_service", return_value=release_service),
         ):
             app = create_app()
             status, _headers, body = asyncio.run(invoke_asgi(app, "/api/admin/runtime"))

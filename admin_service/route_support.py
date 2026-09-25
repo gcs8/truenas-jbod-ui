@@ -1,0 +1,1099 @@
+from __future__ import annotations
+
+import asyncio
+import base64
+import logging
+import os
+import signal
+import tempfile
+from datetime import datetime, timedelta, timezone
+from functools import lru_cache, wraps
+from pathlib import Path
+from typing import Any, Callable
+
+from fastapi import HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.templating import Jinja2Templates
+
+from admin_service.config import AdminSettings, get_admin_settings
+from admin_service.services.backup_receipts import BackupInspectionReceiptStore
+from admin_service.services.backup_scheduler_client import BackupSchedulerClient
+from admin_service.services.esxi_host_prep import (
+    ESXiHostPrepService,
+)
+from admin_service.services.maintenance import AdminMaintenanceService
+from admin_service.services.runtime_control import DockerRuntimeService
+from app import __version__
+from app.config import (
+    SSHConfig,
+    Settings,
+    build_unknown_config_key_warnings,
+    get_settings,
+    runtime_behavior_settings_payload,
+)
+from app.logging_config import configure_service_logging
+from app.http_auth import (
+    basic_auth_matches,
+    configured_origin_identity,
+    origin_identity,
+    request_origin_allowed,
+)
+from app.metrics import observe_backup_operation
+from app.request_context import REQUEST_ID_HEADER, current_request_id, generate_request_id
+from app.script_json import register_script_json_filters
+from app.models.domain import (
+    QuantastorNodeDiscoveryRequest,
+)
+from app.services.inventory import InventoryService
+from app.services.profile_builder import collect_profile_references
+from app.services.profile_registry import ProfileRegistry, build_profile_reference_warnings
+from app.services.quantastor_cli import build_quantastor_cli_invocation
+from app.services.release_status import ReleaseStatusService, describe_release_status
+from app.services.ssh_key_manager import SSHKeyManager
+from app.services.ssh_probe import SSHProbe
+from app.services.storage_view_templates import list_storage_view_templates
+from app.services.storage_views import resolve_system_storage_views
+from app.services.system_setup import (
+    PRESERVE_SECRET_SENTINEL,
+    SECRET_REUSE_MISMATCH_DETAIL,
+    default_ssh_commands_for_platform,
+    resolve_preserved_secret,
+    setup_requirements_for_platform,
+)
+from app.services.parsers import normalize_text
+from history_service.config import get_history_settings
+from history_service.store import HistoryStore
+from history_service.system_backup import (
+    MAX_FILE_BACKED_BACKUP_ARCHIVE_BYTES,
+    SystemBackupService,
+    default_backup_included_paths,
+    default_debug_included_paths,
+    describe_bundle_groups,
+)
+
+
+BASE_DIR = Path(__file__).resolve().parent
+templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+register_script_json_filters(templates.env)
+
+
+class TemporaryFileResponse(FileResponse):
+    def __init__(self, *args: Any, cleanup: Callable[[], None], **kwargs: Any) -> None:
+        self._cleanup = cleanup
+        super().__init__(*args, **kwargs)
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await asyncio.to_thread(self._cleanup)
+
+
+async def run_file_export_worker(
+    operation: Callable[..., Any],
+    *args: Any,
+    **kwargs: Any,
+) -> tuple[Any, Any]:
+    worker = asyncio.create_task(asyncio.to_thread(operation, *args, **kwargs))
+    try:
+        return await asyncio.shield(worker)
+    except BaseException:
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                break
+        if worker.done() and not worker.cancelled():
+            try:
+                artifact, _maintenance = worker.result()
+            except BaseException:
+                pass
+            else:
+                artifact.cleanup()
+        raise
+
+
+configure_service_logging(
+    log_level=os.getenv("APP_LOG_LEVEL", "INFO"),
+    log_format=os.getenv("LOG_FORMAT", "text"),
+    service_name="enclosure-admin",
+)
+# Keeps the "admin_service.main" logger name that operators' log filters already match.
+logger = logging.getLogger("admin_service.main")
+
+
+def admin_request_id() -> str:
+    """The correlation id for the request being served (#418).
+
+    `install_metrics` already mints one per request and logs it, so admin error
+    responses publish that id rather than a second, unrelated one. A client
+    cannot choose it: the middleware generates it and keeps any inbound
+    `X-Request-ID` as the parent only. The fallback covers a failure raised
+    outside the request context (a startup probe, or a direct handler call).
+    """
+    return current_request_id() or generate_request_id()
+
+
+def admin_error_response(
+    detail: str,
+    status_code: int,
+    *,
+    headers: dict[str, str] | None = None,
+    log_level: int = logging.WARNING,
+    exc_info: Any = None,
+) -> JSONResponse:
+    """One admin error surface: the correlation id in the body, header and log.
+
+    The log line carries the id and the status only. Paths, hosts, request
+    bodies and exception text stay out of it, so an operator can quote the id in
+    a support thread without carrying appliance data along with it.
+    """
+    request_id = admin_request_id()
+    logger.log(
+        log_level,
+        "Admin request failed (request id %s, status %s).",
+        request_id,
+        status_code,
+        exc_info=exc_info,
+    )
+    response_headers = {REQUEST_ID_HEADER: request_id}
+    if headers:
+        response_headers.update(headers)
+    return JSONResponse(
+        {"ok": False, "detail": detail, "request_id": request_id},
+        status_code=status_code,
+        headers=response_headers,
+    )
+
+
+def build_offline_recovery_state(
+    *,
+    expires_at: datetime | None,
+    now: datetime | None,
+) -> dict[str, Any]:
+    """What the operator should do once the sidecar's auto-stop time has passed.
+
+    The browser clock must not be the thing that declares a shutdown, so the
+    server states whether the deadline has passed and what to do about it. The
+    guidance never offers to extend the TTL: only restarting the sidecar does.
+    """
+    if expires_at is None or now is None or now < expires_at:
+        return {"expired": False, "summary": "", "next_step": ""}
+    return {
+        "expired": True,
+        "summary": "Admin's auto-stop time has passed.",
+        "next_step": (
+            "It stops on its own and does not come back by itself. If this page "
+            "stops responding, run `docker compose --profile admin up -d enclosure-admin` "
+            "on the Docker host and reload it. This page cannot keep it running."
+        ),
+    }
+
+
+async def system_not_configured_exception_handler(
+    _: Request,
+    exc: Exception,
+) -> JSONResponse:
+    return admin_error_response(str(exc), 404)
+
+
+def observe_backup_route(operation: str):
+    def decorator(handler: Callable[..., Any]):
+        @wraps(handler)
+        async def observed_handler(*args: Any, **kwargs: Any):
+            started = asyncio.get_running_loop().time()
+            outcome = "error"
+            try:
+                response = await handler(*args, **kwargs)
+                outcome = "success"
+                return response
+            except HTTPException as exc:
+                if 400 <= exc.status_code < 500:
+                    outcome = "rejected"
+                raise
+            finally:
+                observe_backup_operation(
+                    service_name="enclosure-admin",
+                    operation=operation,
+                    outcome=outcome,
+                    duration_seconds=max(0.0, asyncio.get_running_loop().time() - started),
+                )
+
+        return observed_handler
+
+    return decorator
+
+
+def _basic_auth_matches(authorization: str | None, settings: AdminSettings) -> bool:
+    return basic_auth_matches(
+        authorization,
+        settings.auth_username,
+        settings.auth_password,
+    )
+
+
+def _accepted_origin(request: Request, settings: AdminSettings) -> str:
+    return (settings.public_origin or f"{request.url.scheme}://{request.url.netloc}").rstrip("/")
+
+
+def _request_origin_allowed(request: Request, settings: AdminSettings) -> bool:
+    return request_origin_allowed(request, _accepted_origin(request, settings))
+
+
+def _describe_request_origin(request: Request) -> str:
+    identity = origin_identity(request.headers.get("origin") or request.headers.get("referer"))
+    if identity is None:
+        return "an unknown address"
+    scheme, host, port = identity
+    default_port = 443 if scheme == "https" else 80
+    return f"{scheme}://{host}" if port == default_port else f"{scheme}://{host}:{port}"
+
+
+def cross_origin_rejection_detail(request: Request, settings: AdminSettings) -> str:
+    opened_at = _describe_request_origin(request)
+    accepted = _accepted_origin(request, settings)
+    return (
+        f"This page was opened at {opened_at}, but the admin service only accepts changes "
+        f"from {accepted}. Open the admin UI at {accepted}, or set ADMIN_PUBLIC_ORIGIN in "
+        f".env to {opened_at} and recreate the admin container."
+    )
+
+
+def validate_admin_export_policy(
+    settings: AdminSettings,
+    *,
+    encrypt: bool,
+    scrub_secrets: bool,
+) -> None:
+    if encrypt or scrub_secrets or settings.allow_plaintext_backup_export:
+        return
+    raise ValueError(
+        "Plaintext backup export is disabled. Enable encryption or explicitly set "
+        "ADMIN_ALLOW_PLAINTEXT_BACKUP_EXPORT=true for a trusted-operator deployment."
+    )
+
+
+def limited_request_content_length(
+    request: Request,
+    *,
+    max_bytes: int = MAX_FILE_BACKED_BACKUP_ARCHIVE_BYTES,
+    body_description: str = "Backup import",
+) -> int | None:
+    too_large_detail = f"{body_description} request body is too large."
+    raw_content_length = request.headers.get("content-length")
+    if raw_content_length is None:
+        return None
+    try:
+        content_length = int(raw_content_length)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Content-Length must be an integer.") from exc
+    if content_length < 0:
+        raise HTTPException(status_code=400, detail="Content-Length must not be negative.")
+    if content_length > max_bytes:
+        raise HTTPException(status_code=413, detail=too_large_detail)
+    return content_length
+
+
+async def stream_limited_request_body_to_file(
+    request: Request,
+    *,
+    max_bytes: int = MAX_FILE_BACKED_BACKUP_ARCHIVE_BYTES,
+    body_description: str = "Backup import",
+    workspace_parent: Path | None = None,
+    workspace_prefix: str = "truenas-jbod-ui-admin-import-",
+) -> Path:
+    limited_request_content_length(
+        request,
+        max_bytes=max_bytes,
+        body_description=body_description,
+    )
+    too_large_detail = f"{body_description} request body is too large."
+
+    workspace = Path(
+        tempfile.mkdtemp(
+            prefix=workspace_prefix,
+            dir=str(workspace_parent) if workspace_parent is not None else None,
+        )
+    )
+    archive_path = workspace / "bundle.archive"
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            archive_path,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        total = 0
+        with os.fdopen(descriptor, "wb") as output:
+            descriptor = None
+            async for chunk in request.stream():
+                total += len(chunk)
+                if total > max_bytes:
+                    raise HTTPException(status_code=413, detail=too_large_detail)
+                output.write(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+        return archive_path
+    except BaseException:
+        if descriptor is not None:
+            os.close(descriptor)
+        archive_path.unlink(missing_ok=True)
+        workspace.rmdir()
+        raise
+
+
+SERVICE_STARTED_AT = datetime.now(timezone.utc)
+
+
+def reload_app_settings() -> Settings:
+    get_settings.cache_clear()
+    return get_settings()
+
+
+@lru_cache
+def get_history_store() -> HistoryStore:
+    history_settings = get_history_settings()
+    return HistoryStore(
+        history_settings.sqlite_path,
+        recover_unreadable_database=False,
+        segment_catalog_path=history_settings.segment_catalog_path,
+        initialize=False,
+    )
+
+
+def decode_optional_secret_header(value: str | None) -> str | None:
+    if value is None or value == "":
+        return None
+    try:
+        decoded = base64.b64decode(value.encode("ascii"), validate=True)
+    except (UnicodeEncodeError, ValueError) as exc:
+        raise ValueError("Backup passphrase header was not valid base64.") from exc
+    try:
+        return decoded.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("Backup passphrase header was not valid UTF-8.") from exc
+
+
+def resolve_saved_secondary_secret(
+    settings: Settings,
+    system_id: str | None,
+    incoming: str | None,
+    saved_value: Callable[[Any], str | None],
+    matches_saved_connection: Callable[[Any], bool],
+) -> str | None:
+    if incoming != PRESERVE_SECRET_SENTINEL:
+        return incoming
+    system = next((item for item in settings.systems if item.id == system_id), None)
+    if system is None or not matches_saved_connection(system):
+        raise ValueError(SECRET_REUSE_MISMATCH_DETAIL)
+    existing = saved_value(system) if system is not None else None
+    return resolve_preserved_secret(incoming, existing)
+
+
+@lru_cache
+def get_backup_service() -> SystemBackupService:
+    history_settings = get_history_settings()
+    return SystemBackupService(history_settings, get_history_store())
+
+
+@lru_cache
+def get_backup_scheduler_client() -> BackupSchedulerClient:
+    return BackupSchedulerClient()
+
+
+@lru_cache
+def get_backup_receipt_store() -> BackupInspectionReceiptStore:
+    return BackupInspectionReceiptStore()
+
+
+@lru_cache
+def get_runtime_service() -> DockerRuntimeService:
+    return DockerRuntimeService(get_admin_settings())
+
+
+@lru_cache
+def get_maintenance_service() -> AdminMaintenanceService:
+    admin_settings = get_admin_settings()
+    return AdminMaintenanceService(
+        get_backup_service(),
+        get_runtime_service(),
+        clean_backup_targets=admin_settings.clean_backup_targets,
+    )
+
+
+@lru_cache
+def get_esxi_host_prep_service() -> ESXiHostPrepService:
+    admin_settings = get_admin_settings()
+    return ESXiHostPrepService(
+        admin_settings.host_prep_temp_dir,
+        stale_ttl_seconds=admin_settings.host_prep_stale_ttl_seconds,
+        max_staged_packages=admin_settings.host_prep_max_packages,
+        max_staged_bytes=admin_settings.host_prep_max_bytes,
+    )
+
+
+@lru_cache
+def get_release_status_service() -> ReleaseStatusService:
+    settings = reload_app_settings()
+    return ReleaseStatusService(
+        current_version=__version__,
+        enabled=settings.app.release_check_enabled,
+        repo_full_name=settings.app.release_check_repo,
+        interval_seconds=settings.app.release_check_interval_seconds,
+        timeout_seconds=settings.app.release_check_timeout_seconds,
+    )
+
+
+def _format_count(value: int, singular: str, plural: str | None = None) -> str:
+    label = singular if value == 1 else (plural or f"{singular}s")
+    return f"{value} {label}"
+
+
+def format_history_cleanup_summary(summary: dict[str, Any]) -> str:
+    tracked_slots = int(summary.get("tracked_slots", 0) or 0)
+    event_count = int(summary.get("event_count", 0) or 0)
+    metric_sample_count = int(summary.get("metric_sample_count", 0) or 0)
+    return ", ".join(
+        (
+            _format_count(tracked_slots, "tracked slot"),
+            _format_count(event_count, "event"),
+            _format_count(metric_sample_count, "metric sample"),
+        )
+    )
+
+
+def format_history_system_summary(summary: dict[str, Any]) -> str:
+    total_rows = int(summary.get("total_rows", 0) or 0)
+    return (
+        f"{summary.get('system_label') or summary.get('system_id')} "
+        f"({_format_count(total_rows, 'saved history row')}; {format_history_cleanup_summary(summary)})"
+    )
+
+
+def validate_admin_public_origin(admin_settings: AdminSettings) -> None:
+    if (
+        admin_settings.auth_mode == "basic"
+        and configured_origin_identity(admin_settings.public_origin) is None
+    ):
+        raise ValueError(
+            "ADMIN_PUBLIC_ORIGIN must be an absolute HTTP(S) origin that matches the address "
+            "shown in the browser for the admin UI, for example http://jbod-admin.example.test:8082. "
+            "Basic authentication requires this origin check."
+        )
+
+
+async def build_admin_state_payload(request: Request) -> dict[str, Any]:
+    settings = reload_app_settings()
+    runtime_service = get_runtime_service()
+    runtime_payload = await build_runtime_payload(runtime_service)
+    key_manager = SSHKeyManager(settings.config_file)
+    ssh_keys = await asyncio.to_thread(key_manager.list_keys)
+    admin_settings = get_admin_settings()
+    history_settings = get_history_settings()
+    expires_at = compute_expires_at(admin_settings)
+    release_status = get_release_status_service().snapshot()
+    return {
+        "ok": True,
+        "app_version": __version__,
+        "release_status": release_status,
+        "admin": {
+            "title": admin_settings.app_name,
+            "started_at": SERVICE_STARTED_AT.isoformat(),
+            "expires_at": expires_at.isoformat() if expires_at else None,
+            "auto_stop_seconds": admin_settings.auto_stop_seconds,
+            "public_origin": resolve_public_origin(admin_settings, request),
+            "offline_recovery": build_offline_recovery_state(
+                expires_at=expires_at,
+                now=datetime.now(timezone.utc),
+            ),
+        },
+        "systems": serialize_systems(settings),
+        "default_system_id": settings.default_system_id,
+        "profiles": serialize_profiles(settings),
+        "configuration_warnings": [
+            *build_unknown_config_key_warnings(settings),
+            *build_profile_reference_warnings(settings),
+        ],
+        "storage_view_templates": serialize_storage_view_templates(),
+        "setup_platform_defaults": serialize_platform_defaults(),
+        "ssh_keys": ssh_keys,
+        "esxi_host_prep": {
+            "temp_dir": admin_settings.host_prep_temp_dir,
+            "staged_packages": await asyncio.to_thread(get_esxi_host_prep_service().list_staged_packages),
+        },
+        "runtime": runtime_payload,
+        "runtime_behavior": runtime_behavior_settings_payload(settings),
+        "backup_defaults": {
+            "packaging": "tar.zst",
+            "stop_services": False,
+            "restart_services": True,
+            "import_stop_services": True,
+            "import_restart_services": True,
+            "included_paths": default_backup_included_paths(),
+            "debug_packaging": "tar.zst",
+            "debug_stop_services": False,
+            "debug_restart_services": True,
+            "debug_included_paths": default_debug_included_paths(),
+            "debug_scrub_secrets": True,
+            "debug_scrub_disk_identifiers": True,
+            "allow_plaintext_backup_export": admin_settings.allow_plaintext_backup_export,
+            "path_groups": describe_bundle_groups(settings, history_settings),
+        },
+        "paths": {
+            "config_file": settings.config_file,
+            "runtime_overrides_file": settings.paths.runtime_overrides_file,
+            "profile_file": settings.paths.profile_file,
+            "mapping_file": settings.paths.mapping_file,
+            "sas_fabric_alias_file": settings.paths.sas_fabric_alias_file,
+            "slot_detail_cache_file": settings.paths.slot_detail_cache_file,
+            "history_db": history_settings.sqlite_path,
+            "tls_dir": str(Path(settings.config_file).parent / "tls"),
+        },
+    }
+
+
+async def build_runtime_payload(runtime_service: DockerRuntimeService | None = None) -> dict[str, Any]:
+    service = runtime_service or get_runtime_service()
+    runtime_payload = await asyncio.to_thread(service.status_payload)
+    return annotate_runtime_versions(runtime_payload, get_release_status_service().snapshot())
+
+
+RUNTIME_OBSERVATION_CONTAINER_FIELDS = (
+    "key",
+    "name",
+    "label",
+    "description",
+    "status",
+    "status_text",
+    "running",
+    "health",
+    "restart_required",
+    "lifecycle_state",
+    "lifecycle_label",
+    "can_stop",
+    "can_start",
+    "can_restart",
+    "running_version",
+    "latest_version",
+    "version_sync_state",
+)
+
+
+def project_runtime_observation(runtime_payload: dict[str, Any] | None) -> dict[str, Any]:
+    payload = dict(runtime_payload or {})
+    available = bool(payload.get("available"))
+    containers: list[dict[str, Any]] = []
+    for raw_container in payload.get("containers") or []:
+        if not isinstance(raw_container, dict):
+            continue
+        container = {
+            field_name: raw_container.get(field_name)
+            for field_name in RUNTIME_OBSERVATION_CONTAINER_FIELDS
+        }
+        raw_release_status = raw_container.get("release_status")
+        release_status = raw_release_status if isinstance(raw_release_status, dict) else {}
+        container["release_status"] = {
+            "status": release_status.get("status"),
+            "summary": release_status.get("summary"),
+        }
+        container["version_sync_summary"] = (
+            "Running container could not report a version."
+            if raw_container.get("version_probe_error")
+            else raw_container.get("version_sync_summary")
+        )
+        containers.append(container)
+    return {
+        "available": available,
+        "detail": None if available else "Docker runtime control is unavailable.",
+        "version_state": payload.get("version_state"),
+        "version_detail": payload.get("version_detail"),
+        "containers": containers,
+    }
+
+
+def annotate_runtime_versions(
+    runtime_payload: dict[str, Any] | None,
+    release_status: dict[str, Any] | None,
+) -> dict[str, Any]:
+    payload = dict(runtime_payload or {})
+    containers = [dict(item) for item in payload.get("containers", [])]
+    release_payload = dict(release_status or {})
+    latest_tag = str(release_payload.get("latest_tag") or "").strip() or None
+    running_versions = sorted(
+        {
+            str(item.get("running_version") or "").strip()
+            for item in containers
+            if item.get("running") and str(item.get("running_version") or "").strip()
+        }
+    )
+    probe_errors_present = any(item.get("running") and item.get("version_probe_error") for item in containers)
+    for item in containers:
+        running_version = str(item.get("running_version") or "").strip() or None
+        if running_version:
+            release_state, release_summary = describe_release_status(running_version, latest_tag)
+        elif latest_tag:
+            release_state, release_summary = "known", f"Latest stable {latest_tag}"
+        else:
+            release_state = str(release_payload.get("status") or "unknown")
+            release_summary = str(release_payload.get("summary") or "Checking for updates...")
+
+        if not item.get("running"):
+            sync_state = "stopped"
+            sync_summary = "Container is not running."
+        elif item.get("version_probe_error"):
+            sync_state = "unknown"
+            sync_summary = f"Version probe failed: {item['version_probe_error']}"
+        elif len(running_versions) > 1 and running_version:
+            peer_versions = [version for version in running_versions if version != running_version]
+            sync_state = "out_of_sync"
+            sync_summary = f"Differs from {', '.join(peer_versions)}."
+        elif probe_errors_present and running_version:
+            sync_state = "partial"
+            sync_summary = "Other running containers could not report a version."
+        elif running_version:
+            sync_state = "aligned"
+            sync_summary = "Matches other running containers."
+        else:
+            sync_state = "unknown"
+            sync_summary = "Running container did not report a version."
+
+        item["latest_version"] = latest_tag
+        item["release_status"] = {
+            "status": release_state,
+            "summary": release_summary,
+        }
+        item["version_sync_state"] = sync_state
+        item["version_sync_summary"] = sync_summary
+
+    payload["containers"] = containers
+    return payload
+
+
+def serialize_systems(settings: Settings) -> list[dict[str, Any]]:
+    profile_registry = ProfileRegistry(settings)
+    return [
+        {
+            "id": system.id,
+            "label": system.label,
+            "platform": system.truenas.platform,
+            "default_profile_id": system.default_profile_id,
+            "is_default": system.id == settings.default_system_id,
+            "truenas_host": system.truenas.host,
+            "api_key": "",
+            "api_key_configured": bool(system.truenas.api_key),
+            "api_user": system.truenas.api_user,
+            "api_password": "",
+            "api_password_configured": bool(system.truenas.api_password),
+            "verify_ssl": bool(system.truenas.verify_ssl),
+            "tls_ca_bundle_path": system.truenas.tls_ca_bundle_path,
+            "tls_server_name": system.truenas.tls_server_name,
+            "enclosure_filter": system.truenas.enclosure_filter,
+            "timeout_seconds": system.truenas.timeout_seconds,
+            "ssh_enabled": bool(system.ssh.enabled),
+            "ssh_host": system.ssh.host,
+            "ssh_extra_hosts": list(system.ssh.extra_hosts),
+            "ha_enabled": bool(
+                system.ssh.ha_enabled
+                or (
+                    system.truenas.platform == "quantastor"
+                    and (system.ssh.ha_nodes or system.ssh.extra_hosts)
+                )
+            ),
+            "ha_nodes": serialize_system_ha_nodes(system),
+            "ssh_port": system.ssh.port,
+            "ssh_user": system.ssh.user,
+            "ssh_key_path": system.ssh.key_path,
+            "ssh_password": "",
+            "ssh_password_configured": bool(system.ssh.password),
+            "ssh_sudo_password": "",
+            "ssh_sudo_password_configured": bool(system.ssh.sudo_password),
+            "ssh_strict_host_key_checking": bool(system.ssh.strict_host_key_checking),
+            "ssh_timeout_seconds": system.ssh.timeout_seconds,
+            "ssh_commands": [
+                f"Saved command {index} (hidden)"
+                for index, _command in enumerate(system.ssh.commands, start=1)
+            ],
+            "ssh_commands_redacted": bool(system.ssh.commands),
+            "ssh_commands_count": len(system.ssh.commands),
+            "bmc_enabled": bool(system.bmc.enabled),
+            "bmc_host": system.bmc.host,
+            "bmc_username": system.bmc.username,
+            "bmc_password": "",
+            "bmc_password_configured": bool(system.bmc.password),
+            "bmc_verify_ssl": bool(system.bmc.verify_ssl),
+            "bmc_timeout_seconds": system.bmc.timeout_seconds,
+            "storage_views": serialize_storage_views(system, profile_registry),
+        }
+        for system in settings.systems
+    ]
+
+
+def serialize_system_ha_nodes(system: Any) -> list[dict[str, Any]]:
+    explicit_nodes = list(getattr(system.ssh, "ha_nodes", []) or [])
+    if explicit_nodes:
+        return [
+            {
+                "system_id": node.system_id,
+                "label": node.label,
+                "host": node.host,
+            }
+            for node in explicit_nodes[:3]
+            if node.system_id or node.label or node.host
+        ]
+
+    if getattr(system.truenas, "platform", None) != "quantastor":
+        return []
+
+    legacy_hosts = [
+        normalize_text(system.ssh.host),
+        *[
+            normalize_text(value)
+            for value in (system.ssh.extra_hosts or [])
+        ],
+    ]
+    nodes: list[dict[str, Any]] = []
+    for index, host in enumerate(host for host in legacy_hosts if host):
+        nodes.append(
+            {
+                "system_id": None,
+                "label": f"Configured Node {index + 1}",
+                "host": host,
+            }
+        )
+    return nodes[:3]
+
+
+def serialize_storage_views(system: Any, profile_registry: ProfileRegistry) -> list[dict[str, Any]]:
+    stored_views = resolve_system_storage_views(system, profile_registry)
+    return [
+        {
+            "id": storage_view.id,
+            "label": storage_view.label,
+            "kind": storage_view.kind,
+            "template_id": storage_view.template_id,
+            "profile_id": storage_view.profile_id,
+            "enabled": bool(storage_view.enabled),
+            "order": storage_view.order,
+            "render": storage_view.render.model_dump(mode="json"),
+            "binding": storage_view.binding.model_dump(mode="json", exclude_none=True),
+            "layout_overrides": (
+                storage_view.layout_overrides.model_dump(mode="json")
+                if storage_view.layout_overrides is not None
+                else None
+            ),
+        }
+        for storage_view in sorted(
+            stored_views,
+            key=lambda item: (item.order, item.label.lower(), item.id),
+        )
+    ]
+
+
+def serialize_storage_view_templates() -> list[dict[str, Any]]:
+    return [
+        template.model_dump(mode="json")
+        for template in list_storage_view_templates()
+    ]
+
+
+def serialize_profiles(settings: Settings) -> list[dict[str, Any]]:
+    registry = ProfileRegistry(settings)
+    custom_profile_ids = {profile.id for profile in settings.profiles}
+    reference_map = collect_profile_references(settings)
+    profiles = []
+    for profile in registry.list_profiles():
+        references = reference_map.get(profile.id, {})
+        is_custom = profile.id in custom_profile_ids
+        profiles.append(
+            {
+                **profile.model_dump(mode="json"),
+                "slot_count": profile.slot_count,
+                "is_custom": is_custom,
+                "source": "custom" if is_custom else "built-in",
+                "reference_count": int(references.get("count", 0) or 0),
+            }
+        )
+    return profiles
+
+
+def serialize_quantastor_nodes(raw_data: Any) -> list[dict[str, Any]]:
+    if raw_data is None:
+        return []
+
+    hardware_system_ids = {
+        system_id
+        for system_id in (
+            normalize_text(str(item.get("storageSystemId")) if item.get("storageSystemId") is not None else None)
+            for item in [*(getattr(raw_data, "hw_disks", []) or []), *(getattr(raw_data, "hw_enclosures", []) or [])]
+        )
+        if system_id
+    }
+    gateway_hosts_by_system = InventoryService._quantastor_gateway_hosts_by_system(raw_data)
+    nodes: list[dict[str, Any]] = []
+    for system_row in getattr(raw_data, "systems", []) or []:
+        system_id = normalize_text(str(system_row.get("id")) if system_row.get("id") is not None else None)
+        if not system_id:
+            continue
+        if hardware_system_ids and system_id not in hardware_system_ids:
+            continue
+        hosts = [
+            *gateway_hosts_by_system.get(system_id, []),
+            *InventoryService._extract_quantastor_system_hosts(system_row),
+        ]
+        nodes.append(
+            {
+                "system_id": system_id,
+                "label": (
+                    normalize_text(
+                        str(system_row.get("name") or system_row.get("hostname") or system_row.get("description") or system_id)
+                    )
+                    or system_id
+                ),
+                "host": next((host for index, host in enumerate(hosts) if host and host not in hosts[:index]), None),
+                "cluster_id": normalize_text(
+                    str(system_row.get("storageSystemClusterId"))
+                    if system_row.get("storageSystemClusterId") is not None
+                    else None
+                ),
+                "is_master": bool(system_row.get("isMaster")),
+            }
+        )
+    return nodes
+
+
+async def enrich_quantastor_nodes_from_ssh(
+    payload: QuantastorNodeDiscoveryRequest,
+    raw_data: Any,
+    nodes: list[dict[str, Any]],
+    *,
+    known_hosts_path: str | None = None,
+) -> dict[str, Any]:
+    missing_hosts = [node for node in nodes if not normalize_text(node.get("host"))]
+    if not missing_hosts:
+        return {"attempted": False, "ok": True, "message": "All discovered Quantastor nodes already include SSH hosts."}
+    if not payload.ssh_enabled:
+        return {
+            "attempted": False,
+            "ok": False,
+            "message": "Quantastor REST did not publish node SSH hosts; enable SSH enrichment to try node interface discovery.",
+        }
+    if not payload.ssh_user:
+        return {
+            "attempted": False,
+            "ok": False,
+            "message": "Quantastor REST did not publish node SSH hosts; enter an SSH user to try node interface discovery.",
+        }
+    if not payload.ssh_key_path and not payload.ssh_password:
+        return {
+            "attempted": False,
+            "ok": False,
+            "message": "Quantastor REST did not publish node SSH hosts; select an SSH key or password to try node interface discovery.",
+        }
+
+    seed_hosts = quantastor_node_discovery_seed_hosts(payload)
+    if not seed_hosts:
+        return {
+            "attempted": False,
+            "ok": False,
+            "message": (
+                "Quantastor REST did not publish node SSH hosts and no safe node SSH seed is filled. "
+                "Enter at least one HA node SSH host, then load nodes again."
+            ),
+        }
+
+    command, stdin_data = build_quantastor_network_port_list_invocation(payload)
+    failures: list[str] = []
+    for seed_host in seed_hosts:
+        ssh_config = SSHConfig(
+            enabled=True,
+            host=seed_host,
+            port=payload.ssh_port,
+            user=payload.ssh_user or "",
+            key_path=payload.ssh_key_path or "",
+            password=payload.ssh_password or "",
+            known_hosts_path=known_hosts_path,
+            strict_host_key_checking=payload.ssh_strict_host_key_checking,
+            timeout_seconds=payload.ssh_timeout_seconds,
+            commands=[],
+        )
+        try:
+            probe = SSHProbe(ssh_config)
+            if stdin_data is None:
+                results = await probe.run_commands([command])
+            else:
+                results = await probe.run_commands([command], stdin_data=stdin_data)
+        except Exception:  # noqa: BLE001 - keep discovery helper best-effort.
+            # Transport exceptions may contain credentials derived from SSH stdin.
+            logger.warning(
+                "Quantastor HA node host discovery failed; SSH interface discovery unavailable",
+                extra={"discovery_stage": "ssh_interface_discovery"},
+            )
+            failures.append(f"{seed_host}: SSH interface discovery failed; see admin logs")
+            continue
+        result = results[0] if results else None
+        if result is None or not result.ok:
+            detail = normalize_text(getattr(result, "stderr", None)) or normalize_text(getattr(result, "stdout", None))
+            failures.append(f"{seed_host}: {detail or 'network-port-list failed'}")
+            continue
+        parsed = InventoryService._parse_quantastor_cli_json(result.stdout)
+        rows = ensure_quantastor_rows(parsed)
+        if not rows:
+            failures.append(f"{seed_host}: network-port-list returned no usable rows")
+            continue
+        raw_data.cli_network_ports = rows
+        host_map = InventoryService._quantastor_gateway_hosts_by_system(raw_data)
+        filled = merge_quantastor_node_hosts(nodes, host_map)
+        if filled:
+            return {
+                "attempted": True,
+                "ok": True,
+                "seed_host": seed_host,
+                "filled_hosts": filled,
+                "message": (
+                    f"Filled {filled} Quantastor HA node SSH host"
+                    f"{'' if filled == 1 else 's'} from default-gateway interface data."
+                ),
+            }
+        failures.append(f"{seed_host}: no default-gateway node IPs matched discovered HA nodes")
+
+    return {
+        "attempted": True,
+        "ok": False,
+        "seed_hosts": seed_hosts,
+        "message": "Quantastor REST did not publish node SSH hosts and SSH interface discovery did not fill them.",
+        "failures": failures[:3],
+    }
+
+
+def quantastor_node_discovery_seed_hosts(payload: QuantastorNodeDiscoveryRequest) -> list[str]:
+    api_host = InventoryService._normalize_host_identity(payload.truenas_host)
+    hosts: list[str] = []
+    for node in payload.ha_nodes or []:
+        host = InventoryService._normalize_host_identity(node.host)
+        if host and not InventoryService._quantastor_hosts_match(host, api_host) and host not in hosts:
+            hosts.append(host)
+    ssh_host = InventoryService._normalize_host_identity(payload.ssh_host)
+    if ssh_host and not InventoryService._quantastor_hosts_match(ssh_host, api_host) and ssh_host not in hosts:
+        hosts.append(ssh_host)
+    return hosts
+
+
+def quantastor_request_node_host_map(payload: QuantastorNodeDiscoveryRequest) -> dict[str, list[str]]:
+    host_map: dict[str, list[str]] = {}
+    api_host = InventoryService._normalize_host_identity(payload.truenas_host)
+    for node in payload.ha_nodes or []:
+        system_id = normalize_text(node.system_id)
+        host = InventoryService._normalize_host_identity(node.host)
+        if not system_id or not host or InventoryService._quantastor_hosts_match(host, api_host):
+            continue
+        host_map.setdefault(system_id, [])
+        if host not in host_map[system_id]:
+            host_map[system_id].append(host)
+    return host_map
+
+
+def build_quantastor_network_port_list_command(payload: QuantastorNodeDiscoveryRequest) -> str:
+    return build_quantastor_network_port_list_invocation(payload)[0]
+
+
+def build_quantastor_network_port_list_invocation(
+    payload: QuantastorNodeDiscoveryRequest,
+) -> tuple[str, str | None]:
+    server_spec = None
+    if payload.api_user and payload.api_password:
+        server_spec = f"localhost,{payload.api_user},{payload.api_password}"
+    return build_quantastor_cli_invocation("network-port-list", server_spec=server_spec)
+
+
+def ensure_quantastor_rows(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if isinstance(payload, dict):
+        for key in ("result", "list", "items", "objects", "data"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+        if all(isinstance(value, dict) for value in payload.values()):
+            return [value for value in payload.values() if isinstance(value, dict)]
+        if payload:
+            return [payload]
+    return []
+
+
+def merge_quantastor_node_hosts(nodes: list[dict[str, Any]], host_map: dict[str, list[str]]) -> int:
+    by_system_id = {
+        normalize_text(node.get("system_id")): node
+        for node in nodes
+        if normalize_text(node.get("system_id"))
+    }
+    filled = 0
+    for system_id, hosts in host_map.items():
+        node = by_system_id.get(system_id)
+        if not node or normalize_text(node.get("host")):
+            continue
+        host = next((normalize_text(item) for item in hosts if normalize_text(item)), None)
+        if not host:
+            continue
+        node["host"] = host
+        filled += 1
+    return filled
+
+
+def serialize_platform_defaults() -> dict[str, dict[str, object]]:
+    return {
+        platform: {
+            "ssh_commands": default_ssh_commands_for_platform(platform),
+            "requirements": setup_requirements_for_platform(platform),
+        }
+        for platform in ("core", "scale", "linux", "quantastor", "esxi", "ipmi")
+    }
+
+
+def serialize_live_enclosures(service: Any, enclosures: list[Any]) -> list[dict[str, Any]]:
+    serialized: list[dict[str, Any]] = []
+    for enclosure in enclosures:
+        resolved_profile = service.profile_registry.resolve_for_enclosure(
+            service.system,
+            enclosure,
+            fallback_label=enclosure.label,
+            fallback_rows=enclosure.rows if enclosure.rows else service.settings.layout.rows,
+            fallback_columns=enclosure.columns if enclosure.columns else service.settings.layout.columns,
+            fallback_slot_count=enclosure.slot_count if enclosure.slot_count else service.settings.layout.slot_count,
+            fallback_slot_layout=enclosure.slot_layout,
+        )
+        serialized.append(
+            {
+                "id": enclosure.id,
+                "label": enclosure.label,
+                "name": enclosure.name,
+                "slot_count": enclosure.slot_count,
+                "profile_id": resolved_profile.id if resolved_profile else enclosure.profile_id,
+                "profile_label": resolved_profile.label if resolved_profile else None,
+            }
+        )
+    return serialized
+
+
+def compute_expires_at(settings: AdminSettings) -> datetime | None:
+    if settings.auto_stop_seconds <= 0:
+        return None
+    return SERVICE_STARTED_AT + timedelta(seconds=settings.auto_stop_seconds)
+
+
+def resolve_public_origin(settings: AdminSettings, request: Request) -> str | None:
+    # Only a configured origin is worth offering as "open the admin UI here";
+    # the request's own address is where the page already is.
+    if settings.public_origin:
+        return settings.public_origin.rstrip("/")
+    return None
+
+
+async def _shutdown_after_ttl(auto_stop_seconds: int) -> None:
+    await asyncio.sleep(auto_stop_seconds)
+    os.kill(os.getpid(), signal.SIGTERM)

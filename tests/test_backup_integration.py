@@ -26,6 +26,8 @@ from history_service.backup_archive.cron import CronError, CronSchedule
 from history_service.backup_archive.journal import ChangeJournal
 from history_service.backup_archive.policy import load_backup_policy
 from history_service.backup_archive.transport import LocalDirectoryTarget
+from admin_service import route_support as admin_route_support
+from admin_service import routes as admin_routes
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 UTC = timezone.utc
@@ -584,8 +586,8 @@ class AdminProxyTests(unittest.TestCase):
         from admin_service import main as admin_main
 
         self.admin_main = admin_main
-        admin_main.get_backup_scheduler_client.cache_clear()
-        self.addCleanup(admin_main.get_backup_scheduler_client.cache_clear)
+        admin_route_support.get_backup_scheduler_client.cache_clear()
+        self.addCleanup(admin_route_support.get_backup_scheduler_client.cache_clear)
 
     def call(self, method: str, path: str, body: Any = None):
         # Origin and auth policy have their own suites; other tests may change the
@@ -615,7 +617,7 @@ class AdminProxyTests(unittest.TestCase):
                     return SchedulerResponse(409, {"detail": "A backup or grooming run is already in progress."})
                 return SchedulerResponse(200, {"ok": True})
 
-        with patch.object(self.admin_main, "get_backup_scheduler_client", return_value=FakeClient()):
+        with patch.object(admin_routes, "get_backup_scheduler_client", return_value=FakeClient()):
             self.assertEqual(self.call("POST", "/api/admin/backups/abc123/verify")[0], 200)
             self.assertEqual(self.call("POST", "/api/admin/backups/abc123/preserve", {"reason": "x"})[0], 200)
             self.assertEqual(self.call("DELETE", "/api/admin/backups/abc123/preserve")[0], 200)
@@ -874,7 +876,7 @@ class HealthTests(unittest.TestCase):
             self.assertEqual(backup_archive_problems(path), ["Full backup failed: no details recorded"])
 
     def test_backup_problem_degrades_but_never_downs(self) -> None:
-        from app.main import build_health_payload, health_status_code
+        from app.route_support import build_health_payload, health_status_code
 
         payload = build_health_payload(None, remote_problems=["Backup target NAS degraded: refused"])
         self.assertEqual(payload["status"], "degraded")

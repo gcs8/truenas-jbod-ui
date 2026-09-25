@@ -22,11 +22,13 @@ from app.config import (
     restart_only_changes,
 )
 from app.settings_reload import (
+    config_reload_problems,
     ConfigReloadMiddleware,
     ConfigReloader,
     SettingsRuntime,
     file_signature,
 )
+from app import route_support
 from app.services.inventory_registry import InventoryRegistry
 
 
@@ -264,7 +266,7 @@ class RestartOnlySettingsTests(ConfigReloadTestCase):
 class ConcurrencyTests(ConfigReloadTestCase):
     def test_request_during_swap_sees_one_generation(self) -> None:
         """A request that started before a reload keeps the old settings and components."""
-        from app import main as app_main
+        from app import route_support
 
         runtime = SettingsRuntime()
         reloader = ConfigReloader(runtime, interval_seconds=0.0, clock=self.clock)
@@ -274,16 +276,16 @@ class ConcurrencyTests(ConfigReloadTestCase):
         release_holder: dict[str, asyncio.Event] = {}
 
         async def slow_app(scope: dict[str, Any], receive: Any, send: Any) -> None:
-            first = app_main.get_settings()
-            registry = app_main.get_inventory_registry()
+            first = route_support.get_settings()
+            registry = route_support.get_inventory_registry()
             release_holder["started"].set()
             await release_holder["release"].wait()
             observed[scope["path"]] = (
                 first.systems[0].label,
-                app_main.get_settings().systems[0].label,
+                route_support.get_settings().systems[0].label,
                 registry.settings.systems[0].label,
-                app_main.get_inventory_registry().settings.systems[0].label,
-                app_main.get_inventory_registry() is registry,
+                route_support.get_inventory_registry().settings.systems[0].label,
+                route_support.get_inventory_registry() is registry,
             )
 
         middleware = ConfigReloadMiddleware(slow_app, reloader=reloader)
@@ -302,7 +304,7 @@ class ConcurrencyTests(ConfigReloadTestCase):
             release_holder["release"].set()
             await asyncio.gather(old_request, new_request)
 
-        with patch.object(app_main, "SETTINGS_RUNTIME", runtime):
+        with patch.object(route_support, "SETTINGS_RUNTIME", runtime):
             asyncio.run(run())
         self.assertEqual(observed["/old"], ("Alpha Shelf",) * 4 + (True,))
         self.assertEqual(observed["/new"], ("Alpha New",) * 4 + (True,))
@@ -387,9 +389,10 @@ class RegistryCarryOverTests(ConfigReloadTestCase):
 class MainAppWiringTests(ConfigReloadTestCase):
     def _app(self) -> Any:
         from app import main as app_main
+        from app import route_support
 
         runtime = SettingsRuntime()
-        patcher = patch.object(app_main, "SETTINGS_RUNTIME", runtime)
+        patcher = patch.object(route_support, "SETTINGS_RUNTIME", runtime)
         patcher.start()
         self.addCleanup(patcher.stop)
         application = app_main.create_app()
@@ -401,12 +404,12 @@ class MainAppWiringTests(ConfigReloadTestCase):
 
     def test_app_generation_follows_reload_and_healthz_reports_invalid_edit(self) -> None:
         app_main, application = self._app()
-        registry_before = app_main.get_inventory_registry()
+        registry_before = route_support.get_inventory_registry()
         self.config["systems"][0]["label"] = "Alpha Renamed"
         self._write_config()
         self.clock.now += 5
         asyncio.run(application.state.config_reloader.check_now())
-        registry_after = app_main.get_inventory_registry()
+        registry_after = route_support.get_inventory_registry()
         self.assertIsNot(registry_after, registry_before)
         self.assertEqual(registry_after.get_system("alpha").label, "Alpha Renamed")
 
@@ -414,14 +417,14 @@ class MainAppWiringTests(ConfigReloadTestCase):
         self.clock.now += 5
         with self.assertLogs("app.settings_reload", level="WARNING"):
             asyncio.run(application.state.config_reloader.check_now())
-        self.assertIs(app_main.get_inventory_registry(), registry_after)
+        self.assertIs(route_support.get_inventory_registry(), registry_after)
         request = type("R", (), {"app": application})()
-        problems = app_main.config_reload_problems(request)
+        problems = config_reload_problems(request)
         self.assertEqual(len(problems), 1)
         self.assertTrue(problems[0].startswith("Config change not applied:"))
-        payload = app_main.build_health_payload(None, remote_problems=problems)
+        payload = route_support.build_health_payload(None, remote_problems=problems)
         self.assertEqual(payload["status"], "degraded")
-        self.assertEqual(app_main.health_status_code(payload), 200)
+        self.assertEqual(route_support.health_status_code(payload), 200)
         self.assertTrue(str(payload["summary"]).startswith("Config change not applied:"))
 
     def test_restart_notice_is_a_page_warning_not_a_health_problem(self) -> None:
@@ -433,10 +436,10 @@ class MainAppWiringTests(ConfigReloadTestCase):
             asyncio.run(application.state.config_reloader.check_now())
         request = type("R", (), {"app": application})()
         self.assertEqual(
-            app_main.config_reload_problems(request),
+            config_reload_problems(request),
             ["Config change to app.port is saved but needs a main UI restart to take effect."],
         )
-        self.assertEqual(app_main.config_reload_problems(request, include_restart_notice=False), [])
+        self.assertEqual(config_reload_problems(request, include_restart_notice=False), [])
 
     def test_inventory_route_carries_the_reload_warning(self) -> None:
         app_main, application = self._app()
@@ -460,7 +463,7 @@ class MainAppWiringTests(ConfigReloadTestCase):
             (),
             {"app": application, "url": type("U", (), {"scheme": "http", "netloc": "ui.example.test"})(), "headers": {}},
         )()
-        with patch.object(app_main, "get_inventory_registry", return_value=registry):
+        with patch("app.routes.get_inventory_registry", return_value=registry):
             response = asyncio.run(route.endpoint(request=request, force=False, system_id=None, enclosure_id=None))
         warnings = json.loads(response.body)["warnings"]
         self.assertTrue(warnings[0].startswith("Config change not applied:"))

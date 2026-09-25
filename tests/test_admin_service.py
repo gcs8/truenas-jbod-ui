@@ -37,17 +37,17 @@ from admin_service.services.esxi_host_prep import (
 )
 from admin_service.services.runtime_control import DockerRuntimeService
 from admin_service.main import app as admin_app
-from admin_service.main import annotate_runtime_versions
-from admin_service.main import build_admin_state_payload
+from admin_service.route_support import annotate_runtime_versions
+from admin_service.route_support import build_admin_state_payload
 from admin_service.main import create_app
-from admin_service.main import decode_optional_secret_header
-from admin_service.main import enrich_quantastor_nodes_from_ssh
+from admin_service.route_support import decode_optional_secret_header
+from admin_service.route_support import enrich_quantastor_nodes_from_ssh
 from admin_service.main import get_esxi_host_prep_service
-from admin_service.main import get_history_store
-from admin_service.main import observe_backup_route
-from admin_service.main import resolve_public_origin
-from admin_service.main import stream_limited_request_body_to_file
-from admin_service.main import templates as admin_templates
+from admin_service.route_support import get_history_store
+from admin_service.route_support import observe_backup_route
+from admin_service.route_support import resolve_public_origin
+from admin_service.route_support import stream_limited_request_body_to_file
+from admin_service.route_support import templates as admin_templates
 from app.config import (
     AdminSurfaceConfig,
     BMCConfig,
@@ -59,11 +59,11 @@ from app.config import (
     TrueNASConfig,
 )
 from app.main import app as main_app
-from app.main import ADMIN_PROBE_CACHE
-from app.main import AdminLaunchState
-from app.main import resolve_admin_launch_url
+from app.route_support import ADMIN_PROBE_CACHE
+from app.route_support import AdminLaunchState
+from app.route_support import resolve_admin_launch_url
 from app.main import EXCEPTION_RESPONSES, mapped_exception_handler
-from app.main import SNAPSHOT_EXPORT_SOURCE_CACHE
+from app.route_support import SNAPSHOT_EXPORT_SOURCE_CACHE
 from app.models.domain import ESXiHostPrepInstallRequest
 from app.models.domain import EnclosureOption
 from app.models.domain import EnclosureProfileRequest
@@ -399,7 +399,7 @@ class BackupImportRequestLimitTests(unittest.TestCase):
         async def unavailable() -> None:
             raise HTTPException(status_code=503, detail="synthetic unavailable")
 
-        with patch("admin_service.main.observe_backup_operation") as observe_operation:
+        with patch("admin_service.route_support.observe_backup_operation") as observe_operation:
             with self.assertRaises(HTTPException):
                 asyncio.run(unavailable())
 
@@ -466,7 +466,7 @@ class BackupImportRequestLimitTests(unittest.TestCase):
                 receive,
             )
 
-            with patch("admin_service.main.tempfile.mkdtemp", return_value=str(workspace)):
+            with patch("admin_service.route_support.tempfile.mkdtemp", return_value=str(workspace)):
                 with self.assertRaises(asyncio.CancelledError):
                     asyncio.run(stream_limited_request_body_to_file(request, max_bytes=4))
 
@@ -509,13 +509,13 @@ class MainAppBoundaryTests(unittest.TestCase):
         try:
             with (
                 patch(
-                    "admin_service.main.get_history_settings",
+                    "admin_service.route_support.get_history_settings",
                     return_value=SimpleNamespace(
                         sqlite_path="/tmp/admin-history.sqlite3",
                         segment_catalog_path="/tmp/admin-history-segments/catalog.json",
                     ),
                 ),
-                patch("admin_service.main.HistoryStore") as history_store,
+                patch("admin_service.route_support.HistoryStore") as history_store,
             ):
                 get_history_store()
 
@@ -539,9 +539,9 @@ class MainAppBoundaryTests(unittest.TestCase):
         service = object()
         try:
             with (
-                patch("admin_service.main.get_admin_settings", return_value=settings),
+                patch("admin_service.route_support.get_admin_settings", return_value=settings),
                 patch(
-                    "admin_service.main.ESXiHostPrepService",
+                    "admin_service.route_support.ESXiHostPrepService",
                     return_value=service,
                 ) as service_type,
             ):
@@ -665,7 +665,7 @@ class MainAppBoundaryTests(unittest.TestCase):
         service.export_bundle.return_value = (artifact, maintenance)
         route = next(route for route in admin_app.routes if route.path == "/api/admin/backup/export")
 
-        with patch("admin_service.main.get_maintenance_service", return_value=service):
+        with patch("admin_service.routes.get_maintenance_service", return_value=service):
             response = asyncio.run(
                 route.endpoint(
                     SystemBackupExportRequest(
@@ -754,22 +754,22 @@ class MainAppBoundaryTests(unittest.TestCase):
 
         with (
             patch(
-                "admin_service.main.time.time",
+                "admin_service.routes.time.time",
                 side_effect=lambda: request_clock.now,
             ),
-            patch("admin_service.main.get_maintenance_service", return_value=service),
-            patch("admin_service.main.get_backup_receipt_store", return_value=receipt_store),
-            patch("admin_service.main.observe_backup_operation") as observe_operation,
+            patch("admin_service.routes.get_maintenance_service", return_value=service),
+            patch("admin_service.routes.get_backup_receipt_store", return_value=receipt_store),
+            patch("admin_service.route_support.observe_backup_operation") as observe_operation,
             patch(
-                "admin_service.main.reload_app_settings",
+                "admin_service.routes.reload_app_settings",
                 return_value=SimpleNamespace(default_system_id=None),
             ),
             patch(
-                "admin_service.main.get_runtime_service",
+                "admin_service.routes.get_runtime_service",
                 return_value=runtime_service,
             ),
-            patch("admin_service.main.build_runtime_payload", new=AsyncMock(return_value={})),
-            patch("admin_service.main.serialize_systems", return_value=[]),
+            patch("admin_service.routes.build_runtime_payload", new=AsyncMock(return_value={})),
+            patch("admin_service.routes.serialize_systems", return_value=[]),
         ):
             response = asyncio.run(
                 route.endpoint(
@@ -846,16 +846,16 @@ class MainAppBoundaryTests(unittest.TestCase):
         route = next(route for route in admin_app.routes if route.path == "/api/admin/backup/import")
 
         with (
-            patch("admin_service.main.get_maintenance_service", return_value=service),
-            patch("admin_service.main.get_backup_receipt_store", return_value=receipt_store),
-            patch("admin_service.main.observe_backup_operation"),
+            patch("admin_service.routes.get_maintenance_service", return_value=service),
+            patch("admin_service.routes.get_backup_receipt_store", return_value=receipt_store),
+            patch("admin_service.route_support.observe_backup_operation"),
             patch(
-                "admin_service.main.reload_app_settings",
+                "admin_service.routes.reload_app_settings",
                 return_value=SimpleNamespace(default_system_id=None),
             ),
-            patch("admin_service.main.get_runtime_service", return_value=runtime_service),
-            patch("admin_service.main.build_runtime_payload", new=AsyncMock(return_value={})),
-            patch("admin_service.main.serialize_systems", return_value=[]),
+            patch("admin_service.routes.get_runtime_service", return_value=runtime_service),
+            patch("admin_service.routes.build_runtime_payload", new=AsyncMock(return_value={})),
+            patch("admin_service.routes.serialize_systems", return_value=[]),
         ):
             response = asyncio.run(
                 route.endpoint(
@@ -914,9 +914,9 @@ class MainAppBoundaryTests(unittest.TestCase):
         )
 
         with (
-            patch("admin_service.main.get_backup_service", return_value=service),
-            patch("admin_service.main.get_backup_receipt_store", return_value=receipt_store),
-            patch("admin_service.main.observe_backup_operation") as observe_operation,
+            patch("admin_service.routes.get_backup_service", return_value=service),
+            patch("admin_service.routes.get_backup_receipt_store", return_value=receipt_store),
+            patch("admin_service.route_support.observe_backup_operation") as observe_operation,
         ):
             response = asyncio.run(route.endpoint(request))
 
@@ -984,8 +984,8 @@ class MainAppBoundaryTests(unittest.TestCase):
 
         async def exercise() -> None:
             with (
-                patch("admin_service.main.get_backup_service", return_value=service),
-                patch("admin_service.main.get_backup_receipt_store", return_value=receipt_store),
+                patch("admin_service.routes.get_backup_service", return_value=service),
+                patch("admin_service.routes.get_backup_receipt_store", return_value=receipt_store),
             ):
                 task = asyncio.create_task(route.endpoint(request))
                 self.assertTrue(await asyncio.to_thread(worker_started.wait, 5))
@@ -1009,7 +1009,7 @@ class MainAppBoundaryTests(unittest.TestCase):
         request, _receive_probe = make_streaming_request([])
         route = next(route for route in admin_app.routes if route.path == "/api/admin/backup/import")
 
-        with patch("admin_service.main.observe_backup_operation") as observe_operation:
+        with patch("admin_service.route_support.observe_backup_operation") as observe_operation:
             with self.assertRaises(HTTPException) as raised:
                 asyncio.run(
                     route.endpoint(
@@ -1040,8 +1040,8 @@ class MainAppBoundaryTests(unittest.TestCase):
         )
 
         with (
-            patch("admin_service.main.get_backup_service", return_value=service),
-            patch("admin_service.main.observe_backup_operation") as observe_operation,
+            patch("admin_service.routes.get_backup_service", return_value=service),
+            patch("admin_service.route_support.observe_backup_operation") as observe_operation,
         ):
             with self.assertRaises(RuntimeError):
                 asyncio.run(route.endpoint(request))
@@ -1091,23 +1091,23 @@ class MainAppBoundaryTests(unittest.TestCase):
 
         with (
             patch(
-                "admin_service.main.get_maintenance_service",
+                "admin_service.routes.get_maintenance_service",
                 return_value=maintenance_service,
             ),
-            patch("admin_service.main.get_backup_receipt_store", return_value=MagicMock()),
+            patch("admin_service.routes.get_backup_receipt_store", return_value=MagicMock()),
             patch(
-                "admin_service.main.reload_app_settings",
+                "admin_service.routes.reload_app_settings",
                 return_value=SimpleNamespace(default_system_id=None),
             ),
             patch(
-                "admin_service.main.get_runtime_service",
+                "admin_service.routes.get_runtime_service",
                 return_value=runtime_service,
             ),
             patch(
-                "admin_service.main.build_runtime_payload",
+                "admin_service.routes.build_runtime_payload",
                 new=AsyncMock(return_value={}),
             ),
-            patch("admin_service.main.serialize_systems", return_value=[]),
+            patch("admin_service.routes.serialize_systems", return_value=[]),
         ):
             asyncio.run(
                 route.endpoint(
@@ -1155,8 +1155,8 @@ class MainAppBoundaryTests(unittest.TestCase):
 
         async def exercise() -> None:
             with (
-                patch("admin_service.main.get_maintenance_service", return_value=service),
-                patch("admin_service.main.get_backup_receipt_store", return_value=MagicMock()),
+                patch("admin_service.routes.get_maintenance_service", return_value=service),
+                patch("admin_service.routes.get_backup_receipt_store", return_value=MagicMock()),
             ):
                 task = asyncio.create_task(
                     route.endpoint(
@@ -1203,9 +1203,9 @@ class MainAppBoundaryTests(unittest.TestCase):
         route = next(route for route in admin_app.routes if route.path == "/api/admin/backup/export")
 
         with (
-            patch("admin_service.main.get_maintenance_service", return_value=service),
+            patch("admin_service.routes.get_maintenance_service", return_value=service),
             patch(
-                "admin_service.main.TemporaryFileResponse",
+                "admin_service.routes.TemporaryFileResponse",
                 side_effect=RuntimeError("response setup failed"),
             ),
         ):
@@ -1253,7 +1253,7 @@ class MainAppBoundaryTests(unittest.TestCase):
         route = next(route for route in admin_app.routes if route.path == "/api/admin/backup/export")
 
         async def cancel_export() -> None:
-            with patch("admin_service.main.get_maintenance_service", return_value=service):
+            with patch("admin_service.routes.get_maintenance_service", return_value=service):
                 export_task = asyncio.create_task(
                     route.endpoint(
                         SystemBackupExportRequest(
@@ -1304,7 +1304,7 @@ class MainAppBoundaryTests(unittest.TestCase):
         route = next(route for route in admin_app.routes if route.path == "/api/admin/backup/export")
 
         async def cancel_export_twice() -> None:
-            with patch("admin_service.main.get_maintenance_service", return_value=service):
+            with patch("admin_service.routes.get_maintenance_service", return_value=service):
                 export_task = asyncio.create_task(
                     route.endpoint(
                         SystemBackupExportRequest(
@@ -1651,7 +1651,7 @@ class MainAppBoundaryTests(unittest.TestCase):
                 fake_registry.get_service.return_value = fake_service
 
                 with (
-                    patch("app.main.get_inventory_registry", return_value=fake_registry),
+                    patch("app.routes.get_inventory_registry", return_value=fake_registry),
                     patch.object(
                         InventorySnapshot, "model_dump",
                         side_effect=AssertionError("healthz must not serialize the parent snapshot"),
@@ -1672,7 +1672,7 @@ class MainAppBoundaryTests(unittest.TestCase):
         fake_registry = MagicMock()
         fake_registry.get_service.return_value = fake_service
 
-        with patch("app.main.get_inventory_registry", return_value=fake_registry):
+        with patch("app.routes.get_inventory_registry", return_value=fake_registry):
             response = self._call_main_route("/healthz")
 
         self.assertEqual(response.status_code, 200)
@@ -1712,8 +1712,8 @@ class MainAppBoundaryTests(unittest.TestCase):
         fake_exporter.estimate_enclosure_snapshot_export = AsyncMock(return_value={"ok": True})
 
         with (
-            patch("app.main.get_inventory_registry", return_value=fake_registry),
-            patch("app.main.get_snapshot_export_service", return_value=fake_exporter),
+            patch("app.routes.get_inventory_registry", return_value=fake_registry),
+            patch("app.routes.get_snapshot_export_service", return_value=fake_exporter),
         ):
             response = asyncio.run(
                 route.endpoint(
@@ -1770,8 +1770,8 @@ class MainAppBoundaryTests(unittest.TestCase):
         )
 
         with (
-            patch("app.main.get_inventory_registry", return_value=fake_registry),
-            patch("app.main.get_snapshot_export_service", return_value=fake_exporter),
+            patch("app.routes.get_inventory_registry", return_value=fake_registry),
+            patch("app.routes.get_snapshot_export_service", return_value=fake_exporter),
         ):
             estimate_response = asyncio.run(
                 estimate_route.endpoint(
@@ -1849,7 +1849,7 @@ class MainAppBoundaryTests(unittest.TestCase):
 
         with (
             request_context("e" * 32),
-            patch("app.main.urllib.request.urlopen", return_value=response) as urlopen,
+            patch("app.route_support.urllib.request.urlopen", return_value=response) as urlopen,
         ):
             launch_url = resolve_admin_launch_url(request, settings)
 
@@ -1869,7 +1869,7 @@ class MainAppBoundaryTests(unittest.TestCase):
         )
 
         with patch(
-            "app.main.urllib.request.urlopen",
+            "app.route_support.urllib.request.urlopen",
             side_effect=urllib.error.URLError("connection refused"),
         ):
             launch_url = resolve_admin_launch_url(request, settings)
@@ -1888,7 +1888,7 @@ class MainAppBoundaryTests(unittest.TestCase):
         )
 
         with patch(
-            "app.main.urllib.request.urlopen",
+            "app.route_support.urllib.request.urlopen",
             side_effect=TimeoutError("timed out"),
         ):
             launch_url = resolve_admin_launch_url(request, settings)
@@ -1927,7 +1927,7 @@ class AdminHeaderDecodeTests(unittest.TestCase):
 class AdminHistoryStoreTests(unittest.TestCase):
     def test_admin_history_store_is_noninitializing_for_maintenance(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        source = (root / "admin_service" / "main.py").read_text(encoding="utf-8")
+        source = (root / "admin_service" / "route_support.py").read_text(encoding="utf-8")
         start = source.index("def get_history_store()")
         end = source.index("\ndef decode_optional_secret_header", start)
         self.assertIn("initialize=False", source[start:end])
@@ -2001,7 +2001,7 @@ class AdminStatePayloadTests(unittest.TestCase):
         service = build_service(runtime, backup)
         stopped = defaults["stop_services"] if stop_services is None else stop_services
         with (
-            patch("admin_service.main.get_maintenance_service", return_value=service),
+            patch("admin_service.routes.get_maintenance_service", return_value=service),
         ):
             response = asyncio.run(route.endpoint(
                 DebugBundleExportRequest(),
@@ -2034,21 +2034,21 @@ class AdminStatePayloadTests(unittest.TestCase):
         release_service = MagicMock()
         release_service.snapshot.return_value = {}
         with (
-            patch("admin_service.main.reload_app_settings", return_value=settings),
-            patch("admin_service.main.get_runtime_service", return_value=runtime_service),
-            patch("admin_service.main.build_runtime_payload", new=AsyncMock(return_value={})),
-            patch("admin_service.main.SSHKeyManager", return_value=key_manager),
-            patch("admin_service.main.get_esxi_host_prep_service", return_value=host_prep_service),
-            patch("admin_service.main.get_release_status_service", return_value=release_service),
-            patch("admin_service.main.get_admin_settings", return_value=AdminSettings()),
-            patch("admin_service.main.get_history_settings", return_value=HistorySettings()),
+            patch("admin_service.route_support.reload_app_settings", return_value=settings),
+            patch("admin_service.route_support.get_runtime_service", return_value=runtime_service),
+            patch("admin_service.route_support.build_runtime_payload", new=AsyncMock(return_value={})),
+            patch("admin_service.route_support.SSHKeyManager", return_value=key_manager),
+            patch("admin_service.route_support.get_esxi_host_prep_service", return_value=host_prep_service),
+            patch("admin_service.route_support.get_release_status_service", return_value=release_service),
+            patch("admin_service.route_support.get_admin_settings", return_value=AdminSettings()),
+            patch("admin_service.route_support.get_history_settings", return_value=HistorySettings()),
         ):
             return asyncio.run(build_admin_state_payload(request))
 
     def test_admin_healthz_shape_remains_minimal_and_backward_compatible(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/healthz")
 
-        with patch("admin_service.main.get_admin_settings", return_value=AdminSettings()):
+        with patch("admin_service.routes.get_admin_settings", return_value=AdminSettings()):
             response = asyncio.run(route.endpoint())
 
         self.assertEqual(set(json.loads(response.body)), {"status", "started_at", "expires_at"})
@@ -2269,12 +2269,12 @@ class AdminStatePayloadTests(unittest.TestCase):
             }
         ]
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.get_runtime_service", return_value=runtime_service):
-                with patch("admin_service.main.SSHKeyManager", return_value=key_manager):
-                    with patch("admin_service.main.get_esxi_host_prep_service", return_value=host_prep_service):
+        with patch("admin_service.route_support.reload_app_settings", return_value=settings):
+            with patch("admin_service.route_support.get_runtime_service", return_value=runtime_service):
+                with patch("admin_service.route_support.SSHKeyManager", return_value=key_manager):
+                    with patch("admin_service.route_support.get_esxi_host_prep_service", return_value=host_prep_service):
                         with patch(
-                            "admin_service.main.get_admin_settings",
+                            "admin_service.route_support.get_admin_settings",
                             return_value=AdminSettings(
                                 auto_stop_seconds=3600,
                                 host_prep_temp_dir="/tmp/truenas-jbod-ui-host-prep",
@@ -2282,7 +2282,7 @@ class AdminStatePayloadTests(unittest.TestCase):
                             ),
                         ):
                             with patch(
-                                "admin_service.main.get_history_settings",
+                                "admin_service.route_support.get_history_settings",
                                 return_value=HistorySettings(sqlite_path="/tmp/history/history.db"),
                             ):
                                 payload = asyncio.run(build_admin_state_payload(request))
@@ -2390,16 +2390,16 @@ class AdminStatePayloadTests(unittest.TestCase):
             "latest_url": "https://github.com/gcs8/truenas-jbod-ui/releases/tag/v0.14.1",
         }
 
-        with patch("admin_service.main.reload_app_settings", return_value=Settings()):
-            with patch("admin_service.main.get_runtime_service", return_value=runtime_service):
-                with patch("admin_service.main.SSHKeyManager", return_value=key_manager):
-                    with patch("admin_service.main.get_release_status_service", return_value=release_service):
+        with patch("admin_service.route_support.reload_app_settings", return_value=Settings()):
+            with patch("admin_service.route_support.get_runtime_service", return_value=runtime_service):
+                with patch("admin_service.route_support.SSHKeyManager", return_value=key_manager):
+                    with patch("admin_service.route_support.get_release_status_service", return_value=release_service):
                         with patch(
-                            "admin_service.main.get_admin_settings",
+                            "admin_service.route_support.get_admin_settings",
                             return_value=AdminSettings(),
                         ):
                             with patch(
-                                "admin_service.main.get_history_settings",
+                                "admin_service.route_support.get_history_settings",
                                 return_value=HistorySettings(sqlite_path="/tmp/history/history.db"),
                             ):
                                 payload = asyncio.run(build_admin_state_payload(request))
@@ -2448,12 +2448,12 @@ class AdminStatePayloadTests(unittest.TestCase):
         key_manager = MagicMock()
         key_manager.list_keys.return_value = []
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.get_runtime_service", return_value=runtime_service):
-                with patch("admin_service.main.SSHKeyManager", return_value=key_manager):
-                    with patch("admin_service.main.get_admin_settings", return_value=AdminSettings()):
+        with patch("admin_service.route_support.reload_app_settings", return_value=settings):
+            with patch("admin_service.route_support.get_runtime_service", return_value=runtime_service):
+                with patch("admin_service.route_support.SSHKeyManager", return_value=key_manager):
+                    with patch("admin_service.route_support.get_admin_settings", return_value=AdminSettings()):
                         with patch(
-                            "admin_service.main.get_history_settings",
+                            "admin_service.route_support.get_history_settings",
                             return_value=HistorySettings(sqlite_path="/tmp/history/history.db"),
                         ):
                             payload = asyncio.run(build_admin_state_payload(make_request(port=8082)))
@@ -2562,7 +2562,7 @@ class AdminStatePayloadTests(unittest.TestCase):
         nodes = [{"id": "node-a", "label": "Node A", "host": ""}]
 
         with patch(
-            "admin_service.main.SSHProbe.run_commands",
+            "admin_service.route_support.SSHProbe.run_commands",
             new=AsyncMock(side_effect=RuntimeError("Traceback: password=ssh-secret timed out")),
         ):
             result = asyncio.run(enrich_quantastor_nodes_from_ssh(payload, raw_data, nodes))
@@ -2601,7 +2601,7 @@ class AdminStatePayloadTests(unittest.TestCase):
             raise RuntimeError("synthetic transport stop")
 
         with patch(
-            "admin_service.main.SSHProbe.run_commands",
+            "admin_service.route_support.SSHProbe.run_commands",
             new=AsyncMock(side_effect=run_commands),
         ):
             result = asyncio.run(enrich_quantastor_nodes_from_ssh(payload, raw_data, nodes))
@@ -2744,12 +2744,12 @@ class AdminStatePayloadTests(unittest.TestCase):
         key_manager = MagicMock()
         key_manager.list_keys.return_value = []
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.get_runtime_service", return_value=runtime_service):
-                with patch("admin_service.main.SSHKeyManager", return_value=key_manager):
-                    with patch("admin_service.main.get_admin_settings", return_value=AdminSettings()):
+        with patch("admin_service.route_support.reload_app_settings", return_value=settings):
+            with patch("admin_service.route_support.get_runtime_service", return_value=runtime_service):
+                with patch("admin_service.route_support.SSHKeyManager", return_value=key_manager):
+                    with patch("admin_service.route_support.get_admin_settings", return_value=AdminSettings()):
                         with patch(
-                            "admin_service.main.get_history_settings",
+                            "admin_service.route_support.get_history_settings",
                             return_value=HistorySettings(sqlite_path="/tmp/history/history.db"),
                         ):
                             payload = asyncio.run(build_admin_state_payload(make_request(port=8082)))
@@ -2782,12 +2782,12 @@ class AdminStatePayloadTests(unittest.TestCase):
         key_manager = MagicMock()
         key_manager.list_keys.return_value = []
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.get_runtime_service", return_value=runtime_service):
-                with patch("admin_service.main.SSHKeyManager", return_value=key_manager):
-                    with patch("admin_service.main.get_admin_settings", return_value=AdminSettings()):
+        with patch("admin_service.route_support.reload_app_settings", return_value=settings):
+            with patch("admin_service.route_support.get_runtime_service", return_value=runtime_service):
+                with patch("admin_service.route_support.SSHKeyManager", return_value=key_manager):
+                    with patch("admin_service.route_support.get_admin_settings", return_value=AdminSettings()):
                         with patch(
-                            "admin_service.main.get_history_settings",
+                            "admin_service.route_support.get_history_settings",
                             return_value=HistorySettings(sqlite_path="/tmp/history/history.db"),
                         ):
                             payload = asyncio.run(build_admin_state_payload(make_request(port=8082)))
@@ -2825,12 +2825,12 @@ class AdminStatePayloadTests(unittest.TestCase):
         key_manager = MagicMock()
         key_manager.list_keys.return_value = []
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.get_runtime_service", return_value=runtime_service):
-                with patch("admin_service.main.SSHKeyManager", return_value=key_manager):
-                    with patch("admin_service.main.get_admin_settings", return_value=AdminSettings()):
+        with patch("admin_service.route_support.reload_app_settings", return_value=settings):
+            with patch("admin_service.route_support.get_runtime_service", return_value=runtime_service):
+                with patch("admin_service.route_support.SSHKeyManager", return_value=key_manager):
+                    with patch("admin_service.route_support.get_admin_settings", return_value=AdminSettings()):
                         with patch(
-                            "admin_service.main.get_history_settings",
+                            "admin_service.route_support.get_history_settings",
                             return_value=HistorySettings(sqlite_path="/tmp/history/history.db"),
                         ):
                             payload = asyncio.run(build_admin_state_payload(make_request(port=8082)))
@@ -2885,12 +2885,12 @@ class AdminStatePayloadTests(unittest.TestCase):
         key_manager = MagicMock()
         key_manager.list_keys.return_value = []
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.get_runtime_service", return_value=runtime_service):
-                with patch("admin_service.main.SSHKeyManager", return_value=key_manager):
-                    with patch("admin_service.main.get_admin_settings", return_value=AdminSettings()):
+        with patch("admin_service.route_support.reload_app_settings", return_value=settings):
+            with patch("admin_service.route_support.get_runtime_service", return_value=runtime_service):
+                with patch("admin_service.route_support.SSHKeyManager", return_value=key_manager):
+                    with patch("admin_service.route_support.get_admin_settings", return_value=AdminSettings()):
                         with patch(
-                            "admin_service.main.get_history_settings",
+                            "admin_service.route_support.get_history_settings",
                             return_value=HistorySettings(sqlite_path="/tmp/history/history.db"),
                         ):
                             payload = asyncio.run(build_admin_state_payload(make_request(port=8082)))
@@ -2937,16 +2937,16 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             "containers": [],
         }
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.get_runtime_service", return_value=runtime_service):
+        with patch("admin_service.routes.reload_app_settings", return_value=settings):
+            with patch("admin_service.routes.get_runtime_service", return_value=runtime_service):
                 with patch(
-                    "admin_service.main.save_runtime_behavior_overrides",
+                    "admin_service.routes.save_runtime_behavior_overrides",
                     return_value={"fields": [{"key": "source_bundle_cache_ttl_seconds", "owner": "admin"}]},
                 ) as save_overrides:
                     with patch(
-                        "admin_service.main.build_runtime_payload",
+                        "admin_service.routes.build_runtime_payload",
                         new=AsyncMock(return_value={"available": True, "containers": []}),
-                    ), patch("admin_service.main.record_config_change") as journal:
+                    ), patch("admin_service.routes.record_config_change") as journal:
                         response = asyncio.run(
                             route.endpoint({"values": {"source_bundle_cache_ttl_seconds": 120}})
                         )
@@ -2978,10 +2978,10 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
                 after = before.model_copy(update=update)
                 runtime_service = MagicMock()
                 with (
-                    patch("admin_service.main.reload_app_settings", side_effect=[before, after]),
-                    patch("admin_service.main.get_runtime_service", return_value=runtime_service),
-                    patch("admin_service.main.save_runtime_behavior_overrides", return_value={"fields": []}),
-                    patch("admin_service.main.build_runtime_payload", new=AsyncMock(return_value={"containers": []})),
+                    patch("admin_service.routes.reload_app_settings", side_effect=[before, after]),
+                    patch("admin_service.routes.get_runtime_service", return_value=runtime_service),
+                    patch("admin_service.routes.save_runtime_behavior_overrides", return_value={"fields": []}),
+                    patch("admin_service.routes.build_runtime_payload", new=AsyncMock(return_value={"containers": []})),
                 ):
                     response = asyncio.run(route.endpoint({"values": {"smart_cache_ttl_seconds": 60}}))
                 payload = json.loads(response.body)
@@ -3044,9 +3044,9 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         runtime_service = MagicMock()
         runtime_service.status_payload.return_value = {"available": True, "detail": None, "containers": []}
 
-        with patch("admin_service.main.reload_app_settings", side_effect=[initial_settings, refreshed_settings]):
-            with patch("admin_service.main.DemoSystemFactory", return_value=demo_factory):
-                with patch("admin_service.main.get_runtime_service", return_value=runtime_service):
+        with patch("admin_service.routes.reload_app_settings", side_effect=[initial_settings, refreshed_settings]):
+            with patch("admin_service.routes.DemoSystemFactory", return_value=demo_factory):
+                with patch("admin_service.routes.get_runtime_service", return_value=runtime_service):
                     response = asyncio.run(route.endpoint())
 
         payload = json.loads(response.body.decode("utf-8"))
@@ -3106,9 +3106,9 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         runtime_service = MagicMock()
         runtime_service.status_payload.return_value = {"available": True, "detail": None, "containers": []}
 
-        with patch("admin_service.main.reload_app_settings", side_effect=[initial_settings, refreshed_settings]):
-            with patch("admin_service.main.SystemSetupService", return_value=setup_service):
-                with patch("admin_service.main.get_runtime_service", return_value=runtime_service):
+        with patch("admin_service.routes.reload_app_settings", side_effect=[initial_settings, refreshed_settings]):
+            with patch("admin_service.routes.SystemSetupService", return_value=setup_service):
+                with patch("admin_service.routes.get_runtime_service", return_value=runtime_service):
                     response = asyncio.run(route.endpoint(system_id="qs-cryostorage"))
 
         payload = json.loads(response.body.decode("utf-8"))
@@ -3176,10 +3176,10 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             "removed_system_ids": ["qs-cryostorage"],
         }
 
-        with patch("admin_service.main.reload_app_settings", side_effect=[initial_settings, refreshed_settings]):
-            with patch("admin_service.main.SystemSetupService", return_value=setup_service):
-                with patch("admin_service.main.get_runtime_service", return_value=runtime_service):
-                    with patch("admin_service.main.get_history_store", return_value=history_store):
+        with patch("admin_service.routes.reload_app_settings", side_effect=[initial_settings, refreshed_settings]):
+            with patch("admin_service.routes.SystemSetupService", return_value=setup_service):
+                with patch("admin_service.routes.get_runtime_service", return_value=runtime_service):
+                    with patch("admin_service.routes.get_history_store", return_value=history_store):
                         response = asyncio.run(route.endpoint(system_id="qs-cryostorage", purge_history=True))
 
         payload = json.loads(response.body.decode("utf-8"))
@@ -3220,10 +3220,10 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         history_store = MagicMock()
         history_store.delete_system_history.side_effect = RuntimeError("Traceback: token=history-secret")
 
-        with patch("admin_service.main.reload_app_settings", side_effect=[initial_settings, refreshed_settings, refreshed_settings]):
-            with patch("admin_service.main.SystemSetupService", return_value=setup_service):
-                with patch("admin_service.main.get_runtime_service", return_value=runtime_service):
-                    with patch("admin_service.main.get_history_store", return_value=history_store):
+        with patch("admin_service.routes.reload_app_settings", side_effect=[initial_settings, refreshed_settings, refreshed_settings]):
+            with patch("admin_service.routes.SystemSetupService", return_value=setup_service):
+                with patch("admin_service.routes.get_runtime_service", return_value=runtime_service):
+                    with patch("admin_service.routes.get_history_store", return_value=history_store):
                         response = asyncio.run(route.endpoint(system_id="qs-cryostorage", purge_history=True))
 
         payload = json.loads(response.body.decode("utf-8"))
@@ -3260,8 +3260,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             "removed_system_ids": ["qs-cryostorage"],
         }
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.get_history_store", return_value=history_store):
+        with patch("admin_service.routes.reload_app_settings", return_value=settings):
+            with patch("admin_service.routes.get_history_store", return_value=history_store):
                 preview_route = next(item for item in admin_app.routes if item.path == "/api/admin/history/orphaned")
                 preview = json.loads(asyncio.run(preview_route.endpoint()).body)
                 response = asyncio.run(route.endpoint({"preview_token": preview["purge_preview_token"], "confirm_irreversible": True}))
@@ -3281,7 +3281,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             {"system_id": "archive-core", "system_label": "Archive CORE", "total_rows": 1240},
         ]
 
-        with patch("admin_service.main.get_history_store", return_value=history_store):
+        with patch("admin_service.routes.get_history_store", return_value=history_store):
             response = asyncio.run(route.endpoint())
 
         payload = json.loads(response.body.decode("utf-8"))
@@ -3295,7 +3295,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         history_store = MagicMock()
         history_store.list_history_system_summaries.side_effect = RuntimeError("private sqlite path")
 
-        with patch("admin_service.main.get_history_store", return_value=history_store):
+        with patch("admin_service.routes.get_history_store", return_value=history_store):
             with self.assertRaises(HTTPException) as raised:
                 asyncio.run(route.endpoint())
 
@@ -3335,8 +3335,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             }
         ]
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.get_history_store", return_value=history_store):
+        with patch("admin_service.routes.reload_app_settings", return_value=settings):
+            with patch("admin_service.routes.get_history_store", return_value=history_store):
                 response = asyncio.run(route.endpoint())
 
         payload = json.loads(response.body.decode("utf-8"))
@@ -3359,8 +3359,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
                 initialize=False,
             )
 
-            with patch("admin_service.main.reload_app_settings", return_value=settings):
-                with patch("admin_service.main.get_history_store", return_value=history_store):
+            with patch("admin_service.routes.reload_app_settings", return_value=settings):
+                with patch("admin_service.routes.get_history_store", return_value=history_store):
                     response = asyncio.run(route.endpoint())
 
             payload = json.loads(response.body.decode("utf-8"))
@@ -3388,8 +3388,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             "Traceback: token=history-secret"
         )
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.get_history_store", return_value=history_store):
+        with patch("admin_service.routes.reload_app_settings", return_value=settings):
+            with patch("admin_service.routes.get_history_store", return_value=history_store):
                 with self.assertRaises(HTTPException) as raised:
                     asyncio.run(
                         route.endpoint(
@@ -3445,8 +3445,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             "slot_state_conflicts": 1,
         }
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.get_history_store", return_value=history_store):
+        with patch("admin_service.routes.reload_app_settings", return_value=settings):
+            with patch("admin_service.routes.get_history_store", return_value=history_store):
                 response = asyncio.run(
                     route.endpoint(
                         payload=HistoryAdoptRequest(
@@ -3497,8 +3497,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         ]
         history_store.adopt_system_history.side_effect = RuntimeError("Traceback: token=history-secret")
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.get_history_store", return_value=history_store):
+        with patch("admin_service.routes.reload_app_settings", return_value=settings):
+            with patch("admin_service.routes.get_history_store", return_value=history_store):
                 with self.assertRaises(HTTPException) as raised:
                     asyncio.run(
                         route.endpoint(
@@ -3550,8 +3550,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         registry = MagicMock()
         registry.get_service.return_value = service
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.InventoryRegistry", return_value=registry):
+        with patch("admin_service.routes.reload_app_settings", return_value=settings):
+            with patch("admin_service.routes.InventoryRegistry", return_value=registry):
                 response = asyncio.run(route.endpoint(system_id="archive-core", force=True))
 
         payload = json.loads(response.body.decode("utf-8"))
@@ -3586,7 +3586,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             smart_test_results=[],
         )
 
-        with patch("admin_service.main.QuantastorRESTClient", return_value=client):
+        with patch("admin_service.routes.QuantastorRESTClient", return_value=client):
             response = asyncio.run(
                 route.endpoint(
                     QuantastorNodeDiscoveryRequest(
@@ -3655,9 +3655,9 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             ]
         )
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.QuantastorRESTClient", return_value=client):
-                with patch("admin_service.main.SSHProbe", return_value=probe) as ssh_probe:
+        with patch("admin_service.routes.reload_app_settings", return_value=settings):
+            with patch("admin_service.routes.QuantastorRESTClient", return_value=client):
+                with patch("admin_service.route_support.SSHProbe", return_value=probe) as ssh_probe:
                     response = asyncio.run(
                         route.endpoint(
                             QuantastorNodeDiscoveryRequest(
@@ -3730,8 +3730,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         registry = MagicMock()
         registry.get_service.return_value = service
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.InventoryRegistry", return_value=registry):
+        with patch("admin_service.routes.reload_app_settings", return_value=settings):
+            with patch("admin_service.routes.InventoryRegistry", return_value=registry):
                 response = asyncio.run(route.endpoint(system_id="archive-core", force=False))
 
         payload = json.loads(response.body.decode("utf-8"))
@@ -3783,9 +3783,9 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         runtime_service = MagicMock()
         runtime_service.status_payload.return_value = {"available": True, "detail": None, "containers": []}
 
-        with patch("admin_service.main.reload_app_settings", side_effect=[initial_settings, refreshed_settings]):
-            with patch("admin_service.main.ProfileBuilderService", return_value=profile_service):
-                with patch("admin_service.main.get_runtime_service", return_value=runtime_service):
+        with patch("admin_service.routes.reload_app_settings", side_effect=[initial_settings, refreshed_settings]):
+            with patch("admin_service.routes.ProfileBuilderService", return_value=profile_service):
+                with patch("admin_service.routes.get_runtime_service", return_value=runtime_service):
                     response = asyncio.run(
                         route.endpoint(
                             payload=EnclosureProfileRequest(
@@ -3856,9 +3856,9 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         runtime_service = MagicMock()
         runtime_service.status_payload.return_value = {"available": True, "detail": None, "containers": []}
 
-        with patch("admin_service.main.reload_app_settings", side_effect=[initial_settings, refreshed_settings]):
-            with patch("admin_service.main.ProfileBuilderService", return_value=profile_service):
-                with patch("admin_service.main.get_runtime_service", return_value=runtime_service):
+        with patch("admin_service.routes.reload_app_settings", side_effect=[initial_settings, refreshed_settings]):
+            with patch("admin_service.routes.ProfileBuilderService", return_value=profile_service):
+                with patch("admin_service.routes.get_runtime_service", return_value=runtime_service):
                     response = asyncio.run(route.endpoint(profile_id="custom-front-24"))
 
         payload = json.loads(response.body.decode("utf-8"))
@@ -4005,7 +4005,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         route = next(route for route in admin_app.routes if route.path == "/api/admin/system-setup/sudoers-preview")
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = self._saved_sudo_command_settings(Path(temp_dir) / "config" / "config.yaml")
-            with patch("admin_service.main.reload_app_settings", return_value=settings):
+            with patch("admin_service.routes.reload_app_settings", return_value=settings):
                 response = asyncio.run(
                     route.endpoint(
                         SystemSetupSudoPreviewRequest(
@@ -4045,7 +4045,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
                     )
                 ],
             )
-            with patch("admin_service.main.reload_app_settings", return_value=settings):
+            with patch("admin_service.routes.reload_app_settings", return_value=settings):
                 with self.assertRaises(HTTPException) as context:
                     asyncio.run(
                         route.endpoint(
@@ -4067,7 +4067,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         route = next(route for route in admin_app.routes if route.path == "/api/admin/system-setup/sudoers-preview")
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = self._saved_sudo_command_settings(Path(temp_dir) / "config" / "config.yaml")
-            with patch("admin_service.main.reload_app_settings", return_value=settings):
+            with patch("admin_service.routes.reload_app_settings", return_value=settings):
                 with self.assertRaises(HTTPException) as context:
                     asyncio.run(
                         route.endpoint(
@@ -4110,8 +4110,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             config_file.parent.mkdir(parents=True)
             settings = self._saved_sudo_command_settings(config_file)
             with (
-                patch("admin_service.main.reload_app_settings", return_value=settings),
-                patch("admin_service.main.ServiceAccountBootstrapService", side_effect=make_service),
+                patch("admin_service.routes.reload_app_settings", return_value=settings),
+                patch("admin_service.routes.ServiceAccountBootstrapService", side_effect=make_service),
             ):
                 response = asyncio.run(
                     route.endpoint(
@@ -4165,7 +4165,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         ).sudo_commands
         self.assertEqual(len(expected_commands[0]), 1024)
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
+        with patch("admin_service.routes.reload_app_settings", return_value=settings):
             from_saved = asyncio.run(
                 preview_route.endpoint(
                     SystemSetupSudoPreviewRequest(
@@ -4204,8 +4204,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
                 return {"ok": True}
 
         with (
-            patch("admin_service.main.reload_app_settings", return_value=settings),
-            patch("admin_service.main.ServiceAccountBootstrapService", RecordingBootstrapService),
+            patch("admin_service.routes.reload_app_settings", return_value=settings),
+            patch("admin_service.routes.ServiceAccountBootstrapService", RecordingBootstrapService),
         ):
             response = asyncio.run(
                 bootstrap_route.endpoint(
@@ -4232,7 +4232,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         route = next(route for route in admin_app.routes if route.path == "/api/admin/system-setup/bootstrap")
         settings = Settings(config_file="C:/tmp/config/config.yaml")
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
+        with patch("admin_service.routes.reload_app_settings", return_value=settings):
             with self.assertRaises(HTTPException) as context:
                 asyncio.run(
                     route.endpoint(
@@ -4276,8 +4276,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             workspace = Path(temp_dir) / "host-prep-upload"
             workspace.mkdir()
-            with patch("admin_service.main.tempfile.mkdtemp", return_value=str(workspace)):
-                with patch("admin_service.main.get_esxi_host_prep_service", return_value=host_prep_service):
+            with patch("admin_service.route_support.tempfile.mkdtemp", return_value=str(workspace)):
+                with patch("admin_service.routes.get_esxi_host_prep_service", return_value=host_prep_service):
                     response = asyncio.run(route.endpoint(request=request, filename="BCM-vmware-storcli64.zip"))
             self.assertFalse(workspace.exists())
 
@@ -4307,7 +4307,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
                 max_staged_bytes=7,
             )
             with patch(
-                "admin_service.main.get_esxi_host_prep_service",
+                "admin_service.routes.get_esxi_host_prep_service",
                 return_value=host_prep_service,
             ):
                 response = asyncio.run(
@@ -4350,7 +4350,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
                         read_finished.set()
 
                 with (
-                    patch("admin_service.main.get_esxi_host_prep_service", return_value=service),
+                    patch("admin_service.routes.get_esxi_host_prep_service", return_value=service),
                     patch.object(Path, "read_bytes", blocking_read),
                 ):
                     task = asyncio.create_task(
@@ -4411,7 +4411,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
                         stage_worker_finished.set()
 
                 with (
-                    patch("admin_service.main.get_esxi_host_prep_service", return_value=service),
+                    patch("admin_service.routes.get_esxi_host_prep_service", return_value=service),
                     patch.object(Path, "mkdir", blocking_package_mkdir),
                     patch.object(
                         service,
@@ -4458,8 +4458,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         }
         host_prep_service.list_staged_packages.return_value = []
 
-        with patch("admin_service.main.tempfile.mkdtemp") as make_workspace:
-            with patch("admin_service.main.get_esxi_host_prep_service", return_value=host_prep_service) as get_service:
+        with patch("admin_service.route_support.tempfile.mkdtemp") as make_workspace:
+            with patch("admin_service.routes.get_esxi_host_prep_service", return_value=host_prep_service) as get_service:
                 with self.assertRaises(HTTPException) as raised:
                     asyncio.run(route.endpoint(request=request, filename="BCM-vmware-storcli64.zip"))
 
@@ -4491,8 +4491,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             workspace = Path(temp_dir) / "host-prep-upload"
             workspace.mkdir()
             with (
-                patch("admin_service.main.tempfile.mkdtemp", return_value=str(workspace)),
-                patch("admin_service.main.get_esxi_host_prep_service", return_value=host_prep_service),
+                patch("admin_service.route_support.tempfile.mkdtemp", return_value=str(workspace)),
+                patch("admin_service.routes.get_esxi_host_prep_service", return_value=host_prep_service),
                 self.assertRaises(HTTPException) as raised,
             ):
                 asyncio.run(route.endpoint(request=request, filename="vendor.vib"))
@@ -4517,7 +4517,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             )
             host_prep_service.stage_package("existing.vib", b"payload")
             with (
-                patch("admin_service.main.get_esxi_host_prep_service", return_value=host_prep_service),
+                patch("admin_service.routes.get_esxi_host_prep_service", return_value=host_prep_service),
                 self.assertRaises(HTTPException) as raised,
             ):
                 asyncio.run(route.endpoint(request=request, filename="blocked.vib"))
@@ -4540,7 +4540,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
                 max_staged_bytes=7,
             )
             with (
-                patch("admin_service.main.get_esxi_host_prep_service", return_value=host_prep_service),
+                patch("admin_service.routes.get_esxi_host_prep_service", return_value=host_prep_service),
                 self.assertRaises(HTTPException) as raised,
             ):
                 asyncio.run(route.endpoint(request=request, filename="blocked.vib"))
@@ -4569,8 +4569,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             {"token": "storcli-1", "filename": "BCM-vmware-storcli64.zip"}
         ]
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.get_esxi_host_prep_service", return_value=host_prep_service):
+        with patch("admin_service.routes.reload_app_settings", return_value=settings):
+            with patch("admin_service.routes.get_esxi_host_prep_service", return_value=host_prep_service):
                 response = asyncio.run(
                     route.endpoint(
                         payload=ESXiHostPrepInstallRequest(
@@ -4636,8 +4636,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         host_prep_service.install_package.return_value = {"ok": True, "detail": "installed"}
         host_prep_service.list_staged_packages.return_value = []
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.get_esxi_host_prep_service", return_value=host_prep_service):
+        with patch("admin_service.routes.reload_app_settings", return_value=settings):
+            with patch("admin_service.routes.get_esxi_host_prep_service", return_value=host_prep_service):
                 asyncio.run(
                     route.endpoint(
                         payload=ESXiHostPrepInstallRequest(
@@ -4674,8 +4674,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         )
         host_prep_service = MagicMock()
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.get_esxi_host_prep_service", return_value=host_prep_service):
+        with patch("admin_service.routes.reload_app_settings", return_value=settings):
+            with patch("admin_service.routes.get_esxi_host_prep_service", return_value=host_prep_service):
                 with self.assertRaises(HTTPException) as captured:
                     asyncio.run(
                         route.endpoint(
@@ -4724,10 +4724,10 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         client.fetch_all = AsyncMock(return_value=SimpleNamespace())
         enrich = AsyncMock(return_value={"attempted": False, "ok": True})
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.QuantastorRESTClient", return_value=client) as client_factory:
-                with patch("admin_service.main.serialize_quantastor_nodes", return_value=[]):
-                    with patch("admin_service.main.enrich_quantastor_nodes_from_ssh", enrich):
+        with patch("admin_service.routes.reload_app_settings", return_value=settings):
+            with patch("admin_service.routes.QuantastorRESTClient", return_value=client) as client_factory:
+                with patch("admin_service.routes.serialize_quantastor_nodes", return_value=[]):
+                    with patch("admin_service.routes.enrich_quantastor_nodes_from_ssh", enrich):
                         asyncio.run(
                             route.endpoint(
                                 QuantastorNodeDiscoveryRequest(
@@ -4783,10 +4783,10 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         client.fetch_all = AsyncMock(return_value=SimpleNamespace())
         enrich = AsyncMock(return_value={"attempted": False, "ok": True})
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.QuantastorRESTClient", return_value=client) as client_factory:
-                with patch("admin_service.main.serialize_quantastor_nodes", return_value=[]):
-                    with patch("admin_service.main.enrich_quantastor_nodes_from_ssh", enrich):
+        with patch("admin_service.routes.reload_app_settings", return_value=settings):
+            with patch("admin_service.routes.QuantastorRESTClient", return_value=client) as client_factory:
+                with patch("admin_service.routes.serialize_quantastor_nodes", return_value=[]):
+                    with patch("admin_service.routes.enrich_quantastor_nodes_from_ssh", enrich):
                         with self.assertRaises(HTTPException) as captured:
                             asyncio.run(
                                 route.endpoint(
@@ -4895,10 +4895,10 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
 
             persisted = MagicMock()
             captured: HTTPException | None = None
-            with patch("admin_service.main.reload_app_settings", return_value=settings):
-                with patch("admin_service.main.QuantastorRESTClient", SyntheticQuantastorClient):
-                    with patch("admin_service.main.SSHProbe.run_commands", new=record_ssh_transport):
-                        with patch("admin_service.main.SystemSetupService.save_system", persisted):
+            with patch("admin_service.routes.reload_app_settings", return_value=settings):
+                with patch("admin_service.routes.QuantastorRESTClient", SyntheticQuantastorClient):
+                    with patch("admin_service.route_support.SSHProbe.run_commands", new=record_ssh_transport):
+                        with patch("admin_service.routes.SystemSetupService.save_system", persisted):
                             try:
                                 asyncio.run(
                                     route.endpoint(
@@ -4973,9 +4973,9 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         client = MagicMock()
         client.fetch_all = AsyncMock(return_value=raw_data)
         with (
-            patch("admin_service.main.reload_app_settings", return_value=settings),
-            patch("admin_service.main.QuantastorRESTClient", return_value=client),
-            patch("admin_service.main.SSHProbe.run_commands", new=fail_transport),
+            patch("admin_service.routes.reload_app_settings", return_value=settings),
+            patch("admin_service.routes.QuantastorRESTClient", return_value=client),
+            patch("admin_service.route_support.SSHProbe.run_commands", new=fail_transport),
             self.assertLogs(level="WARNING") as captured,
         ):
             response = asyncio.run(route.endpoint(QuantastorNodeDiscoveryRequest(
@@ -5031,8 +5031,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             ]
         )
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.QuantastorRESTClient") as client_factory:
+        with patch("admin_service.routes.reload_app_settings", return_value=settings):
+            with patch("admin_service.routes.QuantastorRESTClient") as client_factory:
                 with self.assertRaises(HTTPException) as captured:
                     asyncio.run(
                         route.endpoint(
@@ -5069,8 +5069,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             ]
         )
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.QuantastorRESTClient") as client_factory:
+        with patch("admin_service.routes.reload_app_settings", return_value=settings):
+            with patch("admin_service.routes.QuantastorRESTClient") as client_factory:
                 with self.assertRaises(HTTPException) as captured:
                     asyncio.run(
                         route.endpoint(
@@ -5108,8 +5108,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             ]
         )
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.QuantastorRESTClient") as client_factory:
+        with patch("admin_service.routes.reload_app_settings", return_value=settings):
+            with patch("admin_service.routes.QuantastorRESTClient") as client_factory:
                 with self.assertRaises(HTTPException) as captured:
                     asyncio.run(
                         route.endpoint(
