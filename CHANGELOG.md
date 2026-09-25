@@ -50,6 +50,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Added
 
+- `scripts/update_immutable_deployment.py update --inventory-url` checks disk
+  retention: it reads only the aggregate inventory totals before and after the
+  update, and rolls back when a source disk is unplaced or the source count
+  drops. The receipt records counts, never identifiers (#592).
+
 - Backup policies and remote targets can be edited from the admin Backups page
   (Edit settings). Saves are validated with the scheduler's rules, written to
   `config.yaml` atomically and journalled; environment values stay locked, and
@@ -92,6 +97,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Changed
 
+- The main page reuses bay tiles when a refresh brings the same layout,
+  evaluates the heat map once per render instead of once per saved-view bay,
+  and stops its one-second timer when nothing is counting down. (#596)
+- Reworded the rest of the main page in plain words: "Locate light on/off"
+  instead of Identify, "Save offline copy" instead of Export Snapshot, bay
+  assignment backup and restore messages, and selector groups. (#588)
 - Rewrote the admin setup, backup and maintenance copy in plain words, hid the
   one-time bootstrap, SSH command list and QuantaStor HA controls until they are
   needed, showed only the storage-view fields that apply, and made system pills,
@@ -127,6 +138,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Docs
 
+- The Upgrading wiki page has a "What is tested" table: the Docker host,
+  storage, services, upgrade path, rollback and recovery cases that CI's
+  image-only upgrade check covers, and the ones not tested yet (#590).
+
 - Rewrote the released v0.23.0 upgrade notes so a published-image operator can
   follow them: the ownership step is a plain `chown` that adopts the
   `docker-compose.nonroot.yml` overlay rather than a helper the image does not
@@ -147,6 +162,22 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Saved copies and the public demo hide the bay assignment editor, the
+  Storage Fabric refresh button and selectors with nothing to switch to,
+  instead of showing them disabled. (#587)
+- Refreshed the header release note without a page reload while the first
+  check is still running or has failed, so a failure at boot clears within
+  minutes, and renamed the admin timing labels and storage-view template notes
+  in plain words (#593).
+- Passed the `RELEASE_CHECK_*` settings to the history service, so
+  `RELEASE_CHECK_ENABLED=false` turns the GitHub check off everywhere; quoted
+  the current history bind error in the wiki and explained the three history
+  collection intervals in `.env.example` (#591).
+- Named the closest valid key when `config.yaml` has an unknown key, checked
+  the keys under `backups:`, showed these warnings in the admin banner, and
+  documented every operator environment variable in `.env.example` (#589).
+- Hid the SSH settings in admin setup step 3 until SSH is turned on, so a
+  new system no longer scrolls past a block of disabled fields (#585)
 - Renamed the admin container cards to Main UI, History and Admin, removed
   sidecar and runtime wording from admin messages, and corrected the docs that
   said admin auto-stops by default (only the published Compose files set
@@ -512,6 +543,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   (#564).
 
 ### Internal
+
+- CI now upgrades the public v0.22.2 image to each pull request's build by
+  changing only `JBOD_UI_IMAGE` on root-owned mounts, checks that the
+  containers are healthy, that mappings and history survive and that the
+  schema migrated, then rolls back by pin (#590).
 
 - Added the backup archive transport library for the history sidecar: remote
   targets for a local directory, FTP/FTPS, SFTP (host key checked against

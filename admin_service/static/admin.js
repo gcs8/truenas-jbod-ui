@@ -672,7 +672,7 @@
     }
     if (elements.releaseNote) {
       const releaseStatus = state.releaseStatus || {};
-      const summary = String(releaseStatus.summary || "Checking releases...");
+      const summary = String(releaseStatus.summary || "Checking for updates...");
       const latestUrl = safeHttpUrl(releaseStatus.latest_url);
       elements.releaseNote.className = `hero-stat-note is-${releaseStatus.status || "unknown"}`;
       if (latestUrl) {
@@ -4383,6 +4383,7 @@
   }
 
   let sshFieldNodes = null;
+  let sshBodyNodes = null;
 
   function syncSshFields() {
     const enabled = Boolean(elements.setupSshEnabled?.checked);
@@ -4393,6 +4394,14 @@
     }
     sshFieldNodes.forEach((field) => {
       field.disabled = !enabled;
+    });
+    if (!sshBodyNodes) {
+      sshBodyNodes = Array.from(document.querySelectorAll(".setup-ssh-body"));
+    }
+    // With SSH off the fields are unusable, so hide them rather than make a
+    // first-time user scroll past a block of disabled inputs to reach Save.
+    sshBodyNodes.forEach((node) => {
+      node.classList.toggle("hidden", !enabled);
     });
     if (elements.setupRefreshKeysButton) {
       elements.setupRefreshKeysButton.disabled = !enabled;
@@ -4552,7 +4561,8 @@
     const sshEnabled = Boolean(elements.setupSshEnabled?.checked);
     const packages = currentStagedEsxiHostPrepPackages();
     if (elements.setupEsxiHostPrepPanel) {
-      elements.setupEsxiHostPrepPanel.classList.toggle("hidden", !esxiSupported);
+      // StorCLI install runs over SSH, so keep it out of step 3 until SSH is on.
+      elements.setupEsxiHostPrepPanel.classList.toggle("hidden", !esxiSupported || !sshEnabled);
     }
     if (!esxiSupported) {
       return;

@@ -185,9 +185,9 @@ class CIWorkflowContractTests(unittest.TestCase):
         # Existing actions plus the trial's pinned checkout, the dispatch-only
         # screenshot capture workflow's checkout and upload, the unittest
         # gate job's checkout, Python setup, shard-result download and coverage
-        # upload, and the GHCR release workflow's Python setup for the
-        # public-demo release gate.
-        self.assertEqual(action_count, 40)
+        # upload, the GHCR release workflow's Python setup for the
+        # public-demo release gate, and the image-upgrade smoke's checkout.
+        self.assertEqual(action_count, 41)
         self.assertEqual(unpinned, [])
         self.assertEqual(uncommented, [])
 
@@ -872,6 +872,25 @@ class CIRunsOncePerPullRequestTests(unittest.TestCase):
         )
         self.assertIn("OWNER|MEMBER|COLLABORATOR)", step["run"])
         self.assertIn("--advisory", step["run"])
+
+    def test_fixture_only_browser_specs_run_in_ci(self) -> None:
+        workflow = yaml.safe_load(self.read(CI_WORKFLOW))
+        steps = workflow["jobs"]["public-demo-artifact"]["steps"]
+        step = next(step for step in steps if step.get("name") == "Run fixture-only browser specs")
+        for spec in (
+            "qa/offline-snapshot.spec.js",
+            "qa/saved-view-selection.spec.js",
+            "qa/ui-scope-safety.spec.js",
+            "qa/upgrade-notice.spec.js",
+        ):
+            with self.subTest(spec=spec):
+                self.assertTrue((ROOT / spec).is_file())
+                self.assertIn(spec, step["run"])
+                self.assertNotIn("PLAYWRIGHT_LIVE_APPLIANCE_QA", self.read(ROOT / spec))
+        self.assertIn("--retries=0", step["run"])
+        self.assertIn("git status --short", step["run"])
+        contributing = self.read(ROOT / "CONTRIBUTING.md")
+        self.assertIn("Run fixture-only browser specs", contributing)
 
     def test_contributing_documents_how_to_satisfy_the_changelog_check(self) -> None:
         contributing = " ".join(self.read(ROOT / "CONTRIBUTING.md").split())

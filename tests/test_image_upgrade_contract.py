@@ -221,3 +221,223 @@ class ImageUpgradeTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ImmutableRetentionCheckTests(unittest.TestCase):
+    """#400: the immutable update consumes only aggregate disk-retention totals."""
+
+    make_root = fixtures.ImmutableDeploymentTests.make_root
+    make_spec = fixtures.ImmutableDeploymentTests.make_spec
+    INVENTORY_URL = "http://127.0.0.1:8080/api/inventory"
+
+    @staticmethod
+    def inventory(source, rendered, duplicate, unplaced):
+        return {
+            "summary": {
+                "disk_count": source,
+                "source_disk_count": source,
+                "rendered_unique_disk_count": rendered,
+                "duplicate_disk_view_count": duplicate,
+                "unplaced_disk_count": unplaced,
+            },
+            # Identifiers the check must never copy into the receipt.
+            "slots": [{"serial": "SYNTH-SERIAL-0001", "device_name": "da0"}],
+        }
+
+    def update(self, root, responses):
+        runtime = FakeRuntime(root)
+        answers = list(responses)
+        spec = replace(self.make_spec(root), inventory_url=self.INVENTORY_URL)
+
+        def fetch_json(url):
+            self.assertEqual(url, self.INVENTORY_URL)
+            answer = answers.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        return runtime, lambda: deployment.update_deployment(
+            spec, run=runtime.run, download=runtime.download, probe=runtime.probe, fetch_json=fetch_json)
+
+    def test_healthy_totals_activate_and_record_counts_only(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self.make_root(temp)
+            _, update = self.update(root, [self.inventory(6, 6, 2, 0), self.inventory(6, 6, 0, 0)])
+            result = update()
+            receipt = deployment.validate_receipt(root)
+            self.assertEqual(receipt["status"], "active")
+            self.assertEqual(receipt["retention"]["before"]["source_disk_count"], 6)
+            self.assertEqual(receipt["retention"]["after"]["unplaced_disk_count"], 0)
+            self.assertEqual(result["retention"], receipt["retention"])
+            receipt_text = (root / deployment.RECEIPT_DIR_NAME / "receipt.json").read_text(encoding="utf-8")
+            self.assertNotIn("SYNTH-SERIAL", receipt_text)
+            self.assertNotIn("da0", receipt_text)
+
+    def test_unplaced_disk_rolls_back_automatically(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self.make_root(temp)
+            runtime, update = self.update(root, [self.inventory(6, 6, 0, 0), self.inventory(6, 5, 0, 1)])
+            with self.assertRaisesRegex(deployment.DeploymentError, "automatic rollback completed") as caught:
+                update()
+            self.assertIn("1 of 6 source disks", str(caught.exception.__cause__))
+            receipt = deployment.validate_receipt(root)
+            self.assertEqual(receipt["status"], "rolled_back")
+            self.assertEqual(receipt["retention"]["after"]["unplaced_disk_count"], 1)
+            self.assertEqual(runtime.active_image_id, fixtures.OLD_IMAGE_ID)
+
+    def test_source_disk_loss_across_update_rolls_back(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self.make_root(temp)
+            _, update = self.update(root, [self.inventory(6, 6, 0, 0), self.inventory(5, 5, 0, 0)])
+            with self.assertRaises(deployment.DeploymentError) as caught:
+                update()
+            self.assertIn("source disks fell from 6 to 5", str(caught.exception.__cause__))
+
+    def test_predecessor_without_totals_still_gates_the_candidate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self.make_root(temp)
+            _, update = self.update(root, [{"summary": {"disk_count": 6}}, self.inventory(6, 6, 0, 0)])
+            update()
+            receipt = deployment.validate_receipt(root)
+            self.assertIsNone(receipt["retention"]["before"])
+            self.assertEqual(receipt["status"], "active")
+
+    def test_multipath_collapse_with_zero_unplaced_activates(self):
+        # The supported multipath fixture shape: 5 source records, 4 logical
+        # disks, 1 duplicate view, nothing unplaced.
+        with tempfile.TemporaryDirectory() as temp:
+            root = self.make_root(temp)
+            _, update = self.update(root, [self.inventory(5, 4, 1, 0), self.inventory(5, 4, 1, 0)])
+            update()
+            self.assertEqual(deployment.validate_receipt(root)["status"], "active")
+
+    def test_unreadable_baseline_stops_before_any_change(self):
+        for failure in (
+            deployment.DeploymentError("inventory retention check could not read the inventory"),
+            {"no": "summary"},
+            {"summary": {**self.inventory(6, 6, 0, 0)["summary"], "unplaced_disk_count": "0"}},
+        ):
+            with self.subTest(failure=repr(failure)[:60]), tempfile.TemporaryDirectory() as temp:
+                root = self.make_root(temp)
+                env_before = (root / ".env").read_bytes()
+                runtime, update = self.update(root, [failure, self.inventory(6, 6, 0, 0)])
+                with self.assertRaises(deployment.DeploymentError) as caught:
+                    update()
+                self.assertNotIn("rollback", str(caught.exception))
+                self.assertFalse((root / deployment.RECEIPT_DIR_NAME).exists())
+                self.assertEqual((root / ".env").read_bytes(), env_before)
+                self.assertFalse(any(command[:2] == ("docker", "pull") for command in runtime.commands))
+
+    def test_candidate_without_totals_is_refused(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self.make_root(temp)
+            _, update = self.update(root, [self.inventory(6, 6, 0, 0), {"summary": {"disk_count": 6}}])
+            with self.assertRaises(deployment.DeploymentError) as caught:
+                update()
+            self.assertIn("predates retention totals", str(caught.exception.__cause__))
+
+    def test_inventory_url_must_be_loopback(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self.make_root(temp)
+            spec = replace(self.make_spec(root), inventory_url="http://192.0.2.10:8080/api/inventory")
+            with self.assertRaisesRegex(deployment.DeploymentError, "inventory URL must use an explicit loopback"):
+                deployment.update_deployment(spec, run=FakeRuntime(root).run)
+
+    def test_receipts_without_retention_remain_valid(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self.make_root(temp)
+            runtime = FakeRuntime(root)
+            deployment.update_deployment(self.make_spec(root), run=runtime.run,
+                                         download=runtime.download, probe=runtime.probe)
+            self.assertNotIn("retention", deployment.validate_receipt(root))
+
+    def test_cli_forwards_inventory_url(self):
+        args = deployment._build_parser().parse_args([
+            "update", "/srv/jbod", "--project-name=jbod", "--source-revision=" + "0" * 40,
+            "--expected-image=ghcr.io/gcs8/truenas-jbod-ui@sha256:" + "0" * 64,
+            "--candidate-tag=ghcr.io/gcs8/truenas-jbod-ui:v1", "--compose=docker-compose.yml=live.yml",
+            "--service=app", "--health-url=http://127.0.0.1/healthz",
+            "--inventory-url=http://127.0.0.1:8080/api/inventory",
+        ])
+        self.assertEqual(args.inventory_url, "http://127.0.0.1:8080/api/inventory")
+
+
+class ImageOnlyUpgradeSmokeContractTests(unittest.TestCase):
+    """#399/#463: CI upgrades the previous public release by image pin only."""
+
+    ROOT = Path(__file__).resolve().parents[1]
+
+    def load_smoke(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "run_image_upgrade_smoke", self.ROOT / "scripts" / "run_image_upgrade_smoke.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_ci_job_upgrades_the_pinned_public_previous_release(self):
+        workflow = yaml.safe_load((self.ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8"))
+        job = workflow["jobs"]["image-upgrade-smoke"]
+        self.assertEqual(job["needs"], "route")
+        self.assertIn("needs.route.outputs.run == 'true'", job["if"])
+        self.assertRegex(job["env"]["PREVIOUS_IMAGE"], r"^ghcr\.io/gcs8/truenas-jbod-ui@sha256:[0-9a-f]{64}$")
+        self.assertEqual(job["env"]["PREVIOUS_VERSION"], "0.22.2")
+        commands = "\n".join(str(step.get("run", "")) for step in job["steps"])
+        self.assertIn("tests/fixtures/compose/v0.22.2.yml", commands)
+        self.assertIn('--candidate-revision "$GITHUB_SHA"', commands)
+        self.assertIn('SOURCE_COMMIT="$GITHUB_SHA"', commands)
+        self.assertRegex(commands, r"registry:2@sha256:[0-9a-f]{64}")
+        for step in job["steps"]:
+            if step.get("uses", "").startswith("actions/checkout@"):
+                self.assertFalse(step["with"]["persist-credentials"])
+
+    def test_upgrade_changes_only_the_image_pin_between_phases(self):
+        smoke = self.load_smoke()
+        source = (self.ROOT / "scripts" / "run_image_upgrade_smoke.py").read_text(encoding="utf-8")
+        # The operator procedure: set JBOD_UI_IMAGE, pull, up -d. No ownership
+        # repair, no down, no Compose replacement, no migration command.
+        for forbidden in ("chown", "prepare_nonroot_bind_mounts", "migrate_segmented_history", '"down"'):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, source.split("def cleanup", 1)[0])
+        calls = []
+        deployment = smoke.Deployment(Path("/nonexistent"))
+        deployment.compose = lambda *args, **kwargs: calls.append(args) or ""
+        deployment.pull_and_up()
+        self.assertEqual(calls, [("pull",), ("up", "-d", "--wait", "--wait-timeout", "300")])
+
+    def test_compose_fixture_is_the_exact_previous_release_file(self):
+        fixture = yaml.safe_load((self.ROOT / "tests" / "fixtures" / "compose" / "v0.22.2.yml").read_text(encoding="utf-8"))
+        for service in ("enclosure-ui", "enclosure-history"):
+            with self.subTest(service=service):
+                self.assertEqual(fixture["services"][service]["user"], "0:0")
+                self.assertEqual(fixture["services"][service]["image"], "${JBOD_UI_IMAGE:-ghcr.io/gcs8/truenas-jbod-ui:latest}")
+
+    def test_published_support_matrix_names_the_check_that_backs_it(self):
+        workflow = yaml.safe_load((self.ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8"))
+        guide = (self.ROOT / "wiki" / "Upgrading.md").read_text(encoding="utf-8")
+        matrix = guide.split("## What is tested", 1)[1].split("\n## ", 1)[0]
+        self.assertIn(workflow["jobs"]["image-upgrade-smoke"]["name"], " ".join(matrix.split()))
+        self.assertIn("scripts/run_image_upgrade_smoke.py", matrix)
+        self.assertIn(f"v{workflow['jobs']['image-upgrade-smoke']['env']['PREVIOUS_VERSION']}", matrix)
+        self.assertIn("Not tested yet", matrix)
+
+    def test_expected_history_view_matches_the_seed_shape(self):
+        smoke = self.load_smoke()
+        view = smoke.expected_history_view({1: 2, 4: 1})
+        self.assertEqual(view["events"], [[1, "disk_inserted", "SYNTH-0001", "SYNTH-0001"],
+                                          [4, "disk_inserted", "SYNTH-0004", "SYNTH-0004"]])
+        self.assertEqual(view["samples"], [[1, 30, "SYNTH-0001"], [1, 31, "SYNTH-0001"], [4, 30, "SYNTH-0004"]])
+        source = (self.ROOT / "scripts" / "run_image_upgrade_smoke.py").read_text(encoding="utf-8")
+        rollback = source.split("# 3. The new release writes", 1)[1]
+        self.assertIn("history_api_view((1, 2, 3, 4))", rollback)
+
+    def test_seed_and_read_scripts_compile(self):
+        smoke = self.load_smoke()
+        for name, script in (
+            ("seed_ui", smoke.seed_script(smoke.SEED_UI, (1, 2))),
+            ("seed_history", smoke.seed_script(smoke.SEED_HISTORY, (1,), metrics_per_slot=2)),
+            ("read_ui", smoke.READ_UI),
+            ("read_history", smoke.READ_HISTORY),
+        ):
+            with self.subTest(script=name):
+                compile(script, name, "exec")

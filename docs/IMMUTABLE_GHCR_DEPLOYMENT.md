@@ -85,6 +85,17 @@ The receipt records `replace_compose` and hashes both Compose snapshots. In imag
 
 Use `--replace-compose` only for a separately reviewed Compose migration. It replaces every declared file, including overlays, so compare local customizations and retain configured auth, origins, network choices, and optional services before authorizing it. It is not a data migration or a permission-repair tool.
 
+Add `--inventory-url http://127.0.0.1:8080/api/inventory` to also check disk
+retention (#400). The helper reads only the four aggregate integers in the
+inventory `summary` (`source_disk_count`, `rendered_unique_disk_count`,
+`duplicate_disk_view_count`, `unplaced_disk_count`), before the update and
+after the candidate is healthy. It rolls back automatically when any source disk is
+unplaced, or when the source disk count falls across the update. A predecessor
+without these totals gives no baseline, but the candidate must still report
+them. The receipt stores the counts under `retention`; it stores no disk
+identifiers. Collecting the inventory contacts the monitored systems, so the
+request may take up to two minutes.
+
 The receipt is JSON data, not shell code. The helper rejects symlinks, wrong owners or modes, duplicate or extra keys, missing or extra files, hash changes, and cardinality mismatches before verify or rollback touches Docker. An existing receipt blocks another update so a rerun cannot erase rollback evidence.
 
 Activation and rollback allow up to 120 seconds of Docker `starting` health,

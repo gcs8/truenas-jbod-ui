@@ -35,7 +35,7 @@
       <div class="hero-stat">
         <span class="hero-stat-label">Version</span>
         <span id="admin-app-version" class="hero-stat-value">-</span>
-        <span id="admin-release-note" class="hero-stat-note">Checking releases...</span>
+        <span id="admin-release-note" class="hero-stat-note">Checking for updates...</span>
       </div>
     </div>
   </header>
@@ -496,7 +496,7 @@
               <span>This QuantaStor system is an HA pair</span>
             </label>
 
-            <div class="form-grid">
+            <div class="form-grid setup-ssh-body">
               <label class="field">
                 <span id="setup-ssh-host-label">SSH Host</span>
                 <input id="setup-ssh-host" data-ssh-field type="text" placeholder="Defaults to the same host">
@@ -595,7 +595,7 @@
               </p>
             </div>
 
-            <div class="key-manager">
+            <div class="key-manager setup-ssh-body">
               <div id="setup-reuse-key-panel" class="key-mode-panel">
                 <div class="inline-grid">
                   <label class="field">
@@ -623,9 +623,9 @@
               </div>
             </div>
 
-            <p id="setup-ssh-key-help" class="subtle action-note"></p>
+            <p id="setup-ssh-key-help" class="subtle action-note setup-ssh-body"></p>
 
-            <details id="setup-bootstrap-details" class="setup-details">
+            <details id="setup-bootstrap-details" class="setup-details setup-ssh-body">
               <summary>Create a login on the host for this app (optional, one-time)</summary>
             <div id="setup-bootstrap-panel" class="key-mode-panel">
               <div class="setup-step-header">
@@ -727,7 +727,7 @@
               <p id="setup-esxi-host-prep-detail" class="subtle action-note"></p>
             </div>
 
-            <details id="setup-ssh-commands-details" class="setup-details">
+            <details id="setup-ssh-commands-details" class="setup-details setup-ssh-body">
               <summary>Commands the app runs over SSH (advanced)</summary>
               <label class="field">
                 <span>Commands</span>
