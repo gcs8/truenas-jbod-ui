@@ -13,8 +13,20 @@ upgrade notes. Record what you are running now, so you can go back:
 docker compose images
 ```
 
-Keep a verified backup of `config`, `data` and `history`, your `.env`, and every
-Compose file you start the stack with.
+Take a backup right before you upgrade, and keep it until you are sure you will
+not roll back. It is the only way back if a release changes the history
+database in a way the older release cannot read (see
+[[Roll back after an incompatible history change|History-Maintenance-and-Recovery#roll-back-after-an-incompatible-history-change]]).
+Either:
+
+- if you run the backup scheduler, open **Backups** in the admin UI, press
+  **Back up now** on the full backup, then **Keep** on the new copy so cleanup
+  never deletes it; or
+- stop the stack and copy `config`, `data` and `history`.
+
+Also keep your `.env` and every Compose file you start the stack with. The
+history service's own daily copy under `./history/backups` can be up to a day
+old, so do not rely on it alone.
 
 ## Move to a new release
 
@@ -43,6 +55,13 @@ migration. Two cases need attention before you rely on the data:
 - If the log says the database was unreadable and was moved aside, the original
   file is kept; recover it from the same page before new collection builds on
   an empty database.
+
+If you still start history with the v0.22.2 Compose file and set
+`HISTORY_BIND_ADDRESS` to anything other than `127.0.0.1`, add the small
+`docker-compose.history-bind.yml` overlay described in the
+[history Compose migration](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/HISTORY_COMPOSE_MIGRATION.md).
+The old file does not tell the newer history service which address it is
+published on, and an image-only update cannot fix that.
 
 Segmented history is an advanced opt-in. Ignore its tools unless you set
 `HISTORY_SEGMENT_CATALOG_PATH` yourself.
@@ -100,10 +119,14 @@ need. That covers the history database schema only, not a full container
 upgrade from those releases.
 
 Every history schema change so far only adds columns, indexes and tables, so
-the previous release can still open an upgraded database. What a rollback must
-guarantee after a future change that is not additive (restore the pre-upgrade
-backup and lose later writes, or ship a down-migration) is still an open owner
-decision (#416).
+the previous release can still open an upgraded database. If a future release
+makes a change the previous release cannot read, its upgrade notes will say so,
+and rolling back means restoring the backup taken before the upgrade. Anything
+recorded after the upgrade is lost. There are no down-migrations. See
+[[Roll back after an incompatible history change|History-Maintenance-and-Recovery#roll-back-after-an-incompatible-history-change]].
+
+Windows hosts, including Docker Desktop, are best-effort. CI does not run the
+app or its tests on Windows.
 
 ## Rolling back a release
 
