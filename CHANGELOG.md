@@ -171,6 +171,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- History collection now pauses when SQLite reports the database damaged
+  while the service is running, instead of retrying writes every pass. The
+  pause survives restarts, shows on the dashboard and as `degraded` in
+  `/healthz`, and is cleared with `python -m history_service.recovery
+  acknowledge` once the database passes its integrity check (#604).
 - Saved copies and the public demo hide the bay assignment editor, the
   Storage Fabric refresh button and selectors with nothing to switch to,
   instead of showing them disabled. (#587)

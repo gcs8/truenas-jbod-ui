@@ -84,10 +84,40 @@ QUARANTINE_RECOVERY_STATES = frozenset(
     {QUARANTINE_RECOVERY_REQUIRED_STATE, QUARANTINE_RECOVERY_ACKNOWLEDGED_STATE}
 )
 MAX_QUARANTINE_EVIDENCE_DIRECTORY_ENTRIES = 4096
+# Damage found while the service is running (#417). Collection stops writing and
+# a marker file beside the database records when, so the pause survives a
+# restart. The marker lives outside the damaged file on purpose, holds only a
+# timestamp, and is cleared only by `python -m history_service.recovery
+# acknowledge` after the database passes `PRAGMA quick_check`.
+COLLECTION_PAUSE_MARKER_SUFFIX = ".collection-paused"
+COLLECTION_PAUSE_MARKER_MAX_BYTES = 128
+DATABASE_CORRUPTION_FRAGMENTS = (
+    "file is not a database",
+    "database disk image is malformed",
+)
 MAX_QUARANTINE_NAME_ALLOCATION_ATTEMPTS = 4096
 QUARANTINE_INTENT_PREFIX = ".quarantine-"
 QUARANTINE_INTENT_SUFFIX = ".pending"
 QUARANTINE_INTENT_BYTES = b"history quarantine pending\n"
+
+
+def is_database_corruption_error(exc: BaseException | None) -> bool:
+    """True when `exc`, or anything it was raised from, says the file is damaged.
+
+    Only SQLite's own corruption results count. A locked, read-only or full
+    database is an ordinary failure and never pauses collection.
+    """
+
+    seen: set[int] = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, sqlite3.DatabaseError):
+            message = str(current).lower()
+            if any(fragment in message for fragment in DATABASE_CORRUPTION_FRAGMENTS):
+                return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def describe_unsupported_schema_version(file_path: Path | str, found_version: int) -> str:
@@ -1099,7 +1129,126 @@ class HistoryStore:
                 return None
         return None
 
-    def read_quarantine_recovery(self) -> datetime | None:
+    @property
+    def collection_pause_marker_path(self) -> Path:
+        return Path(f"{self.file_path}{COLLECTION_PAUSE_MARKER_SUFFIX}")
+
+    def read_collection_pause(self) -> tuple[bool, datetime | None]:
+        """Whether collection is paused for damage, and since when (#417).
+
+        Fails closed: a marker that exists but cannot be read, is not a
+        regular file, or holds no valid timestamp still means paused, with no
+        time. Only a missing marker means collection may write.
+        """
+
+        marker = self.collection_pause_marker_path
+        try:
+            metadata = marker.lstat()
+        except FileNotFoundError:
+            return False, None
+        except OSError:
+            return True, None
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > COLLECTION_PAUSE_MARKER_MAX_BYTES:
+            return True, None
+        try:
+            descriptor = os.open(marker, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+            try:
+                raw = os.read(descriptor, COLLECTION_PAUSE_MARKER_MAX_BYTES + 1)
+            finally:
+                os.close(descriptor)
+            paused_at, _ = self._normalize_retention_backup_at(raw.decode("ascii").strip())
+        except (OSError, UnicodeDecodeError, ValueError):
+            return True, None
+        return True, paused_at
+
+    def record_collection_pause(self, paused_at: datetime) -> datetime | None:
+        """Publish the pause marker once; an existing marker keeps its time.
+
+        Returns the effective pause time (None when an existing marker is
+        unreadable). Never opens the database, so it works when the file is
+        too damaged to read.
+        """
+
+        _, serialized = self._normalize_retention_backup_at(paused_at)
+        payload = f"{serialized}\n".encode("ascii")
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            descriptor = os.open(self.collection_pause_marker_path, flags, self.shared_file_mode & 0o666)
+        except FileExistsError:
+            return self.read_collection_pause()[1]
+        try:
+            if os.write(descriptor, payload) != len(payload):
+                raise OSError(errno.EIO, "History collection pause marker write was incomplete.")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        self._fsync_directory(self.file_path.parent)
+        return self.read_collection_pause()[1]
+
+    def clear_collection_pause(self) -> bool:
+        """Remove the pause marker; return whether one was there.
+
+        Only the recovery CLI calls this, after the database passes
+        `PRAGMA quick_check`.
+        """
+
+        marker = self.collection_pause_marker_path
+        try:
+            metadata = marker.lstat()
+        except FileNotFoundError:
+            return False
+        if stat.S_ISDIR(metadata.st_mode):
+            raise OSError(errno.EISDIR, "History collection pause marker is a directory.")
+        marker.unlink()
+        self._fsync_directory(self.file_path.parent)
+        return True
+
+    def quick_check(self) -> str:
+        """`PRAGMA quick_check(1)` on a read-only connection: "ok" or the first problem.
+
+        Read-only and outside the write lock, so it never changes the file,
+        even one too damaged to open.
+        """
+
+        try:
+            with closing(
+                sqlite3.connect(
+                    f"{self.file_path.absolute().as_uri()}?mode=ro",
+                    uri=True,
+                    timeout=SQLITE_CONNECT_TIMEOUT_SECONDS,
+                )
+            ) as connection:
+                row = connection.execute("PRAGMA quick_check(1)").fetchone()
+        except sqlite3.Error as exc:
+            return f"cannot check: {exc}"
+        return str(row[0]) if row else "no result"
+
+    @contextmanager
+    def _readonly_connection(self) -> Iterator[sqlite3.Connection]:
+        """A `mode=ro` connection that cannot change the file or its journal mode.
+
+        Ordinary reads go through `_connect_locked()`, which switches a database
+        to WAL; recovery inspection must not change the file it protects (#604).
+        """
+
+        connection = sqlite3.connect(
+            f"{self.file_path.absolute().as_uri()}?mode=ro",
+            uri=True,
+            timeout=SQLITE_CONNECT_TIMEOUT_SECONDS,
+        )
+        try:
+            connection.row_factory = sqlite3.Row
+            yield connection
+        finally:
+            connection.close()
+
+    def read_quarantine_recovery(self, *, readonly: bool = False) -> datetime | None:
         """Return when history was quarantined, or None once it is acknowledged.
 
         The row lives in `history_maintenance_state` beside the retention
@@ -1108,9 +1257,10 @@ class HistoryStore:
         first installation (#417). Retained broken database files are fallback
         evidence if writing that row failed. An unreadable marker is not repaired
         here; the caller fails closed on it rather than reporting health.
+        `readonly=True` reads through a `mode=ro` connection (recovery CLI).
         """
 
-        with self._read_connection() as connection:
+        with (self._readonly_connection() if readonly else self._read_connection()) as connection:
             row = connection.execute(
                 """
                 SELECT backup_at, state
@@ -1131,7 +1281,7 @@ class HistoryStore:
         later_evidence = [timestamp for timestamp in evidence if timestamp > marked_at]
         return later_evidence[0] if later_evidence else None
 
-    def quarantine_recovery_status(self) -> dict[str, Any]:
+    def quarantine_recovery_status(self, *, readonly: bool = False) -> dict[str, Any]:
         """Report the recovery indication for status surfaces, failing closed.
 
         A marker that cannot be read is not evidence of a healthy database, so
@@ -1140,7 +1290,7 @@ class HistoryStore:
         """
 
         try:
-            quarantined_at = self.read_quarantine_recovery()
+            quarantined_at = self.read_quarantine_recovery(readonly=readonly)
         except (HistoryStartupError, sqlite3.Error, OSError, ValueError):
             logger.warning(
                 "History quarantine recovery marker for %s could not be read; reporting recovery required.",
