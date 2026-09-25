@@ -50,6 +50,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Added
 
+- Added jump links to the sections of the admin Setup + Maintenance view (#582)
 - Added an optional backup scheduler sidecar (`--profile backup-scheduler`):
   config-only backups shortly after configuration changes, full backups on a
   cron schedule, copies to SFTP, FTP, SMB, S3, NFS or filesystem targets,
