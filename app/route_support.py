@@ -507,7 +507,7 @@ def require_read_ui_basic_credentials(request: Request) -> None:
     ):
         raise HTTPException(
             status_code=401,
-            detail="Read UI authentication required.",
+            detail="Main UI authentication required.",
             headers={"WWW-Authenticate": 'Basic realm="truenas-jbod-ui"'},
         )
 
