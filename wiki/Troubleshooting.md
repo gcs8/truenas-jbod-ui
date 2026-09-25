@@ -119,7 +119,7 @@ Do not broaden sudo more than needed.
 
 ## Main-UI writes return 401 or 403
 
-In Basic mode, `Read UI authentication required.` means the page is signed out
+In Basic mode, `Main UI authentication required.` means the page is signed out
 or the credentials are wrong. Sign in again on that page. A cross-origin error
 means `APP_PUBLIC_ORIGIN` does not exactly match the scheme, host, and port in
 the browser address bar.
