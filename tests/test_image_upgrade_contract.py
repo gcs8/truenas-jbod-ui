@@ -221,3 +221,84 @@ class ImageUpgradeTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ImageOnlyUpgradeSmokeContractTests(unittest.TestCase):
+    """#399/#463: CI upgrades the previous public release by image pin only."""
+
+    ROOT = Path(__file__).resolve().parents[1]
+
+    def load_smoke(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "run_image_upgrade_smoke", self.ROOT / "scripts" / "run_image_upgrade_smoke.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_ci_job_upgrades_the_pinned_public_previous_release(self):
+        workflow = yaml.safe_load((self.ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8"))
+        job = workflow["jobs"]["image-upgrade-smoke"]
+        self.assertEqual(job["needs"], "route")
+        self.assertIn("needs.route.outputs.run == 'true'", job["if"])
+        self.assertRegex(job["env"]["PREVIOUS_IMAGE"], r"^ghcr\.io/gcs8/truenas-jbod-ui@sha256:[0-9a-f]{64}$")
+        self.assertEqual(job["env"]["PREVIOUS_VERSION"], "0.22.2")
+        commands = "\n".join(str(step.get("run", "")) for step in job["steps"])
+        self.assertIn("tests/fixtures/compose/v0.22.2.yml", commands)
+        self.assertIn('--candidate-revision "$GITHUB_SHA"', commands)
+        self.assertIn('SOURCE_COMMIT="$GITHUB_SHA"', commands)
+        self.assertRegex(commands, r"registry:2@sha256:[0-9a-f]{64}")
+        for step in job["steps"]:
+            if step.get("uses", "").startswith("actions/checkout@"):
+                self.assertFalse(step["with"]["persist-credentials"])
+
+    def test_upgrade_changes_only_the_image_pin_between_phases(self):
+        smoke = self.load_smoke()
+        source = (self.ROOT / "scripts" / "run_image_upgrade_smoke.py").read_text(encoding="utf-8")
+        # The operator procedure: set JBOD_UI_IMAGE, pull, up -d. No ownership
+        # repair, no down, no Compose replacement, no migration command.
+        for forbidden in ("chown", "prepare_nonroot_bind_mounts", "migrate_segmented_history", '"down"'):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, source.split("def cleanup", 1)[0])
+        calls = []
+        deployment = smoke.Deployment(Path("/nonexistent"))
+        deployment.compose = lambda *args, **kwargs: calls.append(args) or ""
+        deployment.pull_and_up()
+        self.assertEqual(calls, [("pull",), ("up", "-d", "--wait", "--wait-timeout", "300")])
+
+    def test_compose_fixture_is_the_exact_previous_release_file(self):
+        fixture = yaml.safe_load((self.ROOT / "tests" / "fixtures" / "compose" / "v0.22.2.yml").read_text(encoding="utf-8"))
+        for service in ("enclosure-ui", "enclosure-history"):
+            with self.subTest(service=service):
+                self.assertEqual(fixture["services"][service]["user"], "0:0")
+                self.assertEqual(fixture["services"][service]["image"], "${JBOD_UI_IMAGE:-ghcr.io/gcs8/truenas-jbod-ui:latest}")
+
+    def test_published_support_matrix_names_the_check_that_backs_it(self):
+        workflow = yaml.safe_load((self.ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8"))
+        guide = (self.ROOT / "wiki" / "Upgrading.md").read_text(encoding="utf-8")
+        matrix = guide.split("## What is tested", 1)[1].split("\n## ", 1)[0]
+        self.assertIn(workflow["jobs"]["image-upgrade-smoke"]["name"], " ".join(matrix.split()))
+        self.assertIn("scripts/run_image_upgrade_smoke.py", matrix)
+        self.assertIn(f"v{workflow['jobs']['image-upgrade-smoke']['env']['PREVIOUS_VERSION']}", matrix)
+        self.assertIn("Not tested yet", matrix)
+
+    def test_expected_history_view_matches_the_seed_shape(self):
+        smoke = self.load_smoke()
+        view = smoke.expected_history_view({1: 2, 4: 1})
+        self.assertEqual(view["events"], [[1, "disk_inserted", "SYNTH-0001", "SYNTH-0001"],
+                                          [4, "disk_inserted", "SYNTH-0004", "SYNTH-0004"]])
+        self.assertEqual(view["samples"], [[1, 30, "SYNTH-0001"], [1, 31, "SYNTH-0001"], [4, 30, "SYNTH-0004"]])
+        source = (self.ROOT / "scripts" / "run_image_upgrade_smoke.py").read_text(encoding="utf-8")
+        rollback = source.split("# 3. The new release writes", 1)[1]
+        self.assertIn("history_api_view((1, 2, 3, 4))", rollback)
+
+    def test_seed_and_read_scripts_compile(self):
+        smoke = self.load_smoke()
+        for name, script in (
+            ("seed_ui", smoke.seed_script(smoke.SEED_UI, (1, 2))),
+            ("seed_history", smoke.seed_script(smoke.SEED_HISTORY, (1,), metrics_per_slot=2)),
+            ("read_ui", smoke.READ_UI),
+            ("read_history", smoke.READ_HISTORY),
+        ):
+            with self.subTest(script=name):
+                compile(script, name, "exec")
