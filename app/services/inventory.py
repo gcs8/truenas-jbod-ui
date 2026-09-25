@@ -12853,10 +12853,7 @@ class InventoryService:
         return results
 
     async def _queue_ssh_plan(
-        self,
-        planner: Any,
-        initial_commands: list[str],
-        host: str | None,
+        self, planner: Any, initial_commands: list[str], host: str | None,
     ) -> list[SSHCommandResult]:
         """Run one command plan on the host's next shared SSH connection.
 

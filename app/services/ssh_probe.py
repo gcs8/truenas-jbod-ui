@@ -705,4 +705,3 @@ class SSHSession:
         self._client = client
         self.connections += 1
         return client
-
