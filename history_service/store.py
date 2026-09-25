@@ -1864,6 +1864,56 @@ class HistoryStore:
             return None
         return (metadata.st_dev, metadata.st_ino)
 
+    def backup_footprint(
+        self,
+        backup_dir: str | Path,
+        long_term_backup_dir: str | Path | None = None,
+    ) -> dict[str, int]:
+        """Count the sidecar's own snapshot copies and their bytes (#455).
+
+        Read-only: it lists the snapshot names this store writes and adds up
+        their sizes. Nothing is opened, moved or deleted.
+        """
+
+        roots = [Path(backup_dir)]
+        if long_term_backup_dir is not None:
+            long_term_root = Path(long_term_backup_dir)
+            roots.extend((long_term_root / "weekly", long_term_root / "monthly"))
+        copies = 0
+        total = 0
+        for root in roots:
+            try:
+                candidates = list(root.glob(f"{self.file_path.stem}-*.sqlite3"))
+            except OSError:
+                continue
+            for candidate in candidates:
+                try:
+                    metadata = candidate.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if not stat.S_ISREG(metadata.st_mode):
+                    continue
+                copies += 1
+                total += int(metadata.st_size)
+        return {"copies": copies, "bytes": total}
+
+    def reclaimable_bytes(self) -> int | None:
+        """Bytes held by free pages in the hot database, or None if unknown.
+
+        Read-only PRAGMAs on an ordinary read connection; a segmented or
+        unreadable store reports None rather than a guess.
+        """
+
+        if self._segmented_reader() is not None:
+            return None
+        try:
+            with self._read_connection() as connection:
+                free_pages = int(connection.execute("PRAGMA freelist_count").fetchone()[0])
+                page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
+        except (sqlite3.Error, OSError, HistoryStartupError):
+            return None
+        return max(0, free_pages * page_size)
+
     def latest_backup_snapshot_at(self, backup_dir: str | Path) -> datetime | None:
         backup_root = Path(backup_dir)
         if not backup_root.exists():
