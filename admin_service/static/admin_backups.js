@@ -606,6 +606,7 @@
     function openDialog(title, bodyNodes, footerNodes, trigger) {
       const dialog = els.dialog;
       if (!dialog) return null;
+      state.dialogGeneration = (state.dialogGeneration || 0) + 1;
       state.dialogReturnFocus = trigger || doc.activeElement || null;
       const titleId = "backup-dialog-title";
       dialog.setAttribute("aria-labelledby", titleId);
@@ -635,9 +636,25 @@
       (row?.querySelector("[data-dialog-primary]") || row?.querySelector("button"))?.focus?.();
     }
 
+    // A slow response must only touch the dialog that asked for it. Each open
+    // or close starts a new generation; a scope from an older one is inert.
+    function dialogScope() {
+      const generation = state.dialogGeneration || 0;
+      const live = () => generation === (state.dialogGeneration || 0) && Boolean(els.dialog?.open);
+      return {
+        live,
+        result: (text) => (live() ? dialogResult(text) : null),
+        actions: (...nodes) => {
+          if (live()) setDialogActions(...nodes);
+        },
+        body: () => (live() ? els.dialog.querySelector(".backup-dialog-body") : null),
+      };
+    }
+
     function closeDialog() {
       const dialog = els.dialog;
       if (!dialog) return;
+      state.dialogGeneration = (state.dialogGeneration || 0) + 1;
       dialog.querySelectorAll("input[type=password]").forEach((input) => {
         input.value = "";
       });
@@ -676,6 +693,7 @@
     async function showDetails(id, trigger) {
       const artifact = findArtifact(id);
       openDialog("Backup details", [el("p", { className: "subtle", text: "Loading..." })], [cancelButton("Close")], trigger);
+      const scope = dialogScope();
       try {
         const payload = await deps.fetchJson(artifactUrl(id));
         const item = payload.artifact && typeof payload.artifact === "object" ? { ...payload.artifact, ...payload } : payload;
@@ -721,11 +739,9 @@
               : el("li", { className: "subtle", text: "A change whose details are no longer kept" }))))
             : el("p", { className: "subtle", text: "No changes recorded." }));
         }
-        if (els.dialog?.open || els.dialog?.hasAttribute?.("open")) {
-          els.dialog.querySelector(".backup-dialog-body")?.replaceChildren(...body);
-        }
+        scope.body()?.replaceChildren(...body);
       } catch (error) {
-        dialogResult(`Couldn't load details: ${errorText(error)}`);
+        scope.result(`Couldn't load details: ${errorText(error)}`);
         if (!artifact) return;
       }
     }
@@ -763,10 +779,11 @@
 
     function submitPreserve() {
       const id = state.dialogArtifactId;
+      const scope = dialogScope();
       const input = els.dialog?.querySelector("#backup-preserve-reason");
       const reason = String(input?.value || "").trim();
       if (!reason) {
-        dialogResult("Add a short reason first.");
+        scope.result("Add a short reason first.");
         input?.focus?.();
         return Promise.resolve();
       }
@@ -777,11 +794,11 @@
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ reason }),
           });
-          closeDialog();
+          if (scope.live()) closeDialog();
           setBanner("Backup kept.", "success");
           await load({ quiet: true });
         } catch (error) {
-          dialogResult(`Couldn't keep it: ${errorText(error)}`);
+          scope.result(`Couldn't keep it: ${errorText(error)}`);
         }
       });
     }
@@ -877,8 +894,9 @@
 
     function restoreInspect() {
       const id = state.dialogArtifactId;
+      const scope = dialogScope();
       return once(`restore:${id}`, async () => {
-        dialogResult("Checking the backup...");
+        scope.result("Checking the backup...");
         try {
           const inspection = await deps.fetchJson(artifactUrl(id, "/restore/inspect"), {
             method: "POST",
@@ -888,26 +906,28 @@
           if (!["encrypted", "plaintext"].includes(inspection?.encryption_mode) || !inspection?.inspection_receipt) {
             throw new Error("Inspection did not return an observed encryption mode and receipt.");
           }
+          if (!scope.live()) return;
           state.restoreInspection = inspection;
-          dialogResult("");
-          const body = els.dialog?.querySelector(".backup-dialog-body");
+          scope.result("");
+          const body = scope.body();
           body?.append(el("p", { className: "backup-restore-confirmation", text: deps.describeBackupRestoreConfirmation(inspection) }));
-          setDialogActions(primary("Restore", "restore-import", "danger"), cancelButton());
+          scope.actions(primary("Restore", "restore-import", "danger"), cancelButton());
         } catch (error) {
-          dialogResult(`Check failed: ${errorText(error)}`);
+          scope.result(`Check failed: ${errorText(error)}`);
         }
       });
     }
 
     function restoreImport() {
       const id = state.dialogArtifactId;
+      const scope = dialogScope();
       const inspection = state.restoreInspection;
       if (!inspection) return Promise.resolve();
       return once(`restore:${id}`, async () => {
         const stopServices = Boolean(els.dialog?.querySelector("#backup-restore-stop")?.checked);
         const restartServices = stopServices && Boolean(els.dialog?.querySelector("#backup-restore-restart")?.checked);
-        dialogResult("Restoring...");
-        setDialogActions(cancelButton("Close"));
+        scope.result("Restoring...");
+        scope.actions(cancelButton("Close"));
         try {
           const payload = await deps.fetchJson(
             `${artifactUrl(id, "/restore/import")}?stop_services=${String(stopServices)}&restart_services=${String(restartServices)}`,
@@ -929,15 +949,15 @@
               ? Object.keys(payload.restart_failures).join(",")
               : "",
           });
-          const node = dialogResult("");
-          deps.renderMaintenanceResult(node, "Restored", outcome);
+          const node = scope.result("");
+          if (node) deps.renderMaintenanceResult(node, "Restored", outcome);
           setBanner(outcome.ok ? "Backup restored." : `Backup restored, but ${outcome.sentence}`, outcome.ok ? "success" : "error");
           const passphrase = els.dialog?.querySelector("#backup-restore-passphrase");
           if (passphrase) passphrase.value = "";
           await deps.refreshAdminState?.();
           await load({ quiet: true });
         } catch (error) {
-          dialogResult(`Restore failed: ${errorText(error)}`);
+          scope.result(`Restore failed: ${errorText(error)}`);
           setBanner(`Restore failed: ${errorText(error)}`, "error");
         }
       });
@@ -946,18 +966,22 @@
     // Clean up shows the server's dry-run plan and applies exactly that plan
     // by its token; nothing is deleted that the operator did not see.
     function openCleanup(trigger) {
+      if (isPending("cleanup")) return state.pending.get("cleanup");
+      state.cleanupPlan = null;
+      openDialog("Clean up old backups", [el("p", { className: "subtle", text: "Working out what would be deleted..." })], [cancelButton()], trigger);
+      const scope = dialogScope();
       return once("cleanup", async () => {
-        openDialog("Clean up old backups", [el("p", { className: "subtle", text: "Working out what would be deleted..." })], [cancelButton()], trigger);
         try {
           const plan = normalizePlan(await deps.fetchJson(`${API_ROOT}/lifecycle/plan`));
+          if (!scope.live()) return;
           state.cleanupPlan = plan;
-          const body = els.dialog?.querySelector(".backup-dialog-body");
+          const body = scope.body();
           const guardedNote = plan.guarded
             ? el("p", { className: "subtle", text: `${plan.guarded} more ${plan.guarded === 1 ? "is" : "are"} over a limit but kept, because ${plan.guarded === 1 ? "it is" : "each is"} the newest verified copy in its place.` })
             : null;
           if (!plan.items.length) {
             body?.replaceChildren(el("p", { text: "Nothing to clean up. Every copy is within its limits." }), guardedNote || "");
-            setDialogActions(cancelButton("Close"));
+            scope.actions(cancelButton("Close"));
             return;
           }
           if (!plan.token) {
@@ -975,19 +999,20 @@
                 item.reason ? el("span", { className: "subtle", text: `: ${humanizePlanReason(item.reason)}` }) : null);
             })),
             guardedNote || "");
-          setDialogActions(primary(`Delete ${plan.items.length}`, "cleanup-apply", "danger"), cancelButton());
+          scope.actions(primary(`Delete ${plan.items.length}`, "cleanup-apply", "danger"), cancelButton());
         } catch (error) {
-          dialogResult(`Couldn't work out the plan: ${errorText(error)}`);
+          scope.result(`Couldn't work out the plan: ${errorText(error)}`);
         }
       });
     }
 
     function applyCleanup() {
       const plan = state.cleanupPlan;
+      const scope = dialogScope();
       if (!plan || !plan.token) return Promise.resolve();
       return once("cleanup", async () => {
-        dialogResult("Deleting...");
-        setDialogActions(cancelButton("Close"));
+        scope.result("Deleting...");
+        scope.actions(cancelButton("Close"));
         try {
           const payload = await deps.fetchJson(`${API_ROOT}/lifecycle/apply`, {
             method: "POST",
@@ -1003,14 +1028,14 @@
           const text = stopped
             ? `Clean up stopped after ${deleted} of ${deleted + count(payload.not_attempted) + (payload.failed ? 1 : 0)}${failedDetail ? `: ${scrubText(failedDetail)}` : "."}`
             : `Deleted ${deleted} ${deleted === 1 ? "copy" : "copies"}.`;
-          dialogResult(text);
+          scope.result(text);
           setBanner(text, stopped ? "error" : "success");
         } catch (error) {
           state.cleanupPlan = null;
           const text = error?.status === 409
             ? "The list changed since this plan was made, so nothing was deleted. Open Clean up again."
             : `Clean up failed: ${errorText(error)} Some copies may already be gone; the list has been reloaded.`;
-          dialogResult(text);
+          scope.result(text);
           setBanner(text, "error");
         }
         await load({ quiet: true });

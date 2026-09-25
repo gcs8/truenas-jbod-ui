@@ -410,6 +410,40 @@ test("details shows the changes captured in a settings backup", async () => {
   assert.equal(elements.dialog.open, false);
 });
 
+test("a slow details response never lands in a dialog opened after it", async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const base = fakeApi();
+  const slow = fakeApi({ "GET /api/admin/backups/cfg-new": async () => { await gate; return base.data.artifacts[0]; } });
+  const { elements, library } = mount({ api: slow });
+  await library.load();
+  const pending = library.actions.showDetails("cfg-new");
+  library.actions.closeDialog();
+  library.actions.openPreserve("cfg-old");
+  release();
+  await pending;
+  await settle();
+  assert.match(elements.dialog.textContent, /Keep this backup/);
+  assert.ok(elements.dialog.querySelector("#backup-preserve-reason"), "Keep keeps its reason field");
+  assert.doesNotMatch(elements.dialog.textContent, /Checksum|Changes in this backup/);
+});
+
+test("a clean-up plan that arrives after the dialog closed is dropped", async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const base = fakeApi();
+  const slow = fakeApi({ "GET /api/admin/backups/lifecycle/plan": async () => { await gate; return base.fetchJson("/api/admin/backups/lifecycle/plan"); } });
+  const { elements, library, api } = mount({ api: slow });
+  await library.load();
+  const pending = library.actions.openCleanup();
+  library.actions.closeDialog();
+  release();
+  await pending;
+  assert.equal(elements.dialog.open, false);
+  await library.actions.applyCleanup();
+  assert.equal(api.calls.some((call) => call.url.endsWith("/lifecycle/apply")), false);
+});
+
 test("closing a dialog returns focus to the button that opened it, including Escape", async () => {
   const { elements, library, doc } = mount();
   await library.load();
