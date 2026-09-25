@@ -734,6 +734,63 @@ jobs:
             --candidate-version "$(python3 -c 'import app; print(app.__version__)')" \
             --candidate-revision "$GITHUB_SHA"
 
+  # Longer upgrade scenarios, kept out of the required job above so that check
+  # stays fast. Report-only until branch protection adds it.
+  image-upgrade-scenarios:
+    name: Hardened and interrupted upgrade smoke
+    needs: route
+    if: needs.route.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      # Same public v0.22.2 image, pinned by digest, as the required job.
+      PREVIOUS_IMAGE: ghcr.io/gcs8/truenas-jbod-ui@sha256:4bfa37a4c40a058055aef384194f98248722eca25f7fb429d6a5a34446d647a7
+      PREVIOUS_VERSION: "0.22.2"
+      CANDIDATE_IMAGE: localhost:5000/truenas-jbod-ui:ci
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Build this commit and publish it to a local registry
+        run: |
+          set -euo pipefail
+          docker run -d --name upgrade-smoke-registry -p 127.0.0.1:5000:5000 \
+            registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+          docker build --build-arg SOURCE_COMMIT="$GITHUB_SHA" -t "$CANDIDATE_IMAGE" .
+          docker push "$CANDIDATE_IMAGE"
+          docker image rm "$CANDIDATE_IMAGE"
+
+      - name: Upgrade a hardened v0.22.2 install (nonroot overlay) by image pin only, then roll back
+        run: |
+          set -euo pipefail
+          python3 scripts/run_image_upgrade_smoke.py \
+            --scenario hardened \
+            --root "$RUNNER_TEMP/image-upgrade-hardened" \
+            --compose-fixture tests/fixtures/compose/v0.22.2.yml \
+            --nonroot-fixture tests/fixtures/compose/v0.22.2.nonroot.yml \
+            --config-fixture tests/fixtures/ci-smoke-config.yaml \
+            --previous-image "$PREVIOUS_IMAGE" \
+            --previous-version "$PREVIOUS_VERSION" \
+            --candidate-image "$CANDIDATE_IMAGE" \
+            --candidate-version "$(python3 -c 'import app; print(app.__version__)')" \
+            --candidate-revision "$GITHUB_SHA"
+
+      - name: Kill the history migration at each step on v0.22.2 state, then start normally
+        run: |
+          set -euo pipefail
+          python3 scripts/run_image_upgrade_smoke.py \
+            --scenario interrupted-migration \
+            --root "$RUNNER_TEMP/image-upgrade-interrupted" \
+            --compose-fixture tests/fixtures/compose/v0.22.2.yml \
+            --config-fixture tests/fixtures/ci-smoke-config.yaml \
+            --previous-image "$PREVIOUS_IMAGE" \
+            --previous-version "$PREVIOUS_VERSION" \
+            --candidate-image "$CANDIDATE_IMAGE" \
+            --candidate-version "$(python3 -c 'import app; print(app.__version__)')" \
+            --candidate-revision "$GITHUB_SHA"
+
   admin-browser-cleanroom:
     name: Admin clean-room browser QA
     needs: route
