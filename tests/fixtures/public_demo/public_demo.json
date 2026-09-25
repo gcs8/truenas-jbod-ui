@@ -876,6 +876,57 @@
       "vdev_name": "mirror-8"
     }
   ],
+  "storage_fabric": {
+    "controllers": [
+      {
+        "id": "demo-hba-0",
+        "label": "Demo HBA 0",
+        "device": "demo-mpr0",
+        "firmware": "00.00.00.00",
+        "temperature_c": 47,
+        "enclosure_label": "Demo SES Enclosure Front",
+        "paths": [
+          {
+            "id": "demo-path-a",
+            "label": "Demo Expander A",
+            "state": "active",
+            "slot_range": [
+              0,
+              29
+            ]
+          },
+          {
+            "id": "demo-path-b",
+            "label": "Demo Expander B",
+            "state": "fail",
+            "slot_range": [
+              30,
+              44
+            ]
+          }
+        ]
+      },
+      {
+        "id": "demo-hba-1",
+        "label": "Demo HBA 1",
+        "device": "demo-mpr1",
+        "firmware": "00.00.00.00",
+        "temperature_c": 44,
+        "enclosure_label": "Demo SES Enclosure Rear",
+        "paths": [
+          {
+            "id": "demo-path-c",
+            "label": "Demo Expander C",
+            "state": "active",
+            "slot_range": [
+              45,
+              59
+            ]
+          }
+        ]
+      }
+    ]
+  },
   "storage_views": [
     {
       "id": "boot-doms",

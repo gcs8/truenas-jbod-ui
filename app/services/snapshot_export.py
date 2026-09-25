@@ -29,7 +29,7 @@ from app.metrics import (
     observe_snapshot_export_cache_request,
     observe_snapshot_export_cache_size,
 )
-from app.models.domain import InventorySnapshot, StorageViewRuntimePayload
+from app.models.domain import InventorySnapshot, SasFabricSnapshot, StorageViewRuntimePayload
 from app.perf import add_perf_metadata, perf_stage
 from app.services.history_backend import HistoryBackendClient
 from history_service.operation_bounds import (
@@ -1081,6 +1081,7 @@ class SnapshotExportService:
         live_enclosure_smart_summary_cache: dict[str, dict[str, dict[str, Any]]] | None = None,
         storage_view_runtime: StorageViewRuntimePayload | None = None,
         storage_view_smart_summary_cache: dict[str, dict[str, dict[str, Any]]] | None = None,
+        sas_fabric: SasFabricSnapshot | None = None,
         selected_slot: int | None,
         selected_storage_view_id: str | None = None,
         history_window_hours: int | None,
@@ -1103,6 +1104,7 @@ class SnapshotExportService:
                     live_enclosure_smart_summary_cache=live_enclosure_smart_summary_cache,
                     storage_view_runtime=storage_view_runtime,
                     storage_view_smart_summary_cache=storage_view_smart_summary_cache,
+                    sas_fabric=sas_fabric,
                     selected_slot=selected_slot,
                     selected_storage_view_id=selected_storage_view_id,
                     history_window_hours=history_window_hours,
@@ -1132,6 +1134,7 @@ class SnapshotExportService:
                     live_enclosure_smart_summary_cache=live_enclosure_smart_summary_cache,
                     storage_view_runtime=storage_view_runtime,
                     storage_view_smart_summary_cache=storage_view_smart_summary_cache,
+                    sas_fabric=sas_fabric,
                     selected_slot=selected_slot,
                     selected_storage_view_id=selected_storage_view_id,
                     history_window_hours=history_window_hours,
@@ -1183,6 +1186,7 @@ class SnapshotExportService:
             live_enclosure_smart_summary_cache=live_enclosure_smart_summary_cache_for_render,
             storage_view_runtime=storage_view_runtime,
             storage_view_smart_summary_cache=storage_view_smart_summary_cache,
+            sas_fabric=sas_fabric,
             selected_slot=normalized_slot,
             selected_storage_view_id=normalized_storage_view_id,
             history_window_hours=normalized_window_hours,
@@ -1399,6 +1403,9 @@ class SnapshotExportService:
                 ),
                 "preloaded_snapshot_smart_summary_json": json.dumps(live_enclosure_smart_summary_cache_for_export),
                 "preloaded_storage_view_smart_summary_json": json.dumps(storage_view_smart_summary_cache_for_export),
+                "preloaded_sas_fabric_json": json.dumps(
+                    sas_fabric.model_dump(mode="json") if sas_fabric is not None else None
+                ),
                 "initial_selected_slot_json": json.dumps(initial_selected_slot),
                 "initial_selected_storage_view_id_json": json.dumps(initial_selected_storage_view_id),
                 "initial_history_timeframe_hours_json": json.dumps(normalized_window_hours),
@@ -2327,6 +2334,7 @@ class SnapshotExportService:
         live_enclosure_smart_summary_cache: dict[str, dict[str, dict[str, Any]]] | None,
         storage_view_runtime: StorageViewRuntimePayload | None,
         storage_view_smart_summary_cache: dict[str, dict[str, dict[str, Any]]] | None,
+        sas_fabric: SasFabricSnapshot | None,
         selected_slot: int | None,
         selected_storage_view_id: str | None,
         history_window_hours: int | None,
@@ -2362,6 +2370,7 @@ class SnapshotExportService:
             live_enclosure_smart_summary_cache=normalized_live_smart,
             storage_view_runtime=storage_view_runtime,
             storage_view_smart_summary_cache=storage_view_smart_summary_cache,
+            sas_fabric=sas_fabric,
             selected_slot=normalized_slot,
             selected_storage_view_id=normalized_storage_view_id,
             history_window_hours=self._normalize_history_window_hours(history_window_hours),
@@ -2673,6 +2682,7 @@ class SnapshotExportService:
         live_enclosure_smart_summary_cache: dict[str, dict[str, dict[str, Any]]] | None,
         storage_view_runtime: StorageViewRuntimePayload | None,
         storage_view_smart_summary_cache: dict[str, dict[str, dict[str, Any]]] | None,
+        sas_fabric: SasFabricSnapshot | None,
         selected_slot: int | None,
         selected_storage_view_id: str | None,
         history_window_hours: int | None,
@@ -2694,6 +2704,7 @@ class SnapshotExportService:
                 f"livesmart={self._storage_view_smart_summary_cache_fingerprint(live_enclosure_smart_summary_cache)}",
                 f"views={self._storage_view_runtime_fingerprint(storage_view_runtime)}",
                 f"viewsmart={self._storage_view_smart_summary_cache_fingerprint(storage_view_smart_summary_cache)}",
+                f"fabric={self._sas_fabric_fingerprint(sas_fabric)}",
                 f"slot={selected_slot if selected_slot is not None else 'none'}",
                 f"selected-view={selected_storage_view_id or 'none'}",
                 f"window={history_window_hours if history_window_hours is not None else 'all'}",
@@ -2705,6 +2716,14 @@ class SnapshotExportService:
                 f"id-note={identifier_policy_note or ''}",
             ]
         )
+
+    @staticmethod
+    def _sas_fabric_fingerprint(sas_fabric: SasFabricSnapshot | None) -> str:
+        if sas_fabric is None:
+            return "none"
+        return hashlib.sha256(
+            json.dumps(sas_fabric.model_dump(mode="json"), sort_keys=True).encode("utf-8")
+        ).hexdigest()
 
     def _build_history_snapshot_cache_key(
         self,
