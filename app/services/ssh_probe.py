@@ -7,6 +7,7 @@ import shlex
 import threading
 import time
 from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,6 +20,48 @@ logger = logging.getLogger(__name__)
 # Bound each command's combined stdout/stderr before it can enter synchronous
 # parser paths. Four MiB still covers the largest supported SES page.
 MAX_SSH_OUTPUT_BYTES = 4 * 1024 * 1024
+# Channels one planned session runs at once over its single connection. OpenSSH
+# allows ten sessions per connection by default (sshd MaxSessions); staying
+# below that leaves room for the operator's own shells on the same login. A
+# server with a lower MaxSessions refuses the extra channel opens; the run then
+# settles on the channel count that opened (see _ChannelGate).
+MAX_PARALLEL_CHANNELS_PER_CONNECTION = 8
+
+
+class _ChannelGate:
+    """Bound the channels open at once on one connection, lowering it on refusal."""
+
+    def __init__(self, limit: int) -> None:
+        self.limit = max(1, limit)
+        self.active = 0
+        self._condition = threading.Condition()
+
+    def acquire(self) -> None:
+        with self._condition:
+            while self.active >= self.limit:
+                self._condition.wait()
+            self.active += 1
+
+    def release(self) -> None:
+        with self._condition:
+            self.active -= 1
+            self._condition.notify_all()
+
+    def refused(self) -> bool:
+        """Give back a slot whose channel open the server refused.
+
+        Returns True when other channels are open, so the refusal is a
+        per-connection session limit: the limit drops to the channels that did
+        open and the caller retries once one closes. Returns False when this
+        was the only channel, so retrying cannot help.
+        """
+        with self._condition:
+            self.active -= 1
+            others = self.active
+            if others >= 1:
+                self.limit = min(self.limit, others)
+            self._condition.notify_all()
+            return others >= 1
 
 SENSITIVE_OPTION_NAMES = {
     "--api-key",
@@ -186,6 +229,27 @@ class SSHProbe:
             return []
         return await asyncio.to_thread(self._run_planned_commands_sync, planner, initial_commands)
 
+    async def run_planned_command_groups(
+        self,
+        groups: list[tuple[CommandPlanner, list[str]]],
+        *,
+        max_parallel_channels: int = MAX_PARALLEL_CHANNELS_PER_CONNECTION,
+    ) -> list[list[SSHCommandResult]]:
+        """Run several independent command plans over one connection.
+
+        Each group behaves exactly like :meth:`run_planned_commands` would on its
+        own, but all groups share one handshake and host-key check, and up to
+        ``max_parallel_channels`` of them run their commands at the same time on
+        separate channels. Results come back in group order.
+        """
+        if not self.config.enabled:
+            return [[] for _ in groups]
+        return await asyncio.to_thread(self._run_planned_command_groups_sync, groups, max_parallel_channels)
+
+    def open_session(self) -> SSHSession:
+        """One reusable connection for a series of commands; see :class:`SSHSession`."""
+        return SSHSession(self)
+
     async def run_command(
         self,
         command: str,
@@ -264,16 +328,26 @@ class SSHProbe:
         planner: CommandPlanner,
         initial_commands: Iterable[str] | None = None,
     ) -> list[SSHCommandResult]:
-        results: list[SSHCommandResult] = []
-        seen_commands: set[str] = set()
-        pending_commands = self._new_commands(self._command_list(initial_commands), seen_commands)
-        if not pending_commands:
-            pending_commands = self._new_commands(planner(results), seen_commands)
-        if not pending_commands:
-            return []
+        return self._run_planned_command_groups_sync([(planner, self._command_list(initial_commands))], 1)[0]
+
+    def _run_planned_command_groups_sync(
+        self,
+        groups: list[tuple[CommandPlanner, list[str]]],
+        max_parallel_channels: int = MAX_PARALLEL_CHANNELS_PER_CONNECTION,
+    ) -> list[list[SSHCommandResult]]:
+        outcomes: list[list[SSHCommandResult]] = [[] for _ in groups]
+        pending: list[tuple[int, list[str], set[str]]] = []
+        for index, (planner, initial_commands) in enumerate(groups):
+            seen_commands: set[str] = set()
+            first_commands = self._new_commands(self._command_list(initial_commands), seen_commands)
+            if not first_commands:
+                first_commands = self._new_commands(planner([]), seen_commands)
+            if first_commands:
+                pending.append((index, first_commands, seen_commands))
+        if not pending:
+            return outcomes
 
         started = time.perf_counter()
-        batch_count = 0
         try:
             client = self._client()
         except Exception as exc:
@@ -284,61 +358,89 @@ class SSHProbe:
                 exc,
             )
             error_message = str(exc) or exc.__class__.__name__
-            results.extend(self._failure_result(command, error_message) for command in pending_commands)
-            return results
+            for index, first_commands, _seen in pending:
+                outcomes[index] = [self._failure_result(command, error_message) for command in first_commands]
+            return outcomes
 
-        session_error: Exception | None = None
-        failed_pending_commands: list[str] = []
-        try:
-            with client:
+        batch_counts: list[int] = [0] * len(groups)
+        width = max(1, min(int(max_parallel_channels), len(pending)))
+        gate = _ChannelGate(width)
+
+        def run_one(command: str) -> SSHCommandResult:
+            while True:
+                gate.acquire()
+                try:
+                    result = self._run_single_command(client, command, raise_channel_refusal=True)
+                except paramiko.ChannelException as exc:
+                    if gate.refused():
+                        logger.info(
+                            "SSH server %s refused a session channel; running at most %s at once",
+                            self.config.host,
+                            gate.limit,
+                        )
+                        continue
+                    return self._failure_result(command, str(exc) or exc.__class__.__name__)
+                except BaseException:
+                    gate.release()
+                    raise
+                gate.release()
+                return result
+
+        def drive(index: int, first_commands: list[str], seen_commands: set[str]) -> None:
+            planner = groups[index][0]
+            results = outcomes[index]
+            pending_commands = first_commands
+            session_error: Exception | None = None
+            failed_pending_commands: list[str] = []
+            try:
                 while pending_commands:
-                    batch_count += 1
-                    for index, command in enumerate(pending_commands):
+                    batch_counts[index] += 1
+                    for position, command in enumerate(pending_commands):
                         try:
-                            results.append(self._run_single_command(client, command))
+                            results.append(run_one(command))
                         except Exception as exc:  # noqa: BLE001 - preserve partial batch results.
                             session_error = exc
-                            failed_pending_commands = pending_commands[index:]
+                            failed_pending_commands = pending_commands[position:]
                             pending_commands = []
                             break
                     else:
                         pending_commands = self._new_commands(planner(list(results)), seen_commands)
                         continue
                     break
-        except Exception as exc:  # noqa: BLE001 - preserve partial session results.
-            if session_error is None:
-                session_error = exc
+            except Exception as exc:  # noqa: BLE001 - preserve partial session results.
+                if session_error is None:
+                    session_error = exc
+            if session_error is not None:
+                logger.warning(
+                    "SSH planned command session interrupted for %s@%s: %s",
+                    self.config.user,
+                    self.config.host,
+                    session_error,
+                )
+                error_message = str(session_error) or session_error.__class__.__name__
+                results.extend(self._failure_result(command, error_message) for command in failed_pending_commands)
 
-        if session_error is not None:
-            logger.warning(
-                "SSH planned command session interrupted for %s@%s: %s",
-                self.config.user,
-                self.config.host,
-                session_error,
-            )
-            error_message = str(session_error) or session_error.__class__.__name__
-            results.extend(self._failure_result(command, error_message) for command in failed_pending_commands)
-            logger.info(
-                "SSH planned command session completed for %s@%s: connections=1 batches=%s commands=%s failures=%s duration=%.3fs",
-                self.config.user,
-                self.config.host,
-                batch_count,
-                len(results),
-                sum(1 for result in results if not result.ok),
-                time.perf_counter() - started,
-            )
-            return results
+        with client:
+            if width == 1:
+                for item in pending:
+                    drive(*item)
+            else:
+                with ThreadPoolExecutor(max_workers=width, thread_name_prefix="ssh-channel") as executor:
+                    for future in [executor.submit(drive, *item) for item in pending]:
+                        future.result()
 
+        results_count = sum(len(outcomes[index]) for index, _commands, _seen in pending)
         logger.info(
-            "SSH planned command session completed for %s@%s: connections=1 batches=%s commands=%s failures=%s duration=%.3fs",
+            "SSH planned command session completed for %s@%s: connections=1 plans=%s batches=%s commands=%s failures=%s duration=%.3fs",
             self.config.user,
             self.config.host,
-            batch_count,
-            len(results),
-            sum(1 for result in results if not result.ok),
+            len(pending),
+            sum(batch_counts),
+            results_count,
+            sum(1 for index, _commands, _seen in pending for result in outcomes[index] if not result.ok),
             time.perf_counter() - started,
         )
-        return results
+        return outcomes
 
     def _run_command_sync(
         self,
@@ -452,6 +554,7 @@ class SSHProbe:
         *,
         stdin_data: str | None = None,
         timeout_seconds: float | None = None,
+        raise_channel_refusal: bool = False,
     ) -> SSHCommandResult:
         safe_command = redact_ssh_command(command)
         logger.debug("Running SSH command: %s", safe_command)
@@ -498,6 +601,8 @@ class SSHProbe:
                 exit_code=exit_code,
             )
         except Exception as exc:
+            if raise_channel_refusal and isinstance(exc, paramiko.ChannelException):
+                raise
             logger.warning(
                 "SSH command execution failed for %s@%s: %s",
                 self.config.user,
@@ -551,3 +656,52 @@ class SSHProbe:
 
         effective = shlex.join(["sudo", "-S", "-p", "", *remainder])
         return effective, sudo_password
+
+
+class SSHSession:
+    """Run a series of commands over one connection, opened on first use.
+
+    The connection comes from :meth:`SSHProbe._client`, so it is checked against
+    the same host-key policy as every other connection. A connection that has
+    dropped is reopened, and checked again, on the next command. Call
+    :meth:`close` from a worker thread when done.
+    """
+
+    def __init__(self, probe: SSHProbe) -> None:
+        self._probe = probe
+        self._client: paramiko.SSHClient | None = None
+        self._lock = threading.Lock()
+        self.connections = 0
+
+    def run_command(self, command: str, *, timeout_seconds: float | None = None) -> SSHCommandResult:
+        with self._lock:
+            try:
+                client = self._connected_client()
+            except Exception as exc:
+                logger.warning(
+                    "SSH command failed to start for %s@%s: %s",
+                    self._probe.config.user,
+                    self._probe.config.host,
+                    exc,
+                )
+                return self._probe._failure_result(command, str(exc) or exc.__class__.__name__)
+            return self._probe._run_single_command(client, command, timeout_seconds=timeout_seconds)
+
+    def close(self) -> None:
+        with self._lock:
+            client, self._client = self._client, None
+        if client is not None:
+            client.close()
+
+    def _connected_client(self) -> paramiko.SSHClient:
+        client = self._client
+        transport = client.get_transport() if client is not None else None
+        if client is not None and transport is not None and transport.is_active():
+            return client
+        if client is not None:
+            client.close()
+            self._client = None
+        client = self._probe._client()
+        self._client = client
+        self.connections += 1
+        return client

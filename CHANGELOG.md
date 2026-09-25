@@ -474,6 +474,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Performance
 
+- SSH SMART reads that overlap on a host now share one connection and run
+  on up to 8 channels, so `smart_batch_max_concurrency` speeds up SSH grids
+  (60 bays: 60 connections to 5, 13.9 s to 1.6 s in the modeled benchmark).
+  A full disk sync starts and polls over one connection instead of logging
+  in for every poll. (#605)
 - The main page no longer waits for the admin health probe once it has an
   answer: an expired answer is shown at once and refreshed in the
   background, and startup probes admin before the first page load. (#598)
