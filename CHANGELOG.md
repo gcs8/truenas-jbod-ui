@@ -151,6 +151,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Docs
 
+- The history recovery page and CONTRIBUTING now state the rollback policy
+  for a history change an older release cannot read: restore the backup taken
+  before the upgrade and lose later writes, with no down-migrations. Upgrading
+  asks for that backup, says Windows (including Docker Desktop) is
+  best-effort and untested in CI, and points old-Compose history installs to
+  the bind-address overlay. (#610)
 - The Upgrading wiki page has a "What is tested" table: the Docker host,
   storage, services, upgrade path, rollback and recovery cases that CI's
   image-only upgrade check covers, and the ones not tested yet (#590).
