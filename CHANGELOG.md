@@ -50,6 +50,22 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Added
 
+- Full backups can use a much faster encrypted format: set `backups.full.archive_format:
+  tar.zst` (or `BACKUP_FULL_ARCHIVE_FORMAT`). It packs tar + Zstandard and seals it in
+  1 MiB authenticated AES-256-GCM chunks, so a multi-GiB history database is never held
+  in memory and damage is caught chunk by chunk. On a 2 GiB synthetic database it
+  took 17 s instead of 541 s to create. 7z stays the default because older app versions
+  can't read the new format. `scripts/benchmark_full_backup.py --format` measures both.
+  (#600)
+- `scripts/update_immutable_deployment.py update --inventory-url` checks disk
+  retention: it reads only the aggregate inventory totals before and after the
+  update, and rolls back when a source disk is unplaced or the source count
+  drops. The receipt records counts, never identifiers (#592).
+
+- Backup policies and remote targets can be edited from the admin Backups page
+  (Edit settings). Saves are validated with the scheduler's rules, written to
+  `config.yaml` atomically and journalled; environment values stay locked, and
+  credentials stay secret files shown only as present or missing. (#599)
 - Added jump links to the sections of the admin Setup + Maintenance view (#582)
 - Added an optional backup scheduler sidecar (`--profile backup-scheduler`):
   config-only backups shortly after configuration changes, full backups on a
@@ -88,6 +104,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Changed
 
+- The main page reuses bay tiles when a refresh brings the same layout,
+  evaluates the heat map once per render instead of once per saved-view bay,
+  and stops its one-second timer when nothing is counting down. (#596)
+- Reworded the rest of the main page in plain words: "Locate light on/off"
+  instead of Identify, "Save offline copy" instead of Export Snapshot, bay
+  assignment backup and restore messages, and selector groups. (#588)
 - Rewrote the admin setup, backup and maintenance copy in plain words, hid the
   one-time bootstrap, SSH command list and QuantaStor HA controls until they are
   needed, showed only the storage-view fields that apply, and made system pills,
@@ -123,6 +145,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Docs
 
+- The Upgrading wiki page has a "What is tested" table: the Docker host,
+  storage, services, upgrade path, rollback and recovery cases that CI's
+  image-only upgrade check covers, and the ones not tested yet (#590).
+
 - Rewrote the released v0.23.0 upgrade notes so a published-image operator can
   follow them: the ownership step is a plain `chown` that adopts the
   `docker-compose.nonroot.yml` overlay rather than a helper the image does not
@@ -143,6 +169,22 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Saved copies and the public demo hide the bay assignment editor, the
+  Storage Fabric refresh button and selectors with nothing to switch to,
+  instead of showing them disabled. (#587)
+- Refreshed the header release note without a page reload while the first
+  check is still running or has failed, so a failure at boot clears within
+  minutes, and renamed the admin timing labels and storage-view template notes
+  in plain words (#593).
+- Passed the `RELEASE_CHECK_*` settings to the history service, so
+  `RELEASE_CHECK_ENABLED=false` turns the GitHub check off everywhere; quoted
+  the current history bind error in the wiki and explained the three history
+  collection intervals in `.env.example` (#591).
+- Named the closest valid key when `config.yaml` has an unknown key, checked
+  the keys under `backups:`, showed these warnings in the admin banner, and
+  documented every operator environment variable in `.env.example` (#589).
+- Hid the SSH settings in admin setup step 3 until SSH is turned on, so a
+  new system no longer scrolls past a block of disabled fields (#585)
 - Renamed the admin container cards to Main UI, History and Admin, removed
   sidecar and runtime wording from admin messages, and corrected the docs that
   said admin auto-stops by default (only the published Compose files set
@@ -150,6 +192,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Raised the last small labels on the main page (summary labels, legend
   swatches, Connections card details, heat-map controls, timing chips) to at
   least 12px. (#584)
+- Backup and restore now check free space before an export that includes
+  history, run the history integrity check once per restore instead of twice,
+  refuse an old single-file history backup on a segmented deployment before any
+  file is replaced, and use plain error messages (raw 7-Zip output goes to the
+  log only). The unused in-memory import path was removed; byte imports now go
+  through the same file-backed checks. (#594)
 - Honoured a configured `ssh.known_hosts_path` (top level, per system, or the
   restored `SSH_KNOWN_HOSTS_PATH`) instead of always replacing it with
   `<data>/known_hosts`, so pinned host keys can live in a host bind mount;
@@ -513,6 +561,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   (#564).
 
 ### Internal
+
+- CI now upgrades the public v0.22.2 image to each pull request's build by
+  changing only `JBOD_UI_IMAGE` on root-owned mounts, checks that the
+  containers are healthy, that mappings and history survive and that the
+  schema migrated, then rolls back by pin (#590).
 
 - Added the backup archive transport library for the history sidecar: remote
   targets for a local directory, FTP/FTPS, SFTP (host key checked against

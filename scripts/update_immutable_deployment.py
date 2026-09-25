@@ -36,10 +36,25 @@ RunCommand = Callable[..., str]
 Download = Callable[[str], bytes]
 Probe = Callable[[str], None]
 JsonObject = dict[str, Any]
+FetchJson = Callable[[str], object]
+# Aggregate disk-retention totals the main UI publishes in the inventory
+# summary (#400). Only these integers are read or recorded; no identifier from
+# the inventory payload reaches the receipt or the output.
+RETENTION_KEYS = (
+    "source_disk_count",
+    "rendered_unique_disk_count",
+    "duplicate_disk_view_count",
+    "unplaced_disk_count",
+)
+MAX_INVENTORY_BYTES = 64 * 1024 * 1024
 
 
 class DeploymentError(RuntimeError):
     """A bounded update, verification, or rollback failure."""
+
+
+class RetentionTotalsUnavailable(DeploymentError):
+    """The inventory answered normally but its summary has no retention totals."""
 
 
 @dataclass(frozen=True)
@@ -60,6 +75,7 @@ class DeploymentSpec:
     services: tuple[str, ...]
     health_urls: tuple[str, ...]
     replace_compose: bool = False
+    inventory_url: str | None = None
 
 
 def _sha256(data: bytes) -> str:
@@ -270,6 +286,60 @@ def _default_probe(url: str) -> None:
     raise DeploymentError(f"health probe did not converge: {url}") from last_error
 
 
+def _default_fetch_json(url: str) -> object:
+    class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args: object, **kwargs: object) -> None:
+            return None
+
+    opener = urllib.request.build_opener(NoRedirectHandler())
+    try:
+        with opener.open(url, timeout=120) as response:
+            if response.geturl() != url or not 200 <= response.status < 300:
+                raise DeploymentError("inventory response was redirected or unsuccessful")
+            data = response.read(MAX_INVENTORY_BYTES + 1)
+    except OSError as exc:
+        raise DeploymentError("inventory retention check could not read the inventory") from exc
+    if len(data) > MAX_INVENTORY_BYTES:
+        raise DeploymentError("inventory response exceeds the retention check size limit")
+    try:
+        return json.loads(data)
+    except ValueError as exc:
+        raise DeploymentError("inventory response is not JSON") from exc
+
+
+def _retention_totals(fetch_json: FetchJson, url: str) -> dict[str, int]:
+    """Read only the aggregate retention integers from one inventory response."""
+    payload = fetch_json(url)
+    summary = payload.get("summary") if isinstance(payload, dict) else None
+    if not isinstance(summary, dict):
+        raise DeploymentError("inventory response has no summary")
+    totals: dict[str, int] = {}
+    for key in RETENTION_KEYS:
+        value = summary.get(key)
+        if key not in summary:
+            raise RetentionTotalsUnavailable(f"inventory summary has no {key}; the image predates retention totals")
+        if type(value) is not int or value < 0:
+            raise DeploymentError(f"inventory summary {key} is not a non-negative integer")
+        totals[key] = value
+    return totals
+
+
+def _check_retention(before: dict[str, int] | None, after: dict[str, int]) -> None:
+    if after["unplaced_disk_count"] != 0:
+        raise DeploymentError(
+            f"disk retention check failed: {after['unplaced_disk_count']} of "
+            f"{after['source_disk_count']} source disks are not represented in the rendered inventory"
+        )
+    # rendered_unique_disk_count may be lower than source_disk_count: equivalent
+    # multipath records collapse into one logical disk. unplaced_disk_count is
+    # the identity-based answer to "was every source record represented".
+    if before is not None and after["source_disk_count"] < before["source_disk_count"]:
+        raise DeploymentError(
+            f"disk retention check failed: source disks fell from {before['source_disk_count']} "
+            f"to {after['source_disk_count']} across the update"
+        )
+
+
 def _validate_name(value: str, *, label: str, pattern: re.Pattern[str] = NAME_PATTERN) -> None:
     if not pattern.fullmatch(value):
         raise DeploymentError(f"invalid {label}: {value!r}")
@@ -320,6 +390,8 @@ def _validate_spec(spec: DeploymentSpec) -> Path:
         raise DeploymentError("services must be unique")
     for url in spec.health_urls:
         _validate_health_url(url)
+    if spec.inventory_url is not None:
+        _validate_health_url(spec.inventory_url, label="inventory URL")
     env_path = root / ".env"
     if env_path.is_symlink() or not env_path.is_file():
         raise DeploymentError(".env must be a regular non-symlink file")
@@ -478,6 +550,11 @@ def _receipt_payload(
         "hashes": hashes,
         "modes": modes,
         "result": None,
+        **(
+            {"retention": {"inventory_url": spec.inventory_url, "before": None, "after": None}}
+            if spec.inventory_url is not None
+            else {}
+        ),
     }
 
 
@@ -532,6 +609,22 @@ def _prepare_receipt(
         raise
 
 
+def _validate_retention_record(record: object) -> None:
+    if not isinstance(record, dict) or set(record) != {"inventory_url", "before", "after"}:
+        raise DeploymentError("receipt retention record is invalid")
+    if not isinstance(record["inventory_url"], str):
+        raise DeploymentError("receipt retention inventory URL is invalid")
+    _validate_health_url(record["inventory_url"], label="receipt retention inventory URL")
+    for side in ("before", "after"):
+        totals = record[side]
+        if totals is None:
+            continue
+        if not isinstance(totals, dict) or set(totals) != set(RETENTION_KEYS) or not all(
+            type(value) is int and value >= 0 for value in totals.values()
+        ):
+            raise DeploymentError(f"receipt retention {side} totals are invalid")
+
+
 def _validate_receipt_shape(receipt: object) -> JsonObject:
     if not isinstance(receipt, dict):
         raise DeploymentError("receipt must be a JSON object")
@@ -557,6 +650,10 @@ def _validate_receipt_shape(receipt: object) -> JsonObject:
         expected_keys.add("replace_compose")
         if type(receipt["replace_compose"]) is not bool:
             raise DeploymentError("receipt replace_compose must be boolean")
+    # Receipts written without --inventory-url carry no retention record.
+    if "retention" in receipt:
+        expected_keys.add("retention")
+        _validate_retention_record(receipt["retention"])
     if set(receipt) != expected_keys:
         raise DeploymentError("receipt key set does not match the schema")
     if type(receipt["schema"]) is not int or receipt["schema"] != RECEIPT_SCHEMA:
@@ -869,12 +966,23 @@ def update_deployment(
     run: RunCommand = _default_run,
     download: Download = _default_download,
     probe: Probe = _default_probe,
+    fetch_json: FetchJson = _default_fetch_json,
 ) -> JsonObject:
     root = _validate_spec(spec)
     receipt_dir = root / RECEIPT_DIR_NAME
     if receipt_dir.exists() or receipt_dir.is_symlink():
         raise DeploymentError("deployment receipt already exists; archive it before another update")
     previous_image, previous_services = _capture_previous_runtime(spec, root, run)
+    retention_before: dict[str, int] | None = None
+    if spec.inventory_url is not None:
+        # Only a predecessor that answers normally but predates the totals may
+        # skip the baseline; any failure to read the inventory stops here,
+        # before anything changes. The candidate is always held to zero
+        # unplaced disks.
+        try:
+            retention_before = _retention_totals(fetch_json, spec.inventory_url)
+        except RetentionTotalsUnavailable:
+            retention_before = None
     run(["docker", "pull", spec.candidate_tag], cwd=root)
     candidate_digest = _resolve_digest(run, root, spec.candidate_tag)
     if candidate_digest != spec.expected_image:
@@ -941,9 +1049,17 @@ def update_deployment(
         run([*prefix, "pull", *spec.services], cwd=root)
         run([*prefix, "up", "-d", *spec.services], cwd=root)
         result = _verify_runtime(root, receipt, spec.expected_image, run=run, probe=probe)
+        if spec.inventory_url is not None:
+            retention_after = _retention_totals(fetch_json, spec.inventory_url)
+            receipt["retention"]["before"] = retention_before
+            receipt["retention"]["after"] = retention_after
+            _write_receipt(receipt_dir, receipt)
+            _check_retention(retention_before, retention_after)
         receipt["status"] = "active"
         receipt["result"] = result
         _write_receipt(receipt_dir, receipt)
+        if spec.inventory_url is not None:
+            return {"status": "active", **result, "retention": receipt["retention"]}
         return {"status": "active", **result}
     except BaseException as activation_error:
         try:
@@ -1000,6 +1116,13 @@ def _build_parser() -> argparse.ArgumentParser:
     update.add_argument("--profile", action="append", default=[])
     update.add_argument("--service", action="append", required=True)
     update.add_argument("--health-url", action="append", required=True)
+    update.add_argument(
+        "--inventory-url",
+        help=(
+            "loopback main-UI /api/inventory URL; when given, activation also requires every "
+            "source disk to be represented (aggregate totals only) or rolls back"
+        ),
+    )
     for action in ("verify", "rollback"):
         command = subparsers.add_parser(action)
         command.add_argument("root", type=Path)
@@ -1023,6 +1146,7 @@ def main(argv: list[str] | None = None) -> int:
                     services=tuple(args.service),
                     health_urls=tuple(args.health_url),
                     replace_compose=args.replace_compose,
+                    inventory_url=args.inventory_url,
                 )
             )
         elif args.action == "verify":

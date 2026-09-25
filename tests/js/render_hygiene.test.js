@@ -291,6 +291,8 @@ test("timing tick skips DOM work while the document is hidden", () => {
     renderTimingSurfaces() {
       renders += 1;
     },
+    timingTickNeeded: () => true,
+    stopTimingTick() {},
   });
 
   fns.timingTick();
@@ -413,7 +415,7 @@ function createFakeSelectDocument() {
 
 function enclosureOptionsHtml(aliasLabel) {
   return [
-    '<optgroup label="Live Enclosures">',
+    '<optgroup label="Enclosures">',
     '<option value="enclosure:enc-a">Shelf A</option>',
     `<option value="enclosure:enc-b">${aliasLabel}</option>`,
     "</optgroup>",
@@ -458,7 +460,7 @@ test("an option group relabel is not mistaken for an unchanged option list", () 
   const ownerDocument = createFakeSelectDocument();
   const select = createFakeSelect(ownerDocument);
   select.innerHTML = [
-    '<optgroup label="Saved Chassis Views">',
+    '<optgroup label="Saved layouts">',
     '<option value="view:view-a">Rack row</option>',
     "</optgroup>",
   ].join("");
@@ -468,7 +470,7 @@ test("an option group relabel is not mistaken for an unchanged option list", () 
     fns.setSelectOptionsIfChanged(
       select,
       [
-        '<optgroup label="Virtual Storage Views">',
+        '<optgroup label="Other disk groups">',
         '<option value="view:view-a">Rack row</option>',
         "</optgroup>",
       ].join(""),
@@ -476,5 +478,80 @@ test("an option group relabel is not mistaken for an unchanged option list", () 
     ),
     true,
   );
-  assert.equal(select.options[0].parentNode.label, "Virtual Storage Views");
+  assert.equal(select.options[0].parentNode.label, "Other disk groups");
+});
+
+// #461: the 1 Hz timing tick only runs while something counts down.
+test("the timing tick starts only for a live countdown and stops when it ends", () => {
+  const intervals = [];
+  const state = {
+    snapshotMode: false,
+    autoRefresh: true,
+    timerDueAt: 0,
+    timerDelayMs: 0,
+    timingTickId: null,
+    timingVisibilityListenerBound: false,
+    uiPerf: { enabled: false },
+  };
+  let listeners = 0;
+  const windowStub = {
+    setInterval(fn) { intervals.push(fn); return intervals.length; },
+    clearInterval(id) { intervals[id - 1] = null; },
+  };
+  const { fns } = loadFunctions(APP_SOURCE, ["timingTickNeeded", "stopTimingTick", "timingTick", "ensureTimingTick"], {
+    state,
+    window: windowStub,
+    document: { hidden: false, addEventListener() { listeners += 1; } },
+    renderTimingSurfaces() {},
+    handleAutoRefreshVisibilityChange() {},
+  });
+
+  fns.ensureTimingTick();
+  assert.equal(state.timingTickId, null, "nothing counts down, so no interval");
+  assert.equal(listeners, 1, "the visibility listener is still bound once");
+
+  state.timerDueAt = 5000;
+  state.timerDelayMs = 5000;
+  fns.ensureTimingTick();
+  fns.ensureTimingTick();
+  assert.equal(state.timingTickId, 1, "one interval while the auto refresh counts down");
+  assert.equal(listeners, 1);
+
+  state.timerDueAt = 0;
+  fns.timingTick();
+  assert.equal(state.timingTickId, null, "the tick stops itself once the countdown ends");
+  assert.equal(intervals[0], null);
+
+  state.uiPerf.enabled = true;
+  fns.ensureTimingTick();
+  assert.ok(state.timingTickId, "UI Timing cache chips keep the tick alive");
+
+  state.snapshotMode = true;
+  assert.equal(fns.timingTickNeeded(), false, "saved copies never tick");
+});
+
+test("grid renders commit through a staging container and reuse tiles", () => {
+  const renderGrid = APP_SOURCE.slice(APP_SOURCE.indexOf("  function renderGrid() {"), APP_SOURCE.indexOf("  function kvRow("));
+  assert.match(renderGrid, /commitGridRender\(staging\)/);
+  assert.doesNotMatch(renderGrid, /grid\.innerHTML = ""/, "the live grid is no longer cleared before a render");
+  for (const name of ["renderStorageViewGrid", "renderLiveNvmeCarrierGrid"]) {
+    const start = APP_SOURCE.indexOf(`  function ${name}(`);
+    const body = APP_SOURCE.slice(start, APP_SOURCE.indexOf("\n  function ", start + 10));
+    assert.doesNotMatch(body, /\bgrid\.(innerHTML|appendChild)/, `${name} writes into its target`);
+  }
+});
+
+test("a reused hovered tile gets its tooltip back after a render", () => {
+  const refreshed = [];
+  const tile = { dataset: { slot: "7" }, matches: (selector) => selector === ":hover" };
+  const { fns } = loadFunctions(APP_SOURCE, ["restoreReusedTileTooltip"], {
+    state: { hoveredSlot: 7 },
+    grid: { querySelectorAll: () => [tile] },
+    document: { activeElement: null },
+    refreshHoveredTooltip(anchor) { refreshed.push(anchor); },
+  });
+  fns.restoreReusedTileTooltip("patched");
+  fns.restoreReusedTileTooltip("unchanged");
+  fns.restoreReusedTileTooltip("replaced");
+  assert.deepEqual(refreshed, [tile, tile], "replaced grids keep the old hide-on-rebuild behaviour");
 });

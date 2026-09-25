@@ -617,6 +617,48 @@ jobs:
               raise AssertionError("UI identity read the backup-only passphrase")
           PY
 
+  image-upgrade-smoke:
+    name: Image-only upgrade smoke
+    needs: route
+    if: needs.route.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # The public v0.22.2 release image, pinned by digest (#399, #463).
+      PREVIOUS_IMAGE: ghcr.io/gcs8/truenas-jbod-ui@sha256:4bfa37a4c40a058055aef384194f98248722eca25f7fb429d6a5a34446d647a7
+      PREVIOUS_VERSION: "0.22.2"
+      CANDIDATE_IMAGE: localhost:5000/truenas-jbod-ui:ci
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      # `docker compose pull` is part of the published update procedure, so
+      # the candidate build is served from a throwaway local registry instead
+      # of being special-cased.
+      - name: Build this commit and publish it to a local registry
+        run: |
+          set -euo pipefail
+          docker run -d --name upgrade-smoke-registry -p 127.0.0.1:5000:5000 \
+            registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+          docker build --build-arg SOURCE_COMMIT="$GITHUB_SHA" -t "$CANDIDATE_IMAGE" .
+          docker push "$CANDIDATE_IMAGE"
+          docker image rm "$CANDIDATE_IMAGE"
+
+      - name: Upgrade v0.22.2 by image pin only, then roll back
+        run: |
+          set -euo pipefail
+          python3 scripts/run_image_upgrade_smoke.py \
+            --root "$RUNNER_TEMP/image-upgrade-smoke" \
+            --compose-fixture tests/fixtures/compose/v0.22.2.yml \
+            --config-fixture tests/fixtures/ci-smoke-config.yaml \
+            --previous-image "$PREVIOUS_IMAGE" \
+            --previous-version "$PREVIOUS_VERSION" \
+            --candidate-image "$CANDIDATE_IMAGE" \
+            --candidate-version "$(python3 -c 'import app; print(app.__version__)')" \
+            --candidate-revision "$GITHUB_SHA"
+
   admin-browser-cleanroom:
     name: Admin clean-room browser QA
     needs: route
@@ -775,6 +817,29 @@ jobs:
           # The JS tests that assert generated-demo behaviour skip without an
           # artifact; run the whole unit suite once more with this build.
           node --test tests/js/*.test.js
+          status="$(git status --short)"
+          if [ -n "$status" ]; then
+            printf '%s\n' "$status"
+            exit 1
+          fi
+
+      # These specs build their own synthetic fixtures (a stub page, an
+      # offline snapshot, or a local app server on a temporary data dir) and
+      # need no appliance, so they run on every pull request. The live
+      # appliance specs (ui-switching, esxi-smoke) and the private restore spec
+      # stay manual (#445).
+      - name: Run fixture-only browser specs
+        env:
+          PLAYWRIGHT_BROWSER_CHANNEL: chrome
+          PYTHON: python
+        run: |
+          set -euo pipefail
+          npx playwright test \
+            qa/offline-snapshot.spec.js \
+            qa/saved-view-selection.spec.js \
+            qa/ui-scope-safety.spec.js \
+            qa/upgrade-notice.spec.js \
+            --retries=0
           status="$(git status --short)"
           if [ -n "$status" ]; then
             printf '%s\n' "$status"

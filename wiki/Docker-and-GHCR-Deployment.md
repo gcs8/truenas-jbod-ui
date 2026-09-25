@@ -361,7 +361,7 @@ reason to expose it. A tunnel or reverse proxy needs no configuration change.
 Binding the sidecar off loopback is not a single setting. The history service
 refuses to start on a non-loopback address unless refresh requests are
 authenticated by token and one exact browser origin is configured, and it says
-so on stdout: `Non-loopback history exposure requires refresh token mode.`
+so on stdout: `Configuration error: HISTORY_BIND_ADDRESS is not loopback.` followed by the variables to set.
 Set all four values in `.env` together, then recreate the service:
 
 ```dotenv

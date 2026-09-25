@@ -246,6 +246,7 @@ class ScheduledBackupRunner:
         app_gid: int,
         clock: Callable[[], datetime] | None = None,
         apply_retention: bool = True,
+        archive_format: str = "7z",
     ) -> None:
         self.backup_service = backup_service
         self.destination_dir = Path(destination_dir)
@@ -258,6 +259,7 @@ class ScheduledBackupRunner:
         # The backup scheduler sidecar grooms through the artifact catalog and
         # lifecycle manager instead, so it turns the filename-pattern pruning off.
         self.apply_retention = bool(apply_retention)
+        self.archive_format = archive_format
         self.last_manifest: dict[str, Any] | None = None
 
     def _now(self) -> datetime:
@@ -650,9 +652,13 @@ class ScheduledBackupRunner:
                 if scope_changed:
                     self._write_status(status)
                 passphrase = self._read_passphrase()
+                export_options: dict[str, Any] = {}
+                if self.archive_format != "7z":
+                    export_options["archive_format"] = self.archive_format
                 artifact = self.backup_service.export_scheduled_bundle_to_file(
                     passphrase=passphrase,
                     included_paths=list(self.included_groups),
+                    **export_options,
                 )
                 archive_suffix = ".7z" if artifact.filename.endswith(".7z") else _ARCHIVE_SUFFIX
                 filename = (

@@ -70,14 +70,9 @@ class HistoryEnvDocumentationDriftTests(unittest.TestCase):
     # passes to the `enclosure-history` service, so a value set in `.env` has
     # no effect on the sidecar. Wiring one of these in Compose is a fix, not a
     # reason to extend this set (#TBD).
-    UNWIRED_SIDECAR_KEYS = frozenset(
-        {
-            "RELEASE_CHECK_ENABLED",
-            "RELEASE_CHECK_REPO",
-            "RELEASE_CHECK_INTERVAL_SECONDS",
-            "RELEASE_CHECK_TIMEOUT_SECONDS",
-        }
-    )
+    # Every documented history key reaches the sidecar. RELEASE_CHECK_* used to
+    # be unwired, so RELEASE_CHECK_ENABLED=false still let history call GitHub.
+    UNWIRED_SIDECAR_KEYS: frozenset[str] = frozenset()
     LOOPBACK_VALUES = ("127.0.0.1", "::1", "localhost")
 
     def env_example(self) -> str:
@@ -107,9 +102,26 @@ class HistoryEnvDocumentationDriftTests(unittest.TestCase):
 
         self.assertEqual(unwired, set(self.UNWIRED_SIDECAR_KEYS))
         example = self.env_example()
-        self.assertIn("does not reach the history sidecar", example)
-        for key in sorted(self.UNWIRED_SIDECAR_KEYS):
-            self.assertIn(key, example, key)
+        self.assertNotIn("does not reach the history sidecar", example)
+        self.assertIn("applies to the history sidecar too", example)
+        for key in ("RELEASE_CHECK_ENABLED", "RELEASE_CHECK_REPO", "RELEASE_CHECK_INTERVAL_SECONDS",
+                    "RELEASE_CHECK_TIMEOUT_SECONDS"):
+            self.assertIn(f"{key}: ${{{key}:-", self.history_environment_block(), key)
+
+    def test_release_check_settings_reach_ui_admin_and_history_from_one_source(self) -> None:
+        import yaml
+
+        keys = ("RELEASE_CHECK_ENABLED", "RELEASE_CHECK_REPO", "RELEASE_CHECK_INTERVAL_SECONDS",
+                "RELEASE_CHECK_TIMEOUT_SECONDS")
+        for compose_name in ("docker-compose.yml", "docker-compose.dev.yml"):
+            services = yaml.safe_load((ROOT / compose_name).read_text(encoding="utf-8"))["services"]
+            for service in ("enclosure-ui", "enclosure-admin", "enclosure-history"):
+                environment = services[service]["environment"]
+                for key in keys:
+                    with self.subTest(compose=compose_name, service=service, key=key):
+                        # Every service interpolates the same variable, so --env-file
+                        # or a shell export cannot split the release-check policy.
+                        self.assertTrue(str(environment.get(key, "")).startswith(f"${{{key}:-"))
 
     def test_example_says_compose_derives_the_published_bind_address(self) -> None:
         example = self.env_example()

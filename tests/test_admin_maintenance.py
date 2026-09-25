@@ -97,6 +97,21 @@ def build_service(runtime: FakeRuntimeService, backup: FakeBackupService) -> Adm
     return AdminMaintenanceService(backup, runtime, clean_backup_targets=("ui", "history"))
 
 
+def quiesced_import(
+    service: AdminMaintenanceService,
+    content: bytes,
+    *,
+    stop_services: bool = False,
+    restart_services: bool = True,
+) -> tuple[Any, Any]:
+    """Run the fake import inside the real quiesce/restart harness."""
+    return service._run_with_quiesced_services(
+        lambda _stopped: service.backup_service.import_bundle(content),
+        stop_services=stop_services,
+        restart_services=restart_services,
+    )
+
+
 class MaintenanceQuiesceTests(unittest.TestCase):
     def test_archive_snapshot_closes_descriptor_when_workspace_creation_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -252,7 +267,7 @@ class MaintenanceQuiesceTests(unittest.TestCase):
         runtime = UnobservedStartRuntime(["ui", "history"])
         backup = FakeBackupService()
 
-        _result, outcome = build_service(runtime, backup).import_bundle(
+        _result, outcome = quiesced_import(build_service(runtime, backup),
             b"bundle",
             stop_services=True,
         )
@@ -269,7 +284,7 @@ class MaintenanceQuiesceTests(unittest.TestCase):
         runtime = EffectThenErrorRuntime(["ui", "history"])
         backup = FakeBackupService()
 
-        _result, outcome = build_service(runtime, backup).import_bundle(
+        _result, outcome = quiesced_import(build_service(runtime, backup),
             b"bundle",
             stop_services=True,
         )
@@ -302,7 +317,7 @@ class MaintenanceQuiesceTests(unittest.TestCase):
         runtime = AmbiguousRuntime()
 
         with self.assertRaises(MaintenanceStopError) as raised:
-            build_service(runtime, FakeBackupService()).import_bundle(
+            quiesced_import(build_service(runtime, FakeBackupService()),
                 b"bundle",
                 stop_services=True,
             )
@@ -321,7 +336,7 @@ class MaintenanceQuiesceTests(unittest.TestCase):
         )
 
         with self.assertRaises(MaintenanceStopError) as raised:
-            build_service(runtime, FakeBackupService()).import_bundle(
+            quiesced_import(build_service(runtime, FakeBackupService()),
                 b"bundle",
                 stop_services=True,
             )
@@ -335,7 +350,7 @@ class MaintenanceQuiesceTests(unittest.TestCase):
         runtime = FakeRuntimeService(["ui", "history", "admin"])
         backup = FakeBackupService()
 
-        result, outcome = build_service(runtime, backup).import_bundle(b"bundle", stop_services=True)
+        result, outcome = quiesced_import(build_service(runtime, backup), b"bundle", stop_services=True)
 
         self.assertEqual(result, {"ok": True})
         self.assertEqual(outcome.stopped_containers, ["ui", "history"])
@@ -349,7 +364,7 @@ class MaintenanceQuiesceTests(unittest.TestCase):
         backup = FakeBackupService()
 
         with self.assertRaises(MaintenanceStopError) as raised:
-            build_service(runtime, backup).import_bundle(b"bundle", stop_services=True)
+            quiesced_import(build_service(runtime, backup), b"bundle", stop_services=True)
 
         self.assertEqual(backup.import_calls, 0, "import must not run against a partially quiesced stack")
         self.assertIsInstance(raised.exception, DockerRuntimeError)
@@ -384,7 +399,7 @@ class MaintenanceQuiesceTests(unittest.TestCase):
         runtime = FakeRuntimeService(["ui", "history"], stop_failures={"history": "boom"})
 
         with self.assertRaises(MaintenanceStopError) as raised:
-            build_service(runtime, FakeBackupService()).import_bundle(
+            quiesced_import(build_service(runtime, FakeBackupService()),
                 b"bundle", stop_services=True, restart_services=False
             )
 
@@ -396,7 +411,7 @@ class MaintenanceQuiesceTests(unittest.TestCase):
         runtime = FakeRuntimeService(["ui", "history"], start_failures={"ui": "HTTP 500: cannot start"})
         backup = FakeBackupService()
 
-        result, outcome = build_service(runtime, backup).import_bundle(b"bundle", stop_services=True)
+        result, outcome = quiesced_import(build_service(runtime, backup), b"bundle", stop_services=True)
 
         self.assertEqual(result, {"ok": True})
         self.assertEqual(outcome.stopped_containers, ["ui", "history"])
@@ -410,7 +425,7 @@ class MaintenanceQuiesceTests(unittest.TestCase):
         backup = FakeBackupService(fail=ValueError("Bundle manifest is invalid."))
 
         with self.assertRaises(MaintenanceOperationError) as raised:
-            build_service(runtime, backup).import_bundle(b"bundle", stop_services=True)
+            quiesced_import(build_service(runtime, backup), b"bundle", stop_services=True)
 
         self.assertEqual(runtime.calls, [("stop", "ui"), ("stop", "history"), ("start", "ui"), ("start", "history")])
         self.assertEqual(runtime.running, ["history"])

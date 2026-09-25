@@ -15,6 +15,7 @@ supplies the policy; environment variables override single values (and
       full:                      # config + history database on a cron schedule
         enabled: false
         schedule: "0 3 * * *"
+        archive_format: 7z       # or tar.zst: much faster, needs this app version to restore
         local_keep: 7
         remote_keep: null
         remote_max_age_days: 90
@@ -42,7 +43,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
@@ -64,6 +65,7 @@ ENV_POLICY_OVERRIDES: dict[str, tuple[str, str]] = {
     "BACKUP_CONFIG_REMOTE_MAX_AGE_DAYS": ("config", "remote_max_age_days"),
     "BACKUP_FULL_ENABLED": ("full", "enabled"),
     "BACKUP_FULL_SCHEDULE": ("full", "schedule"),
+    "BACKUP_FULL_ARCHIVE_FORMAT": ("full", "archive_format"),
     "BACKUP_FULL_LOCAL_KEEP": ("full", "local_keep"),
     "BACKUP_FULL_REMOTE_KEEP": ("full", "remote_keep"),
     "BACKUP_FULL_REMOTE_MAX_AGE_DAYS": ("full", "remote_max_age_days"),
@@ -104,6 +106,9 @@ class ConfigClassPolicy(_ClassPolicyBase):
 
 class FullClassPolicy(_ClassPolicyBase):
     schedule: str = "0 3 * * *"
+    # 7z stays the default: older app versions cannot read tar.zst full backups
+    # (#397). tar.zst is much faster for multi-GiB history.
+    archive_format: Literal["7z", "tar.zst"] = "7z"
 
     @field_validator("schedule")
     @classmethod
@@ -198,7 +203,22 @@ def load_backup_policy(
 
     env = os.environ if environ is None else environ
     path = Path(config_path or env.get("APP_CONFIG_PATH") or "/app/config/config.yaml")
-    section = _read_backups_section(path)
+    return policy_from_section(_read_backups_section(path), source=str(path), environ=env)
+
+
+def policy_from_section(
+    section: Mapping[str, Any],
+    *,
+    source: str,
+    environ: Mapping[str, str],
+) -> BackupPolicy:
+    """Validate one ``backups`` mapping (plus environment overrides) into a policy.
+
+    ``source`` names where the mapping came from in problem sentences.
+    """
+
+    env = environ
+    path = source
     document: dict[str, Any] = {
         "config": dict(section.get("config") or {}) if isinstance(section.get("config", {}), dict) else section.get("config"),
         "full": dict(section.get("full") or {}) if isinstance(section.get("full", {}), dict) else section.get("full"),
@@ -233,7 +253,7 @@ def load_backup_policy(
     try:
         parsed = _PolicyDocument.model_validate(document)
     except ValidationError as exc:
-        problems = describe_validation_error(exc, resolve_location=resolve, default_source=str(path))
+        problems = describe_validation_error(exc, resolve_location=resolve, default_source=path)
         raise ConfigurationError(problems) from None
     targets = _parse_targets(parsed.targets, targets_source)
     return BackupPolicy(config=parsed.config, full=parsed.full, targets=targets)
@@ -285,4 +305,5 @@ __all__ = [
     "FullClassPolicy",
     "config_backups_enabled_from_environment",
     "load_backup_policy",
+    "policy_from_section",
 ]

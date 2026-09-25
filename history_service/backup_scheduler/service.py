@@ -383,6 +383,7 @@ class BackupScheduler:
             app_gid=self.app_gid,
             clock=self._clock,
             apply_retention=False,
+            archive_format=self.policy.full.archive_format if backup_class == "full" else "7z",
         )
 
     def _run_class(self, backup_class: str, change_ids: tuple[str, ...]) -> ArtifactRecord:
