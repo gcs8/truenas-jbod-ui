@@ -1121,8 +1121,8 @@ class InventoryService:
         )
         sg_ses_limit = now + timedelta(seconds=max(0, int(self.settings.app.sg_ses_device_cache_ttl_seconds)))
         self._sg_ses_device_cache = {
-            host: (list(devices), min(until, sg_ses_limit))
-            for host, (devices, until) in previous._sg_ses_device_cache.items()
+            target: (list(devices), min(until, sg_ses_limit))
+            for target, (devices, until) in previous._sg_ses_device_cache.items()
             if min(until, sg_ses_limit) > now
         }
         self._scale_preferred_ses_host = previous._scale_preferred_ses_host
