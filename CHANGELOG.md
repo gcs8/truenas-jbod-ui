@@ -414,6 +414,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Performance
 
+- Storage views collect SMART data for history in batches of
+  `HISTORY_SMART_BATCH_SIZE` slots through a new
+  `POST /api/storage-views/{view_id}/slots/smart-batch` route, so a 60-slot
+  view takes three requests per pass instead of 60. A main UI without the
+  route still gets per-slot requests. (#PRNUM)
 - Offline exports embed a card photo only when a view or enclosure can draw
   it, and read the static files once per export instead of once per
   downsampling pass. (#493)

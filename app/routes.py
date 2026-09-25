@@ -898,6 +898,60 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             ) from exc
         return SmartBatchResponse(summaries=summaries, layout_bounds=layout_bounds)
 
+    @router.post("/api/storage-views/{view_id}/slots/smart-batch", response_model=SmartBatchResponse)
+    async def get_storage_view_slot_smart_summaries(
+        view_id: str,
+        payload: SmartBatchRequest,
+        system_id: str | None = None,
+        enclosure_id: str | None = None,
+        fresh: bool = False,
+    ) -> SmartBatchResponse:
+        # #457: the storage-view twin of /api/slots/smart-batch, so the history
+        # collector asks for a view in chunks instead of one request per slot.
+        # Slots are storage-view slot indexes; unknown ones are skipped, and
+        # failures map to the same statuses as the enclosure batch.
+        service = route_service(
+            system_id,
+            storage_view_id=view_id,
+            enclosure_id=enclosure_id,
+            slot_count=len(payload.slots),
+            smart_batch_max_concurrency=payload.max_concurrency,
+        )
+        try:
+            summaries = await service.get_storage_view_slot_smart_summaries(
+                view_id,
+                payload.slots,
+                selected_enclosure_id=enclosure_id,
+                max_concurrency=payload.max_concurrency,
+                allow_stale_cache=not fresh,
+                bypass_negative_cache=fresh,
+            )
+        except TrueNASAPIError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except TlsTrustConfigurationError as exc:
+            logger.error(
+                "Storage-view SMART batch could not load the TLS CA bundle for view %s: %s",
+                view_id,
+                exc,
+                exc_info=exc,
+            )
+            raise HTTPException(status_code=500, detail=SMART_BATCH_TLS_TRUST_DETAIL) from exc
+        except (OSError, ConnectionClosed) as exc:
+            if not _is_smart_batch_transport_failure(exc):
+                logger.error(
+                    "Storage-view SMART batch could not write the slot-detail cache for "
+                    "view %s; the data directory is not usable: %s",
+                    view_id,
+                    exc,
+                    exc_info=exc,
+                )
+                raise HTTPException(status_code=500, detail=SMART_BATCH_LOCAL_STORAGE_DETAIL) from exc
+            raise HTTPException(
+                status_code=503,
+                detail="SMART data is temporarily unavailable for this storage view.",
+            ) from exc
+        return SmartBatchResponse(summaries=summaries)
+
     @router.get("/api/history/status")
     async def get_history_status() -> JSONResponse:
         history_backend = get_history_backend()
