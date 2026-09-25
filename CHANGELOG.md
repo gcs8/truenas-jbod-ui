@@ -406,6 +406,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Performance
 
+- The main page no longer waits for the admin health probe once it has an
+  answer: an expired answer is shown at once and refreshed in the
+  background, and startup probes admin before the first page load. (#598)
 - Offline exports embed a card photo only when a view or enclosure can draw
   it, and read the static files once per export instead of once per
   downsampling pass. (#493)
