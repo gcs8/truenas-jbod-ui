@@ -176,9 +176,16 @@ class PublicDocsContractTests(unittest.TestCase):
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
         browser_qa = (ROOT / "qa/admin-operations.spec.js").read_text(encoding="utf-8")
 
-        self.assertNotIn("`app.host`, `app.port`", advanced)
-        self.assertNotIn("Only bind address, port, public origin", changelog)
-        self.assertNotIn('restart_settings: ["app.port"]', browser_qa)
+        restart_table = advanced.split("A few settings are only read", 1)[1].split("When you change one", 1)[0]
+        reload_entry = changelog.split("- The main UI applies edits", 1)[1].split("(#614)", 1)[0]
+
+        self.assertNotRegex(restart_table, r"\bapp\.(?:host|port)\b")
+        self.assertNotRegex(reload_entry.lower(), r"\b(?:bind address|port)\b")
+        self.assertNotRegex(
+            browser_qa,
+            r'restart_settings:\s*\[[^\]]*"app\.(?:host|port)"',
+        )
+        self.assertIn("`app.public_origin`", restart_table)
         self.assertIn('restart_settings: ["app.public_origin"]', browser_qa)
 
     def test_all_yaml_examples_parse(self) -> None:
