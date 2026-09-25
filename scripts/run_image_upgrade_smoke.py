@@ -17,11 +17,13 @@ commands.
   ownership commands documented in ``wiki/Troubleshooting.md``. The same
   upgrade and rollback, with the services running as uid 10001 throughout.
 * ``interrupted-migration``: the new release's history container is killed
-  (``docker kill``) while its own startup is paused inside each history
-  migration step, reusing the per-step seams of
-  ``tests/test_history_released_schema_upgrades.py``. The next ordinary
-  ``docker compose up -d`` must finish the migration with no data lost and the
-  same end state as an uninterrupted upgrade.
+  (``docker kill``) while its own startup is paused inside each schema-
+  initialization step, reusing the per-step seams of
+  ``tests/test_history_released_schema_upgrades.py``. The v0.22.2 database is
+  already at the candidate schema version, so this proves interruption-safe,
+  idempotent startup compatibility, not a schema transition. The next ordinary
+  ``docker compose up -d`` must preserve the same end state as an uninterrupted
+  start.
 * ``segmented-catalog``: v0.22.2 creates and reads a real segmented catalog,
   then its exact generation, catalog bytes and referenced segment bytes must
   survive the image-only upgrade and rollback while both releases read the
@@ -71,11 +73,12 @@ HARDENED_OWNERSHIP_PREP = (
     'sudo install -d -o "$backup_uid" -g "$app_gid" -m 2750 ./backup-status',
 )
 
-# HistoryStore startup migration steps, in order. These are the seams the
-# released-schema kill tests use (#603, KILL_PHASES there). A v0.22.2 database
-# is already stamped user_version 1, so the new release never enters the
-# batched identity backfill on it; `_backfill_disk_identity_batch` is the one
-# #603 phase that cannot be reached from v0.22.2 state and stays unit-tested.
+# HistoryStore schema-initialization steps, in order. These are migration-capable
+# seams used by the released-schema kill tests (#603, KILL_PHASES there), but a
+# v0.22.2 database is already stamped user_version 1, so the smoke reaches them
+# only as idempotent startup steps. The new release never enters the batched
+# identity backfill on it; `_backfill_disk_identity_batch` is the one #603 phase
+# that cannot be reached from v0.22.2 state and stays unit-tested.
 KILL_PHASES = (
     "_ensure_slot_state_columns",
     "_ensure_slot_event_columns",
@@ -320,8 +323,9 @@ print(json.dumps({
 }, sort_keys=True))
 """
 
-# Everything an interrupted migration must preserve or produce, read-only and
-# stdlib-only so it runs the same inside either release. PATH is replaced.
+# Everything an interrupted schema-initialization start must preserve or
+# produce, read-only and stdlib-only so it runs the same inside either release.
+# PATH is replaced.
 END_STATE = f"""
 import hashlib
 import json
@@ -356,8 +360,8 @@ HistoryStore(PATH)
 """ + END_STATE
 
 # Runs as the new release's history container. It pauses the service's own
-# startup (history_service.main opens and migrates the store at import) right
-# after one migration step, announces it, and waits to be killed.
+# startup (history_service.main opens and initializes the store at import) right
+# after one schema-initialization step, announces it, and waits to be killed.
 KILL_HOOK = """
 import signal
 from history_service.store import HistoryStore
@@ -487,6 +491,24 @@ def expect(condition: bool, message: str) -> None:
         raise SmokeError(message)
 
 
+def schema_evidence(predecessor: dict, candidate: dict) -> dict[str, str]:
+    """Describe schema admission without inventing a migration transition."""
+    for label, reading in (("predecessor", predecessor), ("candidate", candidate)):
+        expect(
+            reading["user_version"] == reading["current_schema"],
+            f"{label} schema is not current for its image: {reading}",
+        )
+    before = predecessor["user_version"]
+    after = candidate["user_version"]
+    transition = "none" if before == after else f"{before}->{after}"
+    return {
+        "compatibility": "ok",
+        "before": str(before),
+        "after": str(after),
+        "transition": transition,
+    }
+
+
 OWNED_PATHS = ("data", "history", "config", "data/slot_mappings.json", "history/history.db")
 
 
@@ -533,8 +555,7 @@ def upgrade_and_rollback(args: argparse.Namespace, *, hardened: bool) -> str:
     expect(after_ui["mappings"] == before_ui["mappings"], f"mappings changed across upgrade: {after_ui}")
     expect(after_history["counts"] == before_history["counts"], f"history rows changed across upgrade: {after_history}")
     expect(after_history["integrity"] == "ok", f"integrity_check after upgrade: {after_history['integrity']}")
-    expect(after_history["user_version"] == after_history["current_schema"],
-           f"history schema not migrated on startup: {after_history}")
+    schema = schema_evidence(before_history, after_history)
     expect(history_api_view((1, 2, 3)) == expected_history_view(seeded),
            "upgraded history API does not return the predecessor's records")
     expect(sha256(config_path) == config_digest, "config.yaml changed during the upgrade")
@@ -571,7 +592,9 @@ def upgrade_and_rollback(args: argparse.Namespace, *, hardened: bool) -> str:
         f"previous={args.previous_version} candidate={args.candidate_version} "
         f"revision={args.candidate_revision} services={','.join(sorted(upgraded))} restarts=0 uid={owner} "
         f"mappings={len(after_ui['mappings'])} history_rows={sum(after_history['counts'].values())} "
-        f"schema={after_history['user_version']} rollback_mappings={len(rolled_ui['mappings'])} "
+        f"schema_compatibility=ok schema_before={schema['before']} "
+        f"schema_after={schema['after']} schema_transition={schema['transition']} "
+        f"rollback_mappings={len(rolled_ui['mappings'])} "
         f"rollback_history_rows={sum(rolled_history['counts'].values())} history_api=ok"
     )
 
@@ -670,9 +693,9 @@ def kill_during_startup(deployment: Deployment, phase: str, name: str, timeout: 
     """Start the history service's own startup in a one-off service container, kill it at `phase`.
 
     `docker compose run` gives the same image, mounts, user and environment as
-    the service. The hook pauses the startup right after the named migration
-    step returns (no commit, no close), and `docker kill` sends SIGKILL there,
-    as a host crash or OOM kill would.
+    the service. The hook pauses the startup right after the named schema-
+    initialization step returns (no commit, no close), and `docker kill` sends
+    SIGKILL there, as a host crash or OOM kill would.
     """
     command = ["docker", "compose", *deployment.file_args(), "run", "--rm", "--no-deps", "-T",
                "--name", name, "enclosure-history", "python", "-"]
@@ -717,7 +740,7 @@ def kill_during_startup(deployment: Deployment, phase: str, name: str, timeout: 
 
 
 def interrupted_migration(args: argparse.Namespace) -> str:
-    """Kill the new release's history startup inside each migration step, then start it normally."""
+    """Kill candidate startup at each schema-initialization seam, then restart normally."""
     root = args.root.resolve()
     prepare_root(root, args.compose_fixture, args.config_fixture)
     deployment = Deployment(root)
@@ -741,10 +764,10 @@ def interrupted_migration(args: argparse.Namespace) -> str:
         end_state_script("/reference/history.db", UNINTERRUPTED_REFERENCE),
         extra=("-v", f"{reference_dir}:/reference"),
     )
-    expect(reference["integrity"] == "ok", f"uninterrupted reference upgrade failed: {reference}")
+    expect(reference["integrity"] == "ok", f"uninterrupted reference startup failed: {reference}")
 
-    # 4. Kill the new release's own startup inside every migration step, one
-    #    after another on the same database, as a crash loop would.
+    # 4. Kill the new release's own startup inside every schema-initialization
+    #    step, one after another on the same database, as a crash loop would.
     for index, phase in enumerate(KILL_PHASES):
         kill_during_startup(deployment, phase, f"upgrade-smoke-kill-{os.getpid()}-{index}")
 
@@ -753,10 +776,9 @@ def interrupted_migration(args: argparse.Namespace) -> str:
     check_runtime(deployment, args.candidate_image, args.candidate_version, args.candidate_revision)
     after = deployment.exec_python("enclosure-history", end_state_script(HISTORY_DB))
     after_history = deployment.exec_python("enclosure-history", READ_HISTORY)
-    expect(after["integrity"] == "ok", f"integrity_check after the interrupted upgrade: {after['integrity']}")
-    expect(after == reference, f"interrupted upgrade differs from an uninterrupted one: {after} != {reference}")
-    expect(after_history["user_version"] == after_history["current_schema"],
-           f"history schema not migrated after the interruptions: {after_history}")
+    expect(after["integrity"] == "ok", f"integrity_check after the interrupted startup: {after['integrity']}")
+    expect(after == reference, f"interrupted startup differs from an uninterrupted one: {after} != {reference}")
+    schema = schema_evidence(before_history, after_history)
     expect(after_history["counts"] == before_history["counts"], f"history rows lost: {after_history}")
     expect(history_api_view((1, 2, 3)) == expected_history_view(seeded),
            "history API does not return the predecessor's records after the interruptions")
@@ -765,9 +787,12 @@ def interrupted_migration(args: argparse.Namespace) -> str:
 
     return (
         f"{SUCCESS_PREFIX} scenario=interrupted-migration previous={args.previous_version} "
-        f"candidate={args.candidate_version} revision={args.candidate_revision} killed_steps={len(KILL_PHASES)} "
+        f"candidate={args.candidate_version} revision={args.candidate_revision} "
+        f"startup_steps_interrupted={len(KILL_PHASES)} "
         f"restarts=0 history_rows={sum(after_history['counts'].values())} integrity=ok "
-        f"schema={after_history['user_version']} matches_uninterrupted=true quarantined=0 history_api=ok"
+        f"schema_compatibility=ok schema_before={schema['before']} "
+        f"schema_after={schema['after']} schema_transition={schema['transition']} "
+        f"matches_uninterrupted=true quarantined=0 history_api=ok"
     )
 
 
