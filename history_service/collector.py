@@ -109,6 +109,12 @@ class HistoryCollectionStopping(RuntimeError):
     pass
 
 
+def _is_missing_route(exc: HistorySourceError) -> bool:
+    """True when the main UI answered that it has no such route (an older build)."""
+
+    return exc.kind == "source_rejected" and exc.status_code in {404, 405}
+
+
 class HistoryCollector:
     def __init__(self, settings: HistorySettings, store: HistoryStore) -> None:
         self.settings = settings
@@ -1842,6 +1848,21 @@ class HistoryCollector:
         storage_view_id = normalize_text(scope.snapshot.get("storage_view_id"))
         if storage_view_id:
             backing_enclosure_id = normalize_text(scope.snapshot.get("storage_view_backing_enclosure_id"))
+            quoted_view_id = urllib.parse.quote(storage_view_id)
+            try:
+                # #457: one request per chunk, as enclosure scopes already do.
+                return await self._fetch_smart_summary_batches(
+                    f"/api/storage-views/{quoted_view_id}/slots/smart-batch",
+                    slot_numbers,
+                    system_id=scope.system_id,
+                    enclosure_id=backing_enclosure_id,
+                    force_fresh=force_fresh,
+                )
+            except HistorySourceError as exc:
+                # A main UI older than this history service has no batch route
+                # for storage views; keep collecting through the per-slot route.
+                if not _is_missing_route(exc):
+                    raise
             for slot_number in slot_numbers:
                 params: dict[str, Any] = {
                     "system_id": scope.system_id,
@@ -1850,7 +1871,7 @@ class HistoryCollector:
                 if force_fresh:
                     params["fresh"] = "true"
                 payload = await self._fetch_json(
-                    f"/api/storage-views/{urllib.parse.quote(storage_view_id)}/slots/{slot_number}/smart",
+                    f"/api/storage-views/{quoted_view_id}/slots/{slot_number}/smart",
                     params=params,
                     timeout_seconds=self._smart_request_timeout_seconds(force_fresh=force_fresh),
                 )
@@ -1858,17 +1879,35 @@ class HistoryCollector:
                     summaries[slot_number] = payload
             return summaries
 
+        return await self._fetch_smart_summary_batches(
+            "/api/slots/smart-batch",
+            slot_numbers,
+            system_id=scope.system_id,
+            enclosure_id=scope.enclosure_id,
+            force_fresh=force_fresh,
+        )
+
+    async def _fetch_smart_summary_batches(
+        self,
+        path: str,
+        slot_numbers: list[int],
+        *,
+        system_id: str,
+        enclosure_id: str | None,
+        force_fresh: bool,
+    ) -> dict[int, dict[str, Any]]:
+        summaries: dict[int, dict[str, Any]] = {}
         batch_size = max(1, self.settings.smart_batch_size)
         for offset in range(0, len(slot_numbers), batch_size):
             chunk = slot_numbers[offset : offset + batch_size]
             params: dict[str, Any] = {
-                "system_id": scope.system_id,
-                "enclosure_id": scope.enclosure_id,
+                "system_id": system_id,
+                "enclosure_id": enclosure_id,
             }
             if force_fresh:
                 params["fresh"] = "true"
             payload = await self._fetch_json(
-                "/api/slots/smart-batch",
+                path,
                 params=params,
                 method="POST",
                 body=json.dumps({"slots": chunk}).encode("utf-8"),

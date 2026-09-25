@@ -6983,6 +6983,16 @@ def _collector_store() -> MagicMock:
 
 
 
+def _storage_view_smart_batch_reply(summary: dict[str, object]):
+    """Answer the storage-view SMART batch route the way the main UI does (#457)."""
+
+    async def reply(path: str, **kwargs: object) -> dict[str, object]:
+        slots = json.loads(kwargs["body"])["slots"]  # type: ignore[arg-type]
+        return {"summaries": [{"slot": slot, "summary": dict(summary)} for slot in slots]}
+
+    return reply
+
+
 class HistoryCollectorTests(unittest.TestCase):
     @staticmethod
     def _topology_history_fixture(
@@ -9555,15 +9565,17 @@ class HistoryCollectorTests(unittest.TestCase):
 
         collector._enumerate_scopes = enumerate_scopes  # type: ignore[method-assign]
         collector._fetch_json = AsyncMock(  # type: ignore[method-assign]
-            return_value={
-                "available": True,
-                "temperature_c": 31,
-                "bytes_read": 100,
-                "bytes_written": 200,
-                "annualized_bytes_read": 25,
-                "annualized_bytes_written": None,
-                "power_on_hours": 48,
-            }
+            side_effect=_storage_view_smart_batch_reply(
+                {
+                    "available": True,
+                    "temperature_c": 31,
+                    "bytes_read": 100,
+                    "bytes_written": 200,
+                    "annualized_bytes_read": 25,
+                    "annualized_bytes_written": None,
+                    "power_on_hours": 48,
+                }
+            )
         )
 
         asyncio.run(collector.run_once())
@@ -9600,9 +9612,10 @@ class HistoryCollectorTests(unittest.TestCase):
         self.assertEqual(loaded.persistent_id_label, "GPTID")
         self.assertEqual(loaded.logical_unit_id, "0x5000c500abcd0000")
         self.assertEqual(loaded.sas_address, "0x5000c500abcd0001")
+        # #457: the view is collected through the storage-view batch route.
         self.assertEqual(
             collector._fetch_json.await_args_list[0].args[0],  # type: ignore[attr-defined]
-            "/api/storage-views/boot-doms/slots/0/smart",
+            "/api/storage-views/boot-doms/slots/smart-batch",
         )
         self.assertEqual(
             collector._fetch_json.await_args_list[0].kwargs["params"],  # type: ignore[attr-defined]
@@ -9759,15 +9772,17 @@ class HistoryCollectorTests(unittest.TestCase):
 
         collector._enumerate_scopes = enumerate_scopes  # type: ignore[method-assign]
         collector._fetch_json = AsyncMock(  # type: ignore[method-assign]
-            return_value={
-                "available": True,
-                "temperature_c": 31,
-                "bytes_read": 100,
-                "bytes_written": 200,
-                "annualized_bytes_read": 25,
-                "annualized_bytes_written": 50,
-                "power_on_hours": 48,
-            }
+            side_effect=_storage_view_smart_batch_reply(
+                {
+                    "available": True,
+                    "temperature_c": 31,
+                    "bytes_read": 100,
+                    "bytes_written": 200,
+                    "annualized_bytes_read": 25,
+                    "annualized_bytes_written": 50,
+                    "power_on_hours": 48,
+                }
+            )
         )
 
         asyncio.run(collector.run_once(force_slow=True))
