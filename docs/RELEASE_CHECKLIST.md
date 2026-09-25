@@ -258,7 +258,7 @@ python scripts/validate_release_wrap.py "$version" \
   - stop the disposable development history stack after the drill and preserve
     only sanitized receipts
   - immediately before the one production deployment, take and verify a fresh
-    encrypted FULL backup through the admin sidecar
+    encrypted FULL backup through Admin
   - create a disposable QA Docker stack on the Linux target using the current
     release-candidate source/image, a separate Compose project name, separate
     runtime directories, and a different port range such as

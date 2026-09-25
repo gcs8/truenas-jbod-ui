@@ -6,7 +6,7 @@ GHCR is GitHub's container registry. For this project it means:
 
 - no repo clone for normal installs
 - no local image build for normal updates
-- the same image tag runs the main UI, history sidecar, and admin sidecar
+- the same image tag runs the main UI, history sidecar, and Admin service
 - public pulls from `ghcr.io/gcs8/truenas-jbod-ui` do not require
   `docker login`
 
@@ -422,7 +422,7 @@ To **roll back the permission repair**, stop the sidecar, disable repair, restor
 modes recorded before migration, restore the previous image tag if needed, and
 recreate `enclosure-history`. Do not use `0777` or `0666` as a workaround.
 
-## Optional admin sidecar
+## Optional Admin service
 
 Turn on admin when you want guided setup, storage-view editing, backup/restore,
 runtime controls, or the profile builder:
@@ -484,7 +484,7 @@ docker compose --profile history --profile admin up -d
 | --- | --- | --- |
 | main UI | `8080` | set `APP_PORT` to change it |
 | history sidecar | `8081` | binds to `127.0.0.1` unless `HISTORY_BIND_ADDRESS` changes |
-| admin sidecar | `8082` | set `ADMIN_PORT` to change it |
+| Admin service | `8082` | set `ADMIN_PORT` to change it |
 
 Keep the history sidecar localhost-only unless you actually need to scrape or
 open it from another machine.
