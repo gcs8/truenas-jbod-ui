@@ -270,7 +270,8 @@
   const diskInventorySyncControls = document.getElementById("disk-inventory-sync-controls");
   const searchClearButton = document.getElementById("search-clear");
   const searchSummary = document.getElementById("search-summary");
-  const appVersionNote = document.getElementById("app-version-note");
+  // Reassigned when a refreshed release note gains its release link.
+  let appVersionNote = document.getElementById("app-version-note");
   const detailSlotTitle = document.getElementById("detail-slot-title");
   const detailStatePill = document.getElementById("detail-state-pill");
   const detailKvGrid = document.getElementById("detail-kv-grid");
@@ -2616,6 +2617,77 @@
     if (updated) {
       setStatus("The app was updated. Reload this page.", "error");
     }
+  }
+
+  // The header release note is rendered once by the server. While the first
+  // check is still running or has failed, poll a few times so a boot-time
+  // failure (DNS not ready yet) recovers without a reload. The server retries
+  // failures after 60 s, 5 min, then hourly; these delays trail those.
+  const RELEASE_NOTE_POLL_DELAYS_MS = [20000, 75000, 320000];
+
+  function releaseNoteNeedsRefresh(status) {
+    return status === "checking" || status === "error";
+  }
+
+  function scheduleReleaseNoteRefresh(attempt = 0) {
+    if (state.snapshotMode || !appVersionNote || attempt >= RELEASE_NOTE_POLL_DELAYS_MS.length) {
+      return;
+    }
+    // The server renders the status as a version-note-<status> class.
+    const initialStatus = appVersionNote.classList.contains("version-note-checking")
+      ? "checking"
+      : appVersionNote.classList.contains("version-note-error") ? "error" : "";
+    if (attempt === 0 && !releaseNoteNeedsRefresh(initialStatus)) {
+      return;
+    }
+    window.setTimeout(() => {
+      void refreshReleaseNote(attempt);
+    }, RELEASE_NOTE_POLL_DELAYS_MS[attempt]);
+  }
+
+  async function refreshReleaseNote(attempt) {
+    let payload;
+    try {
+      payload = await fetchJson("/api/release-status");
+    } catch (_error) {
+      scheduleReleaseNoteRefresh(attempt + 1);
+      return;
+    }
+    const status = String(payload?.status || "unknown");
+    const summary = String(payload?.summary || "").trim();
+    if (!state.appUpdated && status !== "disabled" && summary) {
+      applyReleaseNoteLink(payload?.latest_url);
+      setTextIfChanged(appVersionNote, summary);
+      appVersionNote.className = `meta-note version-note version-note-${status.replace(/[^a-z-]/g, "") || "unknown"}`;
+    }
+    if (releaseNoteNeedsRefresh(status)) {
+      scheduleReleaseNoteRefresh(attempt + 1);
+    }
+  }
+
+  // The server renders a link only when it already knows the release URL; a
+  // note that started as checking/error is a <span>. Swap in an https link.
+  function applyReleaseNoteLink(rawUrl) {
+    let url;
+    try {
+      url = new URL(String(rawUrl || ""));
+    } catch (_error) {
+      return;
+    }
+    if (url.protocol !== "https:") {
+      return;
+    }
+    if (String(appVersionNote.tagName || "").toUpperCase() !== "A") {
+      const link = document.createElement("a");
+      link.id = appVersionNote.id;
+      link.target = "_blank";
+      link.rel = "noopener";
+      link.textContent = appVersionNote.textContent;
+      link.className = appVersionNote.className;
+      appVersionNote.replaceWith(link);
+      appVersionNote = link;
+    }
+    appVersionNote.href = url.href;
   }
 
   function renderAppVersionNote() {
@@ -11114,6 +11186,7 @@
   }
   void fetchStorageViewRuntime(false, true);
   void refreshHistoryStatus(true);
+  scheduleReleaseNoteRefresh();
   scheduleSmartPrefetch();
   resetTimer();
   queueIdentifyVerify("startup");
