@@ -114,7 +114,7 @@ files inaccessible. Neither is an automatic upgrade repair.
 
 The admin application default for automatic stop is `0`. The supplied Compose files set the separately launched admin sidecar default to `3600` seconds.
 
-A scheduled backup that includes `history_db` uses encrypted `.7z`, including segmented history. A backup without `history_db` uses the native encrypted `.tar.zst.enc` envelope. The restore path accepts both formats.
+A scheduled backup that includes `history_db` uses encrypted `.7z` (or `.tar.zst.enc` when the backup scheduler's `full.archive_format` is `tar.zst`), including segmented history. A backup without `history_db` uses the native encrypted `.tar.zst.enc` envelope. The restore path accepts both formats.
 
 ### Create the passphrase and state directories
 
@@ -276,6 +276,41 @@ is `0` or `7`. When both day-of-month and day-of-week are set, either one
 matching runs the backup, as in classic cron. Times are in the container's
 time zone, set with `TZ` (default `UTC`).
 
+#### Full backup archive format
+
+`full.archive_format` chooses how a full backup is packed. Both formats are
+encrypted with the passphrase file and checked before they are catalogued.
+
+| `archive_format` | Packing | Restores on |
+| --- | --- | --- |
+| `7z` (default) | 7z, LZMA2, one thread, AES-256 | Every app version, and any 7-Zip |
+| `tar.zst` | tar + Zstandard level 3 (two threads), sealed in 1 MiB AES-256-GCM chunks (`.tar.zst.enc`) | This app version and later only |
+
+`tar.zst` is much faster for a large history database. On a synthetic 2 GiB
+history database (4 CPUs):
+
+| | `7z` | `tar.zst` |
+| --- | --- | --- |
+| Create | 541 s | 17 s |
+| Inspect, verify or extract (each) | 53 s | 33 s |
+| Size | 264 MiB | 288 MiB |
+| Peak memory (create) | 193 MiB | 95 MiB |
+
+These are whole production operations measured with
+`scripts/benchmark_full_backup.py`, with a 1 GiB address-space limit on each
+phase.
+
+`7z` spends most of a full backup compressing on one core, and each 7z step
+stops after 10 minutes, so a history database of about 2 GiB or more can fail
+there. Choose `tar.zst` for large history. Keep `7z` if you may need to restore
+on an older app version or open the file with 7-Zip.
+
+The `tar.zst` file checks every 1 MiB chunk before using it, so a wrong
+passphrase, a damaged or truncated file, or reordered data is refused before
+anything is restored. Restore it through the admin restore path like any other
+backup. Run the benchmark yourself with
+`scripts/benchmark_full_backup.py --size-gib 2 --allow-large --output-root DIR --format tar.zst-stream`.
+
 ### Configure
 
 Put a `backups` section in `config.yaml`. Environment variables override single
@@ -293,6 +328,7 @@ backups:
   full:
     enabled: true
     schedule: "0 3 * * *"
+    archive_format: 7z       # or tar.zst, see "Full backup archive format"
     local_keep: 7
     remote_keep: null
     remote_max_age_days: 90
@@ -312,6 +348,7 @@ backups:
 | `BACKUP_CONFIG_ENABLED`, `BACKUP_FULL_ENABLED` | `enabled` |
 | `BACKUP_CONFIG_DEBOUNCE_SECONDS`, `BACKUP_CONFIG_MAX_DELAY_SECONDS` | debounce |
 | `BACKUP_FULL_SCHEDULE` | `full.schedule` |
+| `BACKUP_FULL_ARCHIVE_FORMAT` | `full.archive_format` (`7z` or `tar.zst`) |
 | `BACKUP_CONFIG_LOCAL_KEEP`, `BACKUP_FULL_LOCAL_KEEP` | `local_keep` |
 | `BACKUP_CONFIG_REMOTE_KEEP`, `BACKUP_FULL_REMOTE_KEEP` | `remote_keep` (`none` for no limit) |
 | `BACKUP_CONFIG_REMOTE_MAX_AGE_DAYS`, `BACKUP_FULL_REMOTE_MAX_AGE_DAYS` | `remote_max_age_days` |
@@ -327,6 +364,32 @@ Target credentials are never written inline. Every secret is a path to a file
 `access_key_id_file`, `secret_access_key_file`) under the read-only
 `./config/backup-secrets` mount (`/run/backup-secrets` in the container). An
 inline `password` or `secret_access_key` is rejected.
+
+### Editing from the admin Backups page
+
+**Edit settings** on the Backups page edits the same `backups:` section. The
+admin checks the whole section with the scheduler's own rules before saving,
+writes `config.yaml` atomically, refuses the save when the file changed since
+the editor opened, and records a `backups.policy.save` entry in the config-change
+journal. Restart the scheduler to apply a save:
+`docker compose --profile backup-scheduler restart enclosure-backup-scheduler`.
+
+- Values set in the environment (the table above) are locked in the editor,
+  show the value the scheduler uses, and name their variable. When
+  `BACKUP_TARGETS_JSON` is set, targets are read-only. Compose passes the same
+  `BACKUP_*` variables to the admin container as to the scheduler, so both see
+  the same overrides.
+- Credentials stay file-only. For each `*_file` setting the editor shows only
+  "Secret file present", "missing or not private", or "not set"; it never shows
+  or returns the path or its contents. To replace a secret, put the new file
+  under `./config/backup-secrets` (mode `600`) and enter its container path,
+  for example `/run/backup-secrets/archive_sftp_key`. The path must be inside
+  `/run/backup-secrets` and cannot be the archive passphrase file. Leaving the
+  field empty keeps the current file.
+- Renaming a target keeps its secret files. Changing where it points (provider,
+  host, port, user name, share, bucket, endpoint and similar settings) means you
+  must choose its secret files again or clear them, so a saved credential is
+  never sent to a new server by accident.
 
 ### Targets
 

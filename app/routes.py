@@ -281,6 +281,13 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
         context["write_policy_json"] = json.dumps(context["write_policy"])
         return templates.TemplateResponse(request, "index.html", context)
 
+    @router.get("/api/release-status")
+    async def get_release_status() -> JSONResponse:
+        # The header note is rendered once; the page polls this while the
+        # first check is still running or has failed (for example DNS not
+        # ready at boot) so it recovers without a reload.
+        return JSONResponse(get_release_status_service().snapshot())
+
     @router.post(
         "/api/upgrade-notice/dismiss",
         dependencies=[Depends(require_read_ui_mutation_authorization)],

@@ -919,7 +919,7 @@ def build_dashboard_context(
         "database_size_label": format_bytes(database_size_bytes),
         "reclaimable_label": reclaimable_label(reclaimable_bytes, database_size_bytes),
         "backup_footprint_label": backup_footprint_label(backup_footprint),
-        "release_summary": str(release_payload.get("summary") or "Checking releases..."),
+        "release_summary": str(release_payload.get("summary") or "Checking for updates..."),
         "latest_url": safe_http_url(release_payload.get("latest_url")),
         "backoff_label": f"{backoff_seconds}s remaining" if backoff_seconds > 0 else "inactive",
         "collector_state_label": collector_state_label(status),

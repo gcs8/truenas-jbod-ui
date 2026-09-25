@@ -580,6 +580,35 @@ def upgrade_bullets(block: str) -> list[str]:
     return found
 
 
+class ReleaseStatusRouteAndCopyTests(unittest.TestCase):
+    def test_release_status_route_returns_the_service_snapshot(self) -> None:
+        from app import main as app_main
+
+        app = app_main.create_app()
+        route = next(route for route in app.routes if getattr(route, "path", "") == "/api/release-status")
+        service = MagicMock()
+        service.snapshot.return_value = {"status": "error", "summary": "Could not check for updates"}
+        with patch.object(app_main, "get_release_status_service", return_value=service):
+            response = asyncio.run(route.endpoint())
+        self.assertEqual(json.loads(response.body), {"status": "error", "summary": "Could not check for updates"})
+
+    def test_timing_and_template_labels_use_plain_words(self) -> None:
+        from app.config import RUNTIME_BEHAVIOR_APP_FIELDS
+        from app.services.storage_view_templates import list_storage_view_templates
+
+        labels = {field["label"] for field in RUNTIME_BEHAVIOR_APP_FIELDS.values()}
+        self.assertEqual(
+            labels,
+            {"Page refresh", "Inventory reuse", "Appliance query reuse", "SMART reuse", "Enclosure path reuse"},
+        )
+        jargon = re.compile(r"TTL|cache|cadence|stale|first.pass|read UI|rollup|downsampl|masking", re.IGNORECASE)
+        for field in RUNTIME_BEHAVIOR_APP_FIELDS.values():
+            self.assertIsNone(jargon.search(field["label"] + " " + field["description"]), field["label"])
+        for template in list_storage_view_templates():
+            text = f"{template.summary or ''} {template.notes or ''}"
+            self.assertIsNone(jargon.search(text), template.id)
+
+
 class UpgradeNotesContractTests(unittest.TestCase):
     def test_the_ownership_helper_is_still_absent_from_the_image(self) -> None:
         # The premise of the other tests: the helper is repository-only, so no

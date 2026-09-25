@@ -5506,6 +5506,15 @@ button.fabric-trace-crumb:hover {
   min-width: 0;
 }
 
+/* Saved copies hide the Bay assignment editor, leaving two cards. */
+.detail-secondary-grid-snapshot {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.meta-select-static {
+  overflow-wrap: anywhere;
+}
+
 .detail-empty {
   padding: 18px;
   border-radius: 14px;
@@ -6134,7 +6143,8 @@ button.fabric-trace-crumb:hover {
     grid-template-columns: 1fr;
   }
 
-  .detail-secondary-grid {
+  .detail-secondary-grid,
+  .detail-secondary-grid-snapshot {
     grid-template-columns: 1fr;
   }
 

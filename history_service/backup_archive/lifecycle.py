@@ -161,9 +161,6 @@ class LifecycleManager:
             self._rules[key] = rule
         self.rules = tuple(self._rules.values())
 
-    def rule_for(self, backup_class: str, location: str) -> RetentionRule | None:
-        return self._rules.get((backup_class, location))
-
     # -- planning ------------------------------------------------------------
 
     def _plan_group(

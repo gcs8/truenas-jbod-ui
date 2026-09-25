@@ -4,6 +4,7 @@ from __future__ import annotations
 # pyright: reportUndefinedVariable=false
 # ruff: noqa: F821
 
+import os
 import secrets
 import time
 from app.services.system_setup import _CONFIG_WRITE_LOCK
@@ -1212,6 +1213,40 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
         if backup_class not in ("config", "full"):
             raise HTTPException(status_code=400, detail="backup_class must be config or full.")
         return await scheduler_call("POST", "/internal/backups/run", {"backup_class": backup_class})
+
+    # Policy and target editor (#573). Secrets stay file-only: the view reports
+    # present/missing per *_file setting and never returns the path itself.
+    @router.get("/api/admin/backups/policy")
+    async def get_backup_policy() -> JSONResponse:
+        from history_service.backup_archive.editor import PolicyEditError, load_editor_view
+
+        settings = reload_app_settings()
+        try:
+            view = await asyncio.to_thread(load_editor_view, settings.config_file, dict(os.environ))
+        except PolicyEditError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return JSONResponse(view)
+
+    @router.put("/api/admin/backups/policy")
+    async def save_backup_policy(payload: dict[str, Any]) -> JSONResponse:
+        from history_service.backup_archive.editor import PolicyEditError, apply_editor_change
+
+        settings = reload_app_settings()
+        try:
+            view = await asyncio.to_thread(
+                apply_editor_change,
+                settings.config_file,
+                payload,
+                dict(os.environ),
+                write_lock=_CONFIG_WRITE_LOCK,
+                record_change=record_config_change,
+            )
+        except PolicyEditError as exc:
+            raise HTTPException(
+                status_code=409 if exc.conflict else 400,
+                detail=str(exc),
+            ) from exc
+        return JSONResponse({"ok": True, "restart_required": True, **view})
 
     @router.get("/api/admin/backups/lifecycle/plan")
     async def plan_backup_grooming() -> JSONResponse:

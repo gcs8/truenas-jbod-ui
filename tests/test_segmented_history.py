@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import io
 import json
+import tempfile
 import unittest
 import zipfile
+from pathlib import Path
 from unittest.mock import patch
 
 from history_service.segment_catalog import MAX_HISTORY_SEGMENT_BYTES
@@ -397,13 +399,16 @@ class SegmentedHistoryManifestTests(unittest.TestCase):
             archive.writestr(str(segment["archive_path"]), b"not-a-sqlite-database")
 
         reader = SystemBackupService.__new__(SystemBackupService)
-        with patch.object(
-            SystemBackupService,
-            "_extract_manifest_zip_members",
-            side_effect=AssertionError("v2 payload extraction must not run"),
-        ):
-            with self.assertRaisesRegex(ValueError, "hot history"):
-                reader._read_archive(archive_bytes.getvalue())
+        with tempfile.TemporaryDirectory() as scratch:
+            bundle_path = Path(scratch) / "segmented.zip"
+            bundle_path.write_bytes(archive_bytes.getvalue())
+            with patch.object(
+                SystemBackupService,
+                "_extract_manifest_zip_members_to_directory",
+                side_effect=AssertionError("v2 payload extraction must not run"),
+            ):
+                with self.assertRaisesRegex(ValueError, "hot history"):
+                    reader._read_archive_file(bundle_path)
 
 
 if __name__ == "__main__":
