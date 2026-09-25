@@ -302,6 +302,32 @@ class ImmutableRetentionCheckTests(unittest.TestCase):
             self.assertIsNone(receipt["retention"]["before"])
             self.assertEqual(receipt["status"], "active")
 
+    def test_multipath_collapse_with_zero_unplaced_activates(self):
+        # The supported multipath fixture shape: 5 source records, 4 logical
+        # disks, 1 duplicate view, nothing unplaced.
+        with tempfile.TemporaryDirectory() as temp:
+            root = self.make_root(temp)
+            _, update = self.update(root, [self.inventory(5, 4, 1, 0), self.inventory(5, 4, 1, 0)])
+            update()
+            self.assertEqual(deployment.validate_receipt(root)["status"], "active")
+
+    def test_unreadable_baseline_stops_before_any_change(self):
+        for failure in (
+            deployment.DeploymentError("inventory retention check could not read the inventory"),
+            {"no": "summary"},
+            {"summary": {**self.inventory(6, 6, 0, 0)["summary"], "unplaced_disk_count": "0"}},
+        ):
+            with self.subTest(failure=repr(failure)[:60]), tempfile.TemporaryDirectory() as temp:
+                root = self.make_root(temp)
+                env_before = (root / ".env").read_bytes()
+                runtime, update = self.update(root, [failure, self.inventory(6, 6, 0, 0)])
+                with self.assertRaises(deployment.DeploymentError) as caught:
+                    update()
+                self.assertNotIn("rollback", str(caught.exception))
+                self.assertFalse((root / deployment.RECEIPT_DIR_NAME).exists())
+                self.assertEqual((root / ".env").read_bytes(), env_before)
+                self.assertFalse(any(command[:2] == ("docker", "pull") for command in runtime.commands))
+
     def test_candidate_without_totals_is_refused(self):
         with tempfile.TemporaryDirectory() as temp:
             root = self.make_root(temp)

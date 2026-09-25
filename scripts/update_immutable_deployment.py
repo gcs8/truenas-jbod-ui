@@ -53,6 +53,10 @@ class DeploymentError(RuntimeError):
     """A bounded update, verification, or rollback failure."""
 
 
+class RetentionTotalsUnavailable(DeploymentError):
+    """The inventory answered normally but its summary has no retention totals."""
+
+
 @dataclass(frozen=True)
 class ComposeFile:
     source: str
@@ -312,8 +316,10 @@ def _retention_totals(fetch_json: FetchJson, url: str) -> dict[str, int]:
     totals: dict[str, int] = {}
     for key in RETENTION_KEYS:
         value = summary.get(key)
+        if key not in summary:
+            raise RetentionTotalsUnavailable(f"inventory summary has no {key}; the image predates retention totals")
         if type(value) is not int or value < 0:
-            raise DeploymentError(f"inventory summary has no valid {key}; the image predates retention totals")
+            raise DeploymentError(f"inventory summary {key} is not a non-negative integer")
         totals[key] = value
     return totals
 
@@ -324,8 +330,9 @@ def _check_retention(before: dict[str, int] | None, after: dict[str, int]) -> No
             f"disk retention check failed: {after['unplaced_disk_count']} of "
             f"{after['source_disk_count']} source disks are not represented in the rendered inventory"
         )
-    if after["rendered_unique_disk_count"] + after["unplaced_disk_count"] < after["source_disk_count"]:
-        raise DeploymentError("disk retention check failed: rendered disks do not cover the source disks")
+    # rendered_unique_disk_count may be lower than source_disk_count: equivalent
+    # multipath records collapse into one logical disk. unplaced_disk_count is
+    # the identity-based answer to "was every source record represented".
     if before is not None and after["source_disk_count"] < before["source_disk_count"]:
         raise DeploymentError(
             f"disk retention check failed: source disks fell from {before['source_disk_count']} "
@@ -968,11 +975,13 @@ def update_deployment(
     previous_image, previous_services = _capture_previous_runtime(spec, root, run)
     retention_before: dict[str, int] | None = None
     if spec.inventory_url is not None:
-        # A predecessor without the totals cannot supply a baseline; the
-        # candidate is still held to zero unplaced disks.
+        # Only a predecessor that answers normally but predates the totals may
+        # skip the baseline; any failure to read the inventory stops here,
+        # before anything changes. The candidate is always held to zero
+        # unplaced disks.
         try:
             retention_before = _retention_totals(fetch_json, spec.inventory_url)
-        except DeploymentError:
+        except RetentionTotalsUnavailable:
             retention_before = None
     run(["docker", "pull", spec.candidate_tag], cwd=root)
     candidate_digest = _resolve_digest(run, root, spec.candidate_tag)
