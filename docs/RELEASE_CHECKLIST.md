@@ -268,13 +268,16 @@ python scripts/validate_release_wrap.py "$version" \
   - **Primary default-format round trip:** export an encrypted FULL backup from
     the long-running local Windows Docker admin API, not by copying host folders.
     Use the standard FULL configuration with no `7z` format override and the
-    default restore-grade path set: `config_file`, `runtime_overrides_file`,
+    restore-controller path set: `config_file`, `runtime_overrides_file`,
     `profile_file`, `mapping_file`, `sas_fabric_alias_file`, `slot_detail_file`,
-    and `history_db`
+    `history_db`, `ssh_keys`, `tls_trust`, and `known_hosts` (the private
+    controller rejects an archive missing any of them). Encrypted exports
+    require a `passphrase`; read it from the private passphrase file and never
+    record it in receipts or the release wrap
   - send
     `POST http://127.0.0.1:8082/api/admin/backup/export?stop_services=false&restart_services=true`
     with JSON body
-    `{"encrypt":true,"included_paths":["config_file","runtime_overrides_file","profile_file","mapping_file","sas_fabric_alias_file","slot_detail_file","history_db"]}`;
+    `{"encrypt":true,"passphrase":"<private passphrase, never recorded>","included_paths":["config_file","runtime_overrides_file","profile_file","mapping_file","sas_fabric_alias_file","slot_detail_file","history_db","ssh_keys","tls_trust","known_hosts"]}`;
     deliberately omit `packaging` so this gate follows the configured FULL
     default instead of forcing a format
   - copy that primary exported bundle to the Linux release target, inspect it,
@@ -284,7 +287,7 @@ python scripts/validate_release_wrap.py "$version" \
     aggregate and application readback below before starting compatibility work
   - **Legacy 7z readability round trip:** make a second encrypted FULL export
     from the same source API and path set, this time explicitly sending
-    `{"encrypt":true,"packaging":"7z","included_paths":["config_file","runtime_overrides_file","profile_file","mapping_file","sas_fabric_alias_file","slot_detail_file","history_db"]}`
+    `{"encrypt":true,"passphrase":"<private passphrase, never recorded>","packaging":"7z","included_paths":["config_file","runtime_overrides_file","profile_file","mapping_file","sas_fabric_alias_file","slot_detail_file","history_db","ssh_keys","tls_trust","known_hosts"]}`
   - copy the legacy bundle separately, then perform a second complete export,
     inspect, import, restart, and readback round trip. Require the observed
     packaging to be `7z`; this backward-readability check cannot replace or be

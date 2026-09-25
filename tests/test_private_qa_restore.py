@@ -87,15 +87,28 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
         legacy = checklist[legacy_start:legacy_end]
 
         self.assertLess(primary_start, legacy_start)
-        self.assertIn('`{"encrypt":true,"included_paths":', primary)
-        self.assertNotIn('`{"encrypt":true,"packaging":', primary)
+        self.assertIn('`{"encrypt":true,"passphrase":"<private passphrase', primary)
+        self.assertNotIn('"packaging":', primary.split("`;", 1)[0])
         self.assertIn("omit `packaging`", primary)
         self.assertIn("observed `tar.zst`", primary)
+        required_groups = "".join(f'"{group}",' for group in (
+            "config_file", "runtime_overrides_file", "profile_file", "mapping_file",
+            "sas_fabric_alias_file", "slot_detail_file", "history_db", "ssh_keys",
+            "tls_trust", "known_hosts",
+        )).rstrip(",")
+        self.assertEqual(
+            set(self.module.REQUIRED_FULL_GROUPS),
+            set(required_groups.replace('"', "").split(",")),
+        )
+        for round_trip, body in (("primary", primary), ("legacy", legacy)):
+            with self.subTest(round_trip=round_trip):
+                self.assertIn(f'"included_paths":[{required_groups}]', body)
+                self.assertIn('"passphrase":"<private passphrase, never recorded>"', body)
         for phase in ("export", "inspect", "import", "restart", "readback"):
             with self.subTest(round_trip="primary", phase=phase):
                 self.assertIn(phase, primary.lower())
 
-        self.assertIn('`{"encrypt":true,"packaging":"7z",', legacy)
+        self.assertIn('"packaging":"7z",', legacy)
         for phase in ("export", "inspect", "import", "restart", "readback"):
             with self.subTest(round_trip="legacy", phase=phase):
                 self.assertIn(phase, legacy.lower())
