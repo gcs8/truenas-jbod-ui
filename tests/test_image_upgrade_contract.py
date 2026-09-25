@@ -273,6 +273,15 @@ class ImageOnlyUpgradeSmokeContractTests(unittest.TestCase):
                 self.assertEqual(fixture["services"][service]["user"], "0:0")
                 self.assertEqual(fixture["services"][service]["image"], "${JBOD_UI_IMAGE:-ghcr.io/gcs8/truenas-jbod-ui:latest}")
 
+    def test_published_support_matrix_names_the_check_that_backs_it(self):
+        workflow = yaml.safe_load((self.ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8"))
+        guide = (self.ROOT / "wiki" / "Upgrading.md").read_text(encoding="utf-8")
+        matrix = guide.split("## What is tested", 1)[1].split("\n## ", 1)[0]
+        self.assertIn(workflow["jobs"]["image-upgrade-smoke"]["name"], " ".join(matrix.split()))
+        self.assertIn("scripts/run_image_upgrade_smoke.py", matrix)
+        self.assertIn(f"v{workflow['jobs']['image-upgrade-smoke']['env']['PREVIOUS_VERSION']}", matrix)
+        self.assertIn("Not tested yet", matrix)
+
     def test_seed_and_read_scripts_compile(self):
         smoke = self.load_smoke()
         for name, script in (

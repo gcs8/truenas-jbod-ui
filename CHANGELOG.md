@@ -123,6 +123,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Docs
 
+- The Upgrading wiki page has a "What is tested" table: the Docker host,
+  storage, services, upgrade path, rollback and recovery cases that CI's
+  image-only upgrade check covers, and the ones not tested yet (#590).
+
 - Rewrote the released v0.23.0 upgrade notes so a published-image operator can
   follow them: the ownership step is a plain `chown` that adopts the
   `docker-compose.nonroot.yml` overlay rather than a helper the image does not
