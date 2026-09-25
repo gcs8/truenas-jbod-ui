@@ -231,7 +231,6 @@ test.describe("admin sidecar smoke", () => {
   });
 
   test("a hot-reloaded save says applied; a restart-only save offers Restart main UI now", async ({ page }) => {
-    test.skip(process.env.PLAYWRIGHT_ADMIN_SYNTHETIC_MUTATIONS !== "1", "Requires the isolated synthetic admin runner.");
     await gotoAdmin(page);
     const field = page.locator('input[data-runtime-behavior-key]:enabled').first();
     const result = page.locator("#runtime-behavior-result");
