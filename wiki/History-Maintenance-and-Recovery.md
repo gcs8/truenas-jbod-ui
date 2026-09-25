@@ -141,14 +141,28 @@ v0.23.0 refuse to start history on such a database, name the newer schema
 version and do not write to the file. v0.23.0 and older have no such check, so
 never start them on the newer database.
 
-There are no down-migrations. To go back:
+There are no down-migrations. Put the pre-upgrade backup back before anything
+built from the newer release can open it again, then pin back.
 
-1. Stop the stack.
-2. Put back the backup you took right before the upgrade: restore it from
-   the admin **Backups** page, or put the copied `history` folder back.
-   Do this before starting the older release.
-3. Set `JBOD_UI_IMAGE` back to the release you were on.
-4. Start the stack and check history's `/healthz`.
+From a backup kept on the admin **Backups** page:
+
+1. Leave the admin UI and the backup scheduler running. They serve that page
+   and the backup file.
+2. Open **Restore** on the pre-upgrade copy. Keep **Pause the main UI and
+   history while importing** checked, and **uncheck Start them again
+   afterwards**. Otherwise the newer history service reopens the restored
+   database and upgrades it again.
+3. Set `JBOD_UI_IMAGE` in `.env` back to the release you were on.
+4. Run `docker compose pull` and `docker compose up -d` with your usual files
+   and profiles, then check history's `/healthz`.
+
+From a copy of the folders:
+
+1. Stop the stack with `docker compose down`, using your usual files and
+   profiles.
+2. Put the copied `history` folder (and `config` and `data`, if you copied
+   them) back in place.
+3. Set `JBOD_UI_IMAGE` back, then `pull` and `up -d` as above.
 
 Everything history recorded after the upgrade is lost: samples, slot events
 and any maintenance you did in the newer release. That is the accepted cost of
