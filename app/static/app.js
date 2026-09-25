@@ -291,6 +291,8 @@
   const refreshCountdownBar = document.getElementById("refresh-countdown-bar");
   const systemSelect = document.getElementById("system-select");
   const enclosureSelect = document.getElementById("enclosure-select");
+  const systemSelectStatic = document.getElementById("system-select-static");
+  const enclosureSelectStatic = document.getElementById("enclosure-select-static");
   const lastUpdated = document.getElementById("last-updated");
   const timezoneLabel = document.getElementById("timezone-label");
   const snapshotGeneratedValue = document.getElementById("snapshot-generated-value");
@@ -9565,6 +9567,19 @@
     }
   }
 
+  // A saved copy shows a selector that cannot change as plain text instead of
+  // a disabled control (#439). Live pages keep the disabled select.
+  function showSelectAsTextInSnapshot(select, staticText) {
+    if (!select || !staticText) {
+      return;
+    }
+    const asText = Boolean(state.snapshotMode && select.disabled);
+    const selectedOption = select.options?.[select.selectedIndex];
+    setTextIfChanged(staticText, asText ? (selectedOption?.textContent || "").trim() : "");
+    select.classList.toggle("hidden", asText);
+    staticText.classList.toggle("hidden", !asText);
+  }
+
   function renderSelectors() {
     const systems = state.snapshot.systems || [];
     const enclosures = state.snapshot.enclosures || [];
@@ -9591,6 +9606,7 @@
         systemSelect.value = state.selectedSystemId;
       }
       systemSelect.disabled = state.snapshotMode || systems.length <= 1;
+      showSelectAsTextInSnapshot(systemSelect, systemSelectStatic);
     }
 
     if (enclosureSelect) {
@@ -9625,6 +9641,7 @@
         enclosureSelect.selectedIndex = 0;
       }
       enclosureSelect.disabled = (state.snapshotMode && !snapshotNavigationAvailable) || (visibleEnclosures.length + storageViews.length) <= 1;
+      showSelectAsTextInSnapshot(enclosureSelect, enclosureSelectStatic);
     }
     updateSasFabricViewLink();
   }
