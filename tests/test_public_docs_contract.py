@@ -114,7 +114,7 @@ class PublicDocsContractTests(unittest.TestCase):
                     f"missing historical read UI context in {relative_path}",
                 )
             with self.subTest(document=relative_path):
-                self.assertNotRegex(text, r"(?i)\badmin\s+sidecar\b")
+                self.assertNotRegex(text, r"(?i)\badmin\s+sidecars?\b")
                 self.assertNotRegex(
                     text_without_allowed_contexts,
                     r"(?i)\bread\s+UI\b",
