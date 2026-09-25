@@ -142,6 +142,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Renamed the admin container cards to Main UI, History and Admin, removed
+  sidecar and runtime wording from admin messages, and corrected the docs that
+  said admin auto-stops by default (only the published Compose files set
+  3600) (#581)
 - Honoured a configured `ssh.known_hosts_path` (top level, per system, or the
   restored `SSH_KNOWN_HOSTS_PATH`) instead of always replacing it with
   `<data>/known_hosts`, so pinned host keys can live in a host bind mount;
