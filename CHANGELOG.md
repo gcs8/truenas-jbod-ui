@@ -150,6 +150,14 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Saved copies and the public demo hide the bay assignment editor, the
   Storage Fabric refresh button and selectors with nothing to switch to,
   instead of showing them disabled. (#587)
+- Refreshed the header release note without a page reload while the first
+  check is still running or has failed, so a failure at boot clears within
+  minutes, and renamed the admin timing labels and storage-view template notes
+  in plain words (#593).
+- Passed the `RELEASE_CHECK_*` settings to the history service, so
+  `RELEASE_CHECK_ENABLED=false` turns the GitHub check off everywhere; quoted
+  the current history bind error in the wiki and explained the three history
+  collection intervals in `.env.example` (#591).
 - Named the closest valid key when `config.yaml` has an unknown key, checked
   the keys under `backups:`, showed these warnings in the admin banner, and
   documented every operator environment variable in `.env.example` (#589).
