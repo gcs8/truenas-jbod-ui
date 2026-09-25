@@ -210,6 +210,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_slot_detail_store",
             "tests.test_smart_grid_io",
             "tests.test_snapshot_export",
+            "tests.test_storage_view_smart_batch",
             "tests.test_system_backup",
         ),
     ),
