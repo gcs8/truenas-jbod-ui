@@ -169,6 +169,11 @@ test("the support card accepts current and compatibility capability names", () =
   assert.match(TEMPLATE, /id="capabilities-title">What this system supports<\/h2>/);
   assert.match(functionSource("renderCapabilities"), /"physical_slots", "physical_slot_mapping", "bay_layout"/);
   assert.match(functionSource("renderCapabilities"), /"identify", "identify_leds", "locate_light", "locate"/);
+  assert.match(
+    functionSource("renderCapabilities"),
+    /if \(!inventoryScopeMatchesSelection\(\)\) \{[\s\S]*capabilitiesPanel\.classList\.add\("hidden"\)/,
+    "capabilities from the previous system stay hidden while a new scope loads",
+  );
   assert.match(STYLES, /\.capability-status[^}]*font-size:\s*0\.75rem/s, "support text stays at the 12px floor");
 });
 

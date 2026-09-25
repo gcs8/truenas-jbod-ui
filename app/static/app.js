@@ -9344,6 +9344,11 @@
     if (!capabilitiesPanel || !capabilitiesGrid) {
       return;
     }
+    if (!inventoryScopeMatchesSelection()) {
+      capabilitiesPanel.classList.add("hidden");
+      capabilitiesGrid.replaceChildren();
+      return;
+    }
     const capabilities = state.snapshot.capabilities || {};
     const entries = [
       { label: "Bay layout", aliases: ["physical_slots", "physical_slot_mapping", "bay_layout"] },
