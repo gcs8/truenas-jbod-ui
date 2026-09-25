@@ -186,6 +186,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_backup_archive_journal",
             "tests.test_history_bulk_bounds",
             "tests.test_history_refresh_bounds",
+            "tests.test_history_backup_coupling",
             "tests.test_history_health_states",
             "tests.test_history_service",
             "tests.test_inventory",
