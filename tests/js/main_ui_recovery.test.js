@@ -153,6 +153,30 @@ test("an empty enclosure list says so instead of claiming an automatic choice", 
   assert.doesNotMatch(APP_SOURCE, /Auto-selected/);
 });
 
+test("the support card accepts current and compatibility capability names", () => {
+  const { capabilityEntry, capabilityStatusLabel } = loadFunctions([
+    "capabilityEntry",
+    "capabilityStatusLabel",
+  ]);
+  const current = { physical_slots: { status: "available" } };
+  const older = { bay_layout: { status: "partial" } };
+  assert.equal(capabilityEntry(current, ["physical_slots", "bay_layout"]).status, "available");
+  assert.equal(capabilityEntry(older, ["physical_slots", "bay_layout"]).status, "partial");
+  assert.equal(capabilityEntry({}, ["physical_slots", "bay_layout"]), null);
+  assert.equal(capabilityStatusLabel("available"), "Available");
+  assert.equal(capabilityStatusLabel("partial"), "Some setup needed");
+  assert.equal(capabilityStatusLabel("unsupported"), "Not supported");
+  assert.match(TEMPLATE, /id="capabilities-title">What this system supports<\/h2>/);
+  assert.match(functionSource("renderCapabilities"), /"physical_slots", "physical_slot_mapping", "bay_layout"/);
+  assert.match(functionSource("renderCapabilities"), /"identify", "identify_leds", "locate_light", "locate"/);
+  assert.match(
+    functionSource("renderCapabilities"),
+    /if \(!inventoryScopeMatchesSelection\(\)\) \{[\s\S]*capabilitiesPanel\.classList\.add\("hidden"\)/,
+    "capabilities from the previous system stay hidden while a new scope loads",
+  );
+  assert.match(STYLES, /\.capability-status[^}]*font-size:\s*0\.75rem/s, "support text stays at the 12px floor");
+});
+
 test("search reports how many bays match, offers a clear control, and selects a lone match", () => {
   const { searchSummaryText } = loadFunctions(["searchSummaryText"]);
   assert.equal(searchSummaryText(3, 60, "tank"), "3 of 60 bays match");
