@@ -234,10 +234,9 @@ def _validate_hash(value: str | None, name: str) -> str | None:
 
 
 def _fsync_directory(path: Path) -> None:
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
-    except OSError:  # pragma: no cover - directory fsync is best effort off Linux
-        return
+    # Errors propagate: a caller must not report a write as durable when the
+    # directory entry could not be persisted (e.g. an unreadable 0300 directory).
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     try:
         os.fsync(fd)
     finally:

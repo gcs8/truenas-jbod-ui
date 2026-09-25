@@ -183,6 +183,36 @@ class ChangeJournalTests(JournalTestCase):
         # Directory creation fsyncs root; the first append fsyncs the journal dir once.
         self.assertEqual(calls, [self.root, self.path.parent])
 
+    def test_directory_fsync_failure_is_not_reported_as_durable(self) -> None:
+        from history_service.backup_archive import journal as journal_module
+
+        def failing(path):
+            raise PermissionError("cannot open directory")
+
+        original = journal_module._fsync_directory
+        journal_module._fsync_directory = failing
+        try:
+            with self.assertRaises(PermissionError):
+                ChangeJournal(self.root / "fresh" / "journal.jsonl")
+        finally:
+            journal_module._fsync_directory = original
+        journal = ChangeJournal(self.path)
+        journal_module._fsync_directory = failing
+        try:
+            with self.assertRaises(PermissionError):
+                journal.append("mapping.save")  # first creation needs the directory fsync
+        finally:
+            journal_module._fsync_directory = original
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root ignores directory permissions")
+    def test_real_unreadable_directory_raises(self) -> None:
+        directory = self.root / "write-only"
+        directory.mkdir(mode=0o700)
+        directory.chmod(0o300)
+        self.addCleanup(directory.chmod, 0o700)
+        with self.assertRaises(PermissionError):
+            ChangeJournal(directory / "journal.jsonl").append("mapping.save")
+
     def test_large_commit_is_split_below_the_line_limit(self) -> None:
         journal = ChangeJournal(self.path, max_bytes=16 * 1024 * 1024)
         ids = [journal.append("mapping.save", f"s{n}").change_id for n in range(1700)]
