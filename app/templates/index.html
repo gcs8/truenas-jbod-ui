@@ -27,6 +27,7 @@
             </option>
           {% endfor %}
         </select>
+        <span class="meta-value meta-select-static hidden" id="system-select-static"></span>
       </div>
       <div class="meta-card meta-select-card enclosure-select-card">
         <label class="meta-label" for="enclosure-select">Enclosure / View</label>
@@ -41,6 +42,7 @@
             <option value="">No enclosures found</option>
           {% endif %}
         </select>
+        <span class="meta-value meta-select-static hidden" id="enclosure-select-static"></span>
       </div>
       <div class="meta-card">
         <span class="meta-label">{% if snapshot_mode %}Snapshot time{% else %}Last Updated{% endif %}</span>
@@ -440,7 +442,7 @@
             <p id="sas-fabric-summary" class="subtle">Shows how disks connect to controllers.</p>
           </div>
           <div class="panel-header-actions">
-            <button class="button secondary small" id="sas-fabric-refresh-button" type="button">
+            <button class="button secondary small{% if snapshot_mode %} hidden{% endif %}" id="sas-fabric-refresh-button" type="button">
               Refresh connections
             </button>
             {% if not snapshot_mode %}
@@ -591,7 +593,7 @@
   </section>
 
   <section id="detail-secondary" class="detail-secondary">
-    <div class="detail-secondary-grid">
+    <div class="detail-secondary-grid{% if snapshot_mode %} detail-secondary-grid-snapshot{% endif %}">
       <section class="panel detail-secondary-card">
         <div class="panel-header compact">
           <h2>Topology Context</h2>
@@ -610,7 +612,9 @@
         </div>
       </section>
 
-      <section class="panel detail-secondary-card">
+      {# A saved copy cannot change bay assignments, so the editor is hidden
+         rather than shown disabled (#439). The markup stays for app.js. #}
+      <section class="panel detail-secondary-card{% if snapshot_mode %} hidden{% endif %}" id="mapping-panel">
         <div class="panel-header compact">
           <h2>Bay assignment</h2>
           <button class="button secondary small" id="prefill-mapping-button" type="button">Use the disk shown in this bay</button>
