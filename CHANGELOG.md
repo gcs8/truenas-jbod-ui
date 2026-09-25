@@ -143,6 +143,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Refreshed the header release note without a page reload while the first
+  check is still running or has failed, so a failure at boot clears within
+  minutes, and renamed the admin timing labels and storage-view template notes
+  in plain words (#593).
 - Raised the last small labels on the main page (summary labels, legend
   swatches, Connections card details, heat-map controls, timing chips) to at
   least 12px. (#584)
