@@ -203,7 +203,22 @@ def load_backup_policy(
 
     env = os.environ if environ is None else environ
     path = Path(config_path or env.get("APP_CONFIG_PATH") or "/app/config/config.yaml")
-    section = _read_backups_section(path)
+    return policy_from_section(_read_backups_section(path), source=str(path), environ=env)
+
+
+def policy_from_section(
+    section: Mapping[str, Any],
+    *,
+    source: str,
+    environ: Mapping[str, str],
+) -> BackupPolicy:
+    """Validate one ``backups`` mapping (plus environment overrides) into a policy.
+
+    ``source`` names where the mapping came from in problem sentences.
+    """
+
+    env = environ
+    path = source
     document: dict[str, Any] = {
         "config": dict(section.get("config") or {}) if isinstance(section.get("config", {}), dict) else section.get("config"),
         "full": dict(section.get("full") or {}) if isinstance(section.get("full", {}), dict) else section.get("full"),
@@ -238,7 +253,7 @@ def load_backup_policy(
     try:
         parsed = _PolicyDocument.model_validate(document)
     except ValidationError as exc:
-        problems = describe_validation_error(exc, resolve_location=resolve, default_source=str(path))
+        problems = describe_validation_error(exc, resolve_location=resolve, default_source=path)
         raise ConfigurationError(problems) from None
     targets = _parse_targets(parsed.targets, targets_source)
     return BackupPolicy(config=parsed.config, full=parsed.full, targets=targets)
@@ -290,4 +305,5 @@ __all__ = [
     "FullClassPolicy",
     "config_backups_enabled_from_environment",
     "load_backup_policy",
+    "policy_from_section",
 ]

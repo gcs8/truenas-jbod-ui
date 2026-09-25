@@ -8004,6 +8004,7 @@
       dialog: document.getElementById("backup-library-dialog"),
       refreshButton: document.getElementById("backup-library-refresh-button"),
       cleanupButton: document.getElementById("backup-library-cleanup-button"),
+      editButton: document.getElementById("backup-library-edit-button"),
     },
     fetchJson,
     formatBytes,
