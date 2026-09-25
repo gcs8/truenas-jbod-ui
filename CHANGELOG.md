@@ -50,6 +50,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Added
 
+- Added a Backups page to the admin: backups kept here and on remote targets,
+  grouped by type with size, place, verified state and a kept flag; verify,
+  download, keep with a reason, back up now, test a target, clean up exactly
+  the previewed list, and restore a stored backup without uploading it. (#579)
+
 - Added a catalog of backup artifacts and a retention manager for the coming
   remote backup archive: per-class, per-location keep-N and max-age rules, a
   preserve flag that pins a backup, a dry-run preview, and deletion only of
