@@ -77,7 +77,7 @@
     </div>
     <div class="snapshot-banner-meta">
       <div class="summary-card compact">
-        <span class="summary-label">Scope</span>
+        <span class="summary-label">Includes</span>
         <span class="summary-value">{{ snapshot_bay_count }} bays{% if snapshot_export_meta.enclosure_count and snapshot_export_meta.enclosure_count > 1 %}, {{ snapshot_export_meta.enclosure_count }} enclosures{% endif %}{% if snapshot_export_meta.storage_view_count %}, {{ snapshot_export_meta.storage_view_count }} views{% endif %}</span>
         <span class="summary-note">{{ snapshot_export_meta.system_label or "Selected system" }}</span>
       </div>
@@ -136,7 +136,7 @@
       <span class="summary-note" id="admin-launch-stopped-note">Admin is stopped (it stops itself when idle). Start it on the Docker host: <code>docker compose --profile admin up -d enclosure-admin</code></span>
     </div>
     {% endif %}
-    <button id="export-snapshot-button" class="button secondary">Export Snapshot</button>
+    <button id="export-snapshot-button" class="button secondary">Save offline copy</button>
     {% endif %}
     <button id="refresh-button" class="button{% if snapshot_mode %} hidden{% endif %}">Refresh Now</button>
     <label class="toggle{% if snapshot_mode %} hidden{% endif %}" id="auto-refresh-field">
@@ -165,8 +165,8 @@
     <form method="dialog" class="snapshot-export-form">
       <div class="panel-header compact">
         <div>
-          <h2 id="export-snapshot-title">Export Enclosure Snapshot</h2>
-          <p class="subtle">Frozen, offline inventory. Review scope and identifiers before sharing.</p>
+          <h2 id="export-snapshot-title">Save an offline copy</h2>
+          <p class="subtle">A single file you can open without this server. Check what it includes before you share it.</p>
         </div>
       </div>
       <div class="snapshot-export-grid">
@@ -200,15 +200,15 @@
         <div id="export-view-selection" class="snapshot-export-view-selection hidden"></div>
       </div>
       <p id="export-snapshot-note" class="subtle snapshot-export-note">
-        Review the selected scope and estimated size.
+        Check what is included and the estimated size.
       </p>
       <p id="export-snapshot-window-hint" class="snapshot-export-tip">
-        Snapshot history uses the current History window. Change it in the History drawer first if you want a different export range.
+        The copy includes history for the window chosen in the History drawer.
       </p>
       <div id="export-snapshot-estimate" class="snapshot-export-estimate" aria-live="polite"></div>
       <div class="button-row">
         <button class="button secondary" id="export-snapshot-cancel" type="button">Cancel</button>
-        <button class="button" id="export-snapshot-confirm" type="button">Download Snapshot</button>
+        <button class="button" id="export-snapshot-confirm" type="button">Download copy</button>
       </div>
     </form>
   </dialog>
@@ -441,7 +441,7 @@
           </div>
           <div class="panel-header-actions">
             <button class="button secondary small" id="sas-fabric-refresh-button" type="button">
-              Refresh Storage Fabric
+              Refresh connections
             </button>
             {% if not snapshot_mode %}
             <a class="button secondary small" id="sas-fabric-view-link" href="{{ sas_fabric_view_url }}">
@@ -479,13 +479,13 @@
       <div class="panel-header detail-panel-top">
         <div>
           <h2>Slot Details</h2>
-          <p class="subtle">Select a bay to inspect metadata or calibrate mapping.</p>
+          <p class="subtle">Click a bay to see its disk, or to fix which disk it shows.</p>
         </div>
         <div class="detail-panel-actions">
           <button class="button secondary small hidden" id="history-toggle-button" aria-controls="detail-history-panel" aria-expanded="false" type="button">History</button>
           <div id="detail-led-controls" class="detail-led-controls hidden">
-            <button class="button small" data-led-action="IDENTIFY">Identify On</button>
-            <button class="button secondary small" data-led-action="CLEAR">Identify Off / Clear</button>
+            <button class="button small" data-led-action="IDENTIFY">Locate light on</button>
+            <button class="button secondary small" data-led-action="CLEAR">Locate light off</button>
           </div>
         </div>
       </div>
