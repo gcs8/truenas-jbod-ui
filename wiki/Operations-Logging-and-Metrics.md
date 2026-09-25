@@ -162,7 +162,7 @@ The services expose Prometheus/OpenMetrics endpoints while metrics are enabled:
 The history sidecar listens on loopback by default. A non-loopback bind
 requires token-authenticated refreshes and one exact browser origin, so set the
 four values together or the service exits at startup with
-`Non-loopback history exposure requires refresh token mode.`:
+`Configuration error: HISTORY_BIND_ADDRESS is not loopback.` followed by the variables to set:
 
 ```dotenv
 HISTORY_BIND_ADDRESS=0.0.0.0
