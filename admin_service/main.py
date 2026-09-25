@@ -807,7 +807,7 @@ def annotate_runtime_versions(
             release_state, release_summary = "known", f"Latest stable {latest_tag}"
         else:
             release_state = str(release_payload.get("status") or "unknown")
-            release_summary = str(release_payload.get("summary") or "Checking releases...")
+            release_summary = str(release_payload.get("summary") or "Checking for updates...")
 
         if not item.get("running"):
             sync_state = "stopped"

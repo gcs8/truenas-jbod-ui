@@ -1,5 +1,9 @@
 # Segmented history v2
 
+Segmented history is an advanced opt-in. A normal install does not use it and
+needs nothing from this page: the history database upgrades itself when the
+new image starts. Read on only if you set `HISTORY_SEGMENT_CATALOG_PATH`.
+
 This document defines the long-horizon history layout, migration procedure,
 query limits, backup format, and recovery behavior.
 
@@ -28,9 +32,9 @@ hot database fails closed; publication does not seize unrelated paths.
 
 The initial implementation uses one segment named `segment-0001.sqlite3` and a
 complete catalog named `generation-0001`. The schema validates `tombstones` and
-each replacement segment's `supersedes` list, but v0.22.2 does not publish later
-generations automatically. The v0.22.3 generation-2 recovery contract is defined
-below. It is a development contract, not authorization to rotate production.
+each replacement segment's `supersedes` list. v0.22.2 did not publish later
+generations; later-generation rotation shipped in v0.23.0 and its recovery
+contract is defined below. Rotation runs only when an operator starts it.
 
 ## Bounds
 
