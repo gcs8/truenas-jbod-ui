@@ -1266,8 +1266,8 @@ def _normalize_systems(settings: Settings) -> Settings:
     )
 
 
-# Settings that only take effect when the main UI process starts: the bind
-# address, values captured while the app object is built (docs routes, the
+# Settings that only take effect when the main UI process starts: values
+# captured while the app object is built (docs routes, the
 # public origin used by write checks, the perf middleware, the release-check
 # task, start-up warm-up) and the file paths behind open log handlers and data
 # stores. Everything else in config.yaml, runtime-overrides.yaml and
@@ -1276,8 +1276,6 @@ def _normalize_systems(settings: Settings) -> Settings:
 # process environment, so they also need a restart; they are not listed here
 # because they are not config-file settings.
 RESTART_ONLY_SETTINGS: tuple[tuple[str, ...], ...] = (
-    ("app", "host"),
-    ("app", "port"),
     ("app", "public_origin"),
     ("app", "debug"),
     ("app", "startup_warm_cache_enabled"),
