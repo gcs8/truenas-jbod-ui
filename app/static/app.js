@@ -2739,7 +2739,11 @@
   }
 
   function describeWriteRejection(error) {
+    // Both the "Main UI" wording and the older "Read UI" wording, so a stale
+    // tab or an older server still gets the plain sentence.
     const originRefusals = [
+      "Cross-origin Main UI mutation rejected.",
+      "Main UI authorization mode is unavailable.",
       "Cross-origin Read UI mutation rejected.",
       "Read UI authorization mode is unavailable.",
     ];

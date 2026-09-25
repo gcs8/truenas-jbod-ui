@@ -1,41 +1,123 @@
 from __future__ import annotations
 
-# Handler globals are populated from app.main by MainModuleAPIRouter.
-# pyright: reportUndefinedVariable=false
-# ruff: noqa: F821
-
+import asyncio
 import email.message
 import errno
 import json
 import logging
 import socket
-from types import ModuleType
+from datetime import (
+    datetime,
+    timedelta,
+    timezone,
+)
 from typing import Any
 
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Query,
+    Request,
+)
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    Response,
+)
 from pydantic import ValidationError
-
 from websockets.exceptions import ConnectionClosed
 
-from app.route_compat import MainModuleAPIRouter
+from app import __version__
+from app.config import get_settings
+from app.models.domain import (
+    DiskInventorySyncRequest,
+    InventoryReadResponse,
+    LedAction,
+    LedRequest,
+    MappingBundle,
+    MappingImportConfirmation,
+    MappingRequest,
+    SasFabricAliasRequest,
+    SasFabricSnapshot,
+    SmartBatchItem,
+    SmartBatchRequest,
+    SmartBatchResponse,
+    SmartSummaryView,
+    SnapshotExportRequest,
+    StorageViewRuntimePayload,
+    SystemLocatorRequest,
+    SystemLocatorStatusView,
+)
+from app.perf import (
+    add_perf_metadata,
+    perf_stage,
+)
+from app.route_support import (
+    INVALID_MAPPING_BUNDLE_DETAIL,
+    HistoryRefreshProxyRequest,
+    HistoryScopeProxyRequest,
+    HistoryScopesProxyRequest,
+    _load_live_enclosure_export_sources,
+    _load_snapshot_export_source,
+    _load_storage_view_export_source,
+    build_health_payload,
+    build_index_context,
+    check_slot_bounds,
+    ensure_read_slot_bounds,
+    ensure_slot_bounds,
+    get_history_backend,
+    get_inventory_registry,
+    get_release_status_service,
+    get_snapshot_export_service,
+    health_status_code,
+    history_service_problem,
+    logger,
+    refresh_storage_problems,
+    require_read_ui_basic_credentials,
+    require_read_ui_mutation_authorization,
+    resolve_admin_launch_url,
+    resolve_layout_slots,
+    resolve_read_layout_slots,
+    resolve_read_ui_write_policy,
+    startup_problems_for,
+    templates,
+    upgrade_notice_data_dir,
+)
+from app.services import upgrade_notice
 from app.services.backup_health import backup_archive_problems
 from app.services.history_backend import (
     HISTORY_BACKEND_DEGRADED_DETAIL,
     HistoryBackendBusyError,
+    HistoryBackendPolicyError,
 )
 from app.services.history_status import project_public_collector_status
+from app.services.inventory import DiskInventorySyncBusy
+from app.services.mapping_store import (
+    MappingImportDigestMismatch,
+    MappingRevisionConflict,
+    MappingScopeConflict,
+)
+from app.services.snapshot_export import (
+    SnapshotExportTooLargeError,
+    collect_configured_hostnames,
+)
 from app.services.storage_writability import StorageDirectoryUnwritable
 from app.services.tls_context import TlsTrustConfigurationError
+from app.services.truenas_ws import TrueNASAPIError
 from history_service.operation_bounds import (
+    ALLOWED_HISTORY_METRICS,
     HISTORY_READ_BUSY_DETAIL,
     HISTORY_READ_RETRY_AFTER_SECONDS,
     MAX_TARGETS,
+    HistoryBudgetExceeded,
+    HistoryRequestShapeError,
+    build_history_read_plan,
 )
 from history_service.refresh_auth import read_limited_request_body
 
-
 MAX_HISTORY_SCOPES_REQUEST_BYTES = 64 * 1024
 
-# Not named `logger`: the main-module facade copies its own globals in here.
 _routes_logger = logging.getLogger(__name__)
 
 
@@ -144,8 +226,8 @@ SMART_BATCH_TLS_TRUST_DETAIL = (
 )
 
 
-def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
-    router = MainModuleAPIRouter(main_module, globals())
+def build_router() -> APIRouter:
+    router = APIRouter()
 
     def route_service(
         system_id: str | None,

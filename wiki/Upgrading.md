@@ -86,22 +86,27 @@ ownership step.
 
 ## What is tested
 
-Every pull request runs the upgrade below in CI, on a disposable Linux Docker
+Every pull request runs the upgrades below in CI, on a disposable Linux Docker
 host with synthetic data. Anything not in this table has not been tested, so
 treat it as unverified, not as broken.
 
 | Area | Tested | Not tested yet |
 | --- | --- | --- |
 | Docker host | Linux, Docker Engine with Compose v2, `linux/amd64` image | Docker Desktop, other architectures, rootless Docker |
-| Local state | Bind mounts on a local POSIX filesystem, owned by root | Network filesystems, read-only or full disks |
-| Services | Main UI and history on the published base Compose file | Admin and backup services, and the hardening overlay, during an upgrade |
-| Upgrade path | v0.22.2 to the current build: change `JBOD_UI_IMAGE`, then `pull` and `up -d` | Releases before v0.22.2, skipping several releases |
-| After upgrading | Both containers healthy with no restarts; the new version and revision are reported; bay mappings, history rows and `config.yaml` unchanged; database integrity check passes; history schema migrated at startup; no change of file ownership | Large (multi-GiB) history databases, many enclosures |
-| Rollback | Pin back to v0.22.2 with the same two commands; the older release starts and reads what the newer one wrote | Rollback across a history schema change |
-| Recovery | | An interrupted migration or restore, an encrypted restore on a clean host |
+| Local state | Bind mounts on a local POSIX filesystem, owned by root; or, with the hardening overlay, handed to uid 10001 by the one-time ownership step in [[Troubleshooting]] | Network filesystems, read-only or full disks |
+| Services | Main UI and history on the published base Compose file, and on the base file plus `docker-compose.nonroot.yml` | Admin and backup services during an upgrade |
+| Upgrade path | v0.22.2 to the current build: change `JBOD_UI_IMAGE`, then `pull` and `up -d`, with the same `-f` files each time | Releases before v0.22.2, skipping several releases |
+| After upgrading | Both containers healthy with no restarts; the new version and revision are reported; bay mappings, history rows and `config.yaml` unchanged; database integrity check passes; history schema migrated at startup; no change of file ownership, and hardened services still run as uid 10001 | Large (multi-GiB) history databases, many enclosures |
+| Rollback | Pin back to v0.22.2 with the same two commands, on both deployments; the older release starts and reads what the newer one wrote | Rollback across a history schema change |
+| Recovery | The new history container killed (`SIGKILL`) inside each of its startup migration steps on v0.22.2 data, one after another; the next `up -d` comes up healthy with no restarts, integrity check `ok`, no rows lost, nothing quarantined, and the same database an uninterrupted upgrade produces | A killed restore, a killed data backfill at runtime (v0.22.2 data needs none; see below), an encrypted restore on a clean host, a full disk |
 
-The check is `scripts/run_image_upgrade_smoke.py`, run by the `Image-only
-upgrade smoke` CI job.
+The checks are `scripts/run_image_upgrade_smoke.py`: the base upgrade runs in
+the `Image-only upgrade smoke` CI job, and `--scenario hardened` and
+`--scenario interrupted-migration` run as separate steps of the
+`Hardened and interrupted upgrade smoke` job. v0.22.2 already has the current
+history schema, so on v0.22.2 data the killed steps have nothing to change;
+that run proves a kill at any point of startup leaves a database the next start
+opens as if nothing happened.
 
 Separately, `tests/test_history_released_schema_upgrades.py` upgrades synthetic
 history databases built from the exact released schemas of v0.8.0, v0.21.2 and
@@ -109,7 +114,8 @@ v0.22.2 (v0.23.0 has the same schema as v0.22.2). The tests check row contents,
 disk identity keys, the row counters and the SQLite integrity check. They kill
 the upgrade after each startup migration step and prove the next start
 finishes it. They also refuse a database stamped newer than this build without
-changing it. That covers the history database schema only, not a full container
+changing it. Those kills land inside the data backfill that older databases
+need. That covers the history database schema only, not a full container
 upgrade from those releases.
 
 Every history schema change so far only adds columns, indexes and tables, so

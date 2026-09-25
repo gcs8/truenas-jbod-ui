@@ -143,8 +143,9 @@ class ScheduledBackupSettingsTests(unittest.TestCase):
         admin_config = (Path(__file__).resolve().parents[1] / "admin_service/config.py").read_text(
             encoding="utf-8"
         )
-        admin_main = (Path(__file__).resolve().parents[1] / "admin_service/main.py").read_text(
-            encoding="utf-8"
+        admin_main = "".join(
+            (Path(__file__).resolve().parents[1] / relative).read_text(encoding="utf-8")
+            for relative in ("admin_service/main.py", "admin_service/route_support.py")
         )
         self.assertNotIn("scheduled_backup", admin_config)
         self.assertNotIn("ScheduledBackup", admin_main)

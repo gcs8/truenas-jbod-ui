@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from fastapi import HTTPException
 
 from app import main as app_main
+from app import routes as app_routes
 from app.config import Settings, SystemConfig, TrueNASConfig
 from app.models.domain import (
     EnclosureOption,
@@ -141,9 +142,9 @@ class MappingImportRouteTests(unittest.TestCase):
             )
 
             with (
-                patch.object(app_main, "get_inventory_registry", return_value=registry),
-                patch.object(app_main, "ensure_slot_bounds"),
-                patch.object(app_main, "add_perf_metadata"),
+                patch.object(app_routes, "get_inventory_registry", return_value=registry),
+                patch.object(app_routes, "ensure_slot_bounds"),
+                patch.object(app_routes, "add_perf_metadata"),
             ):
                 response = asyncio.run(save_route.endpoint(
                     slot=7,
@@ -197,7 +198,7 @@ class MappingImportRouteTests(unittest.TestCase):
         registry = Mock()
         registry.get_service.return_value = service
 
-        with patch.object(app_main, "get_inventory_registry", return_value=registry):
+        with patch.object(app_routes, "get_inventory_registry", return_value=registry):
             response = asyncio.run(
                 route.endpoint(payload=bundle, system_id="system-a", enclosure_id="enc-a")
             )
@@ -238,7 +239,7 @@ class MappingImportRouteTests(unittest.TestCase):
                 registry.get_service.return_value = service
 
                 with (
-                    patch.object(app_main, "get_inventory_registry", return_value=registry),
+                    patch.object(app_routes, "get_inventory_registry", return_value=registry),
                     self.assertRaises(HTTPException) as raised,
                 ):
                     asyncio.run(
@@ -321,9 +322,9 @@ class MappingImportRouteTests(unittest.TestCase):
         )
 
         with (
-            patch.object(app_main, "get_inventory_registry", return_value=registry),
-            patch.object(app_main, "ensure_slot_bounds"),
-            patch.object(app_main, "add_perf_metadata"),
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "ensure_slot_bounds"),
+            patch.object(app_routes, "add_perf_metadata"),
         ):
             asyncio.run(
                 save_route.endpoint(
@@ -399,9 +400,9 @@ class MappingImportRouteTests(unittest.TestCase):
                 arguments = {"payload": payload} if method == "POST" else {"expected_revision": "a" * 64}
 
                 with (
-                    patch.object(app_main, "get_inventory_registry", return_value=registry),
-                    patch.object(app_main, "ensure_slot_bounds"),
-                    patch.object(app_main, "add_perf_metadata"),
+                    patch.object(app_routes, "get_inventory_registry", return_value=registry),
+                    patch.object(app_routes, "ensure_slot_bounds"),
+                    patch.object(app_routes, "add_perf_metadata"),
                     self.assertRaises(HTTPException) as raised,
                 ):
                     asyncio.run(
@@ -437,9 +438,9 @@ class MappingImportRouteTests(unittest.TestCase):
         registry.get_service.return_value = service
 
         with (
-            patch.object(app_main, "get_inventory_registry", return_value=registry),
-            patch.object(app_main, "ensure_slot_bounds"),
-            patch.object(app_main, "add_perf_metadata"),
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "ensure_slot_bounds"),
+            patch.object(app_routes, "add_perf_metadata"),
         ):
             asyncio.run(
                 route.endpoint(
@@ -482,9 +483,9 @@ class MappingImportRouteTests(unittest.TestCase):
         registry.get_service.return_value = service
 
         with (
-            patch.object(app_main, "get_inventory_registry", return_value=registry),
-            patch.object(app_main, "ensure_slot_bounds"),
-            patch.object(app_main, "add_perf_metadata"),
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "ensure_slot_bounds"),
+            patch.object(app_routes, "add_perf_metadata"),
         ):
             asyncio.run(
                 route.endpoint(
@@ -548,9 +549,9 @@ class MappingImportRouteTests(unittest.TestCase):
                 registry = Mock()
                 registry.get_service.return_value = service
                 with (
-                    patch.object(app_main, "get_inventory_registry", return_value=registry),
-                    patch.object(app_main, "ensure_slot_bounds"),
-                    patch.object(app_main, "add_perf_metadata"),
+                    patch.object(app_routes, "get_inventory_registry", return_value=registry),
+                    patch.object(app_routes, "ensure_slot_bounds"),
+                    patch.object(app_routes, "add_perf_metadata"),
                 ):
                     response = asyncio.run(
                         route.endpoint(
@@ -593,9 +594,9 @@ class MappingImportRouteTests(unittest.TestCase):
         registry.get_service.return_value = service
 
         with (
-            patch.object(app_main, "get_inventory_registry", return_value=registry),
-            patch.object(app_main, "ensure_slot_bounds"),
-            patch.object(app_main, "add_perf_metadata"),
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "ensure_slot_bounds"),
+            patch.object(app_routes, "add_perf_metadata"),
         ):
             response = asyncio.run(save_route.endpoint(
                 slot=7,
@@ -647,7 +648,7 @@ class MappingImportRouteTests(unittest.TestCase):
         registry = Mock()
         registry.get_service.return_value = service
 
-        with patch.object(app_main, "get_inventory_registry", return_value=registry):
+        with patch.object(app_routes, "get_inventory_registry", return_value=registry):
             response = asyncio.run(
                 route.endpoint(payload=payload, system_id="system-a", enclosure_id="enc-a")
             )
@@ -712,7 +713,7 @@ class MappingImportRouteTests(unittest.TestCase):
                 service.get_snapshot = AsyncMock()
                 registry = Mock()
                 registry.get_service.return_value = service
-                with patch.object(app_main, "get_inventory_registry", return_value=registry):
+                with patch.object(app_routes, "get_inventory_registry", return_value=registry):
                     response = asyncio.run(
                         route.endpoint(payload=payload, system_id="system-a", enclosure_id="enc-a")
                     )
@@ -759,7 +760,7 @@ class MappingImportRouteTests(unittest.TestCase):
                 service.get_snapshot = AsyncMock()
                 registry = Mock()
                 registry.get_service.return_value = service
-                with patch.object(app_main, "get_inventory_registry", return_value=registry):
+                with patch.object(app_routes, "get_inventory_registry", return_value=registry):
                     response = asyncio.run(
                         route.endpoint(
                             **arguments,
@@ -816,9 +817,9 @@ class UnwritableDataDirectoryRouteTests(unittest.TestCase):
                 )
 
                 with (
-                    patch.object(app_main, "get_inventory_registry", return_value=registry),
-                    patch.object(app_main, "ensure_slot_bounds"),
-                    patch.object(app_main, "add_perf_metadata"),
+                    patch.object(app_routes, "get_inventory_registry", return_value=registry),
+                    patch.object(app_routes, "ensure_slot_bounds"),
+                    patch.object(app_routes, "add_perf_metadata"),
                 ):
                     response = asyncio.run(
                         route.endpoint(
@@ -858,8 +859,8 @@ class UnwritableDataDirectoryRouteTests(unittest.TestCase):
         registry.has_system.return_value = True
 
         with (
-            patch.object(app_main, "get_inventory_registry", return_value=registry),
-            patch.object(app_main, "add_perf_metadata"),
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "add_perf_metadata"),
         ):
             response = asyncio.run(
                 route.endpoint(

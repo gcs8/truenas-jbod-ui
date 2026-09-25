@@ -36,6 +36,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   plain 7-Zip cannot open them; existing `.7z` backups still restore. Set
   `BACKUP_FULL_ARCHIVE_FORMAT=7z` (or `backups.full.archive_format: 7z`) to keep
   making `.7z` FULL backups. (#611)
+- The main UI's 401 answer to an unsigned write now reads `Main UI
+  authentication required.` (was `Read UI authentication required.`). Update
+  any script or monitor that matches the exact old error text. (#608)
 - `/healthz` on the main UI answers HTTP 503 (`status: down`) when its data,
   logs or known-hosts folder is not writable; remote failures stay HTTP 200
   (`status: degraded`). Compose healthchecks probe `/livez` and are unchanged,
@@ -60,9 +63,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   tar.zst` (or `BACKUP_FULL_ARCHIVE_FORMAT`). It packs tar + Zstandard and seals it in
   1 MiB authenticated AES-256-GCM chunks, so a multi-GiB history database is never held
   in memory and damage is caught chunk by chunk. On a 2 GiB synthetic database it
-  took 17 s instead of 541 s to create. 7z stays the default because older app versions
-  can't read the new format. `scripts/benchmark_full_backup.py --format` measures both.
-  (#600)
+  took 17 s instead of 541 s to create. This PR shipped it opt-in; #611 makes it
+  the default (see Upgrade notes). `scripts/benchmark_full_backup.py --format`
+  measures both. (#600)
 - `scripts/update_immutable_deployment.py update --inventory-url` checks disk
   retention: it reads only the aggregate inventory totals before and after the
   update, and rolls back when a source disk is unplaced or the source count
@@ -604,6 +607,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Removed dead code: the legacy `__default__` snapshot key, zero-caller and
   test-only helpers, monkeypatch-only wrappers and the unused "Scrambled IDs"
   label; named three layout magic numbers. (#606)
+- Route handlers now import their collaborators directly: removed the
+  `route_compat` globals copy and the blanket lint suppressions in `main.py`
+  and `routes.py`; tests patch the module each name is looked up in. (#612)
 - Tested history upgrades from the released v0.8.0, v0.21.2 and v0.22.2
   schemas, including a kill after each startup migration step, a second start
   that changes nothing, the previous release reading an upgraded database, and
@@ -613,6 +619,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   of `.env.example`, checks `/livez` and `/healthz`, and checks that the
   container is not restarting (#602).
 
+- CI now also upgrades a hardened v0.22.2 install (base Compose plus
+  `docker-compose.nonroot.yml`) by image pin only and rolls it back, and kills
+  the new history container inside each startup migration step on v0.22.2
+  data before a normal start that must finish cleanly with no data lost (#613).
 - CI now upgrades the public v0.22.2 image to each pull request's build by
   changing only `JBOD_UI_IMAGE` on root-owned mounts, checks that the
   containers are healthy, that mappings and history survive and that the

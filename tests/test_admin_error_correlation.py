@@ -20,10 +20,10 @@ from unittest.mock import patch
 # Must precede admin_service.main, which builds its app at import time.
 from tests.admin_test_env import ADMIN_TEST_PUBLIC_ORIGIN
 from admin_service.config import AdminSettings
-from admin_service.main import (
+from admin_service.main import create_app
+from admin_service.route_support import (
     admin_request_id,
     build_offline_recovery_state,
-    create_app,
 )
 from app.request_context import REQUEST_ID_HEADER
 

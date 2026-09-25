@@ -18,9 +18,9 @@ from fastapi.routing import APIRoute
 # Must precede admin_service.main, which builds its app at import time.
 from tests.admin_test_env import ADMIN_TEST_PUBLIC_ORIGIN
 from admin_service.config import AdminSettings, get_admin_settings
-from admin_service.main import (
+from admin_service.main import create_app
+from admin_service.route_support import (
     _basic_auth_matches,
-    create_app,
     validate_admin_export_policy,
 )
 from app.models.domain import DebugBundleExportRequest, SystemBackupExportRequest
