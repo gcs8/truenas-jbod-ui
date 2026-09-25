@@ -8,7 +8,8 @@ import unittest
 from unittest.mock import patch
 
 from app import __version__
-from app import main as app_main
+from app import route_support as app_route_support
+from app import routes as app_routes
 from app.config import AppConfig, PathConfig, Settings
 from app.models.domain import (
     EnclosureOption,
@@ -138,10 +139,30 @@ class UpgradeNoticeServiceTests(unittest.TestCase):
             data_dir = Path(temp_dir)
             upgrade_notice.current_notice(data_dir, version="0.23.0")
 
-            notice = upgrade_notice.current_notice(data_dir, version="0.24.0")
+            notice = upgrade_notice.current_notice(data_dir, version="0.24.0", auth_mode="basic")
 
         self.assertEqual(notice["text"], "Updated to v0.24.0.")
         self.assertEqual(notice["previous"], "0.23.0")
+
+    def test_network_mode_write_exposure_is_said_after_every_update(self) -> None:
+        # #447: an install that skips v0.23.0, or starts fresh on a later
+        # release, must still be told that network mode takes writes from
+        # anyone who can reach the port.
+        for previous in ("0.22.2", "0.23.0", None):
+            with self.subTest(previous=previous), tempfile.TemporaryDirectory() as temp_dir:
+                data_dir = Path(temp_dir)
+                if previous:
+                    upgrade_notice.current_notice(data_dir, version=previous)
+                notice = upgrade_notice.current_notice(data_dir, version="0.24.0", auth_mode="network")
+                self.assertIn(
+                    "anyone who can reach this port can change bay assignments and lights",
+                    notice["text"],
+                )
+                self.assertIn("Optional authentication", notice["text"])
+        for mode in ("basic", ""):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp_dir:
+                notice = upgrade_notice.current_notice(Path(temp_dir), version="0.24.0", auth_mode=mode)
+                self.assertNotIn("anyone who can reach", notice["text"])
 
     def test_stale_notice_for_another_version_is_replaced(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -228,7 +249,7 @@ class UpgradeNoticeRouteTests(unittest.TestCase):
             ),
             enclosures=[EnclosureOption(id="enc-a", label="Shelf A", raw_label="Shelf A")],
         )
-        return app_main.build_index_context(
+        return app_route_support.build_index_context(
             request=index_request(app),
             snapshot=snapshot,
             storage_view_runtime=StorageViewRuntimePayload(system_id="system-a", views=[]),
@@ -242,11 +263,11 @@ class UpgradeNoticeRouteTests(unittest.TestCase):
         app = build_app(auth_mode="network")
         payload = {"version": "0.23.0", "previous": "0.22.2", "text": "Updated to v0.23.0. Example notice."}
 
-        with_notice = app_main.templates.get_template("index.html").render(
+        with_notice = app_route_support.templates.get_template("index.html").render(
             self._context(app, upgrade_notice_payload=payload)
         )
-        without_notice = app_main.templates.get_template("index.html").render(self._context(app))
-        snapshot_copy = app_main.templates.get_template("index.html").render(
+        without_notice = app_route_support.templates.get_template("index.html").render(self._context(app))
+        snapshot_copy = app_route_support.templates.get_template("index.html").render(
             self._context(app, upgrade_notice_payload=payload, snapshot_mode=True)
         )
 
@@ -268,7 +289,7 @@ class UpgradeNoticeRouteTests(unittest.TestCase):
             upgrade_notice.current_notice(data_dir, version="0.22.2")
             upgrade_notice.current_notice(data_dir, version=__version__)
             app = build_app(auth_mode="network")
-            with patch.object(app_main, "get_settings", return_value=settings):
+            with patch.object(app_routes, "get_settings", return_value=settings):
                 status, _headers, _body = asyncio.run(
                     invoke_asgi(
                         app,
@@ -301,7 +322,7 @@ class UpgradeNoticeRouteTests(unittest.TestCase):
             current = upgrade_notice.current_notice(data_dir, version=__version__)
             app = build_app(auth_mode="network")
 
-            with patch.object(app_main, "get_settings", return_value=settings):
+            with patch.object(app_routes, "get_settings", return_value=settings):
                 status, _headers, body = asyncio.run(
                     invoke_asgi(
                         app,

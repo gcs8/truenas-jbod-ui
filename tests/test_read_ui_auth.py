@@ -16,6 +16,8 @@ from starlette.requests import Request
 
 from app.read_ui_auth_config import ReadUiAuthSettings
 from app import main as app_main
+from app import route_support as app_route_support
+from app import routes as app_routes
 from app.config import AppConfig, Settings
 from app.models.domain import (
     EnclosureOption,
@@ -270,7 +272,7 @@ class ReadUIAuthorizationTests(unittest.TestCase):
         # The upgrade-notice dismiss route writes a version record; keep it out of the checkout.
         data_dir = tempfile.TemporaryDirectory()
         self.addCleanup(data_dir.cleanup)
-        patcher = patch.object(app_main, "upgrade_notice_data_dir", return_value=Path(data_dir.name))
+        patcher = patch.object(app_routes, "upgrade_notice_data_dir", return_value=Path(data_dir.name))
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -535,7 +537,7 @@ class ReadUIWritePolicyBootstrapTests(unittest.TestCase):
             ),
             enclosures=[EnclosureOption(id="enc-a", label="Shelf A", raw_label="Shelf A")],
         )
-        return app_main.build_index_context(
+        return app_route_support.build_index_context(
             request=index_request(app),
             snapshot=snapshot,
             storage_view_runtime=StorageViewRuntimePayload(system_id="system-a", views=[]),
@@ -552,7 +554,7 @@ class ReadUIWritePolicyBootstrapTests(unittest.TestCase):
         self.assertEqual(policy["reason"], "")
         self.assertEqual(json.loads(context["write_policy_json"]), policy)
 
-        html = app_main.templates.get_template("index.html").render(context)
+        html = app_route_support.templates.get_template("index.html").render(context)
         self.assertIn(f"writePolicy: {context['write_policy_json']}", html)
 
     def test_basic_mode_context_requires_in_page_sign_in_before_enabling_writes(self) -> None:
@@ -573,7 +575,7 @@ class ReadUIWritePolicyBootstrapTests(unittest.TestCase):
         context.pop("write_policy_json")
         context["snapshot_mode"] = True
 
-        html = app_main.templates.get_template("index.html").render(context)
+        html = app_route_support.templates.get_template("index.html").render(context)
         self.assertIn("writePolicy: null,", html)
 
     def test_operator_docs_explain_in_page_sign_in_and_credential_lifetime(self) -> None:

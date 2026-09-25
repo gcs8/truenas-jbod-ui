@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import uvicorn
 from starlette.responses import JSONResponse
 
-from app import main as app_main
+from app import routes as app_routes
 from app.config import AppConfig, PathConfig, Settings
 from app.models.domain import (
     EnclosureOption, InventorySnapshot, SlotView, StorageViewRuntimePayload, SystemOption,
@@ -58,10 +58,11 @@ def main() -> None:
             return runtime
 
     app = build_app(auth_mode=args.mode, public_origin=origin)
-    app_main.get_settings = lambda: settings
-    app_main.get_inventory_registry = lambda: SimpleNamespace(get_service=lambda _id: Service())
-    app_main.resolve_admin_launch_url = lambda *_args: None
-    app_main.get_release_status_service = lambda: SimpleNamespace(snapshot=lambda: {})
+    # The index handler looks these up in app.routes at call time.
+    app_routes.get_settings = lambda: settings
+    app_routes.get_inventory_registry = lambda: SimpleNamespace(get_service=lambda _id: Service())
+    app_routes.resolve_admin_launch_url = lambda *_args: None
+    app_routes.get_release_status_service = lambda: SimpleNamespace(snapshot=lambda: {})
     write_state = upgrade_notice._write_state
     upgrade_notice._write_state = lambda path, state: (
         False if (directory / "fail-write").exists() else write_state(path, state)

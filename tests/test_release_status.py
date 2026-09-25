@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from app.services.release_status import ReleaseStatusService, describe_release_status
+from app import routes as app_routes
 
 
 class ReleaseStatusTests(unittest.TestCase):
@@ -588,7 +589,7 @@ class ReleaseStatusRouteAndCopyTests(unittest.TestCase):
         route = next(route for route in app.routes if getattr(route, "path", "") == "/api/release-status")
         service = MagicMock()
         service.snapshot.return_value = {"status": "error", "summary": "Could not check for updates"}
-        with patch.object(app_main, "get_release_status_service", return_value=service):
+        with patch.object(app_routes, "get_release_status_service", return_value=service):
             response = asyncio.run(route.endpoint())
         self.assertEqual(json.loads(response.body), {"status": "error", "summary": "Could not check for updates"})
 

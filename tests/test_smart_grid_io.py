@@ -101,9 +101,10 @@ class SyntheticAPI:
         self.available = True
         self.calls = 0
         self.hours = 321
+        self.model = "Synthetic disk"
 
     async def fetch_all(self):
-        disks = [{"name": f"da{i}", "serial": f"INVENTED-{i:03d}", "model": "Synthetic disk",
+        disks = [{"name": f"da{i}", "serial": f"INVENTED-{i:03d}", "model": self.model,
                   "enclosure": {"id": "synthetic-enclosure", "slot": i}, "status": "ONLINE"}
                  for i in range(self.count)]
         return TrueNASRawData(
@@ -1089,17 +1090,31 @@ class SmartGridIOTests(unittest.IsolatedAsyncioTestCase):
             self.assertGreater(api.calls, 0)
             self.assert_other(store, other)
 
-    async def test_forced_snapshot_preserves_normal_freshness_writes(self):
+    async def test_forced_snapshot_skips_timestamp_only_rewrite(self):
+        # #448 item 2: a refresh that changes nothing but the row stamp leaves
+        # the file alone; a real change still writes, with the new stamp.
         with self.fixture(1) as (service, api, store, other):
             await self.snapshot(service, 1)
-            before = store.load_all()
+            before = store.file_path.read_bytes()
             future = datetime.now(timezone.utc) + timedelta(seconds=10)
             trace = StoreTrace(store)
             with patch("app.services.slot_detail_store.utcnow", return_value=future), trace.capture():
                 await service.get_snapshot(force_refresh=True)
-            trace.report("snapshot-forced", 1)
+            trace.report("snapshot-forced-unchanged", 1)
+            self.assertEqual(trace.operations["write"], 0)
+            self.assertEqual(trace.threads["loop"], 0)
+            self.assertEqual(store.file_path.read_bytes(), before)
+
+            api.model = "Synthetic disk rev B"
+            later = future + timedelta(seconds=10)
+            trace = StoreTrace(store)
+            with patch("app.services.slot_detail_store.utcnow", return_value=later), trace.capture():
+                snapshot = await service.get_snapshot(force_refresh=True)
+            trace.report("snapshot-forced-changed", 1)
             self.assertEqual(trace.operations["write"], 1)
-            self.assertNotEqual(before, store.load_all())
+            entry = store.get_entry(service.system.id, snapshot.slots[0].enclosure_id, snapshot.slots[0].slot)
+            self.assertEqual(entry.slot_fields["model"], "Synthetic disk rev B")
+            self.assertEqual(entry.updated_at, later.isoformat())
             self.assert_other(store, other)
 
     async def test_negative_cache_bypass_performs_fresh_work(self):
@@ -1128,7 +1143,14 @@ class SmartGridIOTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.to_thread(store.save_entries, [other])
             self.assertEqual(repeat.operations, Counter(read=1, json_load=1))
             self.assertEqual(repeat.threads["loop"], 0)
-            changed = other.model_copy(update={"updated_at": "2002-01-01T00:00:00+00:00"})
+            # A new row stamp alone is not a change (#448 item 2).
+            stamped = other.model_copy(update={"updated_at": "2002-01-01T00:00:00+00:00"})
+            stamp_only = StoreTrace(store)
+            with stamp_only.capture():
+                await asyncio.to_thread(store.save_entries, [stamped])
+            self.assertEqual(stamp_only.operations, Counter(read=1, json_load=1))
+            self.assert_other(store, other)
+            changed = stamped.model_copy(update={"slot_fields": {"model": "Changed synthetic model"}})
             trace = StoreTrace(store)
             with trace.capture():
                 await asyncio.to_thread(store.save_entries, [changed])
@@ -1149,23 +1171,37 @@ class SnapshotIOTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(spin(), 3)
 
     async def test_snapshot_real_io_off_loop_and_exact_freshness(self):
+        # Row stamps: cold writes day 1; an unchanged forced refresh writes
+        # nothing and keeps day 1 (#448 item 2); a forced refresh that sees a
+        # real change writes day 3; a warm hit touches nothing.
+        phases = (('cold', 1, True), ('forced-unchanged', 2, False),
+                  ('forced-changed', 3, True), ('warm', 4, None))
         for count in (1, 60, 84):
             with self.subTest(slots=count), self.fixture(count) as (s, api, store, other):
-                for phase in ('cold', 'forced', 'warm'):
+                written_day = None
+                for phase, day, writes in phases:
+                    if phase == 'forced-changed':
+                        api.model = 'Synthetic disk rev B'
                     trace = StoreTrace(store)
-                    stamp = datetime(2030, 1, 1 if phase == 'cold' else 2, tzinfo=timezone.utc)
+                    stamp = datetime(2030, 1, day, tzinfo=timezone.utc)
                     with patch('app.services.slot_detail_store.utcnow', return_value=stamp), trace.capture():
-                        snapshot = await s.get_snapshot(force_refresh=phase == 'forced')
+                        snapshot = await s.get_snapshot(force_refresh=phase.startswith('forced'))
                     trace.report('snapshot-' + phase, count)
                     self.assertEqual(len(snapshot.slots), count)
-                    expected = Counter() if phase == 'warm' else Counter(read=2, json_load=2, write=1, json_dump=1, replace=1)
+                    if writes is None:
+                        expected = Counter()
+                    elif writes:
+                        expected = Counter(read=2, json_load=2, write=1, json_dump=1, replace=1)
+                        written_day = day
+                    else:
+                        expected = Counter(read=2, json_load=2)
                     self.assertEqual(trace.operations, expected)
                     self.assertEqual(trace.threads['loop'], 0)
                     entries = store.load_all()
                     self.assertEqual(entries[store._slot_key(other.system_id, other.enclosure_id, other.slot)], other)
                     for slot in snapshot.slots:
                         entry = store.get_entry(s.system.id, slot.enclosure_id, slot.slot, loaded_entries=entries)
-                        self.assertEqual(entry.updated_at, stamp.isoformat())
+                        self.assertEqual(entry.updated_at, datetime(2030, 1, written_day, tzinfo=timezone.utc).isoformat())
 
     async def test_cancel_twice_retains_snapshot_owner_until_real_io_drains(self):
         for phase in ('load_all', 'save_entries'):
@@ -1235,6 +1271,8 @@ class SnapshotIOTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(cancel=cancel), self.fixture(1) as (s, api, store, other):
                 await s.get_snapshot()
                 before = store.file_path.read_bytes()
+                # A real change, so the forced snapshot has something to write.
+                api.model = 'Synthetic disk rev B'
                 entered, release = threading.Event(), threading.Event()
                 original = json.dump
                 loop_thread = threading.get_ident()
@@ -1540,10 +1578,11 @@ class SmartGridConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             concurrent.slot_fields['probe'] = 1
             changed_other = other.model_copy(update={'updated_at': '2040-01-01T00:00:00+00:00'})
             await asyncio.to_thread(store.save_entries, [concurrent, changed_other])
-            newer_second = second.model_copy(update={'updated_at': '2041-01-01T00:00:00+00:00'})
+            newer_second = second.model_copy(update={'updated_at': '2041-01-01T00:00:00+00:00',
+                                                     'slot_fields': {**second.slot_fields, 'probe': 'newer'}})
             await asyncio.to_thread(store.save_entries, [first, newer_second, third], expected_entries=expected)
             self.assertIs(type(store.get_entry(s.system.id, first.enclosure_id, 0).slot_fields['probe']), int)
-            self.assertEqual(store.get_entry(s.system.id, second.enclosure_id, 1).updated_at, newer_second.updated_at)
+            self.assertEqual(store.get_entry(s.system.id, second.enclosure_id, 1), newer_second)
             self.assertEqual(store.get_entry(other.system_id, other.enclosure_id, other.slot), changed_other)
             # A removed system entry must not be resurrected by the old read snapshot.
             baseline = store.load_all()

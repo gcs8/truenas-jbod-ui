@@ -58,7 +58,7 @@ explicitly approved target; they are not part of ordinary offline source checks.
 | `run_perf_harness.py` | Read-only API performance checks from a checkout against an explicitly selected running app. |
 | `run_history_perf_harness.py` | History-sidecar performance checks from a checkout against an explicitly selected running sidecar. |
 | `run_compose_runtime_matrix.py` | Synthetic service-combination QA on a disposable Linux Docker host; runtime checks use `/proc/meminfo`. |
-| `run_image_upgrade_smoke.py` | CI `Image-only upgrade smoke`: upgrades the previous public release by image pin only, then rolls back, on a disposable Linux Docker host with `sudo`. Synthetic state only. |
+| `run_image_upgrade_smoke.py` | CI `Image-only upgrade smoke`: upgrades the previous public release by image pin only, then rolls back, on a disposable Linux Docker host with `sudo`. `--scenario hardened` does the same through `docker-compose.nonroot.yml`; `--scenario interrupted-migration` kills the new history container inside each startup migration step and checks the next start (CI `Hardened and interrupted upgrade smoke`). Synthetic state only. |
 | `run_private_qa_restore.py` | Private restore drill on an approved disposable Linux Docker QA host; requires private inputs and uses `/proc/meminfo`. Never run as a routine source check. |
 | `build_current_source_browser_fixture.py` | Build deterministic current-source browser fixtures in a development checkout. |
 | `build_public_demo.py` | Generate/check the synthetic public demo in a maintainer checkout. Local-history modes require separate authorization. |

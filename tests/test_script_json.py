@@ -10,7 +10,7 @@ from starlette.datastructures import URLPath
 from starlette.requests import Request
 
 from app.config import Settings
-from app.main import build_index_context, templates
+from app.route_support import build_index_context, templates
 from app.models.domain import (
     EnclosureOption,
     InventorySnapshot,

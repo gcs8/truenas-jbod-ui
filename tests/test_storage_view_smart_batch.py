@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from fastapi import HTTPException
 
 from app import main as app_main
+from app import routes as app_routes
 from app.config import Settings, SystemConfig, TrueNASConfig
 from app.models.domain import (
     SmartBatchItem,
@@ -155,8 +156,8 @@ class StorageViewBatchRouteTests(unittest.TestCase):
         payload.slots = slots
         payload.max_concurrency = None
         with (
-            patch.object(app_main, "get_inventory_registry", return_value=registry),
-            patch.object(app_main, "add_perf_metadata"),
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "add_perf_metadata"),
         ):
             return asyncio.run(
                 route.endpoint(view_id=VIEW_ID, payload=payload, system_id="system-a", **query)
