@@ -43,7 +43,7 @@ from history_service.domain import (
     utcnow,
 )
 from history_service.scheduled_backup import read_scheduled_backup_status
-from history_service.store import HistoryStore, SlotStateUpdate
+from history_service.store import HistoryStore, SlotStateUpdate, is_database_corruption_error
 
 logger = logging.getLogger(__name__)
 STORAGE_VIEW_SCOPE_PREFIX = "storage-view:"
@@ -109,6 +109,13 @@ class HistoryCollectionStopping(RuntimeError):
     pass
 
 
+class HistoryCollectionPaused(RuntimeError):
+    """Collection refuses to write because the database was found damaged (#417)."""
+
+
+COLLECTION_PAUSED_REASON = "The history database is damaged; collection is paused to protect it."
+
+
 def _is_missing_route(exc: HistorySourceError) -> bool:
     """True when the main UI answered that it has no such route (an older build)."""
 
@@ -119,6 +126,7 @@ class HistoryCollector:
     def __init__(self, settings: HistorySettings, store: HistoryStore) -> None:
         self.settings = settings
         self.store = store
+        self._paused_in_memory_at: datetime | None = None
         self._task: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
         self.started_at = isoformat_utc()
@@ -226,6 +234,9 @@ class HistoryCollector:
     ) -> None:
         if not self._run_lock.acquire(blocking=False):
             raise HistoryCollectionAlreadyRunning("History collection already running.")
+        if self.collection_pause()[0]:
+            self._run_lock.release()
+            raise HistoryCollectionPaused(COLLECTION_PAUSED_REASON)
         collection_started_monotonic = time.perf_counter()
         self.current_collection_started_at = isoformat_utc()
         self.current_collection_kind = collection_kind
@@ -241,6 +252,10 @@ class HistoryCollector:
                     cached_root_only=cached_root_only,
                 )
             )
+        except Exception as exc:
+            if is_database_corruption_error(exc):
+                self._pause_for_damage(exc)
+            raise
         finally:
             self.last_collection_duration_seconds = round(time.perf_counter() - collection_started_monotonic, 3)
             self.last_collection_inventory_forced = self.current_collection_inventory_forced
@@ -509,6 +524,9 @@ class HistoryCollector:
                             self.last_backup_error = None
                             self.last_backup_error_kind = None
                 except Exception as exc:  # noqa: BLE001 - collection continues after backup failure.
+                    if is_database_corruption_error(exc):
+                        self._pause_for_damage(exc)
+                        raise
                     backup_kind, backup_summary = classify_backup_failure(exc)
                     self.last_backup_error_kind = backup_kind
                     self.last_backup_error = backup_summary
@@ -537,6 +555,8 @@ class HistoryCollector:
         cleared by the next successful pass.
         """
 
+        if self.collection_pause()[0]:
+            return COLLECTION_PAUSED_REASON
         if self.background_consecutive_failures > 0:
             return "The last background collection failed."
         if self.last_retention_error_kind == "database_read_only":
@@ -611,7 +631,51 @@ class HistoryCollector:
             # database created by recovery has to keep saying so after a restart
             # instead of looking like a first installation (#417).
             **self._quarantine_recovery_status(),
+            **self._collection_pause_status(),
         }
+
+    def collection_pause(self) -> tuple[bool, datetime | None]:
+        """Whether damage paused collection, and since when (#417).
+
+        The marker file is the source of truth, so the pause survives a
+        restart and lifts as soon as `history_service.recovery acknowledge`
+        removes it. If writing the marker failed, this process stays paused
+        in memory until it restarts.
+        """
+
+        reader = getattr(self.store, "read_collection_pause", None)
+        state = reader() if callable(reader) else None
+        if isinstance(state, tuple) and len(state) == 2 and state[0] is True:
+            paused_at = state[1] if isinstance(state[1], datetime) else None
+            return True, paused_at or self._paused_in_memory_at
+        if self._paused_in_memory_at is not None:
+            return True, self._paused_in_memory_at
+        return False, None
+
+    def _collection_pause_status(self) -> dict[str, Any]:
+        paused, paused_at = self.collection_pause()
+        return {
+            "history_collection_paused": paused,
+            "history_collection_paused_at": isoformat_utc(paused_at) if paused_at else None,
+        }
+
+    def _pause_for_damage(self, exc: BaseException) -> None:
+        """Stop scheduled and manual writes after SQLite reports a damaged file."""
+
+        if self.collection_pause()[0]:
+            return
+        now = utcnow()
+        try:
+            self.store.record_collection_pause(now)
+        except Exception:  # noqa: BLE001 - the in-memory pause still protects this process.
+            logger.exception("Could not record the history collection pause marker; pausing in memory only.")
+            self._paused_in_memory_at = now
+        logger.error(
+            "History database is damaged (%s); collection is paused and nothing more is "
+            "written until the database is recovered and `python -m history_service.recovery "
+            "acknowledge` is run. Reads stay available.",
+            type(exc).__name__,
+        )
 
     def _quarantine_recovery_status(self) -> dict[str, Any]:
         """Durable recovery fields from the store, tolerant of a store stub.
@@ -705,6 +769,8 @@ class HistoryCollector:
                 )
             except HistoryCollectionAlreadyRunning:
                 logger.info("Skipping scheduled history collection because another collection pass is already running.")
+            except HistoryCollectionPaused:
+                logger.debug("Skipping scheduled history collection: the database is damaged and collection is paused.")
             except HistoryCollectionStopping:
                 logger.info("Stopping the scheduled history collection at a safe stage boundary.")
                 break
@@ -960,6 +1026,9 @@ class HistoryCollector:
             else:
                 result = maintain_retention()
         except Exception as exc:  # noqa: BLE001 - retention failure must not stop collection.
+            if is_database_corruption_error(exc):
+                # Damage is the one retention failure that must stop writes (#417).
+                self._pause_for_damage(exc)
             duration = time.perf_counter() - started
             self.last_retention_duration_seconds = round(duration, 3)
             retention_kind, retention_summary = classify_retention_failure(exc)
