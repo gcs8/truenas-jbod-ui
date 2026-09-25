@@ -104,6 +104,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Changed
 
+- In network mode, the one-time notice after an update now says that anyone
+  who can reach the port can change bay assignments and lights, on every
+  release rather than only v0.23.0, so installs that skipped it are told
+  too. (#609)
 - The admin now says an SSH key file "was not found in the admin container"
   instead of naming the "admin sidecar". (#601)
 - The main page reuses bay tiles when a refresh brings the same layout,
