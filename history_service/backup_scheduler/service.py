@@ -19,10 +19,12 @@ last result per class and per target; the main UI reads it for ``/healthz``.
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import stat
 import tempfile
@@ -65,6 +67,7 @@ PLAN_TTL_SECONDS = 600
 MAX_PLANS = 16
 MAX_DETAIL_CHARS = 300
 BACKUP_CLASSES = ("config", "full")
+HISTORY_GROUP = "history_db"
 _COPY_CHUNK = 1024 * 1024
 
 
@@ -122,6 +125,9 @@ class SchedulerPaths:
     passphrase_file: Path
     runner_status_dir: Path    # shared status dir for ScheduledBackupRunner status files
     full_status_file: Path | None = None  # e.g. SCHEDULED_BACKUP_STATUS_FILE, keeps segment retention fed
+    history_backup_dir: Path | None = None
+    history_long_term_backup_dir: Path | None = None
+    history_database_stem: str = "history"
 
 
 @dataclass
@@ -212,6 +218,39 @@ class BackupScheduler:
         if payload:
             self._status["classes"] = dict(payload.get("classes") or {})
             self._status["targets"] = dict(payload.get("targets") or {})
+            verified_full = self._validated_verified_full_receipt(payload.get("verified_full"))
+            if verified_full is not None:
+                self._status["verified_full"] = verified_full
+
+    def _validated_verified_full_receipt(self, value: Any) -> dict[str, Any] | None:
+        if not isinstance(value, dict):
+            return None
+        artifact_id = value.get("artifact_id")
+        created_at = value.get("created_at")
+        groups = value.get("included_groups")
+        if (
+            not isinstance(artifact_id, str)
+            or not isinstance(created_at, str)
+            or not isinstance(groups, list)
+            or HISTORY_GROUP not in groups
+            or any(not isinstance(group, str) or not group for group in groups)
+            or len(groups) != len(set(groups))
+        ):
+            return None
+        record = self.catalog.get(artifact_id)
+        if (
+            record is None
+            or record.backup_class != "full"
+            or record.location != LOCAL_LOCATION
+            or not record.verified
+            or _iso(record.created_at) != created_at
+        ):
+            return None
+        return {
+            "artifact_id": artifact_id,
+            "created_at": created_at,
+            "included_groups": list(groups),
+        }
 
     def _write_status(self) -> None:
         path = self.paths.status_file
@@ -231,6 +270,13 @@ class BackupScheduler:
                     if self._status["targets"].get(target.target_id)
                 },
             }
+            verified_full = self._validated_verified_full_receipt(
+                self._status.get("verified_full")
+            )
+            if verified_full is not None:
+                payload["verified_full"] = verified_full
+            else:
+                self._status.pop("verified_full", None)
         try:
             write_shared_status(path, payload, app_gid=self.app_gid)
         except Exception as exc:  # noqa: BLE001 - status is advisory; never fail a backup on it
@@ -407,6 +453,26 @@ class BackupScheduler:
             manifest = getattr(runner, "last_manifest", None) or {}
             self._meta[record.artifact_id] = _manifest_meta(manifest, self.groups[backup_class])
             self._save_meta()
+            if self._full_can_replace_history_snapshots(backup_class, status):
+                with self._state_lock:
+                    self._status["verified_full"] = {
+                        "artifact_id": record.artifact_id,
+                        "created_at": _iso(record.created_at),
+                        "included_groups": list(self.groups[backup_class]),
+                    }
+                try:
+                    removed = self._remove_replaced_history_snapshots(record.created_at)
+                except Exception as exc:  # noqa: BLE001 - the verified FULL remains valid if cleanup fails
+                    logger.warning(
+                        "Older history sidecar copies could not be removed after the verified FULL (%s).",
+                        type(exc).__name__,
+                    )
+                else:
+                    if removed:
+                        logger.info(
+                            "Removed %d older history sidecar backup copy/copies after the verified FULL.",
+                            removed,
+                        )
         except Exception as exc:
             self._record_class(backup_class, RunRecord(at=_iso(started) or "", ok=False, detail=describe_error(exc)))
             raise
@@ -421,6 +487,127 @@ class BackupScheduler:
         except Exception as exc:  # noqa: BLE001 - grooming failure never fails the backup
             logger.warning("Backup grooming failed after %s backup (%s).", backup_class, type(exc).__name__)
         return record
+
+    def _full_can_replace_history_snapshots(
+        self,
+        backup_class: str,
+        runner_status: Mapping[str, Any],
+    ) -> bool:
+        included = runner_status.get("included_groups")
+        absent = runner_status.get("last_absent_groups")
+        return (
+            backup_class == "full"
+            and isinstance(included, list)
+            and isinstance(absent, list)
+            and HISTORY_GROUP in included
+            and HISTORY_GROUP not in absent
+            and set(included) == set(self.groups["full"])
+        )
+
+    def _history_snapshot_specs(self) -> tuple[tuple[Path, re.Pattern[str]], ...]:
+        backup_dir = self.paths.history_backup_dir
+        if backup_dir is None:
+            return ()
+        stem = re.escape(self.paths.history_database_stem)
+        specs: list[tuple[Path, re.Pattern[str]]] = [
+            (
+                backup_dir,
+                re.compile(rf"^{stem}-[0-9]{{8}}T[0-9]{{6}}Z\.sqlite3$"),
+            )
+        ]
+        if self.paths.history_long_term_backup_dir is not None:
+            long_term = self.paths.history_long_term_backup_dir
+            specs.extend(
+                (
+                    (
+                        long_term / "weekly",
+                        re.compile(rf"^{stem}-weekly-[0-9]{{4}}-W[0-9]{{2}}\.sqlite3$"),
+                    ),
+                    (
+                        long_term / "monthly",
+                        re.compile(rf"^{stem}-monthly-[0-9]{{4}}-[0-9]{{2}}\.sqlite3$"),
+                    ),
+                )
+            )
+        return tuple(specs)
+
+    @staticmethod
+    def _snapshot_identity(metadata: os.stat_result) -> tuple[int, ...]:
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mode,
+            metadata.st_nlink,
+            metadata.st_uid,
+            metadata.st_gid,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+        )
+
+    def _remove_replaced_history_snapshots(self, replacement_at: datetime) -> int:
+        """Remove exact sidecar snapshots older than a verified scheduler FULL.
+
+        The caller invokes this only after the replacement archive is published,
+        preflighted, hashed and committed to the verified artifact catalog. A
+        same-age/newer file, unrelated name, symlink, or hard-linked file is
+        left alone. Scheduler artifacts (including pinned ones) live under a
+        different root and are never candidates here.
+        """
+
+        replacement_ns = int(replacement_at.astimezone(timezone.utc).timestamp() * 1_000_000_000)
+        removed = 0
+        for root, name_pattern in self._history_snapshot_specs():
+            flags = (
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            try:
+                descriptor = os.open(root, flags)
+            except OSError as exc:
+                if exc.errno in {errno.ENOENT, errno.ENOTDIR, errno.ELOOP}:
+                    continue
+                raise
+            try:
+                root_removed = False
+                with os.scandir(descriptor) as entries:
+                    for entry in entries:
+                        if name_pattern.fullmatch(entry.name) is None:
+                            continue
+                        try:
+                            initial = os.stat(
+                                entry.name,
+                                dir_fd=descriptor,
+                                follow_symlinks=False,
+                            )
+                        except FileNotFoundError:
+                            continue
+                        if (
+                            not stat.S_ISREG(initial.st_mode)
+                            or initial.st_nlink != 1
+                            or initial.st_mtime_ns >= replacement_ns
+                        ):
+                            continue
+                        try:
+                            final = os.stat(
+                                entry.name,
+                                dir_fd=descriptor,
+                                follow_symlinks=False,
+                            )
+                        except FileNotFoundError:
+                            continue
+                        if self._snapshot_identity(final) != self._snapshot_identity(initial):
+                            continue
+                        os.unlink(entry.name, dir_fd=descriptor)
+                        removed += 1
+                        root_removed = True
+                if root_removed:
+                    os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        return removed
 
     # -- shipping ----------------------------------------------------------------------
 
@@ -736,6 +923,10 @@ class BackupScheduler:
         meta = self._meta.setdefault(artifact_id, {})
         meta["last_verify"] = {"at": at, "ok": ok, "detail": detail}
         self._save_meta()
+        # Re-publish (or clear) verified_full from the catalog's current flag so
+        # the history sidecar never suppresses its own copy after a failed
+        # readback of the replacement artifact.
+        self._write_status()
         return {"ok": ok, "artifact": self.serialize(self.get(artifact_id)), "detail": detail}
 
     def test_target(self, target_id: str) -> dict[str, Any]:

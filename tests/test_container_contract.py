@@ -886,6 +886,10 @@ class ContainerResourceContractTests(unittest.TestCase):
                     "${SCHEDULED_BACKUP_STATUS_FILE:-}",
                 )
                 self.assertEqual(
+                    history["environment"]["BACKUP_ARCHIVE_STATUS_FILE"],
+                    "/app/backup-status/backup-archive.json",
+                )
+                self.assertEqual(
                     history["environment"]["HISTORY_SEGMENTED_BACKUP_MAX_AGE_SECONDS"],
                     "${HISTORY_SEGMENTED_BACKUP_MAX_AGE_SECONDS:-129600}",
                 )
