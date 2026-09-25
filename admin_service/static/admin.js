@@ -4562,7 +4562,8 @@
     const sshEnabled = Boolean(elements.setupSshEnabled?.checked);
     const packages = currentStagedEsxiHostPrepPackages();
     if (elements.setupEsxiHostPrepPanel) {
-      elements.setupEsxiHostPrepPanel.classList.toggle("hidden", !esxiSupported);
+      // StorCLI install runs over SSH, so keep it out of step 3 until SSH is on.
+      elements.setupEsxiHostPrepPanel.classList.toggle("hidden", !esxiSupported || !sshEnabled);
     }
     if (!esxiSupported) {
       return;

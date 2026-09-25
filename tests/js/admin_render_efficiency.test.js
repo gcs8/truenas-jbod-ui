@@ -564,3 +564,8 @@ test("the dead admin.js branches and unused bootstrap keys stay gone", () => {
   assert.doesNotMatch(MAIN_PY, /"debug_scrub_sensitive"/);
   assert.doesNotMatch(MAIN_PY, /"clean_backup_targets": list\(/);
 });
+
+test("the ESXi StorCLI panel stays hidden until SSH is on (#435)", () => {
+  const source = functionSource("syncEsxiHostPrepFields");
+  assert.match(source, /setupEsxiHostPrepPanel\.classList\.toggle\("hidden", !esxiSupported \|\| !sshEnabled\)/);
+});
