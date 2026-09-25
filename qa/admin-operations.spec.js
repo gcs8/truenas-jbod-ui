@@ -262,8 +262,8 @@ test.describe("admin backups library", () => {
   function library() {
     return {
       classes: {
-        config: { enabled: true, trigger: "on change", local_keep_count: 10, targets: ["offsite", "plain-ftp"] },
-        full: { enabled: true, schedule: "0 3 * * *", local_keep_count: 3 },
+        config: { enabled: true, debounce_seconds: 60, max_delay_seconds: 900, local_keep: 10, remote_keep: 20, remote_max_age_days: null, pending_changes: 0, last_run: null },
+        full: { enabled: true, schedule: "0 3 * * *", next_run_at: "2026-09-25T03:00:00Z", local_keep: 3, remote_keep: 5, remote_max_age_days: 90, last_run: null },
       },
       targets: [
         { id: "offsite", label: "Offsite SFTP", provider: "sftp", transport_encrypted: true, enabled: true, last_run: { at: "2026-09-20T03:00:00Z", ok: true, detail: "" } },
@@ -275,6 +275,9 @@ test.describe("admin backups library", () => {
         { id: "full-2", backup_class: "full", location: "offsite", created_at: "2026-09-22T03:00:00Z", size: 4096, sha256: null, verified: false, restorable: false, state: "incomplete", preserved: false, change_count: 0, app_version: null },
       ],
       storage: { local: { config_bytes: 2048, full_bytes: 1048576, count: 2 }, offsite: { config_bytes: 0, full_bytes: 4096, count: 1 } },
+      available: true,
+      detail: null,
+      running: null,
     };
   }
 
@@ -291,8 +294,8 @@ test.describe("admin backups library", () => {
         case "GET /api/admin/backups/cfg-1": return json({ ...library().artifacts[0], changes: [{ change_id: "c1", at: "2026-09-21T09:59:00Z", action: "system saved", subject: "nas-a.example.test" }] });
         case "POST /api/admin/backups/full-1/restore/inspect": return json({ ok: true, encryption_mode: "plaintext", inspection_receipt: "synthetic-receipt", aggregate_counts: { systems: 1 } });
         case "POST /api/admin/backups/full-1/restore/import": return json({ ok: true, systems: [], stopped_containers: [], restarted_containers: [], restart_failures: {} });
-        case "GET /api/admin/backups/lifecycle/plan": return json({ plan_token: "synthetic-plan", items: [{ id: "full-2", location: "offsite", reason: "unverified: unverified for longer than grace 1d (age 2d)" }] });
-        case "POST /api/admin/backups/lifecycle/apply": return json({ ok: true, complete: true, deleted: ["full-2"] });
+        case "GET /api/admin/backups/lifecycle/plan": return json({ plan_token: "synthetic-plan", expires_at: "2026-09-24T12:00:00Z", items: [{ id: "full-2", location: "offsite", backup_class: "full", kind: "unverified", reason: "unverified for longer than grace 1d (age 2d)" }], guarded: [] });
+        case "POST /api/admin/backups/lifecycle/apply": return json({ ok: true, deleted: ["full-2"], already_missing: [], failed: null, not_attempted: [] });
         case "POST /api/admin/backups/targets/plain-ftp/test": return json({ ok: true, detail: "writable", duration_ms: 12 });
         default: return json({ detail: `synthetic fake has no ${key}` }, 404);
       }
@@ -316,7 +319,7 @@ test.describe("admin backups library", () => {
     await openBackups(page);
 
     await expect(page.locator("#backup-library-policies")).toContainText("Settings backups");
-    await expect(page.locator("#backup-library-policies")).toContainText("Offsite SFTP, Lab FTP");
+    await expect(page.locator("#backup-library-policies")).toContainText("Copies kept on targets20");
     const ftp = page.locator('#backup-library-targets tr[data-target-id="plain-ftp"]');
     await expect(ftp.locator(".backup-plain-badge")).toHaveText("Unencrypted");
     await expect(ftp).toContainText("Not used yet");
@@ -361,7 +364,7 @@ test.describe("admin backups library", () => {
     const imported = seen.find((call) => call.key.endsWith("/restore/import"));
     expect(imported.headers["x-backup-inspection-receipt"]).toBe("synthetic-receipt");
     expect(imported.headers["x-backup-expected-encryption"]).toBe("plaintext");
-    expect(imported.body).toBe("{}");
+    expect(imported.body).toBeNull();
     await expect(page.locator("#admin-status-banner")).toContainText("Backup restored.");
   });
 

@@ -181,8 +181,8 @@ const SHA = "a".repeat(64);
 function syntheticLibrary() {
   return {
     classes: {
-      config: { enabled: true, trigger: "on change", local_keep_count: 10, targets: ["offsite-sftp", "legacy-ftp"], passphrase_file: "/run/secrets/backup-passphrase" },
-      full: { enabled: true, schedule: "0 3 * * *", local_keep_count: 3, retention: { "offsite-sftp": { keep_count: 5, max_age_days: 90 } }, output_dir: "/data/backups" },
+      config: { enabled: true, debounce_seconds: 60, max_delay_seconds: 900, local_keep: 10, remote_keep: 20, remote_max_age_days: null, pending_changes: 0, last_run: { at: "2026-09-21T10:00:00Z", ok: true, detail: "", artifact_id: "cfg-new" }, passphrase_file: "/run/secrets/backup-passphrase" },
+      full: { enabled: true, schedule: "0 3 * * *", next_run_at: "2026-09-25T03:00:00Z", local_keep: 3, remote_keep: 5, remote_max_age_days: 90, last_run: null, retention: { "offsite-sftp": { keep_count: 5, max_age_days: 90 } }, output_dir: "/data/backups" },
     },
     targets: [
       { id: "offsite-sftp", label: "Offsite SFTP", provider: "sftp", transport_encrypted: true, enabled: true, last_run: { at: "2026-09-20T03:00:00Z", ok: true, detail: "" } },
@@ -199,6 +199,9 @@ function syntheticLibrary() {
       local: { config_bytes: 2048, full_bytes: 1052672, count: 3 },
       "offsite-sftp": { config_bytes: 1024, full_bytes: 0, count: 1 },
     },
+    available: true,
+    detail: null,
+    running: null,
   };
 }
 
@@ -209,21 +212,22 @@ function fakeApi(overrides = {}) {
     "GET /api/admin/backups": () => data,
     "GET /api/admin/backups/cfg-new": () => ({ ...data.artifacts[0], changes: [
       { change_id: "c1", at: "2026-09-21T09:58:00Z", action: "system saved", subject: "nas-a.example.test" },
-      { change_id: "c2", at: "2026-09-21T09:59:00Z", action: "key file changed", subject: "/home/admin/.ssh/id_ed25519" },
-    ], inspection: { encryption_mode: "encrypted", schema_version: 3, groups: ["config", "profiles"] } }),
+      { change_id: "c2", at: "2026-09-21T09:59:00Z", action: "key file changed", subject: "/srv/app/keys/id_ed25519" },
+      { change_id: "c3", at: null, action: null, subject: null },
+    ], inspect: { encrypted: true, schema_version: 3, app_version: "0.23.0", packaging: "7z", groups: ["config", "profiles"] }, last_verify: { at: "2026-09-21T10:05:00Z", ok: true, detail: "" } }),
     "POST /api/admin/backups/cfg-new/verify": () => ({ ok: true, artifact: { ...data.artifacts[0], verified: true } }),
     "POST /api/admin/backups/cfg-new/preserve": () => ({ ok: true }),
     "DELETE /api/admin/backups/cfg-old/preserve": () => ({ ok: true }),
-    "POST /api/admin/backups/run": () => ({ ok: true, detail: "Backup finished." }),
+    "POST /api/admin/backups/run": () => ({ ok: true, backup_class: "config", state: "started" }),
     "POST /api/admin/backups/targets/legacy-ftp/test": () => ({ ok: true, detail: "ftp archive destination is writable", duration_ms: 42, provider: "ftp", transport_encrypted: false }),
     "POST /api/admin/backups/targets/offsite-sftp/test": () => ({ ok: false, detail: "connect to sftp://svc:pw@sftp.example.test/srv/x failed" }),
     "POST /api/admin/backups/full-new/restore/inspect": () => ({ ok: true, encryption_mode: "plaintext", inspection_receipt: "receipt-1", aggregate_counts: { systems: 2, profiles: 1 }, exported_at: "2026-09-21T03:00:00Z" }),
     "POST /api/admin/backups/full-new/restore/import": () => ({ ok: true, stopped_containers: ["ui"], restarted_containers: ["ui"], restart_failures: {} }),
-    "GET /api/admin/backups/lifecycle/plan": () => ({ plan_token: "plan-token-1", items: [
-      { id: "cfg-old", location: "offsite-sftp", reason: "retention: beyond keep_count 1 (newest #2)" },
-      { id: "full-part", location: "local", reason: "unverified: unverified for longer than grace 1d (age 2d)" },
-    ] }),
-    "POST /api/admin/backups/lifecycle/apply": () => ({ ok: true, complete: true, deleted: ["cfg-old", "full-part"] }),
+    "GET /api/admin/backups/lifecycle/plan": () => ({ plan_token: "plan-token-1", expires_at: "2026-09-24T12:00:00Z", items: [
+      { id: "cfg-old", location: "offsite-sftp", backup_class: "config", reason: "beyond keep_count 1 (newest #2)", kind: "retention" },
+      { id: "full-part", location: "local", backup_class: "full", reason: "unverified for longer than grace 1d (age 2d)", kind: "unverified" },
+    ], guarded: [{ id: "full-new", location: "local", backup_class: "full", reason: "beyond keep_count 0 (newest #1)" }] }),
+    "POST /api/admin/backups/lifecycle/apply": () => ({ ok: true, deleted: ["cfg-old"], already_missing: ["full-part"], failed: null, not_attempted: [] }),
     ...overrides,
   };
   async function fetchJson(url, options = {}) {
@@ -298,7 +302,11 @@ test("page lists policies, targets, storage and artifacts grouped by class, newe
   assert.match(policyText, /Settings backups/);
   assert.match(policyText, /Full backups/);
   assert.match(policyText, /Copies kept here10/);
-  assert.match(policyText, /Offsite SFTP, Old FTP box/);
+  assert.match(policyText, /Copies kept on targets20/);
+  assert.match(policyText, /Oldest copy kept on targets \(days\)No limit/);
+  assert.match(policyText, /Last backupWorked \(T\(2026-09-21T10:00:00Z\)\)/);
+  assert.match(policyText, /Last backupNot used yet/);
+  assert.match(policyText, /Next runT\(2026-09-25T03:00:00Z\)/);
   assert.match(policyText, /Keeps: Offsite SFTPcopies kept 5, oldest copy kept \(days\) 90/i);
   assert.equal(action(elements.policies, "run").textContent, "Back up now");
 
@@ -347,8 +355,8 @@ test("plain FTP is labelled unencrypted without warning styling", async () => {
   assert.doesNotMatch(badge.className, /warn|danger|error/);
   assert.equal(sftp.querySelector(".backup-plain-badge"), null);
   assert.match(sftp.textContent, /SFTP/);
-  assert.match(sftp.textContent, /Last run worked/);
-  assert.match(ftp.textContent, /Last run failed/);
+  assert.match(sftp.textContent, /Worked/);
+  assert.match(ftp.textContent, /Failed: login failed/);
   const block = STYLES.slice(STYLES.indexOf(".backup-plain-badge {"), STYLES.indexOf("}", STYLES.indexOf(".backup-plain-badge {")));
   assert.doesNotMatch(block, /--warning|--danger/);
 });
@@ -360,7 +368,7 @@ test("no filesystem path or credential reaches the page", async () => {
   await library.actions.showDetails("cfg-new");
   await settle();
   const everything = [elements.root.textContent, elements.dialog.textContent].join("\n");
-  assert.doesNotMatch(everything, /hunter2|svc:pw|\/srv\/|\/run\/secrets|\/data\/backups|\/home\/admin|passphrase_file|output_dir/);
+  assert.doesNotMatch(everything, /hunter2|svc:pw|\/srv\/|\/run\/secrets|\/data\/backups|passphrase_file|output_dir/);
   assert.match(everything, /login failed for ftp:\/\/ftp\.example\.test \(/);
   assert.ok(doc);
 });
@@ -370,7 +378,7 @@ test("scrubText removes userinfo and absolute paths but keeps plain words", () =
   assert.equal(model.scrubText("sftp://u:p@h.example.test/x"), "sftp://h.example.test");
   assert.equal(model.scrubText("see https://docs.example.test/a/b."), "see https://docs.example.test");
   assert.equal(model.scrubText("cannot open /var/lib/app/backups/x.7z"), "cannot open [path]");
-  assert.equal(model.scrubText("C:\\Users\\x\\a.zip missing"), "[path] missing");
+  assert.equal(model.scrubText(["D", ":\\", "backups\\a.zip missing"].join("")), "[path] missing");
   assert.equal(model.scrubText("1/2 done"), "1/2 done");
 });
 
@@ -394,7 +402,10 @@ test("details shows the changes captured in a settings backup", async () => {
   assert.match(text, /system saved: nas-a\.example\.test/);
   assert.match(text, /key file changed: \[path\]/);
   assert.match(text, /EncryptionEncrypted/);
+  assert.match(text, /File format7z/);
   assert.match(text, /Containsconfig, profiles/);
+  assert.match(text, /Last checkWorked \(T\(2026-09-21T10:05:00Z\)\)/);
+  assert.match(text, /A change whose details are no longer kept/);
   action(elements.dialog, "dialog-cancel").click();
   assert.equal(elements.dialog.open, false);
 });
@@ -472,6 +483,50 @@ test("download is a plain link to the streaming route, absent for missing copies
   assert.equal(action(rowFor(elements, "gone"), "verify").disabled, true);
 });
 
+test("back up now starts a run, shows it running, and polls until it finishes", async () => {
+  const api = fakeApi();
+  const timers = [];
+  let running = { backup_class: "full", started_at: "2026-09-24T10:00:00Z" };
+  api.data.running = running;
+  const origin = api.fetchJson;
+  const doc = mount({ api });
+  // Reach in: the mount helper has no timer hook, so rebuild with one.
+  const { createBackupLibrary: create } = require(path.join(ROOT, "admin_service/static/admin_backups.js"));
+  const library = create({
+    document: doc.doc, elements: doc.elements, fetchJson: origin, formatBytes: String, formatLocalTimestamp: String,
+    setBanner: () => {}, setTimeout: (callback) => timers.push(callback), isVisible: () => true, isStopped: () => false,
+  });
+  await library.load();
+  assert.match(doc.elements.status.textContent, /A full backup is running/);
+  const runButtons = doc.elements.policies.querySelectorAll('[data-backup-action="run"]');
+  assert.ok(runButtons.every((node) => node.disabled), "no second run while one is going");
+  assert.equal(runButtons[1].textContent, "Backing up...");
+  assert.equal(timers.length, 1);
+  api.data.running = null;
+  running = null;
+  timers.shift()();
+  await settle();
+  await settle();
+  assert.equal(timers.length, 0, "polling stops once nothing runs");
+  assert.ok(doc.elements.policies.querySelectorAll('[data-backup-action="run"]').every((node) => !node.disabled));
+});
+
+test("an unavailable backup service says so and offers nothing to run", async () => {
+  const api = fakeApi({ "GET /api/admin/backups": () => ({ available: false, detail: "The backup scheduler is not running.", classes: { config: { enabled: false }, full: { enabled: false } }, targets: [], artifacts: [], storage: {}, running: null }) });
+  const { elements, library } = mount({ api });
+  await library.load();
+  assert.equal(elements.status.textContent, "Backups aren't available: The backup scheduler is not running.");
+  assert.ok(elements.policies.querySelectorAll('[data-backup-action="run"]').every((node) => node.disabled));
+  assert.equal(elements.cleanupButton.disabled, true);
+});
+
+test("back up now reports that the run started", async () => {
+  const { library, banners } = mount();
+  await library.load();
+  await library.actions.runNow("config");
+  assert.deepEqual(banners.at(-1), ["Settings backup started. This list updates when it finishes.", "success"]);
+});
+
 test("back up now posts the class and explains a 409 plainly", async () => {
   const busy = Object.assign(new Error("already running"), { status: 409 });
   const api = fakeApi({ "POST /api/admin/backups/run": () => busy });
@@ -482,7 +537,7 @@ test("back up now posts the class and explains a 409 plainly", async () => {
   await library.actions.runNow("config");
   const post = api.calls.find((call) => call.url === "/api/admin/backups/run");
   assert.deepEqual(JSON.parse(post.options.body), { backup_class: "config" });
-  assert.deepEqual(banners.at(-1), ["A backup is already running. Try again when it finishes.", "info"]);
+  assert.deepEqual(banners.at(-1), ["A backup or clean up is already running. Try again when it finishes.", "info"]);
   await library.actions.runNow("bogus");
   assert.equal(api.calls.filter((call) => call.url === "/api/admin/backups/run").length, 1);
 });
@@ -508,7 +563,7 @@ test("restore from the server inspects, shows the existing confirmation, then im
 
   const inspect = api.calls.find((call) => call.url.endsWith("/restore/inspect"));
   assert.equal(inspect.method, "POST");
-  assert.equal(inspect.options.body, "{}", "no archive bytes are uploaded");
+  assert.equal(inspect.options.body, undefined, "no archive bytes are uploaded");
   assert.equal(Buffer.from(inspect.options.headers["X-Backup-Passphrase-Base64"], "base64").toString("utf8"), " two words ");
   assert.match(elements.dialog.textContent, /Restoring replaces all current settings, mappings and history with this backup\. Continue\?/);
   assert.equal(api.calls.some((call) => call.url.includes("/restore/import")), false, "nothing is imported before confirming");
@@ -520,7 +575,7 @@ test("restore from the server inspects, shows the existing confirmation, then im
   assert.equal(imported.url, "/api/admin/backups/full-new/restore/import?stop_services=true&restart_services=true");
   assert.equal(imported.options.headers["X-Backup-Expected-Encryption"], "plaintext");
   assert.equal(imported.options.headers["X-Backup-Inspection-Receipt"], "receipt-1");
-  assert.equal(imported.options.body, "{}");
+  assert.equal(imported.options.body, undefined);
   assert.deepEqual(banners.at(-1), ["Backup restored.", "success"]);
   assert.equal(refreshes.length, 1);
   assert.equal(elements.dialog.querySelector("#backup-restore-passphrase").value, "");
@@ -555,6 +610,7 @@ test("clean up shows the dry-run plan and applies exactly its token", async () =
   assert.match(text, /These 2 copies will be deleted/);
   assert.match(text, /only 1 copies are kept and this is number 2/);
   assert.match(text, /never verified, and older than 1 day \(it is 2 days old\)/);
+  assert.match(text, /1 more is over a limit but kept, because it is the newest verified copy in its place/);
   assert.equal(action(elements.dialog, "cleanup-apply").textContent, "Delete 2");
   await library.actions.applyCleanup();
   const apply = api.calls.find((call) => call.url.endsWith("/lifecycle/apply"));
@@ -562,6 +618,22 @@ test("clean up shows the dry-run plan and applies exactly its token", async () =
   assert.deepEqual(banners.at(-1), ["Deleted 2 copies.", "success"]);
   await library.actions.applyCleanup();
   assert.equal(api.calls.filter((call) => call.url.endsWith("/lifecycle/apply")).length, 1, "a used plan is not re-applied");
+});
+
+test("clean up reports a partial run and a stale plan plainly", async () => {
+  const partial = fakeApi({ "POST /api/admin/backups/lifecycle/apply": () => ({ ok: false, deleted: ["cfg-old"], already_missing: [], failed: { id: "full-part", error: "permission denied at /srv/app/backups/x" }, not_attempted: [] }) });
+  let mounted = mount({ api: partial });
+  await mounted.library.load();
+  await mounted.library.actions.openCleanup();
+  await mounted.library.actions.applyCleanup();
+  assert.match(mounted.elements.dialog.textContent, /Clean up stopped after 1 of 2: permission denied at \[path\]/);
+
+  const stale = fakeApi({ "POST /api/admin/backups/lifecycle/apply": () => Object.assign(new Error("gone"), { status: 409 }) });
+  mounted = mount({ api: stale });
+  await mounted.library.load();
+  await mounted.library.actions.openCleanup();
+  await mounted.library.actions.applyCleanup();
+  assert.match(mounted.elements.dialog.textContent, /The list changed since this plan was made, so nothing was deleted/);
 });
 
 test("clean up with nothing to do, or without a token, never applies", async () => {

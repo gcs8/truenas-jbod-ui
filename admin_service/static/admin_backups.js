@@ -132,6 +132,12 @@
       schedule: "Schedule",
       trigger: "Taken",
       keep_count: "Copies kept",
+      local_keep: "Copies kept here",
+      remote_keep: "Copies kept on targets",
+      remote_max_age_days: "Oldest copy kept on targets (days)",
+      max_delay_seconds: "Longest wait after a change (seconds)",
+      pending_changes: "Changes waiting for a backup",
+      next_run_at: "Next run",
       local_keep_count: "Copies kept here",
       remote_keep_count: "Copies kept on targets",
       max_age: "Oldest copy kept",
@@ -160,7 +166,7 @@
 
   // Read-only policy summary. Unknown keys render generically, but anything
   // that could name a path or credential is dropped rather than shown.
-  function describePolicy(policy, targets) {
+  function describePolicy(policy, targets, formatTime = (value) => String(value)) {
     const rows = [];
     if (!policy || typeof policy !== "object") {
       return rows;
@@ -175,6 +181,19 @@
       }
       if (key === "enabled") {
         rows.push(["Turned on", value ? "Yes" : "No"]);
+        return;
+      }
+      if (key === "last_run") {
+        const run = lastRunSummary(value);
+        rows.push(["Last backup", run.at ? `${run.text} (${formatTime(run.at)})` : run.text]);
+        return;
+      }
+      if (key === "next_run_at" || key.endsWith("_at")) {
+        rows.push([humanKey(key), value ? formatTime(value) : "Not scheduled"]);
+        return;
+      }
+      if (value === null && /keep|max_age/.test(key)) {
+        rows.push([humanKey(key), "No limit"]);
         return;
       }
       if (key === "targets" && Array.isArray(value)) {
@@ -236,8 +255,10 @@
       : Array.isArray(payload?.items) ? payload.items
         : Array.isArray(payload?.plan) ? payload.plan : [];
     const token = typeof payload?.plan_token === "string" ? payload.plan_token : "";
+    const guarded = Array.isArray(payload?.guarded) ? payload.guarded.filter((item) => item && validId(item.id)) : [];
     return {
       token,
+      guarded: guarded.length,
       items: items.filter((item) => item && validId(item.id)).map((item) => ({
         id: item.id,
         location: String(item.location || ""),
@@ -252,7 +273,7 @@
     }
     return {
       tone: lastRun.ok ? "is-ok" : "is-bad",
-      text: lastRun.ok ? "Last run worked" : `Last run failed${lastRun.detail ? `: ${scrubText(lastRun.detail)}` : ""}`,
+      text: lastRun.ok ? "Worked" : `Failed${lastRun.detail ? `: ${scrubText(lastRun.detail)}` : ""}`,
       at: lastRun.at || "",
     };
   }
@@ -328,6 +349,12 @@
       });
     }
 
+    // False when the backup service is not deployed or not reachable; the
+    // list is then empty and nothing can be run.
+    function available() {
+      return Boolean(state.data) && state.data.available !== false;
+    }
+
     function targets() {
       return Array.isArray(state.data?.targets) ? state.data.targets : [];
     }
@@ -378,10 +405,23 @@
             targets: Array.isArray(payload.targets) ? payload.targets : [],
             artifacts: Array.isArray(payload.artifacts) ? payload.artifacts : [],
             storage: payload.storage && typeof payload.storage === "object" ? payload.storage : {},
+            available: payload.available !== false,
+            detail: typeof payload.detail === "string" ? payload.detail : "",
+            running: payload.running && CLASSES.includes(payload.running.backup_class) ? payload.running : null,
           };
           state.loadError = "";
           const count = state.data.artifacts.length;
-          setStatus(count ? `${count} backup ${count === 1 ? "copy" : "copies"}.` : "No backups yet.");
+          const parts = [];
+          if (!state.data.available) {
+            parts.push(state.data.detail ? `Backups aren't available: ${scrubText(state.data.detail)}` : "Backups aren't set up on this server.");
+          } else {
+            parts.push(count ? `${count} backup ${count === 1 ? "copy" : "copies"}.` : "No backups yet.");
+          }
+          if (state.data.running) {
+            parts.push(`A ${CLASS_SHORT[state.data.running.backup_class].toLowerCase()} backup is running.`);
+          }
+          setStatus(parts.join(" "));
+          scheduleRunningPoll();
         } catch (error) {
           state.loadError = error?.status === 404
             ? "This admin version has no backup list."
@@ -396,6 +436,18 @@
       return state.loadPromise;
     }
 
+    // While a backup runs, re-read the list now and then so the result shows
+    // without a manual reload. Stops once nothing is running.
+    const POLL_MS = deps.pollMs || 5000;
+    function scheduleRunningPoll() {
+      if (state.pollTimer || !state.data?.running || isStopped() || !deps.setTimeout) return;
+      state.pollTimer = deps.setTimeout(() => {
+        state.pollTimer = null;
+        if (deps.isVisible && !deps.isVisible()) return;
+        void load({ quiet: true });
+      }, POLL_MS);
+    }
+
     // ----------------------------------------------------------- render --
 
     function render() {
@@ -404,7 +456,7 @@
       renderStorage();
       renderArtifacts();
       if (els.refreshButton) els.refreshButton.disabled = state.loading || isStopped();
-      if (els.cleanupButton) els.cleanupButton.disabled = !state.data || isPending("cleanup") || isStopped();
+      if (els.cleanupButton) els.cleanupButton.disabled = !available() || isPending("cleanup") || isStopped();
     }
 
     function renderPolicies() {
@@ -412,19 +464,20 @@
       const classes = state.data?.classes || {};
       const cards = CLASSES.map((backupClass) => {
         const policy = classes[backupClass];
-        const rows = describePolicy(policy, targets());
+        const rows = describePolicy(policy, targets(), fmtTime);
         const list = rows.length
           ? el("dl", { className: "backup-policy-list" }, rows.map(([term, value]) => [el("dt", { text: term }), el("dd", { text: value })]))
           : el("p", { className: "subtle", text: policy ? "No settings." : "Not set up." });
         const runKey = `run:${backupClass}`;
+        const running = isPending(runKey) || state.data?.running?.backup_class === backupClass;
         return el("section", { className: "preview-card backup-policy-card", "aria-labelledby": `backup-policy-${backupClass}` },
           el("div", { className: "preview-card-header" },
             el("h3", { id: `backup-policy-${backupClass}`, text: CLASS_LABELS[backupClass] }),
-            button(isPending(runKey) ? "Backing up..." : "Back up now", {
+            button(running ? "Backing up..." : "Back up now", {
               action: "run",
               extra: { backupClass },
               cls: "small",
-              disabled: !state.data || isPending(runKey),
+              disabled: !available() || Boolean(state.data?.running) || isPending(runKey),
             })),
           el("p", { className: "subtle action-note", text: CLASS_HELP[backupClass] }),
           list);
@@ -643,10 +696,16 @@
         if (inspection && typeof inspection === "object") {
           const mode = inspection.encryption_mode || inspection.encryption;
           if (mode) facts.push(["Encryption", mode === "encrypted" ? "Encrypted" : mode === "plaintext" ? "Not encrypted" : scrubText(mode)]);
+          else if (typeof inspection.encrypted === "boolean") facts.push(["Encryption", inspection.encrypted ? "Encrypted" : "Not encrypted"]);
+          if (inspection.packaging) facts.push(["File format", scrubText(inspection.packaging)]);
           if (inspection.schema_version !== undefined) facts.push(["Format version", scrubText(inspection.schema_version)]);
           if (inspection.app_version) facts.push(["Made by app version", scrubText(inspection.app_version)]);
           const groups = Array.isArray(inspection.groups) ? inspection.groups : Array.isArray(inspection.included_groups) ? inspection.included_groups : [];
           if (groups.length) facts.push(["Contains", groups.map((group) => scrubText(typeof group === "object" ? group.label || group.key : group)).join(", ")]);
+        }
+        if (item.last_verify && typeof item.last_verify === "object") {
+          const verify = lastRunSummary(item.last_verify);
+          facts.push(["Last check", verify.at ? `${verify.text} (${fmtTime(verify.at)})` : verify.text]);
         }
         const body = [
           el("dl", { className: "backup-policy-list" }, facts.map(([term, value]) => [el("dt", { text: term }), el("dd", { text: value })])),
@@ -655,9 +714,11 @@
         if (item.backup_class === "config" || changes) {
           body.push(el("h3", { text: "Changes in this backup" }));
           body.push(changes && changes.length
-            ? el("ul", { className: "backup-change-list" }, changes.map((change) => el("li", {},
-              el("span", { className: "subtle", text: `${fmtTime(change.at)} ` }),
-              `${scrubText(change.action || "Changed")}${change.subject ? `: ${scrubText(change.subject)}` : ""}`)))
+            ? el("ul", { className: "backup-change-list" }, changes.map((change) => (change.at || change.action || change.subject
+              ? el("li", {},
+                el("span", { className: "subtle", text: `${fmtTime(change.at)} ` }),
+                `${scrubText(change.action || "Changed")}${change.subject ? `: ${scrubText(change.subject)}` : ""}`)
+              : el("li", { className: "subtle", text: "A change whose details are no longer kept" }))))
             : el("p", { className: "subtle", text: "No changes recorded." }));
         }
         if (els.dialog?.open || els.dialog?.hasAttribute?.("open")) {
@@ -752,10 +813,12 @@
             body: JSON.stringify({ backup_class: backupClass }),
             timeoutMs: LONG_TIMEOUT_MS,
           });
-          setBanner(payload.detail ? scrubText(payload.detail) : `${CLASS_SHORT[backupClass]} backup done.`, "success");
+          setBanner(payload.state === "started"
+            ? `${CLASS_SHORT[backupClass]} backup started. This list updates when it finishes.`
+            : payload.detail ? scrubText(payload.detail) : `${CLASS_SHORT[backupClass]} backup done.`, "success");
         } catch (error) {
           if (error?.status === 409) {
-            setBanner("A backup is already running. Try again when it finishes.", "info");
+            setBanner("A backup or clean up is already running. Try again when it finishes.", "info");
           } else {
             setBanner(`Backup failed: ${errorText(error)}`, "error");
           }
@@ -819,8 +882,7 @@
         try {
           const inspection = await deps.fetchJson(artifactUrl(id, "/restore/inspect"), {
             method: "POST",
-            headers: { "Content-Type": "application/json", ...restoreHeaders() },
-            body: "{}",
+            headers: restoreHeaders(),
             timeoutMs: LONG_TIMEOUT_MS,
           });
           if (!["encrypted", "plaintext"].includes(inspection?.encryption_mode) || !inspection?.inspection_receipt) {
@@ -852,12 +914,10 @@
             {
               method: "POST",
               headers: {
-                "Content-Type": "application/json",
                 ...restoreHeaders(),
                 "X-Backup-Expected-Encryption": inspection.encryption_mode,
                 "X-Backup-Inspection-Receipt": inspection.inspection_receipt,
               },
-              body: "{}",
               timeoutMs: LONG_TIMEOUT_MS,
             }
           );
@@ -892,8 +952,11 @@
           const plan = normalizePlan(await deps.fetchJson(`${API_ROOT}/lifecycle/plan`));
           state.cleanupPlan = plan;
           const body = els.dialog?.querySelector(".backup-dialog-body");
+          const guardedNote = plan.guarded
+            ? el("p", { className: "subtle", text: `${plan.guarded} more ${plan.guarded === 1 ? "is" : "are"} over a limit but kept, because ${plan.guarded === 1 ? "it is" : "each is"} the newest verified copy in its place.` })
+            : null;
           if (!plan.items.length) {
-            body?.replaceChildren(el("p", { text: "Nothing to clean up. Every copy is within its limits." }));
+            body?.replaceChildren(el("p", { text: "Nothing to clean up. Every copy is within its limits." }), guardedNote || "");
             setDialogActions(cancelButton("Close"));
             return;
           }
@@ -910,7 +973,8 @@
               return el("li", { dataset: { artifactId: item.id } },
                 `${what} on ${locationLabel(item.location || artifact?.location, targets())}`,
                 item.reason ? el("span", { className: "subtle", text: `: ${humanizePlanReason(item.reason)}` }) : null);
-            })));
+            })),
+            guardedNote || "");
           setDialogActions(primary(`Delete ${plan.items.length}`, "cleanup-apply", "danger"), cancelButton());
         } catch (error) {
           dialogResult(`Couldn't work out the plan: ${errorText(error)}`);
@@ -932,15 +996,22 @@
             timeoutMs: LONG_TIMEOUT_MS,
           });
           state.cleanupPlan = null;
-          const deleted = Array.isArray(payload.deleted) ? payload.deleted.length : Number(payload.deleted_count);
-          const text = payload.complete === false
-            ? `Clean up stopped part way${payload.error ? `: ${scrubText(payload.error)}` : "."}`
-            : Number.isFinite(deleted) ? `Deleted ${deleted} ${deleted === 1 ? "copy" : "copies"}.` : "Clean up done.";
+          const count = (value) => (Array.isArray(value) ? value.length : 0);
+          const deleted = count(payload.deleted) + count(payload.already_missing);
+          const stopped = Boolean(payload.failed) || count(payload.not_attempted) > 0 || payload.complete === false;
+          const failedDetail = payload.failed?.error || payload.error;
+          const text = stopped
+            ? `Clean up stopped after ${deleted} of ${deleted + count(payload.not_attempted) + (payload.failed ? 1 : 0)}${failedDetail ? `: ${scrubText(failedDetail)}` : "."}`
+            : `Deleted ${deleted} ${deleted === 1 ? "copy" : "copies"}.`;
           dialogResult(text);
-          setBanner(text, payload.complete === false ? "error" : "success");
+          setBanner(text, stopped ? "error" : "success");
         } catch (error) {
-          dialogResult(`Clean up failed: ${errorText(error)}`);
-          setBanner(`Clean up failed: ${errorText(error)}`, "error");
+          state.cleanupPlan = null;
+          const text = error?.status === 409
+            ? "The list changed since this plan was made, so nothing was deleted. Open Clean up again."
+            : `Clean up failed: ${errorText(error)} Some copies may already be gone; the list has been reloaded.`;
+          dialogResult(text);
+          setBanner(text, "error");
         }
         await load({ quiet: true });
       });

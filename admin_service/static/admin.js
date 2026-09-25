@@ -7976,6 +7976,8 @@
     renderMaintenanceResult,
     refreshAdminState: () => refreshState({ quiet: true }),
     isStopped: () => state.sessionStopped,
+    isVisible: () => state.currentAdminView === "backups" && document.visibilityState !== "hidden",
+    setTimeout: (callback, ms) => window.setTimeout(callback, ms),
   }) || null;
   backupLibrary?.bind();
 
