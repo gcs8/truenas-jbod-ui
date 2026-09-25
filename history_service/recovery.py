@@ -45,7 +45,8 @@ def _status(store: HistoryStore) -> dict[str, object]:
     paused, paused_at = store.read_collection_pause()
     check = store.quick_check()
     try:
-        recovery = store.quarantine_recovery_status()
+        # mode=ro: inspection must not switch the journal mode or write (#604).
+        recovery = store.quarantine_recovery_status(readonly=True)
     except Exception:  # noqa: BLE001 - a damaged database still gets a status line.
         recovery = {"history_recovery_required": True, "history_quarantined_at": None}
     return {

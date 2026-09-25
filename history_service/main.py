@@ -571,6 +571,13 @@ async def refresh_history(request: Request) -> dict[str, object] | JSONResponse:
             },
             status_code=409,
         )
+    # Refuse a paused refresh before admission, so it does not start the
+    # full-refresh cooldown for work it never did (#604).
+    if (await asyncio.to_thread(collector.collection_pause))[0]:
+        return JSONResponse(
+            {"ok": False, "mode": normalized_mode, "detail": COLLECTION_PAUSED_REASON},
+            status_code=409,
+        )
     admission = await refresh_admission.try_acquire(normalized_mode)
     if not admission.accepted:
         detail = (

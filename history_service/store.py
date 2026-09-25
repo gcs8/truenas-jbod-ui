@@ -1229,7 +1229,26 @@ class HistoryStore:
             return f"cannot check: {exc}"
         return str(row[0]) if row else "no result"
 
-    def read_quarantine_recovery(self) -> datetime | None:
+    @contextmanager
+    def _readonly_connection(self) -> Iterator[sqlite3.Connection]:
+        """A `mode=ro` connection that cannot change the file or its journal mode.
+
+        Ordinary reads go through `_connect_locked()`, which switches a database
+        to WAL; recovery inspection must not change the file it protects (#604).
+        """
+
+        connection = sqlite3.connect(
+            f"{self.file_path.absolute().as_uri()}?mode=ro",
+            uri=True,
+            timeout=SQLITE_CONNECT_TIMEOUT_SECONDS,
+        )
+        try:
+            connection.row_factory = sqlite3.Row
+            yield connection
+        finally:
+            connection.close()
+
+    def read_quarantine_recovery(self, *, readonly: bool = False) -> datetime | None:
         """Return when history was quarantined, or None once it is acknowledged.
 
         The row lives in `history_maintenance_state` beside the retention
@@ -1238,9 +1257,10 @@ class HistoryStore:
         first installation (#417). Retained broken database files are fallback
         evidence if writing that row failed. An unreadable marker is not repaired
         here; the caller fails closed on it rather than reporting health.
+        `readonly=True` reads through a `mode=ro` connection (recovery CLI).
         """
 
-        with self._read_connection() as connection:
+        with (self._readonly_connection() if readonly else self._read_connection()) as connection:
             row = connection.execute(
                 """
                 SELECT backup_at, state
@@ -1261,7 +1281,7 @@ class HistoryStore:
         later_evidence = [timestamp for timestamp in evidence if timestamp > marked_at]
         return later_evidence[0] if later_evidence else None
 
-    def quarantine_recovery_status(self) -> dict[str, Any]:
+    def quarantine_recovery_status(self, *, readonly: bool = False) -> dict[str, Any]:
         """Report the recovery indication for status surfaces, failing closed.
 
         A marker that cannot be read is not evidence of a healthy database, so
@@ -1270,7 +1290,7 @@ class HistoryStore:
         """
 
         try:
-            quarantined_at = self.read_quarantine_recovery()
+            quarantined_at = self.read_quarantine_recovery(readonly=readonly)
         except (HistoryStartupError, sqlite3.Error, OSError, ValueError):
             logger.warning(
                 "History quarantine recovery marker for %s could not be read; reporting recovery required.",

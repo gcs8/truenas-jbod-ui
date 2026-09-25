@@ -40,11 +40,21 @@ NOT_A_DATABASE = sqlite3.DatabaseError("file is not a database")
 
 
 def _digest_tree(directory: Path) -> dict[str, str]:
-    return {
-        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
-        for path in sorted(directory.iterdir())
-        if path.is_file()
-    }
+    """Bytes of every file that holds data.
+
+    Any SQLite reader of a WAL database, even `mode=ro`, creates the `-shm`
+    index and an empty `-wal`; neither carries data, so `-shm` is left out and
+    a `-wal` counts only when it holds frames.
+    """
+
+    digests: dict[str, str] = {}
+    for path in sorted(directory.iterdir()):
+        if not path.is_file() or path.name.endswith("-shm"):
+            continue
+        if path.name.endswith("-wal") and path.stat().st_size == 0:
+            continue
+        digests[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return digests
 
 
 class CorruptionClassifierTests(unittest.TestCase):
@@ -199,17 +209,23 @@ class HealthAndRefreshTests(unittest.TestCase):
         self.assertIn("counts", overview)
         self.assertNotIn(str(self.store.file_path.parent), response.body.decode())
 
-    def test_manual_refresh_is_refused_while_paused(self) -> None:
+    def test_manual_refresh_is_refused_while_paused_without_starting_the_cooldown(self) -> None:
         route = next(route for route in history_main.app.routes if route.path == "/api/history/refresh")
         request = MagicMock()
+        admission = history_main.ManualRefreshAdmission(cooldown_seconds=900)
         with (
             patch.object(history_main, "collector", self.collector),
+            patch.object(history_main, "refresh_admission", admission),
             patch.object(history_main, "authorize_refresh_request"),
-            patch.object(history_main, "read_refresh_document", return_value="fast"),
+            patch.object(history_main, "read_refresh_document", return_value="full"),
         ):
             response = asyncio.run(route.endpoint(request=request))
-        self.assertEqual(response.status_code, 409)
-        self.assertEqual(json.loads(response.body)["detail"], COLLECTION_PAUSED_REASON)
+            self.assertEqual(response.status_code, 409)
+            self.assertEqual(json.loads(response.body)["detail"], COLLECTION_PAUSED_REASON)
+            # After recovery the first full refresh must be admitted at once.
+            self.store.clear_collection_pause()
+            decision = asyncio.run(admission.try_acquire("full"))
+        self.assertTrue(decision.accepted, decision)
 
 
 @requires_posix_migration_lock
@@ -247,6 +263,25 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertIs(report["collection_paused"], True)
         self.assertNotIn(str(self.root), out)
         self.assertEqual(_digest_tree(self.root), before)
+
+    def test_status_and_a_refused_acknowledge_leave_a_rollback_journal_database_untouched(self) -> None:
+        # Ordinary reads switch a database to WAL; recovery inspection must not.
+        with contextlib.closing(sqlite3.connect(self.path)) as connection:
+            connection.execute("PRAGMA journal_mode=DELETE").fetchall()
+        self.store.record_quarantine_recovery(datetime(2030, 1, 1, tzinfo=timezone.utc))
+        with contextlib.closing(sqlite3.connect(self.path)) as connection:
+            connection.execute("PRAGMA journal_mode=DELETE").fetchall()
+        before = _digest_tree(self.root)
+
+        code, out, _ = self._run("status")
+
+        self.assertEqual(code, 0)
+        self.assertIs(json.loads(out)["recovery_required"], True)
+        self.assertEqual(_digest_tree(self.root), before)
+        # A rollback-journal database gets no sidecars at all from inspection.
+        self.assertEqual(sorted(path.name for path in self.root.iterdir() if path.name.endswith(("-wal", "-shm"))), [])
+        with contextlib.closing(sqlite3.connect(self.path)) as connection:
+            self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone()[0], "delete")
 
     def test_acknowledge_refuses_while_the_database_is_damaged_and_changes_nothing(self) -> None:
         # Damage a page past the header of a synthetic copy's own file.
