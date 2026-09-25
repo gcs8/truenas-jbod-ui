@@ -203,7 +203,8 @@ class UnknownConfigKeyTests(_LoaderTestCase):
             [
                 "WARNING:app.config:config.yaml: unknown key `unknown_top` is ignored.",
                 "WARNING:app.config:config.yaml: unknown key `truenas.bogus_field` is ignored.",
-                "WARNING:app.config:config.yaml: unknown key `systems[0].truenas.verfiy_ssl` is ignored.",
+                "WARNING:app.config:config.yaml: unknown key `systems[0].truenas.verfiy_ssl` is ignored; "
+                "did you mean `systems[0].truenas.verify_ssl`?",
             ],
         )
         self.assertEqual(
@@ -222,6 +223,78 @@ class UnknownConfigKeyTests(_LoaderTestCase):
         with self.main_ui_environment({}, "app:\n  verify_ssl: true\n"), self.assertLogs("app.config") as logs:
             get_settings()
         self.assertEqual(logs.output, ["WARNING:app.config:config.yaml: unknown key `app.verify_ssl` is ignored."])
+
+    def test_unknown_key_names_the_closest_valid_key(self) -> None:
+        yaml_text = "backup:\n  full:\n    enabled: true\nhistroy:\n  timeout_seconds: 5\n"
+        with self.main_ui_environment({}, yaml_text), self.assertLogs("app.config", level="WARNING") as logs:
+            settings = get_settings()
+            warnings = build_unknown_config_key_warnings(settings)
+
+        self.assertEqual(
+            logs.output,
+            [
+                "WARNING:app.config:config.yaml: unknown key `backup` is ignored; did you mean `backups`?",
+                "WARNING:app.config:config.yaml: unknown key `histroy` is ignored; did you mean `history`?",
+            ],
+        )
+        self.assertEqual([warning["key"] for warning in warnings], ["backup", "histroy"])
+
+    def test_backups_section_keys_are_checked_against_the_scheduler_policy(self) -> None:
+        yaml_text = (
+            "backups:\n"
+            "  config:\n"
+            "    enabled: true\n"
+            "    debounce_seconds: 30\n"
+            "  full:\n"
+            "    enabled: true\n"
+            "    shedule: '0 3 * * *'\n"
+            "  targets:\n"
+            "    - target_id: office-nas\n"
+            "      label: Office NAS\n"
+            "      provider: sftp\n"
+            "      hostnme: nas.example.test\n"
+            "      root: /srv/backups/jbod\n"
+            "  retention: 5\n"
+        )
+        with self.main_ui_environment({}, yaml_text), self.assertLogs("app.config", level="WARNING") as logs:
+            settings = get_settings()
+
+        self.assertEqual(
+            logs.output,
+            [
+                "WARNING:app.config:config.yaml: unknown key `backups.retention` is ignored.",
+                "WARNING:app.config:config.yaml: unknown key `backups.full.shedule` is ignored; "
+                "did you mean `backups.full.schedule`?",
+                "WARNING:app.config:config.yaml: unknown key `backups.targets[0].hostnme` is ignored; "
+                "did you mean `backups.targets[0].hostname`?",
+            ],
+        )
+        # Warn only: the main UI still starts and a valid key elsewhere still applies.
+        self.assertEqual(settings.app.port, 8080)
+
+    def test_backups_key_lists_match_the_scheduler_models(self) -> None:
+        from dataclasses import fields
+
+        from app.config import BACKUPS_SECTION_KEYS
+        from history_service.backup_archive.policy import ConfigClassPolicy, FullClassPolicy, _PolicyDocument
+        from history_service.backup_archive.settings import ArchiveTargetSettings
+
+        self.assertEqual(BACKUPS_SECTION_KEYS[""], set(_PolicyDocument.model_fields))
+        self.assertEqual(BACKUPS_SECTION_KEYS["config"], set(ConfigClassPolicy.model_fields))
+        self.assertEqual(BACKUPS_SECTION_KEYS["full"], set(FullClassPolicy.model_fields))
+        self.assertEqual(
+            BACKUPS_SECTION_KEYS["targets"],
+            {field.name for field in fields(ArchiveTargetSettings)} | {"label", "enabled"},
+        )
+
+    def test_every_documented_backups_key_is_known(self) -> None:
+        from app.config import collect_unknown_config_keys
+        from history_service.backup_archive import policy
+
+        example = policy.__doc__.split("::", 1)[1].split("\n\n")[1]
+        documented = yaml.safe_load(example)
+        self.assertIn("targets", documented["backups"])
+        self.assertEqual(collect_unknown_config_keys(documented), [])
 
 
 if __name__ == "__main__":

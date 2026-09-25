@@ -2111,6 +2111,23 @@ class AdminStatePayloadTests(unittest.TestCase):
 
         self.assertEqual(payload["configuration_warnings"], [])
 
+    def test_build_admin_state_payload_includes_unknown_config_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.yaml"
+            config_path.write_text("histroy:\n  timeout_seconds: 5\n", encoding="utf-8")
+            payload = self._build_minimal_state(Settings(config_file=str(config_path)))
+
+        self.assertEqual(
+            payload["configuration_warnings"],
+            [
+                {
+                    "code": "unknown_config_key",
+                    "key": "histroy",
+                    "message": "config.yaml: unknown key `histroy` is ignored; did you mean `history`?",
+                }
+            ],
+        )
+
     def test_build_admin_state_payload_bounds_missing_profile_warnings(self) -> None:
         settings = Settings(
             systems=[
