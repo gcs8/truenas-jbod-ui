@@ -572,6 +572,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Internal
 
+- Removed dead code: the legacy `__default__` snapshot key, zero-caller and
+  test-only helpers, monkeypatch-only wrappers and the unused "Scrambled IDs"
+  label; named three layout magic numbers. (#606)
 - The production container smoke now starts the main UI under
   `docker-compose.yml` plus `docker-compose.nonroot.yml` with an unedited copy
   of `.env.example`, checks `/livez` and `/healthz`, and checks that the
