@@ -831,6 +831,14 @@ SIDECAR_OWNED_CONFIG_KEYS = frozenset({"backups"})
 
 
 def _unknown_key_message(config_path: Path, key: str, suggestion: str | None = None) -> str:
+    if key.startswith(tuple(f"{section}." for section in SIDECAR_OWNED_CONFIG_KEYS)):
+        # The backup scheduler rejects its whole policy on an unknown key (it
+        # does not ignore it); the main UI keeps running either way.
+        hint = f" Did you mean `{suggestion}`?" if suggestion else ""
+        return (
+            f"{config_path.name}: unknown key `{key}`; the backup scheduler will not start "
+            f"until it is fixed.{hint}"
+        )
     if suggestion:
         return f"{config_path.name}: unknown key `{key}` is ignored; did you mean `{suggestion}`?"
     return f"{config_path.name}: unknown key `{key}` is ignored."

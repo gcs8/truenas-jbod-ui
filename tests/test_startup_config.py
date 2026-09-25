@@ -262,15 +262,25 @@ class UnknownConfigKeyTests(_LoaderTestCase):
         self.assertEqual(
             logs.output,
             [
-                "WARNING:app.config:config.yaml: unknown key `backups.retention` is ignored.",
-                "WARNING:app.config:config.yaml: unknown key `backups.full.shedule` is ignored; "
-                "did you mean `backups.full.schedule`?",
-                "WARNING:app.config:config.yaml: unknown key `backups.targets[0].hostnme` is ignored; "
-                "did you mean `backups.targets[0].hostname`?",
+                "WARNING:app.config:config.yaml: unknown key `backups.retention`; "
+                "the backup scheduler will not start until it is fixed.",
+                "WARNING:app.config:config.yaml: unknown key `backups.full.shedule`; "
+                "the backup scheduler will not start until it is fixed. Did you mean `backups.full.schedule`?",
+                "WARNING:app.config:config.yaml: unknown key `backups.targets[0].hostnme`; "
+                "the backup scheduler will not start until it is fixed. Did you mean `backups.targets[0].hostname`?",
             ],
         )
         # Warn only: the main UI still starts and a valid key elsewhere still applies.
         self.assertEqual(settings.app.port, 8080)
+
+    def test_backups_typo_really_stops_the_scheduler_policy(self) -> None:
+        from history_service.backup_archive.policy import load_backup_policy
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.yaml"
+            config_path.write_text("backups:\n  full:\n    shedule: '0 3 * * *'\n", encoding="utf-8")
+            with self.assertRaises(ConfigurationError):
+                load_backup_policy(config_path, environ={})
 
     def test_backups_key_lists_match_the_scheduler_models(self) -> None:
         from dataclasses import fields
