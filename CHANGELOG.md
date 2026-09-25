@@ -50,6 +50,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Added
 
+- Added jump links to the sections of the admin Setup + Maintenance view (#582)
 - Added an optional backup scheduler sidecar (`--profile backup-scheduler`):
   config-only backups shortly after configuration changes, full backups on a
   cron schedule, copies to SFTP, FTP, SMB, S3, NFS or filesystem targets,
@@ -145,6 +146,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Saved copies and the public demo hide the bay assignment editor, the
   Storage Fabric refresh button and selectors with nothing to switch to,
   instead of showing them disabled. (#587)
+- Raised the last small labels on the main page (summary labels, legend
+  swatches, Connections card details, heat-map controls, timing chips) to at
+  least 12px. (#584)
 - Honoured a configured `ssh.known_hosts_path` (top level, per system, or the
   restored `SSH_KNOWN_HOSTS_PATH`) instead of always replacing it with
   `<data>/known_hosts`, so pinned host keys can live in a host bind mount;
