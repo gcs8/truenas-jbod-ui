@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from collections import Counter
 from pathlib import Path
 
 from scripts import check_release_changelog_coverage as coverage
@@ -45,6 +46,37 @@ CHANGELOG_TEMPLATE = """# Changelog
 
 - Initial release (#5).
 """
+
+
+class ChangelogStructureTests(unittest.TestCase):
+    def test_unreleased_has_no_duplicate_headings_or_bullet_blocks(self) -> None:
+        changelog = (Path(__file__).resolve().parents[1] / "CHANGELOG.md").read_text(encoding="utf-8")
+        section = coverage.changelog_section(changelog, "## Unreleased")
+        headings = [line for line in section.splitlines() if line.startswith("### ")]
+        duplicate_headings = sorted(heading for heading, count in Counter(headings).items() if count > 1)
+
+        bullets: list[str] = []
+        current: list[str] = []
+        for line in section.splitlines():
+            if line.startswith("- "):
+                if current:
+                    bullets.append("\n".join(current))
+                current = [line]
+            elif current and line.startswith("  "):
+                current.append(line)
+            elif current:
+                bullets.append("\n".join(current))
+                current = []
+        if current:
+            bullets.append("\n".join(current))
+        duplicate_bullets = sorted(bullet for bullet, count in Counter(bullets).items() if count > 1)
+
+        self.assertEqual(duplicate_headings, [], f"duplicate Unreleased headings: {duplicate_headings}")
+        self.assertEqual(
+            duplicate_bullets,
+            [],
+            "duplicate Unreleased bullets: " + ", ".join(bullet.splitlines()[0] for bullet in duplicate_bullets),
+        )
 
 
 @unittest.skipIf(shutil.which("git") is None, "git executable is required")

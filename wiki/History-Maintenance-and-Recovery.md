@@ -4,7 +4,7 @@ Use the admin maintenance tools when a saved system is deleted, renamed, or rebu
 
 ## Back up history before changing it
 
-Create a `Full Backup` in the admin sidecar before any destructive cleanup. Include the history database and any configuration, profiles, mappings, or cache files needed for recovery.
+Create a `Full Backup` in Admin before any destructive cleanup. Include the history database and any configuration, profiles, mappings, or cache files needed for recovery.
 
 If you are unsure whether to purge or adopt history, stop and export the backup first.
 

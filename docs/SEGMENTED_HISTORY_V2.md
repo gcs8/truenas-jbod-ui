@@ -719,7 +719,7 @@ A release that enables segmented history must complete all of these gates:
 4. encrypted export, mutation, import, and query drill on data larger than the
    current production history database;
 5. development stack shutdown and cleanup after the drill;
-6. a fresh verified production FULL backup from the admin sidecar;
+6. a fresh verified production FULL backup from Admin;
 7. immutable image digest verification before the one production deployment.
 
 Production remains on the predecessor release until every gate passes.
