@@ -630,7 +630,7 @@ test("restore refuses an inspection without an observed mode and receipt", async
   await library.load();
   library.actions.openRestore("full-new");
   await library.actions.restoreInspect();
-  assert.match(elements.dialog.textContent, /Check failed: Inspection did not return an observed encryption mode and receipt/);
+  assert.match(elements.dialog.textContent, /Check failed: The backup check did not finish/);
   assert.equal(action(elements.dialog, "restore-import"), undefined);
   await library.actions.restoreImport();
   assert.equal(api.calls.some((call) => call.url.includes("/restore/import")), false);

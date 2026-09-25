@@ -575,14 +575,14 @@ class IndexPageTests(unittest.TestCase):
         self.assertIn('id="admin-launch-stopped"', page)
         self.assertIn(">System Setup</button>", page)
         self.assertIn("disabled", page.split('id="admin-launch-stopped"', 1)[1].split("</button>", 1)[0])
-        self.assertIn("Admin is stopped (it stops itself when idle).", page)
+        self.assertIn("Admin is not running (the published Compose files stop it an hour after it starts).", page)
         self.assertIn("docker compose --profile admin up -d enclosure-admin", page)
         self.assertNotIn('href="http://testserver:8082"', page)
 
     def test_running_admin_keeps_the_link(self) -> None:
         page = self.render_index(app_main.AdminLaunchState(url="http://testserver:8082", stopped=False))
         self.assertIn('href="http://testserver:8082"', page)
-        self.assertNotIn("Admin is stopped", page)
+        self.assertNotIn("Admin is not running", page)
 
     def test_unconfigured_admin_hides_the_button(self) -> None:
         page = self.render_index(None)
