@@ -40,7 +40,7 @@ test.describe("admin sidecar smoke", () => {
     await expect(page.locator("#debug-scrub-identifiers-toggle")).toBeVisible();
     await expect(page.locator("#setup-create-demo-button")).toBeVisible();
     await expect(page.locator("#setup-result")).toContainText(
-      "Saved systems appear in the main UI after a restart."
+      "Saved systems appear in the main UI within a few seconds."
     );
   });
 
@@ -228,6 +228,58 @@ test.describe("admin sidecar smoke", () => {
     await expect(page.locator("#admin-status-banner")).toContainText("Refreshed.");
     await expect(field).toHaveValue("99");
     await expect(field).toBeFocused();
+  });
+
+  test("a hot-reloaded save says applied; a restart-only save offers Restart main UI now", async ({ page }) => {
+    test.skip(process.env.PLAYWRIGHT_ADMIN_SYNTHETIC_MUTATIONS !== "1", "Requires the isolated synthetic admin runner.");
+    await gotoAdmin(page);
+    const field = page.locator('input[data-runtime-behavior-key]:enabled').first();
+    const result = page.locator("#runtime-behavior-result");
+
+    // A timing change is applied by the main UI itself: no restart button.
+    await field.fill(String(Number(await field.inputValue()) + 1));
+    await page.locator("#runtime-behavior-save-button").click();
+    await expect(result).toContainText("The main UI applies it within a few seconds; no restart needed.");
+    await expect(result.getByRole("button", { name: "Restart main UI now" })).toHaveCount(0);
+
+    // A save that touched a restart-only setting: the server says so, and the
+    // button runs the existing restart action and its convergence polling.
+    const uiContainer = (overrides) => ({
+      key: "ui", name: "truenas-jbod-ui", label: "Main UI", description: "Main UI.",
+      status: "running", status_text: "Up (healthy)", running: true, health: "healthy",
+      restart_required: true, lifecycle_state: "normal", lifecycle_label: "Normal",
+      can_stop: true, can_start: false, can_restart: true, ...overrides,
+    });
+    const restartedRuntime = { available: true, detail: null, containers: [uiContainer({ restart_required: false })] };
+    const restartCalls = [];
+    await page.route("**/api/admin/runtime-behavior", async (route) => {
+      const response = await route.fetch();
+      const body = await response.json();
+      await route.fulfill({
+        response,
+        json: {
+          ...body,
+          restart_required: ["ui"],
+          restart_settings: ["app.port"],
+          detail: "Timing saved. The main UI needs a restart to apply this.",
+          runtime: { available: true, detail: null, containers: [uiContainer({})] },
+        },
+      });
+    });
+    await page.route("**/api/admin/runtime/containers/ui/restart", async (route) => {
+      restartCalls.push(route.request().method());
+      await route.fulfill({ json: { ok: true, runtime: restartedRuntime } });
+    });
+    await page.route("**/api/admin/runtime", (route) => route.fulfill({ json: { ok: true, runtime: restartedRuntime } }));
+
+    await field.fill(String(Number(await field.inputValue()) + 1));
+    await page.locator("#runtime-behavior-save-button").click();
+    await expect(result).toContainText("Timing saved. The main UI needs a restart to apply this.");
+    const button = result.getByRole("button", { name: "Restart main UI now" });
+    await expect(button).toBeVisible();
+    await button.click();
+    await expect(page.locator("#admin-status-banner")).toContainText("Main UI is running and healthy.");
+    expect(restartCalls).toEqual(["POST"]);
   });
 
   test("demo creation preserves a loaded existing synthetic system", async ({ page }) => {

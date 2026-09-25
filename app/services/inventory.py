@@ -1010,6 +1010,11 @@ DEFAULT_SSH_FAILURE_CONTEXT: dict[str, str] = {
 }
 
 
+def _system_without_display_fields(system: SystemConfig) -> SystemConfig:
+    """``system`` minus what only changes how it is shown: its name and storage views."""
+    return system.model_copy(update={"label": None, "storage_views": []})
+
+
 class InventoryService:
     def __init__(
         self,
@@ -1082,6 +1087,53 @@ class InventoryService:
         self._scale_preferred_ses_host: str | None = None
         self._quantastor_preferred_ses_host: str | None = None
         self._sg_ses_device_cache: dict[str, tuple[list[str], datetime]] = {}
+
+    def adopt_caches_from(self, previous: InventoryService, *, keep_snapshots: bool) -> None:
+        """Take over ``previous``'s appliance answers after a config reload (#432).
+
+        Only when this system still reaches the same appliance the same way
+        (everything but its name and storage views unchanged). The raw source bundle is
+        reused, so the first snapshot after a rename is built without
+        querying the appliance again. Built snapshots are reused only when
+        ``keep_snapshots`` says nothing they were built from changed; they get
+        the new system list and refresh interval. Nothing is shared with the
+        old service except the disk-sync lock, so a request still running on
+        the old settings keeps seeing only old values.
+        """
+        if _system_without_display_fields(previous.system) != _system_without_display_fields(self.system):
+            return
+        self._source_bundle = previous._source_bundle
+        self._source_bundle_until = previous._source_bundle_until
+        self._sg_ses_device_cache = dict(previous._sg_ses_device_cache)
+        self._scale_preferred_ses_host = previous._scale_preferred_ses_host
+        self._quantastor_preferred_ses_host = previous._quantastor_preferred_ses_host
+        self._optional_ssh_backoff_until = dict(previous._optional_ssh_backoff_until)
+        # One TrueNAS disk sync per system, whichever settings started it.
+        self._disk_inventory_sync_lock = previous._disk_inventory_sync_lock
+        self._disk_inventory_sync_active_job_id = previous._disk_inventory_sync_active_job_id
+        if not keep_snapshots:
+            return
+        systems = [
+            SystemOption(id=system.id, label=system.label or system.id, platform=system.truenas.platform)
+            for system in self.settings.systems
+        ]
+        for cache_key, snapshot in list(previous._cache.items()):
+            if cache_key in previous._snapshot_invalidated:
+                continue
+            self._cache[cache_key] = snapshot.model_copy(
+                update={
+                    "systems": systems,
+                    "refresh_interval_seconds": self.settings.app.refresh_interval_seconds,
+                }
+            )
+            self._cache_until[cache_key] = previous._cache_until.get(
+                cache_key,
+                datetime.min.replace(tzinfo=timezone.utc),
+            )
+            self._touch_snapshot_key(cache_key)
+        if previous._canonical_enclosure_options is not None:
+            self._canonical_enclosure_options = dict(previous._canonical_enclosure_options)
+            self._canonical_default_enclosure_id = previous._canonical_default_enclosure_id
 
     def _metrics_labels(self) -> dict[str, str | None]:
         return {

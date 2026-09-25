@@ -104,6 +104,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Changed
 
+- The main UI applies edits to config.yaml, runtime-overrides.yaml and
+  profiles.yaml (admin saves and hand edits) within a few seconds, without a
+  restart. An invalid edit keeps the old settings with a warning in the log,
+  `/healthz` and the page. Only bind address, port, public origin, debug,
+  start-up warm-up, release check, perf and paths still need a restart; admin
+  offers Restart main UI now for those. (#PR)
 - The admin now says an SSH key file "was not found in the admin container"
   instead of naming the "admin sidecar". (#601)
 - The main page reuses bay tiles when a refresh brings the same layout,

@@ -64,14 +64,40 @@ Use the DNS name on the certificate for `TRUENAS_TLS_SERVER_NAME`.
 
 ## Apply config changes
 
-The main UI reads `config/config.yaml` and `config/runtime-overrides.yaml`
-only when it starts. After you edit either file by hand, restart the main UI:
+The main UI applies edits to `config/config.yaml`,
+`config/runtime-overrides.yaml` and `config/profiles.yaml` by itself, without
+a restart. It checks the three files at most every two seconds (modification
+time, size and inode), so both admin saves and hand edits on the host take
+effect within a few seconds. A page that is loading while the file changes
+uses either the old settings or the new ones, never a mix of both.
+
+If an edit is not valid (a YAML syntax error, an unknown platform, a value out
+of range), the main UI keeps its previous settings and says so plainly: in the
+log, as the `/healthz` reason (`status: degraded`), and as a warning on the
+page. Fix the file and the warning clears on the next check.
+
+A few settings are only read when the main UI process starts. Changing them
+needs a restart:
+
+| Setting | Why |
+| --- | --- |
+| `app.host`, `app.port` | The listening address is fixed when the process starts (the image binds `0.0.0.0:8000`) |
+| `app.public_origin` | Write checks capture it when the app is built |
+| `app.debug` | Turns the `/docs` pages on or off when the app is built |
+| `app.startup_warm_cache_enabled`, `app.startup_warm_smart_enabled` | Only used at start-up |
+| `app.release_check_*` | The release-check task starts with the process |
+| `perf.*` | The timing middleware is installed at start-up |
+| `paths.*`, `APP_CONFIG_PATH` | Open log files and data stores |
+| Sign-in (`ADMIN_AUTH_MODE` and its credentials) and every other `.env` value | Process environment |
+
+When you change one of these, the main UI keeps running with the old value,
+logs that a restart is needed and shows it on the page. Admin saves that touch
+one show **Saved. The main UI needs a restart to apply this.** with a
+**Restart main UI now** button; after a hand edit, restart it yourself:
 
 ```bash
 docker compose restart enclosure-ui
 ```
-
-Admin saves show a **Restart main UI now** button for the same reason.
 
 ## Single-system vs multi-system
 

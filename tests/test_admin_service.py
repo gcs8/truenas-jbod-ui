@@ -2927,7 +2927,7 @@ class AdminStatePayloadTests(unittest.TestCase):
 
 
 class AdminSudoPreviewRouteTests(unittest.TestCase):
-    def test_runtime_behavior_route_marks_read_ui_restart(self) -> None:
+    def test_runtime_behavior_route_applies_without_a_main_ui_restart(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/runtime-behavior")
         settings = Settings(config_file="C:/tmp/config/config.yaml")
         runtime_service = MagicMock()
@@ -2946,7 +2946,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
                     with patch(
                         "admin_service.main.build_runtime_payload",
                         new=AsyncMock(return_value={"available": True, "containers": []}),
-                    ):
+                    ), patch("admin_service.main.record_config_change") as journal:
                         response = asyncio.run(
                             route.endpoint({"values": {"source_bundle_cache_ttl_seconds": 120}})
                         )
@@ -2955,11 +2955,42 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["runtime_behavior"]["fields"][0]["key"], "source_bundle_cache_ttl_seconds")
         save_overrides.assert_called_once_with(settings, {"source_bundle_cache_ttl_seconds": 120})
-        runtime_service.mark_restart_required.assert_called_once_with(("ui",))
-        self.assertEqual(payload["restart_required"], ["ui"])
-        self.assertEqual(payload["detail"], "Timing saved. Restart the main UI to apply it.")
+        runtime_service.mark_restart_required.assert_not_called()
+        self.assertEqual(payload["restart_required"], [])
+        self.assertEqual(payload["detail"], "Timing saved. The main UI applies it within a few seconds; no restart needed.")
+        # A save the main UI applies by itself is still journalled (#575/#580).
+        journal.assert_called_once_with("runtime_overrides.save", "source_bundle_cache_ttl_seconds")
 
-    def test_create_demo_system_route_accepts_missing_payload_and_marks_ui_restart(self) -> None:
+    def test_config_save_still_marks_restart_for_restart_only_settings(self) -> None:
+        """Bind/port, public origin, debug docs, perf and paths need a new main UI process (#432)."""
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/runtime-behavior")
+        before = Settings(config_file="C:/tmp/config/config.yaml")
+        cases = {
+            "app.host": {"app": before.app.model_copy(update={"host": "127.0.0.1"})},
+            "app.port": {"app": before.app.model_copy(update={"port": 9090})},
+            "app.public_origin": {"app": before.app.model_copy(update={"public_origin": "https://nas.example.test"})},
+            "app.debug": {"app": before.app.model_copy(update={"debug": True})},
+            "perf": {"perf": before.perf.model_copy(update={"enabled": True})},
+            "paths": {"paths": before.paths.model_copy(update={"log_file": "C:/tmp/logs/other.log"})},
+        }
+        for key, update in cases.items():
+            with self.subTest(key=key):
+                after = before.model_copy(update=update)
+                runtime_service = MagicMock()
+                with (
+                    patch("admin_service.main.reload_app_settings", side_effect=[before, after]),
+                    patch("admin_service.main.get_runtime_service", return_value=runtime_service),
+                    patch("admin_service.main.save_runtime_behavior_overrides", return_value={"fields": []}),
+                    patch("admin_service.main.build_runtime_payload", new=AsyncMock(return_value={"containers": []})),
+                ):
+                    response = asyncio.run(route.endpoint({"values": {"smart_cache_ttl_seconds": 60}}))
+                payload = json.loads(response.body)
+                runtime_service.mark_restart_required.assert_called_once_with(("ui",))
+                self.assertEqual(payload["restart_required"], ["ui"])
+                self.assertEqual(payload["restart_settings"], [key])
+                self.assertEqual(payload["detail"], "Timing saved. The main UI needs a restart to apply this.")
+
+    def test_create_demo_system_route_accepts_missing_payload_and_applies_without_restart(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/system-setup/demo")
         initial_settings = Settings(
             config_file="C:/tmp/config/config.yaml",
@@ -3024,9 +3055,12 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["system"]["id"], "demo-builder-lab")
         self.assertEqual(payload["profile"]["id"], "demo-builder-lab-chassis")
-        runtime_service.mark_restart_required.assert_called_once_with(("ui",))
-        self.assertEqual(payload["restart_required"], ["ui"])
-        self.assertEqual(payload["detail"], "Demo builder system Demo Builder Lab saved. Restart the main UI to show it.")
+        runtime_service.mark_restart_required.assert_not_called()
+        self.assertEqual(payload["restart_required"], [])
+        self.assertEqual(
+            payload["detail"],
+            "Demo builder system Demo Builder Lab saved. The main UI applies it within a few seconds; no restart needed.",
+        )
 
     def test_delete_system_route_returns_updated_system_list(self) -> None:
         route = next(
@@ -3086,7 +3120,9 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertEqual(payload["default_system_id"], "archive-core")
         self.assertFalse(payload["history_purge"]["requested"])
         self.assertEqual([system["id"] for system in payload["systems"]], ["archive-core"])
-        runtime_service.mark_restart_required.assert_called_once_with(("ui",))
+        runtime_service.mark_restart_required.assert_not_called()
+        self.assertEqual(payload["restart_required"], [])
+        self.assertTrue(payload["detail"].endswith("The main UI applies it within a few seconds; no restart needed."))
 
     def test_delete_system_route_can_purge_matching_history(self) -> None:
         route = next(
@@ -3154,7 +3190,9 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertTrue(payload["history_purge"]["ok"])
         self.assertEqual(payload["history_purge"]["summary"]["total_rows"], 6)
         history_store.delete_system_history.assert_called_once_with("qs-cryostorage")
-        runtime_service.mark_restart_required.assert_called_once_with(("ui",))
+        runtime_service.mark_restart_required.assert_not_called()
+        self.assertEqual(payload["restart_required"], [])
+        self.assertTrue(payload["detail"].endswith("The main UI applies it within a few seconds; no restart needed."))
 
     def test_delete_system_route_redacts_history_purge_failure_detail(self) -> None:
         route = next(
@@ -3772,7 +3810,9 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertEqual(payload["profile"]["id"], "custom-front-24")
         self.assertFalse(payload["updated_existing"])
         self.assertIn("custom-front-24", [profile["id"] for profile in payload["profiles"]])
-        runtime_service.mark_restart_required.assert_called_once_with(("ui",))
+        runtime_service.mark_restart_required.assert_not_called()
+        self.assertEqual(payload["restart_required"], [])
+        self.assertTrue(payload["detail"].endswith("The main UI applies it within a few seconds; no restart needed."))
 
     def test_delete_profile_route_returns_updated_profile_list(self) -> None:
         route = next(
@@ -3827,7 +3867,9 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["deleted_label"], "Custom Front 24")
         self.assertNotIn("custom-front-24", [profile["id"] for profile in payload["profiles"]])
-        runtime_service.mark_restart_required.assert_called_once_with(("ui",))
+        runtime_service.mark_restart_required.assert_not_called()
+        self.assertEqual(payload["restart_required"], [])
+        self.assertTrue(payload["detail"].endswith("The main UI applies it within a few seconds; no restart needed."))
 
     def test_sudoers_preview_route_returns_exact_rendered_content(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/system-setup/sudoers-preview")

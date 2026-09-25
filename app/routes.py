@@ -254,7 +254,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             selected_enclosure_id=enclosure_id,
             snapshot=snapshot,
         )
-        startup_problems = startup_problems_for(request)
+        startup_problems = [*startup_problems_for(request), *config_reload_problems(request)]
         if startup_problems:
             snapshot = snapshot.model_copy(update={"warnings": [*startup_problems, *snapshot.warnings]})
         upgrade_notice_payload = await asyncio.to_thread(
@@ -370,6 +370,9 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             allow_stale_cache=not force,
         )
         payload = snapshot.model_dump(mode="json")
+        reload_problems = config_reload_problems(request)
+        if reload_problems:
+            payload["warnings"] = [*reload_problems, *payload.get("warnings", [])]
         # The browser re-syncs its write controls and its cached page from
         # every refresh, so a rejected write or a container upgrade never
         # leaves the page stuck on stale policy or stale JavaScript.
@@ -1361,7 +1364,11 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
         payload = build_health_payload(
             service.peek_cached_snapshot(),
             startup_problems=storage_problems,
-            remote_problems=[*([history_problem] if history_problem else []), *backup_problems],
+            remote_problems=[
+                *config_reload_problems(request, include_restart_notice=False),
+                *([history_problem] if history_problem else []),
+                *backup_problems,
+            ],
         )
         return JSONResponse(payload, status_code=health_status_code(payload))
 
