@@ -562,6 +562,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Internal
 
+- Tested history upgrades from the released v0.8.0, v0.21.2 and v0.22.2
+  schemas, including a kill after each startup migration step, a second start
+  that changes nothing, the previous release reading an upgraded database, and
+  refusal of a newer database before any write (#PRNUM).
 - CI now upgrades the public v0.22.2 image to each pull request's build by
   changing only `JBOD_UI_IMAGE` on root-owned mounts, checks that the
   containers are healthy, that mappings and history survive and that the
