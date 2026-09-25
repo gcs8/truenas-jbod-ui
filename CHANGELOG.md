@@ -128,6 +128,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Docs
 
+- The Upgrading wiki page has a "What is tested" table: the Docker host,
+  storage, services, upgrade path, rollback and recovery cases that CI's
+  image-only upgrade check covers, and the ones not tested yet (#590).
+
 - Rewrote the released v0.23.0 upgrade notes so a published-image operator can
   follow them: the ownership step is a plain `chown` that adopts the
   `docker-compose.nonroot.yml` overlay rather than a helper the image does not
@@ -148,6 +152,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Hid the SSH settings in admin setup step 3 until SSH is turned on, so a
+  new system no longer scrolls past a block of disabled fields (#585)
+- Renamed the admin container cards to Main UI, History and Admin, removed
+  sidecar and runtime wording from admin messages, and corrected the docs that
+  said admin auto-stops by default (only the published Compose files set
+  3600) (#581)
 - Raised the last small labels on the main page (summary labels, legend
   swatches, Connections card details, heat-map controls, timing chips) to at
   least 12px. (#584)
@@ -415,6 +425,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Performance
 
+- Gave admin backup and debug downloads and restore uploads a 30-minute
+  timeout so a stalled transfer ends with a plain message instead of hanging
+  (#583)
 - Offline exports embed a card photo only when a view or enclosure can draw
   it, and read the static files once per export instead of once per
   downsampling pass. (#493)
@@ -506,6 +519,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   (#564).
 
 ### Internal
+
+- CI now upgrades the public v0.22.2 image to each pull request's build by
+  changing only `JBOD_UI_IMAGE` on root-owned mounts, checks that the
+  containers are healthy, that mappings and history survive and that the
+  schema migrated, then rolls back by pin (#590).
 
 - Added the backup archive transport library for the history sidecar: remote
   targets for a local directory, FTP/FTPS, SFTP (host key checked against

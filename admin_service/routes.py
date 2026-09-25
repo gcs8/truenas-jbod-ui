@@ -126,7 +126,7 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
                 "runtime_behavior": runtime_behavior,
                 "runtime": await build_runtime_payload(runtime_service),
                 "restart_required": ["ui"],
-                "detail": "Runtime behavior overrides saved. Restart the main UI to apply them.",
+                "detail": "Timing saved. Restart the main UI to apply it.",
             }
         )
 
@@ -135,7 +135,7 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
         return await container_action_response(
             container_key,
             action="stop",
-            admin_detail="The admin sidecar cannot stop itself from the UI.",
+            admin_detail="Admin can't stop itself from this page.",
         )
 
     @router.post("/api/admin/runtime/containers/{container_key}/start")
@@ -143,7 +143,7 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
         return await container_action_response(
             container_key,
             action="start",
-            admin_detail="The admin sidecar is already running.",
+            admin_detail="Admin is already running.",
         )
 
     @router.post("/api/admin/runtime/containers/{container_key}/restart")
@@ -151,7 +151,7 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
         return await container_action_response(
             container_key,
             action="restart",
-            admin_detail="The admin sidecar cannot restart itself from the UI.",
+            admin_detail="Admin can't restart itself from this page.",
         )
 
     @router.post("/api/admin/backup/export")
