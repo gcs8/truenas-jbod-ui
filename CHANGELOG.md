@@ -142,6 +142,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Hid the SSH settings in admin setup step 3 until SSH is turned on, so a
+  new system no longer scrolls past a block of disabled fields (#585)
 - Honoured a configured `ssh.known_hosts_path` (top level, per system, or the
   restored `SSH_KNOWN_HOSTS_PATH`) instead of always replacing it with
   `<data>/known_hosts`, so pinned host keys can live in a host bind mount;
