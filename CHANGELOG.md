@@ -147,7 +147,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   refuse an old single-file history backup on a segmented deployment before any
   file is replaced, and use plain error messages (raw 7-Zip output goes to the
   log only). The unused in-memory import path was removed; byte imports now go
-  through the same file-backed checks. (#PRNUM)
+  through the same file-backed checks. (#594)
 - Honoured a configured `ssh.known_hosts_path` (top level, per system, or the
   restored `SSH_KNOWN_HOSTS_PATH`) instead of always replacing it with
   `<data>/known_hosts`, so pinned host keys can live in a host bind mount;
