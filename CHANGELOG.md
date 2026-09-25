@@ -56,6 +56,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Security
 
+- Backup-scheduler connection failures no longer copy exception text into the
+  admin API response; the public answer is a fixed message. (#621)
 - Restored the read-only `./config:/app/config:ro` mount for the read UI in the
   default `docker-compose.yml`, which lost its `:ro` when hardening moved to the
   opt-in non-root overlay. Default deployments no longer give the

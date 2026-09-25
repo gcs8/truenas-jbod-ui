@@ -605,7 +605,30 @@ class AdminProxyTests(unittest.TestCase):
             payload = json.loads(body)
             self.assertFalse(payload["available"])
             self.assertEqual(payload["artifacts"], [])
+            self.assertEqual(payload["detail"], "The backup scheduler service is not available.")
             self.assertEqual(self.call("POST", "/api/admin/backups/run", {"backup_class": "full"})[0], 503)
+
+    def test_scheduler_exception_detail_is_not_returned(self) -> None:
+        from admin_service.services.backup_scheduler_client import SchedulerUnavailableError
+
+        class FailingClient:
+            def request(self, *_args, **_kwargs):
+                raise SchedulerUnavailableError("private socket path /run/secrets/backup-scheduler.sock")
+
+        with patch.object(admin_routes, "get_backup_scheduler_client", return_value=FailingClient()):
+            status, body = self.call("GET", "/api/admin/backups")
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                json.loads(body)["detail"],
+                "The backup scheduler service is not available.",
+            )
+            status, body = self.call("POST", "/api/admin/backups/run", {"backup_class": "full"})
+            self.assertEqual(status, 503)
+            self.assertEqual(
+                json.loads(body)["detail"],
+                "The backup scheduler service is not available.",
+            )
+            self.assertNotIn(b"/run/secrets", body)
 
     def test_routes_forward_and_validate(self) -> None:
         from admin_service.services.backup_scheduler_client import SchedulerResponse
