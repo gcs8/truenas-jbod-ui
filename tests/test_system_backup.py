@@ -1382,6 +1382,142 @@ class SystemBackupServiceTests(unittest.TestCase):
         ):
             self.backup_service._require_restore_free_space(manifest, group_entries, extracted)
 
+    def test_export_refuses_when_temp_folder_cannot_hold_the_history_snapshot(self) -> None:
+        usage = shutil.disk_usage(self.temp_dir)
+        short = type(usage)(usage.total, usage.used, 1)
+        with (
+            patch("history_service.system_backup.shutil.disk_usage", return_value=short),
+            patch("history_service.system_backup.tempfile.mkdtemp") as mkdtemp,
+            self.assertRaises(ValueError) as raised,
+        ):
+            self.backup_service.export_bundle_to_file(
+                packaging="zip",
+                included_paths=[HISTORY_DB_KEY],
+            )
+        self.assertIn("Export needs about", str(raised.exception))
+        self.assertIn("1 bytes is available.", str(raised.exception))
+        mkdtemp.assert_not_called()
+
+        with patch("history_service.system_backup.shutil.disk_usage", return_value=short):
+            artifact = self.backup_service.export_bundle_to_file(
+                packaging="zip",
+                included_paths=[CONFIG_FILE_KEY],
+            )
+        artifact.cleanup()
+
+    def test_import_skips_second_quick_check_only_for_the_preflighted_digest(self) -> None:
+        artifact = self.backup_service.export_bundle_to_file(
+            packaging="zip",
+            included_paths=[HISTORY_DB_KEY],
+        )
+        try:
+            real_connect = sqlite3.connect
+            pragmas: list[str] = []
+
+            class CountingConnection:
+                def __init__(self, connection: sqlite3.Connection) -> None:
+                    self._connection = connection
+
+                def execute(self, sql: str, *args: Any):
+                    if "quick_check" in sql:
+                        pragmas.append(sql)
+                    return self._connection.execute(sql, *args)
+
+                def __getattr__(self, name: str) -> Any:
+                    return getattr(self._connection, name)
+
+            def counting_connect(database: Any, *args: Any, **kwargs: Any) -> Any:
+                connection = real_connect(database, *args, **kwargs)
+                if isinstance(database, str) and "mode=ro" in database:
+                    return CountingConnection(connection)
+                return connection
+
+            digest = self.backup_service.preflight_import_bundle_file(artifact.path)
+            self.assertRegex(digest or "", r"^[0-9a-f]{64}$")
+
+            with patch("history_service.system_backup.sqlite3.connect", side_effect=counting_connect):
+                self.backup_service.import_bundle_from_file(
+                    artifact.path,
+                    preflighted_archive_sha256=digest,
+                )
+            self.assertEqual(pragmas, [], "a matching preflight digest must skip quick_check")
+
+            with patch("history_service.system_backup.sqlite3.connect", side_effect=counting_connect):
+                self.backup_service.import_bundle_from_file(
+                    artifact.path,
+                    preflighted_archive_sha256="0" * 64,
+                )
+            self.assertEqual(len(pragmas), 1, "a different digest must run quick_check again")
+        finally:
+            artifact.cleanup()
+
+    def test_v1_history_backup_is_refused_on_a_segmented_deployment_before_any_write(self) -> None:
+        artifact = self.backup_service.export_bundle_to_file(
+            packaging="zip",
+            included_paths=[HISTORY_DB_KEY],
+        )
+        try:
+            self.assertNotEqual(artifact.manifest.get("schema_version"), 2)
+            live_before = self.history_db_path.read_bytes()
+            self.store.segment_catalog_path = self.temp_dir / "segments" / "catalog.json"
+            try:
+                for operation in (
+                    self.backup_service.preflight_import_bundle_file,
+                    self.backup_service.import_bundle_from_file,
+                ):
+                    with self.subTest(operation=operation.__name__):
+                        with self.assertRaisesRegex(ValueError, "old single-file format"):
+                            operation(artifact.path)
+            finally:
+                self.store.segment_catalog_path = None
+            self.assertEqual(self.history_db_path.read_bytes(), live_before)
+        finally:
+            artifact.cleanup()
+
+    def test_7z_failure_keeps_raw_tool_output_out_of_the_error(self) -> None:
+        result = subprocess.CompletedProcess(
+            ["7z"],
+            2,
+            stdout="member config/secret-name.yaml\n",
+            stderr="ERROR: synthetic tool detail",
+        )
+        with (
+            self.assertLogs("history_service.system_backup", level="WARNING") as logs,
+            self.assertRaises(ValueError) as raised,
+        ):
+            SystemBackupService._raise_for_7z_failure(
+                result,
+                "The backup could not be written.",
+                passphrase="synthetic passphrase",
+            )
+        message = str(raised.exception)
+        self.assertEqual(message, "The backup could not be written. The 7-Zip step failed (exit 2).")
+        self.assertNotIn("secret-name", message)
+        self.assertIn("synthetic tool detail", "\n".join(logs.output))
+
+    def test_passphrase_messages_are_one_sentence_each(self) -> None:
+        self.assertEqual(
+            system_backup_module.PASSPHRASE_REQUIRED_MESSAGE,
+            "This backup is encrypted. Enter its passphrase to continue.",
+        )
+        with self.assertRaisesRegex(ValueError, "^Enter a passphrase to encrypt this backup.$"):
+            self.backup_service.export_bundle_to_file(encrypt=True, passphrase=None)
+
+    def test_in_memory_import_chain_is_gone(self) -> None:
+        for name in (
+            "_read_archive",
+            "_build_archive",
+            "_decrypt_scheduled_archive",
+            "_decompress_tar_archive",
+            "_decompress_single_gzip_member",
+            "_decompress_single_zstd_frame",
+            "_extract_manifest_zip_members",
+            "_extract_manifest_tar_members",
+            "_read_tar_member",
+        ):
+            with self.subTest(name=name):
+                self.assertFalse(hasattr(SystemBackupService, name))
+
     def test_format_size_reads_like_a_person_wrote_it(self) -> None:
         format_size = SystemBackupService._format_size
         self.assertEqual(format_size(6 * 1024 ** 3 + 200 * 1024 ** 2), "6.2 GiB")
@@ -1713,7 +1849,7 @@ class SystemBackupServiceTests(unittest.TestCase):
 
         with patch.object(
             self.backup_service,
-            "_extract_manifest_zip_members",
+            "_extract_manifest_zip_members_to_directory",
             side_effect=AssertionError("payload extraction must not start"),
         ):
             with self.assertRaisesRegex(ValueError, "duplicate member key"):
@@ -1848,14 +1984,20 @@ class SystemBackupServiceTests(unittest.TestCase):
             ],
         }
 
-        archive_bytes = self.backup_service._build_archive([member], manifest, "tar.gz")
-        restored_manifest, extracted, packaging, _ = self.backup_service._read_archive(
-            archive_bytes
+        bundle_path = self.temp_dir / "long-member.tar.gz"
+        self.backup_service._build_archive_to_path([member], manifest, "tar.gz", bundle_path)
+        restored_manifest, extracted, packaging, archive_meta = self.backup_service._read_archive_file(
+            bundle_path
         )
-
-        self.assertEqual(packaging, "tar.gz")
-        self.assertEqual(restored_manifest, manifest)
-        self.assertEqual(extracted, {member.key: content})
+        try:
+            self.assertEqual(packaging, "tar.gz")
+            self.assertEqual(restored_manifest, manifest)
+            self.assertEqual(
+                {key: Path(value).read_bytes() for key, value in extracted.items()},
+                {member.key: content},
+            )
+        finally:
+            self.backup_service._cleanup_extracted_archive(archive_meta.get("_cleanup_root"))
 
     def test_tar_gzip_rejects_concatenated_member_before_archive_parse(self) -> None:
         manifest = {
@@ -1880,31 +2022,19 @@ class SystemBackupServiceTests(unittest.TestCase):
             self.backup_service.import_bundle_from_file(archive_path)
 
     def test_tar_gzip_applies_ratio_cap_during_decompression(self) -> None:
-        observed_max_lengths: list[int] = []
-
-        class FakeDecompressor:
-            eof = True
-            unused_data = b""
-
-            def decompress(self, chunk: bytes, max_length: int) -> bytes:
-                observed_max_lengths.append(max_length)
-                return b""
-
-            def flush(self, length: int) -> bytes:
-                return b""
-
-        archive_bytes = b"x" * 100
+        archive_path = self.temp_dir / "ratio.tar.gz"
+        archive_path.write_bytes(gzip.compress(b"\0" * (64 * 1024)))
+        output_path = self.temp_dir / "ratio.tar"
         with (
             patch("history_service.system_backup.MAX_ARCHIVE_COMPRESSION_RATIO", 2),
-            patch("history_service.system_backup.MAX_ARCHIVE_EXPANDED_BYTES", 10_000),
-            patch(
-                "history_service.system_backup.zlib.decompressobj",
-                return_value=FakeDecompressor(),
-            ),
+            patch("history_service.system_backup.MAX_ARCHIVE_EXPANDED_BYTES", 10_000_000),
         ):
-            self.backup_service._decompress_single_gzip_member(archive_bytes)
-
-        self.assertEqual(observed_max_lengths, [201])
+            with self.assertRaisesRegex(ValueError, "compression ratio exceeds"):
+                self.backup_service._decompress_tar_archive_to_file(
+                    archive_path,
+                    output_path,
+                    "tar.gz",
+                )
 
     def test_tar_zstd_rejects_concatenated_frame_before_archive_parse(self) -> None:
         if system_backup_module.zstd is None:
@@ -2322,7 +2452,7 @@ sys.stdout.flush()
                 bundle = self._build_zip_bundle(manifest, {archive_path: b"pwn"})
 
                 with self.assertRaisesRegex(ValueError, "archive member path is invalid"):
-                    self.backup_service._read_archive(bundle)
+                    self.backup_service.import_bundle(bundle)
 
     def test_directory_restore_validates_missing_members_before_replacing_existing_dir(self) -> None:
         target_dir = self.temp_dir / "existing-ssh"
@@ -2802,7 +2932,9 @@ sys.stdout.flush()
             ),
         ):
             with self.assertRaisesRegex(ValueError, expected_error):
-                self.backup_service._read_7z_archive(SEVEN_ZIP_SIGNATURE)
+                signature_path = self.temp_dir / "signature-only.7z"
+                signature_path.write_bytes(SEVEN_ZIP_SIGNATURE)
+                self.backup_service._read_7z_archive(archive_path=signature_path)
 
         self.assertFalse(payload_extraction_started)
 
@@ -3990,11 +4122,11 @@ sys.stdout.flush()
         validated_paths: list[Path] = []
         real_validate_history = SystemBackupService._validate_history_member
 
-        def record_history_path(content: bytes | Path) -> None:
+        def record_history_path(content: bytes | Path, **kwargs: Any) -> None:
             self.assertIsInstance(content, Path)
             assert isinstance(content, Path)
             validated_paths.append(content)
-            real_validate_history(content)
+            real_validate_history(content, **kwargs)
 
         with (
             patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False),
@@ -4026,7 +4158,7 @@ sys.stdout.flush()
         extraction_root = next(
             parent
             for parent in validated_paths[0].parents
-            if parent.name.startswith("truenas-jbod-ui-7z-import-")
+            if parent.name.startswith(("truenas-jbod-ui-7z-import-", "truenas-jbod-ui-file-import-"))
         )
         self.assertFalse(extraction_root.exists())
 
@@ -4521,7 +4653,7 @@ sys.stdout.flush()
 
                 with self.assertRaisesRegex(ValueError, "Check the passphrase"):
                     self.backup_service.import_bundle(artifact.content, passphrase="wrong-secret")
-                with self.assertRaisesRegex(ValueError, "requires a passphrase"):
+                with self.assertRaisesRegex(ValueError, "Enter its passphrase"):
                     self.backup_service.import_bundle(artifact.content)
 
                 result = self.backup_service.import_bundle(artifact.content, passphrase="topsecret")

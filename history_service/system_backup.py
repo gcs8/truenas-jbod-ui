@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import hmac
 import io
 import json
 import logging
@@ -273,6 +274,28 @@ JSON_DUPLICATE_CACHE_KIB = 512
 
 ExtractedMember = bytes | Path
 
+PASSPHRASE_REQUIRED_MESSAGE = "This backup is encrypted. Enter its passphrase to continue."
+EXPORT_PASSPHRASE_REQUIRED_MESSAGE = "Enter a passphrase to encrypt this backup."
+WRONG_PASSPHRASE_MESSAGE = (
+    "The backup could not be decrypted. Check the passphrase and try again."
+)
+SEGMENTED_CATALOG_NOT_SET_MESSAGE = (
+    "This backup contains segmented history but HISTORY_SEGMENT_CATALOG_PATH is not "
+    "set on this deployment."
+)
+V1_HISTORY_ON_SEGMENTED_MESSAGE = (
+    "This history backup is in the old single-file format. This deployment uses "
+    "segmented history; restore a segmented backup, or turn segmented history off first."
+)
+
+
+def _segmented_integrity_message(stage: str) -> str:
+    logger.error("Segmented history restore integrity check failed at stage: %s.", stage)
+    return (
+        "The restore was stopped because a history file changed while it was being "
+        "copied or swapped into place."
+    )
+
 
 class _DiskBackedDuplicateKeyTracker:
     """Track object-scoped JSON keys without retaining payload keys in Python."""
@@ -319,7 +342,7 @@ class _DiskBackedDuplicateKeyTracker:
         except BaseException as initialization_error:
             if isinstance(initialization_error, Exception):
                 primary_error: BaseException = ValueError(
-                    "JSON duplicate-key validation could not be initialized."
+                    "Temporary files could not be created; check free space in the temp folder."
                 )
             else:
                 primary_error = initialization_error
@@ -338,7 +361,7 @@ class _DiskBackedDuplicateKeyTracker:
 
     def add(self, scope: int, key: str) -> None:
         if self.cursor is None:
-            raise ValueError("JSON duplicate-key validation is unavailable.")
+            raise ValueError("Temporary files could not be created; check free space in the temp folder.")
         try:
             self.cursor.execute(
                 "INSERT INTO keys (scope, value) VALUES (?, ?)",
@@ -401,12 +424,12 @@ class _StreamingJSONReader:
 
     def _new_object_scope(self) -> int:
         if self.duplicate_keys is None:
-            raise ValueError("JSON duplicate-key validation is unavailable.")
+            raise ValueError("Temporary files could not be created; check free space in the temp folder.")
         return self.duplicate_keys.new_scope()
 
     def _record_object_key(self, scope: int, key: str) -> None:
         if self.duplicate_keys is None:
-            raise ValueError("JSON duplicate-key validation is unavailable.")
+            raise ValueError("Temporary files could not be created; check free space in the temp folder.")
         self.duplicate_keys.add(scope, key)
 
     def _fill(self) -> bool:
@@ -728,8 +751,8 @@ class _ImportActivationTransaction:
     def __exit__(self, exc_type, exc, traceback) -> Literal[False]:
         if exc is not None and self._preserve_segmented_evidence:
             raise RuntimeError(
-                "Segmented history restore integrity failed; recovery material was "
-                f"preserved at {self.root}."
+                "The history restore was stopped by an integrity check. Nothing was "
+                f"deleted; the files needed to recover are preserved in {self.root}."
             ) from exc
         if exc is not None and not self._committed:
             try:
@@ -885,7 +908,7 @@ class _ImportActivationTransaction:
             raise ValueError("Segmented history restore is already prepared.")
         catalog_path = store.segment_catalog_path
         if catalog_path is None:
-            raise ValueError("Segmented history catalog target is not configured.")
+            raise ValueError(SEGMENTED_CATALOG_NOT_SET_MESSAGE)
         store._segment_reader_cache = None
         store._segment_reader_identity = None
         self._checkpoint_hot_database(store.file_path)
@@ -1099,7 +1122,7 @@ class _ImportActivationTransaction:
         )
         if not prior_matches or not matcher(staged_path, candidate_record):
             self._preserve_segmented_evidence = True
-            raise ValueError("Segmented history restore prepared artifact integrity failed.")
+            raise ValueError(_segmented_integrity_message("prepared artifact"))
         if entry.kind != "missing":
             if self._path_exists(previous_path):
                 raise ValueError("Segmented history prior restore artifact already exists.")
@@ -1110,14 +1133,14 @@ class _ImportActivationTransaction:
             self._fsync_directory(entry.target_path.parent)
             if not matcher(previous_path, prior_record):
                 self._preserve_segmented_evidence = True
-                raise ValueError("Segmented history restore parked prior integrity failed.")
+                raise ValueError(_segmented_integrity_message("parked prior"))
         os.replace(staged_path, entry.target_path)
         self._sibling_artifacts.pop(staged_path, None)
         entry.mutated = True
         self._fsync_directory(entry.target_path.parent)
         if not matcher(entry.target_path, candidate_record):
             self._preserve_segmented_evidence = True
-            raise ValueError("Segmented history restore activated candidate integrity failed.")
+            raise ValueError(_segmented_integrity_message("activated candidate"))
 
     def activate_segmented_history(
         self,
@@ -1557,14 +1580,14 @@ class _ImportActivationTransaction:
             hot = prepared.journal_payload["hot"]
             segments = prepared.journal_payload["segments"]
             if not restore_file_matches(prepared.hot_entry.target_path, hot["candidate"]):
-                raise ValueError("Segmented history restore live hot integrity failed.")
+                raise ValueError(_segmented_integrity_message("live hot"))
             if not restore_tree_matches(prepared.segments_entry.target_path, segments["candidate"]):
-                raise ValueError("Segmented history restore live segment tree integrity failed.")
+                raise ValueError(_segmented_integrity_message("live segment tree"))
             if hot["prior"].get("kind") == "missing":
                 if self._path_exists(prepared.previous_hot_path):
                     raise ValueError("Segmented history restore prior hot artifact is unexpected.")
             elif not restore_file_matches(prepared.previous_hot_path, hot["prior"]):
-                raise ValueError("Segmented history restore prior hot integrity failed.")
+                raise ValueError(_segmented_integrity_message("prior hot"))
             if segments["prior"].get("kind") == "missing":
                 if self._path_exists(prepared.previous_segments_path):
                     raise ValueError("Segmented history restore prior segment artifact is unexpected.")
@@ -1572,7 +1595,7 @@ class _ImportActivationTransaction:
                 prepared.previous_segments_path,
                 segments["prior"],
             ):
-                raise ValueError("Segmented history restore prior segment tree integrity failed.")
+                raise ValueError(_segmented_integrity_message("prior segment tree"))
             if hot["prior"].get("kind") != "missing":
                 remove_recorded_restore_file(
                     prepared.previous_hot_path,
@@ -1671,18 +1694,6 @@ class _ImportActivationTransaction:
         except ValueError:
             return False
         return common_path == first_path or common_path == second_path
-
-    @staticmethod
-    def _reject_symlinked_history_target(target_path: Path) -> None:
-        cursor = target_path
-        while True:
-            if cursor.is_symlink():
-                raise ValueError(
-                    f"Live history restore target {target_path} uses unsafe symlink component {cursor}."
-                )
-            if cursor == cursor.parent:
-                return
-            cursor = cursor.parent
 
     @staticmethod
     def _new_sibling_path(target_path: Path, artifact_kind: str) -> Path:
@@ -2036,8 +2047,9 @@ class SystemBackupService:
         )
         requested_packaging = self._normalize_packaging(packaging)
         if encrypt and not passphrase:
-            raise ValueError("A passphrase is required when encryption is enabled.")
+            raise ValueError(EXPORT_PASSPHRASE_REQUIRED_MESSAGE)
         normalized_packaging: ArchivePackaging = "7z" if encrypt else requested_packaging
+        self._require_export_free_space(selected_groups)
         workspace = Path(tempfile.mkdtemp(prefix="truenas-jbod-ui-export-"))
         try:
             segmented_snapshot: _SegmentedExportSnapshot | None = None
@@ -2156,7 +2168,7 @@ class SystemBackupService:
         included_paths: list[str] | None = None,
     ) -> FileBackupArtifact:
         if not passphrase:
-            raise ValueError("A passphrase is required when encryption is enabled.")
+            raise ValueError(EXPORT_PASSPHRASE_REQUIRED_MESSAGE)
         selected_groups = self._resolve_selected_groups(
             included_paths,
             bundle_type="backup",
@@ -2518,7 +2530,8 @@ class SystemBackupService:
         passphrase: str | None = None,
         expected_encrypted: bool | None = None,
         identity_callback: Callable[[str, str], None] | None = None,
-    ) -> None:
+    ) -> str | None:
+        """Run every import check without activating; return the archive SHA-256."""
         manifest, extracted, _packaging, archive_meta = self._read_archive_file(
             Path(archive_path),
             passphrase=passphrase,
@@ -2542,6 +2555,7 @@ class SystemBackupService:
                     "encrypted" if archive_meta.get("encrypted") is True else "plaintext"
                 )
                 identity_callback(archive_digest, observed_mode)
+            return archive_digest if isinstance(archive_digest, str) else None
         except Exception as exc:
             primary_error = exc
             raise
@@ -2635,32 +2649,6 @@ class SystemBackupService:
                 f"Backup bundle archive exceeds the {MAX_BACKUP_ARCHIVE_BYTES}-byte input limit."
             )
 
-    @classmethod
-    def _decrypt_scheduled_archive(cls, archive_bytes: bytes, passphrase: str | None) -> bytes:
-        header_size = (
-            len(ENCRYPTED_BACKUP_MAGIC)
-            + ENCRYPTED_BACKUP_SALT_BYTES
-            + ENCRYPTED_BACKUP_NONCE_BYTES
-        )
-        if len(archive_bytes) < header_size + ENCRYPTED_BACKUP_TAG_BYTES:
-            raise ValueError("Scheduled backup archive is corrupted.")
-        if not passphrase:
-            raise ValueError("A passphrase is required for this encrypted backup bundle.")
-        header = archive_bytes[:header_size]
-        salt_start = len(ENCRYPTED_BACKUP_MAGIC)
-        nonce_start = salt_start + ENCRYPTED_BACKUP_SALT_BYTES
-        salt = header[salt_start:nonce_start]
-        nonce = header[nonce_start:]
-        ciphertext = archive_bytes[header_size:-ENCRYPTED_BACKUP_TAG_BYTES]
-        tag = archive_bytes[-ENCRYPTED_BACKUP_TAG_BYTES:]
-        key = cls._scheduled_backup_key(passphrase, salt)
-        decryptor = Cipher(algorithms.AES(key), modes.GCM(nonce, tag)).decryptor()
-        decryptor.authenticate_additional_data(header)
-        try:
-            return decryptor.update(ciphertext) + decryptor.finalize()
-        except InvalidTag as exc:
-            raise ValueError("Scheduled backup archive could not be decrypted.") from exc
-
     def export_debug_bundle(
         self,
         *,
@@ -2721,7 +2709,7 @@ class SystemBackupService:
         self._validate_encrypted_scope(selected_groups, encrypt=encrypt)
         requested_packaging = self._normalize_packaging(packaging)
         if encrypt and not passphrase:
-            raise ValueError("A passphrase is required when encryption is enabled.")
+            raise ValueError(EXPORT_PASSPHRASE_REQUIRED_MESSAGE)
         normalized_packaging: ArchivePackaging = "7z" if encrypt else requested_packaging
         scrubber = (
             DebugScrubber(
@@ -2867,14 +2855,32 @@ class SystemBackupService:
         passphrase: str | None = None,
         expected_encrypted: bool | None = None,
     ) -> dict[str, Any]:
+        """Import an in-memory archive through the file-backed pipeline.
+
+        The bytes are spooled to a private temporary file first, so every archive
+        safety rule lives in one place (``_read_archive_file``).
+        """
         if len(content) > MAX_BACKUP_ARCHIVE_BYTES:
             raise ValueError(
                 f"Backup bundle archive exceeds the {MAX_BACKUP_ARCHIVE_BYTES}-byte input limit."
             )
-        return self._import_parsed_bundle(
-            self._read_archive(content, passphrase=passphrase),
-            expected_encrypted=expected_encrypted,
+        descriptor, raw_path = tempfile.mkstemp(
+            prefix="truenas-jbod-ui-bytes-import-",
+            suffix=".archive",
         )
+        archive_path = Path(raw_path)
+        try:
+            with os.fdopen(descriptor, "wb") as output:
+                output.write(content)
+                output.flush()
+                os.fsync(output.fileno())
+            return self.import_bundle_from_file(
+                archive_path,
+                passphrase=passphrase,
+                expected_encrypted=expected_encrypted,
+            )
+        finally:
+            archive_path.unlink(missing_ok=True)
 
     def import_bundle_from_file(
         self,
@@ -2882,10 +2888,19 @@ class SystemBackupService:
         *,
         passphrase: str | None = None,
         expected_encrypted: bool | None = None,
+        preflighted_archive_sha256: str | None = None,
     ) -> dict[str, Any]:
+        """Import an archive file.
+
+        ``preflighted_archive_sha256`` is the digest returned by
+        ``preflight_import_bundle_file`` for the same staged file. When the bytes
+        read now hash to the same value, the history databases already passed
+        ``PRAGMA quick_check`` and it is not repeated; any mismatch runs it again.
+        """
         return self._import_parsed_bundle(
             self._read_archive_file(Path(archive_path), passphrase=passphrase),
             expected_encrypted=expected_encrypted,
+            preflighted_archive_sha256=preflighted_archive_sha256,
         )
 
     def _import_parsed_bundle(
@@ -2898,16 +2913,28 @@ class SystemBackupService:
         ],
         *,
         expected_encrypted: bool | None = None,
+        preflighted_archive_sha256: str | None = None,
     ) -> dict[str, Any]:
         manifest, extracted, detected_packaging, archive_meta = parsed
         cleanup_root = archive_meta.pop("_cleanup_root", None)
+        archive_digest = archive_meta.pop("_archive_sha256", None)
+        history_integrity_checked = (
+            isinstance(preflighted_archive_sha256, str)
+            and isinstance(archive_digest, str)
+            and hmac.compare_digest(preflighted_archive_sha256, archive_digest)
+        )
         primary_error: Exception | None = None
         try:
             self._enforce_expected_encryption(archive_meta, expected_encrypted)
             group_entries = self._manifest_group_entries(manifest)
             self._validate_manifest_member_metadata(manifest, extracted)
             self._preflight_selected_group_members(manifest, group_entries, extracted)
-            self._preflight_import_members(manifest, group_entries, extracted)
+            self._preflight_import_members(
+                manifest,
+                group_entries,
+                extracted,
+                history_integrity_checked=history_integrity_checked,
+            )
             self._require_restore_free_space(manifest, group_entries, extracted)
             version_note = self._app_version_note(manifest)
             if version_note is not None:
@@ -2917,7 +2944,11 @@ class SystemBackupService:
                 group_entries,
                 extracted,
             )
-            self._prepare_segmented_history_import(manifest, extracted)
+            self._prepare_segmented_history_import(
+                manifest,
+                extracted,
+                history_integrity_checked=history_integrity_checked,
+            )
             segmented_restore = manifest.get("schema_version") == SEGMENTED_BACKUP_SCHEMA_VERSION
             segmented_activation = (
                 self._segmented_history_activation_members(
@@ -3078,16 +3109,22 @@ class SystemBackupService:
             if self._manifest_group_selected(group_entries.get(group_key))
             and bool(self._group_members(manifest, group_key))
         ]
+        restores_history = any(
+            destination.group_key == HISTORY_DB_KEY for destination in active_destinations
+        )
+        if (
+            restores_history
+            and manifest.get("schema_version") != SEGMENTED_BACKUP_SCHEMA_VERSION
+            and self.store.segment_catalog_path is not None
+        ):
+            raise ValueError(V1_HISTORY_ON_SEGMENTED_MESSAGE)
         if (
             manifest.get("schema_version") == SEGMENTED_BACKUP_SCHEMA_VERSION
-            and any(
-                destination.group_key == HISTORY_DB_KEY
-                for destination in active_destinations
-            )
+            and restores_history
         ):
             catalog_path = self.store.segment_catalog_path
             if catalog_path is None:
-                raise ValueError("Segmented history catalog target is not configured.")
+                raise ValueError(SEGMENTED_CATALOG_NOT_SET_MESSAGE)
             segmented_destination = _ImportRestoreDestination(
                 SEGMENTED_CATALOG_STAGING_KEY,
                 catalog_path.parent,
@@ -3191,6 +3228,8 @@ class SystemBackupService:
         self,
         manifest: dict[str, Any],
         extracted: dict[str, ExtractedMember],
+        *,
+        history_integrity_checked: bool = False,
     ) -> None:
         if manifest.get("schema_version") != SEGMENTED_BACKUP_SCHEMA_VERSION:
             return
@@ -3208,7 +3247,10 @@ class SystemBackupService:
             member_key = entry.get("member_key")
             if not isinstance(member_key, str) or member_key not in extracted:
                 raise ValueError("Segmented history archive is missing a required segment.")
-            self._validate_history_member(extracted[member_key])
+            self._validate_history_member(
+                extracted[member_key],
+                integrity_checked=history_integrity_checked,
+            )
             segment_id = entry.get("segment_id")
             local_segments.append(
                 {
@@ -3465,6 +3507,8 @@ class SystemBackupService:
         manifest: dict[str, Any],
         group_entries: dict[str, dict[str, Any]],
         extracted_members: dict[str, ExtractedMember],
+        *,
+        history_integrity_checked: bool = False,
     ) -> None:
         validators: dict[str, Any] = {
             CONFIG_FILE_KEY: self._validate_config_member,
@@ -3490,7 +3534,10 @@ class SystemBackupService:
             try:
                 content = extracted_members[member_key]
                 if group_key == HISTORY_DB_KEY:
-                    self._validate_history_member(content)
+                    self._validate_history_member(
+                        content,
+                        integrity_checked=history_integrity_checked,
+                    )
                 elif isinstance(content, Path) and group_key == MAPPING_FILE_KEY:
                     self._validate_streaming_json_member(
                         content,
@@ -3771,6 +3818,46 @@ class SystemBackupService:
                     f"{self._format_size(free_bytes)} is available."
                 )
 
+    def _history_source_bytes(self) -> int:
+        """Size of the live history database plus any segment files."""
+        total = 0
+        try:
+            total += self.store.file_path.stat().st_size
+        except OSError:
+            pass
+        catalog_path = self.store.segment_catalog_path
+        if catalog_path is not None:
+            try:
+                for entry in os.scandir(catalog_path.parent):
+                    if entry.is_file(follow_symlinks=False) and entry.name.endswith(".sqlite3"):
+                        total += entry.stat(follow_symlinks=False).st_size
+            except OSError:
+                pass
+        return total
+
+    def _require_export_free_space(self, selected_groups: Any) -> None:
+        """Fail before writing anything when the temp folder cannot hold the export.
+
+        An export holds a consistent snapshot of the history database and the
+        archive built from it at the same time, so it needs about twice the
+        history size (compression usually makes this an overestimate).
+        """
+        if HISTORY_DB_KEY not in selected_groups:
+            return
+        needed_bytes = 2 * self._history_source_bytes()
+        if needed_bytes == 0:
+            return
+        folder = Path(tempfile.gettempdir())
+        try:
+            free_bytes = shutil.disk_usage(folder).free
+        except OSError:
+            return
+        if free_bytes < needed_bytes:
+            raise ValueError(
+                f"Export needs about {self._format_size(needed_bytes)} free in {folder}; "
+                f"{self._format_size(free_bytes)} is available."
+            )
+
     @staticmethod
     def _format_size(size_bytes: int) -> str:
         for unit, scale in (("GiB", 1024 ** 3), ("MiB", 1024 ** 2), ("KiB", 1024)):
@@ -3779,7 +3866,11 @@ class SystemBackupService:
         return f"{size_bytes} bytes"
 
     @staticmethod
-    def _validate_history_member(content: ExtractedMember) -> None:
+    def _validate_history_member(
+        content: ExtractedMember,
+        *,
+        integrity_checked: bool = False,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             if isinstance(content, Path):
                 candidate_path = content
@@ -3788,7 +3879,11 @@ class SystemBackupService:
                 candidate_path.write_bytes(content)
             database_uri = f"{candidate_path.resolve().as_uri()}?mode=ro"
             with closing(sqlite3.connect(database_uri, uri=True)) as connection:
-                rows = connection.execute("PRAGMA quick_check").fetchall()
+                rows = (
+                    [("ok",)]
+                    if integrity_checked
+                    else connection.execute("PRAGMA quick_check").fetchall()
+                )
                 required_columns = {
                     "slot_state_current": {"system_id", "enclosure_key", "slot"},
                     "slot_events": {"system_id", "enclosure_key", "slot", "observed_at"},
@@ -4600,7 +4695,7 @@ class SystemBackupService:
             )
             encrypted = self._seven_zip_encryption_mode(listed_entries)
             if encrypted != bool(passphrase):
-                raise ValueError("Portable 7z backup export encryption provenance is inconsistent.")
+                raise ValueError("The export could not be verified as encrypted. The file was not saved.")
             self._validate_7z_listed_entries(
                 listed_entries,
                 archive_size=archive_size,
@@ -4626,25 +4721,6 @@ class SystemBackupService:
         content = member.content or b""
         return len(content), hashlib.sha256(content).hexdigest()
 
-    def _build_archive(
-        self,
-        bundle_members: list[BundleMember],
-        manifest: dict[str, Any],
-        packaging: ArchivePackaging,
-        *,
-        passphrase: str | None = None,
-    ) -> bytes:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            archive_path = Path(temp_dir) / f"bundle{ARCHIVE_FILE_SUFFIXES[packaging]}"
-            self._build_archive_to_path(
-                bundle_members,
-                manifest,
-                packaging,
-                archive_path,
-                passphrase=passphrase,
-            )
-            return archive_path.read_bytes()
-
     def _build_archive_to_path(
         self,
         bundle_members: list[BundleMember],
@@ -4655,7 +4731,7 @@ class SystemBackupService:
         passphrase: str | None = None,
     ) -> int | None:
         if passphrase is not None and not passphrase:
-            raise ValueError("A passphrase is required when encryption is enabled.")
+            raise ValueError(EXPORT_PASSPHRASE_REQUIRED_MESSAGE)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         manifest_bytes = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8")
         self._validate_export_manifest_non_history_aggregate(
@@ -4830,76 +4906,6 @@ class SystemBackupService:
                 passphrase=passphrase,
             )
 
-    def _read_archive(
-        self,
-        archive_bytes: bytes,
-        *,
-        passphrase: str | None = None,
-    ) -> tuple[dict[str, Any], dict[str, ExtractedMember], ArchivePackaging, dict[str, Any]]:
-        if archive_bytes.startswith(ENCRYPTED_BACKUP_MAGIC):
-            decrypted = self._decrypt_scheduled_archive(archive_bytes, passphrase)
-            manifest, extracted, packaging, archive_meta = self._read_archive(decrypted)
-            return manifest, extracted, packaging, {
-                **archive_meta,
-                "encrypted": True,
-                "encryption": "aes-256-gcm-scrypt",
-            }
-
-        packaging = self._detect_archive_packaging(archive_bytes)
-        if not packaging:
-            raise ValueError("Backup bundle archive format is not supported.")
-
-        if packaging == "7z":
-            return self._read_7z_archive(archive_bytes, passphrase=passphrase)
-
-        if packaging == "zip":
-            self._preflight_zip_archive(archive_bytes)
-            try:
-                with zipfile.ZipFile(io.BytesIO(archive_bytes), mode="r") as archive:
-                    members = archive.infolist()
-                    self._validate_zip_members(members)
-                    physical_paths = [member.filename for member in members if not member.is_dir()]
-                    self._validate_unique_physical_archive_paths(
-                        physical_paths
-                    )
-                    try:
-                        manifest_member = archive.getinfo("manifest.json")
-                    except KeyError as exc:
-                        raise ValueError("Backup bundle is missing manifest.json.") from exc
-                    if manifest_member.file_size > MAX_MANIFEST_BYTES:
-                        raise ValueError("Backup bundle manifest exceeds its size limit.")
-                    manifest_bytes = archive.read(manifest_member)
-                    manifest = self._load_manifest(manifest_bytes)
-                    self._validate_manifest_before_extraction(manifest)
-                    self._validate_restore_schema_support(manifest)
-                    self._validate_supported_physical_archive_paths(physical_paths, manifest)
-                    extracted = self._extract_manifest_zip_members(archive, manifest)
-            except zipfile.BadZipFile as exc:
-                raise ValueError("Backup bundle ZIP archive is corrupted.") from exc
-            return manifest, extracted, packaging, {"encrypted": False}
-
-        tar_bytes = self._decompress_tar_archive(archive_bytes, packaging)
-        preflight_tar_paths = self._preflight_tar_archive(tar_bytes)
-        try:
-            with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:") as archive:
-                members = self._read_bounded_tar_members(archive)
-                physical_paths = [member.name for member in members if member.isfile()]
-                if physical_paths != preflight_tar_paths:
-                    raise ValueError(
-                        "Backup bundle TAR members do not match its physical headers."
-                    )
-                self._validate_unique_physical_archive_paths(
-                    physical_paths
-                )
-                manifest = self._load_manifest(self._read_tar_member(archive, "manifest.json"))
-                self._validate_manifest_before_extraction(manifest)
-                self._validate_restore_schema_support(manifest)
-                self._validate_supported_physical_archive_paths(physical_paths, manifest)
-                extracted = self._extract_manifest_tar_members(archive, manifest)
-        except tarfile.TarError as exc:
-            raise ValueError("Backup bundle TAR archive is corrupted.") from exc
-        return manifest, extracted, packaging, {"encrypted": False}
-
     def _read_archive_file(
         self,
         archive_path: Path,
@@ -4997,7 +5003,7 @@ class SystemBackupService:
         if source_size < header_size + ENCRYPTED_BACKUP_TAG_BYTES:
             raise ValueError("Scheduled backup archive is corrupted.")
         if not passphrase:
-            raise ValueError("A passphrase is required for this encrypted backup bundle.")
+            raise ValueError(PASSPHRASE_REQUIRED_MESSAGE)
         with source_path.open("rb", buffering=0) as source:
             header = source.read(header_size)
             if not header.startswith(ENCRYPTED_BACKUP_MAGIC) or len(header) != header_size:
@@ -5026,7 +5032,7 @@ class SystemBackupService:
                     os.fsync(output.fileno())
             except InvalidTag as exc:
                 output_path.unlink(missing_ok=True)
-                raise ValueError("Scheduled backup archive could not be decrypted.") from exc
+                raise ValueError(WRONG_PASSPHRASE_MESSAGE) from exc
         output_path.chmod(0o600)
 
     def _read_plain_archive_file(
@@ -5100,7 +5106,7 @@ class SystemBackupService:
                 physical_paths = [member.name for member in members if member.isfile()]
                 if physical_paths != preflight_tar_paths:
                     raise ValueError(
-                        "Backup bundle TAR members do not match its physical headers."
+                        "This backup file is damaged (its contents do not match its index)."
                     )
                 self._validate_unique_physical_archive_paths(physical_paths)
                 manifest = self._load_manifest(
@@ -5123,27 +5129,19 @@ class SystemBackupService:
 
     def _read_7z_archive(
         self,
-        archive_bytes: bytes | None = None,
         *,
-        archive_path: Path | None = None,
+        archive_path: Path,
         passphrase: str | None = None,
         workspace: Path | None = None,
     ) -> tuple[dict[str, Any], dict[str, ExtractedMember], ArchivePackaging, dict[str, Any]]:
-        if (archive_bytes is None) == (archive_path is None):
-            raise ValueError("Exactly one 7z archive source is required.")
         temp_root = (
             Path(tempfile.mkdtemp(prefix="truenas-jbod-ui-7z-import-"))
             if workspace is None
             else workspace
         )
         try:
-            if archive_path is None:
-                archive_path = temp_root / "bundle.7z"
-                archive_path.write_bytes(archive_bytes or b"")
-                archive_size = len(archive_bytes or b"")
-            else:
-                archive_path = Path(archive_path).absolute()
-                archive_size = archive_path.stat(follow_symlinks=False).st_size
+            archive_path = Path(archive_path).absolute()
+            archive_size = archive_path.stat(follow_symlinks=False).st_size
             extract_dir = temp_root / "extract"
             extract_dir.mkdir(parents=True, exist_ok=True)
 
@@ -6114,29 +6112,6 @@ class SystemBackupService:
                 )
         return extracted
 
-    def _extract_manifest_zip_members(
-        self,
-        archive: zipfile.ZipFile,
-        manifest: dict[str, Any],
-    ) -> dict[str, ExtractedMember]:
-        extracted: dict[str, ExtractedMember] = {}
-        for entry in self._manifest_file_entries(manifest):
-            try:
-                extracted[entry["key"]] = archive.read(entry["archive_path"])
-            except KeyError as exc:
-                raise ValueError(f"Backup bundle is missing {entry['archive_path']}.") from exc
-        return extracted
-
-    def _extract_manifest_tar_members(
-        self,
-        archive: tarfile.TarFile,
-        manifest: dict[str, Any],
-    ) -> dict[str, ExtractedMember]:
-        extracted: dict[str, ExtractedMember] = {}
-        for entry in self._manifest_file_entries(manifest):
-            extracted[entry["key"]] = self._read_tar_member(archive, entry["archive_path"])
-        return extracted
-
     def _extract_manifest_directory_members(
         self,
         extract_dir: Path,
@@ -6427,17 +6402,6 @@ class SystemBackupService:
             return cls._read_bounded_stream(extracted, limit)
 
     @staticmethod
-    def _read_tar_member(archive: tarfile.TarFile, archive_path: str) -> bytes:
-        try:
-            member = archive.getmember(archive_path)
-        except KeyError as exc:
-            raise ValueError(f"Backup bundle is missing {archive_path}.") from exc
-        extracted = archive.extractfile(member)
-        if extracted is None:
-            raise ValueError(f"Backup bundle member {archive_path} could not be read.")
-        return extracted.read()
-
-    @staticmethod
     def _normalize_packaging(packaging: str) -> ArchivePackaging:
         normalized = str(packaging or "").strip().lower()
         if normalized not in SUPPORTED_ARCHIVE_PACKAGING:
@@ -6458,62 +6422,6 @@ class SystemBackupService:
         if archive_bytes.startswith(SEVEN_ZIP_SIGNATURE):
             return "7z"
         return None
-
-    @classmethod
-    def _decompress_single_gzip_member(cls, archive_bytes: bytes) -> bytes:
-        decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
-        content = bytearray()
-        ratio_limit = MAX_ARCHIVE_COMPRESSION_RATIO * max(len(archive_bytes), 1)
-        output_limit = min(MAX_ARCHIVE_EXPANDED_BYTES, ratio_limit)
-
-        def reject_output_limit() -> None:
-            if ratio_limit <= MAX_ARCHIVE_EXPANDED_BYTES:
-                raise ValueError("Backup bundle archive compression ratio exceeds its limit.")
-            raise ValueError("Backup bundle archive expanded data exceeds its byte limit.")
-
-        for offset in range(0, len(archive_bytes), ARCHIVE_READ_CHUNK_BYTES):
-            chunk = archive_bytes[offset : offset + ARCHIVE_READ_CHUNK_BYTES]
-            content.extend(
-                decompressor.decompress(
-                    chunk,
-                    output_limit - len(content) + 1,
-                )
-            )
-            if len(content) > output_limit:
-                reject_output_limit()
-            if decompressor.eof:
-                trailing = decompressor.unused_data + archive_bytes[offset + len(chunk) :]
-                if trailing:
-                    raise ValueError("Backup bundle tar.gz archive contains concatenated gzip data.")
-                break
-        if not decompressor.eof:
-            raise ValueError("Backup bundle tar.gz archive is corrupted.")
-        content.extend(decompressor.flush(output_limit - len(content) + 1))
-        if len(content) > output_limit:
-            reject_output_limit()
-        return bytes(content)
-
-    @classmethod
-    def _decompress_single_zstd_frame(cls, archive_bytes: bytes) -> bytes:
-        if zstd is None:
-            raise ValueError("tar.zst import requires the optional 'zstandard' dependency.")
-        declared_size = zstd.frame_content_size(archive_bytes)
-        if declared_size in {zstd.CONTENTSIZE_ERROR, zstd.CONTENTSIZE_UNKNOWN}:
-            raise ValueError("Backup bundle tar.zst archive has unsupported frame metadata.")
-        if declared_size > MAX_ARCHIVE_EXPANDED_BYTES:
-            raise ValueError("Backup bundle archive expanded data exceeds its byte limit.")
-        if declared_size > MAX_ARCHIVE_COMPRESSION_RATIO * max(len(archive_bytes), 1):
-            raise ValueError("Backup bundle archive compression ratio exceeds its limit.")
-        decompressor = zstd.ZstdDecompressor().decompressobj()
-        content = decompressor.decompress(archive_bytes)
-        if not decompressor.eof:
-            raise ValueError("Backup bundle tar.zst archive is corrupted.")
-        if decompressor.unused_data:
-            raise ValueError("Backup bundle tar.zst archive contains concatenated zstd data.")
-        content += decompressor.flush()
-        if len(content) != declared_size:
-            raise ValueError("Backup bundle tar.zst archive size does not match its frame metadata.")
-        return content
 
     @classmethod
     def _decompress_tar_archive_to_file(
@@ -6597,30 +6505,6 @@ class SystemBackupService:
             output_path.unlink(missing_ok=True)
             raise ValueError(f"Backup bundle {packaging} archive is corrupted.") from exc
         output_path.chmod(0o600)
-
-    @classmethod
-    def _decompress_tar_archive(
-        cls,
-        archive_bytes: bytes,
-        packaging: ArchivePackaging,
-    ) -> bytes:
-        if packaging == "tar.gz":
-            try:
-                tar_bytes = cls._decompress_single_gzip_member(archive_bytes)
-            except zlib.error as exc:
-                raise ValueError("Backup bundle tar.gz archive is corrupted.") from exc
-        elif packaging == "tar.zst":
-            if zstd is None:
-                raise ValueError("tar.zst import requires the optional 'zstandard' dependency.")
-            try:
-                tar_bytes = cls._decompress_single_zstd_frame(archive_bytes)
-            except zstd.ZstdError as exc:
-                raise ValueError("Backup bundle tar.zst archive is corrupted.") from exc
-        else:
-            raise ValueError(f"Unsupported tar archive packaging '{packaging}'.")
-        if len(tar_bytes) > MAX_ARCHIVE_COMPRESSION_RATIO * max(len(archive_bytes), 1):
-            raise ValueError("Backup bundle archive compression ratio exceeds its limit.")
-        return tar_bytes
 
     def _run_7z_command(
         self,
@@ -6798,14 +6682,19 @@ class SystemBackupService:
         )
         if "Wrong password?" in combined_output or "Cannot open encrypted archive" in combined_output:
             if passphrase:
-                raise ValueError("Unable to decrypt backup bundle. Check the passphrase and try again.")
-            raise ValueError("This backup is encrypted and requires a passphrase.")
+                raise ValueError(WRONG_PASSPHRASE_MESSAGE)
+            raise ValueError(PASSPHRASE_REQUIRED_MESSAGE)
         if reading_archive and (
             "Headers Error" in combined_output or "Can't open as archive" in combined_output
         ):
-            raise ValueError("Backup bundle 7z archive is corrupted.")
-        detail = f"{message} {combined_output}".strip()
-        raise ValueError(detail)
+            raise ValueError("This backup file is damaged (the 7-Zip archive could not be read).")
+        # Raw 7-Zip output can echo archive member names; keep it in the log only.
+        logger.warning(
+            "7-Zip exited with %s: %s",
+            result.returncode,
+            combined_output[:2000].replace(passphrase, "***") if passphrase else combined_output[:2000],
+        )
+        raise ValueError(f"{message} The 7-Zip step failed (exit {result.returncode}).")
 
     @staticmethod
     def _write_bytes_atomic(target_path: Path, content: bytes) -> None:
