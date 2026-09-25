@@ -1897,6 +1897,18 @@ class HistoryStore:
                 total += int(metadata.st_size)
         return {"copies": copies, "bytes": total}
 
+    def main_file_size_bytes(self) -> int:
+        """Size of the main database file alone, without the -wal and -shm files.
+
+        Free pages (reclaimable_bytes) live in this file, so their share is
+        taken against it rather than the whole on-disk footprint (#597).
+        """
+
+        try:
+            return int(self.file_path.stat().st_size)
+        except OSError:
+            return 0
+
     def reclaimable_bytes(self) -> int | None:
         """Bytes held by free pages in the hot database, or None if unknown.
 

@@ -10,6 +10,7 @@ the database file.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 import tempfile
@@ -17,11 +18,12 @@ import unittest
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from history_service.collector import HistoryCollector
 from history_service.config import HistorySettings
-from history_service.main import backup_footprint_label, reclaimable_label
+from history_service import main as history_main
+from history_service.main import backup_footprint_label, build_dashboard_context, reclaimable_label
 from history_service.store import HistoryStore
 
 NOW = datetime(2030, 1, 2, 12, 0, tzinfo=timezone.utc)
@@ -172,6 +174,74 @@ class FootprintAndReclaimableTests(unittest.TestCase):
 
         self.assertGreater(free_pages, 0)
         self.assertEqual(self.store.reclaimable_bytes(), free_pages * page_size)
+
+    def test_reclaimable_share_divides_by_the_main_file_not_wal_and_shm(self) -> None:
+        # #597: free pages live in the main file, so a large WAL must not
+        # shrink the displayed share.
+        with closing(sqlite3.connect(self.store.file_path)) as reader, closing(
+            sqlite3.connect(self.store.file_path)
+        ) as connection:
+            connection.execute("CREATE TABLE keeper (payload BLOB)")
+            connection.executemany("INSERT INTO keeper VALUES (?)", ((b"k" * 4000,) for _ in range(50)))
+            connection.execute("CREATE TABLE filler (payload BLOB)")
+            connection.executemany("INSERT INTO filler VALUES (?)", ((b"x" * 4000,) for _ in range(200)))
+            connection.commit()
+            connection.execute("DELETE FROM filler")
+            connection.commit()
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            reader.execute("BEGIN")
+            reader.execute("SELECT count(*) FROM sqlite_master").fetchone()
+            # The open read transaction pins the WAL so it stays on disk.
+            # Rewriting existing rows grows the WAL without using free pages.
+            for round_number in range(12):
+                connection.execute("UPDATE keeper SET payload = ?", (bytes([round_number]) * 4000,))
+                connection.commit()
+            main_file = self.store.main_file_size_bytes()
+            main_file_on_disk = self.store.file_path.stat().st_size
+            total = self.store.database_size_bytes()
+            reclaimable = self.store.reclaimable_bytes()
+            reader.rollback()
+
+        self.assertEqual(main_file, main_file_on_disk)
+        self.assertGreater(total, main_file * 1.5)
+        self.assertIsNotNone(reclaimable)
+        expected_share = min(100, round(100 * reclaimable / main_file))
+        self.assertNotEqual(expected_share, min(100, round(100 * reclaimable / total)))
+        self.assertTrue(reclaimable_label(reclaimable, main_file).endswith(f"({expected_share}%)"))
+
+        context = build_dashboard_context(
+            request=MagicMock(),
+            status={},
+            counts={},
+            scopes=[],
+            app_version="test",
+            database_size_bytes=total,
+            reclaimable_bytes=reclaimable,
+            main_file_size_bytes=main_file,
+        )
+        self.assertTrue(context["reclaimable_label"].endswith(f"({expected_share}%)"))
+
+    def test_overview_payload_carries_the_disk_metrics_for_polling(self) -> None:
+        # #597: the dashboard polls /api/history/overview, so the free-space
+        # and backup-footprint labels must ride in that payload.
+        with (
+            patch.object(history_main, "store", self.store),
+            patch.object(history_main.collector, "status", return_value={"collector_running": True}),
+            patch.object(self.store, "reclaimable_bytes", return_value=2048),
+            patch.object(self.store, "main_file_size_bytes", return_value=8192),
+            patch.object(self.store, "database_size_bytes", return_value=40960),
+            patch.object(self.store, "backup_footprint", return_value={"copies": 2, "bytes": 3072}),
+        ):
+            payload = asyncio.run(history_main.overview(exact_counts=False))
+
+        database = payload["database"]
+        self.assertEqual(database["size_bytes"], 40960)
+        self.assertEqual(database["reclaimable_bytes"], 2048)
+        self.assertEqual(database["main_file_size_bytes"], 8192)
+        self.assertEqual(database["reclaimable_label"], "2.0 KiB (25%)")
+        self.assertEqual(database["backup_footprint"], {"copies": 2, "bytes": 3072})
+        self.assertEqual(database["backup_footprint_label"], "3.0 KiB in 2 copies")
+        json.dumps(payload)
 
     def test_reclaimable_label(self) -> None:
         self.assertEqual(reclaimable_label(None, 1000), "unknown")
