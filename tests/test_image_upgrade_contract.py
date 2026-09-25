@@ -398,8 +398,8 @@ class ImageOnlyUpgradeSmokeContractTests(unittest.TestCase):
         # The operator procedure: set JBOD_UI_IMAGE, pull, up -d. No ownership
         # repair, no down, no Compose replacement, no migration command.
         phases = [inspect.getsource(function) for function in (
-            smoke.seed_previous_release, smoke.upgrade_and_rollback, smoke.interrupted_migration,
-            smoke.kill_during_startup, smoke.check_runtime,
+            smoke.seed_previous_release, smoke.upgrade_and_rollback, smoke.segmented_catalog_upgrade,
+            smoke.interrupted_migration, smoke.kill_during_startup, smoke.check_runtime,
             *(value for value in vars(smoke.Deployment).values() if inspect.isfunction(value)))]
         for forbidden in ("chown", "prepare_nonroot_bind_mounts", "migrate_segmented_history", '"down"',
                           "HARDENED_OWNERSHIP_PREP"):
@@ -430,7 +430,7 @@ class ImageOnlyUpgradeSmokeContractTests(unittest.TestCase):
         matrix = guide.split("## What is tested", 1)[1].split("\n## ", 1)[0]
         self.assertIn(workflow["jobs"]["image-upgrade-smoke"]["name"], " ".join(matrix.split()))
         self.assertIn(workflow["jobs"]["image-upgrade-scenarios"]["name"], " ".join(matrix.split()))
-        for scenario in ("hardened", "interrupted-migration"):
+        for scenario in ("hardened", "interrupted-migration", "segmented-catalog"):
             self.assertIn(f"--scenario {scenario}", " ".join(matrix.split()))
         self.assertIn("scripts/run_image_upgrade_smoke.py", matrix)
         self.assertIn(f"v{workflow['jobs']['image-upgrade-smoke']['env']['PREVIOUS_VERSION']}", matrix)
@@ -459,7 +459,7 @@ class ImageOnlyUpgradeSmokeContractTests(unittest.TestCase):
 
 
 class UpgradeScenarioContractTests(unittest.TestCase):
-    """#399/#463: the hardened-overlay upgrade and the interrupted history migration."""
+    """#399/#463: hardened, interrupted-migration and segmented-catalog upgrades."""
 
     ROOT = Path(__file__).resolve().parents[1]
     load_smoke = ImageOnlyUpgradeSmokeContractTests.load_smoke
@@ -477,10 +477,12 @@ class UpgradeScenarioContractTests(unittest.TestCase):
         runs = [str(step.get("run", "")) for step in job["steps"]]
         hardened = [command for command in runs if "--scenario hardened" in command]
         interrupted = [command for command in runs if "--scenario interrupted-migration" in command]
+        segmented = [command for command in runs if "--scenario segmented-catalog" in command]
         self.assertEqual(len(hardened), 1)
         self.assertEqual(len(interrupted), 1)
+        self.assertEqual(len(segmented), 1)
         self.assertIn("--nonroot-fixture tests/fixtures/compose/v0.22.2.nonroot.yml", hardened[0])
-        for command in hardened + interrupted:
+        for command in hardened + interrupted + segmented:
             self.assertIn("--compose-fixture tests/fixtures/compose/v0.22.2.yml", command)
             self.assertIn('--candidate-revision "$GITHUB_SHA"', command)
         # The required job stays the fast base scenario.
@@ -588,6 +590,46 @@ class UpgradeScenarioContractTests(unittest.TestCase):
                                    f"(SELECT MIN(rowid) FROM slot_events WHERE system_id = '{smoke.SMOKE_SYSTEM}')")
                 connection.commit()
             self.assertNotEqual(read()["rows"], first["rows"])
+
+    def test_segmented_catalog_setting_survives_image_pin_changes(self):
+        smoke = self.load_smoke()
+        with tempfile.TemporaryDirectory() as directory:
+            deployment = smoke.Deployment(Path(directory))
+            deployment.set_image("previous")
+            deployment.set_runtime_environment(
+                "HISTORY_SEGMENT_CATALOG_PATH",
+                "/app/history/segments/catalog.json",
+            )
+            deployment.set_image("candidate")
+            values = dict(
+                line.split("=", 1)
+                for line in (Path(directory) / ".env").read_text(encoding="utf-8").splitlines()
+                if line
+            )
+        self.assertEqual(values["JBOD_UI_IMAGE"], "candidate")
+        self.assertEqual(
+            values["HISTORY_SEGMENT_CATALOG_PATH"],
+            "/app/history/segments/catalog.json",
+        )
+
+    def test_segmented_scenario_compares_exact_catalog_identity_across_upgrade_and_rollback(self):
+        import inspect
+
+        smoke = self.load_smoke()
+        self.assertIn("segmented-catalog", smoke.SCENARIOS)
+        for name, script in (
+            ("create_segmented_catalog", smoke.CREATE_SEGMENTED_CATALOG),
+            ("read_segmented_identity", smoke.READ_SEGMENTED_IDENTITY),
+        ):
+            with self.subTest(script=name):
+                compile(script, name, "exec")
+        source = inspect.getsource(smoke.segmented_catalog_upgrade)
+        self.assertIn("seed_segmented_catalog", source)
+        self.assertIn("after_identity == before_identity", source)
+        self.assertIn("rolled_identity == before_identity", source)
+        self.assertIn("history_api_view((1, 2, 3))", source)
+        self.assertIn("history_api_view((1, 2, 3, 4))", source)
+        self.assertIn("catalog_identity=ok", source)
 
     def test_hardened_scenario_requires_the_overlay_fixture(self):
         smoke = self.load_smoke()

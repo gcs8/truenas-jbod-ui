@@ -96,17 +96,20 @@ treat it as unverified, not as broken.
 | Local state | Bind mounts on a local POSIX filesystem, owned by root; or, with the hardening overlay, handed to uid 10001 by the one-time ownership step in [[Troubleshooting]] | Network filesystems, read-only or full disks |
 | Services | Main UI and history on the published base Compose file, and on the base file plus `docker-compose.nonroot.yml` | Admin and backup services during an upgrade |
 | Upgrade path | v0.22.2 to the current build: change `JBOD_UI_IMAGE`, then `pull` and `up -d`, with the same `-f` files each time | Releases before v0.22.2, skipping several releases |
-| After upgrading | Both containers healthy with no restarts; the new version and revision are reported; bay mappings, history rows and `config.yaml` unchanged; database integrity check passes; history schema migrated at startup; no change of file ownership, and hardened services still run as uid 10001 | Large (multi-GiB) history databases, many enclosures |
-| Rollback | Pin back to v0.22.2 with the same two commands, on both deployments; the older release starts and reads what the newer one wrote | Rollback across a history schema change |
+| After upgrading | Both containers healthy with no restarts; the new version and revision are reported; bay mappings, history rows and `config.yaml` unchanged; database integrity check passes; history schema migrated at startup; a v0.22.2 segmented catalog keeps the exact generation, catalog bytes and referenced segment bytes; no change of file ownership, and hardened services still run as uid 10001 | Large (multi-GiB) history databases, many enclosures |
+| Rollback | Pin back to v0.22.2 with the same two commands, on base, hardened and segmented-history deployments; the older release starts and reads what the newer one wrote | Rollback across a history schema change |
 | Recovery | The new history container killed (`SIGKILL`) inside each of its startup migration steps on v0.22.2 data, one after another; the next `up -d` comes up healthy with no restarts, integrity check `ok`, no rows lost, nothing quarantined, and the same database an uninterrupted upgrade produces | A killed restore, a killed data backfill at runtime (v0.22.2 data needs none; see below), an encrypted restore on a clean host, a full disk |
 
 The checks are `scripts/run_image_upgrade_smoke.py`: the base upgrade runs in
-the `Image-only upgrade smoke` CI job, and `--scenario hardened` and
-`--scenario interrupted-migration` run as separate steps of the
-`Hardened and interrupted upgrade smoke` job. v0.22.2 already has the current
-history schema, so on v0.22.2 data the killed steps have nothing to change;
-that run proves a kill at any point of startup leaves a database the next start
-opens as if nothing happened.
+the `Image-only upgrade smoke` CI job, and `--scenario hardened`,
+`--scenario interrupted-migration` and `--scenario segmented-catalog` run as
+separate steps of the `Hardened, interrupted and segmented upgrade smoke` job.
+The segmented run uses v0.22.2's own migration module and reader, captures the
+catalog generation plus exact catalog and segment digests, and requires the
+same identity and combined history view after upgrade and rollback. v0.22.2
+already has the current history schema, so on v0.22.2 data the killed steps
+have nothing to change; that run proves a kill at any point of startup leaves
+a database the next start opens as if nothing happened.
 
 Separately, `tests/test_history_released_schema_upgrades.py` upgrades synthetic
 history databases built from the exact released schemas of v0.8.0, v0.21.2 and

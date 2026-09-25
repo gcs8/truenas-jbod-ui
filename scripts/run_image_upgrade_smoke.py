@@ -9,7 +9,7 @@ restart counts, image identity, version, revision, retained state and SQLite
 integrity, writes with the new release, and rolls back by pin with the same two
 commands.
 
-``--scenario`` picks one of three runs, each a separate CI step:
+``--scenario`` picks one of four runs, each a separate CI step:
 
 * ``base``: the root-owned base Compose file, as above.
 * ``hardened``: the previous release's base file plus its
@@ -22,6 +22,10 @@ commands.
   ``tests/test_history_released_schema_upgrades.py``. The next ordinary
   ``docker compose up -d`` must finish the migration with no data lost and the
   same end state as an uninterrupted upgrade.
+* ``segmented-catalog``: v0.22.2 creates and reads a real segmented catalog,
+  then its exact generation, catalog bytes and referenced segment bytes must
+  survive the image-only upgrade and rollback while both releases read the
+  combined hot and segmented history.
 
 Synthetic data only; it needs a disposable Linux Docker host with ``sudo`` (the
 bind mounts are root-owned on purpose). Every image it pulls is public. CI
@@ -50,7 +54,7 @@ HISTORY_PORT = 18181
 SERVICES = ("enclosure-ui", "enclosure-history")
 SMOKE_SYSTEM = "upgrade-smoke"
 SUCCESS_PREFIX = "image_upgrade_smoke=ok"
-SCENARIOS = ("base", "hardened", "interrupted-migration")
+SCENARIOS = ("base", "hardened", "interrupted-migration", "segmented-catalog")
 HARDENED_FILES = ("docker-compose.yml", "docker-compose.nonroot.yml")
 APP_UID = 10001
 
@@ -110,6 +114,8 @@ class Deployment:
         self.root = root
         # The ordered `-f` chain an operator uses; empty means Compose's default file.
         self.files = files
+        self.image: str | None = None
+        self.runtime_environment: dict[str, str] = {}
 
     def file_args(self) -> list[str]:
         return [arg for name in self.files for arg in ("-f", name)]
@@ -117,19 +123,32 @@ class Deployment:
     def compose(self, *args: str, timeout: int = 600) -> str:
         return run(["docker", "compose", *self.file_args(), *args], cwd=self.root, timeout=timeout)
 
-    def set_image(self, image: str) -> None:
+    def _write_environment(self) -> None:
+        if self.image is None:
+            raise SmokeError("deployment image must be set before its environment")
         env = "\n".join(
             (
-                f"JBOD_UI_IMAGE={image}",
+                f"JBOD_UI_IMAGE={self.image}",
                 "COMPOSE_PROFILES=history",
                 f"APP_PORT={UI_PORT}",
                 f"HISTORY_PORT={HISTORY_PORT}",
+                *(f"{name}={value}" for name, value in sorted(self.runtime_environment.items())),
                 "",
             )
         )
         path = self.root / ".env"
         path.write_text(env, encoding="utf-8")
         path.chmod(0o600)
+
+    def set_image(self, image: str) -> None:
+        self.image = image
+        self._write_environment()
+
+    def set_runtime_environment(self, name: str, value: str) -> None:
+        if not name or "=" in name or "\n" in name or "\n" in value:
+            raise SmokeError("invalid deployment environment value")
+        self.runtime_environment[name] = value
+        self._write_environment()
 
     def pull_and_up(self) -> None:
         # The literal published update procedure; --wait only blocks until the
@@ -249,6 +268,56 @@ finally:
 print(json.dumps({{"counts": counts, "integrity": integrity, "user_version": user_version,
                   "current_schema": getattr(store_module, "CURRENT_SCHEMA_VERSION", None),
                   "uid": os.getuid()}}))
+"""
+
+SEGMENT_CATALOG_PATH = "/app/history/segments/catalog.json"
+
+# v0.22.2 did not package the CLI wrapper yet, but its released image contains
+# the migration module. Running that module in a one-off container uses the
+# released writer/schema and the deployment's real history mount.
+CREATE_SEGMENTED_CATALOG = """
+import json
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from history_service.segment_migration import migrate_segmented_history
+receipt = migrate_segmented_history(
+    source=Path("/app/history/history.db"),
+    segments_directory=Path("/app/history/segments"),
+    cutoff=(datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
+    key_id="upgrade-smoke-key",
+    apply=True,
+)
+print(json.dumps({"apply": receipt["apply"],
+                  "segment_id": receipt["segment"]["segment_id"]}))
+"""
+
+# Logical identity plus exact catalog and referenced-segment bytes. This is
+# intentionally stdlib-only so the same probe runs inside both image versions.
+READ_SEGMENTED_IDENTITY = """
+import hashlib
+import json
+from pathlib import Path
+catalog_path = Path("/app/history/segments/catalog.json")
+catalog_bytes = catalog_path.read_bytes()
+catalog = json.loads(catalog_bytes)
+segments = []
+for entry in catalog["segments"]:
+    segment_path = catalog_path.parent / entry["file_name"]
+    segment_bytes = segment_path.read_bytes()
+    segments.append({
+        "segment_id": entry["segment_id"],
+        "file_name": entry["file_name"],
+        "catalog_sha256": entry["sha256"],
+        "catalog_size_bytes": entry["size_bytes"],
+        "actual_sha256": hashlib.sha256(segment_bytes).hexdigest(),
+        "actual_size_bytes": len(segment_bytes),
+    })
+print(json.dumps({
+    "catalog_version": catalog["catalog_version"],
+    "generation_id": catalog["generation_id"],
+    "catalog_sha256": hashlib.sha256(catalog_bytes).hexdigest(),
+    "segments": segments,
+}, sort_keys=True))
 """
 
 # Everything an interrupted migration must preserve or produce, read-only and
@@ -507,6 +576,91 @@ def upgrade_and_rollback(args: argparse.Namespace, *, hardened: bool) -> str:
     )
 
 
+def seed_segmented_catalog(
+    deployment: Deployment,
+    args: argparse.Namespace,
+    seeded: dict[int, int],
+) -> dict:
+    """Turn the running predecessor state into its own real segmented deployment."""
+    deployment.compose("stop", "enclosure-history")
+    receipt = deployment.run_python("enclosure-history", CREATE_SEGMENTED_CATALOG)
+    expect(receipt == {"apply": True, "segment_id": "segment-0001"},
+           f"predecessor did not create the expected segmented catalog: {receipt}")
+    deployment.set_runtime_environment("HISTORY_SEGMENT_CATALOG_PATH", SEGMENT_CATALOG_PATH)
+    deployment.pull_and_up()
+    check_runtime(deployment, args.previous_image, args.previous_version, None)
+    identity = deployment.exec_python("enclosure-history", READ_SEGMENTED_IDENTITY)
+    expect(identity["catalog_version"] == 1, f"unexpected predecessor catalog version: {identity}")
+    expect(identity["generation_id"] == "generation-0001", f"unexpected predecessor generation: {identity}")
+    expect(len(identity["segments"]) == 1, f"unexpected predecessor segment count: {identity}")
+    segment = identity["segments"][0]
+    expect(segment["catalog_sha256"] == segment["actual_sha256"],
+           f"predecessor segment digest does not match its catalog: {identity}")
+    expect(segment["catalog_size_bytes"] == segment["actual_size_bytes"],
+           f"predecessor segment size does not match its catalog: {identity}")
+    expect(history_api_view((1, 2, 3)) == expected_history_view(seeded),
+           "v0.22.2 cannot read its own segmented history")
+    return identity
+
+
+def segmented_catalog_upgrade(args: argparse.Namespace) -> str:
+    """Preserve a v0.22.2 segmented catalog byte-for-byte across upgrade and rollback."""
+    root = args.root.resolve()
+    prepare_root(root, args.compose_fixture, args.config_fixture)
+    deployment = Deployment(root)
+    config_path = root / "config" / "config.yaml"
+    config_digest = sha256(config_path)
+
+    # Establish the segmented predecessor deployment before the upgrade starts.
+    before_ui, _, seeded = seed_previous_release(deployment, args)
+    before_identity = seed_segmented_catalog(deployment, args, seeded)
+
+    # Image-only upgrade: set JBOD_UI_IMAGE, pull, up -d. The catalog setting and
+    # every durable file remain untouched.
+    deployment.set_image(args.candidate_image)
+    deployment.pull_and_up()
+    upgraded = check_runtime(
+        deployment,
+        args.candidate_image,
+        args.candidate_version,
+        args.candidate_revision,
+    )
+    after_identity = deployment.exec_python("enclosure-history", READ_SEGMENTED_IDENTITY)
+    expect(after_identity == before_identity,
+           f"segmented catalog identity changed across upgrade: {after_identity} != {before_identity}")
+    after_ui = deployment.exec_python("enclosure-ui", READ_UI)
+    after_history = deployment.exec_python("enclosure-history", READ_HISTORY)
+    expect(after_ui["mappings"] == before_ui["mappings"], f"mappings changed across upgrade: {after_ui}")
+    expect(after_history["integrity"] == "ok", f"hot history integrity after upgrade: {after_history}")
+    expect(history_api_view((1, 2, 3)) == expected_history_view(seeded),
+           "upgraded release cannot read the predecessor's segmented records")
+    expect(sha256(config_path) == config_digest, "config.yaml changed during the segmented upgrade")
+
+    # Successor writes land in the hot database. Rollback by image pin must keep
+    # the same catalog identity and expose both archived and successor records.
+    deployment.exec_python("enclosure-ui", seed_script(SEED_UI, (4,)))
+    deployment.exec_python("enclosure-history", seed_script(SEED_HISTORY, (4,), metrics_per_slot=1))
+    expect(deployment.exec_python("enclosure-history", READ_SEGMENTED_IDENTITY) == before_identity,
+           "successor writes changed the immutable segmented catalog identity")
+    deployment.set_image(args.previous_image)
+    deployment.pull_and_up()
+    check_runtime(deployment, args.previous_image, args.previous_version, None)
+    rolled_identity = deployment.exec_python("enclosure-history", READ_SEGMENTED_IDENTITY)
+    expect(rolled_identity == before_identity,
+           f"segmented catalog identity changed across rollback: {rolled_identity} != {before_identity}")
+    seeded[4] = 1
+    expect(history_api_view((1, 2, 3, 4)) == expected_history_view(seeded),
+           "rolled-back release cannot read segmented and successor-written records")
+
+    return (
+        f"{SUCCESS_PREFIX} scenario=segmented-catalog previous={args.previous_version} "
+        f"candidate={args.candidate_version} revision={args.candidate_revision} "
+        f"services={','.join(sorted(upgraded))} restarts=0 "
+        f"catalog_generation={before_identity['generation_id']} "
+        f"catalog_segments={len(before_identity['segments'])} catalog_identity=ok history_api=ok"
+    )
+
+
 HISTORY_DB = "/app/history/history.db"  # HISTORY_SQLITE_PATH in every published Compose file
 
 
@@ -618,6 +772,8 @@ def interrupted_migration(args: argparse.Namespace) -> str:
 def smoke(args: argparse.Namespace) -> str:
     if args.scenario == "interrupted-migration":
         return interrupted_migration(args)
+    if args.scenario == "segmented-catalog":
+        return segmented_catalog_upgrade(args)
     return upgrade_and_rollback(args, hardened=args.scenario == "hardened")
 
 
