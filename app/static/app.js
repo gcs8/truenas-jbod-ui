@@ -325,6 +325,8 @@
   const summarySshSlotHintCount = document.getElementById("summary-ssh-slot-hint-count");
   const mappingHealthSummary = document.getElementById("mapping-health-summary");
   const mappingHealthEvidence = document.getElementById("mapping-health-evidence");
+  const capabilitiesPanel = document.getElementById("capabilities-panel");
+  const capabilitiesGrid = document.getElementById("capabilities-grid");
   const mappingForm = document.getElementById("mapping-form");
   const clearMappingButton = document.getElementById("clear-mapping-button");
   const prefillMappingButton = document.getElementById("prefill-mapping-button");
@@ -9317,6 +9319,65 @@
     return sources.length ? `Bay positions come from: ${sources.join(", ")}.` : "Bay positions: source unknown.";
   }
 
+  function capabilityEntry(capabilities, aliases) {
+    if (!capabilities || typeof capabilities !== "object") {
+      return null;
+    }
+    for (const alias of aliases) {
+      if (capabilities[alias] && typeof capabilities[alias] === "object") {
+        return capabilities[alias];
+      }
+    }
+    return null;
+  }
+
+  function capabilityStatusLabel(status) {
+    return ({
+      available: "Available",
+      partial: "Some setup needed",
+      unavailable: "Unavailable",
+      unsupported: "Not supported",
+    })[String(status || "").toLowerCase()] || "Unknown";
+  }
+
+  function renderCapabilities() {
+    if (!capabilitiesPanel || !capabilitiesGrid) {
+      return;
+    }
+    if (!inventoryScopeMatchesSelection()) {
+      capabilitiesPanel.classList.add("hidden");
+      capabilitiesGrid.replaceChildren();
+      return;
+    }
+    const capabilities = state.snapshot.capabilities || {};
+    const entries = [
+      { label: "Bay layout", aliases: ["physical_slots", "physical_slot_mapping", "bay_layout"] },
+      { label: "SMART details", aliases: ["smart_detail", "smart_details", "smart"] },
+      { label: "Locate light", aliases: ["identify", "identify_leds", "locate_light", "locate"] },
+    ].map((definition) => ({ ...definition, capability: capabilityEntry(capabilities, definition.aliases) }))
+      .filter((entry) => entry.capability);
+    capabilitiesPanel.classList.toggle("hidden", entries.length === 0);
+    capabilitiesGrid.replaceChildren(...entries.map((entry) => {
+      const card = document.createElement("article");
+      const status = String(entry.capability.status || "unknown").toLowerCase();
+      card.className = "capability-card";
+      card.dataset.status = status;
+      card.setAttribute("role", "listitem");
+      const heading = document.createElement("div");
+      heading.className = "capability-card-heading";
+      const label = document.createElement("strong");
+      label.textContent = entry.label;
+      const badge = document.createElement("span");
+      badge.className = "capability-status";
+      badge.textContent = capabilityStatusLabel(status);
+      heading.append(label, badge);
+      const summary = document.createElement("p");
+      summary.textContent = String(entry.capability.summary || "No support details were reported.");
+      card.append(heading, summary);
+      return card;
+    }));
+  }
+
   function renderSummary() {
     const summary = state.snapshot.summary || {};
     summaryDiskCount.textContent = String(summary.disk_count ?? 0);
@@ -9334,6 +9395,7 @@
     if (mappingHealthEvidence) {
       setTextIfChanged(mappingHealthEvidence, mappingHealthSourceNote(healthScope.slots));
     }
+    renderCapabilities();
   }
 
   function renderViewChrome() {

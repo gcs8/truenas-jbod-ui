@@ -784,6 +784,87 @@ textarea {
   line-height: 1.3;
 }
 
+.capabilities-panel {
+  margin-bottom: 18px;
+  padding: 16px;
+}
+
+.capabilities-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: end;
+  gap: 16px;
+  margin-bottom: 12px;
+}
+
+.capabilities-heading h2,
+.capabilities-heading p,
+.capability-card p {
+  margin: 0;
+}
+
+.capabilities-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.capability-card {
+  min-width: 0;
+  padding: 12px 14px;
+  border: 1px solid var(--panel-border);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.capability-card-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+  font-size: 0.85rem;
+}
+
+.capability-status {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.capability-card[data-status="available"] .capability-status {
+  color: #9be7bc;
+}
+
+.capability-card[data-status="partial"] .capability-status {
+  color: #ffe49b;
+}
+
+.capability-card[data-status="unavailable"] .capability-status,
+.capability-card[data-status="unsupported"] .capability-status {
+  color: #ffadad;
+}
+
+.capability-card p {
+  color: var(--muted);
+  font-size: 0.8rem;
+  line-height: 1.4;
+}
+
+@media (max-width: 760px) {
+  .capabilities-heading {
+    display: block;
+  }
+
+  .capabilities-heading > p {
+    margin-top: 6px;
+  }
+
+  .capabilities-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 .status-chip {
   min-width: 68px;
   border: 1px solid var(--panel-border);
