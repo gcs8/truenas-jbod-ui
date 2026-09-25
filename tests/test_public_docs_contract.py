@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -39,6 +40,18 @@ EXPECTED_WIKI_PAGES = {
     "wiki/Visual-Tour.md",
     "wiki/_Sidebar.md",
 }
+EXPECTED_HISTORICAL_READ_UI_LINES = {
+    "docs/ESXI_PLATFORM_FEASIBILITY.md": (
+        "into the ignored local config, restarted the read UI, and confirmed:",
+    ),
+    "docs/M2_CARRIER_RENDERING_NOTES.md": (
+        "layouts in the main read UI and admin preview flow, so we can reuse the same",
+        "The read UI now uses a real board image instead of a CSS-only abstract",
+    ),
+    "docs/PRIVATE_QA_RESTORE.md": (
+        "The read UI has two saved operator edits:",
+    ),
+}
 
 
 def run_checker(*args: str) -> subprocess.CompletedProcess[str]:
@@ -73,11 +86,27 @@ class PublicDocsContractTests(unittest.TestCase):
         self.assertIn("main enclosure UI", guide)
 
     def test_public_docs_use_current_service_names(self) -> None:
-        for relative_path in ("README.md", *sorted(EXPECTED_WIKI_PAGES)):
+        current_reference_docs = tuple(
+            path.relative_to(ROOT).as_posix()
+            for path in sorted((ROOT / "docs").glob("*.md"))
+        )
+        for relative_path in (
+            "README.md",
+            *sorted(EXPECTED_WIKI_PAGES),
+            *current_reference_docs,
+        ):
             text = (ROOT / relative_path).read_text(encoding="utf-8")
+            read_ui_lines = tuple(
+                line.strip()
+                for line in text.splitlines()
+                if re.search(r"(?i)\bread\s+UI\b", line)
+            )
             with self.subTest(document=relative_path):
                 self.assertNotRegex(text, r"(?i)\badmin\s+sidecar\b")
-                self.assertNotRegex(text, r"(?i)\bread\s+UI\b")
+                self.assertEqual(
+                    read_ui_lines,
+                    EXPECTED_HISTORICAL_READ_UI_LINES.get(relative_path, ()),
+                )
 
     def test_architecture_guide_states_the_reachability_boundary_plainly(self) -> None:
         guide = (ROOT / "wiki/Architecture-and-Services.md").read_text(
