@@ -5,7 +5,8 @@ system. Nothing is installed on TrueNAS.
 
 ## What you need
 
-- Docker with Docker Compose
+- Docker with Docker Compose on a Linux host. Windows, including Docker
+  Desktop, is best-effort: CI does not run the app or its tests there.
 - `curl`
 - A folder you can write to, or `sudo` access to create one
 - Outbound HTTPS access to GitHub and GHCR
