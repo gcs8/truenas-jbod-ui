@@ -406,6 +406,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Performance
 
+- Gave admin backup and debug downloads and restore uploads a 30-minute
+  timeout so a stalled transfer ends with a plain message instead of hanging
+  (#583)
 - Offline exports embed a card photo only when a view or enclosure can draw
   it, and read the static files once per export instead of once per
   downsampling pass. (#493)
