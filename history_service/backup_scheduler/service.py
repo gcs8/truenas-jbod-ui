@@ -41,7 +41,6 @@ from history_service.backup_archive.catalog import (
     LOCAL_LOCATION,
     ArtifactCatalog,
     ArtifactRecord,
-    CatalogError,
     new_artifact_id,
 )
 from history_service.backup_archive.cron import CronSchedule
@@ -74,6 +73,10 @@ class SchedulerBusyError(RuntimeError):
 
 class ArtifactNotFoundError(LookupError):
     pass
+
+
+class ArchiveIntegrityError(RuntimeError):
+    """A copy's bytes do not match its catalogued size and SHA-256."""
 
 
 def _utcnow() -> datetime:
@@ -154,6 +157,7 @@ class BackupScheduler:
         self._monotonic = monotonic
         self._local_tz = local_tz
         self._job_lock = threading.Lock()
+        self._job_owner = threading.local()
         self._state_lock = threading.RLock()
         self._running: dict[str, str] | None = None
         self._plans: dict[str, _PlanEntry] = {}
@@ -285,18 +289,56 @@ class BackupScheduler:
         with self._state_lock:
             return dict(self._running) if self._running else None
 
-    @contextlib.contextmanager
-    def _job(self, label: str) -> Iterator[None]:
+    def _reserve(self, label: str) -> None:
         if not self._job_lock.acquire(blocking=False):
             raise SchedulerBusyError("A backup or grooming run is already in progress.")
         with self._state_lock:
             self._running = {"backup_class": label, "started_at": _iso(self._clock()) or ""}
+
+    def _release(self) -> None:
+        with self._state_lock:
+            self._running = None
+        self._job_lock.release()
+
+    @contextlib.contextmanager
+    def _job(self, label: str) -> Iterator[None]:
+        if getattr(self._job_owner, "held", False):
+            yield  # this thread already holds the reservation (start_run worker)
+            return
+        self._reserve(label)
         try:
             yield
         finally:
-            with self._state_lock:
-                self._running = None
-            self._job_lock.release()
+            self._release()
+
+    def start_run(self, backup_class: str) -> threading.Thread:
+        """Reserve the job lock now, then run ``backup_class`` in a worker thread.
+
+        The reservation is taken before this returns, so a caller that answers
+        "started" is never racing a scheduled tick for the lock.
+        """
+
+        if backup_class not in BACKUP_CLASSES:
+            raise ValueError("backup_class must be config or full.")
+        self._reserve(backup_class)
+
+        def worker() -> None:
+            self._job_owner.held = True
+            try:
+                self.run_now(backup_class)
+            except Exception as exc:  # noqa: BLE001 - recorded in status by _run_class
+                logger.error("Requested %s backup failed: %s", backup_class, type(exc).__name__)
+            finally:
+                self._job_owner.held = False
+                self._release()
+
+        thread = threading.Thread(target=worker, name=f"backup-run-{backup_class}", daemon=True)
+        try:
+            thread.start()
+        except BaseException:
+            self._release()
+            raise
+        return thread
 
     def _run_class_locked_or_busy(self, backup_class: str, change_ids: tuple[str, ...]) -> ArtifactRecord:
         # Called by the coalescer; a busy job lock is a failure it retries with backoff.
@@ -310,8 +352,9 @@ class BackupScheduler:
             raise ValueError("backup_class must be config or full.")
         if backup_class == "config" and self.coalescer is not None:
             # Through the coalescer so pending journal entries are committed to it.
-            with self._job("config"):
-                pass  # fail fast with SchedulerBusyError when something is running
+            if not getattr(self._job_owner, "held", False):
+                with self._job("config"):
+                    pass  # fail fast with SchedulerBusyError when something is running
             result = self.coalescer.run()
             if result.status == "busy":
                 raise SchedulerBusyError("A backup or grooming run is already in progress.")
@@ -646,6 +689,7 @@ class BackupScheduler:
             path = self._local_path(record)
             if not path.is_file() or path.is_symlink():
                 raise ArtifactNotFoundError("The local copy is missing.")
+            _require_match(record, *_hash_file(path))
             yield record, path
             return
         target = self.policy.target(record.location)
@@ -655,7 +699,10 @@ class BackupScheduler:
         try:
             local = workspace / "archive"
             with self._open_target(target.settings) as remote:
-                remote.get(record.name, local)
+                size, digest = remote.get(record.name, local)
+            # Never hand out bytes the catalogue did not record: a target (or an
+            # on-path attacker for plain FTP/NFS) could substitute another backup.
+            _require_match(record, size, digest)
             yield record, local
         finally:
             for child in workspace.iterdir():
@@ -665,16 +712,24 @@ class BackupScheduler:
     def verify(self, artifact_id: str) -> dict[str, Any]:
         at = _iso(self._clock())
         ok = False
+        record = self.get(artifact_id)
         try:
-            with self.materialize(artifact_id) as (record, path):
-                size, digest = _hash_file(path)
-            ok = size == record.size and digest == record.sha256
-            detail = "Readback matched the catalogued size and SHA-256." if ok else "Readback does not match the catalogue."
-            if ok:
-                self.catalog.mark_verified(artifact_id, sha256=digest, size=size, now=self._clock())
-        except ArtifactNotFoundError:
-            raise
-        except (CatalogError, Exception) as exc:  # noqa: BLE001 - reported to the operator
+            with self.materialize(artifact_id):
+                pass  # materialize re-hashes and compares with the catalogue
+            self.catalog.mark_verified(artifact_id, sha256=record.sha256, size=record.size, now=self._clock())
+            ok = True
+            detail = "Readback matched the catalogued size and SHA-256."
+        except ArchiveIntegrityError as exc:
+            # A copy that no longer matches must stop counting as verified, so it is
+            # neither offered for restore nor protected as the newest verified copy.
+            self.catalog.mark_unverified(artifact_id)
+            detail = str(exc)
+        except ArtifactNotFoundError as exc:
+            if record.location != LOCAL_LOCATION:
+                raise
+            self.catalog.mark_unverified(artifact_id)
+            detail = str(exc)
+        except Exception as exc:  # noqa: BLE001 - e.g. target unreachable; state unknown, keep flag
             detail = describe_error(exc)
         meta = self._meta.setdefault(artifact_id, {})
         meta["last_verify"] = {"at": at, "ok": ok, "detail": detail}
@@ -714,6 +769,11 @@ def _manifest_meta(manifest: Mapping[str, Any], groups: list[str]) -> dict[str, 
         "packaging": manifest.get("packaging") if isinstance(manifest.get("packaging"), str) else None,
         "groups": list(groups),
     }
+
+
+def _require_match(record: ArtifactRecord, size: int, digest: str) -> None:
+    if size != record.size or digest != record.sha256:
+        raise ArchiveIntegrityError("Readback does not match the catalogued size and SHA-256.")
 
 
 def _hash_file(path: Path) -> tuple[int, str]:
@@ -796,6 +856,7 @@ def read_archive_status(path: str | Path, *, max_bytes: int = 256 * 1024) -> dic
 
 
 __all__ = [
+    "ArchiveIntegrityError",
     "ArtifactNotFoundError",
     "BackupScheduler",
     "SchedulerBusyError",

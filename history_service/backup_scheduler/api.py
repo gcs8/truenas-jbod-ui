@@ -12,7 +12,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import threading
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
@@ -21,6 +20,7 @@ from starlette.background import BackgroundTask
 
 from history_service.backup_archive.catalog import CatalogError
 from history_service.backup_scheduler.service import (
+    ArchiveIntegrityError,
     ArtifactNotFoundError,
     BackupScheduler,
     SchedulerBusyError,
@@ -61,7 +61,6 @@ def _plan_item(item: Any, *, with_kind: bool) -> dict[str, Any]:
 
 def build_app(scheduler: BackupScheduler) -> FastAPI:
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
-    run_threads: list[threading.Thread] = []
 
     @app.exception_handler(ArtifactNotFoundError)
     async def not_found(_: Request, exc: ArtifactNotFoundError) -> JSONResponse:
@@ -85,24 +84,7 @@ def build_app(scheduler: BackupScheduler) -> FastAPI:
         backup_class = payload.get("backup_class")
         if backup_class not in ("config", "full"):
             raise HTTPException(status_code=400, detail="backup_class must be config or full.")
-        if scheduler.running is not None:
-            raise SchedulerBusyError("A backup or grooming run is already in progress.")
-        started = threading.Event()
-
-        def worker() -> None:
-            started.set()
-            try:
-                scheduler.run_now(backup_class)
-            except SchedulerBusyError:
-                logger.info("Requested %s backup skipped: another run is in progress.", backup_class)
-            except Exception as exc:  # noqa: BLE001 - recorded in status by the scheduler
-                logger.error("Requested %s backup failed: %s", backup_class, type(exc).__name__)
-
-        thread = threading.Thread(target=worker, name=f"backup-run-{backup_class}", daemon=True)
-        run_threads[:] = [item for item in run_threads if item.is_alive()]
-        run_threads.append(thread)
-        thread.start()
-        started.wait(timeout=1.0)
+        await asyncio.to_thread(scheduler.start_run, backup_class)  # SchedulerBusyError -> 409
         return JSONResponse({"ok": True, "backup_class": backup_class, "state": "started"}, status_code=202)
 
     @app.get("/internal/backups/lifecycle/plan")
@@ -176,6 +158,9 @@ def build_app(scheduler: BackupScheduler) -> FastAPI:
         except ArtifactNotFoundError:
             stack.close()
             raise
+        except ArchiveIntegrityError as exc:
+            stack.close()
+            raise HTTPException(status_code=409, detail=f"{exc} Verify it, or use another copy.") from exc
         except Exception as exc:  # noqa: BLE001 - remote fetch failures are operator-facing
             stack.close()
             raise HTTPException(status_code=502, detail=f"Could not read the backup: {describe_error(exc)}") from exc

@@ -411,9 +411,18 @@ class SchedulerTests(SchedulerTestBase):
         with scheduler.materialize(remote[0].artifact_id) as (_record, path):
             self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), remote[0].sha256)
         self.assertEqual(list(self._paths.state_dir.glob("backup-fetch-*")), [])
-        # Tamper with the remote copy: verify reports, never raises.
+        # Tamper with the remote copy: verify reports, never raises, and the copy
+        # stops counting as verified (not restorable, not the protected newest).
         (self.remote_root / "nas" / remote[0].name).write_bytes(b"tampered")
-        self.assertFalse(scheduler.verify(remote[0].artifact_id)["ok"])
+        failed = scheduler.verify(remote[0].artifact_id)
+        self.assertFalse(failed["ok"])
+        self.assertFalse(failed["artifact"]["verified"])
+        self.assertFalse(failed["artifact"]["restorable"])
+        from history_service.backup_scheduler.service import ArchiveIntegrityError
+
+        with self.assertRaises(ArchiveIntegrityError), scheduler.materialize(remote[0].artifact_id):
+            pass
+        self.assertEqual(list(self._paths.state_dir.glob("backup-fetch-*")), [])
         scheduler.unpreserve(first.artifact_id, actor="admin")
         token, _expires, plan = scheduler.plan()
         self.assertEqual([item.record.artifact_id for item in plan.items], [first.artifact_id])
@@ -425,6 +434,68 @@ class SchedulerTests(SchedulerTestBase):
         self.mono[0] += 10_000
         with self.assertRaises(LookupError):
             scheduler.apply(_token2)
+
+    def test_substituted_remote_backup_is_never_served(self) -> None:
+        from history_service.backup_scheduler.service import ArchiveIntegrityError
+
+        scheduler = self.make({"full": {"enabled": True}, "targets": [TARGET]})
+        first = scheduler.run_now("full")
+        self.now += timedelta(hours=1)
+        scheduler.run_now("full")
+        remote_first, remote_second = scheduler.catalog.list(location="nas")
+        # Swap in another *valid* backup under the first name.
+        (self.remote_root / "nas" / remote_first.name).write_bytes(
+            (self.remote_root / "nas" / remote_second.name).read_bytes()
+        )
+        with self.assertRaises(ArchiveIntegrityError), scheduler.materialize(remote_first.artifact_id):
+            pass
+        (self._paths.local_dir / first.name).write_bytes(b"x" * first.size)
+        with self.assertRaises(ArchiveIntegrityError), scheduler.materialize(first.artifact_id):
+            pass
+
+    def test_start_run_reserves_before_returning(self) -> None:
+        import threading
+
+        from history_service.backup_scheduler.service import SchedulerBusyError
+
+        scheduler = self.make({"full": {"enabled": True}})
+        gate = threading.Event()
+        original = FakeRunner.run_once
+
+        def slow(runner):
+            gate.wait(5)
+            return original(runner)
+
+        with patch.object(FakeRunner, "run_once", slow):
+            thread = scheduler.start_run("full")
+            # Reserved synchronously: a tick or second request cannot slip in.
+            self.assertEqual(scheduler.running["backup_class"], "full")
+            with self.assertRaises(SchedulerBusyError):
+                scheduler.start_run("config")
+            with self.assertRaises(SchedulerBusyError):
+                scheduler.run_now("full")
+            gate.set()
+            thread.join(5)
+        self.assertIsNone(scheduler.running)
+        self.assertEqual(len(scheduler.catalog.list()), 1)
+
+    def test_idle_scheduler_needs_no_passphrase(self) -> None:
+        from history_service.backup_scheduler import main as scheduler_main
+
+        config = self.root / "idle.yaml"
+        config.write_text("{}\n")
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(config), "APP_GID": str(os.getegid()),
+                                     "BACKUP_ARCHIVE_PASSPHRASE_FILE": "", "SCHEDULED_BACKUP_PASSPHRASE_FILE": "",
+                                     "BACKUP_ARCHIVE_DIR": str(self.root / "a"),
+                                     "BACKUP_ARCHIVE_STATE_DIR": str(self.root / "s")}):
+            policy = load_backup_policy(config, {})
+            with patch("history_service.system_backup.SystemBackupService"), patch("history_service.store.HistoryStore"):
+                scheduler = scheduler_main.build_scheduler(policy)
+            self.addCleanup(scheduler.close)
+            self.assertFalse(scheduler.library()["classes"]["full"]["enabled"])
+            enabled = load_backup_policy(config, {"BACKUP_FULL_ENABLED": "true"})
+            with self.assertRaises(ConfigurationError):
+                scheduler_main.build_scheduler(enabled)
 
     def test_library_shape_matches_contract(self) -> None:
         scheduler = self.make({"config": {"enabled": True}, "full": {"enabled": True}, "targets": [TARGET]})

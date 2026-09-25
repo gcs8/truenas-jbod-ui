@@ -359,13 +359,22 @@ Some copies are never deleted:
 
 ### Deploy
 
+Run these from the Compose folder. `backup_uid` must be the user the scheduler
+runs as: `0` with the base file, or your `BACKUP_UID` (default `1000`) with the
+non-root overlay. The status directory must be owned by that user, as for the
+one-shot runner, or every backup fails before it starts.
+
 ```bash
-mkdir -p backups backup-status backup-journal backup-api
-sudo chgrp "${APP_GID:-10001}" backup-status backup-journal backup-api
-sudo chmod 2750 backup-status
-sudo chmod 2770 backup-journal backup-api
+backup_uid="${BACKUP_UID:-0}"
+app_gid="${APP_GID:-10001}"
+sudo install -d -o "$backup_uid" -g "$app_gid" -m 0700 ./backups
+sudo install -d -o "$backup_uid" -g "$app_gid" -m 2750 ./backup-status
+sudo install -d -o "$backup_uid" -g "$app_gid" -m 2770 ./backup-journal ./backup-api
 docker compose --profile backup-scheduler up -d enclosure-backup-scheduler
 ```
+
+If `./backup-status` already exists for the one-shot runner, keep its owner;
+both writers must run as the same user.
 
 Folders and permissions (all in the shared application group `APP_GID`):
 
@@ -374,7 +383,7 @@ Folders and permissions (all in the shared application group `APP_GID`):
 | `backup-journal/` | `2770`, files `0660` | UI, admin, scheduler | scheduler |
 | `backup-status/` | `2750`, files `0640` | scheduler | UI (`/healthz`) |
 | `backup-api/` | `2770` | scheduler (Unix socket) | admin |
-| `backups/archive`, `backups/archive-state` | `0700` | scheduler | scheduler |
+| `backups/` (archive and catalogue) | `0700` | scheduler | scheduler |
 
 The setgid bit keeps new files in `APP_GID`. The journal files are created
 `0660` explicitly, so the UI, the admin sidecar and the scheduler can all

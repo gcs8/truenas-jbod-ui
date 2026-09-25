@@ -68,7 +68,7 @@ def build_scheduler(policy: BackupPolicy) -> Any:
     )
 
     passphrase = (os.getenv("BACKUP_ARCHIVE_PASSPHRASE_FILE") or os.getenv("SCHEDULED_BACKUP_PASSPHRASE_FILE") or "").strip()
-    if not passphrase:
+    if not passphrase and policy.any_enabled:
         raise ConfigurationError(
             ["BACKUP_ARCHIVE_PASSPHRASE_FILE in the environment is required when a backup class is enabled."]
         )
@@ -98,7 +98,8 @@ def build_scheduler(policy: BackupPolicy) -> Any:
             state_dir=Path(_env("BACKUP_ARCHIVE_STATE_DIR")),
             journal_path=Path(_env("BACKUP_JOURNAL_PATH")),
             status_file=status_file,
-            passphrase_file=Path(passphrase),
+            # Unused while both classes are disabled (the API still serves the catalogue).
+            passphrase_file=Path(passphrase or "/nonexistent-backup-passphrase"),
             runner_status_dir=status_file.parent,
             full_status_file=Path(full_status) if full_status else None,
         ),
