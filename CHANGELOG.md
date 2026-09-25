@@ -206,6 +206,35 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   image pin, the data that a rollback does not revert, and the history restore
   path, and pointed the operations page at it (#541).
 
+- Documented which backups a deployment accepts (a newer app or schema
+  version is refused before anything is replaced) and the unwritable data or
+  history folder symptom, with the command that fixes it (#538)
+
+- Documented the history retention schedule, the bounded wait for a failing
+  backup, the default backup footprint, and what each dashboard diagnostic cell
+  now says (#539).
+
+- Reconciled the v0.23.0 release wrap and Wiki home page with the published
+  GitHub release, GHCR package, and Pages demo while retaining the qualified
+  v0.22.2 beginner-installation pin. (#518)
+
+- Historical release notes, release wraps, and milestone plans moved to
+  `docs/archive/`; `docs/ROADMAP.md` now covers only the current release and
+  the next lane, every live reference document is linked from the wiki or
+  CONTRIBUTING, and seven unused screenshots were removed. (#476)
+
+- `config/config.example.yaml` now lists every option with its default and
+  shows one example system per platform, including ESXi, a BMC-only host,
+  and a storage view; the unused `app.verify_ssl` line is gone. (#489)
+- The Storage Fabric page describes the hardware in plain words (HBAs, paths,
+  expanders, enclosures, bays), its warnings say what was not found and what
+  to check, and a new Storage Fabric wiki page explains the four views, the
+  status chip states and renaming. (#490)
+- Added an Upgrading wiki page, Troubleshooting entries for a restarting
+  container, an unwritable history database and the off-loopback history
+  refusal, and Quick Start notes on `COMPOSE_PROFILES` and admin auto-stop
+  (#564).
+
 ### Fixed
 
 - History collection now pauses when SQLite reports the database damaged
@@ -490,8 +519,6 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 - Clarified history status labels and timestamps, distinguished missing counts
   from zero, and added semantic label/value associations (#470).
-- Bounded history dashboard polling, rejected stale responses, and marked
-  retained values stale after failed checks. (#420)
 - Replaced the encrypted-backup PTY `select()` wait with `poll()` so valid high
   file descriptors no longer fail before the passphrase prompt (#517).
 
@@ -568,57 +595,15 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Batched SMART grid persistence off the event loop, fenced invalidated writes,
   and propagated owning-save failures to in-flight joiners; snapshot persistence
   remained synchronous (#498).
-- Skipped exact repeated slot-detail saves while preserving timestamp and
-  identity changes; normal timestamp-advancing inventory saves still write (#479).
-
 - Moved snapshot slot-detail persistence off the event loop with cancellation
   draining and stale-write guards, preserving timestamp-advancing saves (#499).
-- Batched SMART grid persistence off the event loop, fenced invalidated writes,
-  and propagated owning-save failures to in-flight joiners; snapshot persistence
-  remained synchronous (#498).
-- Skipped exact repeated slot-detail saves while preserving timestamp and
-  identity changes; normal timestamp-advancing inventory saves still write (#479).
 
 - Batched CORE SMART grid calls and rejected stale disk-identity results while
   restoring fresh lookup after serial loss (#504).
-- Moved snapshot slot-detail persistence off the event loop with cancellation
-  draining and stale-write guards, preserving timestamp-advancing saves (#499).
-- Batched SMART grid persistence off the event loop, fenced invalidated writes,
-  and propagated owning-save failures to in-flight joiners; snapshot persistence
-  remained synchronous (#498).
-- Skipped exact repeated slot-detail saves while preserving timestamp and
-  identity changes; normal timestamp-advancing inventory saves still write (#479).
 
-### Docs
-
-- Documented which backups a deployment accepts (a newer app or schema
-  version is refused before anything is replaced) and the unwritable data or
-  history folder symptom, with the command that fixes it (#538)
-
-- Documented the history retention schedule, the bounded wait for a failing
-  backup, the default backup footprint, and what each dashboard diagnostic cell
-  now says (#539).
-
-- Reconciled the v0.23.0 release wrap and Wiki home page with the published
-  GitHub release, GHCR package, and Pages demo while retaining the qualified
-  v0.22.2 beginner-installation pin. (#518)
-
-- Historical release notes, release wraps, and milestone plans moved to
-  `docs/archive/`; `docs/ROADMAP.md` now covers only the current release and
-  the next lane, every live reference document is linked from the wiki or
-  CONTRIBUTING, and seven unused screenshots were removed. (#476)
-
-- `config/config.example.yaml` now lists every option with its default and
-  shows one example system per platform, including ESXi, a BMC-only host,
-  and a storage view; the unused `app.verify_ssl` line is gone. (#489)
-- The Storage Fabric page describes the hardware in plain words (HBAs, paths,
-  expanders, enclosures, bays), its warnings say what was not found and what
-  to check, and a new Storage Fabric wiki page explains the four views, the
-  status chip states and renaming. (#490)
-- Added an Upgrading wiki page, Troubleshooting entries for a restarting
-  container, an unwritable history database and the off-loopback history
-  refusal, and Quick Start notes on `COMPOSE_PROFILES` and admin auto-stop
-  (#564).
+- Delegated every bay-tile interaction to the grid, deferred hover SMART
+  fetches to the batch prefetch that already covers the bay, and indexed bay
+  lookups instead of scanning the slot list on every call (#510)
 
 ### Internal
 
@@ -710,12 +695,6 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   they are rebuilt at the next release; the snapshot renderer accepts the
   payload through one optional argument that operator exports leave unset, so
   no live fabric identifier can reach an exported file by that route (#532).
-
-### Performance
-
-- Delegated every bay-tile interaction to the grid, deferred hover SMART
-  fetches to the batch prefetch that already covers the bay, and indexed bay
-  lookups instead of scanning the slot list on every call (#510)
 
 ## v0.23.0 - 2026-09-08
 
