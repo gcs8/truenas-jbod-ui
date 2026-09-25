@@ -98,11 +98,7 @@ class ConfigExampleCoverageTests(unittest.TestCase):
         self.assertGreater(len(hosts), 10)
         for host in hosts:
             with self.subTest(host=host):
-                # app.host is the listen address, not a documentation host.
-                self.assertTrue(
-                    host == "0.0.0.0" or host.endswith(".example.test") or host.startswith("192.0.2."),
-                    host,
-                )
+                self.assertTrue(host.endswith(".example.test") or host.startswith("192.0.2."), host)
 
 
 ENV_EXAMPLE_PATH = ROOT / ".env.example"
@@ -119,7 +115,6 @@ ENV_INTERNAL_ALLOWLIST = {
     "HISTORY_SQLITE_PATH": "set by Compose",
     # The container command passes --host to uvicorn; these only matter when a
     # service is run by hand outside Compose.
-    "APP_HOST": "listen address is fixed by the container command",
     "ADMIN_HOST": "listen address is fixed by the container command",
     "HISTORY_HOST": "listen address is fixed by the container command",
     # Admin runtime-control internals that match the Compose container names
