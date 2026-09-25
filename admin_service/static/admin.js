@@ -672,7 +672,7 @@
     }
     if (elements.releaseNote) {
       const releaseStatus = state.releaseStatus || {};
-      const summary = String(releaseStatus.summary || "Checking releases...");
+      const summary = String(releaseStatus.summary || "Checking for updates...");
       const latestUrl = safeHttpUrl(releaseStatus.latest_url);
       elements.releaseNote.className = `hero-stat-note is-${releaseStatus.status || "unknown"}`;
       if (latestUrl) {

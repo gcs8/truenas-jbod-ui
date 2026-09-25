@@ -147,6 +147,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Refreshed the header release note without a page reload while the first
+  check is still running or has failed, so a failure at boot clears within
+  minutes, and renamed the admin timing labels and storage-view template notes
+  in plain words (#593).
 - Passed the `RELEASE_CHECK_*` settings to the history service, so
   `RELEASE_CHECK_ENABLED=false` turns the GitHub check off everywhere; quoted
   the current history bind error in the wiki and explained the three history
