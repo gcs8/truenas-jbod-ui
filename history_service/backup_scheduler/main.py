@@ -102,6 +102,13 @@ def build_scheduler(policy: BackupPolicy) -> Any:
             passphrase_file=Path(passphrase or "/nonexistent-backup-passphrase"),
             runner_status_dir=status_file.parent,
             full_status_file=Path(full_status) if full_status else None,
+            history_backup_dir=Path(history_settings.backup_dir),
+            history_long_term_backup_dir=(
+                Path(history_settings.long_term_backup_dir)
+                if history_settings.long_term_backup_dir
+                else None
+            ),
+            history_database_stem=Path(history_settings.sqlite_path).stem,
         ),
         app_gid=_app_gid(),
         config_groups=config_group_keys(DEFAULT_BACKUP_GROUP_KEYS, HISTORY_DB_KEY),

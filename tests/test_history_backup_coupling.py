@@ -18,7 +18,7 @@ import unittest
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from history_service.collector import HistoryCollector
 from history_service.config import HistorySettings
@@ -45,6 +45,27 @@ def _status(*, success_at: datetime, groups: list[str] | None = None, error_code
         "last_absent_groups": [],
         "last_retention_removed": 0,
         "last_error_code": error_code,
+    }
+
+
+def _archive_status(*, created_at: datetime, artifact_id: str = "verified-full-1") -> dict:
+    return {
+        "schema_version": 1,
+        "updated_at": created_at.isoformat(),
+        "classes": {
+            "full": {
+                "at": created_at.isoformat(),
+                "ok": True,
+                "detail": None,
+                "artifact_id": artifact_id,
+            }
+        },
+        "targets": {},
+        "verified_full": {
+            "artifact_id": artifact_id,
+            "created_at": created_at.isoformat(),
+            "included_groups": ["config_file", "history_db"],
+        },
     }
 
 
@@ -129,6 +150,64 @@ class RetentionAcceptsScheduledFullBackupTests(unittest.TestCase):
         collector._run_retention_if_due(NOW, backup_succeeded=False)
 
         store.maintain_retention.assert_not_called()
+
+
+class SchedulerReplacementTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.archive_status_path = self.root / "backup-archive.json"
+        self.archive_status_path.write_text(
+            json.dumps(_archive_status(created_at=NOW - timedelta(hours=6))),
+            encoding="utf-8",
+        )
+        self.archive_status_path.chmod(0o640)
+
+    def _collector(self, store: MagicMock) -> HistoryCollector:
+        settings = HistorySettings(
+            sqlite_path=str(self.root / "history.sqlite3"),
+            backup_dir=str(self.root / "history-backups"),
+            backup_interval_seconds=86400,
+            backup_archive_status_file=str(self.archive_status_path),
+            startup_grace_seconds=0,
+        )
+        collector = HistoryCollector(settings, store)
+        collector.last_fast_metrics_at = collector.started_at
+        collector.last_slow_metrics_at = collector.started_at
+        collector._enumerate_scopes = AsyncMock(return_value=[])  # type: ignore[method-assign]
+        return collector
+
+    def test_verified_scheduler_full_suppresses_the_duplicate_sidecar_copy(self) -> None:
+        store = _store()
+        store.create_backup.return_value = self.root / "history-backups" / "duplicate.sqlite3"
+        collector = self._collector(store)
+
+        with patch("history_service.collector.utcnow", return_value=NOW):
+            asyncio.run(collector.run_once(force_slow=True))
+
+        store.create_backup.assert_not_called()
+        self.assertEqual(collector.status()["last_backup_at"], (NOW - timedelta(hours=6)).isoformat())
+        skipped = [
+            stage
+            for stage in collector.status()["collection_stage_timings"]
+            if stage["stage"] == "db.backup.skipped"
+        ]
+        self.assertEqual(skipped[-1]["reason"], "verified_scheduler_full_backup")
+
+    def test_unverified_archive_status_does_not_suppress_the_sidecar_copy(self) -> None:
+        payload = _archive_status(created_at=NOW - timedelta(hours=6))
+        payload.pop("verified_full")
+        self.archive_status_path.write_text(json.dumps(payload), encoding="utf-8")
+        self.archive_status_path.chmod(0o640)
+        store = _store()
+        store.create_backup.return_value = self.root / "history-backups" / "history.sqlite3"
+        collector = self._collector(store)
+
+        with patch("history_service.collector.utcnow", return_value=NOW):
+            asyncio.run(collector.run_once(force_slow=True))
+
+        store.create_backup.assert_called_once()
 
 
 class FootprintAndReclaimableTests(unittest.TestCase):

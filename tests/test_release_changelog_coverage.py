@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from collections import Counter
 from pathlib import Path
 
 from scripts import check_release_changelog_coverage as coverage
@@ -45,6 +46,37 @@ CHANGELOG_TEMPLATE = """# Changelog
 
 - Initial release (#5).
 """
+
+
+class ChangelogStructureTests(unittest.TestCase):
+    def test_unreleased_has_no_duplicate_headings_or_bullet_blocks(self) -> None:
+        changelog = (Path(__file__).resolve().parents[1] / "CHANGELOG.md").read_text(encoding="utf-8")
+        section = coverage.changelog_section(changelog, "## Unreleased")
+        headings = [line for line in section.splitlines() if line.startswith("### ")]
+        duplicate_headings = sorted(heading for heading, count in Counter(headings).items() if count > 1)
+
+        bullets: list[str] = []
+        current: list[str] = []
+        for line in section.splitlines():
+            if line.startswith("- "):
+                if current:
+                    bullets.append("\n".join(current))
+                current = [line]
+            elif current and line.startswith("  "):
+                current.append(line)
+            elif current:
+                bullets.append("\n".join(current))
+                current = []
+        if current:
+            bullets.append("\n".join(current))
+        duplicate_bullets = sorted(bullet for bullet, count in Counter(bullets).items() if count > 1)
+
+        self.assertEqual(duplicate_headings, [], f"duplicate Unreleased headings: {duplicate_headings}")
+        self.assertEqual(
+            duplicate_bullets,
+            [],
+            "duplicate Unreleased bullets: " + ", ".join(bullet.splitlines()[0] for bullet in duplicate_bullets),
+        )
 
 
 @unittest.skipIf(shutil.which("git") is None, "git executable is required")
@@ -434,6 +466,35 @@ class CoverageParsingTests(unittest.TestCase):
 
         self.assertEqual(numbers, {10, 11, 12, 13, 14})
         self.assertNotIn(5, numbers)
+
+
+class CurrentChangelogConsistencyTests(unittest.TestCase):
+    def test_integrated_backup_libraries_name_their_later_integration(self) -> None:
+        # Scan the whole file: the entries stay valid after the Unreleased
+        # section rolls over into a versioned heading at release time.
+        repository = Path(__file__).resolve().parents[1]
+        text = (repository / "CHANGELOG.md").read_text(encoding="utf-8")
+        bullets: list[str] = []
+        current: list[str] = []
+        for line in text.splitlines():
+            if line.startswith("- "):
+                if current:
+                    bullets.append("\n".join(current))
+                current = [line]
+            elif current and line.startswith("  "):
+                current.append(line)
+            elif current:
+                bullets.append("\n".join(current))
+                current = []
+        if current:
+            bullets.append("\n".join(current))
+
+        for pull_request in (575, 577):
+            with self.subTest(pull_request=pull_request):
+                matching = [bullet for bullet in bullets if f"(#{pull_request})" in bullet]
+                self.assertEqual(len(matching), 1)
+                self.assertIn("#580", matching[0])
+                self.assertNotRegex(matching[0].lower(), r"\b(?:not wired(?: up)?|unwired)\b")
 
 
 class RenderReleaseNotesTests(unittest.TestCase):

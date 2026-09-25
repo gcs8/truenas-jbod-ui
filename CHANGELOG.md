@@ -210,8 +210,42 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   image pin, the data that a rollback does not revert, and the history restore
   path, and pointed the operations page at it (#541).
 
+- Documented which backups a deployment accepts (a newer app or schema
+  version is refused before anything is replaced) and the unwritable data or
+  history folder symptom, with the command that fixes it (#538)
+
+- Documented the history retention schedule, the bounded wait for a failing
+  backup, the default backup footprint, and what each dashboard diagnostic cell
+  now says (#539).
+
+- Reconciled the v0.23.0 release wrap and Wiki home page with the published
+  GitHub release, GHCR package, and Pages demo while retaining the qualified
+  v0.22.2 beginner-installation pin. (#518)
+
+- Historical release notes, release wraps, and milestone plans moved to
+  `docs/archive/`; `docs/ROADMAP.md` now covers only the current release and
+  the next lane, every live reference document is linked from the wiki or
+  CONTRIBUTING, and seven unused screenshots were removed. (#476)
+
+- `config/config.example.yaml` now lists every option with its default and
+  shows one example system per platform, including ESXi, a BMC-only host,
+  and a storage view; the unused `app.verify_ssl` line is gone. (#489)
+- The Storage Fabric page describes the hardware in plain words (HBAs, paths,
+  expanders, enclosures, bays), its warnings say what was not found and what
+  to check, and a new Storage Fabric wiki page explains the four views, the
+  status chip states and renaming. (#490)
+- Added an Upgrading wiki page, Troubleshooting entries for a restarting
+  container, an unwritable history database and the off-loopback history
+  refusal, and Quick Start notes on `COMPOSE_PROFILES` and admin auto-stop
+  (#564).
+
 ### Fixed
 
+- Replaced duplicate history-sidecar snapshots gradually with the backup
+  scheduler's catalog-verified local FULL archives. The two sets retain at least
+  14 copies during cutover, stale verification receipts are cleared on restart,
+  custom history backup paths are shared by both services, and preserved
+  archives plus unrelated/newer files remain untouched. (#628)
 - History collection now pauses when SQLite reports the database damaged
   while the service is running, instead of retrying writes every pass. The
   pause survives restarts, shows on the dashboard and as `degraded` in
@@ -494,8 +528,6 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 - Clarified history status labels and timestamps, distinguished missing counts
   from zero, and added semantic label/value associations (#470).
-- Bounded history dashboard polling, rejected stale responses, and marked
-  retained values stale after failed checks. (#420)
 - Replaced the encrypted-backup PTY `select()` wait with `poll()` so valid high
   file descriptors no longer fail before the passphrase prompt (#517).
 
@@ -572,57 +604,15 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Batched SMART grid persistence off the event loop, fenced invalidated writes,
   and propagated owning-save failures to in-flight joiners; snapshot persistence
   remained synchronous (#498).
-- Skipped exact repeated slot-detail saves while preserving timestamp and
-  identity changes; normal timestamp-advancing inventory saves still write (#479).
-
 - Moved snapshot slot-detail persistence off the event loop with cancellation
   draining and stale-write guards, preserving timestamp-advancing saves (#499).
-- Batched SMART grid persistence off the event loop, fenced invalidated writes,
-  and propagated owning-save failures to in-flight joiners; snapshot persistence
-  remained synchronous (#498).
-- Skipped exact repeated slot-detail saves while preserving timestamp and
-  identity changes; normal timestamp-advancing inventory saves still write (#479).
 
 - Batched CORE SMART grid calls and rejected stale disk-identity results while
   restoring fresh lookup after serial loss (#504).
-- Moved snapshot slot-detail persistence off the event loop with cancellation
-  draining and stale-write guards, preserving timestamp-advancing saves (#499).
-- Batched SMART grid persistence off the event loop, fenced invalidated writes,
-  and propagated owning-save failures to in-flight joiners; snapshot persistence
-  remained synchronous (#498).
-- Skipped exact repeated slot-detail saves while preserving timestamp and
-  identity changes; normal timestamp-advancing inventory saves still write (#479).
 
-### Docs
-
-- Documented which backups a deployment accepts (a newer app or schema
-  version is refused before anything is replaced) and the unwritable data or
-  history folder symptom, with the command that fixes it (#538)
-
-- Documented the history retention schedule, the bounded wait for a failing
-  backup, the default backup footprint, and what each dashboard diagnostic cell
-  now says (#539).
-
-- Reconciled the v0.23.0 release wrap and Wiki home page with the published
-  GitHub release, GHCR package, and Pages demo while retaining the qualified
-  v0.22.2 beginner-installation pin. (#518)
-
-- Historical release notes, release wraps, and milestone plans moved to
-  `docs/archive/`; `docs/ROADMAP.md` now covers only the current release and
-  the next lane, every live reference document is linked from the wiki or
-  CONTRIBUTING, and seven unused screenshots were removed. (#476)
-
-- `config/config.example.yaml` now lists every option with its default and
-  shows one example system per platform, including ESXi, a BMC-only host,
-  and a storage view; the unused `app.verify_ssl` line is gone. (#489)
-- The Storage Fabric page describes the hardware in plain words (HBAs, paths,
-  expanders, enclosures, bays), its warnings say what was not found and what
-  to check, and a new Storage Fabric wiki page explains the four views, the
-  status chip states and renaming. (#490)
-- Added an Upgrading wiki page, Troubleshooting entries for a restarting
-  container, an unwritable history database and the off-loopback history
-  refusal, and Quick Start notes on `COMPOSE_PROFILES` and admin auto-stop
-  (#564).
+- Delegated every bay-tile interaction to the grid, deferred hover SMART
+  fetches to the batch prefetch that already covers the bay, and indexed bay
+  lookups instead of scanning the slot list on every call (#510)
 
 ### Internal
 
@@ -645,6 +635,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   `docker-compose.nonroot.yml`) by image pin only and rolls it back, and kills
   the new history container inside each startup migration step on v0.22.2
   data before a normal start that must finish cleanly with no data lost (#613).
+- CI now creates a real segmented catalog with v0.22.2, then requires its exact
+  generation, catalog bytes and referenced segment bytes to survive an
+  image-only upgrade, successor writes and rollback to v0.22.2 (#632).
 - CI now upgrades the public v0.22.2 image to each pull request's build by
   changing only `JBOD_UI_IMAGE` on root-owned mounts, checks that the
   containers are healthy, that mappings and history survive and that the
@@ -653,12 +646,15 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Added the backup archive transport library for the history sidecar: remote
   targets for a local directory, FTP/FTPS, SFTP (host key checked against
   known_hosts), SMB, a job-scoped NFS mount, and S3. Uploads are atomic and
-  read back to verify, and credentials come from secret files. The library is
-  not wired into the app yet (#577).
+  read back to verify, and credentials come from secret files. The library
+  landed first; #580 subsequently integrated it into the backup scheduler and
+  remote-target workflow (#577).
 
 - Added a change journal library for the backup sidecar that records config
   edits and coalesces a burst of them into one config-only backup, skipped when
-  the config content hash has not changed; it is not wired up yet. (#575)
+  the config content hash has not changed. The library landed first; #580
+  subsequently integrated it with app config-change hooks and scheduler
+  coalescing. (#575)
 
 - Removed the unreachable per-slot history fallback and its concurrency
   setting, unified the unavailable slot-history payload shape, and deleted
@@ -714,12 +710,6 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   they are rebuilt at the next release; the snapshot renderer accepts the
   payload through one optional argument that operator exports leave unset, so
   no live fabric identifier can reach an exported file by that route (#532).
-
-### Performance
-
-- Delegated every bay-tile interaction to the grid, deferred hover SMART
-  fetches to the batch prefetch that already covers the bay, and indexed bay
-  lookups instead of scanning the slot list on every call (#510)
 
 ## v0.23.0 - 2026-09-08
 

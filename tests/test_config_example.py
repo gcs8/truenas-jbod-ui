@@ -113,6 +113,7 @@ ENV_INTERNAL_ALLOWLIST = {
     "ADMIN_SERVICE_URL": "set by Compose",
     "HISTORY_SOURCE_BASE_URL": "set by Compose",
     "HISTORY_SQLITE_PATH": "set by Compose",
+    "BACKUP_ARCHIVE_STATUS_FILE": "fixed shared scheduler receipt path set by Compose",
     # The container command passes --host to uvicorn; these only matter when a
     # service is run by hand outside Compose.
     "ADMIN_HOST": "listen address is fixed by the container command",
