@@ -364,13 +364,16 @@ backups:
 | `BACKUP_ARCHIVE_PASSPHRASE_FILE` | passphrase file (falls back to `SCHEDULED_BACKUP_PASSPHRASE_FILE`) |
 
 A scheduled FULL includes the history database and keeps `14` local copies by
-default (one daily copy for two weeks). After a new FULL is published, hashed and
-recorded as verified in the archive catalog, it replaces older standalone daily,
-weekly and monthly history-sidecar snapshots. The scheduler removes only exact
-older history snapshot names; newer files, unrelated files, links and every
-scheduler archive, including preserved/pinned archives, remain untouched. Until
-that verified replacement exists, the standalone history snapshots remain and
-the history service continues making them. This avoids two independent backup
+default (one daily copy for two weeks). Catalog-verified local FULLs gradually
+replace the standalone daily, weekly and monthly history-sidecar snapshots. The
+scheduler retains enough older sidecars that the two sets still provide at least
+14 copies during cutover; after 14 usable local FULLs exist, no sidecar copy is
+needed for that floor. A lower customized FULL retention therefore leaves the
+remaining sidecars in place. Cleanup considers only exact older history snapshot
+names; newer files, unrelated files, links and every scheduler archive,
+including preserved/pinned archives, remain untouched. Until a catalog-verified
+FULL containing history exists, every standalone history snapshot remains and
+the history service continues making them. This avoids two permanent backup
 sets without reducing the existing 14-copy default.
 
 A mistake stops the scheduler with one plain sentence per problem that names

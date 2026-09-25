@@ -102,6 +102,17 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(policy.full.local_keep, 14)
         self.assertEqual(policy.targets, ())
 
+    def test_operator_guide_keeps_the_same_fourteen_copy_full_default(self) -> None:
+        guide = (REPO_ROOT / "wiki" / "Backup-Restore-and-Debug-Bundles.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            '  full:\n    enabled: true\n    schedule: "0 3 * * *"\n'
+            "    archive_format: tar.zst  # default; 7z for older app versions, see "
+            '"Full backup archive format"\n    local_keep: 14',
+            guide,
+        )
+
     def test_yaml_and_env_overrides(self) -> None:
         self.write({
             "config": {"enabled": True, "debounce_seconds": 5, "max_delay_seconds": 60, "local_keep": 3},
@@ -402,6 +413,9 @@ class SchedulerTests(SchedulerTestBase):
 
     def test_verified_full_replaces_only_older_history_sidecar_copies(self) -> None:
         scheduler = self.make({"full": {"enabled": True}})
+        for _ in range(13):
+            scheduler.run_now("full")
+            self.now += timedelta(days=1)
         daily = self._paths.history_backup_dir
         long_term = self._paths.history_long_term_backup_dir
         old_paths = [
@@ -444,6 +458,52 @@ class SchedulerTests(SchedulerTestBase):
             },
         )
 
+    def test_first_verified_full_does_not_collapse_fourteen_sidecars_to_one_copy(self) -> None:
+        scheduler = self.make({"full": {"enabled": True}})
+        backup_dir = self._paths.history_backup_dir
+        sidecars: list[Path] = []
+        for age in range(14, 0, -1):
+            created = self.now - timedelta(days=age)
+            path = backup_dir / f"history-{created:%Y%m%dT%H%M%S}Z.sqlite3"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(f"sidecar {age}".encode())
+            stamp = created.timestamp()
+            os.utime(path, (stamp, stamp))
+            sidecars.append(path)
+
+        scheduler.run_now("full")
+
+        remaining = [path for path in sidecars if path.exists()]
+        self.assertEqual(len(remaining), 13)
+        self.assertFalse(sidecars[0].exists())
+        self.assertTrue(all(path.exists() for path in sidecars[1:]))
+        self.assertEqual(
+            len(scheduler.catalog.list(backup_class="full", location="local")) + len(remaining),
+            14,
+        )
+
+    def test_fulls_missing_history_do_not_count_toward_cutover_coverage(self) -> None:
+        scheduler = self.make({"full": {"enabled": True, "local_keep": 14}})
+        backup_dir = self._paths.history_backup_dir
+        sidecars: list[Path] = []
+        for age in range(14, 0, -1):
+            created = self.now - timedelta(days=age)
+            path = backup_dir / f"history-{created:%Y%m%dT%H%M%S}Z.sqlite3"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(f"sidecar {age}".encode())
+            stamp = created.timestamp()
+            os.utime(path, (stamp, stamp))
+            sidecars.append(path)
+
+        FakeRunner.absent_groups = ["history_db"]
+        for _ in range(13):
+            scheduler.run_now("full")
+            self.now += timedelta(hours=1)
+        FakeRunner.absent_groups = []
+        scheduler.run_now("full")
+
+        self.assertEqual(sum(path.exists() for path in sidecars), 13)
+
     def test_sidecar_copies_survive_until_a_catalogued_full_contains_history(self) -> None:
         scheduler = self.make({"full": {"enabled": True}})
         old = self._paths.history_backup_dir / "history-20260922T030000Z.sqlite3"
@@ -463,6 +523,19 @@ class SchedulerTests(SchedulerTestBase):
             with self.assertRaisesRegex(RuntimeError, "catalog unavailable"):
                 scheduler.run_now("full")
         self.assertTrue(old.exists())
+
+    def test_restart_rewrites_a_stale_verified_full_receipt(self) -> None:
+        scheduler = self.make({"full": {"enabled": True}})
+        record = scheduler.run_now("full")
+        status_before = json.loads(self._paths.status_file.read_text(encoding="utf-8"))
+        self.assertEqual(status_before["verified_full"]["artifact_id"], record.artifact_id)
+
+        scheduler.catalog.mark_unverified(record.artifact_id)
+        restarted = self.make({"full": {"enabled": True}})
+
+        status_after = json.loads(self._paths.status_file.read_text(encoding="utf-8"))
+        self.assertNotIn("verified_full", status_after)
+        self.assertNotIn("verified_full", restarted._status)
 
     def test_target_failure_is_degraded_status_and_other_targets_still_ship(self) -> None:
         second = {**TARGET, "target_id": "cloud", "label": "Cloud"}

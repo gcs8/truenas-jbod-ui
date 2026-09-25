@@ -68,6 +68,7 @@ MAX_PLANS = 16
 MAX_DETAIL_CHARS = 300
 BACKUP_CLASSES = ("config", "full")
 HISTORY_GROUP = "history_db"
+HISTORY_REPLACEMENT_COPIES = 14
 _COPY_CHUNK = 1024 * 1024
 
 
@@ -218,9 +219,15 @@ class BackupScheduler:
         if payload:
             self._status["classes"] = dict(payload.get("classes") or {})
             self._status["targets"] = dict(payload.get("targets") or {})
-            verified_full = self._validated_verified_full_receipt(payload.get("verified_full"))
+            persisted_receipt = payload.get("verified_full")
+            verified_full = self._validated_verified_full_receipt(persisted_receipt)
             if verified_full is not None:
                 self._status["verified_full"] = verified_full
+            elif "verified_full" in payload:
+                # The shared receipt is consumed independently by history. Keep
+                # its on-disk view synchronized with the catalog during startup
+                # instead of merely rejecting stale evidence in memory.
+                self._write_status()
 
     def _validated_verified_full_receipt(self, value: Any) -> dict[str, Any] | None:
         if not isinstance(value, dict):
@@ -243,6 +250,8 @@ class BackupScheduler:
             or record.backup_class != "full"
             or record.location != LOCAL_LOCATION
             or not record.verified
+            or self.artifact_state(record) != "ok"
+            or (self._meta.get(record.artifact_id) or {}).get("history_replacement") is not True
             or _iso(record.created_at) != created_at
         ):
             return None
@@ -450,29 +459,21 @@ class BackupScheduler:
                 change_ids=tuple(change_ids),
             )
             self.catalog.add(record, now=started)
+            can_replace_history = self._full_can_replace_history_snapshots(
+                backup_class, status
+            )
             manifest = getattr(runner, "last_manifest", None) or {}
-            self._meta[record.artifact_id] = _manifest_meta(manifest, self.groups[backup_class])
+            artifact_meta = _manifest_meta(manifest, self.groups[backup_class])
+            artifact_meta["history_replacement"] = can_replace_history
+            self._meta[record.artifact_id] = artifact_meta
             self._save_meta()
-            if self._full_can_replace_history_snapshots(backup_class, status):
+            if can_replace_history:
                 with self._state_lock:
                     self._status["verified_full"] = {
                         "artifact_id": record.artifact_id,
                         "created_at": _iso(record.created_at),
                         "included_groups": list(self.groups[backup_class]),
                     }
-                try:
-                    removed = self._remove_replaced_history_snapshots(record.created_at)
-                except Exception as exc:  # noqa: BLE001 - the verified FULL remains valid if cleanup fails
-                    logger.warning(
-                        "Older history sidecar copies could not be removed after the verified FULL (%s).",
-                        type(exc).__name__,
-                    )
-                else:
-                    if removed:
-                        logger.info(
-                            "Removed %d older history sidecar backup copy/copies after the verified FULL.",
-                            removed,
-                        )
         except Exception as exc:
             self._record_class(backup_class, RunRecord(at=_iso(started) or "", ok=False, detail=describe_error(exc)))
             raise
@@ -482,10 +483,33 @@ class BackupScheduler:
             backup_class,
             RunRecord(at=_iso(started) or "", ok=True, detail=detail, artifact_id=record.artifact_id),
         )
+        grooming_succeeded = False
         try:
-            self._groom_locked()
+            grooming = self._groom_locked()
+            grooming_succeeded = grooming is None or not grooming.error
         except Exception as exc:  # noqa: BLE001 - grooming failure never fails the backup
             logger.warning("Backup grooming failed after %s backup (%s).", backup_class, type(exc).__name__)
+        if can_replace_history and grooming_succeeded:
+            full_copy_count = self._verified_local_full_count()
+            sidecar_keep = max(0, HISTORY_REPLACEMENT_COPIES - full_copy_count)
+            try:
+                removed = self._remove_replaced_history_snapshots(
+                    record.created_at,
+                    keep_count=sidecar_keep,
+                )
+            except Exception as exc:  # noqa: BLE001 - the verified FULL remains valid if cleanup fails
+                logger.warning(
+                    "Older history sidecar copies could not be removed after the verified FULL (%s).",
+                    type(exc).__name__,
+                )
+            else:
+                if removed:
+                    logger.info(
+                        "Removed %d replaced history sidecar backup copy/copies; "
+                        "%d catalog-verified local FULL copy/copies remain.",
+                        removed,
+                        full_copy_count,
+                    )
         return record
 
     def _full_can_replace_history_snapshots(
@@ -545,39 +569,64 @@ class BackupScheduler:
             metadata.st_ctime_ns,
         )
 
-    def _remove_replaced_history_snapshots(self, replacement_at: datetime) -> int:
-        """Remove exact sidecar snapshots older than a verified scheduler FULL.
+    def _verified_local_full_count(self) -> int:
+        return sum(
+            1
+            for artifact in self.catalog.list(
+                backup_class="full",
+                location=LOCAL_LOCATION,
+            )
+            if (
+                (self._meta.get(artifact.artifact_id) or {}).get("history_replacement")
+                is True
+                and self.artifact_state(artifact) == "ok"
+            )
+        )
 
-        The caller invokes this only after the replacement archive is published,
-        preflighted, hashed and committed to the verified artifact catalog. A
-        same-age/newer file, unrelated name, symlink, or hard-linked file is
-        left alone. Scheduler artifacts (including pinned ones) live under a
-        different root and are never candidates here.
+    @staticmethod
+    def _open_snapshot_directory(root: Path) -> int | None:
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            return os.open(root, flags)
+        except OSError as exc:
+            if exc.errno in {errno.ENOENT, errno.ENOTDIR, errno.ELOOP}:
+                return None
+            raise
+
+    def _remove_replaced_history_snapshots(
+        self,
+        replacement_at: datetime,
+        *,
+        keep_count: int,
+    ) -> int:
+        """Remove only excess sidecar snapshots older than a verified FULL.
+
+        Scheduler FULLs and retained sidecars jointly maintain the 14-copy
+        replacement floor. The caller runs this after archive grooming, so only
+        local FULLs that still exist and remain catalog-verified count toward
+        that floor. Same-age/newer files, unrelated names, symlinks, and
+        hard-linked files are left alone.
         """
 
         replacement_ns = int(replacement_at.astimezone(timezone.utc).timestamp() * 1_000_000_000)
-        removed = 0
-        for root, name_pattern in self._history_snapshot_specs():
-            flags = (
-                os.O_RDONLY
-                | getattr(os, "O_DIRECTORY", 0)
-                | getattr(os, "O_CLOEXEC", 0)
-                | getattr(os, "O_NOFOLLOW", 0)
-            )
+        specs = self._history_snapshot_specs()
+        candidates: list[tuple[int, int, str, tuple[int, ...]]] = []
+        for spec_index, (root, name_pattern) in enumerate(specs):
+            descriptor = self._open_snapshot_directory(root)
+            if descriptor is None:
+                continue
             try:
-                descriptor = os.open(root, flags)
-            except OSError as exc:
-                if exc.errno in {errno.ENOENT, errno.ENOTDIR, errno.ELOOP}:
-                    continue
-                raise
-            try:
-                root_removed = False
                 with os.scandir(descriptor) as entries:
                     for entry in entries:
                         if name_pattern.fullmatch(entry.name) is None:
                             continue
                         try:
-                            initial = os.stat(
+                            metadata = os.stat(
                                 entry.name,
                                 dir_fd=descriptor,
                                 follow_symlinks=False,
@@ -585,26 +634,46 @@ class BackupScheduler:
                         except FileNotFoundError:
                             continue
                         if (
-                            not stat.S_ISREG(initial.st_mode)
-                            or initial.st_nlink != 1
-                            or initial.st_mtime_ns >= replacement_ns
+                            not stat.S_ISREG(metadata.st_mode)
+                            or metadata.st_nlink != 1
+                            or metadata.st_mtime_ns >= replacement_ns
                         ):
                             continue
-                        try:
-                            final = os.stat(
+                        candidates.append(
+                            (
+                                metadata.st_mtime_ns,
+                                spec_index,
                                 entry.name,
-                                dir_fd=descriptor,
-                                follow_symlinks=False,
+                                self._snapshot_identity(metadata),
                             )
-                        except FileNotFoundError:
-                            continue
-                        if self._snapshot_identity(final) != self._snapshot_identity(initial):
-                            continue
-                        os.unlink(entry.name, dir_fd=descriptor)
-                        removed += 1
-                        root_removed = True
-                if root_removed:
-                    os.fsync(descriptor)
+                        )
+            finally:
+                os.close(descriptor)
+
+        remove_count = max(0, len(candidates) - max(0, keep_count))
+        removed = 0
+        for _, spec_index, name, initial_identity in sorted(candidates)[:remove_count]:
+            root, name_pattern = specs[spec_index]
+            if name_pattern.fullmatch(name) is None:
+                continue
+            descriptor = self._open_snapshot_directory(root)
+            if descriptor is None:
+                continue
+            try:
+                try:
+                    current = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if (
+                    self._snapshot_identity(current) != initial_identity
+                    or not stat.S_ISREG(current.st_mode)
+                    or current.st_nlink != 1
+                    or current.st_mtime_ns >= replacement_ns
+                ):
+                    continue
+                os.unlink(name, dir_fd=descriptor)
+                os.fsync(descriptor)
+                removed += 1
             finally:
                 os.close(descriptor)
         return removed

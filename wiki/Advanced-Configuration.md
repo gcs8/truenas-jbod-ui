@@ -310,13 +310,17 @@ default footprint is at most `14` database-sized files: `7` daily plus `4`
 weekly plus `3` monthly. Lower `HISTORY_BACKUP_RETENTION_COUNT` to shrink the
 short-term set; the value must be at least `1`.
 
-When the optional backup scheduler is enabled, its daily FULL archive replaces
-this duplicate set only after the FULL includes `history_db` and is catalogued as
-verified. The scheduler then removes exact older history snapshot files and the
-history service treats the verified FULL as its current daily backup. Until that
-proof exists, history snapshots continue unchanged. FULL retention defaults to
-`14` local copies (two weeks); preserved scheduler archives, newer files and
-unrelated files are never removed by this replacement cleanup.
+When the optional backup scheduler is enabled, its daily FULL archives gradually
+replace this duplicate set only when they include `history_db`, remain present
+locally and are catalogued as verified. During cutover, usable local FULLs and
+retained history snapshots together provide at least the existing 14-copy floor;
+one first FULL therefore leaves 13 sidecar snapshots rather than collapsing the
+set to one copy. The scheduler removes only the oldest excess snapshot each time
+coverage grows. If scheduler retention is set below 14, the remaining sidecars
+stay in place. The history service treats the newest verified FULL as its current
+daily backup. Until that proof exists, history snapshots continue unchanged.
+Preserved scheduler archives, newer files and unrelated files are never removed
+by this replacement cleanup.
 
 The history dashboard shows `Backup copies on disk` (bytes and number of these
 copies) and, under `Database size`, how much of the file is free space that
