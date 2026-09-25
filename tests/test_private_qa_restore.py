@@ -4,6 +4,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import re
 import socket
 import stat
 import tempfile
@@ -87,28 +88,33 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
         legacy = checklist[legacy_start:legacy_end]
 
         self.assertLess(primary_start, legacy_start)
-        self.assertIn('`{"encrypt":true,"passphrase":"<private passphrase', primary)
-        self.assertNotIn('"packaging":', primary.split("`;", 1)[0])
         self.assertIn("omit `packaging`", primary)
         self.assertIn("observed `tar.zst`", primary)
-        required_groups = "".join(f'"{group}",' for group in (
-            "config_file", "runtime_overrides_file", "profile_file", "mapping_file",
-            "sas_fabric_alias_file", "slot_detail_file", "history_db", "ssh_keys",
-            "tls_trust", "known_hosts",
-        )).rstrip(",")
-        self.assertEqual(
-            set(self.module.REQUIRED_FULL_GROUPS),
-            set(required_groups.replace('"', "").split(",")),
-        )
-        for round_trip, body in (("primary", primary), ("legacy", legacy)):
+
+        from app.models.domain import SystemBackupExportRequest
+
+        bodies = {}
+        for round_trip, section in (("primary", primary), ("legacy", legacy)):
+            found = re.findall(r"`(\{\"encrypt\".*?\})`", section)
+            self.assertEqual(len(found), 1, f"{round_trip} needs exactly one export body")
+            body = json.loads(found[0])
+            bodies[round_trip] = body
             with self.subTest(round_trip=round_trip):
-                self.assertIn(f'"included_paths":[{required_groups}]', body)
-                self.assertIn('"passphrase":"<private passphrase, never recorded>"', body)
+                self.assertIs(body["encrypt"], True)
+                self.assertEqual(body["passphrase"], "<private passphrase, never recorded>")
+                self.assertEqual(set(body["included_paths"]), set(self.module.REQUIRED_FULL_GROUPS))
+                self.assertEqual(len(body["included_paths"]), len(self.module.REQUIRED_FULL_GROUPS))
+                SystemBackupExportRequest.model_validate(body)
+
+        self.assertNotIn("packaging", bodies["primary"])
+        self.assertEqual(
+            SystemBackupExportRequest.model_validate(bodies["primary"]).packaging, "tar.zst"
+        )
+        self.assertEqual(bodies["legacy"]["packaging"], "7z")
         for phase in ("export", "inspect", "import", "restart", "readback"):
             with self.subTest(round_trip="primary", phase=phase):
                 self.assertIn(phase, primary.lower())
 
-        self.assertIn('"packaging":"7z",', legacy)
         for phase in ("export", "inspect", "import", "restart", "readback"):
             with self.subTest(round_trip="legacy", phase=phase):
                 self.assertIn(phase, legacy.lower())
