@@ -146,7 +146,9 @@ Important framing:
 - It is intended for LAN/headless/local infrastructure use, not public Internet
   exposure.
 - It is explicitly started when needed.
-- It auto-stops by default after about 3600 seconds unless configured otherwise.
+- The published Compose files set `ADMIN_AUTO_STOP_SECONDS=3600`, so it stops
+  itself after one hour. The application default is `0` (no auto-stop), so set
+  it explicitly when running admin any other way.
 - It is powerful because it can touch config, runtime state, backups, and Docker
   control paths.
 
@@ -342,6 +344,16 @@ npm ci
 npm run qa:ui:install
 npx playwright test qa/public-demo.spec.js
 PLAYWRIGHT_ADMIN_BASE_URL=http://127.0.0.1:8082 npx playwright test qa/admin-operations.spec.js
+```
+
+CI runs the fixture-only browser specs on every pull request, in the
+`Checked-in public demo artifact` job's `Run fixture-only browser specs` step:
+`qa/offline-snapshot.spec.js`, `qa/saved-view-selection.spec.js`,
+`qa/ui-scope-safety.spec.js`, and `qa/upgrade-notice.spec.js`. They build their
+own synthetic fixtures and need no running stack:
+
+```bash
+npx playwright test qa/offline-snapshot.spec.js qa/saved-view-selection.spec.js qa/ui-scope-safety.spec.js qa/upgrade-notice.spec.js
 ```
 
 The switching and ESXi suites are live-appliance contracts, not portable fixture

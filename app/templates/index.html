@@ -135,7 +135,7 @@
     {% elif admin_launch_stopped %}
     <div class="field" id="admin-launch-stopped">
       <button class="button secondary" type="button" disabled aria-describedby="admin-launch-stopped-note">System Setup</button>
-      <span class="summary-note" id="admin-launch-stopped-note">Admin is stopped (it stops itself when idle). Start it on the Docker host: <code>docker compose --profile admin up -d enclosure-admin</code></span>
+      <span class="summary-note" id="admin-launch-stopped-note">Admin is not running. It may have stopped on its own: the published Compose files stop it after an hour by default. Start it on the Docker host: <code>docker compose --profile admin up -d enclosure-admin</code></span>
     </div>
     {% endif %}
     <button id="export-snapshot-button" class="button secondary">Export Snapshot</button>
