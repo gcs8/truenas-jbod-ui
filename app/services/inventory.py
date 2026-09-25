@@ -1656,6 +1656,97 @@ class InventoryService:
             bypass_negative_cache=bypass_negative_cache,
         )
 
+    async def get_storage_view_slot_smart_summaries(
+        self,
+        view_id: str,
+        slot_indices: list[int],
+        selected_enclosure_id: str | None = None,
+        max_concurrency: int | None = None,
+        *,
+        allow_stale_cache: bool = False,
+        bypass_negative_cache: bool = False,
+    ) -> list[SmartBatchItem]:
+        """SMART summaries for many storage-view slots in one call (#457).
+
+        The history collector used to ask for a storage view one slot at a
+        time, so a 60-slot view cost 60 sequential requests per pass. This
+        resolves the view once, sends every slot that maps onto a live
+        enclosure bay through the enclosure batch path, and loads the remaining
+        inventory-only slots under the same concurrency bound. Unknown slot
+        indexes are skipped, as the enclosure batch skips unknown bays.
+        """
+
+        runtime = await self.get_storage_view_runtime(
+            force_refresh=False,
+            selected_enclosure_id=selected_enclosure_id,
+        )
+        runtime_view = next((view for view in runtime.views if view.id == view_id), None)
+        if not runtime_view:
+            raise TrueNASAPIError(f'The saved view "{view_id}" does not exist on this system.')
+        runtime_slots = {slot.slot_index: slot for slot in runtime_view.slots}
+
+        ordered: list[int] = []
+        seen: set[int] = set()
+        for slot_index in slot_indices:
+            if slot_index in seen or slot_index not in runtime_slots:
+                continue
+            seen.add(slot_index)
+            ordered.append(slot_index)
+        if not ordered:
+            return []
+
+        snapshot_slot_by_index = {
+            slot_index: runtime_slots[slot_index].snapshot_slot
+            for slot_index in ordered
+            if runtime_slots[slot_index].snapshot_slot is not None
+        }
+        summaries: dict[int, SmartSummaryView] = {}
+        if snapshot_slot_by_index:
+            batch = await self.get_slot_smart_summaries(
+                list(dict.fromkeys(snapshot_slot_by_index.values())),
+                selected_enclosure_id=selected_enclosure_id or runtime_view.backing_enclosure_id,
+                max_concurrency=max_concurrency,
+                allow_stale_cache=allow_stale_cache,
+                bypass_negative_cache=bypass_negative_cache,
+            )
+            by_snapshot_slot = {item.slot: item.summary for item in batch}
+            for slot_index, snapshot_slot in snapshot_slot_by_index.items():
+                summary = by_snapshot_slot.get(snapshot_slot)
+                if summary is not None:
+                    summaries[slot_index] = summary
+
+        synthetic = [slot_index for slot_index in ordered if slot_index not in snapshot_slot_by_index]
+        if synthetic:
+            limit = self._smart_operation_limit
+            if max_concurrency is not None:
+                limit = min(limit, max(1, max_concurrency))
+            semaphore = asyncio.Semaphore(max(1, limit))
+
+            async def load(slot_index: int) -> tuple[int, SmartSummaryView]:
+                slot_view = self._build_slot_view_from_storage_view_runtime_slot(
+                    runtime_view,
+                    runtime_slots[slot_index],
+                )
+                async with semaphore:
+                    try:
+                        summary = await self._get_slot_smart_summary_for_slot_view(
+                            slot_view,
+                            allow_stale_cache=allow_stale_cache,
+                            bypass_negative_cache=bypass_negative_cache,
+                        )
+                    except TrueNASAPIError as exc:
+                        summary = self._fallback_smart_summary(slot_view, str(exc))
+                return slot_index, summary
+
+            for slot_index, summary in await asyncio.gather(*(load(slot_index) for slot_index in synthetic)):
+                summaries[slot_index] = summary
+
+        return [
+            SmartBatchItem(slot=slot_index, summary=summaries[slot_index])
+            for slot_index in ordered
+            if slot_index in summaries
+        ]
+
     async def resolve_storage_view_slot_history_target(
         self,
         view_id: str,
