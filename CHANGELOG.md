@@ -152,6 +152,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Named the closest valid key when `config.yaml` has an unknown key, checked
+  the keys under `backups:`, showed these warnings in the admin banner, and
+  documented every operator environment variable in `.env.example` (#589).
 - Hid the SSH settings in admin setup step 3 until SSH is turned on, so a
   new system no longer scrolls past a block of disabled fields (#585)
 - Renamed the admin container cards to Main UI, History and Admin, removed
