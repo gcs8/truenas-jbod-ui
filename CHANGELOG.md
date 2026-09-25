@@ -147,6 +147,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   `RELEASE_CHECK_ENABLED=false` turns the GitHub check off everywhere; quoted
   the current history bind error in the wiki and explained the three history
   collection intervals in `.env.example` (#591).
+- Hid the SSH settings in admin setup step 3 until SSH is turned on, so a
+  new system no longer scrolls past a block of disabled fields (#585)
 - Renamed the admin container cards to Main UI, History and Admin, removed
   sidecar and runtime wording from admin messages, and corrected the docs that
   said admin auto-stops by default (only the published Compose files set
@@ -418,6 +420,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Performance
 
+- Gave admin backup and debug downloads and restore uploads a 30-minute
+  timeout so a stalled transfer ends with a plain message instead of hanging
+  (#583)
 - Offline exports embed a card photo only when a view or enclosure can draw
   it, and read the static files once per export instead of once per
   downsampling pass. (#493)
