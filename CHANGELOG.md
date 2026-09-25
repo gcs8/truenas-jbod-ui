@@ -142,6 +142,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Raised the last small labels on the main page (summary labels, legend
+  swatches, Connections card details, heat-map controls, timing chips) to at
+  least 12px. (#584)
 - Honoured a configured `ssh.known_hosts_path` (top level, per system, or the
   restored `SSH_KNOWN_HOSTS_PATH`) instead of always replacing it with
   `<data>/known_hosts`, so pinned host keys can live in a host bind mount;
