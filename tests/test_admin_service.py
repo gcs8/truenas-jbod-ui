@@ -2111,6 +2111,23 @@ class AdminStatePayloadTests(unittest.TestCase):
 
         self.assertEqual(payload["configuration_warnings"], [])
 
+    def test_build_admin_state_payload_includes_unknown_config_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.yaml"
+            config_path.write_text("histroy:\n  timeout_seconds: 5\n", encoding="utf-8")
+            payload = self._build_minimal_state(Settings(config_file=str(config_path)))
+
+        self.assertEqual(
+            payload["configuration_warnings"],
+            [
+                {
+                    "code": "unknown_config_key",
+                    "key": "histroy",
+                    "message": "config.yaml: unknown key `histroy` is ignored; did you mean `history`?",
+                }
+            ],
+        )
+
     def test_build_admin_state_payload_bounds_missing_profile_warnings(self) -> None:
         settings = Settings(
             systems=[
@@ -2221,7 +2238,7 @@ class AdminStatePayloadTests(unittest.TestCase):
             "containers": [
                 {
                     "key": "ui",
-                    "label": "Read UI",
+                    "label": "Main UI",
                     "status": "running",
                     "status_text": "Up 2 minutes (healthy)",
                     "running": True,
@@ -2940,7 +2957,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         save_overrides.assert_called_once_with(settings, {"source_bundle_cache_ttl_seconds": 120})
         runtime_service.mark_restart_required.assert_called_once_with(("ui",))
         self.assertEqual(payload["restart_required"], ["ui"])
-        self.assertEqual(payload["detail"], "Runtime behavior overrides saved. Restart the main UI to apply them.")
+        self.assertEqual(payload["detail"], "Timing saved. Restart the main UI to apply it.")
 
     def test_create_demo_system_route_accepts_missing_payload_and_marks_ui_restart(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/system-setup/demo")

@@ -8,7 +8,11 @@
 //
 // Never render a filesystem path or a credential: the API returns opaque ids,
 // and anything free-form (error details, reasons, change subjects) goes
-// through scrubText before it reaches the page.
+// through scrubText before it reaches the page. The one exception is the
+// settings editor (#573), which edits the operator's own target settings
+// (host, share, root folder). Even there, credentials stay file-only: the
+// server reports each *_file secret as present or missing, never its path or
+// contents, and a secret is only ever replaced by naming a file path.
 (function (root, factory) {
   const api = factory();
   if (typeof module === "object" && module.exports) {
@@ -283,7 +287,57 @@
     return /^[0-9a-f]{64}$/i.test(text) ? `${text.slice(0, 12)}…` : "";
   }
 
+  const SECRET_LABELS = {
+    password_file: "Password file",
+    private_key_file: "Private key file",
+    private_key_passphrase_file: "Private key passphrase file",
+    access_key_id_file: "Access key id file",
+    secret_access_key_file: "Secret access key file",
+  };
+  const BOOLEAN_TARGET_FIELDS = new Set(["use_tls", "trust_on_first_use", "smb_encrypt"]);
+  const NUMBER_TARGET_FIELDS = new Set(["port", "timeout_seconds"]);
+  const NULLABLE_CLASS_FIELDS = new Set(["remote_keep", "remote_max_age_days"]);
+
+  function secretStateText(secret) {
+    if (!secret || !secret.configured) return "Not set";
+    if (secret.present === true) return "Secret file present";
+    if (secret.present === false) return "Secret file missing or not private (chmod 600)";
+    return "Set (file is outside the shared secrets folder, so it can't be checked here)";
+  }
+
+  // Build the PUT body from the editor view plus the operator's edits. Locked
+  // (environment) values and untouched secrets are left out, so the server
+  // keeps them as they are.
+  function buildPolicyPayload(view, edits) {
+    const payload = { revision: view.revision, classes: {} };
+    ["config", "full"].forEach((backupClass) => {
+      const locked = view.classes?.[backupClass]?.locked || {};
+      const values = edits.classes?.[backupClass] || {};
+      const out = {};
+      Object.keys(values).forEach((key) => {
+        if (!Object.prototype.hasOwnProperty.call(locked, key)) out[key] = values[key];
+      });
+      payload.classes[backupClass] = out;
+    });
+    if (!view.targets_locked_by && Array.isArray(edits.targets)) {
+      payload.targets = edits.targets.map((target) => {
+        const secrets = {};
+        Object.keys(target.secretChanges || {}).forEach((name) => {
+          const change = target.secretChanges[name];
+          if (change && change.clear) secrets[name] = null;
+          else if (change && typeof change.path === "string" && change.path.trim()) secrets[name] = change.path.trim();
+        });
+        const entry = { values: { ...target.values }, secrets };
+        if (target.original_target_id) entry.original_target_id = target.original_target_id;
+        return entry;
+      });
+    }
+    return payload;
+  }
+
   const model = {
+    buildPolicyPayload,
+    secretStateText,
     scrubText,
     validId,
     artifactUrl,
@@ -462,6 +516,7 @@
       renderArtifacts();
       if (els.refreshButton) els.refreshButton.disabled = state.loading || isStopped();
       if (els.cleanupButton) els.cleanupButton.disabled = !available() || isPending("cleanup") || isStopped();
+      if (els.editButton) els.editButton.disabled = isStopped();
     }
 
     function renderPolicies() {
@@ -693,6 +748,201 @@
       return `${CLASS_SHORT[artifact.backup_class] || "Backup"} backup from ${fmtTime(artifact.created_at)}, ${fmtBytes(artifact.size)}, on ${locationLabel(artifact.location, targets())}.`;
     }
 
+    // ---------------------------------------------------------- editor --
+
+    const POLICY_URL = `${API_ROOT}/policy`;
+
+    function inputFor(id, value, { type = "text", disabled = false, placeholder } = {}) {
+      const input = el("input", { id, type, autocomplete: "off", disabled, placeholder });
+      if (type === "checkbox") input.checked = Boolean(value);
+      else input.value = value === null || value === undefined ? "" : String(value);
+      return input;
+    }
+
+    function fieldLabel(id, text, input, note) {
+      return el("label", { className: input.type === "checkbox" ? "toggle" : "field", for: id },
+        input.type === "checkbox" ? [input, el("span", { text })] : [el("span", { text }), input],
+        note ? el("span", { className: "subtle", text: note }) : null);
+    }
+
+    function classFieldset(view, backupClass) {
+      const entry = view.classes?.[backupClass] || { values: {}, locked: {} };
+      const rows = Object.keys(entry.values).map((key) => {
+        const id = `backup-edit-${backupClass}-${key}`;
+        const lockedBy = entry.locked?.[key];
+        const value = entry.values[key];
+        const type = typeof value === "boolean" ? "checkbox" : (key === "schedule" ? "text" : "number");
+        const input = inputFor(id, value, { type, disabled: Boolean(lockedBy), placeholder: NULLABLE_CLASS_FIELDS.has(key) ? "No limit" : undefined });
+        input.dataset.policyClass = backupClass;
+        input.dataset.policyKey = key;
+        return fieldLabel(id, key === "enabled" ? "Turned on" : humanKey(key), input, lockedBy ? `Set by ${lockedBy} in the environment; change it there.` : "");
+      });
+      return el("fieldset", { className: "backup-edit-class" }, el("legend", { text: CLASS_LABELS[backupClass] }), rows);
+    }
+
+    function targetFieldset(view, target, index) {
+      const locked = Boolean(view.targets_locked_by);
+      const values = target.values || {};
+      const prefix = `backup-edit-target-${index}`;
+      const plain = ["target_id", "label", "enabled", ...view.target_fields.filter((key) => key !== "target_id")];
+      const rows = plain.map((key) => {
+        const id = `${prefix}-${key}`;
+        let input;
+        if (key === "provider") {
+          input = el("select", { id, disabled: locked }, view.providers.map((provider) => {
+            const option = el("option", { value: provider, text: providerLabel(provider) });
+            if (provider === (values.provider || "filesystem")) option.setAttribute("selected", "");
+            return option;
+          }));
+          input.value = values.provider || "filesystem";
+        } else {
+          const type = key === "enabled" || BOOLEAN_TARGET_FIELDS.has(key) ? "checkbox" : (NUMBER_TARGET_FIELDS.has(key) ? "number" : "text");
+          input = inputFor(id, key === "enabled" ? values.enabled !== false : values[key], { type, disabled: locked });
+        }
+        input.dataset.targetIndex = String(index);
+        input.dataset.targetKey = key;
+        return fieldLabel(id, key === "enabled" ? "Turned on" : humanKey(key), input);
+      });
+      const secretRows = view.secret_fields.map((name) => {
+        const id = `${prefix}-${name}`;
+        const pending = target.pendingSecrets?.[name] || {};
+        const input = inputFor(id, pending.path || "", { disabled: locked, placeholder: "/run/backup-secrets/..." });
+        input.dataset.targetIndex = String(index);
+        input.dataset.secretKey = name;
+        const clear = inputFor(`${id}-clear`, Boolean(pending.clear), { type: "checkbox", disabled: locked || !target.secrets?.[name]?.configured });
+        clear.dataset.targetIndex = String(index);
+        clear.dataset.secretClear = name;
+        return el("div", { className: "backup-edit-secret", dataset: { secret: name } },
+          el("p", {}, el("strong", { text: `${SECRET_LABELS[name] || humanKey(name)}: ` }), el("span", { className: "backup-secret-state", text: secretStateText(target.secrets?.[name]) })),
+          fieldLabel(id, "Use this secret file instead (path inside the backup scheduler)", input),
+          fieldLabel(`${id}-clear`, "Stop using a secret file here", clear));
+      });
+      return el("fieldset", { className: "backup-edit-target", dataset: { targetIndex: String(index) } },
+        el("legend", { text: scrubText(values.label || values.target_id || `Target ${index + 1}`) }),
+        rows,
+        el("details", {}, el("summary", { text: "Credentials (secret files)" }),
+          el("p", { className: "subtle", text: "Secrets are never shown or sent back. Put the secret in a file under config/backup-secrets on the host (mode 600), then name it here." }),
+          secretRows),
+        locked ? null : button("Remove this target", { action: "policy-remove-target", id: String(index), cls: "ghost small" }));
+    }
+
+    function renderEditor(view) {
+      const body = [
+        el("p", { className: "subtle", text: "Changes are checked, then written to config.yaml. The backup scheduler reads them when it starts." }),
+        view.problems?.length ? el("ul", { className: "backup-edit-problems" }, view.problems.map((problem) => el("li", { text: scrubText(problem) }))) : null,
+        classFieldset(view, "config"),
+        classFieldset(view, "full"),
+        el("h3", { text: "Targets" }),
+        view.targets_locked_by
+          ? el("p", { className: "subtle", text: `Targets are set by ${view.targets_locked_by} in the environment; change them there.` })
+          : null,
+        el("div", { className: "backup-edit-targets" }, view.targets.map((target, index) => targetFieldset(view, target, index))),
+        view.targets_locked_by ? null : button("Add a target", { action: "policy-add-target", cls: "secondary small" }),
+      ];
+      return body;
+    }
+
+    function readEdits(view) {
+      const dialog = els.dialog;
+      const edits = {
+        classes: { config: {}, full: {} },
+        targets: view.targets.map((target) => ({ values: {}, secretChanges: {}, original_target_id: target.original_target_id || null })),
+      };
+      dialog.querySelectorAll("[data-policy-key]").forEach((input) => {
+        if (input.disabled) return;
+        const key = input.dataset.policyKey;
+        let value;
+        if (input.type === "checkbox") value = input.checked;
+        else if (input.type === "number") value = input.value.trim() === "" ? null : Number(input.value);
+        else value = input.value.trim();
+        edits.classes[input.dataset.policyClass][key] = value;
+      });
+      dialog.querySelectorAll("[data-target-key]").forEach((input) => {
+        const target = edits.targets[Number(input.dataset.targetIndex)];
+        if (!target) return;
+        const key = input.dataset.targetKey;
+        if (input.type === "checkbox") target.values[key] = input.checked;
+        else if (input.type === "number") {
+          if (input.value.trim() !== "") target.values[key] = Number(input.value);
+        } else if (input.value.trim() !== "") target.values[key] = input.value.trim();
+      });
+      dialog.querySelectorAll("[data-secret-key]").forEach((input) => {
+        const target = edits.targets[Number(input.dataset.targetIndex)];
+        if (target && input.value.trim()) target.secretChanges[input.dataset.secretKey] = { path: input.value.trim() };
+      });
+      dialog.querySelectorAll("[data-secret-clear]").forEach((input) => {
+        const target = edits.targets[Number(input.dataset.targetIndex)];
+        if (target && input.checked) target.secretChanges[input.dataset.secretClear] = { clear: true };
+      });
+      return edits;
+    }
+
+    async function openPolicyEditor(trigger) {
+      openDialog("Backup settings", [el("p", { className: "subtle", text: "Loading..." })], [cancelButton("Close")], trigger);
+      const scope = dialogScope();
+      try {
+        const view = await deps.fetchJson(POLICY_URL);
+        state.policyView = view;
+        showPolicyView(scope, view);
+      } catch (error) {
+        scope.result(`Couldn't load the backup settings: ${errorText(error)}`);
+      }
+    }
+
+    function showPolicyView(scope, view) {
+      const body = scope.body();
+      if (!body) return;
+      body.replaceChildren(...renderEditor(view).filter(Boolean));
+      scope.actions(cancelButton(), primary("Save", "policy-save"));
+    }
+
+    function editorWithTargets(mutate) {
+      const view = state.policyView;
+      if (!view) return;
+      // Keep what was typed: fold the current form back into the view first.
+      const edits = readEdits(view);
+      const targets = view.targets.map((target, index) => ({
+        ...target,
+        values: { ...edits.targets[index].values },
+        pendingSecrets: { ...edits.targets[index].secretChanges },
+      }));
+      state.policyView = { ...view, targets: mutate(targets) };
+      showPolicyView(dialogScope(), state.policyView);
+    }
+
+    function addPolicyTarget() {
+      editorWithTargets((targets) => [...targets, { values: { provider: "filesystem", enabled: true }, secrets: {} }]);
+    }
+
+    function removePolicyTarget(index) {
+      editorWithTargets((targets) => targets.filter((_target, position) => position !== Number(index)));
+    }
+
+    function savePolicy() {
+      const view = state.policyView;
+      if (!view) return Promise.resolve();
+      const scope = dialogScope();
+      const payload = buildPolicyPayload(view, readEdits(view));
+      return once("policy-save", async () => {
+        scope.result("Saving...");
+        try {
+          const saved = await deps.fetchJson(POLICY_URL, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          state.policyView = saved;
+          showPolicyView(scope, saved);
+          scope.result(`Saved. Restart the backup scheduler to use the new settings: ${saved.restart_command || "restart enclosure-backup-scheduler"}`);
+          setBanner("Backup settings saved. Restart the backup scheduler to apply them.", "success");
+        } catch (error) {
+          scope.result(error?.status === 409
+            ? "config.yaml changed since this editor opened. Close it and open it again."
+            : `Not saved: ${errorText(error)}`);
+        }
+      });
+    }
+
     // --------------------------------------------------------- actions --
 
     async function showDetails(id, trigger) {
@@ -909,7 +1159,7 @@
             timeoutMs: LONG_TIMEOUT_MS,
           });
           if (!["encrypted", "plaintext"].includes(inspection?.encryption_mode) || !inspection?.inspection_receipt) {
-            throw new Error("Inspection did not return an observed encryption mode and receipt.");
+            throw new Error("The backup check did not finish. Try the restore again.");
           }
           if (!scope.live()) return;
           state.restoreInspection = inspection;
@@ -1093,6 +1343,15 @@
         case "dialog-cancel":
           closeDialog();
           break;
+        case "policy-add-target":
+          addPolicyTarget();
+          break;
+        case "policy-remove-target":
+          removePolicyTarget(id);
+          break;
+        case "policy-save":
+          void savePolicy();
+          break;
         default:
           return;
       }
@@ -1115,6 +1374,7 @@
       });
       els.refreshButton?.addEventListener("click", () => void load());
       els.cleanupButton?.addEventListener("click", (event) => void openCleanup(event.currentTarget || els.cleanupButton));
+      els.editButton?.addEventListener("click", (event) => void openPolicyEditor(event.currentTarget || els.editButton));
     }
 
     return {
@@ -1123,7 +1383,7 @@
       render,
       state,
       // exposed for tests
-      actions: { verify, runNow, testTarget, unpreserve, openPreserve, submitPreserve, openRestore, restoreInspect, restoreImport, openCleanup, applyCleanup, showDetails, closeDialog },
+      actions: { verify, runNow, testTarget, unpreserve, openPreserve, submitPreserve, openRestore, restoreInspect, restoreImport, openCleanup, applyCleanup, showDetails, closeDialog, openPolicyEditor, savePolicy, addPolicyTarget, removePolicyTarget },
     };
   }
 

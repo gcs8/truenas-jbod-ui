@@ -255,7 +255,29 @@ test("admin copy no longer leaks implementation vocabulary", () => {
   for (const word of [/sidecar/i, /\bpills?\b/i, /geometry/i, /\bpreset\b/i, /first.pass/i, /enrichment/i, /Quantastor/]) {
     assert.doesNotMatch(userFacing, word);
   }
-  assert.match(TEMPLATE, /accept="\.7z,\.zip,\.tar\.gz,\.tgz,\.tar\.zst,\.zst,\.gz"/);
+  assert.match(TEMPLATE, /accept="\.7z,\.zip,\.tar\.gz,\.tgz,\.tar\.zst,\.zst,\.gz,\.enc"/);
   assert.match(TEMPLATE, /Management controller only \(BMC \/ IPMI\)/);
   assert.match(TEMPLATE, /Add a sample system \(fake data\)/);
+});
+
+test("the setup and maintenance view links to each of its sections (#412)", () => {
+  const nav = TEMPLATE.match(/<nav class="admin-section-links"[^>]*>([\s\S]*?)<\/nav>/);
+  assert.ok(nav, "the operations view must have a section link bar");
+  const targets = [...nav[1].matchAll(/href="#([^"]+)"/g)].map((match) => match[1]);
+  assert.deepEqual(targets, [
+    "admin-section-systems",
+    "admin-section-existing-systems",
+    "admin-section-containers",
+    "admin-section-timing",
+    "admin-section-backup",
+    "admin-section-history",
+  ]);
+  const operationsView = TEMPLATE.slice(
+    TEMPLATE.indexOf('data-admin-view-panel="operations"'),
+    TEMPLATE.indexOf('data-admin-view-panel="backups"')
+  );
+  for (const id of targets) {
+    assert.equal(TEMPLATE.split(`id="${id}"`).length - 1, 1, `${id} must exist exactly once`);
+    assert.ok(operationsView.includes(`id="${id}"`), `${id} must be inside the view that shows the links`);
+  }
 });

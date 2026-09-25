@@ -46,6 +46,7 @@ from app.config import (
     SSHConfig,
     Settings,
     TrueNASConfig,
+    build_unknown_config_key_warnings,
     get_settings,
     known_hosts_path_for_target,
     runtime_behavior_settings_payload,
@@ -226,11 +227,11 @@ def build_offline_recovery_state(
         return {"expired": False, "summary": "", "next_step": ""}
     return {
         "expired": True,
-        "summary": "The admin sidecar's auto-stop time has passed.",
+        "summary": "Admin's auto-stop time has passed.",
         "next_step": (
-            "The sidecar stops on its own and does not come back by itself. If this "
-            "page stops responding, run `docker compose up -d enclosure-admin` on the "
-            "Docker host and reload it. This page cannot keep the sidecar running."
+            "It stops on its own and does not come back by itself. If this page "
+            "stops responding, run `docker compose --profile admin up -d enclosure-admin` "
+            "on the Docker host and reload it. This page cannot keep it running."
         ),
     }
 
@@ -681,7 +682,10 @@ async def build_admin_state_payload(request: Request) -> dict[str, Any]:
         "systems": serialize_systems(settings),
         "default_system_id": settings.default_system_id,
         "profiles": serialize_profiles(settings),
-        "configuration_warnings": build_profile_reference_warnings(settings),
+        "configuration_warnings": [
+            *build_unknown_config_key_warnings(settings),
+            *build_profile_reference_warnings(settings),
+        ],
         "storage_view_templates": serialize_storage_view_templates(),
         "setup_platform_defaults": serialize_platform_defaults(),
         "ssh_keys": ssh_keys,
@@ -803,7 +807,7 @@ def annotate_runtime_versions(
             release_state, release_summary = "known", f"Latest stable {latest_tag}"
         else:
             release_state = str(release_payload.get("status") or "unknown")
-            release_summary = str(release_payload.get("summary") or "Checking releases...")
+            release_summary = str(release_payload.get("summary") or "Checking for updates...")
 
         if not item.get("running"):
             sync_state = "stopped"

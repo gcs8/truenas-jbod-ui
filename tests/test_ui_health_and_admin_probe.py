@@ -609,6 +609,73 @@ class AdminProbeHotPathTests(unittest.TestCase):
         # The refresh marker is cleared, so the next lookup can try again.
         self.assertNotIn(self.URL, app_main._ADMIN_PROBE_REFRESHING)
 
+    def test_refresh_landing_before_the_lock_is_not_repeated(self) -> None:
+        """A caller that read the expired entry re-checks the cache under the lock."""
+
+        with patch.object(app_main, "_probe_admin_service", return_value=False):
+            self.assertFalse(app_main.admin_service_reachable(self.URL, 0.75))
+        self._expire()
+        url = self.URL
+        real_lock = app_main._ADMIN_PROBE_LOCK
+
+        class RefreshLandsFirst:
+            """Lets another caller's refresh finish between the unlocked read and the lock."""
+
+            landed = False
+
+            def __enter__(self):
+                if not RefreshLandsFirst.landed:
+                    RefreshLandsFirst.landed = True
+                    app_main.ADMIN_PROBE_CACHE[url] = app_main.AdminProbeCacheEntry(
+                        reachable=True, expires_at_monotonic=time.monotonic() + 30,
+                    )
+                return real_lock.__enter__()
+
+            def __exit__(self, *exc):
+                return real_lock.__exit__(*exc)
+
+        with (
+            patch.object(app_main, "_ADMIN_PROBE_LOCK", RefreshLandsFirst()),
+            patch.object(app_main, "_probe_admin_service") as probe,
+            patch.object(app_main, "_start_admin_probe_refresh") as start,
+        ):
+            # The fresh answer wins over the stale pre-lock read; no second probe.
+            self.assertTrue(app_main.admin_service_reachable(self.URL, 0.75))
+        probe.assert_not_called()
+        start.assert_not_called()
+        self.assertNotIn(self.URL, app_main._ADMIN_PROBE_REFRESHING)
+
+    def test_concurrent_expired_lookups_start_one_refresh(self) -> None:
+        with patch.object(app_main, "_probe_admin_service", return_value=False):
+            self.assertFalse(app_main.admin_service_reachable(self.URL, 0.75))
+        self._expire()
+        gate = threading.Barrier(16)
+        results: list[bool] = []
+        results_lock = threading.Lock()
+
+        def page_load() -> None:
+            gate.wait(5)
+            answer = app_main.admin_service_reachable(self.URL, 0.75)
+            with results_lock:
+                results.append(answer)
+
+        with patch.object(app_main, "_probe_admin_service", return_value=True) as probe:
+            for _round in range(20):
+                threads = [threading.Thread(target=page_load) for _ in range(16)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(5)
+                gate.reset()
+                for _ in range(200):
+                    if self.URL not in app_main._ADMIN_PROBE_REFRESHING:
+                        break
+                    time.sleep(0.005)
+                # Every round after the first sees a fresh answer: no more probes.
+                self.assertEqual(probe.call_count, 1)
+        self.assertEqual(len(results), 16 * 20)
+        self.assertTrue(app_main.admin_service_reachable(self.URL, 0.75))
+
     def test_startup_warm_fills_the_cache_before_the_first_page(self) -> None:
         settings = Settings()
         settings.admin.service_url = self.URL
@@ -653,14 +720,14 @@ class IndexPageTests(unittest.TestCase):
         self.assertIn('id="admin-launch-stopped"', page)
         self.assertIn(">System Setup</button>", page)
         self.assertIn("disabled", page.split('id="admin-launch-stopped"', 1)[1].split("</button>", 1)[0])
-        self.assertIn("Admin is stopped (it stops itself when idle).", page)
+        self.assertIn("Admin is not running. It may have stopped on its own: the published Compose files stop it after an hour by default.", page)
         self.assertIn("docker compose --profile admin up -d enclosure-admin", page)
         self.assertNotIn('href="http://testserver:8082"', page)
 
     def test_running_admin_keeps_the_link(self) -> None:
         page = self.render_index(app_main.AdminLaunchState(url="http://testserver:8082", stopped=False))
         self.assertIn('href="http://testserver:8082"', page)
-        self.assertNotIn("Admin is stopped", page)
+        self.assertNotIn("Admin is not running", page)
 
     def test_unconfigured_admin_hides_the_button(self) -> None:
         page = self.render_index(None)

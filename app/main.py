@@ -933,6 +933,11 @@ def admin_service_reachable(service_url: str, timeout_seconds: float) -> bool:
     if cached is not None and cached.expires_at_monotonic > time.monotonic():
         return cached.reachable
     with _ADMIN_PROBE_LOCK:
+        # Re-read under the lock: a refresh may have landed (and cleared its
+        # marker) between the unlocked read above and taking the lock.
+        cached = ADMIN_PROBE_CACHE.get(service_url)
+        if cached is not None and cached.expires_at_monotonic > time.monotonic():
+            return cached.reachable
         already_refreshing = service_url in _ADMIN_PROBE_REFRESHING
         _ADMIN_PROBE_REFRESHING.add(service_url)
     if cached is None and not already_refreshing:

@@ -69,6 +69,9 @@ class FakeNode {
   get href() {
     return this.attributes.href || "";
   }
+  get type() {
+    return this.attributes.type || "";
+  }
   append(...nodes) {
     nodes.forEach((node) => {
       const child = typeof node === "string" ? this.ownerDocument.createTextNode(node) : node;
@@ -249,7 +252,7 @@ function fakeApi(overrides = {}) {
 
 function mount({ api = fakeApi(), confirm = () => true, stopped = false } = {}) {
   const doc = fakeDocument();
-  const ids = ["root", "heading", "status", "policies", "targets", "storage", "artifacts", "refreshButton", "cleanupButton"];
+  const ids = ["root", "heading", "status", "policies", "targets", "storage", "artifacts", "refreshButton", "cleanupButton", "editButton"];
   const elements = {};
   const root = doc.createElement("section");
   doc.body.append(root);
@@ -630,7 +633,7 @@ test("restore refuses an inspection without an observed mode and receipt", async
   await library.load();
   library.actions.openRestore("full-new");
   await library.actions.restoreInspect();
-  assert.match(elements.dialog.textContent, /Check failed: Inspection did not return an observed encryption mode and receipt/);
+  assert.match(elements.dialog.textContent, /Check failed: The backup check did not finish/);
   assert.equal(action(elements.dialog, "restore-import"), undefined);
   await library.actions.restoreImport();
   assert.equal(api.calls.some((call) => call.url.includes("/restore/import")), false);
@@ -740,4 +743,160 @@ test("library copy stays plain and the module has no framework or innerHTML", ()
   }
   assert.doesNotMatch(LIBRARY_SOURCE, /innerHTML|insertAdjacentHTML|\beval\(|new Function/);
   assert.doesNotMatch(LIBRARY_SOURCE, /require\(|import /);
+});
+
+// ------------------------------------------------ settings editor (#573) --
+
+function syntheticPolicyView(overrides = {}) {
+  return {
+    revision: "rev-1",
+    classes: {
+      config: { values: { enabled: true, local_keep: 30, remote_keep: null, remote_max_age_days: null, debounce_seconds: 30, max_delay_seconds: 600 }, locked: {} },
+      full: { values: { enabled: false, local_keep: 7, remote_keep: null, remote_max_age_days: 90, schedule: "0 3 * * *" }, locked: { schedule: "BACKUP_FULL_SCHEDULE" } },
+    },
+    targets: [{
+      values: { target_id: "office-nas", label: "Office NAS", enabled: true, provider: "sftp", root: "/srv/backups/jbod", hostname: "nas.example.test", username: "backup", known_hosts_path: "/run/backup-secrets/archive_known_hosts" },
+      original_target_id: "office-nas",
+      secrets: {
+        password_file: { configured: true, present: false },
+        private_key_file: { configured: true, present: true },
+        private_key_passphrase_file: { configured: false, present: null },
+        access_key_id_file: { configured: false, present: null },
+        secret_access_key_file: { configured: false, present: null },
+      },
+    }],
+    targets_locked_by: null,
+    providers: ["filesystem", "ftp", "sftp", "smb", "nfs", "s3"],
+    target_fields: ["target_id", "provider", "root", "hostname", "port", "username", "timeout_seconds", "use_tls", "known_hosts_path", "trust_on_first_use"],
+    secret_fields: ["password_file", "private_key_file", "private_key_passphrase_file", "access_key_id_file", "secret_access_key_file"],
+    problems: [],
+    restart_command: "docker compose --profile backup-scheduler restart enclosure-backup-scheduler",
+    ...overrides,
+  };
+}
+
+test("settings editor shows secret state only and locks environment values", async () => {
+  const api = fakeApi({ "GET /api/admin/backups/policy": () => syntheticPolicyView() });
+  const { elements, library } = mount({ api });
+  await library.load();
+  await library.actions.openPolicyEditor(elements.editButton);
+  await settle();
+  const text = elements.dialog.textContent;
+  assert.match(text, /Password file: Secret file missing or not private/);
+  assert.match(text, /Private key file: Secret file present/);
+  assert.match(text, /Set by BACKUP_FULL_SCHEDULE in the environment/);
+  assert.equal(elements.dialog.querySelector("#backup-edit-full-schedule").disabled, true);
+  assert.equal(elements.dialog.querySelector("#backup-edit-target-0-password_file").value, "", "secret inputs start empty");
+  assert.doesNotMatch(text, /hunter2|BEGIN .*PRIVATE KEY/);
+});
+
+test("saving sends edits, file-path secret changes and clears, never locked values", async () => {
+  let sent = null;
+  const api = fakeApi({
+    "GET /api/admin/backups/policy": () => syntheticPolicyView(),
+    "PUT /api/admin/backups/policy": ({ options }) => {
+      sent = JSON.parse(options.body);
+      return { ...syntheticPolicyView({ revision: "rev-2" }), ok: true, restart_required: true };
+    },
+  });
+  const { elements, library, banners } = mount({ api });
+  await library.load();
+  await library.actions.openPolicyEditor(elements.editButton);
+  await settle();
+  elements.dialog.querySelector("#backup-edit-config-local_keep").value = "12";
+  elements.dialog.querySelector("#backup-edit-config-remote_keep").value = "";
+  elements.dialog.querySelector("#backup-edit-target-0-label").value = "Office NAS 2";
+  elements.dialog.querySelector("#backup-edit-target-0-password_file").value = " /run/backup-secrets/new_password ";
+  elements.dialog.querySelector("#backup-edit-target-0-private_key_file-clear").checked = true;
+  await library.actions.savePolicy();
+  assert.equal(sent.revision, "rev-1");
+  assert.equal(sent.classes.config.local_keep, 12);
+  assert.equal(sent.classes.config.remote_keep, null);
+  assert.equal("schedule" in sent.classes.full, false, "a locked value is never sent");
+  assert.equal(sent.targets[0].values.label, "Office NAS 2");
+  assert.deepEqual(sent.targets[0].secrets, { password_file: "/run/backup-secrets/new_password", private_key_file: null });
+  for (const key of Object.keys(sent.targets[0].values)) {
+    assert.doesNotMatch(key, /_file$|password|secret/);
+  }
+  assert.match(elements.dialog.textContent, /Restart the backup scheduler/);
+  assert.match(banners.at(-1)[0], /Backup settings saved/);
+});
+
+test("adding and removing targets keeps what was typed; a stale revision says reload", async () => {
+  let sent = null;
+  const api = fakeApi({
+    "GET /api/admin/backups/policy": () => syntheticPolicyView(),
+    "PUT /api/admin/backups/policy": ({ options }) => {
+      sent = JSON.parse(options.body);
+      return Object.assign(new Error("config.yaml changed"), { status: 409 });
+    },
+  });
+  const { elements, library } = mount({ api });
+  await library.load();
+  await library.actions.openPolicyEditor(elements.editButton);
+  await settle();
+  elements.dialog.querySelector("#backup-edit-target-0-label").value = "Typed label";
+  library.actions.addPolicyTarget();
+  assert.equal(elements.dialog.querySelector("#backup-edit-target-0-label").value, "Typed label");
+  elements.dialog.querySelector("#backup-edit-target-1-target_id").value = "usb-disk";
+  elements.dialog.querySelector("#backup-edit-target-1-root").value = "/srv/usb/jbod";
+  library.actions.removePolicyTarget(0);
+  await library.actions.savePolicy();
+  assert.deepEqual(sent.targets.map((target) => target.values.target_id), ["usb-disk"]);
+  assert.match(elements.dialog.textContent, /changed since this editor opened/);
+});
+
+test("pending secret edits survive adding or removing a target; saved rows keep their identity", async () => {
+  let sent = null;
+  const api = fakeApi({
+    "GET /api/admin/backups/policy": () => syntheticPolicyView(),
+    "PUT /api/admin/backups/policy": ({ options }) => {
+      sent = JSON.parse(options.body);
+      return { ...syntheticPolicyView({ revision: "rev-2" }), ok: true, restart_required: true };
+    },
+  });
+  const { elements, library } = mount({ api });
+  await library.load();
+  await library.actions.openPolicyEditor(elements.editButton);
+  await settle();
+  elements.dialog.querySelector("#backup-edit-target-0-target_id").value = "office-nas-renamed";
+  elements.dialog.querySelector("#backup-edit-target-0-password_file").value = "/run/backup-secrets/new_password";
+  elements.dialog.querySelector("#backup-edit-target-0-private_key_file-clear").checked = true;
+  library.actions.addPolicyTarget();
+  assert.equal(elements.dialog.querySelector("#backup-edit-target-0-password_file").value, "/run/backup-secrets/new_password");
+  assert.equal(elements.dialog.querySelector("#backup-edit-target-0-private_key_file-clear").checked, true);
+  elements.dialog.querySelector("#backup-edit-target-1-target_id").value = "usb-disk";
+  elements.dialog.querySelector("#backup-edit-target-1-root").value = "/srv/usb/jbod";
+  library.actions.removePolicyTarget(1);
+  library.actions.addPolicyTarget();
+  elements.dialog.querySelector("#backup-edit-target-1-target_id").value = "office-nas";
+  elements.dialog.querySelector("#backup-edit-target-1-root").value = "/srv/usb/jbod";
+  await library.actions.savePolicy();
+  assert.deepEqual(sent.targets[0].secrets, { password_file: "/run/backup-secrets/new_password", private_key_file: null });
+  assert.equal(sent.targets[0].values.target_id, "office-nas-renamed");
+  assert.equal(sent.targets[0].original_target_id, "office-nas", "a renamed row keeps its saved identity");
+  assert.equal("original_target_id" in sent.targets[1], false, "a new row reusing an old ID inherits nothing");
+});
+
+test("environment-managed targets are read-only in the editor", async () => {
+  let sent = null;
+  const api = fakeApi({
+    "GET /api/admin/backups/policy": () => syntheticPolicyView({ targets_locked_by: "BACKUP_TARGETS_JSON" }),
+    "PUT /api/admin/backups/policy": ({ options }) => { sent = JSON.parse(options.body); return syntheticPolicyView(); },
+  });
+  const { elements, library } = mount({ api });
+  await library.load();
+  await library.actions.openPolicyEditor(elements.editButton);
+  await settle();
+  assert.match(elements.dialog.textContent, /Targets are set by BACKUP_TARGETS_JSON/);
+  assert.equal(action(elements.dialog, "policy-add-target"), undefined);
+  assert.equal(elements.dialog.querySelector("#backup-edit-target-0-label").disabled, true);
+  await library.actions.savePolicy();
+  assert.equal("targets" in sent, false);
+});
+
+test("the panel offers Edit settings and no longer calls the settings read-only", () => {
+  assert.match(TEMPLATE, /id="backup-library-edit-button"[^>]*>Edit settings</);
+  assert.doesNotMatch(TEMPLATE, /shown here read-only/);
+  assert.match(ADMIN_SOURCE, /editButton: document\.getElementById\("backup-library-edit-button"\)/);
 });
