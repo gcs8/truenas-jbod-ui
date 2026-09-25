@@ -197,8 +197,8 @@ test("busy backup and debug exports coalesce and stay disabled through control s
   for (const operation of ["exportBackup", "exportDebugBundle"]) {
     let reject, posts = 0;
     const bindings = controls();
-    Object.assign(bindings, {fetch: () => {posts++; return new Promise((_resolve, fail) => {reject = fail;});}, readOptionalSecretValue: () => null, setBanner() {}, refreshState: async () => {}, readJsonResponse: async () => null});
-    const api = load([operation, "syncBackupControls", ...(source.includes(`function run${operation[0].toUpperCase() + operation.slice(1)}(`) ? [`run${operation[0].toUpperCase() + operation.slice(1)}`, "runBackupOperation"] : [])], bindings);
+    Object.assign(bindings, {fetch: () => {posts++; return new Promise((_resolve, fail) => {reject = fail;});}, readOptionalSecretValue: () => null, setBanner() {}, refreshState: async () => {}, readJsonResponse: async () => null, BACKUP_TRANSFER_TIMEOUT_MS: 1800000});
+    const api = load([operation, "syncBackupControls", "fetchWithTimeout", "requestTimeoutError", ...(source.includes(`function run${operation[0].toUpperCase() + operation.slice(1)}(`) ? [`run${operation[0].toUpperCase() + operation.slice(1)}`, "runBackupOperation"] : [])], bindings);
     const first = api[operation](); const second = api[operation]();
     await Promise.resolve();
     api.syncBackupControls();

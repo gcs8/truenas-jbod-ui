@@ -34,7 +34,6 @@
         ? bootstrap.backup_defaults.debug_packaging
         : "tar.zst",
     debugForced7z: false,
-    paths: bootstrap.paths || {},
     tlsInspection: null,
     tlsTrustStatus: {
       level: "untrusted",
@@ -5770,10 +5769,16 @@
   }
 
   const DEFAULT_REQUEST_TIMEOUT_MS = 60000;
+  // Backup and debug downloads and restore uploads move whole archives and may
+  // stop and restart containers, so they get a long limit instead of 60 s.
+  const BACKUP_TRANSFER_TIMEOUT_MS = 30 * 60 * 1000;
 
   function requestTimeoutError(timeoutMs) {
     const seconds = Math.max(1, Math.round(timeoutMs / 1000));
-    const error = new Error(`Timed out after ${seconds} second${seconds === 1 ? "" : "s"}. Check that the host is reachable and try again.`);
+    const length = seconds >= 120
+      ? `${Math.round(seconds / 60)} minutes`
+      : `${seconds} second${seconds === 1 ? "" : "s"}`;
+    const error = new Error(`Timed out after ${length}. Check that the host is reachable and try again.`);
     error.name = "TimeoutError";
     error.timedOut = true;
     return error;
@@ -6462,9 +6467,10 @@
     try {
       const stopServices = Boolean(elements.backupExportStopToggle?.checked);
       const restartServices = stopServices && Boolean(elements.backupExportRestartToggle?.checked);
-      const response = await fetch(
+      const response = await fetchWithTimeout(
         `/api/admin/backup/export?stop_services=${String(stopServices)}&restart_services=${String(restartServices)}`,
         {
+          timeoutMs: BACKUP_TRANSFER_TIMEOUT_MS,
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -6539,9 +6545,10 @@
     try {
       const stopServices = Boolean(elements.debugExportStopToggle?.checked);
       const restartServices = stopServices && Boolean(elements.debugExportRestartToggle?.checked);
-      const response = await fetch(
+      const response = await fetchWithTimeout(
         `/api/admin/debug/export?stop_services=${String(stopServices)}&restart_services=${String(restartServices)}`,
         {
+          timeoutMs: BACKUP_TRANSFER_TIMEOUT_MS,
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -6654,7 +6661,8 @@
       const secretHeaders = passphrase !== null
         ? { "X-Backup-Passphrase-Base64": encodeUtf8Base64(passphrase) }
         : {};
-      const inspectionResponse = await fetch("/api/admin/backup/inspect", {
+      const inspectionResponse = await fetchWithTimeout("/api/admin/backup/inspect", {
+        timeoutMs: BACKUP_TRANSFER_TIMEOUT_MS,
         method: "POST",
         headers: {
           "Content-Type": "application/octet-stream",
@@ -6682,9 +6690,10 @@
       if (elements.backupImportResult) {
         elements.backupImportResult.textContent = `Importing inspected ${file.name}...`;
       }
-      const response = await fetch(
+      const response = await fetchWithTimeout(
         `/api/admin/backup/import?stop_services=${String(stopServices)}&restart_services=${String(restartServices)}`,
         {
+          timeoutMs: BACKUP_TRANSFER_TIMEOUT_MS,
           method: "POST",
           headers: {
             "Content-Type": "application/octet-stream",
