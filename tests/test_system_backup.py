@@ -1382,6 +1382,29 @@ class SystemBackupServiceTests(unittest.TestCase):
         ):
             self.backup_service._require_restore_free_space(manifest, group_entries, extracted)
 
+    def test_debug_export_with_history_checks_free_space_before_writing(self) -> None:
+        usage = shutil.disk_usage(self.temp_dir)
+        short = type(usage)(usage.total, usage.used, 1)
+        with (
+            patch("history_service.system_backup.shutil.disk_usage", return_value=short),
+            patch("history_service.system_backup.tempfile.mkdtemp") as mkdtemp,
+            self.assertRaisesRegex(ValueError, "Export needs about"),
+        ):
+            self.backup_service.export_debug_bundle_to_file(
+                packaging="zip",
+                included_paths=[HISTORY_DB_KEY],
+            )
+        mkdtemp.assert_not_called()
+        source_bytes = self.backup_service._history_source_bytes()
+        with patch.object(self.backup_service, "_history_source_bytes", return_value=source_bytes):
+            roomy = type(usage)(usage.total, usage.used, 3 * source_bytes)
+            with patch("history_service.system_backup.shutil.disk_usage", return_value=roomy):
+                self.backup_service._require_export_free_space([HISTORY_DB_KEY], copies=3)
+            tight = type(usage)(usage.total, usage.used, 3 * source_bytes - 1)
+            with patch("history_service.system_backup.shutil.disk_usage", return_value=tight):
+                with self.assertRaisesRegex(ValueError, "Export needs about"):
+                    self.backup_service._require_export_free_space([HISTORY_DB_KEY], copies=3)
+
     def test_export_refuses_when_temp_folder_cannot_hold_the_history_snapshot(self) -> None:
         usage = shutil.disk_usage(self.temp_dir)
         short = type(usage)(usage.total, usage.used, 1)

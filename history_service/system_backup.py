@@ -2711,6 +2711,7 @@ class SystemBackupService:
         if encrypt and not passphrase:
             raise ValueError(EXPORT_PASSPHRASE_REQUIRED_MESSAGE)
         normalized_packaging: ArchivePackaging = "7z" if encrypt else requested_packaging
+        self._require_export_free_space(selected_groups, copies=3 if scrub_disk_identifiers or scrub_secrets else 2)
         scrubber = (
             DebugScrubber(
                 scrub_secrets=scrub_secrets,
@@ -3835,16 +3836,17 @@ class SystemBackupService:
                 pass
         return total
 
-    def _require_export_free_space(self, selected_groups: Any) -> None:
+    def _require_export_free_space(self, selected_groups: Any, *, copies: int = 2) -> None:
         """Fail before writing anything when the temp folder cannot hold the export.
 
-        An export holds a consistent snapshot of the history database and the
-        archive built from it at the same time, so it needs about twice the
-        history size (compression usually makes this an overestimate).
+        A backup export holds a consistent snapshot of the history database and
+        the archive built from it at the same time, so it needs about twice the
+        history size (compression usually makes this an overestimate). A debug
+        export can also hold a scrubbed copy of the snapshot, so it asks for three.
         """
         if HISTORY_DB_KEY not in selected_groups:
             return
-        needed_bytes = 2 * self._history_source_bytes()
+        needed_bytes = copies * self._history_source_bytes()
         if needed_bytes == 0:
             return
         folder = Path(tempfile.gettempdir())
