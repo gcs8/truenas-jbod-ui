@@ -51,12 +51,11 @@ function declarations(body, property) {
 }
 
 // Design floor (#440): no text in the stylesheet renders below 12px (0.75rem at
-// the default 16px root). Relative `em`/`%` sizes and small-caps tricks would
-// hide small text from this check, so they are rejected outright.
-function fontSizeTooSmall(value) {
-  if (/^[\d.]+(em|%)$/.test(value) || /^(x+-)?small(er)?$/.test(value)) {
-    return true;
-  }
+// the default 16px root). The check fails closed: `inherit`, absolute rem/px
+// lengths and `clamp()` with an absolute lower bound are understood; anything
+// else (em, %, keywords, calc(), min(), variables) is reported so a new
+// expression cannot slip smaller text past the floor unexamined.
+function absoluteLengthTooSmall(value) {
   const rem = /^([\d.]+)rem$/.exec(value);
   if (rem) {
     return Number(rem[1]) < MIN_REM;
@@ -65,7 +64,23 @@ function fontSizeTooSmall(value) {
   if (px) {
     return Number(px[1]) < MIN_PX;
   }
-  return false;
+  return null;
+}
+
+function fontSizeTooSmall(value) {
+  if (value === "inherit") {
+    return false;
+  }
+  const absolute = absoluteLengthTooSmall(value);
+  if (absolute !== null) {
+    return absolute;
+  }
+  // clamp(MIN, preferred, MAX) never renders below MIN.
+  const clamp = /^clamp\(\s*([^,()]+?)\s*,[^()]*\)$/.exec(value);
+  if (clamp) {
+    return absoluteLengthTooSmall(clamp[1]) !== false;
+  }
+  return true;
 }
 
 function relativeLuminance(hex) {
@@ -96,7 +111,16 @@ test("no text in the stylesheet drops below 12px", () => {
       }
     }
   }
-  assert.deepEqual(violations, [], `text below the ${MIN_REM}rem floor:\n${violations.join("\n")}`);
+  assert.deepEqual(violations, [], `text below (or not provably above) the ${MIN_REM}rem floor:\n${violations.join("\n")}`);
+});
+
+test("the font-size floor check fails closed on expressions it cannot prove", () => {
+  for (const value of ["0.75rem", "12px", "1rem", "inherit", "clamp(1.8rem, 3vw, 2.2rem)", "clamp(12px, 1vw, 1rem)"]) {
+    assert.equal(fontSizeTooSmall(value), false, value);
+  }
+  for (const value of ["0.7rem", "11px", "clamp(0.5rem, 1vw, 0.6rem)", "clamp(var(--min), 1vw, 1rem)", "0.9em", "80%", "small", "smaller", "calc(1rem - 6px)", "min(1rem, 2vw)", "var(--text-small)"]) {
+    assert.equal(fontSizeTooSmall(value), true, value);
+  }
 });
 
 test("diagnostic chips are not forced to uppercase", () => {
