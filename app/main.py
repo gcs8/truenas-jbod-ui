@@ -4,10 +4,12 @@ from __future__ import annotations
 # ruff: noqa: F401
 
 import asyncio
+import http.client
 import json
 import logging
 import socket
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -599,6 +601,10 @@ def create_app() -> FastAPI:
                 registry.prewarm_all(warm_smart=startup_settings.app.startup_warm_smart_enabled)
             )
         release_task = asyncio.create_task(get_release_status_service().run_periodic_refresh())
+        # A daemon thread, so a slow DNS miss here never holds up shutdown.
+        threading.Thread(
+            target=warm_admin_probe, args=(startup_settings,), name="admin-probe-warm", daemon=True,
+        ).start()
         try:
             yield
         finally:
@@ -880,28 +886,70 @@ def _probe_admin_service(service_url: str, timeout_seconds: float) -> bool:
     try:
         with urllib.request.urlopen(health_request, timeout=timeout_seconds) as response:
             return getattr(response, "status", 200) < 400
-    except (TimeoutError, urllib.error.URLError, ValueError):
+    except (OSError, http.client.HTTPException, ValueError):
+        # OSError covers URLError, timeouts, refusals and resets.
         return False
 
 
-def admin_service_reachable(service_url: str, timeout_seconds: float) -> bool:
-    """Probe admin's health endpoint, remembering the answer briefly.
+_ADMIN_PROBE_REFRESHING: set[str] = set()
+_ADMIN_PROBE_LOCK = threading.Lock()
 
-    Admin is stopped by design most of the time, so without this every page
-    load would wait on a refused connection or a DNS miss.
+
+def _refresh_admin_probe(service_url: str, timeout_seconds: float) -> bool:
+    try:
+        reachable = _probe_admin_service(service_url, timeout_seconds)
+        ttl_seconds = ADMIN_PROBE_SUCCESS_TTL_SECONDS if reachable else ADMIN_PROBE_FAILURE_TTL_SECONDS
+        ADMIN_PROBE_CACHE[service_url] = AdminProbeCacheEntry(
+            reachable=reachable,
+            expires_at_monotonic=time.monotonic() + ttl_seconds,
+        )
+        return reachable
+    finally:
+        with _ADMIN_PROBE_LOCK:
+            _ADMIN_PROBE_REFRESHING.discard(service_url)
+
+
+def _start_admin_probe_refresh(service_url: str, timeout_seconds: float) -> None:
+    threading.Thread(
+        target=_refresh_admin_probe,
+        args=(service_url, timeout_seconds),
+        name="admin-probe-refresh",
+        daemon=True,
+    ).start()
+
+
+def admin_service_reachable(service_url: str, timeout_seconds: float) -> bool:
+    """Answer from the last admin health probe; never wait for a new one if there is an answer.
+
+    Admin is stopped by design most of the time, and a probe of a stopped
+    admin costs a refused connection, a timeout or a DNS miss. A fresh answer
+    is used as is. An expired answer is still returned at once, and one
+    background probe per URL replaces it, so the next page load sees the new
+    state. Only the very first lookup for a URL, before startup has warmed it,
+    waits for the probe.
     """
 
-    now = time.monotonic()
     cached = ADMIN_PROBE_CACHE.get(service_url)
-    if cached is not None and cached.expires_at_monotonic > now:
+    if cached is not None and cached.expires_at_monotonic > time.monotonic():
         return cached.reachable
-    reachable = _probe_admin_service(service_url, timeout_seconds)
-    ttl_seconds = ADMIN_PROBE_SUCCESS_TTL_SECONDS if reachable else ADMIN_PROBE_FAILURE_TTL_SECONDS
-    ADMIN_PROBE_CACHE[service_url] = AdminProbeCacheEntry(
-        reachable=reachable,
-        expires_at_monotonic=now + ttl_seconds,
-    )
-    return reachable
+    with _ADMIN_PROBE_LOCK:
+        already_refreshing = service_url in _ADMIN_PROBE_REFRESHING
+        _ADMIN_PROBE_REFRESHING.add(service_url)
+    if cached is None and not already_refreshing:
+        return _refresh_admin_probe(service_url, timeout_seconds)
+    if not already_refreshing:
+        _start_admin_probe_refresh(service_url, timeout_seconds)
+    # A cold lookup racing another cold lookup has nothing to serve yet; the
+    # admin button's stopped state is the safe answer until the probe lands.
+    return cached.reachable if cached is not None else False
+
+
+def warm_admin_probe(settings: Settings) -> None:
+    """Probe admin once at startup so the first page load has an answer ready."""
+
+    service_url = str(settings.admin.service_url or "").strip()
+    if service_url:
+        admin_service_reachable(service_url, settings.admin.timeout_seconds)
 
 
 def resolve_admin_launch_url(request: Request, settings: Settings) -> AdminLaunchState | None:
