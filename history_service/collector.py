@@ -42,6 +42,7 @@ from history_service.domain import (
     normalize_text,
     utcnow,
 )
+from history_service.backup_scheduler.service import read_archive_status
 from history_service.scheduled_backup import read_scheduled_backup_status
 from history_service.store import HistoryStore, SlotStateUpdate, is_database_corruption_error
 
@@ -489,12 +490,33 @@ class HistoryCollector:
                 )
             else:
                 try:
-                    latest_backup_at = self._latest_backup_at()
+                    latest_sidecar_backup_at = self._latest_backup_at()
+                    verified_full_at = self._verified_scheduler_full_backup_at(
+                        run_started,
+                        max_age=timedelta(
+                            seconds=max(0, int(self.settings.backup_interval_seconds or 0))
+                        ),
+                    )
+                    backup_times = [
+                        value
+                        for value in (latest_sidecar_backup_at, verified_full_at)
+                        if value is not None
+                    ]
+                    latest_backup_at = max(backup_times) if backup_times else None
                     if not self._backup_due(run_started, latest_backup_at=latest_backup_at):
+                        reason = (
+                            "verified_scheduler_full_backup"
+                            if verified_full_at is not None
+                            and (
+                                latest_sidecar_backup_at is None
+                                or verified_full_at >= latest_sidecar_backup_at
+                            )
+                            else "recent_backup"
+                        )
                         self._record_collection_stage(
                             "db.backup.skipped",
                             0.0,
-                            reason="recent_backup",
+                            reason=reason,
                             interval_seconds=max(0, int(self.settings.backup_interval_seconds or 0)),
                             latest_backup_at=isoformat_utc(latest_backup_at) if latest_backup_at else None,
                         )
@@ -938,6 +960,60 @@ class HistoryCollector:
             now,
             max_age=timedelta(seconds=self.settings.segmented_backup_max_age_seconds),
         )
+
+    def _verified_scheduler_full_backup_at(
+        self,
+        now: datetime,
+        *,
+        max_age: timedelta,
+    ) -> datetime | None:
+        """Return the scheduler's current catalog-verified FULL receipt time.
+
+        Unlike ``SCHEDULED_BACKUP_STATUS_FILE``, this receipt is published only
+        after the long-running scheduler has catalogued the local archive as a
+        verified FULL artifact. It is therefore strong enough to replace, not
+        merely gate retention on, the history sidecar's own SQLite copy (#455).
+        """
+
+        status_path = self.settings.backup_archive_status_file
+        if not status_path or max_age <= timedelta(0):
+            return None
+        status = read_archive_status(status_path)
+        if status is None:
+            return None
+        receipt = status.get("verified_full")
+        classes = status.get("classes")
+        full_run = classes.get("full") if isinstance(classes, dict) else None
+        if not isinstance(receipt, dict) or not isinstance(full_run, dict):
+            return None
+        artifact_id = receipt.get("artifact_id")
+        raw_created_at = receipt.get("created_at")
+        included_groups = receipt.get("included_groups")
+        if (
+            not isinstance(artifact_id, str)
+            or not artifact_id
+            or len(artifact_id) > 128
+            or not isinstance(raw_created_at, str)
+            or not isinstance(included_groups, list)
+            or "history_db" not in included_groups
+            or any(not isinstance(group, str) or not group for group in included_groups)
+            or len(included_groups) != len(set(included_groups))
+            or full_run.get("ok") is not True
+            or full_run.get("artifact_id") != artifact_id
+            or full_run.get("at") != raw_created_at
+        ):
+            return None
+        try:
+            created_at = datetime.fromisoformat(raw_created_at)
+        except ValueError:
+            return None
+        if created_at.tzinfo is None:
+            return None
+        created_at = created_at.astimezone(timezone.utc)
+        age = now.astimezone(timezone.utc) - created_at
+        if age < timedelta(0) or age >= max_age:
+            return None
+        return created_at
 
     def _scheduled_full_backup_at(self, now: datetime, *, max_age: timedelta) -> datetime | None:
         """When the scheduled full backup last saved the history database, if recent.
