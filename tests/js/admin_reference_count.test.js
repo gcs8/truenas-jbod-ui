@@ -64,3 +64,64 @@ test("every admin.js request has a timeout; backup transfers get the long one", 
   }
   assert.match(code, /const BACKUP_TRANSFER_TIMEOUT_MS = 30 \* 60 \* 1000;/);
 });
+
+function extractFunction(code, name) {
+  const start = code.search(new RegExp(`(?:async )?function ${name}\\(`));
+  assert.ok(start >= 0, `function ${name} must exist`);
+  const bodyStart = code.indexOf("{", code.indexOf(")", start));
+  let depth = 0;
+  for (let index = bodyStart; index < code.length; index += 1) {
+    if (code[index] === "{") depth += 1;
+    if (code[index] === "}") {
+      depth -= 1;
+      if (depth === 0) return code.slice(start, index + 1);
+    }
+  }
+  assert.fail(`function ${name} must have a complete body`);
+}
+
+test("fetchWithTimeout keeps the timer running while readBody reads a stalled body", async () => {
+  const vm = require("node:vm");
+  const code = fs.readFileSync(path.join(ROOT, FILES[0]), "utf8");
+  let bodyAborted = false;
+  const context = vm.createContext({
+    AbortController,
+    setTimeout,
+    clearTimeout,
+    Math,
+    Number,
+    DEFAULT_REQUEST_TIMEOUT_MS: 60000,
+    // Headers arrive at once; the body never finishes unless the request is aborted.
+    fetch: async (_url, { signal }) => ({
+      ok: true,
+      blob: () => new Promise((_resolve, reject) => {
+        signal.addEventListener("abort", () => {
+          bodyAborted = true;
+          reject(new DOMException("aborted", "AbortError"));
+        });
+      }),
+    }),
+  });
+  vm.runInContext(
+    `${extractFunction(code, "requestTimeoutError")}\n${extractFunction(code, "fetchWithTimeout")}\nglobalThis.fetchWithTimeout = fetchWithTimeout;`,
+    context
+  );
+  await assert.rejects(
+    context.fetchWithTimeout("/api/admin/backup/export", { timeoutMs: 20, readBody: (response) => response.blob() }),
+    (error) => error.timedOut === true && /Timed out after 1 second/.test(error.message)
+  );
+  assert.equal(bodyAborted, true, "the stalled download must be aborted");
+});
+
+test("a restore that times out after upload is reported as unknown, not failed", () => {
+  const code = fs.readFileSync(path.join(ROOT, FILES[0]), "utf8");
+  const source = extractFunction(code, "runImportBackup");
+  const dispatched = source.indexOf("importDispatched = true;");
+  assert.ok(dispatched > source.indexOf("window.confirm"), "the flag is set only once the restore is sent");
+  assert.ok(dispatched < source.indexOf("/api/admin/backup/import"));
+  const catchBlock = source.slice(source.lastIndexOf("} catch (error) {"));
+  const unknownBranch = catchBlock.indexOf("if (importDispatched && error?.timedOut)");
+  assert.ok(unknownBranch >= 0 && unknownBranch < catchBlock.indexOf("Import failed:"));
+  assert.match(catchBlock, /It is unknown whether the restore from \$\{file\.name\} finished\./);
+  assert.match(catchBlock, /before restoring again/);
+});

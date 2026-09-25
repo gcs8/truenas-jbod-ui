@@ -5788,7 +5788,9 @@
     // Every ordinary request gives up after timeoutMs so a stalled SSH or API hop
     // cannot leave a panel on "Inspecting..." forever. Callers may pass their own
     // signal (runtime actions do) and still get the timeout on top of it.
-    const { timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, signal: callerSignal, ...fetchOptions } = options;
+    // With readBody the timer also covers reading the body (fetch resolves once
+    // headers arrive), and the call resolves to { response, body }.
+    const { timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, signal: callerSignal, readBody, ...fetchOptions } = options;
     const controller = new AbortController();
     const cancel = () => controller.abort();
     let timedOut = false;
@@ -5802,7 +5804,8 @@
       callerSignal?.addEventListener("abort", cancel, { once: true });
     }
     try {
-      return await fetch(url, { ...fetchOptions, signal: controller.signal });
+      const response = await fetch(url, { ...fetchOptions, signal: controller.signal });
+      return readBody ? { response, body: await readBody(response) } : response;
     } catch (error) {
       if (timedOut && !callerSignal?.aborted) {
         throw requestTimeoutError(timeoutMs);
@@ -5812,6 +5815,11 @@
       clearTimeout(timerId);
       callerSignal?.removeEventListener("abort", cancel);
     }
+  }
+
+  // Export responses: the archive on success, the JSON error body otherwise.
+  function readDownloadOrError(response) {
+    return response.ok ? response.blob() : readJsonResponse(response);
   }
 
   function readOptionalSecretValue(field) {
@@ -6467,10 +6475,11 @@
     try {
       const stopServices = Boolean(elements.backupExportStopToggle?.checked);
       const restartServices = stopServices && Boolean(elements.backupExportRestartToggle?.checked);
-      const response = await fetchWithTimeout(
+      const { response, body: download } = await fetchWithTimeout(
         `/api/admin/backup/export?stop_services=${String(stopServices)}&restart_services=${String(restartServices)}`,
         {
           timeoutMs: BACKUP_TRANSFER_TIMEOUT_MS,
+          readBody: readDownloadOrError,
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -6482,10 +6491,9 @@
         }
       );
       if (!response.ok) {
-        const payload = await readJsonResponse(response);
-        throw new Error(describeApiError(payload?.detail) || `Request failed with ${response.status}`);
+        throw new Error(describeApiError(download?.detail) || `Request failed with ${response.status}`);
       }
-      const blob = await response.blob();
+      const blob = download;
       const objectUrl = window.URL.createObjectURL(blob);
       const anchor = document.createElement("a");
       anchor.href = objectUrl;
@@ -6545,10 +6553,11 @@
     try {
       const stopServices = Boolean(elements.debugExportStopToggle?.checked);
       const restartServices = stopServices && Boolean(elements.debugExportRestartToggle?.checked);
-      const response = await fetchWithTimeout(
+      const { response, body: download } = await fetchWithTimeout(
         `/api/admin/debug/export?stop_services=${String(stopServices)}&restart_services=${String(restartServices)}`,
         {
           timeoutMs: BACKUP_TRANSFER_TIMEOUT_MS,
+          readBody: readDownloadOrError,
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -6562,10 +6571,9 @@
         }
       );
       if (!response.ok) {
-        const payload = await readJsonResponse(response);
-        throw new Error(describeApiError(payload?.detail) || `Request failed with ${response.status}`);
+        throw new Error(describeApiError(download?.detail) || `Request failed with ${response.status}`);
       }
-      const blob = await response.blob();
+      const blob = download;
       const objectUrl = window.URL.createObjectURL(blob);
       const anchor = document.createElement("a");
       anchor.href = objectUrl;
@@ -6642,6 +6650,7 @@
   }
 
   async function runImportBackup() {
+    let importDispatched = false;
     const file = readSelectedImportFile();
     const passphrase = readOptionalSecretValue(elements.backupImportPassphrase);
     if (!file) {
@@ -6661,8 +6670,9 @@
       const secretHeaders = passphrase !== null
         ? { "X-Backup-Passphrase-Base64": encodeUtf8Base64(passphrase) }
         : {};
-      const inspectionResponse = await fetchWithTimeout("/api/admin/backup/inspect", {
+      const { response: inspectionResponse, body: inspection } = await fetchWithTimeout("/api/admin/backup/inspect", {
         timeoutMs: BACKUP_TRANSFER_TIMEOUT_MS,
+        readBody: readJsonResponse,
         method: "POST",
         headers: {
           "Content-Type": "application/octet-stream",
@@ -6670,7 +6680,6 @@
         },
         body: archiveBytes,
       });
-      const inspection = await readJsonResponse(inspectionResponse);
       if (!inspectionResponse.ok || inspection?.ok === false) {
         throw new Error(
           describeApiError(inspection?.detail) ||
@@ -6690,10 +6699,12 @@
       if (elements.backupImportResult) {
         elements.backupImportResult.textContent = `Importing inspected ${file.name}...`;
       }
-      const response = await fetchWithTimeout(
+      importDispatched = true;
+      const { response, body: payload } = await fetchWithTimeout(
         `/api/admin/backup/import?stop_services=${String(stopServices)}&restart_services=${String(restartServices)}`,
         {
           timeoutMs: BACKUP_TRANSFER_TIMEOUT_MS,
+          readBody: readJsonResponse,
           method: "POST",
           headers: {
             "Content-Type": "application/octet-stream",
@@ -6704,7 +6715,6 @@
           body: archiveBytes,
         }
       );
-      const payload = await readJsonResponse(response);
       if (!response.ok || payload?.ok === false) {
         throw new Error(describeApiError(payload?.detail) || `Request failed with ${response.status}`);
       }
@@ -6734,6 +6744,17 @@
       }
       await refreshState({ quiet: true });
     } catch (error) {
+      if (importDispatched && error?.timedOut) {
+        // The restore runs on the server after the upload, so a browser timeout
+        // does not stop it. Say the outcome is unknown instead of "failed" so
+        // nobody repeats a restore that may already have been applied.
+        const message = `It is unknown whether the restore from ${file.name} finished. ${error.message} Refresh the page to check the current settings before restoring again.`;
+        if (elements.backupImportResult) {
+          elements.backupImportResult.textContent = message;
+        }
+        setBanner(message, "error");
+        return;
+      }
       if (elements.backupImportResult) {
         elements.backupImportResult.textContent = `Import failed: ${error.message || error}`;
       }
