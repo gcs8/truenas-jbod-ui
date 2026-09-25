@@ -469,6 +469,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Performance
 
+- SSH SMART reads that overlap on a host now share one connection and run
+  on up to 8 channels, so `smart_batch_max_concurrency` speeds up SSH grids
+  (60 bays: 60 connections to 5, 13.9 s to 1.6 s in the modeled benchmark).
+  A full disk sync starts and polls over one connection instead of logging
+  in for every poll. (#605)
 - Storage views collect SMART data for history in batches of
   `HISTORY_SMART_BATCH_SIZE` slots through a new
   `POST /api/storage-views/{view_id}/slots/smart-batch` route, so a 60-slot
