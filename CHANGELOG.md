@@ -105,7 +105,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 ### Changed
 
 - The admin now says an SSH key file "was not found in the admin container"
-  instead of naming the "admin sidecar". (#435)
+  instead of naming the "admin sidecar". (#601)
 - The main page reuses bay tiles when a refresh brings the same layout,
   evaluates the heat map once per render instead of once per saved-view bay,
   and stops its one-second timer when nothing is counting down. (#596)
