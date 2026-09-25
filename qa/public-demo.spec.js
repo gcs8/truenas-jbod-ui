@@ -78,6 +78,16 @@ async function startPagesServer(artifactPath) {
   };
 }
 
+// #439: a saved copy hides controls it cannot use instead of showing them
+// disabled. Controls inside a closed <details> or a hidden ancestor count as
+// hidden, so this lists only what a visitor can actually see.
+async function visibleDisabledControls(page) {
+  return page.evaluate(() => Array.from(document.querySelectorAll("button, input, select, textarea"))
+    .filter((control) => control.disabled || control.getAttribute("aria-disabled") === "true")
+    .filter((control) => control.checkVisibility({ visibilityProperty: true }))
+    .map((control) => control.id || control.name || control.textContent.trim()));
+}
+
 test("public demo static artifact is explorable without a live backend", async ({ page }) => {
   const demoPath = resolvePublicDemoArtifact();
   const consoleErrors = [];
@@ -111,6 +121,7 @@ test("public demo static artifact is explorable without a live backend", async (
   await expect(page.locator("#auto-refresh-field")).toBeHidden();
   await expect(page.locator("#refresh-interval-field")).toBeHidden();
   await expect(page.locator("#inventory-evidence-disclosure")).toBeHidden();
+  expect(await visibleDisabledControls(page)).toEqual([]);
   await expect(page.locator(".public-demo-identity")).toHaveCount(2);
   const identities = await page.locator(".public-demo-identity").allTextContents();
   expect(identities[0]).toMatch(/^[0-9a-f]{40}$/);
@@ -217,8 +228,13 @@ test("public demo static artifact is explorable without a live backend", async (
 
   await expect(page.locator("#refresh-button")).toBeDisabled();
   await expect(page.locator("#disk-inventory-sync-controls")).toHaveClass(/hidden/);
-  await expect(page.locator("#export-mappings-button")).toBeDisabled();
-  await expect(page.locator("#import-mappings-button")).toBeDisabled();
+  await expect(page.locator("#mapping-panel")).toBeHidden();
+  await expect(page.locator("#export-mappings-button")).toBeHidden();
+  await expect(page.locator("#import-mappings-button")).toBeHidden();
+  await expect(page.locator("#sas-fabric-refresh-button")).toBeHidden();
+  await expect(page.locator("#system-select")).toBeHidden();
+  await expect(page.locator("#system-select-static")).toHaveText("Demo Storage Host");
+  expect(await visibleDisabledControls(page)).toEqual([]);
   expect(consoleErrors).toEqual([]);
   expect(outboundRequests).toEqual([]);
 });

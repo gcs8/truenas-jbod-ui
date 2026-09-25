@@ -152,6 +152,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Saved copies and the public demo hide the bay assignment editor, the
+  Storage Fabric refresh button and selectors with nothing to switch to,
+  instead of showing them disabled. (#587)
 - Refreshed the header release note without a page reload while the first
   check is still running or has failed, so a failure at boot clears within
   minutes, and renamed the admin timing labels and storage-view template notes
