@@ -4627,7 +4627,18 @@
     }
     if (config.packagingSelect) {
       const currentPackaging = config.packagingSelect.value || config.defaultPackaging || "tar.zst";
-      if (encryptEnabled) {
+      if (encryptEnabled && config.streamEncryptedFull) {
+        // #397: an encrypted FULL backup (with history) defaults to tar.zst in the
+        // TJBENC02 envelope; 7z stays available for older app versions and 7-Zip.
+        if (state[config.forced7zKey] || (currentPackaging !== "7z" && currentPackaging !== "tar.zst")) {
+          if (!state[config.forced7zKey] && currentPackaging && currentPackaging !== "7z") {
+            state[config.lastPlainPackagingKey] = currentPackaging;
+          }
+          config.packagingSelect.value = "tar.zst";
+          state[config.forced7zKey] = true;
+        }
+        config.packagingSelect.disabled = false;
+      } else if (encryptEnabled) {
         if (!state[config.forced7zKey] && currentPackaging && currentPackaging !== "7z") {
           state[config.lastPlainPackagingKey] = currentPackaging;
         }
@@ -4718,6 +4729,7 @@
       lastPlainPackagingKey: "backupLastPlainPackaging",
       forced7zKey: "backupForced7z",
       manualEncryptKey: "backupManualEncrypt",
+      streamEncryptedFull: Array.isArray(state.selectedBackupPaths) && state.selectedBackupPaths.includes("history_db"),
     });
     syncSingleBundleControls("debug", {
       encryptToggle: elements.debugEncryptToggle,
@@ -4918,7 +4930,7 @@
     }
     state.setupDirty = false;
     if (elements.setupResult) {
-      elements.setupResult.textContent = "Saved systems appear in the main UI after a restart.";
+      elements.setupResult.textContent = "Saved systems appear in the main UI within a few seconds.";
     }
     syncPlatformHelp();
     syncVerifySslHelp();
@@ -7139,7 +7151,7 @@
       state.defaultSystemId = result.default_system_id || state.defaultSystemId;
       renderSaveResult(
         elements.setupResult,
-        result.detail || `${result.updated_existing ? "Updated" : "Created"} ${result.system?.label || payload.label}. Restart the main UI to show it.`,
+        result.detail || `${result.updated_existing ? "Updated" : "Created"} ${result.system?.label || payload.label}.`,
         result
       );
       updateCreateButton();
@@ -7232,7 +7244,7 @@
 
       renderSaveResult(
         elements.setupResult,
-        payload.detail || `Removed ${payload.deleted_label || selectedSystem.label || selectedSystem.id}. Restart the main UI to remove it there too.`,
+        payload.detail || `Removed ${payload.deleted_label || selectedSystem.label || selectedSystem.id}.`,
         payload
       );
       if (elements.existingSystemDeleteHistoryToggle) {
@@ -7497,6 +7509,11 @@
       if (!bundleHasLockedSelection("backup") && elements.backupPackaging?.value && elements.backupPackaging.value !== "7z") {
         state.backupLastPlainPackaging = elements.backupPackaging.value;
       }
+      if (elements.backupEncryptToggle?.checked) {
+        // An explicit tar.zst/7z choice for an encrypted FULL backup is kept.
+        state.backupForced7z = false;
+      }
+      syncBackupControls();
     });
     elements.debugScrubSecretsToggle?.addEventListener("change", () => {
       syncBackupControls();

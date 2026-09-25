@@ -1246,21 +1246,110 @@ class SystemBackupServiceTests(unittest.TestCase):
             self._export_stream_full("space passphrase").cleanup()
         self.assertEqual(calls, [3])
 
-    def test_stream_full_backup_keeps_7z_default_and_rejects_unknown_format(self) -> None:
+    def test_stream_full_backup_is_the_default_and_rejects_unknown_format(self) -> None:
+        # #397: new FULL backups default to tar.zst in the TJBENC02 envelope.
+        from history_service.backup_archive import stream_envelope
+
         with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
             get_settings.cache_clear()
             with self.assertRaisesRegex(ValueError, "must be 7z or tar.zst"):
                 self.backup_service.export_scheduled_bundle_to_file(
                     passphrase="x", included_paths=[HISTORY_DB_KEY], archive_format="zip"
                 )
-            with patch.object(self.backup_service, "_run_7z_command", side_effect=self._fake_7z_command):
+            with patch.object(
+                self.backup_service,
+                "_run_7z_command",
+                side_effect=AssertionError("the default FULL format must not invoke 7z"),
+            ):
                 artifact = self.backup_service.export_scheduled_bundle_to_file(
                     passphrase="default format passphrase", included_paths=[HISTORY_DB_KEY]
                 )
         try:
-            self.assertTrue(artifact.filename.endswith(".7z"))
+            self.assertTrue(artifact.filename.endswith(".tar.zst.enc"))
+            self.assertTrue(artifact.path.read_bytes().startswith(stream_envelope.MAGIC))
+            self.assertEqual(artifact.manifest["packaging"], "tar.zst")
         finally:
             artifact.cleanup()
+
+    def test_explicit_7z_full_backup_still_exports_and_restores(self) -> None:
+        # #397: 7z stays available for older app versions and plain 7-Zip, and
+        # 7z FULL backups keep restoring through the file-backed import path.
+        passphrase = "portable 7z full passphrase"
+        original_mapping = self.mapping_path.read_bytes()
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            with patch.object(self.backup_service, "_run_7z_command", side_effect=self._fake_7z_command):
+                artifact = self.backup_service.export_scheduled_bundle_to_file(
+                    passphrase=passphrase,
+                    included_paths=[HISTORY_DB_KEY, MAPPING_FILE_KEY],
+                    archive_format="7z",
+                )
+                try:
+                    self.assertTrue(artifact.filename.endswith(".7z"))
+                    self.assertTrue(artifact.path.read_bytes().startswith(SEVEN_ZIP_SIGNATURE))
+                    self.assertEqual(artifact.manifest["packaging"], "7z")
+                    inspection = self.backup_service.inspect_bundle_file(
+                        artifact.path, passphrase=passphrase, expected_encrypted=True
+                    )
+                    self.assertTrue(inspection["ok"])
+                    self.assertEqual(inspection["packaging"], "7z")
+                    self.mapping_path.write_text('{"version": 1, "slot_mappings": {}}', encoding="utf-8")
+                    result = self.backup_service.import_bundle_from_file(
+                        artifact.path, passphrase=passphrase, expected_encrypted=True
+                    )
+                finally:
+                    artifact.cleanup()
+        self.assertEqual(result["packaging"], "7z")
+        self.assertIn(HISTORY_DB_KEY, result["included_groups"])
+        self.assertEqual(self.mapping_path.read_bytes(), original_mapping)
+
+    def test_admin_encrypted_full_export_defaults_to_stream_and_keeps_7z_choice(self) -> None:
+        # #397: the admin export (packaging defaults to tar.zst) seals an
+        # encrypted FULL backup in TJBENC02; packaging="7z" keeps 7z, and an
+        # encrypted export without history stays 7z.
+        from history_service.backup_archive import stream_envelope
+
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            with patch.object(
+                self.backup_service,
+                "_run_7z_command",
+                side_effect=AssertionError("the default admin FULL export must not invoke 7z"),
+            ):
+                fast = self.backup_service.export_bundle_to_file(
+                    encrypt=True,
+                    passphrase="admin fast passphrase",
+                    included_paths=[HISTORY_DB_KEY, MAPPING_FILE_KEY],
+                )
+            try:
+                self.assertTrue(fast.filename.endswith(".tar.zst.enc"))
+                self.assertEqual(fast.media_type, "application/octet-stream")
+                self.assertTrue(fast.path.read_bytes().startswith(stream_envelope.MAGIC))
+                self.assertEqual(fast.manifest["packaging"], "tar.zst")
+                self.assertTrue(
+                    self.backup_service.inspect_bundle_file(
+                        fast.path, passphrase="admin fast passphrase", expected_encrypted=True
+                    )["ok"]
+                )
+            finally:
+                fast.cleanup()
+            with patch.object(self.backup_service, "_run_7z_command", side_effect=self._fake_7z_command):
+                for groups, packaging in (
+                    ([HISTORY_DB_KEY, MAPPING_FILE_KEY], "7z"),
+                    ([MAPPING_FILE_KEY], "tar.zst"),
+                ):
+                    with self.subTest(groups=groups, packaging=packaging):
+                        portable = self.backup_service.export_bundle_to_file(
+                            encrypt=True,
+                            passphrase="admin portable passphrase",
+                            packaging=packaging,
+                            included_paths=groups,
+                        )
+                        try:
+                            self.assertTrue(portable.filename.endswith(".7z"))
+                            self.assertEqual(portable.manifest["packaging"], "7z")
+                        finally:
+                            portable.cleanup()
 
     def test_one_shot_runner_publishes_restore_grade_mapping_profile_and_calibration_backup(
         self,
@@ -4819,7 +4908,7 @@ sys.stdout.flush()
                 artifact = self.backup_service.export_bundle(
                     encrypt=True,
                     passphrase="topsecret",
-                    packaging="tar.zst",
+                    packaging="7z",
                 )
 
                 self.assertTrue(artifact.filename.endswith(".7z"))
@@ -4892,7 +4981,7 @@ sys.stdout.flush()
                 artifact = self.backup_service.export_bundle(
                     encrypt=True,
                     passphrase=padded_passphrase,
-                    packaging="tar.zst",
+                    packaging="7z",
                 )
 
                 with self.assertRaisesRegex(ValueError, "Check the passphrase"):

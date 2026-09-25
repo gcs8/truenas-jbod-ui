@@ -307,17 +307,20 @@ class ScheduledBackupRunnerTests(unittest.TestCase):
     def tearDown(self) -> None:
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
-    def test_runner_passes_the_fast_full_format_only_when_chosen(self) -> None:
-        # #397: 7z stays the default call shape; tar.zst is passed explicitly.
+    def test_runner_defaults_to_the_fast_full_format_and_keeps_7z_choice(self) -> None:
+        # #397: tar.zst is the default FULL format; 7z is passed when chosen.
         self._runner().run_once()
-        self.assertNotIn("archive_format", self.backup_service.export_scheduled_bundle_to_file.call_args.kwargs)
-        self.backup_service.export_scheduled_bundle_to_file.reset_mock()
-        self.workspace.mkdir(exist_ok=True)  # the first run's artifact cleanup removed it
-        self.artifact_path.write_bytes(b"authenticated-encrypted-archive")
-        self._runner(archive_format="tar.zst").run_once()
         self.assertEqual(
             self.backup_service.export_scheduled_bundle_to_file.call_args.kwargs["archive_format"],
             "tar.zst",
+        )
+        self.backup_service.export_scheduled_bundle_to_file.reset_mock()
+        self.workspace.mkdir(exist_ok=True)  # the first run's artifact cleanup removed it
+        self.artifact_path.write_bytes(b"authenticated-encrypted-archive")
+        self._runner(archive_format="7z").run_once()
+        self.assertEqual(
+            self.backup_service.export_scheduled_bundle_to_file.call_args.kwargs["archive_format"],
+            "7z",
         )
 
     def _runner(self, **overrides: object) -> ScheduledBackupRunner:
@@ -356,6 +359,7 @@ class ScheduledBackupRunnerTests(unittest.TestCase):
         self.backup_service.export_scheduled_bundle_to_file.assert_called_once_with(
             passphrase="correct horse battery staple",
             included_paths=["config_file", "mapping_file", "profile_file"],
+            archive_format="tar.zst",
         )
         preflight_path = self.backup_service.preflight_scheduled_bundle_file.call_args.args[0]
         self.assertEqual(Path(preflight_path).parent, self.destination)
@@ -745,6 +749,18 @@ class ScheduledBackupDeploymentContractTests(unittest.TestCase):
             segment_catalog_path="/tmp/segments/catalog.json",
         )
         self.assertEqual(runner_factory.call_args.kwargs["app_gid"], 10001)
+        # #397: the one-shot job defaults to the fast FULL format.
+        self.assertEqual(runner_factory.call_args.kwargs["archive_format"], "tar.zst")
+
+    def test_one_shot_archive_format_defaults_to_tar_zst_and_reads_the_env_switch(self) -> None:
+        self.assertEqual(ScheduledBackupSettings().archive_format, "tar.zst")
+        with patch.dict(os.environ, {"BACKUP_FULL_ARCHIVE_FORMAT": ""}, clear=False):
+            self.assertEqual(ScheduledBackupSettings.from_environment().archive_format, "tar.zst")
+        with patch.dict(os.environ, {"BACKUP_FULL_ARCHIVE_FORMAT": " 7Z "}, clear=False):
+            self.assertEqual(ScheduledBackupSettings.from_environment().archive_format, "7z")
+        with patch.dict(os.environ, {"BACKUP_FULL_ARCHIVE_FORMAT": "zip"}, clear=False):
+            with self.assertRaisesRegex(ValueError, "BACKUP_FULL_ARCHIVE_FORMAT must be 7z or tar.zst"):
+                ScheduledBackupSettings.from_environment()
 
     def test_runner_module_has_no_network_server_or_docker_control_dependency(self) -> None:
         source = (Path(__file__).resolve().parents[1] / "history_service/scheduled_backup_main.py").read_text(

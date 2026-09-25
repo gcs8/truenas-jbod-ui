@@ -2059,12 +2059,26 @@ class SystemBackupService:
         packaging: ArchivePackaging = "tar.zst",
         included_paths: list[str] | None = None,
     ) -> FileBackupArtifact:
+        """Export a system backup to a private file.
+
+        An encrypted FULL backup (one that includes ``history_db``) requested as
+        ``tar.zst`` is sealed in the chunked TJBENC02 envelope (#397); choose
+        ``7z`` for an archive older app versions and plain 7-Zip can open. Other
+        encrypted exports stay 7z.
+        """
+
+        stream_encrypted = (
+            bool(encrypt)
+            and self._normalize_packaging(packaging) == "tar.zst"
+            and HISTORY_DB_KEY in self._resolve_selected_groups(included_paths, bundle_type="backup")
+        )
         return self._export_bundle_to_file(
             encrypt=encrypt,
             passphrase=passphrase,
             packaging=packaging,
             included_paths=included_paths,
             encrypted_outer_envelope=False,
+            stream_encrypted=stream_encrypted,
         )
 
     def _export_bundle_to_file(
@@ -2220,14 +2234,15 @@ class SystemBackupService:
         *,
         passphrase: str,
         included_paths: list[str] | None = None,
-        archive_format: str = "7z",
+        archive_format: str = "tar.zst",
     ) -> FileBackupArtifact:
         """Export an encrypted scheduled backup.
 
-        With history, ``archive_format`` picks the portable 7z archive (the
-        default) or ``tar.zst`` in the chunked TJBENC02 envelope, which is much
-        faster for multi-GiB history (#397). Without history the archive is
-        always tar.zst in the TJBENC01 envelope.
+        With history, ``archive_format`` picks ``tar.zst`` in the chunked
+        TJBENC02 envelope (the default since #397, much faster for multi-GiB
+        history) or the portable 7z archive that older app versions and plain
+        7-Zip can open. Without history the archive is always tar.zst in the
+        TJBENC01 envelope.
         """
 
         if not passphrase:

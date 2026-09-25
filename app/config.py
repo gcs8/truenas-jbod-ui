@@ -5,8 +5,8 @@ import json
 import logging
 import os
 import re
+import threading
 import types
-from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal, Union, get_args, get_origin
 
@@ -1266,8 +1266,113 @@ def _normalize_systems(settings: Settings) -> Settings:
     )
 
 
-@lru_cache
+# Settings that only take effect when the main UI process starts: the bind
+# address, values captured while the app object is built (docs routes, the
+# public origin used by write checks, the perf middleware, the release-check
+# task, start-up warm-up) and the file paths behind open log handlers and data
+# stores. Everything else in config.yaml, runtime-overrides.yaml and
+# profiles.yaml is applied by the running main UI when the file changes (#432).
+# Sign-in (ADMIN_AUTH_MODE and its credentials) and every other .env value are
+# process environment, so they also need a restart; they are not listed here
+# because they are not config-file settings.
+RESTART_ONLY_SETTINGS: tuple[tuple[str, ...], ...] = (
+    ("app", "host"),
+    ("app", "port"),
+    ("app", "public_origin"),
+    ("app", "debug"),
+    ("app", "startup_warm_cache_enabled"),
+    ("app", "startup_warm_smart_enabled"),
+    ("app", "release_check_enabled"),
+    ("app", "release_check_repo"),
+    ("app", "release_check_interval_seconds"),
+    ("app", "release_check_timeout_seconds"),
+    ("perf",),
+    ("paths",),
+    ("config_file",),
+)
+
+
+def _settings_value(settings: Settings, path: tuple[str, ...]) -> Any:
+    value: Any = settings
+    for part in path:
+        value = getattr(value, part)
+    return value
+
+
+def restart_only_changes(before: Settings, after: Settings) -> list[str]:
+    """Dotted names of restart-only settings that differ between two loads."""
+    return [
+        ".".join(path)
+        for path in RESTART_ONLY_SETTINGS
+        if _settings_value(before, path) != _settings_value(after, path)
+    ]
+
+
+def with_running_restart_only_settings(running: Settings, loaded: Settings) -> Settings:
+    """``loaded`` with every restart-only setting kept at its ``running`` value."""
+    app_fields = {path[1] for path in RESTART_ONLY_SETTINGS if path[0] == "app" and len(path) == 2}
+    return loaded.model_copy(
+        update={
+            "app": loaded.app.model_copy(
+                update={field: getattr(running.app, field) for field in app_fields}
+            ),
+            "perf": running.perf,
+            "paths": running.paths,
+            "config_file": running.config_file,
+        }
+    )
+
+
+def config_watch_paths(settings: Settings) -> tuple[Path, ...]:
+    """The files the main UI watches for changes: config, runtime overrides, profiles."""
+    return (
+        Path(settings.config_file),
+        Path(settings.paths.runtime_overrides_file),
+        Path(settings.paths.profile_file),
+    )
+
+
+_SETTINGS_LOCK = threading.RLock()
+_cached_settings: Settings | None = None
+
+
 def get_settings() -> Settings:
+    """The loaded settings, read from disk once and then reused.
+
+    ``get_settings.cache_clear()`` forces the next call to read the files
+    again, as with the ``lru_cache`` this replaces. ``replace_settings``
+    installs settings that were already loaded and validated elsewhere (the
+    main UI's config reloader), so no caller ever sees a half-loaded value.
+    """
+    cached = _cached_settings
+    if cached is not None:
+        return cached
+    with _SETTINGS_LOCK:
+        if _cached_settings is None:
+            _store_settings(load_settings())
+        return _cached_settings  # type: ignore[return-value]
+
+
+def _store_settings(settings: Settings | None) -> None:
+    global _cached_settings
+    _cached_settings = settings
+
+
+def _clear_settings_cache() -> None:
+    with _SETTINGS_LOCK:
+        _store_settings(None)
+
+
+def replace_settings(settings: Settings) -> None:
+    with _SETTINGS_LOCK:
+        _store_settings(settings)
+
+
+get_settings.cache_clear = _clear_settings_cache  # type: ignore[attr-defined]
+
+
+def load_settings() -> Settings:
+    """Read and validate config.yaml, runtime-overrides.yaml, profiles.yaml and .env."""
     defaults = Settings().model_dump()
     config_path = Path(os.getenv("APP_CONFIG_PATH", defaults["config_file"]))
     yaml_config = _load_yaml_config(config_path)

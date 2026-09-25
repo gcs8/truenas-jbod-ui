@@ -103,7 +103,7 @@
           <h2>Backup and restore</h2>
           <p class="panel-copy">
             Everything this app knows (settings, profiles, mappings, history) in one file.
-            Encrypted backups are standard <code>.7z</code> files.
+            Encrypted backups that include history are <code>.tar.zst.enc</code> by default; choose 7-Zip for a file older app versions and 7-Zip can open.
           </p>
         </div>
       </div>
@@ -135,7 +135,7 @@
               <span>Export Passphrase</span>
               <input id="backup-export-passphrase" type="password" placeholder="Required when export encryption is enabled">
             </label>
-            <p class="subtle action-note field-span">Passphrases preserve all spaces. Encrypted exports use <code>.7z</code>.</p>
+            <p class="subtle action-note field-span">Passphrases preserve all spaces. Encrypted exports with history use <code>.tar.zst.enc</code> (restores on this app version and later) or <code>.7z</code>; other encrypted exports use <code>.7z</code>.</p>
           </div>
 
           <div class="toggle-group">
@@ -891,7 +891,7 @@
             <button id="setup-create-button" class="button" type="button">Save system</button>
           </div>
           <p id="setup-result" class="subtle action-note">
-            Saved systems appear in the main UI after a restart.
+            Saved systems appear in the main UI within a few seconds.
           </p>
         </div>
 
