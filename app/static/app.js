@@ -115,6 +115,7 @@
     timerDueAt: 0,
     timerDelayMs: 0,
     timingTickId: null,
+    timingVisibilityListenerBound: false,
     identifyVerifyTimerId: null,
     diskInventorySync: { inFlight: false },
     refreshesInFlight: 0,
@@ -884,16 +885,18 @@
     return haystack.includes(state.search);
   }
 
-  function buildStorageViewRuntimeTooltip(slot, selectedView) {
+  // Grid renders pass the context they already built, so a heat-map render
+  // evaluates the metric once instead of once per tile (#461).
+  function buildStorageViewRuntimeTooltip(slot, selectedView, heatmapContext = null) {
     if (!slot) {
       return "";
     }
-    return buildStorageViewTooltipLines(slot, selectedView, getStorageViewSmartSummaryEntry(selectedView, slot)).join("\n");
+    return buildStorageViewTooltipLines(slot, selectedView, getStorageViewSmartSummaryEntry(selectedView, slot), heatmapContext).join("\n");
   }
 
-  function renderStorageViewGrid(selectedView) {
+  function renderStorageViewGrid(selectedView, target = grid) {
     hideSlotTooltip();
-    grid.innerHTML = "";
+    target.innerHTML = "";
     const slotLayout = Array.isArray(selectedView?.slot_layout) ? selectedView.slot_layout : [];
     const slotsByIndex = new Map((selectedView?.slots || []).map((slot) => [Number(slot.slot_index), slot]));
     const peerContext = getSelectedPeerContext();
@@ -943,7 +946,7 @@
         if (state.selectedSlot === slot.slot_index) {
           tile.classList.add("selected");
         }
-        tile.setAttribute("aria-label", buildStorageViewRuntimeTooltip(slot, selectedView));
+        tile.setAttribute("aria-label", buildStorageViewRuntimeTooltip(slot, selectedView, heatmapContext));
         tile.innerHTML = buildNvmeRuntimeTileMarkup(slot, selectedView);
         applyHeatmapToTile(tile, heatmapContext, slot.slot_index);
         board.appendChild(tile);
@@ -954,7 +957,7 @@
       edgeNote.textContent = boardLayout.edgeNote;
       board.appendChild(edgeNote);
 
-      grid.appendChild(board);
+      target.appendChild(board);
       return;
     }
 
@@ -1012,7 +1015,7 @@
       }
       tile.setAttribute(
         "aria-label",
-        liveSlot ? slotAccessibleName(liveSlot) : buildStorageViewRuntimeTooltip(slot, selectedView)
+        liveSlot ? slotAccessibleName(liveSlot) : buildStorageViewRuntimeTooltip(slot, selectedView, heatmapContext)
       );
       if (liveSlot) {
         tile.setAttribute("aria-describedby", "slot-tooltip");
@@ -1038,12 +1041,12 @@
       container.appendChild(tile);
     };
 
-    renderChassisRows(slotLayout, geometry, appendTile);
+    renderChassisRows(slotLayout, geometry, appendTile, target);
   }
 
-  function renderLiveNvmeCarrierGrid(selectedProfile) {
+  function renderLiveNvmeCarrierGrid(selectedProfile, target = grid) {
     hideSlotTooltip();
-    grid.innerHTML = "";
+    target.innerHTML = "";
     const slotLayout = activeLayoutRows();
     const slotsByNumber = new Map(state.snapshot.slots.map((slot) => [slot.slot, slot]));
     const peerContext = getSelectedPeerContext();
@@ -1112,7 +1115,7 @@
     edgeNote.textContent = boardLayout.edgeNote;
     board.appendChild(edgeNote);
 
-    grid.appendChild(board);
+    target.appendChild(board);
   }
 
   function usesGenericPersistentIdLabel() {
@@ -1581,7 +1584,7 @@
       .join(" ");
   }
 
-  function renderChassisRows(layoutRows, geometry, appendTile) {
+  function renderChassisRows(layoutRows, geometry, appendTile, target = grid) {
     buildLayoutGridRows(layoutRows, geometry).forEach((layoutRow) => {
       const row = layoutRow.slots;
       const rowWrapper = document.createElement("div");
@@ -1622,7 +1625,7 @@
       }
 
       rowWrapper.appendChild(rowSlots);
-      grid.appendChild(rowWrapper);
+      target.appendChild(rowWrapper);
       rowSlots.style.gridTemplateColumns = isFlatTopLoaderGrouping
         ? flatGroupedColumnTemplate(row.length, flatGroupBreakpoints)
         : groupColumnTemplate(rowGroups, geometry?.layoutMode || "");
@@ -5456,11 +5459,11 @@
     return lines;
   }
 
-  function appendHeatmapTooltipLines(lines, entryKey) {
+  function appendHeatmapTooltipLines(lines, entryKey, context = null) {
     if (!state.heatmap.enabled) {
       return lines;
     }
-    return [...lines, ...heatmapTooltipLines(entryKey)];
+    return [...lines, ...heatmapTooltipLines(entryKey, context)];
   }
 
   function heatmapHistoryScopeRequest() {
@@ -5815,7 +5818,7 @@
     }
   }
 
-  function buildStorageViewTooltipLines(slot, selectedView, smartEntry) {
+  function buildStorageViewTooltipLines(slot, selectedView, smartEntry, heatmapContext = null) {
     if (!slot) {
       return [];
     }
@@ -5852,7 +5855,7 @@
       lines.push(`Source: ${slot.source}`);
     }
 
-    return appendHeatmapTooltipLines(lines, slot.slot_index);
+    return appendHeatmapTooltipLines(lines, slot.slot_index, heatmapContext);
   }
 
   function buildTooltipLines(slot, smartEntry) {
@@ -6342,27 +6345,116 @@
     });
   }
 
+  // Walks the live grid and a freshly rendered one together. When rows, groups,
+  // dividers and slot order match, it collects the [current, next] tile pairs;
+  // any other difference means the layout changed and returns false.
+  function matchGridStructure(current, next, pairs) {
+    if (current.childElementCount !== next.childElementCount) {
+      return false;
+    }
+    let currentChild = current.firstElementChild;
+    let nextChild = next.firstElementChild;
+    while (currentChild) {
+      const currentIsTile = currentChild.matches(".slot-tile[data-slot]");
+      if (currentIsTile !== nextChild.matches(".slot-tile[data-slot]")) {
+        return false;
+      }
+      if (currentIsTile) {
+        if (currentChild.dataset.slot !== nextChild.dataset.slot) {
+          return false;
+        }
+        pairs.push([currentChild, nextChild]);
+      } else if (!currentChild.childElementCount && !nextChild.childElementCount) {
+        if (!currentChild.isEqualNode(nextChild)) {
+          return false;
+        }
+      } else if (
+        currentChild.tagName !== nextChild.tagName
+        || currentChild.className !== nextChild.className
+        || currentChild.getAttribute("style") !== nextChild.getAttribute("style")
+        || !matchGridStructure(currentChild, nextChild, pairs)
+      ) {
+        return false;
+      }
+      currentChild = currentChild.nextElementSibling;
+      nextChild = nextChild.nextElementSibling;
+    }
+    return true;
+  }
+
+  function syncElementAttributes(current, next) {
+    Array.from(current.attributes).forEach((attribute) => {
+      if (!next.hasAttribute(attribute.name)) {
+        current.removeAttribute(attribute.name);
+      }
+    });
+    Array.from(next.attributes).forEach((attribute) => {
+      if (current.getAttribute(attribute.name) !== attribute.value) {
+        current.setAttribute(attribute.name, attribute.value);
+      }
+    });
+  }
+
+  function tileChildrenEqual(current, next) {
+    const currentNodes = current.childNodes;
+    const nextNodes = next.childNodes;
+    if (currentNodes.length !== nextNodes.length) {
+      return false;
+    }
+    for (let index = 0; index < currentNodes.length; index += 1) {
+      if (!currentNodes[index].isEqualNode(nextNodes[index])) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // #461: a refresh used to clear the grid and recreate every tile. Renders now
+  // build into a detached container; when the layout is unchanged, existing
+  // tiles are patched in place (an identical refresh creates no tiles and keeps
+  // focus and hover on the same elements). A new layout replaces the grid.
+  function commitGridRender(staging) {
+    const pairs = [];
+    if (!grid.childElementCount || !matchGridStructure(grid, staging, pairs)) {
+      grid.replaceChildren(...staging.childNodes);
+      return "replaced";
+    }
+    let patched = 0;
+    pairs.forEach(([tile, next]) => {
+      if (tile.isEqualNode(next)) {
+        return;
+      }
+      patched += 1;
+      syncElementAttributes(tile, next);
+      if (!tileChildrenEqual(tile, next)) {
+        tile.replaceChildren(...next.childNodes);
+      }
+    });
+    return patched ? "patched" : "unchanged";
+  }
+
   function renderGrid() {
     const focusedSlotKeyBeforeRender = focusedGridSlotKey();
+    const staging = document.createElement("div");
     const finishGridRender = () => {
+      commitGridRender(staging);
       refreshGridSelectionState();
       renderSearchSummary();
       restoreGridFocus(focusedSlotKeyBeforeRender);
     };
     const selectedStorageView = getSelectedStorageViewRuntime();
     if (selectedStorageView) {
-      renderStorageViewGrid(selectedStorageView);
+      renderStorageViewGrid(selectedStorageView, staging);
       finishGridRender();
       return;
     }
     const selectedProfile = getSelectedProfile();
     if (selectedProfile?.face_style === "nvme-carrier") {
-      renderLiveNvmeCarrierGrid(selectedProfile);
+      renderLiveNvmeCarrierGrid(selectedProfile, staging);
       finishGridRender();
       return;
     }
     hideSlotTooltip();
-    grid.innerHTML = "";
     const slotsByNumber = new Map(state.snapshot.slots.map((slot) => [slot.slot, slot]));
     const peerContext = getSelectedPeerContext();
     const layoutRows = activeLayoutRows();
@@ -6419,7 +6511,7 @@
       container.appendChild(tile);
     };
 
-    renderChassisRows(layoutRows, geometry, appendTile);
+    renderChassisRows(layoutRows, geometry, appendTile, staging);
     finishGridRender();
   }
 
@@ -9547,22 +9639,49 @@
     renderCacheTimingChips();
   }
 
+  // The 1 Hz tick only runs while something on screen counts down: a scheduled
+  // auto refresh, or the cache chips shown with UI Timing (#461). Paused, off,
+  // and "Refreshing..." labels are static and are rendered by the state change.
+  function timingTickNeeded() {
+    if (state.snapshotMode) {
+      return false;
+    }
+    if (state.uiPerf?.enabled) {
+      return true;
+    }
+    return Boolean(state.autoRefresh && state.timerDueAt && state.timerDelayMs);
+  }
+
+  function stopTimingTick() {
+    if (state.timingTickId) {
+      window.clearInterval(state.timingTickId);
+      state.timingTickId = null;
+    }
+  }
+
   function timingTick() {
     if (typeof document !== "undefined" && document.hidden) {
       // Countdowns are re-rendered on visibilitychange; skip DOM work for hidden tabs.
       return;
     }
     renderTimingSurfaces();
+    if (!timingTickNeeded()) {
+      stopTimingTick();
+    }
   }
 
   function ensureTimingTick() {
-    if (state.snapshotMode || state.timingTickId) {
+    if (state.snapshotMode) {
+      return;
+    }
+    if (!state.timingVisibilityListenerBound && typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", handleAutoRefreshVisibilityChange);
+      state.timingVisibilityListenerBound = true;
+    }
+    if (state.timingTickId || !timingTickNeeded()) {
       return;
     }
     state.timingTickId = window.setInterval(timingTick, 1000);
-    if (typeof document !== "undefined") {
-      document.addEventListener("visibilitychange", handleAutoRefreshVisibilityChange);
-    }
   }
 
   function renderSelectors() {
@@ -10941,8 +11060,8 @@
       if (!state.heatmap.enabled) {
         resetHeatmapHistoryCache();
       }
+      // renderGrid renders the heat-map controls with the context it built.
       renderGrid();
-      renderHeatmapControls();
       ensureHeatmapData();
     });
   }

@@ -291,6 +291,8 @@ test("timing tick skips DOM work while the document is hidden", () => {
     renderTimingSurfaces() {
       renders += 1;
     },
+    timingTickNeeded: () => true,
+    stopTimingTick() {},
   });
 
   fns.timingTick();
@@ -477,4 +479,64 @@ test("an option group relabel is not mistaken for an unchanged option list", () 
     true,
   );
   assert.equal(select.options[0].parentNode.label, "Virtual Storage Views");
+});
+
+// #461: the 1 Hz timing tick only runs while something counts down.
+test("the timing tick starts only for a live countdown and stops when it ends", () => {
+  const intervals = [];
+  const state = {
+    snapshotMode: false,
+    autoRefresh: true,
+    timerDueAt: 0,
+    timerDelayMs: 0,
+    timingTickId: null,
+    timingVisibilityListenerBound: false,
+    uiPerf: { enabled: false },
+  };
+  let listeners = 0;
+  const windowStub = {
+    setInterval(fn) { intervals.push(fn); return intervals.length; },
+    clearInterval(id) { intervals[id - 1] = null; },
+  };
+  const { fns } = loadFunctions(APP_SOURCE, ["timingTickNeeded", "stopTimingTick", "timingTick", "ensureTimingTick"], {
+    state,
+    window: windowStub,
+    document: { hidden: false, addEventListener() { listeners += 1; } },
+    renderTimingSurfaces() {},
+    handleAutoRefreshVisibilityChange() {},
+  });
+
+  fns.ensureTimingTick();
+  assert.equal(state.timingTickId, null, "nothing counts down, so no interval");
+  assert.equal(listeners, 1, "the visibility listener is still bound once");
+
+  state.timerDueAt = 5000;
+  state.timerDelayMs = 5000;
+  fns.ensureTimingTick();
+  fns.ensureTimingTick();
+  assert.equal(state.timingTickId, 1, "one interval while the auto refresh counts down");
+  assert.equal(listeners, 1);
+
+  state.timerDueAt = 0;
+  fns.timingTick();
+  assert.equal(state.timingTickId, null, "the tick stops itself once the countdown ends");
+  assert.equal(intervals[0], null);
+
+  state.uiPerf.enabled = true;
+  fns.ensureTimingTick();
+  assert.ok(state.timingTickId, "UI Timing cache chips keep the tick alive");
+
+  state.snapshotMode = true;
+  assert.equal(fns.timingTickNeeded(), false, "saved copies never tick");
+});
+
+test("grid renders commit through a staging container and reuse tiles", () => {
+  const renderGrid = APP_SOURCE.slice(APP_SOURCE.indexOf("  function renderGrid() {"), APP_SOURCE.indexOf("  function kvRow("));
+  assert.match(renderGrid, /commitGridRender\(staging\)/);
+  assert.doesNotMatch(renderGrid, /grid\.innerHTML = ""/, "the live grid is no longer cleared before a render");
+  for (const name of ["renderStorageViewGrid", "renderLiveNvmeCarrierGrid"]) {
+    const start = APP_SOURCE.indexOf(`  function ${name}(`);
+    const body = APP_SOURCE.slice(start, APP_SOURCE.indexOf("\n  function ", start + 10));
+    assert.doesNotMatch(body, /\bgrid\.(innerHTML|appendChild)/, `${name} writes into its target`);
+  }
 });
