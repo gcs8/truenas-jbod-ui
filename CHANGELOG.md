@@ -32,7 +32,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 - The main UI's 401 answer to an unsigned write now reads `Main UI
   authentication required.` (was `Read UI authentication required.`). Update
-  any script or monitor that matches the exact old error text. (#PR)
+  any script or monitor that matches the exact old error text. (#608)
 - `/healthz` on the main UI answers HTTP 503 (`status: down`) when its data,
   logs or known-hosts folder is not writable; remote failures stay HTTP 200
   (`status: degraded`). Compose healthchecks probe `/livez` and are unchanged,
