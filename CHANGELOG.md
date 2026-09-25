@@ -147,6 +147,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   `RELEASE_CHECK_ENABLED=false` turns the GitHub check off everywhere; quoted
   the current history bind error in the wiki and explained the three history
   collection intervals in `.env.example` (#591).
+- Renamed the admin container cards to Main UI, History and Admin, removed
+  sidecar and runtime wording from admin messages, and corrected the docs that
+  said admin auto-stops by default (only the published Compose files set
+  3600) (#581)
 - Raised the last small labels on the main page (summary labels, legend
   swatches, Connections card details, heat-map controls, timing chips) to at
   least 12px. (#584)
