@@ -305,6 +305,27 @@ h3 {
   gap: 22px;
 }
 
+.admin-section-links {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 16px;
+  margin: 0 0 16px;
+  font-size: 0.92rem;
+}
+
+.admin-section-links-label {
+  color: var(--muted);
+}
+
+.admin-section-links a {
+  color: var(--accent);
+}
+
+[id^="admin-section-"] {
+  scroll-margin-top: 16px;
+}
+
 .runtime-panel,
 .backup-panel,
 .setup-panel,
