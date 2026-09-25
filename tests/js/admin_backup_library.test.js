@@ -756,6 +756,7 @@ function syntheticPolicyView(overrides = {}) {
     },
     targets: [{
       values: { target_id: "office-nas", label: "Office NAS", enabled: true, provider: "sftp", root: "/srv/backups/jbod", hostname: "nas.example.test", username: "backup", known_hosts_path: "/run/backup-secrets/archive_known_hosts" },
+      original_target_id: "office-nas",
       secrets: {
         password_file: { configured: true, present: false },
         private_key_file: { configured: true, present: true },
@@ -843,6 +844,38 @@ test("adding and removing targets keeps what was typed; a stale revision says re
   await library.actions.savePolicy();
   assert.deepEqual(sent.targets.map((target) => target.values.target_id), ["usb-disk"]);
   assert.match(elements.dialog.textContent, /changed since this editor opened/);
+});
+
+test("pending secret edits survive adding or removing a target; saved rows keep their identity", async () => {
+  let sent = null;
+  const api = fakeApi({
+    "GET /api/admin/backups/policy": () => syntheticPolicyView(),
+    "PUT /api/admin/backups/policy": ({ options }) => {
+      sent = JSON.parse(options.body);
+      return { ...syntheticPolicyView({ revision: "rev-2" }), ok: true, restart_required: true };
+    },
+  });
+  const { elements, library } = mount({ api });
+  await library.load();
+  await library.actions.openPolicyEditor(elements.editButton);
+  await settle();
+  elements.dialog.querySelector("#backup-edit-target-0-target_id").value = "office-nas-renamed";
+  elements.dialog.querySelector("#backup-edit-target-0-password_file").value = "/run/backup-secrets/new_password";
+  elements.dialog.querySelector("#backup-edit-target-0-private_key_file-clear").checked = true;
+  library.actions.addPolicyTarget();
+  assert.equal(elements.dialog.querySelector("#backup-edit-target-0-password_file").value, "/run/backup-secrets/new_password");
+  assert.equal(elements.dialog.querySelector("#backup-edit-target-0-private_key_file-clear").checked, true);
+  elements.dialog.querySelector("#backup-edit-target-1-target_id").value = "usb-disk";
+  elements.dialog.querySelector("#backup-edit-target-1-root").value = "/srv/usb/jbod";
+  library.actions.removePolicyTarget(1);
+  library.actions.addPolicyTarget();
+  elements.dialog.querySelector("#backup-edit-target-1-target_id").value = "office-nas";
+  elements.dialog.querySelector("#backup-edit-target-1-root").value = "/srv/usb/jbod";
+  await library.actions.savePolicy();
+  assert.deepEqual(sent.targets[0].secrets, { password_file: "/run/backup-secrets/new_password", private_key_file: null });
+  assert.equal(sent.targets[0].values.target_id, "office-nas-renamed");
+  assert.equal(sent.targets[0].original_target_id, "office-nas", "a renamed row keeps its saved identity");
+  assert.equal("original_target_id" in sent.targets[1], false, "a new row reusing an old ID inherits nothing");
 });
 
 test("environment-managed targets are read-only in the editor", async () => {

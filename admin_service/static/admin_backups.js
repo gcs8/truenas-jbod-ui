@@ -327,7 +327,9 @@
           if (change && change.clear) secrets[name] = null;
           else if (change && typeof change.path === "string" && change.path.trim()) secrets[name] = change.path.trim();
         });
-        return { values: { ...target.values }, secrets };
+        const entry = { values: { ...target.values }, secrets };
+        if (target.original_target_id) entry.original_target_id = target.original_target_id;
+        return entry;
       });
     }
     return payload;
@@ -803,10 +805,11 @@
       });
       const secretRows = view.secret_fields.map((name) => {
         const id = `${prefix}-${name}`;
-        const input = inputFor(id, "", { disabled: locked, placeholder: "/run/backup-secrets/..." });
+        const pending = target.pendingSecrets?.[name] || {};
+        const input = inputFor(id, pending.path || "", { disabled: locked, placeholder: "/run/backup-secrets/..." });
         input.dataset.targetIndex = String(index);
         input.dataset.secretKey = name;
-        const clear = inputFor(`${id}-clear`, false, { type: "checkbox", disabled: locked || !target.secrets?.[name]?.configured });
+        const clear = inputFor(`${id}-clear`, Boolean(pending.clear), { type: "checkbox", disabled: locked || !target.secrets?.[name]?.configured });
         clear.dataset.targetIndex = String(index);
         clear.dataset.secretClear = name;
         return el("div", { className: "backup-edit-secret", dataset: { secret: name } },
@@ -841,7 +844,10 @@
 
     function readEdits(view) {
       const dialog = els.dialog;
-      const edits = { classes: { config: {}, full: {} }, targets: view.targets.map((target) => ({ values: {}, secretChanges: {} })) };
+      const edits = {
+        classes: { config: {}, full: {} },
+        targets: view.targets.map((target) => ({ values: {}, secretChanges: {}, original_target_id: target.original_target_id || null })),
+      };
       dialog.querySelectorAll("[data-policy-key]").forEach((input) => {
         if (input.disabled) return;
         const key = input.dataset.policyKey;
@@ -898,6 +904,7 @@
       const targets = view.targets.map((target, index) => ({
         ...target,
         values: { ...edits.targets[index].values },
+        pendingSecrets: { ...edits.targets[index].secretChanges },
       }));
       state.policyView = { ...view, targets: mutate(targets) };
       showPolicyView(dialogScope(), state.policyView);

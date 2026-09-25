@@ -60,6 +60,17 @@ CLASS_FIELDS = {
 # The scheduler container mounts ./config/backup-secrets at this path; the admin
 # container sees the same folder under its config directory.
 SCHEDULER_SECRET_ROOT = PurePosixPath("/run/backup-secrets")
+# The archive passphrase lives in the same folder. A target must never be able
+# to name it, or the scheduler would send it to that target as a credential.
+PASSPHRASE_ENV_NAMES = ("BACKUP_ARCHIVE_PASSPHRASE_FILE", "SCHEDULED_BACKUP_PASSPHRASE_FILE")
+DOCUMENTED_PASSPHRASE_FILE = SCHEDULER_SECRET_ROOT / "scheduled-backup-passphrase"
+# A saved credential only follows a target while these settings stay the same.
+# Changing any of them points the target somewhere else, so its secret files
+# have to be chosen again.
+ENDPOINT_FIELDS = (
+    "provider", "hostname", "port", "username", "use_tls", "known_hosts_path",
+    "trust_on_first_use", "share", "domain", "export_path", "bucket", "region", "endpoint_url",
+)
 MAX_TARGETS = 32
 RESTART_COMMAND = "docker compose --profile backup-scheduler restart enclosure-backup-scheduler"
 
@@ -129,20 +140,32 @@ def _env_locks(environ: Mapping[str, str]) -> tuple[dict[str, dict[str, str]], s
 
 
 def load_editor_view(config_path: str | Path, environ: Mapping[str, str]) -> dict[str, Any]:
-    """The editable backups document, with secrets reduced to present/missing."""
+    """The editable backups document, with secrets reduced to present/missing.
+
+    Fields set in the environment show the value the scheduler actually uses.
+    """
 
     path = Path(config_path)
     document, raw = _read_config(path)
     section = _mapping(document.get("backups"))
     locks, targets_lock = _env_locks(environ)
+    problems: list[str] = []
+    effective = None
+    try:
+        effective = policy_from_section(section, source=str(path), environ=environ)
+    except ConfigurationError as exc:
+        problems = list(exc.problems)
     classes: dict[str, Any] = {}
     for class_name, model in (("config", ConfigClassPolicy), ("full", FullClassPolicy)):
         stored = _mapping(section.get(class_name))
         defaults = model().model_dump()
-        classes[class_name] = {
-            "values": {name: stored.get(name, defaults[name]) for name in CLASS_FIELDS[class_name]},
-            "locked": dict(locks[class_name]),
-        }
+        values = {name: stored.get(name, defaults[name]) for name in CLASS_FIELDS[class_name]}
+        for name, env_name in locks[class_name].items():
+            if effective is not None:
+                values[name] = getattr(getattr(effective, class_name), name)
+            else:
+                values[name] = environ.get(env_name)
+        classes[class_name] = {"values": values, "locked": dict(locks[class_name])}
     targets: list[dict[str, Any]] = []
     for item in section.get("targets") or []:
         if not isinstance(item, dict):
@@ -153,14 +176,10 @@ def load_editor_view(config_path: str | Path, environ: Mapping[str, str]) -> dic
         targets.append(
             {
                 "values": values,
+                "original_target_id": item.get("target_id"),
                 "secrets": {name: _secret_file_state(item.get(name), path.parent) for name in SECRET_FILE_FIELDS},
             }
         )
-    problems: list[str] = []
-    try:
-        policy_from_section(section, source=str(path), environ=environ)
-    except ConfigurationError as exc:
-        problems = list(exc.problems)
     return {
         "revision": _revision(raw),
         "classes": classes,
@@ -180,8 +199,10 @@ def _merge_class(
     stored: Mapping[str, Any],
     locked: Mapping[str, str],
     problems: list[str],
+    environ: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     merged = dict(stored)
+    environ = environ or {}
     if incoming is None:
         return merged
     if not isinstance(incoming, Mapping):
@@ -192,7 +213,10 @@ def _merge_class(
             problems.append(f"backups.{class_name}.{key} is not a setting.")
             continue
         if key in locked:
-            if stored.get(key) != value:
+            # Sending back the value on screen (the stored one or the
+            # environment's) is not an edit.
+            shown = str(environ.get(locked[key], "")).strip()
+            if stored.get(key) != value and str(value).strip().lower() != shown.lower():
                 problems.append(
                     f"backups.{class_name}.{key} is set by {locked[key]} in the environment; change it there."
                 )
@@ -201,11 +225,26 @@ def _merge_class(
     return merged
 
 
+def _forbidden_secret_paths(environ: Mapping[str, str]) -> set[str]:
+    paths = {str(DOCUMENTED_PASSPHRASE_FILE)}
+    for name in PASSPHRASE_ENV_NAMES:
+        value = str(environ.get(name) or "").strip()
+        if value:
+            paths.add(str(PurePosixPath(value)))
+    return paths
+
+
+def _endpoint(values: Mapping[str, Any]) -> tuple[Any, ...]:
+    return tuple(values.get(name) or None for name in ENDPOINT_FIELDS)
+
+
 def _merge_target(
     index: int,
     incoming: Any,
     previous: Mapping[str, Any] | None,
     problems: list[str],
+    *,
+    forbidden_secret_paths: set[str] = frozenset(),  # type: ignore[assignment]
 ) -> dict[str, Any] | None:
     where = f"backups.targets[{index}]"
     if not isinstance(incoming, Mapping):
@@ -226,10 +265,16 @@ def _merge_target(
         if value is None or value == "":
             continue
         merged[key] = value
+    same_endpoint = previous is not None and _endpoint(previous) == _endpoint(merged)
     for name in SECRET_FILE_FIELDS:
         if name not in secrets:
             if previous and previous.get(name):
-                merged[name] = previous[name]
+                if same_endpoint:
+                    merged[name] = previous[name]
+                else:
+                    problems.append(
+                        f"{where} now points somewhere else, so choose its {name} again or clear it."
+                    )
             continue
         change = secrets[name]
         if change is None:
@@ -238,10 +283,21 @@ def _merge_target(
             problems.append(f"{where}.{name} must be an absolute path to a secret file, or null to clear it.")
             continue
         text = change.strip()
-        if not text.startswith("/") or ".." in PurePosixPath(text).parts or "\x00" in text:
+        candidate = PurePosixPath(text)
+        if not text.startswith("/") or ".." in candidate.parts or "\x00" in text:
             problems.append(f"{where}.{name} must be an absolute path to a secret file.")
             continue
-        merged[name] = text
+        try:
+            inside = candidate.relative_to(SCHEDULER_SECRET_ROOT).parts
+        except ValueError:
+            inside = ()
+        if not inside:
+            problems.append(f"{where}.{name} must be a file in {SCHEDULER_SECRET_ROOT}.")
+            continue
+        if str(candidate) in forbidden_secret_paths:
+            problems.append(f"{where}.{name} cannot be the backup archive passphrase file.")
+            continue
+        merged[name] = str(candidate)
     for key in secrets:
         if key not in SECRET_FILE_FIELDS:
             problems.append(f"{where}.{key} is not a secret file setting.")
@@ -283,7 +339,7 @@ def apply_editor_change(
         for class_name in ("config", "full"):
             stored = _mapping(section.get(class_name))
             section[class_name] = _merge_class(
-                class_name, classes.get(class_name), stored, locks[class_name], problems
+                class_name, classes.get(class_name), stored, locks[class_name], problems, environ
             )
         if "targets" in payload:
             incoming_targets = payload.get("targets")
@@ -297,12 +353,17 @@ def apply_editor_change(
                     for item in (existing.get("targets") or [])
                     if isinstance(item, dict)
                 }
+                forbidden = _forbidden_secret_paths(environ)
                 merged_targets = []
                 for index, item in enumerate(incoming_targets):
-                    target_id = None
-                    if isinstance(item, Mapping) and isinstance(item.get("values"), Mapping):
-                        target_id = str(item["values"].get("target_id") or "")
-                    merged = _merge_target(index, item, previous_by_id.get(target_id or ""), problems)
+                    # A target is matched to its saved row by the ID it had when
+                    # the editor opened, so renaming it keeps its credentials.
+                    # A new row has no original ID and inherits nothing.
+                    original_id = item.get("original_target_id") if isinstance(item, Mapping) else None
+                    previous = previous_by_id.get(str(original_id)) if original_id else None
+                    merged = _merge_target(
+                        index, item, previous, problems, forbidden_secret_paths=forbidden
+                    )
                     if merged is not None:
                         merged_targets.append(merged)
                 section["targets"] = merged_targets

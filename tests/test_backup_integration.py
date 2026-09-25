@@ -676,7 +676,8 @@ class PolicyEditorTests(unittest.TestCase):
         payload = {
             "revision": view["revision"],
             "classes": {"full": {"enabled": True, "schedule": "30 2 * * *", "local_keep": 3}},
-            "targets": [{"values": target["values"], "secrets": {"password_file": None}}],
+            "targets": [{"values": target["values"], "original_target_id": target["original_target_id"],
+                         "secrets": {"password_file": None}}],
         }
         saved = self.save(payload)
         stored = yaml.safe_load(self.config.read_text())
@@ -704,6 +705,76 @@ class PolicyEditorTests(unittest.TestCase):
                 view = self.view()
                 with self.assertRaises(self.editor.PolicyEditError):
                     self.save({"revision": view["revision"], "targets": [{"values": values, "secrets": {"password_file": bad}}]})
+
+    def _target_payload(self, view: dict[str, Any], values: dict[str, Any], secrets: dict[str, Any] | None = None,
+                        original: str | None = "office-nas") -> dict[str, Any]:
+        entry: dict[str, Any] = {"values": values, "secrets": secrets or {}}
+        if original is not None:
+            entry["original_target_id"] = original
+        return {"revision": view["revision"], "targets": [entry]}
+
+    def test_renaming_a_target_keeps_its_secret_files(self) -> None:
+        view = self.view()
+        self.assertEqual(view["targets"][0]["original_target_id"], "office-nas")
+        values = dict(view["targets"][0]["values"], target_id="office-nas-2")
+        self.save(self._target_payload(view, values))
+        stored = yaml.safe_load(self.config.read_text())["backups"]["targets"][0]
+        self.assertEqual(stored["target_id"], "office-nas-2")
+        self.assertEqual(stored["private_key_file"], "/run/backup-secrets/archive_sftp_key")
+
+    def test_new_row_reusing_an_old_id_inherits_no_secrets(self) -> None:
+        view = self.view()
+        before = self.config.read_bytes()
+        values = dict(view["targets"][0]["values"])
+        with self.assertRaises(self.editor.PolicyEditError):
+            # sftp needs a key or password; a fresh row gets neither from the old one.
+            self.save(self._target_payload(view, values, original=None))
+        self.assertEqual(self.config.read_bytes(), before)
+
+    def test_changing_where_a_target_points_requires_choosing_secrets_again(self) -> None:
+        for field, value in (("hostname", "attacker.example.test"), ("username", "other"),
+                             ("port", 2222), ("provider", "ftp")):
+            with self.subTest(field=field):
+                view = self.view()
+                before = self.config.read_bytes()
+                values = dict(view["targets"][0]["values"], **{field: value})
+                with self.assertRaisesRegex(self.editor.PolicyEditError, "choose its .* again"):
+                    self.save(self._target_payload(view, values))
+                self.assertEqual(self.config.read_bytes(), before)
+        view = self.view()
+        values = dict(view["targets"][0]["values"], hostname="nas2.example.test")
+        self.save(self._target_payload(view, values, {
+            "private_key_file": "/run/backup-secrets/archive_sftp_key", "password_file": None,
+        }))
+        stored = yaml.safe_load(self.config.read_text())["backups"]["targets"][0]
+        self.assertEqual(stored["hostname"], "nas2.example.test")
+        self.assertNotIn("password_file", stored)
+
+    def test_secret_files_must_be_target_credentials_in_the_secrets_folder(self) -> None:
+        env = {"BACKUP_ARCHIVE_PASSPHRASE_FILE": "/run/backup-secrets/archive-pass"}
+        for bad, message in (
+            ("/run/backup-secrets/scheduled-backup-passphrase", "passphrase file"),
+            ("/run/backup-secrets/archive-pass", "passphrase file"),
+            ("/run/backup-secrets//archive-pass", "passphrase file"),
+            ("/etc/shadow", "must be a file in /run/backup-secrets"),
+            ("/run/backup-secrets", "must be a file in /run/backup-secrets"),
+        ):
+            with self.subTest(bad=bad):
+                view = self.view(env)
+                before = self.config.read_bytes()
+                values = dict(view["targets"][0]["values"])
+                with self.assertRaisesRegex(self.editor.PolicyEditError, message):
+                    self.save(self._target_payload(view, values, {"password_file": bad}), env)
+                self.assertEqual(self.config.read_bytes(), before)
+
+    def test_locked_fields_show_the_effective_environment_value(self) -> None:
+        env = {"BACKUP_FULL_SCHEDULE": "0 4 * * *", "BACKUP_CONFIG_LOCAL_KEEP": "9"}
+        view = self.view(env)
+        self.assertEqual(view["classes"]["full"]["values"]["schedule"], "0 4 * * *")
+        self.assertEqual(view["classes"]["full"]["locked"]["schedule"], "BACKUP_FULL_SCHEDULE")
+        self.assertEqual(view["classes"]["config"]["values"]["local_keep"], 9)
+        # Posting the displayed value back for a locked field is not an edit.
+        self.save({"revision": view["revision"], "classes": {"full": {"schedule": "0 4 * * *"}}}, env)
 
     def test_inline_credentials_and_file_paths_in_values_are_refused(self) -> None:
         for key in ("password", "secret_access_key", "private_key_file"):
