@@ -176,6 +176,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Docs
 
+- Aligned the wiki and current reference docs with the UI's Admin and Main UI
+  names, and added a wording regression check. (#624)
 - The history recovery page and CONTRIBUTING now state the rollback policy
   for a history change an older release cannot read: restore the backup taken
   before the upgrade and lose later writes, with no down-migrations. Upgrading
