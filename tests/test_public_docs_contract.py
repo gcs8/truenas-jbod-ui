@@ -52,6 +52,8 @@ EXPECTED_HISTORICAL_READ_UI_CONTEXTS = {
         r"The\s+read\s+UI\s+has\s+two\s+saved\s+operator\s+edits:",
     ),
 }
+STALE_ADMIN_SIDECAR_PATTERN = re.compile(r"\badmin\s+sidecars?\b", re.IGNORECASE)
+STALE_READ_UI_PATTERN = re.compile(r"\bread\s+UI(?:s)?\b", re.IGNORECASE)
 
 
 def run_checker(*args: str) -> subprocess.CompletedProcess[str]:
@@ -114,11 +116,23 @@ class PublicDocsContractTests(unittest.TestCase):
                     f"missing historical read UI context in {relative_path}",
                 )
             with self.subTest(document=relative_path):
-                self.assertNotRegex(text, r"(?i)\badmin\s+sidecars?\b")
+                self.assertNotRegex(text, STALE_ADMIN_SIDECAR_PATTERN)
                 self.assertNotRegex(
                     text_without_allowed_contexts,
-                    r"(?i)\bread\s+UI\b",
+                    STALE_READ_UI_PATTERN,
                 )
+
+    def test_stale_service_name_patterns_cover_plural_mutations(self) -> None:
+        for stale_text, pattern in (
+            ("admin sidecar", STALE_ADMIN_SIDECAR_PATTERN),
+            ("admin sidecars", STALE_ADMIN_SIDECAR_PATTERN),
+            ("read UI", STALE_READ_UI_PATTERN),
+            ("read UIs", STALE_READ_UI_PATTERN),
+            ("read\nUI", STALE_READ_UI_PATTERN),
+            ("read\nUIs", STALE_READ_UI_PATTERN),
+        ):
+            with self.subTest(stale_text=stale_text):
+                self.assertRegex(stale_text, pattern)
 
     def test_architecture_guide_states_the_reachability_boundary_plainly(self) -> None:
         guide = (ROOT / "wiki/Architecture-and-Services.md").read_text(
