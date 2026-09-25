@@ -30,6 +30,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Upgrade notes
 
+- config.yaml: `app.host` and `app.port` are gone, and the `APP_HOST`
+  environment variable is no longer read. They never changed where the UI
+  answers. Set the port with `APP_PORT` and the address with
+  `APP_BIND_ADDRESS` in `.env`, as before. A config.yaml that still has
+  either key starts normally and logs one line saying so. (#615)
 - New FULL backups (backup scheduler, one-shot `enclosure-backup` job and the
   encrypted admin export with history) now default to the fast `tar.zst` stream
   format (`.tar.zst.enc`). Older app versions cannot restore these files and

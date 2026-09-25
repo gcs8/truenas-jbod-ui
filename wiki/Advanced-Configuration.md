@@ -175,7 +175,6 @@ Useful app-level settings:
 
 ```yaml
 app:
-  port: 8080
   refresh_interval_seconds: 30
   snapshot_cache_ttl_seconds: 10
   source_bundle_cache_ttl_seconds: 60
