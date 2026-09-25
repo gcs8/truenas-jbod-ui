@@ -320,6 +320,41 @@ class CIWorkflowContractTests(unittest.TestCase):
         ci = yaml.safe_load(self.read(CI_WORKFLOW))
         self.assertEqual(ci["jobs"]["public-demo-artifact"]["name"], "Checked-in public demo artifact")
 
+    def test_the_sole_public_demo_validation_always_runs_on_pull_requests(self) -> None:
+        # With the publish workflow off pull_request, this job is the only PR
+        # browser check of current source, so nothing may route it to skipped.
+        ci = yaml.safe_load(self.read(CI_WORKFLOW))
+        self.assertEqual(ci["jobs"]["public-demo-artifact"]["if"], "needs.route.outputs.run == 'true'")
+        route_script = ci["jobs"]["route"]["steps"][0]["run"]
+
+        with tempfile.TemporaryDirectory() as raw:
+            temp = Path(raw)
+            bin_dir = temp / "bin"
+            bin_dir.mkdir()
+            for tool in ("gh", "sleep"):
+                fake = bin_dir / tool
+                fake.write_text("#!/bin/sh\necho unexpected >&2\nexit 97\n", encoding="utf-8")
+                fake.chmod(0o755)
+            output = temp / "github-output"
+            env = dict(
+                os.environ,
+                EVENT_NAME="pull_request",
+                BRANCH_NAME="feature/example",
+                GH_REPO="example/project",
+                GITHUB_OUTPUT=str(output),
+                PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+            )
+            result = subprocess.run(
+                ["bash", "-e", "-o", "pipefail"],
+                input=route_script.encode("utf-8"),
+                env=env,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8"))
+            self.assertEqual(output.read_text(encoding="utf-8"), "run=true\n")
+            self.assertNotIn(b"unexpected", result.stderr)
+
     def test_public_demo_artifact_and_browser_smoke_remain_in_ci(self) -> None:
         spec = self.read(PUBLIC_DEMO_SPEC)
         self.assertNotIn("test.skip", spec)
