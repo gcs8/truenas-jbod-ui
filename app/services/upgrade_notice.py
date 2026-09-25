@@ -34,22 +34,30 @@ class UpgradeNoticeVersionConflict(Exception):
     """The browser tried to dismiss a notice for another app version."""
 
 # Releases whose upgrade notes deserve a sentence in the UI itself. Keys are
-# exact version strings; other releases get only the observation/version prefix.
-VERSION_NOTICES: dict[str, str] = {
-    "0.23.0": (
-        "In network mode, anyone who can reach this port can change bay "
-        "assignments and lights. See Optional authentication on the Advanced "
-        "Configuration wiki page to add a sign-in."
-    ),
-}
+# exact version strings; other releases get only the observation/version prefix
+# and, in network mode, the write-exposure sentence below.
+VERSION_NOTICES: dict[str, str] = {}
+
+# Network mode (the default) takes writes from anyone who can reach the port.
+# Binding to all addresses is the normal install, so this is said after every
+# update and on first start, not only in the release that introduced it (#447):
+# an install that skips v0.23.0 would otherwise never be told.
+NETWORK_MODE_NOTICE = (
+    "In network mode, anyone who can reach this port can change bay "
+    "assignments and lights. See Optional authentication on the Advanced "
+    "Configuration wiki page to add a sign-in."
+)
+BASIC_MODE_NOTICE = "Sign-in is required to change bay assignments and lights. Reads remain anonymous."
 
 
 def notice_text(version: str, *, previous: str | None = None, auth_mode: str = "network") -> str:
     prefix = f"Updated to v{version}." if previous else f"Running v{version}. Previous version unknown."
-    detail = VERSION_NOTICES.get(version, "")
-    if version == "0.23.0" and auth_mode == "basic":
-        detail = "Sign-in is required to change bay assignments and lights. Reads remain anonymous."
-    return f"{prefix} {detail}" if detail else prefix
+    details = [VERSION_NOTICES.get(version, "")]
+    if auth_mode == "network":
+        details.append(NETWORK_MODE_NOTICE)
+    elif version == "0.23.0" and auth_mode == "basic":
+        details.append(BASIC_MODE_NOTICE)
+    return " ".join([prefix, *(detail for detail in details if detail)])
 
 
 def state_path(data_dir: Path) -> Path:
