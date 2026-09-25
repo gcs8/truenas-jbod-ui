@@ -4676,15 +4676,30 @@ sys.stdout.flush()
             self.backup_service._read_archive_file(archive_path)
 
     def test_file_import_rejection_cleans_file_backed_workspace(self) -> None:
-        before = set(Path(tempfile.gettempdir()).glob("truenas-jbod-ui-file-import-*"))
+        workspace = self.temp_dir / "file-import-workspace"
+        unrelated_workspace = Path(
+            tempfile.mkdtemp(prefix="truenas-jbod-ui-file-import-")
+        )
         archive_path = self.temp_dir / "corrupted.zip"
         archive_path.write_bytes(b"PK-corrupted")
 
-        with self.assertRaisesRegex(ValueError, "ZIP archive"):
-            self.backup_service.import_bundle_from_file(archive_path)
+        try:
+            with (
+                patch(
+                    "history_service.system_backup.tempfile.mkdtemp",
+                    return_value=str(workspace),
+                ) as allocate_workspace,
+                self.assertRaisesRegex(ValueError, "ZIP archive"),
+            ):
+                self.backup_service.import_bundle_from_file(archive_path)
 
-        after = set(Path(tempfile.gettempdir()).glob("truenas-jbod-ui-file-import-*"))
-        self.assertEqual(after, before)
+            allocate_workspace.assert_called_once_with(
+                prefix="truenas-jbod-ui-file-import-"
+            )
+            self.assertFalse(workspace.exists())
+            self.assertTrue(unrelated_workspace.exists())
+        finally:
+            shutil.rmtree(unrelated_workspace)
 
     def test_file_backed_aes_decryption_heap_is_flat_from_two_to_thirty_two_mib(self) -> None:
         peaks: list[int] = []
