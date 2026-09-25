@@ -598,6 +598,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Removed dead code: the legacy `__default__` snapshot key, zero-caller and
   test-only helpers, monkeypatch-only wrappers and the unused "Scrambled IDs"
   label; named three layout magic numbers. (#606)
+- Route handlers now import their collaborators directly: removed the
+  `route_compat` globals copy and the blanket lint suppressions in `main.py`
+  and `routes.py`; tests patch the module each name is looked up in. (#612)
 - Tested history upgrades from the released v0.8.0, v0.21.2 and v0.22.2
   schemas, including a kill after each startup migration step, a second start
   that changes nothing, the previous release reading an upgraded database, and

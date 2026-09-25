@@ -20,6 +20,8 @@ from fastapi.routing import APIRoute
 # Must precede admin_service.main, which builds its app at import time.
 import tests.admin_test_env  # noqa: F401  (must precede admin_service.main)
 from app import main as app_main
+from app import route_support as app_route_support
+from app import routes as app_routes
 from app.config import PathConfig, Settings, SSHConfig, SystemConfig
 from app.models.domain import (
     InventorySnapshot,
@@ -180,7 +182,7 @@ class ConfiguredKnownHostsStartupTests(unittest.TestCase):
             root = Path(temp_dir)
             missing = root / "host-trust"
             settings = self.settings_with_known_hosts(root, str(missing / "known_hosts"))
-            problems = app_main.startup_storage_problems(settings)
+            problems = app_route_support.startup_storage_problems(settings)
             self.assertEqual(len(problems), 1)
             self.assertIn("ssh.known_hosts_path", problems[0])
             self.assertIn("does not exist", problems[0])
@@ -192,7 +194,7 @@ class ConfiguredKnownHostsStartupTests(unittest.TestCase):
             root = Path(temp_dir)
             (root / "host-trust").mkdir()
             settings = self.settings_with_known_hosts(root, str(root / "host-trust" / "known_hosts"))
-            self.assertEqual(app_main.startup_storage_problems(settings), [])
+            self.assertEqual(app_route_support.startup_storage_problems(settings), [])
 
     def test_unwritable_configured_folder_is_reported_with_the_chown_line(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -200,7 +202,7 @@ class ConfiguredKnownHostsStartupTests(unittest.TestCase):
             (root / "host-trust").mkdir()
             settings = self.settings_with_known_hosts(root, str(root / "host-trust" / "known_hosts"))
             with patch("app.services.storage_writability.os.access", return_value=False):
-                problems = app_main.startup_storage_problems(settings)
+                problems = app_route_support.startup_storage_problems(settings)
             self.assertEqual(len(problems), 1)
             self.assertIn(f"Cannot write to {root / 'host-trust'}", problems[0])
 
@@ -212,7 +214,7 @@ class ConfiguredKnownHostsStartupTests(unittest.TestCase):
             known_hosts.write_text("", encoding="utf-8")
             settings = self.settings_with_known_hosts(root, str(known_hosts))
             with patch("app.services.storage_writability.os.access", return_value=False):
-                problems = app_main.startup_storage_problems(settings)
+                problems = app_route_support.startup_storage_problems(settings)
             self.assertEqual(len(problems), 1)
             self.assertIn("new host keys cannot be saved", problems[0])
 
@@ -223,7 +225,7 @@ class ConfiguredKnownHostsStartupTests(unittest.TestCase):
             settings.systems = [
                 SystemConfig(id="secondary", ssh=SSHConfig(known_hosts_path=str(root / "absent" / "known_hosts")))
             ]
-            problems = app_main.startup_storage_problems(settings)
+            problems = app_route_support.startup_storage_problems(settings)
             self.assertEqual(len(problems), 1)
             self.assertIn(str(root / "absent"), problems[0])
 
@@ -234,7 +236,7 @@ class HealthzTests(unittest.TestCase):
         service.peek_cached_snapshot.return_value = snapshot
         request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(startup_problems=problems)))
         route = _route("/healthz")
-        with patch.object(app_main, "get_inventory_registry", return_value=_registry(service)):
+        with patch.object(app_routes, "get_inventory_registry", return_value=_registry(service)):
             response = asyncio.run(route.endpoint(request))
         return response.status_code, json.loads(response.body)
 
@@ -327,7 +329,7 @@ class HealthzTests(unittest.TestCase):
 
     def test_unavailable_history_service_is_degraded_not_down(self) -> None:
         problem = "History service unavailable: connection refused."
-        with patch.object(app_main, "history_service_problem", return_value=problem):
+        with patch.object(app_routes, "history_service_problem", return_value=problem):
             status, body = self.call_healthz(_snapshot())
         self.assertEqual(status, 200)
         self.assertEqual(body["status"], "degraded")
@@ -337,7 +339,7 @@ class HealthzTests(unittest.TestCase):
     def test_every_remote_failure_together_is_still_200(self) -> None:
         snapshot = _snapshot(api_ok=False, api_message="connection refused")
         snapshot.sources["ssh"] = SourceStatus(enabled=True, ok=False, message="timed out")
-        with patch.object(app_main, "history_service_problem", return_value="History service unavailable: x"):
+        with patch.object(app_routes, "history_service_problem", return_value="History service unavailable: x"):
             status, body = self.call_healthz(snapshot)
         self.assertEqual(status, 200)
         self.assertEqual(body["status"], "degraded")
@@ -362,18 +364,18 @@ class StorageReprobeTests(unittest.TestCase):
         request = self._request(("/app/data",), (CHOWN_SENTENCE,), checked_at=1000.0)
         with (
             patch.object(app_main.time, "monotonic", return_value=1010.0),
-            patch.object(app_main, "probe_writable_directories") as probe,
+            patch.object(app_route_support, "probe_writable_directories") as probe,
         ):
-            self.assertEqual(app_main.refresh_storage_problems(request), [CHOWN_SENTENCE])
+            self.assertEqual(app_route_support.refresh_storage_problems(request), [CHOWN_SENTENCE])
         probe.assert_not_called()
 
     def test_a_fixed_folder_clears_the_down_state_without_a_restart(self) -> None:
         request = self._request(("/app/data",), (CHOWN_SENTENCE,), checked_at=1000.0)
         with (
             patch.object(app_main.time, "monotonic", return_value=1031.0),
-            patch.object(app_main, "probe_writable_directories", return_value=[]) as probe,
+            patch.object(app_route_support, "probe_writable_directories", return_value=[]) as probe,
         ):
-            self.assertEqual(app_main.refresh_storage_problems(request), [])
+            self.assertEqual(app_route_support.refresh_storage_problems(request), [])
         probe.assert_called_once_with(("/app/data",))
         self.assertEqual(request.app.state.startup_problems, ())
         self.assertEqual(request.app.state.storage_checked_at_monotonic, 1031.0)
@@ -382,16 +384,16 @@ class StorageReprobeTests(unittest.TestCase):
         request = self._request(("/app/data",), (), checked_at=1000.0)
         with (
             patch.object(app_main.time, "monotonic", return_value=1031.0),
-            patch.object(app_main, "probe_writable_directories", return_value=[CHOWN_SENTENCE]),
+            patch.object(app_route_support, "probe_writable_directories", return_value=[CHOWN_SENTENCE]),
             self.assertLogs(app_main.logger, level="ERROR") as logs,
         ):
-            self.assertEqual(app_main.refresh_storage_problems(request), [CHOWN_SENTENCE])
+            self.assertEqual(app_route_support.refresh_storage_problems(request), [CHOWN_SENTENCE])
         self.assertEqual(len(logs.records), 1)
 
     def test_real_probe_round_trip_on_a_writable_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             request = self._request((temp_dir,), (CHOWN_SENTENCE,), checked_at=0.0)
-            self.assertEqual(app_main.refresh_storage_problems(request), [])
+            self.assertEqual(app_route_support.refresh_storage_problems(request), [])
             self.assertEqual(list(Path(temp_dir).iterdir()), [])
 
     def test_create_app_records_the_probe_directories(self) -> None:
@@ -418,12 +420,12 @@ class HistoryProbeTests(unittest.TestCase):
     URL = "http://history.example.test:8001"
 
     def setUp(self) -> None:
-        app_main.HISTORY_PROBE_CACHE.clear()
-        self.addCleanup(app_main.HISTORY_PROBE_CACHE.clear)
+        app_route_support.HISTORY_PROBE_CACHE.clear()
+        self.addCleanup(app_route_support.HISTORY_PROBE_CACHE.clear)
 
     def _probe(self, **urlopen: object) -> str | None:
-        with patch.object(app_main.urllib.request, "urlopen", **urlopen):
-            return app_main._probe_history_service(self.URL, 2.0)
+        with patch.object(app_route_support.urllib.request, "urlopen", **urlopen):
+            return app_route_support._probe_history_service(self.URL, 2.0)
 
     def test_healthy_history_is_not_a_problem(self) -> None:
         self.assertIsNone(self._probe(return_value=_FakeResponse(b'{"status": "ok"}')))
@@ -451,8 +453,8 @@ class HistoryProbeTests(unittest.TestCase):
 
     def test_unresolvable_default_compose_host_means_not_deployed(self) -> None:
         error = urllib.error.URLError(socket.gaierror(-2, "Name or service not known"))
-        with patch.object(app_main.urllib.request, "urlopen", side_effect=error):
-            self.assertIsNone(app_main._probe_history_service("http://enclosure-history:8001", 2.0))
+        with patch.object(app_route_support.urllib.request, "urlopen", side_effect=error):
+            self.assertIsNone(app_route_support._probe_history_service("http://enclosure-history:8001", 2.0))
 
     def test_unresolvable_custom_host_is_a_problem(self) -> None:
         error = urllib.error.URLError(socket.gaierror(-2, "Name or service not known"))
@@ -465,8 +467,8 @@ class HistoryProbeTests(unittest.TestCase):
         self.assertIn("unreadable", self._probe(return_value=_FakeResponse(b"not json")) or "")
 
     def test_unconfigured_history_is_not_probed(self) -> None:
-        with patch.object(app_main, "_probe_history_service") as probe:
-            self.assertIsNone(app_main.history_service_problem(Settings()))
+        with patch.object(app_route_support, "_probe_history_service") as probe:
+            self.assertIsNone(app_route_support.history_service_problem(Settings()))
         probe.assert_not_called()
 
     def test_answers_are_cached_and_the_timeout_is_capped(self) -> None:
@@ -475,80 +477,80 @@ class HistoryProbeTests(unittest.TestCase):
         settings.history.timeout_seconds = 10
         clock = [1000.0]
         with (
-            patch.object(app_main, "_probe_history_service", return_value="History service unavailable: x") as probe,
+            patch.object(app_route_support, "_probe_history_service", return_value="History service unavailable: x") as probe,
             patch.object(app_main.time, "monotonic", side_effect=lambda: clock[0]),
         ):
-            app_main.history_service_problem(settings)
+            app_route_support.history_service_problem(settings)
             clock[0] += 9.0
-            app_main.history_service_problem(settings)
+            app_route_support.history_service_problem(settings)
             self.assertEqual(probe.call_count, 1)
             clock[0] += 2.0
-            app_main.history_service_problem(settings)
+            app_route_support.history_service_problem(settings)
             self.assertEqual(probe.call_count, 2)
-        probe.assert_called_with(self.URL, app_main.HISTORY_PROBE_MAX_TIMEOUT_SECONDS)
+        probe.assert_called_with(self.URL, app_route_support.HISTORY_PROBE_MAX_TIMEOUT_SECONDS)
 
 
 class AdminProbeCacheTests(unittest.TestCase):
     def setUp(self) -> None:
-        app_main.ADMIN_PROBE_CACHE.clear()
-        self.addCleanup(app_main.ADMIN_PROBE_CACHE.clear)
+        app_route_support.ADMIN_PROBE_CACHE.clear()
+        self.addCleanup(app_route_support.ADMIN_PROBE_CACHE.clear)
         # Run the background refresh inline so each TTL test can count probes.
-        inline = patch.object(app_main, "_start_admin_probe_refresh", side_effect=app_main._refresh_admin_probe)
+        inline = patch.object(app_route_support, "_start_admin_probe_refresh", side_effect=app_route_support._refresh_admin_probe)
         inline.start()
         self.addCleanup(inline.stop)
 
     def test_failed_probe_is_remembered_for_ten_seconds(self) -> None:
         clock = [1000.0]
         with (
-            patch.object(app_main, "_probe_admin_service", return_value=False) as probe,
+            patch.object(app_route_support, "_probe_admin_service", return_value=False) as probe,
             patch.object(app_main.time, "monotonic", side_effect=lambda: clock[0]),
         ):
-            self.assertFalse(app_main.admin_service_reachable("http://admin.example.test:8002", 0.75))
+            self.assertFalse(app_route_support.admin_service_reachable("http://admin.example.test:8002", 0.75))
             clock[0] += 9.0
-            self.assertFalse(app_main.admin_service_reachable("http://admin.example.test:8002", 0.75))
+            self.assertFalse(app_route_support.admin_service_reachable("http://admin.example.test:8002", 0.75))
             self.assertEqual(probe.call_count, 1)
             clock[0] += 2.0
-            self.assertFalse(app_main.admin_service_reachable("http://admin.example.test:8002", 0.75))
+            self.assertFalse(app_route_support.admin_service_reachable("http://admin.example.test:8002", 0.75))
             self.assertEqual(probe.call_count, 2)
 
     def test_successful_probe_is_remembered_for_thirty_seconds(self) -> None:
         clock = [1000.0]
         with (
-            patch.object(app_main, "_probe_admin_service", return_value=True) as probe,
+            patch.object(app_route_support, "_probe_admin_service", return_value=True) as probe,
             patch.object(app_main.time, "monotonic", side_effect=lambda: clock[0]),
         ):
-            self.assertTrue(app_main.admin_service_reachable("http://admin.example.test:8002", 0.75))
+            self.assertTrue(app_route_support.admin_service_reachable("http://admin.example.test:8002", 0.75))
             clock[0] += 29.0
-            self.assertTrue(app_main.admin_service_reachable("http://admin.example.test:8002", 0.75))
+            self.assertTrue(app_route_support.admin_service_reachable("http://admin.example.test:8002", 0.75))
             self.assertEqual(probe.call_count, 1)
             clock[0] += 2.0
-            self.assertTrue(app_main.admin_service_reachable("http://admin.example.test:8002", 0.75))
+            self.assertTrue(app_route_support.admin_service_reachable("http://admin.example.test:8002", 0.75))
             self.assertEqual(probe.call_count, 2)
 
     def test_cache_is_per_service_url(self) -> None:
-        with patch.object(app_main, "_probe_admin_service", side_effect=[False, True]) as probe:
-            self.assertFalse(app_main.admin_service_reachable("http://admin-a.example.test:8002", 0.75))
-            self.assertTrue(app_main.admin_service_reachable("http://admin-b.example.test:8002", 0.75))
+        with patch.object(app_route_support, "_probe_admin_service", side_effect=[False, True]) as probe:
+            self.assertFalse(app_route_support.admin_service_reachable("http://admin-a.example.test:8002", 0.75))
+            self.assertTrue(app_route_support.admin_service_reachable("http://admin-b.example.test:8002", 0.75))
         self.assertEqual(probe.call_count, 2)
 
     def test_launch_state_reports_stopped_when_configured_but_unreachable(self) -> None:
         settings = Settings()
         settings.admin.service_url = "http://enclosure-admin:8002"
-        with patch.object(app_main, "_probe_admin_service", return_value=False):
-            state = app_main.resolve_admin_launch_url(_request(), settings)
-        self.assertEqual(state, app_main.AdminLaunchState(url=None, stopped=True))
+        with patch.object(app_route_support, "_probe_admin_service", return_value=False):
+            state = app_route_support.resolve_admin_launch_url(_request(), settings)
+        self.assertEqual(state, app_route_support.AdminLaunchState(url=None, stopped=True))
 
     def test_launch_state_carries_the_url_when_admin_answers(self) -> None:
         settings = Settings()
         settings.admin.service_url = "http://enclosure-admin:8002"
         settings.admin.port = 8082
-        with patch.object(app_main, "_probe_admin_service", return_value=True):
-            state = app_main.resolve_admin_launch_url(_request(), settings)
-        self.assertEqual(state, app_main.AdminLaunchState(url="http://testserver:8082", stopped=False))
+        with patch.object(app_route_support, "_probe_admin_service", return_value=True):
+            state = app_route_support.resolve_admin_launch_url(_request(), settings)
+        self.assertEqual(state, app_route_support.AdminLaunchState(url="http://testserver:8082", stopped=False))
 
     def test_launch_state_is_none_when_admin_is_not_configured(self) -> None:
-        with patch.object(app_main, "_probe_admin_service") as probe:
-            self.assertIsNone(app_main.resolve_admin_launch_url(_request(), Settings()))
+        with patch.object(app_route_support, "_probe_admin_service") as probe:
+            self.assertIsNone(app_route_support.resolve_admin_launch_url(_request(), Settings()))
         probe.assert_not_called()
 
 
@@ -558,13 +560,13 @@ class AdminProbeHotPathTests(unittest.TestCase):
     URL = "http://admin.example.test:8002"
 
     def setUp(self) -> None:
-        app_main.ADMIN_PROBE_CACHE.clear()
-        self.addCleanup(app_main.ADMIN_PROBE_CACHE.clear)
-        app_main._ADMIN_PROBE_REFRESHING.clear()
-        self.addCleanup(app_main._ADMIN_PROBE_REFRESHING.clear)
+        app_route_support.ADMIN_PROBE_CACHE.clear()
+        self.addCleanup(app_route_support.ADMIN_PROBE_CACHE.clear)
+        app_route_support._ADMIN_PROBE_REFRESHING.clear()
+        self.addCleanup(app_route_support._ADMIN_PROBE_REFRESHING.clear)
 
     def _expire(self) -> None:
-        for entry in app_main.ADMIN_PROBE_CACHE.values():
+        for entry in app_route_support.ADMIN_PROBE_CACHE.values():
             entry.expires_at_monotonic = 0.0
 
     def test_expired_answer_is_served_at_once_and_refreshed_in_the_background(self) -> None:
@@ -579,46 +581,46 @@ class AdminProbeHotPathTests(unittest.TestCase):
                 release.wait(5)
             return answer
 
-        with patch.object(app_main, "_probe_admin_service", side_effect=probe) as mocked:
-            self.assertFalse(app_main.admin_service_reachable(self.URL, 0.75))
+        with patch.object(app_route_support, "_probe_admin_service", side_effect=probe) as mocked:
+            self.assertFalse(app_route_support.admin_service_reachable(self.URL, 0.75))
             self._expire()
             begun = time.perf_counter()
             # The slow probe is still blocked, yet the lookup answers with the last state.
-            self.assertFalse(app_main.admin_service_reachable(self.URL, 0.75))
+            self.assertFalse(app_route_support.admin_service_reachable(self.URL, 0.75))
             self.assertLess(time.perf_counter() - begun, 0.5)
             self.assertTrue(started.wait(5))
             # A second expired lookup while that probe runs starts no other probe.
-            self.assertFalse(app_main.admin_service_reachable(self.URL, 0.75))
+            self.assertFalse(app_route_support.admin_service_reachable(self.URL, 0.75))
             release.set()
             for _ in range(200):
-                if self.URL not in app_main._ADMIN_PROBE_REFRESHING:
+                if self.URL not in app_route_support._ADMIN_PROBE_REFRESHING:
                     break
                 time.sleep(0.01)
             self.assertEqual(mocked.call_count, 2)
-        self.assertTrue(app_main.admin_service_reachable(self.URL, 0.75))
+        self.assertTrue(app_route_support.admin_service_reachable(self.URL, 0.75))
 
     def test_failed_background_refresh_keeps_serving_and_retries(self) -> None:
-        with patch.object(app_main, "_probe_admin_service", return_value=True):
-            self.assertTrue(app_main.admin_service_reachable(self.URL, 0.75))
+        with patch.object(app_route_support, "_probe_admin_service", return_value=True):
+            self.assertTrue(app_route_support.admin_service_reachable(self.URL, 0.75))
         self._expire()
         with (
-            patch.object(app_main, "_probe_admin_service", side_effect=RuntimeError("synthetic")),
-            patch.object(app_main, "_start_admin_probe_refresh",
+            patch.object(app_route_support, "_probe_admin_service", side_effect=RuntimeError("synthetic")),
+            patch.object(app_route_support, "_start_admin_probe_refresh",
                          side_effect=lambda url, timeout: self.assertRaises(
-                             RuntimeError, app_main._refresh_admin_probe, url, timeout)),
+                             RuntimeError, app_route_support._refresh_admin_probe, url, timeout)),
         ):
-            self.assertTrue(app_main.admin_service_reachable(self.URL, 0.75))
+            self.assertTrue(app_route_support.admin_service_reachable(self.URL, 0.75))
         # The refresh marker is cleared, so the next lookup can try again.
-        self.assertNotIn(self.URL, app_main._ADMIN_PROBE_REFRESHING)
+        self.assertNotIn(self.URL, app_route_support._ADMIN_PROBE_REFRESHING)
 
     def test_refresh_landing_before_the_lock_is_not_repeated(self) -> None:
         """A caller that read the expired entry re-checks the cache under the lock."""
 
-        with patch.object(app_main, "_probe_admin_service", return_value=False):
-            self.assertFalse(app_main.admin_service_reachable(self.URL, 0.75))
+        with patch.object(app_route_support, "_probe_admin_service", return_value=False):
+            self.assertFalse(app_route_support.admin_service_reachable(self.URL, 0.75))
         self._expire()
         url = self.URL
-        real_lock = app_main._ADMIN_PROBE_LOCK
+        real_lock = app_route_support._ADMIN_PROBE_LOCK
 
         class RefreshLandsFirst:
             """Lets another caller's refresh finish between the unlocked read and the lock."""
@@ -628,7 +630,7 @@ class AdminProbeHotPathTests(unittest.TestCase):
             def __enter__(self):
                 if not RefreshLandsFirst.landed:
                     RefreshLandsFirst.landed = True
-                    app_main.ADMIN_PROBE_CACHE[url] = app_main.AdminProbeCacheEntry(
+                    app_route_support.ADMIN_PROBE_CACHE[url] = app_route_support.AdminProbeCacheEntry(
                         reachable=True, expires_at_monotonic=time.monotonic() + 30,
                     )
                 return real_lock.__enter__()
@@ -637,19 +639,19 @@ class AdminProbeHotPathTests(unittest.TestCase):
                 return real_lock.__exit__(*exc)
 
         with (
-            patch.object(app_main, "_ADMIN_PROBE_LOCK", RefreshLandsFirst()),
-            patch.object(app_main, "_probe_admin_service") as probe,
-            patch.object(app_main, "_start_admin_probe_refresh") as start,
+            patch.object(app_route_support, "_ADMIN_PROBE_LOCK", RefreshLandsFirst()),
+            patch.object(app_route_support, "_probe_admin_service") as probe,
+            patch.object(app_route_support, "_start_admin_probe_refresh") as start,
         ):
             # The fresh answer wins over the stale pre-lock read; no second probe.
-            self.assertTrue(app_main.admin_service_reachable(self.URL, 0.75))
+            self.assertTrue(app_route_support.admin_service_reachable(self.URL, 0.75))
         probe.assert_not_called()
         start.assert_not_called()
-        self.assertNotIn(self.URL, app_main._ADMIN_PROBE_REFRESHING)
+        self.assertNotIn(self.URL, app_route_support._ADMIN_PROBE_REFRESHING)
 
     def test_concurrent_expired_lookups_start_one_refresh(self) -> None:
-        with patch.object(app_main, "_probe_admin_service", return_value=False):
-            self.assertFalse(app_main.admin_service_reachable(self.URL, 0.75))
+        with patch.object(app_route_support, "_probe_admin_service", return_value=False):
+            self.assertFalse(app_route_support.admin_service_reachable(self.URL, 0.75))
         self._expire()
         gate = threading.Barrier(16)
         results: list[bool] = []
@@ -657,11 +659,11 @@ class AdminProbeHotPathTests(unittest.TestCase):
 
         def page_load() -> None:
             gate.wait(5)
-            answer = app_main.admin_service_reachable(self.URL, 0.75)
+            answer = app_route_support.admin_service_reachable(self.URL, 0.75)
             with results_lock:
                 results.append(answer)
 
-        with patch.object(app_main, "_probe_admin_service", return_value=True) as probe:
+        with patch.object(app_route_support, "_probe_admin_service", return_value=True) as probe:
             for _round in range(20):
                 threads = [threading.Thread(target=page_load) for _ in range(16)]
                 for thread in threads:
@@ -670,25 +672,25 @@ class AdminProbeHotPathTests(unittest.TestCase):
                     thread.join(5)
                 gate.reset()
                 for _ in range(200):
-                    if self.URL not in app_main._ADMIN_PROBE_REFRESHING:
+                    if self.URL not in app_route_support._ADMIN_PROBE_REFRESHING:
                         break
                     time.sleep(0.005)
                 # Every round after the first sees a fresh answer: no more probes.
                 self.assertEqual(probe.call_count, 1)
         self.assertEqual(len(results), 16 * 20)
-        self.assertTrue(app_main.admin_service_reachable(self.URL, 0.75))
+        self.assertTrue(app_route_support.admin_service_reachable(self.URL, 0.75))
 
     def test_startup_warm_fills_the_cache_before_the_first_page(self) -> None:
         settings = Settings()
         settings.admin.service_url = self.URL
-        with patch.object(app_main, "_probe_admin_service", return_value=False) as probe:
+        with patch.object(app_route_support, "_probe_admin_service", return_value=False) as probe:
             app_main.warm_admin_probe(settings)
-            self.assertIn(self.URL, app_main.ADMIN_PROBE_CACHE)
-            app_main.resolve_admin_launch_url(_request(), settings)
+            self.assertIn(self.URL, app_route_support.ADMIN_PROBE_CACHE)
+            app_route_support.resolve_admin_launch_url(_request(), settings)
         self.assertEqual(probe.call_count, 1)
 
     def test_startup_warm_skips_an_unconfigured_admin(self) -> None:
-        with patch.object(app_main, "_probe_admin_service") as probe:
+        with patch.object(app_route_support, "_probe_admin_service") as probe:
             app_main.warm_admin_probe(Settings())
         probe.assert_not_called()
 
@@ -706,10 +708,10 @@ class IndexPageTests(unittest.TestCase):
         app_main.app.state.startup_problems = startup_problems
         try:
             with (
-                patch.object(app_main, "get_settings", return_value=settings),
-                patch.object(app_main, "get_inventory_registry", return_value=_registry(_service())),
-                patch.object(app_main, "get_release_status_service", return_value=release_service),
-                patch.object(app_main, "resolve_admin_launch_url", return_value=admin_state),
+                patch.object(app_routes, "get_settings", return_value=settings),
+                patch.object(app_routes, "get_inventory_registry", return_value=_registry(_service())),
+                patch.object(app_routes, "get_release_status_service", return_value=release_service),
+                patch.object(app_routes, "resolve_admin_launch_url", return_value=admin_state),
             ):
                 response = asyncio.run(route.endpoint(request=_request(), system_id=None, enclosure_id=None))
         finally:
@@ -718,7 +720,7 @@ class IndexPageTests(unittest.TestCase):
         return response.body.decode("utf-8")
 
     def test_stopped_admin_renders_a_disabled_button_with_the_restart_command(self) -> None:
-        page = self.render_index(app_main.AdminLaunchState(url=None, stopped=True))
+        page = self.render_index(app_route_support.AdminLaunchState(url=None, stopped=True))
         self.assertIn('id="admin-launch-stopped"', page)
         self.assertIn(">System Setup</button>", page)
         self.assertIn("disabled", page.split('id="admin-launch-stopped"', 1)[1].split("</button>", 1)[0])
@@ -727,7 +729,7 @@ class IndexPageTests(unittest.TestCase):
         self.assertNotIn('href="http://testserver:8082"', page)
 
     def test_running_admin_keeps_the_link(self) -> None:
-        page = self.render_index(app_main.AdminLaunchState(url="http://testserver:8082", stopped=False))
+        page = self.render_index(app_route_support.AdminLaunchState(url="http://testserver:8082", stopped=False))
         self.assertIn('href="http://testserver:8082"', page)
         self.assertNotIn("Admin is not running", page)
 

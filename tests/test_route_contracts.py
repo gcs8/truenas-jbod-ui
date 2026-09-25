@@ -16,7 +16,10 @@ from fastapi.routing import APIRoute
 # Must precede admin_service.main, which builds its app at import time.
 import tests.admin_test_env  # noqa: F401  (must precede admin_service.main)
 from admin_service import main as admin_main
+from admin_service import routes as admin_routes
 from app import main as app_main
+from app import route_support as app_route_support
+from app import routes as app_routes
 from app.models.domain import SystemBackupExportRequest
 from app.services.inventory import SnapshotStateBusyError, UnknownEnclosureError
 from app.services.snapshot_export import SnapshotExportBusyError
@@ -196,7 +199,7 @@ class RouteContractTests(unittest.TestCase):
                 send,
             )
 
-        with patch.object(app_main, "get_inventory_registry", return_value=registry):
+        with patch.object(app_routes, "get_inventory_registry", return_value=registry):
             asyncio.run(invoke())
 
         start = next(message for message in messages if message["type"] == "http.response.start")
@@ -244,7 +247,7 @@ class RouteContractTests(unittest.TestCase):
             with self.subTest(error=type(error).__name__):
                 service = SimpleNamespace(get_snapshot=AsyncMock(side_effect=error))
                 with self.assertRaises(app_main.HTTPException) as raised:
-                    asyncio.run(app_main.resolve_layout_slots(service, None))
+                    asyncio.run(app_route_support.resolve_layout_slots(service, None))
 
                 self.assertEqual(raised.exception.status_code, status_code)
                 self.assertEqual(raised.exception.detail, str(error))
@@ -364,6 +367,18 @@ class RouteContractTests(unittest.TestCase):
                     if isinstance(node, ast.ImportFrom)
                 }
                 self.assertNotIn(forbidden_module, imported_modules)
+        # Route modules import their collaborators, so file-wide lint suppressions
+        # (which would hide a mistyped name) must not come back.
+        for relative_path in (
+            "app/main.py",
+            "app/routes.py",
+            "admin_service/main.py",
+            "admin_service/routes.py",
+        ):
+            with self.subTest(blanket_suppression=relative_path):
+                source = Path(relative_path).read_text(encoding="utf-8")
+                self.assertNotRegex(source, r"(?m)^# ruff: noqa")
+                self.assertNotRegex(source, r"(?m)^# pyright: report")
 
     def test_main_routes_deduplicate_contiguous_service_perf_preambles(self) -> None:
         route_path = Path(__file__).resolve().parents[1] / "app" / "routes.py"
@@ -401,7 +416,7 @@ class RouteContractTests(unittest.TestCase):
                 duplicate_endpoints.append(endpoint.name)
         self.assertEqual(duplicate_endpoints, [])
 
-    def test_main_handler_resolves_main_module_patch_after_app_creation(self) -> None:
+    def test_route_handler_resolves_routes_module_patch_after_app_creation(self) -> None:
         application = app_main.create_app()
         route = cast(
             APIRoute,
@@ -412,7 +427,7 @@ class RouteContractTests(unittest.TestCase):
         registry = MagicMock()
         registry.get_service.return_value = service
 
-        with patch.object(app_main, "get_inventory_registry", return_value=registry) as getter:
+        with patch.object(app_routes, "get_inventory_registry", return_value=registry) as getter:
             response = asyncio.run(route.endpoint(SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(startup_problems=())))))
 
         self.assertEqual(response.status_code, 200)
@@ -442,8 +457,8 @@ class RouteContractTests(unittest.TestCase):
         sentinel = object()
 
         with (
-            patch.object(admin_main, "get_maintenance_service", return_value=service),
-            patch.object(admin_main, "TemporaryFileResponse", return_value=sentinel) as response_class,
+            patch.object(admin_routes, "get_maintenance_service", return_value=service),
+            patch.object(admin_routes, "TemporaryFileResponse", return_value=sentinel) as response_class,
         ):
             response = asyncio.run(
                 route.endpoint(
