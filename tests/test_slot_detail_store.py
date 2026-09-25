@@ -26,13 +26,41 @@ class SlotDetailStoreBatchConflictTests(unittest.TestCase):
             # Real competing write after the batch's read snapshot.
             with ThreadPoolExecutor(max_workers=1) as worker:
                 worker.submit(store.save_entries, [replacement, other]).result(timeout=5)
-            changed = second.model_copy(update={"updated_at": "2030-01-01T00:00:00+00:00"})
+            changed = second.model_copy(update={
+                "updated_at": "2030-01-01T00:00:00+00:00", "slot_fields": {"model": "changed-model"},
+            })
             with patch.object(store, "load_all", wraps=store.load_all) as load:
                 store.save_entries([first, changed], expected_entries=baseline)
                 self.assertEqual(load.call_count, 1)
             self.assertEqual(store.get_entry("invented-a", None, 0), replacement)
             self.assertEqual(store.get_entry("invented-a", None, 1), changed)
             self.assertEqual(store.get_entry("invented-b", None, 0), other)
+
+    def test_restamped_row_does_not_fence_a_concurrent_batch(self):
+        # #448: a writer that rewrote a slot with only a new updated_at (a
+        # snapshot restamping every row because another slot changed) has not
+        # changed that slot, so a batch that read it before must still land.
+        with tempfile.TemporaryDirectory() as directory:
+            store = SlotDetailStore(str(Path(directory) / "details.json"))
+            first = SlotDetailCacheEntry(system_id="invented-a", slot=0, identifiers=["disk-a"],
+                                         updated_at="2026-01-01T00:00:00+00:00")
+            second = first.model_copy(update={"slot": 1})
+            store.save_entries([first, second])
+            baseline = store.load_all()
+            restamped = first.model_copy(update={"updated_at": "2026-01-02T00:00:00+00:00"})
+            second_changed = second.model_copy(update={
+                "identifiers": ["disk-b"], "updated_at": "2026-01-02T00:00:00+00:00",
+            })
+            store.save_entries([restamped, second_changed])
+            smart = first.model_copy(update={
+                "smart_fields": {"temperature": 33}, "smart_updated_at": "2026-01-03T00:00:00+00:00",
+                "updated_at": "2026-01-03T00:00:00+00:00",
+            })
+            store.save_entries([smart], expected_entries=baseline)
+            self.assertEqual(store.get_entry("invented-a", None, 0), smart)
+            # A real change by the other writer still fences.
+            store.save_entries([second], expected_entries=baseline)
+            self.assertEqual(store.get_entry("invented-a", None, 1), second_changed)
 
 
 class SlotDetailStoreSaveTests(unittest.TestCase):
@@ -54,7 +82,11 @@ class SlotDetailStoreSaveTests(unittest.TestCase):
             ("empty", [], 0, 0),
             ("identical", [self._entry()], 1, 0),
             ("changed", [changed], 1, 1),
-            ("timestamp-only", [self._entry(updated_at="2026-01-01T00:00:01+00:00")], 1, 1),
+            # #448 item 2: the row stamp alone is not a change.
+            ("timestamp-only", [self._entry(updated_at="2026-01-01T00:00:01+00:00")], 1, 0),
+            ("smart-stamp", [self._entry(smart_updated_at="2026-01-01T00:00:01+00:00")], 1, 1),
+            ("smart-stale", [self._entry(smart_stale=True)], 1, 1),
+            ("identity-unknown", [self._entry(identity_unknown=True)], 1, 1),
             ("replacement", [self._entry(identifiers=["disk-b"])], 1, 1),
             ("slot-fields", [self._entry(slot_fields={"model": "model-b"})], 1, 1),
             ("duplicate-restored", [changed, self._entry()], 1, 0),
@@ -70,8 +102,9 @@ class SlotDetailStoreSaveTests(unittest.TestCase):
                 before = path.read_bytes()
                 before_stat = path.stat()
                 expected = json.loads(before)["slot_details"]
-                for entry in batch:
-                    expected[store._slot_key(entry.system_id, entry.enclosure_id, entry.slot)] = entry.model_dump(mode="json")
+                if writes:
+                    for entry in batch:
+                        expected[store._slot_key(entry.system_id, entry.enclosure_id, entry.slot)] = entry.model_dump(mode="json")
                 with (
                     patch.object(store, "load_all", wraps=store.load_all) as load,
                     patch.object(store, "_write", wraps=store._write) as write,
@@ -87,6 +120,19 @@ class SlotDetailStoreSaveTests(unittest.TestCase):
                 with patch.object(store, "_write", wraps=store._write) as write:
                     store.save_entries(batch)
                 write.assert_not_called()
+
+    def test_timestamp_only_entry_rides_along_with_a_real_change(self) -> None:
+        # When another entry in the batch really changed, the file is written
+        # and every entry in it carries the stamp the caller gave it.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SlotDetailStore(str(Path(temp_dir) / "slot_detail_cache.json"))
+            store.save_entries([self._entry(), self._entry(slot=1)])
+            stamp = "2026-02-02T00:00:00+00:00"
+            stamped = self._entry(updated_at=stamp)
+            changed = self._entry(slot=1, smart_fields={"temperature": 40}, updated_at=stamp)
+            store.save_entries([stamped, changed])
+            self.assertEqual(store.get_entry("system-a", "enc-1", 0), stamped)
+            self.assertEqual(store.get_entry("system-a", "enc-1", 1), changed)
 
     def test_empty_save_does_not_create_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
