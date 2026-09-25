@@ -480,6 +480,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Performance
 
+- A snapshot refresh no longer rewrites the slot-detail cache file when
+  nothing but the row timestamps changed. SMART freshness still comes from
+  its own read time and stale flag, which still count as changes. (#607)
 - SSH SMART reads that overlap on a host now share one connection and run
   on up to 8 channels, so `smart_batch_max_concurrency` speeds up SSH grids
   (60 bays: 60 connections to 5, 13.9 s to 1.6 s in the modeled benchmark).
