@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import sqlite3
+import stat
 import struct
 import subprocess
 import sys
@@ -1109,6 +1110,157 @@ class SystemBackupServiceTests(unittest.TestCase):
                     )
             finally:
                 artifact.cleanup()
+
+    # -- #397: fast encrypted FULL backups (tar.zst in the chunked TJBENC02 envelope) --
+
+    def _export_stream_full(self, passphrase: str) -> Any:
+        with (
+            patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False),
+            patch.object(
+                self.backup_service,
+                "_run_7z_command",
+                side_effect=AssertionError("the fast FULL format must not invoke 7z"),
+            ),
+        ):
+            get_settings.cache_clear()
+            return self.backup_service.export_scheduled_bundle_to_file(
+                passphrase=passphrase,
+                included_paths=[HISTORY_DB_KEY, MAPPING_FILE_KEY],
+                archive_format="tar.zst",
+            )
+
+    def test_stream_encrypted_full_backup_round_trips_through_file_backed_paths(self) -> None:
+        from history_service.backup_archive import stream_envelope
+
+        passphrase = "fast full backup passphrase"
+        original_mapping = self.mapping_path.read_bytes()
+        artifact = self._export_stream_full(passphrase)
+        try:
+            self.assertTrue(artifact.filename.endswith(".tar.zst.enc"))
+            raw = artifact.path.read_bytes()
+            self.assertTrue(raw.startswith(stream_envelope.MAGIC))
+            self.assertNotIn(passphrase.encode(), raw)
+            self.assertNotIn(b"SQLite format 3", raw)
+            self.assertEqual(stat.S_IMODE(artifact.path.stat().st_mode), 0o600)
+            self.assertEqual(artifact.manifest["packaging"], "tar.zst")
+
+            inspection = self.backup_service.inspect_bundle_file(
+                artifact.path, passphrase=passphrase, expected_encrypted=True
+            )
+            self.assertTrue(inspection["ok"])
+            self.assertIn(HISTORY_DB_KEY, inspection["present_groups"])
+            with self.assertRaisesRegex(ValueError, "expected plaintext"):
+                self.backup_service.inspect_bundle_file(
+                    artifact.path, passphrase=passphrase, expected_encrypted=False
+                )
+            # The multi-GiB path must not map the whole archive into memory.
+            with patch.object(system_backup_module.mmap, "mmap", side_effect=AssertionError("mmap used")):
+                self.backup_service.preflight_import_bundle_file(
+                    artifact.path, passphrase=passphrase, expected_encrypted=True
+                )
+            self.mapping_path.write_text('{"version": 1, "slot_mappings": {}}', encoding="utf-8")
+            with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+                get_settings.cache_clear()
+                result = self.backup_service.import_bundle_from_file(
+                    artifact.path,
+                    passphrase=passphrase,
+                    expected_encrypted=True,
+                )
+            self.assertIn(HISTORY_DB_KEY, result["included_groups"])
+            self.assertEqual(self.mapping_path.read_bytes(), original_mapping)
+        finally:
+            artifact.cleanup()
+
+    def test_stream_encrypted_full_backup_refuses_wrong_passphrase_and_damage(self) -> None:
+        passphrase = "fast full damage passphrase"
+        artifact = self._export_stream_full(passphrase)
+        original_mapping = self.mapping_path.read_bytes()
+        try:
+            with self.assertRaisesRegex(ValueError, "Check the passphrase"):
+                self.backup_service.preflight_import_bundle_file(
+                    artifact.path, passphrase="not the passphrase", expected_encrypted=True
+                )
+            with self.assertRaisesRegex(ValueError, "passphrase is required"):
+                self.backup_service.preflight_import_bundle_file(artifact.path, passphrase=None)
+            raw = artifact.path.read_bytes()
+            damaged = self.temp_dir / "damaged.tar.zst.enc"
+            for label, mutated in (
+                ("flipped", raw[:-40] + bytes([raw[-40] ^ 1]) + raw[-39:]),
+                ("truncated", raw[: len(raw) - 20]),
+                ("appended", raw + b"\0" * 64),
+                ("header", raw[:9] + bytes([raw[9] ^ 1]) + raw[10:]),
+            ):
+                with self.subTest(label=label):
+                    damaged.unlink(missing_ok=True)
+                    damaged.write_bytes(mutated)
+                    with self.assertRaises(ValueError):
+                        self.backup_service.import_bundle_from_file(
+                            damaged, passphrase=passphrase, expected_encrypted=True
+                        )
+            self.assertEqual(self.mapping_path.read_bytes(), original_mapping)
+            self.assertEqual(list(Path(tempfile.gettempdir()).glob("truenas-jbod-ui-file-import-*/bundle.tar")), [])
+        finally:
+            artifact.cleanup()
+
+    def test_stream_envelope_cannot_smuggle_a_plain_small_archive_limit_bypass(self) -> None:
+        # A plaintext tar.zst keeps the small-archive limits; only the
+        # authenticated envelope admits multi-GiB history members.
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            plain = self.backup_service.export_bundle_to_file(
+                packaging="tar.zst", included_paths=[MAPPING_FILE_KEY]
+            )
+        seen: list[dict[str, Any]] = []
+        real = SystemBackupService._decompress_tar_archive_to_file.__func__
+
+        def spy(cls, *args: Any, **kwargs: Any) -> None:
+            seen.append(kwargs)
+            return real(cls, *args, **kwargs)
+
+        try:
+            with patch.object(SystemBackupService, "_decompress_tar_archive_to_file", classmethod(spy)):
+                self.backup_service.inspect_bundle_file(plain.path)
+        finally:
+            plain.cleanup()
+        self.assertEqual(seen, [{}], "a plaintext tar.zst must keep the default small expanded limit")
+        with self.assertRaisesRegex(ValueError, "not supported"):
+            self.backup_service._read_plain_archive_file(
+                self._write_zip_placeholder(), workspace=self.temp_dir, passphrase=None, file_backed_history=True
+            )
+
+    def _write_zip_placeholder(self) -> Path:
+        path = self.temp_dir / "placeholder.zip"
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("manifest.json", "{}")
+        return path
+
+    def test_stream_full_export_reserves_snapshot_tar_and_output_space(self) -> None:
+        calls: list[int] = []
+        real = SystemBackupService._require_export_free_space
+
+        def spy(service: Any, groups: Any, *, copies: int = 2) -> None:
+            calls.append(copies)
+            real(service, groups, copies=copies)
+
+        with patch.object(SystemBackupService, "_require_export_free_space", spy):
+            self._export_stream_full("space passphrase").cleanup()
+        self.assertEqual(calls, [3])
+
+    def test_stream_full_backup_keeps_7z_default_and_rejects_unknown_format(self) -> None:
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            with self.assertRaisesRegex(ValueError, "must be 7z or tar.zst"):
+                self.backup_service.export_scheduled_bundle_to_file(
+                    passphrase="x", included_paths=[HISTORY_DB_KEY], archive_format="zip"
+                )
+            with patch.object(self.backup_service, "_run_7z_command", side_effect=self._fake_7z_command):
+                artifact = self.backup_service.export_scheduled_bundle_to_file(
+                    passphrase="default format passphrase", included_paths=[HISTORY_DB_KEY]
+                )
+        try:
+            self.assertTrue(artifact.filename.endswith(".7z"))
+        finally:
+            artifact.cleanup()
 
     def test_one_shot_runner_publishes_restore_grade_mapping_profile_and_calibration_backup(
         self,
@@ -6938,3 +7090,128 @@ class SSHKeyManagerTests(unittest.TestCase):
         self.assertTrue(Path(generated["public_path"]).exists())
         self.assertEqual(len(listed), 1)
         self.assertEqual(listed[0]["fingerprint"], generated["fingerprint"])
+
+
+class PreadViewTests(unittest.TestCase):
+    def test_bounded_positional_slices(self) -> None:
+        with tempfile.TemporaryFile() as handle:
+            handle.write(b"a" * 1024)
+            handle.flush()
+            view = system_backup_module._PreadView(handle.fileno())
+            self.assertEqual(len(view), 1024)
+            self.assertEqual(view[10:14], b"aaaa")
+            self.assertEqual(view[2000:], b"")
+            with patch.object(system_backup_module, "MAX_ARCHIVE_METADATA_BYTES", 16):
+                with self.assertRaises(ValueError):
+                    view[0:17]
+
+
+class StreamEnvelopeTests(unittest.TestCase):
+    """#397: TJBENC02 chunked AES-256-GCM (STREAM) envelope."""
+
+    def setUp(self) -> None:
+        from history_service.backup_archive import stream_envelope
+
+        self.env = stream_envelope
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.fast = patch.object(stream_envelope, "DEFAULT_SCRYPT", (14, 8, 1))
+        self.fast.start()
+        self.addCleanup(self.fast.stop)
+
+    def seal(self, data: bytes, chunk_log2: int = 16) -> Path:
+        path = self.root / f"sealed-{len(data)}-{chunk_log2}"
+        with path.open("wb") as output:
+            sealer = self.env.StreamSealer(output, "pw", chunk_log2=chunk_log2, scrypt=(14, 8, 1))
+            for offset in range(0, len(data), 7777):
+                sealer.write(data[offset : offset + 7777])
+            sealer.close()
+        return path
+
+    def open(self, path: Path, passphrase: str = "pw", limit: int = 1 << 30) -> bytes:
+        out = self.root / "plain"
+        out.unlink(missing_ok=True)
+        self.env.decrypt_file(path, out, passphrase, max_output_bytes=limit)
+        return out.read_bytes()
+
+    def test_round_trip_at_chunk_boundaries(self) -> None:
+        chunk = 1 << 16
+        for size in (0, 1, chunk - 1, chunk, chunk + 1, 3 * chunk, 3 * chunk + 5):
+            with self.subTest(size=size):
+                data = os.urandom(size)
+                self.assertEqual(self.open(self.seal(data)), data)
+
+    def test_every_tampering_is_refused_and_leaves_no_output(self) -> None:
+        chunk = 1 << 16
+        data = os.urandom(3 * chunk + 100)
+        sealed = self.seal(data).read_bytes()
+        record = chunk + 16
+        header = 48
+        cases = {
+            "wrong passphrase": (sealed, "nope"),
+            "header byte": (sealed[:30] + bytes([sealed[30] ^ 1]) + sealed[31:], "pw"),
+            "body byte": (sealed[:header + 5] + bytes([sealed[header + 5] ^ 1]) + sealed[header + 6:], "pw"),
+            "drop last record": (sealed[: header + 3 * record], "pw"),
+            "truncate": (sealed[:-1], "pw"),
+            "append": (sealed + b"x", "pw"),
+            "swap records": (
+                sealed[:header] + sealed[header + record : header + 2 * record]
+                + sealed[header : header + record] + sealed[header + 2 * record :],
+                "pw",
+            ),
+            "empty body": (sealed[:header], "pw"),
+            "newer version": (sealed[:8] + b"\x02" + sealed[9:], "pw"),
+        }
+        for label, (blob, passphrase) in cases.items():
+            with self.subTest(label=label):
+                path = self.root / "tampered"
+                path.write_bytes(blob)
+                with self.assertRaises(self.env.StreamEnvelopeError) as raised:
+                    self.open(path, passphrase)
+                self.assertFalse((self.root / "plain").exists())
+                self.assertNotIn("pw", str(raised.exception).split())
+        path = self.root / "tampered"
+        path.write_bytes(sealed[:8] + b"\x02" + sealed[9:])
+        with self.assertRaisesRegex(self.env.StreamEnvelopeError, "newer version"):
+            self.open(path)
+
+    def test_crafted_header_cannot_demand_huge_kdf_or_chunk(self) -> None:
+        sealed = bytearray(self.seal(b"data").read_bytes())
+        for offset, value in ((9, 30), (10, 64), (11, 9), (12, 30)):
+            with self.subTest(offset=offset):
+                blob = bytearray(sealed)
+                blob[offset] = value
+                path = self.root / "crafted"
+                path.write_bytes(bytes(blob))
+                with self.assertRaisesRegex(self.env.StreamEnvelopeError, "damaged"):
+                    self.open(path)
+
+    def test_output_limit_is_checked_before_key_derivation(self) -> None:
+        path = self.seal(os.urandom(5000))
+        with patch.object(self.env, "_derive_key", side_effect=AssertionError("KDF ran")):
+            with self.assertRaisesRegex(self.env.StreamEnvelopeError, "larger than"):
+                self.open(path, limit=4000)
+
+    def test_memory_stays_near_one_chunk(self) -> None:
+        source = self.root / "source"
+        with source.open("wb") as output:
+            for _ in range(24):
+                output.write(os.urandom(1 << 20))
+        sealed = self.root / "sealed"
+        out = self.root / "plain"
+        heap_probe.start()
+        try:
+            self.env.encrypt_file(source, sealed, "pw")
+            _, encrypt_peak = heap_probe.get_traced_memory()
+        finally:
+            heap_probe.stop()
+        heap_probe.start()
+        try:
+            self.env.decrypt_file(sealed, out, "pw", max_output_bytes=1 << 30)
+            _, decrypt_peak = heap_probe.get_traced_memory()
+        finally:
+            heap_probe.stop()
+        self.assertLess(encrypt_peak, 8 << 20)
+        self.assertLess(decrypt_peak, 8 << 20)
+        self.assertEqual(out.stat().st_size, source.stat().st_size)

@@ -391,7 +391,10 @@ class FullBackupBenchmarkTests(unittest.TestCase):
         self.assertTrue(report["synthetic_only"])
         self.assertFalse(report["release_acceptance"])
         self.assertEqual(report["worker_cap"], 1)
-        self.assertEqual(report["candidate_profiles"][0]["state"], "unsupported")
+        self.assertEqual(
+            {c["profile"]: c["state"] for c in report["candidate_profiles"]},
+            {"7z": "measured", "tar.zst-stream": "not_run"},
+        )
         self.assertEqual([p["phase"] for p in report["phases"]], ["fixture", "create", "inspect", "verify", "extract"])
         self.assertEqual(report["phases"][0]["state"], "complete")
         self.assertEqual(list(self.root.iterdir()), [])
@@ -405,6 +408,19 @@ class FullBackupBenchmarkTests(unittest.TestCase):
             self.assertTrue(all(p["state"] == "complete" for p in report["phases"]))
         else:
             self.assertTrue(all(p["state"] == "blocked" for p in report["phases"][1:]))
+
+    def test_stream_format_self_test_runs_without_7z_and_cleans_scratch(self):
+        # #397: the fast format needs no external codec, so its phases always run.
+        proc = subprocess.run([sys.executable, "-B", str(SCRIPT), "--self-test", "--format", "tar.zst-stream",
+                               "--output-root", str(self.root)], capture_output=True, text=True, timeout=180)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        report = json.loads(proc.stdout)
+        self.assertEqual(report["profile"]["codec"], "zstd")
+        self.assertEqual(report["worker_cap"], 2)
+        self.assertTrue(all(p["state"] == "complete" for p in report["phases"]), report["phases"])
+        create = next(p for p in report["phases"] if p["phase"] == "create")
+        self.assertGreater(create["output_bytes"], 0)
+        self.assertEqual(list(self.root.iterdir()), [])
 
     def test_production_api_wiring_with_existing_test_codec_not_a_benchmark(self):
         # The repository's test codec is only a unit-test seam. It is never

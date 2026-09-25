@@ -255,7 +255,7 @@ test("admin copy no longer leaks implementation vocabulary", () => {
   for (const word of [/sidecar/i, /\bpills?\b/i, /geometry/i, /\bpreset\b/i, /first.pass/i, /enrichment/i, /Quantastor/]) {
     assert.doesNotMatch(userFacing, word);
   }
-  assert.match(TEMPLATE, /accept="\.7z,\.zip,\.tar\.gz,\.tgz,\.tar\.zst,\.zst,\.gz"/);
+  assert.match(TEMPLATE, /accept="\.7z,\.zip,\.tar\.gz,\.tgz,\.tar\.zst,\.zst,\.gz,\.enc"/);
   assert.match(TEMPLATE, /Management controller only \(BMC \/ IPMI\)/);
   assert.match(TEMPLATE, /Add a sample system \(fake data\)/);
 });
