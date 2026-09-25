@@ -55,6 +55,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   update, and rolls back when a source disk is unplaced or the source count
   drops. The receipt records counts, never identifiers (#592).
 
+- Backup policies and remote targets can be edited from the admin Backups page
+  (Edit settings). Saves are validated with the scheduler's rules, written to
+  `config.yaml` atomically and journalled; environment values stay locked, and
+  credentials stay secret files shown only as present or missing. (#599)
 - Added jump links to the sections of the admin Setup + Maintenance view (#582)
 - Added an optional backup scheduler sidecar (`--profile backup-scheduler`):
   config-only backups shortly after configuration changes, full backups on a

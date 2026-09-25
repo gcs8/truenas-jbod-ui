@@ -98,6 +98,8 @@ ADMIN_ROUTE_MATRIX = [
     ("/api/admin/profiles/{profile_id}", ("DELETE",), "delete_profile", "starlette.responses.JSONResponse", None),
     ("/api/admin/backups", ("GET",), "list_backups", "starlette.responses.JSONResponse", None),
     ("/api/admin/backups/run", ("POST",), "run_backup", "starlette.responses.JSONResponse", None),
+    ("/api/admin/backups/policy", ("GET",), "get_backup_policy", "starlette.responses.JSONResponse", None),
+    ("/api/admin/backups/policy", ("PUT",), "save_backup_policy", "starlette.responses.JSONResponse", None),
     ("/api/admin/backups/lifecycle/plan", ("GET",), "plan_backup_grooming", "starlette.responses.JSONResponse", None),
     ("/api/admin/backups/lifecycle/apply", ("POST",), "apply_backup_grooming", "starlette.responses.JSONResponse", None),
     ("/api/admin/backups/targets/{target_id}/test", ("POST",), "test_backup_target", "starlette.responses.JSONResponse", None),
