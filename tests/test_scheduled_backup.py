@@ -306,6 +306,19 @@ class ScheduledBackupRunnerTests(unittest.TestCase):
     def tearDown(self) -> None:
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
+    def test_runner_passes_the_fast_full_format_only_when_chosen(self) -> None:
+        # #397: 7z stays the default call shape; tar.zst is passed explicitly.
+        self._runner().run_once()
+        self.assertNotIn("archive_format", self.backup_service.export_scheduled_bundle_to_file.call_args.kwargs)
+        self.backup_service.export_scheduled_bundle_to_file.reset_mock()
+        self.workspace.mkdir(exist_ok=True)  # the first run's artifact cleanup removed it
+        self.artifact_path.write_bytes(b"authenticated-encrypted-archive")
+        self._runner(archive_format="tar.zst").run_once()
+        self.assertEqual(
+            self.backup_service.export_scheduled_bundle_to_file.call_args.kwargs["archive_format"],
+            "tar.zst",
+        )
+
     def _runner(self, **overrides: object) -> ScheduledBackupRunner:
         payload: dict[str, object] = {
             "backup_service": self.backup_service,

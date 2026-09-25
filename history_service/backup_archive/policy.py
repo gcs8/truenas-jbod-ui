@@ -15,6 +15,7 @@ supplies the policy; environment variables override single values (and
       full:                      # config + history database on a cron schedule
         enabled: false
         schedule: "0 3 * * *"
+        archive_format: 7z       # or tar.zst: much faster, needs this app version to restore
         local_keep: 7
         remote_keep: null
         remote_max_age_days: 90
@@ -42,7 +43,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
@@ -64,6 +65,7 @@ ENV_POLICY_OVERRIDES: dict[str, tuple[str, str]] = {
     "BACKUP_CONFIG_REMOTE_MAX_AGE_DAYS": ("config", "remote_max_age_days"),
     "BACKUP_FULL_ENABLED": ("full", "enabled"),
     "BACKUP_FULL_SCHEDULE": ("full", "schedule"),
+    "BACKUP_FULL_ARCHIVE_FORMAT": ("full", "archive_format"),
     "BACKUP_FULL_LOCAL_KEEP": ("full", "local_keep"),
     "BACKUP_FULL_REMOTE_KEEP": ("full", "remote_keep"),
     "BACKUP_FULL_REMOTE_MAX_AGE_DAYS": ("full", "remote_max_age_days"),
@@ -104,6 +106,9 @@ class ConfigClassPolicy(_ClassPolicyBase):
 
 class FullClassPolicy(_ClassPolicyBase):
     schedule: str = "0 3 * * *"
+    # 7z stays the default: older app versions cannot read tar.zst full backups
+    # (#397). tar.zst is much faster for multi-GiB history.
+    archive_format: Literal["7z", "tar.zst"] = "7z"
 
     @field_validator("schedule")
     @classmethod

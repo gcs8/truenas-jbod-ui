@@ -58,7 +58,17 @@ PAGE_BYTES = 4096
 OVERSHOOT_RESERVE_BYTES = MIB
 MAX_FIXTURE_ROWS = 1_000_000  # per populated table; two rows per iteration
 MAX_TIMEOUT = 600
-PROFILE = {"format": "7z", "encrypted": True, "codec": "LZMA2", "level": 5, "workers": 1}
+PROFILES = {
+    "7z": {"format": "7z", "encrypted": True, "codec": "LZMA2", "level": 5, "workers": 1},
+    # #397: tar.zst sealed in the chunked TJBENC02 AES-256-GCM envelope.
+    "tar.zst-stream": {"format": "tar.zst+TJBENC02", "encrypted": True, "codec": "zstd", "level": 3, "workers": 2},
+}
+PROFILE = PROFILES["7z"]
+ARCHIVE_NAMES = {"7z": "bundle.7z", "tar.zst-stream": "bundle.tar.zst.enc"}
+
+
+def needs_7z(archive_format: str) -> bool:
+    return archive_format == "7z"
 PHASES = ("fixture", "create", "inspect", "verify", "extract")
 
 
@@ -68,9 +78,9 @@ _OWNED_RUNS = {}
 
 
 @contextmanager
-def owned_run(parent: Path, target_bytes: int, *, allow_large: bool = False):
+def owned_run(parent: Path, target_bytes: int, *, allow_large: bool = False, archive_format: str = "7z"):
     preflight(parent, target_bytes)
-    if target_bytes != MIB and (not allow_large or not shutil.which("7z")):
+    if target_bytes != MIB and (not allow_large or (needs_7z(archive_format) and not shutil.which("7z"))):
         raise ValueError("large fixture requires explicit admission and real codec")
     with tempfile.TemporaryDirectory(prefix="full-backup-benchmark-", dir=parent) as name:
         root = Path(name).resolve(strict=True)
@@ -250,16 +260,26 @@ def operation(phase: str, request: dict) -> dict:
     from history_service.system_backup import HISTORY_DB_KEY, default_backup_included_paths
 
     service = synthetic_service(root, create_config=phase == "create")
-    archive = root / "bundle.7z"
+    archive_format = request.get("format", "7z")
+    if archive_format not in PROFILES:
+        raise ValueError("unknown archive format")
+    archive = root / ARCHIVE_NAMES[archive_format]
+    expected_packaging = "7z" if archive_format == "7z" else "tar.zst"
     passphrase = request["passphrase"]
     if phase == "create":
         groups = default_backup_included_paths()
         if HISTORY_DB_KEY not in groups:
             raise ValueError("production FULL selection no longer includes history")
-        artifact = service.export_bundle_to_file(encrypt=True, passphrase=passphrase,
-                                                packaging="7z", included_paths=groups)
+        if archive_format == "7z":
+            artifact = service.export_bundle_to_file(encrypt=True, passphrase=passphrase,
+                                                    packaging="7z", included_paths=groups)
+        else:
+            # The same export path the scheduler uses, without its extra preflight.
+            artifact = service._export_bundle_to_file(encrypt=True, passphrase=passphrase, packaging="tar.zst",
+                                                     included_paths=groups, encrypted_outer_envelope=False,
+                                                     stream_encrypted=True)
         try:
-            if artifact.manifest["packaging"] != "7z":
+            if artifact.manifest["packaging"] != expected_packaging:
                 raise ValueError("baseline packaging changed")
             os.replace(artifact.path, archive)
         finally:
@@ -269,7 +289,7 @@ def operation(phase: str, request: dict) -> dict:
     input_bytes = archive.stat().st_size
     if phase == "inspect":
         result = service.inspect_bundle_file(archive, passphrase=passphrase, expected_encrypted=True)
-        if result.get("ok") is not True or result["packaging"] != "7z" or HISTORY_DB_KEY not in result["present_groups"]:
+        if result.get("ok") is not True or result["packaging"] != expected_packaging or HISTORY_DB_KEY not in result["present_groups"]:
             raise ValueError("FULL inspection mismatch")
         return {"input_bytes": input_bytes, "output_bytes": result["total_uncompressed_bytes"]}
     if phase == "verify":
@@ -473,29 +493,32 @@ def measure_process(argv: list[str], request: dict, scratch: Path, *, timeout: f
     return result
 
 
-def benchmark(root: Path, target_bytes: int, *, seed: int, timeout: float, allow_large: bool = False) -> dict:
+def benchmark(root: Path, target_bytes: int, *, seed: int, timeout: float, allow_large: bool = False,
+              archive_format: str = "7z") -> dict:
     root = root.resolve(strict=True)
     preflight(root, target_bytes)
     source_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     report = {"schema_version": 1, "synthetic_only": True, "release_acceptance": False,
               "source_sha": source_sha, "source_file_sha256": file_digest(ROOT / "history_service/system_backup.py"),
               "runner_sha256": file_digest(Path(__file__)), "python": sys.version.split()[0],
-              "sqlite": sqlite3.sqlite_version, "profile": PROFILE, "worker_cap": 1,
+              "sqlite": sqlite3.sqlite_version, "profile": PROFILES[archive_format],
+              "worker_cap": PROFILES[archive_format]["workers"],
               "fixture_limits": fixture_limits(),
               "per_process_address_space_limit_bytes": GIB, "phase_timeout_seconds": timeout,
               "process_model": "forked owned-scratch workers; RSS includes inherited supervisor memory",
               "rss_scope": "max Linux process high-water RSS across worker and reaped descendants; not concurrent aggregate",
               "timing_scope": "whole production operations; overlapping work, not additive; fixture excluded from backup timing",
-              "candidate_profiles": [{"profile": "tar.zst+AES-256-GCM FULL", "state": "unsupported",
-                                      "reason": "current production FULL encrypted export selects 7z; no supported alternate FULL export API; guards not bypassed"}],
+              "candidate_profiles": [{"profile": name, "state": "measured" if name == archive_format else "not_run",
+                                      "reason": "this run" if name == archive_format else f"run again with --format {name}"}
+                                     for name in PROFILES],
               "large_matrix": [{"target_bytes": (size * GIB if size == 2 else fixture_limits()["maximum_target_bytes"]), "state": "not_run", "reason": "requires separate explicit opt-in and capacity/tool admission"} for size in (2, 4)],
               "phases": []}
-    with owned_run(root, target_bytes, allow_large=allow_large) as run:
+    with owned_run(root, target_bytes, allow_large=allow_large, archive_format=archive_format) as run:
         name = str(run)
         secret = secrets.token_urlsafe(32)
         blocked = None
         for phase in PHASES:
-            if phase == "create" and not shutil.which("7z"):
+            if phase == "create" and needs_7z(archive_format) and not shutil.which("7z"):
                 blocked = "7z executable unavailable"
             if blocked:
                 report["phases"].append({"phase": phase, "state": "blocked", "reason": blocked,
@@ -504,7 +527,7 @@ def benchmark(root: Path, target_bytes: int, *, seed: int, timeout: float, allow
                 continue
             with tempfile.TemporaryDirectory(prefix="phase-", dir=run) as scratch:
                 request = {"root": str(run), "target_bytes": target_bytes, "seed": seed,
-                           "timeout": timeout, "passphrase": secret}
+                           "timeout": timeout, "passphrase": secret, "format": archive_format}
                 result = measure_process([], request, Path(scratch), timeout=timeout, owned_phase=phase)
             report["phases"].append({"phase": phase, **result})
             if result["state"] != "complete":
@@ -513,7 +536,7 @@ def benchmark(root: Path, target_bytes: int, *, seed: int, timeout: float, allow
         for cell in report["large_matrix"]:
             if cell["target_bytes"] == target_bytes:
                 cell.update(state=report["state"], reason="see separately measured phases")
-            elif not shutil.which("7z"):
+            elif needs_7z(archive_format) and not shutil.which("7z"):
                 cell.update(state="blocked", reason="7z executable unavailable; no large allocation attempted")
     report["scratch_cleaned"] = not Path(name).exists()
     return report
@@ -532,6 +555,8 @@ def main(argv=None) -> int:
     )
     parser.add_argument("--output-root", type=Path, help="existing private scratch parent; never a database input")
     parser.add_argument("--workers", type=int, choices=(1,), default=1, help="baseline fixed to one compressor worker")
+    parser.add_argument("--format", choices=tuple(PROFILES), default="7z",
+                        help="7z baseline (default) or tar.zst-stream, the #397 fast encrypted FULL format")
     parser.add_argument("--timeout", type=float, default=120, help="per-phase wall/CPU budget, maximum 600 seconds")
     parser.add_argument(
         "--seed",
@@ -561,14 +586,15 @@ def main(argv=None) -> int:
         validate_size(target)
     except ValueError as error:
         parser.error(str(error))
-    if args.size_gib and not shutil.which("7z"):
+    if args.size_gib and needs_7z(args.format) and not shutil.which("7z"):
         # Refuse expensive allocation without the only supported adapter.
         print(json.dumps({"state": "blocked", "synthetic_only": True, "release_acceptance": False,
                           "target_bytes": target, "fixture_limits": fixture_limits(),
                           "reason": "7z executable unavailable; no fixture allocated"}))
         return 2
     try:
-        report = benchmark(root, target, seed=args.seed, timeout=args.timeout, allow_large=args.allow_large)
+        report = benchmark(root, target, seed=args.seed, timeout=args.timeout, allow_large=args.allow_large,
+                           archive_format=args.format)
     except ValueError:
         print(json.dumps({"state": "blocked", "synthetic_only": True, "release_acceptance": False,
                           "reason": "scratch free-space admission failed"}))

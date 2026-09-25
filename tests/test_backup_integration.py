@@ -112,6 +112,17 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(policy.max_age("full"), timedelta(days=30))
         self.assertEqual(policy.targets[0].label, "NAS")
 
+    def test_full_archive_format_defaults_to_7z_and_accepts_tar_zst(self) -> None:
+        # #397: the fast format is opt-in so older app versions can still restore by default.
+        self.write({"full": {"enabled": True}})
+        self.assertEqual(load_backup_policy(self.config, {}).full.archive_format, "7z")
+        policy = load_backup_policy(self.config, {"BACKUP_FULL_ARCHIVE_FORMAT": "tar.zst"})
+        self.assertEqual(policy.full.archive_format, "tar.zst")
+        self.write({"full": {"archive_format": "zip"}})
+        with self.assertRaises(ConfigurationError) as caught:
+            load_backup_policy(self.config, {})
+        self.assertTrue(any("backups.full.archive_format" in p for p in caught.exception.problems))
+
     def test_errors_are_plain_sentences_naming_the_source(self) -> None:
         self.write({"config": {"debounce_seconds": "soon"}, "full": {"schedule": "bad"}})
         with self.assertRaises(ConfigurationError) as caught:
@@ -348,6 +359,17 @@ class SchedulerTests(SchedulerTestBase):
         self.mono[0] += 11
         scheduler.tick()
         self.assertEqual(len(FakeRunner.calls), 1)
+
+    def test_full_runs_use_the_policy_archive_format_and_config_runs_stay_7z(self) -> None:
+        FakeRunner.calls.clear()
+        scheduler = self.make({
+            "config": {"enabled": True},
+            "full": {"enabled": True, "archive_format": "tar.zst"},
+        })
+        scheduler.run_now("full")
+        scheduler.run_now("config")
+        formats = [call.get("archive_format") for call in FakeRunner.calls]
+        self.assertEqual(formats, ["tar.zst", "7z"])
 
     def test_full_backup_runs_on_cron_and_grooms_local_keep(self) -> None:
         scheduler = self.make({"full": {"enabled": True, "schedule": "0 * * * *", "local_keep": 2}})

@@ -744,7 +744,7 @@ _BACKUP_CLASS_KEYS = frozenset({"enabled", "local_keep", "remote_keep", "remote_
 BACKUPS_SECTION_KEYS: dict[str, frozenset[str]] = {
     "": frozenset({"config", "full", "targets"}),
     "config": _BACKUP_CLASS_KEYS | {"debounce_seconds", "max_delay_seconds"},
-    "full": _BACKUP_CLASS_KEYS | {"schedule"},
+    "full": _BACKUP_CLASS_KEYS | {"schedule", "archive_format"},
     "targets": frozenset(
         {
             "target_id", "provider", "root", "hostname", "port", "username", "password_file",
