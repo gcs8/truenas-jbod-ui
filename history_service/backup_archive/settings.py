@@ -129,6 +129,71 @@ def normalized_root_parts(root: str) -> tuple[str, ...]:
     return parts
 
 
+def _directory_anchors(root: str | os.PathLike[str], *, label: str) -> list[tuple[tuple[int, int], tuple[str, ...]]]:
+    """Describe a path by existing directory identities plus unresolved suffixes.
+
+    ``realpath`` resolves existing symlinks without requiring the final path to
+    exist. Each resolved component is then inspected with ``lstat`` so a path
+    swap cannot make this check follow a new symlink. Directory device/inode
+    identities let bind-mounted aliases compare equal where the platform
+    exposes that fact. A missing suffix is recorded but never created or opened.
+    """
+
+    text = os.fspath(root)
+    _require(bool(text) and os.path.isabs(text), f"{label} must be an absolute path.")
+    try:
+        resolved = Path(os.path.realpath(text))
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ArchiveConfigError(f"{label} could not be resolved safely.") from exc
+    parts = resolved.parts
+    anchors: list[tuple[tuple[int, int], tuple[str, ...]]] = []
+    current = Path(parts[0])
+    for index in range(len(parts)):
+        if index:
+            current /= parts[index]
+        try:
+            metadata = os.lstat(current)
+        except FileNotFoundError:
+            break
+        except OSError as exc:
+            raise ArchiveConfigError(f"{label} could not be inspected safely.") from exc
+        if stat.S_ISLNK(metadata.st_mode):
+            # ``realpath`` returned this as a plain component but it changed
+            # before inspection. Refuse the unstable result instead of following it.
+            raise ArchiveConfigError(f"{label} changed while it was being resolved.")
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise ArchiveConfigError(f"{label} must resolve through directories only.")
+        anchors.append(((metadata.st_dev, metadata.st_ino), tuple(parts[index + 1 :])))
+    return anchors
+
+
+def _is_path_prefix(left: tuple[str, ...], right: tuple[str, ...]) -> bool:
+    return len(left) <= len(right) and right[: len(left)] == left
+
+
+def filesystem_roots_overlap(
+    local_archive_root: str | os.PathLike[str],
+    target_root: str | os.PathLike[str],
+) -> bool:
+    """Return whether two roots are the same physical tree or contain each other.
+
+    Existing symlinks are resolved, missing tails remain lexical, and matching
+    directory identities detect bind-visible aliases. Inspection failures raise
+    :class:`ArchiveConfigError` so callers fail closed rather than accepting an
+    uncertain target.
+    """
+
+    local_anchors = _directory_anchors(local_archive_root, label="Local backup archive root")
+    target_anchors = _directory_anchors(target_root, label="Filesystem archive target root")
+    for local_identity, local_suffix in local_anchors:
+        for target_identity, target_suffix in target_anchors:
+            if local_identity != target_identity:
+                continue
+            if _is_path_prefix(local_suffix, target_suffix) or _is_path_prefix(target_suffix, local_suffix):
+                return True
+    return False
+
+
 def validate_settings(settings: ArchiveTargetSettings) -> None:
     _require(bool(_TARGET_ID_RE.match(settings.target_id or "")), "Archive target id is invalid.")
     _require(settings.provider in PROVIDERS, f"Unsupported archive provider: {settings.provider!r}")

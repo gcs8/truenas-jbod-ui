@@ -423,6 +423,12 @@ journal. Restart the scheduler to apply a save:
 | `nfs` | No | Needs the NFS overlay below |
 | `filesystem` | n/a | An absolute path, for example a mounted USB disk |
 
+A `filesystem` target must be a different place from the local archive
+(`BACKUP_ARCHIVE_DIR`, `/app/backups/archive` by default). The scheduler refuses
+a root that is the local archive, sits inside it, or contains it, including
+through a symlink or a bind mount of the same directory. Otherwise remote
+retention could delete the only copy of a backup that local retention keeps.
+
 Each backup is copied to every enabled target. If one target fails, the other
 targets still get their copy and the local copy is kept.
 

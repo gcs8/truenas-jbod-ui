@@ -57,6 +57,7 @@ import paramiko
 from history_service.backup_archive.settings import (
     ArchiveConfigError,
     ArchiveTargetSettings,
+    filesystem_roots_overlap,
     normalized_root_parts,
     read_secret_file,
 )
@@ -330,11 +331,13 @@ class LocalDirectoryTarget(_TargetBase):
         provider: str = "filesystem",
         confine_to: Path | None = None,
         encrypted: bool = True,
+        local_archive_root: Path | None = None,
     ) -> None:
         self.provider = provider
         self._encrypted = encrypted
         self._root = Path(root)
         self._confine_to = Path(confine_to) if confine_to is not None else None
+        self._local_archive_root = Path(local_archive_root) if local_archive_root is not None else None
         self._root_real: Path | None = None
 
     @property
@@ -349,6 +352,15 @@ class LocalDirectoryTarget(_TargetBase):
         if not self._root.is_dir():
             raise ArchiveTransportError("Archive root is not a directory.")
         real = Path(os.path.realpath(self._root))
+        if self._local_archive_root is not None:
+            try:
+                overlaps_local = filesystem_roots_overlap(self._local_archive_root, real)
+            except ArchiveConfigError as exc:
+                raise ArchiveTransportError(str(exc)) from exc
+            if overlaps_local:
+                raise ArchiveTransportError(
+                    "Filesystem archive target must not overlap the local archive root."
+                )
         if self._confine_to is not None:
             base = Path(os.path.realpath(self._confine_to))
             if real != base and base not in real.parents:
@@ -1280,12 +1292,19 @@ def _open_s3(settings: ArchiveTargetSettings) -> Iterator[S3Target]:
 
 
 @contextmanager
-def open_target(settings: ArchiveTargetSettings) -> Iterator[ArchiveTarget]:
+def open_target(
+    settings: ArchiveTargetSettings,
+    *,
+    local_archive_root: str | os.PathLike[str] | None = None,
+) -> Iterator[ArchiveTarget]:
     """Open one connection (or NFS mount) for the whole block and close it on exit."""
 
     provider = settings.provider
     if provider == "filesystem":
-        yield LocalDirectoryTarget(Path("/").joinpath(*normalized_root_parts(settings.root)))
+        yield LocalDirectoryTarget(
+            Path("/").joinpath(*normalized_root_parts(settings.root)),
+            local_archive_root=Path(local_archive_root) if local_archive_root is not None else None,
+        )
     elif provider == "ftp":
         with _open_ftp(settings) as target:
             yield target
