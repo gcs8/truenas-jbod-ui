@@ -780,3 +780,26 @@ jobs:
             printf '%s\n' "$status"
             exit 1
           fi
+
+      # These specs build their own synthetic fixtures (a stub page, an
+      # offline snapshot, or a local app server on a temporary data dir) and
+      # need no appliance, so they run on every pull request. The live
+      # appliance specs (ui-switching, esxi-smoke) and the private restore spec
+      # stay manual (#445).
+      - name: Run fixture-only browser specs
+        env:
+          PLAYWRIGHT_BROWSER_CHANNEL: chrome
+          PYTHON: python
+        run: |
+          set -euo pipefail
+          npx playwright test \
+            qa/offline-snapshot.spec.js \
+            qa/saved-view-selection.spec.js \
+            qa/ui-scope-safety.spec.js \
+            qa/upgrade-notice.spec.js \
+            --retries=0
+          status="$(git status --short)"
+          if [ -n "$status" ]; then
+            printf '%s\n' "$status"
+            exit 1
+          fi
