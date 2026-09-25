@@ -78,6 +78,7 @@ from app import __version__
 from app.config import (
     TrueNASConfig,
     known_hosts_path_for_target,
+    restart_only_changes,
     save_runtime_behavior_overrides,
 )
 from app.models.domain import (
@@ -144,10 +145,31 @@ def build_router(admin_settings: Any) -> APIRouter:
             artifact.cleanup()
             raise
 
-    async def config_mutation_response(content: dict[str, Any]) -> JSONResponse:
+    async def config_mutation_response(
+        content: dict[str, Any],
+        *,
+        before: Any,
+        after: Any,
+        lead: str,
+    ) -> JSONResponse:
+        """Answer a config save, saying whether the main UI applies it by itself.
+
+        The main UI reloads config.yaml, runtime-overrides.yaml and
+        profiles.yaml when they change (#432). Only a change to a setting in
+        ``RESTART_ONLY_SETTINGS`` still needs a new main UI process; then the
+        answer carries ``restart_required: ["ui"]`` and the admin page shows
+        the Restart main UI now button.
+        """
         runtime_service = get_runtime_service()
-        await asyncio.to_thread(runtime_service.mark_restart_required, ("ui",))
-        content["restart_required"] = ["ui"]
+        restart_keys = restart_only_changes(before, after)
+        if restart_keys:
+            await asyncio.to_thread(runtime_service.mark_restart_required, ("ui",))
+            content["restart_required"] = ["ui"]
+            content["restart_settings"] = restart_keys
+            content["detail"] = f"{lead} The main UI needs a restart to apply this."
+        else:
+            content["restart_required"] = []
+            content["detail"] = f"{lead} The main UI applies it within a few seconds; no restart needed."
         content["runtime"] = await build_runtime_payload(runtime_service)
         return JSONResponse(content)
 
@@ -216,16 +238,11 @@ def build_router(admin_settings: Any) -> APIRouter:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         await asyncio.to_thread(record_config_change, "runtime_overrides.save", ",".join(sorted(values or {})))
 
-        runtime_service = get_runtime_service()
-        await asyncio.to_thread(runtime_service.mark_restart_required, ("ui",))
-        return JSONResponse(
-            {
-                "ok": True,
-                "runtime_behavior": runtime_behavior,
-                "runtime": await build_runtime_payload(runtime_service),
-                "restart_required": ["ui"],
-                "detail": "Timing saved. Restart the main UI to apply it.",
-            }
+        return await config_mutation_response(
+            {"ok": True, "runtime_behavior": runtime_behavior},
+            before=settings,
+            after=reload_app_settings(),
+            lead="Timing saved.",
         )
 
     @router.post("/api/admin/runtime/containers/{container_key}/stop")
@@ -836,13 +853,11 @@ def build_router(admin_settings: Any) -> APIRouter:
                 },
                 "systems": serialize_systems(refreshed_settings),
                 "default_system_id": refreshed_settings.default_system_id,
-                "detail": (
-                    "Saved. Restart the main UI to show the updated system."
-                    if updated_existing
-                    else "Saved. Restart the main UI to show the new system."
-                ),
                 "updated_existing": updated_existing,
-            }
+            },
+            before=settings,
+            after=refreshed_settings,
+            lead="Saved.",
         )
 
     @router.post("/api/admin/system-setup/demo")
@@ -878,10 +893,10 @@ def build_router(admin_settings: Any) -> APIRouter:
                 "default_system_id": refreshed_settings.default_system_id,
                 "updated_existing": bool(result.get("updated_existing")),
                 "updated_profile": bool(result.get("updated_profile")),
-                "detail": (
-                    f"Demo builder system {saved_system.label} saved. Restart the main UI to show it."
-                ),
-            }
+            },
+            before=settings,
+            after=refreshed_settings,
+            lead=f"Demo builder system {saved_system.label} saved.",
         )
 
     @router.delete("/api/admin/system-setup/{system_id}")
@@ -929,7 +944,6 @@ def build_router(admin_settings: Any) -> APIRouter:
         detail = f"Removed {deleted_label}."
         if purge_history:
             detail = f"{detail} {history_purge['detail']}"
-        detail = f"{detail} Restart the main UI to remove it there too."
         return await config_mutation_response(
             {
                 "ok": True,
@@ -937,9 +951,11 @@ def build_router(admin_settings: Any) -> APIRouter:
                 "deleted_label": deleted_label,
                 "systems": serialize_systems(refreshed_settings),
                 "default_system_id": next_default_id,
-                "detail": detail,
                 "history_purge": history_purge,
-            }
+            },
+            before=settings,
+            after=refreshed_settings,
+            lead=detail,
         )
 
     @router.post("/api/admin/history/purge-orphaned")
@@ -1229,13 +1245,15 @@ def build_router(admin_settings: Any) -> APIRouter:
                 "ok": True,
                 "profile": serialized_profile,
                 "profiles": serialized_profiles,
-                "detail": (
-                    "Custom enclosure profile updated. Restart the main UI to use the updated profile."
-                    if updated_existing
-                    else "Custom enclosure profile saved. Restart the main UI to use the new profile."
-                ),
                 "updated_existing": updated_existing,
-            }
+            },
+            before=settings,
+            after=refreshed_settings,
+            lead=(
+                "Custom enclosure profile updated."
+                if updated_existing
+                else "Custom enclosure profile saved."
+            ),
         )
 
     @router.delete("/api/admin/profiles/{profile_id}")
@@ -1254,10 +1272,10 @@ def build_router(admin_settings: Any) -> APIRouter:
                 "profile_id": profile_id,
                 "deleted_label": deleted_label,
                 "profiles": serialize_profiles(refreshed_settings),
-                "detail": (
-                    f"Deleted custom profile {deleted_label}. Restart the main UI to remove it from the profile list too."
-                ),
-            }
+            },
+            before=settings,
+            after=refreshed_settings,
+            lead=f"Deleted custom profile {deleted_label}.",
         )
 
     # -- backup library (#398/#573): proxied to the backup scheduler sidecar -----------

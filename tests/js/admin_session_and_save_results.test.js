@@ -174,13 +174,13 @@ test("a save response that needs a restart renders a Restart main UI button and 
   const result = new FakeElement();
   const runtime = { containers: [{ key: "ui", label: "Main UI", restart_required: true }] };
 
-  renderSaveResult(result, "Saved. Restart the main UI to show the new system.", {
-    detail: "Saved. Restart the main UI to show the new system.",
+  renderSaveResult(result, "Saved. The main UI needs a restart to apply this.", {
+    detail: "Saved. The main UI needs a restart to apply this.",
     restart_required: ["ui"],
     runtime,
   });
 
-  assert.equal(result.textContent, "Saved. Restart the main UI to show the new system. ");
+  assert.equal(result.textContent, "Saved. The main UI needs a restart to apply this. ");
   assert.equal(result.children.length, 1);
   assert.equal(result.children[0].textContent, "Restart main UI now");
   assert.equal(state.runtime, runtime);
@@ -213,8 +213,9 @@ test("every save, delete, and timing result goes through renderSaveResult and no
   for (const [label, text] of [["admin.js", SOURCE], ["index.html", TEMPLATE], ["routes.py", ROUTES]]) {
     assert.doesNotMatch(text, /read ui/i, `${label} must say main UI`);
   }
-  assert.match(TEMPLATE, /Saved systems appear in the main UI after a restart\./);
-  assert.match(ROUTES, /"restart_required": \["ui"\],\n\s+"detail": "Timing saved\. Restart the main UI to apply it\."/);
+  assert.match(TEMPLATE, /Saved systems appear in the main UI within a few seconds\./);
+  assert.match(ROUTES, /The main UI needs a restart to apply this\./);
+  assert.match(ROUTES, /The main UI applies it within a few seconds; no restart needed\./);
 });
 
 // Auto-stop is announced before and after it happens.

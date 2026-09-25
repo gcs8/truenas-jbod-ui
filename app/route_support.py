@@ -23,10 +23,12 @@ from pydantic import BaseModel, ConfigDict
 from app import __version__
 from app.config import (
     Settings,
-    get_settings,
+    get_settings as load_current_settings,
     is_placeholder_known_hosts_path,
     known_hosts_placeholder_paths,
 )
+from app.settings_reload import SettingsGeneration, SettingsRuntime
+from app.services.profile_registry import build_profile_reference_warnings
 from app.http_auth import (
     basic_auth_matches,
     request_origin_allowed,
@@ -186,25 +188,64 @@ class SnapshotExportSourceCacheEntry:
 SNAPSHOT_EXPORT_SOURCE_CACHE: OrderedDict[str, SnapshotExportSourceCacheEntry] = OrderedDict()
 
 
-@lru_cache
+# One settings generation per validated load of the config files (#432). A
+# request is pinned to the generation current when it arrived, and everything
+# below is built once per generation, so one request never mixes old and new
+# settings. See app/settings_reload.py.
+SETTINGS_RUNTIME = SettingsRuntime(lambda: load_current_settings())
+
+
+def get_settings() -> Settings:
+    """Settings for the running request (or the newest, outside a request)."""
+    return SETTINGS_RUNTIME.active().settings
+
+
+get_settings.cache_clear = load_current_settings.cache_clear  # type: ignore[attr-defined]
+
+
+def _build_inventory_registry(generation: SettingsGeneration) -> InventoryRegistry:
+    configure_logging(generation.settings)
+    return InventoryRegistry(generation.settings, previous=generation.inherited("inventory_registry"))
+
+
+def _build_history_backend(generation: SettingsGeneration) -> HistoryBackendClient:
+    configure_logging(generation.settings)
+    return HistoryBackendClient(generation.settings.history)
+
+
+def _build_snapshot_export_service(generation: SettingsGeneration) -> SnapshotExportService:
+    configure_logging(generation.settings)
+    return SnapshotExportService(
+        generation.settings,
+        generation.component("history_backend", _build_history_backend),
+        templates,
+    )
+
+
 def get_inventory_registry() -> InventoryRegistry:
-    settings = get_settings()
-    configure_logging(settings)
-    return InventoryRegistry(settings)
+    return SETTINGS_RUNTIME.active().component("inventory_registry", _build_inventory_registry)
 
 
-@lru_cache
 def get_history_backend() -> HistoryBackendClient:
-    settings = get_settings()
-    configure_logging(settings)
-    return HistoryBackendClient(settings.history)
+    return SETTINGS_RUNTIME.active().component("history_backend", _build_history_backend)
 
 
-@lru_cache
 def get_snapshot_export_service() -> SnapshotExportService:
-    settings = get_settings()
-    configure_logging(settings)
-    return SnapshotExportService(settings, get_history_backend(), templates)
+    return SETTINGS_RUNTIME.active().component("snapshot_export_service", _build_snapshot_export_service)
+
+
+def after_config_reload(app: Any, _before: Settings, after: Settings) -> None:
+    """Follow-up after the reloader swapped settings (#432).
+
+    Drop export sources built from the old names and re-probe the folders and
+    known-hosts files the new settings name on the next health check.
+    """
+    SNAPSHOT_EXPORT_SOURCE_CACHE.clear()
+    app.state.writable_directories = tuple(ui_writable_directories(after))
+    app.state.known_hosts_files = tuple(split_known_hosts_paths(after)[1])
+    app.state.storage_checked_at_monotonic = 0.0
+    for warning in build_profile_reference_warnings(after):
+        logger.warning("Configuration warning: %s", warning["message"])
 
 
 @lru_cache

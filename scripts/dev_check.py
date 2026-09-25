@@ -139,6 +139,7 @@ WINDOWS_PORTABLE_TEST_MODULES = (
     "tests.test_release_status",
     "tests.test_release_wrap_validator",
     "tests.test_scripts_help",
+    "tests.test_settings_reload",
     "tests.test_ssh_failure_contexts",
     "tests.test_script_platform_guards",
     "tests.test_ssh_probe",

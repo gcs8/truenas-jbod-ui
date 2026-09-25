@@ -113,6 +113,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Changed
 
+- The main UI applies edits to config.yaml, runtime-overrides.yaml and
+  profiles.yaml (admin saves and hand edits) within a few seconds, without a
+  restart. An invalid edit keeps the old settings with a warning in the log,
+  `/healthz` and the page. Only bind address, port, public origin, debug,
+  start-up warm-up, release check, perf and paths still need a restart; admin
+  offers Restart main UI now for those. (#614)
 - In network mode, the one-time notice after an update now says that anyone
   who can reach the port can change bay assignments and lights, on every
   release rather than only v0.23.0, so installs that skipped it are told
