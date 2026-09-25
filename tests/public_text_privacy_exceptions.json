@@ -58,7 +58,7 @@
   "app/config.py": {
     "findings": {
       "internal_hostname": {
-        "sha256:887a316eff930e2f900b70272df8eb85f82c96e2e347994534fcead46aa1f73f": 6
+        "sha256:39d7718b36525db61fb58c3b3895077768efddb10ca656f77462e5b77e677cbc": 5
       }
     },
     "reason": "Reviewed source literal or validation pattern; exact detector counts are pinned."

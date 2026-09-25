@@ -4,9 +4,7 @@
 # this file. Keep secrets in .env or secret files, not here.
 
 app:
-  # Address and port the main UI listens on inside the container.
-  host: 0.0.0.0
-  port: 8080
+  # The main UI port and address are set in .env (APP_PORT, APP_BIND_ADDRESS).
   # Public URL the browser reaches the main UI through, for example
   # https://bays.example.test. Leave empty to let the app accept the origin it is
   # served from.

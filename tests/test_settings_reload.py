@@ -238,7 +238,11 @@ class InvalidEditTests(ConfigReloadTestCase):
 class RestartOnlySettingsTests(ConfigReloadTestCase):
     def test_restart_only_keys_are_named_and_keep_running_values(self) -> None:
         running = self.runtime.current().settings
-        self.config["app"] = {"port": 9090, "debug": True, "refresh_interval_seconds": 45}
+        self.config["app"] = {
+            "public_origin": "https://ui.example.test",
+            "debug": True,
+            "refresh_interval_seconds": 45,
+        }
         self.config["systems"][0]["label"] = "Alpha Renamed"
         self._write_config()
 
@@ -246,10 +250,10 @@ class RestartOnlySettingsTests(ConfigReloadTestCase):
             self.assertTrue(self._check())
 
         current = self.runtime.current().settings
-        self.assertEqual(self.reloader.restart_pending, ("app.port", "app.debug"))
+        self.assertEqual(self.reloader.restart_pending, ("app.public_origin", "app.debug"))
         self.assertIn("needs a main UI restart", "\n".join(logs.output))
         # Restart-only values stay as the process started with them...
-        self.assertEqual(current.app.port, running.app.port)
+        self.assertEqual(current.app.public_origin, running.app.public_origin)
         self.assertEqual(current.app.debug, running.app.debug)
         # ...and everything else is applied.
         self.assertEqual(current.app.refresh_interval_seconds, 45)
@@ -267,14 +271,16 @@ class RestartOnlySettingsTests(ConfigReloadTestCase):
         before = Settings()
         after = before.model_copy(
             update={
-                "app": before.app.model_copy(update={"host": "127.0.0.1", "port": 1, "release_check_enabled": False}),
+                "app": before.app.model_copy(
+                    update={"public_origin": "https://ui.example.test", "release_check_enabled": False}
+                ),
                 "perf": before.perf.model_copy(update={"enabled": True}),
                 "paths": before.paths.model_copy(update={"log_file": "/tmp/elsewhere.log"}),
             }
         )
         self.assertEqual(
             restart_only_changes(before, after),
-            ["app.host", "app.port", "app.release_check_enabled", "perf", "paths"],
+            ["app.public_origin", "app.release_check_enabled", "perf", "paths"],
         )
         renamed = before.model_copy(update={"systems": [], "default_system_id": "x"})
         self.assertEqual(restart_only_changes(before, renamed), [])
@@ -478,7 +484,7 @@ class MainAppWiringTests(ConfigReloadTestCase):
 
     def test_restart_notice_is_a_page_warning_not_a_health_problem(self) -> None:
         app_main, application = self._app()
-        self.config["app"] = {"port": 9191}
+        self.config["app"] = {"public_origin": "https://ui.example.test"}
         self._write_config()
         self.clock.now += 5
         with self.assertLogs("app.settings_reload", level="WARNING"):
@@ -486,7 +492,7 @@ class MainAppWiringTests(ConfigReloadTestCase):
         request = type("R", (), {"app": application})()
         self.assertEqual(
             config_reload_problems(request),
-            ["Config change to app.port is saved but needs a main UI restart to take effect."],
+            ["Config change to app.public_origin is saved but needs a main UI restart to take effect."],
         )
         self.assertEqual(config_reload_problems(request, include_restart_notice=False), [])
 
