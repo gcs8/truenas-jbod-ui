@@ -2618,6 +2618,51 @@
     }
   }
 
+  // The header release note is rendered once by the server. While the first
+  // check is still running or has failed, poll a few times so a boot-time
+  // failure (DNS not ready yet) recovers without a reload. The server retries
+  // failures after 60 s, 5 min, then hourly; these delays trail those.
+  const RELEASE_NOTE_POLL_DELAYS_MS = [20000, 75000, 320000];
+
+  function releaseNoteNeedsRefresh(status) {
+    return status === "checking" || status === "error";
+  }
+
+  function scheduleReleaseNoteRefresh(attempt = 0) {
+    if (state.snapshotMode || !appVersionNote || attempt >= RELEASE_NOTE_POLL_DELAYS_MS.length) {
+      return;
+    }
+    // The server renders the status as a version-note-<status> class.
+    const initialStatus = appVersionNote.classList.contains("version-note-checking")
+      ? "checking"
+      : appVersionNote.classList.contains("version-note-error") ? "error" : "";
+    if (attempt === 0 && !releaseNoteNeedsRefresh(initialStatus)) {
+      return;
+    }
+    window.setTimeout(() => {
+      void refreshReleaseNote(attempt);
+    }, RELEASE_NOTE_POLL_DELAYS_MS[attempt]);
+  }
+
+  async function refreshReleaseNote(attempt) {
+    let payload;
+    try {
+      payload = await fetchJson("/api/release-status");
+    } catch (_error) {
+      scheduleReleaseNoteRefresh(attempt + 1);
+      return;
+    }
+    const status = String(payload?.status || "unknown");
+    const summary = String(payload?.summary || "").trim();
+    if (!state.appUpdated && status !== "disabled" && summary) {
+      setTextIfChanged(appVersionNote, summary);
+      appVersionNote.className = `meta-note version-note version-note-${status.replace(/[^a-z-]/g, "") || "unknown"}`;
+    }
+    if (releaseNoteNeedsRefresh(status)) {
+      scheduleReleaseNoteRefresh(attempt + 1);
+    }
+  }
+
   function renderAppVersionNote() {
     if (!appVersionNote || !state.appUpdated) {
       return;
@@ -11104,6 +11149,7 @@
   }
   void fetchStorageViewRuntime(false, true);
   void refreshHistoryStatus(true);
+  scheduleReleaseNoteRefresh();
   scheduleSmartPrefetch();
   resetTimer();
   queueIdentifyVerify("startup");
