@@ -10,8 +10,6 @@ const STYLE_SOURCE = fs.readFileSync(path.join(ROOT, "app/static/style.css"), "u
 
 const MIN_REM = 0.75;
 const MIN_PX = 12;
-const SECONDARY_TEXT_SELECTOR = /\.(fabric-|disk-path-|slot-)/;
-const GLYPH_PSEUDO_ELEMENT = /::(before|after)/;
 
 function stripComments(css) {
   return css.replace(/\/\*[\s\S]*?\*\//g, (comment) => comment.replace(/[^\n]/g, " "));
@@ -52,7 +50,13 @@ function declarations(body, property) {
   return values;
 }
 
+// Design floor (#440): no text in the stylesheet renders below 12px (0.75rem at
+// the default 16px root). Relative `em`/`%` sizes and small-caps tricks would
+// hide small text from this check, so they are rejected outright.
 function fontSizeTooSmall(value) {
+  if (/^[\d.]+(em|%)$/.test(value) || /^(x+-)?small(er)?$/.test(value)) {
+    return true;
+  }
   const rem = /^([\d.]+)rem$/.exec(value);
   if (rem) {
     return Number(rem[1]) < MIN_REM;
@@ -80,13 +84,10 @@ function contrastRatio(foreground, background) {
 
 const RULES = parseRules(STYLE_SOURCE);
 
-test("bay, fabric and disk-path text never drops below 12px", () => {
+test("no text in the stylesheet drops below 12px", () => {
   const violations = [];
   for (const rule of RULES) {
     if (rule.selector.startsWith("@")) {
-      continue;
-    }
-    if (!SECONDARY_TEXT_SELECTOR.test(rule.selector) || GLYPH_PSEUDO_ELEMENT.test(rule.selector)) {
       continue;
     }
     for (const value of declarations(rule.body, "font-size")) {
