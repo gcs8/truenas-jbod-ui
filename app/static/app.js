@@ -6433,14 +6433,29 @@
     return patched ? "patched" : "unchanged";
   }
 
+  // The renderers hide the tooltip before building. When the hovered or focused
+  // tile survives the commit, no new mouseover/focusin fires on it, so redraw
+  // its tooltip here instead of leaving it empty until the pointer moves away.
+  function restoreReusedTileTooltip(outcome) {
+    if (outcome === "replaced" || !Number.isInteger(state.hoveredSlot)) {
+      return;
+    }
+    const tile = Array.from(grid.querySelectorAll(".slot-tile[data-slot]"))
+      .find((candidate) => Number(candidate.dataset.slot) === state.hoveredSlot);
+    if (tile && (tile.matches(":hover") || tile === document.activeElement)) {
+      refreshHoveredTooltip(tile);
+    }
+  }
+
   function renderGrid() {
     const focusedSlotKeyBeforeRender = focusedGridSlotKey();
     const staging = document.createElement("div");
     const finishGridRender = () => {
-      commitGridRender(staging);
+      const outcome = commitGridRender(staging);
       refreshGridSelectionState();
       renderSearchSummary();
       restoreGridFocus(focusedSlotKeyBeforeRender);
+      restoreReusedTileTooltip(outcome);
     };
     const selectedStorageView = getSelectedStorageViewRuntime();
     if (selectedStorageView) {

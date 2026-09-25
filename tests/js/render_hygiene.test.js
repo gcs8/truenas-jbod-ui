@@ -540,3 +540,18 @@ test("grid renders commit through a staging container and reuse tiles", () => {
     assert.doesNotMatch(body, /\bgrid\.(innerHTML|appendChild)/, `${name} writes into its target`);
   }
 });
+
+test("a reused hovered tile gets its tooltip back after a render", () => {
+  const refreshed = [];
+  const tile = { dataset: { slot: "7" }, matches: (selector) => selector === ":hover" };
+  const { fns } = loadFunctions(APP_SOURCE, ["restoreReusedTileTooltip"], {
+    state: { hoveredSlot: 7 },
+    grid: { querySelectorAll: () => [tile] },
+    document: { activeElement: null },
+    refreshHoveredTooltip(anchor) { refreshed.push(anchor); },
+  });
+  fns.restoreReusedTileTooltip("patched");
+  fns.restoreReusedTileTooltip("unchanged");
+  fns.restoreReusedTileTooltip("replaced");
+  assert.deepEqual(refreshed, [tile, tile], "replaced grids keep the old hide-on-rebuild behaviour");
+});
