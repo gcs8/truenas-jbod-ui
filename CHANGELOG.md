@@ -419,6 +419,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   `POST /api/storage-views/{view_id}/slots/smart-batch` route, so a 60-slot
   view takes three requests per pass instead of 60. A main UI without the
   route still gets per-slot requests. (#595)
+- Gave admin backup and debug downloads and restore uploads a 30-minute
+  timeout so a stalled transfer ends with a plain message instead of hanging
+  (#583)
 - Offline exports embed a card photo only when a view or enclosure can draw
   it, and read the static files once per export instead of once per
   downsampling pass. (#493)
