@@ -771,22 +771,27 @@ them before starting the new images.
   unchanged. Set verification to `true` and provide a CA bundle when the
   appliance certificate is not already trusted. This supersedes the read-only
   network-mode and mandatory-origin upgrade notes from #245 and #201 (#392).
-- `docker-compose.yml` now describes a hardened runtime and needs a one-time
-  ownership step. The UI and history services run as `${APP_UID}:${APP_GID}`
-  instead of root. The UI service also mounts `./config` read-only, so
-  operator configuration is edited on the host or through the admin sidecar
-  rather than from inside the UI container; the history service does not
-  mount `./config` at all. Every service now has a read-only image filesystem,
-  a private `/tmp`, all capabilities dropped, and `no-new-privileges`. The
-  admin service stays UID `0` for Docker control but runs as `0:${APP_GID}`
-  with only `CHOWN` and `FOWNER` added back and without its app-log mount.
-  Hardening is opt-in: it lives in `docker-compose.nonroot.yml`, and a
-  deployment that does not add that overlay keeps root-owned bind mounts and
-  needs no ownership step (#246, and see #426 in the next release).
+- `docker-compose.yml` in the release tag describes a hardened runtime and
+  needs a one-time ownership step. The UI and history services run as
+  `${APP_UID}:${APP_GID}` instead of root. The UI service also mounts
+  `./config` read-only, so operator configuration is edited on the host or
+  through the admin sidecar rather than from inside the UI container; the
+  history service does not mount `./config` at all. Every service has a
+  read-only image filesystem, a private `/tmp`, all capabilities dropped, and
+  `no-new-privileges`. The admin service stays UID `0` for Docker control but
+  runs as `0:${APP_GID}` with only `CHOWN` and `FOWNER` added back and without
+  its app-log mount.
 
-  Skip this note entirely unless you add `-f docker-compose.nonroot.yml`. To
-  adopt the overlay, stop the stack and give the bind mounts to the configured
-  app identity from the host shell. Leave the backup identity alone:
+  In the `v0.23.0` tag, the base `docker-compose.yml` already has those
+  non-root and read-only settings. Its `docker-compose.nonroot.yml` repeats the
+  UI/history identity declarations; it is not the boundary that makes those
+  services non-root. The root-compatible base plus optional hardening overlay
+  on current `main` is a post-release migration, not tagged `v0.23.0`
+  behavior. Do not skip this release's ownership step just because the overlay
+  is absent.
+
+  Before the first start, stop the stack and give the bind mounts to the
+  configured app identity from the host shell. Leave the backup identity alone:
   `config/backup-secrets` stays private to `BACKUP_UID`, and `backup-status`
   is prepared as `BACKUP_UID:APP_GID` mode `2750`, which is what the scheduled
   backup runner requires before it will write status. No repository checkout
@@ -800,12 +805,14 @@ them before starting the new images.
   sudo find ./config -path ./config/backup-secrets -prune -o -exec chown "$app_uid:$app_gid" {} +
   sudo chown -R "$app_uid:$app_gid" ./data ./logs ./history
   sudo install -d -o "$backup_uid" -g "$app_gid" -m 2750 ./backup-status
-  docker compose -f docker-compose.yml -f docker-compose.nonroot.yml up -d
+  docker compose up -d
   ```
 
-  Do not run a recursive ownership or mode change over an existing segmented
-  history tree; see the sealed-segment note below. Without the ownership step
-  the non-root services cannot write their bind-mounted state (#246).
+  Add the same ordered `-f` files and profiles you normally use to the final
+  command. Do not run a recursive ownership or mode change over an existing
+  segmented history tree; see the sealed-segment note below. Without the
+  ownership step the non-root services cannot write their bind-mounted state
+  (#246).
 
 - **Rolling back to `v0.22.2`.** Set `JBOD_UI_IMAGE` in `.env` back to the tag
   or digest you recorded before the update, then run `docker compose pull` and
