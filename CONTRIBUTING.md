@@ -411,9 +411,12 @@ A branch push whose branch already has an open pull request skips the preflight
 jobs, because that pull request's own run already covers the same commit. The
 `Run routing` job makes that decision and the gated jobs report `Skipped`,
 which satisfies a required check; superseding the duplicate by cancellation
-would report `Cancelled`, which does not. Before a pull request exists the
-branch push still runs every job. CodeQL follows the same rule: it analyses
-pushes to `main`, pull requests targeting `main`, and the weekly schedule.
+would report `Cancelled`, which does not. A zero-result lookup receives one
+15-second recheck to cover GitHub's pull-request visibility delay; API failures
+and a second zero result run the full branch preflight. Before a pull request
+exists the branch push still runs every job. CodeQL follows the same rule: it
+analyses pushes to `main`, pull requests targeting `main`, and the weekly
+schedule.
 
 ## CI blocking policy
 
