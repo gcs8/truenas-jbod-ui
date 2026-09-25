@@ -480,6 +480,43 @@ class ImageOnlyUpgradeSmokeContractTests(unittest.TestCase):
         with self.assertRaisesRegex(smoke.SmokeError, "candidate schema is not current"):
             smoke.schema_evidence(predecessor, {"user_version": 0, "current_schema": 1})
 
+    def test_read_history_resolves_the_predecessor_schema_from_the_released_store(self):
+        # READ_HISTORY runs inside the v0.22.2 image, whose store predates
+        # CURRENT_SCHEMA_VERSION. Evaluate the probe's own lookup against the
+        # constants that release actually defines.
+        import ast
+        import subprocess
+        from types import SimpleNamespace
+
+        import history_service.store as current_store
+
+        smoke = self.load_smoke()
+        lookup = smoke.READ_HISTORY.split("current_schema = ", 1)[1].split("\nprint(", 1)[0]
+
+        def released_constants(tag: str) -> SimpleNamespace:
+            source = subprocess.run(
+                ["git", "show", f"{tag}:history_service/store.py"],
+                capture_output=True, text=True, check=True, cwd=self.ROOT,
+            ).stdout
+            names = {}
+            for node in ast.parse(source).body:
+                if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
+                    for target in node.targets:
+                        if isinstance(target, ast.Name) and target.id.isupper():
+                            names[target.id] = node.value.value
+            return SimpleNamespace(**names)
+
+        released = released_constants("v0.22.2")
+        self.assertFalse(hasattr(released, "CURRENT_SCHEMA_VERSION"))
+        self.assertEqual(eval(lookup, {"store_module": released}), 1)
+        self.assertEqual(eval(lookup, {"store_module": current_store}),
+                         current_store.CURRENT_SCHEMA_VERSION)
+        self.assertEqual(eval(lookup, {"store_module": SimpleNamespace()}), None)
+
+        predecessor = {"user_version": 1, "current_schema": eval(lookup, {"store_module": released})}
+        candidate = {"user_version": 1, "current_schema": current_store.CURRENT_SCHEMA_VERSION}
+        self.assertEqual(smoke.schema_evidence(predecessor, candidate)["transition"], "none")
+
     def test_upgrade_evidence_and_docs_do_not_claim_an_equal_schema_was_migrated(self):
         from history_service.store import SCHEMA
 

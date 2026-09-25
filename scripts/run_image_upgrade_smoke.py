@@ -268,8 +268,12 @@ try:
     user_version = connection.execute("PRAGMA user_version").fetchone()[0]
 finally:
     connection.close()
+# v0.22.2 predates CURRENT_SCHEMA_VERSION; there it is the backfill user_version,
+# which is what the newer name aliases.
+current_schema = getattr(store_module, "CURRENT_SCHEMA_VERSION",
+                         getattr(store_module, "DISK_IDENTITY_BACKFILL_USER_VERSION", None))
 print(json.dumps({{"counts": counts, "integrity": integrity, "user_version": user_version,
-                  "current_schema": getattr(store_module, "CURRENT_SCHEMA_VERSION", None),
+                  "current_schema": current_schema,
                   "uid": os.getuid()}}))
 """
 
