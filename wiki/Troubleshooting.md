@@ -286,8 +286,8 @@ Do not use `chmod 777`.
 
 ## History refuses to start after changing HISTORY_BIND_ADDRESS
 
-`Non-loopback history exposure requires refresh token mode.` in the history log
-means `HISTORY_BIND_ADDRESS` is no longer loopback but the token settings are
+`Configuration error: HISTORY_BIND_ADDRESS is not loopback.` in the history log (before v0.24:
+`Non-loopback history exposure requires refresh token mode.`) means `HISTORY_BIND_ADDRESS` is no longer loopback but the token settings are
 missing. Set token mode, a token and `HISTORY_PUBLIC_ORIGIN` together as shown in
 [[Docker and GHCR Deployment|Docker-and-GHCR-Deployment]], then recreate the
 container:
