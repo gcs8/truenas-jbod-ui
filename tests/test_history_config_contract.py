@@ -108,6 +108,21 @@ class HistoryEnvDocumentationDriftTests(unittest.TestCase):
                     "RELEASE_CHECK_TIMEOUT_SECONDS"):
             self.assertIn(f"{key}: ${{{key}:-", self.history_environment_block(), key)
 
+    def test_release_check_settings_reach_ui_admin_and_history_from_one_source(self) -> None:
+        import yaml
+
+        keys = ("RELEASE_CHECK_ENABLED", "RELEASE_CHECK_REPO", "RELEASE_CHECK_INTERVAL_SECONDS",
+                "RELEASE_CHECK_TIMEOUT_SECONDS")
+        for compose_name in ("docker-compose.yml", "docker-compose.dev.yml"):
+            services = yaml.safe_load((ROOT / compose_name).read_text(encoding="utf-8"))["services"]
+            for service in ("enclosure-ui", "enclosure-admin", "enclosure-history"):
+                environment = services[service]["environment"]
+                for key in keys:
+                    with self.subTest(compose=compose_name, service=service, key=key):
+                        # Every service interpolates the same variable, so --env-file
+                        # or a shell export cannot split the release-check policy.
+                        self.assertTrue(str(environment.get(key, "")).startswith(f"${{{key}:-"))
+
     def test_example_says_compose_derives_the_published_bind_address(self) -> None:
         example = self.env_example()
         block = self.history_environment_block()
