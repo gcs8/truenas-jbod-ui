@@ -206,6 +206,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Replaced duplicate history-sidecar snapshots with the backup scheduler's
+  catalog-verified FULL archives. Cleanup starts only after a newer FULL contains
+  the history database, keeps preserved archives and unrelated/newer files, and
+  retains the existing two-week default as 14 local FULL copies. (#628)
 - History collection now pauses when SQLite reports the database damaged
   while the service is running, instead of retrying writes every pass. The
   pause survives restarts, shows on the dashboard and as `degraded` in

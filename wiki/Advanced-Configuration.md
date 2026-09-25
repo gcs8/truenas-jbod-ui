@@ -305,10 +305,18 @@ The default behavior is:
 - keep hourly metric rollups for `365` days and daily rollups for `1825` days
 - run retention hourly in at most `20` transactions of `5000` rows per table
 
-Each copy is the size of the live database, so the default footprint is at most
-`14` database-sized files: `7` daily plus `4` weekly plus `3` monthly. Lower
-`HISTORY_BACKUP_RETENTION_COUNT` to shrink the short-term set; the value must be
-at least `1`.
+Each copy is the size of the live database, so without the backup scheduler the
+default footprint is at most `14` database-sized files: `7` daily plus `4`
+weekly plus `3` monthly. Lower `HISTORY_BACKUP_RETENTION_COUNT` to shrink the
+short-term set; the value must be at least `1`.
+
+When the optional backup scheduler is enabled, its daily FULL archive replaces
+this duplicate set only after the FULL includes `history_db` and is catalogued as
+verified. The scheduler then removes exact older history snapshot files and the
+history service treats the verified FULL as its current daily backup. Until that
+proof exists, history snapshots continue unchanged. FULL retention defaults to
+`14` local copies (two weeks); preserved scheduler archives, newer files and
+unrelated files are never removed by this replacement cleanup.
 
 The history dashboard shows `Backup copies on disk` (bytes and number of these
 copies) and, under `Database size`, how much of the file is free space that

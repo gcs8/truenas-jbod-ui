@@ -337,7 +337,7 @@ backups:
     enabled: true
     schedule: "0 3 * * *"
     archive_format: tar.zst  # default; 7z for older app versions, see "Full backup archive format"
-    local_keep: 7
+    local_keep: 14
     remote_keep: null
     remote_max_age_days: 90
   targets:
@@ -362,6 +362,16 @@ backups:
 | `BACKUP_CONFIG_REMOTE_MAX_AGE_DAYS`, `BACKUP_FULL_REMOTE_MAX_AGE_DAYS` | `remote_max_age_days` |
 | `BACKUP_TARGETS_JSON` | the whole `targets` list, as a JSON array |
 | `BACKUP_ARCHIVE_PASSPHRASE_FILE` | passphrase file (falls back to `SCHEDULED_BACKUP_PASSPHRASE_FILE`) |
+
+A scheduled FULL includes the history database and keeps `14` local copies by
+default (one daily copy for two weeks). After a new FULL is published, hashed and
+recorded as verified in the archive catalog, it replaces older standalone daily,
+weekly and monthly history-sidecar snapshots. The scheduler removes only exact
+older history snapshot names; newer files, unrelated files, links and every
+scheduler archive, including preserved/pinned archives, remain untouched. Until
+that verified replacement exists, the standalone history snapshots remain and
+the history service continues making them. This avoids two independent backup
+sets without reducing the existing 14-copy default.
 
 A mistake stops the scheduler with one plain sentence per problem that names
 the key and where it came from, for example
