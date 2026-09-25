@@ -497,14 +497,19 @@ test("refreshing admin state paints before the removed-system history scan runs"
 test("syncSshFields looks the SSH fields up once and toggles them on every call", () => {
   let queries = 0;
   const fields = [fakeField(), fakeField()];
+  const hidden = new Set();
+  const bodies = [0, 1].map((index) => ({
+    classList: { toggle(name, on) { if (name === "hidden") { if (on) hidden.add(index); else hidden.delete(index); } } },
+  }));
   const elements = sparseElements({ setupSshEnabled: { checked: false }, setupSshHost: fakeField("nas.example.test") });
   const functions = loadFunctions(["syncSshFields"], {
     elements,
     sshFieldNodes: null,
+    sshBodyNodes: null,
     document: {
-      querySelectorAll() {
+      querySelectorAll(selector) {
         queries += 1;
-        return fields;
+        return selector === ".setup-ssh-body" ? bodies : fields;
       },
     },
     suggestedConnectionHost: () => "",
@@ -516,12 +521,30 @@ test("syncSshFields looks the SSH fields up once and toggles them on every call"
   });
 
   functions.syncSshFields();
-  assert.equal(queries, 1);
+  assert.equal(queries, 2);
   assert.deepEqual(fields.map((field) => field.disabled), [true, true]);
+  assert.equal(hidden.size, 2, "with SSH off the SSH settings are hidden, not just disabled");
   elements.setupSshEnabled.checked = true;
   functions.syncSshFields();
-  assert.equal(queries, 1, "the second call reuses the cached fields");
+  assert.equal(queries, 2, "the second call reuses the cached nodes");
   assert.deepEqual(fields.map((field) => field.disabled), [false, false]);
+  assert.equal(hidden.size, 0, "turning SSH on shows the SSH settings");
+});
+
+test("step 3 marks every SSH settings block so it can be hidden while SSH is off (#435)", () => {
+  const template = fs.readFileSync(path.join(__dirname, "../../admin_service/templates/index.html"), "utf8");
+  const step = template.slice(template.indexOf("<h3>SSH (optional)</h3>"), template.indexOf('<span class="step-index">4</span>'));
+  for (const marker of [
+    'class="form-grid setup-ssh-body"',
+    'class="key-manager setup-ssh-body"',
+    'id="setup-ssh-key-help" class="subtle action-note setup-ssh-body"',
+    'id="setup-bootstrap-details" class="setup-details setup-ssh-body"',
+    'id="setup-ssh-commands-details" class="setup-details setup-ssh-body"',
+  ]) {
+    assert.ok(step.includes(marker), `${marker} must be in step 3`);
+  }
+  const toggle = step.indexOf('id="setup-ssh-enabled"');
+  assert.ok(toggle > 0 && toggle < step.indexOf("setup-ssh-body"), "the SSH switch itself stays visible");
 });
 
 test("the dead admin.js branches and unused bootstrap keys stay gone", () => {
