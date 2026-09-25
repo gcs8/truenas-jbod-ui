@@ -25,6 +25,7 @@ from app.settings_reload import (
     config_reload_problems,
     ConfigReloadMiddleware,
     ConfigReloader,
+    PUBLIC_RELOAD_FAILURE,
     SettingsRuntime,
     file_signature,
 )
@@ -186,12 +187,27 @@ class InvalidEditTests(ConfigReloadTestCase):
         self.assertEqual(self.reloader.problems(), [self.reloader.problem])
         self.assertIn("Config change not applied", "\n".join(logs.output))
 
-    def test_schema_error_names_the_setting_and_keeps_old_settings(self) -> None:
+    def test_schema_error_names_the_setting_in_the_log_only(self) -> None:
         self.config["systems"][0]["truenas"]["platform"] = "not-a-platform"
         self._write_config()
-        self.assertFalse(self._check())
+        with self.assertLogs("app.settings_reload", level="WARNING") as logs:
+            self.assertFalse(self._check())
         self.assertEqual(self._labels()["alpha"], "Alpha Shelf")
-        self.assertIn("systems[0].truenas.platform", self.reloader.problem)
+        self.assertIn("systems[0].truenas.platform", "\n".join(logs.output))
+        self.assertEqual(self.reloader.problem, PUBLIC_RELOAD_FAILURE)
+
+    def test_public_warning_never_quotes_file_content(self) -> None:
+        """A YAML parser error quotes the bad line; that must reach neither the page nor /healthz."""
+        secret = "synthetic-credential-7f3a"
+        self._write_config(
+            "systems:\n  - id: alpha\n    truenas:\n      api_key: \"" + secret + "\n      host: [\n"
+        )
+        with self.assertLogs("app.settings_reload", level="WARNING") as logs:
+            self.assertFalse(self._check())
+        self.assertEqual(self.reloader.problem, PUBLIC_RELOAD_FAILURE)
+        self.assertNotIn(secret, self.reloader.problem)
+        self.assertNotIn(secret, "\n".join(logs.output))
+        self.assertIn("line", "\n".join(logs.output))
 
     def test_same_invalid_file_is_not_reparsed_or_relogged(self) -> None:
         self._write_config("- not a mapping\n")
@@ -213,8 +229,10 @@ class InvalidEditTests(ConfigReloadTestCase):
         self.config["systems"][0]["label"] = "Alpha Two"
         self._write_config()
         with patch.object(self.reloader, "_load", side_effect=RuntimeError("synthetic")):
-            self.assertFalse(self._check())
-        self.assertIn("synthetic", self.reloader.problem)
+            with self.assertLogs("app.settings_reload", level="WARNING") as logs:
+                self.assertFalse(self._check())
+        self.assertEqual(self.reloader.problem, PUBLIC_RELOAD_FAILURE)
+        self.assertIn("RuntimeError", "\n".join(logs.output))
 
 
 class RestartOnlySettingsTests(ConfigReloadTestCase):
@@ -360,6 +378,37 @@ class RegistryCarryOverTests(ConfigReloadTestCase):
         self.assertEqual(old_service.system.label, "Alpha Shelf")
         self.assertIs(new_registry.mapping_store, old_registry.mapping_store)
         self.assertIs(new_service._disk_inventory_sync_lock, old_service._disk_inventory_sync_lock)
+
+    def test_layout_change_drops_the_raw_answers(self) -> None:
+        old_registry = InventoryRegistry(self.runtime.current().settings)
+        old_registry.get_service("alpha")._source_bundle = object()  # type: ignore[assignment]
+        self.config["layout"] = {"slot_count": 12, "rows": 3, "columns": 4}
+        self._write_config()
+        self.assertTrue(self._check())
+        new_service = InventoryRegistry(self.runtime.current().settings, previous=old_registry).get_service("alpha")
+        self.assertIsNone(new_service._source_bundle)
+        self.assertEqual(new_service._cache, {})
+
+    def test_lowered_ttls_cap_carried_expiry(self) -> None:
+        from datetime import timedelta
+
+        from app.services.inventory import utcnow
+
+        old_registry = InventoryRegistry(self.runtime.current().settings)
+        old_service = old_registry.get_service("alpha")
+        far = utcnow() + timedelta(hours=20)
+        old_service._source_bundle = object()  # type: ignore[assignment]
+        old_service._source_bundle_until = far
+        old_service._sg_ses_device_cache = {"host": (["/dev/sg1"], far)}
+        self.overrides_path.write_text(
+            yaml.safe_dump({"app": {"source_bundle_cache_ttl_seconds": 0, "sg_ses_device_cache_ttl_seconds": 60}}),
+            encoding="utf-8",
+        )
+        self.assertTrue(self._check())
+        new_service = InventoryRegistry(self.runtime.current().settings, previous=old_registry).get_service("alpha")
+        self.assertLessEqual(new_service._source_bundle_until, utcnow())
+        (_devices, until) = new_service._sg_ses_device_cache["host"]
+        self.assertLessEqual(until, utcnow() + timedelta(seconds=61))
 
     def test_connection_change_drops_the_cache(self) -> None:
         old_registry = InventoryRegistry(self.runtime.current().settings)

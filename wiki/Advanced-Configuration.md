@@ -74,7 +74,9 @@ uses either the old settings or the new ones, never a mix of both.
 If an edit is not valid (a YAML syntax error, an unknown platform, a value out
 of range), the main UI keeps its previous settings and says so plainly: in the
 log, as the `/healthz` reason (`status: degraded`), and as a warning on the
-page. Fix the file and the warning clears on the next check.
+page. The page and `/healthz` only say that the edit was not applied; the
+main UI log names the setting, or the line and column of a YAML syntax error.
+Fix the file and the warning clears on the next check.
 
 A few settings are only read when the main UI process starts. Changing them
 needs a restart:

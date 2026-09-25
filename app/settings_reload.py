@@ -26,6 +26,8 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Callable, Iterator, TypeVar
 
+import yaml
+
 from app.config import (
     Settings,
     config_watch_paths,
@@ -149,19 +151,28 @@ def file_signature(paths: tuple[Path, ...]) -> FileSignature:
     return tuple((str(path), _stat_one(path)) for path in paths)
 
 
+# The reload warning is shown to anyone who can reach the main UI (/healthz,
+# the page, /api/inventory), so it never carries file content: a YAML parser
+# error quotes the offending line, which may hold a credential.
+PUBLIC_RELOAD_FAILURE = (
+    "Config change not applied: the edited configuration is not valid, so the main UI "
+    "keeps the previous settings. The main UI log names the setting or line to fix."
+)
+
+
 def describe_reload_failure(exc: BaseException) -> str:
+    """Log-only detail for a rejected config file, without any file content."""
     if isinstance(exc, ConfigurationError) and exc.problems:
-        detail = exc.problems[0]
-        if len(exc.problems) > 1:
-            detail = f"{detail} (and {len(exc.problems) - 1} more)"
-    else:
-        detail = " ".join(str(exc).split()) or type(exc).__name__
-        if len(detail) > 300:
-            detail = f"{detail[:297]}..."
-    return (
-        "Config change not applied: the edited configuration is not valid, so the main UI "
-        f"keeps the previous settings. {detail}"
-    )
+        # Built from key names and requirements only (pydantic input is
+        # excluded), the same sentences start-up logs.
+        return "; ".join(exc.problems[:5]) + (f" (and {len(exc.problems) - 5} more)" if len(exc.problems) > 5 else "")
+    mark = getattr(exc, "problem_mark", None)
+    if isinstance(exc, yaml.YAMLError) and mark is not None:
+        return (
+            f"YAML syntax error in {getattr(mark, 'name', 'the config file')} at line "
+            f"{int(getattr(mark, 'line', 0)) + 1}, column {int(getattr(mark, 'column', 0)) + 1}."
+        )
+    return f"{type(exc).__name__} while reading the config files."
 
 
 class ConfigReloader:
@@ -235,10 +246,11 @@ class ConfigReloader:
         try:
             loaded, after = await asyncio.to_thread(self._load, paths)
         except Exception as exc:  # noqa: BLE001 - invalid edits keep the old settings.
-            problem = describe_reload_failure(exc)
-            if problem != self.problem:
-                logger.warning("%s", problem)
-            self.problem = problem
+            logger.warning(
+                "Config change not applied; the main UI keeps the previous settings. %s",
+                describe_reload_failure(exc),
+            )
+            self.problem = PUBLIC_RELOAD_FAILURE
             self._rejected = signature
             return False
         if after != signature:

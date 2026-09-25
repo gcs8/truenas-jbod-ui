@@ -1092,9 +1092,11 @@ class InventoryService:
         """Take over ``previous``'s appliance answers after a config reload (#432).
 
         Only when this system still reaches the same appliance the same way
-        (everything but its name and storage views unchanged). The raw source bundle is
-        reused, so the first snapshot after a rename is built without
-        querying the appliance again. Built snapshots are reused only when
+        (everything but its name and storage views unchanged) and the layout
+        and profiles the raw answers were parsed against are unchanged. The
+        raw source bundle is then reused, so the first snapshot after a
+        rename is built without querying the appliance again. Carried-over
+        expiry times are capped at the new TTLs. Built snapshots are reused only when
         ``keep_snapshots`` says nothing they were built from changed; they get
         the new system list and refresh interval. Nothing is shared with the
         old service except the disk-sync lock, so a request still running on
@@ -1102,15 +1104,30 @@ class InventoryService:
         """
         if _system_without_display_fields(previous.system) != _system_without_display_fields(self.system):
             return
-        self._source_bundle = previous._source_bundle
-        self._source_bundle_until = previous._source_bundle_until
-        self._sg_ses_device_cache = dict(previous._sg_ses_device_cache)
-        self._scale_preferred_ses_host = previous._scale_preferred_ses_host
-        self._quantastor_preferred_ses_host = previous._quantastor_preferred_ses_host
-        self._optional_ssh_backoff_until = dict(previous._optional_ssh_backoff_until)
+        # Expiry times were computed from the old TTLs; never keep an entry
+        # longer than the new TTL allows, so a lowered TTL applies at once.
+        now = utcnow()
         # One TrueNAS disk sync per system, whichever settings started it.
         self._disk_inventory_sync_lock = previous._disk_inventory_sync_lock
         self._disk_inventory_sync_active_job_id = previous._disk_inventory_sync_active_job_id
+        if previous.settings.layout != self.settings.layout or previous.settings.profiles != self.settings.profiles:
+            # The raw answers were parsed against the old layout (slot count
+            # filters bays), so they must be collected again.
+            return
+        self._source_bundle = previous._source_bundle
+        self._source_bundle_until = min(
+            previous._source_bundle_until,
+            now + timedelta(seconds=max(0, int(self.settings.app.source_bundle_cache_ttl_seconds))),
+        )
+        sg_ses_limit = now + timedelta(seconds=max(0, int(self.settings.app.sg_ses_device_cache_ttl_seconds)))
+        self._sg_ses_device_cache = {
+            host: (list(devices), min(until, sg_ses_limit))
+            for host, (devices, until) in previous._sg_ses_device_cache.items()
+            if min(until, sg_ses_limit) > now
+        }
+        self._scale_preferred_ses_host = previous._scale_preferred_ses_host
+        self._quantastor_preferred_ses_host = previous._quantastor_preferred_ses_host
+        self._optional_ssh_backoff_until = dict(previous._optional_ssh_backoff_until)
         if not keep_snapshots:
             return
         systems = [
@@ -1126,9 +1143,9 @@ class InventoryService:
                     "refresh_interval_seconds": self.settings.app.refresh_interval_seconds,
                 }
             )
-            self._cache_until[cache_key] = previous._cache_until.get(
-                cache_key,
-                datetime.min.replace(tzinfo=timezone.utc),
+            self._cache_until[cache_key] = min(
+                previous._cache_until.get(cache_key, datetime.min.replace(tzinfo=timezone.utc)),
+                now + timedelta(seconds=max(0, int(self.settings.app.snapshot_cache_ttl_seconds))),
             )
             self._touch_snapshot_key(cache_key)
         if previous._canonical_enclosure_options is not None:
