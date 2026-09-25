@@ -73,6 +73,45 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
         self.assertNotIn('`{"encrypt":false,', checklist)
         self.assertIn('`{"encrypt":true,', checklist)
 
+    def test_release_checklist_uses_default_full_format_then_explicit_legacy_7z(self) -> None:
+        checklist = RELEASE_CHECKLIST.read_text(encoding="utf-8")
+        primary_heading = "**Primary default-format round trip:**"
+        legacy_heading = "**Legacy 7z readability round trip:**"
+        primary_start = checklist.index(primary_heading)
+        legacy_start = checklist.index(legacy_heading)
+        legacy_end = checklist.index(
+            "  - keep a separate sanitized receipt for each round trip.",
+            legacy_start,
+        )
+        primary = checklist[primary_start:legacy_start]
+        legacy = checklist[legacy_start:legacy_end]
+
+        self.assertLess(primary_start, legacy_start)
+        self.assertIn('`{"encrypt":true,"included_paths":', primary)
+        self.assertNotIn('`{"encrypt":true,"packaging":', primary)
+        self.assertIn("omit `packaging`", primary)
+        self.assertIn("observed `tar.zst`", primary)
+        for phase in ("export", "inspect", "import", "restart", "readback"):
+            with self.subTest(round_trip="primary", phase=phase):
+                self.assertIn(phase, primary.lower())
+
+        self.assertIn('`{"encrypt":true,"packaging":"7z",', legacy)
+        for phase in ("export", "inspect", "import", "restart", "readback"):
+            with self.subTest(round_trip="legacy", phase=phase):
+                self.assertIn(phase, legacy.lower())
+
+    def test_restore_receipts_bind_format_export_source_and_candidate_provenance(self) -> None:
+        for path in (RELEASE_CHECKLIST, DOC):
+            text = path.read_text(encoding="utf-8")
+            for marker in (
+                "`inspection.packaging`",
+                "`inspection.app_version`",
+                "`source_commit`",
+                "`image_id`",
+            ):
+                with self.subTest(path=path.name, marker=marker):
+                    self.assertIn(marker, text)
+
     def test_inspection_payload_is_exact_and_aggregate_only(self) -> None:
         payload = {
             "ok": True,
