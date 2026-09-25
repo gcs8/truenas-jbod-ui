@@ -134,8 +134,6 @@ def is_placeholder_known_hosts_path(value: Any, placeholders: set[str]) -> bool:
 
 
 class AppConfig(BaseModel):
-    host: str = "0.0.0.0"
-    port: int = 8080
     public_origin: str | None = None
     refresh_interval_seconds: int = 30
     snapshot_cache_ttl_seconds: int = 10
@@ -535,8 +533,6 @@ class Settings(BaseModel):
 
 
 ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
-    "APP_HOST": ("app", "host"),
-    "APP_PORT": ("app", "port"),
     "APP_PUBLIC_ORIGIN": ("app", "public_origin"),
     "APP_REFRESH_INTERVAL": ("app", "refresh_interval_seconds"),
     "APP_SNAPSHOT_CACHE_TTL_SECONDS": ("app", "snapshot_cache_ttl_seconds"),
@@ -830,7 +826,18 @@ def collect_unknown_config_key_suggestions(
 SIDECAR_OWNED_CONFIG_KEYS = frozenset({"backups"})
 
 
+# Keys an older config.yaml may still carry. The container always listens on
+# port 8000; Docker Compose publishes it from APP_BIND_ADDRESS and APP_PORT in
+# .env, so these keys never changed where the UI answers.
+RETIRED_CONFIG_KEYS = frozenset({"app.host", "app.port"})
+
+
 def _unknown_key_message(config_path: Path, key: str, suggestion: str | None = None) -> str:
+    if key in RETIRED_CONFIG_KEYS:
+        return (
+            f"{config_path.name}: `{key}` is no longer used and is ignored; set the main UI port "
+            f"with APP_PORT and its address with APP_BIND_ADDRESS in .env."
+        )
     if key.startswith(tuple(f"{section}." for section in SIDECAR_OWNED_CONFIG_KEYS)):
         # The backup scheduler rejects its whole policy on an unknown key (it
         # does not ignore it); the main UI keeps running either way.
