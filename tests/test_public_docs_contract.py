@@ -122,6 +122,8 @@ class PublicDocsContractTests(unittest.TestCase):
 
         for required in (
             "--profile backup-scheduler",
+            "The backup scheduler and Backups page are not in v0.22.2",
+            "With a matching newer image and Compose file",
             "[Backups page](wiki/Backup-Restore-and-Debug-Bundles.md#editing-from-the-admin-backups-page)",
             "[`docker-compose.backup-nfs.yml`](wiki/Backup-Restore-and-Debug-Bundles.md#nfs-targets)",
             "[`docker-compose.history-bind.yml`](wiki/Upgrading.md#history)",

@@ -52,8 +52,7 @@ also provide SMART data, path details, or LED control. See the
 You need Docker Compose, the URL of your TrueNAS system, and a TrueNAS API key.
 
 ```bash
-mkdir -p /docker-local/truenas-jbod-ui
-cd /docker-local/truenas-jbod-ui
+mkdir -p /docker-local/truenas-jbod-ui && cd /docker-local/truenas-jbod-ui
 
 curl -fsSL -o compose.yaml https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/v0.22.2/docker-compose.yml
 
@@ -111,10 +110,11 @@ Start the admin UI for guided setup, profile editing, backup and restore, or con
 docker compose --profile admin up -d enclosure-admin
 ```
 
-The [`backup-scheduler` profile](wiki/Backup-Restore-and-Debug-Bundles.md#automatic-backup-archive-and-remote-targets)
-is off by default; start it with `--profile backup-scheduler`. It creates encrypted
-config backups after changes and scheduled full backups, then can copy them to
-filesystem, FTP/FTPS, SFTP, SMB, NFS, or S3. The admin
+The backup scheduler and Backups page are not in v0.22.2. With a matching newer image
+and Compose file, the [`backup-scheduler` profile](wiki/Backup-Restore-and-Debug-Bundles.md#automatic-backup-archive-and-remote-targets)
+is off by default; start it with `--profile backup-scheduler`. It creates encrypted config
+backups after changes and scheduled full backups, then can copy them to filesystem,
+FTP/FTPS, SFTP, SMB, NFS, or S3. The admin
 [Backups page](wiki/Backup-Restore-and-Debug-Bundles.md#editing-from-the-admin-backups-page)
 can run and manage backups. A restore inspects the exact archive and asks for
 confirmation before import. Local and remote retention are configured independently.
