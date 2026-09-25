@@ -148,6 +148,7 @@ MUTATION_ROUTE_TEMPLATES = {
 READ_ONLY_NON_GET_ROUTES = {
     ("POST", "/api/mappings/import/preview"),
     ("POST", "/api/slots/smart-batch"),
+    ("POST", "/api/storage-views/{view_id}/slots/smart-batch"),
     ("POST", "/api/export/enclosure-snapshot"),
     ("POST", "/api/history/scopes/bundle"),
     ("POST", "/api/export/enclosure-snapshot/estimate"),

@@ -465,6 +465,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - The main page no longer waits for the admin health probe once it has an
   answer: an expired answer is shown at once and refreshed in the
   background, and startup probes admin before the first page load. (#598)
+- Storage views collect SMART data for history in batches of
+  `HISTORY_SMART_BATCH_SIZE` slots through a new
+  `POST /api/storage-views/{view_id}/slots/smart-batch` route, so a 60-slot
+  view takes three requests per pass instead of 60. A main UI without the
+  route still gets per-slot requests. (#595)
 - Gave admin backup and debug downloads and restore uploads a 30-minute
   timeout so a stalled transfer ends with a plain message instead of hanging
   (#583)
