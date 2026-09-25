@@ -423,6 +423,7 @@ The following pull-request checks are release-blocking and required for `main`:
 - `JavaScript syntax and npm lock`
 - `Checked-in public demo artifact`
 - `Admin clean-room browser QA`
+- `Image-only upgrade smoke`
 - `Changelog entry` (pull requests only; see "Changelog And Release Notes")
 
 Each `Python compile and unittest (<version>)` check is a gate job over
@@ -437,7 +438,9 @@ coverage runs on the 3.14 shards with coverage's `sys.monitoring` core and is
 combined in the 3.14 gate. Coverage is report-only. CodeQL is report-only until
 repository branch protection explicitly makes it required. `Image-only upgrade smoke` (the previous public release upgraded by
 `JBOD_UI_IMAGE` only, then rolled back, by `scripts/run_image_upgrade_smoke.py`)
-runs on every pull request and is report-only until branch protection adds it.
+is required on `main`. `Hardened and interrupted upgrade smoke` runs the same
+script's longer `hardened` and `interrupted-migration` scenarios on every pull
+request and is report-only until branch protection adds it.
 Publish workflows are release gates,
 not ordinary pull-request checks. `PR type labels` is a labelling helper, not a
 check. If a check name changes, update branch protection and this list together

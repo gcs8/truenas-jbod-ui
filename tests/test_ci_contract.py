@@ -219,8 +219,9 @@ class CIWorkflowContractTests(unittest.TestCase):
         # screenshot capture workflow's checkout and upload, the unittest
         # gate job's checkout, Python setup, shard-result download and coverage
         # upload, the GHCR release workflow's Python setup for the
-        # public-demo release gate, and the image-upgrade smoke's checkout.
-        self.assertEqual(action_count, 41)
+        # public-demo release gate, and the image-upgrade smoke's and the
+        # upgrade-scenario job's checkouts.
+        self.assertEqual(action_count, 42)
         self.assertEqual(unpinned, [])
         self.assertEqual(uncommented, [])
 
@@ -810,6 +811,7 @@ class CIWorkflowContractTests(unittest.TestCase):
             "JavaScript syntax and npm lock",
             "Checked-in public demo artifact",
             "Admin clean-room browser QA",
+            "Image-only upgrade smoke",
             "Changelog entry",
         ):
             self.assertIn(required_check, contributing)
@@ -863,6 +865,8 @@ class CIRunsOncePerPullRequestTests(unittest.TestCase):
             "container-smoke",
             "admin-browser-cleanroom",
             "public-demo-artifact",
+            "image-upgrade-smoke",
+            "image-upgrade-scenarios",
         ):
             job = workflow["jobs"][name]
             needs = job["needs"]

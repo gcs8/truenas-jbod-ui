@@ -1,0 +1,12 @@
+services:
+  enclosure-ui:
+    user: "${APP_UID:-10001}:${APP_GID:-10001}"
+    volumes:
+      - ./config:/app/config:ro
+
+  enclosure-history:
+    user: "${APP_UID:-10001}:${APP_GID:-10001}"
+
+  enclosure-backup:
+    group_add:
+      - "${APP_GID:-10001}"

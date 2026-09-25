@@ -392,13 +392,25 @@ class ImageOnlyUpgradeSmokeContractTests(unittest.TestCase):
                 self.assertFalse(step["with"]["persist-credentials"])
 
     def test_upgrade_changes_only_the_image_pin_between_phases(self):
+        import inspect
         smoke = self.load_smoke()
         source = (self.ROOT / "scripts" / "run_image_upgrade_smoke.py").read_text(encoding="utf-8")
         # The operator procedure: set JBOD_UI_IMAGE, pull, up -d. No ownership
         # repair, no down, no Compose replacement, no migration command.
-        for forbidden in ("chown", "prepare_nonroot_bind_mounts", "migrate_segmented_history", '"down"'):
-            with self.subTest(forbidden=forbidden):
-                self.assertNotIn(forbidden, source.split("def cleanup", 1)[0])
+        phases = [inspect.getsource(function) for function in (
+            smoke.seed_previous_release, smoke.upgrade_and_rollback, smoke.interrupted_migration,
+            smoke.kill_during_startup, smoke.check_runtime,
+            *(value for value in vars(smoke.Deployment).values() if inspect.isfunction(value)))]
+        for forbidden in ("chown", "prepare_nonroot_bind_mounts", "migrate_segmented_history", '"down"',
+                          "HARDENED_OWNERSHIP_PREP"):
+            for phase in phases:
+                with self.subTest(forbidden=forbidden, phase=phase.split("(", 1)[0]):
+                    self.assertNotIn(forbidden, phase)
+        # The only ownership change is the documented one-time step that adopts
+        # the overlay, and it runs in prepare_root, before the first start.
+        prep = source.split("HARDENED_OWNERSHIP_PREP = (", 1)[1].split("\n)\n", 1)[0]
+        self.assertEqual(source.count("chown"), prep.count("chown"))
+        self.assertIn("HARDENED_OWNERSHIP_PREP", inspect.getsource(smoke.prepare_root))
         calls = []
         deployment = smoke.Deployment(Path("/nonexistent"))
         deployment.compose = lambda *args, **kwargs: calls.append(args) or ""
@@ -417,6 +429,9 @@ class ImageOnlyUpgradeSmokeContractTests(unittest.TestCase):
         guide = (self.ROOT / "wiki" / "Upgrading.md").read_text(encoding="utf-8")
         matrix = guide.split("## What is tested", 1)[1].split("\n## ", 1)[0]
         self.assertIn(workflow["jobs"]["image-upgrade-smoke"]["name"], " ".join(matrix.split()))
+        self.assertIn(workflow["jobs"]["image-upgrade-scenarios"]["name"], " ".join(matrix.split()))
+        for scenario in ("hardened", "interrupted-migration"):
+            self.assertIn(f"--scenario {scenario}", " ".join(matrix.split()))
         self.assertIn("scripts/run_image_upgrade_smoke.py", matrix)
         self.assertIn(f"v{workflow['jobs']['image-upgrade-smoke']['env']['PREVIOUS_VERSION']}", matrix)
         self.assertIn("Not tested yet", matrix)
@@ -441,3 +456,144 @@ class ImageOnlyUpgradeSmokeContractTests(unittest.TestCase):
         ):
             with self.subTest(script=name):
                 compile(script, name, "exec")
+
+
+class UpgradeScenarioContractTests(unittest.TestCase):
+    """#399/#463: the hardened-overlay upgrade and the interrupted history migration."""
+
+    ROOT = Path(__file__).resolve().parents[1]
+    load_smoke = ImageOnlyUpgradeSmokeContractTests.load_smoke
+
+    def workflow(self):
+        return yaml.safe_load((self.ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8"))
+
+    def test_scenario_job_runs_each_scenario_as_its_own_step_from_the_pinned_release(self):
+        workflow = self.workflow()
+        required = workflow["jobs"]["image-upgrade-smoke"]
+        job = workflow["jobs"]["image-upgrade-scenarios"]
+        self.assertEqual(job["needs"], "route")
+        self.assertIn("needs.route.outputs.run == 'true'", job["if"])
+        self.assertEqual(job["env"], required["env"])
+        runs = [str(step.get("run", "")) for step in job["steps"]]
+        hardened = [command for command in runs if "--scenario hardened" in command]
+        interrupted = [command for command in runs if "--scenario interrupted-migration" in command]
+        self.assertEqual(len(hardened), 1)
+        self.assertEqual(len(interrupted), 1)
+        self.assertIn("--nonroot-fixture tests/fixtures/compose/v0.22.2.nonroot.yml", hardened[0])
+        for command in hardened + interrupted:
+            self.assertIn("--compose-fixture tests/fixtures/compose/v0.22.2.yml", command)
+            self.assertIn('--candidate-revision "$GITHUB_SHA"', command)
+        # The required job stays the fast base scenario.
+        self.assertNotIn("--scenario", "\n".join(str(step.get("run", "")) for step in required["steps"]))
+
+    def test_nonroot_fixture_is_the_exact_v0_22_2_overlay(self):
+        import hashlib
+        # `git show v0.22.2:docker-compose.nonroot.yml`, byte for byte.
+        data = (self.ROOT / "tests" / "fixtures" / "compose" / "v0.22.2.nonroot.yml").read_bytes()
+        self.assertEqual(hashlib.sha256(data).hexdigest(),
+                         "7b9e6604b402ac02d9a73993fda8032d0d71ee3c521788ce45f24cd31db76154")
+        overlay = yaml.safe_load(data)
+        for service in ("enclosure-ui", "enclosure-history"):
+            self.assertEqual(overlay["services"][service]["user"], "${APP_UID:-10001}:${APP_GID:-10001}")
+
+    def test_hardened_ownership_step_is_the_documented_one(self):
+        smoke = self.load_smoke()
+        guide = (self.ROOT / "wiki" / "Troubleshooting.md").read_text(encoding="utf-8")
+        section = guide.split("## A non-root container gets permission denied", 1)[1].split("\n## ", 1)[0]
+        block = section.split("```bash\n", 1)[1].split("```", 1)[0].splitlines()
+        # The documented block is: down, the preparation, then up with the overlay.
+        self.assertEqual(block[0], "docker compose down")
+        self.assertEqual(block[-1], "docker compose -f docker-compose.yml -f docker-compose.nonroot.yml up -d")
+        self.assertEqual(tuple(block[1:-1]), smoke.HARDENED_OWNERSHIP_PREP)
+        self.assertEqual(smoke.HARDENED_FILES, ("docker-compose.yml", "docker-compose.nonroot.yml"))
+
+    def test_hardened_scenario_runs_every_compose_command_with_the_overlay(self):
+        smoke = self.load_smoke()
+        deployment = smoke.Deployment(Path("/nonexistent"), smoke.HARDENED_FILES)
+        self.assertEqual(deployment.file_args(),
+                         ["-f", "docker-compose.yml", "-f", "docker-compose.nonroot.yml"])
+        calls = []
+        with mock.patch.object(smoke, "run", side_effect=lambda command, **kwargs: calls.append(command) or ""):
+            deployment.compose("pull")
+            deployment.compose("up", "-d")
+        self.assertEqual(calls[0][:6], ["docker", "compose", "-f", "docker-compose.yml",
+                                        "-f", "docker-compose.nonroot.yml"])
+        self.assertEqual(calls[1][6:], ["up", "-d"])
+        self.assertEqual(smoke.Deployment(Path("/nonexistent")).file_args(), [])
+
+    def test_kill_phases_are_the_history_startup_migration_steps_in_order(self):
+        import inspect
+        from history_service.store import HistoryStore
+        from tests import test_history_released_schema_upgrades as released
+
+        smoke = self.load_smoke()
+        body = inspect.getsource(HistoryStore._initialize_schema)
+        positions = [body.index(f"self.{phase}(connection)") for phase in smoke.KILL_PHASES]
+        self.assertEqual(positions, sorted(positions))
+        # Every runtime kill point is one of #603's unit-level kill seams; only
+        # the batched backfill, which v0.22.2 state never enters, is left out.
+        unit_methods = {method for method, _ in released.KILL_PHASES.values()}
+        self.assertLessEqual(set(smoke.KILL_PHASES), unit_methods)
+        self.assertEqual(unit_methods - set(smoke.KILL_PHASES), {"_backfill_disk_identity_batch"})
+        for phase in smoke.KILL_PHASES:
+            self.assertIsInstance(inspect.getattr_static(HistoryStore, phase), staticmethod)
+
+    def test_kill_hook_pauses_the_real_service_startup(self):
+        smoke = self.load_smoke()
+        script = smoke.kill_hook_script("_ensure_identity_indexes")
+        compile(script, "kill_hook", "exec")
+        self.assertIn("import history_service.main", script)
+        self.assertIn(smoke.KILL_MARKER, script)
+        self.assertIn("signal.pause()", script)
+        with self.assertRaises(ValueError):
+            smoke.kill_hook_script("_not_a_phase")
+        for name, template in (("end_state", smoke.END_STATE), ("reference", smoke.UNINTERRUPTED_REFERENCE)):
+            with self.subTest(script=name):
+                compile(smoke.end_state_script("/reference/history.db", template), name, "exec")
+        source = (self.ROOT / "scripts" / "run_image_upgrade_smoke.py").read_text(encoding="utf-8")
+        self.assertIn('"docker", "kill", "--signal", "KILL"', source)
+        self.assertNotIn("time.sleep", source.split("def kill_during_startup", 1)[1].split("\ndef ", 1)[0])
+
+    def test_end_state_matches_an_uninterrupted_upgrade_of_the_same_database(self):
+        import json
+        import sqlite3
+        import subprocess
+        import sys
+        import tempfile
+        from contextlib import closing
+
+        from history_service.store import HistoryStore
+        from tests import test_history_released_schema_upgrades as released
+
+        smoke = self.load_smoke()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.db"
+            released.build_released_database(path, "v0.22.2", stamp_like_release=True)
+            with closing(sqlite3.connect(path)) as connection:
+                connection.execute(f"UPDATE slot_events SET system_id = '{smoke.SMOKE_SYSTEM}'")
+                connection.commit()
+            HistoryStore(str(path))
+
+            def read() -> dict:
+                output = subprocess.run([sys.executable, "-c", smoke.end_state_script(str(path))],
+                                        capture_output=True, text=True, check=True, cwd=self.ROOT)
+                return json.loads(output.stdout.strip().splitlines()[-1])
+
+            first = read()
+            self.assertEqual(first["integrity"], "ok")
+            self.assertTrue(first["counters_match"])
+            self.assertEqual(first, read())
+            with closing(sqlite3.connect(path)) as connection:
+                connection.execute(f"DELETE FROM slot_events WHERE rowid = "
+                                   f"(SELECT MIN(rowid) FROM slot_events WHERE system_id = '{smoke.SMOKE_SYSTEM}')")
+                connection.commit()
+            self.assertNotEqual(read()["rows"], first["rows"])
+
+    def test_hardened_scenario_requires_the_overlay_fixture(self):
+        smoke = self.load_smoke()
+        base = ["--root", "/nonexistent", "--compose-fixture", "a", "--config-fixture", "b",
+                "--previous-image", "p", "--previous-version", "1", "--candidate-image", "c",
+                "--candidate-version", "2", "--candidate-revision", "r"]
+        self.assertEqual(smoke.build_parser().parse_args(base).scenario, "base")
+        with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+            smoke.main([*base, "--scenario", "hardened"])
