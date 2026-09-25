@@ -220,6 +220,7 @@ WINDOWS_EXCLUSIONS = (
         ),
         modules=(
             "tests.test_account_bootstrap",
+            "tests.test_backup_archive_lifecycle",
             "tests.test_backup_archive_transport",
             "tests.test_compose_runtime_matrix",
             "tests.test_container_contract",
