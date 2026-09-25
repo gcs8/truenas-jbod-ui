@@ -20,7 +20,8 @@ class SlotDetailCacheEntry(BaseModel):
     slot_fields: dict[str, Any] = Field(default_factory=dict)
     smart_fields: dict[str, Any] = Field(default_factory=dict)
     # When the SMART half was last read successfully, and whether it has been
-    # carried forward since. ``updated_at`` moves on every snapshot build, so it
+    # carried forward since. ``updated_at`` is only the time this row was last
+    # written (a rebuild that changes nothing else is not written, #448), so it
     # cannot date the SMART fields; without a separate stamp a carried-forward
     # value is indistinguishable from one read this second (#521). Both default
     # to the pre-#521 shape so an existing file loads unchanged.
@@ -109,13 +110,19 @@ class SlotDetailStore:
                     if expected_json != actual_json:
                         continue
                 merged[key] = entry
-            # Compare final full JSON payloads, including freshness and identity.
-            # Model equality alone conflates JSON booleans, integers and floats.
+            # Compare final full JSON payloads, including identity, but not the
+            # entry's own ``updated_at``. Every snapshot build stamps a new one,
+            # so comparing it rewrote the whole file each refresh with nothing
+            # else changed (#448). Nothing reads that stamp as a freshness
+            # signal: the SMART half carries its own ``smart_updated_at`` and
+            # ``smart_stale`` (#521), and those still count as changes. When a
+            # real change forces a write anyway, every entry in the batch is
+            # written with its new stamp. Model equality alone conflates JSON
+            # booleans, integers and floats, hence the JSON comparison.
             if all(
                 key in current and (
                     entry is current[key]
-                    or json.dumps(entry.model_dump(mode="json"), sort_keys=True)
-                    == json.dumps(current[key].model_dump(mode="json"), sort_keys=True)
+                    or self._content_json(entry) == self._content_json(current[key])
                 )
                 for key, entry in merged.items()
             ):
@@ -124,6 +131,12 @@ class SlotDetailStore:
                 self._write(merged)
             else:
                 self._write(merged, commit_guard=commit_guard)
+
+    @staticmethod
+    def _content_json(entry: SlotDetailCacheEntry) -> str:
+        payload = entry.model_dump(mode="json")
+        payload.pop("updated_at", None)
+        return json.dumps(payload, sort_keys=True)
 
     def prune_unknown_systems(self, valid_system_ids: set[str]) -> int:
         with self._lock:
