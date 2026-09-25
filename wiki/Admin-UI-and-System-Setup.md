@@ -254,7 +254,7 @@ material for later runtime use.
 
 Use runtime control when you need to:
 
-- restart the read UI
+- restart the main UI
 - restart the history sidecar
 - coordinate backup or restore work with a cleaner maintenance window
 - confirm whether UI, history, and admin are all running the same app version
@@ -276,7 +276,7 @@ and refresh timing.
 
 Fields owned by `.env` stay read-only and show their source. Fields owned by
 admin runtime overrides are editable and save to
-`config/runtime-overrides.yaml`. After saving those values, restart the read UI
+`config/runtime-overrides.yaml`. After saving those values, restart the main UI
 from the runtime cards so the main surface picks up the new timing behavior.
 
 ## Backup, restore, debug, and demo data
