@@ -8,7 +8,7 @@ test.use({
 
 async function gotoAdmin(page) {
   await page.goto("/", { waitUntil: "domcontentloaded" });
-  await expect(page.getByRole("heading", { name: "Admin", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { level: 1, name: "Admin", exact: true })).toBeVisible();
   await expect(page.locator("#backup-path-list")).toBeVisible();
   await expect(page.locator("#debug-path-list")).toBeVisible();
 }
