@@ -144,6 +144,17 @@ test("older overview cannot replace newer health collector state but can update 
   assert.equal(d.element("tracked-slots-value").textContent, "9");
 });
 
+test("overview polling refreshes free space and backup footprint labels (#597)", async () => {
+  const d = dashboard();
+  d.poll.pollOverviewStatus();
+  await d.reply(0, {
+    ...overview(true, 3),
+    database: { size_bytes: 40960, reclaimable_label: "2.0 KiB (25%)", backup_footprint_label: "3.0 KiB in 2 copies" },
+  });
+  assert.equal(d.element("db-reclaimable").textContent, "Free inside the file: 2.0 KiB (25%)");
+  assert.equal(d.element("status-backup-footprint").textContent, "3.0 KiB in 2 copies");
+});
+
 test("older health cannot replace newer overview collector state", async () => {
   const d = dashboard();
   d.poll.pollCollectorStatus();

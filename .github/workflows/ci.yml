@@ -500,6 +500,7 @@ jobs:
           log_probe.unlink()
           PY
           image_id="$(docker inspect --format '{{.Image}}' "$container_id")"
+          printf 'CI_SMOKE_IMAGE_ID=%s\n' "$image_id" >> "$GITHUB_ENV"
           sudo install -d -m 0755 -o "$(id -u)" -g "$(id -g)" "$compose_contract_root"
           sudo install -d -m 0770 -o 10001 -g 10001 \
             "$compose_contract_root/config" \
@@ -616,6 +617,80 @@ jobs:
           else:
               raise AssertionError("UI identity read the backup-only passphrase")
           PY
+
+      # #428: an unedited `cp .env.example .env` must start the main UI under the
+      # published hardened Compose chain. Only the image comes from the shell
+      # environment (it outranks .env), so .env stays byte-identical.
+      - name: Start hardened Compose from a verbatim .env.example
+        env:
+          JBOD_UI_IMAGE: ${{ env.CI_SMOKE_IMAGE_ID }}
+        run: |
+          set -euo pipefail
+          test -n "$JBOD_UI_IMAGE"
+          env_example_root="${RUNNER_TEMP}/truenas-jbod-ui-env-example"
+          compose_env_example() {
+            docker compose \
+              --project-directory "$env_example_root" \
+              -f "$env_example_root/compose.yaml" \
+              -f "$env_example_root/nonroot.yaml" \
+              "$@"
+          }
+          cleanup() {
+            if [ -f "$env_example_root/compose.yaml" ]; then
+              compose_env_example logs --no-color enclosure-ui || true
+              compose_env_example down --volumes --remove-orphans
+            fi
+            sudo rm -rf "$env_example_root"
+          }
+          trap cleanup EXIT
+          sudo install -d -m 0755 -o "$(id -u)" -g "$(id -g)" "$env_example_root"
+          sudo install -d -m 0770 -o 10001 -g 10001 \
+            "$env_example_root/config" \
+            "$env_example_root/config/ssh" \
+            "$env_example_root/data" \
+            "$env_example_root/logs"
+          sudo install -d -m 2750 -o 1000 -g 10001 "$env_example_root/backup-status"
+          sudo install -d -m 2770 -o 1000 -g 10001 "$env_example_root/backup-journal"
+          cp docker-compose.yml "$env_example_root/compose.yaml"
+          cp docker-compose.nonroot.yml "$env_example_root/nonroot.yaml"
+          cp .env.example "$env_example_root/.env"
+          cmp .env.example "$env_example_root/.env"
+          compose_env_example up -d enclosure-ui
+          container_id="$(compose_env_example ps -q enclosure-ui)"
+          python - <<'PY'
+          import json
+          import time
+          import urllib.error
+          import urllib.request
+
+          def get_json(url: str) -> tuple[int, dict[str, object]]:
+              with urllib.request.urlopen(url, timeout=5) as response:
+                  return response.status, json.load(response)
+
+          deadline = time.monotonic() + 60
+          while True:
+              try:
+                  status, live = get_json("http://127.0.0.1:8080/livez")
+                  break
+              except (OSError, urllib.error.URLError):
+                  if time.monotonic() > deadline:
+                      raise
+                  time.sleep(1)
+          assert status == 200 and live["status"] == "ok", live
+          status, health = get_json("http://127.0.0.1:8080/healthz")
+          assert status == 200, health
+          assert health["status"] != "down", health
+          print(f"env_example_healthz_status={health['status']}")
+          PY
+          started_at="$(docker inspect --format '{{.State.StartedAt}}' "$container_id")"
+          for _ in $(seq 1 10); do
+            sleep 2
+            test "$(docker inspect --format '{{.State.Status}} {{.RestartCount}}' "$container_id")" = "running 0"
+          done
+          test "$(docker inspect --format '{{.State.StartedAt}}' "$container_id")" = "$started_at"
+          docker exec "$container_id" python -c 'import os; assert (os.getuid(), os.getgid()) == (10001, 10001)'
+          curl -fsS http://127.0.0.1:8080/livez >/dev/null
+          printf '%s\n' 'env_example_hardened_compose_ui=ok restart_count=0'
 
   image-upgrade-smoke:
     name: Image-only upgrade smoke

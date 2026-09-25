@@ -958,7 +958,18 @@ class HistoryDashboardRouteTests(unittest.TestCase):
             patch.object(history_main.store, "list_scopes", return_value=[]),
             patch.object(history_main.logger, "exception"),
         ):
-            with patch.object(history_main.store, "database_size_bytes", return_value=0):
+            with (
+                patch.object(history_main.store, "database_size_bytes", return_value=0),
+                patch.object(
+                    history_main,
+                    "database_disk_metrics",
+                    return_value={
+                        "reclaimable_bytes": 0,
+                        "main_file_size_bytes": 0,
+                        "backup_footprint": {"copies": 0, "bytes": 0},
+                    },
+                ),
+            ):
                 response = asyncio.run(route.endpoint(request=self._refresh_request("full")))
 
         run_once.assert_awaited_once_with(

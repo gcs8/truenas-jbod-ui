@@ -194,6 +194,13 @@
     setCount("metric-rollups-value", counts.metric_rollup_count);
     updateFullRefreshCooldown(refresh.full_refresh_cooldown_seconds_remaining);
     setText("db-size-value", formatBytes(payload.database?.size_bytes ?? payload.database_size_bytes));
+    // #597: the server formats these so the page and polling share one rule.
+    if (typeof payload.database?.reclaimable_label === "string") {
+      setText("db-reclaimable", `Free inside the file: ${payload.database.reclaimable_label}`);
+    }
+    if (typeof payload.database?.backup_footprint_label === "string") {
+      setText("status-backup-footprint", payload.database.backup_footprint_label);
+    }
     renderScopes(payload.scopes || []);
   }
 

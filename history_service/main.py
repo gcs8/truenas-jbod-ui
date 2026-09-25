@@ -459,6 +459,7 @@ async def index(request: Request, exact_counts: bool = Query(default=False)) -> 
     )
     scopes = await asyncio.to_thread(store.list_scopes, include_activity_counts=exact_counts)
     database_size_bytes = await asyncio.to_thread(store.database_size_bytes)
+    disk = await asyncio.to_thread(database_disk_metrics)
     return templates.TemplateResponse(
         request,
         "dashboard.html",
@@ -470,6 +471,9 @@ async def index(request: Request, exact_counts: bool = Query(default=False)) -> 
             app_version=__version__,
             release_status=get_release_status_service().snapshot(),
             database_size_bytes=database_size_bytes,
+            reclaimable_bytes=disk["reclaimable_bytes"],
+            main_file_size_bytes=disk["main_file_size_bytes"],
+            backup_footprint=disk["backup_footprint"],
             refresh=refresh_cooldown_status(),
         ),
     )
@@ -537,6 +541,7 @@ async def overview(exact_counts: bool = Query(default=False)) -> dict[str, objec
         "counts_exact": exact_counts or counts.get("estimated") is False,
         "database": {
             "size_bytes": await asyncio.to_thread(store.database_size_bytes),
+            **public_disk_metrics(await asyncio.to_thread(database_disk_metrics)),
         },
         "scopes": await asyncio.to_thread(store.list_scopes, include_activity_counts=exact_counts),
     }
@@ -793,6 +798,61 @@ def format_count(value: object) -> str:
     return f"{value}"
 
 
+def database_disk_metrics() -> dict[str, object]:
+    """Free pages, main-file size and backup footprint, read-only (#455).
+
+    Shared by the page render and /api/history/overview so the dashboard's
+    polling keeps these labels current (#597).
+    """
+
+    return {
+        "reclaimable_bytes": store.reclaimable_bytes(),
+        "main_file_size_bytes": store.main_file_size_bytes(),
+        "backup_footprint": store.backup_footprint(
+            settings.backup_dir,
+            settings.long_term_backup_dir,
+        ),
+    }
+
+
+def public_disk_metrics(disk: dict[str, object]) -> dict[str, object]:
+    footprint = disk.get("backup_footprint")
+    reclaimable = disk.get("reclaimable_bytes")
+    main_file = int(disk.get("main_file_size_bytes") or 0)
+    return {
+        "reclaimable_bytes": reclaimable,
+        "main_file_size_bytes": main_file,
+        "reclaimable_label": reclaimable_label(reclaimable, main_file),  # type: ignore[arg-type]
+        "backup_footprint": footprint,
+        "backup_footprint_label": backup_footprint_label(footprint),  # type: ignore[arg-type]
+    }
+
+
+def reclaimable_label(reclaimable_bytes: int | None, main_file_size_bytes: int) -> str:
+    """Free space inside the database file, as bytes and a share of that file.
+
+    Free pages live in the main SQLite file, so the share divides by its size
+    alone, never by a total that includes the -wal and -shm files (#597).
+    """
+
+    if reclaimable_bytes is None:
+        return "unknown"
+    if reclaimable_bytes <= 0 or main_file_size_bytes <= 0:
+        return "0 B"
+    share = min(100, round(100 * reclaimable_bytes / main_file_size_bytes))
+    return f"{format_bytes(reclaimable_bytes)} ({share}%)"
+
+
+def backup_footprint_label(footprint: dict[str, int] | None) -> str:
+    """Disk used by the sidecar's own snapshot copies."""
+
+    if not footprint or not footprint.get("copies"):
+        return "no copies"
+    copies = int(footprint["copies"])
+    noun = "copy" if copies == 1 else "copies"
+    return f"{format_bytes(int(footprint.get('bytes') or 0))} in {copies} {noun}"
+
+
 def format_bytes(value: int) -> str:
     size = float(max(0, value))
     units = ("B", "KiB", "MiB", "GiB", "TiB")
@@ -873,6 +933,9 @@ def build_dashboard_context(
     app_version: str,
     release_status: dict[str, object] | None = None,
     database_size_bytes: int = 0,
+    reclaimable_bytes: int | None = None,
+    main_file_size_bytes: int | None = None,
+    backup_footprint: dict[str, int] | None = None,
     refresh: dict[str, object] | None = None,
 ) -> dict[str, object]:
     release_payload = release_status or {}
@@ -886,6 +949,11 @@ def build_dashboard_context(
         "counts": counts,
         "scopes": scopes,
         "database_size_label": format_bytes(database_size_bytes),
+        "reclaimable_label": reclaimable_label(
+            reclaimable_bytes,
+            database_size_bytes if main_file_size_bytes is None else main_file_size_bytes,
+        ),
+        "backup_footprint_label": backup_footprint_label(backup_footprint),
         "release_summary": str(release_payload.get("summary") or "Checking for updates..."),
         "latest_url": safe_http_url(release_payload.get("latest_url")),
         "backoff_label": f"{backoff_seconds}s remaining" if backoff_seconds > 0 else "inactive",

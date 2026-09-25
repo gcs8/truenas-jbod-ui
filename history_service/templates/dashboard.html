@@ -59,6 +59,7 @@
         <div class="card">
           <div class="label">Database size</div>
           <div id="db-size-value" class="value">{{ database_size_label }}</div>
+          <span id="db-reclaimable" class="note-text">Free inside the file: {{ reclaimable_label }}</span>
         </div>
         <div class="card">
           <div class="label">Version</div>
@@ -82,6 +83,7 @@
           <dt>Last temperature collection attempt</dt><dd id="status-last-fast-metrics-at">{{ timestamp(status.get('last_fast_metrics_at'), 'never') }}</dd>
           <dt>Last full SMART collection attempt</dt><dd id="status-last-slow-metrics-at">{{ timestamp(status.get('last_slow_metrics_at'), 'never') }}</dd>
           <dt>Last backup</dt><dd id="status-last-backup-at">{{ timestamp(status.get('last_backup_at'), 'never') }}</dd>
+          <dt>Backup copies on disk</dt><dd id="status-backup-footprint">{{ backup_footprint_label }}</dd>
           <dt>Backup error</dt><dd id="status-last-backup-error">{{ status.get('last_backup_error') or 'none' }}</dd>
           <dt>Last cleanup</dt><dd id="status-last-retention-at">{{ timestamp(status.get('last_retention_at'), 'never') }}</dd>
           <dt>Cleanup took</dt><dd id="status-last-retention-duration">{{ last_retention_duration_label }}</dd>
