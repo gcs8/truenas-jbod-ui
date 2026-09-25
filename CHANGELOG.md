@@ -147,6 +147,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Passed the `RELEASE_CHECK_*` settings to the history service, so
+  `RELEASE_CHECK_ENABLED=false` turns the GitHub check off everywhere; quoted
+  the current history bind error in the wiki and explained the three history
+  collection intervals in `.env.example` (#591).
 - Named the closest valid key when `config.yaml` has an unknown key, checked
   the keys under `backups:`, showed these warnings in the admin banner, and
   documented every operator environment variable in `.env.example` (#589).
