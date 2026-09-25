@@ -35,7 +35,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   format (`.tar.zst.enc`). Older app versions cannot restore these files and
   plain 7-Zip cannot open them; existing `.7z` backups still restore. Set
   `BACKUP_FULL_ARCHIVE_FORMAT=7z` (or `backups.full.archive_format: 7z`) to keep
-  making `.7z` FULL backups. (#PRNUM)
+  making `.7z` FULL backups. (#611)
 - `/healthz` on the main UI answers HTTP 503 (`status: down`) when its data,
   logs or known-hosts folder is not writable; remote failures stay HTTP 200
   (`status: degraded`). Compose healthchecks probe `/livez` and are unchanged,
