@@ -10,7 +10,7 @@ Use built-in profiles when they match validated hardware. Use a custom profile
 file when you need a different chassis layout or want to force a specific
 visual presentation for an enclosure.
 
-The optional admin sidecar now also exposes a dedicated
+Admin also exposes a dedicated
 `Enclosure / Profile Builder` workspace that can write safe first-pass custom
 profiles back into `profiles.yaml`. This guide remains the schema-level source
 of truth for the fields the builder is editing.

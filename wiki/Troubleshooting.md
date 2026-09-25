@@ -301,7 +301,7 @@ recreate the container the same way.
 
 ## The admin page is missing
 
-The admin sidecar is optional. If you expected it to be running:
+The Admin service is optional. If you expected it to be running:
 
 ```bash
 docker compose --profile admin ps

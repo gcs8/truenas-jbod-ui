@@ -886,10 +886,25 @@ class ContainerResourceContractTests(unittest.TestCase):
                     "${SCHEDULED_BACKUP_STATUS_FILE:-}",
                 )
                 self.assertEqual(
+                    history["environment"]["BACKUP_ARCHIVE_STATUS_FILE"],
+                    "/app/backup-status/backup-archive.json",
+                )
+                self.assertEqual(
                     history["environment"]["HISTORY_SEGMENTED_BACKUP_MAX_AGE_SECONDS"],
                     "${HISTORY_SEGMENTED_BACKUP_MAX_AGE_SECONDS:-129600}",
                 )
                 self.assertIn("./backup-status:/app/backup-status:ro", history["volumes"])
+
+    def test_backup_scheduler_uses_the_history_service_backup_path_overrides(self) -> None:
+        for compose_name in ("docker-compose.yml", "docker-compose.dev.yml"):
+            services = yaml.safe_load((REPO_ROOT / compose_name).read_text(encoding="utf-8"))[
+                "services"
+            ]
+            history_env = services["enclosure-history"]["environment"]
+            scheduler_env = services["enclosure-backup-scheduler"]["environment"]
+            with self.subTest(compose=compose_name):
+                for variable in ("HISTORY_BACKUP_DIR", "HISTORY_LONG_TERM_BACKUP_DIR"):
+                    self.assertEqual(scheduler_env[variable], history_env[variable])
 
     def test_history_capable_services_keep_segment_catalog_opt_in(self) -> None:
         expected = "${HISTORY_SEGMENT_CATALOG_PATH:-}"

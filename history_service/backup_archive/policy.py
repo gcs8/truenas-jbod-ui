@@ -16,7 +16,7 @@ supplies the policy; environment variables override single values (and
         enabled: false
         schedule: "0 3 * * *"
         archive_format: tar.zst  # or 7z: portable (older app versions, plain 7-Zip) but slow
-        local_keep: 7
+        local_keep: 14
         remote_keep: null
         remote_max_age_days: 90
       targets:
@@ -105,6 +105,10 @@ class ConfigClassPolicy(_ClassPolicyBase):
 
 
 class FullClassPolicy(_ClassPolicyBase):
+    # One daily FULL per day for two weeks. This replacement policy keeps the
+    # owner-approved 14-copy window when scheduler FULLs supersede the history
+    # sidecar's duplicate daily/weekly/monthly copies (#455).
+    local_keep: int = Field(default=14, ge=1, le=10_000)
     schedule: str = "0 3 * * *"
     # tar.zst (TJBENC02) is the default (#397): much faster for multi-GiB
     # history. Older app versions and plain 7-Zip cannot read it; 7z keeps

@@ -737,11 +737,11 @@ jobs:
   # Longer upgrade scenarios, kept out of the required job above so that check
   # stays fast. Report-only until branch protection adds it.
   image-upgrade-scenarios:
-    name: Hardened and interrupted upgrade smoke
+    name: Hardened, interrupted and segmented upgrade smoke
     needs: route
     if: needs.route.outputs.run == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     env:
       # Same public v0.22.2 image, pinned by digest, as the required job.
       PREVIOUS_IMAGE: ghcr.io/gcs8/truenas-jbod-ui@sha256:4bfa37a4c40a058055aef384194f98248722eca25f7fb429d6a5a34446d647a7
@@ -783,6 +783,20 @@ jobs:
           python3 scripts/run_image_upgrade_smoke.py \
             --scenario interrupted-migration \
             --root "$RUNNER_TEMP/image-upgrade-interrupted" \
+            --compose-fixture tests/fixtures/compose/v0.22.2.yml \
+            --config-fixture tests/fixtures/ci-smoke-config.yaml \
+            --previous-image "$PREVIOUS_IMAGE" \
+            --previous-version "$PREVIOUS_VERSION" \
+            --candidate-image "$CANDIDATE_IMAGE" \
+            --candidate-version "$(python3 -c 'import app; print(app.__version__)')" \
+            --candidate-revision "$GITHUB_SHA"
+
+      - name: Preserve v0.22.2 segmented catalog identity through upgrade and rollback
+        run: |
+          set -euo pipefail
+          python3 scripts/run_image_upgrade_smoke.py \
+            --scenario segmented-catalog \
+            --root "$RUNNER_TEMP/image-upgrade-segmented" \
             --compose-fixture tests/fixtures/compose/v0.22.2.yml \
             --config-fixture tests/fixtures/ci-smoke-config.yaml \
             --previous-image "$PREVIOUS_IMAGE" \
