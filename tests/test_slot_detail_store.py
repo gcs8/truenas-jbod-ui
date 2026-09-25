@@ -36,6 +36,32 @@ class SlotDetailStoreBatchConflictTests(unittest.TestCase):
             self.assertEqual(store.get_entry("invented-a", None, 1), changed)
             self.assertEqual(store.get_entry("invented-b", None, 0), other)
 
+    def test_restamped_row_does_not_fence_a_concurrent_batch(self):
+        # #448: a writer that rewrote a slot with only a new updated_at (a
+        # snapshot restamping every row because another slot changed) has not
+        # changed that slot, so a batch that read it before must still land.
+        with tempfile.TemporaryDirectory() as directory:
+            store = SlotDetailStore(str(Path(directory) / "details.json"))
+            first = SlotDetailCacheEntry(system_id="invented-a", slot=0, identifiers=["disk-a"],
+                                         updated_at="2026-01-01T00:00:00+00:00")
+            second = first.model_copy(update={"slot": 1})
+            store.save_entries([first, second])
+            baseline = store.load_all()
+            restamped = first.model_copy(update={"updated_at": "2026-01-02T00:00:00+00:00"})
+            second_changed = second.model_copy(update={
+                "identifiers": ["disk-b"], "updated_at": "2026-01-02T00:00:00+00:00",
+            })
+            store.save_entries([restamped, second_changed])
+            smart = first.model_copy(update={
+                "smart_fields": {"temperature": 33}, "smart_updated_at": "2026-01-03T00:00:00+00:00",
+                "updated_at": "2026-01-03T00:00:00+00:00",
+            })
+            store.save_entries([smart], expected_entries=baseline)
+            self.assertEqual(store.get_entry("invented-a", None, 0), smart)
+            # A real change by the other writer still fences.
+            store.save_entries([second], expected_entries=baseline)
+            self.assertEqual(store.get_entry("invented-a", None, 1), second_changed)
+
 
 class SlotDetailStoreSaveTests(unittest.TestCase):
     @staticmethod

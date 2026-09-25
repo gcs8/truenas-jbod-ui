@@ -105,8 +105,11 @@ class SlotDetailStore:
                     actual = current.get(key)
                     # A batch may span remote awaits. Do not replace a slot that
                     # another writer changed or removed since that batch read it.
-                    expected_json = None if expected is None else json.dumps(expected.model_dump(mode="json"), sort_keys=True)
-                    actual_json = None if actual is None else json.dumps(actual.model_dump(mode="json"), sort_keys=True)
+                    # A new row stamp alone is not a change here either: a
+                    # snapshot that writes because some other slot changed
+                    # restamps every row, and must not fence this one (#448).
+                    expected_json = None if expected is None else self._content_json(expected)
+                    actual_json = None if actual is None else self._content_json(actual)
                     if expected_json != actual_json:
                         continue
                 merged[key] = entry
