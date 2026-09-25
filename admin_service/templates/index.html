@@ -963,12 +963,14 @@
           <h2 id="backup-library-heading" tabindex="-1">Backups</h2>
           <p class="panel-copy">
             Copies this server keeps, here and on remote targets. Restore one without uploading it.
-            Settings for these backups live in <code>config.yaml</code> and <code>.env</code>; they are shown here read-only.
+            Edit the backup settings here (saved to <code>config.yaml</code>); values set in <code>.env</code> stay locked.
+            Credentials are secret files only and are never shown.
           </p>
         </div>
         <div class="button-row">
           <button id="backup-library-refresh-button" class="button secondary small" type="button">Reload list</button>
           <button id="backup-library-cleanup-button" class="button secondary small" type="button">Clean up</button>
+          <button id="backup-library-edit-button" class="button secondary small" type="button">Edit settings</button>
         </div>
       </div>
       <p id="backup-library-status" class="subtle action-note" role="status" aria-live="polite">Open this page to load backups.</p>

@@ -328,6 +328,24 @@ Target credentials are never written inline. Every secret is a path to a file
 `./config/backup-secrets` mount (`/run/backup-secrets` in the container). An
 inline `password` or `secret_access_key` is rejected.
 
+### Editing from the admin Backups page
+
+**Edit settings** on the Backups page edits the same `backups:` section. The
+admin checks the whole section with the scheduler's own rules before saving,
+writes `config.yaml` atomically, refuses the save when the file changed since
+the editor opened, and records a `backups.policy.save` entry in the config-change
+journal. Restart the scheduler to apply a save:
+`docker compose --profile backup-scheduler restart enclosure-backup-scheduler`.
+
+- Values set in the environment (the table above) are locked in the editor and
+  name their variable. When `BACKUP_TARGETS_JSON` is set, targets are read-only.
+- Credentials stay file-only. For each `*_file` setting the editor shows only
+  "Secret file present", "missing or not private", or "not set"; it never shows
+  or returns the path or its contents. To replace a secret, put the new file
+  under `./config/backup-secrets` (mode `600`) and enter its container path,
+  for example `/run/backup-secrets/archive_sftp_key`. Leaving the field empty
+  keeps the current file.
+
 ### Targets
 
 | `provider` | Encrypted in transit | Notes |
