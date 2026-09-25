@@ -132,6 +132,29 @@ To recover:
    quarantine. Collection resumes on the next pass. It does not touch
    `*.broken-*` files or history rows, and it adds no network endpoint.
 
+## Roll back after an incompatible history change
+
+So far every history schema change only adds to the database, and the previous
+release can still open an upgraded one. A future release may make a change the
+previous release cannot read. Its upgrade notes will say so. Releases after
+v0.23.0 refuse to start history on such a database, name the newer schema
+version and do not write to the file. v0.23.0 and older have no such check, so
+never start them on the newer database.
+
+There are no down-migrations. To go back:
+
+1. Stop the stack.
+2. Put back the backup you took right before the upgrade: restore it from
+   the admin **Backups** page, or put the copied `history` folder back.
+   Do this before starting the older release.
+3. Set `JBOD_UI_IMAGE` back to the release you were on.
+4. Start the stack and check history's `/healthz`.
+
+Everything history recorded after the upgrade is lost: samples, slot events
+and any maintenance you did in the newer release. That is the accepted cost of
+rolling back across such a change. Take the backup before upgrading; see
+[[Upgrading|Upgrading#before-you-start]].
+
 ## Common procedures
 
 ### Rename a system
