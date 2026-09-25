@@ -118,6 +118,7 @@ WINDOWS_PORTABLE_TEST_MODULES = (
     "tests.test_history_config_contract",
     "tests.test_history_diagnostics",
     "tests.test_history_operation_bounds",
+    "tests.test_history_released_schema_upgrades",
     "tests.test_history_schema_version_gate",
     "tests.test_logging_config",
     "tests.test_nonroot_cli",

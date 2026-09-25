@@ -474,6 +474,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Performance
 
+- The main page no longer waits for the admin health probe once it has an
+  answer: an expired answer is shown at once and refreshed in the
+  background, and startup probes admin before the first page load. (#598)
 - Storage views collect SMART data for history in batches of
   `HISTORY_SMART_BATCH_SIZE` slots through a new
   `POST /api/storage-views/{view_id}/slots/smart-batch` route, so a 60-slot
@@ -573,6 +576,15 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   (#564).
 
 ### Internal
+
+- Tested history upgrades from the released v0.8.0, v0.21.2 and v0.22.2
+  schemas, including a kill after each startup migration step, a second start
+  that changes nothing, the previous release reading an upgraded database, and
+  refusal of a newer database before any write (#603).
+- The production container smoke now starts the main UI under
+  `docker-compose.yml` plus `docker-compose.nonroot.yml` with an unedited copy
+  of `.env.example`, checks `/livez` and `/healthz`, and checks that the
+  container is not restarting (#602).
 
 - CI now upgrades the public v0.22.2 image to each pull request's build by
   changing only `JBOD_UI_IMAGE` on root-owned mounts, checks that the
