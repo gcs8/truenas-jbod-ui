@@ -889,9 +889,9 @@ test.describe("browser qa smoke", () => {
     await exportButton.click();
 
     await expect(page.locator("#export-snapshot-dialog")).toBeVisible();
-    await expect(page.locator("#export-snapshot-note")).toContainText("Scope");
-    await expect(page.locator("#export-snapshot-estimate")).toContainText("Current Choice");
-    await expect(page.locator("#export-snapshot-estimate")).toContainText("Auto -> HTML");
+    await expect(page.locator("#export-snapshot-note")).toContainText("Includes");
+    await expect(page.locator("#export-snapshot-estimate")).toContainText("Will save");
+    await expect(page.locator("#export-snapshot-estimate")).toContainText("Automatic: HTML file");
     await expect.poll(() => estimateRequests).toBe(1);
 
     await page.locator("#export-packaging-select").selectOption("zip");
