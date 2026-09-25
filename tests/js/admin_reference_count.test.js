@@ -17,7 +17,7 @@ function stripComments(source) {
 }
 
 function escapeRegExp(text) {
-  return text.replace(/[$]/g, "\\$");
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function referenceCount(code, name) {
