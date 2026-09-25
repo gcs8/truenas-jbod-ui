@@ -143,6 +143,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Renamed the admin container cards to Main UI, History and Admin, removed
+  sidecar and runtime wording from admin messages, and corrected the docs that
+  said admin auto-stops by default (only the published Compose files set
+  3600) (#581)
 - Raised the last small labels on the main page (summary labels, legend
   swatches, Connections card details, heat-map controls, timing chips) to at
   least 12px. (#584)

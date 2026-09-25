@@ -909,7 +909,7 @@
             timeoutMs: LONG_TIMEOUT_MS,
           });
           if (!["encrypted", "plaintext"].includes(inspection?.encryption_mode) || !inspection?.inspection_receipt) {
-            throw new Error("Inspection did not return an observed encryption mode and receipt.");
+            throw new Error("The backup check did not finish. Try the restore again.");
           }
           if (!scope.live()) return;
           state.restoreInspection = inspection;

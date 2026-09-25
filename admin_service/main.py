@@ -226,11 +226,11 @@ def build_offline_recovery_state(
         return {"expired": False, "summary": "", "next_step": ""}
     return {
         "expired": True,
-        "summary": "The admin sidecar's auto-stop time has passed.",
+        "summary": "Admin's auto-stop time has passed.",
         "next_step": (
-            "The sidecar stops on its own and does not come back by itself. If this "
-            "page stops responding, run `docker compose up -d enclosure-admin` on the "
-            "Docker host and reload it. This page cannot keep the sidecar running."
+            "It stops on its own and does not come back by itself. If this page "
+            "stops responding, run `docker compose --profile admin up -d enclosure-admin` "
+            "on the Docker host and reload it. This page cannot keep it running."
         ),
     }
 
