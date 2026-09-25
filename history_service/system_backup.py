@@ -2092,7 +2092,9 @@ class SystemBackupService:
         normalized_packaging: ArchivePackaging = (
             "tar.zst" if stream_encrypted else ("7z" if encrypt else requested_packaging)
         )
-        self._require_export_free_space(selected_groups)
+        # A fast encrypted export briefly holds the snapshot, the plain TAR and
+        # the growing encrypted output together, so it reserves three copies.
+        self._require_export_free_space(selected_groups, copies=3 if stream_encrypted else 2)
         workspace = Path(tempfile.mkdtemp(prefix="truenas-jbod-ui-export-"))
         try:
             segmented_snapshot: _SegmentedExportSnapshot | None = None

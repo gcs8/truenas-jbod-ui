@@ -1234,6 +1234,18 @@ class SystemBackupServiceTests(unittest.TestCase):
             archive.writestr("manifest.json", "{}")
         return path
 
+    def test_stream_full_export_reserves_snapshot_tar_and_output_space(self) -> None:
+        calls: list[int] = []
+        real = SystemBackupService._require_export_free_space
+
+        def spy(service: Any, groups: Any, *, copies: int = 2) -> None:
+            calls.append(copies)
+            real(service, groups, copies=copies)
+
+        with patch.object(SystemBackupService, "_require_export_free_space", spy):
+            self._export_stream_full("space passphrase").cleanup()
+        self.assertEqual(calls, [3])
+
     def test_stream_full_backup_keeps_7z_default_and_rejects_unknown_format(self) -> None:
         with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
             get_settings.cache_clear()
