@@ -72,6 +72,13 @@ class PublicDocsContractTests(unittest.TestCase):
         self.assertNotIn("read-only enclosure UI", guide)
         self.assertIn("main enclosure UI", guide)
 
+    def test_public_docs_use_current_service_names(self) -> None:
+        for relative_path in ("README.md", *sorted(EXPECTED_WIKI_PAGES)):
+            text = (ROOT / relative_path).read_text(encoding="utf-8")
+            with self.subTest(document=relative_path):
+                self.assertNotRegex(text, r"(?i)\badmin\s+sidecar\b")
+                self.assertNotRegex(text, r"(?i)\bread\s+UI\b")
+
     def test_architecture_guide_states_the_reachability_boundary_plainly(self) -> None:
         guide = (ROOT / "wiki/Architecture-and-Services.md").read_text(
             encoding="utf-8"

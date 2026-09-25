@@ -1,6 +1,6 @@
 # Backup, restore, and debug bundles
 
-Open the optional admin sidecar on port `8082` to create backups, restore application state, or collect support files.
+Open Admin on port `8082` to create backups, restore application state, or collect support files.
 
 ## Choose the right tool
 
@@ -29,7 +29,7 @@ These secret-material paths can contain credentials or trust data and remain loc
 - imported TLS trust bundles
 - shared `known_hosts`
 
-Selecting a locked path forces encrypted output: `.tar.zst.enc` when the backup includes the history database and the file format is `tar.zst` (the default), otherwise `.7z`. The admin sidecar rejects an unencrypted export of unsanitized state unless `ADMIN_ALLOW_PLAINTEXT_BACKUP_EXPORT=true` is set. That override creates a sensitive plaintext archive. It does not make the archive safe to share.
+Selecting a locked path forces encrypted output: `.tar.zst.enc` when the backup includes the history database and the file format is `tar.zst` (the default), otherwise `.7z`. The Admin service rejects an unencrypted export of unsanitized state unless `ADMIN_ALLOW_PLAINTEXT_BACKUP_EXPORT=true` is set. That override creates a sensitive plaintext archive. It does not make the archive safe to share.
 
 The admin service sends the 7z passphrase through a private, bounded terminal prompt. It does not place the passphrase in process arguments or command output. The passphrase may contain spaces, including trailing spaces, but it cannot contain carriage returns or line feeds.
 
@@ -39,9 +39,9 @@ For a migration:
 
 1. Export a full backup from the source deployment.
 2. Start the target Docker deployment with separate local directories.
-3. Choose the bundle in the target admin sidecar.
+3. Choose the bundle in Admin on the target deployment.
    Supply the original passphrase if the archive is encrypted.
-4. Select `Import Backup`. The admin sidecar inspects the exact bytes and shows
+4. Select `Import Backup`. The Admin service inspects the exact bytes and shows
    the observed encryption mode, selected groups, and aggregate counts.
 5. Confirm that inspection. Import then requires the short-lived, single-use
    receipt and rehashes the same bytes before any service stop or restore parse.
@@ -112,7 +112,7 @@ below. A separate UID cannot access a `root:root 0700` history directory just by
 adding a group. Changing only the producer's group also leaves old root-owned
 files inaccessible. Neither is an automatic upgrade repair.
 
-The admin application default for automatic stop is `0`. The supplied Compose files set the separately launched admin sidecar default to `3600` seconds.
+The admin application default for automatic stop is `0`. The supplied Compose files set the separately launched Admin service default to `3600` seconds.
 
 A scheduled backup that includes `history_db` uses the encrypted `.tar.zst.enc` stream format by default, including segmented history, or encrypted `.7z` when `BACKUP_FULL_ARCHIVE_FORMAT=7z` (see "Full backup archive format"). A backup without `history_db` uses the native encrypted `.tar.zst.enc` envelope. The restore path accepts every format, including `.7z` backups made by earlier versions.
 
@@ -256,7 +256,7 @@ and are checked (decrypted and preflighted) before they are catalogued.
 
 #### Config backups on change
 
-The main UI and the admin sidecar record each configuration save in a change
+The main UI and the Admin service record each configuration save in a change
 journal: mapping and alias edits, system add, edit and remove, storage views,
 profiles, runtime-behaviour overrides and restores. The scheduler waits until
 edits stop for `debounce_seconds` and then takes one backup of the whole burst.
@@ -457,10 +457,10 @@ Folders and permissions (all in the shared application group `APP_GID`):
 | `backups/` (archive and catalogue) | `0700` | scheduler | scheduler |
 
 The setgid bit keeps new files in `APP_GID`. The journal files are created
-`0660` explicitly, so the UI, the admin sidecar and the scheduler can all
+`0660` explicitly, so the UI, the Admin service and the scheduler can all
 append to them even when they run as different users.
 
-The scheduler serves its API on a Unix socket that only the admin sidecar
+The scheduler serves its API on a Unix socket that only the Admin service
 mounts. It publishes no port. The admin UI calls it through
 `/api/admin/backups/*`, with the same authentication and origin checks as the
 other admin routes.
@@ -492,7 +492,7 @@ UI's `/healthz` as `degraded` with a reason such as
 
 ### Admin API
 
-All routes are on the admin sidecar under `/api/admin/backups`: list the
+All routes are on the Admin service under `/api/admin/backups`: list the
 library, show one backup and the changes it captured, verify (re-read and
 re-hash), download, preserve and unpreserve, restore (the same inspect-then-
 import flow and passphrase headers as an uploaded backup), run a backup now,
