@@ -124,6 +124,7 @@ class PublicDocsContractTests(unittest.TestCase):
             "--profile backup-scheduler",
             "The backup scheduler and Backups page are not in v0.22.2",
             "With a matching newer image and Compose file",
+            "only after you enable those two classes in the backup policy",
             "[Backups page](wiki/Backup-Restore-and-Debug-Bundles.md#editing-from-the-admin-backups-page)",
             "[`docker-compose.backup-nfs.yml`](wiki/Backup-Restore-and-Debug-Bundles.md#nfs-targets)",
             "[`docker-compose.history-bind.yml`](wiki/Upgrading.md#history)",
@@ -137,6 +138,12 @@ class PublicDocsContractTests(unittest.TestCase):
         ):
             with self.subTest(required=required):
                 self.assertIn(required, normalized)
+
+        backup_guide = (ROOT / "wiki/Backup-Restore-and-Debug-Bundles.md").read_text(encoding="utf-8")
+        self.assertIn("no with an `http://` custom endpoint", backup_guide)
+        self.assertIn("Artifact and library routes use opaque backup ids", backup_guide)
+        self.assertIn("secret-file paths and credential contents are never returned", backup_guide)
+        self.assertNotIn("No route accepts or returns a file path or a credential", backup_guide)
 
     def test_repository_has_exact_readme_and_wiki_document_set(self) -> None:
         actual = {path.relative_to(ROOT).as_posix() for path in (ROOT / "wiki").glob("*.md")}

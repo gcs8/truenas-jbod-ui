@@ -113,7 +113,7 @@ docker compose --profile admin up -d enclosure-admin
 The backup scheduler and Backups page are not in v0.22.2. With a matching newer image
 and Compose file, the [`backup-scheduler` profile](wiki/Backup-Restore-and-Debug-Bundles.md#automatic-backup-archive-and-remote-targets)
 is off by default; start it with `--profile backup-scheduler`. It creates encrypted config
-backups after changes and scheduled full backups, then can copy them to filesystem,
+backups after changes and scheduled full backups only after you enable those two classes in the backup policy; it can then copy them to filesystem,
 FTP/FTPS, SFTP, SMB, NFS, or S3. The admin
 [Backups page](wiki/Backup-Restore-and-Debug-Bundles.md#editing-from-the-admin-backups-page)
 can run and manage backups. A restore inspects the exact archive and asks for
