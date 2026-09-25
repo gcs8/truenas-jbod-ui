@@ -475,7 +475,7 @@ textarea {
 
 .snapshot-export-estimate-label {
   color: var(--muted);
-  font-size: 0.72rem;
+  font-size: 0.75rem;
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
@@ -594,7 +594,7 @@ textarea {
 .ui-perf-metric-label {
   display: block;
   margin-bottom: 3px;
-  font-size: 0.7rem;
+  font-size: 0.75rem;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--muted);
@@ -766,7 +766,7 @@ textarea {
 }
 
 .summary-label {
-  font-size: 0.72rem;
+  font-size: 0.75rem;
   letter-spacing: 0.14em;
   text-transform: uppercase;
   color: var(--muted);
@@ -833,7 +833,7 @@ textarea {
 
 .cache-timing-chip-label {
   color: var(--muted);
-  font-size: 0.68rem;
+  font-size: 0.75rem;
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
@@ -1014,7 +1014,7 @@ textarea {
 
 .disk-inventory-sync-label {
   color: var(--muted);
-  font-size: 0.72rem;
+  font-size: 0.75rem;
   letter-spacing: 0.06em;
   text-transform: uppercase;
   white-space: nowrap;
@@ -1051,7 +1051,7 @@ textarea {
 }
 
 .heatmap-control-field span {
-  font-size: 0.66rem;
+  font-size: 0.75rem;
 }
 
 .heatmap-scrub-field span,
@@ -1104,7 +1104,7 @@ textarea {
 .heatmap-legend-status {
   grid-column: 1 / -1;
   font-family: var(--mono);
-  font-size: 0.7rem;
+  font-size: 0.75rem;
   color: #c5d4e6;
 }
 
@@ -1172,7 +1172,7 @@ textarea {
 
 .sas-fabric-stage-title {
   font-family: var(--mono);
-  font-size: 0.66rem;
+  font-size: 0.75rem;
   color: #8ea3b8;
   text-transform: uppercase;
 }
@@ -1225,7 +1225,7 @@ textarea {
   overflow: hidden;
   color: var(--muted);
   font-family: var(--mono);
-  font-size: 0.66rem;
+  font-size: 0.75rem;
   line-height: 1.35;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1307,11 +1307,11 @@ textarea {
 }
 
 .sas-fabric-compact-node .sas-fabric-item-label {
-  font-size: 0.74rem;
+  font-size: 0.75rem;
 }
 
 .sas-fabric-compact-node .sas-fabric-item-meta {
-  font-size: 0.61rem;
+  font-size: 0.75rem;
 }
 
 .sas-fabric-bay-list {
@@ -1329,7 +1329,7 @@ textarea {
   background: rgba(13, 19, 25, 0.88);
   color: #dfe9f4;
   font-family: var(--mono);
-  font-size: 0.68rem;
+  font-size: 0.75rem;
   cursor: pointer;
 }
 
@@ -1429,7 +1429,7 @@ textarea {
   margin-top: 2px;
   color: var(--muted);
   font-family: var(--mono);
-  font-size: 0.62rem;
+  font-size: 0.75rem;
   letter-spacing: 0.12em;
   text-transform: uppercase;
 }
@@ -1438,7 +1438,7 @@ textarea {
   flex-basis: 100%;
   color: var(--muted);
   font-family: var(--mono);
-  font-size: 0.64rem;
+  font-size: 0.75rem;
 }
 
 .sas-fabric-bay-overflow,
@@ -1446,7 +1446,7 @@ textarea {
   align-self: center;
   color: var(--muted);
   font-family: var(--mono);
-  font-size: 0.68rem;
+  font-size: 0.75rem;
 }
 
 .sas-fabric-inspector {
@@ -3261,7 +3261,7 @@ button.fabric-trace-crumb:hover {
   border-radius: 4px;
   margin-right: 6px;
   color: #fff;
-  font-size: 0.72rem;
+  font-size: 0.75rem;
   font-style: normal;
   font-weight: 800;
   line-height: 1;
@@ -3333,7 +3333,7 @@ button.fabric-trace-crumb:hover {
   background: rgba(5, 9, 13, 0.88);
   color: #fff;
   font-family: var(--mono);
-  font-size: 0.72rem;
+  font-size: 0.75rem;
   font-weight: 800;
   line-height: 1;
   pointer-events: none;
@@ -4482,7 +4482,7 @@ button.fabric-trace-crumb:hover {
   left: 8.6%;
   bottom: 5.8%;
   font-family: var(--mono);
-  font-size: 0.72rem;
+  font-size: 0.75rem;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: rgba(235, 241, 247, 0.92);
@@ -5000,7 +5000,7 @@ button.fabric-trace-crumb:hover {
   border: 1px solid rgba(137, 220, 179, 0.24);
   background: rgba(18, 40, 33, 0.48);
   color: rgba(156, 235, 195, 0.92);
-  font-size: 0.66rem;
+  font-size: 0.75rem;
   letter-spacing: 0.04em;
   text-transform: uppercase;
 }
@@ -5475,7 +5475,7 @@ button.fabric-trace-crumb:hover {
   border: 1px solid rgba(199, 223, 238, 0.16);
   background: rgba(10, 24, 20, 0.38);
   color: rgba(221, 236, 247, 0.78);
-  font-size: 0.62rem;
+  font-size: 0.75rem;
   line-height: 1;
   white-space: nowrap;
 }
@@ -5504,6 +5504,15 @@ button.fabric-trace-crumb:hover {
 
 .detail-secondary-card {
   min-width: 0;
+}
+
+/* Saved copies hide the Bay assignment editor, leaving two cards. */
+.detail-secondary-grid-snapshot {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.meta-select-static {
+  overflow-wrap: anywhere;
 }
 
 .detail-empty {
@@ -6054,7 +6063,7 @@ button.fabric-trace-crumb:hover {
 
 .topology-pill small {
   color: var(--muted);
-  font-size: 0.72rem;
+  font-size: 0.75rem;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -6134,7 +6143,8 @@ button.fabric-trace-crumb:hover {
     grid-template-columns: 1fr;
   }
 
-  .detail-secondary-grid {
+  .detail-secondary-grid,
+  .detail-secondary-grid-snapshot {
     grid-template-columns: 1fr;
   }
 

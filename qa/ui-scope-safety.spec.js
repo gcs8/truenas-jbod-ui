@@ -114,7 +114,7 @@ test("export scope keyboard focus survives estimates and native close returns fo
   const errors=await openFixture(page);
   const opener=page.locator("#export-snapshot-button");
   await opener.click();
-  await expect(page.getByRole("dialog",{name:"Export Enclosure Snapshot"})).toBeVisible();
+  await expect(page.getByRole("dialog",{name:"Save an offline copy"})).toBeVisible();
   await page.locator("#export-include-views-toggle").check();
   const check=page.locator("[data-export-storage-view-id]").nth(1);
   await check.focus();
@@ -238,7 +238,7 @@ for (const kind of ["enclosure", "system"]) {
   const selector=page.locator(kind==="system"?"#system-select":"#enclosure-select");
   await selector.selectOption(kind==="system"?"synthetic-second":"enclosure:enc-b");
   await expect.poll(()=>Boolean(pending)).toBe(true);
-  await expect(page.locator("#inventory-scope-note")).toContainText("Previous inventory");
+  await expect(page.locator("#inventory-scope-note")).toContainText("Still showing the previous enclosure");
   expect(await page.locator("#slot-grid").evaluate(n=>n.inert)).toBe(true);
   await page.locator('#slot-grid [data-slot="0"]').dispatchEvent("click");
   await expect(page.locator("#detail-content")).toBeHidden();
@@ -379,7 +379,7 @@ test("late LED completion cannot replace a newer shelf or its draft", async ({pa
  await page.route("**/api/slots/0/led?**",route=>{led=route;});
  await page.route("**/api/inventory?**",route=>route.fulfill({contentType:"application/json",body:JSON.stringify(next)}));
  await page.locator('[data-led-action="IDENTIFY"]').click();
- await expect.poll(async()=>({pending:Boolean(led),status:await page.locator('#status-text').textContent(),errors})).toEqual({pending:true,status:"Sending IDENTIFY for slot 00...",errors:[]});
+ await expect.poll(async()=>({pending:Boolean(led),status:await page.locator('#status-text').textContent(),errors})).toEqual({pending:true,status:"Turning on the locate light for slot 00...",errors:[]});
  await page.locator("#enclosure-select").selectOption("enclosure:enc-b");
  await expect(page.locator("#inventory-scope-note")).toBeHidden();
  await page.locator('#slot-grid [data-slot="0"]').click();

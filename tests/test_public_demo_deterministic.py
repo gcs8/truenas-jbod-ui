@@ -154,6 +154,11 @@ class DeterministicPublicDemoContractTests(unittest.TestCase):
                 "APP_CONFIG_PATH": str(materialized / "absent-config.yaml"),
                 "PYTHONHASHSEED": "random",
             }
+            # Windows cannot start Python's socket and random layers without
+            # these; they carry no operator state (#445).
+            for name in ("SYSTEMROOT", "SystemDrive"):
+                if os.environ.get(name):
+                    env[name] = os.environ[name]
             result = subprocess.run(
                 [
                     sys.executable,

@@ -728,7 +728,7 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("buildScopedUrl(url, queryParams)", rendered.html)
         self.assertNotIn("`${url}?${params.toString()}`", rendered.html)
         self.assertNotIn("data:image/", rendered.html)
-        self.assertNotIn("Export Snapshot", rendered.html)
+        self.assertNotIn("Save offline copy", rendered.html)
         self.assertNotIn('id="sas-fabric-view-link"', rendered.html)
 
     @staticmethod
