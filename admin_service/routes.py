@@ -1300,12 +1300,14 @@ def build_router(admin_settings: Any) -> APIRouter:
             raise HTTPException(status_code=404, detail="Backup not found.")
         return artifact_id
 
+    scheduler_unavailable_detail = "The backup scheduler service is not available."
+
     async def scheduler_call(method: str, path: str, body: dict[str, Any] | None = None) -> JSONResponse:
         client = get_backup_scheduler_client()
         try:
             response = await asyncio.to_thread(client.request, method, path, body=body, actor="admin")
-        except SchedulerUnavailableError as exc:
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except SchedulerUnavailableError:
+            raise HTTPException(status_code=503, detail=scheduler_unavailable_detail) from None
         payload = response.payload if isinstance(response.payload, dict) else {"detail": "Unexpected answer."}
         if response.status >= 400:
             raise HTTPException(status_code=response.status, detail=str(payload.get("detail") or "Backup request failed."))
@@ -1316,8 +1318,8 @@ def build_router(admin_settings: Any) -> APIRouter:
         client = get_backup_scheduler_client()
         try:
             response = await asyncio.to_thread(client.request, "GET", "/internal/backups")
-        except SchedulerUnavailableError as exc:
-            return JSONResponse({**_UNAVAILABLE_LIBRARY, "detail": str(exc)})
+        except SchedulerUnavailableError:
+            return JSONResponse({**_UNAVAILABLE_LIBRARY, "detail": scheduler_unavailable_detail})
         if response.status >= 400 or not isinstance(response.payload, dict):
             return JSONResponse({**_UNAVAILABLE_LIBRARY, "detail": "The backup scheduler could not list backups."})
         return JSONResponse(response.payload)
@@ -1410,8 +1412,8 @@ def build_router(admin_settings: Any) -> APIRouter:
         client = get_backup_scheduler_client()
         try:
             response, chunks = await asyncio.to_thread(client.stream, backup_id_or_404(artifact_id))
-        except SchedulerUnavailableError as exc:
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except SchedulerUnavailableError:
+            raise HTTPException(status_code=503, detail=scheduler_unavailable_detail) from None
         if chunks is None:
             detail = response.payload.get("detail") if isinstance(response.payload, dict) else None
             raise HTTPException(status_code=response.status, detail=str(detail or "Backup could not be read."))
@@ -1444,10 +1446,10 @@ def build_router(admin_settings: Any) -> APIRouter:
 
             try:
                 result = await asyncio.to_thread(fetch)
-            except SchedulerUnavailableError as exc:
+            except SchedulerUnavailableError:
                 archive_path.unlink(missing_ok=True)
                 workspace.rmdir()
-                raise HTTPException(status_code=503, detail=str(exc)) from exc
+                raise HTTPException(status_code=503, detail=scheduler_unavailable_detail) from None
             except BaseException:
                 archive_path.unlink(missing_ok=True)
                 workspace.rmdir()
