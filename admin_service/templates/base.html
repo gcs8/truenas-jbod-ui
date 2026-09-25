@@ -9,6 +9,7 @@
 </head>
 <body>
   {% block body %}{% endblock %}
+  <script src="{{ url_for('static', path='admin_backups.js') }}" defer></script>
   <script src="{{ url_for('static', path='admin.js') }}" defer></script>
 </body>
 </html>

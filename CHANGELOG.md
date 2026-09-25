@@ -56,6 +56,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   per-class retention with preserve, `/api/admin/backups` routes, and a
   degraded `/healthz` reason when a target fails. Off by default; NFS needs
   the opt-in `docker-compose.backup-nfs.yml` overlay. (#580)
+- Added a Backups page to the admin: backups kept here and on remote targets,
+  grouped by type with size, place, verified state and a kept flag; verify,
+  download, keep with a reason, back up now, test a target, clean up exactly
+  the previewed list, and restore a stored backup without uploading it. (#579)
 
 - Added a catalog of backup artifacts and a retention manager for the coming
   remote backup archive: per-class, per-location keep-N and max-age rules, a

@@ -1778,3 +1778,126 @@ h3 {
     grid-column: auto;
   }
 }
+
+/* Backups library (#398) */
+.backup-library-panel h3 {
+  margin: 22px 0 10px;
+}
+
+.backup-library-policies {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 16px;
+  margin-top: 12px;
+}
+
+.backup-policy-list {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 6px 16px;
+  margin: 10px 0 0;
+}
+
+.backup-policy-list dt {
+  color: var(--muted);
+}
+
+.backup-policy-list dd {
+  margin: 0;
+}
+
+.backup-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.92rem;
+}
+
+.backup-table th,
+.backup-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  vertical-align: middle;
+}
+
+.backup-table thead th {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.backup-artifact-table tr.is-not-restorable td {
+  color: var(--muted);
+}
+
+.backup-row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.backup-row-actions a.button {
+  text-decoration: none;
+}
+
+/* Plain FTP is labelled, never styled as a warning. */
+.backup-plain-badge {
+  background: transparent;
+  border-color: var(--line-strong);
+  color: var(--muted);
+}
+
+.backup-run-status.is-ok,
+.backup-test-result.is-ok {
+  color: var(--success);
+}
+
+.backup-run-status.is-bad,
+.backup-test-result.is-bad,
+.backup-state.is-incomplete,
+.backup-state.is-unsupported,
+.backup-state.is-missing {
+  color: var(--danger);
+}
+
+.backup-change-list {
+  margin: 8px 0 0;
+  padding-left: 20px;
+  display: grid;
+  gap: 4px;
+}
+
+.backup-dialog {
+  max-width: min(720px, 92vw);
+  max-height: 86vh;
+  overflow: auto;
+  padding: 22px 24px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line-strong);
+  background: var(--panel-strong);
+  color: var(--text);
+  box-shadow: var(--shadow);
+}
+
+.backup-dialog::backdrop {
+  background: rgba(3, 8, 14, 0.66);
+}
+
+.backup-dialog h2 {
+  margin-top: 0;
+}
+
+.backup-restore-confirmation {
+  white-space: pre-line;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 143, 143, 0.36);
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
