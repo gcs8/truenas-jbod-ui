@@ -10,8 +10,6 @@ const STYLE_SOURCE = fs.readFileSync(path.join(ROOT, "app/static/style.css"), "u
 
 const MIN_REM = 0.75;
 const MIN_PX = 12;
-const SECONDARY_TEXT_SELECTOR = /\.(fabric-|disk-path-|slot-)/;
-const GLYPH_PSEUDO_ELEMENT = /::(before|after)/;
 
 function stripComments(css) {
   return css.replace(/\/\*[\s\S]*?\*\//g, (comment) => comment.replace(/[^\n]/g, " "));
@@ -52,7 +50,12 @@ function declarations(body, property) {
   return values;
 }
 
-function fontSizeTooSmall(value) {
+// Design floor (#440): no text in the stylesheet renders below 12px (0.75rem at
+// the default 16px root). The check fails closed: `inherit`, absolute rem/px
+// lengths and `clamp()` with an absolute lower bound are understood; anything
+// else (em, %, keywords, calc(), min(), variables) is reported so a new
+// expression cannot slip smaller text past the floor unexamined.
+function absoluteLengthTooSmall(value) {
   const rem = /^([\d.]+)rem$/.exec(value);
   if (rem) {
     return Number(rem[1]) < MIN_REM;
@@ -61,7 +64,23 @@ function fontSizeTooSmall(value) {
   if (px) {
     return Number(px[1]) < MIN_PX;
   }
-  return false;
+  return null;
+}
+
+function fontSizeTooSmall(value) {
+  if (value === "inherit") {
+    return false;
+  }
+  const absolute = absoluteLengthTooSmall(value);
+  if (absolute !== null) {
+    return absolute;
+  }
+  // clamp(MIN, preferred, MAX) never renders below MIN.
+  const clamp = /^clamp\(\s*([^,()]+?)\s*,[^()]*\)$/.exec(value);
+  if (clamp) {
+    return absoluteLengthTooSmall(clamp[1]) !== false;
+  }
+  return true;
 }
 
 function relativeLuminance(hex) {
@@ -80,13 +99,10 @@ function contrastRatio(foreground, background) {
 
 const RULES = parseRules(STYLE_SOURCE);
 
-test("bay, fabric and disk-path text never drops below 12px", () => {
+test("no text in the stylesheet drops below 12px", () => {
   const violations = [];
   for (const rule of RULES) {
     if (rule.selector.startsWith("@")) {
-      continue;
-    }
-    if (!SECONDARY_TEXT_SELECTOR.test(rule.selector) || GLYPH_PSEUDO_ELEMENT.test(rule.selector)) {
       continue;
     }
     for (const value of declarations(rule.body, "font-size")) {
@@ -95,7 +111,16 @@ test("bay, fabric and disk-path text never drops below 12px", () => {
       }
     }
   }
-  assert.deepEqual(violations, [], `text below the ${MIN_REM}rem floor:\n${violations.join("\n")}`);
+  assert.deepEqual(violations, [], `text below (or not provably above) the ${MIN_REM}rem floor:\n${violations.join("\n")}`);
+});
+
+test("the font-size floor check fails closed on expressions it cannot prove", () => {
+  for (const value of ["0.75rem", "12px", "1rem", "inherit", "clamp(1.8rem, 3vw, 2.2rem)", "clamp(12px, 1vw, 1rem)"]) {
+    assert.equal(fontSizeTooSmall(value), false, value);
+  }
+  for (const value of ["0.7rem", "11px", "clamp(0.5rem, 1vw, 0.6rem)", "clamp(var(--min), 1vw, 1rem)", "0.9em", "80%", "small", "smaller", "calc(1rem - 6px)", "min(1rem, 2vw)", "var(--text-small)"]) {
+    assert.equal(fontSizeTooSmall(value), true, value);
+  }
 });
 
 test("diagnostic chips are not forced to uppercase", () => {
