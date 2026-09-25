@@ -50,6 +50,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Added
 
+- Added an optional backup scheduler sidecar (`--profile backup-scheduler`):
+  config-only backups shortly after configuration changes, full backups on a
+  cron schedule, copies to SFTP, FTP, SMB, S3, NFS or filesystem targets,
+  per-class retention with preserve, `/api/admin/backups` routes, and a
+  degraded `/healthz` reason when a target fails. Off by default; NFS needs
+  the opt-in `docker-compose.backup-nfs.yml` overlay. (#580)
 - Added a Backups page to the admin: backups kept here and on remote targets,
   grouped by type with size, place, verified state and a kept flag; verify,
   download, keep with a reason, back up now, test a target, clean up exactly

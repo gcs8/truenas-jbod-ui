@@ -735,6 +735,8 @@ def collect_unknown_config_keys(
         path = f"{prefix}{key}"
         field = model.model_fields.get(key)
         if field is None:
+            if not prefix and model is Settings and key in SIDECAR_OWNED_CONFIG_KEYS:
+                continue
             unknown.append(path)
             continue
         nested_model = _model_annotation(field.annotation)
@@ -747,6 +749,12 @@ def collect_unknown_config_keys(
         else:
             unknown.extend(collect_unknown_config_keys(value, nested_model, prefix=f"{path}."))
     return unknown
+
+
+# Top-level config.yaml sections read by a sidecar, not by these settings
+# models: `backups` is the backup scheduler policy
+# (history_service/backup_archive/policy.py).
+SIDECAR_OWNED_CONFIG_KEYS = frozenset({"backups"})
 
 
 def _unknown_key_message(config_path: Path, key: str) -> str:

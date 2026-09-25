@@ -576,6 +576,15 @@ test("back up now posts the class and explains a 409 plainly", async () => {
   assert.equal(api.calls.filter((call) => call.url === "/api/admin/backups/run").length, 1);
 });
 
+test("a 503 from an action says the backup scheduler isn't running", async () => {
+  const missing = Object.assign(new Error("Service Unavailable"), { status: 503 });
+  const api = fakeApi({ "POST /api/admin/backups/run": () => missing });
+  const { library, banners } = mount({ api });
+  await library.load();
+  await library.actions.runNow("full");
+  assert.deepEqual(banners.at(-1), ["Backup failed: The backup scheduler isn't running on this server.", "error"]);
+});
+
 test("target test shows the result next to the target, scrubbed", async () => {
   const { elements, library } = mount();
   await library.load();

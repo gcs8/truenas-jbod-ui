@@ -245,6 +245,7 @@ class ScheduledBackupRunner:
         retention_count: int,
         app_gid: int,
         clock: Callable[[], datetime] | None = None,
+        apply_retention: bool = True,
     ) -> None:
         self.backup_service = backup_service
         self.destination_dir = Path(destination_dir)
@@ -254,6 +255,10 @@ class ScheduledBackupRunner:
         self.retention_count = int(retention_count)
         self.app_gid = int(app_gid)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        # The backup scheduler sidecar grooms through the artifact catalog and
+        # lifecycle manager instead, so it turns the filename-pattern pruning off.
+        self.apply_retention = bool(apply_retention)
+        self.last_manifest: dict[str, Any] | None = None
 
     def _now(self) -> datetime:
         value = self._clock()
@@ -659,7 +664,9 @@ class ScheduledBackupRunner:
                     self.destination_dir / filename,
                     passphrase=passphrase,
                 )
-                retention_removed = self._apply_retention()
+                retention_removed = self._apply_retention() if self.apply_retention else 0
+                manifest = getattr(artifact, "manifest", None)
+                self.last_manifest = manifest if isinstance(manifest, dict) else None
                 status.update(
                     {
                         "success_count": int(status.get("success_count") or 0) + 1,

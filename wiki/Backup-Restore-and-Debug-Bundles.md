@@ -88,6 +88,8 @@ compensate for memory regressions.
 
 ## Optional scheduled state backups
 
+For automatic config backups after changes, cron full backups, remote copies and retention, see [Automatic backup archive and remote targets](#automatic-backup-archive-and-remote-targets). The one-shot runner below is unchanged.
+
 Scheduled backups run in a separate one-shot container with no published port, network, or Docker socket. Start that container from a host timer.
 
 The root-compatible base runs backup as `0:0`, matching history ownership for both
@@ -229,6 +231,202 @@ Segmented hot-data retention runs only when the status file records a recent suc
 Mount the whole history directory writable in the one-shot backup container. Do not file-bind only `history.db`; segmented locking rejects database-file mount points. Size the backup destination and temporary workspace for the hot database and every active segment.
 
 See [Segmented history v2](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/SEGMENTED_HISTORY_V2.md) for migration, recovery, rollback, and catalog procedures.
+
+## Automatic backup archive and remote targets
+
+The backup scheduler is an optional long-running sidecar,
+`enclosure-backup-scheduler`. It takes two kinds of backup, keeps a catalogue
+of them, copies each one to remote targets you choose, and deletes old copies
+according to your retention rules. It is off by default. Nothing changes on an
+existing install until you enable a backup class.
+
+The one-shot runner in [Optional scheduled state backups](#optional-scheduled-state-backups)
+(`SCHEDULED_BACKUP_*`, started by a host timer) still works exactly as before.
+Use one or the other.
+
+### Backup classes
+
+| Class | Contains | When it runs |
+| --- | --- | --- |
+| `config` | Every backup group except the history database: `config.yaml`, runtime overrides, profiles, slot mappings, SAS fabric aliases and the slot-detail cache | A short while after configuration changes |
+| `full` | `config` plus the history database | On a cron schedule |
+
+Both classes are encrypted with the same passphrase file as scheduled backups
+and are checked (decrypted and preflighted) before they are catalogued.
+
+#### Config backups on change
+
+The main UI and the admin sidecar record each configuration save in a change
+journal: mapping and alias edits, system add, edit and remove, storage views,
+profiles, runtime-behaviour overrides and restores. The scheduler waits until
+edits stop for `debounce_seconds` and then takes one backup of the whole burst.
+A steady stream of edits still gets a backup after `max_delay_seconds`. If a
+burst nets out to no change (you changed a value and then changed it back), no
+backup is taken.
+
+Recording a change never fails or slows the save. If the journal cannot be
+written, the UI logs a warning and the save goes ahead.
+
+#### Full backups on a schedule
+
+`schedule` is a five-field cron expression (`minute hour day-of-month month
+day-of-week`) or one of `@hourly`, `@daily`, `@midnight`, `@weekly` and
+`@monthly`. Ranges (`1-5`), lists (`1,15`) and steps (`*/15`) work, and Sunday
+is `0` or `7`. When both day-of-month and day-of-week are set, either one
+matching runs the backup, as in classic cron. Times are in the container's
+time zone, set with `TZ` (default `UTC`).
+
+### Configure
+
+Put a `backups` section in `config.yaml`. Environment variables override single
+values, and `BACKUP_TARGETS_JSON` replaces the whole target list.
+
+```yaml
+backups:
+  config:
+    enabled: true
+    debounce_seconds: 30
+    max_delay_seconds: 600
+    local_keep: 30
+    remote_keep: 90          # null means no count limit
+    remote_max_age_days: null
+  full:
+    enabled: true
+    schedule: "0 3 * * *"
+    local_keep: 7
+    remote_keep: null
+    remote_max_age_days: 90
+  targets:
+    - target_id: office-nas
+      label: Office NAS
+      provider: s3
+      endpoint_url: https://nas.example.test:9000
+      bucket: jbod-backups
+      root: jbod
+      access_key_id_file: /run/backup-secrets/archive_s3_access_key_id
+      secret_access_key_file: /run/backup-secrets/archive_s3_secret_access_key
+```
+
+| Environment variable | Overrides |
+| --- | --- |
+| `BACKUP_CONFIG_ENABLED`, `BACKUP_FULL_ENABLED` | `enabled` |
+| `BACKUP_CONFIG_DEBOUNCE_SECONDS`, `BACKUP_CONFIG_MAX_DELAY_SECONDS` | debounce |
+| `BACKUP_FULL_SCHEDULE` | `full.schedule` |
+| `BACKUP_CONFIG_LOCAL_KEEP`, `BACKUP_FULL_LOCAL_KEEP` | `local_keep` |
+| `BACKUP_CONFIG_REMOTE_KEEP`, `BACKUP_FULL_REMOTE_KEEP` | `remote_keep` (`none` for no limit) |
+| `BACKUP_CONFIG_REMOTE_MAX_AGE_DAYS`, `BACKUP_FULL_REMOTE_MAX_AGE_DAYS` | `remote_max_age_days` |
+| `BACKUP_TARGETS_JSON` | the whole `targets` list, as a JSON array |
+| `BACKUP_ARCHIVE_PASSPHRASE_FILE` | passphrase file (falls back to `SCHEDULED_BACKUP_PASSPHRASE_FILE`) |
+
+A mistake stops the scheduler with one plain sentence per problem that names
+the key and where it came from, for example
+`BACKUP_CONFIG_LOCAL_KEEP in the environment must be 1 or more.`
+
+Target credentials are never written inline. Every secret is a path to a file
+(`password_file`, `private_key_file`, `private_key_passphrase_file`,
+`access_key_id_file`, `secret_access_key_file`) under the read-only
+`./config/backup-secrets` mount (`/run/backup-secrets` in the container). An
+inline `password` or `secret_access_key` is rejected.
+
+### Targets
+
+| `provider` | Encrypted in transit | Notes |
+| --- | --- | --- |
+| `sftp` | Yes | Needs `known_hosts_path` and a key or password file. Use SFTP for "SCP" |
+| `ftp` | Only with `use_tls: true` | Plain FTP is allowed and labelled unencrypted. The archive itself is always encrypted |
+| `smb` | With `smb_encrypt: true` | Needs `share` |
+| `s3` | Yes (HTTPS) | S3 and compatible stores: `bucket`, `region`, optional `endpoint_url` |
+| `nfs` | No | Needs the NFS overlay below |
+| `filesystem` | n/a | An absolute path, for example a mounted USB disk |
+
+Each backup is copied to every enabled target. If one target fails, the other
+targets still get their copy and the local copy is kept.
+
+### Retention and preserve
+
+Retention applies per class and per location. `local_keep` keeps the newest N
+local copies. Remote copies keep the newest `remote_keep` and/or those younger
+than `remote_max_age_days`. Grooming runs after every backup, and you can
+preview and apply it from the admin API.
+
+Some copies are never deleted:
+
+- A preserved (pinned) backup is never deleted and does not count toward keep-N.
+  Preserve one before an upgrade or migration and give a reason.
+- The newest verified copy of each class at each location is always kept.
+- Only catalogued copies are deleted. Files you put in the archive folder
+  yourself are left alone.
+
+### Deploy
+
+Run these from the Compose folder. `backup_uid` must be the user the scheduler
+runs as: `0` with the base file, or your `BACKUP_UID` (default `1000`) with the
+non-root overlay. The status directory must be owned by that user, as for the
+one-shot runner, or every backup fails before it starts.
+
+```bash
+backup_uid="${BACKUP_UID:-0}"
+app_gid="${APP_GID:-10001}"
+sudo install -d -o "$backup_uid" -g "$app_gid" -m 0700 ./backups
+sudo install -d -o "$backup_uid" -g "$app_gid" -m 2750 ./backup-status
+sudo install -d -o "$backup_uid" -g "$app_gid" -m 2770 ./backup-journal ./backup-api
+docker compose --profile backup-scheduler up -d enclosure-backup-scheduler
+```
+
+If `./backup-status` already exists for the one-shot runner, keep its owner;
+both writers must run as the same user.
+
+Folders and permissions (all in the shared application group `APP_GID`):
+
+| Folder | Mode | Written by | Read by |
+| --- | --- | --- | --- |
+| `backup-journal/` | `2770`, files `0660` | UI, admin, scheduler | scheduler |
+| `backup-status/` | `2750`, files `0640` | scheduler | UI (`/healthz`) |
+| `backup-api/` | `2770` | scheduler (Unix socket) | admin |
+| `backups/` (archive and catalogue) | `0700` | scheduler | scheduler |
+
+The setgid bit keeps new files in `APP_GID`. The journal files are created
+`0660` explicitly, so the UI, the admin sidecar and the scheduler can all
+append to them even when they run as different users.
+
+The scheduler serves its API on a Unix socket that only the admin sidecar
+mounts. It publishes no port. The admin UI calls it through
+`/api/admin/backups/*`, with the same authentication and origin checks as the
+other admin routes.
+
+### NFS targets
+
+Mounting NFS needs `CAP_SYS_ADMIN`, so it is a separate opt-in overlay that
+grants the capability to the backup scheduler only:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.backup-nfs.yml \
+  --profile backup-scheduler up -d enclosure-backup-scheduler
+```
+
+The share is mounted for the length of one job and unmounted afterwards. The
+image includes `nfs-common` for `mount.nfs`. Use NFSv4
+(`mount_options: nfsvers=4.2`) so no `rpc.statd` is needed. The overlay also
+turns off Docker's default AppArmor profile for this container, because that
+profile blocks mounts. The scheduler must run as root (the base default
+`BACKUP_UID=0`) to use the capability. No other service gains a capability; a
+CI contract test checks this.
+
+### Health
+
+A failed backup, or a failed copy to a remote target, is reported on the main
+UI's `/healthz` as `degraded` with a reason such as
+`Backup target Office NAS degraded: ...`. It never makes `/healthz` return
+503. The next successful run clears it.
+
+### Admin API
+
+All routes are on the admin sidecar under `/api/admin/backups`: list the
+library, show one backup and the changes it captured, verify (re-read and
+re-hash), download, preserve and unpreserve, restore (the same inspect-then-
+import flow and passphrase headers as an uploaded backup), run a backup now,
+preview and apply grooming with a one-time plan token, and test a target.
+Backup ids are opaque. No route accepts or returns a file path or a credential.
 
 ## Create a debug bundle
 

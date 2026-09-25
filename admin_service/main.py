@@ -19,7 +19,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
+from starlette.concurrency import iterate_in_threadpool
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.templating import Jinja2Templates
@@ -30,6 +31,7 @@ from admin_service.services.account_bootstrap import (
     saved_sudo_commands_for_system,
 )
 from admin_service.services.backup_receipts import BackupInspectionReceiptStore
+from admin_service.services.backup_scheduler_client import BackupSchedulerClient, SchedulerUnavailableError
 from admin_service.services.esxi_host_prep import (
     ESXiHostPrepService,
     HostPrepStagingQuotaError,
@@ -81,6 +83,7 @@ from app.services.credential_authority import (
     same_credential_authority,
     ssh_credential_authorities,
 )
+from app.services.config_change_journal import record_config_change
 from app.services.demo_system_factory import DemoSystemFactory
 from app.services.inventory import InventoryService
 from app.services.profile_builder import ProfileBuilderService, collect_profile_references
@@ -440,6 +443,11 @@ def resolve_saved_secondary_secret(
 def get_backup_service() -> SystemBackupService:
     history_settings = get_history_settings()
     return SystemBackupService(history_settings, get_history_store())
+
+
+@lru_cache
+def get_backup_scheduler_client() -> BackupSchedulerClient:
+    return BackupSchedulerClient()
 
 
 @lru_cache

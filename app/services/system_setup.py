@@ -24,6 +24,7 @@ from app.config import (
     normalize_text,
 )
 from app.models.domain import SystemSetupRequest
+from app.services.config_change_journal import record_config_change
 from app.services.credential_authority import (
     api_credential_authority,
     bmc_credential_authority,
@@ -270,6 +271,7 @@ class SystemSetupService:
                     next_default_id = None
 
             self._write_config(config)
+            record_config_change("system.delete", normalized_system_id)
             return removed_system.label or removed_system.id, next_default_id
 
     @staticmethod
@@ -638,6 +640,7 @@ class SystemSetupService:
                 config["default_system_id"] = system_id
 
             self._write_config(config)
+            record_config_change("system.save", system_id)
             return system, existing_index is not None
 
     def _load_config(self) -> dict[str, Any]:

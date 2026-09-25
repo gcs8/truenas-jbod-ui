@@ -388,6 +388,11 @@
     }
 
     function errorText(error) {
+      // The admin answers 503 for backup actions when the backup scheduler
+      // service isn't deployed; say that plainly instead of a bare status.
+      if (error?.status === 503) {
+        return "The backup scheduler isn't running on this server.";
+      }
       return scrubText(error?.message || String(error));
     }
 
