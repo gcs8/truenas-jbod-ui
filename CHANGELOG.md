@@ -147,7 +147,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   backup that included the history database (the backup scheduler's full
   class), so a failing history backup folder no longer delays pruning while
   full backups work. The history dashboard now shows the backup copies on disk
-  and the free space inside the database file. (#PRNUM)
+  and the free space inside the database file. (#597)
 - Renamed the admin container cards to Main UI, History and Admin, removed
   sidecar and runtime wording from admin messages, and corrected the docs that
   said admin auto-stops by default (only the published Compose files set
