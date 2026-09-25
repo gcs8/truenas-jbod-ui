@@ -11,7 +11,8 @@ from app.config_errors import ConfigurationError
 # Must precede admin_service.main, which builds its app at import time.
 from tests.admin_test_env import ADMIN_TEST_PUBLIC_ORIGIN
 from admin_service.config import AdminSettings, get_admin_settings
-from admin_service.main import compute_expires_at, create_app
+from admin_service.main import create_app
+from admin_service.route_support import compute_expires_at
 
 
 class _ReleaseStatusStub:
@@ -81,6 +82,7 @@ class AdminAutoStopContractTests(unittest.TestCase):
 
             with (
                 patch("admin_service.main.get_admin_settings", return_value=settings),
+                patch("admin_service.route_support.get_admin_settings", return_value=settings),
                 patch("admin_service.main.get_release_status_service", return_value=_ReleaseStatusStub()),
                 patch("admin_service.main._shutdown_after_ttl", side_effect=fake_shutdown),
             ):

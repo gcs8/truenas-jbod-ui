@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 from unittest.mock import patch
 
 from app.config import Settings
-from app.main import templates
+from app.route_support import templates
 from app.models.domain import (
     EnclosureOption,
     InventorySnapshot,

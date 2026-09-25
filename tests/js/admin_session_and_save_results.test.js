@@ -11,7 +11,7 @@ const SCRIPT_PATH = path.join(REPO_ROOT, "admin_service/static/admin.js");
 const SOURCE = fs.readFileSync(SCRIPT_PATH, "utf8");
 const TEMPLATE = fs.readFileSync(path.join(REPO_ROOT, "admin_service/templates/index.html"), "utf8");
 const ROUTES = fs.readFileSync(path.join(REPO_ROOT, "admin_service/routes.py"), "utf8");
-const MAIN = fs.readFileSync(path.join(REPO_ROOT, "admin_service/main.py"), "utf8");
+const MAIN = fs.readFileSync(path.join(REPO_ROOT, "admin_service/route_support.py"), "utf8");
 
 function functionSource(name) {
   const start = SOURCE.search(new RegExp(`^  (?:async )?function ${name}\\(`, "m"));

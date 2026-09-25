@@ -15,7 +15,7 @@ from unittest.mock import patch
 import yaml
 
 from app.config import Settings
-from app.main import templates
+from app.route_support import templates
 from app.services.snapshot_export import (
     EXPORT_HISTORY_CACHE,
     EXPORT_RENDER_CACHE,

@@ -19,7 +19,7 @@ from starlette.requests import Request
 
 import app.services.snapshot_export as snapshot_export
 from app.config import BMCConfig, HANodeConfig, HistoryConfig, SSHConfig, Settings, SystemConfig, TrueNASConfig, get_settings
-from app.main import templates
+from app.route_support import templates
 from app.models.domain import (
     EnclosureOption,
     EnclosureProfileView,

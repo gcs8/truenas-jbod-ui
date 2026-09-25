@@ -12,8 +12,10 @@ from fastapi.routing import APIRoute
 # Must precede admin_service.main, which builds its app at import time.
 import tests.admin_test_env  # noqa: F401  (must precede admin_service.main)
 from admin_service import main as admin_main
+from admin_service import routes as admin_routes
 from app import main as app_main
 from app import routes as app_routes
+from app import route_support as app_route_support
 from app.config import Settings, SystemConfig
 from app.models.domain import (
     InventorySnapshot,
@@ -153,7 +155,7 @@ class UnknownSystemRouteTests(unittest.TestCase):
         registry = _registry_with_default_service(default_service)
         route = _route(app_main.app, "/api/inventory")
 
-        with patch.object(app_main, "get_inventory_registry", return_value=registry):
+        with patch.object(app_routes, "get_inventory_registry", return_value=registry):
             self.assert_unknown_system(
                 lambda: route.endpoint(
                     request=_request("/api/inventory"),
@@ -172,7 +174,7 @@ class UnknownSystemRouteTests(unittest.TestCase):
         previous_origin = getattr(app_main.app.state, "read_ui_public_origin", None)
         app_main.app.state.read_ui_public_origin = "https://nas.example.test"
         try:
-            with patch.object(app_main, "get_inventory_registry", return_value=registry):
+            with patch.object(app_routes, "get_inventory_registry", return_value=registry):
                 response = asyncio.run(
                     route.endpoint(
                         request=_request("/api/inventory"),
@@ -194,15 +196,15 @@ class UnknownSystemRouteTests(unittest.TestCase):
 
     def test_inventory_read_schema_describes_write_policy_and_app_version(self) -> None:
         route = _route(app_main.app, "/api/inventory")
-        self.assertIs(route.response_model, app_main.InventoryReadResponse)
-        fields = app_main.InventoryReadResponse.model_fields
+        self.assertIs(route.response_model, app_routes.InventoryReadResponse)
+        fields = app_routes.InventoryReadResponse.model_fields
         self.assertIn("write_policy", fields)
         self.assertIn("app_version", fields)
         self.assertFalse(fields["write_policy"].is_required())
         self.assertFalse(fields["app_version"].is_required())
         # Saved copies embed a plain snapshot; the live-only fields stay off it.
-        self.assertNotIn("write_policy", app_main.InventorySnapshot.model_fields)
-        properties = app_main.InventoryReadResponse.model_json_schema()["properties"]
+        self.assertNotIn("write_policy", app_route_support.InventorySnapshot.model_fields)
+        properties = app_routes.InventoryReadResponse.model_json_schema()["properties"]
         self.assertIn("write_policy", properties)
         self.assertIn("app_version", properties)
 
@@ -225,7 +227,7 @@ class UnknownSystemRouteTests(unittest.TestCase):
         registry = _registry_with_default_service(default_service)
         route = _route(app_main.app, "/api/system-locator", "POST")
 
-        with patch.object(app_main, "get_inventory_registry", return_value=registry):
+        with patch.object(app_routes, "get_inventory_registry", return_value=registry):
             self.assert_unknown_system(
                 lambda: route.endpoint(
                     payload=SystemLocatorRequest(active=True),
@@ -243,8 +245,8 @@ class UnknownSystemRouteTests(unittest.TestCase):
         route = _route(app_main.app, "/api/slots/{slot}/history")
 
         with (
-            patch.object(app_main, "get_inventory_registry", return_value=registry),
-            patch.object(app_main, "get_history_backend", return_value=history_backend) as backend_getter,
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "get_history_backend", return_value=history_backend) as backend_getter,
         ):
             self.assert_unknown_system(
                 lambda: route.endpoint(
@@ -267,8 +269,8 @@ class UnknownSystemRouteTests(unittest.TestCase):
         route = _route(app_main.app, "/api/history/scope")
 
         with (
-            patch.object(app_main, "get_inventory_registry", return_value=registry),
-            patch.object(app_main, "get_history_backend", return_value=history_backend) as backend_getter,
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "get_history_backend", return_value=history_backend) as backend_getter,
         ):
             self.assert_unknown_system(
                 lambda: route.endpoint(
@@ -290,8 +292,8 @@ class UnknownSystemRouteTests(unittest.TestCase):
         route = _route(admin_main.app, "/api/admin/storage-views/candidates")
 
         with (
-            patch.object(admin_main, "reload_app_settings", return_value=registry.settings),
-            patch.object(admin_main, "InventoryRegistry", return_value=registry),
+            patch.object(admin_routes, "reload_app_settings", return_value=registry.settings),
+            patch.object(admin_routes, "InventoryRegistry", return_value=registry),
         ):
             self.assert_unknown_system(
                 lambda: route.endpoint(
@@ -316,10 +318,10 @@ class UnknownSystemRouteTests(unittest.TestCase):
         route = _route(app_main.app, "/")
 
         with (
-            patch.object(app_main, "get_settings", return_value=settings),
-            patch.object(app_main, "get_inventory_registry", return_value=registry),
-            patch.object(app_main, "get_release_status_service", return_value=release_service),
-            patch.object(app_main, "resolve_admin_launch_url", return_value=None),
+            patch.object(app_routes, "get_settings", return_value=settings),
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "get_release_status_service", return_value=release_service),
+            patch.object(app_routes, "resolve_admin_launch_url", return_value=None),
         ):
             response = asyncio.run(
                 route.endpoint(
@@ -353,10 +355,10 @@ class UnknownSystemRouteTests(unittest.TestCase):
         route = _route(app_main.app, "/")
 
         with (
-            patch.object(app_main, "get_settings", return_value=settings),
-            patch.object(app_main, "get_inventory_registry", return_value=registry),
-            patch.object(app_main, "get_release_status_service", return_value=release_service),
-            patch.object(app_main, "resolve_admin_launch_url", return_value=None),
+            patch.object(app_routes, "get_settings", return_value=settings),
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "get_release_status_service", return_value=release_service),
+            patch.object(app_routes, "resolve_admin_launch_url", return_value=None),
         ):
             for requested_system_id in ("system-a", None):
                 with self.subTest(system_id=requested_system_id):

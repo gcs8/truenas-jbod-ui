@@ -11,6 +11,7 @@ import uvicorn
 from starlette.responses import JSONResponse
 
 from app import main as app_main
+from app import route_support as app_route_support
 from app.config import AppConfig, PathConfig, Settings
 from app.models.domain import (
     EnclosureOption, InventorySnapshot, SlotView, StorageViewRuntimePayload, SystemOption,
@@ -60,7 +61,7 @@ def main() -> None:
     app = build_app(auth_mode=args.mode, public_origin=origin)
     app_main.get_settings = lambda: settings
     app_main.get_inventory_registry = lambda: SimpleNamespace(get_service=lambda _id: Service())
-    app_main.resolve_admin_launch_url = lambda *_args: None
+    app_route_support.resolve_admin_launch_url = lambda *_args: None
     app_main.get_release_status_service = lambda: SimpleNamespace(snapshot=lambda: {})
     write_state = upgrade_notice._write_state
     upgrade_notice._write_state = lambda path, state: (
