@@ -392,6 +392,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   kernel-error panels and a half-typed friendly name across renders, expands
   long bay lists in place, keeps visited related traces clickable, and fetches
   inventory and fabric together on refresh. (#478)
+- Drew the Storage Fabric impacted/mapped bay grid in the active enclosure's
+  physical layout instead of a flat sorted chip list, so a bay number sits in
+  the same place there as on the Enclosure tab, with un-impacted and empty
+  bays shown as placeholders and the chassis edge label repeated underneath
+  (#532).
 
 ### Performance
 
@@ -546,6 +551,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   bullet in a shipped release; `dev_check.py` prints one line per skipped group
   (`--verbose` lists the suites); and admin maintenance cleanup works on
   Windows (#561).
+- Gave the public demo fixture a frozen synthetic Storage Fabric payload so
+  the demo and overview screenshot exercise the enclosure-shaped bay grid once
+  they are rebuilt at the next release; the snapshot renderer accepts the
+  payload through one optional argument that operator exports leave unset, so
+  no live fabric identifier can reach an exported file by that route (#532).
 
 ### Performance
 

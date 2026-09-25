@@ -20,6 +20,7 @@ from app.services.public_demo_fixture import (
     PUBLIC_DEMO_SYSTEM_ID,
     PublicDemoFixture,
     build_public_demo_html,
+    build_public_demo_sas_fabric,
     build_public_demo_snapshot_bundle,
     load_public_demo_fixture,
 )
@@ -295,6 +296,79 @@ class PublicDemoFixtureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(fixture.slots), 60)
         self.assertEqual([slot.slot for slot in fixture.slots], list(range(60)))
         self.assertEqual({view.id for view in fixture.storage_views}, {"boot-doms", "nvme-carrier-x4"})
+
+    def test_checked_in_fixture_declares_a_synthetic_storage_fabric(self) -> None:
+        fixture = load_public_demo_fixture(PUBLIC_DEMO_FIXTURE_PATH)
+        fabric = fixture.storage_fabric
+
+        self.assertEqual(len(fabric.controllers), 2)
+        self.assertEqual(
+            [controller.id for controller in fabric.controllers],
+            ["demo-hba-0", "demo-hba-1"],
+        )
+        states = [path.state for controller in fabric.controllers for path in controller.paths]
+        self.assertIn("fail", states, "a non-active path must exist so impacted chips are visible")
+        covered = [
+            slot_number
+            for controller in fabric.controllers
+            for path in controller.paths
+            for slot_number in path.slot_numbers
+        ]
+        self.assertEqual(sorted(covered), list(range(60)))
+        self.assertEqual(len(covered), len(set(covered)), "paths must not claim the same bay twice")
+
+    def test_fixture_rejects_overlapping_fabric_paths(self) -> None:
+        payload = json.loads(PUBLIC_DEMO_FIXTURE_PATH.read_text(encoding="utf-8"))
+        payload["storage_fabric"]["controllers"][1]["paths"][0]["slot_range"] = [0, 59]
+
+        with self.assertRaisesRegex(
+            ValidationError,
+            r"storage fabric paths must cover bays 0-59 exactly once",
+        ):
+            PublicDemoFixture.model_validate(payload)
+
+    def test_storage_fabric_payload_is_shaped_for_the_bay_grid(self) -> None:
+        fabric = build_public_demo_sas_fabric()
+        payload = fabric.model_dump(mode="json")
+
+        self.assertTrue(payload["available"])
+        self.assertEqual(payload["platform"], "core")
+        self.assertEqual(payload["selected_enclosure_id"], PUBLIC_DEMO_ENCLOSURE_ID)
+        self.assertEqual(len(payload["controllers"]), 2)
+        self.assertEqual(len(payload["paths"]), 3)
+
+        lane_one = [
+            slot_number
+            for path in payload["paths"]
+            if path["controller"] == "demo-hba-0"
+            for slot_number in path["slots"]
+        ]
+        lane_two = [
+            slot_number
+            for path in payload["paths"]
+            if path["controller"] == "demo-hba-1"
+            for slot_number in path["slots"]
+        ]
+        self.assertEqual(sorted(lane_one), list(range(45)))
+        self.assertEqual(sorted(lane_two), list(range(45, 60)))
+
+        kinds = {node["kind"] for node in payload["nodes"]}
+        self.assertEqual(kinds, {"host", "controller", "expander", "ses-enclosure"})
+        self.assertEqual(
+            sorted(trace["kind"] for trace in payload["traces"] if trace["kind"] != "bay"),
+            ["path", "path", "path"],
+        )
+        self.assertIn("bay:57", {trace["id"] for trace in payload["traces"]})
+        self.assertEqual(
+            [path["state"] for path in payload["paths"]],
+            ["active", "fail", "active"],
+        )
+
+    def test_public_demo_html_embeds_the_frozen_storage_fabric(self) -> None:
+        bundle = build_public_demo_snapshot_bundle()
+
+        self.assertIsNotNone(bundle.sas_fabric)
+        self.assertTrue(bundle.sas_fabric.available)
 
     def test_fixture_rejects_a_storage_view_missing_a_template_slot(self) -> None:
         payload = json.loads(PUBLIC_DEMO_FIXTURE_PATH.read_text(encoding="utf-8"))
