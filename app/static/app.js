@@ -3394,6 +3394,17 @@
     return slot.identify_active ? "On" : "Off";
   }
 
+  // Plain-language source of a locate-light change, kept in the status line so
+  // an experimental UniFi path never looks like a validated one.
+  function locateLightSourceLabel(slot) {
+    if (!slot || !slot.led_backend) return "an unknown path";
+    if (slot.led_backend === "api") return "the TrueNAS API";
+    if (slot.led_backend === "unifi_fault") {
+      return slot?.raw_status?.experimental_led ? "UniFi over SSH (experimental)" : "UniFi over SSH";
+    }
+    return "the enclosure over SSH";
+  }
+
   function getSmartCacheKey(slot) {
     const systemPart = state.snapshot.selected_system_id || state.selectedSystemId || "system";
     const enclosurePart = state.snapshot.selected_enclosure_id || state.selectedEnclosureId || "all-enclosures";
@@ -7167,18 +7178,18 @@
         ? "Saved as a ZIP file."
         : state.export.packaging === "html"
           ? "Saved as an HTML file."
-          : "Saved as an HTML file, or a ZIP file if that is smaller.",
+          : "Saved as an HTML file, or as a ZIP file if the HTML file is over the size limit.",
       state.export.allowOversize
         ? "Files over the size limit are allowed."
         : "Kept under about 24 MB.",
       state.export.redactSensitive
-        ? "Host names and serial numbers are partly hidden."
-        : "Real host names and serial numbers are included.",
+        ? "Host and enclosure names, IP addresses, serial numbers and disk IDs are partly hidden."
+        : "All real names, IP addresses, serial numbers and disk IDs are included.",
     ];
     parts.push(snapshotExportSelectionDescription());
     if (!isHistoryAvailable()) parts.push("History is unavailable and will be omitted.");
     if (state.export.estimate.data?.downsampling_label && state.export.estimate.data.downsampling_label !== "None") {
-      parts.push(`History will be thinned (${state.export.estimate.data.downsampling_label.toLowerCase()}) to fit the size limit.`);
+      parts.push(`History will be thinned (${state.export.estimate.data.downsampling_label.toLowerCase()}) to get closer to the size limit.`);
     }
     if (state.export.estimate.error) {
       parts.push(state.export.estimate.error);
@@ -9938,7 +9949,7 @@
       applySnapshot(payload.snapshot);
       renderAll();
       scheduleSmartPrefetch();
-      setStatus(`Locate light ${action === "IDENTIFY" ? "on" : "off"} for slot ${slot.slot_label}.`);
+      setStatus(`Locate light ${action === "IDENTIFY" ? "on" : "off"} for slot ${slot.slot_label}, sent through ${locateLightSourceLabel(slot)}.`);
     } catch (error) {
       if (!mutationContextIsCurrent(mutation)) return;
       handleWriteRejection(error);

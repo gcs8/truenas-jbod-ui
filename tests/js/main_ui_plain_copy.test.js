@@ -18,8 +18,8 @@ const INTERNAL_WORDS = /\b(enrichment|evidence|calibrat\w*|scope|scoped|artifact
 
 function templateVisibleText(html) {
   return html
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<script\b[\s\S]*?<\/script[^>]*>/gi, " ")
+    .replace(/<style\b[\s\S]*?<\/style[^>]*>/gi, " ")
     .replace(/\{#[\s\S]*?#\}/g, " ")
     .replace(/\{%[\s\S]*?%\}/g, " ")
     .replace(/\{\{[\s\S]*?\}\}/g, " ")
@@ -92,4 +92,22 @@ test("locate-light, offline-copy and restore wording replaces the old labels", (
 
 test("export enclosure rows show the bay count, not the profile id", () => {
   assert.doesNotMatch(APP_SOURCE, /enclosure\.profile_id \|\| ""\]/);
+});
+
+test("locate-light status names where the change was sent and flags experimental paths", () => {
+  const start = APP_SOURCE.indexOf("  function locateLightSourceLabel(");
+  assert.notEqual(start, -1);
+  const body = APP_SOURCE.slice(start, APP_SOURCE.indexOf("\n  }\n", start) + 4);
+  const locateLightSourceLabel = new Function(`${body}; return locateLightSourceLabel;`)();
+  assert.equal(locateLightSourceLabel({ led_backend: "api" }), "the TrueNAS API");
+  assert.equal(locateLightSourceLabel({ led_backend: "unifi_fault", raw_status: { experimental_led: true } }), "UniFi over SSH (experimental)");
+  assert.equal(locateLightSourceLabel({ led_backend: "unifi_fault" }), "UniFi over SSH");
+  assert.match(APP_SOURCE, /sent through \$\{locateLightSourceLabel\(slot\)\}/);
+});
+
+test("the sharing summary names every identifier class the masking option covers", () => {
+  assert.match(APP_SOURCE, /"Host and enclosure names, IP addresses, serial numbers and disk IDs are partly hidden\."/);
+  assert.match(APP_SOURCE, /"All real names, IP addresses, serial numbers and disk IDs are included\."/);
+  assert.match(APP_SOURCE, /ZIP file if the HTML file is over the size limit/);
+  assert.match(APP_SOURCE, /to get closer to the size limit/);
 });
