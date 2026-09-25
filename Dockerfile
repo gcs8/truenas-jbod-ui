@@ -16,7 +16,9 @@ WORKDIR /app
 
 COPY requirements.txt /app/requirements.txt
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends 7zip \
+    # nfs-common provides mount.nfs for opt-in NFS archive targets
+    # (docker-compose.backup-nfs.yml); about 1.1 MB plus small libraries.
+    && apt-get install -y --no-install-recommends 7zip nfs-common \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir -r /app/requirements.txt
 

@@ -116,6 +116,7 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        await asyncio.to_thread(record_config_change, "runtime_overrides.save", ",".join(sorted(values or {})))
 
         runtime_service = get_runtime_service()
         await asyncio.to_thread(runtime_service.mark_restart_required, ("ui",))
@@ -228,13 +229,16 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
         }
         return export_file_response(artifact, headers)
 
+    async def upload_archive_source(request: Request, body_description: str) -> Path:
+        return await stream_limited_request_body_to_file(request, body_description=body_description)
+
     @router.post("/api/admin/backup/inspect")
     @observe_backup_route("inspect")
     async def inspect_backup(request: Request) -> JSONResponse:
-        archive_path = await stream_limited_request_body_to_file(
-            request,
-            body_description="Backup inspection",
-        )
+        return await inspect_archive(request, upload_archive_source)
+
+    async def inspect_archive(request: Request, archive_source: Any) -> JSONResponse:
+        archive_path = await archive_source(request, "Backup inspection")
         try:
             if archive_path.stat().st_size == 0:
                 raise HTTPException(status_code=400, detail="Backup inspection request body was empty.")
@@ -292,6 +296,14 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
         stop_services: bool = Query(default=True),
         restart_services: bool = Query(default=True),
     ) -> JSONResponse:
+        return await import_archive(request, upload_archive_source, stop_services, restart_services)
+
+    async def import_archive(
+        request: Request,
+        archive_source: Any,
+        stop_services: bool,
+        restart_services: bool,
+    ) -> JSONResponse:
         admission_started_at = int(time.time())
         expected_mode = expected_backup_encryption_mode(request)
         receipt = request.headers.get("X-Backup-Inspection-Receipt", "")
@@ -311,7 +323,7 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
-            archive_path = await stream_limited_request_body_to_file(request)
+            archive_path = await archive_source(request, "Backup import")
             try:
                 if archive_path.stat().st_size == 0:
                     raise HTTPException(status_code=400, detail="Backup import request body was empty.")
@@ -355,6 +367,7 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
                 except (ValueError, DockerRuntimeError) as exc:
                     raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+                record_config_change("backup.restore", "system backup import")
                 settings = reload_app_settings()
                 runtime_service = get_runtime_service()
                 impacted = tuple(
@@ -1147,6 +1160,172 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
                     f"Deleted custom profile {deleted_label}. Restart the main UI to remove it from the profile list too."
                 ),
             }
+        )
+
+    # -- backup library (#398/#573): proxied to the backup scheduler sidecar -----------
+
+    _BACKUP_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    _UNAVAILABLE_LIBRARY = {
+        "available": False,
+        "running": None,
+        "classes": {
+            "config": {"enabled": False, "last_run": None, "pending_changes": 0},
+            "full": {"enabled": False, "last_run": None, "next_run_at": None},
+        },
+        "targets": [],
+        "artifacts": [],
+        "storage": {},
+    }
+
+    def backup_id_or_404(artifact_id: str) -> str:
+        import re
+
+        if not re.fullmatch(_BACKUP_ID_PATTERN, artifact_id or ""):
+            raise HTTPException(status_code=404, detail="Backup not found.")
+        return artifact_id
+
+    async def scheduler_call(method: str, path: str, body: dict[str, Any] | None = None) -> JSONResponse:
+        client = get_backup_scheduler_client()
+        try:
+            response = await asyncio.to_thread(client.request, method, path, body=body, actor="admin")
+        except SchedulerUnavailableError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        payload = response.payload if isinstance(response.payload, dict) else {"detail": "Unexpected answer."}
+        if response.status >= 400:
+            raise HTTPException(status_code=response.status, detail=str(payload.get("detail") or "Backup request failed."))
+        return JSONResponse(payload, status_code=response.status)
+
+    @router.get("/api/admin/backups")
+    async def list_backups() -> JSONResponse:
+        client = get_backup_scheduler_client()
+        try:
+            response = await asyncio.to_thread(client.request, "GET", "/internal/backups")
+        except SchedulerUnavailableError as exc:
+            return JSONResponse({**_UNAVAILABLE_LIBRARY, "detail": str(exc)})
+        if response.status >= 400 or not isinstance(response.payload, dict):
+            return JSONResponse({**_UNAVAILABLE_LIBRARY, "detail": "The backup scheduler could not list backups."})
+        return JSONResponse(response.payload)
+
+    @router.post("/api/admin/backups/run")
+    async def run_backup(payload: dict[str, Any]) -> JSONResponse:
+        backup_class = payload.get("backup_class") if isinstance(payload, dict) else None
+        if backup_class not in ("config", "full"):
+            raise HTTPException(status_code=400, detail="backup_class must be config or full.")
+        return await scheduler_call("POST", "/internal/backups/run", {"backup_class": backup_class})
+
+    @router.get("/api/admin/backups/lifecycle/plan")
+    async def plan_backup_grooming() -> JSONResponse:
+        return await scheduler_call("GET", "/internal/backups/lifecycle/plan")
+
+    @router.post("/api/admin/backups/lifecycle/apply")
+    async def apply_backup_grooming(payload: dict[str, Any]) -> JSONResponse:
+        token = payload.get("plan_token") if isinstance(payload, dict) else None
+        if not isinstance(token, str) or not token or len(token) > 128:
+            raise HTTPException(status_code=400, detail="plan_token is required.")
+        return await scheduler_call("POST", "/internal/backups/lifecycle/apply", {"plan_token": token})
+
+    @router.post("/api/admin/backups/targets/{target_id}/test")
+    async def test_backup_target(target_id: str) -> JSONResponse:
+        return await scheduler_call("POST", f"/internal/backups/targets/{backup_id_or_404(target_id)}/test")
+
+    @router.get("/api/admin/backups/{artifact_id}")
+    async def get_backup(artifact_id: str) -> JSONResponse:
+        return await scheduler_call("GET", f"/internal/backups/{backup_id_or_404(artifact_id)}")
+
+    @router.post("/api/admin/backups/{artifact_id}/verify")
+    async def verify_backup(artifact_id: str) -> JSONResponse:
+        return await scheduler_call("POST", f"/internal/backups/{backup_id_or_404(artifact_id)}/verify")
+
+    @router.post("/api/admin/backups/{artifact_id}/preserve")
+    async def preserve_backup(artifact_id: str, payload: dict[str, Any]) -> JSONResponse:
+        reason = payload.get("reason") if isinstance(payload, dict) else None
+        if not isinstance(reason, str) or not reason.strip():
+            raise HTTPException(status_code=400, detail="reason is required.")
+        return await scheduler_call(
+            "POST", f"/internal/backups/{backup_id_or_404(artifact_id)}/preserve", {"reason": reason}
+        )
+
+    @router.delete("/api/admin/backups/{artifact_id}/preserve")
+    async def unpreserve_backup(artifact_id: str) -> JSONResponse:
+        return await scheduler_call("DELETE", f"/internal/backups/{backup_id_or_404(artifact_id)}/preserve")
+
+    @router.get("/api/admin/backups/{artifact_id}/download")
+    async def download_backup(artifact_id: str) -> Response:
+        client = get_backup_scheduler_client()
+        try:
+            response, chunks = await asyncio.to_thread(client.stream, backup_id_or_404(artifact_id))
+        except SchedulerUnavailableError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        if chunks is None:
+            detail = response.payload.get("detail") if isinstance(response.payload, dict) else None
+            raise HTTPException(status_code=response.status, detail=str(detail or "Backup could not be read."))
+        headers = {"Content-Disposition": f'attachment; filename="{response.payload["filename"]}"'}
+        if response.payload.get("length"):
+            headers["Content-Length"] = str(response.payload["length"])
+        if response.payload.get("sha256"):
+            headers["X-Backup-Sha256"] = str(response.payload["sha256"])
+        return StreamingResponse(
+            iterate_in_threadpool(chunks), media_type="application/octet-stream", headers=headers
+        )
+
+    def catalog_archive_source(artifact_id: str) -> Any:
+        async def source(_request: Request, body_description: str) -> Path:
+            client = get_backup_scheduler_client()
+            workspace = Path(tempfile.mkdtemp(prefix="truenas-jbod-ui-admin-catalog-"))
+            archive_path = workspace / "bundle.archive"
+
+            def fetch() -> Any:
+                descriptor = os.open(
+                    archive_path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                )
+                with os.fdopen(descriptor, "wb") as handle:
+                    result = client.download_to(artifact_id, handle)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                return result
+
+            try:
+                result = await asyncio.to_thread(fetch)
+            except SchedulerUnavailableError as exc:
+                archive_path.unlink(missing_ok=True)
+                workspace.rmdir()
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
+            except BaseException:
+                archive_path.unlink(missing_ok=True)
+                workspace.rmdir()
+                raise
+            if result.status != 200:
+                archive_path.unlink(missing_ok=True)
+                workspace.rmdir()
+                detail = result.payload.get("detail") if isinstance(result.payload, dict) else None
+                raise HTTPException(
+                    status_code=result.status if result.status in (404, 409, 502, 503) else 502,
+                    detail=str(detail or f"{body_description} could not read the backup."),
+                )
+            return archive_path
+
+        return source
+
+    @router.post("/api/admin/backups/{artifact_id}/restore/inspect")
+    @observe_backup_route("inspect")
+    async def inspect_catalog_backup(artifact_id: str, request: Request) -> JSONResponse:
+        return await inspect_archive(request, catalog_archive_source(backup_id_or_404(artifact_id)))
+
+    @router.post("/api/admin/backups/{artifact_id}/restore/import")
+    @observe_backup_route("import")
+    async def import_catalog_backup(
+        artifact_id: str,
+        request: Request,
+        stop_services: bool = Query(default=True),
+        restart_services: bool = Query(default=True),
+    ) -> JSONResponse:
+        return await import_archive(
+            request,
+            catalog_archive_source(backup_id_or_404(artifact_id)),
+            stop_services,
+            restart_services,
         )
 
     @router.get("/healthz")

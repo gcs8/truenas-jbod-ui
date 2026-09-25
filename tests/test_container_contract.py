@@ -36,6 +36,7 @@ EXPECTED_MEMORY_LIMITS = {
     "enclosure-history": "${HISTORY_MEM_LIMIT:-1g}",
     "enclosure-admin": "${ADMIN_MEM_LIMIT:-1g}",
     "enclosure-backup": "${BACKUP_MEM_LIMIT:-3g}",
+    "enclosure-backup-scheduler": "${BACKUP_SCHEDULER_MEM_LIMIT:-3g}",
 }
 EXPECTED_HISTORY_PERMISSION_ENV = {
     "HISTORY_PERMISSION_REPAIR_ENABLED": "${HISTORY_PERMISSION_REPAIR_ENABLED:-false}",
@@ -941,7 +942,7 @@ class ContainerResourceContractTests(unittest.TestCase):
         overlay = yaml.safe_load((REPO_ROOT / "docker-compose.nonroot.yml").read_text(encoding="utf-8"))
         self.assertEqual(
             set(overlay["services"]),
-            {"enclosure-ui", "enclosure-history", "enclosure-admin", "enclosure-backup"},
+            {"enclosure-ui", "enclosure-history", "enclosure-admin", "enclosure-backup", "enclosure-backup-scheduler"},
         )
         self.assertEqual(overlay["services"]["enclosure-ui"]["user"], "${APP_UID:-10001}:${APP_GID:-10001}")
         self.assertEqual(
@@ -1062,7 +1063,7 @@ class ContainerResourceContractTests(unittest.TestCase):
 
     def test_compose_writable_mounts_are_limited_to_service_state(self) -> None:
         expected_targets = {
-            "enclosure-ui": {"/app/data", "/app/logs"},
+            "enclosure-ui": {"/app/data", "/app/logs", "/app/backup-journal"},
             "enclosure-history": {"/app/history"},
             "enclosure-admin": {
                 "/app/config",
@@ -1070,11 +1071,19 @@ class ContainerResourceContractTests(unittest.TestCase):
                 "/app/history",
                 "/app/host-prep",
                 "/var/run/docker.sock",
+                "/app/backup-journal",
             },
             "enclosure-backup": {
                 "/app/history",
                 "/app/backups",
                 "/app/backup-status",
+            },
+            "enclosure-backup-scheduler": {
+                "/app/history",
+                "/app/backups",
+                "/app/backup-status",
+                "/app/backup-journal",
+                "/app/backup-api",
             },
         }
         for compose_name in COMPOSE_FILES:

@@ -530,6 +530,21 @@ class ArtifactCatalog:
             )
         return self.get(artifact_id)  # type: ignore[return-value]
 
+    def mark_unverified(self, artifact_id: str) -> ArtifactRecord:
+        """Record a failed readback: the copy no longer counts as verified.
+
+        It stops being the protected newest verified copy, and after the
+        unverified grace period grooming may delete it.
+        """
+
+        with self._write() as connection:
+            if connection.execute(
+                "UPDATE artifacts SET verified = 0, verified_at = NULL WHERE artifact_id = ?",
+                (artifact_id,),
+            ).rowcount == 0:
+                raise CatalogError("Artifact is not catalogued.")
+        return self.get(artifact_id)  # type: ignore[return-value]
+
     def claim_deletion(
         self,
         expected: ArtifactRecord,
