@@ -482,6 +482,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Internal
 
+- Added the backup archive transport library for the history sidecar: remote
+  targets for a local directory, FTP/FTPS, SFTP (host key checked against
+  known_hosts), SMB, a job-scoped NFS mount, and S3. Uploads are atomic and
+  read back to verify, and credentials come from secret files. The library is
+  not wired into the app yet (#577).
+
 - Removed the unreachable per-slot history fallback and its concurrency
   setting, unified the unavailable slot-history payload shape, and deleted
   duplicated and caller-less helpers (#509).

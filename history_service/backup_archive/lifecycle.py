@@ -50,8 +50,10 @@ PlanKind = Literal["retention", "unverified"]
 class GroomableTarget(Protocol):
     """The part of ``ArchiveTarget`` grooming needs.
 
-    ``delete`` must raise ``FileNotFoundError`` when the object is already
-    gone; any other exception is treated as unexpected and stops ``apply``.
+    ``delete`` may either return quietly (the transport targets in
+    ``transport.py`` are idempotent) or raise ``FileNotFoundError`` when the
+    object is already gone; only the latter is reported as ``already_missing``.
+    Any other exception is treated as unexpected and stops ``apply``.
     """
 
     def list(self, prefix: str = "") -> list[Any]: ...
