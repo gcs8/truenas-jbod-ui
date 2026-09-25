@@ -19,6 +19,12 @@ from pydantic import BaseModel, Field, model_validator
 
 _ARCHIVE_PREFIX = "jbod-scheduled-backup-"
 _ARCHIVE_SUFFIX = ".tar.zst.enc"
+# FULL backups default to tar.zst in the TJBENC02 envelope (#397). Set
+# BACKUP_FULL_ARCHIVE_FORMAT=7z for archives older app versions and plain
+# 7-Zip can open.
+DEFAULT_FULL_ARCHIVE_FORMAT = "tar.zst"
+FULL_ARCHIVE_FORMAT_ENV = "BACKUP_FULL_ARCHIVE_FORMAT"
+_FULL_ARCHIVE_FORMATS = ("7z", "tar.zst")
 _ARCHIVE_NAME = re.compile(
     r"^jbod-scheduled-backup-(?P<timestamp>[0-9]{8}T[0-9]{6}Z)-"
     r"(?P<nonce>[0-9a-f]{8})(?:\.7z|\.tar\.zst\.enc)$"
@@ -169,9 +175,12 @@ class ScheduledBackupSettings(BaseModel):
     included_groups: list[str] = Field(default_factory=list)
     passphrase_file: str | None = None
     app_gid: int | None = None
+    archive_format: str = DEFAULT_FULL_ARCHIVE_FORMAT
 
     @model_validator(mode="after")
     def validate_enabled_settings(self) -> ScheduledBackupSettings:
+        if self.archive_format not in _FULL_ARCHIVE_FORMATS:
+            raise ValueError(f"{FULL_ARCHIVE_FORMAT_ENV} must be 7z or tar.zst.")
         if not self.enabled:
             return self
         if not str(self.destination_dir or "").strip():
@@ -230,6 +239,10 @@ class ScheduledBackupSettings(BaseModel):
             included_groups=groups,
             passphrase_file=os.getenv("SCHEDULED_BACKUP_PASSPHRASE_FILE"),
             app_gid=app_gid,
+            archive_format=(
+                str(os.getenv(FULL_ARCHIVE_FORMAT_ENV) or "").strip().lower()
+                or DEFAULT_FULL_ARCHIVE_FORMAT
+            ),
         )
 
 
@@ -246,7 +259,7 @@ class ScheduledBackupRunner:
         app_gid: int,
         clock: Callable[[], datetime] | None = None,
         apply_retention: bool = True,
-        archive_format: str = "7z",
+        archive_format: str = DEFAULT_FULL_ARCHIVE_FORMAT,
     ) -> None:
         self.backup_service = backup_service
         self.destination_dir = Path(destination_dir)
@@ -652,13 +665,10 @@ class ScheduledBackupRunner:
                 if scope_changed:
                     self._write_status(status)
                 passphrase = self._read_passphrase()
-                export_options: dict[str, Any] = {}
-                if self.archive_format != "7z":
-                    export_options["archive_format"] = self.archive_format
                 artifact = self.backup_service.export_scheduled_bundle_to_file(
                     passphrase=passphrase,
                     included_paths=list(self.included_groups),
-                    **export_options,
+                    archive_format=self.archive_format,
                 )
                 archive_suffix = ".7z" if artifact.filename.endswith(".7z") else _ARCHIVE_SUFFIX
                 filename = (

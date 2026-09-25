@@ -30,6 +30,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Upgrade notes
 
+- New FULL backups (backup scheduler, one-shot `enclosure-backup` job and the
+  encrypted admin export with history) now default to the fast `tar.zst` stream
+  format (`.tar.zst.enc`). Older app versions cannot restore these files and
+  plain 7-Zip cannot open them; existing `.7z` backups still restore. Set
+  `BACKUP_FULL_ARCHIVE_FORMAT=7z` (or `backups.full.archive_format: 7z`) to keep
+  making `.7z` FULL backups. (#PRNUM)
 - `/healthz` on the main UI answers HTTP 503 (`status: down`) when its data,
   logs or known-hosts folder is not writable; remote failures stay HTTP 200
   (`status: degraded`). Compose healthchecks probe `/livez` and are unchanged,
