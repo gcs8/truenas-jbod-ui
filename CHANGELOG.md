@@ -502,6 +502,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Internal
 
+- CI now upgrades the public v0.22.2 image to each pull request's build by
+  changing only `JBOD_UI_IMAGE` on root-owned mounts, checks that the
+  containers are healthy, that mappings and history survive and that the
+  schema migrated, then rolls back by pin (#590).
+
 - Added the backup archive transport library for the history sidecar: remote
   targets for a local directory, FTP/FTPS, SFTP (host key checked against
   known_hosts), SMB, a job-scoped NFS mount, and S3. Uploads are atomic and
