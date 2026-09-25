@@ -61,7 +61,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 - The main UI now shows a small "What this system supports" card for bay
   layout, SMART details and the locate light, including why an item is limited.
-  (#PRNUM)
+  (#623)
 - Full backups can use a much faster encrypted format: set `backups.full.archive_format:
   tar.zst` (or `BACKUP_FULL_ARCHIVE_FORMAT`). It packs tar + Zstandard and seals it in
   1 MiB authenticated AES-256-GCM chunks, so a multi-GiB history database is never held
