@@ -143,6 +143,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Passed the `RELEASE_CHECK_*` settings to the history service, so
+  `RELEASE_CHECK_ENABLED=false` turns the GitHub check off everywhere; quoted
+  the current history bind error in the wiki and explained the three history
+  collection intervals in `.env.example` (#591).
 - Raised the last small labels on the main page (summary labels, legend
   swatches, Connections card details, heat-map controls, timing chips) to at
   least 12px. (#584)
