@@ -123,6 +123,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Changed
 
+- The required production-derived release restore gate now exercises the default
+  encrypted `tar.zst` FULL export through inspection, import, restart and
+  readback, while a separate explicit `7z` round trip preserves backward-format
+  coverage and records source/candidate provenance. (#643)
 - The main UI applies edits to config.yaml, runtime-overrides.yaml and
   profiles.yaml (admin saves and hand edits) within a few seconds, without a
   restart. An invalid edit keeps the old settings with a warning in the log,

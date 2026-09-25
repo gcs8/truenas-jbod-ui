@@ -13,9 +13,11 @@ pass in another.
    archive safety, and controller guards without private data.
 2. The synthetic runtime matrix builds one exact candidate image and exercises
    service combinations with public fixtures.
-3. The private restore drill accepts a separately staged encrypted FULL backup,
-   restores it into an isolated QA root, and compares aggregate counts from the
-   validated archive with the running stack.
+3. The private restore drill accepts two separately staged encrypted FULL
+   backups: a primary export that follows the configured default (`tar.zst`) and
+   a separate explicitly selected `7z` export for backward readability. Each is
+   restored into an isolated QA root and its aggregate counts are compared with
+   the running stack.
 
 Do not put a production-derived archive, passphrase, raw restore response,
 container log, browser trace, screenshot, history database, or admin state in
@@ -75,6 +77,18 @@ LED and system-locator actions are hardware mutations. Neither automated mode
 runs them unless a separate device-safe target and approval are supplied.
 
 ## Private production-derived restore
+
+The release gate runs the private controller twice against separately exported
+archives and separate scratch, runtime, evidence, and target handles:
+
+1. Export the primary encrypted FULL backup with the standard configured default
+   and no request-level `packaging` field. Inspection must report `tar.zst`.
+2. Export a second encrypted FULL backup with `packaging` explicitly set to `7z`.
+   Inspection must report `7z`.
+
+Each run is a complete inspect, import, health/readback, restart, second readback,
+browser, performance, and cleanup cycle. A passing legacy run cannot replace the
+primary default-format run, and the two formats must not share one receipt.
 
 Run `scripts/run_private_qa_restore.py` only on a disposable Docker host. The
 normal mode is egress-blocked. The default Docker network is internal. A
@@ -193,10 +207,14 @@ retains that private state only for an explicitly supervised follow-up check.
 
 `sanitized-receipt.json` contains only:
 
-- run ID, target handle, source commit, exact image ID, archive SHA-256 and size;
+- run ID, target handle, archive SHA-256 and size;
+- `inspection.packaging` for the observed archive format and
+  `inspection.app_version` for the export-source application provenance;
+- `source_commit` and exact candidate `image_id` for the release candidate that
+  performed the inspect/import/restart/readback cycle;
 - offline or live-read-only mode;
-- schema, packaging, encryption, selected/present/absent group names, aggregate
-  counts, and member totals;
+- schema, encryption, selected/present/absent group names, aggregate counts, and
+  member totals;
 - restore/restart counts without names or paths;
 - pass/fail for count reconciliation, pencil cleanup, restart survival, browser,
   and performance gates;
