@@ -40,16 +40,16 @@ EXPECTED_WIKI_PAGES = {
     "wiki/Visual-Tour.md",
     "wiki/_Sidebar.md",
 }
-EXPECTED_HISTORICAL_READ_UI_LINES = {
+EXPECTED_HISTORICAL_READ_UI_CONTEXTS = {
     "docs/ESXI_PLATFORM_FEASIBILITY.md": (
-        "into the ignored local config, restarted the read UI, and confirmed:",
+        r"into\s+the\s+ignored\s+local\s+config,\s+restarted\s+the\s+read\s+UI,\s+and\s+confirmed:",
     ),
     "docs/M2_CARRIER_RENDERING_NOTES.md": (
-        "layouts in the main read UI and admin preview flow, so we can reuse the same",
-        "The read UI now uses a real board image instead of a CSS-only abstract",
+        r"layouts\s+in\s+the\s+main\s+read\s+UI\s+and\s+admin\s+preview\s+flow,\s+so\s+we\s+can\s+reuse\s+the\s+same",
+        r"The\s+read\s+UI\s+now\s+uses\s+a\s+real\s+board\s+image\s+instead\s+of\s+a\s+CSS-only\s+abstract",
     ),
     "docs/PRIVATE_QA_RESTORE.md": (
-        "The read UI has two saved operator edits:",
+        r"The\s+read\s+UI\s+has\s+two\s+saved\s+operator\s+edits:",
     ),
 }
 
@@ -96,16 +96,28 @@ class PublicDocsContractTests(unittest.TestCase):
             *current_reference_docs,
         ):
             text = (ROOT / relative_path).read_text(encoding="utf-8")
-            read_ui_lines = tuple(
-                line.strip()
-                for line in text.splitlines()
-                if re.search(r"(?i)\bread\s+UI\b", line)
+            allowed_read_ui_contexts = EXPECTED_HISTORICAL_READ_UI_CONTEXTS.get(
+                relative_path, ()
             )
+            text_without_allowed_contexts = text
+            for allowed_context in allowed_read_ui_contexts:
+                text_without_allowed_contexts, replacements = re.subn(
+                    allowed_context,
+                    "",
+                    text_without_allowed_contexts,
+                    count=1,
+                    flags=re.IGNORECASE,
+                )
+                self.assertEqual(
+                    replacements,
+                    1,
+                    f"missing historical read UI context in {relative_path}",
+                )
             with self.subTest(document=relative_path):
                 self.assertNotRegex(text, r"(?i)\badmin\s+sidecar\b")
-                self.assertEqual(
-                    read_ui_lines,
-                    EXPECTED_HISTORICAL_READ_UI_LINES.get(relative_path, ()),
+                self.assertNotRegex(
+                    text_without_allowed_contexts,
+                    r"(?i)\bread\s+UI\b",
                 )
 
     def test_architecture_guide_states_the_reachability_boundary_plainly(self) -> None:
