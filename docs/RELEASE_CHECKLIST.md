@@ -53,7 +53,7 @@ using this shape:
 | Full Playwright/browser gates | yes | command output summary | Pass/Blocked/N/A | reason |
 | Feature-specific live API/UI gates | yes | API/browser evidence | Pass/Blocked/N/A | reason |
 | Local release perf harnesses | yes | artifact path and summary | Pass/Blocked/N/A | reason |
-| Linux QA restore gate | yes | target, counts, health, smoke evidence | Pass/Blocked/N/A | reason |
+| Linux QA restore gate | yes | separate default `tar.zst` and explicit `7z` receipts with observed format, export-source app version, candidate commit/image, counts, health, and smoke evidence | Pass/Blocked/N/A | reason |
 | Restored Linux QA perf harnesses | yes | artifact path and summary | Pass/Blocked/N/A | reason |
 | Snapshot/export/offline artifact gate | yes | command and browser smoke | Pass/Blocked/N/A | reason |
 | Docs/wiki/public-demo gate | yes | changed files, reviewed source diff, privacy checks, checked-in artifact commands and results | Pass/Blocked/N/A | reason |
@@ -259,26 +259,50 @@ python scripts/validate_release_wrap.py "$version" \
     only sanitized receipts
   - immediately before the one production deployment, take and verify a fresh
     encrypted FULL backup through Admin
-  - export a full backup from the long-running local Windows Docker admin API,
-    not by copying host folders. Use the default restore-grade path set:
-    `config_file`, `runtime_overrides_file`, `profile_file`, `mapping_file`,
-    `sas_fabric_alias_file`, `slot_detail_file`, and `history_db`
-  - example export request:
-    `POST http://127.0.0.1:8082/api/admin/backup/export?stop_services=false&restart_services=true`
-    with JSON body
-    `{"encrypt":true,"packaging":"7z","included_paths":["config_file","runtime_overrides_file","profile_file","mapping_file","sas_fabric_alias_file","slot_detail_file","history_db"]}`
-  - copy that exported bundle to the Linux release target
   - create a disposable QA Docker stack on the Linux target using the current
     release-candidate source/image, a separate Compose project name, separate
     runtime directories, and a different port range such as
     `APP_BIND_ADDRESS=127.0.0.1`, `APP_PORT=18080`,
     `HISTORY_BIND_ADDRESS=127.0.0.1`, `HISTORY_PORT=18081`,
     `ADMIN_BIND_ADDRESS=127.0.0.1`, and `ADMIN_PORT=18082`
-  - inspect the copied bundle first through
-    `POST http://127.0.0.1:18082/api/admin/backup/inspect`, confirm the returned
-    observed encryption mode and aggregate counts, and retain its short-lived
-    single-use inspection receipt only in memory
-  - import the backup through the disposable Linux admin API:
+  - **Primary default-format round trip:** export an encrypted FULL backup from
+    the long-running local Windows Docker admin API, not by copying host folders.
+    Use the standard FULL configuration with no `7z` format override and the
+    restore-controller path set: `config_file`, `runtime_overrides_file`,
+    `profile_file`, `mapping_file`, `sas_fabric_alias_file`, `slot_detail_file`,
+    `history_db`, `ssh_keys`, `tls_trust`, and `known_hosts` (the private
+    controller rejects an archive missing any of them). Encrypted exports
+    require a `passphrase`; read it from the private passphrase file and never
+    record it in receipts or the release wrap
+  - send
+    `POST http://127.0.0.1:8082/api/admin/backup/export?stop_services=false&restart_services=true`
+    with JSON body
+    `{"encrypt":true,"passphrase":"<private passphrase, never recorded>","included_paths":["config_file","runtime_overrides_file","profile_file","mapping_file","sas_fabric_alias_file","slot_detail_file","history_db","ssh_keys","tls_trust","known_hosts"]}`;
+    deliberately omit `packaging` so this gate follows the configured FULL
+    default instead of forcing a format
+  - copy that primary exported bundle to the Linux release target, inspect it,
+    and require the observed `tar.zst` packaging before import; a `7z` result in
+    the primary path is a release `HOLD`, not substitute coverage
+  - import the primary archive, restart the disposable stack, and complete the
+    aggregate and application readback below before starting compatibility work
+  - **Legacy 7z readability round trip:** make a second encrypted FULL export
+    from the same source API and path set, this time explicitly sending
+    `{"encrypt":true,"passphrase":"<private passphrase, never recorded>","packaging":"7z","included_paths":["config_file","runtime_overrides_file","profile_file","mapping_file","sas_fabric_alias_file","slot_detail_file","history_db","ssh_keys","tls_trust","known_hosts"]}`
+  - copy the legacy bundle separately, then perform a second complete export,
+    inspect, import, restart, and readback round trip. Require the observed
+    packaging to be `7z`; this backward-readability check cannot replace or be
+    combined with the primary default-format result
+  - keep a separate sanitized receipt for each round trip. Each receipt must
+    retain `inspection.packaging` and `inspection.app_version` as the archive
+    format and export-source application provenance, plus `source_commit` and
+    `image_id` for the release candidate that performed inspection, import,
+    restart, and readback. Record both receipt paths and results in the release
+    wrap without copying raw private payloads
+  - for each copied bundle, inspect it first through
+    `POST http://127.0.0.1:18082/api/admin/backup/inspect`, confirm the required
+    observed packaging and encryption mode plus aggregate counts, and retain its
+    short-lived single-use inspection receipt only in memory
+  - import that same backup through the disposable Linux admin API:
     `POST http://127.0.0.1:18082/api/admin/backup/import?stop_services=true&restart_services=true`
     with the same exported bundle as `application/octet-stream`, the observed
     mode in `X-Backup-Expected-Encryption`, and the receipt in
