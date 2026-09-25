@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -39,6 +40,20 @@ EXPECTED_WIKI_PAGES = {
     "wiki/Visual-Tour.md",
     "wiki/_Sidebar.md",
 }
+EXPECTED_HISTORICAL_READ_UI_CONTEXTS = {
+    "docs/ESXI_PLATFORM_FEASIBILITY.md": (
+        r"into\s+the\s+ignored\s+local\s+config,\s+restarted\s+the\s+read\s+UI,\s+and\s+confirmed:",
+    ),
+    "docs/M2_CARRIER_RENDERING_NOTES.md": (
+        r"layouts\s+in\s+the\s+main\s+read\s+UI\s+and\s+admin\s+preview\s+flow,\s+so\s+we\s+can\s+reuse\s+the\s+same",
+        r"The\s+read\s+UI\s+now\s+uses\s+a\s+real\s+board\s+image\s+instead\s+of\s+a\s+CSS-only\s+abstract",
+    ),
+    "docs/PRIVATE_QA_RESTORE.md": (
+        r"The\s+read\s+UI\s+has\s+two\s+saved\s+operator\s+edits:",
+    ),
+}
+STALE_ADMIN_SIDECAR_PATTERN = re.compile(r"\badmin\s+sidecars?\b", re.IGNORECASE)
+STALE_READ_UI_PATTERN = re.compile(r"\bread\s+UI(?:s)?\b", re.IGNORECASE)
 
 
 def run_checker(*args: str) -> subprocess.CompletedProcess[str]:
@@ -71,6 +86,53 @@ class PublicDocsContractTests(unittest.TestCase):
 
         self.assertNotIn("read-only enclosure UI", guide)
         self.assertIn("main enclosure UI", guide)
+
+    def test_public_docs_use_current_service_names(self) -> None:
+        current_reference_docs = tuple(
+            path.relative_to(ROOT).as_posix()
+            for path in sorted((ROOT / "docs").glob("*.md"))
+        )
+        for relative_path in (
+            "README.md",
+            *sorted(EXPECTED_WIKI_PAGES),
+            *current_reference_docs,
+        ):
+            text = (ROOT / relative_path).read_text(encoding="utf-8")
+            allowed_read_ui_contexts = EXPECTED_HISTORICAL_READ_UI_CONTEXTS.get(
+                relative_path, ()
+            )
+            text_without_allowed_contexts = text
+            for allowed_context in allowed_read_ui_contexts:
+                text_without_allowed_contexts, replacements = re.subn(
+                    allowed_context,
+                    "",
+                    text_without_allowed_contexts,
+                    count=1,
+                    flags=re.IGNORECASE,
+                )
+                self.assertEqual(
+                    replacements,
+                    1,
+                    f"missing historical read UI context in {relative_path}",
+                )
+            with self.subTest(document=relative_path):
+                self.assertNotRegex(text, STALE_ADMIN_SIDECAR_PATTERN)
+                self.assertNotRegex(
+                    text_without_allowed_contexts,
+                    STALE_READ_UI_PATTERN,
+                )
+
+    def test_stale_service_name_patterns_cover_plural_mutations(self) -> None:
+        for stale_text, pattern in (
+            ("admin sidecar", STALE_ADMIN_SIDECAR_PATTERN),
+            ("admin sidecars", STALE_ADMIN_SIDECAR_PATTERN),
+            ("read UI", STALE_READ_UI_PATTERN),
+            ("read UIs", STALE_READ_UI_PATTERN),
+            ("read\nUI", STALE_READ_UI_PATTERN),
+            ("read\nUIs", STALE_READ_UI_PATTERN),
+        ):
+            with self.subTest(stale_text=stale_text):
+                self.assertRegex(stale_text, pattern)
 
     def test_architecture_guide_states_the_reachability_boundary_plainly(self) -> None:
         guide = (ROOT / "wiki/Architecture-and-Services.md").read_text(

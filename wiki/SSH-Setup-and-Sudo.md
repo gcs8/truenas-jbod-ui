@@ -16,8 +16,8 @@ Current ESXi support is the exception to that pattern: it is SSH-only,
 read-only, and intentionally skips the Linux bootstrap/sudo flow. On the
 validated ESXi host the saved SSH user stays `root`, and the app uses direct
 read-only runtime commands instead of trying to synthesize Linux sudo rules.
-If the host is using password auth, leave `key_path` blank and use the admin
-sidecar's `Password Only / No Key` mode instead of forcing a fake key path.
+If the host is using password auth, leave `key_path` blank and use Admin's
+`Password Only / No Key` mode instead of forcing a fake key path.
 
 ## Recommended SSH user pattern
 
@@ -174,7 +174,7 @@ esxcli storage san sas list
 
 On validated Broadcom / AVAGO MegaRAID hosts, `lsi_mr3` and
 `lsuv2-lsiv2-drivers-plugin` alone are not enough for the richer member-detail
-path. If StorCLI is missing, the admin sidecar's `Host Prep / Vendor Tool
+path. If StorCLI is missing, the Admin's `Host Prep / Vendor Tool
 Upload` panel is the intended place to stage and install an operator-supplied
 Broadcom bundle or VIB. The project does not ship that vendor package itself.
 
@@ -200,7 +200,7 @@ with ESXi added later only as optional enrichment.
 
 ## Generated bootstrap permission previews
 
-The admin sidecar's Sudoers Preview is the canonical copy/paste source. The
+The Admin's Sudoers Preview is the canonical copy/paste source. The
 blocks below match the policy used by the one-time bootstrap. Do not split them
 into partial SMART and SES files or add command
 wildcards. Linux-like policies must pass `visudo -cf` before installation.

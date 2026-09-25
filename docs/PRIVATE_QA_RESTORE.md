@@ -62,8 +62,8 @@ readback, clear, and restored-count checks for both. The private egress-blocked
 restore drill always exercises labels. Slot mappings need a resolved enclosure
 layout, so the private drill exercises them only in the separately approved
 live-read-only mode. This is not a gap in the standalone UI proof because the
-synthetic UI-only matrix runs the real mapping route with no history or admin
-sidecar.
+synthetic UI-only matrix runs the real mapping route with no history or Admin
+service.
 
 Admin touchpoints include system/profile setup, SSH and TLS material, runtime
 behavior overrides, backup inspection/import/export, container controls, and
