@@ -65,6 +65,25 @@ update. See
 and [[Troubleshooting]] and the release upgrade notes for the one-time
 ownership step.
 
+## What is tested
+
+Every pull request runs the upgrade below in CI, on a disposable Linux Docker
+host with synthetic data. Anything not in this table has not been tested, so
+treat it as unverified, not as broken.
+
+| Area | Tested | Not tested yet |
+| --- | --- | --- |
+| Docker host | Linux, Docker Engine with Compose v2, `linux/amd64` image | Docker Desktop, other architectures, rootless Docker |
+| Local state | Bind mounts on a local POSIX filesystem, owned by root | Network filesystems, read-only or full disks |
+| Services | Main UI and history on the published base Compose file | Admin and backup services, and the hardening overlay, during an upgrade |
+| Upgrade path | v0.22.2 to the current build: change `JBOD_UI_IMAGE`, then `pull` and `up -d` | Releases before v0.22.2, skipping several releases |
+| After upgrading | Both containers healthy with no restarts; the new version and revision are reported; bay mappings, history rows and `config.yaml` unchanged; database integrity check passes; history schema migrated at startup; no change of file ownership | Large (multi-GiB) history databases, many enclosures |
+| Rollback | Pin back to v0.22.2 with the same two commands; the older release starts and reads what the newer one wrote | Rollback across a history schema change |
+| Recovery | | An interrupted migration or restore, an encrypted restore on a clean host |
+
+The check is `scripts/run_image_upgrade_smoke.py`, run by the `Image-only
+upgrade smoke` CI job.
+
 ## Rolling back a release
 
 Set `JBOD_UI_IMAGE` back to the recorded tag or digest and run the same `pull`

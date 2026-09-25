@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 import json
 import logging
 import os
@@ -727,7 +728,72 @@ def collect_unknown_config_keys(
     prefix: str = "",
 ) -> list[str]:
     """List YAML keys that no settings model reads, as ``systems[0].truenas.bogus_field`` paths."""
-    unknown: list[str] = []
+    return [path for path, _suggestion in collect_unknown_config_key_suggestions(payload, model, prefix=prefix)]
+
+
+def _closest_key(key: str, candidates: Any) -> str | None:
+    matches = difflib.get_close_matches(key, sorted(str(candidate) for candidate in candidates), n=1, cutoff=0.6)
+    return matches[0] if matches else None
+
+
+# Keys the backup scheduler reads under ``backups:``. Listed here rather than
+# imported from history_service/backup_archive so the main UI (and the public
+# demo build) does not depend on the backup modules; tests.test_startup_config
+# pins these sets to ConfigClassPolicy, FullClassPolicy and ArchiveTargetSettings.
+_BACKUP_CLASS_KEYS = frozenset({"enabled", "local_keep", "remote_keep", "remote_max_age_days"})
+BACKUPS_SECTION_KEYS: dict[str, frozenset[str]] = {
+    "": frozenset({"config", "full", "targets"}),
+    "config": _BACKUP_CLASS_KEYS | {"debounce_seconds", "max_delay_seconds"},
+    "full": _BACKUP_CLASS_KEYS | {"schedule"},
+    "targets": frozenset(
+        {
+            "target_id", "provider", "root", "hostname", "port", "username", "password_file",
+            "timeout_seconds", "use_tls", "known_hosts_path", "trust_on_first_use",
+            "private_key_file", "private_key_passphrase_file", "share", "domain", "smb_encrypt",
+            "export_path", "mount_options", "mount_parent", "bucket", "region", "endpoint_url",
+            "access_key_id_file", "secret_access_key_file",
+            # Read by the policy loader itself, not the target settings.
+            "label", "enabled",
+        }
+    ),
+}
+
+
+def _collect_unknown_backups_keys(payload: Any, prefix: str) -> list[tuple[str, str | None]]:
+    # The scheduler sidecar rejects these keys when it loads its policy; the
+    # main UI only reports them so a typo is visible without a hard failure.
+    if not isinstance(payload, dict):
+        return []
+    schema = BACKUPS_SECTION_KEYS
+    unknown: list[tuple[str, str | None]] = []
+
+    def check(mapping: Any, allowed: frozenset[str], path_prefix: str) -> None:
+        if not isinstance(mapping, dict):
+            return
+        for raw_key in mapping:
+            key = str(raw_key)
+            if key not in allowed:
+                suggestion = _closest_key(key, allowed)
+                unknown.append((f"{path_prefix}{key}", f"{path_prefix}{suggestion}" if suggestion else None))
+
+    check(payload, schema[""], prefix)
+    check(payload.get("config"), schema["config"], f"{prefix}config.")
+    check(payload.get("full"), schema["full"], f"{prefix}full.")
+    targets = payload.get("targets")
+    if isinstance(targets, list):
+        for index, item in enumerate(targets):
+            check(item, schema["targets"], f"{prefix}targets[{index}].")
+    return unknown
+
+
+def collect_unknown_config_key_suggestions(
+    payload: Any,
+    model: type[BaseModel] = Settings,
+    *,
+    prefix: str = "",
+) -> list[tuple[str, str | None]]:
+    """Like :func:`collect_unknown_config_keys`, paired with the closest valid key path (or None)."""
+    unknown: list[tuple[str, str | None]] = []
     if not isinstance(payload, dict):
         return unknown
     for raw_key, value in payload.items():
@@ -736,8 +802,13 @@ def collect_unknown_config_keys(
         field = model.model_fields.get(key)
         if field is None:
             if not prefix and model is Settings and key in SIDECAR_OWNED_CONFIG_KEYS:
+                unknown.extend(_collect_unknown_backups_keys(value, prefix=f"{path}."))
                 continue
-            unknown.append(path)
+            candidates = set(model.model_fields)
+            if not prefix and model is Settings:
+                candidates |= SIDECAR_OWNED_CONFIG_KEYS
+            suggestion = _closest_key(key, candidates)
+            unknown.append((path, f"{prefix}{suggestion}" if suggestion else None))
             continue
         nested_model = _model_annotation(field.annotation)
         if nested_model is None:
@@ -745,9 +816,11 @@ def collect_unknown_config_keys(
         if get_origin(field.annotation) is list:
             if isinstance(value, list):
                 for index, item in enumerate(value):
-                    unknown.extend(collect_unknown_config_keys(item, nested_model, prefix=f"{path}[{index}]."))
+                    unknown.extend(
+                        collect_unknown_config_key_suggestions(item, nested_model, prefix=f"{path}[{index}].")
+                    )
         else:
-            unknown.extend(collect_unknown_config_keys(value, nested_model, prefix=f"{path}."))
+            unknown.extend(collect_unknown_config_key_suggestions(value, nested_model, prefix=f"{path}."))
     return unknown
 
 
@@ -757,7 +830,17 @@ def collect_unknown_config_keys(
 SIDECAR_OWNED_CONFIG_KEYS = frozenset({"backups"})
 
 
-def _unknown_key_message(config_path: Path, key: str) -> str:
+def _unknown_key_message(config_path: Path, key: str, suggestion: str | None = None) -> str:
+    if key.startswith(tuple(f"{section}." for section in SIDECAR_OWNED_CONFIG_KEYS)):
+        # The backup scheduler rejects its whole policy on an unknown key (it
+        # does not ignore it); the main UI keeps running either way.
+        hint = f" Did you mean `{suggestion}`?" if suggestion else ""
+        return (
+            f"{config_path.name}: unknown key `{key}`; the backup scheduler will not start "
+            f"until it is fixed.{hint}"
+        )
+    if suggestion:
+        return f"{config_path.name}: unknown key `{key}` is ignored; did you mean `{suggestion}`?"
     return f"{config_path.name}: unknown key `{key}` is ignored."
 
 
@@ -772,9 +855,9 @@ def build_unknown_config_key_warnings(settings: Settings) -> list[dict[str, str]
         {
             "code": "unknown_config_key",
             "key": key,
-            "message": _unknown_key_message(config_path, key),
+            "message": _unknown_key_message(config_path, key, suggestion),
         }
-        for key in collect_unknown_config_keys(yaml_config)
+        for key, suggestion in collect_unknown_config_key_suggestions(yaml_config)
     ]
 
 
@@ -1178,8 +1261,8 @@ def get_settings() -> Settings:
     yaml_config = _load_yaml_config(config_path)
     runtime_overrides_path = Path(_derive_runtime_layout_paths(config_path)["runtime_overrides_file"])
     runtime_overrides = _load_runtime_overrides_config(runtime_overrides_path)
-    for key in collect_unknown_config_keys(yaml_config):
-        logger.warning("%s", _unknown_key_message(config_path, key))
+    for key, suggestion in collect_unknown_config_key_suggestions(yaml_config):
+        logger.warning("%s", _unknown_key_message(config_path, key, suggestion))
     merged = _deep_merge(defaults, yaml_config)
     merged = _deep_merge(merged, runtime_overrides)
 

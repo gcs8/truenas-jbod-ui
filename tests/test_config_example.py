@@ -105,5 +105,78 @@ class ConfigExampleCoverageTests(unittest.TestCase):
                 )
 
 
+ENV_EXAMPLE_PATH = ROOT / ".env.example"
+
+# Variables the services read that .env.example deliberately leaves out, with
+# the reason. Everything else a service reads must appear in .env.example,
+# as an active line or a commented example.
+ENV_INTERNAL_ALLOWLIST = {
+    # Set by docker-compose.yml to the in-stack service addresses; a value in
+    # .env would be overridden anyway.
+    "HISTORY_BACKEND_URL": "set by Compose",
+    "ADMIN_SERVICE_URL": "set by Compose",
+    "HISTORY_SOURCE_BASE_URL": "set by Compose",
+    "HISTORY_SQLITE_PATH": "set by Compose",
+    # The container command passes --host to uvicorn; these only matter when a
+    # service is run by hand outside Compose.
+    "APP_HOST": "listen address is fixed by the container command",
+    "ADMIN_HOST": "listen address is fixed by the container command",
+    "HISTORY_HOST": "listen address is fixed by the container command",
+    # Admin runtime-control internals that match the Compose container names
+    # and socket mount; changing them without editing Compose breaks controls.
+    "ADMIN_APP_NAME": "page title only",
+    "ADMIN_DOCKER_SOCKET_PATH": "matches the Compose socket mount",
+    "ADMIN_CONTAINER_UI_NAME": "matches the Compose container_name",
+    "ADMIN_CONTAINER_HISTORY_NAME": "matches the Compose container_name",
+    "ADMIN_CONTAINER_ADMIN_NAME": "matches the Compose container_name",
+    "ADMIN_CONTAINER_CONTROL_TIMEOUT_SECONDS": "Docker API timeout for runtime controls",
+}
+
+
+def _env_example_names() -> set[str]:
+    text = ENV_EXAMPLE_PATH.read_text(encoding="utf-8")
+    return set(re.findall(r"(?m)^#?\s*([A-Z][A-Z0-9_]+)=", text))
+
+
+class EnvExampleCoverageTests(unittest.TestCase):
+    def test_every_service_env_override_is_documented_or_allowlisted(self) -> None:
+        from admin_service.config import ENV_OVERRIDES as ADMIN_ENV_OVERRIDES
+        from app.config import ENV_OVERRIDES as APP_ENV_OVERRIDES
+        from history_service.backup_archive.policy import ENV_POLICY_OVERRIDES
+        from history_service.config import ENV_OVERRIDES as HISTORY_ENV_OVERRIDES
+
+        documented = _env_example_names()
+        for service, overrides in (
+            ("app", APP_ENV_OVERRIDES),
+            ("admin", ADMIN_ENV_OVERRIDES),
+            ("history", HISTORY_ENV_OVERRIDES),
+            ("backup policy", ENV_POLICY_OVERRIDES),
+        ):
+            missing = sorted(name for name in overrides if name not in documented and name not in ENV_INTERNAL_ALLOWLIST)
+            with self.subTest(service=service):
+                self.assertEqual(missing, [], "add these to .env.example or ENV_INTERNAL_ALLOWLIST with a reason")
+
+    def test_every_compose_interpolation_is_documented(self) -> None:
+        compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+        interpolated = set(re.findall(r"\$\{([A-Z][A-Z0-9_]*)", compose))
+        missing = sorted(interpolated - _env_example_names())
+        self.assertEqual(missing, [])
+
+    def test_allowlist_names_only_real_variables(self) -> None:
+        from admin_service.config import ENV_OVERRIDES as ADMIN_ENV_OVERRIDES
+        from app.config import ENV_OVERRIDES as APP_ENV_OVERRIDES
+        from history_service.config import ENV_OVERRIDES as HISTORY_ENV_OVERRIDES
+
+        known = set(APP_ENV_OVERRIDES) | set(ADMIN_ENV_OVERRIDES) | set(HISTORY_ENV_OVERRIDES)
+        self.assertEqual(sorted(set(ENV_INTERNAL_ALLOWLIST) - known), [])
+
+    def test_env_example_starts_with_a_copy_guide_and_no_stale_version_wording(self) -> None:
+        text = ENV_EXAMPLE_PATH.read_text(encoding="utf-8")
+        self.assertIn("Copy only the lines you change", text.split("\n\n", 1)[0])
+        for stale in ("v0.5.x", "first-pass", "conclusively old"):
+            with self.subTest(stale=stale):
+                self.assertNotIn(stale, text)
+
+
 if __name__ == "__main__":
     unittest.main()
