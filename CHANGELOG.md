@@ -88,6 +88,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Changed
 
+- The main page reuses bay tiles when a refresh brings the same layout,
+  evaluates the heat map once per render instead of once per saved-view bay,
+  and stops its one-second timer when nothing is counting down. (#596)
 - Rewrote the admin setup, backup and maintenance copy in plain words, hid the
   one-time bootstrap, SSH command list and QuantaStor HA controls until they are
   needed, showed only the storage-view fields that apply, and made system pills,
