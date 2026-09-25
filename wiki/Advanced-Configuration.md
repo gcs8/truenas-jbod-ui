@@ -283,13 +283,19 @@ Each copy is the size of the live database, so the default footprint is at most
 `HISTORY_BACKUP_RETENTION_COUNT` to shrink the short-term set; the value must be
 at least `1`.
 
+The history dashboard shows `Backup copies on disk` (bytes and number of these
+copies) and, under `Database size`, how much of the file is free space that
+cleanup has not handed back yet.
+
 Set any of the four retention-day values to `0` to keep that data tier forever.
 Each retention transaction commits separately, so a stop or restart resumes from
 the remaining rows instead of restarting one large delete.
 
 Retention runs on its own schedule and is not part of the backup. It prunes
-whenever the snapshot taken in that pass succeeded, or a snapshot on disk is
-younger than `HISTORY_RAW_METRIC_RETENTION_DAYS`. When neither is true, for
+whenever the snapshot taken in that pass succeeded, a snapshot on disk is
+younger than `HISTORY_RAW_METRIC_RETENTION_DAYS`, or the full backup named by
+`SCHEDULED_BACKUP_STATUS_FILE` (for example the backup scheduler's full class)
+last succeeded within that window and included the history database. When neither is true, for
 example because the backup directory is unwritable or the disk is full,
 retention waits for at most `HISTORY_RETENTION_BACKUP_SKIP_MAX_SECONDS`
 (`86400` by default) and the dashboard shows the reason and the time pruning
