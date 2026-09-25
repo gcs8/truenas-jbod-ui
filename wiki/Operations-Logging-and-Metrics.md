@@ -73,7 +73,7 @@ failure. An unset `HISTORY_BACKEND_URL` is not probed, and the default
 custom history host that does not resolve is. The Docker healthcheck for the main UI probes
 `/livez`, not `/healthz`, so neither level restarts the container.
 
-The history and admin sidecars provide their own `/livez` and `/healthz`
+The history service and Admin service provide their own `/livez` and `/healthz`
 endpoints while running. History `/healthz` answers HTTP 503 with
 `status: down` only when its database could not be opened; collection and
 cleanup failures are `degraded` with HTTP 200. Admin `/healthz` is `ok` while
@@ -103,7 +103,7 @@ LOG_FORMAT=json
 
 ## Correlate requests
 
-The UI, history sidecar, and admin sidecar create a new 32-character lowercase hexadecimal request ID for every inbound HTTP request. The response returns it in `X-Request-ID`.
+The UI, history sidecar, and Admin service create a new 32-character lowercase hexadecimal request ID for every inbound HTTP request. The response returns it in `X-Request-ID`.
 
 A caller-provided value never becomes the service's request ID. When valid, it can appear as `parent_request_id`, which lets you follow internal calls across services. Internal clients forward the server-issued ID in `X-Request-ID`.
 
@@ -157,7 +157,7 @@ The services expose Prometheus/OpenMetrics endpoints while metrics are enabled:
 
 - main UI: `http://your-docker-host:8080/metrics`
 - history sidecar: `http://your-docker-host:8081/metrics`
-- admin sidecar: `http://your-docker-host:8082/metrics`
+- Admin service: `http://your-docker-host:8082/metrics`
 
 The history sidecar listens on loopback by default. A non-loopback bind
 requires token-authenticated refreshes and one exact browser origin, so set the
@@ -264,7 +264,7 @@ rule_files:
   - /etc/prometheus/rules/truenas-jbod-ui-alerts-v1.yml
 ```
 
-Add `truenas_jbod_ui_monitor: required` only to services that must remain available. The admin sidecar normally stops when it is not needed, so do not label it `required` unless you intentionally keep it running.
+Add `truenas_jbod_ui_monitor: required` only to services that must remain available. The Admin service normally stops when it is not needed, so do not label it `required` unless you intentionally keep it running.
 
 ```yaml
 scrape_configs:

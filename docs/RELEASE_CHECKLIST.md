@@ -258,7 +258,7 @@ python scripts/validate_release_wrap.py "$version" \
   - stop the disposable development history stack after the drill and preserve
     only sanitized receipts
   - immediately before the one production deployment, take and verify a fresh
-    encrypted FULL backup through the admin sidecar
+    encrypted FULL backup through Admin
   - export a full backup from the long-running local Windows Docker admin API,
     not by copying host folders. Use the default restore-grade path set:
     `config_file`, `runtime_overrides_file`, `profile_file`, `mapping_file`,
