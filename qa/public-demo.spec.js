@@ -134,7 +134,7 @@ test("public demo static artifact is explorable without a live backend", async (
   await expect(page.locator("#ssh-status-chip")).toHaveText("SSH: off at capture");
   await expect(page.locator("#history-status-chip")).toHaveText("History: included");
   await expect(page.locator("#last-updated").locator("xpath=.." )).toContainText("Snapshot time");
-  await expect(page.locator("#status-text")).toContainText("Frozen offline snapshot loaded");
+  await expect(page.locator("#status-text")).toContainText("Offline copy. Live actions are off.");
 
   await expect(page.locator("#sas-fabric-view-link")).toHaveCount(0);
   await page.locator("#sas-fabric-toggle-button").click();

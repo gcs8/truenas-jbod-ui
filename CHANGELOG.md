@@ -93,6 +93,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Changed
 
+- Reworded the rest of the main page in plain words: "Locate light on/off"
+  instead of Identify, "Save offline copy" instead of Export Snapshot, bay
+  assignment backup and restore messages, and selector groups. (#588)
 - Rewrote the admin setup, backup and maintenance copy in plain words, hid the
   one-time bootstrap, SSH command list and QuantaStor HA controls until they are
   needed, showed only the storage-view fields that apply, and made system pills,

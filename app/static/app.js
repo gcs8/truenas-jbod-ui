@@ -2473,7 +2473,7 @@
     if (note) {
       note.classList.toggle("hidden", !unavailable);
       note.textContent = !matched
-        ? "Previous inventory, not the selected scope. Slot actions are unavailable until matching inventory loads. Use Refresh to retry."
+        ? "Still showing the previous enclosure. Bay actions are off until the new one loads. Use Refresh to retry."
         : "Previous storage view. Slot actions are unavailable until its refresh succeeds.";
     }
     if (exportSnapshotButton) exportSnapshotButton.disabled = unavailable || state.export.running;
@@ -3468,13 +3468,15 @@
     return slot.identify_active ? "On" : "Off";
   }
 
-  function ledBackendLabel(slot) {
-    if (!slot || !slot.led_backend) return "unknown backend";
-    if (slot.led_backend === "api") return "API";
+  // Plain-language source of a locate-light change, kept in the status line so
+  // an experimental UniFi path never looks like a validated one.
+  function locateLightSourceLabel(slot) {
+    if (!slot || !slot.led_backend) return "an unknown path";
+    if (slot.led_backend === "api") return "the TrueNAS API";
     if (slot.led_backend === "unifi_fault") {
-      return slot?.raw_status?.experimental_led ? "UniFi SSH LED (Experimental)" : "UniFi SSH LED";
+      return slot?.raw_status?.experimental_led ? "UniFi over SSH (experimental)" : "UniFi over SSH";
     }
-    return "SSH SES";
+    return "the enclosure over SSH";
   }
 
   function getSmartCacheKey(slot) {
@@ -3621,7 +3623,7 @@
       const unavailable = Object.values(payload.histories)
         .find((entry) => entry?.available === false);
       if (unavailable) {
-        return unavailable.detail || "History data is unavailable for part of this scope.";
+        return unavailable.detail || "History is missing for some of these bays.";
       }
     }
     return null;
@@ -7063,13 +7065,13 @@
           <span class="snapshot-export-estimate-meta">${escapeHtml(estimate.zip_within_limit ? "OK" : "Too large")}</span>
         </div>
         <div class="snapshot-export-estimate-card ${selectedTone === "error" ? "error" : selectedTone === "warning" ? "warning" : ""}">
-          <span class="snapshot-export-estimate-label">Current Choice</span>
+          <span class="snapshot-export-estimate-label">Will save</span>
           <span class="snapshot-export-estimate-value">${escapeHtml(estimateCurrentPackagingLabel(estimate))}</span>
           <span class="snapshot-export-estimate-meta">${escapeHtml(estimateCurrentPackagingMeta(estimate))}</span>
         </div>
         <div class="snapshot-export-estimate-card">
-          <span class="snapshot-export-estimate-label">Downsampling</span>
-          <span class="snapshot-export-estimate-value">${escapeHtml(estimate.downsampling_label || "None")}</span>
+          <span class="snapshot-export-estimate-label">History detail</span>
+          <span class="snapshot-export-estimate-value">${escapeHtml(estimate.downsampling_label && estimate.downsampling_label !== "None" ? estimate.downsampling_label : "Full")}</span>
           <span class="snapshot-export-estimate-meta">${escapeHtml(`${estimate.metric_sample_count ?? 0} samples / ${estimate.event_count ?? 0} events`)}</span>
         </div>
       </div>
@@ -7118,7 +7120,7 @@
         checked: selectedIds.has(enclosure.id) || enclosure.id === currentId,
         disabled: enclosure.id === currentId || state.export.running,
         meta: enclosure.id === currentId ? "Current enclosure, always included"
-          : [Number.isFinite(Number(enclosure.slot_count)) ? `${Number(enclosure.slot_count)} bays` : "", enclosure.profile_id || ""].filter(Boolean).join(" / "),
+          : (Number.isFinite(Number(enclosure.slot_count)) ? `${Number(enclosure.slot_count)} bays` : ""),
       })));
     }
     if (!exportIncludeViewsToggle || !exportViewSelection) return;
@@ -7234,34 +7236,34 @@
       "current enclosure";
     const selectedEnclosureCount = selectedExportEnclosureIds().length;
     const selectedViewCount = selectedExportStorageViewIds().length;
-    const scopeParts = [
+    const includedParts = [
       selectedEnclosureCount > 1
-        ? `${selectedEnclosureCount} live enclosures`
+        ? `${selectedEnclosureCount} enclosures`
         : scopeLabel,
       selectedViewCount
-        ? `${selectedViewCount} saved or virtual view${selectedViewCount === 1 ? "" : "s"}`
+        ? `${selectedViewCount} saved view${selectedViewCount === 1 ? "" : "s"}`
         : "",
     ].filter(Boolean);
 
     const parts = [
-      `Scope ${scopeParts.join(" plus ")}.`,
-      `Window ${formatHistoryWindowDescription(currentHistoryWindowHours())}.`,
+      `Includes ${includedParts.join(" and ")}.`,
+      `History: ${formatHistoryWindowDescription(currentHistoryWindowHours())}.`,
       state.export.packaging === "zip"
-        ? "Force ZIP packaging."
+        ? "Saved as a ZIP file."
         : state.export.packaging === "html"
-          ? "Force plain HTML packaging."
-          : "Auto prefers HTML, then falls back to ZIP if needed.",
+          ? "Saved as an HTML file."
+          : "Saved as an HTML file, or as a ZIP file if the HTML file is over the size limit.",
       state.export.allowOversize
-        ? "Oversize exports are allowed."
-        : "Default target stays under about 24 MiB.",
+        ? "Files over the size limit are allowed."
+        : "Kept under about 24 MB.",
       state.export.redactSensitive
-        ? "Host and enclosure aliases plus partial ID masking are enabled."
-        : "Full identifiers will be included.",
+        ? "Host and enclosure names, IP addresses, serial numbers and disk IDs are partly hidden."
+        : "All real names, IP addresses, serial numbers and disk IDs are included.",
     ];
     parts.push(snapshotExportSelectionDescription());
     if (!isHistoryAvailable()) parts.push("History is unavailable and will be omitted.");
     if (state.export.estimate.data?.downsampling_label && state.export.estimate.data.downsampling_label !== "None") {
-      parts.push(`Adaptive ${state.export.estimate.data.downsampling_label.toLowerCase()} will be used to stay closer to the size target.`);
+      parts.push(`History will be thinned (${state.export.estimate.data.downsampling_label.toLowerCase()}) to get closer to the size limit.`);
     }
     if (state.export.estimate.error) {
       parts.push(state.export.estimate.error);
@@ -9698,9 +9700,9 @@
           .map((view) => `<option value="view:${escapeHtml(view.id)}"${state.storageViewsRuntimeLoading || state.storageViewsRuntimeError ? " disabled" : ""}>${escapeHtml(selectorLabelForStorageViewOption(view))}${state.storageViewsRuntimeLoading || state.storageViewsRuntimeError ? " (previous)" : ""}</option>`)
           .join("");
         enclosureOptionsHtml = [
-          enclosureOptions ? `<optgroup label="Live Enclosures">${enclosureOptions}</optgroup>` : "",
-          savedChassisViewOptions ? `<optgroup label="Saved Chassis Views">${savedChassisViewOptions}</optgroup>` : "",
-          virtualStorageViewOptions ? `<optgroup label="Virtual Storage Views">${virtualStorageViewOptions}</optgroup>` : "",
+          enclosureOptions ? `<optgroup label="Enclosures">${enclosureOptions}</optgroup>` : "",
+          savedChassisViewOptions ? `<optgroup label="Saved layouts">${savedChassisViewOptions}</optgroup>` : "",
+          virtualStorageViewOptions ? `<optgroup label="Other disk groups">${virtualStorageViewOptions}</optgroup>` : "",
         ].filter(Boolean).join("");
       }
       const selectedValue = state.selectedStorageViewRuntimeId
@@ -10025,7 +10027,7 @@
     if (!mutation) return;
     let succeeded = false;
     try {
-      setStatus(`Sending ${action} for slot ${slot.slot_label}...`);
+      setStatus(`${action === "IDENTIFY" ? "Turning on" : "Turning off"} the locate light for slot ${slot.slot_label}...`);
       const payload = await sendScopedRequest(`/api/slots/${slot.slot}/led`, {
         method: "POST",
         readUiAuth: true,
@@ -10036,11 +10038,11 @@
       applySnapshot(payload.snapshot);
       renderAll();
       scheduleSmartPrefetch();
-      setStatus(`Slot ${slot.slot_label} LED action ${action} completed via ${ledBackendLabel(slot)}.`);
+      setStatus(`Locate light ${action === "IDENTIFY" ? "on" : "off"} for slot ${slot.slot_label}, sent through ${locateLightSourceLabel(slot)}.`);
     } catch (error) {
       if (!mutationContextIsCurrent(mutation)) return;
       handleWriteRejection(error);
-      setStatus(`LED action failed: ${error.message || error}`, "error");
+      setStatus(`Could not change the locate light: ${error.message || error}`, "error");
     } finally {
       finishMutationContext(mutation, succeeded);
     }
@@ -10322,11 +10324,11 @@
 
   async function exportMappings() {
     if (state.snapshotMode) {
-      setStatus("Mapping export is disabled in an offline snapshot export.", "error");
+      setStatus("Bay assignments cannot be backed up from an offline copy.", "error");
       return;
     }
     try {
-      setStatus("Preparing mapping export...");
+      setStatus("Preparing the bay assignment backup...");
       const bundle = await sendScopedRequest("/api/mappings/export");
       const blob = new Blob([JSON.stringify(bundle, null, 2)], { type: "application/json" });
       const objectUrl = window.URL.createObjectURL(blob);
@@ -10337,9 +10339,10 @@
       anchor.click();
       anchor.remove();
       window.URL.revokeObjectURL(objectUrl);
-      setStatus(`Exported ${bundle.mappings?.length || 0} mappings.`);
+      const saved = bundle.mappings?.length || 0;
+      setStatus(`Backed up ${saved} bay assignment${saved === 1 ? "" : "s"}.`);
     } catch (error) {
-      setStatus(`Export failed: ${error.message || error}`, "error");
+      setStatus(`Backup failed: ${error.message || error}`, "error");
     }
   }
 
@@ -10347,11 +10350,18 @@
     const formatValue = (value) => (
       value === null || value === undefined ? "∅" : String(value).replace(/\s+/g, " ")
     );
+    const fieldLabels = {
+      serial: "Serial",
+      device_name: "Device",
+      gptid: "Persistent ID",
+      notes: "Notes",
+    };
+    const fieldLabel = (field) => fieldLabels[field] || String(field).replaceAll("_", " ");
     const formatRecord = (record) => Object.entries(record || {})
-      .map(([field, value]) => `${field}=${formatValue(value)}`)
+      .map(([field, value]) => `${fieldLabel(field)} ${formatValue(value)}`)
       .join(", ");
     const formatChanges = (changes) => Object.entries(changes || {})
-      .map(([field, values]) => `${field}: ${formatValue(values.from)} → ${formatValue(values.to)}`)
+      .map(([field, values]) => `${fieldLabel(field)}: ${formatValue(values.from)} → ${formatValue(values.to)}`)
       .join(", ");
     const formatEntries = (entries, detail) => {
       if (!Array.isArray(entries) || entries.length === 0) return "none";
@@ -10379,7 +10389,7 @@
 
   async function importMappingsFromFile(file) {
     if (state.snapshotMode) {
-      setStatus("Mapping import is disabled in an offline snapshot export.", "error");
+      setStatus("Bay assignments cannot be restored in an offline copy.", "error");
       return;
     }
     if (!file) return;
@@ -10434,11 +10444,11 @@
       state.mappingFormScopeKey = null;
       renderAll();
       scheduleSmartPrefetch();
-      setStatus(`Imported ${result.imported} mappings into the active scope.`);
+      setStatus(`Restored ${result.imported} bay assignment${result.imported === 1 ? "" : "s"}.`);
     } catch (error) {
       if (!mutationContextIsCurrent(mutation)) return;
       handleWriteRejection(error);
-      setStatus(`Import failed: ${error.message || error}`, "error");
+      setStatus(`Restore failed: ${error.message || error}`, "error");
     } finally {
       finishMutationContext(mutation, succeeded);
       // File cleanup belongs to this operation, even after its UI scope expires.
@@ -11189,7 +11199,7 @@
   ensureHeatmapData();
   renderUiPerfPanel();
   if (state.snapshotMode) {
-    setStatus("Frozen offline snapshot loaded. Live actions are disabled.");
+    setStatus("Offline copy. Live actions are off.");
   }
   void fetchStorageViewRuntime(false, true);
   void refreshHistoryStatus(true);

@@ -413,7 +413,7 @@ function createFakeSelectDocument() {
 
 function enclosureOptionsHtml(aliasLabel) {
   return [
-    '<optgroup label="Live Enclosures">',
+    '<optgroup label="Enclosures">',
     '<option value="enclosure:enc-a">Shelf A</option>',
     `<option value="enclosure:enc-b">${aliasLabel}</option>`,
     "</optgroup>",
@@ -458,7 +458,7 @@ test("an option group relabel is not mistaken for an unchanged option list", () 
   const ownerDocument = createFakeSelectDocument();
   const select = createFakeSelect(ownerDocument);
   select.innerHTML = [
-    '<optgroup label="Saved Chassis Views">',
+    '<optgroup label="Saved layouts">',
     '<option value="view:view-a">Rack row</option>',
     "</optgroup>",
   ].join("");
@@ -468,7 +468,7 @@ test("an option group relabel is not mistaken for an unchanged option list", () 
     fns.setSelectOptionsIfChanged(
       select,
       [
-        '<optgroup label="Virtual Storage Views">',
+        '<optgroup label="Other disk groups">',
         '<option value="view:view-a">Rack row</option>',
         "</optgroup>",
       ].join(""),
@@ -476,5 +476,5 @@ test("an option group relabel is not mistaken for an unchanged option list", () 
     ),
     true,
   );
-  assert.equal(select.options[0].parentNode.label, "Virtual Storage Views");
+  assert.equal(select.options[0].parentNode.label, "Other disk groups");
 });

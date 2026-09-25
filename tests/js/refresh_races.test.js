@@ -669,9 +669,9 @@ test("mapping import preview lists every exact scope and slot classification", (
     unchanged: [{ enclosure_id: null, slot: 4 }],
   });
 
-  assert.match(message, /Add \(1\): enc-a slot 1.*serial=ADD/);
-  assert.match(message, /Update \(1\): enc-a slot 2.*serial: OLD → NEW/);
-  assert.match(message, /Remove \(1\): enc-b slot 3.*serial=REMOVE/);
+  assert.match(message, /Add \(1\): enc-a slot 1.*Serial ADD/);
+  assert.match(message, /Update \(1\): enc-a slot 2.*Serial: OLD → NEW/);
+  assert.match(message, /Remove \(1\): enc-b slot 3.*Serial REMOVE/);
   assert.match(message, /Unchanged \(1\): default enclosure slot 4/);
   assert.match(message, /^Restore these bay assignments\?/);
   assert.match(message, /inventory changes before you confirm/i);
