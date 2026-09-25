@@ -25,7 +25,12 @@ from app.metrics import install_metrics
 from app.script_json import register_script_json_filters
 from app.services.history_status import project_public_collector_status
 from app.services.release_status import ReleaseStatusService
-from history_service.collector import HistoryCollectionAlreadyRunning, HistoryCollector
+from history_service.collector import (
+    COLLECTION_PAUSED_REASON,
+    HistoryCollectionAlreadyRunning,
+    HistoryCollectionPaused,
+    HistoryCollector,
+)
 from history_service.config import HistorySettings, get_history_settings
 from history_service.domain import isoformat_utc, utcnow
 from history_service.operation_bounds import (
@@ -162,6 +167,8 @@ HISTORY_DIAGNOSTIC_STATUS_FIELDS = (
     # recovery indication has to be visible.
     "history_recovery_required",
     "history_quarantined_at",
+    "history_collection_paused",
+    "history_collection_paused_at",
     "last_error_kind",
     "last_error_summary",
     "last_retention_error_kind",
@@ -506,8 +513,12 @@ async def healthz() -> JSONResponse:
     # is read-only, cleanup failed twice in a row, or history needs recovery. A
     # failed manual refresh alone is shown in "Last error" but is not degraded.
     recovery_required = bool(collector_status.get("history_recovery_required"))
+    # Damage found at run time pauses collection (#417); that outranks an
+    # earlier quarantine because it is about the database in use right now.
     degraded_reason = (
-        "Earlier history was quarantined; recovery is required."
+        COLLECTION_PAUSED_REASON
+        if collector_status.get("history_collection_paused")
+        else "Earlier history was quarantined; recovery is required."
         if recovery_required
         else collector.degraded_reason()
     )
@@ -594,6 +605,15 @@ async def refresh_history(request: Request) -> dict[str, object] | JSONResponse:
                 "ok": False,
                 "mode": normalized_mode,
                 "detail": "History collection already running.",
+            },
+            status_code=409,
+        )
+    except HistoryCollectionPaused:
+        return JSONResponse(
+            {
+                "ok": False,
+                "mode": normalized_mode,
+                "detail": COLLECTION_PAUSED_REASON,
             },
             status_code=409,
         )

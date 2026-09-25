@@ -158,6 +158,16 @@
       ? `${collector.collection_kind || "background"} for ${formatDuration(collector.collection_elapsed_seconds)}: ${collector.collection_activity || "working"}`
       : "no";
     setText("status-current-collection", currentCollection);
+    // #417: damage found at run time pauses collection; keep the card current.
+    if (typeof collector.history_collection_paused === "boolean") {
+      setText(
+        "status-history-collection-paused",
+        collector.history_collection_paused
+          ? "yes, the database is damaged; nothing is written until it is recovered"
+          : "no",
+      );
+      document.getElementById("status-history-collection-paused")?.classList?.toggle("status-error", collector.history_collection_paused);
+    }
     setText("status-last-inventory-at", formatTimestamp(collector.last_inventory_at));
     setText("status-last-fast-metrics-at", formatTimestamp(collector.last_fast_metrics_at));
     setText("status-last-slow-metrics-at", formatTimestamp(collector.last_slow_metrics_at));
