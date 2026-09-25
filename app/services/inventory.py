@@ -12863,8 +12863,9 @@ class InventoryService:
         A SMART grid asks for one plan per bay. Plans that arrive while the
         host's connection is busy wait for the next round, and each round opens
         one connection (one handshake and host-key check) and runs its plans on
-        parallel channels. The per-host lock is held for the whole round, as it
-        was for a single plan, so other SSH work on the host still waits its turn.
+        parallel channels. The per-host lock is held for each round, as it was
+        for a single plan, and released between rounds, so other SSH work on the
+        host waits at most one round.
         """
         key = self._optional_ssh_backoff_key(host)
         future: asyncio.Future[list[SSHCommandResult]] = asyncio.get_running_loop().create_future()
@@ -12885,13 +12886,16 @@ class InventoryService:
             else SSHProbe(self.system.ssh.model_copy(update={"host": target_host}))
         )
         try:
-            async with self._ssh_session_lock_for_host(host):
-                while True:
-                    # Let requests released in the same loop turn join this round.
-                    for _ in range(SSH_PLAN_GATHER_TURNS):
-                        await asyncio.sleep(0)
-                    if not queue:
-                        break
+            while True:
+                # Let requests released in the same loop turn join this round.
+                for _ in range(SSH_PLAN_GATHER_TURNS):
+                    await asyncio.sleep(0)
+                if not queue:
+                    break
+                # Each round takes the host lock on its own, so SSH work already
+                # waiting on this host (an LED action, a disk-sync poll) runs
+                # between rounds instead of after the whole grid.
+                async with self._ssh_session_lock_for_host(host):
                     batch = list(queue)
                     queue.clear()
                     try:
@@ -12917,9 +12921,9 @@ class InventoryService:
                             if not future.done():
                                 future.set_exception(exc)
                         continue
-                    for (_planner, _commands, future), results in zip(batch, outcomes, strict=True):
-                        if not future.done():
-                            future.set_result(results)
+                for (_planner, _commands, future), results in zip(batch, outcomes, strict=True):
+                    if not future.done():
+                        future.set_result(results)
         except BaseException as exc:
             # The drain itself died (cancelled at shutdown, or a bug): no plan
             # may be left waiting on a round that will never run.

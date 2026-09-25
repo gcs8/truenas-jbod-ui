@@ -182,6 +182,54 @@ class HostKeyPolicyIsUnchangedTests(unittest.TestCase):
         self.assertGreater(counters["peak"], 1)
 
     @patch("app.services.ssh_probe.paramiko.SSHClient")
+    def test_planned_groups_settle_on_a_lower_server_session_limit(self, ssh_client_cls: MagicMock) -> None:
+        """A server with MaxSessions below 8 refuses extra channels; those commands wait and retry."""
+        server_limit = 3
+        lock = threading.Lock()
+        state = {"open": 0, "peak": 0, "refused": 0}
+        ok_exec = _exec_ok(delay=0.01)
+
+        def exec_command(command: str, timeout=None):
+            with lock:
+                if state["open"] >= server_limit:
+                    state["refused"] += 1
+                    raise paramiko.ChannelException(1, "Administratively prohibited")
+                state["open"] += 1
+                state["peak"] = max(state["peak"], state["open"])
+            try:
+                return ok_exec(command, timeout)
+            finally:
+                with lock:
+                    state["open"] -= 1
+
+        client = _fake_ssh_client()
+        client.exec_command.side_effect = exec_command
+        ssh_client_cls.return_value = client
+        known_hosts = "/var/lib/example/known_hosts"
+        groups = [((lambda _results: []), [f"smartctl -j -a /dev/da{bay}"]) for bay in range(12)]
+        with patch.object(SSHProbe, "_prepare_known_hosts_path", return_value=known_hosts):
+            outcomes = SSHProbe(_tofu_config(known_hosts))._run_planned_command_groups_sync(groups)
+
+        self.assertTrue(all(result.ok for outcome in outcomes for result in outcome))
+        self.assertEqual(sum(len(outcome) for outcome in outcomes), 12)
+        self.assertGreater(state["refused"], 0)
+        self.assertLessEqual(state["peak"], server_limit)
+        client.connect.assert_called_once()
+
+    @patch("app.services.ssh_probe.paramiko.SSHClient")
+    def test_a_refused_only_channel_fails_its_command_without_looping(self, ssh_client_cls: MagicMock) -> None:
+        client = _fake_ssh_client()
+        client.exec_command.side_effect = paramiko.ChannelException(1, "Administratively prohibited")
+        ssh_client_cls.return_value = client
+        known_hosts = "/var/lib/example/known_hosts"
+        with patch.object(SSHProbe, "_prepare_known_hosts_path", return_value=known_hosts):
+            outcomes = SSHProbe(_tofu_config(known_hosts))._run_planned_command_groups_sync(
+                [((lambda _results: []), ["a"])]
+            )
+        self.assertEqual([[result.ok for result in outcome] for outcome in outcomes], [[False]])
+        self.assertEqual(client.exec_command.call_count, 1)
+
+    @patch("app.services.ssh_probe.paramiko.SSHClient")
     def test_planned_groups_fail_every_group_when_the_host_key_is_rejected(self, ssh_client_cls: MagicMock) -> None:
         client = _fake_ssh_client()
         client.connect.side_effect = paramiko.SSHException("Server not found in known_hosts")
@@ -295,6 +343,49 @@ class PerHostPlanCoalescingTests(unittest.IsolatedAsyncioTestCase):
         release.set()
         await asyncio.gather(planned, batch)
         self.assertTrue(batch_started.is_set())
+        await self._drained()
+
+    async def test_the_host_lock_is_released_between_rounds(self) -> None:
+        """An LED batch waiting on the host runs before the next SMART round, not after the grid."""
+        release_first = asyncio.Event()
+        started = asyncio.Event()
+        order: list[str] = []
+
+        async def run_planned(_planner, *, initial_commands=None):
+            order.append("round-1")
+            started.set()
+            await release_first.wait()
+            return _ok(initial_commands or [])
+
+        async def run_groups(groups, *, max_parallel_channels):
+            order.append("round-2")
+            return [_ok(commands) for _planner, commands in groups]
+
+        async def run_commands(commands):
+            order.append("led")
+            return _ok(commands)
+
+        self.probe.run_planned_commands = AsyncMock(side_effect=run_planned)  # type: ignore[method-assign]
+        self.probe.run_planned_command_groups = AsyncMock(side_effect=run_groups)  # type: ignore[method-assign]
+        self.probe.run_commands = AsyncMock(side_effect=run_commands)  # type: ignore[method-assign]
+        first = asyncio.create_task(
+            self.service._run_ssh_planned_commands(lambda _r: [], initial_commands=["bay-0"], host=HOST)
+        )
+        await started.wait()
+        led = asyncio.create_task(self.service._run_ssh_commands(["led"], HOST))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        more = [
+            asyncio.create_task(
+                self.service._run_ssh_planned_commands(lambda _r: [], initial_commands=[f"bay-{bay}"], host=HOST)
+            )
+            for bay in (1, 2)
+        ]
+        for _ in range(5):
+            await asyncio.sleep(0)
+        release_first.set()
+        await asyncio.gather(first, led, *more)
+        self.assertEqual(order, ["round-1", "led", "round-2"])
         await self._drained()
 
     async def test_plans_for_different_hosts_never_share_a_round(self) -> None:
