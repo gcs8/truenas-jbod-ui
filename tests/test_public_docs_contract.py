@@ -171,6 +171,16 @@ class PublicDocsContractTests(unittest.TestCase):
         self.assertIn("trusted, isolated logging network", operations)
         self.assertIn("authenticated and encrypted", operations)
 
+    def test_retired_app_bind_keys_are_not_described_as_restart_only(self) -> None:
+        advanced = (ROOT / "wiki/Advanced-Configuration.md").read_text(encoding="utf-8")
+        changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        browser_qa = (ROOT / "qa/admin-operations.spec.js").read_text(encoding="utf-8")
+
+        self.assertNotIn("`app.host`, `app.port`", advanced)
+        self.assertNotIn("Only bind address, port, public origin", changelog)
+        self.assertNotIn('restart_settings: ["app.port"]', browser_qa)
+        self.assertIn('restart_settings: ["app.public_origin"]', browser_qa)
+
     def test_all_yaml_examples_parse(self) -> None:
         count = 0
         for relative_path in ("README.md", *sorted(EXPECTED_WIKI_PAGES)):

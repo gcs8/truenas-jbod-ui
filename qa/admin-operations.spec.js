@@ -275,7 +275,7 @@ test.describe("admin sidecar smoke", () => {
         json: {
           ...body,
           restart_required: ["ui"],
-          restart_settings: ["app.port"],
+          restart_settings: ["app.public_origin"],
           detail: "Timing saved. The main UI needs a restart to apply this.",
           runtime: { available: true, detail: null, containers: [uiContainer({})] },
         },
