@@ -15,7 +15,7 @@ supplies the policy; environment variables override single values (and
       full:                      # config + history database on a cron schedule
         enabled: false
         schedule: "0 3 * * *"
-        archive_format: 7z       # or tar.zst: much faster, needs this app version to restore
+        archive_format: tar.zst  # or 7z: portable (older app versions, plain 7-Zip) but slow
         local_keep: 7
         remote_keep: null
         remote_max_age_days: 90
@@ -106,9 +106,10 @@ class ConfigClassPolicy(_ClassPolicyBase):
 
 class FullClassPolicy(_ClassPolicyBase):
     schedule: str = "0 3 * * *"
-    # 7z stays the default: older app versions cannot read tar.zst full backups
-    # (#397). tar.zst is much faster for multi-GiB history.
-    archive_format: Literal["7z", "tar.zst"] = "7z"
+    # tar.zst (TJBENC02) is the default (#397): much faster for multi-GiB
+    # history. Older app versions and plain 7-Zip cannot read it; 7z keeps
+    # the portable format for operators who need that.
+    archive_format: Literal["7z", "tar.zst"] = "tar.zst"
 
     @field_validator("schedule")
     @classmethod

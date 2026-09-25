@@ -58,10 +58,26 @@ test.describe("admin sidecar smoke", () => {
     await expect(lockedPill).toHaveClass(/is-selected/);
     await expect(page.locator("#backup-encrypt-toggle")).toBeChecked();
     await expect(page.locator("#backup-encrypt-toggle")).toBeDisabled();
-    await expect(page.locator("#backup-packaging")).toHaveValue("7z");
     await expect(page.locator("#backup-path-summary")).toContainText(
       `${selectedBefore + 1} of`
     );
+
+    // #397: an encrypted FULL backup with history defaults to tar.zst (TJBENC02)
+    // and keeps 7z selectable; without history the locked selection forces 7z.
+    const historyPill = page.locator('#backup-path-list .path-pill[data-path-key="history_db"]');
+    if (!(await historyPill.getAttribute("class")).includes("is-selected")) {
+      await historyPill.click();
+    }
+    await expect(historyPill).toHaveClass(/is-selected/);
+    await expect(page.locator("#backup-packaging")).toHaveValue("tar.zst");
+    await expect(page.locator("#backup-packaging")).toBeEnabled();
+    await page.locator("#backup-packaging").selectOption("7z");
+    await expect(page.locator("#backup-packaging")).toHaveValue("7z");
+
+    await historyPill.click();
+    await expect(historyPill).not.toHaveClass(/is-selected/);
+    await expect(page.locator("#backup-packaging")).toHaveValue("7z");
+    await expect(page.locator("#backup-packaging")).toBeDisabled();
   });
 
   test("split debug scrub controls gate locked debug paths", async ({ page }) => {

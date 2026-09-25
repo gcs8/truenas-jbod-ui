@@ -114,12 +114,14 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(policy.max_age("full"), timedelta(days=30))
         self.assertEqual(policy.targets[0].label, "NAS")
 
-    def test_full_archive_format_defaults_to_7z_and_accepts_tar_zst(self) -> None:
-        # #397: the fast format is opt-in so older app versions can still restore by default.
+    def test_full_archive_format_defaults_to_tar_zst_and_accepts_7z(self) -> None:
+        # #397 (owner decision): tar.zst is the FULL default; 7z stays selectable.
         self.write({"full": {"enabled": True}})
+        self.assertEqual(load_backup_policy(self.config, {}).full.archive_format, "tar.zst")
+        policy = load_backup_policy(self.config, {"BACKUP_FULL_ARCHIVE_FORMAT": "7z"})
+        self.assertEqual(policy.full.archive_format, "7z")
+        self.write({"full": {"enabled": True, "archive_format": "7z"}})
         self.assertEqual(load_backup_policy(self.config, {}).full.archive_format, "7z")
-        policy = load_backup_policy(self.config, {"BACKUP_FULL_ARCHIVE_FORMAT": "tar.zst"})
-        self.assertEqual(policy.full.archive_format, "tar.zst")
         self.write({"full": {"archive_format": "zip"}})
         with self.assertRaises(ConfigurationError) as caught:
             load_backup_policy(self.config, {})

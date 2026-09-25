@@ -657,8 +657,9 @@ last.
 
 Schema 1 imports remain supported for hot-only deployments. Schema 2 import
 requires `HISTORY_SEGMENT_CATALOG_PATH` on the target. Multi-gigabyte schema 2
-FULL backups use encrypted portable 7z and the file-backed admin/scheduled
-paths. The byte-returning compatibility APIs remain capped at 256 MiB; the
+FULL backups use the encrypted `tar.zst` stream format (TJBENC02) by default,
+or encrypted portable 7z when `BACKUP_FULL_ARCHIVE_FORMAT=7z`, and the
+file-backed admin/scheduled paths. The byte-returning compatibility APIs remain capped at 256 MiB; the
 file-backed outer archive cap is 6 GiB, with independent member and expanded
 data caps. Legacy native scheduled AES-256-GCM envelopes remain readable within
 the compatibility byte cap. Locked secret groups require encrypted portable
