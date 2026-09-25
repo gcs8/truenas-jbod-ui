@@ -53,8 +53,17 @@
 
   <main class="admin-views">
     <div class="admin-view is-active" data-admin-view-panel="operations">
+      <nav class="admin-section-links" aria-label="On this page">
+        <span class="admin-section-links-label">Jump to:</span>
+        <a href="#admin-section-systems">Add or edit a system</a>
+        <a href="#admin-section-existing-systems">Existing systems</a>
+        <a href="#admin-section-containers">Containers</a>
+        <a href="#admin-section-timing">Timing</a>
+        <a href="#admin-section-backup">Backup and restore</a>
+        <a href="#admin-section-history">History cleanup</a>
+      </nav>
       <div class="admin-layout">
-        <section class="panel runtime-panel">
+        <section id="admin-section-containers" class="panel runtime-panel">
       <div class="panel-header">
         <div>
           <p class="eyebrow">Services</p>
@@ -68,7 +77,7 @@
       <div id="runtime-cards" class="runtime-cards"></div>
     </section>
 
-        <section class="panel runtime-panel">
+        <section id="admin-section-timing" class="panel runtime-panel">
       <div class="panel-header">
         <div>
           <p class="eyebrow">Settings</p>
@@ -87,7 +96,7 @@
       </div>
     </section>
 
-        <section class="panel backup-panel">
+        <section id="admin-section-backup" class="panel backup-panel">
       <div class="panel-header">
         <div>
           <p class="eyebrow">Backup</p>
@@ -242,6 +251,7 @@
           <p id="backup-import-result" class="subtle action-note">
             Restoring replaces all current settings, mappings and history with the backup.
           </p>
+          <h3 id="admin-section-history">History cleanup</h3>
           <p class="subtle action-note">
             Renamed a system? Adopt its history below to preserve it. Purge only when you intend to permanently delete removed-system history.
           </p>
@@ -274,7 +284,7 @@
       </div>
     </section>
 
-        <section class="panel setup-panel">
+        <section id="admin-section-systems" class="panel setup-panel">
       <div class="panel-header">
         <div>
           <p class="eyebrow">Systems</p>
@@ -911,7 +921,7 @@
             </div>
           </section>
 
-          <section class="preview-card">
+          <section id="admin-section-existing-systems" class="preview-card">
             <div class="preview-card-header">
               <h3>Existing systems</h3>
               <span id="current-default-system" class="badge">No default yet</span>
