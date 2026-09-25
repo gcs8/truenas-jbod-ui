@@ -282,6 +282,16 @@ class ImageOnlyUpgradeSmokeContractTests(unittest.TestCase):
         self.assertIn(f"v{workflow['jobs']['image-upgrade-smoke']['env']['PREVIOUS_VERSION']}", matrix)
         self.assertIn("Not tested yet", matrix)
 
+    def test_expected_history_view_matches_the_seed_shape(self):
+        smoke = self.load_smoke()
+        view = smoke.expected_history_view({1: 2, 4: 1})
+        self.assertEqual(view["events"], [[1, "disk_inserted", "SYNTH-0001", "SYNTH-0001"],
+                                          [4, "disk_inserted", "SYNTH-0004", "SYNTH-0004"]])
+        self.assertEqual(view["samples"], [[1, 30, "SYNTH-0001"], [1, 31, "SYNTH-0001"], [4, 30, "SYNTH-0004"]])
+        source = (self.ROOT / "scripts" / "run_image_upgrade_smoke.py").read_text(encoding="utf-8")
+        rollback = source.split("# 3. The new release writes", 1)[1]
+        self.assertIn("history_api_view((1, 2, 3, 4))", rollback)
+
     def test_seed_and_read_scripts_compile(self):
         smoke = self.load_smoke()
         for name, script in (

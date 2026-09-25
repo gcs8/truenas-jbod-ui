@@ -194,6 +194,42 @@ def get_json(url: str) -> tuple[int, dict]:
             return exc.code, {}
 
 
+def history_api_view(slots: tuple[int, ...]) -> dict[str, list]:
+    """Read seeded history through the running release's own history API.
+
+    Raw counts prove rows exist; this proves the running release can still
+    interpret them the way operators read them.
+    """
+    base = f"http://127.0.0.1:{HISTORY_PORT}/api/history/slots"
+    query = f"system_id={SMOKE_SYSTEM}&enclosure_id=shelf-a"
+    events: list = []
+    samples: list = []
+    for slot in slots:
+        status, payload = get_json(f"{base}/{slot}/events?{query}&limit=1000")
+        if status != 200:
+            raise SmokeError(f"history events API for slot {slot} returned {status}")
+        events.extend(
+            [slot, row.get("event_type"), row.get("current_value"), row.get("serial")]
+            for row in payload.get("events", [])
+        )
+        status, payload = get_json(f"{base}/{slot}/metrics?{query}&metric_name=temperature_c&limit=5000")
+        if status != 200:
+            raise SmokeError(f"history metrics API for slot {slot} returned {status}")
+        samples.extend(
+            [slot, row.get("value_integer"), row.get("serial")] for row in payload.get("samples", [])
+        )
+    return {"events": sorted(events), "samples": sorted(samples)}
+
+
+def expected_history_view(seeded: dict[int, int]) -> dict[str, list]:
+    """What SEED_HISTORY wrote: slot -> number of metric samples."""
+    events = [[slot, "disk_inserted", f"SYNTH-{slot:04d}", f"SYNTH-{slot:04d}"] for slot in seeded]
+    samples = [
+        [slot, 30 + minute, f"SYNTH-{slot:04d}"] for slot, count in seeded.items() for minute in range(count)
+    ]
+    return {"events": sorted(events), "samples": sorted(samples)}
+
+
 def check_runtime(deployment: Deployment, image: str, version: str, revision: str | None) -> dict:
     image_id = run(["docker", "image", "inspect", "--format", "{{.Id}}", image]).strip()
     rows = {}
@@ -259,6 +295,9 @@ def smoke(args: argparse.Namespace) -> str:
     expect(len(before_ui["mappings"]) == 3, f"seeded mappings not readable: {before_ui}")
     expect(before_history["counts"] == {"slot_state_current": 3, "slot_events": 3, "metric_samples": 12},
            f"seeded history not readable: {before_history}")
+    seeded = {1: 4, 2: 4, 3: 4}
+    expect(history_api_view((1, 2, 3)) == expected_history_view(seeded),
+           "previous release history API does not return the seeded records")
 
     # 2. Image-only upgrade: change JBOD_UI_IMAGE, pull, up -d. Nothing else.
     deployment.set_image(args.candidate_image)
@@ -271,6 +310,8 @@ def smoke(args: argparse.Namespace) -> str:
     expect(after_history["integrity"] == "ok", f"integrity_check after upgrade: {after_history['integrity']}")
     expect(after_history["user_version"] == after_history["current_schema"],
            f"history schema not migrated on startup: {after_history}")
+    expect(history_api_view((1, 2, 3)) == expected_history_view(seeded),
+           "upgraded history API does not return the predecessor's records")
     expect(sha256(config_path) == config_digest, "config.yaml changed during the upgrade")
     for name in ("data", "history", "config", "data/slot_mappings.json", "history/history.db"):
         expect(owner_uid(root / name) == 0, f"{name} ownership changed; the base upgrade must not migrate it")
@@ -287,13 +328,21 @@ def smoke(args: argparse.Namespace) -> str:
     expect(rolled_history["counts"] == {"slot_state_current": 4, "slot_events": 4, "metric_samples": 13},
            f"previous release cannot read successor history: {rolled_history}")
     expect(rolled_history["integrity"] == "ok", f"integrity_check after rollback: {rolled_history['integrity']}")
+    # The rolled-back release must serve both its own and the successor's
+    # records through its normal history API, not just count them.
+    seeded[4] = 1
+    expect(history_api_view((1, 2, 3, 4)) == expected_history_view(seeded),
+           "rolled-back history API does not return the successor-written records")
+    successor = [row for row in rolled_ui["mappings"] if row[1] == 4]
+    expect(successor == [["shelf-a", 4, "SYNTH-0004", "synthetic upgrade smoke"]],
+           f"rolled-back release reads the successor mapping differently: {successor}")
 
     return (
         f"{SUCCESS_PREFIX} previous={args.previous_version} candidate={args.candidate_version} "
         f"revision={args.candidate_revision} services={','.join(sorted(upgraded))} restarts=0 "
         f"mappings={len(after_ui['mappings'])} history_rows={sum(after_history['counts'].values())} "
         f"schema={after_history['user_version']} rollback_mappings={len(rolled_ui['mappings'])} "
-        f"rollback_history_rows={sum(rolled_history['counts'].values())}"
+        f"rollback_history_rows={sum(rolled_history['counts'].values())} history_api=ok"
     )
 
 
