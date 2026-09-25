@@ -469,6 +469,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Performance
 
+- The main page no longer waits for the admin health probe once it has an
+  answer: an expired answer is shown at once and refreshed in the
+  background, and startup probes admin before the first page load. (#598)
 - Storage views collect SMART data for history in batches of
   `HISTORY_SMART_BATCH_SIZE` slots through a new
   `POST /api/storage-views/{view_id}/slots/smart-batch` route, so a 60-slot

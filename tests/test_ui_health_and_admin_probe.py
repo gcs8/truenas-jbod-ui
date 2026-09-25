@@ -6,6 +6,8 @@ import io
 import json
 import socket
 import tempfile
+import threading
+import time
 import unittest
 import urllib.error
 from pathlib import Path
@@ -490,6 +492,10 @@ class AdminProbeCacheTests(unittest.TestCase):
     def setUp(self) -> None:
         app_main.ADMIN_PROBE_CACHE.clear()
         self.addCleanup(app_main.ADMIN_PROBE_CACHE.clear)
+        # Run the background refresh inline so each TTL test can count probes.
+        inline = patch.object(app_main, "_start_admin_probe_refresh", side_effect=app_main._refresh_admin_probe)
+        inline.start()
+        self.addCleanup(inline.stop)
 
     def test_failed_probe_is_remembered_for_ten_seconds(self) -> None:
         clock = [1000.0]
@@ -543,6 +549,147 @@ class AdminProbeCacheTests(unittest.TestCase):
     def test_launch_state_is_none_when_admin_is_not_configured(self) -> None:
         with patch.object(app_main, "_probe_admin_service") as probe:
             self.assertIsNone(app_main.resolve_admin_launch_url(_request(), Settings()))
+        probe.assert_not_called()
+
+
+class AdminProbeHotPathTests(unittest.TestCase):
+    """A page load never waits for an admin probe once there is an answer (#453)."""
+
+    URL = "http://admin.example.test:8002"
+
+    def setUp(self) -> None:
+        app_main.ADMIN_PROBE_CACHE.clear()
+        self.addCleanup(app_main.ADMIN_PROBE_CACHE.clear)
+        app_main._ADMIN_PROBE_REFRESHING.clear()
+        self.addCleanup(app_main._ADMIN_PROBE_REFRESHING.clear)
+
+    def _expire(self) -> None:
+        for entry in app_main.ADMIN_PROBE_CACHE.values():
+            entry.expires_at_monotonic = 0.0
+
+    def test_expired_answer_is_served_at_once_and_refreshed_in_the_background(self) -> None:
+        release = threading.Event()
+        started = threading.Event()
+        answers = iter([False, True])
+
+        def probe(_url: str, _timeout: float) -> bool:
+            answer = next(answers)
+            if answer:
+                started.set()
+                release.wait(5)
+            return answer
+
+        with patch.object(app_main, "_probe_admin_service", side_effect=probe) as mocked:
+            self.assertFalse(app_main.admin_service_reachable(self.URL, 0.75))
+            self._expire()
+            begun = time.perf_counter()
+            # The slow probe is still blocked, yet the lookup answers with the last state.
+            self.assertFalse(app_main.admin_service_reachable(self.URL, 0.75))
+            self.assertLess(time.perf_counter() - begun, 0.5)
+            self.assertTrue(started.wait(5))
+            # A second expired lookup while that probe runs starts no other probe.
+            self.assertFalse(app_main.admin_service_reachable(self.URL, 0.75))
+            release.set()
+            for _ in range(200):
+                if self.URL not in app_main._ADMIN_PROBE_REFRESHING:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(mocked.call_count, 2)
+        self.assertTrue(app_main.admin_service_reachable(self.URL, 0.75))
+
+    def test_failed_background_refresh_keeps_serving_and_retries(self) -> None:
+        with patch.object(app_main, "_probe_admin_service", return_value=True):
+            self.assertTrue(app_main.admin_service_reachable(self.URL, 0.75))
+        self._expire()
+        with (
+            patch.object(app_main, "_probe_admin_service", side_effect=RuntimeError("synthetic")),
+            patch.object(app_main, "_start_admin_probe_refresh",
+                         side_effect=lambda url, timeout: self.assertRaises(
+                             RuntimeError, app_main._refresh_admin_probe, url, timeout)),
+        ):
+            self.assertTrue(app_main.admin_service_reachable(self.URL, 0.75))
+        # The refresh marker is cleared, so the next lookup can try again.
+        self.assertNotIn(self.URL, app_main._ADMIN_PROBE_REFRESHING)
+
+    def test_refresh_landing_before_the_lock_is_not_repeated(self) -> None:
+        """A caller that read the expired entry re-checks the cache under the lock."""
+
+        with patch.object(app_main, "_probe_admin_service", return_value=False):
+            self.assertFalse(app_main.admin_service_reachable(self.URL, 0.75))
+        self._expire()
+        url = self.URL
+        real_lock = app_main._ADMIN_PROBE_LOCK
+
+        class RefreshLandsFirst:
+            """Lets another caller's refresh finish between the unlocked read and the lock."""
+
+            landed = False
+
+            def __enter__(self):
+                if not RefreshLandsFirst.landed:
+                    RefreshLandsFirst.landed = True
+                    app_main.ADMIN_PROBE_CACHE[url] = app_main.AdminProbeCacheEntry(
+                        reachable=True, expires_at_monotonic=time.monotonic() + 30,
+                    )
+                return real_lock.__enter__()
+
+            def __exit__(self, *exc):
+                return real_lock.__exit__(*exc)
+
+        with (
+            patch.object(app_main, "_ADMIN_PROBE_LOCK", RefreshLandsFirst()),
+            patch.object(app_main, "_probe_admin_service") as probe,
+            patch.object(app_main, "_start_admin_probe_refresh") as start,
+        ):
+            # The fresh answer wins over the stale pre-lock read; no second probe.
+            self.assertTrue(app_main.admin_service_reachable(self.URL, 0.75))
+        probe.assert_not_called()
+        start.assert_not_called()
+        self.assertNotIn(self.URL, app_main._ADMIN_PROBE_REFRESHING)
+
+    def test_concurrent_expired_lookups_start_one_refresh(self) -> None:
+        with patch.object(app_main, "_probe_admin_service", return_value=False):
+            self.assertFalse(app_main.admin_service_reachable(self.URL, 0.75))
+        self._expire()
+        gate = threading.Barrier(16)
+        results: list[bool] = []
+        results_lock = threading.Lock()
+
+        def page_load() -> None:
+            gate.wait(5)
+            answer = app_main.admin_service_reachable(self.URL, 0.75)
+            with results_lock:
+                results.append(answer)
+
+        with patch.object(app_main, "_probe_admin_service", return_value=True) as probe:
+            for _round in range(20):
+                threads = [threading.Thread(target=page_load) for _ in range(16)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(5)
+                gate.reset()
+                for _ in range(200):
+                    if self.URL not in app_main._ADMIN_PROBE_REFRESHING:
+                        break
+                    time.sleep(0.005)
+                # Every round after the first sees a fresh answer: no more probes.
+                self.assertEqual(probe.call_count, 1)
+        self.assertEqual(len(results), 16 * 20)
+        self.assertTrue(app_main.admin_service_reachable(self.URL, 0.75))
+
+    def test_startup_warm_fills_the_cache_before_the_first_page(self) -> None:
+        settings = Settings()
+        settings.admin.service_url = self.URL
+        with patch.object(app_main, "_probe_admin_service", return_value=False) as probe:
+            app_main.warm_admin_probe(settings)
+            self.assertIn(self.URL, app_main.ADMIN_PROBE_CACHE)
+            app_main.resolve_admin_launch_url(_request(), settings)
+        self.assertEqual(probe.call_count, 1)
+
+    def test_startup_warm_skips_an_unconfigured_admin(self) -> None:
+        with patch.object(app_main, "_probe_admin_service") as probe:
+            app_main.warm_admin_probe(Settings())
         probe.assert_not_called()
 
 
