@@ -642,13 +642,15 @@ def segmented_catalog_upgrade(args: argparse.Namespace) -> str:
     deployment.exec_python("enclosure-history", seed_script(SEED_HISTORY, (4,), metrics_per_slot=1))
     expect(deployment.exec_python("enclosure-history", READ_SEGMENTED_IDENTITY) == before_identity,
            "successor writes changed the immutable segmented catalog identity")
+    seeded[4] = 1
+    expect(history_api_view((1, 2, 3, 4)) == expected_history_view(seeded),
+           "upgraded release cannot combine segmented and successor-written records")
     deployment.set_image(args.previous_image)
     deployment.pull_and_up()
     check_runtime(deployment, args.previous_image, args.previous_version, None)
     rolled_identity = deployment.exec_python("enclosure-history", READ_SEGMENTED_IDENTITY)
     expect(rolled_identity == before_identity,
            f"segmented catalog identity changed across rollback: {rolled_identity} != {before_identity}")
-    seeded[4] = 1
     expect(history_api_view((1, 2, 3, 4)) == expected_history_view(seeded),
            "rolled-back release cannot read segmented and successor-written records")
 

@@ -443,8 +443,11 @@ class ImageOnlyUpgradeSmokeContractTests(unittest.TestCase):
                                           [4, "disk_inserted", "SYNTH-0004", "SYNTH-0004"]])
         self.assertEqual(view["samples"], [[1, 30, "SYNTH-0001"], [1, 31, "SYNTH-0001"], [4, 30, "SYNTH-0004"]])
         source = (self.ROOT / "scripts" / "run_image_upgrade_smoke.py").read_text(encoding="utf-8")
-        rollback = source.split("# 3. The new release writes", 1)[1]
-        self.assertIn("history_api_view((1, 2, 3, 4))", rollback)
+        segmented = source.split("def segmented_catalog_upgrade", 1)[1].split("\n\ndef ", 1)[0]
+        candidate_read = segmented.index("history_api_view((1, 2, 3, 4))")
+        rollback = segmented.index("deployment.set_image(args.previous_image)")
+        self.assertLess(candidate_read, rollback)
+        self.assertEqual(segmented.count("history_api_view((1, 2, 3, 4))"), 2)
 
     def test_seed_and_read_scripts_compile(self):
         smoke = self.load_smoke()
