@@ -446,7 +446,7 @@ test("backup export, debug export, and import errors are described instead of st
     "every raw payload?.detail throw must route through describeApiError"
   );
   for (const name of ["runExportBackup", "runExportDebugBundle", "runImportBackup"]) {
-    assert.match(functionSource(name), /describeApiError\(payload\?\.detail\)/, `${name} must describe API errors`);
+    assert.match(functionSource(name), /describeApiError\((?:payload|download)\?\.detail\)/, `${name} must describe API errors`);
   }
 });
 
