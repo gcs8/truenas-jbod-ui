@@ -116,6 +116,26 @@ class PublicDocsContractTests(unittest.TestCase):
             with self.subTest(internal_note=internal_note):
                 self.assertNotIn(internal_note, readme)
 
+    def test_readme_discovers_backup_scheduler_and_admin_backup_workflows(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        normalized = " ".join(readme.split())
+
+        for required in (
+            "--profile backup-scheduler",
+            "[Backups page](wiki/Backup-Restore-and-Debug-Bundles.md#editing-from-the-admin-backups-page)",
+            "[`docker-compose.backup-nfs.yml`](wiki/Backup-Restore-and-Debug-Bundles.md#nfs-targets)",
+            "[`docker-compose.history-bind.yml`](wiki/Upgrading.md#history)",
+            "filesystem, FTP/FTPS, SFTP, SMB, NFS, or S3",
+            "encrypted `tar.zst`",
+            "existing `.7z` backups remain readable",
+            "inspects the exact archive and asks for confirmation before import",
+            "Local and remote retention are configured independently",
+            "[Backup, restore, and debug bundles](wiki/Backup-Restore-and-Debug-Bundles.md)",
+            "[Upgrading](wiki/Upgrading.md)",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, normalized)
+
     def test_repository_has_exact_readme_and_wiki_document_set(self) -> None:
         actual = {path.relative_to(ROOT).as_posix() for path in (ROOT / "wiki").glob("*.md")}
 
