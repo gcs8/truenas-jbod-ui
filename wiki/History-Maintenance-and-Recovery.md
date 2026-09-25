@@ -95,6 +95,43 @@ not push it out and does not bring it forward. If that record cannot be read or
 written, `Cleanup waiting` says the retention wait record could not be read or
 written and nothing is pruned at all until the database is writable again.
 
+## Recover a damaged history database
+
+If SQLite reports the history database as damaged while the service is running
+(`database disk image is malformed` or `file is not a database`), collection
+stops writing to protect what is left. `/healthz` reports `degraded` with "The
+history database is damaged; collection is paused to protect it." The
+dashboard shows `Collection paused: yes`, and a manual refresh is refused. Reads
+stay available. The pause is recorded in a small marker file next to the
+database (`history.sqlite3.collection-paused`, holding only a timestamp), so a
+restart does not resume writing.
+
+The same state is used when startup had to quarantine an unreadable database
+and start an empty one (`Recovery required: yes`). The original file is kept
+next to the database as `*.broken-*` and is never deleted automatically.
+
+To recover:
+
+1. Restore a full backup that includes the history database from the admin
+   **Backups** page, or put a known-good copy of the database in place.
+2. Check the result:
+
+   ```bash
+   docker compose exec enclosure-history python -m history_service.recovery status
+   ```
+
+   `database_check` must read `ok`.
+3. Acknowledge the recovery:
+
+   ```bash
+   docker compose exec enclosure-history python -m history_service.recovery acknowledge
+   ```
+
+   This refuses and changes nothing while the integrity check fails. When the
+   check passes, it removes the pause marker and acknowledges a pending
+   quarantine. Collection resumes on the next pass. It does not touch
+   `*.broken-*` files or history rows, and it adds no network endpoint.
+
 ## Common procedures
 
 ### Rename a system

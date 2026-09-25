@@ -84,6 +84,21 @@ treat it as unverified, not as broken.
 The check is `scripts/run_image_upgrade_smoke.py`, run by the `Image-only
 upgrade smoke` CI job.
 
+Separately, `tests/test_history_released_schema_upgrades.py` upgrades synthetic
+history databases built from the exact released schemas of v0.8.0, v0.21.2 and
+v0.22.2 (v0.23.0 has the same schema as v0.22.2). The tests check row contents,
+disk identity keys, the row counters and the SQLite integrity check. They kill
+the upgrade after each startup migration step and prove the next start
+finishes it. They also refuse a database stamped newer than this build without
+changing it. That covers the history database schema only, not a full container
+upgrade from those releases.
+
+Every history schema change so far only adds columns, indexes and tables, so
+the previous release can still open an upgraded database. What a rollback must
+guarantee after a future change that is not additive (restore the pre-upgrade
+backup and lose later writes, or ship a down-migration) is still an open owner
+decision (#416).
+
 ## Rolling back a release
 
 Set `JBOD_UI_IMAGE` back to the recorded tag or digest and run the same `pull`

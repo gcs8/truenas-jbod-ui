@@ -123,7 +123,13 @@ from app.services.parsers import (
     parse_ssh_outputs,
     shift_hex_identifier,
 )
-from app.services.ssh_probe import SSHCommandResult, SSHProbe, redact_ssh_command
+from app.services.ssh_probe import (
+    MAX_PARALLEL_CHANNELS_PER_CONNECTION,
+    SSHCommandResult,
+    SSHProbe,
+    SSHSession,
+    redact_ssh_command,
+)
 from app.services.slot_detail_store import SlotDetailCacheEntry, SlotDetailStore
 from app.services.supermicro_bmc import BMCInventory, SupermicroBMCService
 from app.services.truenas_ws import (
@@ -371,6 +377,8 @@ SMART_SUMMARY_VALUE_FIELDS = tuple(
     if field_name not in {"available", "message"}
 )
 OPTIONAL_SSH_BATCH_FAILURE_BACKOFF_SECONDS = 30
+# Loop turns a per-host SSH round waits before choosing its plans.
+SSH_PLAN_GATHER_TURNS = 3
 PARSED_SSH_BUNDLE_CACHE_MAX_ENTRIES = 64
 QUANTASTOR_ENCLOSURE_OPTIONS_MAX_ENTRIES = 64
 SNAPSHOT_STATE_MAX_ENTRIES = 64
@@ -900,6 +908,9 @@ class SmartDetailBatch:
 
 
 _smart_detail_batch: ContextVar[SmartDetailBatch | None] = ContextVar("smart_detail_batch", default=None)
+# A reusable connection to the system's own SSH host for the current task, set
+# while a long command series such as the disk-sync poll loop runs.
+_ssh_command_session: ContextVar[SSHSession | None] = ContextVar("ssh_command_session", default=None)
 
 
 # What each SSH command is used for, reported beside a command failure in the
@@ -1054,6 +1065,11 @@ class InventoryService:
         self._snapshot_topology_generation = 0
         self._source_bundle_lock = asyncio.Lock()
         self._ssh_session_locks: dict[str, asyncio.Lock] = {}
+        # Planned SSH sessions waiting for the per-host connection, and the task
+        # that runs them. Requests that queue while one round runs share the
+        # next round's connection instead of each opening their own.
+        self._ssh_plan_queues: dict[str, list[tuple[Any, list[str], asyncio.Future]]] = {}
+        self._ssh_plan_drains: dict[str, asyncio.Task[None]] = {}
         self._disk_inventory_sync_lock = asyncio.Lock()
         self._disk_inventory_sync_active_job_id: int | None = None
         # Injected so tests can drive the full-sync poll loop with a fake clock.
@@ -3485,7 +3501,9 @@ class InventoryService:
             # fallback merge and the exports all claim to serve. The
             # values keep the timestamp of the read that produced them and are
             # marked stale, so nothing reads them as current.
-            previous = self._previous_slot_detail_entry(slot_view, loaded_entries=loaded_entries)
+            previous = self._previous_slot_detail_entry(
+                slot_view, loaded_entries=loaded_entries, current_identifiers=set(identifiers),
+            )
             if previous is not None and previous.smart_fields:
                 smart_fields = dict(previous.smart_fields)
                 smart_updated_at = previous.smart_updated_at or previous.updated_at
@@ -3508,6 +3526,7 @@ class InventoryService:
     def _previous_slot_detail_entry(
         self, slot_view: SlotView, *,
         loaded_entries: Mapping[str, SlotDetailCacheEntry] | None = None,
+        current_identifiers: set[str] | None = None,
     ) -> SlotDetailCacheEntry | None:
         """The stored entry for this bay, only when it describes this same disk."""
         store = self.slot_detail_store
@@ -3516,11 +3535,19 @@ class InventoryService:
         entry = store.get_entry(
             self.system.id, slot_view.enclosure_id, slot_view.slot, loaded_entries=loaded_entries,
         )
-        if entry is None or not self._slot_detail_entry_matches(slot_view, entry):
+        if entry is None or not self._slot_detail_entry_matches(
+            slot_view, entry, current_identifiers=current_identifiers,
+        ):
             return None
         return entry
 
-    def _slot_detail_entry_matches(self, slot_view: SlotView, entry: SlotDetailCacheEntry) -> bool:
+    def _slot_detail_entry_matches(
+        self,
+        slot_view: SlotView,
+        entry: SlotDetailCacheEntry,
+        *,
+        current_identifiers: set[str] | None = None,
+    ) -> bool:
         if slot_view.state == SlotState.empty or not slot_view.present:
             return False
         # Admit the entry when the two observations agree on hardware identity,
@@ -3546,7 +3573,8 @@ class InventoryService:
         # offers none is historical evidence about a different observation.
         if not shared_identity:
             return False
-        current_identifiers = self._slot_detail_identifiers(slot_view)
+        if current_identifiers is None:
+            current_identifiers = self._slot_detail_identifiers(slot_view)
         if not current_identifiers:
             return False
         return bool(current_identifiers.intersection({item.lower() for item in entry.identifiers}))
@@ -3751,18 +3779,41 @@ class InventoryService:
         return result
 
     async def _run_full_disk_inventory_sync(self, midclt: str, started: float) -> DiskInventorySyncResult:
-        start_result = await self._run_disk_inventory_sync_command(
-            [midclt, "call", "disk.sync_all"],
-            failure_prefix="TrueNAS could not start the full disk sync",
-        )
-        job_id = _parse_disk_inventory_sync_job_id(start_result.stdout)
-        if job_id is None:
-            raise TrueNASAPIError(
-                "TrueNAS did not return a job id for disk.sync_all, so the sync could not be tracked."
+        # Start and poll over one connection instead of logging in again for
+        # every poll: up to 90 logins per sync filled the NAS auth log and
+        # tripped sshd MaxStartups. The per-host lock is still taken per
+        # command, so LED actions can run between polls as before.
+        session = self.ssh_probe.open_session() if isinstance(self.ssh_probe, SSHProbe) else None
+        session_token = _ssh_command_session.set(session)
+        try:
+            start_result = await self._run_disk_inventory_sync_command(
+                [midclt, "call", "disk.sync_all"],
+                failure_prefix="TrueNAS could not start the full disk sync",
             )
-        self._disk_inventory_sync_active_job_id = job_id
-        timeout_seconds = max(1, int(self.settings.app.disk_inventory_sync_timeout_seconds))
-        poll_interval = max(0.0, float(self.settings.app.disk_inventory_sync_poll_interval_seconds))
+            job_id = _parse_disk_inventory_sync_job_id(start_result.stdout)
+            if job_id is None:
+                raise TrueNASAPIError(
+                    "TrueNAS did not return a job id for disk.sync_all, so the sync could not be tracked."
+                )
+            self._disk_inventory_sync_active_job_id = job_id
+            timeout_seconds = max(1, int(self.settings.app.disk_inventory_sync_timeout_seconds))
+            poll_interval = max(0.0, float(self.settings.app.disk_inventory_sync_poll_interval_seconds))
+            return await self._poll_disk_inventory_sync_job(
+                midclt, job_id, started, timeout_seconds, poll_interval,
+            )
+        finally:
+            _ssh_command_session.reset(session_token)
+            if session is not None:
+                await asyncio.to_thread(session.close)
+
+    async def _poll_disk_inventory_sync_job(
+        self,
+        midclt: str,
+        job_id: int,
+        started: float,
+        timeout_seconds: int,
+        poll_interval: float,
+    ) -> DiskInventorySyncResult:
         while True:
             state, error = await self._get_disk_inventory_sync_job_state(midclt, job_id)
             elapsed = self._disk_inventory_sync_elapsed(started)
@@ -4170,19 +4221,31 @@ class InventoryService:
         # a batch destroy every other slot's stale-serve entry and force
         # foreground refetches across the grid.  Evicting past the horizon also
         # bounds how old a stale-served summary can get.
+        #
+        # The full scan runs only when an entry has actually passed the
+        # horizon. Checking that is one C-level min() over the expiry values;
+        # the scan itself used to run on every lookup and store in a warm grid.
+        # No cached bound is kept, so an expiry changed in place is
+        # still seen on the next call.
         now = utcnow()
         eviction_horizon = now - self._smart_cache_stale_retention()
-        expired_keys = {
-            cache_key
-            for cache_key in set(self._smart_cache) | set(self._smart_cache_until)
-            if self._smart_cache_until.get(cache_key, datetime.min.replace(tzinfo=timezone.utc))
-            <= eviction_horizon
-        }
-        if self._remove_smart_cache_keys(expired_keys):
-            self._observe_inventory_cache_metrics()
-        for cache_key, (_summary, expires_at) in tuple(self._smart_negative_cache.items()):
-            if expires_at <= now:
-                self._smart_negative_cache.pop(cache_key, None)
+        smart_until = self._smart_cache_until
+        if (smart_until and min(smart_until.values()) <= eviction_horizon) or not (
+            self._smart_cache.keys() <= smart_until.keys()
+        ):
+            expired_keys = {
+                cache_key
+                for cache_key in set(self._smart_cache) | set(smart_until)
+                if smart_until.get(cache_key, datetime.min.replace(tzinfo=timezone.utc))
+                <= eviction_horizon
+            }
+            if self._remove_smart_cache_keys(expired_keys):
+                self._observe_inventory_cache_metrics()
+        negative = self._smart_negative_cache
+        if negative and min(expires_at for _summary, expires_at in negative.values()) <= now:
+            for cache_key, (_summary, expires_at) in tuple(negative.items()):
+                if expires_at <= now:
+                    negative.pop(cache_key, None)
 
     def _store_smart_summary_cache(
         self,
@@ -4191,8 +4254,12 @@ class InventoryService:
         *,
         expires_at: datetime | None = None,
         expected_generation: SmartCacheGenerationToken | None = None,
+        cache_key: SmartCacheKey | None = None,
     ) -> bool:
-        cache_key = self._smart_cache_key(slot_view)
+        # Callers that already hold the lookup's key pass it in, so one SMART
+        # lookup derives its candidate devices once, not per store.
+        if cache_key is None:
+            cache_key = self._smart_cache_key(slot_view)
         if summary.available is False or not self._smart_disk_is_current(cache_key):
             return False
         if (
@@ -4406,6 +4473,7 @@ class InventoryService:
                 slot_view,
                 summary,
                 expected_generation=generation_token,
+                cache_key=cache_key,
             ):
                 await persist(summary)
                 self._observe_inventory_cache_metrics()
@@ -4433,6 +4501,7 @@ class InventoryService:
                 slot_view,
                 summary,
                 expected_generation=generation_token,
+                cache_key=cache_key,
             ):
                 await persist(summary)
                 self._observe_inventory_cache_metrics()
@@ -4456,6 +4525,7 @@ class InventoryService:
                 persisted,
                 expires_at=utcnow(),
                 expected_generation=generation_token,
+                cache_key=cache_key,
             ):
                 self._schedule_background_smart_refresh(cache_key, slot_view)
                 self._observe_inventory_cache_metrics()
@@ -4475,6 +4545,7 @@ class InventoryService:
                     slot_view,
                     summary,
                     expected_generation=generation_token,
+                    cache_key=cache_key,
                 ):
                     await persist(summary)
                     self._observe_inventory_cache_metrics()
@@ -4551,6 +4622,7 @@ class InventoryService:
                 slot_view,
                 api_summary,
                 expected_generation=generation_token,
+                cache_key=cache_key,
             ):
                 await persist(api_summary)
                 self._observe_inventory_cache_metrics()
@@ -4569,6 +4641,7 @@ class InventoryService:
                     slot_view,
                     ssh_summary,
                     expected_generation=generation_token,
+                    cache_key=cache_key,
                 ):
                     await persist(ssh_summary)
                     self._observe_inventory_cache_metrics()
@@ -10270,6 +10343,7 @@ class InventoryService:
                 ssh_data,
                 filter_value=filter_value,
                 excluded_ids=primary_ids | selected_ids,
+                finalize=False,
             ):
                 if enclosure.id in seen_ids:
                     continue
@@ -10277,7 +10351,7 @@ class InventoryService:
                 options.append(enclosure)
 
         if self.system.truenas.platform == "scale":
-            for enclosure in self._build_scale_linux_enclosure_options(ssh_data):
+            for enclosure in self._build_scale_linux_enclosure_options(ssh_data, finalize=False):
                 if enclosure.id in seen_ids:
                     continue
                 seen_ids.add(enclosure.id)
@@ -10318,7 +10392,10 @@ class InventoryService:
         *,
         filter_value: str | None,
         excluded_ids: set[str],
+        finalize: bool = True,
     ) -> list[EnclosureOption]:
+        # `finalize=False` leaves alias labels to a caller that finalizes the
+        # merged list, so the alias file is read once per build.
         options: list[EnclosureOption] = []
         for enclosure in ssh_data.ses_enclosures:
             option = self._ses_enclosure_to_option(enclosure)
@@ -10335,18 +10412,19 @@ class InventoryService:
             if filter_value and filter_value not in haystack:
                 continue
             options.append(option)
-        return self._finalize_enclosure_options(
-            sorted(
-                options,
-                key=lambda item: (
-                    0 if "front" in item.label.lower() else 1 if "rear" in item.label.lower() else 2,
-                    item.slot_count or 0,
-                    item.label,
-                ),
-            )
+        ordered = sorted(
+            options,
+            key=lambda item: (
+                0 if "front" in item.label.lower() else 1 if "rear" in item.label.lower() else 2,
+                item.slot_count or 0,
+                item.label,
+            ),
         )
+        return self._finalize_enclosure_options(ordered) if finalize else ordered
 
-    def _build_scale_linux_enclosure_options(self, ssh_data: ParsedSSHData) -> list[EnclosureOption]:
+    def _build_scale_linux_enclosure_options(
+        self, ssh_data: ParsedSSHData, *, finalize: bool = True,
+    ) -> list[EnclosureOption]:
         options: list[EnclosureOption] = []
         for enclosure in ssh_data.ses_enclosures:
             option = self._ses_enclosure_to_option(enclosure)
@@ -10380,16 +10458,15 @@ class InventoryService:
                 )
             options.append(option)
 
-        return self._finalize_enclosure_options(
-            sorted(
-                options,
-                key=lambda item: (
-                    0 if "front" in item.label.lower() else 1 if "rear" in item.label.lower() else 2,
-                    item.slot_count or 0,
-                    item.label,
-                ),
-            )
+        ordered = sorted(
+            options,
+            key=lambda item: (
+                0 if "front" in item.label.lower() else 1 if "rear" in item.label.lower() else 2,
+                item.slot_count or 0,
+                item.label,
+            ),
         )
+        return self._finalize_enclosure_options(ordered) if finalize else ordered
 
     def _finalize_enclosure_options(self, options: list[EnclosureOption]) -> list[EnclosureOption]:
         aliases = (
@@ -12072,10 +12149,11 @@ class InventoryService:
             model = ssh_data.camcontrol_models.get(device_name.lower())
         multipath = self._build_multipath_view(disk, ssh_data)
 
-        identify_active = bool(raw_slot_status.get("identify_active")) or self._status_contains(raw_slot_status, "identify", "led=locate")
+        status_haystack = self._status_haystack(raw_slot_status)
+        identify_active = bool(raw_slot_status.get("identify_active")) or self._haystack_contains(status_haystack, "identify", "led=locate")
         if not identify_active and slot in ssh_data.unifi_led_states:
             identify_active = ssh_data.unifi_led_states[slot]
-        faulty = self._status_contains(raw_slot_status, "fault") or self._health_is_bad(
+        faulty = self._haystack_contains(status_haystack, "fault") or self._health_is_bad(
             disk.health if disk else None,
             zpool.health if zpool else None,
             normalize_text(raw_slot_status.get("status")),
@@ -12097,7 +12175,7 @@ class InventoryService:
             )
         )
         empty = raw_present is False or (
-            raw_present is None and not disk and self._status_contains(raw_slot_status, "empty", "not installed", "absent")
+            raw_present is None and not disk and self._haystack_contains(status_haystack, "empty", "not installed", "absent")
         )
         # When SES explicitly reports the bay empty, only a resolved disk may
         # override it. Status keywords, identify LEDs, and fault codes can all
@@ -12109,9 +12187,9 @@ class InventoryService:
         # keywords must not fire on a negated status: "Not installed" contains
         # "installed" and used to mark an API-only empty bay present=True while
         # its state was already empty.
-        status_says_populated = self._status_contains(
-            raw_slot_status, "ok", "installed", "ready", "present"
-        ) and not self._status_contains(raw_slot_status, "not installed", "empty", "absent")
+        status_says_populated = self._haystack_contains(
+            status_haystack, "ok", "installed", "ready", "present"
+        ) and not self._haystack_contains(status_haystack, "not installed", "empty", "absent")
         present = False if quantastor_ses_empty else (
             raw_present is True
             or disk is not None
@@ -12544,6 +12622,10 @@ class InventoryService:
         if not self._ssh_destination_authority_approved(host):
             return self._ssh_authority_failure_results([command])[0]
         ssh_probe: Any = self.ssh_probe
+        session = _ssh_command_session.get()
+        if session is not None and (not normalize_text(host) or normalize_text(host) == normalize_text(self.system.ssh.host)):
+            async with self._ssh_session_lock_for_host(host):
+                return await asyncio.to_thread(session.run_command, command, timeout_seconds=timeout_seconds)
         if isinstance(ssh_probe, SSHProbe):
             async with self._ssh_session_lock_for_host(host):
                 target_host = normalize_text(host)
@@ -12713,17 +12795,7 @@ class InventoryService:
             return backoff_results
 
         if isinstance(self.ssh_probe, SSHProbe):
-            target_host = normalize_text(host)
-            probe = (
-                self.ssh_probe
-                if not target_host or target_host == normalize_text(self.system.ssh.host)
-                else SSHProbe(self.system.ssh.model_copy(update={"host": target_host}))
-            )
-            async with self._ssh_session_lock_for_host(host):
-                results = await probe.run_planned_commands(
-                    planner,
-                    initial_commands=initial_list,
-                )
+            results = await self._queue_ssh_plan(planner, initial_list, host)
             self._record_optional_ssh_batch_failure(results, host)
             return results
 
@@ -12744,6 +12816,96 @@ class InventoryService:
             results.extend(await self._run_ssh_commands(pending, host))
             pending = unseen(planner(list(results)))
         return results
+
+    async def _queue_ssh_plan(
+        self, planner: Any, initial_commands: list[str], host: str | None,
+    ) -> list[SSHCommandResult]:
+        """Run one command plan on the host's next shared SSH connection.
+
+        A SMART grid asks for one plan per bay. Plans that arrive while the
+        host's connection is busy wait for the next round, and each round opens
+        one connection (one handshake and host-key check) and runs its plans on
+        parallel channels. The per-host lock is held for each round, as it was
+        for a single plan, and released between rounds, so other SSH work on the
+        host waits at most one round.
+        """
+        key = self._optional_ssh_backoff_key(host)
+        future: asyncio.Future[list[SSHCommandResult]] = asyncio.get_running_loop().create_future()
+        self._ssh_plan_queues.setdefault(key, []).append((planner, initial_commands, future))
+        drain = self._ssh_plan_drains.get(key)
+        if drain is None or drain.done():
+            drain = asyncio.create_task(self._drain_ssh_plans(key, host))
+            drain.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+            self._ssh_plan_drains[key] = drain
+        return await _await_retained(future)
+
+    async def _drain_ssh_plans(self, key: str, host: str | None) -> None:
+        queue = self._ssh_plan_queues.setdefault(key, [])
+        target_host = normalize_text(host)
+        probe = (
+            self.ssh_probe
+            if not target_host or target_host == normalize_text(self.system.ssh.host)
+            else SSHProbe(self.system.ssh.model_copy(update={"host": target_host}))
+        )
+        try:
+            while True:
+                # Let requests released in the same loop turn join this round.
+                for _ in range(SSH_PLAN_GATHER_TURNS):
+                    await asyncio.sleep(0)
+                if not queue:
+                    break
+                # Each round takes the host lock on its own, so SSH work already
+                # waiting on this host (an LED action, a disk-sync poll) runs
+                # between rounds instead of after the whole grid.
+                async with self._ssh_session_lock_for_host(host):
+                    batch = list(queue)
+                    queue.clear()
+                    try:
+                        if len(batch) == 1:
+                            planner, commands, _future = batch[0]
+                            outcomes = [await probe.run_planned_commands(planner, initial_commands=commands)]
+                        else:
+                            outcomes = await probe.run_planned_command_groups(
+                                [(planner, commands) for planner, commands, _future in batch],
+                                max_parallel_channels=min(len(batch), MAX_PARALLEL_CHANNELS_PER_CONNECTION),
+                            )
+                    except asyncio.CancelledError:
+                        for _planner, _commands, future in batch:
+                            future.cancel()
+                        raise
+                    except Exception as exc:  # noqa: BLE001 - handed to each waiter.
+                        # Drop this frame from the traceback first: a waiter
+                        # that clears its frames (unittest's assertRaises does)
+                        # would otherwise close this suspended drain and strand
+                        # every plan still queued behind it.
+                        exc = exc.with_traceback(None)
+                        for _planner, _commands, future in batch:
+                            if not future.done():
+                                future.set_exception(exc)
+                        continue
+                for (_planner, _commands, future), results in zip(batch, outcomes, strict=True):
+                    if not future.done():
+                        future.set_result(results)
+        except BaseException as exc:
+            # The drain itself died (cancelled at shutdown, or a bug): no plan
+            # may be left waiting on a round that will never run.
+            waiting, queue[:] = list(queue), []
+            for _planner, _commands, future in waiting:
+                if future.done():
+                    continue
+                if isinstance(exc, asyncio.CancelledError):
+                    future.cancel()
+                else:
+                    future.set_exception(RuntimeError(f"SSH plan queue stopped: {exc}"))
+            raise
+        finally:
+            if self._ssh_plan_drains.get(key) is asyncio.current_task():
+                self._ssh_plan_drains.pop(key, None)
+            if queue:
+                # Arrived after the last round was chosen; give them their own.
+                drain = asyncio.create_task(self._drain_ssh_plans(key, host))
+                drain.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+                self._ssh_plan_drains[key] = drain
 
     async def _run_ssh_commands(
         self,
@@ -13246,12 +13408,20 @@ class InventoryService:
         Descriptors, hints, and vendor payloads are free text ("Drive bay 3
         fault LED" names an LED, not a fault) and never take part.
         """
-        haystack = " ".join(
+        return InventoryService._haystack_contains(InventoryService._status_haystack(raw_status), *needles)
+
+    @staticmethod
+    def _status_haystack(raw_status: dict[str, Any]) -> str:
+        """The lowercase status text `_status_contains` searches; build it once per slot."""
+        return " ".join(
             str(raw_status.get(key)).lower()
             for key in SLOT_STATUS_TEXT_KEYS
             if raw_status.get(key) is not None
             and not isinstance(raw_status.get(key), (dict, list, tuple, set))
         )
+
+    @staticmethod
+    def _haystack_contains(haystack: str, *needles: str) -> bool:
         if not haystack:
             return False
         return any(

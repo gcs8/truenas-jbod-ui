@@ -171,6 +171,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- History collection now pauses when SQLite reports the database damaged
+  while the service is running, instead of retrying writes every pass. The
+  pause survives restarts, shows on the dashboard and as `degraded` in
+  `/healthz`, and is cleared with `python -m history_service.recovery
+  acknowledge` once the database passes its integrity check (#604).
 - Saved copies and the public demo hide the bay assignment editor, the
   Storage Fabric refresh button and selectors with nothing to switch to,
   instead of showing them disabled. (#587)
@@ -469,6 +474,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Performance
 
+- SSH SMART reads that overlap on a host now share one connection and run
+  on up to 8 channels, so `smart_batch_max_concurrency` speeds up SSH grids
+  (60 bays: 60 connections to 5, 13.9 s to 1.6 s in the modeled benchmark).
+  A full disk sync starts and polls over one connection instead of logging
+  in for every poll. (#605)
 - The main page no longer waits for the admin health probe once it has an
   answer: an expired answer is shown at once and refreshed in the
   background, and startup probes admin before the first page load. (#598)
@@ -575,6 +585,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Removed dead code: the legacy `__default__` snapshot key, zero-caller and
   test-only helpers, monkeypatch-only wrappers and the unused "Scrambled IDs"
   label; named three layout magic numbers. (#606)
+- Tested history upgrades from the released v0.8.0, v0.21.2 and v0.22.2
+  schemas, including a kill after each startup migration step, a second start
+  that changes nothing, the previous release reading an upgraded database, and
+  refusal of a newer database before any write (#603).
 - The production container smoke now starts the main UI under
   `docker-compose.yml` plus `docker-compose.nonroot.yml` with an unedited copy
   of `.env.example`, checks `/livez` and `/healthz`, and checks that the

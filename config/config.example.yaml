@@ -33,7 +33,9 @@ app:
   startup_warm_cache_enabled: false
   # Also read SMART detail for every disk at startup (slower start, faster first page).
   startup_warm_smart_enabled: false
-  # Upper bound on SMART reads running at the same time.
+  # Upper bound on SMART reads running at the same time. Over SSH, reads that
+  # overlap on one host share a single connection and run on up to 8 channels
+  # of it, so raising this past 8 does not add SSH parallelism.
   smart_batch_max_concurrency: 12
   # Delay before the main UI starts fetching SMART detail in the background.
   smart_prefetch_delay_ms: 120

@@ -77,6 +77,7 @@
         <p>Times use your browser's local time. Without JavaScript, timestamps include their recorded UTC offset.</p>
         <dl>
           <dt>Recovery required</dt><dd id="status-history-recovery-required" class="{{ 'status-error' if status.get('history_recovery_required') else '' }}">{{ 'yes, earlier history was quarantined and this database started empty' if status.get('history_recovery_required') else 'no' }}</dd>
+          <dt>Collection paused</dt><dd id="status-history-collection-paused" class="{{ 'status-error' if status.get('history_collection_paused') else '' }}">{{ 'yes, the database is damaged; nothing is written until it is recovered' if status.get('history_collection_paused') else 'no' }}</dd>
           <dt>History quarantined at</dt><dd id="status-history-quarantined-at">{{ timestamp(status.get('history_quarantined_at'), 'never') }}</dd>
           <dt>Collecting now</dt><dd id="status-current-collection">{{ current_collection_label if status.get('collection_running') else 'no' }}</dd>
           <dt>Last shelf scan</dt><dd id="status-last-inventory-at">{{ timestamp(status.get('last_inventory_at'), 'never') }}</dd>
