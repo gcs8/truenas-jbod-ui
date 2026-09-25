@@ -115,6 +115,39 @@ class CIWorkflowContractTests(unittest.TestCase):
             workflow_text,
         )
 
+    def test_container_smoke_starts_hardened_compose_from_verbatim_env_example(self) -> None:
+        workflow = yaml.safe_load(self.read(CI_WORKFLOW))
+        steps = workflow["jobs"]["container-smoke"]["steps"]
+        names = [step.get("name") for step in steps]
+        step_name = "Start hardened Compose from a verbatim .env.example"
+        self.assertIn(step_name, names)
+        self.assertGreater(
+            names.index(step_name),
+            names.index("Build production image and verify cache-only health"),
+        )
+        build_run = steps[names.index("Build production image and verify cache-only health")]["run"]
+        self.assertIn('printf \'CI_SMOKE_IMAGE_ID=%s\\n\' "$image_id" >> "$GITHUB_ENV"', build_run)
+        step = steps[names.index(step_name)]
+        # Only the image comes from the shell environment; .env stays unedited.
+        self.assertEqual(step["env"], {"JBOD_UI_IMAGE": "${{ env.CI_SMOKE_IMAGE_ID }}"})
+        run = step["run"]
+        self.assertIn('cp docker-compose.yml "$env_example_root/compose.yaml"', run)
+        self.assertIn('cp docker-compose.nonroot.yml "$env_example_root/nonroot.yaml"', run)
+        self.assertIn('cp .env.example "$env_example_root/.env"', run)
+        self.assertIn('cmp .env.example "$env_example_root/.env"', run)
+        self.assertNotIn('>> "$env_example_root/.env"', run)
+        self.assertNotIn('> "$env_example_root/.env"', run)
+        self.assertIn('-f "$env_example_root/nonroot.yaml"', run)
+        self.assertIn("compose_env_example up -d enclosure-ui", run)
+        self.assertIn("trap cleanup EXIT", run)
+        self.assertIn("compose_env_example down --volumes --remove-orphans", run)
+        self.assertIn("http://127.0.0.1:8080/livez", run)
+        self.assertIn("http://127.0.0.1:8080/healthz", run)
+        self.assertIn('assert health["status"] != "down", health', run)
+        self.assertIn("{{.State.Status}} {{.RestartCount}}", run)
+        self.assertIn('= "running 0"', run)
+        self.assertIn("env_example_hardened_compose_ui=ok restart_count=0", run)
+
     def test_ci_runs_admin_browser_qa_against_cleanroom_fixture_without_skips(self) -> None:
         workflow = yaml.safe_load(self.read(CI_WORKFLOW))
         config = yaml.safe_load(self.read(ADMIN_CLEANROOM_CONFIG))
