@@ -219,7 +219,7 @@ class PerfConfigTests(unittest.TestCase):
                 settings = get_settings()
                 get_settings.cache_clear()
 
-            self.assertEqual(settings.app.port, 8080)
+            self.assertNotIn("port", settings.app.model_dump())
             self.assertEqual(settings.app.source_bundle_cache_ttl_seconds, 150)
             self.assertNotEqual(Path(settings.paths.mapping_file), Path("C:/should/not/win.json"))
 

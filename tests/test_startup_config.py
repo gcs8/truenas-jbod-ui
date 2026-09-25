@@ -224,6 +224,45 @@ class UnknownConfigKeyTests(_LoaderTestCase):
             get_settings()
         self.assertEqual(logs.output, ["WARNING:app.config:config.yaml: unknown key `app.verify_ssl` is ignored."])
 
+    def test_retired_app_host_and_port_start_fine_with_a_pointer_to_env(self) -> None:
+        self.assertNotIn("host", AppConfig.model_fields)
+        self.assertNotIn("port", AppConfig.model_fields)
+        self.assertNotIn("APP_HOST", APP_ENV_OVERRIDES)
+        self.assertNotIn("APP_PORT", APP_ENV_OVERRIDES)
+        example = yaml.safe_load((ROOT / "config" / "config.example.yaml").read_text(encoding="utf-8"))
+        self.assertNotIn("host", example["app"])
+        self.assertNotIn("port", example["app"])
+
+        yaml_text = "app:\n  host: 0.0.0.0\n  port: 8080\n  refresh_interval_seconds: 45\n"
+        # APP_PORT stays in .env for Compose, and Compose passes .env into the
+        # container; the settings loader must neither read it nor complain.
+        env = {"APP_HOST": "0.0.0.0", "APP_PORT": "18080"}
+        with self.main_ui_environment(env, yaml_text), self.assertLogs("app.config", level="WARNING") as logs:
+            settings = get_settings()
+            warnings = build_unknown_config_key_warnings(settings)
+
+        pointer = "is no longer used and is ignored; set the main UI port with APP_PORT and its address with APP_BIND_ADDRESS in .env."
+        self.assertEqual(
+            logs.output,
+            [
+                f"WARNING:app.config:config.yaml: `app.host` {pointer}",
+                f"WARNING:app.config:config.yaml: `app.port` {pointer}",
+            ],
+        )
+        for line in logs.output:
+            with self.subTest(line=line):
+                self.assertNotIn("did you mean", line)
+                self.assertNotIn("\n", line)
+        self.assertEqual([warning["key"] for warning in warnings], ["app.host", "app.port"])
+        self.assertEqual(warnings[1]["message"], f"config.yaml: `app.port` {pointer}")
+        # The rest of the app section still applies.
+        self.assertEqual(settings.app.refresh_interval_seconds, 45)
+        self.assertNotIn("port", settings.app.model_dump())
+
+    def test_compose_still_publishes_the_ui_from_env(self) -> None:
+        compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+        self.assertIn('"${APP_BIND_ADDRESS:-0.0.0.0}:${APP_PORT:-8080}:8000"', compose)
+
     def test_unknown_key_names_the_closest_valid_key(self) -> None:
         yaml_text = "backup:\n  full:\n    enabled: true\nhistroy:\n  timeout_seconds: 5\n"
         with self.main_ui_environment({}, yaml_text), self.assertLogs("app.config", level="WARNING") as logs:
@@ -271,7 +310,7 @@ class UnknownConfigKeyTests(_LoaderTestCase):
             ],
         )
         # Warn only: the main UI still starts and a valid key elsewhere still applies.
-        self.assertEqual(settings.app.port, 8080)
+        self.assertEqual(settings.app.refresh_interval_seconds, 30)
 
     def test_backups_typo_really_stops_the_scheduler_policy(self) -> None:
         from history_service.backup_archive.policy import load_backup_policy

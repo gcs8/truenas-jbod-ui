@@ -2962,12 +2962,10 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         journal.assert_called_once_with("runtime_overrides.save", "source_bundle_cache_ttl_seconds")
 
     def test_config_save_still_marks_restart_for_restart_only_settings(self) -> None:
-        """Bind/port, public origin, debug docs, perf and paths need a new main UI process (#432)."""
+        """Public origin, debug docs, perf and paths need a new main UI process (#432/#615)."""
         route = next(route for route in admin_app.routes if route.path == "/api/admin/runtime-behavior")
         before = Settings(config_file="/app/config/config.yaml")
         cases = {
-            "app.host": {"app": before.app.model_copy(update={"host": "127.0.0.1"})},
-            "app.port": {"app": before.app.model_copy(update={"port": 9090})},
             "app.public_origin": {"app": before.app.model_copy(update={"public_origin": "https://nas.example.test"})},
             "app.debug": {"app": before.app.model_copy(update={"debug": True})},
             "perf": {"perf": before.perf.model_copy(update={"enabled": True})},
