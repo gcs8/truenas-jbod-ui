@@ -78,7 +78,7 @@ to choose node targets. A configured `ha_nodes[*].host` remains the fallback
 when the API does not provide a usable address.
 
 Strict checking does not learn keys on first connection. Preload and verify
-every HA node in the shared derived `known_hosts` file before enabling SSH. Use
+every HA node in the shared `known_hosts` file before enabling SSH. Use
 the ownership-safe procedure in [[SSH Setup and Sudo|SSH-Setup-and-Sudo]]. Keep
 `strict_host_key_checking: true`.
 

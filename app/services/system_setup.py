@@ -19,6 +19,8 @@ from app.config import (
     TrueNASConfig,
     _derive_runtime_layout_paths,
     _normalize_system_id,
+    is_placeholder_known_hosts_path,
+    known_hosts_placeholder_paths,
     normalize_text,
 )
 from app.models.domain import SystemSetupRequest
@@ -210,6 +212,17 @@ SECRET_REUSE_MISMATCH_DETAIL = (
     "You changed the host, user, or TLS settings, so the saved API key or password "
     "cannot be reused. Enter it again and save."
 )
+
+
+def _preserved_known_hosts_path(config_path: str | Path, raw_system: Any) -> str:
+    derived = _derive_runtime_layout_paths(config_path)["known_hosts_path"]
+    if not isinstance(raw_system, dict):
+        return derived
+    raw_ssh = raw_system.get("ssh")
+    configured = raw_ssh.get("known_hosts_path") if isinstance(raw_ssh, dict) else None
+    if is_placeholder_known_hosts_path(configured, known_hosts_placeholder_paths(config_path)):
+        return derived
+    return str(configured)
 
 
 class SystemSetupService:
@@ -589,7 +602,12 @@ class SystemSetupService:
                         payload.ssh_sudo_password,
                         existing_system.ssh.sudo_password if existing_system is not None else None,
                     ),
-                    known_hosts_path=_derive_runtime_layout_paths(self.config_path)["known_hosts_path"],
+                    # The request never chooses the trust file; a path the
+                    # operator set on this system in config.yaml is kept.
+                    known_hosts_path=_preserved_known_hosts_path(
+                        self.config_path,
+                        raw_systems[existing_index] if existing_index is not None else None,
+                    ),
                     strict_host_key_checking=payload.ssh_strict_host_key_checking,
                     timeout_seconds=(
                         existing_system.ssh.timeout_seconds

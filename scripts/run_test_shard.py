@@ -111,6 +111,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_app_history_body_bound",
         "test_app_history_bounds",
         "test_backup_archive_journal",
+        "test_backup_archive_transport",
         "test_container_contract",
         "test_enclosure_aliases",
         "test_history_backend_bounds",

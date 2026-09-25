@@ -33,9 +33,12 @@ On the Docker host:
 - private key in `./config/ssh/id_truenas`
 - pinned host keys in `./data/known_hosts` by default
 
-The known-hosts location is derived from the runtime layout. Do not add
-`known_hosts_path` to YAML; configured values are discarded. Inside the default
-container layout the derived file is `/app/data/known_hosts`.
+By default the known-hosts location is derived from the runtime layout. Inside
+the default container layout the derived file is `/app/data/known_hosts`. To
+keep pinned keys in a host bind mount instead, set `ssh.known_hosts_path` (top
+level or per system) or `SSH_KNOWN_HOSTS_PATH`; the folder must exist and be
+writable by the app user, or the UI reports it at startup. The examples below
+use the default `data/known_hosts`; substitute your host path if you set one.
 
 Strict checking rejects an unknown key, so preload and verify every SSH target
 before enabling the system. Get each fingerprint through a trusted channel, then

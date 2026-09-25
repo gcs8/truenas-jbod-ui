@@ -126,6 +126,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Honoured a configured `ssh.known_hosts_path` (top level, per system, or the
+  restored `SSH_KNOWN_HOSTS_PATH`) instead of always replacing it with
+  `<data>/known_hosts`, so pinned host keys can live in a host bind mount;
+  unset and default values still use the data folder, and a missing or
+  unwritable folder is reported at startup (#576).
+
 - Added an explicit legacy Compose migration that forwarded history's published
   bind address without replacing deployment customizations and aligned optional
   UI/history refresh-token forwarding across CLI and shell inputs. (#571)
@@ -470,6 +476,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   (#564).
 
 ### Internal
+
+- Added the backup archive transport library for the history sidecar: remote
+  targets for a local directory, FTP/FTPS, SFTP (host key checked against
+  known_hosts), SMB, a job-scoped NFS mount, and S3. Uploads are atomic and
+  read back to verify, and credentials come from secret files. The library is
+  not wired into the app yet (#577).
 
 - Added a change journal library for the backup sidecar that records config
   edits and coalesces a burst of them into one config-only backup, skipped when
