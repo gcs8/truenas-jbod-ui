@@ -560,6 +560,8 @@ class AdminProbeHotPathTests(unittest.TestCase):
     def setUp(self) -> None:
         app_main.ADMIN_PROBE_CACHE.clear()
         self.addCleanup(app_main.ADMIN_PROBE_CACHE.clear)
+        app_main._ADMIN_PROBE_REFRESHING.clear()
+        self.addCleanup(app_main._ADMIN_PROBE_REFRESHING.clear)
 
     def _expire(self) -> None:
         for entry in app_main.ADMIN_PROBE_CACHE.values():
