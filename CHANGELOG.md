@@ -166,9 +166,6 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Docs
 
-- The README now points operators to the backup scheduler, the admin Backups page,
-  remote targets, restore confirmation, retention controls, archive formats and
-  the two opt-in Compose overlays, with links to the full guides. (#625)
 - The history recovery page and CONTRIBUTING now state the rollback policy
   for a history change an older release cannot read: restore the backup taken
   before the upgrade and lose later writes, with no down-migrations. Upgrading
