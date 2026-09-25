@@ -33,6 +33,7 @@ from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import local as _ThreadLocal
 from typing import Any
 
 import yaml
@@ -157,7 +158,7 @@ class BackupScheduler:
         self._monotonic = monotonic
         self._local_tz = local_tz
         self._job_lock = threading.Lock()
-        self._job_owner = threading.local()
+        self._job_owner = _ThreadLocal()
         self._state_lock = threading.RLock()
         self._running: dict[str, str] | None = None
         self._plans: dict[str, _PlanEntry] = {}
