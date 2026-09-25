@@ -18,6 +18,8 @@ from app.perf import install_perf_timing_middleware
 from app.read_ui_auth_config import load_read_ui_auth_settings
 from app.route_support import (
     BASE_DIR,
+    SETTINGS_RUNTIME,
+    after_config_reload,
     EXCEPTION_RESPONSES,
     get_inventory_registry,
     get_release_status_service,
@@ -31,6 +33,7 @@ from app.route_support import (
 )
 from app.router_inclusion import include_router_preserving_route_objects
 from app.routes import build_router
+from app.settings_reload import install_config_reload
 from app.services.mapping_store import (
     MappingDurabilityError,
     MappingScopeConflict,
@@ -114,6 +117,7 @@ def create_app() -> FastAPI:
     install_perf_timing_middleware(app, startup_settings)
 
     include_router_preserving_route_objects(app, build_router())
+    install_config_reload(app, SETTINGS_RUNTIME, startup_settings, on_applied=after_config_reload)
     for mapped_exception_type in EXCEPTION_RESPONSES:
         app.add_exception_handler(mapped_exception_type, mapped_exception_handler)
     app.add_exception_handler(

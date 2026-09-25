@@ -4930,7 +4930,7 @@
     }
     state.setupDirty = false;
     if (elements.setupResult) {
-      elements.setupResult.textContent = "Saved systems appear in the main UI after a restart.";
+      elements.setupResult.textContent = "Saved systems appear in the main UI within a few seconds.";
     }
     syncPlatformHelp();
     syncVerifySslHelp();
@@ -7151,7 +7151,7 @@
       state.defaultSystemId = result.default_system_id || state.defaultSystemId;
       renderSaveResult(
         elements.setupResult,
-        result.detail || `${result.updated_existing ? "Updated" : "Created"} ${result.system?.label || payload.label}. Restart the main UI to show it.`,
+        result.detail || `${result.updated_existing ? "Updated" : "Created"} ${result.system?.label || payload.label}.`,
         result
       );
       updateCreateButton();
@@ -7244,7 +7244,7 @@
 
       renderSaveResult(
         elements.setupResult,
-        payload.detail || `Removed ${payload.deleted_label || selectedSystem.label || selectedSystem.id}. Restart the main UI to remove it there too.`,
+        payload.detail || `Removed ${payload.deleted_label || selectedSystem.label || selectedSystem.id}.`,
         payload
       );
       if (elements.existingSystemDeleteHistoryToggle) {
