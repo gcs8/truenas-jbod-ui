@@ -55,7 +55,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   cron schedule, copies to SFTP, FTP, SMB, S3, NFS or filesystem targets,
   per-class retention with preserve, `/api/admin/backups` routes, and a
   degraded `/healthz` reason when a target fails. Off by default; NFS needs
-  the opt-in `docker-compose.backup-nfs.yml` overlay. (#PRNUM)
+  the opt-in `docker-compose.backup-nfs.yml` overlay. (#580)
 
 - Added a catalog of backup artifacts and a retention manager for the coming
   remote backup archive: per-class, per-location keep-N and max-age rules, a
