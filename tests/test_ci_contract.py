@@ -290,54 +290,70 @@ class CIWorkflowContractTests(unittest.TestCase):
                 self.assertLess(install_index, generator_index)
                 self.assertNotIn("requirements-dev.txt", str(steps[install_index].get("run", "")))
 
-    def test_public_demo_publish_push_trigger_requires_checked_in_artifact_change(self) -> None:
+    def test_public_demo_publish_workflow_is_reserved_for_main_and_dispatch(self) -> None:
         workflow = yaml.safe_load(self.read(PUBLISH_PUBLIC_DEMO_WORKFLOW))
         triggers = workflow.get("on", workflow.get(True, {}))
 
-        self.assertIn(".github/workflows/publish-public-demo.yml", triggers["pull_request"]["paths"])
-        self.assertIn("scripts/build_current_source_browser_fixture.py", triggers["pull_request"]["paths"])
+        self.assertEqual(set(triggers), {"push", "workflow_dispatch"})
         self.assertEqual(triggers["push"]["branches"], ["main"])
         self.assertEqual(triggers["push"]["paths"], ["public-demo/**"])
-        self.assertIn("workflow_dispatch", triggers)
+
+    def test_ordinary_pull_requests_have_one_current_source_public_demo_browser_validation(self) -> None:
+        current_source_build = (
+            'python scripts/build_public_demo.py --output "$PUBLIC_DEMO_ARTIFACT" '
+            '--source-revision "$(git rev-parse HEAD)"'
+        )
+        browser_command = "npx playwright test qa/public-demo.spec.js --retries=0"
+        validations: list[tuple[str, str]] = []
+
+        for workflow_path in (CI_WORKFLOW, PUBLISH_PUBLIC_DEMO_WORKFLOW):
+            workflow = yaml.safe_load(self.read(workflow_path))
+            triggers = workflow.get("on", workflow.get(True, {}))
+            if "pull_request" not in triggers:
+                continue
+            for job_name, job in workflow["jobs"].items():
+                commands = "\n".join(str(step.get("run", "")) for step in job.get("steps", []))
+                if current_source_build in commands and browser_command in commands:
+                    validations.append((workflow_path.name, job_name))
+
+        self.assertEqual(validations, [("ci.yml", "public-demo-artifact")])
+        ci = yaml.safe_load(self.read(CI_WORKFLOW))
+        self.assertEqual(ci["jobs"]["public-demo-artifact"]["name"], "Checked-in public demo artifact")
 
     def test_public_demo_artifact_and_browser_smoke_remain_in_ci(self) -> None:
         spec = self.read(PUBLIC_DEMO_SPEC)
         self.assertNotIn("test.skip", spec)
         self.assertIn("SLOT_FOCUS_ARTIFACT", spec)
 
-        current_source_build = (
-            'python scripts/build_public_demo.py --output "$PUBLIC_DEMO_ARTIFACT" '
-            '--source-revision "$(git rev-parse HEAD)"'
-        )
         for workflow_path in (CI_WORKFLOW, PUBLISH_PUBLIC_DEMO_WORKFLOW):
             with self.subTest(workflow=workflow_path.name):
                 workflow_text = self.read(workflow_path)
                 self.assertIn("python scripts/check_public_demo_artifact.py public-demo", workflow_text)
                 self.assertIn("python scripts/build_current_source_browser_fixture.py", workflow_text)
-                # The checked-in demo is only rebuilt at release time, so pull
-                # request browser QA runs against a throwaway current-source build.
-                self.assertIn(current_source_build, workflow_text)
                 self.assertIn("SLOT_FOCUS_ARTIFACT:", workflow_text)
                 self.assertIn("npx playwright test qa/public-demo.spec.js --retries=0", workflow_text)
                 self.assertIn("npm ci --ignore-scripts", workflow_text)
                 self.assertIn('rm -rf "$fixture_root"', workflow_text)
                 self.assertIn("git status --short", workflow_text)
 
+        current_source_build = (
+            'python scripts/build_public_demo.py --output "$PUBLIC_DEMO_ARTIFACT" '
+            '--source-revision "$(git rev-parse HEAD)"'
+        )
         ci_text = self.read(CI_WORKFLOW)
+        self.assertIn(current_source_build, ci_text)
         self.assertIn(
             "PUBLIC_DEMO_ARTIFACT: ${{ runner.temp }}/truenas-jbod-ui-current-source-browser/public-demo.html",
             ci_text,
         )
         self.assertNotIn("PUBLIC_DEMO_ARTIFACT: public-demo/index.html", ci_text)
         self.assertIn("node --test tests/js/*.test.js", ci_text)
-        # A Pages dispatch publishes the checked-in bytes, so it must browser-test
-        # exactly those; only pull requests build a throwaway current-source demo.
+
+        # Publication validates the exact checked-in bytes; current-source pull
+        # request behavior stays in the required CI check above.
         publish_text = self.read(PUBLISH_PUBLIC_DEMO_WORKFLOW)
-        self.assertIn(
-            "github.event_name == 'workflow_dispatch' && 'public-demo/index.html'",
-            publish_text,
-        )
-        self.assertIn('if [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]; then', publish_text)
+        self.assertIn("PUBLIC_DEMO_ARTIFACT: public-demo/index.html", publish_text)
+        self.assertNotIn(current_source_build, publish_text)
 
     def test_screenshot_capture_workflow_is_dispatch_only_pinned_and_read_only(self) -> None:
         workflow = yaml.safe_load(self.read(CAPTURE_SCREENSHOTS_WORKFLOW))
