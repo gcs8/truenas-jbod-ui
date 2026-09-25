@@ -23,6 +23,7 @@ from app.models.domain import (
     EnclosureOption,
     InventorySnapshot,
     InventorySummary,
+    PlatformCapability,
     SasFabricNode,
     SasFabricSnapshot,
     SasFabricTrace,
@@ -576,6 +577,26 @@ def build_public_demo_snapshot_bundle(
         sources={
             "api": SourceStatus(enabled=False, ok=True, message="Static synthetic fixture; no API is configured."),
             "ssh": SourceStatus(enabled=False, ok=True, message="Static synthetic fixture; no SSH is configured."),
+        },
+        capabilities={
+            "physical_slots": PlatformCapability(
+                label="Physical Slots",
+                status="available",
+                summary="The physical 60-bay layout is included in this demo.",
+                sources=["synthetic fixture"],
+            ),
+            "smart_detail": PlatformCapability(
+                label="SMART Detail",
+                status="available",
+                summary="Saved SMART details are included for occupied demo bays.",
+                sources=["synthetic fixture"],
+            ),
+            "identify": PlatformCapability(
+                label="Identify LEDs",
+                status="unsupported",
+                summary="Locate lights are unavailable in an offline copy.",
+                sources=["offline snapshot"],
+            ),
         },
         summary=InventorySummary(
             disk_count=sum(slot.state != SlotState.empty for slot in slots),
