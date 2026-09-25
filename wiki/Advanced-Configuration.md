@@ -83,7 +83,6 @@ needs a restart:
 
 | Setting | Why |
 | --- | --- |
-| `app.host`, `app.port` | The listening address is fixed when the process starts (the image binds `0.0.0.0:8000`) |
 | `app.public_origin` | Write checks capture it when the app is built |
 | `app.debug` | Turns the `/docs` pages on or off when the app is built |
 | `app.startup_warm_cache_enabled`, `app.startup_warm_smart_enabled` | Only used at start-up |

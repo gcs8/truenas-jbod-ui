@@ -6,7 +6,7 @@ SES, SATADOM, or identify detail.
 
 ## 1. Connect through the API
 
-In the admin sidecar, add one Quantastor system with the shared API or
+In Admin, add one Quantastor system with the shared API or
 management VIP as `truenas.host`:
 
 ```yaml
@@ -34,7 +34,7 @@ This first connection does not verify the appliance certificate. After the UI
 works, [[Advanced Configuration|Advanced-Configuration]] explains how to enable
 verification with the system trust store or a private CA bundle.
 
-Start the admin sidecar when you need the setup form:
+Start Admin when you need the setup form:
 
 ```bash
 docker compose --profile admin up -d enclosure-admin
