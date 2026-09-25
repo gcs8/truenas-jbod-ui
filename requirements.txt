@@ -8,3 +8,5 @@ pydantic==2.13.5
 cryptography==50.0.1
 zstandard==0.25.0
 prometheus-client==0.26.0
+smbprotocol==1.17.0
+boto3==1.43.102

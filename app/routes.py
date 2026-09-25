@@ -17,6 +17,7 @@ from pydantic import ValidationError
 from websockets.exceptions import ConnectionClosed
 
 from app.route_compat import MainModuleAPIRouter
+from app.services.backup_health import backup_archive_problems
 from app.services.history_backend import (
     HISTORY_BACKEND_DEGRADED_DETAIL,
     HistoryBackendBusyError,
@@ -1292,14 +1293,15 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
     async def healthz(request: Request) -> JSONResponse:
         registry = get_inventory_registry()
         service = registry.get_service(None)
-        storage_problems, history_problem = await asyncio.gather(
+        storage_problems, history_problem, backup_problems = await asyncio.gather(
             asyncio.to_thread(refresh_storage_problems, request),
             asyncio.to_thread(history_service_problem, get_settings()),
+            asyncio.to_thread(backup_archive_problems),
         )
         payload = build_health_payload(
             service.peek_cached_snapshot(),
             startup_problems=storage_problems,
-            remote_problems=[history_problem] if history_problem else [],
+            remote_problems=[*([history_problem] if history_problem else []), *backup_problems],
         )
         return JSONResponse(payload, status_code=health_status_code(payload))
 

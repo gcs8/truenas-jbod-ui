@@ -24,7 +24,8 @@ defects found in review fixed (see #573 and gcs8/switch-explorer#179):
 Pruning is intentionally absent: the lifecycle module decides what to delete
 from its catalog and calls ``delete()`` by exact name.
 
-Nothing in the running application uses this module yet.
+The backup scheduler sidecar (``history_service/backup_scheduler``) ships
+archives through it; ``get`` streams a remote copy back for download/restore.
 """
 
 from __future__ import annotations
@@ -123,6 +124,8 @@ class ArchiveTarget(Protocol):
     def list(self, prefix: str = "") -> list[RemoteObject]: ...
 
     def delete(self, name: str) -> None: ...
+
+    def get(self, name: str, local_path: Path) -> tuple[int, str]: ...
 
     def test(self) -> dict[str, Any]: ...
 
@@ -243,6 +246,25 @@ def _check_readback(label: str, expected_size: int, expected_sha: str, size: int
         raise ArchiveVerificationError(f"{label} readback SHA-256 does not match the bytes sent.")
 
 
+@contextmanager
+def _download_destination(local_path: Path) -> Iterator[BinaryIO]:
+    """Create ``local_path`` exclusively (0600, no symlink follow); remove it on failure."""
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(local_path, flags, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            yield handle
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        try:
+            os.unlink(local_path)
+        except FileNotFoundError:
+            pass
+        raise
+
+
 def _probe_name() -> str:
     return f"archive-probe-{uuid.uuid4().hex}.tmp"
 
@@ -258,6 +280,10 @@ class _TargetBase:
         raise NotImplementedError
 
     def delete(self, name: str) -> None:  # pragma: no cover - abstract
+        raise NotImplementedError
+
+    def get(self, name: str, local_path: Path) -> tuple[int, str]:  # pragma: no cover - abstract
+        """Stream object ``name`` into a new private file; return (size, sha256)."""
         raise NotImplementedError
 
     def test(self) -> dict[str, Any]:
@@ -417,6 +443,11 @@ class LocalDirectoryTarget(_TargetBase):
                 )
         return results
 
+    def get(self, name: str, local_path: Path) -> tuple[int, str]:
+        path = self._object_path(name, create_parents=False)
+        with _open_local_source(path) as (source, _size), _download_destination(Path(local_path)) as target:
+            return _copy_stream(source, target.write)
+
     def delete(self, name: str) -> None:
         path = self._object_path(name, create_parents=False)
         try:
@@ -538,6 +569,20 @@ class FtpTarget(_TargetBase):
                         modified=_ftp_modified(facts.get("modify")),
                     )
                 )
+
+    def get(self, name: str, local_path: Path) -> tuple[int, str]:
+        path = self._path(*validate_object_name(name))
+        digest = hashlib.sha256()
+        size = 0
+        with _download_destination(Path(local_path)) as target:
+            def write(chunk: bytes) -> None:
+                nonlocal size
+                digest.update(chunk)
+                size += len(chunk)
+                target.write(chunk)
+
+            self._ftp.retrbinary(f"RETR {path}", write, blocksize=CHUNK_SIZE)
+        return size, digest.hexdigest()
 
     def delete(self, name: str) -> None:
         parts = validate_object_name(name)
@@ -725,6 +770,11 @@ class SftpTarget(_TargetBase):
                 )
                 results.append(RemoteObject(name=child, size=int(entry.st_size or 0), modified=modified))
 
+    def get(self, name: str, local_path: Path) -> tuple[int, str]:
+        path = self._path(*validate_object_name(name))
+        with self._sftp.open(path, "rb") as remote, _download_destination(Path(local_path)) as target:
+            return _copy_stream(remote, target.write)
+
     def delete(self, name: str) -> None:
         parts = validate_object_name(name)
         try:
@@ -850,6 +900,11 @@ class SmbTarget(_TargetBase):
                         modified=datetime.fromtimestamp(info.st_mtime, tz=timezone.utc),
                     )
                 )
+
+    def get(self, name: str, local_path: Path) -> tuple[int, str]:
+        path = self._path(*validate_object_name(name))
+        with self._client.open_file(path, mode="rb") as remote, _download_destination(Path(local_path)) as target:
+            return _copy_stream(remote, target.write)
 
     def delete(self, name: str) -> None:
         parts = validate_object_name(name)
@@ -1166,6 +1221,17 @@ class S3Target(_TargetBase):
                     )
                 )
         return sorted(results, key=lambda item: item.name)
+
+    def get(self, name: str, local_path: Path) -> tuple[int, str]:
+        validate_object_name(name)
+        body = self._client.get_object(Bucket=self._bucket, Key=self._key(name))["Body"]
+        try:
+            with _download_destination(Path(local_path)) as target:
+                return _copy_stream(body, target.write)
+        finally:
+            close = getattr(body, "close", None)
+            if callable(close):
+                close()
 
     def delete(self, name: str) -> None:
         validate_object_name(name)

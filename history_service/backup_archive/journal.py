@@ -11,8 +11,9 @@ when the content hash did not change (an edit and its revert, or a re-save that
 only moved a timestamp). A burst of twenty edits makes one backup, never twenty
 identical copies.
 
-Nothing here is wired into the UI or admin routes yet; the library is inert until
-the integration PR constructs it.
+The UI, the admin sidecar and restore append entries through
+``app/services/config_change_journal.py``; the backup scheduler sidecar
+(``history_service/backup_scheduler``) runs the coalescer.
 
 Storage format: JSON lines, not SQLite. The journal is tiny, written a few times
 per operator action, and read whole; JSON lines keeps it inspectable with a text
@@ -259,8 +260,16 @@ class ChangeJournal:
         max_bytes: int = DEFAULT_MAX_JOURNAL_BYTES,
         retain_committed_entries: int = DEFAULT_RETAIN_COMMITTED_ENTRIES,
         utcnow: Callable[[], datetime] = _utcnow,
+        file_mode: int = 0o600,
     ) -> None:
         self.path = Path(path)
+        if file_mode not in (0o600, 0o660):
+            raise ValueError("file_mode must be 0o600 (single owner) or 0o660 (shared group)")
+        # 0o660 lets processes with different uids that share a group (the UI,
+        # the admin sidecar and the backup scheduler share APP_GID) append to one
+        # journal. New files are chmod'ed explicitly so the umask cannot strip
+        # the group bits; the directory should be setgid so the group is kept.
+        self.file_mode = int(file_mode)
         if max_bytes < 4096:
             raise ValueError("max_bytes must be at least 4096")
         if retain_committed_entries < 0:
@@ -418,6 +427,9 @@ class ChangeJournal:
                 directory.mkdir(mode=0o700)
             except FileExistsError:
                 continue
+            if self.file_mode == 0o660:
+                # Shared journals live in a setgid group directory (2770).
+                os.chmod(directory, 0o2770)
             # A new directory entry is durable only once its parent is fsync'd.
             _fsync_directory(directory.parent)
         if not parent.is_dir():
@@ -426,7 +438,7 @@ class ChangeJournal:
     @contextmanager
     def _locked(self) -> Iterator[None]:
         with self._thread_lock:
-            fd = os.open(self._lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+            fd = _open_shared_file(self._lock_path, self.file_mode)
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX)
                 try:
@@ -437,8 +449,9 @@ class ChangeJournal:
                 os.close(fd)
 
     def _open_journal(self, flags: int) -> int:
+        existed = os.path.lexists(self.path)
         try:
-            fd = os.open(self.path, flags | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+            fd = os.open(self.path, flags | os.O_NOFOLLOW | os.O_CLOEXEC, self.file_mode)
         except OSError as exc:
             if exc.errno == errno.ELOOP:
                 raise JournalError("journal path is a symlink; refusing to follow it") from exc
@@ -446,6 +459,8 @@ class ChangeJournal:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             os.close(fd)
             raise JournalError("journal path is not a regular file")
+        if not existed and flags & os.O_CREAT:
+            _set_mode(fd, self.file_mode)
         return fd
 
     def _size_locked(self) -> int:
@@ -715,9 +730,10 @@ class ChangeJournal:
         )
         payload = b"".join(_stable_json(record).encode("utf-8") + b"\n" for record in records)
         temp_path = self.path.with_name(f".{self.path.name}.{uuid.uuid4().hex}.tmp")
-        fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, self.file_mode)
         try:
             try:
+                _set_mode(fd, self.file_mode)
                 view = memoryview(payload)
                 while view:
                     view = view[os.write(fd, view) :]
@@ -739,6 +755,23 @@ class ChangeJournal:
                 self.max_bytes,
                 len(pending),
             )
+
+
+def _set_mode(fd: int, mode: int) -> None:
+    if stat.S_IMODE(os.fstat(fd).st_mode) != mode:
+        os.fchmod(fd, mode)
+
+
+def _open_shared_file(path: Path, mode: int) -> int:
+    existed = os.path.lexists(path)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, mode)
+    if not existed:
+        try:
+            _set_mode(fd, mode)
+        except OSError:
+            os.close(fd)
+            raise
+    return fd
 
 
 def _recovered_entry(number: int, raw: bytes, *, torn: bool) -> JournalEntry:
@@ -926,7 +959,7 @@ class ConfigBackupCoalescer:
         if not self._run_lock.acquire(blocking=False):
             return CoalescerResult(status="busy")
         try:
-            fd = os.open(self._run_lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+            fd = _open_shared_file(self._run_lock_path, self.journal.file_mode)
             try:
                 try:
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)

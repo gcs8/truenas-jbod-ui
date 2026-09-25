@@ -18,6 +18,9 @@ services:
       ADMIN_AUTH_USERNAME: ${ADMIN_AUTH_USERNAME:-}
       ADMIN_AUTH_PASSWORD: ${ADMIN_AUTH_PASSWORD:-}
       SCHEDULED_BACKUP_STATUS_FILE: ${SCHEDULED_BACKUP_STATUS_FILE:-}
+      BACKUP_CONFIG_ENABLED: ${BACKUP_CONFIG_ENABLED:-}
+      BACKUP_JOURNAL_PATH: /app/backup-journal/config-changes.jsonl
+      BACKUP_ARCHIVE_STATUS_FILE: /app/backup-status/backup-archive.json
     ports:
       - "${APP_BIND_ADDRESS:-0.0.0.0}:${APP_PORT:-8080}:8000"
     volumes:
@@ -28,6 +31,8 @@ services:
       - ./logs:/app/logs
       - ./config/ssh:/run/ssh:ro
       - ./backup-status:/app/backup-status:ro
+      # Config-change journal for config-on-change backups (setgid 2770, APP_GID).
+      - ./backup-journal:/app/backup-journal
     restart: unless-stopped
     mem_limit: ${APP_MEM_LIMIT:-1g}
 
@@ -129,6 +134,9 @@ services:
       ADMIN_AUTH_PASSWORD: ${ADMIN_AUTH_PASSWORD:-}
       ADMIN_ALLOW_PLAINTEXT_BACKUP_EXPORT: ${ADMIN_ALLOW_PLAINTEXT_BACKUP_EXPORT:-false}
       ADMIN_CLEAN_BACKUP_TARGETS_JSON: '${ADMIN_CLEAN_BACKUP_TARGETS_JSON:-["ui","history"]}'
+      BACKUP_CONFIG_ENABLED: ${BACKUP_CONFIG_ENABLED:-}
+      BACKUP_JOURNAL_PATH: /app/backup-journal/config-changes.jsonl
+      BACKUP_SCHEDULER_SOCKET: /app/backup-api/scheduler.sock
     ports:
       - "${ADMIN_BIND_ADDRESS:-0.0.0.0}:${ADMIN_PORT:-8082}:8002"
     volumes:
@@ -138,6 +146,9 @@ services:
       - host-prep-staging:/app/host-prep
       - ./config/ssh:/run/ssh:ro
       - /var/run/docker.sock:/var/run/docker.sock
+      - ./backup-journal:/app/backup-journal
+      # Unix socket of the backup scheduler API; connecting needs no write mount.
+      - ./backup-api:/app/backup-api:ro
     restart: "no"
     mem_limit: ${ADMIN_MEM_LIMIT:-1g}
     healthcheck:
@@ -191,6 +202,73 @@ services:
     mem_limit: ${BACKUP_MEM_LIMIT:-3g}
     healthcheck:
       disable: true
+
+  # Long-running backup scheduler (#398/#573): config backups after config
+  # changes, cron full backups, remote copies and retention. Off until
+  # BACKUP_CONFIG_ENABLED / BACKUP_FULL_ENABLED (or backups: in config.yaml).
+  # Needs network access for remote targets; see docker-compose.backup-nfs.yml for NFS.
+  enclosure-backup-scheduler:
+    profiles:
+      - backup-scheduler
+    image: ${JBOD_UI_IMAGE:-ghcr.io/gcs8/truenas-jbod-ui:latest}
+    command: ["python", "-m", "history_service.backup_scheduler.main"]
+    user: "${BACKUP_UID:-0}:${BACKUP_GID:-0}"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    group_add:
+      - "${APP_GID:-10001}"
+    environment:
+      TMPDIR: /app/backups
+      APP_LOG_LEVEL: ${APP_LOG_LEVEL:-INFO}
+      APP_GID: ${APP_GID:-10001}
+      LOG_FORMAT: ${LOG_FORMAT:-text}
+      HISTORY_SQLITE_PATH: /app/history/history.db
+      HISTORY_SEGMENT_CATALOG_PATH: ${HISTORY_SEGMENT_CATALOG_PATH:-}
+      HISTORY_BACKUP_DIR: /app/history/backups
+      SCHEDULED_BACKUP_STATUS_FILE: ${SCHEDULED_BACKUP_STATUS_FILE:-}
+      SCHEDULED_BACKUP_PASSPHRASE_FILE: ${SCHEDULED_BACKUP_PASSPHRASE_FILE:-}
+      BACKUP_ARCHIVE_PASSPHRASE_FILE: ${BACKUP_ARCHIVE_PASSPHRASE_FILE:-}
+      BACKUP_ARCHIVE_DIR: /app/backups/archive
+      BACKUP_ARCHIVE_STATE_DIR: /app/backups/archive-state
+      BACKUP_ARCHIVE_STATUS_FILE: /app/backup-status/backup-archive.json
+      BACKUP_JOURNAL_PATH: /app/backup-journal/config-changes.jsonl
+      BACKUP_SCHEDULER_SOCKET: /app/backup-api/scheduler.sock
+      BACKUP_CONFIG_ENABLED: ${BACKUP_CONFIG_ENABLED:-}
+      BACKUP_CONFIG_DEBOUNCE_SECONDS: ${BACKUP_CONFIG_DEBOUNCE_SECONDS:-}
+      BACKUP_CONFIG_MAX_DELAY_SECONDS: ${BACKUP_CONFIG_MAX_DELAY_SECONDS:-}
+      BACKUP_CONFIG_LOCAL_KEEP: ${BACKUP_CONFIG_LOCAL_KEEP:-}
+      BACKUP_CONFIG_REMOTE_KEEP: ${BACKUP_CONFIG_REMOTE_KEEP:-}
+      BACKUP_CONFIG_REMOTE_MAX_AGE_DAYS: ${BACKUP_CONFIG_REMOTE_MAX_AGE_DAYS:-}
+      BACKUP_FULL_ENABLED: ${BACKUP_FULL_ENABLED:-}
+      BACKUP_FULL_SCHEDULE: ${BACKUP_FULL_SCHEDULE:-}
+      BACKUP_FULL_LOCAL_KEEP: ${BACKUP_FULL_LOCAL_KEEP:-}
+      BACKUP_FULL_REMOTE_KEEP: ${BACKUP_FULL_REMOTE_KEEP:-}
+      BACKUP_FULL_REMOTE_MAX_AGE_DAYS: ${BACKUP_FULL_REMOTE_MAX_AGE_DAYS:-}
+      BACKUP_TARGETS_JSON: '${BACKUP_TARGETS_JSON:-}'
+      TZ: ${TZ:-UTC}
+    volumes:
+      - ./config:/app/config:ro
+      - ./data:/app/data:ro
+      - ./history:/app/history
+      - ./backups:/app/backups
+      - ./backup-status:/app/backup-status
+      - ./backup-journal:/app/backup-journal
+      - ./backup-api:/app/backup-api
+      - ./config/ssh:/run/ssh:ro
+      - ./config/backup-secrets:/run/backup-secrets:ro
+    restart: unless-stopped
+    mem_limit: ${BACKUP_SCHEDULER_MEM_LIMIT:-3g}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os, stat, sys; sys.exit(0 if stat.S_ISSOCK(os.stat('/app/backup-api/scheduler.sock').st_mode) else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
 volumes:
   host-prep-staging:

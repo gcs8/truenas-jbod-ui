@@ -39,3 +39,7 @@ services:
   enclosure-backup:
     user: "${BACKUP_UID:-1000}:${BACKUP_GID:-1000}"
     # Inherit group_add from the base; Compose appends overlay list entries.
+
+  enclosure-backup-scheduler:
+    user: "${BACKUP_UID:-1000}:${BACKUP_GID:-1000}"
+    # Inherit group_add from the base; Compose appends overlay list entries.

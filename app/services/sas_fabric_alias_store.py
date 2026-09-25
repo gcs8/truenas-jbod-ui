@@ -9,6 +9,7 @@ from typing import Iterable
 from pydantic import ValidationError
 
 from app.models.domain import SasFabricAlias
+from app.services.config_change_journal import record_config_change
 from app.services.storage_writability import (
     StorageDirectoryUnwritable,
     is_unwritable_error,
@@ -80,6 +81,7 @@ class SasFabricAliasStore:
                     current.pop(self._key(saved.system_id, saved.enclosure_id, object_id), None)
             current[self._key(saved.system_id, saved.enclosure_id, saved.object_id)] = saved
             self._write(current)
+        record_config_change("sas_alias.save", f"{saved.system_id or ''}:{saved.object_id}")
         return saved
 
     def clear_alias(
@@ -103,6 +105,7 @@ class SasFabricAliasStore:
             if not removed:
                 return False
             self._write(current)
+        record_config_change("sas_alias.clear", f"{system_id or ''}:{object_id}")
         return True
 
     def _write(self, aliases: dict[str, SasFabricAlias]) -> None:

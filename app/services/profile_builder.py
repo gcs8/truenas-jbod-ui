@@ -9,6 +9,7 @@ import yaml
 
 from app.config import EnclosureProfileConfig, Settings, _load_profile_yaml, normalize_text
 from app.models.domain import EnclosureProfileRequest
+from app.services.config_change_journal import record_config_change
 from app.services.profile_registry import ProfileRegistry, built_in_profile_ids, default_slot_layout
 
 
@@ -182,6 +183,7 @@ class ProfileBuilderService:
                 profiles[existing_index] = profile
 
             self._write_profiles(profiles)
+            record_config_change("profile.save", profile.id)
             return profile, existing_index is not None
 
     def delete_profile(self, profile_id: str, settings: Settings) -> str:
@@ -220,6 +222,7 @@ class ProfileBuilderService:
 
             removed = profiles.pop(existing_index)
             self._write_profiles(profiles)
+            record_config_change("profile.delete", removed.id)
             return removed.label or removed.id
 
     def _load_profiles(self) -> list[EnclosureProfileConfig]:

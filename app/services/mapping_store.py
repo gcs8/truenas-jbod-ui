@@ -16,6 +16,7 @@ from pydantic import ValidationError
 
 from app.models.domain import ManualMapping
 from app.services.profile_registry import ENCLOSURE_SUB_VIEW_PROFILE_IDS
+from app.services.config_change_journal import record_config_change
 from app.services.storage_writability import (
     StorageDirectoryUnwritable,
     is_unwritable_error,
@@ -1138,6 +1139,7 @@ class MappingStore:
             identity = (saved.system_id, saved.enclosure_id, saved.slot)
             current[identity] = saved
             self._commit_v2(current)
+            record_config_change("mapping.save", f"{saved.system_id or ''}:{saved.enclosure_id or ''}:{saved.slot}")
             return saved
 
     def clear_mapping(
@@ -1176,6 +1178,7 @@ class MappingStore:
                 ):
                     current.pop(identity)
             self._commit_v2(current)
+            record_config_change("mapping.clear", f"{system_id or ''}:{enclosure_id or ''}:{slot}")
             return True
 
     def replace_mappings(
@@ -1200,6 +1203,7 @@ class MappingStore:
                 saved = mapping.model_copy(update={"updated_at": now})
                 current[(saved.system_id, saved.enclosure_id, saved.slot)] = saved
             self._commit_v2(current)
+            record_config_change("mapping.replace", f"{system_id or ''}:{enclosure_id or ''}")
             return len(incoming)
 
     def apply_mapping_import(
@@ -1235,6 +1239,7 @@ class MappingStore:
                 saved = mapping.model_copy(update={"updated_at": now})
                 current[(saved.system_id, saved.enclosure_id, saved.slot)] = saved
             self._commit_v2(current)
+            record_config_change("mapping.import", f"{system_id or ''}:{enclosure_id or ''}")
             final_state = self._classify_entries(
                 2,
                 {
