@@ -422,9 +422,9 @@ class ReadUIAuthorizationTests(unittest.TestCase):
             anonymous_headers.get("www-authenticate"),
             'Basic realm="truenas-jbod-ui"',
         )
-        self.assertEqual(json.loads(anonymous_body), {"ok": False, "detail": "Read UI authentication required."})
+        self.assertEqual(json.loads(anonymous_body), {"ok": False, "detail": "Main UI authentication required."})
         self.assertEqual(invalid_status, 401)
-        self.assertEqual(json.loads(invalid_body), {"ok": False, "detail": "Read UI authentication required."})
+        self.assertEqual(json.loads(invalid_body), {"ok": False, "detail": "Main UI authentication required."})
         self.assertEqual(valid_status, 200)
         self.assertEqual(json.loads(valid_body), {"ok": True})
         self.assertEqual(valid_headers.get("cache-control"), "no-store")

@@ -558,7 +558,7 @@ class ContainerResourceContractTests(unittest.TestCase):
     def test_troubleshooting_covers_current_auth_export_and_nonroot_failures(self) -> None:
         guide = (REPO_ROOT / "wiki/Troubleshooting.md").read_text(encoding="utf-8")
         for expected in (
-            "Read UI authentication required.",
+            "Main UI authentication required.",
             "but the admin service only accepts changes from",
             "Plaintext backup export is disabled.",
             "permission denied",

@@ -264,23 +264,53 @@ test("sign-in restores policy-owned controls without changing independently disa
 test("a 401 write response applies the server detail as the disabled reason", () => {
   const { fns, state, controls, writePolicyNotice, statuses } = buildHarness({ enabled: true, mode: "basic", reason: "" });
 
-  const denied = new Error("Read UI authentication required.");
+  const denied = new Error("Main UI authentication required.");
   denied.status = 401;
-  denied.detail = "Read UI authentication required.";
+  denied.detail = "Main UI authentication required.";
   assert.equal(fns.handleWriteRejection(denied), true);
 
   assert.equal(state.writePolicy.enabled, false);
   assert.equal(state.writePolicy.mode, "basic");
-  assert.equal(state.writePolicy.reason, "Read UI authentication required.");
+  assert.equal(state.writePolicy.reason, "Main UI authentication required.");
   for (const element of controls) {
     assert.equal(element.disabled, true, `${element.name} must be disabled after a rejected write`);
-    assert.equal(element.title, "Read UI authentication required.");
+    assert.equal(element.title, "Main UI authentication required.");
   }
-  assert.equal(writePolicyNotice.textContent, "Read UI authentication required.");
+  assert.equal(writePolicyNotice.textContent, "Main UI authentication required.");
   assert.equal(writePolicyNotice.classList.contains("hidden"), false);
 
   assert.equal(fns.writeBlockedByPolicy(), true);
-  assert.deepEqual(statuses, [{ message: "Read UI authentication required.", tone: "error" }]);
+  assert.deepEqual(statuses, [{ message: "Main UI authentication required.", tone: "error" }]);
+});
+
+test("describeWriteRejection still recognises the pre-rename Read UI wording", () => {
+  const { fns, state } = buildHarness({
+    enabled: true,
+    mode: "network",
+    reason: "",
+    publicOrigin: "https://nas.example.test",
+  });
+  for (const detail of [
+    "Cross-origin Read UI mutation rejected.",
+    "Cross-origin Main UI mutation rejected.",
+  ]) {
+    assert.equal(
+      fns.describeWriteRejection({ status: 403, detail }),
+      "This server does not allow changes from this address. Open the UI at https://nas.example.test.",
+      detail,
+    );
+  }
+  state.writePolicy.publicOrigin = "";
+  for (const detail of [
+    "Read UI authorization mode is unavailable.",
+    "Main UI authorization mode is unavailable.",
+  ]) {
+    assert.equal(
+      fns.describeWriteRejection({ status: 403, detail }),
+      "This server does not allow changes from this address.",
+      detail,
+    );
+  }
 });
 
 test("a 403 refuses one request in plain words and leaves every write control usable", () => {
@@ -291,9 +321,9 @@ test("a 403 refuses one request in plain words and leaves every write control us
     publicOrigin: "https://nas.example.test",
   });
 
-  const rejected = new Error("Cross-origin Read UI mutation rejected.");
+  const rejected = new Error("Cross-origin Main UI mutation rejected.");
   rejected.status = 403;
-  rejected.detail = "Cross-origin Read UI mutation rejected.";
+  rejected.detail = "Cross-origin Main UI mutation rejected.";
   assert.equal(fns.handleWriteRejection(rejected), true);
 
   assert.equal(rejected.message, "This server does not allow changes from this address. Open the UI at https://nas.example.test.");
@@ -305,9 +335,9 @@ test("a 403 refuses one request in plain words and leaves every write control us
   assert.equal(fns.writeBlockedByPolicy(), false);
 
   state.writePolicy.publicOrigin = "";
-  const unavailable = new Error("Read UI authorization mode is unavailable.");
+  const unavailable = new Error("Main UI authorization mode is unavailable.");
   unavailable.status = 403;
-  unavailable.detail = "Read UI authorization mode is unavailable.";
+  unavailable.detail = "Main UI authorization mode is unavailable.";
   fns.handleWriteRejection(unavailable);
   assert.equal(unavailable.message, "This server does not allow changes from this address.");
 
@@ -443,14 +473,14 @@ test("Storage Fabric rejects blocked alias writes and adopts 401/403 details", (
   assert.equal(state.error, NETWORK_REASON);
 
   state.writePolicy = fns.normalizeFabricWritePolicy({ enabled: true, mode: "basic", reason: "" });
-  const denied = new Error("Read UI authentication required.");
+  const denied = new Error("Main UI authentication required.");
   denied.status = 401;
-  denied.detail = "Read UI authentication required.";
+  denied.detail = "Main UI authentication required.";
   assert.equal(fns.handleFabricWriteRejection(denied), true);
   assert.equal(state.writePolicy.enabled, false);
   assert.equal(state.writePolicy.mode, "basic");
-  assert.equal(state.writePolicy.reason, "Read UI authentication required.");
-  assert.equal(state.error, "Read UI authentication required.");
+  assert.equal(state.writePolicy.reason, "Main UI authentication required.");
+  assert.equal(state.error, "Main UI authentication required.");
 });
 
 test("main UI Basic credentials stay in memory and are sent only on explicit same-origin auth requests", async () => {
@@ -771,7 +801,7 @@ test("a policy refresh keeps the configured public origin for wrong-origin guida
     renderAll() {},
     setStatus() {},
   });
-  const crossOrigin = { status: 403, detail: "Cross-origin Read UI mutation rejected." };
+  const crossOrigin = { status: 403, detail: "Cross-origin Main UI mutation rejected." };
 
   await fns.submitReadUiSignIn({ preventDefault() {} });
 

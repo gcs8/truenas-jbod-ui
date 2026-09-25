@@ -322,9 +322,9 @@ test("a rejected alias write reports the server detail and keeps the editor open
       getSelectedEnclosureOption: () => ({ id: "enc-a" }),
       currentLiveEnclosureId: () => "enc-a",
       fetchJson: async () => {
-        const denied = new Error("Read UI authentication required.");
+        const denied = new Error("Main UI authentication required.");
         denied.status = 401;
-        denied.detail = "Read UI authentication required.";
+        denied.detail = "Main UI authentication required.";
         throw denied;
       },
       handleWriteRejection(error) {
@@ -342,7 +342,7 @@ test("a rejected alias write reports the server detail and keeps the editor open
 
   assert.equal(rejections.length, 1);
   assert.equal(rejections[0].status, 401);
-  assert.deepEqual(statuses, [{ message: "Read UI authentication required.", tone: "error" }]);
+  assert.deepEqual(statuses, [{ message: "Main UI authentication required.", tone: "error" }]);
   assert.equal(focused, 1);
   assert.equal(closed, 0);
   assert.equal(refreshed, 0);
@@ -351,10 +351,10 @@ test("a rejected alias write reports the server detail and keeps the editor open
   await submitEnclosureAlias({ preventDefault() {} });
   assert.equal(rejections.length, 1);
   assert.equal(statuses.length, 2);
-  assert.equal(statuses[1].message, "Read UI authentication required.");
+  assert.equal(statuses[1].message, "Main UI authentication required.");
   assert.equal(writePolicyAllowsWrites(), false);
   assert.equal(writeBlockedByPolicy(), true);
-  assert.equal(writePolicyReason(), "Read UI authentication required.");
+  assert.equal(writePolicyReason(), "Main UI authentication required.");
 });
 
 test("remove-name control asks first, then clears the draft and submits the clear operation", async () => {
