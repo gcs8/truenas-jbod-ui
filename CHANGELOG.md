@@ -30,6 +30,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Upgrade notes
 
+- `/healthz` on the main UI answers HTTP 503 (`status: down`) when its data,
+  logs or known-hosts folder is not writable; remote failures stay HTTP 200
+  (`status: degraded`). Compose healthchecks probe `/livez` and are unchanged,
+  but an external monitor using `curl -f /healthz` will now alert on an
+  unwritable folder. History `/healthz` reports `status: down` instead of
+  `unavailable`. (#578)
 - docker-compose.nonroot.yml: Keep this overlay for hardened deployments.
   Image-only upgrades now preserve existing Compose files and wait for healthy
   containers; optional backup defaults match the selected ownership setup. (#426)
@@ -43,6 +49,16 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   does write configuration, keeps its read-write mount. (#550, #552)
 
 ### Added
+
+- Added a catalog of backup artifacts and a retention manager for the coming
+  remote backup archive: per-class, per-location keep-N and max-age rules, a
+  preserve flag that pins a backup, a dry-run preview, and deletion only of
+  catalogued copies, never the newest verified one. Not wired in yet. (#574)
+
+- Showed a one-time dismissible notice in the main UI after the app is
+  updated, kept until dismissed and stored per install; v0.23.0 says that
+  network mode lets anyone who can reach the port change bay assignments and
+  lights, and where to add a sign-in. (#491, #562)
 
 - Added a JSON-RPC 2.0 websocket transport selectable per TrueNAS host with
   `api_dialect` (and `api_version` to pin a documented API release), keeping the
@@ -60,6 +76,19 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Changed
 
+- Rewrote the admin setup, backup and maintenance copy in plain words, hid the
+  one-time bootstrap, SSH command list and QuantaStor HA controls until they are
+  needed, showed only the storage-view fields that apply, and made system pills,
+  delete confirmations, restore inspections and validation errors read as
+  sentences instead of developer strings. (#487)
+- Rewrote the warnings, bay-light and mapping reasons, SMART messages, HTTP error details, export banner labels and release-check summaries the main page shows, in plain words with no roadmap prose; the QuantaStor cluster master is shown in Platform Details instead of as a warning, and history backend log lines now say why a request failed (#496).
+- Rewrote the main page copy in plain words: header and profile subtitles,
+  the bay status line and Summary panel, the Bay assignment panel, status
+  chips with the source message as tooltip and a neutral SSH-off style,
+  cache countdown chips shown only with UI Timing, plain "Bay reported by"
+  labels in Slot Details, and heat-map metric names that match the wiki
+  (#484, #562).
+
 - Admin failures now answer with the request's correlation id in the response
   body and the `X-Request-ID` header, and the admin log records that id with the
   HTTP status only; the admin state reports whether the sidecar's auto-stop time
@@ -72,6 +101,13 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Kept a dispatched admin mutation with a lost response in the status-unknown
   path even if the browser went offline afterward, and told container-action
   operators to re-check current state before retrying (#553).
+- `/healthz` now has three levels. `ok` and `degraded` answer HTTP 200;
+  `degraded` now also covers SSH and BMC failures and an unavailable or
+  degraded history service, besides the TrueNAS API. `down` answers HTTP 503
+  only for a local fault the container cannot work through: an unwritable data,
+  logs or known-hosts folder, re-checked every 30 seconds so a `chown` clears
+  it without a restart. The history service reports `down` instead of
+  `unavailable` when its database cannot be opened. (#578)
 
 ### Docs
 
@@ -95,6 +131,85 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Honoured a configured `ssh.known_hosts_path` (top level, per system, or the
+  restored `SSH_KNOWN_HOSTS_PATH`) instead of always replacing it with
+  `<data>/known_hosts`, so pinned host keys can live in a host bind mount;
+  unset and default values still use the data folder, and a missing or
+  unwritable folder is reported at startup (#576).
+
+- Added an explicit legacy Compose migration that forwarded history's published
+  bind address without replacing deployment customizations and aligned optional
+  UI/history refresh-token forwarding across CLI and shell inputs. (#571)
+- Reported an unknown `system_id` on the main page instead of silently
+  showing the default system, and mapped service errors to responses from one
+  table with a 5-second retry hint for busy exports. (#475)
+- Drew TrueNAS CORE bays from the count the enclosure reports instead of
+  always using the 60-bay CSE-946 face, listed small SES enclosures on CORE,
+  stopped the false SES warning on SCALE hosts without an expander, and kept
+  descriptor text from marking empty bays present or faulty. (#482)
+- The main UI now checks at startup that it can write its data, logs and
+  known-hosts directories, logs one plain line per refusal naming the fix,
+  and shows it first in the Warnings panel. `/healthz` gains a plain `summary`
+  and a `problems` list and reports `status: degraded` for an unwritable
+  directory or a degraded TrueNAS API, still answering HTTP 200 so Compose
+  healthchecks keep working. The admin health probe is cached (30 s after
+  success, 10 s after failure) and runs alongside the inventory read, and a
+  stopped admin leaves a disabled System Setup button with the start command
+  instead of the button vanishing. (#565)
+
+- A bad setting now stops the service with one plain line per problem that
+  names the `.env` variable or the `config.yaml` key path and what it must be,
+  instead of a pydantic report with documentation links. Text settings stay
+  text (`TRUENAS_HOST=1234`), blank main-UI values count as unset, unknown
+  `config.yaml` keys are logged once and listed in the admin
+  configuration-warnings banner, and the unused `app.verify_ssl` setting is
+  removed. The history bind error names the variables to set. (#568)
+- Admin save results now offer a "Restart main UI now" button and say "main UI"
+  instead of "read UI"; the admin page warns five minutes before it stops
+  itself, explains how to start it again once it has, and folds the three
+  session stats into one line; debug bundle exports no longer pause the main
+  UI and history by default; and the setup form gets BMC-only wording for
+  IPMI systems, a safe key-mode default when no SSH keys exist, an
+  actionable cross-origin message that keeps the draft, a clearer
+  secret-reuse error, an up-front disabled profile delete when systems still
+  use the profile, and an origin link only when a configured address
+  differs from the current one (#481)
+- Kept inventory and action results in their selected scope, preserved
+  export keyboard focus, and improved history controls and failure text.
+  (#425, #562)
+- Kept main-UI error messages visible across background refreshes, recovered
+  write controls after a rejected write, honoured the configured refresh
+  interval, added search results and a real empty-bay state, and asked for a
+  reload after a container upgrade; `/api/inventory` now documents the
+  `write_policy` and `app_version` fields it returns (#508, #562).
+- Raised the smallest Storage Fabric, disk-path and bay text to 12px, stopped
+  forcing the diagnostic chips to uppercase, let card labels wrap instead of
+  clipping device names, added a print stylesheet that keeps bay colours on a
+  white page, and darkened the empty NVMe bay size chip to AA contrast
+  (#477, #562).
+- Led the public demo and saved copies with what the app does, moved
+  version, source revision and build ID into a collapsed block, and hid the
+  refresh controls and inventory evidence counters in saved copies.
+  (#485, #562)
+- Distinguished BMC-managed systems from ESXi in unsupported bootstrap
+  guidance without enabling host provisioning (#480).
+- Prevented destructive demo collisions and unconfirmed history purges,
+  preserved admin drafts and restart choices, and rejected false success. (#424)
+- Reported failed SCALE and QuantaStor enrichment without hiding source
+  disks or leaving SSH status falsely healthy; a SCALE host whose SES
+  discovery succeeds but finds no enclosure device stays healthy and quiet. (#422)
+
+- A pending history rotation, migration or restore marker now names the marker
+  file and a copy-pasteable recovery command (paths shell-quoted) instead of
+  only saying the database is closed, and logs it once at startup. Four unused
+  history lock and restore helpers were removed (#563).
+- The history `/healthz` now says why it is degraded (last background pass
+  failed, read-only database, cleanup failed twice in a row, or recovery
+  required) and no longer counts a failed manual refresh; collector fields are
+  returned once, under `collector`. The dashboard shows `Starting` during the
+  startup grace period, counts down the cooldown on the Full refresh button only,
+  never renders an uncounted value as "deferred", and names a scheduled backup
+  status file with unsafe permissions (#566).
 - Published aggregate disk-retention totals on the inventory summary
   (`source_disk_count`, `rendered_unique_disk_count`,
   `duplicate_disk_view_count`, `unplaced_disk_count`) so a release check can
@@ -266,6 +381,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 - Preserved history availability, scope identity and outage errors across
   bulk responses and offline exports. (#423)
+- Removed invented physical backplanes and bay labels from virtual inventories.
+  Logical disk paths and known physical aliases were preserved. (#419)
+- The Storage Fabric page keeps keyboard focus, scroll position, open
+  kernel-error panels and a half-typed friendly name across renders, expands
+  long bay lists in place, keeps visited related traces clickable, and fetches
+  inventory and fabric together on refresh. (#478)
 - Drew the Storage Fabric impacted/mapped bay grid in the active enclosure's
   physical layout instead of a flat sorted chip list, so a bay number sits in
   the same place there as on the Enclosure tab, with un-impacted and empty
@@ -273,6 +394,28 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   (#532).
 
 ### Performance
+
+- Offline exports embed a card photo only when a view or enclosure can draw
+  it, and read the static files once per export instead of once per
+  downsampling pass. (#493)
+- Delegated every bay-tile interaction to the grid, deferred hover SMART
+  fetches to the batch prefetch that already covers the bay, and indexed bay
+  lookups instead of scanning the slot list on every call (#510, #562).
+
+- Coalesced admin storage-view renders into one paint per animation frame,
+  cached the HA row fields and SSH field lookups, timed out stuck admin
+  requests after 60 seconds with a retry message, painted the refreshed admin
+  state before the removed-system history scan, and removed dead admin code
+  (#474)
+
+- History cleanup now hands freed space back to the disk on new history
+  databases (incremental auto-vacuum plus a WAL truncate after each cleanup that
+  removed rows), selects each cleanup batch with a bounded subquery so any
+  `HISTORY_RETENTION_BATCH_SIZE` works, copies the local backup without holding
+  the history locks, recounts table sizes at startup only when a counter row is
+  missing, and runs the one-time disk-identity upgrade in resumable batches with
+  progress in the log. Existing databases keep reusing freed pages in place
+  (#560).
 
 - Served a slot history bundle from one SQLite connection instead of fifteen
   and cached the history lock address per database identity instead of parsing
@@ -333,8 +476,39 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - `config/config.example.yaml` now lists every option with its default and
   shows one example system per platform, including ESXi, a BMC-only host,
   and a storage view; the unused `app.verify_ssl` line is gone. (#489)
+- The Storage Fabric page describes the hardware in plain words (HBAs, paths,
+  expanders, enclosures, bays), its warnings say what was not found and what
+  to check, and a new Storage Fabric wiki page explains the four views, the
+  status chip states and renaming. (#490)
+- Added an Upgrading wiki page, Troubleshooting entries for a restarting
+  container, an unwritable history database and the off-loopback history
+  refusal, and Quick Start notes on `COMPOSE_PROFILES` and admin auto-stop
+  (#564).
 
 ### Internal
+
+- Added the backup archive transport library for the history sidecar: remote
+  targets for a local directory, FTP/FTPS, SFTP (host key checked against
+  known_hosts), SMB, a job-scoped NFS mount, and S3. Uploads are atomic and
+  read back to verify, and credentials come from secret files. The library is
+  not wired into the app yet (#577).
+
+- Added a change journal library for the backup sidecar that records config
+  edits and coalesces a burst of them into one config-only backup, skipped when
+  the config content hash has not changed; it is not wired up yet. (#575)
+
+- Removed the unreachable per-slot history fallback and its concurrency
+  setting, unified the unavailable slot-history payload shape, and deleted
+  duplicated and caller-less helpers (#509).
+
+- Moved the public-demo rebuild from every pull request to release cutting.
+  Pull-request CI now only checks that the checked-in demo is an exact build
+  of the reachable commit it records, so a change to a demo input no longer
+  needs a rebuild, screenshot recapture, and pixel review in the same pull
+  request. `check_public_demo_artifact.py --require-current`,
+  `validate_release_wrap.py --public-demo-only`, and a new step in the GHCR
+  release workflow refuse a release until the demo, screenshots, and pixel
+  review were rebuilt from the release source (#572).
 
 - Replaced the chain of command comparisons behind the SSH command failure
   contexts with a lookup table and pinned every answer with tests; the debug
@@ -365,11 +539,24 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   maintainer owes before changing either — with `tests/test_ci_contract.py`
   reading the pair out of the workflow so the doc cannot drift from the
   enforced values again. (#536)
-- Gave the checked-in public demo a frozen synthetic Storage Fabric payload so
-  the published overview screenshot exercises the enclosure-shaped bay grid;
-  the snapshot renderer accepts the payload through one optional argument that
-  operator exports leave unset, so no live fabric identifier can reach an
-  exported file by that route (#532).
+- `scripts/update_immutable_deployment.py` and the two Docker-host QA harnesses
+  now refuse on a non-Linux host before doing any work, instead of pulling
+  images or leaving a stale receipt directory behind; the changelog gate now
+  fails with the fix when `## Unreleased` is missing rather than accepting a
+  bullet in a shipped release; `dev_check.py` prints one line per skipped group
+  (`--verbose` lists the suites); and admin maintenance cleanup works on
+  Windows (#561).
+- Gave the public demo fixture a frozen synthetic Storage Fabric payload so
+  the demo and overview screenshot exercise the enclosure-shaped bay grid once
+  they are rebuilt at the next release; the snapshot renderer accepts the
+  payload through one optional argument that operator exports leave unset, so
+  no live fabric identifier can reach an exported file by that route (#532).
+
+### Performance
+
+- Delegated every bay-tile interaction to the grid, deferred hover SMART
+  fetches to the batch prefetch that already covers the bay, and indexed bay
+  lookups instead of scanning the slot list on every call (#510)
 
 ## v0.23.0 - 2026-09-08
 

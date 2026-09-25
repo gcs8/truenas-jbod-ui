@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
+import itertools
 import inspect
 import json
 import tempfile
@@ -104,6 +106,169 @@ def build_inventory_service(
         ProfileRegistry(settings),
         SlotDetailStore(str(Path(temp_dir) / "slot_detail_cache.json")),
     )
+
+
+OVERLAY_STATUS_MODES = ("throw", "empty_failure", "rows_failure", "success", "empty_success")
+
+
+class InventoryOverlayStatusTests(unittest.IsolatedAsyncioTestCase):
+    def make_service(self, platform):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        raw = TrueNASRawData(
+            enclosures=[],
+            disks=[{"name": "sda", "serial": "SYNTHETIC-DISK"}],
+            pools=[{"name": "synthetic-pool"}],
+            disk_temperatures={"sda": 30},
+            smart_test_results=[],
+        )
+        system = SystemConfig(
+            id="synthetic-overlay",
+            truenas=TrueNASConfig(platform=platform),
+            ssh=SSHConfig(enabled=True, host="192.0.2.10", commands=[]),
+            bmc=BMCConfig(enabled=True, host="192.0.2.11"),
+        )
+        api = AsyncMock()
+        api.fetch_all.return_value = raw
+        ssh = AsyncMock()
+        ssh.run_planned_commands.return_value = [
+            SSHCommandResult(command="synthetic-base", ok=True, stdout="base-output", exit_code=0)
+        ]
+        bmc = MagicMock()
+        bmc.fetch_inventory.return_value = BMCInventory(system_model="Synthetic model")
+        service = build_inventory_service(Settings(), system, api, ssh, directory.name, bmc)
+        return service, raw, bmc.fetch_inventory.return_value
+
+    def overlay(self, mode, label, *, cli=False):
+        loaded = mode in {"success", "rows_failure"}
+        data = (
+            {"cli_disks": [{"id": "synthetic-cli-disk"}] if loaded else []}
+            if cli else ParsedSSHData(
+                ses_enclosures=[SESMapEnclosure(enclosure_id="synthetic-ses", slots={})] if loaded else []
+            )
+        )
+        if mode == "throw":
+            return AsyncMock(side_effect=RuntimeError("SYNTHETIC-SECRET\n" * 1000))
+        failures = [f"{label} returned a synthetic failure."] if mode.endswith("failure") else []
+        return AsyncMock(return_value=(data, failures))
+
+    def assert_preserved(self, bundle, raw, original, bmc):
+        self.assertIs(bundle.raw_data, raw)
+        for field in ("disks", "pools", "disk_temperatures", "smart_test_results", "enclosures"):
+            self.assertEqual(getattr(bundle.raw_data, field), getattr(original, field))
+        self.assertTrue(bundle.sources["api"].ok)
+        self.assertTrue(bundle.sources["bmc"].ok)
+        self.assertEqual(bundle.sources["bmc"].message, "BMC / IPMI inventory reachable.")
+        self.assertIs(bundle.bmc_inventory, bmc)
+        self.assertTrue(bundle.ssh_collected)
+        self.assertEqual(bundle.ssh_outputs, {"synthetic-base": "base-output"})
+        for text in [bundle.sources["ssh"].message or "", *bundle.warnings]:
+            self.assertNotIn("SYNTHETIC-SECRET", text)
+            self.assertNotIn("\n", text)
+            self.assertLessEqual(len(text), 400)
+
+    async def test_scale_overlay_health_does_not_depend_on_rows(self):
+        for mode in OVERLAY_STATUS_MODES:
+            with self.subTest(mode=mode):
+                service, raw, bmc = self.make_service("scale")
+                original = copy.deepcopy(raw)
+                service._fetch_scale_ses_overlay = self.overlay(mode, "SCALE SES")
+                with patch("app.services.inventory.logger.exception"):
+                    bundle = await service._collect_inventory_source_bundle()
+                self.assert_preserved(bundle, raw, original, bmc)
+                failed = mode in {"throw", "empty_failure", "rows_failure"}
+                with self.subTest(check="status"):
+                    self.assertEqual(bundle.sources["ssh"].ok, not failed)
+                    if failed:
+                        self.assertIn("failures", bundle.sources["ssh"].message)
+                with self.subTest(check="warnings"):
+                    self.assertEqual(len(bundle.warnings), int(failed))
+                    if mode.endswith("failure"):
+                        self.assertIn("SCALE SES returned a synthetic failure.", bundle.warnings)
+                self.assertEqual(bool(bundle.scale_ses_data.ses_enclosures), mode in {"success", "rows_failure"})
+
+    async def test_quantastor_overlay_health_combines_cli_and_ses_outcomes(self):
+        for cli_mode, ses_mode in itertools.product(OVERLAY_STATUS_MODES, repeat=2):
+            with self.subTest(cli=cli_mode, ses=ses_mode):
+                service, raw, bmc = self.make_service("quantastor")
+                original = copy.deepcopy(raw)
+                service._fetch_quantastor_cli_overlay = self.overlay(cli_mode, "Quantastor CLI", cli=True)
+                service._fetch_quantastor_ses_overlay = self.overlay(ses_mode, "Quantastor SES")
+                with patch("app.services.inventory.logger.exception"):
+                    bundle = await service._collect_inventory_source_bundle()
+                self.assert_preserved(bundle, raw, original, bmc)
+                failures = [mode in {"throw", "empty_failure", "rows_failure"} for mode in (cli_mode, ses_mode)]
+                with self.subTest(check="status"):
+                    self.assertEqual(bundle.sources["ssh"].ok, not any(failures))
+                    if any(failures):
+                        self.assertIn("failures", bundle.sources["ssh"].message)
+                with self.subTest(check="warnings"):
+                    self.assertEqual(len(bundle.warnings), sum(failures))
+                    for mode, label in ((cli_mode, "Quantastor CLI"), (ses_mode, "Quantastor SES")):
+                        if mode.endswith("failure"):
+                            self.assertIn(f"{label} returned a synthetic failure.", bundle.warnings)
+                if ses_mode == "throw" and cli_mode in {"throw", "empty_failure", "empty_success"}:
+                    self.assertFalse(any("CLI slot truth" in warning for warning in bundle.warnings))
+                self.assertEqual(bool(raw.cli_disks), cli_mode in {"success", "rows_failure"})
+                self.assertEqual(bool(bundle.quantastor_ses_data.ses_enclosures), ses_mode in {"success", "rows_failure"})
+
+    async def _scale_bundle_with_discovery(self, discovery_ok, stdout, *, api_enclosures):
+        service, raw, _ = self.make_service("scale")
+        if api_enclosures:
+            raw.enclosures = [{"id": "synthetic-api-enclosure", "elements": []}]
+        discovery_command = service._build_sg_ses_discovery_command()
+
+        async def run_planned(planner, *, initial_commands, host=None):
+            return [
+                SSHCommandResult(
+                    command=discovery_command,
+                    ok=discovery_ok,
+                    stdout=stdout,
+                    stderr="" if discovery_ok else "synthetic discovery failure",
+                    exit_code=0 if discovery_ok else 1,
+                )
+            ]
+
+        service._run_ssh_planned_commands = AsyncMock(side_effect=run_planned)
+        return await service._collect_inventory_source_bundle()
+
+    async def test_scale_successful_discovery_with_no_ses_devices_stays_healthy_without_api_enclosures(self):
+        bundle = await self._scale_bundle_with_discovery(True, "", api_enclosures=False)
+        self.assertTrue(bundle.sources["ssh"].ok)
+        self.assertEqual(bundle.warnings, [])
+
+    async def test_scale_no_ses_devices_is_degraded_when_the_api_reports_enclosures(self):
+        bundle = await self._scale_bundle_with_discovery(True, "", api_enclosures=True)
+        self.assertFalse(bundle.sources["ssh"].ok)
+        self.assertEqual(len(bundle.warnings), 1)
+        self.assertIn("No SES enclosure was found over SSH on 192.0.2.10", bundle.warnings[0])
+        self.assertIn("TrueNAS API reports enclosures", bundle.warnings[0])
+
+    async def test_scale_failed_ses_discovery_command_stays_degraded(self):
+        for api_enclosures in (False, True):
+            with self.subTest(api_enclosures=api_enclosures):
+                bundle = await self._scale_bundle_with_discovery(False, "", api_enclosures=api_enclosures)
+                self.assertFalse(bundle.sources["ssh"].ok)
+                self.assertTrue(
+                    any("discovery failed on 192.0.2.10" in warning for warning in bundle.warnings),
+                    bundle.warnings,
+                )
+
+    async def test_successful_overlays_do_not_erase_unrelated_base_ssh_failures(self):
+        for platform in ("scale", "quantastor"):
+            with self.subTest(platform=platform):
+                service, _, _ = self.make_service(platform)
+                service.ssh_probe.run_planned_commands.return_value.append(
+                    SSHCommandResult(command="synthetic-failed-base", ok=False, stdout="", exit_code=1)
+                )
+                service._fetch_scale_ses_overlay = self.overlay("success", "SCALE SES")
+                service._fetch_quantastor_cli_overlay = self.overlay("success", "Quantastor CLI", cli=True)
+                service._fetch_quantastor_ses_overlay = self.overlay("success", "Quantastor SES")
+                bundle = await service._collect_inventory_source_bundle()
+                self.assertFalse(bundle.sources["ssh"].ok)
+                self.assertTrue(any("synthetic-failed-base" in warning for warning in bundle.warnings))
+                self.assertTrue(bundle.sources["api"].ok)
+                self.assertTrue(bundle.sources["bmc"].ok)
 
 
 class InventoryHelpersTests(unittest.TestCase):
@@ -248,7 +413,7 @@ class InventoryHelpersTests(unittest.TestCase):
             name="Shelf A",
             rows=2,
             columns=2,
-            slot_count=4,
+            slot_count=3,
             slot_layout=[[2, None], [0, 1]],
         )
         selected_profile = EnclosureProfileView(
@@ -256,7 +421,7 @@ class InventoryHelpersTests(unittest.TestCase):
             label="Profile A",
             rows=2,
             columns=2,
-            slot_count=4,
+            slot_count=3,
             slot_layout=[[2, None], [0, 1]],
         )
         service.profile_registry = MagicMock()
@@ -414,8 +579,8 @@ class InventoryHelpersTests(unittest.TestCase):
             )
             self.assertIsNone(resolved)
             self.assertEqual(len(warnings), 1)
-            self.assertIn("no identified physical enclosure", warnings[0])
-            self.assertIn("Re-save", warnings[0])
+            self.assertIn("no known enclosure", warnings[0])
+            self.assertIn("save the assignment again", warnings[0])
 
     def test_zero_enclosure_disks_use_system_virtual_inventory_without_legacy_mapping(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -487,16 +652,16 @@ class InventoryHelpersTests(unittest.TestCase):
             self.assertTrue(all(slot.physical_location_known is False for slot in slots))
             self.assertTrue(all(slot.led_supported is False for slot in slots))
             self.assertTrue(all(slot.mapping_supported is False for slot in slots))
-            self.assertTrue(all("physical enclosure" in slot.mapping_reason for slot in slots))
+            self.assertTrue(all("no known enclosure" in slot.mapping_reason for slot in slots))
             # The virtual fallback states that physical location is unavailable
             # separately from the legacy-mapping warning, and neither one claims
             # a source fetch failure.
             self.assertEqual(len(warnings), 2)
             self.assertEqual(warnings[0], inventory_module.VIRTUAL_INVENTORY_PHYSICAL_LOCATION_WARNING)
-            self.assertIn("1 manual mapping", warnings[1])
-            self.assertIn("no identified physical enclosure", warnings[1])
-            self.assertIn("system-scoped virtual inventory", warnings[1])
-            self.assertIn("Re-save", warnings[1])
+            self.assertIn("1 saved bay assignment", warnings[1])
+            self.assertIn("no known enclosure", warnings[1])
+            self.assertIn("shown without bay positions", warnings[1])
+            self.assertIn("save the assignment again", warnings[1])
             self.assertNotIn("SYNTH", warnings[1])
             self.assertNotIn("system-a", warnings[1])
 
@@ -604,7 +769,7 @@ class InventoryHelpersTests(unittest.TestCase):
             self.assertIsInstance(frame, inventory_module._LayoutFrame)
             self.assertFalse(frame.allow_legacy_mapping_fallback)
             self.assertEqual(len(warnings), 1)
-            self.assertIn("2 manual mappings", warnings[0])
+            self.assertIn("2 saved bay assignments", warnings[0])
             self.assertNotIn("SYNTH", warnings[0])
             self.assertNotIn("enc-a", warnings[0])
 
@@ -654,8 +819,8 @@ class InventoryHelpersTests(unittest.TestCase):
                 "enc-a::dell-md1280-drawer-bottom-42",
             )
             self.assertEqual(len(warnings), 1)
-            self.assertIn("1 manual mapping ", warnings[0])
-            self.assertNotIn("2 manual", warnings[0])
+            self.assertIn("1 saved bay assignment ", warnings[0])
+            self.assertNotIn("2 saved", warnings[0])
 
     def test_legacy_mapping_warning_checks_the_selected_drawer_slot_ids(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -692,7 +857,7 @@ class InventoryHelpersTests(unittest.TestCase):
             self.assertFalse(frame.allow_legacy_mapping_fallback)
             self.assertEqual(set(frame.slot_positions), set(range(42, 84)))
             self.assertEqual(len(warnings), 1)
-            self.assertIn("1 manual mapping ", warnings[0])
+            self.assertIn("1 saved bay assignment ", warnings[0])
 
     def test_storage_view_slot_label_honors_profile_slot_number_base(self) -> None:
         storage_view = StorageViewConfig.model_validate(
@@ -897,17 +1062,17 @@ class InventoryHelpersTests(unittest.TestCase):
             "Quantastor SSH CLI enrichment failed on 10.13.37.30: Skipping optional SSH command batch after a recent connection startup failure; retry after 2026-06-12T15:07:41.513217+00:00. REST data is still being used.",
             "Quantastor SSH SES discovery failed on 10.13.37.31: Skipping optional SSH command batch after a recent connection startup failure; retry after 2026-06-12T15:07:44.593780+00:00.",
             "Quantastor SSH SES discovery failed on 10.13.37.30: Skipping optional SSH command batch after a recent connection startup failure; retry after 2026-06-12T15:07:41.513217+00:00.",
-            "Quantastor HA detected. Cluster master is QSOSN-Left.",
+            "IO fencing is off on this QuantaStor cluster.",
         ]
 
         collapsed = InventoryService._collapse_quantastor_optional_ssh_backoff_warnings(warnings)
 
         self.assertEqual(len(collapsed), 2)
-        self.assertEqual(collapsed[1], "Quantastor HA detected. Cluster master is QSOSN-Left.")
-        self.assertIn("Quantastor optional SSH enrichment is paused", collapsed[0])
+        self.assertEqual(collapsed[1], "IO fencing is off on this QuantaStor cluster.")
+        self.assertIn("is paused after a connection failure", collapsed[0])
         self.assertIn("10.13.37.30", collapsed[0])
         self.assertIn("10.13.37.31", collapsed[0])
-        self.assertIn("REST data is still being used", collapsed[0])
+        self.assertIn("Data still comes from the QuantaStor API", collapsed[0])
         self.assertNotIn("SES discovery", "\n".join(collapsed))
         self.assertNotIn("disk inventory", "\n".join(collapsed))
 
@@ -1093,11 +1258,11 @@ class InventoryHelpersTests(unittest.TestCase):
         self.assertEqual(
             warnings,
             [
-                "SSH connection or authentication failed before inventory commands could run: "
-                "Authentication failed. Host-side inventory enrichment is unavailable for this refresh."
+                "Could not log in over SSH: Authentication failed. "
+                "Bay details from SSH are missing for this refresh."
             ],
         )
-        self.assertEqual(status_message, "SSH connection or authentication failed.")
+        self.assertEqual(status_message, "SSH login failed.")
 
     def test_summarize_ssh_failures_collapses_missing_storcli_batch(self) -> None:
         command_results = [
@@ -1129,8 +1294,8 @@ class InventoryHelpersTests(unittest.TestCase):
         self.assertEqual(
             warnings,
             [
-                "StorCLI commands are unavailable on this ESXi host, so physical-drive enrichment "
-                "is unavailable for this refresh. Detail: sh: /opt/lsi/storcli64/storcli64: not found."
+                "StorCLI is not available on this ESXi host, so drive details behind the RAID controller "
+                "are missing for this refresh. Detail: sh: /opt/lsi/storcli64/storcli64: not found."
             ],
         )
         self.assertEqual(status_message, "StorCLI commands unavailable.")
@@ -1170,10 +1335,10 @@ class InventoryHelpersTests(unittest.TestCase):
         self.assertEqual(
             warnings,
             [
-                "StorCLI commands are unavailable on this ESXi host. Broadcom/LSI driver packages "
-                "such as lsi-mr3 or lsuv2-lsiv2-drivers-plugin do not expose the MegaRAID member "
-                "detail this app needs; install a compatible StorCLI ESXi VIB for physical-drive "
-                "enrichment. Detail: sh: /opt/lsi/storcli64/storcli64: not found."
+                "StorCLI is not installed on this ESXi host, so drive details behind the RAID "
+                "controller are missing. The Broadcom driver packages alone (lsi-mr3, "
+                "lsuv2-lsiv2-drivers-plugin) do not provide them; install the Broadcom StorCLI VIB. "
+                "Detail: sh: /opt/lsi/storcli64/storcli64: not found."
             ],
         )
         self.assertEqual(status_message, "StorCLI commands unavailable.")
@@ -1198,11 +1363,11 @@ class InventoryHelpersTests(unittest.TestCase):
         self.assertEqual(
             warnings,
             [
-                "Storage Fabric enrichment probes had partial command failures; topology can still render, "
-                "but IOC facts may be incomplete. Debug output keeps the command, exit code, and stderr details."
+                "Some SSH commands failed (IOC facts). The bay map still works; "
+                "see Debug for the command output."
             ],
         )
-        self.assertEqual(status_message, "Storage Fabric enrichment completed with partial command failures.")
+        self.assertEqual(status_message, "SSH finished with some failed commands.")
         self.assertEqual(details[0]["canonical_command"], "mprutil -u 10 show iocfacts")
         self.assertEqual(details[0]["controller"], "mpr10")
         self.assertEqual(details[0]["context"], "sas_fabric_mprutil_iocfacts")
@@ -1250,11 +1415,11 @@ class InventoryHelpersTests(unittest.TestCase):
         self.assertEqual(
             warnings,
             [
-                "Storage Fabric enrichment probes had partial command failures; topology can still render, "
-                "but Linux NVMe subsystem detail may be incomplete. Debug output keeps the command, exit code, and stderr details."
+                "Some SSH commands failed (Linux NVMe subsystem detail). The bay map still works; "
+                "see Debug for the command output."
             ],
         )
-        self.assertEqual(status_message, "Storage Fabric enrichment completed with partial command failures.")
+        self.assertEqual(status_message, "SSH finished with some failed commands.")
         self.assertEqual(details[0]["canonical_command"], "nvme list-subsys -o json")
         self.assertEqual(details[0]["context"], "storage_fabric_linux_nvme_subsystems")
         self.assertEqual(details[0]["criticality"], "enrichment")
@@ -1325,7 +1490,7 @@ class InventoryHelpersTests(unittest.TestCase):
             "StorCLI is installed on this ESXi host, but it currently reports no visible "
             "MegaRAID controllers. Broadcom/LSI packages such as lsi-mr3, lsuv2-lsiv2-drivers-plugin, "
             "and vmware-storcli64 are present, but no compatible controller is being surfaced to StorCLI, "
-            "so physical-drive enrichment is unavailable for this refresh.",
+            "so drive details behind the RAID controller are missing for this refresh.",
         )
 
     def test_esxi_storcli_runtime_warning_reports_pci_passthrough_when_detected(self) -> None:
@@ -1365,7 +1530,7 @@ class InventoryHelpersTests(unittest.TestCase):
             "StorCLI is installed on this ESXi host, but the Broadcom MegaRAID controller is "
             "currently configured for PCI passthrough (0000:3b:00.0). ESXi will not bind that "
             "device to lsi_mr3 or expose it to StorCLI until passthrough is disabled and the host "
-            "is rebooted, so physical-drive enrichment is unavailable for this refresh.",
+            "is rebooted, so drive details behind the RAID controller are missing for this refresh.",
         )
 
     def test_extract_block_sizes_from_scale_disk_metadata(self) -> None:
@@ -1498,7 +1663,7 @@ class InventoryHelpersTests(unittest.TestCase):
                 all(call.kwargs["loaded_entries"] is loaded_mappings for call in service.mapping_store.get_mapping.call_args_list)
             )
             self.assertFalse(slots[0].led_supported)
-            self.assertIn("LED control is not enabled for ESXi", slots[0].led_reason or "")
+            self.assertEqual(slots[0].led_reason, "Bay lights cannot be controlled on ESXi hosts.")
 
             smart = service._build_esxi_smart_summary(slots[0])
             self.assertTrue(smart.available)
@@ -1507,7 +1672,7 @@ class InventoryHelpersTests(unittest.TestCase):
             self.assertEqual(smart.negotiated_link_rate, "8.0GT/s")
             self.assertEqual(smart.transport_protocol, "NVMe")
             self.assertEqual(smart.form_factor, "M.2")
-            self.assertIn("host-level SMART", smart.message or "")
+            self.assertEqual(smart.message, "SMART data comes from the RAID controller (StorCLI).")
 
     def test_build_esxi_smart_summary_does_not_force_nvme_wording_for_sas_slot(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1547,7 +1712,7 @@ class InventoryHelpersTests(unittest.TestCase):
             self.assertEqual(smart.transport_protocol, "SAS")
             self.assertIsNone(smart.form_factor)
             self.assertNotIn("NVMe SMART", smart.message or "")
-            self.assertIn("host-level SMART", smart.message or "")
+            self.assertEqual(smart.message, "SMART data comes from the RAID controller (StorCLI).")
 
     def test_build_esxi_smart_summary_does_not_assume_m2_for_generic_nvme_transport(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1738,7 +1903,10 @@ class InventoryHelpersTests(unittest.TestCase):
             self.assertIsNone(smart.uncorrected_write_errors)
             self.assertEqual(smart.bytes_written, 114814325279232)
             self.assertEqual(smart.bytes_read, 25282046342144)
-            self.assertIn("local physical device", smart.message or "")
+            self.assertEqual(
+                smart.message,
+                "SMART data comes from ESXi, with drive health from the RAID controller (StorCLI).",
+            )
             self.assertEqual(
                 probe.commands,
                 [
@@ -2060,7 +2228,7 @@ class InventoryHelpersTests(unittest.TestCase):
             self.assertIsNone(slot.serial)
             self.assertIsNone(slot.gptid)
             self.assertEqual(slot.mapping_source, "ses-empty")
-            self.assertIn("Stale manual mapping", slot.notes or "")
+            self.assertIn("assigned by hand, but the enclosure reports it empty", slot.notes or "")
             self.assertTrue(slot.raw_status["stale_manual_mapping"])
 
     def test_disk_resolution_reports_the_evidence_tier_that_matched(self) -> None:
@@ -2173,7 +2341,7 @@ class InventoryHelpersTests(unittest.TestCase):
 
             self.assertTrue(
                 any(
-                    "The AOC carrier-card view needs StorCLI to map physical M.2 slots behind the RAID LUNs."
+                    "StorCLI did not return drive details, so the M.2 slots on this RAID card cannot be mapped."
                     in warning
                     for warning in warnings
                 )
@@ -4445,7 +4613,14 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
                         {"name": f"zram{index}", "type": "disk", "size": "2G"}
                         for index in range(10)
                     ],
+                    {"name": "nbd0", "type": "disk", "size": "2G"},
+                    {"name": "md127", "type": "disk", "size": "2G"},
+                    {"name": "dm-0", "type": "disk", "size": "2G"},
                     {"name": "loop0", "type": "loop", "size": "64M"},
+                    *[
+                        {"name": f"oddblk{index}", "type": "disk", "size": "2G"}
+                        for index in range(9)
+                    ],
                 ]
             )
             warnings: list[str] = []
@@ -4458,11 +4633,13 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             self.assertEqual(by_name["mmcblk0"].bus, "MMC")
             self.assertEqual(by_name["dasda"].smart_devices, ["dasda"])
             self.assertEqual(by_name["dasda"].bus, "CCW")
+            # Kernel-made virtual devices (zram, nbd, md, dm-) are skipped in
+            # silence; only names the app has never seen are worth a warning.
             self.assertEqual(
                 warnings,
                 [
                     "Skipped unrecognized Linux block devices: "
-                    "zram0, zram1, zram2, zram3, zram4, zram5, zram6, zram7 (+2 more)."
+                    "oddblk0, oddblk1, oddblk2, oddblk3, oddblk4, oddblk5, oddblk6, oddblk7 (+1 more)."
                 ],
             )
 
@@ -4730,8 +4907,8 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             self.assertFalse(slot_views[2].present)
             self.assertEqual(slot_views[2].state.value, "empty")
             self.assertEqual(slot_views[2].mapping_source, "ubntstorage")
-            self.assertTrue(any("UniFi UNVR Pro LED control is experimental." in warning for warning in warnings))
-            self.assertIn("Skipped unrecognized Linux block devices: zram0.", warnings)
+            self.assertTrue(any("Bay lights on the UNVR Pro are switched through the UniFi service." in warning for warning in warnings))
+            self.assertFalse(any("Skipped unrecognized Linux block devices" in warning for warning in warnings))
 
     def test_correlate_linux_host_enables_unvr_led_backend_and_gpio_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -4845,7 +5022,7 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             self.assertTrue(slot_views[0].led_supported)
             self.assertTrue(slot_views[0].identify_active)
             self.assertTrue(slot_views[0].raw_status.get("experimental_led"))
-            self.assertTrue(any("UniFi UNVR Pro LED control is experimental." in warning for warning in warnings))
+            self.assertTrue(any("Bay lights on the UNVR Pro are switched through the UniFi service." in warning for warning in warnings))
 
     def test_build_disk_records_adds_camcontrol_peer_aliases_to_lookup_keys(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -9253,8 +9430,10 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(snapshot.selected_profile.id, "supermicro-ssg-2028r-shared-front-24")
             self.assertEqual(len(snapshot.enclosures), 2)
             self.assertEqual({option.id for option in snapshot.enclosures}, {"node-a", "node-b"})
-            self.assertTrue(any("Cluster master is Node B; selected view is Node A." in warning for warning in snapshot.warnings))
-            self.assertFalse(any("IO fencing is currently disabled" in warning for warning in snapshot.warnings))
+            # The HA master is a fact for the header, not a warning.
+            self.assertFalse(any("Cluster master is" in warning for warning in snapshot.warnings))
+            self.assertEqual(snapshot.platform_context.get("master_label"), "Node B")
+            self.assertFalse(any("IO fencing is off" in warning for warning in snapshot.warnings))
             slot0 = next(slot for slot in snapshot.slots if slot.slot == 0)
             self.assertEqual(slot0.device_name, "sdb")
             self.assertEqual(slot0.pool_name, "archive")
@@ -9263,7 +9442,7 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("active on Node B", slot0.topology_label or "")
             self.assertEqual(slot0.mapping_source, "api-slot")
             self.assertFalse(slot0.led_supported)
-            self.assertIn("REST and CLI identify operations are being rejected", slot0.led_reason or "")
+            self.assertIn("the appliance rejected the identify command", slot0.led_reason or "")
             slot12 = next(slot for slot in snapshot.slots if slot.slot == 12)
             self.assertEqual(slot12.device_name, "sdm")
             self.assertEqual(slot12.pool_name, "archive")
@@ -9334,7 +9513,7 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
 
             snapshot = await service.get_snapshot(selected_enclosure_id="node-a")
 
-            self.assertTrue(any("IO fencing is currently disabled" in warning for warning in snapshot.warnings))
+            self.assertTrue(any("IO fencing is off" in warning for warning in snapshot.warnings))
 
     async def test_quantastor_smart_summary_uses_first_pass_disk_payload(self) -> None:
         class DummyQuantastorClient:
@@ -9434,7 +9613,7 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(summary.predictive_errors, 4)
             self.assertEqual(summary.transport_protocol, "SAS")
             self.assertEqual(summary.sas_address, "5000cca000000001")
-            self.assertIn("Quantastor REST SMART detail is first-pass", summary.message or "")
+            self.assertEqual(summary.message, "SMART data comes from QuantaStor.")
 
     async def test_quantastor_snapshot_uses_cli_hw_rows_for_shared_slot_truth(self) -> None:
         class DummyQuantastorClient:
@@ -10496,8 +10675,7 @@ Enclosure Status diagnostic page:
             self.assertNotIn("sg_ses -p aes", warning_text)
             self.assertNotIn("sg_ses -p ec", warning_text)
             self.assertIn(
-                "TrueNAS SCALE did not return enclosure rows, so this view is using Linux SES AES page parsing "
-                "for slot mapping on the selected enclosure.",
+                "TrueNAS did not report any enclosures, so bay positions come from the enclosure over SSH.",
                 snapshot.warnings,
             )
 
@@ -10669,7 +10847,7 @@ Enclosure Status diagnostic page:
             self.assertEqual(summary.predictive_errors, 4)
             self.assertEqual(summary.read_cache_enabled, True)
             self.assertEqual(summary.writeback_cache_enabled, True)
-            self.assertIn("supplemented with SSH CLI disk rows", summary.message or "")
+            self.assertEqual(summary.message, "SMART data comes from QuantaStor and smartctl over SSH.")
 
     async def test_quantastor_smart_summary_prefers_ses_target_host(self) -> None:
         class DummyQuantastorClient:
@@ -11012,33 +11190,7 @@ Enclosure Status diagnostic page:
             systems=[{"id": "node-a", "name": "ExampleQS-Right"}],
             pool_devices=[],
         )
-        disk = DiskRecord(
-            raw={"storagePoolId": "pool-1", "name": "disk/by-id/wwn-0x5000"},
-            device_name="disk/by-id/wwn-0x5000",
-            path_device_name="disk/by-id/wwn-0x5000",
-            multipath_name=None,
-            multipath_member=None,
-            serial="SERIAL-1",
-            model="MODEL-1",
-            size_bytes=None,
-            identifier="scsi-SERIAL-1",
-            health="ONLINE",
-            pool_name="HA-Pool-R10",
-            lunid=None,
-            bus=None,
-            temperature_c=None,
-            last_smart_test_type=None,
-            last_smart_test_status=None,
-            last_smart_test_lifetime_hours=None,
-            logical_block_size=None,
-            physical_block_size=None,
-            enclosure_id="node-a",
-            slot=0,
-            smart_devices=[],
-            lookup_keys={"disk/by-id/wwn-0x5000", "serial-1"},
-        )
-
-        members = service._build_quantastor_topology_members(raw_data, [disk])
+        members = service._build_quantastor_topology_members(raw_data)
 
         self.assertEqual(members, {})
 
@@ -11659,9 +11811,10 @@ Enclosure Status diagnostic page:
             self.assertEqual(summary.temperature_c, 31)
             self.assertIsNotNone(summary.message)
             assert summary.message is not None
-            self.assertIn("jbodmap is missing sudo permission for smartctl", summary.message)
-            self.assertIn("/usr/local/sbin/smartctl", summary.message)
-            self.assertIn("/usr/sbin/smartctl", summary.message)
+            self.assertIn("The SSH user jbodmap is not allowed to run smartctl", summary.message)
+            self.assertIn("SSH access setup", summary.message)
+            self.assertIn("/dev/da95", summary.message)
+            self.assertNotIn("sudo rules", summary.message)
 
     async def test_scale_smart_summary_falls_back_to_ssh_smartctl(self) -> None:
         class DummyTrueNASClient:
@@ -13380,7 +13533,7 @@ class InventoryServiceSnapshotStateBoundsTests(unittest.IsolatedAsyncioTestCase)
                 service._snapshot_activity[key] = 1
             service._build_snapshot = AsyncMock()
 
-            with self.assertRaisesRegex(Exception, "Snapshot state capacity is temporarily busy"):
+            with self.assertRaisesRegex(Exception, "The server is busy"):
                 await service.get_snapshot(selected_enclosure_id=option_ids[-1])
 
             self.assertEqual(
@@ -13531,7 +13684,7 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
                 "TrueNAS API reachable with degraded enclosure data.",
             )
             self.assertIn(
-                "TrueNAS API enclosure discovery failed; using the last trusted enclosure topology.",
+                "TrueNAS could not list enclosures this time, so the last known bay layout is shown.",
                 returned.warnings,
             )
 
@@ -13592,7 +13745,7 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             slot = next(item for item in snapshot.slots if item.slot == 0)
             self.assertFalse(slot.led_supported)
             self.assertIsNone(slot.led_backend)
-            self.assertIn("enclosure discovery failed", slot.led_reason or "")
+            self.assertIn("could not list the enclosure", slot.led_reason or "")
             self.assertEqual(snapshot.capabilities["identify"].status, "partial")
 
     async def test_sas_fabric_snapshot_reports_stale_inventory_and_source_cache_states(self) -> None:
@@ -13757,7 +13910,14 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             returned = await service.get_snapshot(allow_stale_cache=True)
 
             self.assertIs(returned, stale_snapshot)
-            await asyncio.sleep(0.05)
+            # Poll instead of one fixed sleep: slow coverage runners can take
+            # longer than 50 ms to finish the background refresh.
+            deadline = asyncio.get_running_loop().time() + 5
+            while asyncio.get_running_loop().time() < deadline:
+                cached = service._cache.get(inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY)
+                if cached is not None and cached.slots[0].device_name == "da1":
+                    break
+                await asyncio.sleep(0.01)
             self.assertEqual(
                 service._cache[inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY].slots[0].device_name,
                 "da1",
@@ -14146,8 +14306,8 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             _cli_overlay, cli_failures = await service._fetch_quantastor_cli_overlay(raw_data)
             _ses_overlay, ses_failures = await service._fetch_quantastor_ses_overlay(raw_data)
 
-            self.assertIn("no node SSH host", " ".join(cli_failures))
-            self.assertIn("no node SSH host", " ".join(ses_failures))
+            self.assertIn("no QuantaStor node address", " ".join(cli_failures))
+            self.assertIn("no QuantaStor node address", " ".join(ses_failures))
             service._run_ssh_commands.assert_not_called()
 
     async def test_force_source_bundle_refresh_clears_sg_ses_device_cache(self) -> None:
@@ -14624,10 +14784,7 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
                 enclosure_id=virtual_enclosure_id,
                 physical_location_known=False,
                 mapping_supported=False,
-                mapping_reason=(
-                    "Manual mapping is unavailable because this system disk has no identified physical enclosure "
-                    "or stable physical location."
-                ),
+                mapping_reason="Bay mapping is not available because this system has no known enclosure.",
             )
             service.get_snapshot = AsyncMock(
                 return_value=InventorySnapshot(slots=[slot], refresh_interval_seconds=30)
@@ -14642,7 +14799,7 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             )
             before = service.mapping_store.load_all()
 
-            with self.assertRaisesRegex(TrueNASAPIError, "identified physical enclosure"):
+            with self.assertRaisesRegex(TrueNASAPIError, "no known enclosure"):
                 await service.save_mapping(0, {"serial": "REPLACEMENT"})
 
             self.assertEqual(service.mapping_store.load_all(), before)
@@ -14667,10 +14824,7 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
                 enclosure_id=virtual_enclosure_id,
                 physical_location_known=False,
                 mapping_supported=False,
-                mapping_reason=(
-                    "Manual mapping is unavailable because this system disk has no identified physical enclosure "
-                    "or stable physical location."
-                ),
+                mapping_reason="Bay mapping is not available because this system has no known enclosure.",
             )
             service.get_snapshot = AsyncMock(
                 return_value=InventorySnapshot(slots=[slot], refresh_interval_seconds=30)
@@ -14685,7 +14839,7 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             )
             before = service.mapping_store.load_all()
 
-            with self.assertRaisesRegex(TrueNASAPIError, "identified physical enclosure"):
+            with self.assertRaisesRegex(TrueNASAPIError, "no known enclosure"):
                 await service.clear_mapping(0)
 
             self.assertEqual(service.mapping_store.load_all(), before)
@@ -14817,7 +14971,7 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             )
             service.mapping_store.preview_replace_mappings = preview_replace_mappings
 
-            with self.assertRaisesRegex(TrueNASAPIError, "no identified physical enclosure"):
+            with self.assertRaisesRegex(TrueNASAPIError, "no known enclosure"):
                 await service.preview_mapping_bundle(bundle)
 
             preview_replace_mappings.assert_not_called()
@@ -14843,7 +14997,7 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             )
             service.mapping_store.apply_mapping_import = apply_mapping_import
 
-            with self.assertRaisesRegex(TrueNASAPIError, "no identified physical enclosure"):
+            with self.assertRaisesRegex(TrueNASAPIError, "no known enclosure"):
                 await service.import_mapping_bundle(
                     bundle,
                     expected_revision="a" * 64,
@@ -14912,7 +15066,7 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             )
             service.mapping_store.preview_replace_mappings = preview_replace_mappings
 
-            with self.assertRaisesRegex(TrueNASAPIError, "no identified physical enclosure"):
+            with self.assertRaisesRegex(TrueNASAPIError, "no known enclosure"):
                 await service.preview_mapping_bundle(
                     bundle,
                     selected_enclosure_id="enc-a",
@@ -14934,7 +15088,7 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             bundle = MappingBundle(mappings=[ManualMapping(slot=0, serial="UNSTABLE")])
             before = service.mapping_store.load_all()
 
-            with self.assertRaisesRegex(TrueNASAPIError, "no identified physical enclosure"):
+            with self.assertRaisesRegex(TrueNASAPIError, "no known enclosure"):
                 await service.preview_mapping_bundle(
                     bundle,
                     selected_enclosure_id="virtual-system:default",
@@ -14963,7 +15117,7 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             )
             before = service.mapping_store.load_all()
 
-            with self.assertRaisesRegex(TrueNASAPIError, "no identified physical enclosure"):
+            with self.assertRaisesRegex(TrueNASAPIError, "no known enclosure"):
                 await service.import_mapping_bundle(
                     bundle,
                     selected_enclosure_id=virtual_enclosure_id,
@@ -15230,7 +15384,7 @@ class InventoryServiceLedTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertFalse(slot.led_supported)
             self.assertIsNone(slot.led_backend)
-            self.assertIn("exactly one authentic SES element", slot.led_reason or "")
+            self.assertIn("not tied to exactly one enclosure element", slot.led_reason or "")
 
     async def test_core_non_ses_device_disables_ssh_identify_capability(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -15268,7 +15422,7 @@ class InventoryServiceLedTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertFalse(slot.led_supported)
             self.assertIsNone(slot.led_backend)
-            self.assertIn("exactly one authentic SES element", slot.led_reason or "")
+            self.assertIn("not tied to exactly one enclosure element", slot.led_reason or "")
 
     async def test_core_degraded_api_enclosure_keeps_authentic_ssh_identify_capability(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -15376,7 +15530,7 @@ class InventoryServiceLedTests(unittest.IsolatedAsyncioTestCase):
                 ],
             )
 
-            with self.assertRaisesRegex(TrueNASAPIError, "exactly one authentic SES element"):
+            with self.assertRaisesRegex(TrueNASAPIError, "not tied to exactly one enclosure element"):
                 await service._set_slot_led_over_ssh(slot, LedAction.identify)
 
             service._run_ssh_command.assert_not_awaited()
@@ -16956,3 +17110,277 @@ class QuantastorMultiShelfSnapshotRegressionTests(unittest.IsolatedAsyncioTestCa
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InventoryDefaultRegressionTests(unittest.IsolatedAsyncioTestCase):
+    """CORE bay counts, small enclosures, SES notes, presence, and pool binding."""
+
+    @staticmethod
+    def _core_api_raw_data(bay_count: int) -> TrueNASRawData:
+        return TrueNASRawData(
+            enclosures=[
+                {
+                    "id": "enc-synthetic",
+                    "name": "Synthetic Shelf",
+                    "label": "Synthetic Shelf",
+                    "elements": [
+                        {
+                            "slot": index + 1,
+                            "dev": f"/dev/da{index}",
+                            "status": "OK",
+                            "descriptor": f"Slot{index:02d}",
+                        }
+                        for index in range(bay_count)
+                    ],
+                }
+            ],
+            disks=[
+                {
+                    "name": f"da{index}",
+                    "devname": f"da{index}",
+                    "serial": f"SN-{index:04d}",
+                    "model": "SYNTHETIC-MODEL",
+                    "size": 4_000_000_000_000,
+                    "identifier": f"{{serial_lunid}}SN-{index:04d}_5000c500{index:08x}",
+                    "lunid": f"5000c500{index:08x}",
+                    "enclosure": {"id": "enc-synthetic", "slot": index + 1},
+                    "pool": "tank",
+                }
+                for index in range(bay_count)
+            ],
+            pools=[],
+            disk_temperatures={},
+            smart_test_results=[],
+        )
+
+    def _core_service(self, temp_dir: str, raw_data: TrueNASRawData, **system_overrides) -> InventoryService:
+        settings = Settings()
+        system = SystemConfig(
+            id="core-synthetic",
+            label="Synthetic CORE",
+            truenas=TrueNASConfig(host="https://core.example.test", api_key="token", platform="core"),
+            **system_overrides,
+        )
+        service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+        service._get_inventory_source_bundle = AsyncMock(
+            return_value=InventorySourceBundle(
+                raw_data=raw_data,
+                ssh_outputs={},
+                ssh_collected=False,
+                warnings=[],
+                sources={},
+                scale_ses_data=ParsedSSHData(),
+                quantastor_ses_data=ParsedSSHData(),
+            )
+        )
+        return service
+
+    @staticmethod
+    def _bare_service(platform: str = "core") -> InventoryService:
+        settings = Settings()
+        system = SystemConfig(id=f"{platform}-synthetic", truenas=TrueNASConfig(platform=platform))
+        return InventoryService(
+            settings,
+            system,
+            MagicMock(),
+            MagicMock(),
+            None,
+            MagicMock(),
+            ProfileRegistry(settings),
+        )
+
+    async def test_core_draws_every_api_reported_bay_without_a_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._core_service(temp_dir, self._core_api_raw_data(84))
+            snapshot = await service.get_snapshot(force_refresh=True)
+
+        self.assertEqual(snapshot.layout_slot_count, 84)
+        self.assertEqual(len(snapshot.slots), 84)
+        self.assertEqual(sum(1 for slot in snapshot.slots if slot.present), 84)
+        self.assertTrue(snapshot.selected_profile.id.startswith("runtime-"))
+        self.assertEqual(snapshot.selected_profile.slot_count, 84)
+        self.assertFalse(any("bays" in warning for warning in snapshot.warnings))
+
+    async def test_core_small_chassis_is_not_padded_out_to_sixty_bays(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._core_service(temp_dir, self._core_api_raw_data(12))
+            snapshot = await service.get_snapshot(force_refresh=True)
+
+        self.assertEqual(snapshot.layout_slot_count, 12)
+        self.assertEqual(len(snapshot.slots), 12)
+        self.assertLessEqual(snapshot.selected_profile.columns, 12)
+        self.assertFalse(any("bays" in warning for warning in snapshot.warnings))
+
+    async def test_core_sixty_bay_shelf_keeps_the_cse_946_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._core_service(temp_dir, self._core_api_raw_data(60))
+            snapshot = await service.get_snapshot(force_refresh=True)
+
+        self.assertEqual(snapshot.selected_profile.id, CORE_CSE_946_PROFILE_ID)
+        self.assertEqual(len(snapshot.slots), 60)
+
+    async def test_core_explicit_smaller_profile_warns_about_hidden_bays(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._core_service(
+                temp_dir,
+                self._core_api_raw_data(84),
+                default_profile_id=CORE_CSE_946_PROFILE_ID,
+            )
+            snapshot = await service.get_snapshot(force_refresh=True)
+
+        self.assertEqual(snapshot.selected_profile.id, CORE_CSE_946_PROFILE_ID)
+        self.assertEqual(len(snapshot.slots), 60)
+        self.assertIn(
+            "This enclosure reports 84 bays but the selected layout draws 60, so the extra bays "
+            "are not shown. Choose a matching layout in System Setup.",
+            snapshot.warnings,
+        )
+
+    def test_core_ssh_small_enclosures_are_selectable_but_the_ahci_pseudo_enclosure_is_not(self) -> None:
+        service = self._bare_service()
+
+        def enclosure(enclosure_id: str, name: str, bays: int) -> SESMapEnclosure:
+            ses_device = f"/dev/ses-{enclosure_id}"
+            return SESMapEnclosure(
+                ses_device=ses_device,
+                enclosure_id=enclosure_id,
+                enclosure_name=name,
+                slots={
+                    index: SESMapSlot(slot_number=index, element_id=index, ses_device=ses_device)
+                    for index in range(bays)
+                },
+            )
+
+        ssh_data = ParsedSSHData(
+            ses_enclosures=[
+                enclosure("5000aaaa", "Rear SSD cage", 8),
+                enclosure("5000bbbb", "Front 24", 24),
+                enclosure("5000cccc", "Boot pair", 2),
+                enclosure("3061686369656d30", "AHCI SGPIO Enclosure 2.00", 6),
+            ]
+        )
+
+        options = service._build_core_ssh_enclosure_options(ssh_data, filter_value=None, excluded_ids=set())
+
+        self.assertEqual(
+            {(option.id, option.slot_count) for option in options},
+            {("5000aaaa", 8), ("5000bbbb", 24), ("5000cccc", 2)},
+        )
+
+    @staticmethod
+    def _scale_service(temp_dir: str, enclosures: list[dict]) -> InventoryService:
+        raw_data = TrueNASRawData(
+            enclosures=enclosures,
+            disks=[{"name": "sda", "serial": "SN-0001"}],
+            pools=[],
+            disk_temperatures={},
+            smart_test_results=[],
+        )
+        system = SystemConfig(
+            id="scale-synthetic",
+            truenas=TrueNASConfig(platform="scale", host="https://scale.example.test", api_key="token"),
+            ssh=SSHConfig(enabled=True, host="192.0.2.10", commands=[]),
+        )
+        api = AsyncMock()
+        api.fetch_all.return_value = raw_data
+        ssh = AsyncMock()
+        ssh.run_planned_commands.return_value = [
+            SSHCommandResult(command="synthetic-base", ok=True, stdout="base-output", exit_code=0)
+        ]
+        # Every SES discovery command succeeds but finds no sg_ses device,
+        # which is what a plain HBA or SATA build looks like over SSH.
+        ssh.run_command.side_effect = lambda command, **_kwargs: SSHCommandResult(
+            command=command, ok=True, stdout="", exit_code=0
+        )
+        return build_inventory_service(Settings(), system, api, ssh, temp_dir)
+
+    async def test_healthy_scale_without_a_ses_expander_has_no_warning_and_green_ssh(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._scale_service(temp_dir, enclosures=[])
+            bundle = await service._collect_inventory_source_bundle()
+
+        self.assertTrue(bundle.ssh_collected)
+        self.assertEqual(bundle.warnings, [])
+        self.assertTrue(bundle.sources["ssh"].ok)
+        self.assertFalse(bundle.scale_ses_data.ses_enclosures)
+
+    async def test_scale_with_api_enclosures_but_no_ses_over_ssh_is_degraded_with_a_plain_note(self) -> None:
+        # Expected enclosure evidence that SSH cannot find stays degraded (#422, #449).
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._scale_service(temp_dir, enclosures=[{"id": "enc-1", "name": "Shelf", "elements": []}])
+            bundle = await service._collect_inventory_source_bundle()
+
+        self.assertEqual(
+            bundle.warnings,
+            [
+                "No SES enclosure was found over SSH on 192.0.2.10, although the TrueNAS API reports "
+                "enclosures, so bay positions come from the TrueNAS API only."
+            ],
+        )
+        self.assertFalse(bundle.sources["ssh"].ok)
+
+    def test_descriptor_text_cannot_flip_an_empty_bay_to_fault(self) -> None:
+        service = self._bare_service()
+        enclosure_meta = {"id": "enc-1", "label": "Shelf", "name": None}
+
+        def build(raw_slot_status: dict) -> SlotView:
+            return service._build_slot_view(
+                slot=2,
+                row_index=0,
+                column_index=2,
+                enclosure_meta=enclosure_meta,
+                raw_slot_status=raw_slot_status,
+                disk=None,
+                mapping=None,
+                ssh_data=ParsedSSHData(),
+                api_topology_members={},
+                api_enclosure_ids={"enc-1"},
+            )
+
+        descriptor_only = build({"slot": 3, "descriptor": "Drive bay 3 fault LED", "enclosure_id": "enc-1"})
+        self.assertFalse(descriptor_only.present)
+        self.assertNotEqual(descriptor_only.state, SlotState.fault)
+
+        not_installed = build(
+            {"slot": 3, "status": "Not installed", "descriptor": "Drive bay 3 fault LED", "enclosure_id": "enc-1"}
+        )
+        self.assertFalse(not_installed.present)
+        self.assertEqual(not_installed.state, SlotState.empty)
+
+        # A real fault code still shows as a fault, but it does not invent a disk.
+        faulted = build({"slot": 3, "status": "Critical", "value": "fault", "enclosure_id": "enc-1"})
+        self.assertEqual(faulted.state, SlotState.fault)
+        self.assertFalse(faulted.present)
+
+        populated = build({"slot": 3, "status": "OK", "enclosure_id": "enc-1"})
+        self.assertTrue(populated.present)
+
+    def test_status_keywords_match_whole_words_in_status_fields_only(self) -> None:
+        self.assertTrue(InventoryService._status_contains({"status": "OK"}, "ok"))
+        self.assertTrue(InventoryService._status_contains({"value": "Fault sensed"}, "fault"))
+        self.assertTrue(InventoryService._status_contains({"status": "Faulted"}, "fault"))
+        self.assertFalse(InventoryService._status_contains({"status": "default"}, "fault"))
+        self.assertFalse(InventoryService._status_contains({"descriptor": "Drive bay 3 fault LED"}, "fault"))
+        self.assertFalse(InventoryService._status_contains({"mapping_resolution_source": "ses-empty"}, "empty"))
+        self.assertFalse(InventoryService._status_contains({"model_hint": "Brokenfault-2000"}, "fault"))
+
+    def test_pool_binding_mode_only_accepts_pool_matches(self) -> None:
+        from app.config import StorageViewBindingConfig
+
+        service = self._bare_service()
+        pool_view = StorageViewConfig(
+            id="tank-view",
+            label="Tank",
+            kind="manual",
+            template_id="manual",
+            binding=StorageViewBindingConfig(mode="pool"),
+        )
+        auto_view = pool_view.model_copy(update={"binding": StorageViewBindingConfig(mode="auto")})
+
+        with patch.object(service, "_candidate_match_reasons", return_value=["serial", "device"]):
+            self.assertFalse(service._candidate_matches_storage_view(pool_view, {}))
+            self.assertTrue(service._candidate_matches_storage_view(auto_view, {}))
+        with patch.object(service, "_candidate_match_reasons", return_value=["pool", "serial"]):
+            self.assertTrue(service._candidate_matches_storage_view(pool_view, {}))
+        with patch.object(service, "_candidate_match_reasons", return_value=[]):
+            self.assertFalse(service._candidate_matches_storage_view(pool_view, {}))

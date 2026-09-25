@@ -121,6 +121,17 @@ textarea {
   outline-offset: 2px;
 }
 
+.enclosure-alias-edit-text {
+  margin-left: 6px;
+  font-size: 0.82rem;
+}
+
+@media (max-width: 820px) {
+  .enclosure-alias-edit-text {
+    display: none;
+  }
+}
+
 .enclosure-alias-editor {
   display: grid;
   gap: 6px;
@@ -336,6 +347,11 @@ textarea {
   line-height: 1.15;
 }
 
+.snapshot-banner-about {
+  flex: 1 1 100%;
+  margin-bottom: 0;
+}
+
 .summary-card.compact {
   min-height: 0;
 }
@@ -486,14 +502,6 @@ textarea {
   color: #ffadad;
 }
 
-.system-setup-dialog {
-  width: min(920px, calc(100vw - 32px));
-}
-
-.field input.is-readonly {
-  background: rgba(255, 255, 255, 0.04);
-}
-
 .meta-select {
   width: 100%;
   min-width: 0;
@@ -515,6 +523,12 @@ textarea {
   align-items: end;
   padding: 16px 18px;
   margin-bottom: 14px;
+}
+
+.search-summary {
+  align-self: center;
+  color: var(--muted);
+  font-size: 0.85rem;
 }
 
 .ui-perf-panel {
@@ -873,6 +887,23 @@ textarea {
   padding: 0 16px;
 }
 
+.upgrade-notice {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+  margin: -8px 0 18px;
+  padding: 12px 16px;
+  border: 1px solid rgba(91, 183, 255, 0.35);
+  border-radius: 14px;
+  background: rgba(91, 183, 255, 0.08);
+}
+
+.upgrade-notice-text {
+  flex: 1 1 320px;
+  margin: 0;
+}
+
 .read-ui-auth-panel {
   display: flex;
   align-items: center;
@@ -989,31 +1020,12 @@ textarea {
   white-space: nowrap;
 }
 
-.disk-inventory-sync-controls .button[data-armed="true"] {
-  border-color: rgba(215, 182, 43, 0.75);
-  background: rgba(215, 182, 43, 0.16);
-  color: #fff6d6;
-}
-
-.disk-inventory-sync-hint {
-  flex-basis: 100%;
-  max-width: 34rem;
-  color: var(--muted);
-  font-size: 0.82rem;
-  line-height: 1.35;
-  text-align: right;
-}
-
 @media (max-width: 820px) {
   .disk-inventory-sync-controls {
     flex-basis: 100%;
     justify-content: flex-start;
     padding-left: 0;
     border-left: 0;
-  }
-
-  .disk-inventory-sync-hint {
-    text-align: left;
   }
 }
 
@@ -1231,6 +1243,7 @@ textarea {
   align-items: center;
   min-height: 18px;
   padding: 1px 6px;
+  font: inherit;
   border: 1px solid rgba(85, 214, 235, 0.42);
   border-radius: 999px;
   background: rgba(85, 214, 235, 0.1);
@@ -1649,7 +1662,7 @@ textarea {
   overflow: hidden;
   color: #8ea3b8;
   font-family: var(--mono);
-  font-size: 0.62rem;
+  font-size: 0.75rem;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   text-overflow: ellipsis;
@@ -1660,15 +1673,15 @@ textarea {
   overflow: hidden;
   color: #eef6ff;
   font-size: 0.86rem;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .fabric-focus-card small {
   overflow: hidden;
   color: var(--muted);
   font-family: var(--mono);
-  font-size: 0.66rem;
+  font-size: 0.75rem;
   line-height: 1.35;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1734,7 +1747,7 @@ textarea {
 .fabric-stage-title,
 .fabric-node-kind {
   font-family: var(--mono);
-  font-size: 0.66rem;
+  font-size: 0.75rem;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: #8ea3b8;
@@ -1805,8 +1818,8 @@ textarea {
   overflow: hidden;
   color: #eef6ff;
   font-size: 0.86rem;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .fabric-node-card span,
@@ -1822,10 +1835,10 @@ textarea {
   overflow: hidden;
   color: var(--muted);
   font-family: var(--mono);
-  font-size: 0.66rem;
+  font-size: 0.75rem;
   line-height: 1.35;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .fabric-path-card em {
@@ -1915,7 +1928,7 @@ textarea {
   background: rgba(13, 19, 25, 0.88);
   color: #dfe9f4;
   font-family: var(--mono);
-  font-size: 0.68rem;
+  font-size: 0.75rem;
   cursor: pointer;
 }
 
@@ -1936,7 +1949,7 @@ textarea {
   background: rgba(85, 214, 235, 0.1);
   color: #dffaff;
   font-family: var(--mono);
-  font-size: 0.66rem;
+  font-size: 0.75rem;
   cursor: pointer;
 }
 
@@ -1951,7 +1964,7 @@ textarea {
   align-self: center;
   color: var(--muted);
   font-family: var(--mono);
-  font-size: 0.68rem;
+  font-size: 0.75rem;
 }
 
 .fabric-impact-grid {
@@ -2010,7 +2023,7 @@ textarea {
 .disk-path-selected small {
   color: var(--muted);
   font-family: var(--mono);
-  font-size: 0.68rem;
+  font-size: 0.75rem;
   overflow-wrap: anywhere;
 }
 
@@ -2124,7 +2137,7 @@ textarea {
 
 .disk-path-branch-header span {
   color: #8ea3b8;
-  font-size: 0.66rem;
+  font-size: 0.75rem;
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
@@ -2201,7 +2214,7 @@ button.disk-path-card:hover,
 .disk-path-kind {
   color: #8ea3b8;
   font-family: var(--mono);
-  font-size: 0.62rem;
+  font-size: 0.75rem;
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
@@ -2221,7 +2234,7 @@ button.disk-path-card:hover,
   color: var(--muted);
   display: -webkit-box;
   font-family: var(--mono);
-  font-size: 0.62rem;
+  font-size: 0.75rem;
   line-height: 1.35;
   overflow: hidden;
   -webkit-box-orient: vertical;
@@ -2242,7 +2255,7 @@ button.disk-path-card:hover,
   min-width: 0;
   color: #b7c9d8;
   font-family: var(--mono);
-  font-size: 0.61rem;
+  font-size: 0.75rem;
   line-height: 1.25;
   overflow-wrap: anywhere;
 }
@@ -2302,7 +2315,7 @@ button.disk-path-card:hover,
 .fabric-diagnostic-evidence-head small {
   color: #c6d6e4;
   font-family: var(--mono);
-  font-size: 0.64rem;
+  font-size: 0.75rem;
 }
 
 .fabric-diagnostic-chips {
@@ -2335,19 +2348,18 @@ button.disk-path-card:hover,
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.035);
   color: #d8e7f5;
-  font-size: 0.56rem;
-  text-transform: uppercase;
+  font-size: 0.75rem;
 }
 
 .fabric-diagnostic-impact b {
   display: inline-grid;
   place-items: center;
-  width: 13px;
-  height: 13px;
+  width: 16px;
+  height: 16px;
   border-radius: 50%;
   background: rgba(177, 190, 205, 0.18);
   color: #f5fbff;
-  font-size: 0.52rem;
+  font-size: 0.75rem;
   font-weight: 800;
 }
 
@@ -2384,7 +2396,7 @@ button.disk-path-card:hover,
 .fabric-diagnostic-impact-count em {
   color: #d8e7f5;
   font-style: normal;
-  font-size: 0.62rem;
+  font-size: 0.75rem;
 }
 
 .fabric-diagnostic-chip {
@@ -2398,7 +2410,7 @@ button.disk-path-card:hover,
   background: rgba(255, 255, 255, 0.035);
   color: #d8e7f5;
   font-family: var(--mono);
-  font-size: 0.62rem;
+  font-size: 0.75rem;
 }
 
 .fabric-diagnostic-chip.severity-error {
@@ -2458,7 +2470,7 @@ button.disk-path-card:hover,
 
 .fabric-diagnostic-event strong {
   color: #eef6ff;
-  font-size: 0.68rem;
+  font-size: 0.75rem;
 }
 
 .fabric-diagnostic-confidence {
@@ -2467,7 +2479,7 @@ button.disk-path-card:hover,
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.03);
   color: #9fb3c7;
-  font-size: 0.55rem;
+  font-size: 0.75rem;
 }
 
 .fabric-diagnostic-confidence.confidence-standard,
@@ -2490,7 +2502,7 @@ button.disk-path-card:hover,
 .fabric-diagnostic-event span,
 .fabric-diagnostic-event small {
   color: #9fb3c7;
-  font-size: 0.6rem;
+  font-size: 0.75rem;
   line-height: 1.35;
 }
 
@@ -2503,7 +2515,7 @@ button.disk-path-card:hover,
 .fabric-diagnostic-raw {
   color: #aebfd0;
   font-family: var(--mono);
-  font-size: 0.62rem;
+  font-size: 0.75rem;
 }
 
 .fabric-diagnostic-raw summary {
@@ -2558,12 +2570,12 @@ button.disk-path-card:hover,
 
 .fabric-diagnostic-table-status strong {
   color: #d8e7f5;
-  font-size: 0.64rem;
+  font-size: 0.75rem;
 }
 
 .fabric-diagnostic-table-status small {
   color: #7890a7;
-  font-size: 0.58rem;
+  font-size: 0.75rem;
   line-height: 1.35;
 }
 
@@ -2573,8 +2585,7 @@ button.disk-path-card:hover,
   min-width: 0;
   color: #7890a7;
   font-family: var(--mono);
-  font-size: 0.56rem;
-  text-transform: uppercase;
+  font-size: 0.75rem;
   letter-spacing: 0;
 }
 
@@ -2588,7 +2599,7 @@ button.disk-path-card:hover,
   background: rgba(2, 6, 10, 0.45);
   color: #d8e7f5;
   font-family: var(--mono);
-  font-size: 0.62rem;
+  font-size: 0.75rem;
 }
 
 .fabric-diagnostic-raw .fabric-diagnostic-pagination {
@@ -2599,7 +2610,7 @@ button.disk-path-card:hover,
   align-items: center;
   color: #7890a7;
   font-family: var(--mono);
-  font-size: 0.58rem;
+  font-size: 0.75rem;
 }
 
 .fabric-diagnostic-pagination button {
@@ -2613,7 +2624,7 @@ button.disk-path-card:hover,
   background: rgba(255, 255, 255, 0.035);
   color: #d8e7f5;
   font-family: var(--mono);
-  font-size: 0.6rem;
+  font-size: 0.75rem;
   cursor: pointer;
 }
 
@@ -2654,7 +2665,7 @@ button.disk-path-card:hover,
   border-collapse: collapse;
   color: #b9c9da;
   font-family: var(--mono);
-  font-size: 0.6rem;
+  font-size: 0.75rem;
   table-layout: fixed;
 }
 
@@ -2756,7 +2767,7 @@ button.disk-path-card:hover,
   background: rgba(255, 255, 255, 0.035);
   color: #d8e7f5;
   font-family: var(--mono);
-  font-size: 0.66rem;
+  font-size: 0.75rem;
   line-height: 1.2;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2781,7 +2792,7 @@ button.fabric-trace-crumb:hover {
 .fabric-trace-separator {
   color: rgba(177, 190, 205, 0.45);
   font-family: var(--mono);
-  font-size: 0.68rem;
+  font-size: 0.75rem;
 }
 
 .fabric-trace-chain {
@@ -2817,7 +2828,7 @@ button.fabric-trace-crumb:hover {
   background: rgba(85, 214, 235, 0.1);
   color: #dffaff;
   font-family: var(--mono);
-  font-size: 0.7rem;
+  font-size: 0.75rem;
 }
 
 .fabric-link-list h3,
@@ -2903,7 +2914,7 @@ button.fabric-trace-crumb:hover {
   margin-top: 5px;
   color: #a9c0d6;
   font-family: var(--mono);
-  font-size: 0.68rem;
+  font-size: 0.75rem;
   line-height: 1.35;
   overflow-wrap: anywhere;
 }
@@ -2916,7 +2927,7 @@ button.fabric-trace-crumb:hover {
   background: rgba(76, 216, 164, 0.1);
   color: #bdf7db;
   font-family: var(--mono);
-  font-size: 0.62rem;
+  font-size: 0.75rem;
   font-weight: 800;
   letter-spacing: 0.06em;
   text-transform: uppercase;
@@ -2947,7 +2958,7 @@ button.fabric-trace-crumb:hover {
 .fabric-path-member-card dt {
   color: #8ea3b8;
   font-family: var(--mono);
-  font-size: 0.6rem;
+  font-size: 0.75rem;
   font-style: normal;
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -2957,7 +2968,7 @@ button.fabric-trace-crumb:hover {
   min-width: 0;
   color: #eaf4ff;
   font-family: var(--mono);
-  font-size: 0.72rem;
+  font-size: 0.75rem;
   line-height: 1.35;
   overflow-wrap: anywhere;
 }
@@ -2975,7 +2986,7 @@ button.fabric-trace-crumb:hover {
 .fabric-identity-card code {
   color: #d8f3ff;
   font-family: var(--mono);
-  font-size: 0.72rem;
+  font-size: 0.75rem;
   line-height: 1.35;
   overflow-wrap: anywhere;
   white-space: normal;
@@ -2993,7 +3004,7 @@ button.fabric-trace-crumb:hover {
   min-width: 0;
   color: #dbe8f4;
   font-family: var(--mono);
-  font-size: 0.68rem;
+  font-size: 0.75rem;
   overflow-wrap: anywhere;
 }
 
@@ -3013,7 +3024,7 @@ button.fabric-trace-crumb:hover {
   background: rgba(85, 214, 235, 0.07);
   color: #cfefff;
   font-family: var(--mono);
-  font-size: 0.62rem;
+  font-size: 0.75rem;
   font-weight: 700;
 }
 
@@ -3058,7 +3069,7 @@ button.fabric-trace-crumb:hover {
 .fabric-path-member-card > div span {
   color: #bdf7db;
   font-family: var(--mono);
-  font-size: 0.62rem;
+  font-size: 0.75rem;
   font-weight: 800;
   text-transform: uppercase;
 }
@@ -3066,7 +3077,7 @@ button.fabric-trace-crumb:hover {
 .fabric-path-member-card small {
   color: #a9c0d6;
   font-family: var(--mono);
-  font-size: 0.66rem;
+  font-size: 0.75rem;
   line-height: 1.35;
   overflow-wrap: anywhere;
 }
@@ -3088,7 +3099,7 @@ button.fabric-trace-crumb:hover {
   margin: 0;
   color: #dbe8f4;
   font-family: var(--mono);
-  font-size: 0.66rem;
+  font-size: 0.75rem;
   overflow-wrap: anywhere;
 }
 
@@ -3114,7 +3125,7 @@ button.fabric-trace-crumb:hover {
 
 .fabric-alias-row small {
   color: var(--muted);
-  font-size: 0.68rem;
+  font-size: 0.75rem;
   font-weight: 500;
   line-height: 1.35;
 }
@@ -3177,7 +3188,7 @@ button.fabric-trace-crumb:hover {
   background: rgba(255, 255, 255, 0.055);
   color: #dceaf7;
   padding: 0 10px;
-  font-size: 0.74rem;
+  font-size: 0.75rem;
 }
 
 .fabric-alias-actions button:hover:not(:disabled),
@@ -4386,13 +4397,13 @@ button.fabric-trace-crumb:hover {
 
 .slot-device {
   margin-top: auto;
-  font-size: 0.74rem;
+  font-size: 0.75rem;
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
 
 .slot-pool {
-  font-size: 0.72rem;
+  font-size: 0.75rem;
   color: var(--muted);
 }
 
@@ -4431,7 +4442,7 @@ button.fabric-trace-crumb:hover {
   max-height: 42px;
   padding: 3px 3px;
   border-radius: 5px;
-  font-size: 0.68rem;
+  font-size: 0.75rem;
   line-height: 1.02;
 }
 
@@ -4442,7 +4453,7 @@ button.fabric-trace-crumb:hover {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 0.66rem;
+  font-size: 0.75rem;
   color: rgba(198, 212, 226, 0.72);
 }
 
@@ -5137,7 +5148,7 @@ button.fabric-trace-crumb:hover {
   background:
     linear-gradient(180deg, rgba(255,255,255,0.42), rgba(255,255,255,0.12) 14%, rgba(255,255,255,0.08) 15%, rgba(203, 208, 215, 0.92) 100%),
     linear-gradient(180deg, #d8dce1, #bcc3cb 52%, #aeb6bf);
-  color: #6c7783;
+  color: #3a4450;
 }
 
 .slot-tile.state-empty::before {
@@ -5663,12 +5674,6 @@ button.fabric-trace-crumb:hover {
   line-height: 1.35;
 }
 
-.history-chart-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 14px;
-}
-
 .history-main-grid {
   display: grid;
   gap: 14px;
@@ -5898,6 +5903,24 @@ button.fabric-trace-crumb:hover {
   gap: 10px;
 }
 
+.detail-empty-bay {
+  margin: 0;
+  padding: 10px 12px;
+  color: var(--muted);
+}
+
+.detail-smart-details > summary {
+  cursor: pointer;
+  padding: 8px 12px;
+  color: var(--muted);
+  font-size: 0.85rem;
+  font-weight: 700;
+}
+
+.detail-smart-details[open] > summary {
+  margin-bottom: 10px;
+}
+
 .kv-row {
   display: grid;
   grid-template-columns: 116px 1fr auto;
@@ -6124,7 +6147,6 @@ button.fabric-trace-crumb:hover {
   }
 
   .history-metric-grid,
-  .history-chart-grid,
   .history-main-grid,
   .history-chart-column {
     grid-template-columns: 1fr;
@@ -6257,8 +6279,53 @@ button.fabric-trace-crumb:hover {
     justify-content: flex-start;
   }
 
-  .system-setup-dialog {
-    width: min(100vw - 16px, 920px);
+}
+
+/* Printing: browsers drop page backgrounds, so switch the dark theme to black
+   on white and keep the bay colours and hatching that carry the bay state. */
+@media print {
+  :root {
+    --bg: #fff;
+    --panel: #fff;
+    --panel-2: #fff;
+    --panel-border: #999;
+    --text: #000;
+    --muted: #333;
+    --surface: #fff;
+    --shadow: none;
+    background: #fff;
   }
 
+  body {
+    background: #fff;
+    color: #000;
+  }
+
+  .topbar,
+  .summary-strip,
+  .panel {
+    background: #fff;
+    box-shadow: none;
+  }
+
+  .slot-tile,
+  .slot-tile::before,
+  .slot-tile::after,
+  .swatch,
+  .heatmap-legend-bar,
+  .history-legend-swatch {
+    print-color-adjust: exact;
+    -webkit-print-color-adjust: exact;
+  }
+
+  .toolbar,
+  .topbar-meta,
+  .status-strip .status-chip,
+  .detail-panel-actions,
+  .detail-led-controls,
+  .detail-panel button,
+  .history-drawer-actions,
+  .slot-tooltip {
+    display: none !important;
+  }
 }

@@ -65,9 +65,12 @@ class PublicDemoArtifactTests(unittest.TestCase):
         html = (ROOT / "public-demo/index.html").read_text(encoding="utf-8")
 
         for marker in (
-            "Frozen Sanitized Snapshot",
-            f"Artifact app v{__version__}",
+            "Demo data",
+            f'id="snapshot-app-version">v{__version__}<',
             PUBLIC_DEMO_GENERATED_AT.isoformat(),
+            "A 60-bay JBOD with made-up disks.",
+            "About this demo",
+            "Everything on this page is made-up demo data.",
             "Synthetic IDs",
             "Demo Storage Host",
             "Demo 60-Bay Top Loader",
@@ -87,8 +90,8 @@ class PublicDemoArtifactTests(unittest.TestCase):
             artifact = self.copy_artifact(demo_dir)
             artifact.write_text(
                 artifact.read_text(encoding="utf-8").replace(
-                    f"Artifact app v{__version__}",
-                    "Artifact app v0.0.0-stale",
+                    f'id="snapshot-app-version">v{__version__}<',
+                    'id="snapshot-app-version">v0.0.0-stale<',
                 ),
                 encoding="utf-8",
             )
@@ -398,6 +401,13 @@ class PublicDemoFixtureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(nvme.slot_layout, [[3], [2], [1], [0]])
         self.assertEqual([slot.slot_label for slot in nvme.slots], ["M2-1", "M2-2", "M2-3", "M2-4"])
         self.assertEqual(nvme.slots[0].model, "Demo NVMe Flash 2TB")
+
+    async def test_public_demo_embeds_all_declared_images_for_strict_source_parity(self) -> None:
+        from scripts.public_demo_source_parity import inline_source_errors
+
+        html = await build_public_demo_html()
+
+        self.assertEqual(inline_source_errors(html, ROOT), [])
 
     async def test_public_demo_html_is_deterministic_and_self_contained(self) -> None:
         first = await build_public_demo_html()

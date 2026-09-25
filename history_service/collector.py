@@ -4,6 +4,8 @@ import asyncio
 import json
 import logging
 import math
+import os
+import stat
 import threading
 import time
 import urllib.error
@@ -16,6 +18,7 @@ from typing import Any
 
 from history_service.config import HistorySettings
 from history_service.diagnostics import (
+    RETENTION_FAILURE_SENTENCES,
     RETENTION_RAN_WITHOUT_BACKUP,
     RETENTION_SKIP_ANCHOR_UNAVAILABLE,
     RETENTION_SKIP_WAITING_FOR_BACKUP,
@@ -130,6 +133,7 @@ class HistoryCollector:
         self.last_retention_has_more: bool = False
         self.last_retention_error: str | None = None
         self.last_retention_error_kind: str | None = None
+        self.retention_consecutive_failures: int = 0
         self.last_retention_skip_reason: str | None = None
         self.last_retention_skip_until: str | None = None
         self.last_retention_ran_without_backup: bool = False
@@ -139,6 +143,7 @@ class HistoryCollector:
         self.last_error: str | None = None
         self.last_error_kind: str | None = None
         self.last_error_summary: str | None = None
+        self._starting = False
         self.last_scope_count: int = 0
         self.current_collection_started_at: str | None = None
         self.current_collection_kind: str | None = None
@@ -517,10 +522,29 @@ class HistoryCollector:
         self._set_collection_activity("collection completed")
         self._clear_background_failure_backoff()
 
+    def degraded_reason(self) -> str | None:
+        """Why /healthz reports ``degraded``, or None when the service is healthy.
+
+        Degraded means one of: the last background collection pass failed, the
+        history database is read-only, or cleanup failed twice in a row. A failed
+        manual refresh alone does not count; it is shown in "Last error" and
+        cleared by the next successful pass.
+        """
+
+        if self.background_consecutive_failures > 0:
+            return "The last background collection failed."
+        if self.last_retention_error_kind == "database_read_only":
+            return "The history database is read-only."
+        if self.retention_consecutive_failures >= 2:
+            return "History cleanup has failed twice in a row."
+        return None
+
     def status(self) -> dict[str, Any]:
         collection_started_at = self.current_collection_started_at
+        collector_running = bool(self._task and not self._task.done())
         return {
-            "collector_running": bool(self._task and not self._task.done()),
+            "collector_running": collector_running,
+            "collector_starting": collector_running and self._starting,
             "collection_running": self.collection_running,
             "collection_started_at": collection_started_at,
             "collection_kind": self.current_collection_kind,
@@ -565,6 +589,7 @@ class HistoryCollector:
             "last_retention_has_more": self.last_retention_has_more,
             "last_retention_error": self.last_retention_error,
             "last_retention_error_kind": self.last_retention_error_kind,
+            "retention_consecutive_failures": self.retention_consecutive_failures,
             "last_retention_skip_reason": self.last_retention_skip_reason,
             "last_retention_skip_until": self.last_retention_skip_until,
             "last_retention_ran_without_backup": self.last_retention_ran_without_backup,
@@ -609,6 +634,7 @@ class HistoryCollector:
 
     async def _run_loop(self) -> None:
         if self.settings.startup_grace_seconds > 0:
+            self._starting = True
             try:
                 await asyncio.wait_for(
                     self._stopping.wait(),
@@ -616,6 +642,8 @@ class HistoryCollector:
                 )
             except asyncio.TimeoutError:
                 pass
+            finally:
+                self._starting = False
 
         while not self._stopping.is_set():
             if self.collection_running:
@@ -667,7 +695,7 @@ class HistoryCollector:
                     result="success",
                     duration_seconds=time.perf_counter() - started_monotonic,
                     status=self.status(),
-                    counts=self.store.estimated_counts(),
+                    counts=await asyncio.to_thread(self.store.estimated_counts),
                 )
             except HistoryCollectionAlreadyRunning:
                 logger.info("Skipping scheduled history collection because another collection pass is already running.")
@@ -800,10 +828,41 @@ class HistoryCollector:
             return True
         return False
 
+    def _report_unsafe_backup_status_mode(self, status_path: str) -> None:
+        """Name the status-file problem the reader hides behind "no backup".
+
+        read_scheduled_backup_status treats a group- or world-writable file like a
+        missing one, which is the right safety call but left cleanup saying
+        "never" with no reason. This only reports; the reader stays the gate.
+        """
+
+        try:
+            metadata = os.lstat(status_path)
+        except OSError:
+            return
+        if not stat.S_ISREG(metadata.st_mode):
+            return
+        mode = stat.S_IMODE(metadata.st_mode)
+        if not mode & 0o022:
+            if self.last_retention_error_kind == "backup_status_mode":
+                self.last_retention_error_kind = None
+                self.last_retention_error = None
+            return
+        if self.last_retention_error_kind != "backup_status_mode":
+            logger.warning(
+                "Scheduled backup status file %s has unsafe permissions (mode %04o, expected 0640); "
+                "segmented history cleanup waits until the mode is fixed.",
+                status_path,
+                mode,
+            )
+        self.last_retention_error_kind = "backup_status_mode"
+        self.last_retention_error = RETENTION_FAILURE_SENTENCES["backup_status_mode"]
+
     def _segmented_backup_at_for_retention(self, now: datetime) -> datetime | None:
         status_path = self.settings.scheduled_backup_status_file
         if not status_path:
             return None
+        self._report_unsafe_backup_status_mode(status_path)
         status = read_scheduled_backup_status(status_path)
         if (
             status is None
@@ -887,6 +946,7 @@ class HistoryCollector:
             retention_kind, retention_summary = classify_retention_failure(exc)
             self.last_retention_error_kind = retention_kind
             self.last_retention_error = retention_summary
+            self.retention_consecutive_failures += 1
             partial_result = getattr(exc, "retention_summary", None)
             if not isinstance(partial_result, dict):
                 partial_result = {}
@@ -918,6 +978,7 @@ class HistoryCollector:
         self.last_retention_duration_seconds = round(duration, 3)
         self.last_retention_error = None
         self.last_retention_error_kind = None
+        self.retention_consecutive_failures = 0
         removed_rows = self._apply_retention_result(result)
         observe_history_retention_run(
             service_name=HISTORY_METRICS_SERVICE_NAME,

@@ -27,6 +27,7 @@ from app.services.tls_context import TlsTrustConfigurationError
 from history_service.operation_bounds import (
     HISTORY_READ_BUSY_DETAIL,
     HISTORY_READ_RETRY_AFTER_SECONDS,
+    MAX_TARGETS,
 )
 from history_service.refresh_auth import read_limited_request_body
 
@@ -51,6 +52,19 @@ def _storage_unwritable_response(exc: StorageDirectoryUnwritable) -> JSONRespons
     )
 
 
+def live_write_policy(request: Request) -> dict[str, Any]:
+    """Write policy for the main UI plus the public origin a browser must use.
+
+    The origin is only named when an operator configured one; otherwise the
+    browser has no better address to suggest than the one it is already on.
+    """
+    policy = dict(resolve_read_ui_write_policy(request))
+    app_state = getattr(request.app, "state", None)
+    public_origin = getattr(app_state, "read_ui_public_origin", None)
+    policy["public_origin"] = public_origin if isinstance(public_origin, str) and public_origin else None
+    return policy
+
+
 def _history_read_busy_response() -> JSONResponse:
     return JSONResponse(
         {"detail": HISTORY_READ_BUSY_DETAIL},
@@ -68,6 +82,14 @@ def _is_json_media_type(content_type: str | None) -> bool:
         return False
     subtype = message.get_content_subtype()
     return subtype == "json" or subtype.endswith("+json")
+
+
+def _unknown_system_notice(system_id: str, settings: Any) -> str:
+    default_label = next(
+        (system.label or system.id for system in settings.systems if system.id == settings.default_system_id),
+        settings.default_system_id or "the default system",
+    )
+    return f'System "{system_id}" is not configured. Showing {default_label} instead.'
 
 
 SMART_BATCH_TRANSPORT_EXCEPTIONS = (
@@ -133,7 +155,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
     ) -> Any:
         registry = get_inventory_registry()
         if exact_system_id and (system_id is None or not registry.has_system(system_id)):
-            raise HTTPException(status_code=404, detail=f"System {system_id!r} is not configured.")
+            raise HTTPException(status_code=404, detail=f'No system named "{system_id}" is configured.')
         service = registry.get_service(system_id)
         add_perf_metadata(
             system_id=service.system.id,
@@ -215,31 +237,73 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             if system_id in configured_system_ids
             else current_settings.default_system_id
         )
+        system_notice = (
+            None
+            if system_id is None or system_id in configured_system_ids
+            else _unknown_system_notice(system_id, current_settings)
+        )
         service = route_service(selected_system_id, enclosure_id=enclosure_id)
-        admin_launch_url = await asyncio.to_thread(resolve_admin_launch_url, request, current_settings)
-        snapshot = await service.get_snapshot(
-            selected_enclosure_id=enclosure_id,
-            allow_stale_cache=True,
+        admin_launch, snapshot = await asyncio.gather(
+            asyncio.to_thread(resolve_admin_launch_url, request, current_settings),
+            service.get_snapshot(
+                selected_enclosure_id=enclosure_id,
+                allow_stale_cache=True,
+            ),
         )
         storage_view_runtime = await service.get_storage_view_runtime(
             selected_enclosure_id=enclosure_id,
             snapshot=snapshot,
         )
-        return templates.TemplateResponse(
-            request,
-            "index.html",
-            build_index_context(
-                request=request,
-                snapshot=snapshot,
-                storage_view_runtime=storage_view_runtime,
-                settings=current_settings,
-                history_configured=bool(current_settings.history.service_url),
-                read_ui_mutation_auth_mode=request.app.state.operator_auth_settings.auth_mode,
-                admin_launch_url=admin_launch_url,
-                app_version=__version__,
-                release_status=get_release_status_service().snapshot(),
-            ),
+        startup_problems = startup_problems_for(request)
+        if startup_problems:
+            snapshot = snapshot.model_copy(update={"warnings": [*startup_problems, *snapshot.warnings]})
+        upgrade_notice_payload = await asyncio.to_thread(
+            upgrade_notice.current_notice,
+            upgrade_notice_data_dir(current_settings),
+            auth_mode=resolve_read_ui_write_policy(request)["mode"],
         )
+        context = build_index_context(
+            request=request,
+            snapshot=snapshot,
+            storage_view_runtime=storage_view_runtime,
+            settings=current_settings,
+            history_configured=bool(current_settings.history.service_url),
+            read_ui_mutation_auth_mode=request.app.state.operator_auth_settings.auth_mode,
+            admin_launch_url=admin_launch.url if admin_launch else None,
+            admin_launch_stopped=bool(admin_launch and admin_launch.stopped),
+            app_version=__version__,
+            release_status=get_release_status_service().snapshot(),
+            upgrade_notice_payload=upgrade_notice_payload,
+            system_notice=system_notice,
+        )
+        context["write_policy"] = live_write_policy(request)
+        context["write_policy_json"] = json.dumps(context["write_policy"])
+        return templates.TemplateResponse(request, "index.html", context)
+
+    @router.post(
+        "/api/upgrade-notice/dismiss",
+        dependencies=[Depends(require_read_ui_mutation_authorization)],
+    )
+    async def dismiss_upgrade_notice(
+        payload: upgrade_notice.UpgradeNoticeDismissRequest,
+    ) -> JSONResponse:
+        try:
+            cleared = await asyncio.to_thread(
+                upgrade_notice.dismiss_notice,
+                upgrade_notice_data_dir(get_settings()),
+                notice_version=payload.version,
+            )
+        except upgrade_notice.UpgradeNoticeVersionConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="A newer upgrade notice is pending. Reload the page before dismissing it.",
+            ) from exc
+        if not cleared:
+            raise HTTPException(
+                status_code=503,
+                detail="The notice could not be saved as dismissed because the data directory is not writable.",
+            )
+        return JSONResponse({"ok": True})
 
     @router.get("/sas-fabric", response_class=HTMLResponse)
     async def sas_fabric_view(
@@ -281,22 +345,30 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             },
         )
 
-    @router.get("/api/inventory", response_model=InventorySnapshot)
+    @router.get("/api/inventory", response_model=InventoryReadResponse)
     async def get_inventory(
+        request: Request,
         force: bool = False,
         system_id: str | None = None,
         enclosure_id: str | None = None,
-    ) -> InventorySnapshot:
+    ) -> JSONResponse:
         service = route_service(
             system_id,
             enclosure_id=enclosure_id,
             force_refresh=force,
         )
-        return await service.get_snapshot(
+        snapshot = await service.get_snapshot(
             force_refresh=force,
             selected_enclosure_id=enclosure_id,
             allow_stale_cache=not force,
         )
+        payload = snapshot.model_dump(mode="json")
+        # The browser re-syncs its write controls and its cached page from
+        # every refresh, so a rejected write or a container upgrade never
+        # leaves the page stuck on stale policy or stale JavaScript.
+        payload["write_policy"] = live_write_policy(request)
+        payload["app_version"] = __version__
+        return JSONResponse(payload)
 
     @router.get(
         "/api/read-ui/auth/verify",
@@ -848,7 +920,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
         try:
             result = await history_backend.refresh(payload.mode)
         except HistoryBackendPolicyError as exc:
-            raise HTTPException(status_code=exc.status_code, detail="History refresh was rejected by policy.") from exc
+            raise HTTPException(status_code=exc.status_code, detail="The history service refused this request. Check the history service log.") from exc
         return JSONResponse(result)
 
     history_scopes_request_schema = HistoryScopesProxyRequest.model_json_schema()
@@ -874,12 +946,12 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
         if not _is_json_media_type(request.headers.get("content-type")):
             raise HTTPException(
                 status_code=415,
-                detail="History request Content-Type must be application/json or application/*+json.",
+                detail="Send this request with Content-Type: application/json.",
             )
         body = await read_limited_request_body(
             request,
             limit=MAX_HISTORY_SCOPES_REQUEST_BYTES,
-            detail=f"History request exceeds {MAX_HISTORY_SCOPES_REQUEST_BYTES} bytes.",
+            detail="History request is too large.",
         )
         try:
             document = json.loads(body)
@@ -901,7 +973,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
         except HistoryBackendBusyError:
             return _history_read_busy_response()
         except HistoryBackendPolicyError as exc:
-            raise HTTPException(status_code=exc.status_code, detail="History request was rejected by policy.") from exc
+            raise HTTPException(status_code=exc.status_code, detail="The history service refused this request. Check the history service log.") from exc
         except (HistoryRequestShapeError, HistoryBudgetExceeded, ValueError) as exc:
             raise HTTPException(
                 status_code=413 if isinstance(exc, HistoryBudgetExceeded) else 422,
@@ -947,12 +1019,15 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
         metric_limit: int = 60,
     ) -> JSONResponse:
         requested_slots = [int(slot) for slot in (slots or [])]
-        if len(requested_slots) > 347:
-            raise HTTPException(status_code=413, detail="History request exceeds target_count limit (347).")
+        if len(requested_slots) > MAX_TARGETS:
+            raise HTTPException(
+                status_code=413,
+                detail=f"History can be requested for at most {MAX_TARGETS} slots at a time.",
+            )
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
         if not requested_slots or not isinstance(window_hours, int) or not 1 <= window_hours <= 8760:
-            raise HTTPException(status_code=422, detail="Bounded history slots and window_hours are required.")
+            raise HTTPException(status_code=422, detail="Choose at least one slot and a time range between 1 hour and 1 year.")
         selected_metrics = metrics or list(ALLOWED_HISTORY_METRICS)
         since = (datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat()
         try:
@@ -1018,7 +1093,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
         metric_limit: int = 60,
     ) -> JSONResponse:
         if not isinstance(window_hours, int) or not 1 <= window_hours <= 8760:
-            raise HTTPException(status_code=422, detail="A bounded window_hours is required.")
+            raise HTTPException(status_code=422, detail="Choose a time range between 1 hour and 1 year.")
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
         try:
@@ -1030,7 +1105,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         runtime_view = next((view for view in runtime.views if view.id == view_id), None)
         if not runtime_view:
-            raise HTTPException(status_code=404, detail=f"Storage view {view_id!r} is not present for this system.")
+            raise HTTPException(status_code=404, detail=f'The saved view "{view_id}" does not exist on this system.')
 
         display_slot_by_target: dict[tuple[str | None, int], list[int]] = {}
         slots_by_enclosure: dict[str | None, set[int]] = {}
@@ -1214,33 +1289,18 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
         )
 
     @router.get("/healthz")
-    async def healthz() -> JSONResponse:
+    async def healthz(request: Request) -> JSONResponse:
         registry = get_inventory_registry()
         service = registry.get_service(None)
-        snapshot = service.peek_cached_snapshot()
-        if snapshot is None:
-            return JSONResponse(
-                {
-                    "status": "ok",
-                    "dependency_status": "unknown",
-                    "last_updated": None,
-                    "sources": {},
-                    "warnings": [],
-                    "cache_state": "empty",
-                },
-                status_code=200,
-            )
-        api_status = snapshot.sources.get("api")
-        return JSONResponse(
-            {
-                "status": "ok",
-                "dependency_status": "ok" if api_status and api_status.ok else "degraded",
-                "last_updated": snapshot.last_updated.isoformat(),
-                "sources": {name: status.model_dump(mode="json") for name, status in snapshot.sources.items()},
-                "warnings": snapshot.warnings,
-                "cache_state": "cached",
-            },
-            status_code=200,
+        storage_problems, history_problem = await asyncio.gather(
+            asyncio.to_thread(refresh_storage_problems, request),
+            asyncio.to_thread(history_service_problem, get_settings()),
         )
+        payload = build_health_payload(
+            service.peek_cached_snapshot(),
+            startup_problems=storage_problems,
+            remote_problems=[history_problem] if history_problem else [],
+        )
+        return JSONResponse(payload, status_code=health_status_code(payload))
 
     return router

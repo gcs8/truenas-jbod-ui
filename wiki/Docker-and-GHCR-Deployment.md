@@ -73,6 +73,14 @@ admin port can use the controls available there. Do not publish those ports
 directly to the Internet. Confirm the UI and health endpoints work before adding
 optional hardening.
 
+## Legacy history publication migration
+
+If you retain the v0.22.2 Compose file while updating the image, follow the
+[explicit history Compose migration](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/HISTORY_COMPOSE_MIGRATION.md).
+It forwards the published address without replacing deployment customizations
+or changing loopback and network-auth defaults. An image-only update cannot
+supply metadata that the old history service never receives.
+
 ## Optional hardening after startup
 
 To opt into Basic authentication, set shared credentials and the exact browser
@@ -316,9 +324,13 @@ curl http://your-docker-host:8080/livez
 curl http://your-docker-host:8080/healthz
 ```
 
-`/livez` should answer quickly when the container is alive. `/healthz` is the
-better operator view when the UI is up but a backend, host, cache, or sidecar
-looks suspicious.
+`/livez` should answer quickly when the container is alive; the image
+healthcheck probes it. `/healthz` is the better operator view when the UI is up
+but a backend, host, cache, or sidecar looks suspicious. It answers HTTP 200
+with `status: ok` or `status: degraded` (a remote TrueNAS API, SSH, BMC, or the
+history service is unhealthy), and HTTP 503 with `status: down` only for a local
+fault such as an unwritable data, logs or known-hosts folder. See
+[[Troubleshooting]] for the full table.
 
 ## Optional history sidecar
 

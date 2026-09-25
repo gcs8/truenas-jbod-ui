@@ -132,6 +132,7 @@ MUTATION_ROUTES = (
     ("POST", "/api/slots/0/mapping"),
     ("DELETE", "/api/slots/0/mapping"),
     ("POST", "/api/mappings/import"),
+    ("POST", "/api/upgrade-notice/dismiss"),
 )
 MUTATION_ROUTE_TEMPLATES = {
     ("POST", "/api/sas-fabric/aliases"),
@@ -142,6 +143,7 @@ MUTATION_ROUTE_TEMPLATES = {
     ("DELETE", "/api/slots/{slot}/mapping"),
     ("POST", "/api/mappings/import"),
     ("POST", "/api/history/refresh"),
+    ("POST", "/api/upgrade-notice/dismiss"),
 }
 READ_ONLY_NON_GET_ROUTES = {
     ("POST", "/api/mappings/import/preview"),
@@ -263,6 +265,14 @@ def index_request(app) -> Request:
 
 
 class ReadUIAuthorizationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # The upgrade-notice dismiss route writes a version record; keep it out of the checkout.
+        data_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(data_dir.cleanup)
+        patcher = patch.object(app_main, "upgrade_notice_data_dir", return_value=Path(data_dir.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def make_app(
         self,
         *,
@@ -420,7 +430,7 @@ class ReadUIAuthorizationTests(unittest.TestCase):
         self.assertEqual(unavailable_status, 403)
         self.assertEqual(
             json.loads(unavailable_body),
-            {"ok": False, "detail": "Read UI sign-in requires ADMIN_AUTH_MODE=basic."},
+            {"ok": False, "detail": "Sign-in is not enabled on this server."},
         )
 
     def test_basic_mode_requires_explicit_main_ui_public_origin(self) -> None:
@@ -550,7 +560,7 @@ class ReadUIWritePolicyBootstrapTests(unittest.TestCase):
         policy = context["write_policy"]
         self.assertEqual(policy["enabled"], False)
         self.assertEqual(policy["mode"], "basic")
-        self.assertEqual(policy["reason"], "Sign in to enable mapping, LED, and alias changes.")
+        self.assertEqual(policy["reason"], "Sign in to make changes.")
         self.assertEqual(json.loads(context["write_policy_json"]), policy)
 
     def test_snapshot_export_context_without_policy_renders_null(self) -> None:

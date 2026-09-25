@@ -405,10 +405,23 @@ SSH_STRICT_HOST_KEY_CHECKING=true
 If the appliance only exposes password SSH, set `SSH_PASSWORD` and leave
 `SSH_KEY_PATH` empty.
 
-The trust-on-first-use file is not configurable. The app always uses
-`known_hosts` in its own data directory (`/app/data/known_hosts` in the
-container), derived from the runtime layout, and ignores any value supplied by
-config, environment, or a setup request.
+By default the app pins host keys in `known_hosts` in its own data directory
+(`/app/data/known_hosts` in the container), derived from the runtime layout.
+To keep them somewhere else, such as a host bind mount instead of the data
+volume, set `ssh.known_hosts_path` in `config.yaml` (top level, or per system
+under `systems[].ssh`) or `SSH_KNOWN_HOSTS_PATH` in `.env`:
+
+```env
+SSH_KNOWN_HOSTS_PATH=/app/ssh-trust/known_hosts
+```
+
+A system without its own value uses the top-level path. Leaving the setting
+unset, blank, or at the `/app/data/known_hosts` default keeps the derived
+file. The folder holding a configured file must already exist and be writable
+by the app user; if it is not, the UI reports it at startup (in the log, on
+`/healthz`, and as a page warning) and keeps running. Setup requests from the
+admin UI never choose the file; a per-system path set in `config.yaml` is kept
+when that system is saved again.
 
 The current default already uses:
 

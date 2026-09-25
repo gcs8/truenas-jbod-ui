@@ -19,7 +19,7 @@ class DevCheckPlanTests(unittest.TestCase):
         check, skips = dev_check._windows_test_check(ROOT, "python")
         self.assertIn("tests.test_nonroot_cli", check.argv)
         self.assertNotIn("tests.test_nonroot_migration", check.argv)
-        self.assertTrue(any("tests.test_nonroot_migration" in skip.reason for skip in skips))
+        self.assertTrue(any("tests.test_nonroot_migration" in skip.details for skip in skips))
 
     @staticmethod
     def _copy_ci_contract(root: Path) -> None:
@@ -214,12 +214,49 @@ class DevCheckPlanTests(unittest.TestCase):
         exclusion_skips = [skip for skip in plan.skips if skip.name.startswith("Windows exclusion:")]
         self.assertEqual(len(exclusion_skips), len(dev_check.WINDOWS_EXCLUSIONS))
         rendered = "\n".join(f"{skip.name}: {skip.reason}" for skip in exclusion_skips)
+        listed = "\n".join(module for skip in exclusion_skips for module in skip.details)
         for exclusion in dev_check.WINDOWS_EXCLUSIONS:
             self.assertIn(exclusion.category, rendered)
             self.assertIn(exclusion.reason, rendered)
+            self.assertIn(f"{len(exclusion.modules)} suites skipped", rendered)
             for module in exclusion.modules:
-                self.assertIn(module, rendered)
-        self.assertIn("tests.test_esxi_host_prep", rendered)
+                self.assertNotIn(module, rendered)
+                self.assertIn(module, listed)
+        self.assertIn("tests.test_esxi_host_prep", listed)
+        for line in rendered.splitlines():
+            self.assertLess(len(line), 240, line)
+
+    def test_runner_lists_skip_details_only_when_verbose(self) -> None:
+        plan = dev_check.Plan(
+            checks=(dev_check.Check("passing check", ("tool", "pass")),),
+            skips=(
+                dev_check.Skip(
+                    "Windows exclusion: sample",
+                    "2 suites skipped; need POSIX",
+                    details=("tests.test_alpha", "tests.test_beta"),
+                ),
+            ),
+        )
+        runner = lambda argv, **_kwargs: subprocess.CompletedProcess(argv, 0)  # noqa: E731
+
+        quiet = io.StringIO()
+        dev_check.run_plan(plan, root=ROOT, runner=runner, output=quiet)
+        self.assertIn("SKIP  Windows exclusion: sample: 2 suites skipped; need POSIX", quiet.getvalue())
+        self.assertNotIn("tests.test_alpha", quiet.getvalue())
+        self.assertIn("(--verbose lists the skipped suites)", quiet.getvalue())
+
+        verbose = io.StringIO()
+        dev_check.run_plan(plan, root=ROOT, runner=runner, output=verbose, verbose=True)
+        self.assertIn("        tests.test_alpha\n        tests.test_beta\n", verbose.getvalue())
+        self.assertNotIn("(--verbose lists the skipped suites)", verbose.getvalue())
+
+    def test_argument_parser_documents_modes_and_verbose(self) -> None:
+        parser = dev_check.build_parser()
+        rendered = parser.format_help()
+        self.assertIn("no Docker, network or live data", rendered)
+        self.assertIn("checked-in public-demo artifact", rendered)
+        self.assertTrue(parser.parse_args(["--safe", "--verbose"]).verbose)
+        self.assertFalse(parser.parse_args(["--safe"]).verbose)
 
     def test_smart_grid_io_is_classified_by_inventory_import_graph(self) -> None:
         exclusion = next(
@@ -404,7 +441,7 @@ class DevCheckPlanTests(unittest.TestCase):
                 "python -m compileall app",
             ),
             "performance-baseline/python-unittest": (
-                'python -m unittest discover -s tests -p "test_*.py" -v',
+                'python scripts/run_test_shard.py run --shard "${{ matrix.shard }}" --results-dir shard-results',
                 "python -m unittest tests.test_perf_budgets -v",
             ),
             "bounded-ruff": (

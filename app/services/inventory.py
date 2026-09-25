@@ -103,6 +103,7 @@ from app.services.parsers import (
     canonicalize_ssh_command,
     extract_nvme_controller_name,
     extract_enclosure_slot_candidates,
+    extract_enclosure_slot_count,
     format_bytes,
     merge_enclosure_meta,
     merge_slot_candidate_maps,
@@ -153,8 +154,7 @@ SMART_CACHE_STALE_RETENTION_FLOOR_SECONDS = 3600
 SMART_NEGATIVE_CACHE_TTL_SECONDS = 15
 SMART_NEGATIVE_CACHE_MAX_ENTRIES = 1024
 VIRTUAL_MAPPING_UNAVAILABLE_REASON = (
-    "Mapping import is unavailable because this system disk inventory has no identified "
-    "physical enclosure or stable physical slot identities."
+    "Bay mapping is not available because this system has no known enclosure."
 )
 # Rendering a system-scoped virtual inventory means physical location is
 # unavailable. It is not a source failure: the disks themselves were fetched.
@@ -184,6 +184,10 @@ QUANTASTOR_OPTIONAL_SSH_BACKOFF_WARNING_REGEX = re.compile(
     r"Skipping optional SSH command batch after a recent connection startup failure; "
     r"retry after (?P<retry_at>\S+)"
 )
+# Raw slot status keys that carry a state word; every other key is free text
+# or an identifier and must not drive presence, fault, or identify detection.
+SLOT_STATUS_TEXT_KEYS = ("status", "value", "value_raw", "state", "sas_device_type")
+LINUX_VIRTUAL_BLOCK_DEVICE_REGEX = re.compile(r"(?:zram|loop|ram|nbd|rbd|drbd|md|dm-)\d+")
 _CORE_GMULTIPATH_BACKFILL_WARNING = (
     "TrueNAS API disk inventory omitted multipath metadata, so this snapshot used gmultipath list to "
     "backfill multipath attribution. Use the live TrueNAS disk inventory controls in the enclosure header to "
@@ -791,7 +795,7 @@ class SnapshotStateBusyError(Exception):
     """Raised when every bounded snapshot-state entry is active."""
 
     def __init__(self) -> None:
-        super().__init__("Snapshot state capacity is temporarily busy; retry later.")
+        super().__init__("The server is busy. Try again in a moment.")
 
 
 @dataclass(slots=True)
@@ -1474,7 +1478,6 @@ class InventoryService:
     ) -> dict[str, Any]:
         if self.sas_fabric_alias_store is None:
             return {"ok": False, "cleared": False, "alias": None}
-        from app.models.domain import SasFabricAlias
 
         object_text = normalize_text(object_id)
         if not object_text:
@@ -1633,7 +1636,7 @@ class InventoryService:
         )
         runtime_view = next((view for view in runtime.views if view.id == view_id), None)
         if not runtime_view:
-            raise TrueNASAPIError(f"Storage view {view_id!r} is not present for this system.")
+            raise TrueNASAPIError(f'The saved view "{view_id}" does not exist on this system.')
         runtime_slot = next((slot for slot in runtime_view.slots if slot.slot_index == slot_index), None)
         if not runtime_slot:
             raise TrueNASAPIError(f"Storage view slot {slot_index} is not present in {runtime_view.label}.")
@@ -1665,7 +1668,7 @@ class InventoryService:
         )
         runtime_view = next((view for view in runtime.views if view.id == view_id), None)
         if not runtime_view:
-            raise TrueNASAPIError(f"Storage view {view_id!r} is not present for this system.")
+            raise TrueNASAPIError(f'The saved view "{view_id}" does not exist on this system.')
         runtime_slot = next((slot for slot in runtime_view.slots if slot.slot_index == slot_index), None)
         if not runtime_slot:
             raise TrueNASAPIError(f"Storage view slot {slot_index} is not present in {runtime_view.label}.")
@@ -1835,16 +1838,12 @@ class InventoryService:
         notes = []
         if snapshot.selected_enclosure_label and storage_view_profile:
             notes.append(
-                f"Saved chassis view layered on top of the live enclosure {snapshot.selected_enclosure_label}, rendered through the {storage_view_profile.label} profile."
+                f"Chassis view for {snapshot.selected_enclosure_label} using the {storage_view_profile.label} layout."
             )
         elif snapshot.selected_enclosure_label:
-            notes.append(
-                f"Saved chassis view layered on top of the live enclosure {snapshot.selected_enclosure_label}."
-            )
+            notes.append(f"Chassis view for {snapshot.selected_enclosure_label}.")
         elif storage_view_profile:
-            notes.append(
-                f"Saved chassis view layered on top of the current live enclosure, rendered through the {storage_view_profile.label} profile."
-            )
+            notes.append(f"Chassis view using the {storage_view_profile.label} layout.")
         return StorageViewRuntimeView(
             id=storage_view.id,
             label=storage_view.label,
@@ -1910,14 +1909,14 @@ class InventoryService:
 
         template = get_storage_view_template(storage_view.template_id)
         notes = [
-            "Placement follows your saved binding order first, then falls back to live inventory sort for any remaining matches.",
+            "Drives are placed in the order you saved; any others follow the inventory order.",
         ]
         if target_system_id and self.system.truenas.platform == "quantastor":
             notes.append(
-                f"Candidate matching is currently scoped to the Quantastor HA node {snapshot.selected_enclosure_label or target_system_id}."
+                f"Drives are matched from the QuantaStor node {snapshot.selected_enclosure_label or target_system_id} only."
             )
         if storage_view.render.show_in_main_ui is False:
-            notes.append("This view is marked maintenance-only in config, but is still shown here for runtime inspection.")
+            notes.append("This view is hidden from the main page (maintenance-only).")
         return StorageViewRuntimeView(
             id=storage_view.id,
             label=storage_view.label,
@@ -2113,7 +2112,7 @@ class InventoryService:
         if storage_view.binding.mode == "auto":
             return bool(reasons)
         if storage_view.binding.mode == "pool":
-            return "pool" in reasons or bool([reason for reason in reasons if reason != "pool"])
+            return "pool" in reasons
         if storage_view.binding.mode == "serial":
             return bool([reason for reason in reasons if reason in {"serial", "device", "pcie"}])
         return bool(reasons)
@@ -2360,7 +2359,7 @@ class InventoryService:
                         previous_bundle.raw_data.enclosures
                     )
                     bundle.warnings.append(
-                        "TrueNAS API enclosure discovery failed; using the last trusted enclosure topology."
+                        "TrueNAS could not list enclosures this time, so the last known bay layout is shown."
                     )
             self._source_bundle = bundle
             self._source_bundle_until = utcnow() + timedelta(
@@ -2440,10 +2439,9 @@ class InventoryService:
             detail = next(iter(unique_stderr)).rstrip(".")
             return (
                 [
-                    "SSH connection or authentication failed before inventory commands could run: "
-                    f"{detail}. Host-side inventory enrichment is unavailable for this refresh."
+                    f"Could not log in over SSH: {detail}. Bay details from SSH are missing for this refresh."
                 ],
-                "SSH connection or authentication failed.",
+                "SSH login failed.",
             )
 
         normalized_outputs = {
@@ -2476,15 +2474,14 @@ class InventoryService:
             )
             if broadcom_stack_detected:
                 warning = (
-                    "StorCLI commands are unavailable on this ESXi host. Broadcom/LSI driver packages "
-                    "such as lsi-mr3 or lsuv2-lsiv2-drivers-plugin do not expose the MegaRAID "
-                    "member detail this app needs; install a compatible StorCLI ESXi VIB for "
-                    "physical-drive enrichment."
+                    "StorCLI is not installed on this ESXi host, so drive details behind the RAID "
+                    "controller are missing. The Broadcom driver packages alone (lsi-mr3, "
+                    "lsuv2-lsiv2-drivers-plugin) do not provide them; install the Broadcom StorCLI VIB."
                 )
             else:
                 warning = (
-                    "StorCLI commands are unavailable on this ESXi host, so physical-drive "
-                    "enrichment is unavailable for this refresh."
+                    "StorCLI is not available on this ESXi host, so drive details behind the RAID "
+                    "controller are missing for this refresh."
                 )
             if detail:
                 warning = f"{warning} Detail: {detail}."
@@ -2508,11 +2505,10 @@ class InventoryService:
                 context_text = f"{context_text}, +{len(affected_contexts) - 3} more"
             return (
                 [
-                    "Storage Fabric enrichment probes had partial command failures; "
-                    f"topology can still render, but {context_text} may be incomplete. "
-                    "Debug output keeps the command, exit code, and stderr details."
+                    f"Some SSH commands failed ({context_text}). The bay map still works; "
+                    "see Debug for the command output."
                 ],
-                "Storage Fabric enrichment completed with partial command failures.",
+                "SSH finished with some failed commands.",
             )
 
         return (
@@ -2655,7 +2651,7 @@ class InventoryService:
                 "StorCLI is installed on this ESXi host, but the Broadcom MegaRAID controller is "
                 f"currently configured for PCI passthrough ({address_list}). ESXi will not bind that "
                 "device to lsi_mr3 or expose it to StorCLI until passthrough is disabled and the host "
-                "is rebooted, so physical-drive enrichment is unavailable for this refresh."
+                "is rebooted, so drive details behind the RAID controller are missing for this refresh."
             )
 
         vib_output = (normalized_outputs.get("esxcli software vib list") or "").lower()
@@ -2675,11 +2671,11 @@ class InventoryService:
                 "StorCLI is installed on this ESXi host, but it currently reports no visible "
                 "MegaRAID controllers. Broadcom/LSI packages such as lsi-mr3, lsuv2-lsiv2-drivers-plugin, "
                 "and vmware-storcli64 are present, but no compatible controller is being surfaced to StorCLI, "
-                "so physical-drive enrichment is unavailable for this refresh."
+                "so drive details behind the RAID controller are missing for this refresh."
             )
         return (
             "StorCLI is installed on this ESXi host, but it currently reports no visible storage "
-            "controllers, so physical-drive enrichment is unavailable for this refresh."
+            "controllers, so drive details behind the RAID controller are missing for this refresh."
         )
 
     @staticmethod
@@ -2849,14 +2845,14 @@ class InventoryService:
             "api": SourceStatus(
                 enabled=api_enabled,
                 ok=not api_enabled,
-                message=f"{api_label} disabled for this SSH-only {ssh_only_platform_label} system." if not api_enabled else None,
+                message=f"{api_label} is not used on {ssh_only_platform_label} systems." if not api_enabled else None,
             ),
             "ssh": SourceStatus(enabled=self.system.ssh.enabled, ok=not self.system.ssh.enabled, message=None),
             "bmc": SourceStatus(
                 enabled=bmc_enabled,
                 ok=not bmc_enabled,
                 message=(
-                    "BMC / IPMI enrichment is disabled for this system."
+                    "BMC/IPMI is not configured for this system."
                     if not bmc_enabled
                     else None
                 ),
@@ -2948,7 +2944,7 @@ class InventoryService:
                         message=f"{api_label} reachable with degraded enclosure data.",
                     )
                     warnings.append(
-                        f"{api_label} enclosure discovery failed; fresh disk, pool, temperature, and SMART data are retained."
+                        f"{api_label} could not list enclosures this time. Disks, pools, temperatures, and SMART data are current."
                     )
                 else:
                     sources["api"] = SourceStatus(enabled=True, ok=True, message=f"{api_label} reachable.")
@@ -2959,7 +2955,7 @@ class InventoryService:
             except Exception as exc:
                 logger.exception("Failed to collect SSH diagnostics")
                 sources["ssh"] = SourceStatus(enabled=True, ok=False, message=str(exc))
-                warnings.append("SSH mode is enabled but could not collect fallback command output.")
+                warnings.append("SSH is turned on but no command output came back.")
             else:
                 sources["ssh"] = ssh_status
                 warnings.extend(ssh_failures)
@@ -2970,7 +2966,7 @@ class InventoryService:
             except Exception as exc:
                 logger.exception("Failed to collect BMC / IPMI diagnostics")
                 sources["bmc"] = SourceStatus(enabled=True, ok=False, message=str(exc))
-                warnings.append("BMC / IPMI enrichment is enabled but could not collect out-of-band inventory.")
+                warnings.append("BMC/IPMI is turned on but the BMC could not be read.")
             else:
                 sources["bmc"] = SourceStatus(enabled=True, ok=True, message="BMC / IPMI inventory reachable.")
                 warnings.extend(bmc_inventory.warnings)
@@ -2986,10 +2982,15 @@ class InventoryService:
                 )
             else:
                 scale_ses_loaded = bool(scale_ses_data.ses_enclosures)
-                warnings.extend(scale_ses_failures)
+                if not scale_ses_loaded and not scale_ses_failures and raw_data.enclosures:
+                    # SES was expected: the TrueNAS API reports enclosures but
+                    # SSH found none. Absence without that evidence stays quiet.
+                    scale_ses_failures.append(self._scale_expected_ses_missing_failure())
+            warnings.extend(scale_ses_failures)
 
             if scale_ses_loaded:
                 warnings, ssh_failures = self._suppress_scale_configured_sg_ses_failures(warnings, ssh_failures)
+            if scale_ses_loaded or scale_ses_failures:
                 sources["ssh"] = SourceStatus(
                     enabled=True,
                     ok=not ssh_failures and not scale_ses_failures,
@@ -3022,7 +3023,7 @@ class InventoryService:
                         raw_data.cli_network_ports,
                     )
                 )
-                warnings.extend(quantastor_cli_failures)
+            warnings.extend(quantastor_cli_failures)
 
             try:
                 with perf_stage("inventory.quantastor.fetch_ses_overlay"):
@@ -3030,13 +3031,20 @@ class InventoryService:
             except Exception:
                 logger.exception("Failed to collect Quantastor SES diagnostics")
                 quantastor_ses_failures.append(
-                    "Quantastor SSH SES enrichment failed unexpectedly. REST and CLI slot truth is still being used."
+                    "Quantastor SSH SES enrichment failed unexpectedly. Available REST and CLI data is still being used."
                 )
             else:
                 quantastor_ses_loaded = bool(quantastor_ses_data.ses_enclosures)
-                warnings.extend(quantastor_ses_failures)
+            warnings.extend(quantastor_ses_failures)
 
-            if quantastor_cli_loaded:
+            # Failed attempts matter even when they contributed no overlay rows.
+            if quantastor_cli_failures or quantastor_ses_failures:
+                sources["ssh"] = SourceStatus(
+                    enabled=True,
+                    ok=False,
+                    message="Quantastor CLI/SES enrichment completed with some failures.",
+                )
+            elif quantastor_cli_loaded:
                 sources["ssh"] = SourceStatus(
                     enabled=True,
                     ok=not ssh_failures and not quantastor_cli_failures and not quantastor_ses_failures,
@@ -3572,7 +3580,7 @@ class InventoryService:
                 active = False
             else:
                 raise TrueNASAPIError(
-                    "Supermicro BMC LED control currently supports identify on and clear/off only."
+                    "The Supermicro BMC can only turn the locate light on or off."
                 )
             await asyncio.to_thread(self.bmc_service.set_drive_identify, controller_id, physical_index, active)
         else:
@@ -3886,6 +3894,8 @@ class InventoryService:
             loaded_slot_entries = self.slot_detail_store.load_all()
 
         resolved_enclosure_id = normalize_text(selected_enclosure_id)
+        # Route tests build this service without __init__, so the snapshot
+        # cache may be absent here.
         snapshots = getattr(self, "_cache", {})
         default_snapshot = snapshots.get("__default__")
         if resolved_enclosure_id is None and default_snapshot is not None:
@@ -4369,7 +4379,7 @@ class InventoryService:
         if not candidates:
             fallback = self._fallback_smart_summary(
                 slot_view,
-                "No SMART-capable device path is available for this slot.",
+                "This bay has no device to read SMART from.",
             )
             cached_fallback = await merge_fallback(fallback)
             self._observe_smart_summary_request("no-device-fallback")
@@ -4412,9 +4422,9 @@ class InventoryService:
                 slot_view,
                 error_message
                 or (
-                    "Detailed SMART JSON is not currently available through the SCALE API on this system."
+                    "TrueNAS did not return SMART data; turn on SSH for full SMART details."
                     if self.system.truenas.platform == "scale"
-                    else "Detailed SMART data is not available for this Linux slot."
+                    else "No SMART data is available for this bay."
                 ),
             )
             cached_fallback = await merge_fallback(fallback)
@@ -4715,10 +4725,7 @@ class InventoryService:
         slot_view: SlotView | None = None,
     ) -> tuple[SmartSummaryView | None, str | None]:
         if not self.system.ssh.enabled:
-            return None, (
-                "Detailed SMART JSON is not currently available through the SCALE API on this system, "
-                "and SSH fallback is disabled."
-            )
+            return None, "SMART detail needs SSH on this system, and SSH is turned off."
 
         host_candidates = [normalize_text(host) for host in (hosts or []) if normalize_text(host)]
         if not host_candidates:
@@ -4893,14 +4900,13 @@ class InventoryService:
         if "not allowed to execute" in lowered and "smartctl" in lowered:
             service_user = normalize_text(self.system.ssh.user) or "the SSH service account"
             return (
-                f"{service_user} is missing sudo permission for smartctl on {device_path}. "
-                "Grant /usr/local/sbin/smartctl and /usr/sbin/smartctl for both `-x -j` and `-x`, "
-                "or rerun the admin bootstrap to refresh the service-account sudo rules."
+                f"The SSH user {service_user} is not allowed to run smartctl on {device_path}. "
+                "Re-run the SSH access setup in the admin console to fix the sudo permissions."
             )
         if "a password is required" in lowered or "password is required" in lowered:
             return (
-                "SSH smartctl requires a sudo password on this host. Set SSH_SUDO_PASSWORD or update the "
-                "service-account sudo rules to allow the command-limited smartctl probes."
+                "smartctl needs a sudo password on this host. "
+                "Re-run the SSH access setup in the admin console to fix the sudo permissions."
             )
         return detail
 
@@ -5094,24 +5100,21 @@ class InventoryService:
         if self.system.truenas.platform not in {"linux", "esxi", "ipmi"} and not raw_data.enclosures:
             if self.system.truenas.platform == "scale" and has_scale_linux_ses:
                 warnings.append(
-                    "TrueNAS SCALE did not return enclosure rows, so this view is using Linux SES AES page parsing "
-                    "for slot mapping on the selected enclosure."
+                    "TrueNAS did not report any enclosures, so bay positions come from the enclosure over SSH."
                 )
             elif self.system.truenas.platform == "scale":
                 warnings.append(
-                    "TrueNAS SCALE did not return mappable enclosure rows. This first-pass SCALE mode can still "
-                    "show disk and pool metadata, but physical slot mapping and LED control will require future "
-                    "Linux enclosure support or manual calibration."
+                    "TrueNAS did not report any drive bays for this system. Disks and pools are shown without "
+                    "bay positions. To map bays, add an enclosure layout or set positions by hand."
                 )
             elif self.system.truenas.platform == "quantastor":
                 warnings.append(
-                    "Quantastor did not expose any storage-system rows through the REST API, so no enclosure-scoped "
-                    "view can be rendered yet."
+                    "QuantaStor did not report any storage systems, so no enclosure can be drawn yet."
                 )
             else:
                 warnings.append(
-                    "TrueNAS API returned no enclosure rows. API-only mode can still show disk and pool metadata, "
-                    "but physical slot mapping on this system will require SSH enrichment or manual calibration."
+                    "TrueNAS did not report any drive bays for this system. Disks and pools are shown without "
+                    "bay positions. Turn on SSH or set positions by hand to map bays."
                 )
 
         with perf_stage("inventory.correlate"):
@@ -5441,7 +5444,7 @@ class InventoryService:
             identify_requirements: list[str] = []
         elif platform == "esxi":
             identify_status = "unsupported"
-            identify_summary = "ESXi identify/write actions are intentionally disabled until a safe per-slot path is proven."
+            identify_summary = "Bay lights cannot be controlled on ESXi hosts."
             identify_sources = ["ESXi SSH"]
             identify_requirements = ["validated vendor or BMC per-slot identify support"]
         elif platform == "ipmi":
@@ -5634,6 +5637,17 @@ class InventoryService:
         )
         layout_slot_count = infer_slot_count_from_layout(layout_rows, layout_count_fallback)
         slot_positions = layout_slot_positions(layout_rows)
+        reported_slot_count = selected_option.slot_count if selected_option is not None else None
+        if (
+            selected_profile is not None
+            and reported_slot_count
+            and layout_slot_count
+            and reported_slot_count > layout_slot_count
+        ):
+            warnings.append(
+                f"This enclosure reports {reported_slot_count} bays but the selected layout draws "
+                f"{layout_slot_count}, so the extra bays are not shown. Choose a matching layout in System Setup."
+            )
         # #260 pins one mapping load per correlation pass, so the entries are
         # loaded here and read back off the frame by every caller.
         loaded_mappings = self.mapping_store.load_all()
@@ -5890,16 +5904,11 @@ class InventoryService:
                         "slot_label": f"Disk {index + 1}",
                         "led_supported": False,
                         "led_backend": None,
-                        "led_reason": (
-                            "Identify unavailable because no physical enclosure or slot location was identified."
-                        ),
+                        "led_reason": VIRTUAL_MAPPING_UNAVAILABLE_REASON,
                         "physical_location_known": False,
                         "mapping_source": "system-inventory",
                         "mapping_supported": False,
-                        "mapping_reason": (
-                            "Manual mapping is unavailable because this system disk has no identified physical "
-                            "enclosure or stable physical location."
-                        ),
+                        "mapping_reason": VIRTUAL_MAPPING_UNAVAILABLE_REASON,
                     }
                 )
             )
@@ -6162,8 +6171,8 @@ class InventoryService:
             available_enclosures,
             selected_enclosure_id,
             warnings,
-            selection_warning="No profile-backed Linux enclosure is configured for this host yet.",
-            profile_warning="This Linux host is missing an enclosure profile for rendering.",
+            selection_warning="Choose an enclosure layout for this host in the admin console to draw its bays.",
+            profile_warning="This host has no enclosure layout, so its bays cannot be drawn.",
         )
         if not isinstance(frame, _LayoutFrame):
             return frame
@@ -6192,12 +6201,12 @@ class InventoryService:
         slot_hints = selected_profile.slot_hints or {}
         if not slot_hints and not vendor_slot_candidates:
             warnings.append(
-                "This Linux profile does not define slot hints yet, so physical slot correlation will require manual mapping."
+                "This layout has no bay hints, so disks must be assigned to bays by hand."
             )
         if selected_profile.id == UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID:
             warnings.append(
-                "UniFi UNVR Pro LED control is experimental. The vendor-local SSH command path is responding and "
-                "GPIO state changes are visible, but operator-visible bay validation is still pending."
+                "Bay lights on the UNVR Pro are switched through the UniFi service. "
+                "Check the bay after using Identify."
             )
 
         for slot in frame.actual_slot_ids():
@@ -6294,8 +6303,8 @@ class InventoryService:
             available_enclosures,
             selected_enclosure_id,
             warnings,
-            selection_warning="No profile-backed ESXi enclosure is configured for this host yet.",
-            profile_warning="This ESXi host is missing an enclosure profile for rendering.",
+            selection_warning="Choose an enclosure layout for this host in the admin console to draw its bays.",
+            profile_warning="This host has no enclosure layout, so its bays cannot be drawn.",
         )
         if not isinstance(frame, _LayoutFrame):
             return frame
@@ -6308,8 +6317,7 @@ class InventoryService:
         if not ssh_data.esxi_storcli_physical_drives:
             if selected_profile.id == ESXI_AOC_SLG4_2H8M2_PROFILE_ID:
                 warnings.append(
-                    "ESXi SSH inventory ran, but StorCLI physical-drive JSON was not available. "
-                    "The AOC carrier-card view needs StorCLI to map physical M.2 slots behind the RAID LUNs."
+                    "StorCLI did not return drive details, so the M.2 slots on this RAID card cannot be mapped."
                 )
             elif bmc_inventory is None:
                 warnings.append(
@@ -6486,8 +6494,8 @@ class InventoryService:
             available_enclosures,
             selected_enclosure_id,
             warnings,
-            selection_warning="No profile-backed BMC enclosure is configured for this host yet.",
-            profile_warning="This BMC host is missing an enclosure profile for rendering.",
+            selection_warning="Choose an enclosure layout for this host in the admin console to draw its bays.",
+            profile_warning="This host has no enclosure layout, so its bays cannot be drawn.",
         )
         if not isinstance(frame, _LayoutFrame):
             return frame
@@ -6511,8 +6519,7 @@ class InventoryService:
         discovered_slot_numbers = sorted(disks_by_slot)
         if not bmc_slot_hints and discovered_slot_numbers:
             warnings.append(
-                "This BMC profile does not define explicit BMC slot hints yet, so bays are being mapped "
-                "from discovered slot numbers in ascending order."
+                "Bays are numbered in the order the BMC reported them; verify against the chassis."
             )
 
         empty_ssh = ParsedSSHData()
@@ -6774,7 +6781,7 @@ class InventoryService:
         )
         bmc_disks_by_serial = self._build_bmc_serial_disk_index(bmc_inventory, disk_records)
 
-        api_topology_members = self._build_quantastor_topology_members(raw_data, disk_records)
+        api_topology_members = self._build_quantastor_topology_members(raw_data)
         selected_meta = frame.selected_meta
         selected_meta["storage_system_id"] = selected_system_id
         empty_ssh = ParsedSSHData()
@@ -7516,7 +7523,6 @@ class InventoryService:
     def _build_quantastor_topology_members(
         self,
         raw_data: TrueNASRawData,
-        _disk_records: list[DiskRecord],
     ) -> dict[str, ZpoolMember]:
         pool_index = {
             normalize_text(str(pool.get("id")) if pool.get("id") is not None else None): pool
@@ -7668,30 +7674,11 @@ class InventoryService:
         ] or cluster_rows
 
         master_row = next((row for row in node_rows if self._quantastor_bool(row.get("isMaster"))), None)
-        selected_label = normalize_text(
-            str(selected_row.get("name") or selected_row.get("hostname") or selected_system_id)
-            if isinstance(selected_row, dict) and (selected_row.get("name") or selected_row.get("hostname") or selected_system_id)
-            else selected_system_id
-        ) or "selected node"
         warnings: list[str] = []
 
-        if master_row is not None:
-            master_id = normalize_text(str(master_row.get("id")) if master_row.get("id") is not None else None)
-            master_label = normalize_text(
-                str(master_row.get("name") or master_row.get("hostname") or master_id)
-                if (master_row.get("name") or master_row.get("hostname") or master_id) is not None
-                else None
-            ) or "unknown master"
-            if selected_system_id and master_id and selected_system_id != master_id:
-                warnings.append(
-                    f"Quantastor HA detected. Cluster master is {master_label}; selected view is {selected_label}."
-                )
-            else:
-                warnings.append(f"Quantastor HA detected. Cluster master is {master_label}.")
-        else:
+        if master_row is None:
             warnings.append(
-                "Quantastor HA groups were detected. This first-pass adapter renders storage-system-scoped views; "
-                "shared-slot ownership overlays and IO-fencing context are still future work."
+                "This QuantaStor cluster is shown one node at a time. Pick the node in the enclosure list."
             )
 
         # Quantastor can return an aggregate cluster object alongside the real
@@ -7700,9 +7687,7 @@ class InventoryService:
         # so prefer the hardware-backed node rows when deciding whether to warn.
         io_fencing_rows = node_rows or cluster_rows
         if any(self._quantastor_bool(row.get("disableIoFencing")) for row in io_fencing_rows):
-            warnings.append(
-                "Quantastor cluster metadata reports IO fencing is currently disabled."
-            )
+            warnings.append("IO fencing is off on this QuantaStor cluster.")
 
         return warnings
 
@@ -8496,7 +8481,7 @@ class InventoryService:
         if not isinstance(raw_drive, dict):
             return self._fallback_smart_summary(
                 slot_view,
-                "ESXi logical-device SMART is not exposed for this slot, and StorCLI physical-drive detail is unavailable.",
+                "No SMART data is available for this bay.",
             )
 
         smart_alert = normalize_text(raw_drive.get("smart_alert"))
@@ -8542,10 +8527,7 @@ class InventoryService:
             trim_supported=trim_supported,
             transport_protocol=transport_protocol,
             negotiated_link_rate=normalize_text(raw_drive.get("link_speed")),
-            message=(
-                "ESXi exposes controller-backed members as logical devices, so this detail comes from "
-                "StorCLI physical-drive health rather than host-level SMART."
-            ),
+            message="SMART data comes from the RAID controller (StorCLI).",
         )
 
     async def _build_esxi_slot_smart_summary(self, slot_view: SlotView) -> SmartSummaryView:
@@ -8562,15 +8544,9 @@ class InventoryService:
         drive_type = normalize_text(raw_drive.get("esxi_drive_type")) if isinstance(raw_drive, dict) else None
         raid_level = normalize_text(raw_drive.get("esxi_raid_level")) if isinstance(raw_drive, dict) else None
         if (drive_type or "").lower() == "physical" and (not raid_level or raid_level.upper() == "NA"):
-            summary.message = (
-                "ESXi exposes this JBOD disk as a local physical device, so host SMART counters are shown from "
-                "`esxcli storage core device smart get` and supplemented with StorCLI physical-drive health."
-            )
+            summary.message = "SMART data comes from ESXi, with drive health from the RAID controller (StorCLI)."
         else:
-            summary.message = (
-                "ESXi host SMART counters were merged from `esxcli storage core device smart get`, "
-                "supplemented with StorCLI physical-drive health and slot mapping."
-            )
+            summary.message = "SMART data comes from ESXi and the RAID controller (StorCLI)."
         return summary
 
     async def _fetch_esxi_host_smart_summary(self, slot_view: SlotView) -> SmartSummaryView | None:
@@ -8644,7 +8620,7 @@ class InventoryService:
         if not isinstance(raw_disk, dict):
             return self._fallback_smart_summary(
                 slot_view,
-                "Detailed Quantastor SMART drill-down is not wired for this slot yet.",
+                "No extra SMART data is available for this bay.",
             )
 
         temperature_c = (
@@ -8715,10 +8691,9 @@ class InventoryService:
                 or slot_view.raw_status.get("attached_sas_address")
             ),
             message=(
-                "Quantastor slot detail is first-pass and reflects the current appliance payload, "
-                "supplemented with SSH CLI disk rows and smartctl when available."
+                "SMART data comes from QuantaStor and smartctl over SSH."
                 if raw_disk.get("quantastor_cli_disk") or raw_disk.get("quantastor_hw_disk_source") == "cli"
-                else "Quantastor REST SMART detail is first-pass and reflects the current disk payload exposed by the appliance API."
+                else "SMART data comes from QuantaStor."
             ),
         )
         if not any(
@@ -8736,7 +8711,7 @@ class InventoryService:
         ):
             return self._fallback_smart_summary(
                 slot_view,
-                "Quantastor returned inventory for this disk, but no richer SMART counters in the current payload.",
+                "QuantaStor reports this disk but no SMART counters.",
             )
         return summary
 
@@ -8757,9 +8732,8 @@ class InventoryService:
         if not self.system.ssh.enabled or not ha_context:
             return []
         return [
-            "Quantastor SSH enrichment is enabled, but no node SSH host is configured "
-            "or discoverable for this HA system; configure HA node hosts or a non-shared SSH host. "
-            "REST data is still being used."
+            "SSH is turned on but no QuantaStor node address is set. Add the node addresses in the admin "
+            "console. Data still comes from the QuantaStor API."
         ]
 
     async def _fetch_quantastor_cli_overlay(
@@ -8862,17 +8836,16 @@ class InventoryService:
         )
         if best_host:
             self._quantastor_preferred_ses_host = best_host
-            return overlay, failures
         return overlay, failures
 
     async def _fetch_scale_ses_overlay(self) -> tuple[ParsedSSHData, list[str]]:
         overlay, failures, best_host = await self._fetch_sg_ses_overlay(
             self._build_scale_ssh_hosts(),
             failure_prefix="TrueNAS SCALE SSH SES",
+            report_empty_discovery=False,
         )
         if best_host:
             self._scale_preferred_ses_host = best_host
-            return overlay, failures
         return overlay, failures
 
     def _get_cached_sg_ses_devices(self, host: str) -> list[str]:
@@ -8926,6 +8899,7 @@ class InventoryService:
         host: str,
         *,
         failure_prefix: str,
+        report_empty_discovery: bool = True,
     ) -> tuple[list[str], ParsedSSHData, list[str]]:
         discovery_command = self._build_sg_ses_discovery_command()
 
@@ -8970,6 +8944,12 @@ class InventoryService:
 
         devices = self._parse_sg_ses_discovery_devices(discovery_result.stdout)
         if not devices:
+            if not report_empty_discovery:
+                # Discovery ran and found no SES device. On a host with a
+                # plain HBA that is the normal answer, not a failure; the
+                # caller decides whether enclosure evidence was expected.
+                logger.info("%s discovery found no sg_ses devices on %s.", failure_prefix, host)
+                return [], ParsedSSHData(), []
             return (
                 [],
                 ParsedSSHData(),
@@ -9050,6 +9030,7 @@ class InventoryService:
         *,
         failure_prefix: str,
         merge_hosts: bool = False,
+        report_empty_discovery: bool = True,
     ) -> tuple[ParsedSSHData, list[str], str | None]:
         best_overlay = ParsedSSHData()
         best_score = 0
@@ -9082,6 +9063,7 @@ class InventoryService:
             devices, host_overlay, host_failures = await self._discover_and_fetch_sg_ses_host_overlay(
                 host,
                 failure_prefix=failure_prefix,
+                report_empty_discovery=report_empty_discovery,
             )
             if not devices:
                 failures.extend(host_failures)
@@ -9107,6 +9089,13 @@ class InventoryService:
         if merge_hosts and successful_overlays:
             best_overlay = self._augment_ses_targets_from_redundant_hosts(best_overlay, successful_overlays)
         return best_overlay, best_failures, best_host
+
+    def _scale_expected_ses_missing_failure(self) -> str:
+        hosts = ", ".join(self._build_scale_ssh_hosts()) or "this system"
+        return (
+            f"No SES enclosure was found over SSH on {hosts}, although the TrueNAS API reports "
+            "enclosures, so bay positions come from the TrueNAS API only."
+        )
 
     def _build_scale_ssh_hosts(self) -> list[str]:
         hosts: list[str] = []
@@ -10161,6 +10150,10 @@ class InventoryService:
                     id=enclosure_id,
                     label=enclosure_label or enclosure_name or enclosure_id,
                     name=enclosure_name,
+                    slot_count=extract_enclosure_slot_count(
+                        enclosure,
+                        self.settings.layout.api_slot_number_base,
+                    ),
                 )
             )
 
@@ -10277,9 +10270,12 @@ class InventoryService:
                 continue
             if option.id in excluded_ids:
                 continue
-            if option.slot_count and option.slot_count < 12:
-                continue
             haystack = " ".join(filter(None, [option.id, option.name, option.label])).lower()
+            # The motherboard's AHCI SGPIO pseudo-enclosure wraps the onboard
+            # SATA ports, not a drive shelf, so it is never offered as one.
+            # Real small cages (2-8 bay rear SSD backplanes) stay selectable.
+            if "ahci sgpio" in haystack:
+                continue
             if filter_value and filter_value not in haystack:
                 continue
             options.append(option)
@@ -10372,26 +10368,23 @@ class InventoryService:
         if not unapplied:
             return
         noun, verb, auxiliary = (
-            ("mapping", "uses", "was") if unapplied == 1 else ("mappings", "use", "were")
+            ("assignment", "is", "was") if unapplied == 1 else ("assignments", "are", "were")
         )
         if no_identified_physical_enclosure:
             warnings.append(
-                f"{unapplied} manual {noun} {verb} the legacy unscoped format and "
-                f"{auxiliary} not applied because this system has no identified physical enclosure. "
-                "Disks are shown in a system-scoped virtual inventory without physical bay or slot "
-                "attribution. Re-save each affected mapping after selecting its discovered physical "
-                "enclosure."
+                f"{unapplied} saved bay {noun} {verb} from an older version and {auxiliary} not applied "
+                "because this system has no known enclosure. Disks are shown without bay positions. "
+                "Open each bay and save the assignment again once an enclosure is selected."
             )
             return
         scope = (
-            "multi-system deployment"
+            "more than one system"
             if len(self.settings.systems) > 1
-            else "multi-enclosure system"
+            else "more than one enclosure"
         )
         warnings.append(
-            f"{unapplied} manual {noun} {verb} the legacy unscoped format and "
-            f"{auxiliary} not applied on this {scope}. Re-save each affected "
-            "mapping to scope it."
+            f"{unapplied} saved bay {noun} {verb} from an older version and {auxiliary} not applied "
+            f"because this setup has {scope}. Open each bay and save the assignment again."
         )
 
     def _legacy_mapping_fallback_allowed(
@@ -10948,6 +10941,8 @@ class InventoryService:
             if device_type and device_type.lower() != "disk":
                 continue
             if re.fullmatch(r"mmcblk\d+(?:boot\d+|rpmb)", device_name):
+                continue
+            if LINUX_VIRTUAL_BLOCK_DEVICE_REGEX.fullmatch(device_name):
                 continue
             is_boot_media = supports_boot_media and self._is_linux_boot_media_device_name(device_name)
             is_supported_disk = bool(
@@ -12064,14 +12059,7 @@ class InventoryService:
         present = False if quantastor_ses_empty else (
             raw_present is True
             or disk is not None
-            or (
-                not ses_says_empty_without_disk
-                and (
-                    status_says_populated
-                    or identify_active
-                    or faulty
-                )
-            )
+            or (not ses_says_empty_without_disk and status_says_populated)
         )
 
         if identify_active:
@@ -12095,7 +12083,7 @@ class InventoryService:
         size_human = format_bytes(size_bytes) or normalize_text(raw_slot_status.get("reported_size"))
         notes = mapping.notes if mapping else None
         if stale_manual_mapping:
-            stale_note = "Stale manual mapping: live SES evidence reports this bay empty."
+            stale_note = "This bay is assigned by hand, but the enclosure reports it empty."
             notes = f"{notes}\n{stale_note}" if notes else stale_note
         persistent_id, persistent_id_label = resolve_persistent_id(
             gptid,
@@ -12190,17 +12178,13 @@ class InventoryService:
             led_supported = False
             led_backend = None
             led_reason = (
-                "LED control is currently unavailable on this Quantastor cluster because the documented "
-                "REST and CLI identify operations are being rejected, and no working SES enclosure path "
-                "was discovered over SSH."
+                "Bay lights cannot be controlled on this QuantaStor cluster: the appliance rejected the "
+                "identify command and no SES enclosure was reachable over SSH."
             )
         elif self.system.truenas.platform == "esxi":
             led_supported = False
             led_backend = None
-            led_reason = (
-                "LED control is not enabled for ESXi first-pass support. StorCLI is used read-only for "
-                "physical member health, and no safe per-M.2 identify path has been validated."
-            )
+            led_reason = "Bay lights cannot be controlled on ESXi hosts."
         elif api_led_supported:
             led_supported = True
             led_backend = "api"
@@ -12220,32 +12204,31 @@ class InventoryService:
         elif api_enclosure_query_failed:
             led_supported = False
             led_backend = None
-            led_reason = "API LED control is unavailable because enclosure discovery failed for this refresh."
+            led_reason = "Bay lights are unavailable because TrueNAS could not list the enclosure this time. Refresh to try again."
         elif core_ses_target_invalid:
             led_supported = False
             led_backend = None
             led_reason = (
-                f"Slot {slot:02d} must resolve to exactly one authentic SES element before CORE identify control can run."
+                f"Bay {slot:02d} is not tied to exactly one enclosure element, so its light cannot be switched safely."
             )
         elif not enclosure_id and not ses_device:
             led_supported = False
             led_backend = None
-            led_reason = "LED control unavailable because this slot has no API or SSH enclosure mapping."
+            led_reason = "This bay is not linked to an enclosure, so its light cannot be switched."
         else:
             led_supported = False
             led_backend = None
             if enclosure_id and self.system.ssh.enabled:
                 led_reason = (
-                    "LED control unavailable because this slot did not expose the SES controller metadata "
-                    "needed for SSH `sesutil locate`."
+                    "The enclosure did not report the details needed to switch this bay's light over SSH."
                 )
             elif enclosure_id:
                 led_reason = (
-                    "LED control unavailable because this slot is mapped from SSH fallback data, "
-                    "but TrueNAS API did not expose a matching enclosure id."
+                    "This bay was mapped over SSH, but TrueNAS did not report a matching enclosure, "
+                    "so its light cannot be switched."
                 )
             else:
-                led_reason = "LED control unavailable because this slot is missing SES controller metadata."
+                led_reason = "This bay is missing enclosure details, so its light cannot be switched."
 
         linux_block_summary = (
             disk.raw.get("linux_blockdevice")
@@ -12383,7 +12366,7 @@ class InventoryService:
 
     async def _set_slot_led_over_ssh(self, slot_view: SlotView, action: LedAction) -> None:
         if not self.system.ssh.enabled:
-            raise TrueNASAPIError("SSH fallback is disabled, so LED control cannot use enclosure control commands.")
+            raise TrueNASAPIError("SSH is off, so bay lights cannot be switched through the enclosure.")
         ses_targets = slot_view.ssh_ses_targets or []
         if not ses_targets and slot_view.ssh_ses_device and slot_view.ssh_ses_element_id is not None:
             ses_targets = [
@@ -12397,7 +12380,7 @@ class InventoryService:
         if not ses_targets:
             raise TrueNASAPIError(
                 slot_view.led_reason
-                or f"Slot {slot_view.slot_label} is missing SES controller metadata required for SSH LED control."
+                or f"Bay {slot_view.slot_label} is missing the enclosure details needed to switch its light over SSH."
             )
 
         if self.system.truenas.platform == "core":
@@ -12408,8 +12391,8 @@ class InventoryService:
             ]
             if len(ses_targets) != 1 or len(authentic_targets) != 1:
                 raise TrueNASAPIError(
-                    f"Slot {slot_view.slot_label} must resolve to exactly one authentic SES element "
-                    "before CORE identify control can run."
+                    f"Bay {slot_view.slot_label} is not tied to exactly one enclosure element, "
+                    "so its light cannot be switched safely."
                 )
             ses_targets = authentic_targets
 
@@ -12418,7 +12401,7 @@ class InventoryService:
         elif action == LedAction.clear:
             locate_state = "off"
         else:
-            raise TrueNASAPIError("SSH LED fallback currently supports identify on and clear/off only.")
+            raise TrueNASAPIError("The enclosure can only turn the locate light on or off.")
 
         failures: list[str] = []
         for target in ses_targets:
@@ -12434,7 +12417,7 @@ class InventoryService:
                 elif action == LedAction.clear:
                     sg_action = "--clear=ident"
                 else:
-                    raise TrueNASAPIError("SCALE sg_ses LED control currently supports identify on and clear/off only.")
+                    raise TrueNASAPIError("The enclosure can only turn the locate light on or off.")
 
                 target_slot = target_slot_number if isinstance(target_slot_number, int) else slot_view.slot
                 command = shlex.join(
@@ -12471,7 +12454,7 @@ class InventoryService:
 
     async def _set_unifi_slot_led_over_ssh(self, slot_view: SlotView, action: LedAction) -> None:
         if not self.system.ssh.enabled:
-            raise TrueNASAPIError("SSH fallback is disabled, so UniFi LED control cannot run.")
+            raise TrueNASAPIError("SSH is off, so bay lights cannot be switched through the UniFi service.")
 
         vendor_slot_number = slot_view.raw_status.get("vendor_slot_number")
         if not isinstance(vendor_slot_number, int):
@@ -12485,7 +12468,7 @@ class InventoryService:
         elif action == LedAction.clear:
             toggle = "False"
         else:
-            raise TrueNASAPIError("UniFi SSH LED control currently supports identify on and clear/off only.")
+            raise TrueNASAPIError("The UniFi service can only turn the locate light on or off.")
 
         command = shlex.join(
             [
@@ -12624,8 +12607,8 @@ class InventoryService:
         )
         collapsed.insert(
             insertion_index or 0,
-            "Quantastor optional SSH enrichment is paused for "
-            f"{hosts} after recent connection startup failures. REST data is still being used.",
+            f"SSH to {hosts} is paused after a connection failure. "
+            "Data still comes from the QuantaStor API.",
         )
         return collapsed
 
@@ -13209,19 +13192,23 @@ class InventoryService:
 
     @staticmethod
     def _status_contains(raw_status: dict[str, Any], *needles: str) -> bool:
-        scalar_values: list[str] = []
-        for value in raw_status.values():
-            if value is None:
-                continue
-            if isinstance(value, dict):
-                scalar_values.extend(str(item).lower() for item in value.values() if not isinstance(item, (dict, list, tuple, set)) and item is not None)
-                continue
-            if isinstance(value, (list, tuple, set)):
-                scalar_values.extend(str(item).lower() for item in value if not isinstance(item, (dict, list, tuple, set)) and item is not None)
-                continue
-            scalar_values.append(str(value).lower())
-        haystack = " ".join(scalar_values)
-        return any(needle.lower() in haystack for needle in needles)
+        """Match status keywords at word starts in the slot's status fields only.
+
+        Descriptors, hints, and vendor payloads are free text ("Drive bay 3
+        fault LED" names an LED, not a fault) and never take part.
+        """
+        haystack = " ".join(
+            str(raw_status.get(key)).lower()
+            for key in SLOT_STATUS_TEXT_KEYS
+            if raw_status.get(key) is not None
+            and not isinstance(raw_status.get(key), (dict, list, tuple, set))
+        )
+        if not haystack:
+            return False
+        return any(
+            re.search(rf"(?<![a-z0-9]){re.escape(needle.lower())}", haystack) is not None
+            for needle in needles
+        )
 
     @staticmethod
     def _health_is_bad(*values: str | None) -> bool:

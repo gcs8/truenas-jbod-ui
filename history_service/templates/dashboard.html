@@ -1,6 +1,6 @@
-{% macro count(value, estimated=false) -%}
+{% macro count(value) -%}
 {%- if value is none -%}<span title="not counted yet" aria-label="not counted yet">-</span>
-{%- else -%}{{ '~' if estimated else '' }}{{ value }}{%- endif -%}
+{%- else -%}{{ value }}{%- endif -%}
 {%- endmacro %}
 {% macro timestamp(value, fallback='never') -%}
 {%- if value -%}<time datetime="{{ value }}">{{ value }}</time>{%- else -%}{{ fallback }}{%- endif -%}
@@ -23,7 +23,7 @@
       <div class="actions" aria-label="History refresh actions">
         {% if direct_refresh_enabled %}
         <button id="history-refresh-fast" type="button" title="Read current temperature and fast counters, normally using cached inventory. Does not request a full SMART scan.">Quick refresh</button>
-        <button id="history-refresh-full" class="secondary" type="button" title="Re-read inventory and full SMART data. Full refresh has a configurable cooldown, 15 minutes by default; the server enforces the configured wait.">Full refresh</button>
+        <button id="history-refresh-full" class="secondary" type="button" data-cooldown-seconds-remaining="{{ refresh.get('full_refresh_cooldown_seconds_remaining', 0) }}" title="Re-read inventory and full SMART data. Full refresh has a configurable cooldown, 15 minutes by default; the server enforces the configured wait.">Full refresh</button>
         <span id="history-refresh-status" class="action-status" role="status" aria-live="polite"></span>
         {% else %}
         <span class="action-status">Refresh from the main page, or with an API token.</span>
@@ -37,7 +37,7 @@
         <div class="card">
           <div class="label">Collector</div>
           <div id="collector-state-value" class="value {{ 'status-ok' if status.get('collector_running') else 'status-error' }}">
-            {{ 'Running' if status.get('collector_running') else 'Stopped' }}
+            {{ collector_state_label }}
           </div>
         </div>
         <div class="card">
@@ -46,15 +46,15 @@
         </div>
         <div class="card">
           <div class="label">Slot changes</div>
-          <div id="slot-events-value" class="value">{{ count(counts.get('event_count'), estimated=counts_are_estimated) }}</div>
+          <div id="slot-events-value" class="value">{{ count(counts.get('event_count')) }}</div>
         </div>
         <div class="card">
           <div class="label">Temperature and SMART readings</div>
-          <div id="metric-samples-value" class="value">{{ count(counts.get('metric_sample_count'), estimated=counts_are_estimated) }}</div>
+          <div id="metric-samples-value" class="value">{{ count(counts.get('metric_sample_count')) }}</div>
         </div>
         <div class="card">
           <div class="label">Hourly summaries</div>
-          <div id="metric-rollups-value" class="value">{{ count(counts.get('metric_rollup_count'), estimated=counts_are_estimated) }}</div>
+          <div id="metric-rollups-value" class="value">{{ count(counts.get('metric_rollup_count')) }}</div>
         </div>
         <div class="card">
           <div class="label">Database size</div>

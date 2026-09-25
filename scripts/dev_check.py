@@ -84,7 +84,7 @@ CI_SOURCE_GATE_WORKFLOW_COMMANDS: Mapping[str, str] = {
         )
     ),
     "javascript-unit-tests": "npm run test:unit",
-    "performance-baseline": 'python -m unittest discover -s tests -p "test_*.py" -v',
+    "performance-baseline": 'python scripts/run_test_shard.py run --shard "${{ matrix.shard }}" --results-dir shard-results',
     "prometheus-rules": "\n".join(
         (
             "promtool check rules prometheus/rules/truenas-jbod-ui-alerts-v1.yml",
@@ -94,7 +94,7 @@ CI_SOURCE_GATE_WORKFLOW_COMMANDS: Mapping[str, str] = {
     "python-compileall": (
         "python -m compileall app admin_service history_service scripts tests"
     ),
-    "python-unittest": 'python -m unittest discover -s tests -p "test_*.py" -v',
+    "python-unittest": 'python scripts/run_test_shard.py run --shard "${{ matrix.shard }}" --results-dir shard-results',
 }
 CI_SOURCE_GATE_MARKER = re.compile(
     r"^(?P<indent> *)# dev-check-source-gate: (?P<gate>[a-z0-9-]+)\s*$",
@@ -111,25 +111,25 @@ WINDOWS_PORTABLE_TEST_MODULES = (
     "tests.test_dev_check",
     "tests.test_disk_retention_accounting",
     "tests.test_ghcr_release_contract",
-    "tests.test_history_schema_version_gate",
     "tests.test_heap_probe",
     "tests.test_history_backend",
     "tests.test_history_backend_bounds",
     "tests.test_history_config_contract",
     "tests.test_history_diagnostics",
     "tests.test_history_operation_bounds",
+    "tests.test_history_schema_version_gate",
     "tests.test_logging_config",
     "tests.test_nonroot_cli",
     "tests.test_parsers",
     "tests.test_profile_builder",
     "tests.test_profiles",
     "tests.test_prometheus_alert_rules",
-    "tests.test_public_doc_privacy",
     "tests.test_public_demo_deployment",
     "tests.test_public_demo_deterministic",
     "tests.test_public_demo_fixture",
     "tests.test_public_demo_history_consistency",
     "tests.test_public_demo_provenance",
+    "tests.test_public_doc_privacy",
     "tests.test_public_docs_contract",
     "tests.test_public_screenshots",
     "tests.test_quantastor_api",
@@ -138,13 +138,18 @@ WINDOWS_PORTABLE_TEST_MODULES = (
     "tests.test_release_wrap_validator",
     "tests.test_scripts_help",
     "tests.test_ssh_failure_contexts",
+    "tests.test_script_platform_guards",
     "tests.test_ssh_probe",
+    "tests.test_startup_config",
     "tests.test_startup_migration_recovery",
     "tests.test_startup_writability",
     "tests.test_system_setup_api_dialect",
     "tests.test_tls_trust",
     "tests.test_truenas_ws",
     "tests.test_truenas_ws_jsonrpc",
+    "tests.test_ui_health_and_admin_probe",
+    "tests.test_unittest_shards",
+    "tests.test_upgrade_notice",
     "tests.test_wiki_drift_verifier",
 )
 
@@ -160,14 +165,15 @@ WINDOWS_EXCLUSIONS = (
     WindowsExclusion(
         category="fcntl-dependent history/backup import graph",
         reason=(
-            "history_service.scheduled_backup imports fcntl and its transitive history, "
-            "backup, app, and route suites require POSIX locking"
+            "scheduled_backup and backup_archive.journal import fcntl and their "
+            "transitive history, backup, app, and route suites require POSIX locking"
         ),
         modules=(
             "tests.test_admin_auth",
             "tests.test_admin_error_correlation",
             "tests.test_admin_runtime_routes",
             "tests.test_admin_service",
+            "tests.test_admin_safety",
             "tests.test_admin_ttl",
             "tests.test_disk_inventory_sync",
             "tests.test_disk_inventory_sync_grants",
@@ -176,8 +182,10 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_history_routes",
             "tests.test_app_history_body_bound",
             "tests.test_app_history_bounds",
+            "tests.test_backup_archive_journal",
             "tests.test_history_bulk_bounds",
             "tests.test_history_refresh_bounds",
+            "tests.test_history_health_states",
             "tests.test_history_service",
             "tests.test_inventory",
             "tests.test_inventory_registry_routes",
@@ -212,6 +220,8 @@ WINDOWS_EXCLUSIONS = (
         ),
         modules=(
             "tests.test_account_bootstrap",
+            "tests.test_backup_archive_lifecycle",
+            "tests.test_backup_archive_transport",
             "tests.test_compose_runtime_matrix",
             "tests.test_container_contract",
             "tests.test_esxi_host_prep",
@@ -254,6 +264,8 @@ class Skip:
     name: str
     reason: str
     ci_gate: str | None = None
+    # Individual items behind the one-line reason; printed only with --verbose.
+    details: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -303,7 +315,8 @@ def _windows_test_check(root: Path, python_executable: str) -> tuple[Check, tupl
     skips = tuple(
         Skip(
             f"Windows exclusion: {exclusion.category}",
-            f"{exclusion.reason}; excluded suites: {', '.join(exclusion.modules)}",
+            f"{len(exclusion.modules)} suites skipped; {exclusion.reason}",
+            details=exclusion.modules,
         )
         for exclusion in WINDOWS_EXCLUSIONS
     )
@@ -718,6 +731,7 @@ def run_plan(
     root: Path = ROOT,
     runner: Runner = subprocess.run,
     output: TextIO = sys.stdout,
+    verbose: bool = False,
 ) -> int:
     results: list[tuple[str, str]] = []
     for check in plan.checks:
@@ -748,6 +762,11 @@ def run_plan(
         print(result, file=output)
     for skip in plan.skips:
         print(f"SKIP  {skip.name}: {skip.reason}", file=output)
+        if verbose:
+            for detail in skip.details:
+                print(f"        {detail}", file=output)
+    if not verbose and any(skip.details for skip in plan.skips):
+        print("      (--verbose lists the skipped suites)", file=output)
 
     failed = any(result.startswith("FAIL") for _name, result in results)
     print(f"FINAL: {'FAIL' if failed else 'PASS'}", file=output)
@@ -776,6 +795,11 @@ def build_parser() -> argparse.ArgumentParser:
         const="full",
         help="Everything in --safe plus the checked-in public-demo artifact check.",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="List the individual test suites behind each SKIP line in the summary.",
+    )
     return parser
 
 
@@ -789,7 +813,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"FAIL  validation plan: {exc}")
         print("FINAL: FAIL")
         return 1
-    return run_plan(plan)
+    return run_plan(plan, verbose=args.verbose)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 from typing import Any
 
 
@@ -21,6 +22,14 @@ SOURCE_PARITY_SCHEMA = 3
 SOURCE_PARITY_PREFIX = "<!-- public-demo-source-parity "
 SOURCE_PARITY_SUFFIX = " -->\n"
 SOURCE_REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+# The input declaration as it existed at a recorded revision. It is read as
+# text, never imported, so an old revision's code is not executed.
+RECORDED_INPUT_DECLARATION = Path("scripts/public_demo_inputs.py")
+DECLARED_INPUT_PATTERN = re.compile(r'Path\("([^"\\]+)"\)')
+RECORDED_VERSION_PATTERN = re.compile(
+    r'^__version__\s*=\s*["\'](?P<version>[0-9A-Za-z][0-9A-Za-z.+-]*)["\']\s*$',
+    re.MULTILINE,
+)
 OFFLINE_IMAGE_INPUTS: dict[Path, str] = {
     Path("app/static/images/aoc-slg4-2h8m2.jpg"): "image/jpeg",
     Path("app/static/images/hyper-m2-gen3-card.png"): "image/png",
@@ -63,7 +72,18 @@ def add_source_parity_manifest(
     return f"{SOURCE_PARITY_PREFIX}{payload}{SOURCE_PARITY_SUFFIX}{html}"
 
 
-def check_source_parity_manifest(html: str, *, source_root: Path) -> list[str]:
+def check_source_parity_manifest(
+    html: str,
+    *,
+    source_root: Path,
+    input_paths: tuple[Path, ...] = PUBLIC_DEMO_INPUT_PATHS,
+) -> list[str]:
+    """Check the artifact against the declared inputs found under ``source_root``.
+
+    ``input_paths`` defaults to the current declaration. The pull-request
+    integrity check passes the input set recorded in the artifact, with
+    ``source_root`` holding those inputs read back from the recorded revision.
+    """
     manifest, artifact_html, parse_errors = parse_manifest(html)
     if parse_errors:
         return parse_errors
@@ -71,7 +91,7 @@ def check_source_parity_manifest(html: str, *, source_root: Path) -> list[str]:
     if manifest.get("schema") != SOURCE_PARITY_SCHEMA:
         errors.append(f"unsupported public demo source parity schema: {manifest.get('schema')!r}")
 
-    expected_paths = tuple(path.as_posix() for path in PUBLIC_DEMO_INPUT_PATHS)
+    expected_paths = tuple(path.as_posix() for path in input_paths)
     declared_sources = manifest.get("sources")
     if not isinstance(declared_sources, dict):
         errors.append("invalid public demo source parity source map")
@@ -85,7 +105,7 @@ def check_source_parity_manifest(html: str, *, source_root: Path) -> list[str]:
         source_revision = ""
 
     actual_source_digests: dict[str, str] = {}
-    for relative_path in PUBLIC_DEMO_INPUT_PATHS:
+    for relative_path in input_paths:
         source_key = relative_path.as_posix()
         source_file = source_root / relative_path
         if not source_file.is_file():
@@ -138,7 +158,7 @@ def inject_visible_build_identity(html: str, *, source_revision: str, build_id: 
         '      <div class="summary-card compact">\n'
         '        <span class="summary-label">Redaction</span>\n'
         '        <span class="summary-value">Synthetic IDs</span>\n'
-        '        <span class="summary-note">Generated only from schema-validated, deterministic, checked-in synthetic values.</span>\n'
+        '        <span class="summary-note">Made-up disks, serials and hosts. Nothing here comes from a real system.</span>\n'
         "      </div>"
     )
     if html.count(marker) != 1:
@@ -148,19 +168,137 @@ def inject_visible_build_identity(html: str, *, source_revision: str, build_id: 
         '      <div class="summary-card compact">\n'
         '        <span class="summary-label">Source revision</span>\n'
         f'        <span class="summary-value public-demo-identity">{source_revision}</span>\n'
-        '        <span class="summary-note">exact Git commit for declared demo inputs</span>\n'
+        '        <span class="summary-note">Git commit of the files this demo was built from</span>\n'
         "      </div>\n"
         '      <div class="summary-card compact">\n'
         '        <span class="summary-label">Build ID</span>\n'
         f'        <span class="summary-value public-demo-identity">{build_id}</span>\n'
-        '        <span class="summary-note">deterministic input-manifest fingerprint</span>\n'
+        '        <span class="summary-note">fingerprint of that commit and the demo inputs</span>\n'
         "      </div>"
     )
     return html.replace(marker, marker + identity_cards, 1)
 
 
+def _git_toplevel(source_root: Path) -> Path | None:
+    result = subprocess.run(
+        ["git", "-C", str(source_root), "rev-parse", "--show-toplevel"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    return Path(result.stdout.strip()).resolve()
+
+
+def _git_show(source_root: Path, revision: str, relative_path: str) -> bytes | None:
+    result = subprocess.run(
+        ["git", "-C", str(source_root), "show", f"{revision}:{relative_path}"],
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
+def _safe_relative_input(value: object) -> Path | None:
+    if not isinstance(value, str) or not value or "\\" in value:
+        return None
+    path = Path(value)
+    if path.is_absolute() or any(part in ("", ".", "..") for part in path.parts):
+        return None
+    return path
+
+
+def recorded_source_integrity(html: str, *, source_root: Path) -> tuple[list[str], str | None] | None:
+    """Check the artifact against the inputs at the revision it records.
+
+    This is the pull-request check. It proves the checked-in artifact is an
+    untampered build of a reachable commit, without requiring that commit to
+    match the current source. Release preparation uses the stricter current
+    source check instead (``check_public_demo_artifact.py --require-current``).
+
+    Returns ``None`` when ``source_root`` is not the top of a Git checkout, so
+    the caller can fall back to the strict working-tree comparison. Otherwise
+    returns the errors and the app version recorded at that revision.
+    """
+    toplevel = _git_toplevel(source_root)
+    if toplevel is None or toplevel != source_root.resolve():
+        return None
+    manifest, _artifact_html, parse_errors = parse_manifest(html)
+    if parse_errors:
+        return parse_errors, None
+    try:
+        revision = normalize_source_revision(str(manifest.get("source_revision", "")))
+    except ValueError:
+        return ["invalid public demo source revision"], None
+    if subprocess.run(
+        ["git", "-C", str(source_root), "cat-file", "-e", f"{revision}^{{commit}}"],
+        capture_output=True,
+        check=False,
+    ).returncode != 0:
+        return ["recorded public demo source revision is not a local commit"], None
+    if subprocess.run(
+        ["git", "-C", str(source_root), "merge-base", "--is-ancestor", revision, "HEAD"],
+        capture_output=True,
+        check=False,
+    ).returncode != 0:
+        return ["recorded public demo source revision is not an ancestor of HEAD"], None
+
+    declaration = _git_show(source_root, revision, RECORDED_INPUT_DECLARATION.as_posix())
+    if declaration is None:
+        return ["recorded public demo input declaration is missing at the source revision"], None
+    declared = {
+        match.group(1)
+        for match in DECLARED_INPUT_PATTERN.finditer(declaration.decode("utf-8", errors="replace"))
+    }
+    recorded_sources = manifest.get("sources")
+    if not isinstance(recorded_sources, dict) or set(recorded_sources) != declared:
+        return ["public demo source parity input set mismatch at the source revision"], None
+    input_paths: list[Path] = []
+    for key in sorted(declared):
+        relative_path = _safe_relative_input(key)
+        if relative_path is None:
+            return [f"unsafe recorded public demo input path: {key!r}"], None
+        input_paths.append(relative_path)
+
+    with tempfile.TemporaryDirectory(prefix="public-demo-recorded-") as temp_dir:
+        recorded_root = Path(temp_dir)
+        errors: list[str] = []
+        for relative_path in input_paths:
+            payload = _git_show(source_root, revision, relative_path.as_posix())
+            if payload is None:
+                errors.append(f"missing authoritative source input at the source revision: {relative_path.as_posix()}")
+                continue
+            target = recorded_root / relative_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(payload)
+        if errors:
+            return errors, None
+        try:
+            errors.extend(
+                check_source_parity_manifest(
+                    html,
+                    source_root=recorded_root,
+                    input_paths=tuple(input_paths),
+                )
+            )
+        except OSError as exc:
+            errors.append(f"unable to read recorded public demo inputs: {exc}")
+        version_source = (recorded_root / "app" / "__init__.py")
+        recorded_version = None
+        if version_source.is_file():
+            match = RECORDED_VERSION_PATTERN.search(version_source.read_text(encoding="utf-8"))
+            recorded_version = match.group("version") if match else None
+        return errors, recorded_version
+
+
 def recorded_source_revision_errors(*, source_root: Path, source_revision: str) -> list[str]:
-    """Check Git ancestry and declared-input stability when Git metadata exists."""
+    """Release check: the recorded revision is reachable and no input changed since.
+
+    Used by ``check_public_demo_artifact.py --require-current``.
+    """
     try:
         revision = normalize_source_revision(source_revision)
     except ValueError as exc:

@@ -8,7 +8,12 @@ const test = require("node:test");
 const ROOT = path.resolve(__dirname, "../..");
 const APP_SOURCE = fs.readFileSync(path.join(ROOT, "app/static/app.js"), "utf8");
 const TEMPLATE = fs.readFileSync(path.join(ROOT, "app/templates/index.html"), "utf8");
-const PUBLIC_DEMO = fs.readFileSync(path.join(ROOT, "public-demo/index.html"), "utf8");
+const { SKIP_REASON, currentSourceDemo } = require("./current_source_demo");
+
+// A current-source demo build (PUBLIC_DEMO_ARTIFACT), never the checked-in
+// public-demo/index.html, which is only rebuilt when a release is cut.
+const PUBLIC_DEMO = currentSourceDemo();
+const DEMO_SKIP = PUBLIC_DEMO === null && SKIP_REASON;
 
 test("the read UI accepts a preloaded Storage Fabric payload in snapshot mode only", () => {
   assert.match(
@@ -24,7 +29,7 @@ test("the read UI accepts a preloaded Storage Fabric payload in snapshot mode on
   assert.match(APP_SOURCE, /data: preloadedSasFabric,/, "snapshot mode seeds state.sasFabric.data");
 });
 
-test("the checked-in public demo embeds a frozen fabric payload that lights the bay grid", () => {
+test("the generated public demo embeds a frozen fabric payload that lights the bay grid", { skip: DEMO_SKIP }, () => {
   const marker = "preloadedSasFabric: ";
   const start = PUBLIC_DEMO.indexOf(marker);
   assert.notEqual(start, -1, "the artifact must carry a preloadedSasFabric bootstrap entry");
@@ -64,7 +69,7 @@ test("the checked-in public demo embeds a frozen fabric payload that lights the 
   );
 });
 
-test("the artifact still ships the layout-shaped grid renderer", () => {
+test("the generated demo ships the layout-shaped grid renderer", { skip: DEMO_SKIP }, () => {
   for (const token of [
     "sas-fabric-bay-layout",
     "sas-fabric-bay-row",
@@ -72,6 +77,6 @@ test("the artifact still ships the layout-shaped grid renderer", () => {
     "sas-fabric-bay-edge-label",
     "buildLayoutGridRows",
   ]) {
-    assert.ok(PUBLIC_DEMO.includes(token), `${token} must be present in the published artifact`);
+    assert.ok(PUBLIC_DEMO.includes(token), `${token} must be present in the generated demo`);
   }
 });

@@ -166,8 +166,8 @@ jobs:
             --labels "$labels" \
             "${mode[@]}"
 
-  python-source:
-    name: Python compile and unittest (${{ matrix.python-version }})
+  python-unittest:
+    name: Python unittest shard (${{ matrix.python-version }}, ${{ matrix.shard }})
     needs: route
     if: needs.route.outputs.run == 'true'
     runs-on: ubuntu-latest
@@ -176,6 +176,10 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.12", "3.14"]
+        # One shard per entry of SHARDS in scripts/run_test_shard.py. The
+        # required checks are the `python-source` gate jobs below, which fail
+        # unless every shard of their Python version uploaded a green result.
+        shard: ["1", "2", "3", "4"]
     env:
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
@@ -231,23 +235,89 @@ jobs:
       - name: Compile Python source
         run: python -m compileall app admin_service history_service scripts tests
 
-      # Both full-discovery matrix branches run tests.test_perf_budgets,
-      # including the checked-in baseline command contract.
+      # Every shard runs tests.test_unittest_shards, and shard 2 runs
+      # tests.test_perf_budgets, including the checked-in baseline command
+      # contract. `run` refuses a module that is missing from the shard table.
       # dev-check-source-gate: performance-baseline
       # dev-check-source-gate: python-unittest
       - name: Run deterministic unittest suite
-        if: matrix.python-version != '3.12'
-        run: python -m unittest discover -s tests -p "test_*.py" -v
+        if: matrix.python-version != '3.14'
+        run: python scripts/run_test_shard.py run --shard "${{ matrix.shard }}" --results-dir shard-results
 
+      # Report-only coverage rides the 3.14 leg: coverage's sys.monitoring
+      # core is free there (measured 161 s with and without on 2026-09-24),
+      # while on 3.12 branch coverage falls back to the tracer (+63 s).
       - name: Run deterministic unittest suite with report-only coverage
-        if: matrix.python-version == '3.12'
+        if: matrix.python-version == '3.14'
+        env:
+          COVERAGE_CORE: sysmon
+          COVERAGE_FILE: shard-results/.coverage.shard-${{ matrix.shard }}
+        run: coverage run scripts/run_test_shard.py run --shard "${{ matrix.shard }}" --results-dir shard-results
+
+      - name: Upload shard result
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: python-unittest-${{ matrix.python-version }}-shard-${{ matrix.shard }}
+          path: shard-results/
+          include-hidden-files: true
+          if-no-files-found: error
+
+  python-source:
+    name: Python compile and unittest (${{ matrix.python-version }})
+    needs:
+      - route
+      - python-unittest
+    # Runs after the shards whether they passed or failed (not when the run
+    # was cancelled), so the required check turns red on any shard failure
+    # and on a shard that never uploaded a result.
+    if: "${{ !cancelled() && needs.route.outputs.run == 'true' }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.14"]
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install validation dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Download shard results
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: python-unittest-${{ matrix.python-version }}-shard-*
+          path: shard-results
+          merge-multiple: true
+
+      - name: Require a green result from every shard
+        run: python scripts/run_test_shard.py verify --results-dir shard-results --python-version "${{ matrix.python-version }}"
+
+      - name: Combine report-only coverage
+        if: matrix.python-version == '3.14'
         run: |
-          coverage run -m unittest discover -s tests -p "test_*.py" -v
+          coverage combine shard-results/.coverage.shard-*
           coverage report
           coverage xml -o coverage.xml
 
       - name: Upload coverage XML artifact
-        if: matrix.python-version == '3.12'
+        if: matrix.python-version == '3.14'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: python-coverage-xml
@@ -383,6 +453,8 @@ jobs:
           assert live["status"] == "ok"
           assert health == {
               "status": "ok",
+              "summary": "Waiting for the first inventory",
+              "problems": [],
               "dependency_status": "unknown",
               "last_updated": None,
               "sources": {},
@@ -590,7 +662,8 @@ jobs:
           ADMIN_DOCKER_SOCKET_PATH: /tmp/truenas-jbod-ui-admin-cleanroom/missing-docker.sock
           ADMIN_HOST_PREP_TEMP_DIR: /tmp/truenas-jbod-ui-admin-cleanroom/host-prep
           ADMIN_PUBLIC_ORIGIN: http://127.0.0.1:8082
-          APP_CONFIG_PATH: ${{ github.workspace }}/qa/fixtures/admin-cleanroom-config.yaml
+          APP_CONFIG_PATH: /tmp/truenas-jbod-ui-admin-cleanroom/config.yaml
+          PLAYWRIGHT_ADMIN_SYNTHETIC_MUTATIONS: "1"
           HISTORY_SQLITE_PATH: /tmp/truenas-jbod-ui-admin-cleanroom/history/history.db
           PLAYWRIGHT_ADMIN_BASE_URL: http://127.0.0.1:8082
           PLAYWRIGHT_BROWSER_CHANNEL: chrome
@@ -599,6 +672,7 @@ jobs:
           runtime_root=/tmp/truenas-jbod-ui-admin-cleanroom
           rm -rf "$runtime_root"
           mkdir -p "$runtime_root"
+          cp qa/fixtures/admin-cleanroom-config.yaml "$APP_CONFIG_PATH"
           python -m uvicorn admin_service.main:app --host 127.0.0.1 --port 8082 >"$runtime_root/admin.log" 2>&1 &
           admin_pid=$!
           cleanup() {
@@ -671,9 +745,12 @@ jobs:
       - name: Use hosted Chrome for browser smoke tests
         run: google-chrome --version
 
-      - name: Smoke test checked-in artifact and current-source fixture
+      # The checked-in demo is only rebuilt when a release is cut, so the
+      # browser QA runs against a throwaway build of this commit's source. The
+      # checked-in bytes are covered by the integrity check above.
+      - name: Smoke test current-source public demo and browser fixture
         env:
-          PUBLIC_DEMO_ARTIFACT: public-demo/index.html
+          PUBLIC_DEMO_ARTIFACT: ${{ runner.temp }}/truenas-jbod-ui-current-source-browser/public-demo.html
           SLOT_FOCUS_ARTIFACT: ${{ runner.temp }}/truenas-jbod-ui-current-source-browser/index.html
           PLAYWRIGHT_BROWSER_CHANNEL: chrome
         run: |
@@ -692,8 +769,12 @@ jobs:
           trap cleanup EXIT
           rm -rf "$fixture_root"
           mkdir -p "$fixture_root"
+          python scripts/build_public_demo.py --output "$PUBLIC_DEMO_ARTIFACT" --source-revision "$(git rev-parse HEAD)"
           python scripts/build_current_source_browser_fixture.py --output "$SLOT_FOCUS_ARTIFACT"
           npx playwright test qa/public-demo.spec.js --retries=0
+          # The JS tests that assert generated-demo behaviour skip without an
+          # artifact; run the whole unit suite once more with this build.
+          node --test tests/js/*.test.js
           status="$(git status --short)"
           if [ -n "$status" ]; then
             printf '%s\n' "$status"

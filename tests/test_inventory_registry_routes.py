@@ -13,6 +13,7 @@ from fastapi.routing import APIRoute
 import tests.admin_test_env  # noqa: F401  (must precede admin_service.main)
 from admin_service import main as admin_main
 from app import main as app_main
+from app import routes as app_routes
 from app.config import Settings, SystemConfig
 from app.models.domain import (
     InventorySnapshot,
@@ -25,7 +26,7 @@ from app.services.inventory_registry import InventoryRegistry, SystemNotConfigur
 
 
 UNKNOWN_SYSTEM_ID = "retired-nas"
-UNKNOWN_SYSTEM_DETAIL = f"System '{UNKNOWN_SYSTEM_ID}' is not configured."
+UNKNOWN_SYSTEM_DETAIL = f'No system named "{UNKNOWN_SYSTEM_ID}" is configured.'
 
 
 def _registry_with_default_service(default_service: Mock) -> InventoryRegistry:
@@ -104,7 +105,7 @@ class InventoryRegistrySelectionTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             SystemNotConfiguredError,
-            "^System 'retired-nas' is not configured\\.$",
+            '^No system named "retired-nas" is configured\\.$',
         ):
             registry.get_system(UNKNOWN_SYSTEM_ID)
 
@@ -114,7 +115,7 @@ class InventoryRegistrySelectionTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             SystemNotConfiguredError,
-            "^System 'retired-nas' is not configured\\.$",
+            '^No system named "retired-nas" is configured\\.$',
         ):
             registry.get_service(UNKNOWN_SYSTEM_ID)
 
@@ -125,14 +126,14 @@ class UnknownSystemRouteTests(unittest.TestCase):
     def assert_unknown_system(self, callback) -> None:
         with self.assertRaisesRegex(
             SystemNotConfiguredError,
-            "^System 'retired-nas' is not configured\\.$",
+            '^No system named "retired-nas" is configured\\.$',
         ):
             asyncio.run(callback())
 
     def test_registered_handlers_map_unknown_system_errors_to_404(self) -> None:
         error = SystemNotConfiguredError(UNKNOWN_SYSTEM_ID)
         for application, handler in (
-            (app_main.app, app_main.system_not_configured_exception_handler),
+            (app_main.app, app_main.mapped_exception_handler),
             (admin_main.app, admin_main.system_not_configured_exception_handler),
         ):
             with self.subTest(application=application.title):
@@ -155,6 +156,7 @@ class UnknownSystemRouteTests(unittest.TestCase):
         with patch.object(app_main, "get_inventory_registry", return_value=registry):
             self.assert_unknown_system(
                 lambda: route.endpoint(
+                    request=_request("/api/inventory"),
                     force=False,
                     system_id=UNKNOWN_SYSTEM_ID,
                     enclosure_id=None,
@@ -162,6 +164,61 @@ class UnknownSystemRouteTests(unittest.TestCase):
             )
 
         default_service.get_snapshot.assert_not_awaited()
+
+    def test_inventory_read_carries_write_policy_and_app_version(self) -> None:
+        default_service = _default_service()
+        registry = _registry_with_default_service(default_service)
+        route = _route(app_main.app, "/api/inventory")
+        previous_origin = getattr(app_main.app.state, "read_ui_public_origin", None)
+        app_main.app.state.read_ui_public_origin = "https://nas.example.test"
+        try:
+            with patch.object(app_main, "get_inventory_registry", return_value=registry):
+                response = asyncio.run(
+                    route.endpoint(
+                        request=_request("/api/inventory"),
+                        force=False,
+                        system_id="system-a",
+                        enclosure_id=None,
+                    )
+                )
+        finally:
+            app_main.app.state.read_ui_public_origin = previous_origin
+
+        payload = json.loads(bytes(response.body))
+        self.assertEqual(payload["selected_system_id"], "system-a")
+        self.assertEqual(payload["app_version"], app_main.__version__)
+        self.assertEqual(payload["write_policy"]["public_origin"], "https://nas.example.test")
+        self.assertIn("enabled", payload["write_policy"])
+        self.assertIn("mode", payload["write_policy"])
+        self.assertIn("reason", payload["write_policy"])
+
+    def test_inventory_read_schema_describes_write_policy_and_app_version(self) -> None:
+        route = _route(app_main.app, "/api/inventory")
+        self.assertIs(route.response_model, app_main.InventoryReadResponse)
+        fields = app_main.InventoryReadResponse.model_fields
+        self.assertIn("write_policy", fields)
+        self.assertIn("app_version", fields)
+        self.assertFalse(fields["write_policy"].is_required())
+        self.assertFalse(fields["app_version"].is_required())
+        # Saved copies embed a plain snapshot; the live-only fields stay off it.
+        self.assertNotIn("write_policy", app_main.InventorySnapshot.model_fields)
+        properties = app_main.InventoryReadResponse.model_json_schema()["properties"]
+        self.assertIn("write_policy", properties)
+        self.assertIn("app_version", properties)
+
+    def test_index_write_policy_names_the_public_origin_only_when_configured(self) -> None:
+        request = _request("/")
+        previous_origin = getattr(app_main.app.state, "read_ui_public_origin", None)
+        try:
+            app_main.app.state.read_ui_public_origin = None
+            self.assertIsNone(app_routes.live_write_policy(request)["public_origin"])
+            app_main.app.state.read_ui_public_origin = "https://nas.example.test"
+            self.assertEqual(
+                app_routes.live_write_policy(request)["public_origin"],
+                "https://nas.example.test",
+            )
+        finally:
+            app_main.app.state.read_ui_public_origin = previous_origin
 
     def test_explicit_unknown_locator_mutation_returns_404_without_calling_default_service(self) -> None:
         default_service = _default_service()
@@ -276,7 +333,42 @@ class UnknownSystemRouteTests(unittest.TestCase):
         registry.get_service.assert_called_once_with("system-a")
         response_text = response.body.decode("utf-8")
         self.assertIn('value="system-a" selected', response_text)
-        self.assertNotIn(UNKNOWN_SYSTEM_ID, response_text)
+        self.assertNotIn(f'value="{UNKNOWN_SYSTEM_ID}"', response_text)
+        self.assertIn(
+            f'<p class="status-text" id="system-notice" role="status" data-tone="info">'
+            f'System &#34;{UNKNOWN_SYSTEM_ID}&#34; is not configured. Showing System A instead.</p>',
+            response_text,
+        )
+
+    def test_index_with_configured_system_renders_no_system_notice(self) -> None:
+        settings = Settings(
+            systems=[SystemConfig(id="system-a", label="System A")],
+            default_system_id="system-a",
+        )
+        service = _default_service()
+        registry = Mock()
+        registry.get_service.return_value = service
+        release_service = Mock()
+        release_service.snapshot.return_value = {}
+        route = _route(app_main.app, "/")
+
+        with (
+            patch.object(app_main, "get_settings", return_value=settings),
+            patch.object(app_main, "get_inventory_registry", return_value=registry),
+            patch.object(app_main, "get_release_status_service", return_value=release_service),
+            patch.object(app_main, "resolve_admin_launch_url", return_value=None),
+        ):
+            for requested_system_id in ("system-a", None):
+                with self.subTest(system_id=requested_system_id):
+                    response = asyncio.run(
+                        route.endpoint(
+                            request=_request(),
+                            system_id=requested_system_id,
+                            enclosure_id=None,
+                        )
+                    )
+                    self.assertEqual(response.status_code, 200)
+                    self.assertNotIn('id="system-notice"', response.body.decode("utf-8"))
 
 
 if __name__ == "__main__":

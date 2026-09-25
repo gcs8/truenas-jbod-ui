@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import inspect
 import json
+import re
 import secrets
 import shlex
 import stat
@@ -43,6 +45,7 @@ from admin_service.main import enrich_quantastor_nodes_from_ssh
 from admin_service.main import get_esxi_host_prep_service
 from admin_service.main import get_history_store
 from admin_service.main import observe_backup_route
+from admin_service.main import resolve_public_origin
 from admin_service.main import stream_limited_request_body_to_file
 from admin_service.main import templates as admin_templates
 from app.config import (
@@ -56,9 +59,11 @@ from app.config import (
     TrueNASConfig,
 )
 from app.main import app as main_app
+from app.main import ADMIN_PROBE_CACHE
+from app.main import AdminLaunchState
 from app.main import resolve_admin_launch_url
-from app.main import snapshot_state_busy_exception_handler
-from app.main import _clear_snapshot_export_source_cache_for_tests
+from app.main import EXCEPTION_RESPONSES, mapped_exception_handler
+from app.main import SNAPSHOT_EXPORT_SOURCE_CACHE
 from app.models.domain import ESXiHostPrepInstallRequest
 from app.models.domain import EnclosureOption
 from app.models.domain import EnclosureProfileRequest
@@ -470,11 +475,16 @@ class BackupImportRequestLimitTests(unittest.TestCase):
 
 class MainAppBoundaryTests(unittest.TestCase):
     def setUp(self) -> None:
-        _clear_snapshot_export_source_cache_for_tests()
+        SNAPSHOT_EXPORT_SOURCE_CACHE.clear()
+        ADMIN_PROBE_CACHE.clear()
+        self.addCleanup(ADMIN_PROBE_CACHE.clear)
 
     @staticmethod
     def _call_main_route(path: str) -> object:
         route = next(route for route in main_app.routes if route.path == path)
+        if path == "/healthz":
+            request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(startup_problems=())))
+            return asyncio.run(route.endpoint(request))
         return asyncio.run(route.endpoint())
 
     def test_admin_sidecar_exposes_one_time_bootstrap_route(self) -> None:
@@ -1320,7 +1330,7 @@ class MainAppBoundaryTests(unittest.TestCase):
 
     def test_unhandled_exception_handlers_redact_exception_details(self) -> None:
         for app, port, expected_detail in (
-            (main_app, 8080, "Unhandled application error; see application logs."),
+            (main_app, 8080, "Something went wrong on the server. The application log has details."),
             (admin_app, 8082, "Unhandled admin service error; see admin logs."),
         ):
             handler = app.exception_handlers[Exception]
@@ -1341,8 +1351,9 @@ class MainAppBoundaryTests(unittest.TestCase):
     def test_snapshot_export_busy_uses_the_retryable_busy_handler(self) -> None:
         self.assertIs(
             main_app.exception_handlers.get(SnapshotExportBusyError),
-            snapshot_state_busy_exception_handler,
+            mapped_exception_handler,
         )
+        self.assertEqual(EXCEPTION_RESPONSES[SnapshotExportBusyError].retry_after_seconds, 5)
 
     def test_main_app_exposes_storage_view_runtime_route(self) -> None:
         paths = {route.path for route in main_app.routes}
@@ -1420,7 +1431,7 @@ class MainAppBoundaryTests(unittest.TestCase):
 
         self.assertIn('id="admin-app-version"', template_text)
         self.assertIn('id="admin-release-note"', template_text)
-        self.assertIn('<option value="none">Password Only / No Key</option>', template_text)
+        self.assertIn('<option value="none">Password only (no key)</option>', template_text)
         self.assertIn('id="setup-esxi-host-prep-panel"', template_text)
         self.assertIn('id="setup-esxi-host-prep-package-select"', template_text)
         self.assertIn('id="setup-platform-requirements"', template_text)
@@ -1501,7 +1512,8 @@ class MainAppBoundaryTests(unittest.TestCase):
         self.assertIn("relatedTracesForNode", script_text)
         self.assertIn("traceIsInSelectionTrail", script_text)
         self.assertIn("data-fabric-breadcrumb", script_text)
-        self.assertIn("data-fabric-trace-disabled", script_text)
+        self.assertNotIn("data-fabric-trace-disabled", script_text)
+        self.assertIn("(visited)", script_text)
         self.assertIn("data-fabric-trace-home", script_text)
         self.assertIn('<span class="fabric-trace-index">1</span>', script_text)
         self.assertIn("renderDiagnosticTableControls", script_text)
@@ -1515,7 +1527,7 @@ class MainAppBoundaryTests(unittest.TestCase):
         self.assertIn("data-fabric-alias-edit", script_text)
         self.assertIn("/api/sas-fabric/aliases", script_text)
         self.assertIn("Time / Order", script_text)
-        self.assertIn("Filters apply only to this sample", script_text)
+        self.assertIn("Filters search only these.", script_text)
         self.assertIn("Previous event page", script_text)
         self.assertIn("PCI address", script_text)
         self.assertIn("PCIe slot", script_text)
@@ -1564,8 +1576,7 @@ class MainAppBoundaryTests(unittest.TestCase):
         self.assertIn("setupPlatformUsesSshOnlyHost", script_text)
         self.assertIn("renderSetupPlatformRequirements", script_text)
         self.assertIn("setupPlatformRequirements", script_text)
-        self.assertIn("Required", script_text)
-        self.assertIn("Unsupported", script_text)
+        self.assertIn("You will need", script_text)
         self.assertIn("truenas_host: primaryHost", script_text)
         self.assertIn('value === "generate" || value === "manual" || value === "none"', script_text)
         self.assertIn('setupSshSudoPasswordField.classList.toggle("hidden", !savedSudoSupported)', script_text)
@@ -1618,8 +1629,15 @@ class MainAppBoundaryTests(unittest.TestCase):
                     warnings=["cached warning", "synthetic warning: café"],
                 )
                 # Keep an exact oracle for the previous parent-serialization contract.
+                problems = (
+                    []
+                    if dependency_status == "ok"
+                    else [f"TrueNAS API degraded: {sources.get('api', {}).get('message') or 'no details recorded'}"]
+                )
                 expected = {
-                    "status": "ok",
+                    "status": "ok" if not problems else "degraded",
+                    "summary": problems[0] if problems else "All sources OK",
+                    "problems": problems,
                     "dependency_status": dependency_status,
                     "last_updated": "2026-04-25T12:00:00+00:00",
                     "sources": snapshot.model_dump(mode="json")["sources"],
@@ -1662,6 +1680,8 @@ class MainAppBoundaryTests(unittest.TestCase):
             response.body,
             JSONResponse({
                 "status": "ok",
+                "summary": "Waiting for the first inventory",
+                "problems": [],
                 "dependency_status": "unknown",
                 "last_updated": None,
                 "sources": {},
@@ -1833,11 +1853,11 @@ class MainAppBoundaryTests(unittest.TestCase):
         ):
             launch_url = resolve_admin_launch_url(request, settings)
 
-        self.assertEqual(launch_url, "http://127.0.0.1:8082")
+        self.assertEqual(launch_url, AdminLaunchState(url="http://127.0.0.1:8082", stopped=False))
         outbound_request = urlopen.call_args.args[0]
         self.assertEqual(outbound_request.get_header("X-request-id"), "e" * 32)
 
-    def test_resolve_admin_launch_url_hides_button_when_sidecar_is_down(self) -> None:
+    def test_resolve_admin_launch_url_reports_stopped_when_sidecar_is_down(self) -> None:
         request = make_request(port=8080)
         settings = Settings(
             admin=AdminSurfaceConfig(
@@ -1854,9 +1874,9 @@ class MainAppBoundaryTests(unittest.TestCase):
         ):
             launch_url = resolve_admin_launch_url(request, settings)
 
-        self.assertIsNone(launch_url)
+        self.assertEqual(launch_url, AdminLaunchState(url=None, stopped=True))
 
-    def test_resolve_admin_launch_url_hides_button_when_sidecar_times_out(self) -> None:
+    def test_resolve_admin_launch_url_reports_stopped_when_sidecar_times_out(self) -> None:
         request = make_request(port=8080)
         settings = Settings(
             admin=AdminSurfaceConfig(
@@ -1873,7 +1893,7 @@ class MainAppBoundaryTests(unittest.TestCase):
         ):
             launch_url = resolve_admin_launch_url(request, settings)
 
-        self.assertIsNone(launch_url)
+        self.assertEqual(launch_url, AdminLaunchState(url=None, stopped=True))
 
     def test_admin_runtime_version_probe_propagates_current_server_request_id(self) -> None:
         service = DockerRuntimeService(AdminSettings(docker_socket_path="/nonexistent.sock"))
@@ -2253,7 +2273,9 @@ class AdminStatePayloadTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["configuration_warnings"], [])
         self.assertEqual(payload["app_version"], __version__)
-        self.assertEqual(payload["admin"]["public_origin"], "http://localhost:8082")
+        self.assertIsNone(payload["admin"]["public_origin"])
+        self.assertFalse(payload["backup_defaults"]["debug_stop_services"])
+        self.assertTrue(payload["backup_defaults"]["debug_restart_services"])
         self.assertEqual(payload["default_system_id"], "archive-core")
         self.assertEqual(payload["systems"][0]["truenas_host"], "https://archive-core.local")
         self.assertFalse(payload["systems"][0]["verify_ssl"])
@@ -2294,19 +2316,32 @@ class AdminStatePayloadTests(unittest.TestCase):
         self.assertTrue(
             any("/var/log/messages" in command for command in payload["setup_platform_defaults"]["core"]["ssh_commands"])
         )
+        jargon = re.compile(
+            r"sidecar|runtime|read UI|enrichment|evidence|first.pass|middleware|wildcard|payload|/dev/sg",
+            re.IGNORECASE,
+        )
+        for platform_key, defaults in payload["setup_platform_defaults"].items():
+            requirements = defaults["requirements"]
+            self.assertEqual(
+                set(requirements), {"summary", "required", "optional", "guidance"}, platform_key
+            )
+            self.assertTrue(requirements["summary"], platform_key)
+            self.assertTrue(requirements["required"], platform_key)
+            for text in [requirements["summary"], requirements["guidance"], *requirements["required"], *requirements["optional"]]:
+                self.assertIsNone(jargon.search(text), f"{platform_key}: {text}")
+                self.assertNotIn("Quantastor", text, platform_key)
         scale_requirements = payload["setup_platform_defaults"]["scale"]["requirements"]
-        self.assertIn("/usr/bin/lsscsi -g -t", scale_requirements["required"][1])
-        self.assertIn("/usr/bin/lsblk --json", scale_requirements["required"][1])
-        self.assertTrue(any("/dev/sgN" in item for item in scale_requirements["optional"]))
-        self.assertTrue(any("nvme-cli" in item for item in scale_requirements["optional"]))
-        self.assertTrue(any("sesutil" in item for item in scale_requirements["unsupported"]))
-        self.assertTrue(any("mprutil" in item for item in scale_requirements["unsupported"]))
+        self.assertIn("API key", scale_requirements["required"][0])
+        self.assertTrue(any("SSH login" in item for item in scale_requirements["optional"]))
         linux_requirements = payload["setup_platform_defaults"]["linux"]["requirements"]
-        self.assertTrue(any("lsblk --json" in item for item in linux_requirements["required"]))
-        self.assertIn("lsscsi -g -t", linux_requirements["guidance"])
+        self.assertTrue(any("SSH login" in item for item in linux_requirements["required"]))
         esxi_requirements = payload["setup_platform_defaults"]["esxi"]["requirements"]
-        self.assertTrue(any("Linux sudoers/bootstrap" in item for item in esxi_requirements["unsupported"]))
-        self.assertIn("/cN or /call", esxi_requirements["guidance"])
+        self.assertIn("host-managed", esxi_requirements["summary"])
+        self.assertIn("StorCLI", esxi_requirements["summary"])
+        self.assertIn("BMC", esxi_requirements["summary"])
+        self.assertIn("/c0", esxi_requirements["guidance"])
+        quantastor_requirements = payload["setup_platform_defaults"]["quantastor"]["requirements"]
+        self.assertIn("QuantaStor", quantastor_requirements["summary"])
         self.assertIn("esxi", payload["setup_platform_defaults"])
         self.assertIn("ipmi", payload["setup_platform_defaults"])
         self.assertEqual(payload["ssh_keys"][0]["name"], "id_truenas")
@@ -2849,6 +2884,31 @@ class AdminStatePayloadTests(unittest.TestCase):
         self.assertEqual(views[0]["template_id"], "nvme-carrier-4")
 
 
+    def test_resolve_public_origin_only_offers_a_configured_address(self) -> None:
+        request = make_request(host="192.0.2.10", port=8082)
+
+        self.assertIsNone(resolve_public_origin(AdminSettings(auto_stop_seconds=0), request))
+        self.assertEqual(
+            resolve_public_origin(
+                AdminSettings(auto_stop_seconds=0, public_origin="http://nas.example.test:8082/"),
+                request,
+            ),
+            "http://nas.example.test:8082",
+        )
+
+    def test_debug_export_route_defaults_to_not_pausing_services(self) -> None:
+        debug_route = next(route for route in admin_app.routes if route.path == "/api/admin/debug/export")
+        backup_route = next(route for route in admin_app.routes if route.path == "/api/admin/backup/export")
+        import_route = next(route for route in admin_app.routes if route.path == "/api/admin/backup/import")
+
+        for route in (debug_route, backup_route):
+            with self.subTest(path=route.path):
+                parameters = inspect.signature(route.endpoint).parameters
+                self.assertIs(parameters["stop_services"].default.default, False)
+                self.assertIs(parameters["restart_services"].default.default, True)
+        self.assertIs(inspect.signature(import_route.endpoint).parameters["stop_services"].default.default, True)
+
+
 class AdminSudoPreviewRouteTests(unittest.TestCase):
     def test_runtime_behavior_route_marks_read_ui_restart(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/runtime-behavior")
@@ -2879,6 +2939,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertEqual(payload["runtime_behavior"]["fields"][0]["key"], "source_bundle_cache_ttl_seconds")
         save_overrides.assert_called_once_with(settings, {"source_bundle_cache_ttl_seconds": 120})
         runtime_service.mark_restart_required.assert_called_once_with(("ui",))
+        self.assertEqual(payload["restart_required"], ["ui"])
+        self.assertEqual(payload["detail"], "Runtime behavior overrides saved. Restart the main UI to apply them.")
 
     def test_create_demo_system_route_accepts_missing_payload_and_marks_ui_restart(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/system-setup/demo")
@@ -2946,6 +3008,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertEqual(payload["system"]["id"], "demo-builder-lab")
         self.assertEqual(payload["profile"]["id"], "demo-builder-lab-chassis")
         runtime_service.mark_restart_required.assert_called_once_with(("ui",))
+        self.assertEqual(payload["restart_required"], ["ui"])
+        self.assertEqual(payload["detail"], "Demo builder system Demo Builder Lab saved. Restart the main UI to show it.")
 
     def test_delete_system_route_returns_updated_system_list(self) -> None:
         route = next(
@@ -3132,6 +3196,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             default_system_id="archive-core",
         )
         history_store = MagicMock()
+        history_store.list_history_system_summaries.return_value = [{"system_id": "qs-cryostorage", "total_rows": 8}]
         history_store.purge_orphaned_history.return_value = {
             "tracked_slots": 1,
             "event_count": 2,
@@ -3142,7 +3207,9 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
 
         with patch("admin_service.main.reload_app_settings", return_value=settings):
             with patch("admin_service.main.get_history_store", return_value=history_store):
-                response = asyncio.run(route.endpoint())
+                preview_route = next(item for item in admin_app.routes if item.path == "/api/admin/history/orphaned")
+                preview = json.loads(asyncio.run(preview_route.endpoint()).body)
+                response = asyncio.run(route.endpoint({"preview_token": preview["purge_preview_token"], "confirm_irreversible": True}))
 
         payload = json.loads(response.body.decode("utf-8"))
 
@@ -3150,7 +3217,41 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["summary"]["removed_system_ids"], ["qs-cryostorage"])
         self.assertEqual(payload["valid_system_ids"], ["archive-core"])
-        history_store.purge_orphaned_history.assert_called_once_with(["archive-core"])
+        history_store.purge_orphaned_history.assert_called_once_with(["archive-core"], expected_summaries=history_store.list_history_system_summaries.return_value)
+
+    def test_list_history_systems_route_returns_row_counts_for_every_system(self) -> None:
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/history/systems")
+        history_store = MagicMock()
+        history_store.list_history_system_summaries.return_value = [
+            {"system_id": "archive-core", "system_label": "Archive CORE", "total_rows": 1240},
+        ]
+
+        with patch("admin_service.main.get_history_store", return_value=history_store):
+            response = asyncio.run(route.endpoint())
+
+        payload = json.loads(response.body.decode("utf-8"))
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["systems"][0]["system_id"], "archive-core")
+        self.assertEqual(payload["systems"][0]["total_rows"], 1240)
+        history_store.list_history_system_summaries.assert_called_once_with()
+
+    def test_list_history_systems_route_fails_closed_without_leaking_store_errors(self) -> None:
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/history/systems")
+        history_store = MagicMock()
+        history_store.list_history_system_summaries.side_effect = RuntimeError("private sqlite path")
+
+        with patch("admin_service.main.get_history_store", return_value=history_store):
+            with self.assertRaises(HTTPException) as raised:
+                asyncio.run(route.endpoint())
+
+        self.assertEqual(raised.exception.status_code, 500)
+        self.assertEqual(raised.exception.detail, "Unable to inspect saved history; see admin logs.")
+
+    def test_container_descriptions_avoid_implementation_words(self) -> None:
+        jargon = re.compile(r"sidecar|read UI|read-mostly|first.pass|surface|collector", re.IGNORECASE)
+        runtime = DockerRuntimeService(AdminSettings())
+        for container in runtime.managed_containers.values():
+            self.assertIsNone(jargon.search(container["description"]), container["description"])
 
     def test_list_orphaned_history_route_returns_history_sources(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/history/orphaned")
@@ -3942,8 +4043,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
                     exit_code=0,
                 )
 
-        def make_service(config_path: str) -> ServiceAccountBootstrapService:
-            return ServiceAccountBootstrapService(config_path, probe_factory=RecordingProbe)
+        def make_service(config_path: str, **kwargs: object) -> ServiceAccountBootstrapService:
+            return ServiceAccountBootstrapService(config_path, probe_factory=RecordingProbe, **kwargs)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             config_file = Path(temp_dir) / "config" / "config.yaml"
@@ -4035,8 +4136,9 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         received: list[SystemSetupBootstrapRequest] = []
 
         class RecordingBootstrapService:
-            def __init__(self, config_path: str) -> None:
+            def __init__(self, config_path: str, *, known_hosts_path: str | None = None) -> None:
                 self.config_path = config_path
+                self.known_hosts_path = known_hosts_path
 
             def bootstrap_service_account(self, payload: SystemSetupBootstrapRequest) -> dict[str, object]:
                 received.append(payload)
@@ -4770,7 +4872,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         assert captured is not None
         self.assertEqual(captured.status_code, 400)
         detail = str(captured.detail)
-        self.assertIn("saved connection settings", detail)
+        self.assertIn("cannot be reused. Enter it again and save.", detail)
         self.assertNotIn(saved_api_password, detail)
         self.assertNotIn(fresh_ssh_password, detail)
 

@@ -68,10 +68,21 @@ service logs.
 | `Last error` | A collection pass failed. The text stays generic on purpose. |
 | `What went wrong` | The classified reason for that failure, such as not reaching the main UI, a request timeout, or a rejected request with its status code. |
 | `Backup error` | The last snapshot attempt failed, named in plain words: a full disk, an unwritable backup directory, or a read-only database. |
-| `Cleanup error` | The last retention pass failed. A batch size above the SQLite variable limit names `HISTORY_RETENTION_BATCH_SIZE` as the setting to lower. |
+| `Cleanup error` | The last retention pass failed, named in plain words (read-only database, full disk, missing permission). Retention selects each batch with a bounded subquery, so any `HISTORY_RETENTION_BATCH_SIZE` works; a very large value only makes each cleanup transaction longer. |
 | `Cleanup waiting` | Retention is holding off because no recent backup exists. |
 | `Cleanup resumes by` | The deadline after which retention prunes anyway. |
 | `Full refresh available` | When the next manual full refresh is allowed, instead of a refusal after the fact. |
+
+The history service `/healthz` answers HTTP 503 with `status: down` only when
+the history database could not be opened at startup (for example an unwritable
+`./history` folder); `reason` carries the plain line from the log. Otherwise it
+answers HTTP 200. Its `status` is `degraded`, with a plain `detail`, when the last background
+collection failed, the history database is read-only, cleanup failed twice in a
+row, or earlier history was quarantined and needs recovery. A failed manual
+refresh shows in `Last error` but does not make the service degraded. The
+Collector card reads `Starting` during the startup grace period, and a scheduled
+backup status file with group or world write permission is named in
+`Cleanup error` (expected mode `0640`).
 
 If `Cleanup waiting` stays set, fix the backup first: read `Backup error`, check
 that the backup directory is writable by the history service and has free

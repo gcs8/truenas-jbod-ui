@@ -235,7 +235,8 @@ Raw command reference (the wrapper remains authoritative):
 
 ```bash
 python -m unittest discover -s tests -p "test_*.py" -v
-coverage run -m unittest discover -s tests -p "test_*.py" -v && coverage report
+COVERAGE_CORE=sysmon coverage run -m unittest discover -s tests -p "test_*.py" -v && coverage report
+python scripts/run_test_shard.py run --shard 1   # one CI shard; `list` prints the table
 python -m compileall app admin_service history_service scripts tests
 node --check app/static/app.js
 node --check app/static/sas_fabric_view.js
@@ -412,8 +413,17 @@ The following pull-request checks are release-blocking and required for `main`:
 - `Admin clean-room browser QA`
 - `Changelog entry` (pull requests only; see "Changelog And Release Notes")
 
-Coverage is report-only. CodeQL is report-only until repository branch
-protection explicitly makes it required. Publish workflows are release gates,
+Each `Python compile and unittest (<version>)` check is a gate job over
+four parallel shard jobs (`Python unittest shard (<version>, <shard>)`). The
+shards split the test modules by the `SHARDS` table in
+`scripts/run_test_shard.py`; the gate downloads every shard's result and fails
+unless each one ran and passed on that Python version, so a shard that failed,
+was skipped, or never uploaded a result turns the required check red. Every
+`tests/test_*.py` module must sit in exactly one shard; `run` refuses to start
+otherwise and `tests.test_unittest_shards` asserts the same partition. Report-only
+coverage runs on the 3.14 shards with coverage's `sys.monitoring` core and is
+combined in the 3.14 gate. Coverage is report-only. CodeQL is report-only until
+repository branch protection explicitly makes it required. Publish workflows are release gates,
 not ordinary pull-request checks. `PR type labels` is a labelling helper, not a
 check. If a check name changes, update branch protection and this list together
 after the new workflow has run successfully.
@@ -484,15 +494,15 @@ that comment yet; the table below is the authoritative list either way.
 
 | If you change | Also change | Why |
 | --- | --- | --- |
-| Any file listed in `PUBLIC_DEMO_INPUT_PATHS` (`scripts/public_demo_inputs.py`): `app/main.py`, `app/config.py`, `app/static/app.js`, `app/static/style.css`, `app/templates/*.html`, the services and images it names | Rebuild `public-demo/index.html` with `scripts/build_public_demo.py --source-revision <the commit that changed the input>` in a following commit, then recapture the two screenshots on Linux and record the review (see below) | `tests.test_public_demo_fixture` and `tests.test_public_demo_provenance` fingerprint every declared input; `scripts/check_public_demo_artifact.py` refuses a stale artifact |
+| Any file listed in `PUBLIC_DEMO_INPUT_PATHS` (`scripts/public_demo_inputs.py`): `app/main.py`, `app/config.py`, `app/static/app.js`, `app/static/style.css`, `app/templates/*.html`, the services and images it names | Nothing in the pull request. Do not rebuild the public demo or recapture screenshots. The demo is rebuilt once per release (see "Public Demo And Fixture Policy") | Pull-request CI checks that the checked-in demo is an exact build of the commit it records. `scripts/validate_release_wrap.py` and the GHCR release workflow refuse a release whose demo was not rebuilt from the release source |
 | A Python module that a declared demo input imports (for example a new helper imported by `app/config.py`) | Add it to `PUBLIC_DEMO_INPUT_PATHS`, to the `paths:` list in `.github/workflows/publish-public-demo.yml`, and to the mirrored list in `tests/test_public_demo_deterministic.py` | `test_shared_input_graph_covers_recursive_local_python_imports` and `test_publish_workflow_watches_every_declared_input` compare the three lists |
 | `public-demo/index.html` | `docs/images/screenshots/manifest.json`, the two PNGs under `docs/images/screenshots/` and their byte-identical copies under `wiki/images/`, and the review record `docs/PUBLIC_SCREENSHOT_REVIEW.md` (revision, artifact hash, per-image hash, `PASS`) | `tests.test_public_screenshots` and `scripts/check_public_screenshots.py` bind the manifest to the exact artifact bytes; a Windows capture produces different bytes, so capture on Linux |
 | Any user-visible string the snapshot page shows | `qa/public-demo.spec.js` (Playwright assertions on the demo page) and the `tests/js` assertions that pin it | The CI job named `Checked-in public demo artifact` runs those specs, and only the first mismatch is reported per run |
 | `downsampling_label` and other values that look like copy but are compared in code (`"None"` is a sentinel read by two consumers in `app/static/app.js`) | Every consumer, or leave the value alone and change only the neighbouring note | A plain-language rename turns a sentinel into a false positive |
 | A warning or note that states where data came from (live data, cached topology, fallback geometry) | Only reword in a way that keeps the same claim; if the source is uncertain, say less, not more | Bay geometry is safety-relevant: an operator who believes a drawing came from live data may pull the wrong drive |
-| A new `tests/test_*.py` module | `WINDOWS_PORTABLE_TEST_MODULES` or `WINDOWS_EXCLUSIONS` in `scripts/dev_check.py` | `tests.test_dev_check` fails on an unclassified module, on every platform |
+| A new `tests/test_*.py` module | `WINDOWS_PORTABLE_TEST_MODULES` or `WINDOWS_EXCLUSIONS` in `scripts/dev_check.py`, and one shard tuple in `SHARDS` in `scripts/run_test_shard.py` (keep it sorted) | `tests.test_dev_check` fails on an unclassified module, on every platform; `tests.test_unittest_shards` and the CI shard runner fail on a module outside every shard |
 | Serial numbers, WWNs, hostnames or addresses in any tracked text, including tests and fixtures | Use the synthetic forms the privacy scan accepts (`SANITIZED-` serials, `host.example.test`-style hosts, `192.0.2.x` addresses) or add a reviewed exception in `tests/public_text_privacy_exceptions.json` with a reason | `tests.test_public_doc_privacy` pins every finding by file, category and value hash |
-| A wiki page added or removed | The page count in `scripts/check_public_docs.py`, its row in `docs/DOCUMENTATION_INVENTORY.md`, the page set in `tests/test_public_docs_contract.py`, and `wiki/_Sidebar.md` | `check_public_docs.py` and the docs contract test count and enumerate pages |
+| A wiki page added or removed | The page count in `scripts/check_public_docs.py`, the page set in `tests/test_public_docs_contract.py`, and `wiki/_Sidebar.md` (the inventory under `docs/archive/` is a historical baseline and is not updated) | `check_public_docs.py` and the docs contract test count and enumerate pages |
 | `.env.example` comment wording that a test quotes (for example the `latest remains the compatibility default` sentence) | The quoting test in `tests/test_ghcr_release_contract.py`, or keep the sentence | The test pins the sentence |
 | A behaviour or policy that a workflow, a contract test, `CONTRIBUTING.md`, `CHANGELOG.md` and the PR body all describe (CI triggers, defaults, auto-stop) | All of them, in the same change; a revert that leaves one surface asserting the old behaviour is not a revert | `tests/test_ci_contract.py` and `tests/test_container_contract.py` assert the documented policy against the live files |
 
@@ -517,21 +527,30 @@ Rules:
 3. Generated public-demo artifacts are produced by the builder, never by manual
    edits.
 4. The builder and checker share one centrally declared semantic input graph.
-   Any declared input change must make the old artifact fail closed.
-5. Any future local-history conversion must be an explicit maintainer-only tool
+   The checked-in artifact must always be an exact build of the reachable
+   commit it records.
+5. The public demo is rebuilt when a release is cut, not in ordinary pull
+   requests. A pull request that changes a declared input leaves
+   `public-demo/**`, the screenshots, and the review record alone. Release
+   preparation rebuilds the demo from the release source, recaptures the
+   screenshots on Linux, and records the pixel review. The release checks
+   (`check_public_demo_artifact.py --require-current`,
+   `validate_release_wrap.py --public-demo-only`, and the same check in
+   `.github/workflows/publish-ghcr.yml`) fail until that is done.
+6. Any future local-history conversion must be an explicit maintainer-only tool
    that writes the bounded public fixture. Fixture review, artifact regeneration,
    and publication remain separate later steps.
-6. Public-demo output must not contain real hostnames, private IPs, serials,
+7. Public-demo output must not contain real hostnames, private IPs, serials,
    WWNs/SAS addresses, keys, configured system names, credentials, or secrets.
 
-Regenerate and verify from a clean checkout:
+At release time, regenerate and verify from a clean checkout of the release commit:
 
 ```bash
 python -m unittest tests.test_public_demo_fixture tests.test_public_demo_deterministic -v
 SOURCE_COMMIT="$(git rev-parse HEAD)"
 python scripts/build_public_demo.py --output public-demo/index.html --source-revision "$SOURCE_COMMIT"
 python scripts/build_public_demo.py --output public-demo/index.html --check
-python scripts/check_public_demo_artifact.py public-demo
+python scripts/check_public_demo_artifact.py public-demo --require-current
 python scripts/check_public_docs.py
 python scripts/check_public_screenshots.py
 slot_focus_artifact="$(mktemp "${TMPDIR:-/tmp}/truenas-jbod-ui-slot-focus-XXXXXX.html")"

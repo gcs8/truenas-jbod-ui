@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
 from scripts.public_demo_source_parity import (  # noqa: E402
     check_source_parity_manifest,
     parse_manifest,
+    recorded_source_integrity,
     recorded_source_revision_errors,
 )
 
@@ -37,9 +38,9 @@ SENSITIVE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("non-demo serial", re.compile(r"(?i)\bserial(?:_number)?[\"']?\s*[:=]\s*[\"'](?!DEMO-|null)[^\"']+")),
 )
 REQUIRED_MARKERS: tuple[str, ...] = (
-    "Frozen Sanitized Snapshot",
-    "Artifact app v",
-    "Capture time",
+    "Demo data",
+    'id="snapshot-app-version">v',
+    "Captured",
     "Synthetic IDs",
     "Source revision",
     "Build ID",
@@ -53,7 +54,7 @@ FORBIDDEN_MARKERS: tuple[tuple[str, str], ...] = (
     ("live-derived provenance claim", "Live-derived"),
     ("local history dependency", "history/history.db"),
 )
-ARTIFACT_VERSION_PATTERN = re.compile(r"\bArtifact app v(?P<version>[0-9A-Za-z][0-9A-Za-z.+-]*)\b")
+ARTIFACT_VERSION_PATTERN = re.compile(r'id="snapshot-app-version">v(?P<version>[0-9A-Za-z][0-9A-Za-z.+-]*)<')
 RESOURCE_REFERENCE_PATTERN = re.compile(
     r"<(?:script|img|link|source|video|audio|iframe)\b[^>]*\b(?:src|href|poster)\s*=\s*[\"'](?!data:|#)[^\"']+",
     re.IGNORECASE,
@@ -103,6 +104,15 @@ def parse_args() -> argparse.Namespace:
         default=ROOT,
         help="Repository root containing the centrally declared source graph.",
     )
+    parser.add_argument(
+        "--require-current",
+        action="store_true",
+        help=(
+            "Release check: also require the artifact to be built from the current source, "
+            "with no declared demo input changed since its recorded source revision. "
+            "Without this flag the artifact only has to match the commit it records."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -134,22 +144,34 @@ def main() -> int:
         errors.append("public demo artifact is not valid UTF-8")
         html = ""
     if html:
-        errors.extend(check_source_parity_manifest(html, source_root=args.source_root))
-        manifest, _artifact_html, manifest_errors = parse_manifest(html)
-        if not manifest_errors:
-            source_revision = manifest.get("source_revision")
-            if isinstance(source_revision, str):
-                errors.extend(
-                    recorded_source_revision_errors(
-                        source_root=args.source_root,
-                        source_revision=source_revision,
+        recorded = None if args.require_current else recorded_source_integrity(html, source_root=args.source_root)
+        if recorded is not None:
+            # Pull-request mode: the artifact must be an exact build of the
+            # reachable commit it records. Later source changes are expected;
+            # the demo is rebuilt when a release is cut.
+            recorded_errors, source_version = recorded
+            errors.extend(recorded_errors)
+            if source_version is None and not recorded_errors:
+                errors.append("unable to parse the app version at the recorded source revision")
+        else:
+            # Release mode (--require-current), or a source root outside Git:
+            # the artifact must match the current source exactly.
+            errors.extend(check_source_parity_manifest(html, source_root=args.source_root))
+            manifest, _artifact_html, manifest_errors = parse_manifest(html)
+            if not manifest_errors:
+                source_revision = manifest.get("source_revision")
+                if isinstance(source_revision, str):
+                    errors.extend(
+                        recorded_source_revision_errors(
+                            source_root=args.source_root,
+                            source_revision=source_revision,
+                        )
                     )
-                )
-        try:
-            source_version = read_source_version(args.source_root)
-        except ValueError as exc:
-            errors.append(str(exc))
-            source_version = None
+            try:
+                source_version = read_source_version(args.source_root)
+            except ValueError as exc:
+                errors.append(str(exc))
+                source_version = None
         for marker in REQUIRED_MARKERS:
             if marker not in html:
                 errors.append(f"missing required marker: {marker}")

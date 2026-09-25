@@ -166,8 +166,8 @@ test("explicit plaintext policy permits unscrubbed unencrypted export", () => {
 });
 
 test("submission and passphrase input recheck the same policy", () => {
-  assert.match(functionSource("exportDebugBundle"), /getDebugExportPolicy\(\)/);
-  assert.match(functionSource("exportDebugBundle"), /if \(!policy\.allowed\)/);
+  assert.match(functionSource("runExportDebugBundle"), /getDebugExportPolicy\(\)/);
+  assert.match(functionSource("runExportDebugBundle"), /if \(!policy\.allowed\)/);
   assert.match(
     SOURCE,
     /debugExportPassphrase\?\.addEventListener\("input",\s*syncBackupControls\)/
@@ -206,7 +206,7 @@ test("encrypted full backup needs a passphrase and is otherwise exportable", () 
   elements.backupExportPassphrase.value = "synthetic-passphrase";
   functions.syncBackupControls();
   assert.equal(elements.backupExportButton.disabled, false);
-  assert.match(elements.backupExportResult.textContent, /Exports can stay live/);
+  assert.match(elements.backupExportResult.textContent, /export while the app is running/);
 });
 
 test("explicit plaintext policy permits an unencrypted full backup", () => {
@@ -233,8 +233,8 @@ test("full backup without selected paths stays disabled even when policy allows 
 });
 
 test("full backup submission and passphrase input recheck the backup policy", () => {
-  assert.match(functionSource("exportBackup"), /getBackupExportPolicy\(\)/);
-  assert.match(functionSource("exportBackup"), /if \(!policy\.allowed\)/);
+  assert.match(functionSource("runExportBackup"), /getBackupExportPolicy\(\)/);
+  assert.match(functionSource("runExportBackup"), /if \(!policy\.allowed\)/);
   assert.match(
     SOURCE,
     /backupExportPassphrase\?\.addEventListener\("input",\s*syncBackupControls\)/

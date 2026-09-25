@@ -1,26 +1,26 @@
 {
   "images": {
     "public-demo-history.png": {
-      "bytes": 1226115,
+      "bytes": 953927,
       "dimensions": [
         1920,
-        4852
+        3817
       ],
       "pixel_review": "PASS",
-      "sha256": "5d4bd72304218b3680ee787a22cf77ac6862f641afb5012b9d9e6602720422f2"
+      "sha256": "66e61def4a0ca56ba68aae0bd95e1bc980be42d5f3c70ba1daf303475138de8d"
     },
     "public-demo-overview.png": {
-      "bytes": 1099132,
+      "bytes": 851100,
       "dimensions": [
         1920,
-        4092
+        3059
       ],
       "pixel_review": "PASS",
-      "sha256": "a5b71d60b647717f4d03b6788de7f17a0f5125f84b25482b3578ba0618f628ca"
+      "sha256": "1c6242674f8a661f0851d0bef9842f3f501fb6a392f3f1bc4f292488ba9d55d7"
     }
   },
   "provenance": "synthetic-public-demo",
   "schema_version": 1,
-  "source_artifact_sha256": "505568b3660bef9baa2f1fb144d615b761f9edb0bec7b64b47d08de79c9d646a",
-  "source_revision": "2288c324d3df1baf2cfeeb4d60d60c816e837cb8"
+  "source_artifact_sha256": "a52fb93384f25902fe6668600101f82992560701d1a8528d51882b7429593446",
+  "source_revision": "2a7f11258083a4cd27b156fe4a073f83db2842a5"
 }

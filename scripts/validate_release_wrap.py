@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import re
+import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -51,6 +53,11 @@ VALID_RESULTS = {"pass", "blocked", "n/a"}
 WIKI_DRIFT_REQUIRED_FROM = (0, 22, 3)
 CHANGELOG_COVERAGE_REQUIRED_FROM = (0, 22, 3)
 VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)(?:[-+][0-9A-Za-z.-]+)?")
+# Releases from this version on must ship a public demo rebuilt from the
+# release source. Earlier releases predate the release-time rebuild rule.
+PUBLIC_DEMO_FRESHNESS_REQUIRED_FROM = (0, 23, 1)
+PUBLIC_DEMO_GATE = "Docs/wiki/public-demo gate"
+PUBLIC_DEMO_VERSION_RE = re.compile(r'id="snapshot-app-version">v([0-9A-Za-z][0-9A-Za-z.+-]*)<')
 CHANGELOG_COVERAGE_LINE = re.compile(r"^Changelog coverage: pass \(\d+ PRs\)$", re.MULTILINE)
 
 
@@ -270,6 +277,60 @@ def changelog_coverage_required(version: str) -> bool:
     return tuple(int(part) for part in match.groups()) >= CHANGELOG_COVERAGE_REQUIRED_FROM
 
 
+def public_demo_freshness_required(version: str) -> bool:
+    match = VERSION_RE.fullmatch(version.removeprefix("v"))
+    if match is None:
+        raise ValueError("version must use semantic version form X.Y.Z")
+    return tuple(int(part) for part in match.groups()) >= PUBLIC_DEMO_FRESHNESS_REQUIRED_FROM
+
+
+def public_demo_release_issues(repository: Path, version: str) -> list[ValidationIssue]:
+    """Refuse a release whose checked-in public demo was not rebuilt for it.
+
+    Pull requests only check that the demo is an untampered build of the commit
+    it records. Cutting a release is where the demo must be rebuilt from the
+    release source, recaptured, and pixel-reviewed; these checks fail until that
+    has happened.
+    """
+
+    version = version.removeprefix("v")
+    issues: list[ValidationIssue] = []
+    for label, command in (
+        (
+            "checked-in public demo is not current for this release source",
+            ("scripts/check_public_demo_artifact.py", "public-demo", "--require-current"),
+        ),
+        (
+            "public demo screenshots do not match the rebuilt demo or lack a PASS pixel review",
+            ("scripts/check_public_screenshots.py", "--root", "."),
+        ),
+    ):
+        result = subprocess.run(
+            (sys.executable, *command),
+            cwd=repository,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            details = "; ".join(line.strip() for line in result.stderr.splitlines() if line.strip())
+            issues.append(ValidationIssue(f"{PUBLIC_DEMO_GATE}: {label}: {details or 'check failed'}"))
+    artifact = repository / "public-demo" / "index.html"
+    try:
+        artifact_versions = set(PUBLIC_DEMO_VERSION_RE.findall(artifact.read_text(encoding="utf-8")))
+    except (OSError, UnicodeError):
+        artifact_versions = set()
+    if artifact_versions != {version}:
+        found = ", ".join(sorted(artifact_versions)) or "none"
+        issues.append(
+            ValidationIssue(
+                f"{PUBLIC_DEMO_GATE}: public demo shows app version {found}, not the release version {version}; "
+                "rebuild it from the release commit (see docs/RELEASE_CHECKLIST.md, Public demo rebuild)"
+            )
+        )
+    return issues
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Validate release-wrap checklist evidence.")
     parser.add_argument("version", help="Release version, for example 0.20.2 or v0.20.2.")
@@ -291,6 +352,14 @@ def build_parser() -> argparse.ArgumentParser:
             "Use final after GHCR, deployment sniff tests, and reopen work are recorded."
         ),
     )
+    parser.add_argument(
+        "--public-demo-only",
+        action="store_true",
+        help=(
+            "Only check that the checked-in public demo and screenshots were rebuilt and "
+            "reviewed for this release version. The GHCR release workflow runs this."
+        ),
+    )
     return parser
 
 
@@ -298,6 +367,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     version = args.version.removeprefix("v")
+    if args.public_demo_only:
+        try:
+            demo_issues = public_demo_release_issues(args.repository, version)
+        except ValueError as exc:
+            print(f"- {exc}")
+            return 1
+        for issue in demo_issues:
+            print(f"- {issue.message}")
+        if demo_issues:
+            return 1
+        print(f"Public demo is current for release {version}.")
+        return 0
     try:
         require_wiki_verification = wiki_drift_required(version)
         require_changelog_coverage = changelog_coverage_required(version)
@@ -345,6 +426,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         require_wiki_verification=require_wiki_verification,
         wiki_verification=wiki_verification,
     )
+    if public_demo_freshness_required(version):
+        issues.extend(public_demo_release_issues(args.repository, version))
     if issues:
         for issue in issues:
             print(f"- {issue.message}")

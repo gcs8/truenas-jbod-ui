@@ -9,6 +9,8 @@ from __future__ import annotations
 import errno
 import os
 import sqlite3
+import uuid
+from collections.abc import Iterable
 from pathlib import Path
 
 UNWRITABLE_ERRNOS = frozenset(
@@ -110,3 +112,71 @@ def unwritable_directory_error(
     if not is_unwritable_error(exc):
         return None
     return StorageDirectoryUnwritable(directory)
+
+
+def probe_writable_directories(directories: Iterable[Path | str | None]) -> list[str]:
+    """Create and delete a probe file in each directory; one operator line per refusal.
+
+    Only permission-shaped failures (see `is_unwritable_error`) are reported;
+    anything else is left for the code that actually writes there to surface.
+    Missing directories are created first, as the stores do on first write.
+    """
+    problems: list[str] = []
+    seen: set[str] = set()
+    for raw in directories:
+        if not raw:
+            continue
+        directory = Path(raw)
+        key = os.path.normcase(os.path.abspath(directory))
+        if key in seen:
+            continue
+        seen.add(key)
+        probe = directory / f".write-probe-{os.getpid()}-{uuid.uuid4().hex}"
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            descriptor = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.close(descriptor)
+            probe.unlink()
+        except OSError as exc:
+            if is_unwritable_error(exc):
+                problems.append(describe_unwritable_directory(directory))
+    return problems
+
+
+def probe_known_hosts_files(paths: Iterable[Path | str | None]) -> list[str]:
+    """Check operator-chosen known-hosts files; one operator line per problem.
+
+    Unlike `probe_writable_directories`, a missing parent is reported rather
+    than created: a configured path usually names a host bind mount, and
+    creating the folder inside the container would pin keys where they vanish
+    on the next restart. The app keeps running either way; SSH reports its own
+    host-key errors until the path is fixed.
+    """
+    problems: list[str] = []
+    seen: set[str] = set()
+    for raw in paths:
+        if not raw:
+            continue
+        path = Path(raw)
+        key = os.path.normcase(os.path.abspath(path))
+        if key in seen:
+            continue
+        seen.add(key)
+        parent = path.parent
+        if not parent.is_dir():
+            problems.append(
+                f"The known-hosts file {path} is set in ssh.known_hosts_path, but its folder {parent} "
+                "does not exist. Create or mount that folder, or remove the setting to use the "
+                "data folder's known_hosts."
+            )
+            continue
+        target = path if path.exists() else parent
+        if not os.access(target, os.W_OK):
+            if target == parent:
+                problems.append(describe_unwritable_directory(parent))
+            else:
+                problems.append(
+                    f"The known-hosts file {path} is not writable by the app, so new host keys "
+                    f"cannot be saved. {describe_unwritable_directory(parent)}"
+                )
+    return problems

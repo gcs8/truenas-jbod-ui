@@ -64,7 +64,7 @@ CORE_MPR_SYSCTL_LOCATION_COMMAND = (
 
 _INVENTORY_SNAPSHOT_EVIDENCE = ("inventory snapshot",)
 _PROFILE_SLOT_LAYOUT_EVIDENCE = ("profile slot layout",)
-_SLOT_MULTIPATH_EVIDENCE = ("slot.multipath.members",)
+_SLOT_MULTIPATH_EVIDENCE = ("multipath members",)
 _LINUX_SES_PATH_EVIDENCE = (
     "lsscsi -g",
     "lsscsi -g -t",
@@ -212,6 +212,30 @@ def _build_sas_fabric_result(
     raw: dict[str, Any] | None = None,
     sort_controllers: bool = False,
 ) -> SasFabricSnapshot:
+    # Keep bay IDs/kinds for selection and alias compatibility, but never present
+    # a logical inventory ordinal as a known physical bay.
+    location_unknown_slots = [slot for slot in snapshot.slots if not slot.physical_location_known]
+    if location_unknown_slots:
+        warnings = [*(warnings or []), (
+            "Logical disk inventory (virtual): physical location unavailable for unmapped disks. "
+            "Disk numbers are inventory ordinals, not physical bays."
+        )]
+        for slot in location_unknown_slots:
+            object_id = f"bay:{slot.slot}"
+            provenance = {
+                "physical_location_known": False,
+                "virtual_enclosure": bool(slot.raw_status.get("virtual_enclosure")),
+            }
+            node = (nodes or {}).get(object_id)
+            trace = (traces or {}).get(object_id)
+            for item in (node, trace):
+                if item is not None:
+                    item.label = f"Disk {slot.slot + 1}"
+                    item.metrics.update(provenance)
+                    item.evidence = _dedupe_strings([*item.evidence, "physical location unavailable"])
+            if node is not None:
+                node.raw.update(provenance)
+        available = available or any(_slot_has_disk(slot) for slot in location_unknown_slots)
     controller_rows = controllers or []
     if sort_controllers:
         controller_rows = sorted(controller_rows, key=lambda item: str(item.get("name") or ""))
@@ -288,7 +312,7 @@ def _add_backplane_zone_nodes(
     nodes: dict[str, SasFabricNode],
     snapshot: InventorySnapshot,
 ) -> dict[int, dict[str, Any]]:
-    backplane_zones = _backplane_zones_for_slots(snapshot.slots)
+    backplane_zones = _backplane_zones_for_slots([slot for slot in snapshot.slots if slot.physical_location_known])
     for zone in backplane_zones.values():
         add_node(
             nodes,
@@ -369,6 +393,13 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
 
     adapter_summary = parse_mpr_adapter_summary(normalized_outputs.get("mprutil show adapters", ""))
     unit_data = _parse_unit_data(normalized_outputs)
+    if snapshot.slots and all(not slot.physical_location_known for slot in snapshot.slots):
+        # The legacy unit -1 placeholder is not observed controller evidence.
+        if -1 in unit_data and not any(
+            normalized_outputs.get(f"mprutil show {subcommand}", "").strip()
+            for subcommand in CORE_MPRUTIL_UNIT_SUBCOMMANDS
+        ):
+            unit_data.pop(-1)
     pci_controllers = parse_pciconf_sas_controllers(normalized_outputs.get("pciconf -lv", ""))
     pcie_slots = parse_dmidecode_slots(normalized_outputs.get("dmidecode slot", ""))
     mpr_sysctl_locations = parse_mpr_sysctl_locations(normalized_outputs.get("mpr sysctl pci locations", ""))
@@ -612,7 +643,7 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
                     label=ses_device,
                     raw_id=ses_device,
                     related_slots=[slot.slot],
-                    evidence=["slot.ssh_ses_device"],
+                    evidence=["SES enclosure device"],
                     raw={"ses_device": ses_device},
                 ),
             )
@@ -648,7 +679,7 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
                 ],
                 "mpr_devices": mpr_device_metrics,
             },
-            evidence=["inventory snapshot", "slot.multipath.members"],
+            evidence=["inventory snapshot", *_SLOT_MULTIPATH_EVIDENCE],
         )
 
     _scope_mpr_infrastructure(
@@ -780,8 +811,8 @@ def _build_linux_ses_fabric_snapshot(context: SasFabricBuildContext) -> SasFabri
     platform_label = "TrueNAS SCALE" if system.truenas.platform == "scale" else "Linux"
     if not slots_with_ses:
         fabric_warnings.append(
-            f"No {_linux_ses_platform_phrase(platform_label)} slot evidence is available for this selection. "
-            "Run stable lsblk --json, lsscsi -g -t, and sg_ses AES/EC/join probes before rendering a SCALE/Linux Storage Fabric map."
+            f"No SES enclosure data was found for this {platform_label} system. "
+            "Check that SSH works and that sg_ses is installed on the host (see Troubleshooting)."
         )
         return _build_unavailable_sas_fabric_snapshot(
             system=system,
@@ -1139,8 +1170,7 @@ def _build_platform_storage_fabric_snapshot(context: SasFabricBuildContext) -> S
 
     if not evidence_slots:
         fabric_warnings.append(
-            f"No Storage Fabric evidence is available for {platform_label}. "
-            "This selection needs platform inventory, slot, block-device, controller, or BMC evidence before a graph can render."
+            f"No disk or enclosure data was found for {platform_label}, so there is nothing to map yet."
         )
         return _build_unavailable_sas_fabric_snapshot(
             system=system,
@@ -1672,10 +1702,6 @@ def _snapshot_has_linux_ses_evidence(snapshot: InventorySnapshot) -> bool:
     return any(_slot_ses_devices(slot) for slot in snapshot.slots)
 
 
-def _linux_ses_platform_phrase(platform_label: str) -> str:
-    return "Linux SES" if platform_label.strip().lower() == "linux" else f"{platform_label} Linux SES"
-
-
 def _platform_label(platform: str | None) -> str:
     normalized = normalize_text(platform).lower()
     return {
@@ -1702,27 +1728,27 @@ def _storage_fabric_kind(platform: str | None) -> str:
 def _storage_fabric_scope_warning(platform_label: str, fabric_kind: str) -> str:
     if fabric_kind == "storage_quantastor":
         return (
-            f"{platform_label} Storage Fabric is built from Quantastor storage-system, "
-            "HA-node, pool, disk, and optional SES/qs evidence. Low-level controller, path, or expander hops are shown only when those sources prove them."
+            f"{platform_label} Storage Fabric is built from Quantastor storage-system, HA-node, pool, disk and "
+            "optional SES data; controller and expander hops appear only when those sources report them."
         )
     if fabric_kind == "storage_esxi":
         return (
-            f"{platform_label} Storage Fabric is built from ESXCLI and vendor controller evidence. "
-            "It shows host/controller/member relationships without enabling RAID-management actions."
+            f"{platform_label} Storage Fabric is built from ESXCLI and vendor controller data; "
+            "it shows host, controller and member relationships and never changes RAID settings."
         )
     if fabric_kind in {"storage_linux", "storage_scale"}:
         return (
-            f"{platform_label} Storage Fabric is built from Linux block, pool, profile, SMART, and optional SES evidence. "
-            "Unproven physical HBA or expander hops are kept out of the map."
+            f"{platform_label} Storage Fabric is built from Linux block, pool, profile, SMART and optional SES data; "
+            "HBA and expander hops are not shown."
         )
     if fabric_kind == "storage_bmc":
         return (
-            f"{platform_label} Storage Fabric is limited to BMC slot/chassis evidence for this selection. "
-            "Host storage paths need OS or vendor storage data."
+            f"{platform_label} Storage Fabric is built from BMC slot and chassis data only; "
+            "host storage paths need OS or vendor storage data."
         )
     return (
-        f"{platform_label} Storage Fabric is built from the platform evidence available in this snapshot. "
-        "Unproven physical hops are labeled by omission rather than inferred."
+        f"{platform_label} Storage Fabric is built from the data this platform reports; "
+        "hops it does not report are left out rather than guessed."
     )
 
 
@@ -2130,7 +2156,10 @@ def _linux_storage_route(
         "enclosure_kind": "storage-enclosure",
         "enclosure_label": enclosure_label,
         "enclosure_raw_id": snapshot.selected_enclosure_id,
-        "enclosure_evidence": ["profile/storage view"],
+        "enclosure_evidence": (
+            ["inventory snapshot", "virtual inventory", "physical location unavailable"]
+            if not slot.physical_location_known else ["profile/storage view"]
+        ),
         "enclosure_raw": {
             "source": source,
             "fabric_kind": fabric_kind,

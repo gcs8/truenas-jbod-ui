@@ -1,17 +1,23 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
+import types
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Union, get_args, get_origin
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, field_validator, model_validator
 
+from app.config_errors import ConfigurationError, describe_validation_error, format_location
+from app.env_values import annotation_is_text, env_is_set
 from app.secret_files import load_secret_environment_value
 from app.slot_layout import normalize_slot_layout, validate_slot_layout
+
+logger = logging.getLogger(__name__)
 
 
 def _standard_runtime_config_path() -> Path:
@@ -78,6 +84,54 @@ def _legacy_container_layout_paths() -> dict[str, str]:
     return _derive_runtime_layout_paths(Path("/app/config/config.yaml"))
 
 
+def known_hosts_placeholder_paths(config_path: str | Path) -> set[str]:
+    """Known-hosts values that are not an operator choice for ``config_path``.
+
+    The shipped default, the legacy container path and the path derived from
+    this config file all mean "use ``<data>/known_hosts``"; admin saves write
+    the derived value into each system, so it must not count as a choice.
+    """
+    return {
+        _default_known_hosts_path(),
+        _legacy_container_layout_paths()["known_hosts_path"],
+        _derive_runtime_layout_paths(config_path)["known_hosts_path"],
+    }
+
+
+def known_hosts_path_for_target(
+    settings: "Settings",
+    *,
+    system_id: str | None = None,
+    target_host: str | None = None,
+) -> str | None:
+    """The known-hosts file a connection to a saved system should use.
+
+    A system may set its own ``ssh.known_hosts_path``; the default system's
+    value is only right for systems that do not. Match the saved system by id
+    first, then by the target host (primary, extra or HA node host), and fall
+    back to the top-level file for unsaved targets.
+    """
+    wanted_id = normalize_text(system_id)
+    wanted_host = (normalize_text(target_host) or "").lower()
+    if wanted_id:
+        for system in settings.systems:
+            if system.id == wanted_id:
+                return system.ssh.known_hosts_path
+    if wanted_host:
+        for system in settings.systems:
+            hosts = [system.ssh.host, *system.ssh.extra_hosts, *(node.host for node in system.ssh.ha_nodes)]
+            if any((normalize_text(candidate) or "").lower() == wanted_host for candidate in hosts):
+                return system.ssh.known_hosts_path
+    return settings.ssh.known_hosts_path
+
+
+def is_placeholder_known_hosts_path(value: Any, placeholders: set[str]) -> bool:
+    """True when ``value`` is unset, blank or one of ``placeholders``."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return True
+    return value in placeholders
+
+
 class AppConfig(BaseModel):
     host: str = "0.0.0.0"
     port: int = 8080
@@ -108,7 +162,6 @@ class AppConfig(BaseModel):
     export_cache_max_bytes: int = 32 * 1024 * 1024
     log_level: str = "INFO"
     debug: bool = False
-    verify_ssl: bool = True
 
 
 class PerfConfig(BaseModel):
@@ -433,9 +486,6 @@ class HistoryConfig(BaseModel):
 
     service_url: str = ""
     timeout_seconds: int = 10
-    # Upper bound on concurrent per-slot requests when the batched scope endpoint fails
-    # and the client falls back to one request per slot.
-    fallback_max_concurrency: int = 4
     refresh_token: SecretStr | None = None
 
     @field_validator("refresh_token", mode="before")
@@ -513,7 +563,6 @@ ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
     "APP_EXPORT_CACHE_MAX_BYTES": ("app", "export_cache_max_bytes"),
     "APP_LOG_LEVEL": ("app", "log_level"),
     "APP_DEBUG": ("app", "debug"),
-    "APP_VERIFY_SSL": ("app", "verify_ssl"),
     "APP_CONFIG_PATH": ("config_file",),
     "PERF_TIMING_ENABLED": ("perf", "enabled"),
     "PERF_LOG_ALL_REQUESTS": ("perf", "log_all_requests"),
@@ -537,6 +586,7 @@ ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
     "SSH_PORT": ("ssh", "port"),
     "SSH_USER": ("ssh", "user"),
     "SSH_KEY_PATH": ("ssh", "key_path"),
+    "SSH_KNOWN_HOSTS_PATH": ("ssh", "known_hosts_path"),
     "SSH_PASSWORD": ("ssh", "password"),
     "SSH_SUDO_PASSWORD": ("ssh", "sudo_password"),
     "SSH_STRICT_HOST_KEY_CHECKING": ("ssh", "strict_host_key_checking"),
@@ -544,7 +594,6 @@ ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
     "SSH_COMMANDS_JSON": ("ssh", "commands"),
     "HISTORY_BACKEND_URL": ("history", "service_url"),
     "HISTORY_BACKEND_TIMEOUT": ("history", "timeout_seconds"),
-    "HISTORY_BACKEND_FALLBACK_CONCURRENCY": ("history", "fallback_max_concurrency"),
     "HISTORY_REFRESH_TOKEN": ("history", "refresh_token"),
     "ADMIN_SERVICE_URL": ("admin", "service_url"),
     "ADMIN_PUBLIC_URL": ("admin", "public_url"),
@@ -640,8 +689,91 @@ def _parse_scalar(value: str) -> Any:
         return value
 
 
+def _override_target_annotation(path: tuple[str, ...]) -> Any:
+    model: Any = Settings
+    annotation: Any = None
+    for key in path:
+        if not (isinstance(model, type) and issubclass(model, BaseModel)) or key not in model.model_fields:
+            return None
+        annotation = model.model_fields[key].annotation
+        model = annotation
+    return annotation
+
+
+def _override_is_text(path: tuple[str, ...]) -> bool:
+    return annotation_is_text(_override_target_annotation(path))
+
+
+def _model_annotation(annotation: Any) -> type[BaseModel] | None:
+    """Return the settings model behind ``annotation`` (``Model``, ``Model | None``, ``list[Model]``)."""
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return annotation
+    origin = get_origin(annotation)
+    if origin is list:
+        return _model_annotation(get_args(annotation)[0]) if get_args(annotation) else None
+    if origin is Union or origin is types.UnionType:
+        for member in get_args(annotation):
+            if member is not type(None):
+                nested = _model_annotation(member)
+                if nested is not None:
+                    return nested
+    return None
+
+
+def collect_unknown_config_keys(
+    payload: Any,
+    model: type[BaseModel] = Settings,
+    *,
+    prefix: str = "",
+) -> list[str]:
+    """List YAML keys that no settings model reads, as ``systems[0].truenas.bogus_field`` paths."""
+    unknown: list[str] = []
+    if not isinstance(payload, dict):
+        return unknown
+    for raw_key, value in payload.items():
+        key = str(raw_key)
+        path = f"{prefix}{key}"
+        field = model.model_fields.get(key)
+        if field is None:
+            unknown.append(path)
+            continue
+        nested_model = _model_annotation(field.annotation)
+        if nested_model is None:
+            continue
+        if get_origin(field.annotation) is list:
+            if isinstance(value, list):
+                for index, item in enumerate(value):
+                    unknown.extend(collect_unknown_config_keys(item, nested_model, prefix=f"{path}[{index}]."))
+        else:
+            unknown.extend(collect_unknown_config_keys(value, nested_model, prefix=f"{path}."))
+    return unknown
+
+
+def _unknown_key_message(config_path: Path, key: str) -> str:
+    return f"{config_path.name}: unknown key `{key}` is ignored."
+
+
+def build_unknown_config_key_warnings(settings: Settings) -> list[dict[str, str]]:
+    """Describe config file keys the app does not read, for the admin warning banner."""
+    config_path = Path(settings.config_file)
+    try:
+        yaml_config = _load_yaml_config(config_path)
+    except (OSError, ValueError, yaml.YAMLError):
+        return []
+    return [
+        {
+            "code": "unknown_config_key",
+            "key": key,
+            "message": _unknown_key_message(config_path, key),
+        }
+        for key in collect_unknown_config_keys(yaml_config)
+    ]
+
+
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
-    merged = dict(base)
+    # Copy nested mappings too: later in-place writes to the result (environment
+    # overrides) must not leak back into the defaults they are compared against.
+    merged = {key: _deep_merge(value, {}) if isinstance(value, dict) else value for key, value in base.items()}
     for key, value in override.items():
         if isinstance(value, dict) and isinstance(merged.get(key), dict):
             merged[key] = _deep_merge(merged[key], value)
@@ -693,15 +825,6 @@ def _has_path(source: dict[str, Any], path: tuple[str, ...]) -> bool:
     return True
 
 
-def _get_path_value(source: dict[str, Any], path: tuple[str, ...]) -> Any:
-    cursor: Any = source
-    for key in path:
-        if not isinstance(cursor, dict):
-            return None
-        cursor = cursor.get(key)
-    return cursor
-
-
 def _explicit_app_field(source: dict[str, Any], field_name: str) -> bool:
     return _has_path(source, ("app", field_name))
 
@@ -715,7 +838,7 @@ def _apply_legacy_cache_ttl_compat(
     legacy_explicit = (
         _explicit_app_field(yaml_config, "cache_ttl_seconds")
         or _explicit_app_field(runtime_overrides, "cache_ttl_seconds")
-        or os.getenv("APP_CACHE_TTL") is not None
+        or env_is_set("APP_CACHE_TTL")
     )
     if not legacy_explicit:
         return
@@ -724,13 +847,13 @@ def _apply_legacy_cache_ttl_compat(
     if (
         not _explicit_app_field(yaml_config, "snapshot_cache_ttl_seconds")
         and not _explicit_app_field(runtime_overrides, "snapshot_cache_ttl_seconds")
-        and os.getenv("APP_SNAPSHOT_CACHE_TTL_SECONDS") is None
+        and not env_is_set("APP_SNAPSHOT_CACHE_TTL_SECONDS")
     ):
         app_payload["snapshot_cache_ttl_seconds"] = legacy_value
     if (
         not _explicit_app_field(yaml_config, "source_bundle_cache_ttl_seconds")
         and not _explicit_app_field(runtime_overrides, "source_bundle_cache_ttl_seconds")
-        and os.getenv("APP_SOURCE_BUNDLE_CACHE_TTL_SECONDS") is None
+        and not env_is_set("APP_SOURCE_BUNDLE_CACHE_TTL_SECONDS")
     ):
         app_payload["source_bundle_cache_ttl_seconds"] = legacy_value
 
@@ -743,7 +866,7 @@ def _runtime_behavior_env_owner(
     metadata = RUNTIME_BEHAVIOR_APP_FIELDS.get(field_name) or {}
     for env_name in metadata.get("env") or ():
         normalized_env_name = str(env_name)
-        if os.getenv(normalized_env_name) is None:
+        if not env_is_set(normalized_env_name):
             continue
         if (
             normalized_env_name == "APP_CACHE_TTL"
@@ -898,14 +1021,26 @@ def _apply_config_path_relative_defaults(
         if key not in merged_paths or merged_paths.get(key) in {defaults["paths"][key], legacy[key]}:
             merged_paths[key] = derived[key]
 
+    # A known-hosts path the operator chose (config file, per system, or
+    # SSH_KNOWN_HOSTS_PATH) is honoured, e.g. a host bind mount instead of the
+    # data volume. Unset, default and legacy container values follow the
+    # runtime layout; a system without its own choice follows the top level.
+    placeholder_known_hosts_paths = {
+        defaults["ssh"]["known_hosts_path"],
+        *known_hosts_placeholder_paths(config_path),
+    }
     merged_ssh = merged.setdefault("ssh", {})
-    merged_ssh["known_hosts_path"] = derived["known_hosts_path"]
+    if is_placeholder_known_hosts_path(merged_ssh.get("known_hosts_path"), placeholder_known_hosts_paths):
+        merged_ssh["known_hosts_path"] = derived["known_hosts_path"]
 
     for system_payload in merged.get("systems") or []:
         if not isinstance(system_payload, dict):
             continue
         ssh_payload = system_payload.setdefault("ssh", {})
-        ssh_payload["known_hosts_path"] = derived["known_hosts_path"]
+        if not isinstance(ssh_payload, dict):
+            continue
+        if is_placeholder_known_hosts_path(ssh_payload.get("known_hosts_path"), placeholder_known_hosts_paths):
+            ssh_payload["known_hosts_path"] = merged_ssh["known_hosts_path"]
 
     return merged
 
@@ -1035,6 +1170,8 @@ def get_settings() -> Settings:
     yaml_config = _load_yaml_config(config_path)
     runtime_overrides_path = Path(_derive_runtime_layout_paths(config_path)["runtime_overrides_file"])
     runtime_overrides = _load_runtime_overrides_config(runtime_overrides_path)
+    for key in collect_unknown_config_keys(yaml_config):
+        logger.warning("%s", _unknown_key_message(config_path, key))
     merged = _deep_merge(defaults, yaml_config)
     merged = _deep_merge(merged, runtime_overrides)
 
@@ -1046,9 +1183,14 @@ def get_settings() -> Settings:
         )
         if raw_value is None:
             continue
-        parsed_value = (
-            raw_value if env_name in EXACT_STRING_ENV_OVERRIDES else _parse_scalar(raw_value)
-        )
+        if env_name in EXACT_STRING_ENV_OVERRIDES:
+            parsed_value = raw_value
+        elif not raw_value.strip():
+            continue
+        elif _override_is_text(target_path):
+            parsed_value = raw_value.strip()
+        else:
+            parsed_value = _parse_scalar(raw_value)
         _set_path_value(merged, target_path, parsed_value)
     _apply_legacy_cache_ttl_compat(merged, yaml_config, runtime_overrides)
 
@@ -1063,7 +1205,23 @@ def get_settings() -> Settings:
         profile_config = _load_profile_yaml(profile_path)
         merged["profiles"] = [*(merged.get("profiles") or []), *(profile_config.get("profiles") or [])]
 
-    settings = _normalize_systems(Settings.model_validate(merged))
+    env_by_target = {target_path: env_name for env_name, target_path in ENV_OVERRIDES.items()}
+
+    def resolve_location(location: tuple[int | str, ...]) -> tuple[str, str]:
+        parts = tuple(str(part) for part in location)
+        env_name = env_by_target.get(parts)
+        if env_name is not None and env_is_set(env_name):
+            return env_name, ".env"
+        source = runtime_overrides_path if _has_path(runtime_overrides, parts) else config_path
+        return format_location(location), str(source)
+
+    try:
+        validated = Settings.model_validate(merged)
+    except ValidationError as exc:
+        raise ConfigurationError(
+            describe_validation_error(exc, resolve_location=resolve_location, default_source=str(config_path))
+        ) from None
+    settings = _normalize_systems(validated)
     Path(settings.paths.mapping_file).parent.mkdir(parents=True, exist_ok=True)
     Path(settings.paths.sas_fabric_alias_file).parent.mkdir(parents=True, exist_ok=True)
     Path(settings.paths.log_file).parent.mkdir(parents=True, exist_ok=True)
