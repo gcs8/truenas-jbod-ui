@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+from tests.mapping_fixtures import write_v1_mappings
 from app.models.domain import ManualMapping, SlotView
 from app.services.mapping_store import (
     MappingRevisionConflict,
@@ -141,7 +142,7 @@ class PhysicalMappingScopeLifecycleTests(unittest.TestCase):
                 serial="ALIAS",
             )
             alias_key = self.alias_key("synthetic-system-a", DRAWER_TOP, 7)
-            store._write({alias_key: alias})
+            write_v1_mappings(store, {alias_key: alias})
             before = store.file_path.read_bytes()
 
             resolved = store.get_mapping("synthetic-system-a", DRAWER_BOTTOM, 7)
@@ -178,7 +179,7 @@ class PhysicalMappingScopeLifecycleTests(unittest.TestCase):
                     serial="ALIAS",
                 )
                 alias_key = self.alias_key("synthetic-system-a", DRAWER_TOP, 7)
-                store._write({alias_key: alias})
+                write_v1_mappings(store, {alias_key: alias})
 
                 if operation == "clear":
                     revision = store.clear_revision(
@@ -255,7 +256,7 @@ class PhysicalMappingScopeLifecycleTests(unittest.TestCase):
                     "enclosure_id": DRAWER_BOTTOM,
                 }
             )
-            store._write({
+            write_v1_mappings(store, {
                 store._slot_key("synthetic-system-a", "synthetic-shelf-a", 7): canonical,
                 self.alias_key("synthetic-system-a", DRAWER_TOP, 7): alias,
                 self.alias_key("synthetic-system-b", DRAWER_BOTTOM, 7): other,
@@ -283,14 +284,14 @@ class PhysicalMappingScopeLifecycleTests(unittest.TestCase):
                     slot=7,
                     serial="OLD",
                 )
-                store._write({alias_key: alias})
+                write_v1_mappings(store, {alias_key: alias})
                 save_revision = store.save_revision("synthetic-system-a", DRAWER_BOTTOM, 7)
                 clear_revision = store.clear_revision("synthetic-system-a", DRAWER_BOTTOM, 7)
                 incoming = [alias.model_copy(update={"enclosure_id": DRAWER_BOTTOM, "serial": "NEW"})]
                 preview = store.preview_replace_mappings(
                     "synthetic-system-a", DRAWER_BOTTOM, incoming
                 )
-                store._write({alias_key: alias.model_copy(update={"notes": "changed"})})
+                write_v1_mappings(store, {alias_key: alias.model_copy(update={"notes": "changed"})})
                 before = store.file_path.read_bytes()
 
                 with self.assertRaises(MappingRevisionConflict):
@@ -323,7 +324,7 @@ class PhysicalMappingScopeLifecycleTests(unittest.TestCase):
                 serial="CANONICAL",
             )
             alias = canonical.model_copy(update={"enclosure_id": DRAWER_TOP, "serial": "DIVERGENT"})
-            store._write({
+            write_v1_mappings(store, {
                 store._slot_key("synthetic-system-a", "synthetic-shelf-a", 7): canonical,
                 self.alias_key("synthetic-system-a", DRAWER_TOP, 7): alias,
             })
@@ -357,7 +358,7 @@ class PhysicalMappingScopeLifecycleTests(unittest.TestCase):
                 slot=7,
                 serial="DIVERGENT",
             )
-            store._write({
+            write_v1_mappings(store, {
                 store._slot_key("synthetic-system-a", "synthetic-shelf-a", 7): canonical,
                 f"{DRAWER_TOP}:7": admitted_alias,
             })
@@ -388,7 +389,7 @@ class AliasKeyModelConsistencyTests(unittest.TestCase):
         slot: int = SLOT,
     ) -> MappingStore:
         store = self.make_store(root)
-        store._write({
+        write_v1_mappings(store, {
             f"{self.SYSTEM_A}:{DRAWER_TOP}:{self.SLOT}": ManualMapping(
                 system_id=system_id,
                 enclosure_id=enclosure_id,
@@ -468,7 +469,7 @@ class AliasKeyModelConsistencyTests(unittest.TestCase):
                 tempfile.TemporaryDirectory() as temp_dir,
             ):
                 store = self.make_store(temp_dir)
-                store._write({
+                write_v1_mappings(store, {
                     f"{self.SYSTEM_A}:{keyed_enclosure_id}:{self.SLOT}": ManualMapping(
                         system_id=self.SYSTEM_A,
                         enclosure_id=model_enclosure_id,
@@ -486,7 +487,7 @@ class AliasKeyModelConsistencyTests(unittest.TestCase):
     def test_system_scoped_key_with_legacy_none_model_system_remains_accepted(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = self.make_store(temp_dir)
-            store._write({
+            write_v1_mappings(store, {
                 f"{self.SYSTEM_A}:{DRAWER_TOP}:{self.SLOT}": ManualMapping(
                     system_id=None,
                     enclosure_id=DRAWER_BOTTOM,
@@ -600,7 +601,7 @@ class AliasKeyModelConsistencyTests(unittest.TestCase):
                     "serial": "OTHER-PHYSICAL",
                 }
             )
-            store._write(current)
+            write_v1_mappings(store, current)
             before = store.file_path.read_bytes()
 
             self.assertEqual(
@@ -673,7 +674,7 @@ class AliasKeyModelConsistencyTests(unittest.TestCase):
                         slot=slot,
                         serial="HIDDEN",
                     )
-                    store._write({
+                    write_v1_mappings(store, {
                         store._slot_key(
                             self.SYSTEM_A, self.SHELF_A, self.SLOT
                         ): valid,
@@ -697,7 +698,7 @@ class AliasKeyModelConsistencyTests(unittest.TestCase):
                     slot=self.SLOT,
                     serial="VALID",
                 )
-                store._write({
+                write_v1_mappings(store, {
                     store._slot_key(self.SYSTEM_A, self.SHELF_A, self.SLOT): valid,
                 })
                 preview = store.preview_replace_mappings(self.SYSTEM_A, self.SHELF_A, [])
@@ -708,7 +709,7 @@ class AliasKeyModelConsistencyTests(unittest.TestCase):
                 current[f"{self.SYSTEM_B}:unknown-shelf:{self.SLOT}"] = valid.model_copy(
                     update={"serial": "HIDDEN"}
                 )
-                store._write(current)
+                write_v1_mappings(store, current)
                 before = store.file_path.read_bytes()
 
                 with self.assertRaises(MappingScopeConflict):
@@ -771,7 +772,7 @@ class AliasKeyModelConsistencyTests(unittest.TestCase):
                     slot=1,
                     serial="OTHER-SYSTEM",
                 )
-                store._write(rows)
+                write_v1_mappings(store, rows)
                 before = store.file_path.read_bytes()
 
                 result = operation(store)
@@ -797,7 +798,7 @@ class AliasKeyModelConsistencyTests(unittest.TestCase):
                     serial="TEN",
                 ),
             }
-            store._write(rows)
+            write_v1_mappings(store, rows)
 
             self.assertEqual(
                 [mapping.serial for mapping in store.list_mappings()],
@@ -819,7 +820,8 @@ class MappingStoreImportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = self.make_store(temp_dir)
             slot_count = 347
-            store._write(
+            write_v1_mappings(
+                store,
                 {
                     store._slot_key("system-a", "enc-a", slot): ManualMapping(
                         system_id="system-a",
@@ -1064,9 +1066,9 @@ class MappingStoreImportTests(unittest.TestCase):
                 slot=0,
                 serial="LEGACY-OLD",
             )
-            store._write({"default:0": legacy})
+            write_v1_mappings(store, {"default:0": legacy})
             clear_revision = store.clear_revision("system-a", "enc-a", 0)
-            store._write({"default:0": legacy.model_copy(update={"serial": "LEGACY-NEW"})})
+            write_v1_mappings(store, {"default:0": legacy.model_copy(update={"serial": "LEGACY-NEW"})})
 
             with self.assertRaisesRegex(RuntimeError, "revision"):
                 store.clear_mapping(
@@ -1095,7 +1097,7 @@ class MappingStoreImportTests(unittest.TestCase):
                 slot=0,
                 serial="LEGACY-ORIGINAL",
             )
-            store._write({"enc-a:0": legacy})
+            write_v1_mappings(store, {"enc-a:0": legacy})
 
             preview = store.preview_replace_mappings("system-a", "enc-a", [])
 
@@ -1130,9 +1132,9 @@ class MappingStoreImportTests(unittest.TestCase):
                 slot=0,
                 serial="LEGACY-OLD",
             )
-            store._write({"default:0": legacy})
+            write_v1_mappings(store, {"default:0": legacy})
             clear_revision = store.clear_revision("system-a", "enc-a", 0)
-            store._write({"default:0": legacy.model_copy(update={"serial": "LEGACY-NEW"})})
+            write_v1_mappings(store, {"default:0": legacy.model_copy(update={"serial": "LEGACY-NEW"})})
 
             with self.assertRaisesRegex(RuntimeError, "revision"):
                 store.clear_mapping(
@@ -1161,7 +1163,7 @@ class MappingStoreImportTests(unittest.TestCase):
                 slot=0,
                 serial="LEGACY",
             )
-            store._write({"enc-a:0": legacy})
+            write_v1_mappings(store, {"enc-a:0": legacy})
 
             self.assertEqual(store.count_for_system("system-a"), 1)
             self.assertEqual(
@@ -1178,7 +1180,7 @@ class MappingStoreImportTests(unittest.TestCase):
                 slot=3,
                 device_name="sda",
             )
-            store._write({"default:3": legacy})
+            write_v1_mappings(store, {"default:3": legacy})
 
             self.assertIsNone(store.get_mapping("system-b", "enc-b", 3))
             admitted = store.get_mapping(
@@ -1194,7 +1196,7 @@ class MappingStoreImportTests(unittest.TestCase):
     def test_has_legacy_only_mapping_reports_rows_without_resolving_them(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = self.make_store(temp_dir)
-            store._write({
+            write_v1_mappings(store, {
                 "default:3": ManualMapping(slot=3, device_name="sda"),
                 store._slot_key("system-a", "enc-a", 4): ManualMapping(
                     system_id="system-a",
@@ -1246,7 +1248,7 @@ class MappingStoreImportTests(unittest.TestCase):
     def test_exact_key_with_foreign_model_system_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = self.make_store(temp_dir)
-            store._write({
+            write_v1_mappings(store, {
                 store._slot_key("system-b", "enc-b", 3): ManualMapping(
                     system_id="system-a",
                     enclosure_id="enc-b",
@@ -1270,7 +1272,7 @@ class MappingStoreImportTests(unittest.TestCase):
                 slot=0,
                 serial="LEGACY-COLON",
             )
-            store._write({"sas:enclosure-a:0": legacy})
+            write_v1_mappings(store, {"sas:enclosure-a:0": legacy})
 
             self.assertEqual(
                 [mapping.serial for mapping in store.list_mappings("system-a", "sas:enclosure-a")],
@@ -1286,7 +1288,7 @@ class MappingStoreImportTests(unittest.TestCase):
                 slot=0,
                 serial="LEGACY",
             )
-            store._write({"enc-a:0": legacy})
+            write_v1_mappings(store, {"enc-a:0": legacy})
 
             store.replace_mappings("system-a", "enc-a", [])
 
@@ -1297,7 +1299,7 @@ class MappingStoreImportTests(unittest.TestCase):
             with self.subTest(enclosure_id=enclosure_id), tempfile.TemporaryDirectory() as temp_dir:
                 store = self.make_store(temp_dir)
                 legacy_key = f"{enclosure_id}:0"
-                store._write({
+                write_v1_mappings(store, {
                     legacy_key: ManualMapping(
                         system_id=None,
                         enclosure_id=enclosure_id,
@@ -1327,7 +1329,7 @@ class MappingStoreImportTests(unittest.TestCase):
     def test_canonical_save_removes_global_legacy_alias(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = self.make_store(temp_dir)
-            store._write({
+            write_v1_mappings(store, {
                 "default:0": ManualMapping(
                     system_id=None,
                     enclosure_id=None,
@@ -1362,7 +1364,7 @@ class MappingStoreImportTests(unittest.TestCase):
                 serial="CANONICAL",
             )
             legacy = canonical.model_copy(update={"system_id": None, "serial": "LEGACY"})
-            store._write({
+            write_v1_mappings(store, {
                 store._slot_key("default", "enc-a", 0): canonical,
                 "enc-a:0": legacy,
             })
@@ -1380,7 +1382,7 @@ class MappingStoreImportTests(unittest.TestCase):
     def test_canonical_save_invalidates_pre_migration_revision(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = self.make_store(temp_dir)
-            store._write({
+            write_v1_mappings(store, {
                 "enc-a:0": ManualMapping(
                     system_id=None,
                     enclosure_id="enc-a",
@@ -1420,7 +1422,7 @@ class MappingStoreImportTests(unittest.TestCase):
                 serial="CANONICAL",
             )
             legacy = canonical.model_copy(update={"system_id": None, "serial": "LEGACY"})
-            store._write({
+            write_v1_mappings(store, {
                 store._slot_key("default", "enc-a", 0): canonical,
                 "enc-a:0": legacy,
             })
@@ -1440,7 +1442,7 @@ class MappingStoreImportTests(unittest.TestCase):
     def test_canonical_save_removes_scoped_enclosureless_sibling(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = self.make_store(temp_dir)
-            store._write({
+            write_v1_mappings(store, {
                 store._slot_key("system-a", None, 5): ManualMapping(
                     system_id="system-a",
                     enclosure_id=None,
@@ -1465,7 +1467,7 @@ class MappingStoreImportTests(unittest.TestCase):
     def test_clear_removes_scoped_enclosureless_sibling(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = self.make_store(temp_dir)
-            store._write({
+            write_v1_mappings(store, {
                 store._slot_key("system-a", None, 5): ManualMapping(
                     system_id="system-a",
                     enclosure_id=None,
@@ -1509,10 +1511,10 @@ class MappingStoreImportTests(unittest.TestCase):
                 slot=5,
                 serial="FALLBACK-OLD",
             )
-            store._write({exact_key: exact, fallback_key: fallback})
+            write_v1_mappings(store, {exact_key: exact, fallback_key: fallback})
             revision = store.save_revision("system-a", "enc-a", 5)
             newer_fallback = fallback.model_copy(update={"serial": "FALLBACK-NEW"})
-            store._write({exact_key: exact, fallback_key: newer_fallback})
+            write_v1_mappings(store, {exact_key: exact, fallback_key: newer_fallback})
 
             with self.assertRaisesRegex(RuntimeError, "revision"):
                 store.save_mapping(
@@ -1541,10 +1543,10 @@ class MappingStoreImportTests(unittest.TestCase):
                 slot=5,
                 serial="FALLBACK-OLD",
             )
-            store._write({exact_key: exact, fallback_key: fallback})
+            write_v1_mappings(store, {exact_key: exact, fallback_key: fallback})
             revision = store.clear_revision("system-a", "enc-a", 5)
             newer_fallback = fallback.model_copy(update={"serial": "FALLBACK-NEW"})
-            store._write({exact_key: exact, fallback_key: newer_fallback})
+            write_v1_mappings(store, {exact_key: exact, fallback_key: newer_fallback})
 
             with self.assertRaisesRegex(RuntimeError, "revision"):
                 store.clear_mapping(
@@ -1570,7 +1572,7 @@ class MappingStoreImportTests(unittest.TestCase):
             other_mapping = default_mapping.model_copy(
                 update={"system_id": "system-a", "serial": "SYSTEM-A"}
             )
-            store._write({
+            write_v1_mappings(store, {
                 store._slot_key(None, "enc-a", 0): default_mapping,
                 store._slot_key("system-a", "enc-a", 0): other_mapping,
             })

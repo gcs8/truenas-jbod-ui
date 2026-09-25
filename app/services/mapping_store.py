@@ -1457,18 +1457,3 @@ class MappingStore:
             if is_unwritable_error(exc):
                 raise MappingStorageUnwritable(self.file_path.parent) from exc
             raise
-
-    def _write(self, mappings: dict[str, ManualMapping]) -> None:
-        """Write an explicit version-1 fixture; production mutations use v2."""
-        payload = {
-            "version": 1,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-            "slot_mappings": {
-                key: value.model_dump(mode="json")
-                for key, value in mappings.items()
-            },
-        }
-        self.file_path.write_text(
-            json.dumps(payload, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )

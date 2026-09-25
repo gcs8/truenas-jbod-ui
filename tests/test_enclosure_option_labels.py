@@ -322,7 +322,7 @@ class EnclosureAliasOptionLabelTests(unittest.TestCase):
             drawer_bottom = "enc-a::dell-md1280-drawer-bottom-42"
 
             def seed_cache() -> None:
-                for key in ("__default__", "enc-a", drawer_top, "enc-other"):
+                for key in (inventory.UNSCOPED_KEY, "enc-a", drawer_top, "enc-other"):
                     service._cache[key] = InventorySnapshot(slots=[], refresh_interval_seconds=30)
                     service._cache_until[key] = future
 

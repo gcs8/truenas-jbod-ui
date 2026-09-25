@@ -530,15 +530,6 @@ class SnapshotRedactor:
             return "enclosure"
         return None
 
-    @staticmethod
-    def _build_aliases(values: list[str], prefix: str) -> dict[str, str]:
-        aliases: dict[str, str] = {}
-        for value in values:
-            if value in aliases:
-                continue
-            aliases[value] = f"{prefix}-{len(aliases) + 1:02d}"
-        return aliases
-
     @classmethod
     def _build_system_aliases(
         cls,

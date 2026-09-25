@@ -21,6 +21,7 @@ from app.models.domain import (
 from app.services.inventory import (
     DiskInventorySyncBusy,
     DiskInventorySyncUnavailable,
+    SNAPSHOT_NO_ENCLOSURE_KEY,
     InventoryService,
     _parse_disk_inventory_sync_job,
 )
@@ -121,7 +122,8 @@ class DiskInventorySyncServiceTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def prime_cache(service: InventoryService) -> None:
         snapshot = InventorySnapshot(slots=[], refresh_interval_seconds=30)
-        service._cache["__default__"] = snapshot
+        service._canonical_enclosure_options = service._canonical_enclosure_options or {}
+        service._cache[SNAPSHOT_NO_ENCLOSURE_KEY] = snapshot
         service._cache["enc-a"] = snapshot
 
     async def test_multipath_mode_runs_only_the_core_multipath_sync_command(self) -> None:
