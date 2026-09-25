@@ -292,7 +292,7 @@ test("an unknown-outcome action failure from fetchJson is reported as status unk
         return runtimePayload({ running: true, health: "healthy" });
       }
       const error = new Error(
-        "The admin sidecar could not be reached after the request was sent, so it is unknown whether the change was applied. Re-check the current state before retrying."
+        "Admin could not be reached after the request was sent, so it is unknown whether the change was applied. Refresh to check before retrying."
       );
       error.adminOutcome = "unknown";
       error.outcomeUnknown = true;

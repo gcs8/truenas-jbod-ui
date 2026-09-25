@@ -62,6 +62,17 @@ TRUENAS_TLS_SERVER_NAME=truenas.example.test
 
 Use the DNS name on the certificate for `TRUENAS_TLS_SERVER_NAME`.
 
+## Apply config changes
+
+The main UI reads `config/config.yaml` and `config/runtime-overrides.yaml`
+only when it starts. After you edit either file by hand, restart the main UI:
+
+```bash
+docker compose restart enclosure-ui
+```
+
+Admin saves show a **Restart main UI now** button for the same reason.
+
 ## Single-system vs multi-system
 
 The app supports:

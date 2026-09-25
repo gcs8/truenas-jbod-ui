@@ -136,9 +136,9 @@ test("the offline recovery words come from the server state only", () => {
   assert.equal(
     describeOfflineRecovery({
       expired: true,
-      summary: "The admin sidecar's auto-stop time has passed.",
+      summary: "Admin's auto-stop time has passed.",
       next_step: "Run `docker compose up -d enclosure-admin` on the Docker host.",
     }),
-    "The admin sidecar's auto-stop time has passed. Run `docker compose up -d enclosure-admin` on the Docker host."
+    "Admin's auto-stop time has passed. Run `docker compose up -d enclosure-admin` on the Docker host."
   );
 });

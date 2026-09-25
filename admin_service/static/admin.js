@@ -1084,7 +1084,7 @@
     state.runtimeBehaviorSaving = true;
     elements.runtimeBehaviorSaveButton.disabled = true;
     if (elements.runtimeBehaviorResult) {
-      elements.runtimeBehaviorResult.textContent = "Saving runtime behavior overrides...";
+      elements.runtimeBehaviorResult.textContent = "Saving timing...";
     }
     try {
       const payload = await fetchJson("/api/admin/runtime-behavior", {
@@ -1109,15 +1109,15 @@
       state.runtimeBehaviorSaving = false;
       renderRuntimeBehaviorSettings();
       renderRuntimeCards();
-      const detail = payload.detail || "Runtime behavior overrides saved.";
+      const detail = payload.detail || "Timing saved.";
       if (elements.runtimeBehaviorResult) {
         renderSaveResult(elements.runtimeBehaviorResult, detail, payload);
       }
       setBanner(detail, "success");
     } catch (error) {
       const message = [400, 422].includes(error.status)
-        ? `Runtime behavior save rejected: ${error.message}. Draft retained.`
-        : "Runtime behavior save outcome is unknown. Changes may already have been saved. Draft retained; check the saved runtime settings before saving again."
+        ? `Timing rejected: ${error.message} Your changes are still in the form.`
+        : "Timing save outcome is unknown. It may already have been saved. Your changes are still in the form; check the saved timing before saving again."
           + (error.requestId || "");
       if (elements.runtimeBehaviorResult) {
         elements.runtimeBehaviorResult.textContent = message;
@@ -5650,12 +5650,12 @@
 
   function describeTransportFailure(outcome, offlineBeforeDispatch) {
     if (outcome === "unknown") {
-      return "The admin sidecar could not be reached after the request was sent, so it is unknown whether the change was applied. Re-check the current state before retrying.";
+      return "Admin could not be reached after the request was sent, so it is unknown whether the change was applied. Refresh to check before retrying.";
     }
     if (offlineBeforeDispatch) {
       return "This browser is offline, so the request was not sent. Reconnect, then retry.";
     }
-    return "The admin sidecar could not be reached, so nothing was changed. Check that it is running, then retry.";
+    return "Admin could not be reached, so nothing was changed. Check that it is running, then retry.";
   }
 
   function classifyResponseFailure(status, mutating) {
@@ -6239,10 +6239,10 @@
   function describeRuntimeObservation(observation) {
     const container = observation?.container;
     if (!observation?.runtimeAvailable) {
-      return `runtime unavailable${observation?.runtime?.detail ? ` (${observation.runtime.detail})` : ""}`;
+      return `container control unavailable${observation?.runtime?.detail ? ` (${observation.runtime.detail})` : ""}`;
     }
     if (!container) {
-      return "container absent from runtime status";
+      return "container not found";
     }
     const health = String(container.health || "").trim() || "unavailable";
     const statusText = String(container.status_text || container.status || "unknown").trim();
@@ -6260,7 +6260,7 @@
 
   function sleepForRuntimePoll(delayMs, signal) {
     if (signal?.aborted) {
-      return Promise.reject(new DOMException("Runtime action polling was cancelled.", "AbortError"));
+      return Promise.reject(new DOMException("Stopped waiting for the container.", "AbortError"));
     }
     return new Promise((resolve, reject) => {
       const cleanup = () => signal?.removeEventListener("abort", cancelDelay);
@@ -6272,7 +6272,7 @@
       const cancelDelay = () => {
         clearTimeout(timerId);
         cleanup();
-        reject(new DOMException("Runtime action polling was cancelled.", "AbortError"));
+        reject(new DOMException("Stopped waiting for the container.", "AbortError"));
       };
       signal?.addEventListener("abort", cancelDelay, { once: true });
     });
@@ -6292,7 +6292,7 @@
         await sleep(pollIntervalMs, signal);
       }
       if (signal?.aborted) {
-        throw new DOMException("Runtime action polling was cancelled.", "AbortError");
+        throw new DOMException("Stopped waiting for the container.", "AbortError");
       }
       const pollController = new AbortController();
       let pollTimedOut = false;
@@ -6313,7 +6313,7 @@
         }
       } catch (error) {
         if (signal?.aborted) {
-          throw new DOMException("Runtime action polling was cancelled.", "AbortError");
+          throw new DOMException("Stopped waiting for the container.", "AbortError");
         }
         if (pollTimedOut && error?.name === "AbortError") {
           lastPollError = `Status request timed out after ${pollTimeoutMs} ms`;
@@ -6350,7 +6350,7 @@
     setBanner(`${verb} ${label}...`);
     try {
       if (signal?.aborted) {
-        throw new DOMException("Runtime action was cancelled.", "AbortError");
+        throw new DOMException("Container action cancelled.", "AbortError");
       }
       const actionController = new AbortController();
       let actionTimedOut = false;
@@ -6368,7 +6368,7 @@
         });
       } catch (error) {
         if (signal?.aborted) {
-          throw new DOMException("Runtime action was cancelled.", "AbortError");
+          throw new DOMException("Container action cancelled.", "AbortError");
         }
         if (actionTimedOut && error?.name === "AbortError") {
           const timeoutError = new Error(
@@ -6683,7 +6683,7 @@
         !["encrypted", "plaintext"].includes(inspection?.encryption_mode) ||
         !inspection?.inspection_receipt
       ) {
-        throw new Error("Inspection did not return an observed encryption mode and receipt.");
+        throw new Error("The backup check did not finish. Try the restore again.");
       }
       const confirmed = window.confirm(describeBackupRestoreConfirmation(inspection));
       if (!confirmed) {
