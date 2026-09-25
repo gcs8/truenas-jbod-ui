@@ -30,6 +30,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Upgrade notes
 
+- New FULL backups (backup scheduler, one-shot `enclosure-backup` job and the
+  encrypted admin export with history) now default to the fast `tar.zst` stream
+  format (`.tar.zst.enc`). Older app versions cannot restore these files and
+  plain 7-Zip cannot open them; existing `.7z` backups still restore. Set
+  `BACKUP_FULL_ARCHIVE_FORMAT=7z` (or `backups.full.archive_format: 7z`) to keep
+  making `.7z` FULL backups. (#611)
 - The main UI's 401 answer to an unsigned write now reads `Main UI
   authentication required.` (was `Read UI authentication required.`). Update
   any script or monitor that matches the exact old error text. (#608)
@@ -57,9 +63,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   tar.zst` (or `BACKUP_FULL_ARCHIVE_FORMAT`). It packs tar + Zstandard and seals it in
   1 MiB authenticated AES-256-GCM chunks, so a multi-GiB history database is never held
   in memory and damage is caught chunk by chunk. On a 2 GiB synthetic database it
-  took 17 s instead of 541 s to create. 7z stays the default because older app versions
-  can't read the new format. `scripts/benchmark_full_backup.py --format` measures both.
-  (#600)
+  took 17 s instead of 541 s to create. This PR shipped it opt-in; #611 makes it
+  the default (see Upgrade notes). `scripts/benchmark_full_backup.py --format`
+  measures both. (#600)
 - `scripts/update_immutable_deployment.py update --inventory-url` checks disk
   retention: it reads only the aggregate inventory totals before and after the
   update, and rolls back when a source disk is unplaced or the source count

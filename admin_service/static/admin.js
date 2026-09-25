@@ -4627,7 +4627,18 @@
     }
     if (config.packagingSelect) {
       const currentPackaging = config.packagingSelect.value || config.defaultPackaging || "tar.zst";
-      if (encryptEnabled) {
+      if (encryptEnabled && config.streamEncryptedFull) {
+        // #397: an encrypted FULL backup (with history) defaults to tar.zst in the
+        // TJBENC02 envelope; 7z stays available for older app versions and 7-Zip.
+        if (state[config.forced7zKey] || (currentPackaging !== "7z" && currentPackaging !== "tar.zst")) {
+          if (!state[config.forced7zKey] && currentPackaging && currentPackaging !== "7z") {
+            state[config.lastPlainPackagingKey] = currentPackaging;
+          }
+          config.packagingSelect.value = "tar.zst";
+          state[config.forced7zKey] = true;
+        }
+        config.packagingSelect.disabled = false;
+      } else if (encryptEnabled) {
         if (!state[config.forced7zKey] && currentPackaging && currentPackaging !== "7z") {
           state[config.lastPlainPackagingKey] = currentPackaging;
         }
@@ -4718,6 +4729,7 @@
       lastPlainPackagingKey: "backupLastPlainPackaging",
       forced7zKey: "backupForced7z",
       manualEncryptKey: "backupManualEncrypt",
+      streamEncryptedFull: Array.isArray(state.selectedBackupPaths) && state.selectedBackupPaths.includes("history_db"),
     });
     syncSingleBundleControls("debug", {
       encryptToggle: elements.debugEncryptToggle,
@@ -7497,6 +7509,11 @@
       if (!bundleHasLockedSelection("backup") && elements.backupPackaging?.value && elements.backupPackaging.value !== "7z") {
         state.backupLastPlainPackaging = elements.backupPackaging.value;
       }
+      if (elements.backupEncryptToggle?.checked) {
+        // An explicit tar.zst/7z choice for an encrypted FULL backup is kept.
+        state.backupForced7z = false;
+      }
+      syncBackupControls();
     });
     elements.debugScrubSecretsToggle?.addEventListener("change", () => {
       syncBackupControls();

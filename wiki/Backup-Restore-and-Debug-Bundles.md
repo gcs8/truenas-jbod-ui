@@ -23,13 +23,13 @@ Full Backup exports are encrypted by default. Select the state groups needed for
 - slot mappings and slot-detail cache JSON
 - the history SQLite database
 
-These secret-material paths can contain credentials or trust data and remain locked until you choose an encrypted portable `.7z` export:
+These secret-material paths can contain credentials or trust data and remain locked until you choose an encrypted export:
 
 - `config/ssh`
 - imported TLS trust bundles
 - shared `known_hosts`
 
-Selecting a locked path forces encrypted `.7z` output. The admin sidecar rejects an unencrypted export of unsanitized state unless `ADMIN_ALLOW_PLAINTEXT_BACKUP_EXPORT=true` is set. That override creates a sensitive plaintext archive. It does not make the archive safe to share.
+Selecting a locked path forces encrypted output: `.tar.zst.enc` when the backup includes the history database and the file format is `tar.zst` (the default), otherwise `.7z`. The admin sidecar rejects an unencrypted export of unsanitized state unless `ADMIN_ALLOW_PLAINTEXT_BACKUP_EXPORT=true` is set. That override creates a sensitive plaintext archive. It does not make the archive safe to share.
 
 The admin service sends the 7z passphrase through a private, bounded terminal prompt. It does not place the passphrase in process arguments or command output. The passphrase may contain spaces, including trailing spaces, but it cannot contain carriage returns or line feeds.
 
@@ -114,7 +114,7 @@ files inaccessible. Neither is an automatic upgrade repair.
 
 The admin application default for automatic stop is `0`. The supplied Compose files set the separately launched admin sidecar default to `3600` seconds.
 
-A scheduled backup that includes `history_db` uses encrypted `.7z` (or `.tar.zst.enc` when the backup scheduler's `full.archive_format` is `tar.zst`), including segmented history. A backup without `history_db` uses the native encrypted `.tar.zst.enc` envelope. The restore path accepts both formats.
+A scheduled backup that includes `history_db` uses the encrypted `.tar.zst.enc` stream format by default, including segmented history, or encrypted `.7z` when `BACKUP_FULL_ARCHIVE_FORMAT=7z` (see "Full backup archive format"). A backup without `history_db` uses the native encrypted `.tar.zst.enc` envelope. The restore path accepts every format, including `.7z` backups made by earlier versions.
 
 ### Create the passphrase and state directories
 
@@ -204,7 +204,7 @@ docker compose --profile backup run --rm enclosure-backup
 
 The runner writes private `0600` archives, validates the archive through restore preflight, avoids overwriting an existing name, writes `0640` status, and prunes only files that match its owned filename pattern.
 
-When `history_db` is selected, the runner creates `.7z`. Without `history_db`, it creates a validated inner system backup and encrypts the `.tar.zst.enc` envelope with AES-256-GCM, a per-file salt, and a per-file nonce. Import either format through the admin restore path with the same passphrase.
+When `history_db` is selected, the runner creates `.tar.zst.enc` (or `.7z` with `BACKUP_FULL_ARCHIVE_FORMAT=7z`). Without `history_db`, it creates a validated inner system backup and encrypts the `.tar.zst.enc` envelope with AES-256-GCM, a per-file salt, and a per-file nonce. Import either format through the admin restore path with the same passphrase.
 
 ### Enable the systemd timer
 
@@ -283,8 +283,16 @@ encrypted with the passphrase file and checked before they are catalogued.
 
 | `archive_format` | Packing | Restores on |
 | --- | --- | --- |
-| `7z` (default) | 7z, LZMA2, one thread, AES-256 | Every app version, and any 7-Zip |
-| `tar.zst` | tar + Zstandard level 3 (two threads), sealed in 1 MiB AES-256-GCM chunks (`.tar.zst.enc`) | This app version and later only |
+| `tar.zst` (default) | tar + Zstandard level 3 (two threads), sealed in 1 MiB AES-256-GCM chunks (`.tar.zst.enc`) | This app version and later only |
+| `7z` | 7z, LZMA2, one thread, AES-256 | Every app version, and any 7-Zip |
+
+> **Upgrade note.** New FULL backups use `tar.zst` by default. An older app
+> version cannot restore them, and plain 7-Zip cannot open them. Existing `.7z`
+> backups keep restoring as before. To keep making `.7z` FULL backups, set
+> `BACKUP_FULL_ARCHIVE_FORMAT=7z` (or `backups.full.archive_format: 7z` in
+> `config.yaml`). The same variable sets the one-shot `enclosure-backup` job's
+> format. In the admin Backup page, pick `7-Zip (.7z)` as the file format
+> before exporting an encrypted backup that includes history.
 
 `tar.zst` is much faster for a large history database. On a synthetic 2 GiB
 history database (4 CPUs):
@@ -302,8 +310,8 @@ phase.
 
 `7z` spends most of a full backup compressing on one core, and each 7z step
 stops after 10 minutes, so a history database of about 2 GiB or more can fail
-there. Choose `tar.zst` for large history. Keep `7z` if you may need to restore
-on an older app version or open the file with 7-Zip.
+there. That is why `tar.zst` is the default. Choose `7z` if you may need to
+restore on an older app version or open the file with 7-Zip.
 
 The `tar.zst` file checks every 1 MiB chunk before using it, so a wrong
 passphrase, a damaged or truncated file, or reordered data is refused before
@@ -328,7 +336,7 @@ backups:
   full:
     enabled: true
     schedule: "0 3 * * *"
-    archive_format: 7z       # or tar.zst, see "Full backup archive format"
+    archive_format: tar.zst  # default; 7z for older app versions, see "Full backup archive format"
     local_keep: 7
     remote_keep: null
     remote_max_age_days: 90
@@ -348,7 +356,7 @@ backups:
 | `BACKUP_CONFIG_ENABLED`, `BACKUP_FULL_ENABLED` | `enabled` |
 | `BACKUP_CONFIG_DEBOUNCE_SECONDS`, `BACKUP_CONFIG_MAX_DELAY_SECONDS` | debounce |
 | `BACKUP_FULL_SCHEDULE` | `full.schedule` |
-| `BACKUP_FULL_ARCHIVE_FORMAT` | `full.archive_format` (`7z` or `tar.zst`) |
+| `BACKUP_FULL_ARCHIVE_FORMAT` | `full.archive_format` (`tar.zst`, the default, or `7z`); also the one-shot `enclosure-backup` job's format |
 | `BACKUP_CONFIG_LOCAL_KEEP`, `BACKUP_FULL_LOCAL_KEEP` | `local_keep` |
 | `BACKUP_CONFIG_REMOTE_KEEP`, `BACKUP_FULL_REMOTE_KEEP` | `remote_keep` (`none` for no limit) |
 | `BACKUP_CONFIG_REMOTE_MAX_AGE_DAYS`, `BACKUP_FULL_REMOTE_MAX_AGE_DAYS` | `remote_max_age_days` |
