@@ -1467,7 +1467,11 @@ class InventoryService:
                     trusted_topology = self._snapshot_has_trusted_topology(discovered_snapshot)
                     options = {option.id: option for option in discovered_snapshot.enclosures}
                     if not options and not trusted_topology:
-                        raise SnapshotStateBusyError()
+                        # The source could not be read, so there is nothing to
+                        # learn. Show this snapshot (it carries the source error)
+                        # without recording canonical options; the next request
+                        # runs discovery again instead of trusting an empty list.
+                        return SNAPSHOT_NO_ENCLOSURE_KEY, candidate
                     self._canonical_enclosure_options = options
                     self._canonical_default_enclosure_id = (
                         discovered_snapshot.selected_enclosure_id

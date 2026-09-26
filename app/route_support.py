@@ -730,6 +730,10 @@ async def resolve_layout_slots(
             detail=ENCLOSURE_LAYOUT_UNAVAILABLE_DETAIL,
         ) from exc
     if selected_enclosure_id and snapshot.selected_enclosure_id != selected_enclosure_id:
+        if snapshot.selected_enclosure_id is None and not snapshot.enclosures:
+            # Discovery found no enclosures (source unreachable), so the ID is
+            # unknown rather than wrong: report the layout as unavailable.
+            raise HTTPException(status_code=503, detail=ENCLOSURE_LAYOUT_UNAVAILABLE_DETAIL)
         raise HTTPException(status_code=404, detail=UNKNOWN_ENCLOSURE_DETAIL)
     layout_slots = snapshot_layout_slots(snapshot)
     if not layout_slots:
