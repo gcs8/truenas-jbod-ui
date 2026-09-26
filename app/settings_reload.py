@@ -246,7 +246,16 @@ class ConfigReloader:
             self._baseline = await asyncio.to_thread(file_signature, paths)
             return False
         signature = await asyncio.to_thread(file_signature, paths)
-        if signature == self._baseline or signature == self._rejected:
+        if signature == self._baseline:
+            # The files are back to exactly what is running (for example a
+            # config.yaml moved away and restored): nothing to apply, and any
+            # warning about the rejected state no longer holds.
+            if self.problem or self._rejected is not None:
+                logger.info("Config files match the running settings again; cleared the reload warning.")
+                self.problem = None
+                self._rejected = None
+            return False
+        if signature == self._rejected:
             return False
         baseline_by_path = dict(self._baseline)
         signature_by_path = dict(signature)

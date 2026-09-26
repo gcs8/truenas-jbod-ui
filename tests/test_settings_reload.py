@@ -227,6 +227,20 @@ class InvalidEditTests(ConfigReloadTestCase):
         self.assertIsNone(self.reloader.problem)
         self.assertEqual(self._labels()["alpha"], "Alpha Fixed")
 
+    def test_config_restored_unchanged_clears_missing_warning(self) -> None:
+        before = self.runtime.current()
+        moved = self.config_path.with_name("config.yaml.moved")
+        self.config_path.rename(moved)
+        with self.assertLogs("app.settings_reload", level="WARNING"):
+            self.assertFalse(self._check())
+        self.assertIsNotNone(self.reloader.problem)
+
+        # Same inode, size and mtime: the signature equals the running baseline.
+        moved.rename(self.config_path)
+        self.assertFalse(self._check())
+        self.assertIsNone(self.reloader.problem)
+        self.assertIs(self.runtime.current(), before)
+
     def test_missing_config_after_start_keeps_last_valid_generation(self) -> None:
         before = self.runtime.current()
         self.config_path.unlink()

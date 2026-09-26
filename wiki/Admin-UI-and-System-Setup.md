@@ -276,10 +276,10 @@ and refresh timing.
 
 Fields owned by `.env` stay read-only and show their source. Fields owned by
 admin runtime overrides are editable and save to
-`config/runtime-overrides.yaml`. The main UI applies saved values within a few
-seconds; no restart is needed. Only settings that need a new process (see
-[[Advanced Configuration|Advanced-Configuration]]) show a **Restart main UI now**
-button next to the save result.
+`config/runtime-overrides.yaml`. The main UI applies saved values when it next
+handles a non-static page or API request; no restart is needed. Only settings
+that need a new process (see [[Advanced Configuration|Advanced-Configuration]])
+show a **Restart main UI now** button next to the save result.
 
 ## Backup, restore, debug, and demo data
 
