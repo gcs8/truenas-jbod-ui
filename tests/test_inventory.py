@@ -13008,6 +13008,58 @@ class InventoryServiceSnapshotStateBoundsTests(unittest.IsolatedAsyncioTestCase)
             ],
         )
 
+    @staticmethod
+    def _unreachable_source_snapshot() -> InventorySnapshot:
+        return InventorySnapshot(
+            slots=[],
+            refresh_interval_seconds=30,
+            selected_system_id="bounded",
+            selected_system_platform="core",
+            selected_enclosure_id=None,
+            enclosures=[],
+            sources={"api": SourceStatus(enabled=True, ok=False, message="connection refused")},
+            warnings=["Failed to fetch platform API data"],
+        )
+
+    async def test_unreachable_source_returns_its_snapshot_and_rediscovers_later(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            unreachable = self._unreachable_source_snapshot()
+            service._build_snapshot = AsyncMock(return_value=unreachable)
+
+            first = await service.get_snapshot(allow_stale_cache=True)
+
+            self.assertIs(first, unreachable)
+            self.assertFalse(first.sources["api"].ok)
+            self.assertIsNone(service._canonical_enclosure_options)
+
+            # The source comes back: the next request discovers enclosures.
+            service._build_snapshot = AsyncMock(return_value=self._snapshot())
+            second = await service.get_snapshot(allow_stale_cache=True)
+
+            self.assertEqual(second.selected_enclosure_id, "enc-a")
+            self.assertEqual(
+                set(service._canonical_enclosure_options or {}),
+                {"enc-a", "enc-b", "enc-a:drawer-top", "view:flash"},
+            )
+
+    async def test_unreachable_source_does_not_admit_a_named_enclosure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            unreachable = self._unreachable_source_snapshot()
+            service._build_snapshot = AsyncMock(return_value=unreachable)
+
+            # A bookmarked enclosure link shows the source error, not a 404,
+            # and request-supplied IDs never become snapshot state keys.
+            for requested in ("enc-a", "made-up-1", "made-up-2"):
+                snapshot = await service.get_snapshot(selected_enclosure_id=requested)
+                self.assertIs(snapshot, unreachable)
+                self.assertNotIn(requested, service._snapshot_state_keys())
+            self.assertIsNone(service._canonical_enclosure_options)
+            self.assertEqual(
+                service._snapshot_state_keys(), {inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY}
+            )
+
     async def test_unknown_ids_fail_before_request_keyed_state_or_build(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = self._service(temp_dir)
