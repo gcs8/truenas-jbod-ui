@@ -1030,8 +1030,11 @@ def _safe_diagnostics(prefix: Sequence[str]) -> None:
 
 
 def _assert_compose_resources_removed(project: str) -> None:
+    # The scheduler service has no container_name, so Compose names it
+    # <project>-<service>-1.
     for resource_type, name in (
         *(("container", name) for name in MATRIX_CONTAINER_NAMES),
+        ("container", f"{project}-enclosure-backup-scheduler-1"),
         ("network", f"{project}_default"),
     ):
         result = subprocess.run(

@@ -85,6 +85,13 @@ the scheduler also keeps both backup classes off until policy enables one.
 All services use the same published image. You still need local persistent
 folders for configuration and data.
 
+> **Backup scheduler: current-source checkout only.** The scheduler command
+> above needs the source checkout's `docker-compose.yml` (add
+> `-f docker-compose.yml` if a `compose.yaml` is also present). The beginner
+> install's `compose.yaml` is the v0.22.2 base file, which has no scheduler
+> service, and an image-only update cannot add one. See
+> [[Backup, Restore and Debug Bundles|Backup-Restore-and-Debug-Bundles#automatic-backup-archive-and-remote-targets]].
+
 ## Persistent folders
 
 | Path | Contents |
@@ -109,7 +116,9 @@ or an authenticated reverse proxy before widening access.
 
 The one-shot `backup` worker is deliberately isolated: it has no network, no
 published port, and no Docker socket. It reads `./config` and `./data`, snapshots
-`./history`, and writes only its archive and secret-free status mounts. A host
+`./history`, and writes its archive and secret-free status mounts. `./history`
+is mounted read-write, and its default history backup folder is
+`./history/backups`. A host
 timer starts a fresh container for each run.
 
 The long-running `backup-scheduler` worker has outbound network access because

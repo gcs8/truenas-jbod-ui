@@ -363,6 +363,200 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
             ),
         )
 
+    def _scheduler_libraries(self):
+        initial = {
+            "available": True,
+            "running": None,
+            "classes": {"config": {"enabled": True, "last_run": None}, "full": {"enabled": False}},
+            "artifacts": [],
+        }
+        artifact = {
+            "id": "synthetic-config-backup",
+            "backup_class": "config",
+            "location": "local",
+            "size": 123,
+            "verified": True,
+            "restorable": True,
+            "state": "ok",
+        }
+        completed = {
+            **initial,
+            "classes": {"config": {"enabled": True, "last_run": {"ok": True}}, "full": {"enabled": False}},
+            "artifacts": [artifact],
+        }
+        return initial, artifact, completed
+
+    def _run_enabled_with(self, module, verify_body: bytes, restart_library: dict) -> None:
+        initial, _, completed = self._scheduler_libraries()
+        with (
+            patch.object(
+                module,
+                "_scheduler_request",
+                return_value={"status": 200, "payload": {"status": "ok"}},
+            ),
+            patch.object(
+                module,
+                "_require_status",
+                side_effect=[
+                    json.dumps(initial).encode(),
+                    b'{"ok":true,"backup_class":"config","state":"started"}',
+                    json.dumps(completed).encode(),
+                    verify_body,
+                    json.dumps(restart_library).encode(),
+                ],
+            ),
+            patch.object(module, "_run"),
+            patch.object(module.time, "sleep"),
+        ):
+            module._verify_scheduler_enabled(
+                module.Ports(19080, 19081, 19082), ("docker", "compose", "-p", "m")
+            )
+
+    def test_enabled_scheduler_rejects_failed_verify_and_changed_restart_artifact(self) -> None:
+        module = self.load_matrix_module()
+        _, artifact, completed = self._scheduler_libraries()
+
+        with self.assertRaisesRegex(RuntimeError, "verification failed"):
+            self._run_enabled_with(module, b'{"ok":false}', completed)
+
+        replaced = {**completed, "artifacts": [{**artifact, "id": "another-backup"}]}
+        with self.assertRaisesRegex(RuntimeError, "restart readback"):
+            self._run_enabled_with(module, b'{"ok":true}', replaced)
+
+        self._run_enabled_with(module, b'{"ok":true}', completed)
+
+    def test_disabled_scheduler_rejects_an_artifact_running_job_or_enabled_class(self) -> None:
+        module = self.load_matrix_module()
+        idle = {
+            "running": None,
+            "classes": {"config": {"enabled": False}, "full": {"enabled": False}},
+            "artifacts": [],
+        }
+        bad_libraries = (
+            {**idle, "artifacts": [{"id": "unexpected"}]},
+            {**idle, "running": {"backup_class": "config"}},
+            {**idle, "classes": {"config": {"enabled": True}, "full": {"enabled": False}}},
+        )
+        for library in bad_libraries:
+            with self.subTest(library=library):
+                with (
+                    patch.object(
+                        module,
+                        "_scheduler_request",
+                        side_effect=[
+                            {"status": 200, "payload": {"status": "ok"}},
+                            {"status": 200, "payload": library},
+                        ],
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "Disabled backup scheduler"),
+                ):
+                    module._verify_scheduler_disabled(("docker", "compose", "-p", "m"))
+
+    def test_run_variant_dispatches_the_matching_scheduler_check(self) -> None:
+        module = self.load_matrix_module()
+        variants = {variant.name: variant for variant in module.VARIANTS}
+        expected = {
+            "scheduler-disabled": ("_verify_scheduler_disabled", "_verify_scheduler_enabled"),
+            "scheduler-enabled": ("_verify_scheduler_enabled", "_verify_scheduler_disabled"),
+        }
+        for name, (called, skipped) in expected.items():
+            variant = variants[name]
+            running = Mock(stdout="\n".join(variant.services) + "\n")
+            with self.subTest(variant=name), contextlib.ExitStack() as stack:
+                stack.enter_context(patch.object(module, "_prepare_variant_root"))
+                stack.enter_context(patch.object(module, "_compose_prefix", return_value=["docker", "compose"]))
+                stack.enter_context(patch.object(module, "_run", return_value=running))
+                stack.enter_context(patch.object(module, "_cleanup_variant"))
+                stack.enter_context(patch.object(module, "_verify_admin"))
+                mocks = {
+                    helper: stack.enter_context(patch.object(module, helper))
+                    for helper in ("_verify_scheduler_disabled", "_verify_scheduler_enabled")
+                }
+                stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                module._run_variant(
+                    Path("/private/scratch"),
+                    variant,
+                    compose_path=Path("/private/compose.yaml"),
+                    config_fixture=Path("/private/config.yaml"),
+                    image="sha256:" + "a" * 64,
+                    ports=module.Ports(19080, 19081, 19082),
+                )
+                mocks[called].assert_called_once()
+                mocks[skipped].assert_not_called()
+
+    def test_scheduler_variant_root_installs_shared_dirs_and_private_passphrase(self) -> None:
+        module = self.load_matrix_module()
+        variants = {variant.name: variant for variant in module.VARIANTS}
+        for name, expect_passphrase in (("scheduler-disabled", False), ("scheduler-enabled", True)):
+            with self.subTest(variant=name), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir) / "variant"
+                compose = Path(temp_dir) / "compose.yaml"
+                compose.write_text("services: {}\n", encoding="utf-8")
+                with patch.object(module, "_run") as run:
+                    module._prepare_variant_root(
+                        root,
+                        variant=variants[name],
+                        compose_path=compose,
+                        config_fixture=Path(temp_dir) / "config.yaml",
+                        image="sha256:" + "a" * 64,
+                        ports=module.Ports(19080, 19081, 19082),
+                    )
+                commands = [tuple(c.args[0]) for c in run.call_args_list]
+                shared = next(
+                    cmd for cmd in commands if str(root / "backup-journal") in cmd
+                )
+                self.assertIn("2770", shared)
+                self.assertIn(str(root / "backup-api"), shared)
+                passphrase = [
+                    cmd
+                    for cmd in commands
+                    if cmd[-1] == str(root / "config" / "backup-secrets" / "archive-passphrase")
+                ]
+                if expect_passphrase:
+                    self.assertEqual(len(passphrase), 1)
+                    self.assertIn("0600", passphrase[0])
+                    self.assertIn(str(module.BACKUP_UID), passphrase[0])
+                else:
+                    self.assertEqual(passphrase, [])
+                self.assertFalse((root / ".synthetic-backup-passphrase").exists())
+
+    def test_variant_cleanup_removes_volumes_and_orphans(self) -> None:
+        module = self.load_matrix_module()
+        prefix = ["docker", "compose", "-p", "synthetic"]
+        with (
+            patch.object(module.subprocess, "run", return_value=Mock(returncode=0)) as run,
+            patch.object(module, "_assert_compose_resources_removed"),
+        ):
+            module._cleanup_variant(prefix, Path("/private/scratch/missing-variant"))
+        self.assertEqual(
+            run.call_args_list[0].args[0],
+            (*prefix, "down", "--volumes", "--remove-orphans"),
+        )
+
+    def test_release_docs_list_both_scheduler_variants(self) -> None:
+        checklist = " ".join(RELEASE_CHECKLIST.read_text(encoding="utf-8").split())
+        private_qa = (ROOT / "docs" / "PRIVATE_QA_RESTORE.md").read_text(encoding="utf-8")
+        contributing = " ".join((ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8").split())
+        for text in (
+            "**Scheduler disabled:** start only `enclosure-backup-scheduler`",
+            "**Scheduler enabled:** start `enclosure-admin` plus `enclosure-backup-scheduler`",
+            "restart the scheduler, confirm the same artifact from the persisted catalogue",
+        ):
+            self.assertIn(text, checklist)
+        self.assertIn("| Scheduler disabled | Scheduler only;", private_qa)
+        self.assertIn("| Scheduler enabled | Scheduler + admin;", private_qa)
+        self.assertIn("5. Scheduler disabled:", contributing)
+        self.assertIn("6. Scheduler enabled:", contributing)
+        self.assertIn("restart/readback retains the same catalogued artifact", contributing)
+
+    def test_architecture_guide_scopes_the_scheduler_to_source_checkouts(self) -> None:
+        guide = " ".join(
+            (ROOT / "wiki" / "Architecture-and-Services.md").read_text(encoding="utf-8").split()
+        )
+        self.assertIn("**Backup scheduler: current-source checkout only.**", guide)
+        self.assertIn("`-f docker-compose.yml`", guide)
+        self.assertIn("an image-only update cannot add one", guide)
+
     def test_matrix_stays_off_hosted_ci(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
 
@@ -740,6 +934,10 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
         inspected = [call.args[0] for call in run.call_args_list]
         for name in module.MATRIX_CONTAINER_NAMES:
             self.assertIn(["docker", "container", "inspect", name], inspected)
+        self.assertIn(
+            ["docker", "container", "inspect", "tjui-matrix-ui-only-enclosure-backup-scheduler-1"],
+            inspected,
+        )
         self.assertIn(
             ["docker", "network", "inspect", "tjui-matrix-ui-only_default"],
             inspected,
