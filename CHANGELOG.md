@@ -268,7 +268,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   custom history backup paths are shared by both services, and preserved
   archives plus unrelated/newer files remain untouched. (#628)
 - Kept config reloads generation-consistent: old snapshot exports cannot refill a
-  newer cache, pending restart-only profile paths do not supply live profiles,
+  newer cache, pending restart-only profile paths do not supply live profiles
+  (and a new profile file that would fail the next start is rejected),
   temporary `config.yaml` deletion retains the last valid settings, and a disk
   sync in flight remains visible after reload. Admin and docs now describe the
   request-triggered timing instead of promising an autonomous delay. (#634, #652)

@@ -336,6 +336,39 @@ class RestartOnlySettingsTests(ConfigReloadTestCase):
         self.assertEqual([profile.id for profile in current.profiles], ["running-profile"])
         self.assertEqual(reloader.restart_pending, ("paths",))
 
+    def test_pending_profile_file_that_would_break_restart_is_rejected(self) -> None:
+        running_profile_path = self.root / "config" / "profiles.yaml"
+        running_profile_path.write_text(
+            yaml.safe_dump({"profiles": [{"id": "running-profile", "label": "Running", "rows": 1, "columns": 1}]}),
+            encoding="utf-8",
+        )
+        pending_profile_path = self.root / "config" / "pending-profiles.yaml"
+        broken_contents = {
+            "malformed yaml": "profiles: [unclosed\n",
+            "wrong shape": yaml.safe_dump({"profiles": "not-a-list"}),
+            "invalid profile": yaml.safe_dump({"profiles": [{"id": "bad", "rows": "many"}]}),
+        }
+        for label, contents in broken_contents.items():
+            with self.subTest(label):
+                pending_profile_path.write_text(contents, encoding="utf-8")
+                self.config["paths"] = {}
+                self._write_config()
+                get_settings.cache_clear()
+                runtime = SettingsRuntime()
+                reloader = ConfigReloader(runtime, interval_seconds=0.0, clock=self.clock)
+                reloader.prime()
+                before = runtime.current()
+
+                self.config["paths"] = {"profile_file": str(pending_profile_path)}
+                self.config["systems"][0]["label"] = f"Alpha {label}"
+                self._write_config()
+                with self.assertLogs("app.settings_reload", level="WARNING"):
+                    self.assertFalse(asyncio.run(reloader.check_now()))
+
+                self.assertIs(runtime.current(), before)
+                self.assertIsNotNone(reloader.problem)
+                self.assertEqual(reloader.restart_pending, ())
+
     def test_restart_only_change_alone_does_not_swap(self) -> None:
         before = self.runtime.current()
         self.config["app"] = {"public_origin": "https://nas.example.test"}

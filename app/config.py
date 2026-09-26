@@ -1418,9 +1418,23 @@ def load_settings(*, running_restart_only: Settings | None = None) -> Settings:
         if running_restart_only is not None
         else configured_profile_path
     )
+    inline_profiles = list(merged.get("profiles") or [])
     if profile_path.exists():
         profile_config = _load_profile_yaml(profile_path)
-        merged["profiles"] = [*(merged.get("profiles") or []), *(profile_config.get("profiles") or [])]
+        merged["profiles"] = [*inline_profiles, *(profile_config.get("profiles") or [])]
+    # A pending restart-only profile path never supplies live profiles, but
+    # the next start will read it. Refuse the edit now if that file would
+    # stop the restart, instead of accepting it as "restart required".
+    pending_profile_path = Path(configured_profile_path)
+    pending_profiles: list[Any] | None = None
+    if running_restart_only is not None and pending_profile_path != profile_path:
+        try:
+            pending_config = _load_profile_yaml(pending_profile_path)
+        except (OSError, yaml.YAMLError, ValueError) as exc:
+            raise ConfigurationError(
+                [f"paths.profile_file in {config_path}: the new profile file cannot be loaded ({type(exc).__name__})."]
+            ) from None
+        pending_profiles = [*inline_profiles, *(pending_config.get("profiles") or [])]
 
     env_by_target = {target_path: env_name for env_name, target_path in ENV_OVERRIDES.items()}
 
@@ -1434,6 +1448,8 @@ def load_settings(*, running_restart_only: Settings | None = None) -> Settings:
 
     try:
         validated = Settings.model_validate(merged)
+        if pending_profiles is not None:
+            Settings.model_validate({**merged, "profiles": pending_profiles})
     except ValidationError as exc:
         raise ConfigurationError(
             describe_validation_error(exc, resolve_location=resolve_location, default_source=str(config_path))
