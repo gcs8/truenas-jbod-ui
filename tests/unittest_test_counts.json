@@ -38,7 +38,7 @@
     "test_history_backend_bounds": 10,
     "test_history_backup_coupling": 11,
     "test_history_bulk_bounds": 14,
-    "test_history_config_contract": 13,
+    "test_history_config_contract": 14,
     "test_history_diagnostics": 13,
     "test_history_health_states": 13,
     "test_history_operation_bounds": 14,
