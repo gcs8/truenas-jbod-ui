@@ -901,10 +901,11 @@ class ContainerResourceContractTests(unittest.TestCase):
                 "services"
             ]
             history_env = services["enclosure-history"]["environment"]
-            scheduler_env = services["enclosure-backup-scheduler"]["environment"]
-            with self.subTest(compose=compose_name):
-                for variable in ("HISTORY_BACKUP_DIR", "HISTORY_LONG_TERM_BACKUP_DIR"):
-                    self.assertEqual(scheduler_env[variable], history_env[variable])
+            for service_name in ("enclosure-backup-scheduler", "enclosure-backup"):
+                service_env = services[service_name]["environment"]
+                with self.subTest(compose=compose_name, service=service_name):
+                    for variable in ("HISTORY_BACKUP_DIR", "HISTORY_LONG_TERM_BACKUP_DIR"):
+                        self.assertEqual(service_env[variable], history_env[variable])
 
     def test_history_capable_services_keep_segment_catalog_opt_in(self) -> None:
         expected = "${HISTORY_SEGMENT_CATALOG_PATH:-}"

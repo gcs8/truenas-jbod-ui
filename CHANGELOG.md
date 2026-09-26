@@ -259,6 +259,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- The one-shot `enclosure-backup` job now uses the same `HISTORY_BACKUP_DIR`
+  and `HISTORY_LONG_TERM_BACKUP_DIR` overrides as the history service and the
+  backup scheduler, instead of always using the default history backup folder.
+  (#645)
 - A `filesystem` backup target can no longer share a directory with the local
   backup archive. Before, the catalog could record one file as both a local and
   a remote copy, and remote retention could then delete a copy that local
