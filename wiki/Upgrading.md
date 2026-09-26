@@ -78,11 +78,18 @@ docker compose --profile admin up -d enclosure-admin
 
 ## Optional hardening
 
-Adding `docker-compose.nonroot.yml` is a separate change, not part of an image
+On current `main`, the base Compose file is root-compatible. Adding the optional
+`docker-compose.nonroot.yml` overlay is a separate change, not part of an image
 update. See
 [[Docker and GHCR Deployment|Docker-and-GHCR-Deployment#optional-container-hardening]]
-and [[Troubleshooting]] and the release upgrade notes for the one-time
-ownership step.
+and [[Troubleshooting]] for the one-time ownership step.
+
+Unlike the `v0.23.0` tag, this is a post-release Compose migration. The v0.23.0
+base `docker-compose.yml` already ran the UI and history services non-root with
+read-only image filesystems, so that tagged base file required ownership
+preparation even without the overlay. Keep the Compose files that belong to the
+release you installed; do not apply current `main` defaults retroactively to a
+tagged deployment.
 
 ## What is tested
 
