@@ -136,6 +136,7 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
             "ok": True,
             "schema_version": 2,
             "app_version": "0.22.3",
+            "app_version_note": None,
             "exported_at": "2030-01-02T03:04:05+00:00",
             "encrypted": True,
             "encryption_mode": "encrypted",
@@ -193,6 +194,20 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
                 unsafe = {**payload, unsafe_key: []}
                 with self.assertRaisesRegex(self.module.QaRestoreError, "unexpected fields"):
                     self.module.validate_inspection_payload(unsafe)
+
+        older = {
+            **payload,
+            "app_version_note": "This backup was made by v0.22.2; settings and history will be "
+            "brought up to date during restore.",
+        }
+        self.assertEqual(self.module.validate_inspection_payload(older), older)
+        for bad_note in (7, ["note"], "x" * 513):
+            with self.subTest(bad_note=bad_note):
+                with self.assertRaisesRegex(self.module.QaRestoreError, "app version note"):
+                    self.module.validate_inspection_payload({**payload, "app_version_note": bad_note})
+        missing_note = {key: value for key, value in payload.items() if key != "app_version_note"}
+        with self.assertRaisesRegex(self.module.QaRestoreError, "missing required fields"):
+            self.module.validate_inspection_payload(missing_note)
 
         plaintext = {**payload, "encrypted": False}
         with self.assertRaisesRegex(self.module.QaRestoreError, "encrypted FULL backup"):

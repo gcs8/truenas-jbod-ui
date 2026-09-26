@@ -21,7 +21,7 @@
     "test_bash_ci_contract": 6,
     "test_changelog_entry_gate": 23,
     "test_ci_contract": 47,
-    "test_compose_runtime_matrix": 36,
+    "test_compose_runtime_matrix": 38,
     "test_config_example": 8,
     "test_container_contract": 64,
     "test_dev_check": 31,

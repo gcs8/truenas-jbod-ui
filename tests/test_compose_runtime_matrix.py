@@ -522,6 +522,39 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
                 mocks[called].assert_called_once()
                 mocks[skipped].assert_not_called()
 
+    def test_initial_setup_variant_starts_from_a_config_without_systems(self) -> None:
+        import yaml
+
+        module = self.load_matrix_module()
+        for variant in module.VARIANTS:
+            with self.subTest(variant=variant.name), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir) / "variant"
+                compose = Path(temp_dir) / "compose.yaml"
+                compose.write_text("services: {}\n", encoding="utf-8")
+                fixture = Path(temp_dir) / "config.yaml"
+                with patch.object(module, "_run") as run:
+                    module._prepare_variant_root(
+                        root,
+                        variant=variant,
+                        compose_path=compose,
+                        config_fixture=fixture,
+                        image="sha256:" + "a" * 64,
+                        ports=module.Ports(19080, 19081, 19082),
+                    )
+                commands = [tuple(c.args[0]) for c in run.call_args_list]
+                installed = [
+                    cmd for cmd in commands if cmd[-1] == str(root / "config" / "config.yaml")
+                ]
+                self.assertEqual(len(installed), 1)
+                source = Path(installed[0][-2])
+                if variant.admin_initial_setup:
+                    self.assertNotEqual(source, fixture)
+                    config = yaml.safe_load(source.read_text(encoding="utf-8"))
+                    self.assertNotIn("systems", config)
+                    self.assertNotIn("truenas", config)
+                else:
+                    self.assertEqual(source, fixture)
+
     def test_scheduler_variant_root_installs_shared_dirs_and_private_passphrase(self) -> None:
         module = self.load_matrix_module()
         variants = {variant.name: variant for variant in module.VARIANTS}
@@ -875,8 +908,6 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
             {"selected_system_id": None, "selected_enclosure_id": "synthetic-enclosure"},
             {"selected_system_id": "", "selected_enclosure_id": "synthetic-enclosure"},
             {"selected_system_id": 7, "selected_enclosure_id": "synthetic-enclosure"},
-            {"selected_system_id": "synthetic-core"},
-            {"selected_system_id": "synthetic-core", "selected_enclosure_id": None},
             {"selected_system_id": "synthetic-core", "selected_enclosure_id": ""},
             {"selected_system_id": "synthetic-core", "selected_enclosure_id": 7},
         )
@@ -901,6 +932,38 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
                     200,
                     authenticated=True,
                 )
+
+    def test_mapping_cycle_uses_system_scope_when_no_enclosure_is_selected(self) -> None:
+        module = self.load_matrix_module()
+        ports = module.Ports(19080, 19081, 19082)
+        prefix = ("docker", "compose", "--project-name", "matrix")
+        request_urls: list[str] = []
+        inventory: dict[str, object] = {}
+
+        def stop_after_export(url, expected, **kwargs):
+            request_urls.append(url)
+            if url.endswith("/api/inventory"):
+                return json.dumps(inventory).encode()
+            raise RuntimeError("stop after scope check")
+
+        for inventory_extra in ({}, {"selected_enclosure_id": None}):
+            request_urls.clear()
+            inventory.clear()
+            inventory.update(
+                {
+                    "selected_system_id": "synthetic-core",
+                    "slots": [{"slot": 0, "mapping_revision": "c" * 64}],
+                    **inventory_extra,
+                }
+            )
+            with self.subTest(inventory_extra=inventory_extra), tempfile.TemporaryDirectory() as temp_dir:
+                with (
+                    patch.object(module, "_require_status", side_effect=stop_after_export),
+                    self.assertRaisesRegex(RuntimeError, "stop after scope check"),
+                ):
+                    module._verify_mapping_cycle(Path(temp_dir), module.VARIANTS[0], ports, prefix)
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(request_urls[1]).query)
+                self.assertEqual(query, {"system_id": ["synthetic-core"]})
 
     def test_mapping_cycle_stops_when_slot_save_revision_is_unavailable(self) -> None:
         module = self.load_matrix_module()

@@ -390,6 +390,23 @@ def _write_environment(
     env_path.chmod(0o600)
 
 
+# Initial setup starts from a fresh install: no systems and no legacy
+# single-system `truenas:` block. The smoke fixture has a legacy host, and the
+# demo builder refuses to add a demo until that system is saved (#424).
+INITIAL_SETUP_CONFIG = """app:
+  release_check_enabled: false
+  startup_warm_cache_enabled: false
+  startup_warm_smart_enabled: false
+"""
+
+
+def _initial_setup_config(root: Path) -> Path:
+    path = root / ".initial-setup-config.yaml"
+    path.write_text(INITIAL_SETUP_CONFIG, encoding="utf-8")
+    path.chmod(0o600)
+    return path
+
+
 def _prepare_variant_root(
     root: Path,
     *,
@@ -478,7 +495,7 @@ def _prepare_variant_root(
             str(APP_UID),
             "-g",
             str(APP_GID),
-            str(config_fixture),
+            str(_initial_setup_config(root) if variant.admin_initial_setup else config_fixture),
             str(root / "config" / "config.yaml"),
         )
     )
@@ -875,11 +892,13 @@ def _verify_mapping_cycle(
     )
     system_id = inventory.get("selected_system_id")
     enclosure_id = inventory.get("selected_enclosure_id")
+    # The CI smoke fixture points at an unreachable source, so discovery finds no
+    # enclosure and the UI selects none. Mapping then uses the system scope alone,
+    # which the mapping routes accept. A present enclosure ID must still be valid.
     if (
         not isinstance(system_id, str)
         or not system_id
-        or not isinstance(enclosure_id, str)
-        or not enclosure_id
+        or (enclosure_id is not None and (not isinstance(enclosure_id, str) or not enclosure_id))
     ):
         raise RuntimeError("physical mapping scope is unavailable")
     inventory_slots = inventory.get("slots")
@@ -898,9 +917,10 @@ def _verify_mapping_cycle(
     )
     if not isinstance(save_revision, str) or len(save_revision) != 64:
         raise RuntimeError("slot save revision is unavailable")
-    scope_query = urllib.parse.urlencode(
-        (("system_id", system_id), ("enclosure_id", enclosure_id))
-    )
+    scope = [("system_id", system_id)]
+    if enclosure_id is not None:
+        scope.append(("enclosure_id", enclosure_id))
+    scope_query = urllib.parse.urlencode(scope)
     export_url = f"{base}/api/mappings/export?{scope_query}"
     initial = json.loads(_require_status(export_url, 200, authenticated=True))
     initial_revision = initial.get("revision")
