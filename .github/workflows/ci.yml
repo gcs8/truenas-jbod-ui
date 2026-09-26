@@ -61,14 +61,28 @@ jobs:
           # run. An unreadable pull request list runs the preflight rather
           # than skipping it, so an API failure can never hide a broken
           # branch.
-          open_pull_requests="$(
+          list_open_pull_requests() {
             gh pr list --repo "$GH_REPO" --head "$BRANCH_NAME" --base main --state open \
-              --json number --jq 'length' || echo ""
-          )"
-          if [ -z "${open_pull_requests}" ]; then
+              --json number --jq 'length'
+          }
+
+          if ! open_pull_requests="$(list_open_pull_requests)"; then
             echo "run=true" >> "$GITHUB_OUTPUT"
             echo "::warning::Could not list pull requests for ${BRANCH_NAME}; running the full preflight."
             exit 0
+          fi
+
+          # GitHub may start the push workflow before a just-created pull
+          # request is visible to the list API. Only a successful zero result
+          # gets one short recheck; failures still fail safe without waiting.
+          if [ "${open_pull_requests}" -eq 0 ]; then
+            echo "No open pull request visible for ${BRANCH_NAME}; rechecking once in 15 seconds."
+            sleep 15
+            if ! open_pull_requests="$(list_open_pull_requests)"; then
+              echo "run=true" >> "$GITHUB_OUTPUT"
+              echo "::warning::Could not recheck pull requests for ${BRANCH_NAME}; running the full preflight."
+              exit 0
+            fi
           fi
 
           if [ "${open_pull_requests}" -gt 0 ]; then
