@@ -206,7 +206,8 @@ class ConfiguredKnownHostsStartupTests(unittest.TestCase):
             self.assertEqual(len(problems), 1)
             self.assertIn(f"Cannot write to {root / 'host-trust'}", problems[0])
 
-    def test_unwritable_configured_file_is_reported(self) -> None:
+    def test_read_only_configured_file_is_a_warning_not_a_down_problem(self) -> None:
+        # Compose mounts /run/ssh read-only; a file pinned there still verifies hosts.
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             (root / "host-trust").mkdir()
@@ -215,8 +216,19 @@ class ConfiguredKnownHostsStartupTests(unittest.TestCase):
             settings = self.settings_with_known_hosts(root, str(known_hosts))
             with patch("app.services.storage_writability.os.access", return_value=False):
                 problems = app_route_support.startup_storage_problems(settings)
-            self.assertEqual(len(problems), 1)
-            self.assertIn("new host keys cannot be saved", problems[0])
+                warnings = app_route_support.startup_known_hosts_warnings(settings)
+            self.assertEqual(problems, [])
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("new host keys cannot be saved", warnings[0])
+
+    def test_unwritable_folder_without_a_file_is_still_a_down_problem(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "host-trust").mkdir()
+            settings = self.settings_with_known_hosts(root, str(root / "host-trust" / "known_hosts"))
+            with patch("app.services.storage_writability.os.access", return_value=False):
+                self.assertEqual(len(app_route_support.startup_storage_problems(settings)), 1)
+                self.assertEqual(app_route_support.startup_known_hosts_warnings(settings), [])
 
     def test_per_system_configured_path_is_checked(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -231,10 +243,22 @@ class ConfiguredKnownHostsStartupTests(unittest.TestCase):
 
 
 class HealthzTests(unittest.TestCase):
-    def call_healthz(self, snapshot: InventorySnapshot | None, problems: tuple[str, ...] = ()) -> tuple[int, dict]:
+    def call_healthz(
+        self,
+        snapshot: InventorySnapshot | None,
+        problems: tuple[str, ...] = (),
+        known_hosts_warnings: tuple[str, ...] = (),
+    ) -> tuple[int, dict]:
         service = Mock()
         service.peek_cached_snapshot.return_value = snapshot
-        request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(startup_problems=problems)))
+        request = SimpleNamespace(
+            app=SimpleNamespace(
+                state=SimpleNamespace(
+                    startup_problems=problems,
+                    known_hosts_warnings=known_hosts_warnings,
+                )
+            )
+        )
         route = _route("/healthz")
         with patch.object(app_routes, "get_inventory_registry", return_value=_registry(service)):
             response = asyncio.run(route.endpoint(request))
@@ -335,6 +359,13 @@ class HealthzTests(unittest.TestCase):
         self.assertEqual(body["status"], "degraded")
         self.assertEqual(body["summary"], problem)
         self.assertEqual(body["problems"], [problem])
+
+    def test_read_only_pinned_known_hosts_is_degraded_not_down(self) -> None:
+        warning = "The known-hosts file /run/ssh/known_hosts is not writable by the app, so new host keys cannot be saved."
+        status, body = self.call_healthz(_snapshot(), known_hosts_warnings=(warning,))
+        self.assertEqual(status, 200)
+        self.assertEqual(body["status"], "degraded")
+        self.assertEqual(body["problems"], [warning])
 
     def test_every_remote_failure_together_is_still_200(self) -> None:
         snapshot = _snapshot(api_ok=False, api_message="connection refused")

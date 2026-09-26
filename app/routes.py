@@ -82,6 +82,7 @@ from app.route_support import (
     resolve_read_layout_slots,
     resolve_read_ui_write_policy,
     startup_problems_for,
+    known_hosts_warnings_for,
     templates,
     upgrade_notice_data_dir,
 )
@@ -337,7 +338,11 @@ def build_router() -> APIRouter:
             selected_enclosure_id=enclosure_id,
             snapshot=snapshot,
         )
-        startup_problems = [*startup_problems_for(request), *config_reload_problems(request)]
+        startup_problems = [
+            *startup_problems_for(request),
+            *known_hosts_warnings_for(request),
+            *config_reload_problems(request),
+        ]
         if startup_problems:
             snapshot = snapshot.model_copy(update={"warnings": [*startup_problems, *snapshot.warnings]})
         upgrade_notice_payload = await asyncio.to_thread(
@@ -1448,6 +1453,7 @@ def build_router() -> APIRouter:
             service.peek_cached_snapshot(),
             startup_problems=storage_problems,
             remote_problems=[
+                *known_hosts_warnings_for(request),
                 *config_reload_problems(request, include_restart_notice=False),
                 *([history_problem] if history_problem else []),
                 *backup_problems,

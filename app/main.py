@@ -40,7 +40,7 @@ from app.services.mapping_store import (
 )
 from app.services.profile_registry import build_profile_reference_warnings
 from app.services.storage_writability import (
-    probe_known_hosts_files,
+    check_known_hosts_files,
     probe_writable_directories,
 )
 
@@ -101,13 +101,17 @@ def create_app() -> FastAPI:
     writable_directories = tuple(ui_writable_directories(startup_settings))
     _, configured_known_hosts = split_known_hosts_paths(startup_settings)
     known_hosts_files = tuple(configured_known_hosts)
+    known_hosts_problems, known_hosts_read_only = check_known_hosts_files(known_hosts_files)
     startup_problems = [
         *probe_writable_directories(writable_directories),
-        *probe_known_hosts_files(known_hosts_files),
+        *known_hosts_problems,
     ]
     for problem in startup_problems:
         logger.error("%s", problem)
+    for warning in known_hosts_read_only:
+        logger.warning("%s", warning)
     app.state.startup_problems = tuple(startup_problems)
+    app.state.known_hosts_warnings = tuple(known_hosts_read_only)
     app.state.writable_directories = writable_directories
     app.state.known_hosts_files = known_hosts_files
     app.state.storage_checked_at_monotonic = time.monotonic()

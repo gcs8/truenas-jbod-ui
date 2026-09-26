@@ -84,6 +84,13 @@ def build_history_store(settings: HistorySettings) -> HistoryStore:
 
 
 HISTORY_UNAVAILABLE_DETAIL = "History storage is unavailable; see the service logs."
+SEGMENT_CATALOG_MISSING_REASON = (
+    "Segmented history is configured but its catalog does not exist yet. Run the "
+    "segmented-history migration or restore a segmented backup."
+)
+SEGMENT_CATALOG_UNREADABLE_REASON = (
+    "Segmented history could not be read; see the service logs."
+)
 
 
 def _configured_history_directory() -> Path:
@@ -522,11 +529,25 @@ async def healthz() -> JSONResponse:
         if recovery_required
         else collector.degraded_reason()
     )
+    # Segmented history reads its catalog to size the database. A fresh
+    # segmented deployment has no catalog until a migration or restore
+    # publishes one, and a pending recovery marker also refuses the read.
+    # Report those as degraded instead of failing the health route.
+    database_size_bytes: int | None
+    try:
+        database_size_bytes = await asyncio.to_thread(store.database_size_bytes)
+    except FileNotFoundError:
+        database_size_bytes = None
+        degraded_reason = degraded_reason or SEGMENT_CATALOG_MISSING_REASON
+    except (OSError, ValueError) as exc:
+        logger.warning("History health could not size the database: %s", exc)
+        database_size_bytes = None
+        degraded_reason = degraded_reason or SEGMENT_CATALOG_UNREADABLE_REASON
     payload = {
         "status": "degraded" if degraded_reason else "ok",
         "detail": degraded_reason,
         "collector": collector_status,
-        "database_size_bytes": await asyncio.to_thread(store.database_size_bytes),
+        "database_size_bytes": database_size_bytes,
     }
     return JSONResponse(payload, status_code=200)
 

@@ -57,7 +57,12 @@ from app.services.snapshot_export import (
     SnapshotExportBusyError,
     SnapshotExportService,
 )
-from app.services.storage_writability import probe_known_hosts_files, probe_writable_directories
+from app.services.storage_writability import (
+    check_known_hosts_files,
+    probe_known_hosts_files,
+    probe_read_only_known_hosts_files,
+    probe_writable_directories,
+)
 from app.services.truenas_ws import TrueNASAPIError
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -942,6 +947,18 @@ def startup_storage_problems(settings: Settings) -> list[str]:
     ]
 
 
+def startup_known_hosts_warnings(settings: Settings) -> list[str]:
+    _, configured_known_hosts = split_known_hosts_paths(settings)
+    return probe_read_only_known_hosts_files(configured_known_hosts)
+
+
+def known_hosts_warnings_for(request: Request) -> list[str]:
+    """Read-only pinned known-hosts lines; health reports them as degraded."""
+
+    app_state = getattr(getattr(request, "app", None), "state", None)
+    return [str(line) for line in (getattr(app_state, "known_hosts_warnings", None) or ())]
+
+
 def startup_problems_for(request: Request) -> list[str]:
     app_state = getattr(getattr(request, "app", None), "state", None)
     return [str(problem) for problem in (getattr(app_state, "startup_problems", None) or ())]
@@ -969,10 +986,16 @@ def refresh_storage_problems(request: Request) -> list[str]:
     if isinstance(checked_at, (int, float)) and now - checked_at < STORAGE_REPROBE_SECONDS:
         return list(previous)
     known_hosts_files = tuple(getattr(app_state, "known_hosts_files", None) or ())
-    current = tuple([*probe_writable_directories(directories), *probe_known_hosts_files(known_hosts_files)])
+    known_hosts_problems, known_hosts_read_only = check_known_hosts_files(known_hosts_files)
+    current = tuple([*probe_writable_directories(directories), *known_hosts_problems])
     for problem in current:
         if problem not in previous:
             logger.error("%s", problem)
+    previous_warnings = tuple(getattr(app_state, "known_hosts_warnings", None) or ())
+    for warning in known_hosts_read_only:
+        if warning not in previous_warnings:
+            logger.warning("%s", warning)
+    app_state.known_hosts_warnings = tuple(known_hosts_read_only)
     if previous and not current:
         logger.info("Data, log and known-hosts folders are writable again.")
     app_state.startup_problems = current

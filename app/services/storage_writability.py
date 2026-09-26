@@ -144,7 +144,30 @@ def probe_writable_directories(directories: Iterable[Path | str | None]) -> list
 
 
 def probe_known_hosts_files(paths: Iterable[Path | str | None]) -> list[str]:
-    """Check operator-chosen known-hosts files; one operator line per problem.
+    """Known-hosts problems the UI cannot operate through (health ``down``)."""
+
+    return check_known_hosts_files(paths)[0]
+
+
+def probe_read_only_known_hosts_files(paths: Iterable[Path | str | None]) -> list[str]:
+    """Pinned known-hosts files the app can read but not update (health ``degraded``).
+
+    Compose mounts ``/run/ssh`` read-only, so a file pinned there is a normal
+    layout: SSH still checks hosts against the keys already in it, but a new
+    host key cannot be saved.
+    """
+
+    return check_known_hosts_files(paths)[1]
+
+
+def check_known_hosts_files(
+    paths: Iterable[Path | str | None],
+) -> tuple[list[str], list[str]]:
+    """Check operator-chosen known-hosts files; one operator line per finding.
+
+    Returns ``(problems, read_only)``. A missing folder, or an unwritable folder
+    with no file in it yet, is a problem. An existing file the app cannot write
+    is read-only.
 
     Unlike `probe_writable_directories`, a missing parent is reported rather
     than created: a configured path usually names a host bind mount, and
@@ -153,6 +176,7 @@ def probe_known_hosts_files(paths: Iterable[Path | str | None]) -> list[str]:
     host-key errors until the path is fixed.
     """
     problems: list[str] = []
+    read_only: list[str] = []
     seen: set[str] = set()
     for raw in paths:
         if not raw:
@@ -175,8 +199,8 @@ def probe_known_hosts_files(paths: Iterable[Path | str | None]) -> list[str]:
             if target == parent:
                 problems.append(describe_unwritable_directory(parent))
             else:
-                problems.append(
+                read_only.append(
                     f"The known-hosts file {path} is not writable by the app, so new host keys "
                     f"cannot be saved. {describe_unwritable_directory(parent)}"
                 )
-    return problems
+    return problems, read_only

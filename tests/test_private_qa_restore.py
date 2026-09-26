@@ -496,6 +496,39 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
                 0o600,
             )
 
+    def test_segmented_history_flag_sets_the_documented_catalog_path(self) -> None:
+        for segmented, expected in ((False, False), (True, True)):
+            with self.subTest(segmented=segmented), tempfile.TemporaryDirectory() as raw_root:
+                runtime = Path(raw_root) / "runtime"
+                self.module._write_runtime_files(
+                    ROOT,
+                    runtime,
+                    "sha256:" + "a" * 64,
+                    (28080, 28081, 28082),
+                    "qa-user",
+                    "qa-password",
+                    live_read_only=False,
+                    segmented_history=segmented,
+                )
+                environment = (runtime / ".env").read_text(encoding="utf-8")
+                self.assertEqual(
+                    "HISTORY_SEGMENT_CATALOG_PATH=/app/history/segments/catalog.json" in environment,
+                    expected,
+                )
+
+    def test_history_mode_must_match_the_backup_before_import(self) -> None:
+        self.module.require_matching_history_mode({"schema_version": 2}, segmented_history=True)
+        self.module.require_matching_history_mode({"schema_version": 1}, segmented_history=False)
+        with self.assertRaisesRegex(self.module.QaRestoreError, "rerun with --segmented-history"):
+            self.module.require_matching_history_mode({"schema_version": 2}, segmented_history=False)
+        with self.assertRaisesRegex(self.module.QaRestoreError, "single-file history"):
+            self.module.require_matching_history_mode({"schema_version": 1}, segmented_history=True)
+
+    def test_drill_schema_constant_matches_the_app(self) -> None:
+        from history_service.segment_catalog import SEGMENTED_BACKUP_SCHEMA_VERSION
+
+        self.assertEqual(self.module.SEGMENTED_BACKUP_SCHEMA_VERSION, SEGMENTED_BACKUP_SCHEMA_VERSION)
+
     def test_loopback_proxy_forwards_and_releases_listener(self) -> None:
         self.assertTrue(hasattr(self.module, "_LoopbackProxySet"))
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as target:

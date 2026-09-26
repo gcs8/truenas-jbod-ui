@@ -419,7 +419,11 @@ A system without its own value uses the top-level path. Leaving the setting
 unset, blank, or at the `/app/data/known_hosts` default keeps the derived
 file. The folder holding a configured file must already exist and be writable
 by the app user; if it is not, the UI reports it at startup (in the log, on
-`/healthz`, and as a page warning) and keeps running. Setup requests from the
+`/healthz`, and as a page warning) and keeps running. An existing file on a
+read-only mount, such as the `/run/ssh` mount Compose provides, is a supported
+layout: SSH still checks hosts against the keys already in it, but it cannot
+save new ones, so `/healthz` reports `degraded` (HTTP 200) with that warning
+rather than `down`. Setup requests from the
 admin UI never choose the file; a per-system path set in `config.yaml` is kept
 when that system is saved again.
 

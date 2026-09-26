@@ -259,6 +259,16 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- The main UI no longer reports itself down when a pinned known-hosts file sits
+  on a read-only mount, such as the `/run/ssh` mount in the shipped Compose
+  file. SSH still verifies hosts against the keys in it; `/healthz` now answers
+  `degraded` (HTTP 200) with a warning that new host keys cannot be saved,
+  instead of `down` (HTTP 503). A missing folder, or an unwritable folder with
+  no file yet, is still `down`. History `/healthz` no longer fails with HTTP 500
+  when segmented history is configured but no catalog exists yet, as on a fresh
+  install before a migration or restore; it reports `degraded` with the reason.
+  The private restore drill gains `--segmented-history` and checks it against
+  the backup before import. (#663)
 - Backup inspect, import and export in the admin service work again when
   `.env` doesn't set the `RELEASE_CHECK_*` keys. Compose passes unset keys as
   empty values, and the history settings loader rejected them ("must be true
