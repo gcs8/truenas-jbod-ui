@@ -259,6 +259,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Backup inspect, import and export in the admin service work again when
+  `.env` doesn't set the `RELEASE_CHECK_*` keys. Compose passes unset keys as
+  empty values, and the history settings loader rejected them ("must be true
+  or false"), so every backup route answered HTTP 400. Blank values for
+  non-text history settings now keep their defaults. (#660, #661)
 - The main page loads again when the storage system can't be reached (for
   example at startup or after a config reload), showing the connection problem
   as a warning, as v0.22.2 did. Since v0.23.0 it answered HTTP 503 "The server
