@@ -14,9 +14,14 @@ asserts the same partition and that ``.github/workflows/ci.yml`` runs every shar
 
 ``run`` imports the shard's modules the way discovery does (``tests`` is the
 top-level directory, so a module is ``test_x``, not ``tests.test_x``) and writes
-``shard-<id>.json`` with the outcome. ``verify`` requires one successful result
-for every shard of the expected Python version and fails closed on a missing,
-extra, failed, or empty result.
+``shard-<id>.json`` with the outcome and per-module discovered test counts.
+``verify`` requires one successful result for every shard of the expected Python
+version and compares those counts with the reviewed manifest at
+``tests/unittest_test_counts.json``. Skipped tests still count because the
+contract records discovery, not platform-dependent outcomes.
+
+    python scripts/run_test_shard.py check-counts
+    python scripts/run_test_shard.py update-counts  # review the manifest diff
 
 Local full runs keep using discovery (``scripts/dev_check.py --safe``); the shard
 table only serves CI. Rebalance it from a per-test timing run when a shard
@@ -40,6 +45,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 TESTS_DIR = ROOT / "tests"
 TEST_MODULE_PATTERN = "test_*.py"
+TEST_COUNT_MANIFEST = TESTS_DIR / "unittest_test_counts.json"
+TEST_COUNT_MANIFEST_SCHEMA = 1
 RESULT_PREFIX = "shard-"
 RESULT_SUFFIX = ".json"
 
@@ -211,14 +218,125 @@ def python_version_label() -> str:
     return f"{sys.version_info.major}.{sys.version_info.minor}"
 
 
-def build_suite(modules: tuple[str, ...], tests_dir: Path = TESTS_DIR) -> unittest.TestSuite:
-    """Load ``modules`` exactly as ``unittest discover -s <tests_dir>`` would."""
+def build_suite_and_counts(
+    modules: tuple[str, ...],
+    tests_dir: Path = TESTS_DIR,
+    *,
+    fail_on_discovery_errors: bool = False,
+) -> tuple[unittest.TestSuite, dict[str, int]]:
+    """Load modules in discovery form and retain each module's discovered count."""
 
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
+    counts: dict[str, int] = {}
     for module in modules:
-        suite.addTests(loader.discover(str(tests_dir), pattern=f"{module}.py"))
-    return suite
+        error_count = len(loader.errors)
+        module_suite = loader.discover(str(tests_dir), pattern=f"{module}.py")
+        if fail_on_discovery_errors and len(loader.errors) > error_count:
+            raise ValueError(f"{module} failed discovery; fix imports before updating counts")
+        if fail_on_discovery_errors and _is_module_level_skip(module_suite):
+            # unittest replaces a module that raises SkipTest at import with one
+            # synthetic skipped test, which would hide every real test count.
+            raise ValueError(f"{module} skipped itself at import; counts need its real tests")
+        counts[module] = module_suite.countTestCases()
+        suite.addTests(module_suite)
+    return suite, counts
+
+
+def _iter_cases(suite: unittest.TestSuite):
+    for item in suite:
+        if isinstance(item, unittest.TestSuite):
+            yield from _iter_cases(item)
+        else:
+            yield item
+
+
+def _is_module_level_skip(suite: unittest.TestSuite) -> bool:
+    return any(
+        type(case).__name__ == "ModuleSkipped" and type(case).__module__ == "unittest.loader"
+        for case in _iter_cases(suite)
+    )
+
+
+def build_suite(modules: tuple[str, ...], tests_dir: Path = TESTS_DIR) -> unittest.TestSuite:
+    """Load ``modules`` exactly as ``unittest discover -s <tests_dir>`` would."""
+
+    return build_suite_and_counts(modules, tests_dir)[0]
+
+
+def discovered_test_counts(
+    modules: tuple[str, ...], tests_dir: Path = TESTS_DIR
+) -> dict[str, int]:
+    """Return sorted per-module counts; skips remain part of discovery."""
+
+    _suite, counts = build_suite_and_counts(
+        tuple(sorted(modules)), tests_dir, fail_on_discovery_errors=True
+    )
+    return counts
+
+
+def load_test_count_manifest(path: Path = TEST_COUNT_MANIFEST) -> dict[str, int]:
+    """Load and validate the reviewed per-module discovery-count manifest."""
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or payload.get("schema") != TEST_COUNT_MANIFEST_SCHEMA:
+        raise ValueError(f"expected schema {TEST_COUNT_MANIFEST_SCHEMA}")
+    modules = payload.get("modules")
+    if not isinstance(modules, dict):
+        raise ValueError("modules must be an object")
+    for module, count in modules.items():
+        if not isinstance(module, str) or not module:
+            raise ValueError("module names must be non-empty strings")
+        if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+            raise ValueError(f"{module}: count must be a positive integer")
+    if list(modules) != sorted(modules):
+        raise ValueError("module names must be sorted")
+    return modules
+
+
+def write_test_count_manifest(
+    path: Path = TEST_COUNT_MANIFEST,
+    *,
+    modules: tuple[str, ...] | None = None,
+    tests_dir: Path = TESTS_DIR,
+) -> dict[str, int]:
+    """Regenerate the reviewed manifest; callers must review the resulting diff."""
+
+    counts = discovered_test_counts(modules or discovered_modules(tests_dir), tests_dir)
+    payload = {"schema": TEST_COUNT_MANIFEST_SCHEMA, "modules": counts}
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return counts
+
+
+def test_count_problems(expected: dict[str, int], actual: dict[str, int]) -> list[str]:
+    """Describe every module/count change without depending on discovery order."""
+
+    problems: list[str] = []
+    for module in sorted(set(expected) | set(actual)):
+        old = expected.get(module)
+        new = actual.get(module)
+        if old is None:
+            problems.append(
+                f"test-count manifest: {module} is new with {new} tests; update the manifest"
+            )
+        elif new is None:
+            problems.append(
+                f"test-count manifest: {module} was not reported (expected {old} tests)"
+            )
+        elif new < old:
+            lost = old - new
+            noun = "test" if lost == 1 else "tests"
+            problems.append(
+                f"test-count manifest: {module} lost {lost} {noun} (expected {old}, found {new})"
+            )
+        elif new > old:
+            gained = new - old
+            noun = "test" if gained == 1 else "tests"
+            problems.append(
+                f"test-count manifest: {module} gained {gained} {noun} "
+                f"(expected {old}, found {new}); update the manifest"
+            )
+    return problems
 
 
 def run_shard(
@@ -246,13 +364,15 @@ def run_shard(
     # `python -m unittest` enables "default" warnings unless -W was given.
     warnings = None if sys.warnoptions else "default"
     runner = unittest.TextTestRunner(stream=stream, verbosity=2, warnings=warnings)
-    result = runner.run(build_suite(modules, tests_dir))
+    suite, test_counts = build_suite_and_counts(modules, tests_dir)
+    result = runner.run(suite)
 
     if results_dir is not None:
         payload = {
             "shard": shard_id,
             "python_version": python_version_label(),
             "modules": list(modules),
+            "test_counts": test_counts,
             "tests_run": result.testsRun,
             "failures": len(result.failures),
             "errors": len(result.errors),
@@ -273,6 +393,7 @@ def verify_results(
     *,
     shards: dict[str, tuple[str, ...]] = SHARDS,
     tests_dir: Path = TESTS_DIR,
+    expected_counts: dict[str, int] | None = None,
 ) -> list[str]:
     """Problems that must make the required check fail; empty means every shard passed."""
 
@@ -280,6 +401,15 @@ def verify_results(
     found: dict[str, dict] = {}
     if not results_dir.is_dir():
         return problems + [f"results directory is missing: {results_dir}"]
+    compare_counts = True
+    if expected_counts is None:
+        try:
+            expected_counts = load_test_count_manifest()
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            problems.append(f"test-count manifest: cannot load {TEST_COUNT_MANIFEST} ({exc})")
+            expected_counts = {}
+            compare_counts = False
+    actual_counts: dict[str, int] = {}
     for path in sorted(results_dir.glob(f"{RESULT_PREFIX}*{RESULT_SUFFIX}")):
         shard_id = path.name[len(RESULT_PREFIX) : -len(RESULT_SUFFIX)]
         try:
@@ -306,6 +436,17 @@ def verify_results(
             )
         if payload.get("modules") != list(modules):
             problems.append(f"shard {shard_id}: module list differs from the table")
+        shard_counts = payload.get("test_counts")
+        if not isinstance(shard_counts, dict):
+            problems.append(f"shard {shard_id}: test_counts is not an object")
+        else:
+            if set(shard_counts) != set(modules):
+                problems.append(f"shard {shard_id}: test_counts module list differs from the table")
+            for module, count in shard_counts.items():
+                if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+                    problems.append(f"shard {shard_id}: {module} has invalid test count {count!r}")
+                elif module in modules:
+                    actual_counts[module] = count
         if not isinstance(payload.get("tests_run"), int) or payload["tests_run"] <= 0:
             problems.append(f"shard {shard_id}: ran no tests")
         if payload.get("was_successful") is not True:
@@ -314,6 +455,8 @@ def verify_results(
                 f"(failures={payload.get('failures')}, errors={payload.get('errors')}, "
                 f"unexpected successes={payload.get('unexpected_successes')})"
             )
+    if compare_counts:
+        problems.extend(test_count_problems(expected_counts, actual_counts))
     return problems
 
 
@@ -338,6 +481,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help="major.minor every result must have run on, for example 3.14",
     )
 
+    commands.add_parser("check-counts", help="compare full discovery with the reviewed count manifest")
+    commands.add_parser("update-counts", help="regenerate the count manifest for review")
     commands.add_parser("list", help="print the shard table")
     return parser
 
@@ -353,6 +498,43 @@ def main(argv: list[str] | None = None) -> int:
         for problem in problems:
             print(f"shard partition: {problem}", file=sys.stderr)
         return 2 if problems else 0
+    if args.command in {"check-counts", "update-counts"}:
+        problems = partition_problems()
+        if problems:
+            for problem in problems:
+                print(f"shard partition: {problem}", file=sys.stderr)
+            return 2
+        if args.command == "update-counts":
+            try:
+                counts = write_test_count_manifest()
+            except ValueError as exc:
+                print(f"test-count manifest: cannot update ({exc})", file=sys.stderr)
+                return 1
+            print(
+                f"test-count manifest: wrote {len(counts)} modules / "
+                f"{sum(counts.values())} tests to {TEST_COUNT_MANIFEST}"
+            )
+            return 0
+        try:
+            expected = load_test_count_manifest()
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"test-count manifest: cannot load {TEST_COUNT_MANIFEST} ({exc})", file=sys.stderr)
+            return 1
+        try:
+            actual = discovered_test_counts(discovered_modules())
+        except ValueError as exc:
+            print(f"test-count manifest: cannot check ({exc})", file=sys.stderr)
+            return 1
+        problems = test_count_problems(expected, actual)
+        if problems:
+            for problem in problems:
+                print(problem, file=sys.stderr)
+            return 1
+        print(
+            f"test-count manifest: full discovery matches "
+            f"{len(actual)} modules / {sum(actual.values())} tests"
+        )
+        return 0
     if args.command == "run":
         return run_shard(args.shard, results_dir=args.results_dir)
     problems = verify_results(args.results_dir, args.python_version)

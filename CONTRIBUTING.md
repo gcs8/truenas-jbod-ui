@@ -242,7 +242,9 @@ Raw command reference (the wrapper remains authoritative):
 ```bash
 python -m unittest discover -s tests -p "test_*.py" -v
 COVERAGE_CORE=sysmon coverage run -m unittest discover -s tests -p "test_*.py" -v && coverage report
-python scripts/run_test_shard.py run --shard 1   # one CI shard; `list` prints the table
+python scripts/run_test_shard.py check-counts  # compare discovery with the reviewed per-module baseline
+python scripts/run_test_shard.py update-counts # after intentional test additions/removals; review the JSON diff
+python scripts/run_test_shard.py run --shard 1 # one CI shard; `list` prints the table
 python -m compileall app admin_service history_service scripts tests
 node --check app/static/app.js
 node --check app/static/sas_fabric_view.js
@@ -448,9 +450,17 @@ four parallel shard jobs (`Python unittest shard (<version>, <shard>)`). The
 shards split the test modules by the `SHARDS` table in
 `scripts/run_test_shard.py`; the gate downloads every shard's result and fails
 unless each one ran and passed on that Python version, so a shard that failed,
-was skipped, or never uploaded a result turns the required check red. Every
-`tests/test_*.py` module must sit in exactly one shard; `run` refuses to start
-otherwise and `tests.test_unittest_shards` asserts the same partition. Report-only
+was skipped, or never uploaded a result turns the required check red. Each result
+also records discovery counts by module. The gate compares their union with the
+reviewed `tests/unittest_test_counts.json` baseline and names every module that
+gained or lost tests; method- and class-level skips remain counted because the
+contract concerns discovery, not platform-dependent outcomes. A module that raises
+`SkipTest` at import collapses to one test, so the gate reports it as lost tests
+and `update-counts` refuses to record it. Regenerate the baseline only after an intentional
+test change with `python scripts/run_test_shard.py update-counts`, then review the
+manifest diff. Every `tests/test_*.py` module must sit in exactly one shard; `run`
+refuses to start otherwise and `tests.test_unittest_shards` asserts the same
+partition. Report-only
 coverage runs on the 3.14 shards with coverage's `sys.monitoring` core and is
 combined in the 3.14 gate. Coverage is report-only. CodeQL is report-only until
 repository branch protection explicitly makes it required. `Image-only upgrade smoke` (the previous public release upgraded by
@@ -560,7 +570,8 @@ that comment yet; the table below is the authoritative list either way.
 | Any user-visible string the snapshot page shows | `qa/public-demo.spec.js` (Playwright assertions on the demo page) and the `tests/js` assertions that pin it | The CI job named `Checked-in public demo artifact` runs those specs, and only the first mismatch is reported per run |
 | `downsampling_label` and other values that look like copy but are compared in code (`"None"` is a sentinel read by two consumers in `app/static/app.js`) | Every consumer, or leave the value alone and change only the neighbouring note | A plain-language rename turns a sentinel into a false positive |
 | A warning or note that states where data came from (live data, cached topology, fallback geometry) | Only reword in a way that keeps the same claim; if the source is uncertain, say less, not more | Bay geometry is safety-relevant: an operator who believes a drawing came from live data may pull the wrong drive |
-| A new `tests/test_*.py` module | `WINDOWS_PORTABLE_TEST_MODULES` or `WINDOWS_EXCLUSIONS` in `scripts/dev_check.py`, and one shard tuple in `SHARDS` in `scripts/run_test_shard.py` (keep it sorted) | `tests.test_dev_check` fails on an unclassified module, on every platform; `tests.test_unittest_shards` and the CI shard runner fail on a module outside every shard |
+| A new `tests/test_*.py` module | `WINDOWS_PORTABLE_TEST_MODULES` or `WINDOWS_EXCLUSIONS` in `scripts/dev_check.py`, one shard tuple in `SHARDS` in `scripts/run_test_shard.py` (keep it sorted), and `tests/unittest_test_counts.json` via `python scripts/run_test_shard.py update-counts` | `tests.test_dev_check` fails on an unclassified module; the shard runner rejects a module outside every shard; the reviewed count baseline makes the intentional addition explicit |
+| An added, removed, or generated Python unittest | `tests/unittest_test_counts.json` via `python scripts/run_test_shard.py update-counts`, with the resulting per-module count change reviewed | The required shard gate reports per-module count drift. It compares counts, not test IDs, so a rename, or a deletion paired with an addition in the same module, leaves the count unchanged and needs a reviewer's eye on the test diff |
 | Serial numbers, WWNs, hostnames or addresses in any tracked text, including tests and fixtures | Use the synthetic forms the privacy scan accepts (`SANITIZED-` serials, `host.example.test`-style hosts, `192.0.2.x` addresses) or add a reviewed exception in `tests/public_text_privacy_exceptions.json` with a reason | `tests.test_public_doc_privacy` pins every finding by file, category and value hash |
 | A wiki page added or removed | The page count in `scripts/check_public_docs.py`, the page set in `tests/test_public_docs_contract.py`, and `wiki/_Sidebar.md` (the inventory under `docs/archive/` is a historical baseline and is not updated) | `check_public_docs.py` and the docs contract test count and enumerate pages |
 | `.env.example` comment wording that a test quotes (for example the `latest remains the compatibility default` sentence) | The quoting test in `tests/test_ghcr_release_contract.py`, or keep the sentence | The test pins the sentence |
