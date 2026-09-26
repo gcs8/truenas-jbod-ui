@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
 import re
+import subprocess
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+import yaml
 
 from app.services.release_status import ReleaseStatusService, describe_release_status
 from app import routes as app_routes
@@ -556,6 +560,28 @@ UPGRADE_DOCKERFILE = UPGRADE_NOTES_ROOT / "Dockerfile"
 REPO_ONLY_HELPER = "prepare_nonroot_bind_mounts.py"
 
 
+# `git show v0.23.0:docker-compose.yml`, byte for byte. A checked-in copy keeps
+# the suite working in shallow and --no-tags checkouts.
+V0230_COMPOSE_FIXTURE = UPGRADE_NOTES_ROOT / "tests" / "fixtures" / "compose" / "v0.23.0.yml"
+V0230_COMPOSE_SHA256 = "191e492e2f7fab841654a5cfbddfe664a8a82d372f26cdeaa6c18e36309233a9"
+
+
+def tagged_v0230_compose() -> dict:
+    data = V0230_COMPOSE_FIXTURE.read_bytes()
+    if hashlib.sha256(data).hexdigest() != V0230_COMPOSE_SHA256:
+        raise AssertionError("tests/fixtures/compose/v0.23.0.yml is not the v0.23.0 tag's docker-compose.yml")
+    tagged = subprocess.run(
+        ["git", "show", "v0.23.0:docker-compose.yml"],
+        cwd=UPGRADE_NOTES_ROOT,
+        capture_output=True,
+        check=False,
+    )
+    # Cross-check against the tag only when this checkout has it.
+    if tagged.returncode == 0 and tagged.stdout != data:
+        raise AssertionError("tests/fixtures/compose/v0.23.0.yml differs from the v0.23.0 tag")
+    return yaml.safe_load(data)
+
+
 def upgrade_release_section(version: str) -> str:
     text = UPGRADE_CHANGELOG.read_text(encoding="utf-8")
     start = text.index(f"## {version}")
@@ -611,6 +637,57 @@ class ReleaseStatusRouteAndCopyTests(unittest.TestCase):
 
 
 class UpgradeNotesContractTests(unittest.TestCase):
+    def test_v0230_hardening_claims_match_the_tag_and_current_guidance(self) -> None:
+        tagged_base = tagged_v0230_compose()["services"]
+        current_base = yaml.safe_load(
+            (UPGRADE_NOTES_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+        )["services"]
+        current_overlay = yaml.safe_load(
+            (UPGRADE_NOTES_ROOT / "docker-compose.nonroot.yml").read_text(encoding="utf-8")
+        )["services"]
+
+        for service in ("enclosure-ui", "enclosure-history"):
+            with self.subTest(service=service):
+                self.assertEqual(
+                    tagged_base[service]["user"],
+                    "${APP_UID:-10001}:${APP_GID:-10001}",
+                )
+                self.assertIs(tagged_base[service]["read_only"], True)
+                self.assertEqual(current_base[service]["user"], "0:0")
+                self.assertFalse(current_base[service].get("read_only", False))
+                self.assertEqual(
+                    current_overlay[service]["user"],
+                    "${APP_UID:-10001}:${APP_GID:-10001}",
+                )
+                self.assertIs(current_overlay[service]["read_only"], True)
+
+        historical_documents = (
+            UPGRADE_RELEASE_NOTES.read_text(encoding="utf-8"),
+            upgrade_release_section("v0.23.0"),
+        )
+        for document in historical_documents:
+            normalized = " ".join(document.split())
+            with self.subTest(document=normalized[:40]):
+                self.assertIn("the `v0.23.0` tag", normalized)
+                self.assertIn("base `docker-compose.yml` already", normalized)
+                self.assertIn("one-time ownership step", normalized)
+                self.assertIn("post-release", normalized)
+                self.assertIn("current `main`", normalized)
+                self.assertNotIn("Hardening is opt-in", normalized)
+                self.assertNotIn("base Compose file is root-compatible", normalized)
+                self.assertNotIn("Skip this note entirely unless", normalized)
+
+        upgrading = " ".join(
+            (UPGRADE_NOTES_ROOT / "wiki" / "Upgrading.md")
+            .read_text(encoding="utf-8")
+            .split()
+        )
+        self.assertIn("Unlike the `v0.23.0` tag", upgrading)
+        self.assertIn("current `main`", upgrading)
+        self.assertIn("root-compatible", upgrading)
+        self.assertIn("optional `docker-compose.nonroot.yml` overlay", upgrading)
+        self.assertIn("v0.23.0 base `docker-compose.yml`", upgrading)
+
     def test_the_ownership_helper_is_still_absent_from_the_image(self) -> None:
         # The premise of the other tests: the helper is repository-only, so no
         # published-image instruction may depend on it.
