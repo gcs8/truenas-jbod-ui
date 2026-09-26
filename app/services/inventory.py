@@ -248,6 +248,14 @@ class DiskInventorySyncBusy(TrueNASAPIError):
     """Another disk inventory sync is already running for this system."""
 
 
+@dataclass(slots=True)
+class _DiskInventorySyncState:
+    """Mutable state handed intact to services built by later generations."""
+
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    active_job_id: int | None = None
+
+
 def _bounded_middleware_text(value: Any) -> str | None:
     """Collapse middleware error text to one bounded line for operator display."""
 
@@ -1075,8 +1083,7 @@ class InventoryService:
         # next round's connection instead of each opening their own.
         self._ssh_plan_queues: dict[str, list[tuple[Any, list[str], asyncio.Future]]] = {}
         self._ssh_plan_drains: dict[str, asyncio.Task[None]] = {}
-        self._disk_inventory_sync_lock = asyncio.Lock()
-        self._disk_inventory_sync_active_job_id: int | None = None
+        self._disk_inventory_sync_state = _DiskInventorySyncState()
         # Injected so tests can drive the full-sync poll loop with a fake clock.
         self._disk_inventory_sync_clock = time.monotonic
         self._disk_inventory_sync_sleep = asyncio.sleep
@@ -1087,6 +1094,18 @@ class InventoryService:
         self._scale_preferred_ses_host: str | None = None
         self._quantastor_preferred_ses_host: str | None = None
         self._sg_ses_device_cache: dict[str, tuple[list[str], datetime]] = {}
+
+    @property
+    def _disk_inventory_sync_lock(self) -> asyncio.Lock:
+        return self._disk_inventory_sync_state.lock
+
+    @property
+    def _disk_inventory_sync_active_job_id(self) -> int | None:
+        return self._disk_inventory_sync_state.active_job_id
+
+    @_disk_inventory_sync_active_job_id.setter
+    def _disk_inventory_sync_active_job_id(self, value: int | None) -> None:
+        self._disk_inventory_sync_state.active_job_id = value
 
     def adopt_caches_from(self, previous: InventoryService, *, keep_snapshots: bool) -> None:
         """Take over ``previous``'s appliance answers after a config reload (#432).
@@ -1099,17 +1118,19 @@ class InventoryService:
         expiry times are capped at the new TTLs. Built snapshots are reused only when
         ``keep_snapshots`` says nothing they were built from changed; they get
         the new system list and refresh interval. Nothing is shared with the
-        old service except the disk-sync lock, so a request still running on
-        the old settings keeps seeing only old values.
+        old service except the disk-sync state, so a request still running on
+        the old settings keeps seeing only old inventory values.
         """
         if _system_without_display_fields(previous.system) != _system_without_display_fields(self.system):
             return
         # Expiry times were computed from the old TTLs; never keep an entry
         # longer than the new TTL allows, so a lowered TTL applies at once.
         now = utcnow()
-        # One TrueNAS disk sync per system, whichever settings started it.
-        self._disk_inventory_sync_lock = previous._disk_inventory_sync_lock
-        self._disk_inventory_sync_active_job_id = previous._disk_inventory_sync_active_job_id
+        # One TrueNAS disk sync per system, whichever settings started it. The
+        # mutable state must be handed off as one object: a reload can build the
+        # successor after the old service takes the lock but before the remote
+        # start returns its job id.
+        self._disk_inventory_sync_state = previous._disk_inventory_sync_state
         if previous.settings.layout != self.settings.layout or previous.settings.profiles != self.settings.profiles:
             # The raw answers were parsed against the old layout (slot count
             # filters bays), so they must be collected again.

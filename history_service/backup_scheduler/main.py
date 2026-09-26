@@ -27,12 +27,16 @@ from typing import Any
 
 from app.config_errors import ConfigurationError
 from app.logging_config import configure_service_logging
-from history_service.backup_archive.policy import BackupPolicy, load_backup_policy
+from history_service.backup_archive.policy import (
+    DEFAULT_LOCAL_ARCHIVE_ROOT,
+    BackupPolicy,
+    load_backup_policy,
+)
 
 logger = logging.getLogger(__name__)
 
 DEFAULTS = {
-    "BACKUP_ARCHIVE_DIR": "/app/backups/archive",
+    "BACKUP_ARCHIVE_DIR": DEFAULT_LOCAL_ARCHIVE_ROOT,
     "BACKUP_ARCHIVE_STATE_DIR": "/app/backups/archive-state",
     "BACKUP_JOURNAL_PATH": "/app/backup-journal/config-changes.jsonl",
     "BACKUP_ARCHIVE_STATUS_FILE": "/app/backup-status/backup-archive.json",

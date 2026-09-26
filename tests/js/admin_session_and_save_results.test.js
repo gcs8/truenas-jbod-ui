@@ -213,9 +213,10 @@ test("every save, delete, and timing result goes through renderSaveResult and no
   for (const [label, text] of [["admin.js", SOURCE], ["index.html", TEMPLATE], ["routes.py", ROUTES]]) {
     assert.doesNotMatch(text, /read ui/i, `${label} must say main UI`);
   }
-  assert.match(TEMPLATE, /Saved systems appear in the main UI within a few seconds\./);
+  assert.match(TEMPLATE, /Saved systems appear after the main UI next handles a page or API request\./);
   assert.match(ROUTES, /The main UI needs a restart to apply this\./);
-  assert.match(ROUTES, /The main UI applies it within a few seconds; no restart needed\./);
+  assert.match(ROUTES, /The main UI applies it when it next handles a page or API request; /);
+  assert.match(ROUTES, /"no restart needed\."/);
 });
 
 // Auto-stop is announced before and after it happens.

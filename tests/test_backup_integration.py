@@ -176,6 +176,29 @@ class PolicyTests(unittest.TestCase):
         with self.assertRaises(ConfigurationError):
             load_backup_policy(self.config, {"BACKUP_TARGETS_JSON": "{not json"})
 
+    def test_filesystem_targets_reject_local_archive_overlap_and_aliases(self) -> None:
+        local = Path(self.temp.name) / "archive"
+        local.mkdir()
+        alias = Path(self.temp.name) / "archive-alias"
+        alias.symlink_to(local, target_is_directory=True)
+        unrelated = Path(self.temp.name) / "remote"
+        self.write({
+            "targets": [{"target_id": "nas", "provider": "filesystem", "root": str(unrelated)}],
+        })
+        self.assertEqual(
+            load_backup_policy(self.config, {"BACKUP_ARCHIVE_DIR": str(local)}).targets[0].settings.root,
+            str(unrelated),
+        )
+
+        for target_root in (local, local.parent, local / "future", alias, alias / "future"):
+            with self.subTest(target_root=target_root):
+                self.write({
+                    "targets": [{"target_id": "nas", "provider": "filesystem", "root": str(target_root)}],
+                })
+                with self.assertRaisesRegex(ConfigurationError, "must not overlap the local archive root"):
+                    load_backup_policy(self.config, {"BACKUP_ARCHIVE_DIR": str(local)})
+        self.assertFalse((local / "future").exists(), "validation must not create a missing target")
+
 
 class JournalHookTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -698,6 +721,117 @@ class SchedulerTests(SchedulerTestBase):
         (self._paths.local_dir / record.name).unlink()
         self.assertEqual(scheduler.serialize(record)["state"], "missing")
 
+    def test_runtime_rejects_alias_before_remote_retention_can_share_a_local_copy(self) -> None:
+        local_copy = self._paths.local_dir / "full" / "preserved.tar.zst.enc"
+        local_copy.parent.mkdir(parents=True)
+        local_copy.write_bytes(b"preserved-local-copy")
+        alias = self.root / "local-alias"
+        alias.symlink_to(self._paths.local_dir, target_is_directory=True)
+        target = {**TARGET, "root": str(alias)}
+
+        with self.assertRaisesRegex(ConfigurationError, "must not overlap the local archive root"):
+            self.make({"full": {"enabled": True, "local_keep": 2, "remote_keep": 1}, "targets": [target]})
+
+        self.assertEqual(local_copy.read_bytes(), b"preserved-local-copy")
+        self.assertFalse((self._paths.state_dir / "catalog.sqlite3").exists())
+
+    def test_runtime_rechecks_alias_before_shipping_or_remote_catalogue_insert(self) -> None:
+        physical_remote = self.root / "physical-remote"
+        physical_remote.mkdir()
+        alias = self.root / "mutable-target"
+        alias.symlink_to(physical_remote, target_is_directory=True)
+        scheduler = self.make({
+            "full": {"enabled": True, "local_keep": 2, "remote_keep": 1},
+            "targets": [{**TARGET, "root": str(alias)}],
+        })
+
+        alias.unlink()
+        alias.symlink_to(self._paths.local_dir, target_is_directory=True)
+        local_record = scheduler.run_now("full")
+        self.assertIsNotNone(local_record)
+        assert local_record is not None
+
+        self.assertEqual([record.location for record in scheduler.catalog.list()], ["local"])
+        self.assertTrue((self._paths.local_dir / local_record.name).is_file())
+        status_file = self._paths.status_file
+        self.assertIsNotNone(status_file)
+        assert status_file is not None
+        status = json.loads(status_file.read_text())
+        self.assertFalse(status["targets"]["nas"]["ok"])
+        self.assertIn("must not overlap the local archive root", status["targets"]["nas"]["detail"])
+
+    def test_uninspectable_target_refuses_only_that_target_and_keeps_local_backups(self) -> None:
+        from unittest import mock
+
+        from history_service.backup_archive import settings as archive_settings
+
+        unreadable = self.root / "stale-usb"
+        unreadable.mkdir()
+        real_lstat = os.lstat
+
+        def lstat(path, *args, **kwargs):
+            if Path(path) == unreadable:
+                raise PermissionError(13, "Permission denied")
+            return real_lstat(path, *args, **kwargs)
+
+        with mock.patch.object(archive_settings.os, "lstat", side_effect=lstat):
+            with self.assertLogs("history_service.backup_archive.policy", "WARNING") as logs:
+                scheduler = self.make({
+                    "full": {"enabled": True, "local_keep": 2, "remote_keep": 1},
+                    "targets": [{**TARGET, "root": str(unreadable)}],
+                })
+            self.assertIn("could not be checked for local archive overlap", "\n".join(logs.output))
+            local_record = scheduler.run_now("full")
+
+        self.assertIsNotNone(local_record)
+        assert local_record is not None
+        self.assertTrue((self._paths.local_dir / local_record.name).is_file())
+        self.assertEqual([record.location for record in scheduler.catalog.list()], ["local"])
+        status_file = self._paths.status_file
+        assert status_file is not None
+        status = json.loads(status_file.read_text())
+        self.assertFalse(status["targets"]["nas"]["ok"])
+        self.assertIn("could not be inspected safely", status["targets"]["nas"]["detail"])
+
+    def test_runtime_rechecks_alias_before_remote_retention_deletes_preserved_local_copy(self) -> None:
+        from dataclasses import replace
+
+        from history_service.backup_archive.transport import open_target
+
+        physical_remote = self.root / "physical-remote"
+        physical_remote.mkdir()
+        alias = self.root / "mutable-target"
+        alias.symlink_to(physical_remote, target_is_directory=True)
+        scheduler = self.make({
+            "full": {"enabled": True, "local_keep": 2, "remote_keep": 2},
+            "targets": [{**TARGET, "root": str(alias)}],
+        })
+        first = scheduler.run_now("full")
+        self.assertIsNotNone(first)
+        assert first is not None
+        scheduler.preserve(first.artifact_id, reason="sole known-good copy", actor="admin")
+        self.now += timedelta(hours=1)
+        scheduler.run_now("full")
+        self.assertEqual(len(scheduler.catalog.list(location="nas")), 2)
+
+        scheduler.policy = replace(
+            scheduler.policy,
+            full=scheduler.policy.full.model_copy(update={"remote_keep": 1}),
+        )
+        alias.unlink()
+        alias.symlink_to(self._paths.local_dir, target_is_directory=True)
+        scheduler._open_target = open_target
+        result = scheduler._groom_locked()
+
+        self.assertFalse(result.complete)
+        self.assertIn("must not overlap the local archive root", result.error)
+        self.assertTrue((self._paths.local_dir / first.name).is_file())
+        preserved = scheduler.catalog.get(first.artifact_id)
+        self.assertIsNotNone(preserved)
+        assert preserved is not None
+        self.assertTrue(preserved.preserved)
+        self.assertEqual(len(scheduler.catalog.list(location="nas")), 2)
+
 
 class SchedulerApiTests(SchedulerTestBase):
     def test_internal_routes(self) -> None:
@@ -993,6 +1127,30 @@ class PolicyEditorTests(unittest.TestCase):
         with self.assertRaises(self.editor.PolicyEditError):
             self.save({"revision": view["revision"], "classes": {"config": {"debounce_seconds": 900, "max_delay_seconds": 60}}})
         self.assertEqual(self.config.read_bytes(), before)
+        self.assertEqual(self.journal, [])
+
+    def test_editor_refuses_filesystem_target_overlapping_local_archive(self) -> None:
+        local = self.root / "archive"
+        local.mkdir()
+        view = self.view({"BACKUP_ARCHIVE_DIR": str(local)})
+        before = self.config.read_bytes()
+        target = {
+            "values": {
+                "target_id": "same-files",
+                "label": "Unsafe local target",
+                "provider": "filesystem",
+                "root": str(local / "remote"),
+                "enabled": True,
+            },
+            "secrets": {},
+        }
+        with self.assertRaisesRegex(self.editor.PolicyEditError, "must not overlap the local archive root"):
+            self.save(
+                {"revision": view["revision"], "targets": [target]},
+                {"BACKUP_ARCHIVE_DIR": str(local)},
+            )
+        self.assertEqual(self.config.read_bytes(), before)
+        self.assertFalse((local / "remote").exists())
         self.assertEqual(self.journal, [])
 
     def test_stale_revision_is_a_conflict(self) -> None:

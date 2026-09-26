@@ -38,8 +38,9 @@ value.
 from __future__ import annotations
 
 import json
+import logging
 import os
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
@@ -50,10 +51,18 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from app.config_errors import ConfigurationError, describe_validation_error
 from history_service.backup_archive.cron import CronError, CronSchedule
-from history_service.backup_archive.settings import ArchiveConfigError, ArchiveTargetSettings
+from history_service.backup_archive.settings import (
+    ArchiveConfigError,
+    ArchiveRootUnavailableError,
+    ArchiveTargetSettings,
+    filesystem_roots_overlap,
+)
+
+logger = logging.getLogger(__name__)
 
 TRUE_VALUES = {"1", "true", "yes", "on"}
 FALSE_VALUES = {"0", "false", "no", "off"}
+DEFAULT_LOCAL_ARCHIVE_ROOT = "/app/backups/archive"
 
 # Environment variable -> (class, field). Values are parsed by the model.
 ENV_POLICY_OVERRIDES: dict[str, tuple[str, str]] = {
@@ -169,6 +178,52 @@ class BackupPolicy:
         return None if days is None else timedelta(days=days)
 
 
+def local_archive_root_from_environment(environ: Mapping[str, str]) -> str:
+    return str(environ.get("BACKUP_ARCHIVE_DIR") or "").strip() or DEFAULT_LOCAL_ARCHIVE_ROOT
+
+
+def validate_filesystem_target_roots(
+    targets: Iterable[ArchiveTarget],
+    local_archive_root: str | os.PathLike[str],
+    *,
+    allow_unavailable: bool = False,
+) -> None:
+    """Fail closed when a filesystem target aliases or overlaps local storage.
+
+    With ``allow_unavailable`` (startup and config saves), a root that cannot
+    be inspected right now is logged and skipped. A proven overlap is still an
+    error. The check before every target operation passes ``False``, so an
+    uninspectable target is refused there instead of stopping every backup.
+    """
+
+    problems: list[str] = []
+    for target in targets:
+        if target.settings.provider != "filesystem":
+            continue
+        try:
+            overlaps = filesystem_roots_overlap(local_archive_root, target.settings.root)
+        except ArchiveRootUnavailableError as exc:
+            if allow_unavailable:
+                logger.warning(
+                    "Filesystem archive target %r could not be checked for local archive overlap (%s); "
+                    "it will be refused until the check succeeds.",
+                    target.target_id,
+                    exc,
+                )
+                continue
+            problems.append(f"Filesystem archive target {target.target_id!r}: {exc}")
+            continue
+        except ArchiveConfigError as exc:
+            problems.append(f"Filesystem archive target {target.target_id!r}: {exc}")
+            continue
+        if overlaps:
+            problems.append(
+                f"Filesystem archive target {target.target_id!r} must not overlap the local archive root."
+            )
+    if problems:
+        raise ConfigurationError(problems)
+
+
 def config_backups_enabled_from_environment(yaml_backups: Mapping[str, Any] | None = None) -> bool:
     """Cheap check used by the journal hooks: env wins, then ``backups.config.enabled``."""
 
@@ -261,7 +316,11 @@ def policy_from_section(
         problems = describe_validation_error(exc, resolve_location=resolve, default_source=path)
         raise ConfigurationError(problems) from None
     targets = _parse_targets(parsed.targets, targets_source)
-    return BackupPolicy(config=parsed.config, full=parsed.full, targets=targets)
+    policy = BackupPolicy(config=parsed.config, full=parsed.full, targets=targets)
+    validate_filesystem_target_roots(
+        targets, local_archive_root_from_environment(env), allow_unavailable=True
+    )
+    return policy
 
 
 def _parse_targets(items: list[Any], source: str) -> tuple[ArchiveTarget, ...]:
@@ -302,6 +361,7 @@ def _parse_targets(items: list[Any], source: str) -> tuple[ArchiveTarget, ...]:
 
 
 __all__ = [
+    "DEFAULT_LOCAL_ARCHIVE_ROOT",
     "ENV_POLICY_OVERRIDES",
     "TARGETS_ENV",
     "ArchiveTarget",
@@ -310,5 +370,7 @@ __all__ = [
     "FullClassPolicy",
     "config_backups_enabled_from_environment",
     "load_backup_policy",
+    "local_archive_root_from_environment",
     "policy_from_section",
+    "validate_filesystem_target_roots",
 ]

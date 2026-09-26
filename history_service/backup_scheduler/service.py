@@ -54,7 +54,11 @@ from history_service.backup_archive.lifecycle import (
     RetentionRule,
     local_target_resolver,
 )
-from history_service.backup_archive.policy import BackupPolicy
+from history_service.backup_archive.policy import (
+    ArchiveTarget,
+    BackupPolicy,
+    validate_filesystem_target_roots,
+)
 from history_service.backup_archive.transport import open_target, transport_encrypted
 from history_service.scheduled_backup import ScheduledBackupRunner
 
@@ -148,18 +152,25 @@ class BackupScheduler:
         config_groups: list[str],
         full_groups: list[str],
         snapshot_config: Callable[[], Mapping[str, Any]],
-        open_target_fn: Callable[[Any], Any] = open_target,
+        open_target_fn: Callable[..., Any] = open_target,
         runner_factory: Callable[..., Any] = ScheduledBackupRunner,
         clock: Callable[[], datetime] = _utcnow,
         monotonic: Callable[[], float] = time.monotonic,
         local_tz: Any = None,
     ) -> None:
+        # Policy loading normally performs this check, but the scheduler is the
+        # final authority because its local root may be injected directly and
+        # filesystem aliases may have changed since the config was parsed. A
+        # target that cannot be inspected right now must not stop local
+        # backups; the per-operation check below refuses it until it can.
+        validate_filesystem_target_roots(policy.targets, paths.local_dir, allow_unavailable=True)
         self.policy = policy
         self.backup_service = backup_service
         self.paths = paths
         self.app_gid = int(app_gid)
         self.groups = {"config": list(config_groups), "full": list(full_groups)}
         self._open_target = open_target_fn
+        self._open_target_is_default = open_target_fn is open_target
         self._runner_factory = runner_factory
         self._clock = clock
         self._monotonic = monotonic
@@ -680,13 +691,27 @@ class BackupScheduler:
 
     # -- shipping ----------------------------------------------------------------------
 
+    @contextlib.contextmanager
+    def _open_configured_target(self, target: ArchiveTarget) -> Iterator[Any]:
+        # Recheck immediately before every operation. This catches a symlink or
+        # bind-visible alias introduced after startup, before copy or retention
+        # receives a second catalog identity for local bytes.
+        validate_filesystem_target_roots((target,), self.paths.local_dir)
+        opened = (
+            self._open_target(target.settings, local_archive_root=self.paths.local_dir)
+            if self._open_target_is_default
+            else self._open_target(target.settings)
+        )
+        with opened as remote:
+            yield remote
+
     def _ship(self, record: ArtifactRecord) -> list[str]:
         failures: list[str] = []
         local_path = self._local_path(record)
         for target in self.policy.enabled_targets():
             at = _iso(self._clock()) or ""
             try:
-                with self._open_target(target.settings) as remote:
+                with self._open_configured_target(target) as remote:
                     stored = remote.put(local_path, record.name)
                 if stored.size != record.size or stored.sha256 != record.sha256:
                     raise RuntimeError("remote copy does not match the local archive")
@@ -745,7 +770,7 @@ class BackupScheduler:
                     target = self.policy.target(location)
                     if target is None:
                         raise LookupError(f"No archive target is configured for location {location!r}.")
-                    opened[location] = stack.enter_context(self._open_target(target.settings))
+                    opened[location] = stack.enter_context(self._open_configured_target(target))
                 return opened[location]
 
             yield local_target_resolver(self.paths.local_dir, remote)
@@ -956,7 +981,7 @@ class BackupScheduler:
         workspace = Path(tempfile.mkdtemp(prefix="backup-fetch-", dir=self.paths.state_dir))
         try:
             local = workspace / "archive"
-            with self._open_target(target.settings) as remote:
+            with self._open_configured_target(target) as remote:
                 size, digest = remote.get(record.name, local)
             # Never hand out bytes the catalogue did not record: a target (or an
             # on-path attacker for plain FTP/NFS) could substitute another backup.
@@ -1003,7 +1028,7 @@ class BackupScheduler:
         if target is None:
             raise ArtifactNotFoundError("Target not found.")
         try:
-            with self._open_target(target.settings) as remote:
+            with self._open_configured_target(target) as remote:
                 return remote.test()
         except Exception as exc:  # noqa: BLE001 - connection failures are results, not errors
             return {

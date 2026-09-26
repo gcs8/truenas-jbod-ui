@@ -53,6 +53,13 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - docker-compose.nonroot.yml: Keep this overlay for hardened deployments.
   Image-only upgrades now preserve existing Compose files and wait for healthy
   containers; optional backup defaults match the selected ownership setup. (#426)
+- Backup policy: a `filesystem` target whose root is the local backup archive,
+  inside it, or contains it (directly, through a symlink or through a bind
+  mount of the same directory) is now a configuration error. The backup
+  scheduler will not start and the admin policy editor will not save it. Point
+  the target at a separate directory or disk before upgrading. With a
+  filesystem target, `BACKUP_ARCHIVE_DIR` must also be an absolute path.
+  (#633, #651)
 
 ### Security
 
@@ -128,10 +135,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   readback, while a separate explicit `7z` round trip preserves backward-format
   coverage and records source/candidate provenance. (#643)
 - The main UI applies edits to config.yaml, runtime-overrides.yaml and
-  profiles.yaml (admin saves and hand edits) within a few seconds, without a
-  restart. An invalid edit keeps the old settings with a warning in the log,
-  `/healthz` and the page. Only public origin, debug, start-up warm-up,
-  release check, perf and paths still need a restart; admin
+  profiles.yaml (admin saves and hand edits) when it next handles a non-static
+  page or API request, without a restart. An invalid edit keeps the old settings
+  with a warning in the log, `/healthz` and the page. Only public origin, debug,
+  start-up warm-up, release check, perf and paths still need a restart; admin
   offers Restart main UI now for those. (#614)
 - In network mode, the one-time notice after an update now says that anyone
   who can reach the port can change bay assignments and lights, on every
@@ -252,11 +259,26 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- A `filesystem` backup target can no longer share a directory with the local
+  backup archive. Before, the catalog could record one file as both a local and
+  a remote copy, and remote retention could then delete a copy that local
+  retention or a preserve still kept. Overlap is checked when the policy loads,
+  when the editor saves, and again before every copy, restore fetch, test and
+  retention pass, so a symlink or a bind mount of the same directory added
+  later is also caught. A target whose path cannot be inspected at startup
+  (for example a stale mount or a permission error) is skipped with a warning
+  rather than stopping local backups. (#633, #651)
 - Replaced duplicate history-sidecar snapshots gradually with the backup
   scheduler's catalog-verified local FULL archives. The two sets retain at least
   14 copies during cutover, stale verification receipts are cleared on restart,
   custom history backup paths are shared by both services, and preserved
   archives plus unrelated/newer files remain untouched. (#628)
+- Kept config reloads generation-consistent: old snapshot exports cannot refill a
+  newer cache, pending restart-only profile paths do not supply live profiles
+  (and a new profile file that would fail the next start is rejected),
+  temporary `config.yaml` deletion retains the last valid settings, and a disk
+  sync in flight remains visible after reload. Admin and docs now describe the
+  request-triggered timing instead of promising an autonomous delay. (#634, #652)
 - History collection now pauses when SQLite reports the database damaged
   while the service is running, instead of retrying writes every pass. The
   pause survives restarts, shows on the dashboard and as `degraded` in
@@ -642,17 +664,23 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   of `.env.example`, checks `/livez` and `/healthz`, and checks that the
   container is not restarting (#602).
 
+- Corrected the image-upgrade smoke evidence: v0.22.2 and the candidate have
+  the same history schema, so CI now reports compatibility with no schema
+  transition. The interrupted case reports idempotent startup interruption,
+  while keeping its image, health, restart, state and integrity checks.
+  (#637, #647)
 - CI now also upgrades a hardened v0.22.2 install (base Compose plus
   `docker-compose.nonroot.yml`) by image pin only and rolls it back, and kills
-  the new history container inside each startup migration step on v0.22.2
-  data before a normal start that must finish cleanly with no data lost (#613).
+  the new history container inside each startup schema-initialization step on
+  v0.22.2 data before a normal start that must finish cleanly with no data
+  lost (#613).
 - CI now creates a real segmented catalog with v0.22.2, then requires its exact
   generation, catalog bytes and referenced segment bytes to survive an
   image-only upgrade, successor writes and rollback to v0.22.2 (#632).
 - CI now upgrades the public v0.22.2 image to each pull request's build by
   changing only `JBOD_UI_IMAGE` on root-owned mounts, checks that the
-  containers are healthy, that mappings and history survive and that the
-  schema migrated, then rolls back by pin (#590).
+  containers are healthy and that mappings, history and schema compatibility
+  survive, then rolls back by pin (#590).
 
 - Added the backup archive transport library for the history sidecar: remote
   targets for a local directory, FTP/FTPS, SFTP (host key checked against
