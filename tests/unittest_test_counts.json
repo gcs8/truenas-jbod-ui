@@ -50,7 +50,7 @@
     "test_history_service": 277,
     "test_image_upgrade_contract": 41,
     "test_immutable_deployment": 20,
-    "test_inventory": 350,
+    "test_inventory": 352,
     "test_inventory_registry_routes": 14,
     "test_jbod_runner_trial": 15,
     "test_logging_config": 16,
