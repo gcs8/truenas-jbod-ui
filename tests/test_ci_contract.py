@@ -16,6 +16,7 @@ WORKFLOW_DIR = ROOT / ".github" / "workflows"
 CI_WORKFLOW = WORKFLOW_DIR / "ci.yml"
 PUBLISH_GHCR_WORKFLOW = WORKFLOW_DIR / "publish-ghcr.yml"
 PUBLISH_PUBLIC_DEMO_WORKFLOW = WORKFLOW_DIR / "publish-public-demo.yml"
+PUBLIC_DOCS_LINKS_WORKFLOW = WORKFLOW_DIR / "public-docs-links.yml"
 CAPTURE_SCREENSHOTS_WORKFLOW = WORKFLOW_DIR / "capture-public-demo-screenshots.yml"
 RELEASE_CHECKLIST = ROOT / "docs" / "RELEASE_CHECKLIST.md"
 PUBLIC_DEMO_SPEC = ROOT / "qa" / "public-demo.spec.js"
@@ -220,8 +221,9 @@ class CIWorkflowContractTests(unittest.TestCase):
         # gate job's checkout, Python setup, shard-result download and coverage
         # upload, the GHCR release workflow's Python setup for the
         # public-demo release gate, and the image-upgrade smoke's and the
-        # upgrade-scenario job's checkouts.
-        self.assertEqual(action_count, 42)
+        # upgrade-scenario job's checkouts, and the pull-request docs
+        # external-link workflow's checkout and Python setup.
+        self.assertEqual(action_count, 44)
         self.assertEqual(unpinned, [])
         self.assertEqual(uncommented, [])
 
@@ -618,6 +620,21 @@ class CIWorkflowContractTests(unittest.TestCase):
             'fixture.requests.every((request) => request.startsWith("/truenas-jbod-ui/"))',
             spec,
         )
+
+    def test_pull_requests_that_change_public_docs_keep_the_external_link_check(self) -> None:
+        # The publish workflow no longer runs on pull_request, so this workflow
+        # is the only online link check a README or Wiki change gets before merge.
+        workflow = yaml.safe_load(self.read(PUBLIC_DOCS_LINKS_WORKFLOW))
+        triggers = workflow.get("on", workflow.get(True, {}))
+        self.assertEqual(triggers["pull_request"]["branches"], ["main"])
+        paths = triggers["pull_request"]["paths"]
+        for path in ("README.md", "wiki/**", "scripts/check_public_docs.py"):
+            self.assertIn(path, paths)
+        commands = "\n".join(
+            str(step.get("run", "")) for step in workflow["jobs"]["external-links"]["steps"]
+        )
+        self.assertIn("python scripts/check_public_docs.py --check-external", commands)
+        self.assertEqual(workflow["permissions"], {"contents": "read"})
 
     def test_public_docs_screenshots_and_deployment_readback_are_release_gates(self) -> None:
         ci = self.read(CI_WORKFLOW)
