@@ -628,7 +628,12 @@ class CIWorkflowContractTests(unittest.TestCase):
         triggers = workflow.get("on", workflow.get(True, {}))
         self.assertEqual(triggers["pull_request"]["branches"], ["main"])
         paths = triggers["pull_request"]["paths"]
-        for path in ("README.md", "wiki/**", "scripts/check_public_docs.py"):
+        for path in (
+            ".github/workflows/public-docs-links.yml",
+            "README.md",
+            "wiki/**",
+            "scripts/check_public_docs.py",
+        ):
             self.assertIn(path, paths)
         commands = "\n".join(
             str(step.get("run", "")) for step in workflow["jobs"]["external-links"]["steps"]
