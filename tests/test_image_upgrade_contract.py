@@ -493,20 +493,27 @@ class ImageOnlyUpgradeSmokeContractTests(unittest.TestCase):
         smoke = self.load_smoke()
         lookup = smoke.READ_HISTORY.split("current_schema = ", 1)[1].split("\nprint(", 1)[0]
 
-        def released_constants(tag: str) -> SimpleNamespace:
-            source = subprocess.run(
-                ["git", "show", f"{tag}:history_service/store.py"],
-                capture_output=True, text=True, check=True, cwd=self.ROOT,
-            ).stdout
+        # The schema-version constants v0.22.2's history_service/store.py
+        # defines. Pinned so shallow and --no-tags checkouts can run this test;
+        # cross-checked against the tag whenever the checkout has it.
+        v0222_schema_constants = {"DISK_IDENTITY_BACKFILL_USER_VERSION": 1}
+
+        tagged = subprocess.run(
+            ["git", "show", "v0.22.2:history_service/store.py"],
+            capture_output=True, text=True, check=False, cwd=self.ROOT,
+        )
+        if tagged.returncode == 0:
             names = {}
-            for node in ast.parse(source).body:
+            for node in ast.parse(tagged.stdout).body:
                 if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
                     for target in node.targets:
                         if isinstance(target, ast.Name) and target.id.isupper():
                             names[target.id] = node.value.value
-            return SimpleNamespace(**names)
+            self.assertNotIn("CURRENT_SCHEMA_VERSION", names)
+            for name, value in v0222_schema_constants.items():
+                self.assertEqual(names.get(name), value, name)
 
-        released = released_constants("v0.22.2")
+        released = SimpleNamespace(**v0222_schema_constants)
         self.assertFalse(hasattr(released, "CURRENT_SCHEMA_VERSION"))
         self.assertEqual(eval(lookup, {"store_module": released}), 1)
         self.assertEqual(eval(lookup, {"store_module": current_store}),
