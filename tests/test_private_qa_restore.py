@@ -7,6 +7,7 @@ import json
 import re
 import socket
 import stat
+import sys
 import tempfile
 import threading
 import unittest
@@ -955,12 +956,14 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
 
     def test_browser_uses_private_file_credentials_and_private_artifact_mode(self) -> None:
         observed_env: dict[str, str] = {}
+        observed_umasks: list[object] = []
         with tempfile.TemporaryDirectory() as raw_root:
             raw_dir = Path(raw_root)
 
             def record_run(command, **kwargs):
                 if command[:3] == ["npx", "playwright", "test"]:
                     observed_env.update(kwargs["env"])
+                    observed_umasks.append(kwargs.get("umask"))
 
             with patch.object(self.module, "_run", side_effect=record_run):
                 self.module._run_browser_and_perf(
@@ -982,10 +985,25 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
         self.assertIn("PLAYWRIGHT_HTTP_USERNAME_FILE", observed_env)
         self.assertIn("PLAYWRIGHT_HTTP_PASSWORD_FILE", observed_env)
         self.assertIn("PLAYWRIGHT_PRIVATE_OUTPUT_DIR", observed_env)
+        # Playwright recreates the output folder, so it must run with a private umask.
+        self.assertEqual(observed_umasks, [0o077])
         config = PLAYWRIGHT_CONFIG.read_text(encoding="utf-8")
         self.assertIn("PLAYWRIGHT_PRIVATE_OUTPUT_DIR", config)
         self.assertIn("PLAYWRIGHT_HTTP_USERNAME_FILE", config)
         self.assertIn("PLAYWRIGHT_HTTP_PASSWORD_FILE", config)
+
+    def test_run_applies_the_requested_umask_to_the_child(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            raw_dir = Path(raw_root)
+            target = raw_dir / "made-by-child"
+            self.module._run(
+                [sys.executable, "-c", f"import os; os.mkdir({str(target)!r})"],
+                cwd=raw_dir,
+                log_path=raw_dir / "logs" / "child.log",
+                timeout=60,
+                umask=0o077,
+            )
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode) & 0o077, 0)
 
     def test_private_runtime_root_removal_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:

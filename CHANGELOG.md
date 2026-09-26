@@ -268,7 +268,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   when segmented history is configured but no catalog exists yet, as on a fresh
   install before a migration or restore; it reports `degraded` with the reason.
   The private restore drill gains `--segmented-history` and checks it against
-  the backup before import. (#663)
+  the backup before import, and runs Playwright with a private umask so its
+  recreated output folder passes the config's private-folder check. (#663)
 - Backup inspect, import and export in the admin service work again when
   `.env` doesn't set the `RELEASE_CHECK_*` keys. Compose passes unset keys as
   empty values, and the history settings loader rejected them ("must be true

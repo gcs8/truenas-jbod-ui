@@ -28,6 +28,10 @@ import yaml
 # The documented segmented-history catalog location (.env.example).
 SEGMENT_CATALOG_PATH = "/app/history/segments/catalog.json"
 SEGMENTED_BACKUP_SCHEMA_VERSION = 2
+# Playwright deletes and recreates its output folder at the start of a run, so
+# the folder gets the process umask. playwright.config.js refuses a private
+# output folder that is group- or world-accessible.
+PLAYWRIGHT_UMASK = 0o077
 APP_UID = 10001
 APP_GID = 10001
 APP_CONTAINER_NAMES = (
@@ -758,6 +762,7 @@ def _run(
     log_path: Path,
     timeout: int,
     env: dict[str, str] | None = None,
+    umask: int = -1,
 ) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     log_path.parent.chmod(0o700)
@@ -771,6 +776,7 @@ def _run(
             stderr=subprocess.STDOUT,
             timeout=timeout,
             check=False,
+            umask=umask,
         )
     if result.returncode != 0:
         raise QaRestoreError(f"command failed with exit code {result.returncode}")
@@ -1452,6 +1458,7 @@ def _run_browser_and_perf(
             log_path=raw_dir / "browser-offline.log",
             timeout=900,
             env=env,
+            umask=PLAYWRIGHT_UMASK,
         )
         _run(
             [
@@ -1485,6 +1492,7 @@ def _run_browser_and_perf(
                 log_path=raw_dir / "browser-live-read-only.log",
                 timeout=1800,
                 env=env,
+                umask=PLAYWRIGHT_UMASK,
             )
             _run(
                 [
