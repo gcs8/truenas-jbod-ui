@@ -39,6 +39,7 @@ INSPECTION_FIELDS = {
     "ok",
     "schema_version",
     "app_version",
+    "app_version_note",
     "exported_at",
     "encrypted",
     "encryption_mode",
@@ -177,6 +178,9 @@ def validate_inspection_payload(payload: object) -> dict[str, Any]:
         )
     if payload.get("ok") is not True:
         raise QaRestoreError("backup inspection did not report success")
+    note = payload.get("app_version_note")
+    if note is not None and (not isinstance(note, str) or len(note) > 512):
+        raise QaRestoreError("inspection app version note must be short text or null")
     if payload.get("encrypted") is not True:
         raise QaRestoreError("private QA requires an encrypted FULL backup")
     if payload.get("encryption_mode") != "encrypted":

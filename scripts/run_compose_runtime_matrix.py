@@ -875,11 +875,13 @@ def _verify_mapping_cycle(
     )
     system_id = inventory.get("selected_system_id")
     enclosure_id = inventory.get("selected_enclosure_id")
+    # The CI smoke fixture points at an unreachable source, so discovery finds no
+    # enclosure and the UI selects none. Mapping then uses the system scope alone,
+    # which the mapping routes accept. A present enclosure ID must still be valid.
     if (
         not isinstance(system_id, str)
         or not system_id
-        or not isinstance(enclosure_id, str)
-        or not enclosure_id
+        or (enclosure_id is not None and (not isinstance(enclosure_id, str) or not enclosure_id))
     ):
         raise RuntimeError("physical mapping scope is unavailable")
     inventory_slots = inventory.get("slots")
@@ -898,9 +900,10 @@ def _verify_mapping_cycle(
     )
     if not isinstance(save_revision, str) or len(save_revision) != 64:
         raise RuntimeError("slot save revision is unavailable")
-    scope_query = urllib.parse.urlencode(
-        (("system_id", system_id), ("enclosure_id", enclosure_id))
-    )
+    scope = [("system_id", system_id)]
+    if enclosure_id is not None:
+        scope.append(("enclosure_id", enclosure_id))
+    scope_query = urllib.parse.urlencode(scope)
     export_url = f"{base}/api/mappings/export?{scope_query}"
     initial = json.loads(_require_status(export_url, 200, authenticated=True))
     initial_revision = initial.get("revision")

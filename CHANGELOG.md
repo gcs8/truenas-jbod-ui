@@ -666,6 +666,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Internal
 
+- The release QA scripts run end to end again. The Compose runtime matrix
+  maps a slot with the system scope alone when the smoke fixture's unreachable
+  source yields no enclosure, instead of stopping with "physical mapping scope
+  is unavailable". The private restore drill accepts the `app_version_note`
+  field that backup inspection now returns. (#662)
 - The release runtime matrix (`scripts/run_compose_runtime_matrix.py`)
   expects files written by the UI to be owned by root, matching the default
   `docker-compose.yml` since #399, instead of the non-root identity that only
