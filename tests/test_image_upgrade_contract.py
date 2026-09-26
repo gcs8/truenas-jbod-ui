@@ -460,6 +460,102 @@ class ImageOnlyUpgradeSmokeContractTests(unittest.TestCase):
             with self.subTest(script=name):
                 compile(script, name, "exec")
 
+    def test_schema_evidence_reports_equal_versions_as_compatibility_not_a_transition(self):
+        smoke = self.load_smoke()
+        predecessor = {"user_version": 1, "current_schema": 1}
+        candidate = {"user_version": 1, "current_schema": 1}
+
+        evidence = smoke.schema_evidence(predecessor, candidate)
+
+        self.assertEqual(
+            evidence,
+            {"compatibility": "ok", "before": "1", "after": "1", "transition": "none"},
+        )
+        self.assertEqual(
+            smoke.schema_evidence(predecessor, {"user_version": 2, "current_schema": 2}),
+            {"compatibility": "ok", "before": "1", "after": "2", "transition": "1->2"},
+        )
+        with self.assertRaisesRegex(smoke.SmokeError, "predecessor schema is not current"):
+            smoke.schema_evidence({"user_version": 0, "current_schema": 1}, candidate)
+        with self.assertRaisesRegex(smoke.SmokeError, "candidate schema is not current"):
+            smoke.schema_evidence(predecessor, {"user_version": 0, "current_schema": 1})
+
+    def test_read_history_resolves_the_predecessor_schema_from_the_released_store(self):
+        # READ_HISTORY runs inside the v0.22.2 image, whose store predates
+        # CURRENT_SCHEMA_VERSION. Evaluate the probe's own lookup against the
+        # constants that release actually defines.
+        import ast
+        import subprocess
+        from types import SimpleNamespace
+
+        import history_service.store as current_store
+
+        smoke = self.load_smoke()
+        lookup = smoke.READ_HISTORY.split("current_schema = ", 1)[1].split("\nprint(", 1)[0]
+
+        # The schema-version constants v0.22.2's history_service/store.py
+        # defines. Pinned so shallow and --no-tags checkouts can run this test;
+        # cross-checked against the tag whenever the checkout has it.
+        v0222_schema_constants = {"DISK_IDENTITY_BACKFILL_USER_VERSION": 1}
+
+        tagged = subprocess.run(
+            ["git", "show", "v0.22.2:history_service/store.py"],
+            capture_output=True, text=True, check=False, cwd=self.ROOT,
+        )
+        if tagged.returncode == 0:
+            names = {}
+            for node in ast.parse(tagged.stdout).body:
+                if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
+                    for target in node.targets:
+                        if isinstance(target, ast.Name) and target.id.isupper():
+                            names[target.id] = node.value.value
+            self.assertNotIn("CURRENT_SCHEMA_VERSION", names)
+            for name, value in v0222_schema_constants.items():
+                self.assertEqual(names.get(name), value, name)
+
+        released = SimpleNamespace(**v0222_schema_constants)
+        self.assertFalse(hasattr(released, "CURRENT_SCHEMA_VERSION"))
+        self.assertEqual(eval(lookup, {"store_module": released}), 1)
+        self.assertEqual(eval(lookup, {"store_module": current_store}),
+                         current_store.CURRENT_SCHEMA_VERSION)
+        self.assertEqual(eval(lookup, {"store_module": SimpleNamespace()}), None)
+
+        predecessor = {"user_version": 1, "current_schema": eval(lookup, {"store_module": released})}
+        candidate = {"user_version": 1, "current_schema": current_store.CURRENT_SCHEMA_VERSION}
+        self.assertEqual(smoke.schema_evidence(predecessor, candidate)["transition"], "none")
+
+    def test_upgrade_evidence_and_docs_do_not_claim_an_equal_schema_was_migrated(self):
+        from history_service.store import SCHEMA
+
+        released_schema = (
+            self.ROOT / "tests" / "fixtures" / "history_released_schemas" / "v0.22.2.sql"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(SCHEMA, released_schema, "update the evidence when the candidate schema changes")
+        source = (self.ROOT / "scripts" / "run_image_upgrade_smoke.py").read_text(encoding="utf-8")
+        upgrade = source.split("def upgrade_and_rollback", 1)[1].split("\ndef ", 1)[0]
+        interrupted = source.split("def interrupted_migration", 1)[1].split("\ndef ", 1)[0]
+        guide = (self.ROOT / "wiki" / "Upgrading.md").read_text(encoding="utf-8")
+        matrix = guide.split("## What is tested", 1)[1].split("\n## ", 1)[0]
+        scripts_guide = (self.ROOT / "scripts" / "README.md").read_text(encoding="utf-8")
+        changelog = (self.ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+
+        for text in (upgrade, interrupted, matrix, scripts_guide):
+            self.assertNotIn("schema migrated", text)
+            self.assertNotIn("finish the migration", text)
+        self.assertIn("schema_compatibility=ok", upgrade)
+        self.assertIn("schema_before={schema['before']}", upgrade)
+        self.assertIn("schema_after={schema['after']}", upgrade)
+        self.assertIn("schema_transition={schema['transition']}", upgrade)
+        self.assertIn("schema_compatibility=ok", interrupted)
+        self.assertIn("schema_before={schema['before']}", interrupted)
+        self.assertIn("schema_after={schema['after']}", interrupted)
+        self.assertIn("schema_transition={schema['transition']}", interrupted)
+        self.assertIn("does not exercise a schema transition", matrix)
+        self.assertRegex(
+            changelog.split("## Unreleased", 1)[1].split("\n## ", 1)[0],
+            r"\(#637(?:, #\d+)*\)",
+        )
+
 
 class UpgradeScenarioContractTests(unittest.TestCase):
     """#399/#463: hardened, interrupted-migration and segmented-catalog upgrades."""
