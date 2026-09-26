@@ -934,6 +934,10 @@ class CIRunsOncePerPullRequestTests(unittest.TestCase):
             "A branch push whose branch already has an open pull request skips",
             contributing,
         )
+        self.assertIn(
+            "A zero-result lookup receives one 15-second recheck",
+            " ".join(contributing.split()),
+        )
 
     def test_codeql_does_not_run_twice_for_branches_with_pull_requests(self) -> None:
         workflow = yaml.safe_load(self.read(WORKFLOW_DIR / "codeql.yml"))
