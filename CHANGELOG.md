@@ -661,6 +661,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Internal
 
+- The release runtime matrix (`scripts/run_compose_runtime_matrix.py`)
+  expects files written by the UI to be owned by root, matching the default
+  `docker-compose.yml` since #399, instead of the non-root identity that only
+  `docker-compose.nonroot.yml` applies. A contract test ties the expected owner
+  to the Compose `user:` value, and a failure now names the observed and
+  expected owner. (#657, #658)
 - Removed dead code: the legacy `__default__` snapshot key, zero-caller and
   test-only helpers, monkeypatch-only wrappers and the unused "Scrambled IDs"
   label; named three layout magic numbers. (#606)
