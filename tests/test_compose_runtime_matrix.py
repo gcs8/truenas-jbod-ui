@@ -38,6 +38,8 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
                 "services": variant.services,
                 "ui": variant.ui_enabled,
                 "admin_setup": variant.admin_initial_setup,
+                "scheduler": variant.scheduler_enabled,
+                "scheduler_policy": variant.scheduler_policy_enabled,
             }
             for variant in module.VARIANTS
         }
@@ -50,30 +52,56 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
                     "services": ("enclosure-ui",),
                     "ui": True,
                     "admin_setup": False,
+                    "scheduler": False,
+                    "scheduler_policy": False,
                 },
                 "ui-history": {
                     "profiles": ("history",),
                     "services": ("enclosure-ui", "enclosure-history"),
                     "ui": True,
                     "admin_setup": False,
+                    "scheduler": False,
+                    "scheduler_policy": False,
                 },
                 "admin-only": {
                     "profiles": ("admin",),
                     "services": ("enclosure-admin",),
                     "ui": False,
                     "admin_setup": True,
+                    "scheduler": False,
+                    "scheduler_policy": False,
                 },
                 "ui-admin": {
                     "profiles": ("admin",),
                     "services": ("enclosure-ui", "enclosure-admin"),
                     "ui": True,
                     "admin_setup": False,
+                    "scheduler": False,
+                    "scheduler_policy": False,
                 },
                 "ui-history-admin": {
                     "profiles": ("history", "admin"),
                     "services": ("enclosure-ui", "enclosure-history", "enclosure-admin"),
                     "ui": True,
                     "admin_setup": False,
+                    "scheduler": False,
+                    "scheduler_policy": False,
+                },
+                "scheduler-disabled": {
+                    "profiles": ("backup-scheduler",),
+                    "services": ("enclosure-backup-scheduler",),
+                    "ui": False,
+                    "admin_setup": False,
+                    "scheduler": True,
+                    "scheduler_policy": False,
+                },
+                "scheduler-enabled": {
+                    "profiles": ("admin", "backup-scheduler"),
+                    "services": ("enclosure-admin", "enclosure-backup-scheduler"),
+                    "ui": False,
+                    "admin_setup": False,
+                    "scheduler": True,
+                    "scheduler_policy": True,
                 },
             },
         )
@@ -162,12 +190,178 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
         self.assertIn("mapping persistence readback failed", source)
         self.assertIn("mapping clear readback failed", source)
         self.assertIn("admin-only initial setup readback failed", source)
-        self.assertIn(
-            "compose_runtime_matrix=ok variants=5 ui_alias_cycles=4 ui_mapping_cycles=4 admin_setup_cycles=1",
-            source,
+        self.assertEqual(
+            module.SUCCESS_MARKER,
+            "compose_runtime_matrix=ok variants=7 ui_alias_cycles=4 "
+            "ui_mapping_cycles=4 admin_setup_cycles=1 scheduler_disabled_cycles=1 "
+            "scheduler_backup_cycles=1",
         )
         self.assertEqual(sum(variant.ui_enabled for variant in module.VARIANTS), 4)
         self.assertEqual(sum(variant.admin_initial_setup for variant in module.VARIANTS), 1)
+        self.assertEqual(sum(variant.scheduler_enabled for variant in module.VARIANTS), 2)
+        self.assertEqual(sum(variant.scheduler_policy_enabled for variant in module.VARIANTS), 1)
+
+    def test_scheduler_variants_write_disabled_and_enabled_policy_environment(self) -> None:
+        module = self.load_matrix_module()
+        variants = {variant.name: variant for variant in module.VARIANTS}
+        image = "sha256:" + "a" * 64
+        ports = module.Ports(19080, 19081, 19082)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            module._write_environment(
+                root,
+                image,
+                ports,
+                variant=variants["scheduler-disabled"],
+            )
+            disabled = (root / ".env").read_text(encoding="utf-8")
+            module._write_environment(
+                root,
+                image,
+                ports,
+                variant=variants["scheduler-enabled"],
+            )
+            enabled = (root / ".env").read_text(encoding="utf-8")
+
+        self.assertIn("BACKUP_CONFIG_ENABLED=false", disabled)
+        self.assertIn("BACKUP_FULL_ENABLED=false", disabled)
+        self.assertNotIn("BACKUP_ARCHIVE_PASSPHRASE_FILE=", disabled)
+        self.assertIn("BACKUP_CONFIG_ENABLED=true", enabled)
+        self.assertIn("BACKUP_FULL_ENABLED=false", enabled)
+        self.assertIn(
+            "BACKUP_ARCHIVE_PASSPHRASE_FILE=/run/backup-secrets/archive-passphrase",
+            enabled,
+        )
+
+    def test_disabled_scheduler_serves_socket_health_with_both_classes_off(self) -> None:
+        module = self.load_matrix_module()
+        prefix = ("docker", "compose", "--project-name", "matrix")
+        library = {
+            "available": True,
+            "running": None,
+            "classes": {
+                "config": {"enabled": False},
+                "full": {"enabled": False},
+            },
+            "artifacts": [],
+        }
+        with patch.object(
+            module,
+            "_scheduler_request",
+            side_effect=[
+                {"status": 200, "payload": {"status": "ok"}},
+                {"status": 200, "payload": library},
+            ],
+        ) as request:
+            module._verify_scheduler_disabled(prefix)
+
+        self.assertEqual(
+            request.call_args_list,
+            [
+                call(prefix, "GET", "/internal/healthz"),
+                call(prefix, "GET", "/internal/backups"),
+            ],
+        )
+
+    def test_enabled_scheduler_runs_verifies_restarts_and_reads_back_one_backup(self) -> None:
+        module = self.load_matrix_module()
+        prefix = ("docker", "compose", "--project-name", "matrix")
+        ports = module.Ports(19080, 19081, 19082)
+        initial = {
+            "available": True,
+            "running": None,
+            "classes": {
+                "config": {"enabled": True, "last_run": None},
+                "full": {"enabled": False},
+            },
+            "artifacts": [],
+        }
+        running = {**initial, "running": {"backup_class": "config"}}
+        artifact = {
+            "id": "synthetic-config-backup",
+            "backup_class": "config",
+            "location": "local",
+            "size": 123,
+            "verified": True,
+            "restorable": True,
+            "state": "ok",
+        }
+        completed = {
+            **initial,
+            "classes": {
+                "config": {"enabled": True, "last_run": {"ok": True}},
+                "full": {"enabled": False},
+            },
+            "artifacts": [artifact],
+        }
+        with (
+            patch.object(
+                module,
+                "_scheduler_request",
+                side_effect=[
+                    {"status": 200, "payload": {"status": "ok"}},
+                    {"status": 200, "payload": {"status": "ok"}},
+                ],
+            ) as scheduler_request,
+            patch.object(
+                module,
+                "_require_status",
+                side_effect=[
+                    json.dumps(initial).encode(),
+                    b'{"ok":true,"backup_class":"config","state":"started"}',
+                    json.dumps(running).encode(),
+                    json.dumps(completed).encode(),
+                    b'{"ok":true}',
+                    json.dumps(completed).encode(),
+                ],
+            ) as require_status,
+            patch.object(module, "_run") as run,
+            patch.object(module.time, "sleep"),
+        ):
+            module._verify_scheduler_enabled(ports, prefix)
+
+        self.assertEqual(scheduler_request.call_count, 2)
+        self.assertEqual(
+            run.call_args_list,
+            [
+                call((*prefix, "restart", "enclosure-backup-scheduler")),
+                call(
+                    (
+                        *prefix,
+                        "up",
+                        "-d",
+                        "--no-deps",
+                        "--wait",
+                        "--wait-timeout",
+                        "90",
+                        "enclosure-backup-scheduler",
+                    )
+                ),
+            ],
+        )
+        self.assertEqual(require_status.call_count, 6)
+        self.assertEqual(
+            require_status.call_args_list[1],
+            call(
+                "http://127.0.0.1:19082/api/admin/backups/run",
+                202,
+                method="POST",
+                payload={"backup_class": "config"},
+                authenticated=True,
+                origin="http://127.0.0.1:19082",
+            ),
+        )
+        self.assertEqual(
+            require_status.call_args_list[4],
+            call(
+                "http://127.0.0.1:19082/api/admin/backups/synthetic-config-backup/verify",
+                200,
+                method="POST",
+                authenticated=True,
+                origin="http://127.0.0.1:19082",
+            ),
+        )
 
     def test_matrix_stays_off_hosted_ci(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")

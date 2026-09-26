@@ -1,7 +1,8 @@
 # Architecture and services
 
 The app runs on your Docker host and connects from there to each storage host.
-It has one required service and two optional sidecars.
+It has one required HTTP service, two optional HTTP sidecars, and two opt-in
+backup workers.
 
 ## Service map
 
@@ -11,11 +12,18 @@ flowchart LR
     UI["Main UI :8080\nread-oriented enclosure view"]
     History["History :8081\noptional samples and events"]
     Admin["Admin :8082\noptional setup and maintenance"]
+    Backup["One-shot backup\nbackup profile, no network"]
+    Scheduler["Backup scheduler\nbackup-scheduler profile"]
+    Socket["./backup-api\nUnix socket"]
     Config["./config\nsystems, profiles, SSH material"]
     Data["./data\nmappings and caches"]
     HistDB["./history\nSQLite history database"]
+    Archives["./backups\nencrypted archives and catalogue"]
+    Journal["./backup-journal\nconfig-change journal"]
+    Status["./backup-status\nsecret-free status"]
     Logs["./logs\nlocal logs"]
     Hosts["Storage hosts\nTrueNAS, Quantastor, ESXi, Linux, UniFi, BMC"]
+    Targets["Remote backup targets\nSFTP, SMB, S3, FTP, filesystem, NFS overlay"]
     GHCR["GHCR image\nghcr.io/gcs8/truenas-jbod-ui"]
     Pages["GitHub Pages demo\nstatic sample data"]
 
@@ -25,34 +33,56 @@ flowchart LR
     GHCR --> UI
     GHCR --> History
     GHCR --> Admin
+    GHCR --> Backup
+    GHCR --> Scheduler
     UI --> Hosts
     History --> UI
     Admin --> UI
     Admin --> History
+    Admin --> Socket
+    Socket --> Scheduler
     UI --> Config
     UI --> Data
+    UI --> Journal
     History --> HistDB
     Admin --> Config
     Admin --> Data
     Admin --> HistDB
+    Admin --> Journal
     UI --> Logs
     History --> Logs
+    Backup --> Config
+    Backup --> Data
+    Backup --> HistDB
+    Backup --> Archives
+    Backup --> Status
+    Scheduler --> Config
+    Scheduler --> Data
+    Scheduler --> HistDB
+    Scheduler --> Archives
+    Scheduler --> Journal
+    Scheduler --> Status
+    Scheduler --> Targets
 
     Pages -. no live backend .-> Browser
 ```
 
 ## Services
 
-| Service | Port | Required | Purpose | Start command |
-| --- | ---: | --- | --- | --- |
-| Main UI | `8080` | yes | enclosure view, slot details, and host inventory | `docker compose up -d` |
-| History | `8081` | no | metric samples, events, and snapshot history | `docker compose --profile history up -d` |
-| Admin | `8082` | no | setup, runtime controls, profiles, backups, and maintenance | `docker compose --profile admin up -d enclosure-admin` |
+| Service | Port / interface | Required | Purpose | Network and start boundary |
+| --- | --- | --- | --- | --- |
+| Main UI | `8080` | yes | enclosure view, slot details, and host inventory | ordinary Compose network; `docker compose up -d` |
+| History | `8081` | no | metric samples, events, and snapshot history | ordinary Compose network; `docker compose --profile history up -d` |
+| Admin | `8082` | no | setup, runtime controls, profiles, backups, and maintenance | ordinary Compose network plus Docker socket; `docker compose --profile admin up -d enclosure-admin` |
+| One-shot backup | no port | no | one encrypted backup for a host timer | `backup` profile, `network_mode: none`, no Docker socket; `docker compose --profile backup run --rm enclosure-backup` |
+| Backup scheduler | Unix socket only | no | config-on-change and cron backups, remote copies, retention | `backup-scheduler` profile, outbound network for remote targets, no published TCP port or Docker socket; `docker compose --profile backup-scheduler up -d enclosure-backup-scheduler` |
 
-The main UI works without either sidecar. When history is stopped, the UI marks
-history-backed features unavailable instead of hiding the base enclosure view.
+The main UI works without either HTTP sidecar. When history is stopped, the UI
+marks history-backed features unavailable instead of hiding the base enclosure
+view. The backup workers are dormant unless an operator selects their profiles;
+the scheduler also keeps both backup classes off until policy enables one.
 
-All three services use the same published image. You still need local persistent
+All services use the same published image. You still need local persistent
 folders for configuration and data.
 
 ## Persistent folders
@@ -64,14 +94,33 @@ folders for configuration and data.
 | `./config/backup-secrets` | passphrase files for the one-shot backup service |
 | `./data` | slot mappings, detail cache, and known host records |
 | `./history` | the history SQLite database and history backups |
-| `./backups` | scheduled backup archives |
-| `./backup-status` | shared read-only scheduled backup status |
+| `./backups` | one-shot and scheduler encrypted archives plus the scheduler catalogue |
+| `./backup-status` | shared read-only, secret-free backup health status |
+| `./backup-journal` | configuration-change records shared by UI, admin, and scheduler |
+| `./backup-api` | private scheduler Unix socket shared only with admin |
 | `./logs` | application logs when file logging is configured |
 
 Protect these folders as local application data. The default has no application
 login. Anyone who can reach an enabled service can use the controls available
 there. Restrict port access to authorized users, or enable Basic authentication
 or an authenticated reverse proxy before widening access.
+
+## Backup worker trust boundaries
+
+The one-shot `backup` worker is deliberately isolated: it has no network, no
+published port, and no Docker socket. It reads `./config` and `./data`, snapshots
+`./history`, and writes only its archive and secret-free status mounts. A host
+timer starts a fresh container for each run.
+
+The long-running `backup-scheduler` worker has outbound network access because
+configured SFTP, SMB, S3, FTP, and NFS targets need it. It has no published TCP
+port and no Docker socket. Admin reaches it only through the Unix socket under
+`./backup-api`; the UI, admin, and scheduler share config-change records under
+`./backup-journal`. The scheduler writes its encrypted archives and private
+catalogue under `./backups` and exposes only secret-free health under
+`./backup-status`. The optional NFS overlay grants `SYS_ADMIN` and disables the
+default AppArmor profile for the scheduler alone; use it only for configured NFS
+targets.
 
 ## Host connections
 

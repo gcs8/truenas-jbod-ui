@@ -321,6 +321,7 @@ Optional sidecars:
 docker compose -f docker-compose.dev.yml --profile history up -d --build
 docker compose -f docker-compose.dev.yml --profile admin up -d --build enclosure-admin
 docker compose -f docker-compose.dev.yml --profile history --profile admin up -d --build
+docker compose -f docker-compose.dev.yml --profile backup-scheduler up -d --build enclosure-backup-scheduler
 ```
 
 Sidecar matrix to validate when relevant:
@@ -338,8 +339,17 @@ Sidecar matrix to validate when relevant:
    - `:8080/livez`, `:8082/livez`, `:8082/healthz`
    - admin runtime cards handle stopped history intentionally
 4. UI + history + admin:
-   - all services healthy
+   - all HTTP services healthy
    - runtime cards show aligned running versions after startup/restart
+5. Scheduler disabled:
+   - scheduler is the only running service
+   - Unix-socket health and library requests succeed
+   - config and full policies stay disabled, with no job or artifact
+6. Scheduler enabled:
+   - scheduler and admin are the only running services
+   - one synthetic config backup completes and verifies
+   - restart/readback retains the same catalogued artifact
+   - Compose resources and scratch state are removed afterward
 
 Browser smoke:
 
