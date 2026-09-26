@@ -180,6 +180,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Docs
 
+- Corrected the v0.23.0 release notes and upgrade note: the tagged base
+  `docker-compose.yml` already ran the UI and history services as non-root, so
+  its ownership step was never optional. The Upgrading page now marks the
+  root-compatible base plus `docker-compose.nonroot.yml` overlay as a later
+  change. (#641, #646)
 - Aligned the wiki and current reference docs with the UI's Admin and Main UI
   names, and added a wording regression check. (#624)
 - The history recovery page and CONTRIBUTING now state the rollback policy
