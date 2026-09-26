@@ -4,6 +4,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import re
 import socket
 import stat
 import tempfile
@@ -72,6 +73,63 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
         checklist = RELEASE_CHECKLIST.read_text(encoding="utf-8")
         self.assertNotIn('`{"encrypt":false,', checklist)
         self.assertIn('`{"encrypt":true,', checklist)
+
+    def test_release_checklist_uses_default_full_format_then_explicit_legacy_7z(self) -> None:
+        checklist = RELEASE_CHECKLIST.read_text(encoding="utf-8")
+        primary_heading = "**Primary default-format round trip:**"
+        legacy_heading = "**Legacy 7z readability round trip:**"
+        primary_start = checklist.index(primary_heading)
+        legacy_start = checklist.index(legacy_heading)
+        legacy_end = checklist.index(
+            "  - keep a separate sanitized receipt for each round trip.",
+            legacy_start,
+        )
+        primary = checklist[primary_start:legacy_start]
+        legacy = checklist[legacy_start:legacy_end]
+
+        self.assertLess(primary_start, legacy_start)
+        self.assertIn("omit `packaging`", primary)
+        self.assertIn("observed `tar.zst`", primary)
+
+        from app.models.domain import SystemBackupExportRequest
+
+        bodies = {}
+        for round_trip, section in (("primary", primary), ("legacy", legacy)):
+            found = re.findall(r"`(\{\"encrypt\".*?\})`", section)
+            self.assertEqual(len(found), 1, f"{round_trip} needs exactly one export body")
+            body = json.loads(found[0])
+            bodies[round_trip] = body
+            with self.subTest(round_trip=round_trip):
+                self.assertIs(body["encrypt"], True)
+                self.assertEqual(body["passphrase"], "<private passphrase, never recorded>")
+                self.assertEqual(set(body["included_paths"]), set(self.module.REQUIRED_FULL_GROUPS))
+                self.assertEqual(len(body["included_paths"]), len(self.module.REQUIRED_FULL_GROUPS))
+                SystemBackupExportRequest.model_validate(body)
+
+        self.assertNotIn("packaging", bodies["primary"])
+        self.assertEqual(
+            SystemBackupExportRequest.model_validate(bodies["primary"]).packaging, "tar.zst"
+        )
+        self.assertEqual(bodies["legacy"]["packaging"], "7z")
+        for phase in ("export", "inspect", "import", "restart", "readback"):
+            with self.subTest(round_trip="primary", phase=phase):
+                self.assertIn(phase, primary.lower())
+
+        for phase in ("export", "inspect", "import", "restart", "readback"):
+            with self.subTest(round_trip="legacy", phase=phase):
+                self.assertIn(phase, legacy.lower())
+
+    def test_restore_receipts_bind_format_export_source_and_candidate_provenance(self) -> None:
+        for path in (RELEASE_CHECKLIST, DOC):
+            text = path.read_text(encoding="utf-8")
+            for marker in (
+                "`inspection.packaging`",
+                "`inspection.app_version`",
+                "`source_commit`",
+                "`image_id`",
+            ):
+                with self.subTest(path=path.name, marker=marker):
+                    self.assertIn(marker, text)
 
     def test_inspection_payload_is_exact_and_aggregate_only(self) -> None:
         payload = {
