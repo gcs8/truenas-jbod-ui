@@ -544,7 +544,10 @@ class ImageOnlyUpgradeSmokeContractTests(unittest.TestCase):
         self.assertIn("schema_after={schema['after']}", interrupted)
         self.assertIn("schema_transition={schema['transition']}", interrupted)
         self.assertIn("does not exercise a schema transition", matrix)
-        self.assertIn("(#637)", changelog.split("## Unreleased", 1)[1].split("\n## ", 1)[0])
+        self.assertRegex(
+            changelog.split("## Unreleased", 1)[1].split("\n## ", 1)[0],
+            r"\(#637(?:, #\d+)*\)",
+        )
 
 
 class UpgradeScenarioContractTests(unittest.TestCase):

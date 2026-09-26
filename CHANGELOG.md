@@ -635,7 +635,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   the same history schema, so CI now reports compatibility with no schema
   transition. The interrupted case reports idempotent startup interruption,
   while keeping its image, health, restart, state, integrity, ownership and
-  rollback checks. (#637)
+  rollback checks. (#637, #647)
 - CI now also upgrades a hardened v0.22.2 install (base Compose plus
   `docker-compose.nonroot.yml`) by image pin only and rolls it back, and kills
   the new history container inside each startup migration step on v0.22.2
