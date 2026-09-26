@@ -254,8 +254,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   retention or a preserve still kept. Overlap is checked when the policy loads,
   when the editor saves, and again before every copy, restore fetch, test and
   retention pass, so a symlink or a bind mount of the same directory added
-  later is also caught. A target whose path cannot be read at startup is
-  skipped with a warning rather than stopping local backups. (#633, #651)
+  later is also caught. A target whose path cannot be inspected at startup
+  (for example a stale mount or a permission error) is skipped with a warning
+  rather than stopping local backups. (#633, #651)
 - Replaced duplicate history-sidecar snapshots gradually with the backup
   scheduler's catalog-verified local FULL archives. The two sets retain at least
   14 copies during cutover, stale verification receipts are cleared on restart,
