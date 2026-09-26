@@ -187,6 +187,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Docs
 
+- The backup scheduler and NFS instructions now say they apply to a
+  current-source checkout only: the beginner install's `compose.yaml` has no
+  scheduler service, and an image-only update cannot add one. The architecture
+  guide now lists the one-shot backup job and the scheduler, and the release
+  runtime matrix adds scheduler-disabled and scheduler-enabled variants.
+  (#639, #653)
 - Corrected the v0.23.0 release notes and upgrade note: the tagged base
   `docker-compose.yml` already ran the UI and history services as non-root, so
   its ownership step was never optional. The Upgrading page now marks the

@@ -9,6 +9,7 @@ import socket
 import stat
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -31,7 +32,13 @@ MATRIX_CONTAINER_NAMES = {
     "truenas-jbod-history",
     "truenas-jbod-admin",
 }
-SUCCESS_MARKER = "compose_runtime_matrix=ok variants=5 ui_alias_cycles=4 ui_mapping_cycles=4 admin_setup_cycles=1"
+SYNTHETIC_BACKUP_PASSPHRASE = "synthetic-compose-matrix-backup-passphrase"
+SCHEDULER_WAIT_SECONDS = 90
+SUCCESS_MARKER = (
+    "compose_runtime_matrix=ok variants=7 ui_alias_cycles=4 "
+    "ui_mapping_cycles=4 admin_setup_cycles=1 scheduler_disabled_cycles=1 "
+    "scheduler_backup_cycles=1"
+)
 
 
 class Variant(NamedTuple):
@@ -42,6 +49,8 @@ class Variant(NamedTuple):
     history_enabled: bool
     admin_enabled: bool
     admin_initial_setup: bool = False
+    scheduler_enabled: bool = False
+    scheduler_policy_enabled: bool = False
 
 
 class Ports(NamedTuple):
@@ -84,6 +93,25 @@ VARIANTS = (
         True,
         True,
         True,
+    ),
+    Variant(
+        "scheduler-disabled",
+        ("backup-scheduler",),
+        ("enclosure-backup-scheduler",),
+        False,
+        False,
+        False,
+        scheduler_enabled=True,
+    ),
+    Variant(
+        "scheduler-enabled",
+        ("admin", "backup-scheduler"),
+        ("enclosure-admin", "enclosure-backup-scheduler"),
+        False,
+        False,
+        True,
+        scheduler_enabled=True,
+        scheduler_policy_enabled=True,
     ),
 )
 
@@ -305,33 +333,53 @@ def _compose_prefix(root: Path, variant: Variant) -> list[str]:
     return command
 
 
-def _write_environment(root: Path, image: str, ports: Ports) -> None:
-    environment = "\n".join(
-        (
-            f"JBOD_UI_IMAGE={image}",
-            f"APP_UID={APP_UID}",
-            f"APP_GID={APP_GID}",
-            f"BACKUP_UID={BACKUP_UID}",
-            f"BACKUP_GID={BACKUP_GID}",
-            f"APP_PORT={ports.ui}",
-            f"HISTORY_PORT={ports.history}",
-            "HISTORY_BIND_ADDRESS=127.0.0.1",
-            f"ADMIN_PORT={ports.admin}",
-            "ADMIN_BIND_ADDRESS=127.0.0.1",
-            "ADMIN_AUTO_STOP_SECONDS=0",
-            "READ_UI_AUTH_MODE=basic",
-            f"READ_UI_AUTH_USERNAME={AUTH_USERNAME}",
-            f"READ_UI_AUTH_PASSWORD={AUTH_PASSWORD}",
-            "ADMIN_AUTH_MODE=basic",
-            f"ADMIN_AUTH_USERNAME={AUTH_USERNAME}",
-            f"ADMIN_AUTH_PASSWORD={AUTH_PASSWORD}",
-            f"APP_PUBLIC_ORIGIN=http://127.0.0.1:{ports.ui}",
-            f"ADMIN_PUBLIC_ORIGIN=http://127.0.0.1:{ports.admin}",
-            "METRICS_ENABLED=true",
-            "SCHEDULED_BACKUP_ENABLED=false",
-            "",
+def _write_environment(
+    root: Path,
+    image: str,
+    ports: Ports,
+    *,
+    variant: Variant | None = None,
+) -> None:
+    scheduler_policy_enabled = bool(variant and variant.scheduler_policy_enabled)
+    values = [
+        f"JBOD_UI_IMAGE={image}",
+        f"APP_UID={APP_UID}",
+        f"APP_GID={APP_GID}",
+        f"BACKUP_UID={BACKUP_UID}",
+        f"BACKUP_GID={BACKUP_GID}",
+        f"APP_PORT={ports.ui}",
+        f"HISTORY_PORT={ports.history}",
+        "HISTORY_BIND_ADDRESS=127.0.0.1",
+        f"ADMIN_PORT={ports.admin}",
+        "ADMIN_BIND_ADDRESS=127.0.0.1",
+        "ADMIN_AUTO_STOP_SECONDS=0",
+        "READ_UI_AUTH_MODE=basic",
+        f"READ_UI_AUTH_USERNAME={AUTH_USERNAME}",
+        f"READ_UI_AUTH_PASSWORD={AUTH_PASSWORD}",
+        "ADMIN_AUTH_MODE=basic",
+        f"ADMIN_AUTH_USERNAME={AUTH_USERNAME}",
+        f"ADMIN_AUTH_PASSWORD={AUTH_PASSWORD}",
+        f"APP_PUBLIC_ORIGIN=http://127.0.0.1:{ports.ui}",
+        f"ADMIN_PUBLIC_ORIGIN=http://127.0.0.1:{ports.admin}",
+        "METRICS_ENABLED=true",
+        "SCHEDULED_BACKUP_ENABLED=false",
+        f"BACKUP_CONFIG_ENABLED={'true' if scheduler_policy_enabled else 'false'}",
+        "BACKUP_FULL_ENABLED=false",
+        # Replace any backups.targets from the config fixture: the matrix must
+        # never ship to, or run retention against, real remote storage.
+        "BACKUP_TARGETS_JSON=[]",
+    ]
+    if scheduler_policy_enabled:
+        values.extend(
+            (
+                "BACKUP_CONFIG_DEBOUNCE_SECONDS=1",
+                "BACKUP_CONFIG_MAX_DELAY_SECONDS=2",
+                "BACKUP_CONFIG_LOCAL_KEEP=1",
+                "BACKUP_ARCHIVE_PASSPHRASE_FILE=/run/backup-secrets/archive-passphrase",
+            )
         )
-    )
+    values.append("")
+    environment = "\n".join(values)
     env_path = root / ".env"
     env_path.write_text(environment, encoding="utf-8", newline="\n")
     env_path.chmod(0o600)
@@ -340,6 +388,7 @@ def _write_environment(root: Path, image: str, ports: Ports) -> None:
 def _prepare_variant_root(
     root: Path,
     *,
+    variant: Variant,
     compose_path: Path,
     config_fixture: Path,
     image: str,
@@ -348,7 +397,7 @@ def _prepare_variant_root(
     root.mkdir(mode=0o700)
     shutil.copyfile(compose_path, root / "compose.yaml")
     (root / "compose.yaml").chmod(0o600)
-    _write_environment(root, image, ports)
+    _write_environment(root, image, ports, variant=variant)
     _run(
         (
             "sudo",
@@ -403,6 +452,21 @@ def _prepare_variant_root(
         (
             "sudo",
             "install",
+            "-d",
+            "-m",
+            "2770",
+            "-o",
+            str(BACKUP_UID),
+            "-g",
+            str(APP_GID),
+            str(root / "backup-journal"),
+            str(root / "backup-api"),
+        )
+    )
+    _run(
+        (
+            "sudo",
+            "install",
             "-m",
             "0640",
             "-o",
@@ -413,6 +477,27 @@ def _prepare_variant_root(
             str(root / "config" / "config.yaml"),
         )
     )
+    if variant.scheduler_policy_enabled:
+        source = root / ".synthetic-backup-passphrase"
+        source.write_text(SYNTHETIC_BACKUP_PASSPHRASE, encoding="utf-8")
+        source.chmod(0o600)
+        try:
+            _run(
+                (
+                    "sudo",
+                    "install",
+                    "-m",
+                    "0600",
+                    "-o",
+                    str(BACKUP_UID),
+                    "-g",
+                    str(BACKUP_GID),
+                    str(source),
+                    str(root / "config" / "backup-secrets" / "archive-passphrase"),
+                )
+            )
+        finally:
+            source.unlink(missing_ok=True)
 
 
 def _authorization_header() -> str:
@@ -463,6 +548,210 @@ def _require_status(
     if status != expected:
         raise RuntimeError(f"Unexpected HTTP status for matrix route: expected {expected}, got {status}.")
     return body
+
+
+def _json_object(raw: bytes, label: str) -> dict[str, object]:
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{label} returned unreadable JSON.") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"{label} did not return a JSON object.")
+    return payload
+
+
+def _scheduler_request(
+    prefix: Sequence[str],
+    method: str,
+    path: str,
+) -> dict[str, object]:
+    script = (
+        "import json,sys; "
+        "from admin_service.services.backup_scheduler_client import BackupSchedulerClient; "
+        "response=BackupSchedulerClient().request(sys.argv[1],sys.argv[2]); "
+        "print(json.dumps({'status':response.status,'payload':response.payload},sort_keys=True))"
+    )
+    result = _run(
+        (
+            *prefix,
+            "exec",
+            "-T",
+            "enclosure-backup-scheduler",
+            "python",
+            "-c",
+            script,
+            method,
+            path,
+        ),
+        capture_output=True,
+    )
+    try:
+        response = json.loads(result.stdout)
+    except ValueError as exc:
+        raise RuntimeError("Backup scheduler socket returned unreadable JSON.") from exc
+    if not isinstance(response, dict):
+        raise RuntimeError("Backup scheduler socket returned an invalid response.")
+    return response
+
+
+def _verify_scheduler_socket(prefix: Sequence[str]) -> None:
+    response = _scheduler_request(prefix, "GET", "/internal/healthz")
+    if response.get("status") != 200 or response.get("payload") != {"status": "ok"}:
+        raise RuntimeError("Backup scheduler Unix-socket health check failed.")
+
+
+def _verify_scheduler_disabled(prefix: Sequence[str]) -> None:
+    _verify_scheduler_socket(prefix)
+    response = _scheduler_request(prefix, "GET", "/internal/backups")
+    library = response.get("payload")
+    if response.get("status") != 200 or not isinstance(library, dict):
+        raise RuntimeError("Disabled backup scheduler library check failed.")
+    classes = library.get("classes")
+    if not isinstance(classes, dict):
+        raise RuntimeError("Disabled backup scheduler class policy is unavailable.")
+    config = classes.get("config")
+    full = classes.get("full")
+    if (
+        not isinstance(config, dict)
+        or config.get("enabled") is not False
+        or not isinstance(full, dict)
+        or full.get("enabled") is not False
+        or library.get("running") is not None
+        or library.get("artifacts") != []
+    ):
+        raise RuntimeError("Disabled backup scheduler did not remain idle with both classes off.")
+
+
+def _restart_scheduler(prefix: Sequence[str]) -> None:
+    _run((*prefix, "restart", "enclosure-backup-scheduler"))
+    _run(
+        (
+            *prefix,
+            "up",
+            "-d",
+            "--no-deps",
+            "--wait",
+            "--wait-timeout",
+            "90",
+            "enclosure-backup-scheduler",
+        )
+    )
+
+
+def _scheduler_admin_library(ports: Ports) -> dict[str, object]:
+    return _json_object(
+        _require_status(
+            f"http://127.0.0.1:{ports.admin}/api/admin/backups",
+            200,
+            authenticated=True,
+        ),
+        "Backup scheduler library",
+    )
+
+
+def _completed_config_artifact(library: dict[str, object]) -> dict[str, object] | None:
+    classes = library.get("classes")
+    if not isinstance(classes, dict):
+        raise RuntimeError("Backup scheduler class policy is unavailable.")
+    config = classes.get("config")
+    full = classes.get("full")
+    if (
+        not isinstance(config, dict)
+        or config.get("enabled") is not True
+        or not isinstance(full, dict)
+        or full.get("enabled") is not False
+    ):
+        raise RuntimeError("Backup scheduler enabled-policy state did not match the matrix contract.")
+    artifacts = library.get("artifacts")
+    if not isinstance(artifacts, list):
+        raise RuntimeError("Backup scheduler artifact list is unavailable.")
+    if library.get("running") is not None:
+        return None
+    last_run = config.get("last_run")
+    if isinstance(last_run, dict) and last_run.get("ok") is False:
+        raise RuntimeError("Backup scheduler config backup failed.")
+    if not artifacts:
+        return None
+    if len(artifacts) != 1 or not isinstance(artifacts[0], dict):
+        raise RuntimeError("Backup scheduler created an unexpected artifact set.")
+    artifact = artifacts[0]
+    if (
+        artifact.get("backup_class") != "config"
+        or artifact.get("location") != "local"
+        or artifact.get("verified") is not True
+        or artifact.get("restorable") is not True
+        or artifact.get("state") != "ok"
+        or not isinstance(artifact.get("size"), int)
+        or int(artifact["size"]) <= 0
+        or not isinstance(artifact.get("id"), str)
+        or not artifact["id"]
+    ):
+        raise RuntimeError("Backup scheduler config artifact failed readback validation.")
+    if not isinstance(last_run, dict) or last_run.get("ok") is not True:
+        raise RuntimeError("Backup scheduler success status is unavailable.")
+    return artifact
+
+
+def _verify_scheduler_enabled(ports: Ports, prefix: Sequence[str]) -> None:
+    _verify_scheduler_socket(prefix)
+    initial = _scheduler_admin_library(ports)
+    classes = initial.get("classes")
+    if (
+        initial.get("available") is not True
+        or initial.get("running") is not None
+        or initial.get("artifacts") != []
+        or not isinstance(classes, dict)
+        or not isinstance(classes.get("config"), dict)
+        or classes["config"].get("enabled") is not True
+        or not isinstance(classes.get("full"), dict)
+        or classes["full"].get("enabled") is not False
+    ):
+        raise RuntimeError("Backup scheduler did not start with the expected enabled policy.")
+
+    base = f"http://127.0.0.1:{ports.admin}"
+    started = _json_object(
+        _require_status(
+            f"{base}/api/admin/backups/run",
+            202,
+            method="POST",
+            payload={"backup_class": "config"},
+            authenticated=True,
+            origin=base,
+        ),
+        "Backup scheduler run request",
+    )
+    if started.get("ok") is not True or started.get("state") != "started":
+        raise RuntimeError("Backup scheduler did not accept the config backup request.")
+
+    deadline = time.monotonic() + SCHEDULER_WAIT_SECONDS
+    artifact: dict[str, object] | None = None
+    while time.monotonic() < deadline:
+        artifact = _completed_config_artifact(_scheduler_admin_library(ports))
+        if artifact is not None:
+            break
+        time.sleep(1)
+    if artifact is None:
+        raise RuntimeError("Backup scheduler config backup did not finish before the deadline.")
+
+    artifact_id = str(artifact["id"])
+    verified = _json_object(
+        _require_status(
+            f"{base}/api/admin/backups/{artifact_id}/verify",
+            200,
+            method="POST",
+            authenticated=True,
+            origin=base,
+        ),
+        "Backup scheduler artifact verification",
+    )
+    if verified.get("ok") is not True:
+        raise RuntimeError("Backup scheduler artifact verification failed.")
+
+    _restart_scheduler(prefix)
+    _verify_scheduler_socket(prefix)
+    restored = _completed_config_artifact(_scheduler_admin_library(ports))
+    if restored is None or restored.get("id") != artifact_id:
+        raise RuntimeError("Backup scheduler restart readback did not retain the verified artifact.")
 
 
 def _restart_ui(prefix: Sequence[str], ports: Ports) -> None:
@@ -744,8 +1033,11 @@ def _safe_diagnostics(prefix: Sequence[str]) -> None:
 
 
 def _assert_compose_resources_removed(project: str) -> None:
+    # The scheduler service has no container_name, so Compose names it
+    # <project>-<service>-1.
     for resource_type, name in (
         *(("container", name) for name in MATRIX_CONTAINER_NAMES),
+        ("container", f"{project}-enclosure-backup-scheduler-1"),
         ("network", f"{project}_default"),
     ):
         result = subprocess.run(
@@ -825,6 +1117,7 @@ def _run_variant(
     root = runtime_root / variant.name
     _prepare_variant_root(
         root,
+        variant=variant,
         compose_path=compose_path,
         config_fixture=config_fixture,
         image=image,
@@ -853,12 +1146,19 @@ def _run_variant(
             _verify_admin(ports)
         if variant.admin_initial_setup:
             _verify_admin_initial_setup(root, prefix, ports)
+        if variant.scheduler_enabled:
+            if variant.scheduler_policy_enabled:
+                _verify_scheduler_enabled(ports, prefix)
+            else:
+                _verify_scheduler_disabled(prefix)
         print(
             json.dumps(
                 {
                     "admin_initial_setup": variant.admin_initial_setup,
                     "alias_cycle": variant.ui_enabled,
                     "mapping_cycle": variant.ui_enabled,
+                    "scheduler": variant.scheduler_enabled,
+                    "scheduler_backup": variant.scheduler_policy_enabled,
                     "services": list(variant.services),
                     "status": "pass",
                     "variant": variant.name,

@@ -144,6 +144,37 @@ class PublicDocsContractTests(unittest.TestCase):
         self.assertIn("Anyone who can reach an enabled service", normalized)
         self.assertIn("Basic authentication", normalized)
 
+    def test_architecture_and_backup_guides_bound_both_backup_workers(self) -> None:
+        architecture = (ROOT / "wiki/Architecture-and-Services.md").read_text(
+            encoding="utf-8"
+        )
+        backup = (ROOT / "wiki/Backup-Restore-and-Debug-Bundles.md").read_text(
+            encoding="utf-8"
+        )
+        normalized_backup = " ".join(backup.split())
+
+        for marker in (
+            "One-shot backup",
+            "Backup scheduler",
+            "`backup`",
+            "`backup-scheduler`",
+            "no network",
+            "Unix socket",
+            "no published TCP port",
+            "Docker socket",
+            "./backup-journal",
+            "./backup-api",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, architecture)
+        self.assertIn("NFS overlay", architecture)
+        self.assertIn("current-source", normalized_backup)
+        self.assertIn("v0.22.2", backup)
+        self.assertIn("v0.23.0", backup)
+        self.assertIn("image-only update cannot add", normalized_backup)
+        self.assertIn("source checkout's `docker-compose.yml`", normalized_backup)
+        self.assertIn("beginner install's `compose.yaml`", normalized_backup)
+
     def test_readme_is_a_short_human_facing_entry_point(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
 

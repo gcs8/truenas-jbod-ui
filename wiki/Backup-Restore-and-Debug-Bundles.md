@@ -234,6 +234,16 @@ See [Segmented history v2](https://github.com/gcs8/truenas-jbod-ui/blob/main/doc
 
 ## Automatic backup archive and remote targets
 
+> **Deployment scope: current-source checkout only.** The scheduler commands in
+> this section require the source checkout's `docker-compose.yml` and, for NFS,
+> `docker-compose.backup-nfs.yml`. They do not apply to the beginner install's `compose.yaml`:
+> that flow downloads the v0.22.2 base Compose file, which has no scheduler
+> service or profile, and an image-only update cannot add a Compose service.
+> This current-source qualification does not claim that the released
+> v0.22.2 or v0.23.0 deployment path includes a qualified scheduler migration.
+> Preserve local Compose customization and keep the scheduler disabled on those
+> installs until an explicit migration path is published.
+
 The backup scheduler is an optional long-running sidecar,
 `enclosure-backup-scheduler`. It takes two kinds of backup, keeps a catalogue
 of them, copies each one to remote targets you choose, and deletes old copies
