@@ -234,6 +234,16 @@ See [Segmented history v2](https://github.com/gcs8/truenas-jbod-ui/blob/main/doc
 
 ## Automatic backup archive and remote targets
 
+> **Deployment scope: current-source checkout only.** The scheduler commands in
+> this section require the source checkout's `docker-compose.yml` and, for NFS,
+> `docker-compose.backup-nfs.yml`. They do not apply to the beginner install's `compose.yaml`:
+> that flow downloads the v0.22.2 base Compose file, which has no scheduler
+> service or profile, and an image-only update cannot add a Compose service.
+> This current-source qualification does not claim that the released
+> v0.22.2 or v0.23.0 deployment path includes a qualified scheduler migration.
+> Preserve local Compose customization and keep the scheduler disabled on those
+> installs until an explicit migration path is published.
+
 The backup scheduler is an optional long-running sidecar,
 `enclosure-backup-scheduler`. It takes two kinds of backup, keeps a catalogue
 of them, copies each one to remote targets you choose, and deletes old copies
@@ -422,6 +432,17 @@ journal. Restart the scheduler to apply a save:
 | `s3` | By default (HTTPS); no with an `http://` custom endpoint | S3 and compatible stores: `bucket`, `region`, optional `endpoint_url` |
 | `nfs` | No | Needs the NFS overlay below |
 | `filesystem` | n/a | An absolute path, for example a mounted USB disk |
+
+A `filesystem` target must be a different place from the local archive
+(`BACKUP_ARCHIVE_DIR`, `/app/backups/archive` by default). The scheduler refuses
+a root that is the local archive, sits inside it, or contains it, including
+through a symlink or a bind mount of the same directory. Otherwise remote
+retention could delete the only copy of a backup that local retention keeps.
+When a filesystem target is in use, `BACKUP_ARCHIVE_DIR` must be an absolute
+path. If the target's path cannot be inspected at startup (for example a stale
+mount or a permission error), the scheduler logs a warning and still runs local
+backups. It will not use that target until the check passes. A target path
+that does not exist yet is compared by name and is not an error at startup.
 
 Each backup is copied to every enabled target. If one target fails, the other
 targets still get their copy and the local copy is kept.

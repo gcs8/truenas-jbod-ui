@@ -239,9 +239,21 @@ python scripts/validate_release_wrap.py "$version" \
     or history service started, save a synthetic demo system/profile, read the
     files back, then start the UI from that saved configuration and verify it
     becomes healthy without rebuilding or weakening mount permissions
-  - **UI + history + admin:** run all three services, then confirm UI,
+  - **UI + history + admin:** run all three HTTP services, then confirm UI,
     history, and admin health plus `Runtime Control` cards showing aligned
     running versions after startup or sidecar restarts
+  - **Scheduler disabled:** start only `enclosure-backup-scheduler` through the
+    `backup-scheduler` profile with both policy classes explicitly disabled;
+    call `/internal/healthz` and `/internal/backups` through its Unix socket,
+    confirm no artifact or running job, then remove the container and scratch
+    state
+  - **Scheduler enabled:** start `enclosure-admin` plus
+    `enclosure-backup-scheduler` with only synthetic config backups enabled;
+    call the scheduler through the Unix socket, request one config backup through
+    the authenticated admin API, wait for verified/restorable local readback,
+    verify it again, restart the scheduler, confirm the same artifact from the
+    persisted catalogue, then remove all archive, catalogue, socket, container,
+    network, and scratch state
 - run the Linux QA Docker restore release gate before ship/no-ship:
   - for a segmented-history release, first complete an encrypted schema-v2
     export/mutation/import/query drill with historical data larger than the

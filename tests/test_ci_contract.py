@@ -16,6 +16,7 @@ WORKFLOW_DIR = ROOT / ".github" / "workflows"
 CI_WORKFLOW = WORKFLOW_DIR / "ci.yml"
 PUBLISH_GHCR_WORKFLOW = WORKFLOW_DIR / "publish-ghcr.yml"
 PUBLISH_PUBLIC_DEMO_WORKFLOW = WORKFLOW_DIR / "publish-public-demo.yml"
+PUBLIC_DOCS_LINKS_WORKFLOW = WORKFLOW_DIR / "public-docs-links.yml"
 CAPTURE_SCREENSHOTS_WORKFLOW = WORKFLOW_DIR / "capture-public-demo-screenshots.yml"
 RELEASE_CHECKLIST = ROOT / "docs" / "RELEASE_CHECKLIST.md"
 PUBLIC_DEMO_SPEC = ROOT / "qa" / "public-demo.spec.js"
@@ -220,8 +221,9 @@ class CIWorkflowContractTests(unittest.TestCase):
         # gate job's checkout, Python setup, shard-result download and coverage
         # upload, the GHCR release workflow's Python setup for the
         # public-demo release gate, and the image-upgrade smoke's and the
-        # upgrade-scenario job's checkouts.
-        self.assertEqual(action_count, 42)
+        # upgrade-scenario job's checkouts, and the pull-request docs
+        # external-link workflow's checkout and Python setup.
+        self.assertEqual(action_count, 44)
         self.assertEqual(unpinned, [])
         self.assertEqual(uncommented, [])
 
@@ -290,54 +292,105 @@ class CIWorkflowContractTests(unittest.TestCase):
                 self.assertLess(install_index, generator_index)
                 self.assertNotIn("requirements-dev.txt", str(steps[install_index].get("run", "")))
 
-    def test_public_demo_publish_push_trigger_requires_checked_in_artifact_change(self) -> None:
+    def test_public_demo_publish_workflow_is_reserved_for_main_and_dispatch(self) -> None:
         workflow = yaml.safe_load(self.read(PUBLISH_PUBLIC_DEMO_WORKFLOW))
         triggers = workflow.get("on", workflow.get(True, {}))
 
-        self.assertIn(".github/workflows/publish-public-demo.yml", triggers["pull_request"]["paths"])
-        self.assertIn("scripts/build_current_source_browser_fixture.py", triggers["pull_request"]["paths"])
+        self.assertEqual(set(triggers), {"push", "workflow_dispatch"})
         self.assertEqual(triggers["push"]["branches"], ["main"])
         self.assertEqual(triggers["push"]["paths"], ["public-demo/**"])
-        self.assertIn("workflow_dispatch", triggers)
+
+    def test_ordinary_pull_requests_have_one_current_source_public_demo_browser_validation(self) -> None:
+        current_source_build = (
+            'python scripts/build_public_demo.py --output "$PUBLIC_DEMO_ARTIFACT" '
+            '--source-revision "$(git rev-parse HEAD)"'
+        )
+        browser_command = "npx playwright test qa/public-demo.spec.js --retries=0"
+        validations: list[tuple[str, str]] = []
+
+        for workflow_path in (CI_WORKFLOW, PUBLISH_PUBLIC_DEMO_WORKFLOW):
+            workflow = yaml.safe_load(self.read(workflow_path))
+            triggers = workflow.get("on", workflow.get(True, {}))
+            if "pull_request" not in triggers:
+                continue
+            for job_name, job in workflow["jobs"].items():
+                commands = "\n".join(str(step.get("run", "")) for step in job.get("steps", []))
+                if current_source_build in commands and browser_command in commands:
+                    validations.append((workflow_path.name, job_name))
+
+        self.assertEqual(validations, [("ci.yml", "public-demo-artifact")])
+        ci = yaml.safe_load(self.read(CI_WORKFLOW))
+        self.assertEqual(ci["jobs"]["public-demo-artifact"]["name"], "Checked-in public demo artifact")
+
+    def test_the_sole_public_demo_validation_always_runs_on_pull_requests(self) -> None:
+        # With the publish workflow off pull_request, this job is the only PR
+        # browser check of current source, so nothing may route it to skipped.
+        ci = yaml.safe_load(self.read(CI_WORKFLOW))
+        self.assertEqual(ci["jobs"]["public-demo-artifact"]["if"], "needs.route.outputs.run == 'true'")
+        route_script = ci["jobs"]["route"]["steps"][0]["run"]
+
+        with tempfile.TemporaryDirectory() as raw:
+            temp = Path(raw)
+            bin_dir = temp / "bin"
+            bin_dir.mkdir()
+            for tool in ("gh", "sleep"):
+                fake = bin_dir / tool
+                fake.write_text("#!/bin/sh\necho unexpected >&2\nexit 97\n", encoding="utf-8")
+                fake.chmod(0o755)
+            output = temp / "github-output"
+            env = dict(
+                os.environ,
+                EVENT_NAME="pull_request",
+                BRANCH_NAME="feature/example",
+                GH_REPO="example/project",
+                GITHUB_OUTPUT=str(output),
+                PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+            )
+            result = subprocess.run(
+                ["bash", "-e", "-o", "pipefail"],
+                input=route_script.encode("utf-8"),
+                env=env,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8"))
+            self.assertEqual(output.read_text(encoding="utf-8"), "run=true\n")
+            self.assertNotIn(b"unexpected", result.stderr)
 
     def test_public_demo_artifact_and_browser_smoke_remain_in_ci(self) -> None:
         spec = self.read(PUBLIC_DEMO_SPEC)
         self.assertNotIn("test.skip", spec)
         self.assertIn("SLOT_FOCUS_ARTIFACT", spec)
 
-        current_source_build = (
-            'python scripts/build_public_demo.py --output "$PUBLIC_DEMO_ARTIFACT" '
-            '--source-revision "$(git rev-parse HEAD)"'
-        )
         for workflow_path in (CI_WORKFLOW, PUBLISH_PUBLIC_DEMO_WORKFLOW):
             with self.subTest(workflow=workflow_path.name):
                 workflow_text = self.read(workflow_path)
                 self.assertIn("python scripts/check_public_demo_artifact.py public-demo", workflow_text)
                 self.assertIn("python scripts/build_current_source_browser_fixture.py", workflow_text)
-                # The checked-in demo is only rebuilt at release time, so pull
-                # request browser QA runs against a throwaway current-source build.
-                self.assertIn(current_source_build, workflow_text)
                 self.assertIn("SLOT_FOCUS_ARTIFACT:", workflow_text)
                 self.assertIn("npx playwright test qa/public-demo.spec.js --retries=0", workflow_text)
                 self.assertIn("npm ci --ignore-scripts", workflow_text)
                 self.assertIn('rm -rf "$fixture_root"', workflow_text)
                 self.assertIn("git status --short", workflow_text)
 
+        current_source_build = (
+            'python scripts/build_public_demo.py --output "$PUBLIC_DEMO_ARTIFACT" '
+            '--source-revision "$(git rev-parse HEAD)"'
+        )
         ci_text = self.read(CI_WORKFLOW)
+        self.assertIn(current_source_build, ci_text)
         self.assertIn(
             "PUBLIC_DEMO_ARTIFACT: ${{ runner.temp }}/truenas-jbod-ui-current-source-browser/public-demo.html",
             ci_text,
         )
         self.assertNotIn("PUBLIC_DEMO_ARTIFACT: public-demo/index.html", ci_text)
         self.assertIn("node --test tests/js/*.test.js", ci_text)
-        # A Pages dispatch publishes the checked-in bytes, so it must browser-test
-        # exactly those; only pull requests build a throwaway current-source demo.
+
+        # Publication validates the exact checked-in bytes; current-source pull
+        # request behavior stays in the required CI check above.
         publish_text = self.read(PUBLISH_PUBLIC_DEMO_WORKFLOW)
-        self.assertIn(
-            "github.event_name == 'workflow_dispatch' && 'public-demo/index.html'",
-            publish_text,
-        )
-        self.assertIn('if [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]; then', publish_text)
+        self.assertIn("PUBLIC_DEMO_ARTIFACT: public-demo/index.html", publish_text)
+        self.assertNotIn(current_source_build, publish_text)
 
     def test_screenshot_capture_workflow_is_dispatch_only_pinned_and_read_only(self) -> None:
         workflow = yaml.safe_load(self.read(CAPTURE_SCREENSHOTS_WORKFLOW))
@@ -567,6 +620,26 @@ class CIWorkflowContractTests(unittest.TestCase):
             'fixture.requests.every((request) => request.startsWith("/truenas-jbod-ui/"))',
             spec,
         )
+
+    def test_pull_requests_that_change_public_docs_keep_the_external_link_check(self) -> None:
+        # The publish workflow no longer runs on pull_request, so this workflow
+        # is the only online link check a README or Wiki change gets before merge.
+        workflow = yaml.safe_load(self.read(PUBLIC_DOCS_LINKS_WORKFLOW))
+        triggers = workflow.get("on", workflow.get(True, {}))
+        self.assertEqual(triggers["pull_request"]["branches"], ["main"])
+        paths = triggers["pull_request"]["paths"]
+        for path in (
+            ".github/workflows/public-docs-links.yml",
+            "README.md",
+            "wiki/**",
+            "scripts/check_public_docs.py",
+        ):
+            self.assertIn(path, paths)
+        commands = "\n".join(
+            str(step.get("run", "")) for step in workflow["jobs"]["external-links"]["steps"]
+        )
+        self.assertIn("python scripts/check_public_docs.py --check-external", commands)
+        self.assertEqual(workflow["permissions"], {"contents": "read"})
 
     def test_public_docs_screenshots_and_deployment_readback_are_release_gates(self) -> None:
         ci = self.read(CI_WORKFLOW)
@@ -882,6 +955,10 @@ class CIRunsOncePerPullRequestTests(unittest.TestCase):
         self.assertIn(
             "A branch push whose branch already has an open pull request skips",
             contributing,
+        )
+        self.assertIn(
+            "A zero-result lookup receives one 15-second recheck",
+            " ".join(contributing.split()),
         )
 
     def test_codeql_does_not_run_twice_for_branches_with_pull_requests(self) -> None:

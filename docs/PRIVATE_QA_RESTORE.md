@@ -36,6 +36,8 @@ required full source commit:
 | Admin only / initial setup | Admin health and auth; create a synthetic initial system; start the UI from the saved config; verify persistence |
 | UI + admin | Exact running service set; UI/admin health; runtime cards; both pencil cycles |
 | UI + history + admin | All three health paths; history and admin APIs; both pencil cycles |
+| Scheduler disabled | Scheduler only; Unix-socket `/internal/healthz` and library readback; config and full classes both off; no running job or artifact |
+| Scheduler enabled | Scheduler + admin; Unix-socket health; one authenticated synthetic config backup; verified/restorable artifact; explicit verify; scheduler restart and persisted catalogue readback |
 | One-shot FULL backup | Separate `backup` profile contract; no network; disk-backed archive workspace; encrypted archive preflight and cleanup |
 
 History-only is not a supported combination because the history service depends

@@ -6,12 +6,13 @@ the snapshot exporter). Every request is pinned to the generation that was
 current when it arrived, so a request that is running while the files change
 sees either the old settings or the new ones, never a mix.
 
-``ConfigReloader`` looks at the watched files at most every ``interval``
-seconds, comparing (mtime, size, inode). A change is read and validated in a
-worker thread. Valid settings replace the current generation; invalid ones are
-ignored, the old settings stay in use, and ``problem`` carries one plain
-sentence for the log, ``/healthz`` and the page. Settings that only a new
-process can apply (``RESTART_ONLY_SETTINGS``) keep their running values.
+``ConfigReloader`` checks the watched files before non-static HTTP requests,
+no more often than once per ``interval``, comparing (mtime, size, inode). A
+change is read and validated in a worker thread. Valid settings replace the
+current generation; invalid ones are ignored, the old settings stay in use,
+and ``problem`` carries one plain sentence for the log, ``/healthz`` and the
+page. Settings that only a new process can apply (``RESTART_ONLY_SETTINGS``)
+keep their running values.
 """
 
 from __future__ import annotations
@@ -158,6 +159,10 @@ PUBLIC_RELOAD_FAILURE = (
     "Config change not applied: the edited configuration is not valid, so the main UI "
     "keeps the previous settings. The main UI log names the setting or line to fix."
 )
+PUBLIC_RELOAD_MISSING_CONFIG = (
+    "Config change not applied: config.yaml is missing, so the main UI keeps the previous settings. "
+    "Restore the file or restart the main UI to use first-start defaults."
+)
 
 
 def describe_reload_failure(exc: BaseException) -> str:
@@ -176,7 +181,7 @@ def describe_reload_failure(exc: BaseException) -> str:
 
 
 class ConfigReloader:
-    """Check the config files every few seconds and swap in valid changes."""
+    """Rate-limit request-triggered checks and swap in valid config changes."""
 
     def __init__(
         self,
@@ -184,7 +189,7 @@ class ConfigReloader:
         *,
         interval_seconds: float = DEFAULT_RELOAD_CHECK_SECONDS,
         clock: Callable[[], float] = time.monotonic,
-        loader: Callable[[], Settings] = load_settings,
+        loader: Callable[[], Settings] | None = None,
         on_applied: Callable[[Settings, Settings], None] | None = None,
     ) -> None:
         self.runtime = runtime
@@ -241,10 +246,29 @@ class ConfigReloader:
             self._baseline = await asyncio.to_thread(file_signature, paths)
             return False
         signature = await asyncio.to_thread(file_signature, paths)
-        if signature == self._baseline or signature == self._rejected:
+        if signature == self._baseline:
+            # The files are back to exactly what is running (for example a
+            # config.yaml moved away and restored): nothing to apply, and any
+            # warning about the rejected state no longer holds.
+            if self.problem or self._rejected is not None:
+                logger.info("Config files match the running settings again; cleared the reload warning.")
+                self.problem = None
+                self._rejected = None
+            return False
+        if signature == self._rejected:
+            return False
+        baseline_by_path = dict(self._baseline)
+        signature_by_path = dict(signature)
+        primary_config = str(paths[0])
+        if baseline_by_path.get(primary_config) is not None and signature_by_path.get(primary_config) is None:
+            logger.warning(
+                "Config change not applied; the main UI keeps the previous settings because the config file is missing."
+            )
+            self.problem = PUBLIC_RELOAD_MISSING_CONFIG
+            self._rejected = signature
             return False
         try:
-            loaded, after = await asyncio.to_thread(self._load, paths)
+            loaded, after = await asyncio.to_thread(self._load, paths, running)
         except Exception as exc:  # noqa: BLE001 - invalid edits keep the old settings.
             logger.warning(
                 "Config change not applied; the main UI keeps the previous settings. %s",
@@ -258,8 +282,12 @@ class ConfigReloader:
             return False
         return self._apply(loaded, signature)
 
-    def _load(self, paths: tuple[Path, ...]) -> tuple[Settings, FileSignature]:
-        loaded = self._loader()
+    def _load(self, paths: tuple[Path, ...], running: Settings) -> tuple[Settings, FileSignature]:
+        loaded = (
+            load_settings(running_restart_only=running)
+            if self._loader is None
+            else self._loader()
+        )
         return loaded, file_signature(paths)
 
     def _apply(self, loaded: Settings, signature: FileSignature) -> bool:

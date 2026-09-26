@@ -38,7 +38,7 @@ Open Admin and select `Add Demo Builder System`. The action writes these synthet
 - `Demo Boot Pair`
 - `Demo Manual Group`
 
-Use the seed to test the profile builder, saved chassis views, or virtual storage views without connecting a real appliance. The main UI shows the new system within a few seconds of saving; no restart is needed.
+Use the seed to test the profile builder, saved chassis views, or virtual storage views without connecting a real appliance. The main UI shows the new system after it next handles a page or API request; no restart is needed.
 
 See [[Admin UI and System Setup|Admin-UI-and-System-Setup]] for the setup flow.
 

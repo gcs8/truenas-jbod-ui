@@ -65,18 +65,23 @@ Use the DNS name on the certificate for `TRUENAS_TLS_SERVER_NAME`.
 ## Apply config changes
 
 The main UI applies edits to `config/config.yaml`,
-`config/runtime-overrides.yaml` and `config/profiles.yaml` by itself, without
-a restart. It checks the three files at most every two seconds (modification
-time, size and inode), so both admin saves and hand edits on the host take
-effect within a few seconds. A page that is loading while the file changes
-uses either the old settings or the new ones, never a mix of both.
+`config/runtime-overrides.yaml` and `config/profiles.yaml` without a restart.
+Before each non-static page or API request, it checks whether at least two
+seconds have passed since its last check; a saved edit therefore takes effect
+when the main UI next handles such a request. A page that is already loading
+while the file changes uses either the old settings or the new ones, never a
+mix of both.
 
 If an edit is not valid (a YAML syntax error, an unknown platform, a value out
 of range), the main UI keeps its previous settings and says so plainly: in the
 log, as the `/healthz` reason (`status: degraded`), and as a warning on the
 page. The page and `/healthz` only say that the edit was not applied; the
 main UI log names the setting, or the line and column of a YAML syntax error.
-Fix the file and the warning clears on the next check.
+Fix the file and the warning clears on the next check. If `config.yaml`
+disappears after startup (for example during a temporary host-side replacement),
+the running main UI treats that as a rejected edit and keeps its last valid
+generation rather than installing defaults. A process that starts with no
+`config.yaml` still uses the documented first-start defaults.
 
 A few settings are only read when the main UI process starts. Changing them
 needs a restart:

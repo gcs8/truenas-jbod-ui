@@ -32,6 +32,7 @@ from history_service.backup_archive.settings import (
 )
 from history_service.backup_archive.transport import (
     ArchiveTarget,
+    ArchiveTransportError,
     ArchiveVerificationError,
     DependencyMissingError,
     NfsUnmountError,
@@ -277,6 +278,26 @@ class FilesystemTargetTests(_TempCase):
             result = target.test()
         self.assertFalse(result["ok"])
         self.assertTrue(result["detail"])
+
+    def test_root_alias_changed_after_open_is_rejected_before_file_write(self) -> None:
+        local = self.tmp / "local"
+        local.mkdir()
+        physical_remote = self.tmp / "physical-remote"
+        physical_remote.mkdir()
+        alias = self.tmp / "mutable-target"
+        alias.symlink_to(physical_remote, target_is_directory=True)
+        settings = ArchiveTargetSettings(target_id="local", provider="filesystem", root=str(alias))
+        source = self.source(b"do not duplicate")
+
+        with open_target(settings, local_archive_root=local) as target:
+            alias.unlink()
+            alias.symlink_to(local, target_is_directory=True)
+            with self.assertRaisesRegex(ArchiveTransportError, "must not overlap the local archive root"):
+                target.put(source, "full/copy.tar.zst")
+
+        self.assertEqual(list(local.iterdir()), [])
+        self.assertEqual(list(physical_remote.iterdir()), [])
+        self.assertEqual(source.read_bytes(), b"do not duplicate")
 
 
 # --------------------------------------------------------------------------
