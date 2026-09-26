@@ -250,7 +250,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   newer cache, pending restart-only profile paths do not supply live profiles,
   temporary `config.yaml` deletion retains the last valid settings, and a disk
   sync in flight remains visible after reload. Admin and docs now describe the
-  request-triggered timing instead of promising an autonomous delay. (#634)
+  request-triggered timing instead of promising an autonomous delay. (#634, #652)
 - History collection now pauses when SQLite reports the database damaged
   while the service is running, instead of retrying writes every pass. The
   pause survives restarts, shows on the dashboard and as `degraded` in
