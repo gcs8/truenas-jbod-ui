@@ -82,7 +82,7 @@
     "test_release_changelog_coverage": 21,
     "test_release_status": 37,
     "test_release_wrap_validator": 27,
-    "test_route_contracts": 14,
+    "test_route_contracts": 15,
     "test_sas_fabric": 80,
     "test_scheduled_backup": 27,
     "test_script_json": 13,

@@ -253,6 +253,24 @@ class RouteContractTests(unittest.TestCase):
                 self.assertEqual(raised.exception.detail, str(error))
                 self.assertEqual((raised.exception.headers or {}).get("Retry-After"), retry_after)
 
+    def test_slot_bounds_report_unavailable_when_discovery_found_no_enclosures(self) -> None:
+        unreachable = SimpleNamespace(selected_enclosure_id=None, enclosures=[])
+        wrong_shelf = SimpleNamespace(
+            selected_enclosure_id="enc-b", enclosures=[SimpleNamespace(id="enc-b")]
+        )
+        for snapshot, status_code in ((unreachable, 503), (wrong_shelf, 404)):
+            with self.subTest(selected=snapshot.selected_enclosure_id):
+                service = SimpleNamespace(get_snapshot=AsyncMock(return_value=snapshot))
+                with self.assertRaises(app_main.HTTPException) as raised:
+                    asyncio.run(app_route_support.resolve_layout_slots(service, "enc-a"))
+                self.assertEqual(raised.exception.status_code, status_code)
+
+        service = SimpleNamespace(get_snapshot=AsyncMock(return_value=unreachable))
+        self.assertEqual(
+            asyncio.run(app_route_support.resolve_read_layout_slots(service, "enc-a")),
+            (None, "unavailable"),
+        )
+
     def test_admin_route_matrix_is_frozen(self) -> None:
         self.assertEqual(_route_matrix(admin_main.create_app()), ADMIN_ROUTE_MATRIX)
 

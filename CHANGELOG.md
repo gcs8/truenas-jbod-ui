@@ -259,11 +259,13 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
-- The main page loads again when the storage system can't be reached at
-  startup, showing the connection problem as a warning, as v0.22.2 did.
-  Since v0.23.0 it answered HTTP 503 "The server is busy" instead, while
-  `/livez` and `/healthz` still reported healthy. The page now tries to find
-  enclosures again on the next load, once the source is back. (#655, #656)
+- The main page loads again when the storage system can't be reached (for
+  example at startup or after a config reload), showing the connection problem
+  as a warning, as v0.22.2 did. Since v0.23.0 it answered HTTP 503 "The server
+  is busy" instead, while `/livez` and `/healthz` still reported healthy. Slot
+  requests for a named enclosure now say the layout is unavailable instead of
+  that the enclosure doesn't exist. The page finds enclosures again on the next
+  load once the source is back. (#655, #656)
 - The one-shot `enclosure-backup` service now receives the same
   `HISTORY_BACKUP_DIR` and `HISTORY_LONG_TERM_BACKUP_DIR` overrides as the
   history service and the backup scheduler, so all three Compose services
