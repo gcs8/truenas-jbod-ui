@@ -522,6 +522,39 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
                 mocks[called].assert_called_once()
                 mocks[skipped].assert_not_called()
 
+    def test_initial_setup_variant_starts_from_a_config_without_systems(self) -> None:
+        import yaml
+
+        module = self.load_matrix_module()
+        for variant in module.VARIANTS:
+            with self.subTest(variant=variant.name), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir) / "variant"
+                compose = Path(temp_dir) / "compose.yaml"
+                compose.write_text("services: {}\n", encoding="utf-8")
+                fixture = Path(temp_dir) / "config.yaml"
+                with patch.object(module, "_run") as run:
+                    module._prepare_variant_root(
+                        root,
+                        variant=variant,
+                        compose_path=compose,
+                        config_fixture=fixture,
+                        image="sha256:" + "a" * 64,
+                        ports=module.Ports(19080, 19081, 19082),
+                    )
+                commands = [tuple(c.args[0]) for c in run.call_args_list]
+                installed = [
+                    cmd for cmd in commands if cmd[-1] == str(root / "config" / "config.yaml")
+                ]
+                self.assertEqual(len(installed), 1)
+                source = Path(installed[0][-2])
+                if variant.admin_initial_setup:
+                    self.assertNotEqual(source, fixture)
+                    config = yaml.safe_load(source.read_text(encoding="utf-8"))
+                    self.assertNotIn("systems", config)
+                    self.assertNotIn("truenas", config)
+                else:
+                    self.assertEqual(source, fixture)
+
     def test_scheduler_variant_root_installs_shared_dirs_and_private_passphrase(self) -> None:
         module = self.load_matrix_module()
         variants = {variant.name: variant for variant in module.VARIANTS}

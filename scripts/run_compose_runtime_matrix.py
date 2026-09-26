@@ -390,6 +390,23 @@ def _write_environment(
     env_path.chmod(0o600)
 
 
+# Initial setup starts from a fresh install: no systems and no legacy
+# single-system `truenas:` block. The smoke fixture has a legacy host, and the
+# demo builder refuses to add a demo until that system is saved (#424).
+INITIAL_SETUP_CONFIG = """app:
+  release_check_enabled: false
+  startup_warm_cache_enabled: false
+  startup_warm_smart_enabled: false
+"""
+
+
+def _initial_setup_config(root: Path) -> Path:
+    path = root / ".initial-setup-config.yaml"
+    path.write_text(INITIAL_SETUP_CONFIG, encoding="utf-8")
+    path.chmod(0o600)
+    return path
+
+
 def _prepare_variant_root(
     root: Path,
     *,
@@ -478,7 +495,7 @@ def _prepare_variant_root(
             str(APP_UID),
             "-g",
             str(APP_GID),
-            str(config_fixture),
+            str(_initial_setup_config(root) if variant.admin_initial_setup else config_fixture),
             str(root / "config" / "config.yaml"),
         )
     )

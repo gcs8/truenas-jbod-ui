@@ -669,8 +669,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - The release QA scripts run end to end again. The Compose runtime matrix
   maps a slot with the system scope alone when the smoke fixture's unreachable
   source yields no enclosure, instead of stopping with "physical mapping scope
-  is unavailable". The private restore drill accepts the `app_version_note`
-  field that backup inspection now returns. (#662)
+  is unavailable". Its admin-only initial-setup variant starts from a config
+  with no systems, as a fresh install does, because the demo builder refuses to
+  add a demo next to an unsaved legacy system. The private restore drill accepts
+  the `app_version_note` field that backup inspection now returns. (#662)
 - The release runtime matrix (`scripts/run_compose_runtime_matrix.py`)
   expects files written by the UI to be owned by root, matching the default
   `docker-compose.yml` since #399, instead of the non-root identity that only
