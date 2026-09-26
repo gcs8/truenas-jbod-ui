@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
 import re
@@ -559,13 +560,26 @@ UPGRADE_DOCKERFILE = UPGRADE_NOTES_ROOT / "Dockerfile"
 REPO_ONLY_HELPER = "prepare_nonroot_bind_mounts.py"
 
 
-def tagged_yaml(tag: str, relative_path: str) -> dict:
-    document = subprocess.check_output(
-        ["git", "show", f"{tag}:{relative_path}"],
+# `git show v0.23.0:docker-compose.yml`, byte for byte. A checked-in copy keeps
+# the suite working in shallow and --no-tags checkouts.
+V0230_COMPOSE_FIXTURE = UPGRADE_NOTES_ROOT / "tests" / "fixtures" / "compose" / "v0.23.0.yml"
+V0230_COMPOSE_SHA256 = "191e492e2f7fab841654a5cfbddfe664a8a82d372f26cdeaa6c18e36309233a9"
+
+
+def tagged_v0230_compose() -> dict:
+    data = V0230_COMPOSE_FIXTURE.read_bytes()
+    if hashlib.sha256(data).hexdigest() != V0230_COMPOSE_SHA256:
+        raise AssertionError("tests/fixtures/compose/v0.23.0.yml is not the v0.23.0 tag's docker-compose.yml")
+    tagged = subprocess.run(
+        ["git", "show", "v0.23.0:docker-compose.yml"],
         cwd=UPGRADE_NOTES_ROOT,
-        text=True,
+        capture_output=True,
+        check=False,
     )
-    return yaml.safe_load(document)
+    # Cross-check against the tag only when this checkout has it.
+    if tagged.returncode == 0 and tagged.stdout != data:
+        raise AssertionError("tests/fixtures/compose/v0.23.0.yml differs from the v0.23.0 tag")
+    return yaml.safe_load(data)
 
 
 def upgrade_release_section(version: str) -> str:
@@ -624,7 +638,7 @@ class ReleaseStatusRouteAndCopyTests(unittest.TestCase):
 
 class UpgradeNotesContractTests(unittest.TestCase):
     def test_v0230_hardening_claims_match_the_tag_and_current_guidance(self) -> None:
-        tagged_base = tagged_yaml("v0.23.0", "docker-compose.yml")["services"]
+        tagged_base = tagged_v0230_compose()["services"]
         current_base = yaml.safe_load(
             (UPGRADE_NOTES_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
         )["services"]
