@@ -42,6 +42,14 @@ class ArchiveConfigError(ValueError):
     """A target setting is missing, malformed, or unsafe."""
 
 
+class ArchiveRootUnavailableError(ArchiveConfigError):
+    """A root could not be inspected right now (for example EACCES or EIO).
+
+    The setting itself may be valid, so the overlap is unknown. Callers must
+    not use the target until a later check succeeds.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class ArchiveTargetSettings:
     """Configuration for one archive target. Holds secret file paths, never secrets."""
@@ -156,7 +164,7 @@ def _directory_anchors(root: str | os.PathLike[str], *, label: str) -> list[tupl
         except FileNotFoundError:
             break
         except OSError as exc:
-            raise ArchiveConfigError(f"{label} could not be inspected safely.") from exc
+            raise ArchiveRootUnavailableError(f"{label} could not be inspected safely.") from exc
         if stat.S_ISLNK(metadata.st_mode):
             # ``realpath`` returned this as a plain component but it changed
             # before inspection. Refuse the unstable result instead of following it.

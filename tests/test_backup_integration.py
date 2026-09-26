@@ -760,6 +760,39 @@ class SchedulerTests(SchedulerTestBase):
         self.assertFalse(status["targets"]["nas"]["ok"])
         self.assertIn("must not overlap the local archive root", status["targets"]["nas"]["detail"])
 
+    def test_uninspectable_target_refuses_only_that_target_and_keeps_local_backups(self) -> None:
+        from unittest import mock
+
+        from history_service.backup_archive import settings as archive_settings
+
+        unreadable = self.root / "stale-usb"
+        unreadable.mkdir()
+        real_lstat = os.lstat
+
+        def lstat(path, *args, **kwargs):
+            if Path(path) == unreadable:
+                raise PermissionError(13, "Permission denied")
+            return real_lstat(path, *args, **kwargs)
+
+        with mock.patch.object(archive_settings.os, "lstat", side_effect=lstat):
+            with self.assertLogs("history_service.backup_archive.policy", "WARNING") as logs:
+                scheduler = self.make({
+                    "full": {"enabled": True, "local_keep": 2, "remote_keep": 1},
+                    "targets": [{**TARGET, "root": str(unreadable)}],
+                })
+            self.assertIn("could not be checked for local archive overlap", "\n".join(logs.output))
+            local_record = scheduler.run_now("full")
+
+        self.assertIsNotNone(local_record)
+        assert local_record is not None
+        self.assertTrue((self._paths.local_dir / local_record.name).is_file())
+        self.assertEqual([record.location for record in scheduler.catalog.list()], ["local"])
+        status_file = self._paths.status_file
+        assert status_file is not None
+        status = json.loads(status_file.read_text())
+        self.assertFalse(status["targets"]["nas"]["ok"])
+        self.assertIn("could not be inspected safely", status["targets"]["nas"]["detail"])
+
     def test_runtime_rechecks_alias_before_remote_retention_deletes_preserved_local_copy(self) -> None:
         from dataclasses import replace
 

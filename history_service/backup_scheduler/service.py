@@ -160,8 +160,10 @@ class BackupScheduler:
     ) -> None:
         # Policy loading normally performs this check, but the scheduler is the
         # final authority because its local root may be injected directly and
-        # filesystem aliases may have changed since the config was parsed.
-        validate_filesystem_target_roots(policy.targets, paths.local_dir)
+        # filesystem aliases may have changed since the config was parsed. A
+        # target that cannot be inspected right now must not stop local
+        # backups; the per-operation check below refuses it until it can.
+        validate_filesystem_target_roots(policy.targets, paths.local_dir, allow_unavailable=True)
         self.policy = policy
         self.backup_service = backup_service
         self.paths = paths

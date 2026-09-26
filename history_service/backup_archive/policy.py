@@ -38,6 +38,7 @@ value.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
@@ -52,9 +53,12 @@ from app.config_errors import ConfigurationError, describe_validation_error
 from history_service.backup_archive.cron import CronError, CronSchedule
 from history_service.backup_archive.settings import (
     ArchiveConfigError,
+    ArchiveRootUnavailableError,
     ArchiveTargetSettings,
     filesystem_roots_overlap,
 )
+
+logger = logging.getLogger(__name__)
 
 TRUE_VALUES = {"1", "true", "yes", "on"}
 FALSE_VALUES = {"0", "false", "no", "off"}
@@ -181,8 +185,16 @@ def local_archive_root_from_environment(environ: Mapping[str, str]) -> str:
 def validate_filesystem_target_roots(
     targets: Iterable[ArchiveTarget],
     local_archive_root: str | os.PathLike[str],
+    *,
+    allow_unavailable: bool = False,
 ) -> None:
-    """Fail closed when a filesystem target aliases or overlaps local storage."""
+    """Fail closed when a filesystem target aliases or overlaps local storage.
+
+    With ``allow_unavailable`` (startup and config saves), a root that cannot
+    be inspected right now is logged and skipped. A proven overlap is still an
+    error. The check before every target operation passes ``False``, so an
+    uninspectable target is refused there instead of stopping every backup.
+    """
 
     problems: list[str] = []
     for target in targets:
@@ -190,6 +202,17 @@ def validate_filesystem_target_roots(
             continue
         try:
             overlaps = filesystem_roots_overlap(local_archive_root, target.settings.root)
+        except ArchiveRootUnavailableError as exc:
+            if allow_unavailable:
+                logger.warning(
+                    "Filesystem archive target %r could not be checked for local archive overlap (%s); "
+                    "it will be refused until the check succeeds.",
+                    target.target_id,
+                    exc,
+                )
+                continue
+            problems.append(f"Filesystem archive target {target.target_id!r}: {exc}")
+            continue
         except ArchiveConfigError as exc:
             problems.append(f"Filesystem archive target {target.target_id!r}: {exc}")
             continue
@@ -294,7 +317,9 @@ def policy_from_section(
         raise ConfigurationError(problems) from None
     targets = _parse_targets(parsed.targets, targets_source)
     policy = BackupPolicy(config=parsed.config, full=parsed.full, targets=targets)
-    validate_filesystem_target_roots(targets, local_archive_root_from_environment(env))
+    validate_filesystem_target_roots(
+        targets, local_archive_root_from_environment(env), allow_unavailable=True
+    )
     return policy
 
 
