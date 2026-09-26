@@ -262,7 +262,7 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
                     {
                         "backups": {
                             "targets": [
-                                {"target_id": "real-nas", "provider": "filesystem", "root": "/mnt/real-nas"}
+                                {"target_id": "remote", "provider": "filesystem", "root": str(root / "remote")}
                             ]
                         }
                     }

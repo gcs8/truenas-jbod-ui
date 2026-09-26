@@ -151,7 +151,6 @@ class PublicDocsContractTests(unittest.TestCase):
         backup = (ROOT / "wiki/Backup-Restore-and-Debug-Bundles.md").read_text(
             encoding="utf-8"
         )
-        normalized_architecture = " ".join(architecture.split())
         normalized_backup = " ".join(backup.split())
 
         for marker in (
