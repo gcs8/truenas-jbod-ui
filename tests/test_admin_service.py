@@ -3343,7 +3343,142 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["orphaned_systems"][0]["system_id"], "qs-cryostorage")
         self.assertEqual(payload["valid_system_ids"], ["archive-core"])
-        history_store.list_history_system_summaries.assert_called_once_with(["archive-core"])
+        # One shared unfiltered scan; the route drops the saved systems itself.
+        history_store.list_history_system_summaries.assert_called_once_with()
+
+    def _blocking_summary_store(self, release: "threading.Event", calls: list[int]) -> MagicMock:
+        history_store = MagicMock()
+
+        def slow_scan() -> list[dict[str, object]]:
+            calls.append(1)
+            release.wait(10)
+            return [
+                {"system_id": "archive-core", "total_rows": 3},
+                {"system_id": "qs-cryostorage", "total_rows": 8},
+            ]
+
+        history_store.list_history_system_summaries.side_effect = slow_scan
+        return history_store
+
+    def test_concurrent_history_scans_share_one_worker_and_mint_their_own_tokens(self) -> None:
+        import threading
+
+        preview = next(route for route in admin_app.routes if route.path == "/api/admin/history/orphaned").endpoint
+        systems = next(route for route in admin_app.routes if route.path == "/api/admin/history/systems").endpoint
+        settings = Settings(
+            systems=[SystemConfig(id="archive-core", label="Archive CORE", truenas=TrueNASConfig(host="https://a.local", platform="core"))],
+            default_system_id="archive-core",
+        )
+        release, calls = threading.Event(), []
+        history_store = self._blocking_summary_store(release, calls)
+
+        async def scenario() -> list[object]:
+            tasks = [asyncio.ensure_future(preview()) for _ in range(6)] + [asyncio.ensure_future(systems())]
+            await asyncio.sleep(0.2)
+            release.set()
+            return await asyncio.gather(*tasks)
+
+        with patch("admin_service.routes.reload_app_settings", return_value=settings), patch(
+            "admin_service.routes.get_history_store", return_value=history_store
+        ):
+            responses = asyncio.run(scenario())
+
+        self.assertEqual(len(calls), 1, "every concurrent caller must join one scan")
+        previews = [json.loads(response.body) for response in responses[:6]]
+        self.assertEqual({item["orphaned_systems"][0]["system_id"] for item in previews}, {"qs-cryostorage"})
+        self.assertEqual(len({item["purge_preview_token"] for item in previews}), 6)
+        self.assertEqual(len(json.loads(responses[6].body)["systems"]), 2)
+
+    def test_a_scan_is_not_reused_after_it_finishes_or_after_history_changes(self) -> None:
+        import threading
+
+        preview = next(route for route in admin_app.routes if route.path == "/api/admin/history/orphaned").endpoint
+        purge = next(route for route in admin_app.routes if route.path == "/api/admin/history/purge-orphaned").endpoint
+        settings = Settings(systems=[])
+        release, calls = threading.Event(), []
+        history_store = self._blocking_summary_store(release, calls)
+        history_store.purge_orphaned_history.return_value = {"total_rows": 0, "removed_system_ids": []}
+
+        async def scenario() -> None:
+            release.set()
+            first = json.loads((await preview()).body)
+            await preview()
+            self.assertEqual(len(calls), 2, "a finished scan is never served again")
+            release.clear()
+            stale = asyncio.ensure_future(preview())
+            await asyncio.sleep(0.1)
+            await purge({"preview_token": first["purge_preview_token"], "confirm_irreversible": True})
+            fresh = asyncio.ensure_future(preview())
+            await asyncio.sleep(0.1)
+            release.set()
+            await asyncio.gather(stale, fresh)
+
+        with patch("admin_service.routes.reload_app_settings", return_value=settings), patch(
+            "admin_service.routes.get_history_store", return_value=history_store
+        ):
+            asyncio.run(scenario())
+
+        self.assertEqual(len(calls), 4, "a caller after a purge must not join the scan that predates it")
+
+    def test_history_scans_hold_at_most_two_worker_threads(self) -> None:
+        import threading
+
+        from admin_service import routes as admin_routes
+
+        release = threading.Event()
+        running, peak, lock = [0], [0], threading.Lock()
+        history_store = MagicMock()
+
+        def scan() -> list[dict[str, object]]:
+            with lock:
+                running[0] += 1
+                peak[0] = max(peak[0], running[0])
+            release.wait(10)
+            with lock:
+                running[0] -= 1
+            return []
+
+        history_store.list_history_system_summaries.side_effect = scan
+        scans = admin_routes.HistorySummaryScans()
+
+        async def scenario() -> None:
+            tasks = []
+            for _ in range(4):
+                tasks.append(asyncio.ensure_future(scans.scan()))
+                await asyncio.sleep(0.05)
+                scans.history_changed()  # each caller now needs its own scan
+            await asyncio.sleep(0.3)
+            with lock:
+                self.assertEqual(running[0], admin_routes.HISTORY_SCAN_CONCURRENCY)
+            release.set()
+            await asyncio.gather(*tasks)
+
+        with patch("admin_service.routes.get_history_store", return_value=history_store):
+            asyncio.run(scenario())
+        self.assertEqual(history_store.list_history_system_summaries.call_count, 4)
+        self.assertEqual(peak[0], admin_routes.HISTORY_SCAN_CONCURRENCY)
+
+    def test_a_cancelled_waiter_does_not_cancel_the_shared_scan(self) -> None:
+        import threading
+
+        from admin_service import routes as admin_routes
+
+        release = threading.Event()
+        history_store = MagicMock()
+        history_store.list_history_system_summaries.side_effect = lambda: (release.wait(10), [{"system_id": "a"}])[1]
+        scans = admin_routes.HistorySummaryScans()
+
+        async def scenario() -> list[dict[str, object]]:
+            abandoned = asyncio.ensure_future(scans.scan())
+            kept = asyncio.ensure_future(scans.scan())
+            await asyncio.sleep(0.1)
+            abandoned.cancel()
+            release.set()
+            return await kept
+
+        with patch("admin_service.routes.get_history_store", return_value=history_store):
+            self.assertEqual(asyncio.run(scenario()), [{"system_id": "a"}])
+        self.assertEqual(history_store.list_history_system_summaries.call_count, 1)
 
     def test_list_orphaned_history_route_treats_missing_noninitializing_database_as_empty(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/history/orphaned")

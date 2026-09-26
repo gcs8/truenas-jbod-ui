@@ -270,6 +270,16 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   The private restore drill gains `--segmented-history` and checks it against
   the backup before import, and runs Playwright with a private umask so its
   recreated output folder passes the config's private-folder check. (#663)
+- The admin page stays responsive on large history. Every page load and refresh
+  used to start its own removed-system history scan; on production-sized
+  history one scan takes minutes and keeps its worker thread until it finishes,
+  even after the browser gives up. A few page loads used every worker, and
+  `/api/admin/state` then waited 86 s. Concurrent requests now share one scan,
+  at most two scans hold worker threads, and Refresh reports "Refreshed."
+  without waiting for the scan; the history section shows its own progress. A
+  purge, adoption, system delete or backup import makes the next request start
+  a new scan instead of joining an older one. The scan itself is as slow as in
+  v0.22.2. (#663)
 - Backup inspect, import and export in the admin service work again when
   `.env` doesn't set the `RELEASE_CHECK_*` keys. Compose passes unset keys as
   empty values, and the history settings loader rejected them ("must be true

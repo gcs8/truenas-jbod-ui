@@ -113,10 +113,74 @@ from app.services.ssh_key_manager import SSHKeyManager
 from app.services.system_setup import _CONFIG_WRITE_LOCK, SystemSetupService
 
 
+# History-summary scans allowed to hold worker threads at once, so a slow scan
+# never takes the whole default executor from the rest of the admin API.
+HISTORY_SCAN_CONCURRENCY = 2
+
+
+class HistorySummaryScans:
+    """One shared history-summary scan per history generation.
+
+    On production-sized history a scan takes minutes and cannot be cancelled
+    once it is in a worker thread, so every page load starting its own scan
+    filled the default executor and stalled unrelated admin requests. Callers
+    join the scan in flight; a history change bumps the generation so later
+    callers never join a scan that may predate it. Results are not kept after a
+    scan finishes, so purge proofs are always taken from a scan that started
+    after the last change.
+    """
+
+    def __init__(self, concurrency: int = HISTORY_SCAN_CONCURRENCY) -> None:
+        self.concurrency = concurrency
+        self.generation = 0
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._inflight: tuple[int, asyncio.Task[list[dict[str, Any]]]] | None = None
+        self._limit: asyncio.Semaphore | None = None
+
+    def history_changed(self) -> None:
+        self.generation += 1
+
+    async def scan(self) -> list[dict[str, Any]]:
+        loop = asyncio.get_running_loop()
+        if self._loop is not loop:
+            self._loop, self._inflight = loop, None
+            self._limit = asyncio.Semaphore(self.concurrency)
+        inflight = self._inflight
+        if inflight is None or inflight[0] != self.generation or inflight[1].done():
+            history_store = get_history_store()
+            limit = self._limit
+
+            async def run_scan() -> list[dict[str, Any]]:
+                async with limit:
+                    return await asyncio.to_thread(history_store.list_history_system_summaries)
+
+            entry = (self.generation, loop.create_task(run_scan()))
+            self._inflight = inflight = entry
+
+            def clear(done: asyncio.Task[Any]) -> None:
+                if self._inflight is entry:
+                    self._inflight = None
+                if not done.cancelled():
+                    done.exception()  # retrieved so a failure with no waiter is not logged as unhandled
+
+            entry[1].add_done_callback(clear)
+        # A waiter that goes away must not cancel the scan other callers share.
+        return list(await asyncio.shield(inflight[1]))
+
+
 def build_router(admin_settings: Any) -> APIRouter:
     router = APIRouter()
     # Bounded, short-lived, one-use proof of the exact preview shown to the operator.
     purge_previews: dict[str, tuple[float, list[str], list[dict[str, Any]]]] = {}
+    summary_scans = HistorySummaryScans()
+    history_changed = summary_scans.history_changed
+    scan_history_summaries = summary_scans.scan
+
+    def without_system_ids(
+        summaries: list[dict[str, Any]], system_ids: list[str] | tuple[str, ...]
+    ) -> list[dict[str, Any]]:
+        excluded = {system_id.strip() for system_id in system_ids if system_id and system_id.strip()}
+        return [summary for summary in summaries if summary.get("system_id") not in excluded]
 
     async def container_action_response(
         container_key: str,
@@ -485,6 +549,7 @@ def build_router(admin_settings: Any) -> APIRouter:
                 except (ValueError, DockerRuntimeError) as exc:
                     raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+                history_changed()
                 record_config_change("backup.restore", "system backup import")
                 settings = reload_app_settings()
                 runtime_service = get_runtime_service()
@@ -920,7 +985,10 @@ def build_router(admin_settings: Any) -> APIRouter:
         if purge_history:
             history_store = get_history_store()
             try:
-                purge_summary = await asyncio.to_thread(history_store.delete_system_history, system_id)
+                try:
+                    purge_summary = await asyncio.to_thread(history_store.delete_system_history, system_id)
+                finally:
+                    history_changed()
                 if purge_summary["total_rows"]:
                     purge_detail = (
                         f"Purged {_format_count(int(purge_summary['total_rows']), 'saved history row')} "
@@ -979,7 +1047,11 @@ def build_router(admin_settings: Any) -> APIRouter:
                 return summary, valid_ids
 
         try:
-            summary, valid_system_ids = await run_retained_thread_worker(purge_confirmed)
+            try:
+                summary, valid_system_ids = await run_retained_thread_worker(purge_confirmed)
+            finally:
+                # Bump after the write settles, so no scan that could predate it is joined.
+                history_changed()
         except ValueError as exc:
             raise HTTPException(status_code=409, detail="Orphaned history or saved systems changed. Preview again before purging.") from exc
         except Exception as exc:  # noqa: BLE001 - surface maintenance failures directly in admin.
@@ -1009,12 +1081,8 @@ def build_router(admin_settings: Any) -> APIRouter:
     async def list_orphaned_history() -> JSONResponse:
         settings = reload_app_settings()
         valid_system_ids = [system.id for system in settings.systems]
-        history_store = get_history_store()
         try:
-            orphaned_systems = await asyncio.to_thread(
-                history_store.list_history_system_summaries,
-                valid_system_ids,
-            )
+            orphaned_systems = without_system_ids(await scan_history_summaries(), valid_system_ids)
         except Exception as exc:  # noqa: BLE001 - surface maintenance failures directly in admin.
             logger.exception("Unable to inspect orphaned history")
             raise HTTPException(status_code=500, detail="Unable to inspect orphaned history; see admin logs.") from exc
@@ -1038,9 +1106,8 @@ def build_router(admin_settings: Any) -> APIRouter:
 
     @router.get("/api/admin/history/systems")
     async def list_history_systems() -> JSONResponse:
-        history_store = get_history_store()
         try:
-            systems = await asyncio.to_thread(history_store.list_history_system_summaries)
+            systems = await scan_history_summaries()
         except Exception as exc:  # noqa: BLE001 - surface maintenance failures directly in admin.
             logger.exception("Unable to inspect saved history")
             raise HTTPException(status_code=500, detail="Unable to inspect saved history; see admin logs.") from exc
@@ -1065,10 +1132,7 @@ def build_router(admin_settings: Any) -> APIRouter:
 
         history_store = get_history_store()
         try:
-            orphaned_systems = await asyncio.to_thread(
-                history_store.list_history_system_summaries,
-                valid_system_ids,
-            )
+            orphaned_systems = without_system_ids(await scan_history_summaries(), valid_system_ids)
         except Exception as exc:  # noqa: BLE001 - surface maintenance failures directly in admin.
             logger.exception("Unable to inspect orphaned history before adoption")
             raise HTTPException(status_code=500, detail="Unable to inspect orphaned history; see admin logs.") from exc
@@ -1084,16 +1148,16 @@ def build_router(admin_settings: Any) -> APIRouter:
             )
 
         try:
-            summary = await asyncio.to_thread(
-                history_store.adopt_system_history,
-                source_system_id,
-                target_system_id,
-                target_system_label=target_system.label,
-            )
-            remaining_orphaned_systems = await asyncio.to_thread(
-                history_store.list_history_system_summaries,
-                valid_system_ids,
-            )
+            try:
+                summary = await asyncio.to_thread(
+                    history_store.adopt_system_history,
+                    source_system_id,
+                    target_system_id,
+                    target_system_label=target_system.label,
+                )
+            finally:
+                history_changed()
+            remaining_orphaned_systems = without_system_ids(await scan_history_summaries(), valid_system_ids)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:  # noqa: BLE001 - surface maintenance failures directly in admin.

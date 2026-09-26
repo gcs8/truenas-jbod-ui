@@ -10,7 +10,7 @@
     "test_admin_runtime_routes": 3,
     "test_admin_safety": 10,
     "test_admin_secret_models": 4,
-    "test_admin_service": 142,
+    "test_admin_service": 146,
     "test_admin_ttl": 5,
     "test_app_history_body_bound": 8,
     "test_app_history_bounds": 9,

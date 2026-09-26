@@ -234,6 +234,9 @@ class ConfiguredKnownHostsStartupTests(unittest.TestCase):
                 warnings = app_route_support.startup_known_hosts_warnings(settings)
             self.assertEqual(len(problems), 1)
             self.assertIn("not readable by the app", problems[0])
+            # The remedy names the file itself, not a folder write fix.
+            self.assertNotIn("Cannot write to", problems[0])
+            self.assertIn(f"chown {os.geteuid()}:{os.getegid()} {known_hosts}", problems[0])
             self.assertEqual(warnings, [])
 
     def test_untraversable_folder_is_a_problem_not_an_exception(self) -> None:
@@ -251,7 +254,7 @@ class ConfiguredKnownHostsStartupTests(unittest.TestCase):
             with patch("app.services.storage_writability.Path.is_dir", is_dir):
                 problems = app_route_support.startup_storage_problems(settings)
             self.assertEqual(len(problems), 1)
-            self.assertIn(str(locked), problems[0])
+            self.assertIn(f"Cannot open the known-hosts folder {locked}", problems[0])
 
     def test_unwritable_folder_without_a_file_is_still_a_down_problem(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

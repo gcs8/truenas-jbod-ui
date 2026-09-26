@@ -63,9 +63,8 @@ def _running_identity() -> tuple[int | None, int | None]:
     )
 
 
-def describe_unwritable_directory(directory: Path | str) -> str:
-    """Return the one line that tells an operator what to do about `directory`."""
-    path = Path(directory)
+def _ownership_and_remedy(path: Path, *, access: str, recursive: bool) -> str:
+    """``(owner, running identity). Remedy`` for a path the app cannot use."""
     running_uid, running_gid = _running_identity()
     try:
         owner_uid: int | None = path.stat().st_uid
@@ -76,12 +75,17 @@ def describe_unwritable_directory(directory: Path | str) -> str:
     running = f"running as uid {running_uid}" if running_uid is not None else "running as this user"
     target = host_repair_path(path)
     if running_uid is None or running_gid is None:
-        remedy = f"On the Docker host, give the app user write access to {target}."
+        remedy = f"On the Docker host, give the app user {access} access to {target}."
     else:
-        remedy = (
-            f"On the Docker host run: sudo chown -R {running_uid}:{running_gid} {target}"
-        )
-    return f"Cannot write to {path} ({owner}, {running}). {remedy}"
+        flag = "-R " if recursive else ""
+        remedy = f"On the Docker host run: sudo chown {flag}{running_uid}:{running_gid} {target}"
+    return f"({owner}, {running}). {remedy}"
+
+
+def describe_unwritable_directory(directory: Path | str) -> str:
+    """Return the one line that tells an operator what to do about `directory`."""
+    path = Path(directory)
+    return f"Cannot write to {path} {_ownership_and_remedy(path, access='write', recursive=True)}"
 
 
 class StorageDirectoryUnwritable(RuntimeError):
@@ -192,7 +196,10 @@ def check_known_hosts_files(
             file_exists = parent_is_dir and path.exists()
         except OSError:
             # A folder the app cannot enter: SSH cannot read the file either.
-            problems.append(describe_unwritable_directory(parent))
+            problems.append(
+                f"Cannot open the known-hosts folder {parent}, so SSH cannot verify host keys "
+                f"{_ownership_and_remedy(parent, access='read', recursive=True)}"
+            )
             continue
         if not parent_is_dir:
             problems.append(
@@ -205,7 +212,7 @@ def check_known_hosts_files(
             # Strict host-key checking loads this file; unreadable means SSH fails.
             problems.append(
                 f"The known-hosts file {path} is not readable by the app, so SSH cannot verify "
-                f"host keys. {describe_unwritable_directory(parent)}"
+                f"host keys {_ownership_and_remedy(path, access='read', recursive=False)}"
             )
             continue
         target = path if file_exists else parent

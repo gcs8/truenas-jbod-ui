@@ -246,6 +246,31 @@ test.describe("admin sidecar smoke", () => {
     await expect(field).toBeFocused();
   });
 
+  test("a slow history scan runs once per page and never holds up Refreshed.", async ({ page }) => {
+    let scans = 0;
+    let releaseScan;
+    const scanReleased = new Promise(resolve => {
+      releaseScan = resolve;
+    });
+    await page.route("**/api/admin/history/orphaned", async route => {
+      scans += 1;
+      await scanReleased;
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ ok: true, orphaned_systems: [], valid_system_ids: [], purge_preview_token: "synthetic" }),
+      });
+    });
+    await gotoAdmin(page);
+    await expect(page.locator("#history-adopt-result")).toContainText("Scanning");
+    await page.locator("#refresh-state-button").evaluate(button => button.click());
+    await expect(page.locator("#admin-status-banner")).toContainText("Refreshed.", { timeout: 5_000 });
+    expect(scans).toBe(1);
+    releaseScan();
+    await expect(page.locator("#history-adopt-result")).toContainText("No orphaned history rows");
+    expect(scans).toBe(1);
+  });
+
   test("a hot-reloaded save says applied; a restart-only save offers Restart main UI now", async ({ page }) => {
     await gotoAdmin(page);
     const field = page.locator('input[data-runtime-behavior-key]:enabled').first();

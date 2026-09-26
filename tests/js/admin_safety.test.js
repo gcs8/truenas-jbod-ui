@@ -21,7 +21,7 @@ function load(names, bindings = {}) {
 }
 test("failed history source scan preserves last known rows and marks them unavailable", async () => {
   const state = {orphanedHistory: [{system_id: "removed", total_rows: 4}]};
-  await load(["loadOrphanedHistory"], {state, elements: {}, fetchJson: async () => {throw new Error("offline");}, renderHistoryMaintenance() {}, setBanner() {}}).loadOrphanedHistory();
+  await load(["loadOrphanedHistory", "startOrphanedHistoryScan", "runOrphanedHistoryScan"], {state, elements: {}, fetchJson: async () => {throw new Error("offline");}, renderHistoryMaintenance() {}, setBanner() {}}).loadOrphanedHistory();
   assert.equal(state.orphanedHistory.length, 1);
   assert.equal(state.orphanedHistoryError, true);
 });
