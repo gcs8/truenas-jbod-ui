@@ -3366,7 +3366,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         preview = next(route for route in admin_app.routes if route.path == "/api/admin/history/orphaned").endpoint
         systems = next(route for route in admin_app.routes if route.path == "/api/admin/history/systems").endpoint
         settings = Settings(
-            systems=[SystemConfig(id="archive-core", label="Archive CORE", truenas=TrueNASConfig(host="https://a.local", platform="core"))],
+            systems=[SystemConfig(id="archive-core", label="Archive CORE", truenas=TrueNASConfig(host="https://archive-core.example.test", platform="core"))],
             default_system_id="archive-core",
         )
         release, calls = threading.Event(), []
