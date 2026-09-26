@@ -20,6 +20,11 @@ from typing import Callable, NamedTuple, Sequence
 APP_UID = 10001
 APP_GID = 10001
 BACKUP_UID = 1000
+# The default docker-compose.yml runs enclosure-ui as root ("0:0") since #399;
+# the non-root identity lives in docker-compose.nonroot.yml, which this matrix
+# does not apply. Files the UI writes are therefore owned by root.
+UI_WRITER_UID = 0
+UI_WRITER_GID = 0
 BACKUP_GID = 1000
 AUTH_USERNAME = "operator"
 AUTH_PASSWORD = "synthetic-compose-matrix-passphrase"
@@ -771,6 +776,15 @@ def _restart_ui(prefix: Sequence[str], ports: Ports) -> None:
     _verify_ui(ports)
 
 
+def _require_ui_written_file(owner_uid: int, owner_gid: int, file_mode: int, kind: str) -> None:
+    expected = (UI_WRITER_UID, UI_WRITER_GID)
+    if (owner_uid, owner_gid) != expected or not stat.S_ISREG(file_mode):
+        raise RuntimeError(
+            f"{kind} persistence ownership failed: owner={owner_uid}:{owner_gid} "
+            f"regular={stat.S_ISREG(file_mode)} expected={expected[0]}:{expected[1]}"
+        )
+
+
 def _verify_pencil_cycle(
     root: Path,
     variant: Variant,
@@ -819,8 +833,7 @@ def _verify_pencil_cycle(
     if saved_alias.get("object_id") != object_id or saved_alias.get("label") != save_payload["label"]:
         raise RuntimeError("alias persistence readback failed")
     owner_uid, owner_gid, file_mode, _size = _read_app_owned_metadata(alias_path)
-    if (owner_uid, owner_gid) != (APP_UID, APP_GID) or not stat.S_ISREG(file_mode):
-        raise RuntimeError("alias persistence ownership failed")
+    _require_ui_written_file(owner_uid, owner_gid, file_mode, "alias")
 
     _restart_ui(prefix, ports)
     aliases = _read_app_owned_json(alias_path).get("sas_fabric_aliases")
@@ -938,8 +951,7 @@ def _verify_mapping_cycle(
     if saved_mapping.get("slot") != 0 or saved_mapping.get("notes") != payload["notes"]:
         raise RuntimeError("mapping persistence readback failed")
     owner_uid, owner_gid, file_mode, _size = _read_app_owned_metadata(mapping_path)
-    if (owner_uid, owner_gid) != (APP_UID, APP_GID) or not stat.S_ISREG(file_mode):
-        raise RuntimeError("mapping persistence ownership failed")
+    _require_ui_written_file(owner_uid, owner_gid, file_mode, "mapping")
 
     _restart_ui(prefix, ports)
     mappings = _read_app_owned_json(mapping_path).get("slot_mappings")

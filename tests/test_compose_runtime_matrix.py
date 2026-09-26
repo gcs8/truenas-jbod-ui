@@ -638,6 +638,25 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
         )
         verify_ui.assert_called_once_with(ports)
 
+    def test_ui_writer_owner_matches_the_default_compose_user(self) -> None:
+        import yaml
+
+        module = self.load_matrix_module()
+        compose = yaml.safe_load((ROOT / "docker-compose.yml").read_text(encoding="utf-8"))
+        user = compose["services"]["enclosure-ui"]["user"]
+        self.assertEqual(user, f"{module.UI_WRITER_UID}:{module.UI_WRITER_GID}")
+
+    def test_ui_written_file_ownership_names_observed_and_expected_owner(self) -> None:
+        module = self.load_matrix_module()
+        regular = 0o100644
+        module._require_ui_written_file(module.UI_WRITER_UID, module.UI_WRITER_GID, regular, "alias")
+        with self.assertRaisesRegex(
+            RuntimeError, r"alias persistence ownership failed: owner=10001:10001 .*expected=0:0"
+        ):
+            module._require_ui_written_file(10001, 10001, regular, "alias")
+        with self.assertRaisesRegex(RuntimeError, "regular=False"):
+            module._require_ui_written_file(0, 0, 0o040755, "mapping")
+
     def test_alias_cycle_restarts_after_persisted_readback_before_clear(self) -> None:
         module = self.load_matrix_module()
         ports = module.Ports(19080, 19081, 19082)
@@ -679,8 +698,8 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
                 patch.object(module, "_request", side_effect=[(401, b""), (403, b"")]),
                 patch.object(module, "_require_status", side_effect=require_alias),
                 patch.object(module, "_restart_ui", side_effect=lambda *_: events.append("restart")),
-                patch.object(module, "APP_UID", os.getuid()),
-                patch.object(module, "APP_GID", os.getgid()),
+                patch.object(module, "UI_WRITER_UID", os.getuid()),
+                patch.object(module, "UI_WRITER_GID", os.getgid()),
             ):
                 module._verify_pencil_cycle(root, module.VARIANTS[0], ports, prefix)
         self.assertEqual(events, ["save", "restart", "clear"])
@@ -807,8 +826,8 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
             with (
                 patch.object(module, "_require_status", side_effect=require_mapping),
                 patch.object(module, "_restart_ui", side_effect=lambda *_: events.append("restart")),
-                patch.object(module, "APP_UID", os.getuid()),
-                patch.object(module, "APP_GID", os.getgid()),
+                patch.object(module, "UI_WRITER_UID", os.getuid()),
+                patch.object(module, "UI_WRITER_GID", os.getgid()),
             ):
                 module._verify_mapping_cycle(root, module.VARIANTS[0], ports, prefix)
         self.assertEqual(
