@@ -259,6 +259,27 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- The main UI no longer reports itself down when a pinned known-hosts file sits
+  on a read-only mount, such as the `/run/ssh` mount in the shipped Compose
+  file. SSH still verifies hosts against the keys in it; `/healthz` now answers
+  `degraded` (HTTP 200) with a warning that new host keys cannot be saved,
+  instead of `down` (HTTP 503). A missing folder, or an unwritable folder with
+  no file yet, is still `down`. History `/healthz` no longer fails with HTTP 500
+  when segmented history is configured but no catalog exists yet, as on a fresh
+  install before a migration or restore; it reports `degraded` with the reason.
+  The private restore drill gains `--segmented-history` and checks it against
+  the backup before import, and runs Playwright with a private umask so its
+  recreated output folder passes the config's private-folder check. (#663)
+- The admin page stays responsive on large history. Every page load and refresh
+  used to start its own removed-system history scan; on production-sized
+  history one scan takes minutes and keeps its worker thread until it finishes,
+  even after the browser gives up. A few page loads used every worker, and
+  `/api/admin/state` then waited 86 s. Concurrent requests now share one scan,
+  at most two scans hold worker threads, and Refresh reports "Refreshed."
+  without waiting for the scan; the history section shows its own progress. A
+  purge, adoption, system delete or backup import makes the next request start
+  a new scan instead of joining an older one. The scan itself is as slow as in
+  v0.22.2. (#663)
 - Backup inspect, import and export in the admin service work again when
   `.env` doesn't set the `RELEASE_CHECK_*` keys. Compose passes unset keys as
   empty values, and the history settings loader rejected them ("must be true

@@ -150,6 +150,13 @@ The controller performs these phases:
 12. Write `sanitized-receipt.json` only after default cleanup succeeds. A
     cleanup failure cannot produce a passing receipt.
 
+A backup from a deployment with segmented history (bundle `schema_version` 2)
+needs `--segmented-history`. The flag sets the documented
+`HISTORY_SEGMENT_CATALOG_PATH` in the QA stack before it starts, so the restore
+runs the same fresh-host path an operator would. After inspection the controller
+compares the flag with the backup and stops before import if they disagree. It
+never creates a placeholder catalog or segments folder.
+
 The controller's help output is the command authority:
 
 ```bash

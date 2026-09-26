@@ -101,6 +101,48 @@ class HealthzShapeTests(unittest.TestCase):
         self.assertEqual(payload["status"], "degraded")
         self.assertEqual(payload["detail"], "History cleanup has failed twice in a row.")
 
+    def _healthz_with_size_error(self, error: Exception, degraded: str | None = None) -> dict[str, object]:
+        with (
+            patch.object(history_main, "startup_failure_reason", None),
+            patch.object(history_main.collector, "status", return_value={"collector_running": True}),
+            patch.object(history_main.collector, "degraded_reason", return_value=degraded),
+            patch.object(history_main.store, "database_size_bytes", side_effect=error),
+        ):
+            response = asyncio.run(history_main.healthz())
+        self.assertEqual(response.status_code, 200)
+        return json.loads(response.body)
+
+    def test_a_missing_segmented_catalog_is_degraded_not_a_crash(self) -> None:
+        with patch.object(history_main.store, "segment_catalog_path", Path("/nonexistent-qa/segments/catalog.json")):
+            payload = self._healthz_with_size_error(
+                FileNotFoundError(2, "No such file", "/nonexistent-qa/segments/catalog.json")
+            )
+
+        self.assertEqual(payload["status"], "degraded")
+        self.assertEqual(payload["detail"], history_main.SEGMENT_CATALOG_MISSING_REASON)
+        self.assertIsNone(payload["database_size_bytes"])
+
+    def test_an_unreadable_segmented_catalog_is_degraded_without_internal_text(self) -> None:
+        for error in (ValueError("Segmented history migration recovery is pending."), PermissionError(13, "denied")):
+            with self.subTest(error=type(error).__name__):
+                payload = self._healthz_with_size_error(error)
+                self.assertEqual(payload["status"], "degraded")
+                self.assertEqual(payload["detail"], history_main.SEGMENT_CATALOG_UNREADABLE_REASON)
+                self.assertIsNone(payload["database_size_bytes"])
+
+    def test_a_missing_segment_under_an_existing_catalog_is_not_called_a_fresh_install(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            catalog = Path(temp_dir) / "catalog.json"
+            catalog.write_text("{}", encoding="utf-8")
+            with patch.object(history_main.store, "segment_catalog_path", catalog):
+                payload = self._healthz_with_size_error(FileNotFoundError(2, "No such file", "segment-0001.sqlite"))
+        self.assertEqual(payload["detail"], history_main.SEGMENT_CATALOG_UNREADABLE_REASON)
+
+    def test_an_existing_degraded_reason_is_kept_when_sizing_fails(self) -> None:
+        payload = self._healthz_with_size_error(FileNotFoundError(), "The last background collection failed.")
+
+        self.assertEqual(payload["detail"], "The last background collection failed.")
+
     def test_a_failed_manual_refresh_leaves_healthz_ok(self) -> None:
         payload = self._healthz(
             {"collector_running": True, "last_error": "History full refresh failed; see service logs."},

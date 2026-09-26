@@ -7,6 +7,7 @@ import json
 import re
 import socket
 import stat
+import sys
 import tempfile
 import threading
 import unittest
@@ -496,6 +497,39 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
                 0o600,
             )
 
+    def test_segmented_history_flag_sets_the_documented_catalog_path(self) -> None:
+        for segmented, expected in ((False, False), (True, True)):
+            with self.subTest(segmented=segmented), tempfile.TemporaryDirectory() as raw_root:
+                runtime = Path(raw_root) / "runtime"
+                self.module._write_runtime_files(
+                    ROOT,
+                    runtime,
+                    "sha256:" + "a" * 64,
+                    (28080, 28081, 28082),
+                    "qa-user",
+                    "qa-password",
+                    live_read_only=False,
+                    segmented_history=segmented,
+                )
+                environment = (runtime / ".env").read_text(encoding="utf-8")
+                self.assertEqual(
+                    "HISTORY_SEGMENT_CATALOG_PATH=/app/history/segments/catalog.json" in environment,
+                    expected,
+                )
+
+    def test_history_mode_must_match_the_backup_before_import(self) -> None:
+        self.module.require_matching_history_mode({"schema_version": 2}, segmented_history=True)
+        self.module.require_matching_history_mode({"schema_version": 1}, segmented_history=False)
+        with self.assertRaisesRegex(self.module.QaRestoreError, "rerun with --segmented-history"):
+            self.module.require_matching_history_mode({"schema_version": 2}, segmented_history=False)
+        with self.assertRaisesRegex(self.module.QaRestoreError, "single-file history"):
+            self.module.require_matching_history_mode({"schema_version": 1}, segmented_history=True)
+
+    def test_drill_schema_constant_matches_the_app(self) -> None:
+        from history_service.segment_catalog import SEGMENTED_BACKUP_SCHEMA_VERSION
+
+        self.assertEqual(self.module.SEGMENTED_BACKUP_SCHEMA_VERSION, SEGMENTED_BACKUP_SCHEMA_VERSION)
+
     def test_loopback_proxy_forwards_and_releases_listener(self) -> None:
         self.assertTrue(hasattr(self.module, "_LoopbackProxySet"))
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as target:
@@ -922,12 +956,14 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
 
     def test_browser_uses_private_file_credentials_and_private_artifact_mode(self) -> None:
         observed_env: dict[str, str] = {}
+        observed_umasks: list[object] = []
         with tempfile.TemporaryDirectory() as raw_root:
             raw_dir = Path(raw_root)
 
             def record_run(command, **kwargs):
                 if command[:3] == ["npx", "playwright", "test"]:
                     observed_env.update(kwargs["env"])
+                    observed_umasks.append(kwargs.get("umask"))
 
             with patch.object(self.module, "_run", side_effect=record_run):
                 self.module._run_browser_and_perf(
@@ -949,10 +985,25 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
         self.assertIn("PLAYWRIGHT_HTTP_USERNAME_FILE", observed_env)
         self.assertIn("PLAYWRIGHT_HTTP_PASSWORD_FILE", observed_env)
         self.assertIn("PLAYWRIGHT_PRIVATE_OUTPUT_DIR", observed_env)
+        # Playwright recreates the output folder, so it must run with a private umask.
+        self.assertEqual(observed_umasks, [0o077])
         config = PLAYWRIGHT_CONFIG.read_text(encoding="utf-8")
         self.assertIn("PLAYWRIGHT_PRIVATE_OUTPUT_DIR", config)
         self.assertIn("PLAYWRIGHT_HTTP_USERNAME_FILE", config)
         self.assertIn("PLAYWRIGHT_HTTP_PASSWORD_FILE", config)
+
+    def test_run_applies_the_requested_umask_to_the_child(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            raw_dir = Path(raw_root)
+            target = raw_dir / "made-by-child"
+            self.module._run(
+                [sys.executable, "-c", f"import os; os.mkdir({str(target)!r})"],
+                cwd=raw_dir,
+                log_path=raw_dir / "logs" / "child.log",
+                timeout=60,
+                umask=0o077,
+            )
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode) & 0o077, 0)
 
     def test_private_runtime_root_removal_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:

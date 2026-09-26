@@ -83,6 +83,8 @@
     haNodesLoading: false,
     orphanedHistory: [],
     orphanedHistoryLoading: false,
+    orphanedHistoryPromise: null,
+    orphanedHistoryQueued: null,
     selectedHistoryAdoptSourceId: "",
     selectedHistoryAdoptTargetId:
       (Array.isArray(bootstrap.systems) && bootstrap.systems.find((system) => system.id === bootstrap.default_system_id)?.id)
@@ -6225,7 +6227,9 @@
         void fetchLiveEnclosures({ quiet: true });
         void fetchStorageViewCandidates({ quiet: true });
       }
-      await loadOrphanedHistory({ quiet: true });
+      // The scan can take minutes on large history; the history section shows its
+      // own progress, so the refresh reports done without waiting on it.
+      void loadOrphanedHistory({ quiet: true });
       if (!quiet) {
         setBanner("Refreshed.", "success");
       }
@@ -6866,7 +6870,7 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ preview_token: preview.purge_preview_token, confirm_irreversible: true }),
       });
-      await loadOrphanedHistory({ quiet: true });
+      await loadOrphanedHistory({ quiet: true, fresh: true });
       if (elements.historyPurgeOrphanedResult) {
         elements.historyPurgeOrphanedResult.textContent = payload.detail || "Orphaned history scan finished.";
       }
@@ -6888,12 +6892,41 @@
     }
   }
 
-  async function loadOrphanedHistory({ quiet = false, render = true } = {}) {
+  function loadOrphanedHistory({ quiet = false, render = true, fresh = false } = {}) {
+    // One scan at a time: callers join the scan in flight. A caller that just
+    // changed history (fresh) instead queues one follow-up scan, so it never
+    // reads a result that started before its change.
+    if (state.orphanedHistoryPromise) {
+      if (!fresh) {
+        return state.orphanedHistoryPromise;
+      }
+      if (!state.orphanedHistoryQueued) {
+        state.orphanedHistoryQueued = state.orphanedHistoryPromise
+          .catch(() => {})
+          .then(() => startOrphanedHistoryScan({ quiet, render }));
+      }
+      return state.orphanedHistoryQueued;
+    }
+    return startOrphanedHistoryScan({ quiet, render });
+  }
+
+  function startOrphanedHistoryScan({ quiet = false, render = true } = {}) {
+    state.orphanedHistoryQueued = null;
+    const run = runOrphanedHistoryScan({ quiet, render }).finally(() => {
+      if (state.orphanedHistoryPromise === run) {
+        state.orphanedHistoryPromise = null;
+      }
+    });
+    state.orphanedHistoryPromise = run;
+    return run;
+  }
+
+  async function runOrphanedHistoryScan({ quiet = false, render = true } = {}) {
     state.orphanedHistoryLoading = true;
     if (elements.historyAdoptButton) {
       elements.historyAdoptButton.disabled = true;
     }
-    if (elements.historyAdoptResult && !quiet) {
+    if (elements.historyAdoptResult) {
       elements.historyAdoptResult.textContent = "Scanning for removed-system history that can be adopted...";
     }
     try {

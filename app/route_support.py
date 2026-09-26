@@ -57,7 +57,12 @@ from app.services.snapshot_export import (
     SnapshotExportBusyError,
     SnapshotExportService,
 )
-from app.services.storage_writability import probe_known_hosts_files, probe_writable_directories
+from app.services.storage_writability import (
+    check_known_hosts_files,
+    probe_known_hosts_files,
+    probe_read_only_known_hosts_files,
+    probe_writable_directories,
+)
 from app.services.truenas_ws import TrueNASAPIError
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -246,6 +251,7 @@ def after_config_reload(app: Any, _before: Settings, after: Settings) -> None:
         SNAPSHOT_EXPORT_SOURCE_CACHE.clear()
     app.state.writable_directories = tuple(ui_writable_directories(after))
     app.state.known_hosts_files = tuple(split_known_hosts_paths(after)[1])
+    app.state.known_hosts_warnings = tuple(startup_known_hosts_warnings(after))
     app.state.storage_checked_at_monotonic = 0.0
     for warning in build_profile_reference_warnings(after):
         logger.warning("Configuration warning: %s", warning["message"])
@@ -942,6 +948,18 @@ def startup_storage_problems(settings: Settings) -> list[str]:
     ]
 
 
+def startup_known_hosts_warnings(settings: Settings) -> list[str]:
+    _, configured_known_hosts = split_known_hosts_paths(settings)
+    return probe_read_only_known_hosts_files(configured_known_hosts)
+
+
+def known_hosts_warnings_for(request: Request) -> list[str]:
+    """Read-only pinned known-hosts lines; health reports them as degraded."""
+
+    app_state = getattr(getattr(request, "app", None), "state", None)
+    return [str(line) for line in (getattr(app_state, "known_hosts_warnings", None) or ())]
+
+
 def startup_problems_for(request: Request) -> list[str]:
     app_state = getattr(getattr(request, "app", None), "state", None)
     return [str(problem) for problem in (getattr(app_state, "startup_problems", None) or ())]
@@ -969,12 +987,20 @@ def refresh_storage_problems(request: Request) -> list[str]:
     if isinstance(checked_at, (int, float)) and now - checked_at < STORAGE_REPROBE_SECONDS:
         return list(previous)
     known_hosts_files = tuple(getattr(app_state, "known_hosts_files", None) or ())
-    current = tuple([*probe_writable_directories(directories), *probe_known_hosts_files(known_hosts_files)])
+    known_hosts_problems, known_hosts_read_only = check_known_hosts_files(known_hosts_files)
+    current = tuple([*probe_writable_directories(directories), *known_hosts_problems])
     for problem in current:
         if problem not in previous:
             logger.error("%s", problem)
-    if previous and not current:
+    previous_warnings = tuple(getattr(app_state, "known_hosts_warnings", None) or ())
+    for warning in known_hosts_read_only:
+        if warning not in previous_warnings:
+            logger.warning("%s", warning)
+    app_state.known_hosts_warnings = tuple(known_hosts_read_only)
+    if previous and not current and not known_hosts_read_only:
         logger.info("Data, log and known-hosts folders are writable again.")
+    elif previous_warnings and not known_hosts_read_only:
+        logger.info("Pinned known-hosts files are writable again.")
     app_state.startup_problems = current
     app_state.storage_checked_at_monotonic = now
     return list(current)
@@ -1075,9 +1101,10 @@ def build_health_payload(
     """Describe main-UI health in three levels (#429).
 
     - ``ok``: nothing to act on. Waiting for the first inventory is not a problem.
-    - ``degraded``: something outside this container is unhealthy: the TrueNAS
-      API, SSH, the BMC, or the history sidecar. The app keeps serving what it
-      has, so the route still answers HTTP 200.
+    - ``degraded``: something the app can work around is unhealthy: the TrueNAS
+      API, SSH, the BMC, or the history sidecar, or a pinned known-hosts file on
+      a read-only mount (hosts are still verified; new keys cannot be saved).
+      The app keeps serving what it has, so the route still answers HTTP 200.
     - ``down``: a local fault the container cannot operate through: a data,
       log or known-hosts folder it cannot write (``startup_problems``). The
       route answers HTTP 503.

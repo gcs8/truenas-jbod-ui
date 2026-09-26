@@ -25,6 +25,13 @@ from typing import Any, Callable, NamedTuple, Sequence
 import yaml
 
 
+# The documented segmented-history catalog location (.env.example).
+SEGMENT_CATALOG_PATH = "/app/history/segments/catalog.json"
+SEGMENTED_BACKUP_SCHEMA_VERSION = 2
+# Playwright deletes and recreates its output folder at the start of a run, so
+# the folder gets the process umask. playwright.config.js refuses a private
+# output folder that is group- or world-accessible.
+PLAYWRIGHT_UMASK = 0o077
 APP_UID = 10001
 APP_GID = 10001
 APP_CONTAINER_NAMES = (
@@ -165,6 +172,20 @@ def _validate_optional_count(value: object, field: str) -> None:
         return
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise QaRestoreError(f"inspection {field} must be a non-negative integer or null")
+
+
+def require_matching_history_mode(inspection: dict[str, Any], *, segmented_history: bool) -> None:
+    """Fail before import when the stack's history mode does not match the backup."""
+
+    segmented_backup = inspection.get("schema_version") == SEGMENTED_BACKUP_SCHEMA_VERSION
+    if segmented_backup and not segmented_history:
+        raise QaRestoreError(
+            "backup contains segmented history; rerun with --segmented-history"
+        )
+    if segmented_history and not segmented_backup:
+        raise QaRestoreError(
+            "--segmented-history was set but the backup has single-file history"
+        )
 
 
 def validate_inspection_payload(payload: object) -> dict[str, Any]:
@@ -741,6 +762,7 @@ def _run(
     log_path: Path,
     timeout: int,
     env: dict[str, str] | None = None,
+    umask: int = -1,
 ) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     log_path.parent.chmod(0o700)
@@ -754,6 +776,7 @@ def _run(
             stderr=subprocess.STDOUT,
             timeout=timeout,
             check=False,
+            umask=umask,
         )
     if result.returncode != 0:
         raise QaRestoreError(f"command failed with exit code {result.returncode}")
@@ -916,6 +939,7 @@ def _write_runtime_files(
     password: str,
     *,
     live_read_only: bool,
+    segmented_history: bool = False,
 ) -> None:
     runtime_root.mkdir(mode=0o700)
     for name in (
@@ -957,6 +981,7 @@ def _write_runtime_files(
             "HISTORY_STARTUP_GRACE_SECONDS=0",
             "HISTORY_POLL_INTERVAL_SECONDS=3600",
             "ADMIN_AUTO_STOP_SECONDS=0",
+            *((f"HISTORY_SEGMENT_CATALOG_PATH={SEGMENT_CATALOG_PATH}",) if segmented_history else ()),
             "",
         )
     )
@@ -1433,6 +1458,7 @@ def _run_browser_and_perf(
             log_path=raw_dir / "browser-offline.log",
             timeout=900,
             env=env,
+            umask=PLAYWRIGHT_UMASK,
         )
         _run(
             [
@@ -1466,6 +1492,7 @@ def _run_browser_and_perf(
                 log_path=raw_dir / "browser-live-read-only.log",
                 timeout=1800,
                 env=env,
+                umask=PLAYWRIGHT_UMASK,
             )
             _run(
                 [
@@ -1531,6 +1558,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--minimum-available-memory-mib", type=int, default=3072)
     parser.add_argument("--minimum-free-disk-gib", type=int, default=10)
     parser.add_argument("--approval", required=True)
+    parser.add_argument(
+        "--segmented-history",
+        action="store_true",
+        help="Configure the QA stack for segmented history; required for a segmented backup.",
+    )
     parser.add_argument("--live-read-only", action="store_true")
     parser.add_argument("--live-approval")
     parser.add_argument("--keep-running", action="store_true")
@@ -1595,6 +1627,7 @@ def main() -> int:
             username,
             password,
             live_read_only=args.live_read_only,
+            segmented_history=args.segmented_history,
         )
         _run(
             [
@@ -1656,6 +1689,7 @@ def main() -> int:
                 password,
             )
         )
+        require_matching_history_mode(inspection, segmented_history=args.segmented_history)
         phase = "backup-import"
         imported = post_archive(
             ports[2],

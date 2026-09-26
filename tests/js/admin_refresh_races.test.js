@@ -462,3 +462,106 @@ test("backup encryption remains enabled after JavaScript startup state sync", ()
   assert.match(SOURCE, /backupManualEncrypt:\s*true/);
   assert.match(functionSource("syncSingleBundleControls"), /encryptToggle\.checked = encryptEnabled/);
 });
+
+test("loadOrphanedHistory shares one scan between overlapping callers", async () => {
+  const requests = [];
+  const state = { orphanedHistory: [], orphanedHistoryPromise: null, orphanedHistoryQueued: null };
+  const elements = { historyAdoptResult: { textContent: "" } };
+  const { loadOrphanedHistory } = loadFunctions(
+    ["loadOrphanedHistory", "startOrphanedHistoryScan", "runOrphanedHistoryScan"],
+    {
+      state,
+      elements,
+      setBanner() {},
+      renderHistoryMaintenance() {},
+      fetchJson() {
+        const request = deferred();
+        requests.push(request);
+        return request.promise;
+      },
+      Array,
+      Boolean,
+    }
+  );
+
+  const first = loadOrphanedHistory({ quiet: true });
+  const second = loadOrphanedHistory({ quiet: true });
+  await flushPromises();
+  assert.equal(first, second, "an overlapping caller joins the scan in flight");
+  assert.equal(requests.length, 1);
+  assert.match(elements.historyAdoptResult.textContent, /Scanning/, "the section says it is scanning even when quiet");
+
+  requests[0].resolve({ orphaned_systems: [{ system_id: "old" }] });
+  await first;
+  assert.deepEqual(state.orphanedHistory, [{ system_id: "old" }]);
+  assert.equal(state.orphanedHistoryPromise, null);
+
+  const next = loadOrphanedHistory({ quiet: true });
+  await flushPromises();
+  assert.equal(requests.length, 2, "a finished scan is not reused");
+  requests[1].resolve({ orphaned_systems: [] });
+  await next;
+});
+
+test("loadOrphanedHistory after a change queues one fresh scan instead of joining an older one", async () => {
+  const requests = [];
+  const state = { orphanedHistory: [], orphanedHistoryPromise: null, orphanedHistoryQueued: null };
+  const { loadOrphanedHistory } = loadFunctions(
+    ["loadOrphanedHistory", "startOrphanedHistoryScan", "runOrphanedHistoryScan"],
+    {
+      state,
+      elements: {},
+      setBanner() {},
+      renderHistoryMaintenance() {},
+      fetchJson() {
+        const request = deferred();
+        requests.push(request);
+        return request.promise;
+      },
+      Array,
+      Boolean,
+    }
+  );
+
+  const stale = loadOrphanedHistory({ quiet: true });
+  await flushPromises();
+  const freshA = loadOrphanedHistory({ quiet: true, fresh: true });
+  const freshB = loadOrphanedHistory({ quiet: true, fresh: true });
+  assert.notEqual(freshA, stale);
+  assert.equal(freshA, freshB, "fresh callers share the single queued follow-up");
+  assert.equal(requests.length, 1, "the follow-up waits for the older scan");
+
+  requests[0].resolve({ orphaned_systems: [{ system_id: "before-change" }] });
+  await stale;
+  await flushPromises();
+  assert.equal(requests.length, 2, "the fresh scan starts once the older one settles");
+  requests[1].resolve({ orphaned_systems: [] });
+  await freshA;
+  assert.deepEqual(state.orphanedHistory, [], "the caller sees history from after its change");
+});
+
+test("runRefreshState reports Refreshed. without waiting for the history scan", async () => {
+  const banners = [];
+  const scan = deferred();
+  const state = baseRefreshState();
+  const { runRefreshState } = loadFunctions(["runRefreshState"], {
+    state,
+    elements: {},
+    setBanner(message, tone) {
+      banners.push([message, tone]);
+    },
+    fetchJson: async () => ({ systems: [], profiles: [] }),
+    currentStagedEsxiHostPrepPackages: () => [],
+    renderAll() {},
+    loadOrphanedHistory() {
+      return scan.promise;
+    },
+    fetchLiveEnclosures: () => Promise.resolve(),
+    fetchStorageViewCandidates: () => Promise.resolve(),
+    Array,
+    Boolean,
+  });
+  await runRefreshState({ quiet: false });
+  assert.ok(banners.some(([message]) => message === "Refreshed."), "the banner does not wait on a slow scan");
+  scan.resolve();
+});

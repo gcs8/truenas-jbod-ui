@@ -4,6 +4,7 @@ import asyncio
 import errno
 import io
 import json
+import os
 import socket
 import tempfile
 import threading
@@ -206,17 +207,63 @@ class ConfiguredKnownHostsStartupTests(unittest.TestCase):
             self.assertEqual(len(problems), 1)
             self.assertIn(f"Cannot write to {root / 'host-trust'}", problems[0])
 
-    def test_unwritable_configured_file_is_reported(self) -> None:
+    def test_read_only_configured_file_is_a_warning_not_a_down_problem(self) -> None:
+        # Compose mounts /run/ssh read-only; a file pinned there still verifies hosts.
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             (root / "host-trust").mkdir()
             known_hosts = root / "host-trust" / "known_hosts"
             known_hosts.write_text("", encoding="utf-8")
             settings = self.settings_with_known_hosts(root, str(known_hosts))
-            with patch("app.services.storage_writability.os.access", return_value=False):
+            with patch("app.services.storage_writability.os.access", side_effect=lambda p, mode: mode != os.W_OK):
+                problems = app_route_support.startup_storage_problems(settings)
+                warnings = app_route_support.startup_known_hosts_warnings(settings)
+            self.assertEqual(problems, [])
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("new host keys cannot be saved", warnings[0])
+
+    def test_unreadable_configured_file_is_a_down_problem(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "host-trust").mkdir()
+            known_hosts = root / "host-trust" / "known_hosts"
+            known_hosts.write_text("", encoding="utf-8")
+            settings = self.settings_with_known_hosts(root, str(known_hosts))
+            with patch("app.services.storage_writability.os.access", side_effect=lambda p, mode: mode != os.R_OK):
+                problems = app_route_support.startup_storage_problems(settings)
+                warnings = app_route_support.startup_known_hosts_warnings(settings)
+            self.assertEqual(len(problems), 1)
+            self.assertIn("not readable by the app", problems[0])
+            # The remedy names the file itself, not a folder write fix.
+            self.assertNotIn("Cannot write to", problems[0])
+            self.assertIn(f"chown {os.geteuid()}:{os.getegid()} {known_hosts}", problems[0])
+            self.assertEqual(warnings, [])
+
+    def test_untraversable_folder_is_a_problem_not_an_exception(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            locked = root / "locked"
+            settings = self.settings_with_known_hosts(root, str(locked / "known_hosts"))
+            real_is_dir = Path.is_dir
+
+            def is_dir(self: Path) -> bool:
+                if self == locked:
+                    raise PermissionError(13, "denied")
+                return real_is_dir(self)
+
+            with patch("app.services.storage_writability.Path.is_dir", is_dir):
                 problems = app_route_support.startup_storage_problems(settings)
             self.assertEqual(len(problems), 1)
-            self.assertIn("new host keys cannot be saved", problems[0])
+            self.assertIn(f"Cannot open the known-hosts folder {locked}", problems[0])
+
+    def test_unwritable_folder_without_a_file_is_still_a_down_problem(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "host-trust").mkdir()
+            settings = self.settings_with_known_hosts(root, str(root / "host-trust" / "known_hosts"))
+            with patch("app.services.storage_writability.os.access", return_value=False):
+                self.assertEqual(len(app_route_support.startup_storage_problems(settings)), 1)
+                self.assertEqual(app_route_support.startup_known_hosts_warnings(settings), [])
 
     def test_per_system_configured_path_is_checked(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -231,10 +278,22 @@ class ConfiguredKnownHostsStartupTests(unittest.TestCase):
 
 
 class HealthzTests(unittest.TestCase):
-    def call_healthz(self, snapshot: InventorySnapshot | None, problems: tuple[str, ...] = ()) -> tuple[int, dict]:
+    def call_healthz(
+        self,
+        snapshot: InventorySnapshot | None,
+        problems: tuple[str, ...] = (),
+        known_hosts_warnings: tuple[str, ...] = (),
+    ) -> tuple[int, dict]:
         service = Mock()
         service.peek_cached_snapshot.return_value = snapshot
-        request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(startup_problems=problems)))
+        request = SimpleNamespace(
+            app=SimpleNamespace(
+                state=SimpleNamespace(
+                    startup_problems=problems,
+                    known_hosts_warnings=known_hosts_warnings,
+                )
+            )
+        )
         route = _route("/healthz")
         with patch.object(app_routes, "get_inventory_registry", return_value=_registry(service)):
             response = asyncio.run(route.endpoint(request))
@@ -336,6 +395,13 @@ class HealthzTests(unittest.TestCase):
         self.assertEqual(body["summary"], problem)
         self.assertEqual(body["problems"], [problem])
 
+    def test_read_only_pinned_known_hosts_is_degraded_not_down(self) -> None:
+        warning = "The known-hosts file /run/ssh/known_hosts is not writable by the app, so new host keys cannot be saved."
+        status, body = self.call_healthz(_snapshot(), known_hosts_warnings=(warning,))
+        self.assertEqual(status, 200)
+        self.assertEqual(body["status"], "degraded")
+        self.assertEqual(body["problems"], [warning])
+
     def test_every_remote_failure_together_is_still_200(self) -> None:
         snapshot = _snapshot(api_ok=False, api_message="connection refused")
         snapshot.sources["ssh"] = SourceStatus(enabled=True, ok=False, message="timed out")
@@ -400,6 +466,57 @@ class StorageReprobeTests(unittest.TestCase):
         application = app_main.create_app()
         self.assertTrue(application.state.writable_directories)
         self.assertIsInstance(application.state.storage_checked_at_monotonic, float)
+        self.assertIsInstance(application.state.known_hosts_warnings, tuple)
+
+    def test_reprobe_sets_logs_once_and_clears_known_hosts_warnings(self) -> None:
+        warning = "The known-hosts file /run/ssh/known_hosts is not writable by the app."
+        request = self._request(("/app/data",), (), checked_at=0.0)
+        request.app.state.known_hosts_files = ("/run/ssh/known_hosts",)
+        request.app.state.known_hosts_warnings = ()
+        with (
+            patch.object(app_route_support, "probe_writable_directories", return_value=[]),
+            patch.object(app_route_support, "check_known_hosts_files", return_value=([], [warning])),
+            self.assertLogs(app_main.logger, level="WARNING") as logs,
+        ):
+            self.assertEqual(app_route_support.refresh_storage_problems(request), [])
+            request.app.state.storage_checked_at_monotonic = 0.0
+            self.assertEqual(app_route_support.refresh_storage_problems(request), [])
+        self.assertEqual([r.getMessage() for r in logs.records], [warning])
+        self.assertEqual(request.app.state.known_hosts_warnings, (warning,))
+        request.app.state.storage_checked_at_monotonic = 0.0
+        with (
+            patch.object(app_route_support, "probe_writable_directories", return_value=[]),
+            patch.object(app_route_support, "check_known_hosts_files", return_value=([], [])),
+            self.assertLogs(app_main.logger, level="INFO") as logs,
+        ):
+            app_route_support.refresh_storage_problems(request)
+        self.assertEqual(request.app.state.known_hosts_warnings, ())
+        self.assertIn("Pinned known-hosts files are writable again.", [r.getMessage() for r in logs.records])
+
+    def test_folder_fixed_but_file_read_only_does_not_claim_all_writable(self) -> None:
+        warning = "The known-hosts file /run/ssh/known_hosts is not writable by the app."
+        request = self._request(("/app/data",), (CHOWN_SENTENCE,), checked_at=0.0)
+        request.app.state.known_hosts_files = ("/run/ssh/known_hosts",)
+        request.app.state.known_hosts_warnings = ()
+        with (
+            patch.object(app_route_support, "probe_writable_directories", return_value=[]),
+            patch.object(app_route_support, "check_known_hosts_files", return_value=([], [warning])),
+            self.assertLogs(app_main.logger, level="INFO") as logs,
+        ):
+            app_route_support.refresh_storage_problems(request)
+        self.assertNotIn(
+            "Data, log and known-hosts folders are writable again.",
+            [r.getMessage() for r in logs.records],
+        )
+
+    def test_config_reload_recomputes_known_hosts_warnings_for_the_new_paths(self) -> None:
+        state = SimpleNamespace(known_hosts_warnings=("stale warning",))
+        application = SimpleNamespace(state=state)
+        settings = Settings()
+        with patch.object(app_route_support, "startup_known_hosts_warnings", return_value=[]) as recompute:
+            app_route_support.after_config_reload(application, settings, settings)
+        recompute.assert_called_once_with(settings)
+        self.assertEqual(state.known_hosts_warnings, ())
 
 
 class _FakeResponse:
