@@ -55,9 +55,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   containers; optional backup defaults match the selected ownership setup. (#426)
 - Backup policy: a `filesystem` target whose root is the local backup archive,
   inside it, or contains it (directly, through a symlink or through a bind
-  mount) is now a configuration error. The backup scheduler will not start and
-  the admin policy editor will not save it. Point the target at a separate
-  directory or disk before upgrading. (#633, #651)
+  mount of the same directory) is now a configuration error. The backup
+  scheduler will not start and the admin policy editor will not save it. Point
+  the target at a separate directory or disk before upgrading. (#633, #651)
 
 ### Security
 
@@ -251,8 +251,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   a remote copy, and remote retention could then delete a copy that local
   retention or a preserve still kept. Overlap is checked when the policy loads,
   when the editor saves, and again before every copy, restore fetch, test and
-  retention pass, so a symlink or bind mount added later is also caught.
-  (#633, #651)
+  retention pass, so a symlink or a bind mount of the same directory added
+  later is also caught. (#633, #651)
 - Replaced duplicate history-sidecar snapshots gradually with the backup
   scheduler's catalog-verified local FULL archives. The two sets retain at least
   14 copies during cutover, stale verification receipts are cleared on restart,
