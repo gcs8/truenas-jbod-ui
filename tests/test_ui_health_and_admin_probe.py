@@ -4,6 +4,7 @@ import asyncio
 import errno
 import io
 import json
+import os
 import socket
 import tempfile
 import threading
@@ -214,12 +215,43 @@ class ConfiguredKnownHostsStartupTests(unittest.TestCase):
             known_hosts = root / "host-trust" / "known_hosts"
             known_hosts.write_text("", encoding="utf-8")
             settings = self.settings_with_known_hosts(root, str(known_hosts))
-            with patch("app.services.storage_writability.os.access", return_value=False):
+            with patch("app.services.storage_writability.os.access", side_effect=lambda p, mode: mode != os.W_OK):
                 problems = app_route_support.startup_storage_problems(settings)
                 warnings = app_route_support.startup_known_hosts_warnings(settings)
             self.assertEqual(problems, [])
             self.assertEqual(len(warnings), 1)
             self.assertIn("new host keys cannot be saved", warnings[0])
+
+    def test_unreadable_configured_file_is_a_down_problem(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "host-trust").mkdir()
+            known_hosts = root / "host-trust" / "known_hosts"
+            known_hosts.write_text("", encoding="utf-8")
+            settings = self.settings_with_known_hosts(root, str(known_hosts))
+            with patch("app.services.storage_writability.os.access", side_effect=lambda p, mode: mode != os.R_OK):
+                problems = app_route_support.startup_storage_problems(settings)
+                warnings = app_route_support.startup_known_hosts_warnings(settings)
+            self.assertEqual(len(problems), 1)
+            self.assertIn("not readable by the app", problems[0])
+            self.assertEqual(warnings, [])
+
+    def test_untraversable_folder_is_a_problem_not_an_exception(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            locked = root / "locked"
+            settings = self.settings_with_known_hosts(root, str(locked / "known_hosts"))
+            real_is_dir = Path.is_dir
+
+            def is_dir(self: Path) -> bool:
+                if self == locked:
+                    raise PermissionError(13, "denied")
+                return real_is_dir(self)
+
+            with patch("app.services.storage_writability.Path.is_dir", is_dir):
+                problems = app_route_support.startup_storage_problems(settings)
+            self.assertEqual(len(problems), 1)
+            self.assertIn(str(locked), problems[0])
 
     def test_unwritable_folder_without_a_file_is_still_a_down_problem(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -187,14 +187,28 @@ def check_known_hosts_files(
             continue
         seen.add(key)
         parent = path.parent
-        if not parent.is_dir():
+        try:
+            parent_is_dir = parent.is_dir()
+            file_exists = parent_is_dir and path.exists()
+        except OSError:
+            # A folder the app cannot enter: SSH cannot read the file either.
+            problems.append(describe_unwritable_directory(parent))
+            continue
+        if not parent_is_dir:
             problems.append(
                 f"The known-hosts file {path} is set in ssh.known_hosts_path, but its folder {parent} "
                 "does not exist. Create or mount that folder, or remove the setting to use the "
                 "data folder's known_hosts."
             )
             continue
-        target = path if path.exists() else parent
+        if file_exists and not os.access(path, os.R_OK):
+            # Strict host-key checking loads this file; unreadable means SSH fails.
+            problems.append(
+                f"The known-hosts file {path} is not readable by the app, so SSH cannot verify "
+                f"host keys. {describe_unwritable_directory(parent)}"
+            )
+            continue
+        target = path if file_exists else parent
         if not os.access(target, os.W_OK):
             if target == parent:
                 problems.append(describe_unwritable_directory(parent))

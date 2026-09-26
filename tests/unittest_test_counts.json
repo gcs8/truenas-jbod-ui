@@ -111,7 +111,7 @@
     "test_tls_trust": 12,
     "test_truenas_ws": 37,
     "test_truenas_ws_jsonrpc": 19,
-    "test_ui_health_and_admin_probe": 58,
+    "test_ui_health_and_admin_probe": 60,
     "test_unittest_shards": 15,
     "test_upgrade_notice": 18,
     "test_wiki_drift_verifier": 21
