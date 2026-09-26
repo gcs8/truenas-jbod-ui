@@ -329,6 +329,28 @@ class TestCountManifestTests(unittest.TestCase):
 
             self.assertFalse(manifest_path.exists())
 
+    def test_update_counts_refuses_a_module_level_skip(self) -> None:
+        with _SyntheticTestsDir(self) as synthetic:
+            synthetic.write(
+                "test_skipped",
+                "import unittest\nraise unittest.SkipTest('platform')\n"
+                "class T(unittest.TestCase):\n    def test_a(self):\n        pass\n",
+            )
+            manifest_path = synthetic.path / "counts.json"
+
+            with self.assertRaisesRegex(ValueError, "test_skipped skipped itself at import"):
+                run_test_shard.write_test_count_manifest(
+                    manifest_path,
+                    modules=("test_skipped",),
+                    tests_dir=synthetic.path,
+                )
+
+            self.assertFalse(manifest_path.exists())
+
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "full discovery imports POSIX-only modules excluded from the Windows portable suite",
+    )
     def test_checked_in_manifest_matches_full_discovery(self) -> None:
         expected = run_test_shard.load_test_count_manifest()
         actual = run_test_shard.discovered_test_counts(run_test_shard.discovered_modules())

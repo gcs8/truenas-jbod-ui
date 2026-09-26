@@ -234,9 +234,28 @@ def build_suite_and_counts(
         module_suite = loader.discover(str(tests_dir), pattern=f"{module}.py")
         if fail_on_discovery_errors and len(loader.errors) > error_count:
             raise ValueError(f"{module} failed discovery; fix imports before updating counts")
+        if fail_on_discovery_errors and _is_module_level_skip(module_suite):
+            # unittest replaces a module that raises SkipTest at import with one
+            # synthetic skipped test, which would hide every real test count.
+            raise ValueError(f"{module} skipped itself at import; counts need its real tests")
         counts[module] = module_suite.countTestCases()
         suite.addTests(module_suite)
     return suite, counts
+
+
+def _iter_cases(suite: unittest.TestSuite):
+    for item in suite:
+        if isinstance(item, unittest.TestSuite):
+            yield from _iter_cases(item)
+        else:
+            yield item
+
+
+def _is_module_level_skip(suite: unittest.TestSuite) -> bool:
+    return any(
+        type(case).__name__ == "ModuleSkipped" and type(case).__module__ == "unittest.loader"
+        for case in _iter_cases(suite)
+    )
 
 
 def build_suite(modules: tuple[str, ...], tests_dir: Path = TESTS_DIR) -> unittest.TestSuite:
