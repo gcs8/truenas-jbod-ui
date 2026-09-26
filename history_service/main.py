@@ -536,9 +536,15 @@ async def healthz() -> JSONResponse:
     database_size_bytes: int | None
     try:
         database_size_bytes = await asyncio.to_thread(store.database_size_bytes)
-    except FileNotFoundError:
+    except FileNotFoundError as exc:
         database_size_bytes = None
-        degraded_reason = degraded_reason or SEGMENT_CATALOG_MISSING_REASON
+        catalog_path = store.segment_catalog_path
+        if catalog_path is not None and not os.path.lexists(catalog_path):
+            degraded_reason = degraded_reason or SEGMENT_CATALOG_MISSING_REASON
+        else:
+            # A catalog that names a missing segment is damage, not a fresh install.
+            logger.warning("History health could not size the database: %s", exc)
+            degraded_reason = degraded_reason or SEGMENT_CATALOG_UNREADABLE_REASON
     except (OSError, ValueError) as exc:
         logger.warning("History health could not size the database: %s", exc)
         database_size_bytes = None

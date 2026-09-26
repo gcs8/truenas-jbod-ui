@@ -251,6 +251,7 @@ def after_config_reload(app: Any, _before: Settings, after: Settings) -> None:
         SNAPSHOT_EXPORT_SOURCE_CACHE.clear()
     app.state.writable_directories = tuple(ui_writable_directories(after))
     app.state.known_hosts_files = tuple(split_known_hosts_paths(after)[1])
+    app.state.known_hosts_warnings = tuple(startup_known_hosts_warnings(after))
     app.state.storage_checked_at_monotonic = 0.0
     for warning in build_profile_reference_warnings(after):
         logger.warning("Configuration warning: %s", warning["message"])
@@ -996,8 +997,10 @@ def refresh_storage_problems(request: Request) -> list[str]:
         if warning not in previous_warnings:
             logger.warning("%s", warning)
     app_state.known_hosts_warnings = tuple(known_hosts_read_only)
-    if previous and not current:
+    if previous and not current and not known_hosts_read_only:
         logger.info("Data, log and known-hosts folders are writable again.")
+    elif previous_warnings and not known_hosts_read_only:
+        logger.info("Pinned known-hosts files are writable again.")
     app_state.startup_problems = current
     app_state.storage_checked_at_monotonic = now
     return list(current)
@@ -1098,9 +1101,10 @@ def build_health_payload(
     """Describe main-UI health in three levels (#429).
 
     - ``ok``: nothing to act on. Waiting for the first inventory is not a problem.
-    - ``degraded``: something outside this container is unhealthy: the TrueNAS
-      API, SSH, the BMC, or the history sidecar. The app keeps serving what it
-      has, so the route still answers HTTP 200.
+    - ``degraded``: something the app can work around is unhealthy: the TrueNAS
+      API, SSH, the BMC, or the history sidecar, or a pinned known-hosts file on
+      a read-only mount (hosts are still verified; new keys cannot be saved).
+      The app keeps serving what it has, so the route still answers HTTP 200.
     - ``down``: a local fault the container cannot operate through: a data,
       log or known-hosts folder it cannot write (``startup_problems``). The
       route answers HTTP 503.

@@ -431,6 +431,57 @@ class StorageReprobeTests(unittest.TestCase):
         application = app_main.create_app()
         self.assertTrue(application.state.writable_directories)
         self.assertIsInstance(application.state.storage_checked_at_monotonic, float)
+        self.assertIsInstance(application.state.known_hosts_warnings, tuple)
+
+    def test_reprobe_sets_logs_once_and_clears_known_hosts_warnings(self) -> None:
+        warning = "The known-hosts file /run/ssh/known_hosts is not writable by the app."
+        request = self._request(("/app/data",), (), checked_at=0.0)
+        request.app.state.known_hosts_files = ("/run/ssh/known_hosts",)
+        request.app.state.known_hosts_warnings = ()
+        with (
+            patch.object(app_route_support, "probe_writable_directories", return_value=[]),
+            patch.object(app_route_support, "check_known_hosts_files", return_value=([], [warning])),
+            self.assertLogs(app_main.logger, level="WARNING") as logs,
+        ):
+            self.assertEqual(app_route_support.refresh_storage_problems(request), [])
+            request.app.state.storage_checked_at_monotonic = 0.0
+            self.assertEqual(app_route_support.refresh_storage_problems(request), [])
+        self.assertEqual([r.getMessage() for r in logs.records], [warning])
+        self.assertEqual(request.app.state.known_hosts_warnings, (warning,))
+        request.app.state.storage_checked_at_monotonic = 0.0
+        with (
+            patch.object(app_route_support, "probe_writable_directories", return_value=[]),
+            patch.object(app_route_support, "check_known_hosts_files", return_value=([], [])),
+            self.assertLogs(app_main.logger, level="INFO") as logs,
+        ):
+            app_route_support.refresh_storage_problems(request)
+        self.assertEqual(request.app.state.known_hosts_warnings, ())
+        self.assertIn("Pinned known-hosts files are writable again.", [r.getMessage() for r in logs.records])
+
+    def test_folder_fixed_but_file_read_only_does_not_claim_all_writable(self) -> None:
+        warning = "The known-hosts file /run/ssh/known_hosts is not writable by the app."
+        request = self._request(("/app/data",), (CHOWN_SENTENCE,), checked_at=0.0)
+        request.app.state.known_hosts_files = ("/run/ssh/known_hosts",)
+        request.app.state.known_hosts_warnings = ()
+        with (
+            patch.object(app_route_support, "probe_writable_directories", return_value=[]),
+            patch.object(app_route_support, "check_known_hosts_files", return_value=([], [warning])),
+            self.assertLogs(app_main.logger, level="INFO") as logs,
+        ):
+            app_route_support.refresh_storage_problems(request)
+        self.assertNotIn(
+            "Data, log and known-hosts folders are writable again.",
+            [r.getMessage() for r in logs.records],
+        )
+
+    def test_config_reload_recomputes_known_hosts_warnings_for_the_new_paths(self) -> None:
+        state = SimpleNamespace(known_hosts_warnings=("stale warning",))
+        application = SimpleNamespace(state=state)
+        settings = Settings()
+        with patch.object(app_route_support, "startup_known_hosts_warnings", return_value=[]) as recompute:
+            app_route_support.after_config_reload(application, settings, settings)
+        recompute.assert_called_once_with(settings)
+        self.assertEqual(state.known_hosts_warnings, ())
 
 
 class _FakeResponse:

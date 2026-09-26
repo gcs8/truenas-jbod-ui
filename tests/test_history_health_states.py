@@ -113,7 +113,10 @@ class HealthzShapeTests(unittest.TestCase):
         return json.loads(response.body)
 
     def test_a_missing_segmented_catalog_is_degraded_not_a_crash(self) -> None:
-        payload = self._healthz_with_size_error(FileNotFoundError(2, "No such file", "/app/history/segments/catalog.json"))
+        with patch.object(history_main.store, "segment_catalog_path", Path("/nonexistent-qa/segments/catalog.json")):
+            payload = self._healthz_with_size_error(
+                FileNotFoundError(2, "No such file", "/nonexistent-qa/segments/catalog.json")
+            )
 
         self.assertEqual(payload["status"], "degraded")
         self.assertEqual(payload["detail"], history_main.SEGMENT_CATALOG_MISSING_REASON)
@@ -126,6 +129,14 @@ class HealthzShapeTests(unittest.TestCase):
                 self.assertEqual(payload["status"], "degraded")
                 self.assertEqual(payload["detail"], history_main.SEGMENT_CATALOG_UNREADABLE_REASON)
                 self.assertIsNone(payload["database_size_bytes"])
+
+    def test_a_missing_segment_under_an_existing_catalog_is_not_called_a_fresh_install(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            catalog = Path(temp_dir) / "catalog.json"
+            catalog.write_text("{}", encoding="utf-8")
+            with patch.object(history_main.store, "segment_catalog_path", catalog):
+                payload = self._healthz_with_size_error(FileNotFoundError(2, "No such file", "segment-0001.sqlite"))
+        self.assertEqual(payload["detail"], history_main.SEGMENT_CATALOG_UNREADABLE_REASON)
 
     def test_an_existing_degraded_reason_is_kept_when_sizing_fails(self) -> None:
         payload = self._healthz_with_size_error(FileNotFoundError(), "The last background collection failed.")
