@@ -290,6 +290,51 @@ class DiskInventorySyncServiceTests(unittest.IsolatedAsyncioTestCase):
             "the blocked request must not start another remote job",
         )
 
+    async def test_reload_during_job_start_shares_the_late_job_id_with_successor(self) -> None:
+        previous = self.build_service(platform="core", timeout_seconds=1)
+        started_remote_job = asyncio.Event()
+        release_job_id = asyncio.Event()
+        previous_commands: list[str] = []
+
+        async def previous_runner(command: str, *_args: Any, **_kwargs: Any) -> SSHCommandResult:
+            previous_commands.append(command)
+            if command.endswith("call disk.sync_all"):
+                started_remote_job.set()
+                await release_job_id.wait()
+                return ok("268071")
+            return ok(job_payload(268071, "RUNNING"))
+
+        previous._run_ssh_command = previous_runner
+        clock = [0.0]
+
+        async def fake_sleep(_seconds: float) -> None:
+            clock[0] += 2.0
+
+        previous._disk_inventory_sync_clock = lambda: clock[0]
+        previous._disk_inventory_sync_sleep = fake_sleep
+        previous_task = asyncio.create_task(previous.sync_disk_inventory(DiskInventorySyncMode.full))
+        await started_remote_job.wait()
+
+        successor = self.build_service(platform="core", timeout_seconds=1)
+        successor.adopt_caches_from(previous, keep_snapshots=False)
+        successor_runner = RecordingSSHRunner([ok(job_payload(268071, "RUNNING"))])
+        successor._run_ssh_command = successor_runner
+
+        release_job_id.set()
+        timed_out = await previous_task
+        self.assertTrue(timed_out.timed_out)
+        self.assertEqual(timed_out.job_id, 268071)
+
+        with self.assertRaisesRegex(DiskInventorySyncBusy, "job 268071 is still running"):
+            await successor.sync_disk_inventory(DiskInventorySyncMode.full)
+
+        self.assertEqual(sum(command.endswith("call disk.sync_all") for command in previous_commands), 1)
+        self.assertEqual(
+            successor_runner.commands,
+            [f"sudo -n {CORE_MIDCLT} call core.get_jobs '[[\"id\",\"=\",268071]]'"],
+            "the successor must recheck the inherited job instead of starting another",
+        )
+
     async def test_full_mode_reports_a_failed_job_with_its_middleware_error(self) -> None:
         service = self.build_service(platform="core")
         service._run_ssh_command = RecordingSSHRunner(

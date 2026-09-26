@@ -9,6 +9,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -30,6 +31,7 @@ from app.settings_reload import (
     file_signature,
 )
 from app import route_support
+from app.models.domain import InventorySnapshot, SnapshotExportRequest
 from app.services.inventory_registry import InventoryRegistry
 
 
@@ -225,6 +227,53 @@ class InvalidEditTests(ConfigReloadTestCase):
         self.assertIsNone(self.reloader.problem)
         self.assertEqual(self._labels()["alpha"], "Alpha Fixed")
 
+    def test_config_restored_unchanged_clears_missing_warning(self) -> None:
+        before = self.runtime.current()
+        moved = self.config_path.with_name("config.yaml.moved")
+        self.config_path.rename(moved)
+        with self.assertLogs("app.settings_reload", level="WARNING"):
+            self.assertFalse(self._check())
+        self.assertIsNotNone(self.reloader.problem)
+
+        # Same inode, size and mtime: the signature equals the running baseline.
+        moved.rename(self.config_path)
+        self.assertFalse(self._check())
+        self.assertIsNone(self.reloader.problem)
+        self.assertIs(self.runtime.current(), before)
+
+    def test_missing_config_after_start_keeps_last_valid_generation(self) -> None:
+        before = self.runtime.current()
+        self.config_path.unlink()
+
+        with self.assertLogs("app.settings_reload", level="WARNING") as logs:
+            self.assertFalse(self._check())
+
+        self.assertIs(self.runtime.current(), before)
+        self.assertEqual(self._labels()["alpha"], "Alpha Shelf")
+        self.assertIsNotNone(self.reloader.problem)
+        self.assertIn("config.yaml is missing", self.reloader.problem or "")
+        self.assertIn("keeps the previous settings", self.reloader.problem or "")
+        self.assertIn("config file is missing", "\n".join(logs.output).lower())
+
+        self.config["systems"][0]["label"] = "Alpha Restored"
+        self._write_config()
+        self.assertTrue(self._check())
+        self.assertEqual(self._labels()["alpha"], "Alpha Restored")
+        self.assertIsNone(self.reloader.problem)
+
+    def test_first_start_without_config_keeps_explicit_default_behavior(self) -> None:
+        self.config_path.unlink()
+        get_settings.cache_clear()
+        startup = app_config.load_settings()
+        runtime = SettingsRuntime(lambda: startup)
+        reloader = ConfigReloader(runtime, interval_seconds=0.0, clock=self.clock)
+
+        reloader.prime(startup)
+
+        self.assertFalse(asyncio.run(reloader.check_now()))
+        self.assertIsNone(reloader.problem)
+        self.assertEqual(runtime.current().settings.config_file, str(self.config_path))
+
     def test_unexpected_loader_failure_never_raises(self) -> None:
         self.config["systems"][0]["label"] = "Alpha Two"
         self._write_config()
@@ -259,6 +308,83 @@ class RestartOnlySettingsTests(ConfigReloadTestCase):
         self.assertEqual(current.app.refresh_interval_seconds, 45)
         self.assertEqual(self._labels()["alpha"], "Alpha Renamed")
 
+    def test_pending_profile_file_path_does_not_supply_live_profiles(self) -> None:
+        running_profile_path = self.root / "config" / "profiles.yaml"
+        pending_profile_path = self.root / "config" / "pending-profiles.yaml"
+        running_profile_path.write_text(
+            yaml.safe_dump({"profiles": [{"id": "running-profile", "label": "Running", "rows": 1, "columns": 1}]}),
+            encoding="utf-8",
+        )
+        pending_profile_path.write_text(
+            yaml.safe_dump({"profiles": [{"id": "pending-profile", "label": "Pending", "rows": 1, "columns": 1}]}),
+            encoding="utf-8",
+        )
+        get_settings.cache_clear()
+        runtime = SettingsRuntime()
+        reloader = ConfigReloader(runtime, interval_seconds=0.0, clock=self.clock)
+        reloader.prime()
+        self.assertEqual([profile.id for profile in runtime.current().settings.profiles], ["running-profile"])
+
+        self.config["paths"] = {"profile_file": str(pending_profile_path)}
+        self.config["systems"][0]["label"] = "Alpha Renamed"
+        self._write_config()
+
+        self.assertTrue(asyncio.run(reloader.check_now()))
+
+        current = runtime.current().settings
+        self.assertEqual(current.paths.profile_file, str(running_profile_path))
+        self.assertEqual([profile.id for profile in current.profiles], ["running-profile"])
+        self.assertEqual(reloader.restart_pending, ("paths",))
+
+    def test_pending_profile_file_that_would_break_restart_is_rejected(self) -> None:
+        running_profile_path = self.root / "config" / "profiles.yaml"
+        running_profile_path.write_text(
+            yaml.safe_dump({"profiles": [{"id": "running-profile", "label": "Running", "rows": 1, "columns": 1}]}),
+            encoding="utf-8",
+        )
+        pending_profile_path = self.root / "config" / "pending-profiles.yaml"
+        broken_contents = {
+            "malformed yaml": "profiles: [unclosed\n",
+            "wrong shape": yaml.safe_dump({"profiles": "not-a-list"}),
+            "invalid profile": yaml.safe_dump({"profiles": [{"id": "bad", "rows": "many"}]}),
+        }
+        for label, contents in broken_contents.items():
+            with self.subTest(label):
+                pending_profile_path.write_text(contents, encoding="utf-8")
+                self.config["paths"] = {}
+                self._write_config()
+                get_settings.cache_clear()
+                runtime = SettingsRuntime()
+                reloader = ConfigReloader(runtime, interval_seconds=0.0, clock=self.clock)
+                reloader.prime()
+                before = runtime.current()
+
+                self.config["paths"] = {"profile_file": str(pending_profile_path)}
+                self.config["systems"][0]["label"] = f"Alpha {label}"
+                self._write_config()
+                with self.assertLogs("app.settings_reload", level="WARNING"):
+                    self.assertFalse(asyncio.run(reloader.check_now()))
+
+                self.assertIs(runtime.current(), before)
+                self.assertIsNotNone(reloader.problem)
+                self.assertEqual(reloader.restart_pending, ())
+
+    def test_scalar_inline_profiles_is_a_configuration_error(self) -> None:
+        from app.config import load_settings
+        from app.config_errors import ConfigurationError
+
+        profile_path = self.root / "config" / "profiles.yaml"
+        for with_profile_file in (False, True):
+            with self.subTest(with_profile_file=with_profile_file):
+                if with_profile_file:
+                    profile_path.write_text(yaml.safe_dump({"profiles": []}), encoding="utf-8")
+                else:
+                    profile_path.unlink(missing_ok=True)
+                self.config["profiles"] = 5
+                self._write_config()
+                with self.assertRaises(ConfigurationError):
+                    load_settings()
+
     def test_restart_only_change_alone_does_not_swap(self) -> None:
         before = self.runtime.current()
         self.config["app"] = {"public_origin": "https://nas.example.test"}
@@ -288,6 +414,66 @@ class RestartOnlySettingsTests(ConfigReloadTestCase):
 
 
 class ConcurrencyTests(ConfigReloadTestCase):
+    def test_pre_reload_export_cannot_repopulate_the_new_generation_cache(self) -> None:
+        route_support.SNAPSHOT_EXPORT_SOURCE_CACHE.clear()
+        self.addCleanup(route_support.SNAPSHOT_EXPORT_SOURCE_CACHE.clear)
+        runtime = SettingsRuntime()
+        app = SimpleNamespace(state=SimpleNamespace())
+        reloader = ConfigReloader(
+            runtime,
+            interval_seconds=0.0,
+            clock=self.clock,
+            on_applied=lambda before, after: route_support.after_config_reload(app, before, after),
+        )
+        reloader.prime()
+        old_generation = runtime.current()
+        old_settings = old_generation.settings
+
+        class SlowService:
+            system = SimpleNamespace(id="alpha")
+
+            def __init__(self) -> None:
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def get_snapshot(self, **_: Any) -> InventorySnapshot:
+                self.started.set()
+                await self.release.wait()
+                return InventorySnapshot(slots=[], refresh_interval_seconds=30)
+
+            async def get_slot_smart_summaries(self, *_: Any, **__: Any) -> list[Any]:
+                return []
+
+        service = SlowService()
+
+        async def run() -> None:
+            with runtime.pin(old_generation):
+                old_export = asyncio.create_task(
+                    route_support._load_snapshot_export_source(
+                        service=service,
+                        payload=SnapshotExportRequest(),
+                        enclosure_id=None,
+                        stage_prefix="test.export",
+                        settings=old_settings,
+                    )
+                )
+            await service.started.wait()
+            self.config["systems"][0]["label"] = "Alpha New"
+            self._write_config()
+            self.assertTrue(await reloader.check_now())
+            self.assertEqual(route_support.SNAPSHOT_EXPORT_SOURCE_CACHE, {})
+            service.release.set()
+            await old_export
+
+        with patch.object(route_support, "SETTINGS_RUNTIME", runtime):
+            asyncio.run(run())
+
+        self.assertEqual(
+            route_support.SNAPSHOT_EXPORT_SOURCE_CACHE,
+            {},
+            "work pinned to the old generation must not publish after reload invalidation",
+        )
+
     def test_request_during_swap_sees_one_generation(self) -> None:
         """A request that started before a reload keeps the old settings and components."""
         from app import route_support

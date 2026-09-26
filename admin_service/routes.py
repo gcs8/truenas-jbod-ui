@@ -152,10 +152,10 @@ def build_router(admin_settings: Any) -> APIRouter:
         after: Any,
         lead: str,
     ) -> JSONResponse:
-        """Answer a config save, saying whether the main UI applies it by itself.
+        """Answer a config save, saying whether the main UI applies it on its next request.
 
-        The main UI reloads config.yaml, runtime-overrides.yaml and
-        profiles.yaml when they change (#432). Only a change to a setting in
+        The main UI checks config.yaml, runtime-overrides.yaml and profiles.yaml
+        before its next non-static request (#432). Only a change to a setting in
         ``RESTART_ONLY_SETTINGS`` still needs a new main UI process; then the
         answer carries ``restart_required: ["ui"]`` and the admin page shows
         the Restart main UI now button.
@@ -169,7 +169,10 @@ def build_router(admin_settings: Any) -> APIRouter:
             content["detail"] = f"{lead} The main UI needs a restart to apply this."
         else:
             content["restart_required"] = []
-            content["detail"] = f"{lead} The main UI applies it within a few seconds; no restart needed."
+            content["detail"] = (
+                f"{lead} The main UI applies it when it next handles a page or API request; "
+                "no restart needed."
+            )
         content["runtime"] = await build_runtime_payload(runtime_service)
         return JSONResponse(content)
 

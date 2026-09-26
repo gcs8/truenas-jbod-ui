@@ -2957,8 +2957,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         save_overrides.assert_called_once_with(settings, {"source_bundle_cache_ttl_seconds": 120})
         runtime_service.mark_restart_required.assert_not_called()
         self.assertEqual(payload["restart_required"], [])
-        self.assertEqual(payload["detail"], "Timing saved. The main UI applies it within a few seconds; no restart needed.")
-        # A save the main UI applies by itself is still journalled (#575/#580).
+        self.assertEqual(payload["detail"], "Timing saved. The main UI applies it when it next handles a page or API request; no restart needed.")
+        # A save applied on the main UI's next request is still journalled (#575/#580).
         journal.assert_called_once_with("runtime_overrides.save", "source_bundle_cache_ttl_seconds")
 
     def test_config_save_still_marks_restart_for_restart_only_settings(self) -> None:
@@ -3057,7 +3057,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertEqual(payload["restart_required"], [])
         self.assertEqual(
             payload["detail"],
-            "Demo builder system Demo Builder Lab saved. The main UI applies it within a few seconds; no restart needed.",
+            "Demo builder system Demo Builder Lab saved. The main UI applies it when it next handles a page or API request; no restart needed.",
         )
 
     def test_delete_system_route_returns_updated_system_list(self) -> None:
@@ -3120,7 +3120,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertEqual([system["id"] for system in payload["systems"]], ["archive-core"])
         runtime_service.mark_restart_required.assert_not_called()
         self.assertEqual(payload["restart_required"], [])
-        self.assertTrue(payload["detail"].endswith("The main UI applies it within a few seconds; no restart needed."))
+        self.assertTrue(payload["detail"].endswith("The main UI applies it when it next handles a page or API request; no restart needed."))
 
     def test_delete_system_route_can_purge_matching_history(self) -> None:
         route = next(
@@ -3190,7 +3190,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         history_store.delete_system_history.assert_called_once_with("qs-cryostorage")
         runtime_service.mark_restart_required.assert_not_called()
         self.assertEqual(payload["restart_required"], [])
-        self.assertTrue(payload["detail"].endswith("The main UI applies it within a few seconds; no restart needed."))
+        self.assertTrue(payload["detail"].endswith("The main UI applies it when it next handles a page or API request; no restart needed."))
 
     def test_delete_system_route_redacts_history_purge_failure_detail(self) -> None:
         route = next(
@@ -3810,7 +3810,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertIn("custom-front-24", [profile["id"] for profile in payload["profiles"]])
         runtime_service.mark_restart_required.assert_not_called()
         self.assertEqual(payload["restart_required"], [])
-        self.assertTrue(payload["detail"].endswith("The main UI applies it within a few seconds; no restart needed."))
+        self.assertTrue(payload["detail"].endswith("The main UI applies it when it next handles a page or API request; no restart needed."))
 
     def test_delete_profile_route_returns_updated_profile_list(self) -> None:
         route = next(
@@ -3867,7 +3867,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertNotIn("custom-front-24", [profile["id"] for profile in payload["profiles"]])
         runtime_service.mark_restart_required.assert_not_called()
         self.assertEqual(payload["restart_required"], [])
-        self.assertTrue(payload["detail"].endswith("The main UI applies it within a few seconds; no restart needed."))
+        self.assertTrue(payload["detail"].endswith("The main UI applies it when it next handles a page or API request; no restart needed."))
 
     def test_sudoers_preview_route_returns_exact_rendered_content(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/system-setup/sudoers-preview")
