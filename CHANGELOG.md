@@ -636,17 +636,23 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   of `.env.example`, checks `/livez` and `/healthz`, and checks that the
   container is not restarting (#602).
 
+- Corrected the image-upgrade smoke evidence: v0.22.2 and the candidate have
+  the same history schema, so CI now reports compatibility with no schema
+  transition. The interrupted case reports idempotent startup interruption,
+  while keeping its image, health, restart, state and integrity checks.
+  (#637, #647)
 - CI now also upgrades a hardened v0.22.2 install (base Compose plus
   `docker-compose.nonroot.yml`) by image pin only and rolls it back, and kills
-  the new history container inside each startup migration step on v0.22.2
-  data before a normal start that must finish cleanly with no data lost (#613).
+  the new history container inside each startup schema-initialization step on
+  v0.22.2 data before a normal start that must finish cleanly with no data
+  lost (#613).
 - CI now creates a real segmented catalog with v0.22.2, then requires its exact
   generation, catalog bytes and referenced segment bytes to survive an
   image-only upgrade, successor writes and rollback to v0.22.2 (#632).
 - CI now upgrades the public v0.22.2 image to each pull request's build by
   changing only `JBOD_UI_IMAGE` on root-owned mounts, checks that the
-  containers are healthy, that mappings and history survive and that the
-  schema migrated, then rolls back by pin (#590).
+  containers are healthy and that mappings, history and schema compatibility
+  survive, then rolls back by pin (#590).
 
 - Added the backup archive transport library for the history sidecar: remote
   targets for a local directory, FTP/FTPS, SFTP (host key checked against
