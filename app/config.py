@@ -1418,8 +1418,11 @@ def load_settings(*, running_restart_only: Settings | None = None) -> Settings:
         if running_restart_only is not None
         else configured_profile_path
     )
-    inline_profiles = list(merged.get("profiles") or [])
-    if profile_path.exists():
+    # Only a list can be merged with file profiles. Any other shape is left
+    # as-is so validation reports it as a configuration error.
+    inline_raw = merged.get("profiles") or []
+    inline_profiles = list(inline_raw) if isinstance(inline_raw, list) else None
+    if profile_path.exists() and inline_profiles is not None:
         profile_config = _load_profile_yaml(profile_path)
         merged["profiles"] = [*inline_profiles, *(profile_config.get("profiles") or [])]
     # A pending restart-only profile path never supplies live profiles, but
@@ -1427,7 +1430,11 @@ def load_settings(*, running_restart_only: Settings | None = None) -> Settings:
     # stop the restart, instead of accepting it as "restart required".
     pending_profile_path = Path(configured_profile_path)
     pending_profiles: list[Any] | None = None
-    if running_restart_only is not None and pending_profile_path != profile_path:
+    if (
+        running_restart_only is not None
+        and pending_profile_path != profile_path
+        and inline_profiles is not None
+    ):
         try:
             pending_config = _load_profile_yaml(pending_profile_path)
         except (OSError, yaml.YAMLError, ValueError) as exc:

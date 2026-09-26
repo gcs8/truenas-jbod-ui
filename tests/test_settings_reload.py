@@ -369,6 +369,22 @@ class RestartOnlySettingsTests(ConfigReloadTestCase):
                 self.assertIsNotNone(reloader.problem)
                 self.assertEqual(reloader.restart_pending, ())
 
+    def test_scalar_inline_profiles_is_a_configuration_error(self) -> None:
+        from app.config import load_settings
+        from app.config_errors import ConfigurationError
+
+        profile_path = self.root / "config" / "profiles.yaml"
+        for with_profile_file in (False, True):
+            with self.subTest(with_profile_file=with_profile_file):
+                if with_profile_file:
+                    profile_path.write_text(yaml.safe_dump({"profiles": []}), encoding="utf-8")
+                else:
+                    profile_path.unlink(missing_ok=True)
+                self.config["profiles"] = 5
+                self._write_config()
+                with self.assertRaises(ConfigurationError):
+                    load_settings()
+
     def test_restart_only_change_alone_does_not_swap(self) -> None:
         before = self.runtime.current()
         self.config["app"] = {"public_origin": "https://nas.example.test"}
