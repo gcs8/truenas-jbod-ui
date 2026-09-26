@@ -257,6 +257,10 @@ def get_history_settings() -> HistorySettings:
                 ) from None
         elif _field_is_text(field_name):
             payload[field_name] = raw_value.strip()
+        elif not raw_value.strip():
+            # Compose passes unset keys as "${KEY:-}", an empty string. Keep the
+            # default instead of failing bool/number validation (as app/config.py does).
+            continue
         else:
             payload[field_name] = _parse_scalar(raw_value)
 

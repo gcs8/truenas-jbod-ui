@@ -123,6 +123,41 @@ class HistoryEnvDocumentationDriftTests(unittest.TestCase):
                         # or a shell export cannot split the release-check policy.
                         self.assertTrue(str(environment.get(key, "")).startswith(f"${{{key}:-"))
 
+    def test_blank_compose_values_keep_history_defaults(self) -> None:
+        from history_service.config import ENV_OVERRIDES, HistorySettings, get_history_settings
+
+        defaults = HistorySettings()
+        blank_non_text = {
+            "RELEASE_CHECK_ENABLED": "",
+            "RELEASE_CHECK_INTERVAL_SECONDS": " ",
+            "RELEASE_CHECK_TIMEOUT_SECONDS": "",
+            "HISTORY_POLL_INTERVAL_SECONDS": "",
+            "HISTORY_FORCE_INVENTORY_ON_FAST_COLLECTION": "",
+        }
+        self.assertTrue(set(blank_non_text) <= set(ENV_OVERRIDES))
+        with tempfile.TemporaryDirectory() as temporary:
+            env = {
+                **blank_non_text,
+                "RELEASE_CHECK_REPO": "",
+                "HISTORY_SQLITE_PATH": f"{temporary}/history.db",
+                "HISTORY_BACKUP_DIR": f"{temporary}/backups",
+            }
+            with patch.dict(os.environ, env, clear=True):
+                get_history_settings.cache_clear()
+                try:
+                    settings = get_history_settings()
+                finally:
+                    get_history_settings.cache_clear()
+        self.assertIs(settings.release_check_enabled, defaults.release_check_enabled)
+        self.assertEqual(settings.release_check_interval_seconds, defaults.release_check_interval_seconds)
+        self.assertEqual(settings.release_check_timeout_seconds, defaults.release_check_timeout_seconds)
+        self.assertEqual(settings.poll_interval_seconds, defaults.poll_interval_seconds)
+        self.assertIs(
+            settings.force_inventory_on_fast_collection, defaults.force_inventory_on_fast_collection
+        )
+        # Text keys keep their existing handling: a blank value stays blank.
+        self.assertEqual(settings.release_check_repo, "")
+
     def test_example_says_compose_derives_the_published_bind_address(self) -> None:
         example = self.env_example()
         block = self.history_environment_block()
