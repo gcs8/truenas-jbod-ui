@@ -365,6 +365,9 @@ def _write_environment(
         "SCHEDULED_BACKUP_ENABLED=false",
         f"BACKUP_CONFIG_ENABLED={'true' if scheduler_policy_enabled else 'false'}",
         "BACKUP_FULL_ENABLED=false",
+        # Replace any backups.targets from the config fixture: the matrix must
+        # never ship to, or run retention against, real remote storage.
+        "BACKUP_TARGETS_JSON=[]",
     ]
     if scheduler_policy_enabled:
         values.extend(

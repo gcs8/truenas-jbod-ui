@@ -224,6 +224,8 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
             )
             enabled = (root / ".env").read_text(encoding="utf-8")
 
+        for environment in (disabled, enabled):
+            self.assertIn("BACKUP_TARGETS_JSON=[]\n", environment)
         self.assertIn("BACKUP_CONFIG_ENABLED=false", disabled)
         self.assertIn("BACKUP_FULL_ENABLED=false", disabled)
         self.assertNotIn("BACKUP_ARCHIVE_PASSPHRASE_FILE=", disabled)
@@ -233,6 +235,42 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
             "BACKUP_ARCHIVE_PASSPHRASE_FILE=/run/backup-secrets/archive-passphrase",
             enabled,
         )
+
+    def test_matrix_environment_replaces_fixture_backup_targets(self) -> None:
+        import yaml
+
+        from history_service.backup_archive.policy import load_backup_policy
+
+        module = self.load_matrix_module()
+        variants = {variant.name: variant for variant in module.VARIANTS}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            module._write_environment(
+                root,
+                "sha256:" + "a" * 64,
+                module.Ports(19080, 19081, 19082),
+                variant=variants["scheduler-enabled"],
+            )
+            environment = dict(
+                line.split("=", 1)
+                for line in (root / ".env").read_text(encoding="utf-8").splitlines()
+                if line
+            )
+            config = root / "config.yaml"
+            config.write_text(
+                yaml.safe_dump(
+                    {
+                        "backups": {
+                            "targets": [
+                                {"target_id": "real-nas", "provider": "filesystem", "root": "/mnt/real-nas"}
+                            ]
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            policy = load_backup_policy(config, environment)
+        self.assertEqual(policy.targets, ())
 
     def test_disabled_scheduler_serves_socket_health_with_both_classes_off(self) -> None:
         module = self.load_matrix_module()
