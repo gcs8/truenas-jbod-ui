@@ -259,6 +259,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Bound SMART requests and cached results to the selected disk identity,
+  preserving compatible saved views and coalescing duplicate pending requests. (#843)
 - Kept missing SMART and history metrics unknown instead of displaying zero or
   inventing critical heat and endurance warnings; preserved real zero values
   and fallback error counters. (#743)
