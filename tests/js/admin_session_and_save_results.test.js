@@ -382,6 +382,38 @@ test("the one-second countdown tick shows the auto-stop warning on an idle page"
   assert.match(banner.textContent, /^The auto-stop time has passed\./);
 });
 
+test("a refresh that finds admin stopped leaves the Refresh button disabled", async () => {
+  const refreshButton = new FakeElement();
+  const banners = [];
+  const state = {
+    admin: { expires_at: new Date(Date.now() - 1000).toISOString(), auto_stop_seconds: 3600 },
+    sessionStopped: false,
+    countdownTimerId: null,
+  };
+  let functions = null;
+  functions = loadFunctions(
+    [...SESSION_FUNCTIONS, "runRefreshState"],
+    {
+      state,
+      elements: sparseElements({ sessionBanner: new FakeElement({ classes: ["hidden"] }), refreshStateButton: refreshButton }),
+      document: fakeDocument([refreshButton]),
+      window: { clearInterval() {} },
+      setBanner: (message, tone) => banners.push([message, tone]),
+      fetchJson: async () => {
+        functions.markAdminStopped();
+        throw new TypeError("Failed to fetch");
+      },
+    },
+    SESSION_CONSTANTS
+  );
+
+  await functions.runRefreshState({ quiet: true });
+
+  assert.equal(state.sessionStopped, true);
+  assert.equal(refreshButton.disabled, true);
+  assert.match(banners[0][0], /^Unable to refresh admin state/);
+});
+
 // Debug bundle exports never pause production by default.
 
 test("debug bundle export defaults to not pausing services in the template, the state payload, and the route", () => {
