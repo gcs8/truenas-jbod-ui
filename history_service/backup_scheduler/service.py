@@ -982,7 +982,7 @@ class BackupScheduler:
         try:
             local = workspace / "archive"
             with self._open_configured_target(target) as remote:
-                size, digest = remote.get(record.name, local)
+                size, digest = remote.get(record.name, local, limit=record.size + 1)
             # Never hand out bytes the catalogue did not record: a target (or an
             # on-path attacker for plain FTP/NFS) could substitute another backup.
             _require_match(record, size, digest)
