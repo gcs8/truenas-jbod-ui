@@ -3955,6 +3955,9 @@ class HistoryStore:
             if target_mode is not None and stat.S_IMODE(temp_metadata.st_mode) != target_mode:
                 os.fchmod(temp_descriptor, target_mode)
                 temp_metadata = os.fstat(temp_descriptor)
+            # SQLite/copy completion is not a publication barrier. Flush the
+            # final file metadata too, after mode and restore-owner changes.
+            os.fsync(temp_descriptor)
             if not self._path_matches_metadata(temp_path, temp_metadata):
                 raise ValueError(f"History replacement refuses changed temporary path {temp_path}.")
 
@@ -4043,6 +4046,22 @@ class HistoryStore:
         if target_mode is not None and stat.S_IMODE(published_metadata.st_mode) != target_mode:
             self._unlink_owned_path(target_path, temp_metadata)
             raise ValueError(f"History replacement refuses changed temporary mode for {temp_path}.")
+        try:
+            self._sync_replacement_parents(temp_path, target_path)
+        except Exception:
+            # Do not leave an unacknowledged timestamp discoverable as a recent
+            # backup by the collector. Never overwrite a reappeared temp name.
+            if self._path_matches_metadata(target_path, temp_metadata):
+                self._rename_at2(target_path, temp_path, flags=RENAME_NOREPLACE)
+                self._sync_replacement_parents(temp_path, target_path)
+            raise
+
+    def _sync_replacement_parents(self, temp_path: Path, target_path: Path) -> None:
+        # The private staging directory and public destination are normally
+        # distinct. Both name changes must be durable before evidence retirement.
+        self._fsync_directory(temp_path.parent)
+        if target_path.parent != temp_path.parent:
+            self._fsync_directory(target_path.parent)
 
     def _exchange_existing_target(
         self,
@@ -4062,6 +4081,7 @@ class HistoryStore:
                 raise ValueError(f"History replacement refuses changed target path {target_path}.")
             if target_mode is not None and stat.S_IMODE(published_metadata.st_mode) != target_mode:
                 raise ValueError(f"History replacement refuses changed temporary mode for {temp_path}.")
+            self._sync_replacement_parents(temp_path, target_path)
             self._unlink_owned_path(temp_path, target_metadata)
         except Exception:
             self._rollback_exchange(
@@ -4084,6 +4104,7 @@ class HistoryStore:
         if not target_is_published_temp or not temp_is_displaced_target:
             return
         self._rename_at2(target_path, temp_path, flags=RENAME_EXCHANGE)
+        self._sync_replacement_parents(temp_path, target_path)
         self._discard_owned_path(temp_path, temp_metadata)
 
     @staticmethod

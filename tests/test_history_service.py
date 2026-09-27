@@ -1168,6 +1168,270 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         self.assertEqual(request.get_header("X-request-id"), "d" * 32)
 
 
+class HistoryPublicationDurabilityTests(unittest.TestCase):
+    """Real SQLite/rename/fsync probes; not a power-loss simulation."""
+
+    @contextmanager
+    def _observe_publication(self, store, *, fail_syncs=()):
+        events = []
+        real_sync = os.fsync
+        real_rename = store._rename_at2
+        real_unlink = os.unlink
+        directory_syncs = 0
+
+        def sync(fd):
+            nonlocal directory_syncs
+            path = Path(os.readlink(f"/proc/self/fd/{fd}"))
+            kind = "directory" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file"
+            events.append((kind, path))
+            if kind == "directory":
+                directory_syncs += 1
+                if directory_syncs in fail_syncs:
+                    raise OSError(errno.EIO, f"injected directory sync {directory_syncs}")
+            real_sync(fd)
+
+        def rename(source, target, *, flags):
+            real_rename(source, target, flags=flags)
+            events.append(("rename", source, target, flags))
+
+        def unlink(path, *, dir_fd=None):
+            resolved = Path(path)
+            if dir_fd is not None:
+                resolved = Path(os.readlink(f"/proc/self/fd/{dir_fd}")) / path
+            events.append(("unlink", resolved))
+            if dir_fd is None:
+                real_unlink(path)
+            else:
+                real_unlink(path, dir_fd=dir_fd)
+
+        with (
+            patch("history_service.store.os.fsync", side_effect=sync),
+            patch.object(store, "_rename_at2", side_effect=rename),
+            patch("history_service.store.os.unlink", side_effect=unlink),
+        ):
+            yield events
+
+    def _seed(self, root):
+        store = HistoryStore(str(root / "history.db"))
+        with closing(sqlite3.connect(store.file_path)) as connection:
+            connection.execute("CREATE TABLE synthetic_publication (value TEXT)")
+            connection.execute("INSERT INTO synthetic_publication VALUES ('prior')")
+            connection.commit()
+        return store
+
+    def _change(self, store):
+        with closing(sqlite3.connect(store.file_path)) as connection:
+            connection.execute("UPDATE synthetic_publication SET value = 'successor'")
+            connection.commit()
+
+    def _value(self, path):
+        with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as connection:
+            self.assertEqual(connection.execute("PRAGMA quick_check").fetchone()[0], "ok")
+            return connection.execute("SELECT value FROM synthetic_publication").fetchone()[0]
+
+    def test_local_publication_syncs_file_and_both_parents_before_retirement(self):
+        for existing in (False, True):
+            with self.subTest(existing=existing), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                store = self._seed(root)
+                prior = store.create_backup(root / "backups", snapshot_label="2030-01-01T00:00:00Z")
+                label = "2030-01-01T00:00:00Z" if existing else "2030-01-02T00:00:00Z"
+                self._change(store)
+                with self._observe_publication(store) as events:
+                    result = store.create_backup(root / "backups", snapshot_label=label, retention_count=1)
+                rename_index = next(i for i, event in enumerate(events) if event[0] == "rename")
+                rename = events[rename_index]
+                self.assertEqual(rename[3], 2 if existing else 1)
+                self.assertTrue(any(event[0] == "file" for event in events[:rename_index]))
+                barriers = events[rename_index + 1:rename_index + 3]
+                self.assertEqual(barriers, [("directory", rename[1].parent), ("directory", rename[2].parent)])
+                unlinks = [i for i, event in enumerate(events) if event[0] == "unlink"]
+                self.assertTrue(unlinks)
+                self.assertGreater(min(unlinks), rename_index + 2)
+                self.assertEqual(self._value(result), "successor")
+                if not existing:
+                    self.assertFalse(prior.exists())
+
+    def test_local_directory_sync_failures_preserve_prior_and_gate_pruning(self):
+        for existing in (False, True):
+            for failed in (1, 2):
+                with self.subTest(existing=existing, failed=failed), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    store = self._seed(root)
+                    prior = store.create_backup(root / "backups", snapshot_label="2030-01-01T00:00:00Z")
+                    before = prior.read_bytes()
+                    self._change(store)
+                    label = "2030-01-01T00:00:00Z" if existing else "2030-01-02T00:00:00Z"
+                    with (
+                        self._observe_publication(store, fail_syncs=(failed,)),
+                        patch.object(store, "_prune_backup_snapshots", wraps=store._prune_backup_snapshots) as prune,
+                        self.assertRaisesRegex(OSError, "injected directory sync"),
+                    ):
+                        store.create_backup(root / "backups", snapshot_label=label, retention_count=1)
+                    prune.assert_not_called()
+                    self.assertEqual(prior.read_bytes(), before)
+                    self.assertEqual(self._value(prior), "prior")
+                    self.assertEqual(list((root / "backups").glob("*.sqlite3")), [prior])
+
+    def test_promotion_durability_and_failures_gate_weekly_and_monthly_pruning(self):
+        for period in ("weekly", "monthly"):
+            for existing in (False, True):
+                for failed in (None, 1, 2):
+                    with self.subTest(period=period, existing=existing, failed=failed), tempfile.TemporaryDirectory() as tmp:
+                        root = Path(tmp)
+                        store = self._seed(root)
+                        source = store.create_backup(root / "backups", snapshot_label="2030-01-01T00:00:00Z")
+                        options = dict(long_term_backup_dir=root / "archive", weekly_retention_count=0, monthly_retention_count=0)
+                        options[f"{period}_retention_count"] = 1
+                        store._promote_long_term_backups(source, snapshot_label="2030-01-01T00:00:00Z", **options)
+                        prior = next((root / "archive" / period).glob("*.sqlite3"))
+                        before = prior.read_bytes()
+                        self._change(store)
+                        source = store.create_backup(root / "backups", snapshot_label="2030-03-01T00:00:00Z")
+                        label = "2030-01-01T00:00:00Z" if existing else "2030-03-01T00:00:00Z"
+                        with (
+                            self._observe_publication(store, fail_syncs=(() if failed is None else (failed,))) as events,
+                            patch.object(store, "_prune_named_backups", wraps=store._prune_named_backups) as prune,
+                        ):
+                            if failed is None:
+                                store._promote_long_term_backups(source, snapshot_label=label, **options)
+                            else:
+                                with self.assertRaisesRegex(OSError, "injected directory sync"):
+                                    store._promote_long_term_backups(source, snapshot_label=label, **options)
+                        if failed is not None:
+                            prune.assert_not_called()
+                            self.assertEqual(prior.read_bytes(), before)
+                            self.assertEqual(self._value(prior), "prior")
+                        else:
+                            prune.assert_called_once()
+                            index = next(i for i, event in enumerate(events) if event[0] == "rename")
+                            rename = events[index]
+                            self.assertEqual(rename[3], 2 if existing else 1)
+                            self.assertTrue(any(event[0] == "file" for event in events[:index]))
+                            self.assertEqual(events[index + 1:index + 3], [
+                                ("directory", rename[1].parent), ("directory", rename[2].parent),
+                            ])
+                            self.assertTrue(all(i > index + 2 for i, event in enumerate(events) if event[0] == "unlink"))
+                            self.assertEqual(self._value(next(prior.parent.glob("*.sqlite3"))), "successor")
+
+    def test_restore_directory_sync_failure_rolls_back_before_sidecar_cleanup(self):
+        for failed in (1, 2):
+            with self.subTest(failed=failed), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                store = self._seed(root)
+                backup = store.create_backup(root / "backups", snapshot_label="2030-01-01T00:00:00Z")
+                self._change(store)
+                before = store.file_path.read_bytes()
+                family = [Path(f"{store.file_path}{suffix}") for suffix in ("-wal", "-shm")]
+                for path in family:
+                    path.write_bytes(b"synthetic-sidecar")
+                with self._observe_publication(store, fail_syncs=(failed,)), self.assertRaises(OSError):
+                    store.restore_backup(backup)
+                self.assertEqual(store.file_path.read_bytes(), before)
+                for path in family:
+                    self.assertEqual(path.read_bytes(), b"synthetic-sidecar")
+
+    def test_rollback_sync_failure_keeps_prior_generation(self):
+        for rollback_failure in (2, 3):
+            with self.subTest(rollback_failure=rollback_failure), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                store = self._seed(root)
+                prior = store.create_backup(root / "backups", snapshot_label="2030-01-01T00:00:00Z")
+                before = prior.read_bytes()
+                self._change(store)
+                with (
+                    self._observe_publication(store, fail_syncs=(1, rollback_failure)) as events,
+                    self.assertRaises(OSError),
+                ):
+                    store.create_backup(root / "backups", snapshot_label="2030-01-01T00:00:00Z")
+                self.assertEqual(prior.read_bytes(), before)
+                self.assertEqual(self._value(prior), "prior")
+                self.assertEqual(len([e for e in events if e[0] == "rename"]), 2)
+                self.assertEqual(len([e for e in events if e[0] == "directory"]), rollback_failure)
+
+    def test_file_sync_failure_prevents_publication_and_preserves_prior(self):
+        for existing in (False, True):
+            with self.subTest(existing=existing), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                store = self._seed(root)
+                prior = store.create_backup(root / "backups", snapshot_label="2030-01-01T00:00:00Z")
+                assert prior is not None
+                before = prior.read_bytes()
+                self._change(store)
+                label = "2030-01-01T00:00:00Z" if existing else "2030-01-02T00:00:00Z"
+                with (
+                    patch("history_service.store.os.fsync", side_effect=OSError(errno.EIO, "injected file sync")),
+                    patch.object(store, "_rename_at2", wraps=store._rename_at2) as rename,
+                    self.assertRaisesRegex(OSError, "injected file sync"),
+                ):
+                    store.create_backup(root / "backups", snapshot_label=label, retention_count=1)
+                rename.assert_not_called()
+                self.assertEqual(prior.read_bytes(), before)
+                self.assertEqual(self._value(prior), "prior")
+
+    def test_archive_failure_keeps_existing_best_effort_local_backup_contract(self):
+        for period in ("weekly", "monthly"):
+            with self.subTest(period=period), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                store = self._seed(root)
+                options: dict[str, Any] = dict(
+                    long_term_backup_dir=root / "archive",
+                    weekly_retention_count=0, monthly_retention_count=0,
+                )
+                options[f"{period}_retention_count"] = 1
+                store.create_backup(root / "backups", snapshot_label="2030-01-01T00:00:00Z", **options)
+                prior = next((root / "archive" / period).glob("*.sqlite3"))
+                before = prior.read_bytes()
+                self._change(store)
+                # Local publication has two directory barriers; fail the first
+                # archive barrier, not the already-durable local snapshot.
+                with (
+                    self._observe_publication(store, fail_syncs=(3,)),
+                    patch.object(store, "_prune_named_backups", wraps=store._prune_named_backups) as prune,
+                    self.assertLogs("history_service.store", level="WARNING") as warnings,
+                ):
+                    result = store.create_backup(
+                        root / "backups", snapshot_label="2030-03-01T00:00:00Z", **options,
+                    )
+                prune.assert_not_called()
+                self.assertIn("long-term backup promotion failed", warnings.output[0])
+                self.assertEqual(self._value(result), "successor")
+                self.assertEqual(prior.read_bytes(), before)
+                self.assertEqual(list(prior.parent.glob("*.sqlite3")), [prior])
+
+    def test_collector_does_not_credit_failed_real_publication_for_retention(self):
+        for failed in (None, 1, 2):
+            with self.subTest(failed=failed), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                store = self._seed(root)
+                collector = HistoryCollector(HistorySettings(
+                    sqlite_path=str(store.file_path), backup_dir=str(root / "backups"),
+                    startup_grace_seconds=0,
+                ), store)
+                collector.last_fast_metrics_at = collector.started_at
+                collector._enumerate_scopes = AsyncMock(return_value=[])
+                with (
+                    self._observe_publication(store, fail_syncs=(failed,)),
+                    patch.object(store, "maintain_retention", wraps=store.maintain_retention) as retention,
+                    patch.object(collector, "_run_retention_if_due", wraps=collector._run_retention_if_due) as gate,
+                ):
+                    asyncio.run(collector.run_once(force_slow=True))
+                if failed is None:
+                    self.assertTrue(gate.call_args.kwargs["backup_succeeded"])
+                    self.assertIsNotNone(gate.call_args.kwargs["backup_at"])
+                    retention.assert_called_once()
+                    self.assertIsNotNone(collector.last_backup_at)
+                    self.assertIsNone(collector.last_backup_error)
+                    self.assertEqual(len(list((root / "backups").glob("*.sqlite3"))), 1)
+                else:
+                    self.assertFalse(gate.call_args.kwargs["backup_succeeded"])
+                    self.assertIsNone(gate.call_args.kwargs["backup_at"])
+                    retention.assert_not_called()
+                    self.assertIsNone(collector.last_backup_at)
+                    self.assertIsNotNone(collector.last_backup_error)
+                    self.assertEqual(list((root / "backups").glob("*.sqlite3")), [])
+
+
 class HistoryStoreTests(unittest.TestCase):
     @staticmethod
     def _create_crashed_wal_fixture(db_path: Path) -> dict[str, str]:
