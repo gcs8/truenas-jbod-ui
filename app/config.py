@@ -5,10 +5,12 @@ import json
 import logging
 import os
 import re
+import tempfile
 import threading
 import types
 from pathlib import Path
 from typing import Any, Literal, Union, get_args, get_origin
+from weakref import WeakValueDictionary
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, field_validator, model_validator
@@ -161,6 +163,14 @@ class AppConfig(BaseModel):
     export_cache_max_bytes: int = 32 * 1024 * 1024
     log_level: str = "INFO"
     debug: bool = False
+
+    @field_validator("log_level")
+    @classmethod
+    def _validate_log_level(cls, value: str) -> str:
+        # Logging consumers uppercase names, including Python's standard aliases.
+        if value.upper() not in {"NOTSET", "DEBUG", "INFO", "WARN", "WARNING", "ERROR", "FATAL", "CRITICAL"}:
+            raise ValueError("must be one of NOTSET, DEBUG, INFO, WARN, WARNING, ERROR, FATAL, CRITICAL")
+        return value
 
 
 class PerfConfig(BaseModel):
@@ -1039,12 +1049,35 @@ def runtime_behavior_settings_payload(settings: Settings | None = None) -> dict[
     }
 
 
+_RUNTIME_OVERRIDE_LOCKS_GUARD = threading.Lock()
+_RUNTIME_OVERRIDE_LOCKS: WeakValueDictionary[Path, Any] = WeakValueDictionary()
+
+
 def save_runtime_behavior_overrides(settings: Settings, values: dict[str, Any]) -> dict[str, Any]:
+    """Serialize partial updates from this process through response construction.
+
+    This is not a revision/conflict policy for stale full-form submissions.
+    """
     if not isinstance(values, dict):
         raise ValueError("Runtime behavior settings payload must be a mapping.")
 
-    yaml_config = _load_yaml_config(Path(settings.config_file))
     runtime_overrides_path = Path(settings.paths.runtime_overrides_file)
+    lock_key = runtime_overrides_path.resolve()
+    with _RUNTIME_OVERRIDE_LOCKS_GUARD:
+        lock = _RUNTIME_OVERRIDE_LOCKS.get(lock_key)
+        if lock is None:
+            lock = threading.Lock()
+            _RUNTIME_OVERRIDE_LOCKS[lock_key] = lock
+    # Each waiting writer retains the lock, so weak entries cannot expire
+    # while another writer is using or waiting for the same path.
+    with lock:
+        return _save_runtime_behavior_overrides(settings, values, runtime_overrides_path)
+
+
+def _save_runtime_behavior_overrides(
+    settings: Settings, values: dict[str, Any], runtime_overrides_path: Path,
+) -> dict[str, Any]:
+    yaml_config = _load_yaml_config(Path(settings.config_file))
     runtime_overrides = _load_runtime_overrides_config(runtime_overrides_path)
     clean_values: dict[str, int] = {}
     for field_name, raw_value in values.items():
@@ -1070,12 +1103,50 @@ def save_runtime_behavior_overrides(settings: Settings, values: dict[str, Any]) 
     app_payload.update(clean_values)
 
     runtime_overrides_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = runtime_overrides_path.with_suffix(".tmp")
-    with temp_path.open("w", encoding="utf-8", newline="\n") as handle:
-        yaml.safe_dump(runtime_overrides, handle, sort_keys=False)
-    temp_path.replace(runtime_overrides_path)
-    get_settings.cache_clear()
-    return runtime_behavior_settings_payload(get_settings())
+    # Replacement must retain the readers of an existing file, including a
+    # private file owned by the UI rather than the admin writer. New files use
+    # the ordinary 0644 config-file reader mode, not mkstemp's private mode.
+    # Only POSIX has the UID/GID and permission-bit contract handled here.
+    existing_metadata = None
+    if os.name == "posix":
+        try:
+            existing_metadata = runtime_overrides_path.stat()
+        except FileNotFoundError:
+            pass
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline="\n",
+            dir=runtime_overrides_path.parent,
+            prefix=f".{runtime_overrides_path.name}.", suffix=".tmp", delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            yaml.safe_dump(runtime_overrides, handle, sort_keys=False)
+            handle.flush()
+            if os.name == "posix":
+                descriptor = handle.fileno()
+                mode = 0o644
+                if existing_metadata is not None:
+                    staged_metadata = os.fstat(descriptor)
+                    owner = (existing_metadata.st_uid, existing_metadata.st_gid)
+                    if (staged_metadata.st_uid, staged_metadata.st_gid) != owner:
+                        os.fchown(descriptor, *owner)
+                    # YAML is data: preserve read/write permissions, never
+                    # execute, set-ID or sticky bits. Do not widen private files.
+                    mode = existing_metadata.st_mode & 0o666
+                # Serialize and flush privately; admit final metadata before
+                # replace so a permissions failure cannot publish or succeed.
+                os.fchmod(descriptor, mode)
+        temp_path.replace(runtime_overrides_path)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+    # Read back the file this transaction owns, not a pending restart-only
+    # path or a shared cache that another path's writer can replace.
+    loaded = load_settings(running_restart_only=settings)
+    effective = with_running_restart_only_settings(settings, loaded)
+    replace_settings(effective)
+    return runtime_behavior_settings_payload(effective)
 
 
 def _load_profile_yaml(profile_path: Path) -> dict[str, Any]:
@@ -1372,7 +1443,7 @@ get_settings.cache_clear = _clear_settings_cache  # type: ignore[attr-defined]
 def load_settings(*, running_restart_only: Settings | None = None) -> Settings:
     """Read and validate config.yaml, runtime-overrides.yaml, profiles.yaml and .env.
 
-    During live reload, dependent profile content stays on the running
+    During live reload, dependent override and profile content stays on the running
     restart-only path. The pending path is still validated and reported as a
     restart-only change, but its content is not combined with the old process's
     open stores and paths.
@@ -1380,11 +1451,21 @@ def load_settings(*, running_restart_only: Settings | None = None) -> Settings:
     defaults = Settings().model_dump()
     config_path = Path(os.getenv("APP_CONFIG_PATH", defaults["config_file"]))
     yaml_config = _load_yaml_config(config_path)
-    runtime_overrides_path = Path(_derive_runtime_layout_paths(config_path)["runtime_overrides_file"])
+    merged = _deep_merge(defaults, yaml_config)
+    configured_overrides_path = merged["paths"]["runtime_overrides_file"]
+    if configured_overrides_path in {
+        defaults["paths"]["runtime_overrides_file"],
+        _legacy_container_layout_paths()["runtime_overrides_file"],
+    }:
+        configured_overrides_path = _derive_runtime_layout_paths(config_path)["runtime_overrides_file"]
+    runtime_overrides_path = Path(
+        running_restart_only.paths.runtime_overrides_file
+        if running_restart_only is not None
+        else configured_overrides_path
+    )
     runtime_overrides = _load_runtime_overrides_config(runtime_overrides_path)
     for key, suggestion in collect_unknown_config_key_suggestions(yaml_config):
         logger.warning("%s", _unknown_key_message(config_path, key, suggestion))
-    merged = _deep_merge(defaults, yaml_config)
     merged = _deep_merge(merged, runtime_overrides)
 
     for env_name, target_path in ENV_OVERRIDES.items():

@@ -78,12 +78,12 @@ class BlankAndTextValueTests(_LoaderTestCase):
         self.assertIsNone(settings.app.public_origin)
 
     def test_text_values_stay_text(self) -> None:
-        env = {"TRUENAS_HOST": "1234", "APP_LOG_LEVEL": "null", "TRUENAS_PLATFORM": " scale "}
+        env = {"TRUENAS_HOST": "1234", "TRUENAS_API_USER": "null", "TRUENAS_PLATFORM": " scale "}
         with self.main_ui_environment(env):
             settings = get_settings()
 
         self.assertEqual(settings.truenas.host, "1234")
-        self.assertEqual(settings.app.log_level, "null")
+        self.assertEqual(settings.truenas.api_user, "null")
         self.assertEqual(settings.truenas.platform, "scale")
 
     def test_blank_legacy_cache_ttl_does_not_claim_the_other_windows(self) -> None:
@@ -92,6 +92,35 @@ class BlankAndTextValueTests(_LoaderTestCase):
 
         self.assertEqual(settings.app.snapshot_cache_ttl_seconds, 10)
         self.assertEqual(settings.app.source_bundle_cache_ttl_seconds, 60)
+
+
+class LogLevelValidationTests(_LoaderTestCase):
+    def test_invalid_yaml_log_level_is_rejected_before_startup(self) -> None:
+        with self.main_ui_environment({}, 'app:\n  log_level: "not-a-log-level"\n'):
+            with self.assertRaises(ConfigurationError) as captured:
+                get_settings()
+        self.assertIn("app.log_level", str(captured.exception))
+        self.assertNotIn("not-a-log-level", str(captured.exception))
+
+    def test_invalid_environment_log_level_is_rejected_before_startup(self) -> None:
+        with self.main_ui_environment({"APP_LOG_LEVEL": "null"}):
+            with self.assertRaises(ConfigurationError) as captured:
+                get_settings()
+        self.assertIn("APP_LOG_LEVEL in .env", str(captured.exception))
+        self.assertNotIn("null", str(captured.exception))
+
+    def test_standard_names_aliases_case_and_environment_precedence(self) -> None:
+        import logging
+
+        for name in ("NOTSET", "DEBUG", "INFO", "WARN", "WARNING", "ERROR", "FATAL", "CRITICAL"):
+            for value in (name, name.lower(), name.title()):
+                for env in ({}, {"APP_LOG_LEVEL": value}):
+                    with self.subTest(value=value, env=bool(env)):
+                        yaml_value = "invalid-but-env-wins" if env else value
+                        with self.main_ui_environment(env, yaml.safe_dump({"app": {"log_level": yaml_value}})):
+                            settings = get_settings()
+                        self.assertEqual(settings.app.log_level.upper(), name)
+                        logging.Logger("synthetic-level-check").setLevel(settings.app.log_level.upper())
 
 
 class PlainConfigurationErrorTests(_LoaderTestCase):
