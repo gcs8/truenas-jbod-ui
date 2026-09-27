@@ -964,6 +964,139 @@ class SegmentedHistoryReaderCliTests(unittest.TestCase):
     def test_followed_bundle_rollup_limit_preserves_all_fragments(self) -> None:
         self._assert_tight_rollup_limit("followed_bundle")
 
+    def _observe_retained_rollup_hydration(
+        self, *, decoys: int, variable_limit: int, retained_count: int = 150,
+    ) -> list[dict[str, Any]]:
+        """Observe actual SQL work and Python hydration, not a replacement query."""
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            paths = [Path(temporary_directory) / f"source-{i}.sqlite3" for i in range(2)]
+            bucket = "2025-01-01T00:00:00+00:00"
+            for index, path in enumerate(paths):
+                connection = sqlite3.connect(path)
+                try:
+                    connection.executescript(SCHEMA)
+                    connection.executemany(
+                        """INSERT INTO metric_rollups (
+                            bucket_start, bucket_seconds, system_id, enclosure_key, slot, slot_label,
+                            metric_name, disk_identity_key, sample_count, value_sum, value_min,
+                            value_max, last_value, last_observed_at
+                        ) VALUES (?, 3600, 'system-1', ?, 1, 'slot-1', 'temperature', ?,
+                                  2, ?, ?, ?, ?, ?)""",
+                        [(bucket, enclosure, identity, 62 if index else 70,
+                          30 if index else 34, 32 if index else 36, 32 if index else 36,
+                          "2025-01-01T00:30:00+00:00" if index else "2025-01-01T00:50:00+00:00")
+                         for enclosure, identity in (
+                             [("other-enclosure", f"decoy-{i:05d}") for i in range(decoys)]
+                             + [("enclosure-1", f"target-{i:05d}") for i in range(retained_count)]
+                         )],
+                    )
+                    connection.commit()
+                finally:
+                    connection.close()
+            reader = SegmentedHistoryReader(hot_path=paths[0], segment_paths=paths[1:])
+            original = reader._query_connection
+            records = []
+            case = self
+
+            @contextmanager
+            def observed_connection(path):
+                with original(path) as connection:
+                    connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, variable_limit)
+
+                    class ObservedConnection:
+                        def execute(self, query, parameters=()):
+                            case.assertLessEqual(len(parameters), min(variable_limit, 999))
+                            if "metric_rollups" not in query or "_last_observed_at" not in query:
+                                return connection.execute(query, parameters)
+                            plan = [row[3] for row in connection.execute(
+                                "EXPLAIN QUERY PLAN " + query, parameters
+                            ).fetchall()]
+                            steps = 0
+                            physical_rows = 0
+
+                            def progress():
+                                nonlocal steps
+                                steps += 1
+                                return 0
+
+                            def count_row(cursor, row):
+                                nonlocal physical_rows
+                                physical_rows += 1
+                                return sqlite3.Row(cursor, row)
+
+                            connection.row_factory = count_row
+                            connection.set_progress_handler(progress, 1)
+                            try:
+                                rows = connection.execute(query, parameters).fetchall()
+                            finally:
+                                connection.set_progress_handler(None, 0)
+                                connection.row_factory = sqlite3.Row
+                            key_count = (len(parameters) - 1) // 7
+                            case.assertEqual(len(parameters), 7 * key_count + 1)
+                            case.assertEqual(parameters[-1], key_count)
+                            case.assertGreater(key_count, 0)
+                            case.assertEqual(physical_rows, key_count)
+                            case.assertEqual(len(rows), key_count)
+                            records.append({
+                                "source": paths.index(path), "plan": plan, "vm_steps": steps,
+                                "physical_rows": physical_rows, "binds": len(parameters),
+                                "limit": parameters[-1], "sql_sha256": hashlib.sha256(query.encode()).hexdigest(),
+                            })
+
+                            class BufferedCursor:
+                                def fetchall(self):
+                                    return rows
+
+                            return BufferedCursor()
+
+                        def __getattr__(self, name):
+                            return getattr(connection, name)
+
+                    yield ObservedConnection()
+
+            with patch.object(reader, "_query_connection", side_effect=observed_connection):
+                if variable_limit < 8:
+                    with self.assertRaisesRegex(ValueError, "SQLite variable limit is too small"):
+                        reader.list_metric_samples(
+                            "system-1", "enclosure-1", 1, metric_name="temperature", limit=retained_count
+                        )
+                    self.assertEqual(records, [])
+                    return records
+                samples = reader.list_metric_samples(
+                    "system-1", "enclosure-1", 1, metric_name="temperature", limit=retained_count
+                )
+            self.assertEqual(len(samples), retained_count)
+            self.assertEqual({row["disk_identity_key"] for row in samples},
+                             {f"target-{i:05d}" for i in range(retained_count)})
+            self.assertEqual({(row["sample_count"], row["value"], row["value_min"], row["value_max"],
+                               row["observed_at"], row["rollup_seconds"]) for row in samples},
+                             {(4, 33.0, 30.0, 36.0, bucket, 3600)})
+            self.assertEqual(sum(record["physical_rows"] for record in records), 2 * retained_count)
+            chunk_size = (min(variable_limit, 999) - 1) // 7
+            self.assertEqual(len(records), 2 * ((retained_count + chunk_size - 1) // chunk_size))
+            return records
+
+    def test_retained_rollup_hydration_uses_complete_primary_key_without_interval_rescan(self) -> None:
+        measurements = [self._observe_retained_rollup_hydration(decoys=count, variable_limit=999)
+                        for count in (64, 512)]
+        for records in measurements:
+            for record in records:
+                searches = [detail for detail in record["plan"] if "SEARCH metric_rollups " in detail]
+                self.assertEqual(len(searches), 1, record)
+                for field in ("bucket_seconds", "bucket_start", "system_id", "enclosure_key",
+                              "slot", "metric_name", "disk_identity_key"):
+                    self.assertIn(f"{field}=?", searches[0], record)
+        self.assertEqual([record["vm_steps"] for record in measurements[0]],
+                         [record["vm_steps"] for record in measurements[1]])
+
+    def test_retained_rollup_hydration_honors_lowest_and_legacy_variable_limits(self) -> None:
+        for variable_limit in (7, 8, 15, 999, 32766):
+            with self.subTest(variable_limit=variable_limit):
+                self._observe_retained_rollup_hydration(
+                    decoys=16, variable_limit=variable_limit,
+                    retained_count=3 if variable_limit < 999 else 150,
+                )
+
     def test_direct_rollup_completion_is_bounded_at_maximum_limit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             paths = [Path(temporary_directory) / f"source-{i}.sqlite3" for i in range(2)]

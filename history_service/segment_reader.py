@@ -1542,7 +1542,10 @@ class SegmentedHistoryReader:
                 )[:remaining])
             if not retained_keys:
                 continue
+            # Drive hydration from retained keys. Tuple IN can scan the whole
+            # interval on SQLite 3.45; CROSS JOIN keeps full primary-key lookups.
             query = """
+                WITH retained(k0, k1, k2, k3, k4, k5, k6) AS (VALUES {key_values})
                 SELECT
                     NULL AS id,
                     CASE
@@ -1581,9 +1584,15 @@ class SegmentedHistoryReader:
                     value_sum AS _value_sum,
                     last_value AS _last_value,
                     last_observed_at AS _last_observed_at
-                FROM metric_rollups
-                WHERE (bucket_seconds, bucket_start, system_id, enclosure_key,
-                       slot, metric_name, disk_identity_key) IN (VALUES {key_values})
+                FROM retained
+                CROSS JOIN metric_rollups
+                    ON metric_rollups.bucket_seconds = retained.k0
+                   AND metric_rollups.bucket_start = retained.k1
+                   AND metric_rollups.system_id = retained.k2
+                   AND metric_rollups.enclosure_key = retained.k3
+                   AND metric_rollups.slot = retained.k4
+                   AND metric_rollups.metric_name = retained.k5
+                   AND metric_rollups.disk_identity_key = retained.k6
                 LIMIT ?
             """
             rollups: list[dict[str, Any]] = []
