@@ -915,6 +915,7 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
                             {"slot": 0, "mapping_revision": "c" * 64},
                         ]},
                         {"revision": "a" * 64, "mappings": []},
+                        {"revision": "d" * 64, "mappings": []},
                     ],
                 ) as get_json,
                 patch.object(
@@ -935,7 +936,7 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
             result,
             {"sas_fabric_label": True, "slot_mapping": True},
         )
-        self.assertEqual(get_json.call_count, 2)
+        self.assertEqual(get_json.call_count, 3)
         self.assertIn("expected_revision=" + "b" * 64, delete_json.call_args.args[1])
 
     def test_live_mapping_cycle_real_store_cas_and_preservation(self) -> None:
@@ -1011,6 +1012,176 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
                             invoke()
                         self.assertEqual(tokens, [])
                         self.assertEqual(path.read_bytes() if path.exists() else None, before)
+
+    def test_live_mapping_guard_scopes_real_store_without_losing_legacy_safety(self) -> None:
+        import urllib.parse
+
+        from app.models.domain import ManualMapping
+        from app.services.mapping_store import (
+            MappingRevisionConflict,
+            MappingScopeConflict,
+            MappingStore,
+        )
+
+        system = "synthetic-system"
+        physical = "synthetic-enclosure"
+        drawer = physical + "::dell-md1280-drawer-top-42"
+        cases = (
+            ("other-enclosure", physical, "synthetic-other", system, "success"),
+            ("drawer-other-enclosure", drawer, "synthetic-other", system, "success"),
+            ("other-enclosure-legacy", physical, "synthetic-other", None, "success"),
+            ("unknown-suffix-distinct", physical + "::unknown", physical, system, "success"),
+            ("selected-populated", physical, physical, system, "occupied"),
+            ("drawer-physical-populated", drawer, physical, system, "occupied"),
+            ("physical-drawer-populated", physical, drawer, system, "occupied"),
+            ("system-enclosureless", physical, None, system, "occupied"),
+            ("global-enclosureless", drawer, None, None, "occupied"),
+            ("global-selected", drawer, physical, None, "occupied"),
+            ("ambiguous-legacy", drawer, physical, system, "ambiguous"),
+            ("clear-conflict", physical, "synthetic-other", system, "conflict"),
+        )
+        for name, selected, existing_enclosure, existing_system, outcome in cases:
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as raw_root:
+                path = Path(raw_root) / "mappings.json"
+                store = MappingStore(str(path))
+                original = ManualMapping(
+                    system_id=existing_system, enclosure_id=existing_enclosure,
+                    slot=0, notes="original must survive", serial="SANITIZED-ORIGINAL",
+                )
+                if outcome == "ambiguous":
+                    alias = original.model_copy(update={
+                        "system_id": None, "enclosure_id": drawer,
+                        "notes": "conflicting legacy owner",
+                    })
+                    path.write_text(json.dumps({"version": 1, "slot_mappings": {
+                        f"{system}:{physical}:0": original.model_dump(mode="json"),
+                        f"{drawer}:0": alias.model_dump(mode="json"),
+                    }}), encoding="utf-8")
+                else:
+                    original = store.save_mapping(original)
+                before = path.read_bytes()
+                requests = []
+                mutations = []
+                revisions = {}
+                conflict_bytes = None
+
+                def request_query(url):
+                    query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+                    self.assertEqual(query["system_id"], [system])
+                    return query
+
+                def get_response(_port, url, *_auth):
+                    requests.append(url)
+                    query = request_query(url)
+                    if url.startswith("/api/inventory?"):
+                        revisions["save"] = store.save_revision(system, selected, 0)
+                        return {"selected_enclosure_id": selected, "slots": [{
+                            "slot": 0, "enclosure_id": selected,
+                            "mapping_revision": revisions["save"],
+                        }]}
+                    self.assertTrue(url.startswith("/api/mappings/export?"))
+                    scope = query.get("enclosure_id", [None])[0]
+                    mappings = store.list_mappings(system, scope)
+                    preview = store.preview_replace_mappings(system, scope, mappings)
+                    return {"revision": preview["revision"], "mappings": [
+                        mapping.model_dump(mode="json") for mapping in mappings
+                    ]}
+
+                def post_response(_port, url, payload, *_auth):
+                    if url == "/api/sas-fabric/aliases":
+                        return {"ok": True, "cleared": payload["label"] is None,
+                                "alias": payload if payload["label"] else None}
+                    self.assertTrue(url.startswith("/api/slots/0/mapping?"))
+                    self.assertEqual(request_query(url)["enclosure_id"], [selected])
+                    self.assertEqual(payload["expected_revision"], revisions["save"])
+                    self.assertFalse(payload["clear_identify_after_save"])
+                    mutations.append("save")
+                    saved = store.save_mapping(ManualMapping(
+                        system_id=system, enclosure_id=selected, slot=0, notes=payload["notes"],
+                    ), expected_revision=payload["expected_revision"])
+                    revisions["clear"] = store.clear_revision(system, selected, 0)
+                    self.assertNotEqual(revisions["save"], revisions["clear"])
+                    return {"ok": True, "mapping": saved.model_dump(mode="json"),
+                            "snapshot": {"slots": [{
+                                "slot": 0, "mapping_clear_revision": revisions["clear"],
+                            }]}}
+
+                def delete_response(_port, url, *_auth):
+                    nonlocal conflict_bytes
+                    self.assertTrue(url.startswith("/api/slots/0/mapping?"))
+                    query = request_query(url)
+                    self.assertEqual(query["enclosure_id"], [selected])
+                    self.assertEqual(query["expected_revision"], [revisions["clear"]])
+                    mutations.append("clear")
+                    if outcome == "conflict":
+                        store.save_mapping(ManualMapping(
+                            system_id=system, enclosure_id=selected, slot=0,
+                            notes="concurrent owner must survive",
+                        ))
+                        conflict_bytes = path.read_bytes()
+                    return {"ok": store.clear_mapping(
+                        system, selected, 0, expected_revision=query["expected_revision"][0],
+                    )}
+
+                with (patch.object(self.module, "get_json", side_effect=get_response),
+                      patch.object(self.module, "post_json", side_effect=post_response),
+                      patch.object(self.module, "delete_json", side_effect=delete_response)):
+                    def invoke():
+                        return self.module._exercise_pencil_writes(
+                            Path(raw_root), 28080, "qa-user", "qa-password", system,
+                            live_read_only=True,
+                        )
+                    if outcome == "success":
+                        self.assertTrue(invoke()["slot_mapping"])
+                        self.assertEqual(mutations, ["save", "clear"])
+                        reopened = MappingStore(str(path))
+                        self.assertIsNone(reopened.get_mapping(system, selected, 0))
+                        self.assertEqual(reopened.get_mapping(existing_system, existing_enclosure, 0), original)
+                        # A real save/clear updates the document timestamp, but no retained row.
+                        self.assertEqual(json.loads(path.read_bytes())["slot_mappings"],
+                                         json.loads(before)["slot_mappings"])
+                        self.assertEqual(json.loads(path.read_bytes())["version"], json.loads(before)["version"])
+                    elif outcome == "conflict":
+                        with self.assertRaises(MappingRevisionConflict):
+                            invoke()
+                        self.assertEqual(mutations, ["save", "clear"])
+                        self.assertEqual(path.read_bytes(), conflict_bytes)
+                        self.assertEqual(store.get_mapping(system, "synthetic-other", 0), original)
+                    else:
+                        if outcome == "occupied":
+                            with self.assertRaisesRegex(self.module.QaRestoreError, "unpopulated target"):
+                                invoke()
+                        else:
+                            with self.assertRaises(MappingScopeConflict):
+                                invoke()
+                        self.assertEqual(mutations, [])
+                        self.assertEqual(path.read_bytes(), before)
+                    if outcome != "ambiguous":
+                        self.assertIn("/api/mappings/export?system_id=" + system, requests)
+
+    def test_live_mapping_guard_rejects_invalid_selected_export_before_slot_writes(self) -> None:
+        for invalid in (None, {}, [None]):
+            with self.subTest(mappings=invalid), tempfile.TemporaryDirectory() as raw_root:
+                def post_response(_port, url, payload, *_auth):
+                    self.assertEqual(url, "/api/sas-fabric/aliases")
+                    return {"ok": True, "cleared": payload["label"] is None,
+                            "alias": payload if payload["label"] else None}
+
+                with (patch.object(self.module, "get_json", side_effect=[
+                    {"selected_enclosure_id": "synthetic-enclosure", "slots": [
+                        {"slot": 0, "mapping_revision": "c" * 64},
+                    ]},
+                    {"mappings": []},
+                    {"mappings": invalid},
+                ]), patch.object(self.module, "post_json", side_effect=post_response) as post,
+                      patch.object(self.module, "delete_json") as delete):
+                    with self.assertRaisesRegex(self.module.QaRestoreError, "mapping export"):
+                        self.module._exercise_pencil_writes(
+                            Path(raw_root), 28080, "qa-user", "qa-password", "synthetic-system",
+                            live_read_only=True,
+                        )
+                    self.assertEqual(post.call_count, 2)
+                    delete.assert_not_called()
 
     def test_partial_temporary_credential_creation_is_cleaned_up(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:

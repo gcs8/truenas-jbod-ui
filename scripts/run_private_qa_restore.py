@@ -1265,7 +1265,8 @@ def _exercise_pencil_writes(
     revision = candidates[0].get("mapping_revision") if len(candidates) == 1 else None
     if not isinstance(revision, str) or not revision.strip():
         raise QaRestoreError("selected physical slot save revision is unavailable")
-    # Include legacy/system-wide mappings, not only the selected enclosure.
+    # Retain the system-wide export so enclosureless legacy mappings stay protected.
+    # Resolve the selected physical scope through the API, including drawer aliases.
     # Refuse a populated target rather than replacing and then deleting it.
     export = get_json(
         ui_port,
@@ -1276,7 +1277,18 @@ def _exercise_pencil_writes(
     mappings = export.get("mappings")
     if not isinstance(mappings, list) or any(not isinstance(item, dict) for item in mappings):
         raise QaRestoreError("mapping export did not return mappings")
-    if any(item.get("slot") == 0 for item in mappings):
+    if any(item.get("slot") == 0 and item.get("enclosure_id") is None for item in mappings):
+        raise QaRestoreError("transient mapping probe requires an unpopulated target")
+    selected_export = get_json(
+        ui_port,
+        "/api/mappings/export?" + query,
+        username,
+        password,
+    )
+    selected_mappings = selected_export.get("mappings")
+    if not isinstance(selected_mappings, list) or any(not isinstance(item, dict) for item in selected_mappings):
+        raise QaRestoreError("selected mapping export did not return mappings")
+    if any(item.get("slot") == 0 for item in selected_mappings):
         raise QaRestoreError("transient mapping probe requires an unpopulated target")
     mapping_payload = {
         "expected_revision": revision,
