@@ -906,6 +906,21 @@ class SchedulerApiTests(SchedulerTestBase):
         with scheduler._job("full"):
             self.assertEqual(asgi_call(app, "POST", "/internal/backups/run", {"backup_class": "full"})[0], 409)
 
+    def test_library_carries_the_last_grooming_outcome(self) -> None:
+        from history_service.backup_scheduler.api import build_app
+
+        scheduler = self.make({"full": {"enabled": True}, "targets": [TARGET]})
+        app = build_app(scheduler)
+        self.assertIsNone(json.loads(asgi_call(app, "GET", "/internal/backups")[1])["grooming"])
+        scheduler._record_grooming(
+            ok=False, deleted=2, detail="ConnectionRefusedError: refused", failed_locations={"nas": "refused"}
+        )
+        status, body = asgi_call(app, "GET", "/internal/backups")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["grooming"], {
+            "at": "2026-09-24T12:00:00+00:00", "ok": False, "deleted": 2,
+            "detail": "ConnectionRefusedError: refused", "failed_locations": {"nas": "refused"}})
+
 
 class AdminProxyTests(unittest.TestCase):
     def setUp(self) -> None:

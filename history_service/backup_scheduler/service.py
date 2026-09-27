@@ -930,6 +930,7 @@ class BackupScheduler:
         with self._state_lock:
             class_runs = dict(self._status["classes"])
             target_runs = dict(self._status["targets"])
+            grooming = self._status.get("grooming")
         pending = 0
         if self.coalescer is not None:
             try:
@@ -976,6 +977,7 @@ class BackupScheduler:
             ],
             "artifacts": [self.serialize(record) for record in reversed(records)],
             "storage": storage,
+            "grooming": grooming,
         }
 
     # -- per-artifact actions ----------------------------------------------------------
