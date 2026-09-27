@@ -130,3 +130,15 @@ def write_text_atomically(path: Path, text: str) -> None:
         temp_path.unlink(missing_ok=True)
         raise
     os.replace(temp_path, path)
+    if os.name == "posix":
+        # fsync the directory so the rename itself survives a power loss.
+        try:
+            directory = os.open(path.parent, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(directory)
+        except OSError:
+            pass
+        finally:
+            os.close(directory)

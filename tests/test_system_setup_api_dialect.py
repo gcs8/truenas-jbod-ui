@@ -5,6 +5,7 @@ import stat
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import yaml
 
@@ -396,9 +397,25 @@ class ConfigFileModeTests(_DialectConfigMixin, unittest.TestCase):
 
     def test_a_saved_config_keeps_its_mode(self) -> None:
         self.config_path.chmod(0o640)
-        self._save_new_system()
+        real_open = os.open
+        parent_descriptors: list[int] = []
+
+        def recording_open(path, flags, *args, **kwargs):
+            descriptor = real_open(path, flags, *args, **kwargs)
+            if os.fspath(path) == os.fspath(self.config_path.parent):
+                parent_descriptors.append(descriptor)
+            return descriptor
+
+        with (
+            mock.patch("os.open", side_effect=recording_open),
+            mock.patch("os.fsync", wraps=os.fsync) as fsync,
+        ):
+            self._save_new_system()
 
         self.assertEqual(stat.S_IMODE(self.config_path.stat().st_mode), 0o640)
+        # The rename is made durable by fsyncing the parent directory.
+        self.assertEqual(len(parent_descriptors), 1)
+        fsync.assert_any_call(parent_descriptors[0])
         self.assertEqual(self._saved_truenas("other-scale").get("host"), "https://other.example.test")
 
 
