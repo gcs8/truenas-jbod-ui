@@ -4,7 +4,8 @@ Supported: ``minute hour day-of-month month day-of-week`` with ``*``, numbers,
 ranges ``a-b``, lists ``a,b``, steps ``*/n`` and ``a-b/n``, and the shortcuts
 ``@hourly``, ``@daily``/``@midnight``, ``@weekly``, ``@monthly``. Day of week is
 0-7 (0 and 7 are Sunday). As in classic cron, when both day-of-month and
-day-of-week are restricted a day matches if either matches.
+day-of-week are restricted a day matches if either matches; a field that starts
+with ``*`` (including ``*/n``) is not restricted, so then both must match.
 
 Times are evaluated in the timezone of the datetime passed in (the scheduler
 passes container local time, which is UTC unless ``TZ`` is set).
@@ -88,8 +89,8 @@ class CronSchedule:
             days=parsed[2],
             months=parsed[3],
             weekdays=weekdays,
-            day_restricted=parts[2] != "*",
-            weekday_restricted=parts[4] != "*",
+            day_restricted=not parts[2].startswith("*"),
+            weekday_restricted=not parts[4].startswith("*"),
         )
 
     def _day_matches(self, moment: datetime) -> bool:

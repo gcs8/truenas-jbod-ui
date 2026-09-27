@@ -80,6 +80,20 @@ class CronTests(unittest.TestCase):
         self.assertEqual(either.next_after(datetime(2026, 9, 24, tzinfo=UTC)), datetime(2026, 9, 28, tzinfo=UTC))
         self.assertEqual(CronSchedule.parse("0 12 29 2 *").next_after(datetime(2026, 3, 1, tzinfo=UTC)).year, 2028)
 
+    def test_star_step_day_field_is_not_restricted(self) -> None:
+        # Classic cron: a day field that starts with "*" does not count as restricted,
+        # so "*/2" day-of-month with a weekday means both must match.
+        odd_mondays = CronSchedule.parse("0 3 */2 * 1")
+        self.assertEqual(odd_mondays.next_after(datetime(2026, 9, 24, tzinfo=UTC)), datetime(2026, 10, 5, 3, 0, tzinfo=UTC))
+        self.assertEqual(odd_mondays.next_after(datetime(2026, 10, 5, 3, 0, tzinfo=UTC)), datetime(2026, 10, 19, 3, 0, tzinfo=UTC))
+        either = CronSchedule.parse("0 3 1,15 * 1")  # 1st, 15th, or any Monday
+        start = datetime(2026, 9, 24, tzinfo=UTC)
+        runs = []
+        for _ in range(5):
+            start = either.next_after(start)
+            runs.append(start.day)
+        self.assertEqual(runs, [28, 1, 5, 12, 15])
+
     def test_invalid(self) -> None:
         for text in ("", "* * * *", "60 * * * *", "* * 0 * *", "a * * * *", "*/0 * * * *", "5-1 * * * *", "0 0 31 2 *"):
             with self.subTest(text=text), self.assertRaises(CronError):
