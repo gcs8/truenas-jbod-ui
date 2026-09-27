@@ -222,7 +222,7 @@ function mutationProbe(name, fetchResult, extra = {}) {
     fetchJson: async () => {fetches++; if (fetchResult instanceof Error) throw fetchResult; return fetchResult;},
     refreshState: async () => {refreshes++;},
     setBanner(text, kind) {banners.push({text, kind});},
-    collectSetupPayload: () => ({label: "Synthetic", truenas_host: "https://nas.example.test"}),
+    collectSetupPayload: () => ({label: "Synthetic", truenas_host: "https://nas.example.test", default_profile_id: elements.setupProfile.value}),
     updateCreateButton() {}, fetchStorageViewCandidates: async () => {}, getSystemById: () => null, renderAll() {},
     currentBuilderSourceProfile: () => ({id: "source"}),
     readProfileBuilderDraft: () => ({id: "custom-draft", label: "Custom Draft", source_profile_id: "source", rows: 1, columns: 2, slot_count: 2}),
@@ -230,7 +230,7 @@ function mutationProbe(name, fetchResult, extra = {}) {
     getProfileById: () => null, loadProfileIntoBuilder() {}, renderProfileBuilder() {},
     ...extra,
   };
-  const api = load([name, ...MUTATION_RESULT_HELPERS], bindings);
+  const api = load([name, "setupDraftSnapshot", "recordSetupDraftChange", ...MUTATION_RESULT_HELPERS], bindings);
   return {api, state, elements, banners, counts: () => ({refreshes, fetches})};
 }
 function outcomeError(message, outcome, status) {
@@ -282,6 +282,10 @@ for (const [name, resultKey, valid] of MUTATIONS) {
     await probe.api[name]();
     assert.equal(probe.banners.at(-1).kind, "success");
     assert.equal(probe.counts().refreshes, 1);
+    if (name === "saveCustomProfile") {
+      assert.equal(probe.state.setupDirty, true);
+      assert.equal(probe.state.setupDraftRevision, 1);
+    }
   });
 }
 test("fetchJson turns a malformed 2xx mutation body into an unknown outcome and a GET into an error", async () => {

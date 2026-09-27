@@ -44,6 +44,9 @@
     storageViewCandidates: [],
     storageViewCandidatesLoading: false,
     storageViewCandidatesSystemId: null,
+    storageViewCandidatesTargetSystemId: null,
+    storageViewCandidatesScope: null,
+    storageViewCandidatesRequestScope: null,
     liveEnclosures: [],
     liveEnclosuresLoading: false,
     liveEnclosuresSystemId: null,
@@ -57,6 +60,8 @@
       || (Array.isArray(bootstrap.systems) && bootstrap.systems[0]?.id)
       || "",
     loadedSystemId: null,
+    setupEditorGeneration: 0,
+    setupDraftRevision: 0,
     sshCommandsAutoPlatform: null,
     sshUserAutoPlatform: null,
     sshUserEdited: false,
@@ -3412,6 +3417,12 @@
   }
 
   function renderStorageViews() {
+    // Invalidate on the selection change, not the next paint. A -> B -> A in
+    // one frame must not revive the first visit's pending request or hints.
+    if (state.storageViewCandidatesRequestScope
+      && state.storageViewCandidatesRequestScope !== currentStorageViewCandidateScope()) {
+      resetStorageViewCandidateState();
+    }
     scheduleStorageViewRender({ full: true });
   }
 
@@ -3438,6 +3449,8 @@
       return;
     }
     const preferredId = mutator(selected) || selected.id || state.selectedStorageViewId;
+    state.setupDirty = true;
+    state.setupDraftRevision = (state.setupDraftRevision || 0) + 1;
     state.storageViews = normalizeStorageViews(state.storageViews);
     state.selectedStorageViewId =
       state.storageViews.find((storageView) => storageView.id === preferredId)?.id
@@ -3505,10 +3518,25 @@
     state.liveEnclosuresError = null;
   }
 
+  function currentStorageViewCandidateScope() {
+    return JSON.stringify([
+      currentStorageViewSystemId(), currentStorageViewTargetSystemId(),
+      state.selectedStorageViewId || "", state.setupEditorGeneration || 0,
+    ]);
+  }
+
+  function storageViewCandidatesReady() {
+    return !state.storageViewCandidatesLoading
+      && state.storageViewCandidatesScope === currentStorageViewCandidateScope();
+  }
+
   function resetStorageViewCandidateState() {
     state.storageViewCandidatesRequestSeq = (state.storageViewCandidatesRequestSeq || 0) + 1;
     state.storageViewCandidates = [];
     state.storageViewCandidatesSystemId = null;
+    state.storageViewCandidatesTargetSystemId = null;
+    state.storageViewCandidatesScope = null;
+    state.storageViewCandidatesRequestScope = null;
     state.storageViewCandidatesLoading = false;
   }
 
@@ -3559,7 +3587,8 @@
   }
 
   function candidateBindingAlreadyAttached(candidate, storageView = getSelectedStorageView()) {
-    if (!candidate || !storageView) {
+    if (!candidate || !storageView
+      || currentStorageViewTargetSystemId(storageView) !== state.storageViewCandidatesTargetSystemId) {
       return false;
     }
     const recommended = candidate.recommended_binding || {};
@@ -3577,7 +3606,7 @@
   }
 
   function visibleStorageViewCandidates(storageView = getSelectedStorageView()) {
-    if (!storageView) {
+    if (!storageView || !storageViewCandidatesReady()) {
       return [];
     }
     return state.storageViewCandidates.filter((candidate) => {
@@ -3591,7 +3620,7 @@
   }
 
   function applyStorageViewCandidate(candidate) {
-    if (!candidate) {
+    if (!candidate || !storageViewCandidatesReady() || !visibleStorageViewCandidates().includes(candidate)) {
       return;
     }
     updateSelectedStorageView((storageView) => {
@@ -3607,6 +3636,9 @@
   }
 
   function applyAllStorageViewCandidates() {
+    if (!storageViewCandidatesReady()) {
+      return;
+    }
     const selectedStorageView = getSelectedStorageView();
     if (!selectedStorageView) {
       setBanner("Select a storage view first so the candidate bindings know where to land.", "error");
@@ -3633,8 +3665,14 @@
     const systemId = currentStorageViewSystemId();
     const targetSystemId = currentStorageViewTargetSystemId(selectedStorageView);
     const targetLabel = haTargetOptions().find((node) => node.system_id === targetSystemId)?.label || targetSystemId;
+    // All view-selection paths converge here, including add/remove/duplicate.
+    // Action guards compare the scope synchronously, before this queued paint.
+    if (systemId && selectedStorageView && state.storageViewCandidatesRequestScope !== currentStorageViewCandidateScope()) {
+      void fetchStorageViewCandidates({ quiet: true });
+    }
     const availableCandidates = visibleStorageViewCandidates(selectedStorageView);
-    const claimedElsewhereCount = state.storageViewCandidates.length - availableCandidates.length;
+    const claimedElsewhereCount = storageViewCandidatesReady()
+      ? state.storageViewCandidates.length - availableCandidates.length : 0;
     elements.setupStorageViewCandidatesAddAllButton.disabled =
       !selectedStorageView || !availableCandidates.some((candidate) => !candidateBindingAlreadyAttached(candidate, selectedStorageView));
     const where = `${systemId}${targetLabel ? ` (${targetLabel})` : ""}`;
@@ -3705,7 +3743,13 @@
       return;
     }
     const requestSeq = (state.storageViewCandidatesRequestSeq || 0) + 1;
+    const scope = currentStorageViewCandidateScope();
+    const ownsRequest = () => requestSeq === state.storageViewCandidatesRequestSeq
+      && scope === currentStorageViewCandidateScope();
     state.storageViewCandidatesRequestSeq = requestSeq;
+    state.storageViewCandidatesRequestScope = scope;
+    state.storageViewCandidatesScope = null;
+    state.storageViewCandidates = [];
     state.storageViewCandidatesLoading = true;
     scheduleStorageViewRender({ full: false });
     try {
@@ -3717,18 +3761,22 @@
         params.set("force", "true");
       }
       const payload = await fetchJson(`/api/admin/storage-views/candidates?${params.toString()}`);
-      if (requestSeq !== state.storageViewCandidatesRequestSeq) {
-        // A newer request (fast system switch) owns the state now; drop this response.
+      if (!ownsRequest()) {
         return;
       }
+      if (payload.system_id && payload.system_id !== systemId) {
+        throw new Error("Candidate response does not match the selected system.");
+      }
       state.storageViewCandidates = Array.isArray(payload.candidates) ? payload.candidates : [];
-      state.storageViewCandidatesSystemId = payload.system_id || systemId;
+      state.storageViewCandidatesSystemId = systemId;
+      state.storageViewCandidatesTargetSystemId = targetSystemId;
+      state.storageViewCandidatesScope = scope;
       if (!quiet) {
         const targetSuffix = targetSystemId ? ` targeting ${targetSystemId}` : "";
         setBanner(`Loaded ${state.storageViewCandidates.length} unmapped inventory candidate${state.storageViewCandidates.length === 1 ? "" : "s"} for ${state.storageViewCandidatesSystemId}${targetSuffix}.`, "success");
       }
     } catch (error) {
-      if (requestSeq !== state.storageViewCandidatesRequestSeq) {
+      if (!ownsRequest()) {
         return;
       }
       state.storageViewCandidates = [];
@@ -3737,7 +3785,7 @@
         setBanner(`Unable to load unmapped inventory candidates: ${error.message || error}`, "error");
       }
     } finally {
-      if (requestSeq === state.storageViewCandidatesRequestSeq) {
+      if (ownsRequest()) {
         state.storageViewCandidatesLoading = false;
         scheduleStorageViewRender({ full: false });
       }
@@ -3772,6 +3820,8 @@
       }
       return;
     }
+    state.setupDirty = true;
+    state.setupDraftRevision = (state.setupDraftRevision || 0) + 1;
     state.storageViews = normalizeStorageViews([...state.storageViews, storageView]);
     state.selectedStorageViewId = storageView.id;
     renderStorageViews();
@@ -3786,6 +3836,8 @@
     if (!selectedId) {
       return;
     }
+    state.setupDirty = true;
+    state.setupDraftRevision = (state.setupDraftRevision || 0) + 1;
     state.storageViews = state.storageViews.filter((storageView) => storageView.id !== selectedId);
     state.selectedStorageViewId = state.storageViews[0]?.id || "";
     renderStorageViews();
@@ -3800,6 +3852,8 @@
     duplicated.id = uniqueStorageViewId(`${selected.id}-copy`);
     duplicated.label = `${selected.label} Copy`;
     duplicated.order = nextStorageViewOrder();
+    state.setupDirty = true;
+    state.setupDraftRevision = (state.setupDraftRevision || 0) + 1;
     state.storageViews = normalizeStorageViews([...state.storageViews, duplicated]);
     state.selectedStorageViewId = duplicated.id;
     renderStorageViews();
@@ -3822,6 +3876,8 @@
     const currentOrder = ordered[currentIndex].order;
     ordered[currentIndex].order = ordered[targetIndex].order;
     ordered[targetIndex].order = currentOrder;
+    state.setupDirty = true;
+    state.setupDraftRevision = (state.setupDraftRevision || 0) + 1;
     state.storageViews = normalizeStorageViews(ordered);
     state.selectedStorageViewId = selected.id;
     renderStorageViews();
@@ -4793,6 +4849,7 @@
   }
 
   function resetSetupForm() {
+    state.setupEditorGeneration = (state.setupEditorGeneration || 0) + 1;
     state.loadedSystemId = null;
     state.selectedProfileId = "";
     state.tlsInspection = null;
@@ -4956,6 +5013,7 @@
     if (!system) {
       return;
     }
+    state.setupEditorGeneration = (state.setupEditorGeneration || 0) + 1;
     state.setupDirty = false;
     state.loadedSystemId = system.id || null;
     state.selectedExistingSystemId = system.id || state.selectedExistingSystemId;
@@ -5246,6 +5304,22 @@
     };
   }
 
+  // Programmatic edits do not emit input/change. Compare only submitted values,
+  // synchronously around each mutation, so same-value suggestions remain no-ops.
+  // Never retain this snapshot across an await or use it to replace visit/revision
+  // ownership: changing away and back still advances setupDraftRevision.
+  function setupDraftSnapshot() {
+    // This is a local comparison, not a write: do not request secret-preservation sentinels.
+    return JSON.stringify(collectSetupPayload());
+  }
+
+  function recordSetupDraftChange(before) {
+    if (before !== setupDraftSnapshot()) {
+      state.setupDirty = true;
+      state.setupDraftRevision = (state.setupDraftRevision || 0) + 1;
+    }
+  }
+
   async function discoverQuantastorHaNodes() {
     if (currentSetupPlatform() !== "quantastor" || !elements.setupHaEnabled?.checked) {
       setBanner("Turn on the QuantaStor HA option first.", "error");
@@ -5279,7 +5353,9 @@
           ha_nodes: setupPayload.ha_nodes,
         }),
       });
+      const draftBefore = setupDraftSnapshot();
       state.haNodes = normalizeHaNodes(payload.nodes || []);
+      recordSetupDraftChange(draftBefore);
       renderQuantastorHaSection();
       renderStorageViews();
       const hostDiscovery = payload.host_discovery || {};
@@ -6126,6 +6202,7 @@
           tls_server_name: collectTlsServerName() || null,
         }),
       });
+      const draftBefore = setupDraftSnapshot();
       state.tlsInspection = payload.inspection || state.tlsInspection;
       if (elements.setupTlsCaBundlePath) {
         elements.setupTlsCaBundlePath.value = payload.bundle_path || "";
@@ -6133,6 +6210,7 @@
       if (elements.setupVerifySsl) {
         elements.setupVerifySsl.checked = true;
       }
+      recordSetupDraftChange(draftBefore);
       renderTlsInspection();
       syncVerifySslHelp();
       syncTlsServerNameHelp();
@@ -6187,12 +6265,14 @@
           tls_server_name: collectTlsServerName() || null,
         }),
       });
+      const draftBefore = setupDraftSnapshot();
       if (elements.setupTlsCaBundlePath) {
         elements.setupTlsCaBundlePath.value = payload.bundle_path || "";
       }
       if (elements.setupVerifySsl) {
         elements.setupVerifySsl.checked = true;
       }
+      recordSetupDraftChange(draftBefore);
       syncVerifySslHelp();
       const trusted = syncTlsTrustStatus(payload.validation || null);
       const validationDetail = buildTlsValidationSuggestion(payload.validation);
@@ -7086,8 +7166,10 @@
     syncKeyHelp();
     try {
       const payload = await fetchJson("/api/admin/ssh-keys");
+      const draftBefore = setupDraftSnapshot();
       state.sshKeys = Array.isArray(payload.keys) ? payload.keys : [];
       syncKeyMode();
+      recordSetupDraftChange(draftBefore);
       if (!quiet) {
         setBanner("SSH key list refreshed.", "success");
       }
@@ -7115,6 +7197,7 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name: desiredName }),
       });
+      const draftBefore = setupDraftSnapshot();
       state.sshKeys = Array.isArray(payload.keys) ? payload.keys : state.sshKeys;
       renderSshKeyOptions(payload.key?.name || desiredName);
       if (elements.setupSshKeyMode) {
@@ -7125,6 +7208,7 @@
         elements.setupSshExistingKey.value = payload.key.name;
       }
       applySelectedKey();
+      recordSetupDraftChange(draftBefore);
       setBanner(`SSH key pair ${desiredName} generated.`, "success");
     } catch (error) {
       setBanner(`SSH key generation failed: ${error.message || error}`, "error");
@@ -7156,6 +7240,7 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
+      const draftBefore = setupDraftSnapshot();
       if (elements.setupSshEnabled) {
         elements.setupSshEnabled.checked = true;
       }
@@ -7182,6 +7267,7 @@
       }
       syncSshFields();
       maybeLoadRecommendedCommands();
+      recordSetupDraftChange(draftBefore);
       scheduleSudoersPreviewRefresh(0);
       if (elements.setupBootstrapResult) {
         const sudoState = result.sudo_rules_installed
@@ -7219,6 +7305,16 @@
       setBanner("Choose or create an SSH key first.", "error");
       return;
     }
+    // Acknowledgement belongs to this visit and revision, not whichever form is
+    // visible when the request finishes. Keep the saved-list refresh independent.
+    const editorGeneration = state.setupEditorGeneration;
+    const draftRevision = state.setupDraftRevision;
+    const loadedSystemId = state.loadedSystemId;
+    const selectedSystemId = state.selectedExistingSystemId;
+    const ownsEditor = () => state.setupEditorGeneration === editorGeneration
+      && state.loadedSystemId === loadedSystemId;
+    const ownsDraft = () => ownsEditor() && state.setupDraftRevision === draftRevision
+      && (elements.setupSystemId?.value?.trim() || null) === (payload.system_id || null);
     if (elements.setupCreateButton) {
       elements.setupCreateButton.disabled = true;
     }
@@ -7232,15 +7328,21 @@
         body: JSON.stringify(payload),
       });
       requireMutationResult(validSystemSaveResult(result), "system save");
-      state.setupDirty = false;
-      state.loadedSystemId = result.system?.id || state.loadedSystemId;
-      state.selectedExistingSystemId = result.system?.id || state.selectedExistingSystemId;
+      if (ownsDraft()) {
+        state.setupDirty = false;
+        state.loadedSystemId = result.system?.id || state.loadedSystemId;
+        if (state.selectedExistingSystemId === selectedSystemId) {
+          state.selectedExistingSystemId = result.system?.id || state.selectedExistingSystemId;
+        }
+      }
       state.defaultSystemId = result.default_system_id || state.defaultSystemId;
-      renderSaveResult(
-        elements.setupResult,
-        result.detail || `${result.updated_existing ? "Updated" : "Created"} ${result.system?.label || payload.label}.`,
-        result
-      );
+      if (state.setupEditorGeneration === editorGeneration) {
+        renderSaveResult(
+          elements.setupResult,
+          result.detail || `${result.updated_existing ? "Updated" : "Created"} ${result.system?.label || payload.label}.`,
+          result
+        );
+      }
       updateCreateButton();
       setBanner(`${result.updated_existing ? "Updated" : "Created"} system ${result.system?.label || payload.label}.`, "success");
       await refreshState({ quiet: true });
@@ -7250,7 +7352,7 @@
       const reason = error?.message || String(error);
       const keptDraftNote = /only accepts changes from/.test(reason) ? " Your entries are still in the form." : "";
       const message = `${describeMutationFailure("System setup", error)}${keptDraftNote}`;
-      if (elements.setupResult) {
+      if (ownsEditor() && elements.setupResult) {
         elements.setupResult.textContent = message;
       }
       setBanner(message, "error");
@@ -7430,10 +7532,14 @@
       });
       requireMutationResult(validProfileSaveResult(payload), "custom profile save");
       const savedProfileId = payload.profile.id;
-      state.loadedBuilderProfileId = savedProfileId;
-      state.selectedProfileId = savedProfileId;
-      if (elements.setupProfile) {
-        elements.setupProfile.value = savedProfileId;
+      {
+        const draftBefore = setupDraftSnapshot();
+        state.loadedBuilderProfileId = savedProfileId;
+        state.selectedProfileId = savedProfileId;
+        if (elements.setupProfile) {
+          elements.setupProfile.value = savedProfileId;
+        }
+        recordSetupDraftChange(draftBefore);
       }
       await refreshState({ quiet: true });
       const refreshedProfile = getProfileById(savedProfileId);
@@ -7512,7 +7618,10 @@
     }
   }
 
-  function renderAll() {
+  function renderAll({ trackSetupDraft = true } = {}) {
+    // Refresh can remove a selected profile/key or derive SSH defaults. Loading
+    // a system/resetting uses its own generation and does not call this path.
+    const draftBefore = trackSetupDraft ? setupDraftSnapshot() : null;
     updateAdminMeta();
     renderConfigurationWarnings();
     renderAdminView();
@@ -7538,6 +7647,9 @@
     syncSshFields();
     updateCreateButton();
     scheduleSudoersPreviewRefresh(0);
+    if (trackSetupDraft) {
+      recordSetupDraftChange(draftBefore);
+    }
   }
 
   function bindEvents() {
@@ -7684,7 +7796,9 @@
       if (!button || !elements.setupTlsServerName) {
         return;
       }
+      const draftBefore = setupDraftSnapshot();
       elements.setupTlsServerName.value = button.dataset.tlsServerName || "";
+      recordSetupDraftChange(draftBefore);
       syncVerifySslHelp();
       syncTlsServerNameHelp();
       renderTlsServerNameSuggestions();
@@ -7735,8 +7849,10 @@
       if (!card || !elements.setupProfile) {
         return;
       }
+      const draftBefore = setupDraftSnapshot();
       state.selectedProfileId = card.dataset.profileId || "";
       elements.setupProfile.value = state.selectedProfileId;
+      recordSetupDraftChange(draftBefore);
       renderProfilePreview();
       elements.profileCatalog.querySelectorAll("[data-profile-id]").forEach((profileCard) => {
         const selected = profileCard.dataset.profileId === state.selectedProfileId;
@@ -7873,12 +7989,15 @@
         resetSetupForm();
       }
     });
-    elements.setupPanel?.addEventListener("input", (event) => {
+    const markSetupDraftChanged = (event) => {
       if (event.target?.closest?.("[data-runtime-behavior-key], .setup-preview-column")) {
         return;
       }
       state.setupDirty = true;
-    });
+      state.setupDraftRevision = (state.setupDraftRevision || 0) + 1;
+    };
+    elements.setupPanel?.addEventListener("input", markSetupDraftChanged);
+    elements.setupPanel?.addEventListener("change", markSetupDraftChanged);
     elements.currentSystemsList?.addEventListener("click", (event) => {
       const button = event.target.closest("[data-existing-system-id]");
       if (!button) {
@@ -8003,7 +8122,9 @@
       });
     });
     elements.setupLoadRecommendedButton?.addEventListener("click", () => {
+      const draftBefore = setupDraftSnapshot();
       maybeLoadRecommendedCommands(true);
+      recordSetupDraftChange(draftBefore);
     });
     elements.setupCreateButton?.addEventListener("click", () => {
       void createSystem();
@@ -8129,7 +8250,7 @@
   backupLibrary?.bind();
 
   bindEvents();
-  renderAll();
+  renderAll({ trackSetupDraft: false });
   void loadOrphanedHistory({ quiet: true });
   maybeLoadRecommendedCommands();
   startCountdownTimer();

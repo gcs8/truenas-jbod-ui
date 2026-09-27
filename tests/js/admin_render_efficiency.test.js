@@ -179,6 +179,7 @@ test("loading a saved system paints the storage-view panel once, not four times"
       "cancelRenderFrame",
       "fetchLiveEnclosures",
       "fetchStorageViewCandidates",
+      "currentStorageViewCandidateScope",
       "resetLiveEnclosureState",
       "resetStorageViewCandidateState",
     ],

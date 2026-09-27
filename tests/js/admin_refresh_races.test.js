@@ -335,7 +335,7 @@ test("fetchStorageViewCandidates ignores a slow response for a system the operat
     storageViewCandidatesSystemId: null,
     storageViewCandidates: [],
   };
-  const { fetchStorageViewCandidates } = loadFunctions(["fetchStorageViewCandidates"], {
+  const { fetchStorageViewCandidates } = loadFunctions(["fetchStorageViewCandidates", "currentStorageViewCandidateScope"], {
     state,
     currentStorageViewSystemId() {
       return systemId;
@@ -386,7 +386,7 @@ test("clearing the selected system invalidates in-flight live-enclosure and cand
     storageViewCandidates: [],
   };
   const { fetchLiveEnclosures, fetchStorageViewCandidates, resetLiveEnclosureState, resetStorageViewCandidateState } = loadFunctions(
-    ["resetLiveEnclosureState", "resetStorageViewCandidateState", "fetchLiveEnclosures", "fetchStorageViewCandidates"],
+    ["resetLiveEnclosureState", "resetStorageViewCandidateState", "fetchLiveEnclosures", "fetchStorageViewCandidates", "currentStorageViewCandidateScope"],
     {
       state,
       currentStorageViewSystemId() {
