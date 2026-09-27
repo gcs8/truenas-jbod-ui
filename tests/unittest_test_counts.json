@@ -4,7 +4,7 @@
     "test_account_bootstrap": 19,
     "test_admin_auth": 24,
     "test_admin_command_state": 5,
-    "test_admin_config": 6,
+    "test_admin_config": 8,
     "test_admin_error_correlation": 10,
     "test_admin_maintenance": 23,
     "test_admin_runtime_routes": 3,

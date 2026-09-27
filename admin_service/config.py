@@ -89,6 +89,9 @@ def get_admin_settings() -> AdminSettings:
             payload[field_name] = raw_value
         elif _field_is_text(field_name):
             payload[field_name] = raw_value.strip()
+        elif not raw_value.strip():
+            # A blank non-text value keeps the default, as history_service/config.py does.
+            continue
         else:
             payload[field_name] = _parse_scalar(raw_value)
 

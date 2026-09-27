@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from admin_service.config import get_admin_settings
+from app.config_errors import ConfigurationError
 
 
 class AdminSettingsHostPrepTempDirTests(unittest.TestCase):
@@ -91,6 +92,39 @@ class AdminSettingsHostPrepTempDirTests(unittest.TestCase):
 
         self.assertEqual(settings.host_prep_max_packages, 3)
         self.assertEqual(settings.host_prep_max_bytes, 1073741824)
+
+    def test_blank_non_text_env_values_keep_defaults(self) -> None:
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "ADMIN_CONTAINER_VERSION_PROBE_TIMEOUT_SECONDS": "",
+                    "ADMIN_PORT": "  ",
+                    "ADMIN_ALLOW_PLAINTEXT_BACKUP_EXPORT": "",
+                },
+                clear=True,
+            ),
+            patch("admin_service.config.Path.mkdir"),
+        ):
+            settings = get_admin_settings()
+
+        self.assertEqual(settings.container_version_probe_timeout_seconds, 1.5)
+        self.assertEqual(settings.port, 8002)
+        self.assertFalse(settings.allow_plaintext_backup_export)
+
+    def test_non_numeric_env_value_still_raises(self) -> None:
+        with (
+            patch.dict(
+                os.environ,
+                {"ADMIN_CONTAINER_VERSION_PROBE_TIMEOUT_SECONDS": "soon"},
+                clear=True,
+            ),
+            patch("admin_service.config.Path.mkdir"),
+        ):
+            with self.assertRaises(ConfigurationError) as caught:
+                get_admin_settings()
+
+        self.assertIn("ADMIN_CONTAINER_VERSION_PROBE_TIMEOUT_SECONDS", str(caught.exception))
 
 
 if __name__ == "__main__":
