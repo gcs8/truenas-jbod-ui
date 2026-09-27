@@ -997,6 +997,11 @@ class PolicyEditorTests(unittest.TestCase):
         self.assertEqual(view["classes"]["config"]["values"]["local_keep"], 30)
         self.assertEqual(view["problems"], [])
 
+    def test_view_lists_the_allowed_archive_formats_for_the_editor_choice(self) -> None:
+        view = self.view()
+        self.assertEqual(view["archive_formats"], ["7z", "tar.zst"])
+        self.assertIn(view["classes"]["full"]["values"]["archive_format"], view["archive_formats"])
+
     def test_group_readable_secret_file_is_reported_missing(self) -> None:
         (self.root / "backup-secrets" / "archive_sftp_key").chmod(0o640)
         self.assertFalse(self.view()["targets"][0]["secrets"]["private_key_file"]["present"])

@@ -772,7 +772,17 @@
         const lockedBy = entry.locked?.[key];
         const value = entry.values[key];
         const type = typeof value === "boolean" ? "checkbox" : (key === "schedule" ? "text" : "number");
-        const input = inputFor(id, value, { type, disabled: Boolean(lockedBy), placeholder: NULLABLE_CLASS_FIELDS.has(key) ? "No limit" : undefined });
+        let input;
+        if (key === "archive_format") {
+          input = el("select", { id, disabled: Boolean(lockedBy) }, (view.archive_formats || []).map((format) => {
+            const option = el("option", { value: format, text: format });
+            if (format === value) option.setAttribute("selected", "");
+            return option;
+          }));
+          input.value = value;
+        } else {
+          input = inputFor(id, value, { type, disabled: Boolean(lockedBy), placeholder: NULLABLE_CLASS_FIELDS.has(key) ? "No limit" : undefined });
+        }
         input.dataset.policyClass = backupClass;
         input.dataset.policyKey = key;
         return fieldLabel(id, key === "enabled" ? "Turned on" : humanKey(key), input, lockedBy ? `Set by ${lockedBy} in the environment; change it there.` : "");
