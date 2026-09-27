@@ -888,29 +888,45 @@ def _remove_runtime_root(runtime_root: Path) -> None:
         raise QaRestoreError("private QA runtime cleanup failed")
 
 
-def _assert_compose_resources_removed(
-    project: str,
-    *,
-    env: dict[str, str],
-) -> None:
-    targets = [
-        *(
-            ("container", name)
-            for name in APP_CONTAINER_NAMES
-        ),
-        ("network", f"{project}_default"),
+def _compose_resource_state(project: str, *, env: dict[str, str]) -> str:
+    # Only successful list operations can prove absence. `inspect` exit 1 also
+    # means daemon/permission failures, not just a missing object.
+    commands = [
+        ["docker", "container", "ls", "--all", "--format", "{{.Names}} {{.State}}"],
+        ["docker", "container", "ls", "--all", "--filter",
+         f"label=com.docker.compose.project={project}", "--format", "{{.Names}} {{.State}}"],
+        *(["docker", kind, "ls", "--filter", f"label=com.docker.compose.project={project}",
+           "--format", "{{.Name}}"] for kind in ("network", "volume")),
     ]
-    for resource_type, name in targets:
-        result = subprocess.run(
-            ["docker", resource_type, "inspect", name],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=30,
-            check=False,
-            env=env,
-        )
-        if result.returncode != 1:
-            raise QaRestoreError("private QA cleanup readback found a remaining resource")
+    residual = False
+    unknown = False
+    running = False
+    for index, command in enumerate(commands):
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=30,
+                                    check=False, env=env)
+        except (OSError, subprocess.SubprocessError):
+            unknown = True
+            continue
+        if result.returncode != 0:
+            unknown = True
+            continue
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if not fields:
+                continue
+            if index == 0 and fields[0] not in APP_CONTAINER_NAMES:
+                continue
+            residual = True
+            running |= index < 2 and len(fields) == 2 and fields[1] == "running"
+    if running:
+        return "running"
+    return "unknown" if residual or unknown else "verified-stopped"
+
+
+def _assert_compose_resources_removed(project: str, *, env: dict[str, str]) -> None:
+    if _compose_resource_state(project, env=env) != "verified-stopped":
+        raise QaRestoreError("private QA cleanup readback did not verify resource absence")
 
 
 def _compose_command(runtime_root: Path, project: str) -> list[str]:
@@ -1240,15 +1256,28 @@ def _exercise_pencil_writes(
     query = urllib.parse.urlencode(
         {"system_id": system_id, "enclosure_id": enclosure_id}
     )
+    slots = inventory.get("slots")
+    candidates = [
+        item for item in slots
+        if isinstance(item, dict) and type(item.get("slot")) is int and item["slot"] == 0
+        and item.get("enclosure_id", enclosure_id) == enclosure_id
+    ] if isinstance(slots, list) else []
+    revision = candidates[0].get("mapping_revision") if len(candidates) == 1 else None
+    if not isinstance(revision, str) or not revision.strip():
+        raise QaRestoreError("selected physical slot save revision is unavailable")
+    # Include legacy/system-wide mappings, not only the selected enclosure.
+    # Refuse a populated target rather than replacing and then deleting it.
     export = get_json(
         ui_port,
-        f"/api/mappings/export?{query}",
+        "/api/mappings/export?" + urllib.parse.urlencode({"system_id": system_id}),
         username,
         password,
     )
-    revision = export.get("revision")
-    if not isinstance(revision, str):
-        raise QaRestoreError("mapping export did not return a revision")
+    mappings = export.get("mappings")
+    if not isinstance(mappings, list) or any(not isinstance(item, dict) for item in mappings):
+        raise QaRestoreError("mapping export did not return mappings")
+    if any(item.get("slot") == 0 for item in mappings):
+        raise QaRestoreError("transient mapping probe requires an unpopulated target")
     mapping_payload = {
         "expected_revision": revision,
         "notes": f"QA restore transient mapping {nonce}",
@@ -1287,7 +1316,7 @@ def _exercise_pencil_writes(
         if isinstance(saved_slot, dict)
         else None
     )
-    if not isinstance(next_revision, str):
+    if not isinstance(next_revision, str) or not next_revision.strip():
         raise QaRestoreError("saved slot did not return a clear revision")
     removed = delete_json(
         ui_port,
@@ -1612,12 +1641,15 @@ def main() -> int:
     project = f"tjuiqa{uuid.uuid4().hex[:12]}"
     compose: list[str] = []
     service_access: _LoopbackProxySet | None = None
-    stack_started = False
+    startup_attempted = False
     completed = False
+    receipt: dict[str, Any] = {}
+    backup_digest: str | None = None
     phase = "preflight"
     started_at = time.time()
     receipt_path = evidence_dir / "sanitized-receipt.json"
     try:
+        backup_digest = sha256_file(backup)
         phase = "runtime-setup"
         _write_runtime_files(
             repo_root,
@@ -1647,6 +1679,7 @@ def main() -> int:
         )
         compose = _compose_command(args.runtime_root, project)
         phase = "compose-start"
+        startup_attempted = True
         _run(
             [*compose, "up", "-d", "enclosure-ui", "enclosure-history", "enclosure-admin"],
             cwd=args.runtime_root,
@@ -1654,7 +1687,6 @@ def main() -> int:
             timeout=600,
             env=compose_env,
         )
-        stack_started = True
         access_plans = (
             _resolve_service_access(
                 "truenas-jbod-ui", 8000, ports[0], env=compose_env
@@ -1794,27 +1826,12 @@ def main() -> int:
             raw_dir,
             env=compose_env,
         )
-        if not args.keep_running:
-            phase = "cleanup"
-            if service_access is not None:
-                service_access.close()
-                service_access = None
-            _run(
-                [*compose, "down", "--remove-orphans", "--volumes"],
-                cwd=args.runtime_root,
-                log_path=raw_dir / "compose-down.log",
-                timeout=600,
-                env=compose_env,
-            )
-            _assert_compose_resources_removed(project, env=compose_env)
-            stack_started = False
-            _remove_runtime_root(args.runtime_root)
         receipt = {
             "status": "PASS",
             "run_id": run_id,
             "source_commit": args.source_commit,
             "image_id": args.image,
-            "backup_sha256": sha256_file(backup),
+            "backup_sha256": backup_digest,
             "backup_size_bytes": backup.stat().st_size,
             "target_handle": target_handle,
             "network_mode": "live-read-only" if args.live_read_only else "egress-blocked",
@@ -1841,66 +1858,78 @@ def main() -> int:
             "stack_running": bool(args.keep_running),
             "elapsed_seconds": round(time.time() - started_at, 3),
         }
-        write_private_json(receipt_path, receipt)
         completed = True
-        print(
-            "private_qa_restore=PASS "
-            f"receipt={receipt_path} stack_running={str(args.keep_running).lower()}"
-        )
-        return 0
     except BaseException as exc:
-        if stack_started and compose:
+        if startup_attempted and compose:
             try:
-                _capture_compose_logs(
-                    compose,
-                    args.runtime_root,
-                    raw_dir,
-                    env=compose_env,
-                )
+                _capture_compose_logs(compose, args.runtime_root, raw_dir, env=compose_env)
             except BaseException:
                 pass
-        failure_receipt = {
+        receipt = {
             "status": "FAIL",
             "run_id": run_id,
             "source_commit": args.source_commit,
             "image_id": args.image,
-            "backup_sha256": sha256_file(backup),
             "target_handle": target_handle,
             "failed_phase": phase,
             "error_class": type(exc).__name__,
-            "stack_running": False,
-            "elapsed_seconds": round(time.time() - started_at, 3),
+            "backup_sha256": backup_digest,
         }
-        write_private_json(receipt_path, failure_receipt)
         raise
     finally:
         passphrase = ""
+        original_error = sys.exc_info()[1]
+        cleanup_errors: list[BaseException] = []
+
+        def attempt(step: Callable[[], None]) -> bool:
+            try:
+                step()
+                return True
+            except BaseException as error:
+                cleanup_errors.append(error)
+                return False
+
+        # A proxy failure must not prevent independent container teardown.
         if service_access is not None:
-            if _cleanup_after_run(service_access.close, "QA service access close"):
-                service_access = None
-        if stack_started and compose and not (completed and args.keep_running):
-
-            def _teardown_stack() -> None:
-                _run(
-                    [*compose, "down", "--remove-orphans", "--volumes"],
-                    cwd=args.runtime_root,
-                    log_path=raw_dir / "compose-down.log",
-                    timeout=600,
-                    env=compose_env,
-                )
-                _assert_compose_resources_removed(project, env=compose_env)
-
-            if _cleanup_after_run(_teardown_stack, "QA compose stack teardown"):
-                stack_started = False
-        if (
-            not stack_started
-            and args.runtime_root.exists()
-            and not (completed and args.keep_running)
-        ):
-            _cleanup_after_run(
-                lambda: _remove_runtime_root(args.runtime_root),
-                "QA runtime-root cleanup",
-            )
+            attempt(service_access.close)
+        keep_running = completed and args.keep_running
+        down_ok = not startup_attempted
+        if startup_attempted and not keep_running:
+            phase = "cleanup"
+            down_ok = attempt(lambda: _run(
+                [*compose, "down", "--remove-orphans", "--volumes"],
+                cwd=args.runtime_root, log_path=raw_dir / "compose-down.log",
+                timeout=600, env=compose_env,
+            ))
+        # Read back even if up/down failed. Retain config on failed down even
+        # when this independent read happens to prove absence.
+        state = "unknown"
+        try:
+            state = _compose_resource_state(project, env=compose_env)
+        except BaseException as error:
+            cleanup_errors.append(error)
+        if not keep_running and state != "verified-stopped":
+            cleanup_errors.append(QaRestoreError("private QA cleanup readback is incomplete"))
+        if keep_running and state != "running":
+            cleanup_errors.append(QaRestoreError("private QA running stack readback is incomplete"))
+        if down_ok and state == "verified-stopped" and not keep_running and args.runtime_root.exists():
+            attempt(lambda: _remove_runtime_root(args.runtime_root))
+        if cleanup_errors and original_error is None:
+            receipt.update(status="FAIL", failed_phase="cleanup", error_class=type(cleanup_errors[0]).__name__)
+        receipt.update(
+            stack_state=state,
+            stack_running={"running": True, "verified-stopped": False, "unknown": None}[state],
+            cleanup_verified=down_ok and state == "verified-stopped",
+            runtime_retained=args.runtime_root.exists(),
+            elapsed_seconds=round(time.time() - started_at, 3),
+        )
+        attempt(lambda: write_private_json(receipt_path, receipt))
+        if cleanup_errors:
+            print("warning: QA cleanup incomplete; consult finalized receipt and retained runtime", file=sys.stderr)
+            if original_error is None:
+                raise cleanup_errors[0]
+    print(f"private_qa_restore=PASS receipt={receipt_path} stack_running={str(args.keep_running).lower()}")
+    return 0
 
 
 if __name__ == "__main__":
