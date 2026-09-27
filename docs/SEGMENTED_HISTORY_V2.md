@@ -268,19 +268,57 @@ as SQLite or JSON is not authenticated.
 
 ### Durable phase state machine
 
+These are all persisted rotation phases accepted by `ROTATION_JOURNAL_PHASES`
+in `history_service/segment_rotation.py`. The state column describes the
+checkpoint, not every possible crash state. Publication can change a live file
+before the next journal update. Recovery authenticates the live catalog against
+exactly one of the recorded prior and candidate identities, rather than choosing
+from the phase name alone.
+
 | Phase | Durable state | Recovery outcome |
 |---|---|---|
-| `prepared` | Journal, verified backup evidence, prior catalog identity, source identity, and closed prior-hot rollback copy are durable. No new final segment is visible. | Keep the prior hot and catalog authoritative. Remove only authenticated staging artifacts, then remove the journal last. |
-| `segment-published` | The journal authenticated the final segment name, size, and digest before no-clobber publication; the segment directory was fsynced. Prior hot and catalog remain active. | Remove only the exact journal-authenticated orphan segment and staging artifacts. Keep prior hot and catalog byte-identical. Remove the journal last. |
-| `hot-staged` | New segment is durable. Staged complementary hot and candidate catalog bytes are closed, hashed, and recorded. Prior hot and catalog remain active. | Remove authenticated staged files and the new segment. Keep prior hot and catalog byte-identical. Remove the journal last. |
-| `hot-replaced` | Live hot matches the staged-hot digest; prior-hot rollback and prior catalog remain preserved; active catalog is still the prior generation. Readers remain blocked. | Restore the authenticated prior hot, remove the authenticated new segment and staged candidate catalog, and retain the prior catalog. Remove the journal last. |
-| `catalog-replaced` | Live hot, new segment, and active catalog match the candidate generation; prior hot and catalog are still preserved. Readers remain blocked. | Finalize forward only when every candidate artifact matches the journal and the catalog retains every prior active segment. Any mismatch fails closed without cleanup. |
-| `cleanup` | Candidate generation is authenticated and committed. Prior rollback artifacts may remain. | Remove only authenticated prior-generation rollback artifacts. Fsync each containing directory and remove the journal last. |
+| `prepared` | Initial journal, verified backup evidence, prior catalog and source identities, and both rollback copies are durable. A further journal write in this phase records the new segment's name, size, and digest before publication. | With the prior catalog active, keep the prior hot and catalog, then enter `prior-restored` before authenticated cleanup. A crash during segment publication can leave an authenticated orphan even in this phase. |
+| `segment-published` | The new segment is published without clobbering an existing name and its directory is fsynced. Prior hot and catalog remain active. A further journal write records the staged hot before catalog staging. | With the prior catalog active, keep the prior hot and catalog, then enter `prior-restored` before removing authenticated staging artifacts and the new segment. |
+| `hot-staged` | New segment is durable. Closed, hashed staged hot and candidate catalog bytes are recorded. Prior hot and catalog remain active at this checkpoint. | With the prior catalog active, keep the prior hot or restore it if hot replacement already occurred, then enter `prior-restored` before cleanup. |
+| `hot-replaced` | Live hot matches the staged-hot digest; both rollback copies remain; active catalog is still prior at this checkpoint. | Restore the prior hot if the prior catalog remains active. If candidate catalog publication already occurred, authenticate and finalize the candidate instead. Persist the selected terminal phase before cleanup. |
+| `catalog-replaced` | Live hot, new segment, and active catalog match the candidate generation; both rollback copies remain. | With the candidate catalog active, authenticate the candidate hot, new segment, and every catalog-selected segment, then enter `cleanup`. |
+| `cleanup` | The terminal decision selects the candidate generation. Rollback or staging artifacts may already have been removed. | Revalidate the selected candidate generation, refresh the durable `cleanup` journal, and remove only remaining authenticated rollback and staging artifacts. Remove the journal last. |
+| `prior-restored` | Recovery has verified the retained segments and authenticated the prior hot and catalog. Any needed hot restoration has completed its parent-directory fsync. The terminal journal selects the prior generation before cleanup. | Require the prior hot and catalog and revalidate every retained segment. Refresh the durable `prior-restored` journal, remove only remaining authenticated new-segment, staging, and rollback artifacts, and remove the journal last. |
 
-Before `catalog-replaced`, recovery always returns to the prior generation. At or
-after `catalog-replaced`, recovery only finalizes the candidate generation when
-all recorded bytes match. It never guesses between generations. A mismatch keeps
-the journal and all evidence in place for repair.
+For a nonterminal phase, both rollback copies must still exist and match their
+journal records. If the live catalog matches the prior record, the hot database
+must match either the prior source or the staged hot record. Recovery verifies
+the prior catalog's retained segments and restores the prior hot when needed.
+If the live catalog matches the candidate record, the hot database and new
+segment must match their candidate records and every catalog-selected segment
+must verify. A catalog matching neither record, or both, fails closed.
+
+Only `cleanup` and `prior-restored` permit missing rollback copies as already
+retired evidence. Every remaining rollback copy must still authenticate.
+`cleanup` requires the candidate catalog and hot; `prior-restored` requires the
+prior catalog and hot. Recovery never switches the selected generation on replay,
+even if the other generation's recorded bytes reappear. This allowance does not
+permit missing or divergent files in the selected generation. Recorded staging
+paths already consumed or removed, and an already-removed orphan new segment on
+the prior branch, need not be recreated. Any remaining artifact must pass its
+own authentication before deletion.
+
+On apply, recovery authenticates the current journal and writes the selected
+terminal phase before removing cleanup evidence. It repeats that write on every
+applied replay, including an already terminal phase. The journal file fsync and
+parent-directory fsync must both finish before cleanup proceeds. Either fsync
+failure stops cleanup, even if the journal replacement is already visible. After
+a failure, keep the journal and remaining evidence for recovery. Cleanup fsyncs
+the affected directories and removes the authenticated journal last. Readers
+remain blocked while the activation journal exists.
+
+The public recovery API holds the history write lock. `--recover` without
+`--apply` reports `prior-generation-ready-to-restore` or
+`candidate-ready-to-finalize` after the branch checks, even for a terminal phase;
+these are not proof that cleanup has completed. An applied recovery reports
+`prior-generation-restored` or `candidate-finalized` only after journal removal.
+For these journal-backed receipts, `phase` is the phase read at entry, not the
+terminal phase newly written during that call.
 
 ### Admission and accounting rules
 
