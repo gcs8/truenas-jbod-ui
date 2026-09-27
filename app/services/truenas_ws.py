@@ -13,6 +13,7 @@ from typing import Any, Awaitable, Callable, Iterator
 from urllib.parse import urlsplit, urlunsplit
 
 from websockets.asyncio.client import ClientConnection, connect
+from websockets.exceptions import ConnectionClosed
 
 from app.config import TRUENAS_API_VERSION_PATTERN, TrueNASConfig
 from app.services.tls_context import build_tls_client_context, resolve_tls_server_name
@@ -404,7 +405,14 @@ class TrueNASWebsocketClient:
                 # A reader failure must also interrupt calls blocked in send().
                 await asyncio.wait({gathered, dispatcher._reader_task}, return_when=asyncio.FIRST_COMPLETED)
                 if dispatcher._reader_task.done():
-                    dispatcher._reader_task.result()
+                    try:
+                        dispatcher._reader_task.result()
+                    except ConnectionClosed:
+                        # A peer may close after delivering every reply. Only
+                        # completed consumers can decide the operation outcome;
+                        # incomplete calls (including blocked sends) still fail.
+                        if not all(task.done() for task in fetch_tasks):
+                            raise
                 enclosure_result, disks, pools, disk_temperatures, smart_test_results = await gathered
             except BaseException as exc:
                 primary = exc
@@ -586,7 +594,13 @@ class TrueNASWebsocketClient:
             # batch immediately rather than waiting for that worker's deadline.
             await asyncio.wait({gathered, dispatcher._reader_task}, return_when=asyncio.FIRST_COMPLETED)
             if dispatcher._reader_task.done():
-                dispatcher._reader_task.result()
+                try:
+                    dispatcher._reader_task.result()
+                except ConnectionClosed:
+                    # Completed positions retain their results or application
+                    # error; transport loss cannot complete unfinished workers.
+                    if not all(task.done() for task in tasks):
+                        raise
             await gathered
         except BaseException as exc:
             primary = exc

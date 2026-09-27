@@ -1538,5 +1538,225 @@ class RealWebsocketCloseTests(RealWebsocketCloseChecks, unittest.IsolatedAsyncio
     pass
 
 
+class CompletedReplyPeer(NormalOperationPeer):
+    """Public-feedback peer: deliver the entire requested batch, then close."""
+
+    def __init__(self, dialect, *, count, outcome, close_code=1000):
+        super().__init__(dialect, mode="normal")
+        self.count, self.outcome = count, outcome
+        self.close_code = close_code
+        self.requests = []
+        self.delivered = 0
+        self.close_observed = False
+
+    async def send(self, raw):
+        request = json.loads(raw)
+        if request.get("method") in (None, "auth.login_with_api_key"):
+            return await super().send(raw)
+        self.sent.append(request)
+        self.requests.append(request)
+        if len(self.requests) == self.count:
+            for index, item in enumerate(self.requests):
+                if self.outcome == "incomplete" and index == self.count - 1:
+                    continue
+                self.reply(item, error=self.outcome == "application_error" and item["method"] in ("pool.query", "disk.smartctl"))
+            if self.outcome != "open":
+                from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
+                from websockets.frames import Close
+                cls = ConnectionClosedOK if self.close_code == 1000 else ConnectionClosedError
+                error = cls(Close(self.close_code, "synthetic done"),
+                            Close(self.close_code, "synthetic done"), True)
+                self.queue.put_nowait(self.reader_error if self.outcome == "reader_error" else error)
+
+    async def recv(self):
+        try:
+            raw = await super().recv()
+        except Exception:
+            self.close_observed = True
+            raise
+        if self.requests:
+            self.delivered += 1
+        return raw
+
+
+class CompletedReplyTransport(RealCloseTransport):
+    """Actual installed parser and close handshake, with peer-initiated close."""
+
+    def __init__(self, connection, dialect, *, count, outcome, close_code):
+        super().__init__(connection, dialect)
+        self.responses = CompletedReplyPeer(dialect, count=count, outcome=outcome,
+                                            close_code=close_code)
+        self.requests = []
+        self.delivered = 0
+        self.count, self.outcome, self.close_code = count, outcome, close_code
+        self.abort_closed_states = []
+
+    def abort(self):
+        self.abort_closed_states.append(self.closed)
+        super().abort()
+
+    def write(self, data):
+        from websockets.frames import Frame, Opcode
+        self.peer.receive_data(bytes(data))
+        for event in self.peer.events_received():
+            assert isinstance(event, Frame)
+            if event.opcode == Opcode.CLOSE:
+                self.close_sent.set()
+                self.deliveries.append(asyncio.get_running_loop().call_soon(self.acknowledge_close))
+                continue
+            assert event.opcode == Opcode.TEXT
+            request = json.loads(bytes(event.data))
+            self.sent.append(request)
+            if request.get("msg") == "connect":
+                self.responses.queue.put_nowait({"msg": "connected"})
+            elif request["method"] == "auth.login_with_api_key":
+                self.responses.reply(request)
+            else:
+                self.requests.append(request)
+                if len(self.requests) != self.count:
+                    continue
+                for index, item in enumerate(self.requests):
+                    if self.outcome == "incomplete" and index == self.count - 1:
+                        continue
+                    self.responses.reply(item, error=self.outcome == "application_error" and item["method"] in ("pool.query", "disk.smartctl"))
+                    self.delivered += 1
+            while not self.responses.queue.empty():
+                self.peer.send_text(json.dumps(self.responses.queue.get_nowait()).encode())
+            if len(self.requests) == self.count:
+                self.peer.send_close(self.close_code, "synthetic done")
+            wire = b"".join(self.peer.data_to_send())
+            self.deliveries.append(asyncio.get_running_loop().call_soon(self.connection.data_received, wire))
+
+
+class CompletedReplyChecks:
+    dialect = "ddp"
+    asyncSetUp = RealWebsocketCloseChecks.asyncSetUp
+    asyncTearDown = NormalOperationDeadlineChecks.asyncTearDown
+
+    async def check_completed_replies(self, *, real, outcome):
+        from websockets.asyncio.client import ClientConnection, connect as RealConnect
+        from websockets.client import ClientProtocol
+        from websockets.datastructures import Headers
+        from websockets.exceptions import ConnectionClosed
+        from websockets.http11 import Response
+        from websockets.protocol import OPEN
+        from websockets.uri import parse_uri
+
+        for operation in ("fetch_all", "smartctl_batch"):
+            for close_code in (1000, 1011):
+                with self.subTest(real=real, outcome=outcome, operation=operation, close_code=close_code):
+                    # CORE needs exactly five inventory replies in either dialect.
+                    self.client.config.platform = "core"
+                    self.client.config.timeout_seconds = 0.2
+                    count = 5 if operation == "fetch_all" else 2
+                    exits = []
+                    connection = None
+                    if real:
+                        connection = ClientConnection(
+                            ClientProtocol(parse_uri(self.client._endpoint_url()), state=OPEN),
+                            ping_interval=None, close_timeout=0.2,
+                        )
+                        connection.process_event(Response(101, "Switching Protocols", Headers()))
+                        peer = CompletedReplyTransport(connection, self.dialect, count=count,
+                                                       outcome=outcome, close_code=close_code)
+                        connection.connection_made(peer)
+
+                        class MemoryConnect:
+                            async def __aenter__(self):
+                                return connection
+
+                            async def __aexit__(self, *args):
+                                exits.append(asyncio.current_task())
+                                self.connection = connection
+                                await RealConnect.__aexit__(self, *args)
+
+                        def connect(*args, **kwargs):
+                            return MemoryConnect()
+                    else:
+                        peer = CompletedReplyPeer(self.dialect, count=count, outcome=outcome,
+                                                  close_code=close_code)
+                        connect = peer.connect
+                    task = None
+                    try:
+                        with patch("app.services.truenas_ws.connect", connect):
+                            call = (self.client.fetch_all() if operation == "fetch_all" else
+                                    self.client.smartctl_batch(["da0", "da1"], max_concurrency=2))
+                            task = asyncio.create_task(call)
+                            done, _ = await asyncio.wait({task}, timeout=1)
+                            self.assertIn(task, done, "public operation failed to finish")
+                            if real:
+                                # Assert ownership BEFORE any fixture safety cleanup.
+                                self.assertTrue(peer.closed)
+                                self.assertTrue(connection.connection_lost_waiter.done())
+                                self.assertFalse(connection.connection_lost_waiter.cancelled())
+                                self.assertEqual(connection.protocol.state.name, "CLOSED")
+                                # Installed close() re-aborts an already closed connection.
+                                self.assertEqual((peer.close_calls, peer.abort_calls), (1, 1))
+                                self.assertEqual(peer.abort_closed_states, [True])
+                                self.assertEqual(len(exits), 1)
+                                self.assertTrue(exits[0].done())
+                            else:
+                                self.assertEqual((peer.connections, peer.closes), (1, 1))
+                                self.assertEqual(peer.close_observed, outcome != "open")
+                                self.assertLessEqual(peer.peak_receivers, 1)
+                            self.assertEqual(len(peer.requests), count)
+                            self.assertEqual(peer.delivered, count - int(outcome == "incomplete"))
+                            methods = [item.get("method") for item in peer.sent]
+                            self.assertEqual(methods.count("auth.login_with_api_key"), 1)
+                            if outcome == "incomplete":
+                                with self.assertRaises(ConnectionClosed):
+                                    task.result()
+                            elif outcome == "application_error":
+                                with self.assertRaisesRegex(TrueNASAPIError, "synthetic primary rejection"):
+                                    task.result()
+                            elif outcome == "reader_error":
+                                with self.assertRaises(RuntimeError) as caught:
+                                    task.result()
+                                self.assertIs(caught.exception, peer.reader_error)
+                            elif operation == "fetch_all":
+                                result = task.result()
+                                self.assertEqual(result.disks, [{"name": "da0"}])
+                                self.assertEqual(result.enclosures, [{"id": "synthetic-enclosure"}])
+                                self.assertEqual(result.pools, [{"name": "synthetic-pool"}])
+                                self.assertEqual(result.disk_temperatures, {"da0": 30})
+                                self.assertEqual(result.smart_test_results, [{"disk": "da0", "status": "SUCCESS"}])
+                                self.assertFalse(result.enclosure_query_failed)
+                            else:
+                                self.assertEqual(task.result(), ["synthetic SMART"] * 2)
+                    finally:
+                        if real:
+                            peer.finish()
+                        if task is not None:
+                            if not task.done():
+                                task.cancel()
+                            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_public_peer_complete_replies_survive_close(self):
+        await self.check_completed_replies(real=False, outcome="complete")
+        await self.check_completed_replies(real=False, outcome="open")
+
+    async def test_public_peer_incomplete_replies_fail(self):
+        await self.check_completed_replies(real=False, outcome="incomplete")
+
+    async def test_public_peer_application_error_survives_close(self):
+        await self.check_completed_replies(real=False, outcome="application_error")
+
+    async def test_public_peer_arbitrary_reader_error_not_suppressed(self):
+        await self.check_completed_replies(real=False, outcome="reader_error")
+
+    async def test_installed_wire_complete_replies_survive_close(self):
+        await self.check_completed_replies(real=True, outcome="complete")
+
+    async def test_installed_wire_incomplete_replies_fail(self):
+        await self.check_completed_replies(real=True, outcome="incomplete")
+
+    async def test_installed_wire_application_error_survives_close(self):
+        await self.check_completed_replies(real=True, outcome="application_error")
+
+
+class CompletedReplyTests(CompletedReplyChecks, unittest.IsolatedAsyncioTestCase):
+    pass
+
+
 if __name__ == "__main__":
     unittest.main()

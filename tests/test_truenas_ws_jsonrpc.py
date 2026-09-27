@@ -291,6 +291,10 @@ class JsonRpcNormalOperationDeadlineTests(ddp_tests.NormalOperationDeadlineCheck
     dialect = "jsonrpc"
 
 
+class JsonRpcCompletedReplyTests(ddp_tests.CompletedReplyChecks, unittest.IsolatedAsyncioTestCase):
+    dialect = "jsonrpc"
+
+
 class JsonRpcRealWebsocketCloseTests(ddp_tests.RealWebsocketCloseChecks, unittest.IsolatedAsyncioTestCase):
     dialect = "jsonrpc"
 
