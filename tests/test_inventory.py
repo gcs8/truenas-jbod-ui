@@ -15403,6 +15403,241 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(service.mapping_store.get_mapping(system.id, physical_id, 7))
 
 
+class InventoryTargetEvidenceTests(unittest.IsolatedAsyncioTestCase):
+    # Invented one-based shelf: EC element 1 is device slot 2, never UI slot 1.
+    EC = """  ExampleCo EvidenceShelf 0001
+  Primary enclosure logical identifier (hex): synthetic-enclosure
+Enclosure status diagnostic page:
+  Element type: Array device slot, subenclosure id: 0 [ti=0]
+    Element 0 descriptor:
+      Predicted failure=0, Disabled=0, Swap=0, status: Not installed
+      Ident=0
+    Element 1 descriptor:
+      Predicted failure=0, Disabled=0, Swap=0, status: OK
+      Slot address: 1
+      Ident=1
+"""
+    AES = """  ExampleCo EvidenceShelf 0001
+  Primary enclosure logical identifier (hex): synthetic-enclosure
+Additional element status diagnostic page:
+  Element type: Array device slot, subenclosure id: 0 [ti=0]
+    Element index: 0  eiioe=0
+      Transport protocol: SAS
+      number of phys: 0, device slot number: 1
+    Element index: 1  eiioe=0
+      Transport protocol: SAS
+      number of phys: 0, device slot number: 2
+"""
+    JOIN = """  ExampleCo EvidenceShelf 0001
+  Primary enclosure logical identifier (hex): synthetic-enclosure
+Slot01 [0,0] Element type: Array device slot
+  Predicted failure=0, Disabled=0, Swap=0, status: Not installed
+  device slot number: 1
+Slot02 [0,1] Element type: Array device slot
+  Predicted failure=0, Disabled=0, Swap=0, status: OK
+  device slot number: 2
+"""
+    CAM_ROWS = (
+        "scbus0 on mpr0 bus 0:\n"
+        "<ExampleCo SAME-MODEL 0001> at scbus0 target 0 lun 0 (da0,pass0)",
+        "scbus1 on mpr1 bus 0:\n"
+        "<ExampleCo SAME-MODEL 0001> at scbus1 target 0 lun 0 (da1,pass1)",
+    )
+    CORE_MAP = """ses0:
+  Enclosure Name: ExampleCo EvidenceShelf
+  Enclosure ID: synthetic-enclosure
+  Element 7, Type: Array Device Slot
+    Status: OK
+    Description: Slot01
+    Device Names: da0, pass0
+  Element 9, Type: Array Device Slot
+    Status: OK
+    Description: Slot02
+    Device Names: da1, pass1
+"""
+    GEOM = """Geom name: disk0
+Providers:
+1. Name: multipath/disk0
+Consumers:
+1. Name: da0
+   State: ACTIVE
+"""
+
+    def make_service(self, platform, outputs, disks=(), enclosures=()):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        settings = Settings()
+        settings.layout.slot_count = 2
+        settings.layout.rows = 1
+        settings.layout.columns = 2
+        if platform == "quantastor":
+            settings.profiles = [EnclosureProfileConfig(
+                id="synthetic-two-bay", label="Synthetic two bay", rows=1, columns=2, slot_count=2,
+            )]
+        client = AsyncMock()
+        client.fetch_all.return_value = TrueNASRawData(
+            enclosures=list(enclosures), disks=list(disks), pools=[],
+            systems=[{"id": "synthetic-node", "name": "Synthetic node"}] if platform == "quantastor" else [],
+            disk_temperatures={}, smart_test_results=[],
+        )
+        probe = AsyncMock()
+        probe.run_planned_commands.return_value = [
+            SSHCommandResult(command=command, ok=True, stdout=output, exit_code=0)
+            for command, output in outputs.items()
+        ]
+        system = SystemConfig(
+            id="synthetic-evidence", truenas=TrueNASConfig(platform=platform),
+            default_profile_id="synthetic-two-bay" if platform == "quantastor" else None,
+            ssh=SSHConfig(enabled=True, host="192.0.2.10", commands=list(outputs)),
+        )
+        service = build_inventory_service(settings, system, client, probe, directory.name)
+        # No discovery or transport escapes this fixture. Parsing, public
+        # snapshot construction, capability admission and LED dispatch are real.
+        service._fetch_scale_ses_overlay = AsyncMock(return_value=(ParsedSSHData(), []))
+        service._fetch_quantastor_cli_overlay = AsyncMock(return_value=({}, []))
+        service._fetch_quantastor_ses_overlay = AsyncMock(
+            side_effect=lambda *_: (parse_ssh_outputs(outputs, 2, None), [])
+        )
+        service._run_ssh_command = AsyncMock(
+            return_value=SSHCommandResult(command="", ok=True, stdout="", exit_code=0)
+        )
+        return service
+
+    async def test_ec_only_public_snapshot_keeps_status_but_refuses_led(self):
+        for platform in ("scale", "quantastor", "linux"):
+            with self.subTest(platform=platform):
+                service = self.make_service(platform, {"sg_ses -p ec /dev/sg9": self.EC})
+                snapshot = await service.get_snapshot()
+                self.assertEqual(len(snapshot.slots), 2)
+                if platform != "linux":
+                    slot = next(item for item in snapshot.slots if item.ssh_ses_element_id == 1)
+                    self.assertTrue(slot.present)
+                    self.assertTrue(slot.identify_active)
+                    self.assertFalse(slot.led_supported)
+                    self.assertEqual(slot.raw_status["slot_number_source"], "ses_element_id_fallback")
+                    self.assertIn("device slot number", slot.raw_status["slot_number_warning"])
+                    self.assertIsNone(slot.raw_status.get("ses_slot_number"))
+                for slot in snapshot.slots:
+                    self.assertFalse(slot.led_supported)
+                    with self.assertRaises(TrueNASAPIError):
+                        await service.set_slot_led(slot.slot, LedAction.identify)
+                service._run_ssh_command.assert_not_awaited()
+                service.truenas_client.set_slot_status.assert_not_awaited()
+
+    async def test_verified_aes_and_join_public_led_use_device_slot_not_element(self):
+        for platform, page, reverse in itertools.product(
+            ("scale", "quantastor"), ("aes", "join"), (False, True)
+        ):
+            with self.subTest(platform=platform, page=page, reverse=reverse):
+                items = [("sg_ses -p ec /dev/sg9", self.EC), (
+                    "sg_ses -p aes /dev/sg9" if page == "aes" else "sg_ses --join --filter /dev/sg9",
+                    self.AES if page == "aes" else self.JOIN,
+                )]
+                service = self.make_service(platform, dict(reversed(items) if reverse else items))
+                snapshot = await service.get_snapshot()
+                slot = next(item for item in snapshot.slots if item.ssh_ses_element_id == 1)
+                self.assertTrue(slot.led_supported)
+                self.assertTrue(slot.identify_active)
+                self.assertEqual(slot.ssh_ses_targets[0]["ses_slot_number"], 2)
+                for action, flag in ((LedAction.identify, "--set=ident"), (LedAction.clear, "--clear=ident")):
+                    await service.set_slot_led(slot.slot, action, invalidate_snapshot=False)
+                    service._run_ssh_command.assert_awaited_with(
+                        f"sudo -n /usr/bin/sg_ses --dev-slot-num=2 {flag} /dev/sg9", None
+                    )
+                self.assertEqual(service._run_ssh_command.await_count, 2)
+
+    async def test_sg_dispatch_refuses_missing_coordinates_without_ui_fallback(self):
+        target_sets = [[]]
+        for coordinate in (None, -1, True, "2"):
+            invalid = {"ses_device": "/dev/sg9", "ses_element_id": 1, "ses_slot_number": coordinate}
+            target_sets.append([invalid])
+            target_sets.append([
+                {"ses_device": "/dev/sg8", "ses_element_id": 0, "ses_slot_number": 2}, invalid,
+            ])
+        for targets in target_sets:
+            with self.subTest(targets=targets):
+                service = self.make_service("scale", {})
+                # Supplemental dispatch defense. The EC regression above uses
+                # the actual public snapshot and public LED admission path.
+                slot = SlotView(
+                    slot=17, slot_label="18", row_index=0, column_index=0,
+                    ssh_ses_device="/dev/sg9", ssh_ses_element_id=1,
+                    ssh_ses_targets=targets,
+                )
+                with self.assertRaises(TrueNASAPIError):
+                    await service._set_slot_led_over_ssh(slot, LedAction.identify)
+                service._run_ssh_command.assert_not_awaited()
+
+    async def test_core_public_led_retains_type_qualified_element_control(self):
+        service = self.make_service("core", {"sesutil map": self.CORE_MAP})
+        snapshot = await service.get_snapshot()
+        slot = snapshot.slots[0]
+        self.assertTrue(slot.led_supported)
+        await service.set_slot_led(slot.slot, LedAction.identify)
+        service._run_ssh_command.assert_awaited_once_with(
+            "sudo -n /usr/sbin/sesutil locate -u /dev/ses0 7 on", None
+        )
+
+    async def test_cross_controller_disks_stay_distinct_in_public_snapshot_and_smart(self):
+        for one_geom, reverse_api, reverse_cam in itertools.product((False, True), repeat=3):
+            with self.subTest(one_geom=one_geom, reverse_api=reverse_api, reverse_cam=reverse_cam):
+                outputs = {
+                    "camcontrol devlist -v": "\n".join(reversed(self.CAM_ROWS) if reverse_cam else self.CAM_ROWS),
+                    "sesutil map": self.CORE_MAP,
+                }
+                if one_geom:
+                    outputs["gmultipath list"] = self.GEOM
+                disks = [
+                    {"name": f"da{i}", "serial": f"SANITIZED-INDEPENDENT-{i}", "model": "SAME-MODEL"}
+                    for i in range(2)
+                ]
+                service = self.make_service("core", outputs, list(reversed(disks)) if reverse_api else disks)
+                snapshot = await service.get_snapshot()
+                self.assertEqual(snapshot.summary.source_disk_count, 2)
+                self.assertEqual(snapshot.summary.rendered_unique_disk_count, 2)
+                self.assertEqual(snapshot.summary.duplicate_disk_view_count, 0)
+                self.assertEqual(snapshot.summary.unplaced_disk_count, 0)
+                self.assertEqual(snapshot.summary.disk_count, 2)
+                for i, slot in enumerate(snapshot.slots):
+                    expected = ["da0", "multipath/disk0"] if one_geom and i == 0 else [f"da{i}"]
+                    self.assertEqual(slot.serial, f"SANITIZED-INDEPENDENT-{i}")
+                    self.assertEqual(service._smart_candidate_devices(slot), expected)
+                    self.assertEqual(slot.smart_device_names, expected)
+                    service.truenas_client.fetch_disk_smartctl.reset_mock()
+                    service.truenas_client.fetch_disk_smartctl.return_value = json.dumps({
+                        "smart_status": {"passed": True}, "temperature": {"current": 30 + i},
+                    })
+                    summary = await service.get_slot_smart_summary(slot.slot)
+                    self.assertTrue(summary.available)
+                    self.assertEqual(summary.temperature_c, 30 + i)
+                    calls = service.truenas_client.fetch_disk_smartctl.await_args_list
+                    self.assertGreater(len(calls), 0)
+                    self.assertTrue(all(call.args[0] == f"da{i}" for call in calls), calls)
+
+    async def test_explicit_multipath_consumers_preserve_public_backfill(self):
+        for reverse, missing_identity in itertools.product((False, True), repeat=2):
+            with self.subTest(reverse=reverse, missing_identity=missing_identity):
+                disks = [
+                    {"name": "da0", "serial": "SANITIZED-DUAL-PATH"},
+                    {"name": "da1", "serial": None if missing_identity else "SANITIZED-DUAL-PATH"},
+                ]
+                service = self.make_service("core", {
+                    "camcontrol devlist -v": "\n".join(self.CAM_ROWS),
+                    "gmultipath list": self.GEOM + "2. Name: da1\n   State: PASSIVE\n",
+                    "sesutil map": self.CORE_MAP.split("  Element 9,")[0],
+                }, list(reversed(disks)) if reverse else disks)
+                snapshot = await service.get_snapshot()
+                self.assertEqual(snapshot.summary.source_disk_count, 1)
+                self.assertEqual(snapshot.summary.rendered_unique_disk_count, 1)
+                self.assertEqual(snapshot.summary.duplicate_disk_view_count, 0)
+                self.assertEqual(snapshot.summary.unplaced_disk_count, 0)
+                slot = snapshot.slots[0]
+                self.assertEqual(slot.serial, "SANITIZED-DUAL-PATH")
+                self.assertEqual(slot.device_name, "multipath/disk0")
+                self.assertEqual(service._smart_candidate_devices(slot), ["da0", "da1", "multipath/disk0"])
+                self.assertTrue(any("gmultipath list" in warning for warning in snapshot.warnings))
+
+
 class InventoryServiceLedTests(unittest.IsolatedAsyncioTestCase):
     async def test_core_duplicate_slot_descriptions_disable_ssh_identify_capability(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

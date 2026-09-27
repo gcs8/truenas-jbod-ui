@@ -75,8 +75,11 @@ scbus13 on mpr1 bus 0:
         self.assertEqual(parsed.models["da77"], "HGST HUH728080AL5200 A907")
         self.assertEqual(parsed.controllers["da24"], "mpr0")
         self.assertEqual(parsed.controllers["da71"], "mpr1")
-        self.assertEqual(parsed.peer_devices["da24"], ["da71"])
-        self.assertEqual(parsed.peer_devices["da77"], ["da30"])
+        self.assertEqual(parsed.peer_devices, {})
+        same_row = parse_camcontrol_devlist(
+            "<Synthetic disk> at scbus0 target 0 lun 0 (da0,ada0,pass0)"
+        )
+        self.assertEqual(same_row.peer_devices, {"da0": ["ada0"], "ada0": ["da0"]})
 
     def test_parse_pool_query_topology_groups_spares_by_pool(self) -> None:
         parsed = parse_pool_query_topology(
@@ -1927,7 +1930,8 @@ Enclosure status diagnostic page:
         self.assertEqual(parsed.slots[0].identify_active, True)
         self.assertEqual(parsed.slots[0].status, "OK")
         self.assertTrue(parsed.slots[0].present)
-        self.assertEqual(parsed.slots[0].control_targets[0]["ses_slot_number"], 0)
+        self.assertIsNone(parsed.slots[0].control_targets[0]["ses_slot_number"])
+        self.assertEqual(parsed.slots[0].slot_number_source, "ses_element_id_fallback")
         self.assertEqual(parsed.slots[1].identify_active, False)
         self.assertFalse(parsed.slots[1].present)
 

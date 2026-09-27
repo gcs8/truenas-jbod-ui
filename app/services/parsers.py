@@ -549,7 +549,7 @@ def parse_glabel_status(output: str) -> GlabelInfo:
 def parse_camcontrol_devlist(output: str) -> CamcontrolInfo:
     info = CamcontrolInfo()
     current_controller: str | None = None
-    grouped_devices: dict[tuple[str, str | None, str | None], list[str]] = {}
+    device_rows: list[list[str]] = []
 
     for line in output.splitlines():
         bus_match = re.match(r"^(?:scbus|umass-sim)\d+\s+on\s+(?P<controller>\S+)\s+bus\s+\d+:", line.strip(), re.IGNORECASE)
@@ -565,11 +565,6 @@ def parse_camcontrol_devlist(output: str) -> CamcontrolInfo:
             continue
 
         model = match.group("model").strip()
-        group_key = (
-            model,
-            normalize_text(match.group("target")),
-            normalize_text(match.group("lun")),
-        )
         parsed_devices: list[str] = []
         for device in match.group("devices").split(","):
             if not DEVICE_REGEX.search(device.strip()):
@@ -581,9 +576,11 @@ def parse_camcontrol_devlist(output: str) -> CamcontrolInfo:
                 if current_controller:
                     info.controllers[normalized.lower()] = current_controller
         if parsed_devices:
-            grouped_devices.setdefault(group_key, []).extend(parsed_devices)
+            device_rows.append(parsed_devices)
 
-    for devices in grouped_devices.values():
+    # Only aliases explicitly listed on one CAM row describe the same device.
+    # Model/target/LUN repeats across HBAs do not establish disk identity.
+    for devices in device_rows:
         deduped = list(dict.fromkeys(devices))
         if len(deduped) < 2:
             continue
@@ -1669,11 +1666,16 @@ def parse_sg_ses_enclosure_status(output: str, command: str | None = None) -> SE
                 element_id=slot_number,
                 ses_device=ses_device,
                 description=f"Slot {slot_number:02d}",
+                slot_number_source="ses_element_id_fallback",
+                slot_number_warning=(
+                    f"SES EC element {slot_number} has no verified device slot number; "
+                    "using element order for status geometry only, not LED control."
+                ),
                 control_targets=[
                     {
                         "ses_device": ses_device,
                         "ses_element_id": slot_number,
-                        "ses_slot_number": slot_number,
+                        "ses_slot_number": None,
                     }
                 ],
             )
@@ -2574,6 +2576,12 @@ def build_slot_candidates_from_ses_enclosures(
                 if combined_slot < 0 or combined_slot >= slot_count:
                     continue
 
+                # EC element order is useful display geometry, not an SG
+                # device-slot coordinate. Stronger AES/join evidence replaces
+                # this fallback when the pages are merged by element identity.
+                control_slot_number = (
+                    None if slot.slot_number_source == "ses_element_id_fallback" else slot.slot_number
+                )
                 candidates[combined_slot] = {
                     "status": slot.status,
                     "descriptor": slot.description,
@@ -2597,7 +2605,7 @@ def build_slot_candidates_from_ses_enclosures(
                     "enclosure_name": enclosure.enclosure_name,
                     "ses_device": enclosure.ses_device,
                     "ses_element_id": slot.element_id,
-                    "ses_slot_number": slot.slot_number,
+                    "ses_slot_number": control_slot_number,
                     "sas_address_hint": None if slot.sas_address_degraded else slot.sas_address,
                     "sas_address_source": slot.sas_address_source,
                     "sas_address_conflict": slot.sas_address_conflict,
@@ -2620,7 +2628,7 @@ def build_slot_candidates_from_ses_enclosures(
                             {
                                 "ses_device": slot.ses_device or enclosure.ses_device,
                                 "ses_element_id": slot.element_id,
-                                "ses_slot_number": slot.slot_number,
+                                "ses_slot_number": control_slot_number,
                             }
                         ],
                     ),
