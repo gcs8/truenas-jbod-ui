@@ -259,6 +259,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Kept the startup, storage-writability and known_hosts warnings on every
+  inventory refresh and re-probed the directories at most every 30 seconds, so
+  a warning no longer vanishes on the first refresh or outlives its fix.
+  (#806)
 - The main UI no longer reports itself down when a pinned known-hosts file sits
   on a read-only mount, such as the `/run/ssh` mount in the shipped Compose
   file. SSH still verifies hosts against the keys in it; `/healthz` now answers
