@@ -16,15 +16,17 @@ candidate, oldest first. The guarantees, in order:
 * A (class, location) pair without a rule is left alone entirely.
 
 ``LifecycleManager.plan(now)`` is a dry run. ``apply(plan, resolver)`` deletes
-exactly the planned items, tombstoning each in the catalog, and stops at the
-first unexpected error with the partial progress in the result.
+exactly the planned items, tombstoning each in the catalog. A location whose
+target cannot be opened is skipped (recorded in ``ApplyResult.failed_locations``)
+while the other locations are still groomed; any other unexpected error stops
+the run with the partial progress in the result.
 """
 
 from __future__ import annotations
 
 import os
 import stat
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
@@ -113,6 +115,7 @@ class ApplyResult:
     failed: PlanItem | None = None
     error: str | None = None
     not_attempted: tuple[PlanItem, ...] = ()
+    failed_locations: Mapping[str, str] = field(default_factory=dict)
 
     @property
     def complete(self) -> bool:
@@ -243,14 +246,18 @@ class LifecycleManager:
         still equal the planned record (so a copy pinned after planning is not
         deleted) and must not have become the newest verified copy, and while
         the claim is held it cannot be pinned. An object already gone from its
-        location is tombstoned as missing. Any other failure releases the claim
-        and stops the run.
+        location is tombstoned as missing. When a location's target cannot be
+        resolved, that location's items are skipped and the others continue.
+        Any other failure releases the claim and stops the run.
         """
 
         clock = now or (lambda: datetime.now(timezone.utc))
         deleted: list[PlanItem] = []
         missing: list[PlanItem] = []
         targets: dict[str, GroomableTarget] = {}
+        failed_locations: dict[str, str] = {}
+        first_failure: tuple[PlanItem, str] | None = None
+        skipped: list[PlanItem] = []
         items = list(plan.items)
         for index, item in enumerate(items):
             record = item.record
@@ -261,13 +268,23 @@ class LifecycleManager:
                     already_missing=tuple(missing),
                     failed=item,
                     error=message,
-                    not_attempted=tuple(items[index + 1 :]),
+                    not_attempted=tuple(skipped + items[index + 1 :]),
+                    failed_locations=failed_locations,
                 )
 
-            try:
-                if record.location not in targets:
+            if record.location in failed_locations:
+                skipped.append(item)
+                continue
+            if record.location not in targets:
+                try:
                     targets[record.location] = target_resolver(record.location)
-                target = targets[record.location]
+                except Exception as exc:  # noqa: BLE001 - reported per location, not swallowed
+                    failed_locations[record.location] = f"{type(exc).__name__}: {exc}"
+                    first_failure = first_failure or (item, failed_locations[record.location])
+                    skipped.append(item)
+                    continue
+            target = targets[record.location]
+            try:
                 self.catalog.claim_deletion(record, actor=actor, now=clock())
             except Exception as exc:  # noqa: BLE001 - reported, not swallowed
                 return stop(f"{type(exc).__name__}: {exc}")
@@ -289,7 +306,15 @@ class LifecycleManager:
             except Exception as exc:  # noqa: BLE001 - reported, not swallowed
                 return stop(f"{type(exc).__name__}: {exc}")
             (missing if gone else deleted).append(item)
-        return ApplyResult(deleted=tuple(deleted), already_missing=tuple(missing))
+        failed, error = first_failure or (None, None)
+        return ApplyResult(
+            deleted=tuple(deleted),
+            already_missing=tuple(missing),
+            failed=failed,
+            error=error,
+            not_attempted=tuple(entry for entry in skipped if entry is not failed),
+            failed_locations=failed_locations,
+        )
 
 
 def reconcile(catalog: ArtifactCatalog, target: GroomableTarget, location: str) -> ReconcileReport:

@@ -578,6 +578,34 @@ class SchedulerTests(SchedulerTestBase):
         self.assertEqual(len(problems), 1)
         self.assertTrue(problems[0].startswith("Backup target Office NAS degraded:"))
 
+    def test_disabled_target_gets_no_retention_rule(self) -> None:
+        disabled = {**TARGET, "target_id": "cloud", "label": "Cloud", "enabled": False}
+        scheduler = self.make({"full": {"enabled": True, "remote_keep": 3}, "targets": [TARGET, disabled]})
+        self.assertEqual({rule.location for rule in scheduler.retention_rules()}, {"local", "nas"})
+
+    def test_unreachable_target_still_grooms_local_and_reports_grooming(self) -> None:
+        scheduler = self.make({"full": {"enabled": True, "local_keep": 3, "remote_keep": 3}, "targets": [TARGET]})
+        for hour in (13, 14, 15):
+            self.now = datetime(2026, 9, 24, hour, 0, tzinfo=UTC)
+            scheduler.run_now("full")
+        scheduler.close()
+        self.broken_targets = {"nas"}
+        scheduler = self.make({"full": {"enabled": True, "local_keep": 1, "remote_keep": 1}, "targets": [TARGET]})
+        self.now = datetime(2026, 9, 24, 16, 0, tzinfo=UTC)
+        scheduler.run_now("full")
+        self.assertEqual(len(scheduler.catalog.list(location="local")), 1)
+        self.assertEqual(len(scheduler.catalog.list(location="nas")), 3)
+        grooming = json.loads(self._paths.status_file.read_text())["grooming"]
+        self.assertFalse(grooming["ok"])
+        self.assertEqual(grooming["deleted"], 3)
+        self.assertEqual(sorted(grooming["failed_locations"]), ["nas"])
+        self.assertIn("connection refused", grooming["failed_locations"]["nas"])
+
+        from app.services.backup_health import backup_archive_problems
+
+        problems = backup_archive_problems(self._paths.status_file)
+        self.assertTrue(any(p.startswith("Backup grooming stopped: ConnectionRefusedError") for p in problems))
+
     def test_failed_backup_recorded_and_single_flight(self) -> None:
         from history_service.backup_scheduler.service import SchedulerBusyError
 

@@ -400,6 +400,29 @@ class LifecycleApplyTests(CatalogCase):
         for item in result.not_attempted:
             self.assertIsNotNone(self.catalog.get(item.record.artifact_id))
 
+    def test_unreachable_location_skips_only_its_own_items(self) -> None:
+        plan = self.manager.plan(NOW)
+        local_items = tuple(i for i in plan.items if i.record.location == "local")
+        remote_items = tuple(i for i in plan.items if i.record.location == "nas-1")
+        # A remote item sorts before later local items, so a stop-the-run would strand them.
+        self.assertLess(plan.items.index(remote_items[0]), plan.items.index(local_items[-1]))
+
+        def resolver(location: str):
+            if location == "nas-1":
+                raise OSError("synthetic connection refused")
+            return self.resolver(location)
+
+        result = self.manager.apply(plan, resolver)
+        self.assertEqual(result.deleted, local_items)
+        self.assertEqual(dict(result.failed_locations), {"nas-1": "OSError: synthetic connection refused"})
+        self.assertEqual(result.failed, remote_items[0])
+        self.assertIn("OSError", result.error)
+        self.assertEqual(result.not_attempted, remote_items[1:])
+        self.assertFalse(result.complete)
+        self.assertEqual(self.remote.deleted, [])
+        for item in remote_items:
+            self.assertIsNotNone(self.catalog.get(item.record.artifact_id))
+
     def test_apply_refuses_item_pinned_after_planning(self) -> None:
         plan = self.manager.plan(NOW)
         first = plan.items[0].record
