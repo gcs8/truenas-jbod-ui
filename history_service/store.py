@@ -1937,6 +1937,70 @@ class HistoryStore:
         finally:
             os.close(descriptor)
 
+    def _ensure_backup_directory(self, directory: Path) -> None:
+        """Persist only entries we create, including retries after a failed sync.
+
+        Install each new directory with a pending marker already inside it. A
+        failed parent barrier must not turn that directory into an apparently
+        durable pre-existing ancestor on the next call or in a fresh store.
+        Existing unmarked directories are provisioned by the caller, not repaired.
+        """
+        marker_name = ".history-backup-directory-pending"
+        if not directory.is_dir():
+            self._ensure_backup_directory(directory.parent)
+            for _ in range(32):
+                staged = directory.parent / f".history-directory-{secrets.token_hex(8)}"
+                try:
+                    staged.mkdir()
+                    break
+                except FileExistsError:
+                    continue
+            else:
+                raise FileExistsError("Unable to allocate a history backup directory.")
+            installed = False
+            try:
+                # Prepare the marker before the public name can exist. Even a
+                # failure creating/syncing the marker leaves no unmarked target.
+                descriptor = os.open(
+                    staged / marker_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
+                )
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+                self._fsync_directory(staged)
+                try:
+                    self._rename_at2(staged, directory, flags=RENAME_NOREPLACE)
+                    installed = True
+                except FileExistsError:
+                    if not directory.is_dir():
+                        raise
+                    # Another creator won. Its pending marker, if present,
+                    # carries the same parent barrier obligation below.
+            finally:
+                if not installed:
+                    try:
+                        (staged / marker_name).unlink(missing_ok=True)
+                        staged.rmdir()
+                    except OSError:
+                        # Never adopt an abandoned private staging name as a
+                        # backup root, and never recursively remove its contents.
+                        logger.warning("History backup directory staging cleanup failed for %s", staged)
+        marker = directory / marker_name
+        try:
+            metadata = marker.lstat()
+        except FileNotFoundError:
+            return
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size != 0 or metadata.st_nlink != 1:
+            raise ValueError(f"History backup refuses invalid directory marker {marker}.")
+        self._fsync_directory(directory.parent)
+        # Only a successful parent barrier permits retirement. If this unlink
+        # fails, the marker remains for retry; if it reappears after a crash, an
+        # extra parent sync is harmless. No acknowledged data depends on unlink.
+        marker.unlink(missing_ok=True)
+
     def create_backup(
         self,
         backup_dir: str | Path,
@@ -1949,7 +2013,7 @@ class HistoryStore:
     ) -> Path | None:
         self._require_unsegmented_operation("v1 backup")
         backup_root = Path(backup_dir)
-        backup_root.mkdir(parents=True, exist_ok=True)
+        self._ensure_backup_directory(backup_root)
         self._normalize_shared_path_permissions(backup_root, is_dir=True)
         backup_name = f"{self.file_path.stem}-{self._backup_stamp(snapshot_label)}.sqlite3"
         final_path = backup_root / backup_name
@@ -2176,7 +2240,7 @@ class HistoryStore:
 
         observed_at = self._parse_snapshot_label(snapshot_label)
         long_term_root = Path(long_term_backup_dir)
-        long_term_root.mkdir(parents=True, exist_ok=True)
+        self._ensure_backup_directory(long_term_root)
         self._normalize_shared_path_permissions(long_term_root, is_dir=True)
 
         if weekly_retention_count > 0:
@@ -2199,7 +2263,7 @@ class HistoryStore:
             )
 
     def _refresh_backup_copy(self, source_backup_path: Path, target_path: Path) -> None:
-        target_path.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_backup_directory(target_path.parent)
         self._normalize_shared_path_permissions(target_path.parent, is_dir=True)
         temp_fd, temp_path = self._create_private_replacement_file(
             target_path.parent,

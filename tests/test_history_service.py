@@ -1229,6 +1229,225 @@ class HistoryPublicationDurabilityTests(unittest.TestCase):
             self.assertEqual(connection.execute("PRAGMA quick_check").fetchone()[0], "ok")
             return connection.execute("SELECT value FROM synthetic_publication").fetchone()[0]
 
+    @contextmanager
+    def _observe_directory_entries(self, store):
+        real_mkdir = os.mkdir
+        real_rename = store._rename_at2
+        real_local_prune = store._prune_backup_snapshots
+        real_archive_prune = store._prune_named_backups
+        with self._observe_publication(store) as events:
+            observed_rename = store._rename_at2
+
+            def mkdir(path, mode=0o777, *, dir_fd=None):
+                real_mkdir(path, mode, dir_fd=dir_fd)
+                resolved = Path(path) if dir_fd is None else Path(os.readlink(f"/proc/self/fd/{dir_fd}")) / path
+                events.append(("created-directory", resolved))
+
+            def rename(source, target, *, flags):
+                if source.is_dir():
+                    real_rename(source, target, flags=flags)
+                    events.append(("created-directory", target))
+                else:
+                    observed_rename(source, target, flags=flags)
+
+            def local_prune(path, count):
+                events.append(("prune", path))
+                return real_local_prune(path, count)
+
+            def archive_prune(path, pattern, count):
+                events.append(("prune", path))
+                return real_archive_prune(path, pattern, count)
+
+            with (
+                patch("history_service.store.os.mkdir", side_effect=mkdir),
+                patch.object(store, "_rename_at2", side_effect=rename),
+                patch.object(store, "_prune_backup_snapshots", side_effect=local_prune),
+                patch.object(store, "_prune_named_backups", side_effect=archive_prune),
+            ):
+                yield events
+
+    @contextmanager
+    def _fail_entry_parent(self, parent):
+        real_sync = os.fsync
+        attempts = []
+
+        def sync(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode) and Path(os.readlink(f"/proc/self/fd/{fd}")) == parent:
+                attempts.append(parent)
+                raise OSError(errno.EIO, "injected new-directory parent sync")
+            real_sync(fd)
+
+        with patch("history_service.store.os.fsync", side_effect=sync):
+            yield attempts
+
+    def test_public_backup_persists_only_new_directory_entry_chains(self):
+        cases = (
+            (0, None, (), False),
+            (1, None, (), False),
+            (2, None, (), False),
+            (0, 0, ("weekly",), False),
+            (0, 0, ("monthly",), False),
+            (0, 1, ("weekly", "monthly"), False),
+            (0, 2, ("weekly", "monthly"), False),
+            (0, 0, ("weekly", "monthly"), True),
+        )
+        for local_depth, archive_depth, periods, existing_periods in cases:
+            with self.subTest(case=(local_depth, archive_depth, periods, existing_periods)), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                store = self._seed(root)
+                local = root / "local-parent" / "local" if local_depth == 2 else root / "local"
+                if local_depth == 0:
+                    local.mkdir()
+                archive = root / "archive-parent" / "archive" if archive_depth == 2 else root / "archive"
+                if archive_depth == 0:
+                    archive.mkdir()
+                if existing_periods:
+                    for period in periods:
+                        (archive / period).mkdir()
+                destinations = [local, *(archive / period for period in periods)]
+                required = set()
+                for destination in destinations:
+                    while not destination.exists():
+                        required.add(destination)
+                        destination = destination.parent
+                with self._observe_directory_entries(store) as events:
+                    result = store.create_backup(
+                        local, snapshot_label="2030-01-01T00:00:00Z", retention_count=1,
+                        long_term_backup_dir=archive if periods else None,
+                        weekly_retention_count=int("weekly" in periods),
+                        monthly_retention_count=int("monthly" in periods),
+                    )
+                    events.append(("return", result))
+                for directory in required:
+                    created = next(i for i, event in enumerate(events) if event == ("created-directory", directory))
+                    barrier = next((i for i, event in enumerate(events) if i > created and event == ("directory", directory.parent)), None)
+                    self.assertIsNotNone(barrier, f"new directory entry lacks parent barrier: {directory}")
+                    assert barrier is not None
+                    relevant_prunes = [i for i, event in enumerate(events) if event[0] == "prune" and event[1].is_relative_to(directory)]
+                    self.assertTrue(relevant_prunes)
+                    self.assertLess(barrier, min(relevant_prunes))
+                # No attempt to repair arbitrary pre-existing ancestors.
+                allowed = {directory.parent for directory in required} | set(destinations)
+                for event in events:
+                    if event[0] == "directory":
+                        self.assertTrue(event[1] in allowed or event[1].name.startswith(".history-"), event)
+                for destination in destinations:
+                    snapshots = list(destination.glob("*.sqlite3"))
+                    self.assertEqual(len(snapshots), 1)
+                    self.assertEqual(self._value(snapshots[0]), "prior")
+
+    def test_new_local_entry_failure_refuses_pruning_and_retries_in_fresh_store(self):
+        for position in range(3):
+            with self.subTest(position=position), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                store = self._seed(root)
+                chain = [root / "one", root / "one" / "two", root / "one" / "two" / "local"]
+                failed_parent = chain[position].parent
+                for attempt in range(2):
+                    store = HistoryStore(str(store.file_path))
+                    with (
+                        self._fail_entry_parent(failed_parent) as failures,
+                        patch.object(store, "_prune_backup_snapshots", wraps=store._prune_backup_snapshots) as prune,
+                        self.assertRaisesRegex(OSError, "injected new-directory parent sync"),
+                    ):
+                        store.create_backup(chain[-1], snapshot_label="2030-01-01T00:00:00Z")
+                    self.assertEqual(failures, [failed_parent], f"fresh retry {attempt} skipped its failed entry")
+                    prune.assert_not_called()
+                    self.assertEqual(list(chain[-1].glob("*.sqlite3")), [])
+                store = HistoryStore(str(store.file_path))
+                with self._observe_directory_entries(store) as events:
+                    result = store.create_backup(chain[-1], snapshot_label="2030-01-01T00:00:00Z")
+                self.assertIn(("directory", failed_parent), events)
+                self.assertEqual(self._value(result), "prior")
+                # Once acknowledged, an ordinary repeat must not sync ancestors.
+                store = HistoryStore(str(store.file_path))
+                with self._observe_directory_entries(store) as events:
+                    store.create_backup(chain[-1], snapshot_label="2030-01-02T00:00:00Z", retention_count=1)
+                self.assertNotIn(("directory", failed_parent), events)
+
+    def test_new_archive_entry_failure_keeps_local_backup_and_retries_in_fresh_store(self):
+        for period in ("weekly", "monthly"):
+            for position in range(3):
+                with self.subTest(period=period, position=position), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    store = self._seed(root)
+                    local = root / "local"
+                    local.mkdir()
+                    archive = root / "one" / "archive"
+                    chain = [root / "one", archive, archive / period]
+                    failed_parent = chain[position].parent
+                    options: dict[str, Any] = dict(long_term_backup_dir=archive, weekly_retention_count=0, monthly_retention_count=0)
+                    options[f"{period}_retention_count"] = 1
+                    for attempt in range(2):
+                        store = HistoryStore(str(store.file_path))
+                        with (
+                            self._fail_entry_parent(failed_parent) as failures,
+                            patch.object(store, "_prune_named_backups", wraps=store._prune_named_backups) as prune,
+                            self.assertLogs("history_service.store", level="WARNING"),
+                        ):
+                            result = store.create_backup(local, snapshot_label="2030-01-01T00:00:00Z", **options)
+                        self.assertEqual(failures, [failed_parent], f"fresh archive retry {attempt} skipped its failed entry")
+                        prune.assert_not_called()
+                        self.assertEqual(self._value(result), "prior")
+                        self.assertEqual(list(chain[-1].glob("*.sqlite3")), [])
+                    store = HistoryStore(str(store.file_path))
+                    with self._observe_directory_entries(store) as events:
+                        result = store.create_backup(local, snapshot_label="2030-01-01T00:00:00Z", **options)
+                    self.assertIn(("directory", failed_parent), events)
+                    self.assertEqual(self._value(result), "prior")
+                    self.assertEqual(self._value(next(chain[-1].glob("*.sqlite3"))), "prior")
+
+    def test_new_directory_preparation_and_marker_retirement_fail_closed(self):
+        for boundary in ("marker-sync", "staging-sync", "install", "marker-unlink"):
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                store = self._seed(root)
+                local = root / "local"
+                real_sync, real_rename, real_unlink = os.fsync, store._rename_at2, os.unlink
+                failures = []
+
+                def fail():
+                    failures.append(boundary)
+                    raise OSError(errno.EIO, "injected directory preparation failure")
+
+                def sync(fd):
+                    path = Path(os.readlink(f"/proc/self/fd/{fd}"))
+                    is_directory = stat.S_ISDIR(os.fstat(fd).st_mode)
+                    if boundary == "marker-sync" and path.name == ".history-backup-directory-pending":
+                        fail()
+                    if boundary == "staging-sync" and is_directory and path.name.startswith(".history-directory-"):
+                        fail()
+                    return real_sync(fd)
+
+                def rename(source, target, *, flags):
+                    if boundary == "install" and target == local:
+                        fail()
+                    return real_rename(source, target, flags=flags)
+
+                def unlink(path, *, dir_fd=None):
+                    if boundary == "marker-unlink" and Path(path) == local / ".history-backup-directory-pending":
+                        fail()
+                    return real_unlink(path, dir_fd=dir_fd)
+
+                with (
+                    patch("history_service.store.os.fsync", side_effect=sync),
+                    patch.object(store, "_rename_at2", side_effect=rename),
+                    patch("history_service.store.os.unlink", side_effect=unlink),
+                    patch.object(store, "_prune_backup_snapshots", wraps=store._prune_backup_snapshots) as prune,
+                    self.assertRaisesRegex(OSError, "injected directory preparation failure"),
+                ):
+                    store.create_backup(local, snapshot_label="2030-01-01T00:00:00Z")
+                self.assertEqual(failures, [boundary])
+                prune.assert_not_called()
+                self.assertEqual(list(local.glob("*.sqlite3")), [])
+                self.assertEqual(local.exists(), boundary == "marker-unlink")
+                self.assertEqual(list(root.glob(".history-directory-*")), [])
+                store = HistoryStore(str(store.file_path))
+                with self._observe_directory_entries(store) as events:
+                    result = store.create_backup(local, snapshot_label="2030-01-01T00:00:00Z")
+                self.assertIn(("directory", root), events)
+                self.assertEqual(self._value(result), "prior")
+
     def test_local_publication_syncs_file_and_both_parents_before_retirement(self):
         for existing in (False, True):
             with self.subTest(existing=existing), tempfile.TemporaryDirectory() as tmp:
