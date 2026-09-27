@@ -3898,7 +3898,7 @@ class InventoryService:
         finally:
             _ssh_command_session.reset(session_token)
             if session is not None:
-                await asyncio.to_thread(session.close)
+                await session.close_owned()
 
     async def _poll_disk_inventory_sync_job(
         self,
@@ -12719,7 +12719,7 @@ class InventoryService:
         session = _ssh_command_session.get()
         if session is not None and (not normalize_text(host) or normalize_text(host) == normalize_text(self.system.ssh.host)):
             async with self._ssh_session_lock_for_host(host):
-                return await asyncio.to_thread(session.run_command, command, timeout_seconds=timeout_seconds)
+                return await session.run_command_owned(command, timeout_seconds=timeout_seconds)
         if isinstance(ssh_probe, SSHProbe):
             async with self._ssh_session_lock_for_host(host):
                 target_host = normalize_text(host)

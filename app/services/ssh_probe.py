@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import functools
 import logging
 import re
 import shlex
@@ -9,6 +11,7 @@ import time
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from contextlib import contextmanager
 from pathlib import Path
 
 import paramiko
@@ -34,13 +37,23 @@ class _ChannelGate:
     def __init__(self, limit: int) -> None:
         self.limit = max(1, limit)
         self.active = 0
+        self._stopped = False
         self._condition = threading.Condition()
 
-    def acquire(self) -> None:
+    def acquire(self, cancellation: _WorkerCancellation) -> None:
         with self._condition:
-            while self.active >= self.limit:
-                self._condition.wait()
+            cancellation.check()
+            while self.active >= self.limit and not self._stopped:
+                self._condition.wait(0.05)
+                cancellation.check()
+            if self._stopped:
+                raise RuntimeError("SSH channel cleanup was not confirmed; session stopped.")
             self.active += 1
+
+    def stop(self) -> None:
+        with self._condition:
+            self._stopped = True
+            self._condition.notify_all()
 
     def release(self) -> None:
         with self._condition:
@@ -195,6 +208,76 @@ class SSHCommandResult:
 CommandPlanner = Callable[[list[SSHCommandResult]], Iterable[str]]
 
 
+class _WorkerCancellation:
+    """One invocation owns its clients until all synchronous workers stop."""
+
+    def __init__(self) -> None:
+        self.cancelled = threading.Event()
+        self._lock = threading.Lock()
+        self._clients: set[paramiko.SSHClient] = set()
+
+    def check(self) -> None:
+        if self.cancelled.is_set():
+            raise asyncio.CancelledError()
+
+    def register(self, client: paramiko.SSHClient) -> None:
+        with self._lock:
+            cancelled = self.cancelled.is_set()
+            if not cancelled:
+                self._clients.add(client)
+        if cancelled:
+            client.close()
+            self.check()
+
+    def discard(self, client: paramiko.SSHClient) -> None:
+        with self._lock:
+            self._clients.discard(client)
+
+    def interrupt(self) -> None:
+        with self._lock:
+            clients = list(self._clients)
+        for client in clients:
+            try:
+                client.close()
+            except Exception:
+                # The owning worker still runs its finally and must be drained.
+                logger.warning("SSH cancellation transport close failed", exc_info=False)
+
+
+class _CommandDeadline:
+    """Interrupt even Paramiko's exec acknowledgement and input-send waits."""
+
+    def __init__(self, client: paramiko.SSHClient, seconds: float) -> None:
+        self.until = time.monotonic() + seconds
+        self.expired = threading.Event()
+        self._lock = threading.Lock()
+        self._target = client
+        self._timer = threading.Timer(max(0, seconds), self._expire)
+        self._timer.start()
+
+    def _expire(self) -> None:
+        with self._lock:
+            self.expired.set()
+            target = self._target
+        try:
+            target.close()
+        except Exception:
+            logger.warning("SSH deadline close failed", exc_info=False)
+
+    def channel(self, channel: paramiko.Channel) -> None:
+        with self._lock:
+            self._target = channel
+        self.check()
+
+    def check(self) -> None:
+        if self.expired.is_set() or time.monotonic() >= self.until:
+            raise TimeoutError("SSH command timed out.")
+
+    def close(self) -> None:
+        self._timer.cancel()
+        self._timer.join()
+
+
 class SSHProbe:
     def __init__(self, config: SSHConfig) -> None:
         self.config = config
@@ -217,7 +300,7 @@ class SSHProbe:
         command_list = self._command_list(commands)
         if not command_list:
             return []
-        return await asyncio.to_thread(self._run_commands_sync, command_list, stdin_data)
+        return await self._run_owned(self._run_commands_sync, command_list, stdin_data)
 
     async def run_planned_commands(
         self,
@@ -227,7 +310,7 @@ class SSHProbe:
     ) -> list[SSHCommandResult]:
         if not self.config.enabled:
             return []
-        return await asyncio.to_thread(self._run_planned_commands_sync, planner, initial_commands)
+        return await self._run_owned(self._run_planned_commands_sync, planner, initial_commands)
 
     async def run_planned_command_groups(
         self,
@@ -244,7 +327,57 @@ class SSHProbe:
         """
         if not self.config.enabled:
             return [[] for _ in groups]
-        return await asyncio.to_thread(self._run_planned_command_groups_sync, groups, max_parallel_channels)
+        return await self._run_owned(self._run_planned_command_groups_sync, groups, max_parallel_channels)
+
+    async def _run_owned(self, function, *args, **kwargs):
+        cancellation = _WorkerCancellation()
+        context = contextvars.copy_context()
+        loop = asyncio.get_running_loop()
+        # An executor Future, not a Task: asyncio.run shutdown cancels Tasks,
+        # including a to_thread Task, before the underlying thread has stopped.
+        worker = loop.run_in_executor(
+            None, context.run, functools.partial(function, *args, _cancel=cancellation, **kwargs),
+        )
+        interrupted = None
+        interrupt_executor = None
+        cancelled = None
+        pending = {worker}
+        while pending:
+            try:
+                _done, pending = await asyncio.wait(pending)
+            except asyncio.CancelledError as exc:
+                if cancelled is None:
+                    cancelled = exc
+                    cancellation.cancelled.set()
+                    # The default executor may be full of blocked SSH calls.
+                    # Its cleanup cannot queue behind those same calls.
+                    interrupt_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ssh-interrupt")
+                    interrupted = loop.run_in_executor(interrupt_executor, cancellation.interrupt)
+                    pending.add(interrupted)
+                # Each wait removes its callbacks on cancellation. Never cancel
+                # the worker or leave shield callbacks with unobserved errors.
+        if interrupt_executor is not None:
+            interrupt_executor.shutdown(wait=True)
+        if cancelled is not None:
+            for future in (worker, interrupted):
+                if future is not None and not future.cancelled():
+                    future.exception()
+            raise cancelled
+        return worker.result()
+
+    @contextmanager
+    def _owned_client(self, cancellation: _WorkerCancellation):
+        cancellation.check()
+        client = self._client(_cancel=cancellation)
+        try:
+            cancellation.register(client)
+            cancellation.check()
+            yield client
+        finally:
+            try:
+                client.close()
+            finally:
+                cancellation.discard(client)
 
     def open_session(self) -> SSHSession:
         """One reusable connection for a series of commands; see :class:`SSHSession`."""
@@ -263,7 +396,7 @@ class SSHProbe:
                 stderr="SSH fallback is disabled.",
                 exit_code=1,
             )
-        return await asyncio.to_thread(
+        return await self._run_owned(
             self._run_command_sync,
             command,
             timeout_seconds=timeout_seconds,
@@ -288,7 +421,10 @@ class SSHProbe:
         self,
         commands: Iterable[str] | None = None,
         stdin_data: str | None = None,
+        *,
+        _cancel: _WorkerCancellation | None = None,
     ) -> list[SSHCommandResult]:
+        _cancel = _cancel or _WorkerCancellation()
         command_list = self._command_list(commands)
         if not command_list:
             return []
@@ -296,9 +432,10 @@ class SSHProbe:
         results: list[SSHCommandResult] = []
         started = time.perf_counter()
         try:
-            with self._client() as client:
+            with self._owned_client(_cancel) as client:
                 for command in command_list:
-                    results.append(self._run_single_command(client, command, stdin_data=stdin_data))
+                    _cancel.check()
+                    results.append(self._run_single_command(client, command, stdin_data=stdin_data, _cancel=_cancel))
         except Exception as exc:
             logger.warning(
                 "SSH command batch failed for %s@%s: %s",
@@ -327,17 +464,25 @@ class SSHProbe:
         self,
         planner: CommandPlanner,
         initial_commands: Iterable[str] | None = None,
+        *,
+        _cancel: _WorkerCancellation | None = None,
     ) -> list[SSHCommandResult]:
-        return self._run_planned_command_groups_sync([(planner, self._command_list(initial_commands))], 1)[0]
+        return self._run_planned_command_groups_sync(
+            [(planner, self._command_list(initial_commands))], 1, _cancel=_cancel,
+        )[0]
 
     def _run_planned_command_groups_sync(
         self,
         groups: list[tuple[CommandPlanner, list[str]]],
         max_parallel_channels: int = MAX_PARALLEL_CHANNELS_PER_CONNECTION,
+        *,
+        _cancel: _WorkerCancellation | None = None,
     ) -> list[list[SSHCommandResult]]:
+        _cancel = _cancel or _WorkerCancellation()
         outcomes: list[list[SSHCommandResult]] = [[] for _ in groups]
         pending: list[tuple[int, list[str], set[str]]] = []
         for index, (planner, initial_commands) in enumerate(groups):
+            _cancel.check()
             seen_commands: set[str] = set()
             first_commands = self._new_commands(self._command_list(initial_commands), seen_commands)
             if not first_commands:
@@ -349,7 +494,8 @@ class SSHProbe:
 
         started = time.perf_counter()
         try:
-            client = self._client()
+            _cancel.check()
+            client = self._client(_cancel=_cancel)
         except Exception as exc:
             logger.warning(
                 "SSH planned command session failed for %s@%s: %s",
@@ -368,9 +514,10 @@ class SSHProbe:
 
         def run_one(command: str) -> SSHCommandResult:
             while True:
-                gate.acquire()
+                gate.acquire(_cancel)
                 try:
-                    result = self._run_single_command(client, command, raise_channel_refusal=True)
+                    _cancel.check()
+                    result = self._run_single_command(client, command, raise_channel_refusal=True, _cancel=_cancel)
                 except paramiko.ChannelException as exc:
                     if gate.refused():
                         logger.info(
@@ -381,7 +528,9 @@ class SSHProbe:
                         continue
                     return self._failure_result(command, str(exc) or exc.__class__.__name__)
                 except BaseException:
-                    gate.release()
+                    # An exception escaping command cleanup is not proof of a
+                    # closed channel. Keep its capacity charged and stop reuse.
+                    gate.stop()
                     raise
                 gate.release()
                 return result
@@ -394,6 +543,7 @@ class SSHProbe:
             failed_pending_commands: list[str] = []
             try:
                 while pending_commands:
+                    _cancel.check()
                     batch_counts[index] += 1
                     for position, command in enumerate(pending_commands):
                         try:
@@ -404,6 +554,7 @@ class SSHProbe:
                             pending_commands = []
                             break
                     else:
+                        _cancel.check()
                         pending_commands = self._new_commands(planner(list(results)), seen_commands)
                         continue
                     break
@@ -420,14 +571,22 @@ class SSHProbe:
                 error_message = str(session_error) or session_error.__class__.__name__
                 results.extend(self._failure_result(command, error_message) for command in failed_pending_commands)
 
-        with client:
+        try:
+            _cancel.register(client)
+            _cancel.check()
             if width == 1:
                 for item in pending:
+                    _cancel.check()
                     drive(*item)
             else:
                 with ThreadPoolExecutor(max_workers=width, thread_name_prefix="ssh-channel") as executor:
                     for future in [executor.submit(drive, *item) for item in pending]:
                         future.result()
+        finally:
+            try:
+                client.close()
+            finally:
+                _cancel.discard(client)
 
         results_count = sum(len(outcomes[index]) for index, _commands, _seen in pending)
         logger.info(
@@ -447,13 +606,16 @@ class SSHProbe:
         command: str,
         *,
         timeout_seconds: float | None = None,
+        _cancel: _WorkerCancellation | None = None,
     ) -> SSHCommandResult:
+        _cancel = _cancel or _WorkerCancellation()
         try:
-            with self._client() as client:
+            with self._owned_client(_cancel) as client:
                 return self._run_single_command(
                     client,
                     command,
                     timeout_seconds=timeout_seconds,
+                    _cancel=_cancel,
                 )
         except Exception as exc:
             logger.warning(
@@ -465,8 +627,10 @@ class SSHProbe:
             error_message = str(exc) or exc.__class__.__name__
             return self._failure_result(command, error_message)
 
-    def _client(self):
+    def _client(self, *, _cancel: _WorkerCancellation | None = None):
         client = paramiko.SSHClient()
+        if _cancel is not None:
+            _cancel.register(client)
 
         if self.config.strict_host_key_checking:
             if self.config.known_hosts_path:
@@ -501,11 +665,13 @@ class SSHProbe:
             except paramiko.BadAuthenticationType as exc:
                 if not self._try_keyboard_interactive(client, exc):
                     raise
-        except Exception:
+        except BaseException:
             # A failed connect can leave a live transport thread and socket
             # behind; close before propagating so repeated failures can't
             # accumulate threads/FDs.
             client.close()
+            if _cancel is not None:
+                _cancel.discard(client)
             raise
         return client
 
@@ -555,6 +721,7 @@ class SSHProbe:
         stdin_data: str | None = None,
         timeout_seconds: float | None = None,
         raise_channel_refusal: bool = False,
+        _cancel: _WorkerCancellation | None = None,
     ) -> SSHCommandResult:
         safe_command = redact_ssh_command(command)
         logger.debug("Running SSH command: %s", safe_command)
@@ -564,9 +731,18 @@ class SSHProbe:
                 command,
                 "SSH command input cannot be combined with sudo password input.",
             )
+        _cancel = _cancel or _WorkerCancellation()
+        _cancel.check()
+        command_timeout = self.config.timeout_seconds if timeout_seconds is None else timeout_seconds
+        deadline = _CommandDeadline(client, command_timeout)
+        streams = ()
+        channel = None
         try:
-            command_timeout = self.config.timeout_seconds if timeout_seconds is None else timeout_seconds
-            stdin, stdout, stderr = client.exec_command(effective_command, timeout=command_timeout)
+            deadline.check()
+            stdin, stdout, stderr = streams = client.exec_command(effective_command, timeout=command_timeout)
+            channel = stdout.channel
+            deadline.channel(channel)
+            _cancel.check()
             command_input = f"{sudo_password}\n" if sudo_password else stdin_data
             if command_input is not None:
                 stdin.write(command_input)
@@ -574,22 +750,36 @@ class SSHProbe:
                 stdin.channel.shutdown_write()
             else:
                 stdin.close()
-            output_bytes = stdout.read(MAX_SSH_OUTPUT_BYTES + 1)
-            if len(output_bytes) > MAX_SSH_OUTPUT_BYTES:
-                return self._failure_result(
-                    command,
-                    f"SSH command output exceeded the {MAX_SSH_OUTPUT_BYTES}-byte limit.",
-                )
-            remaining_bytes = MAX_SSH_OUTPUT_BYTES - len(output_bytes)
-            error_bytes = stderr.read(remaining_bytes + 1)
-            if len(error_bytes) > remaining_bytes:
-                return self._failure_result(
-                    command,
-                    f"SSH command output exceeded the {MAX_SSH_OUTPUT_BYTES}-byte limit.",
-                )
+            output_bytes = bytearray()
+            error_bytes = bytearray()
+            while True:
+                _cancel.check()
+                deadline.check()
+                received = False
+                for ready, receive, buffer in (
+                    (channel.recv_ready, channel.recv, output_bytes),
+                    (channel.recv_stderr_ready, channel.recv_stderr, error_bytes),
+                ):
+                    if ready():
+                        remaining = MAX_SSH_OUTPUT_BYTES - len(output_bytes) - len(error_bytes)
+                        buffer.extend(receive(min(32768, remaining + 1)))
+                        received = True
+                        if len(output_bytes) + len(error_bytes) > MAX_SSH_OUTPUT_BYTES:
+                            return self._failure_result(
+                                command, f"SSH command output exceeded the {MAX_SSH_OUTPUT_BYTES}-byte limit.",
+                            )
+                # Exit status can precede the last data/EOF. Conversely, EOF
+                # without status must keep the original deadline, not wait().
+                if (channel.eof_received or channel.closed) and channel.exit_status_ready():
+                    if not channel.recv_ready() and not channel.recv_stderr_ready():
+                        _cancel.check()
+                        deadline.check()
+                        exit_code = channel.recv_exit_status()
+                        break
+                if not received:
+                    _cancel.cancelled.wait(min(0.01, max(0, deadline.until - time.monotonic())))
             output = output_bytes.decode("utf-8", errors="replace")
             error = error_bytes.decode("utf-8", errors="replace")
-            exit_code = stdout.channel.recv_exit_status()
             ok = exit_code == 0
             if not ok:
                 logger.warning("SSH command failed: %s (exit=%s)", safe_command, exit_code)
@@ -601,16 +791,36 @@ class SSHProbe:
                 exit_code=exit_code,
             )
         except Exception as exc:
-            if raise_channel_refusal and isinstance(exc, paramiko.ChannelException):
+            _cancel.check()
+            effective_error = (
+                TimeoutError("SSH command timed out.")
+                if deadline.expired.is_set() or time.monotonic() >= deadline.until
+                else exc
+            )
+            if raise_channel_refusal and isinstance(effective_error, paramiko.ChannelException):
                 raise
             logger.warning(
                 "SSH command execution failed for %s@%s: %s",
                 self.config.user,
                 self.config.host,
-                exc,
+                effective_error,
             )
-            error_message = str(exc) or exc.__class__.__name__
+            error_message = str(effective_error) or effective_error.__class__.__name__
             return self._failure_result(command, error_message)
+        finally:
+            # Cancel and join the watchdog before reuse: no late timer may
+            # close the next command's connection. Channel closure precedes
+            # the caller's gate release, including output-cap and error paths.
+            deadline.close()
+            try:
+                if channel is not None:
+                    channel.close()
+            finally:
+                for stream in streams:
+                    try:
+                        stream.close()
+                    except Exception:
+                        logger.warning("SSH command stream close failed", exc_info=False)
 
     @staticmethod
     def _failure_result(command: str, error_message: str) -> SSHCommandResult:
@@ -663,8 +873,9 @@ class SSHSession:
 
     The connection comes from :meth:`SSHProbe._client`, so it is checked against
     the same host-key policy as every other connection. A connection that has
-    dropped is reopened, and checked again, on the next command. Call
-    :meth:`close` from a worker thread when done.
+    dropped is reopened, and checked again, on the next command. Async callers
+    use :meth:`run_command_owned` and :meth:`close_owned` to retain ownership
+    through cancellation. Synchronous callers close from their worker thread.
     """
 
     def __init__(self, probe: SSHProbe) -> None:
@@ -673,11 +884,34 @@ class SSHSession:
         self._lock = threading.Lock()
         self.connections = 0
 
-    def run_command(self, command: str, *, timeout_seconds: float | None = None) -> SSHCommandResult:
-        with self._lock:
+    async def run_command_owned(self, command: str, *, timeout_seconds: float | None = None) -> SSHCommandResult:
+        try:
+            return await self._probe._run_owned(self.run_command, command, timeout_seconds=timeout_seconds)
+        except asyncio.CancelledError as cancelled:
+            # _run_owned has drained both the command and its interrupt helper.
+            # Finish session teardown before the caller releases its host lock,
+            # including cancellation racing with a successful worker return.
             try:
-                client = self._connected_client()
+                await self.close_owned()
+            finally:
+                raise cancelled
+
+    async def close_owned(self) -> None:
+        # Cleanup must run even if cancellation arrives before its worker starts.
+        await self._probe._run_owned(lambda *, _cancel: self.close())
+
+    def run_command(
+        self, command: str, *, timeout_seconds: float | None = None,
+        _cancel: _WorkerCancellation | None = None,
+    ) -> SSHCommandResult:
+        with self._lock:
+            if _cancel is not None:
+                _cancel.check()
+            try:
+                client = self._connected_client(_cancel=_cancel)
             except Exception as exc:
+                if _cancel is not None:
+                    _cancel.check()
                 logger.warning(
                     "SSH command failed to start for %s@%s: %s",
                     self._probe.config.user,
@@ -685,7 +919,16 @@ class SSHSession:
                     exc,
                 )
                 return self._probe._failure_result(command, str(exc) or exc.__class__.__name__)
-            return self._probe._run_single_command(client, command, timeout_seconds=timeout_seconds)
+            try:
+                if _cancel is not None:
+                    _cancel.register(client)
+                    _cancel.check()
+                return self._probe._run_single_command(
+                    client, command, timeout_seconds=timeout_seconds, _cancel=_cancel,
+                )
+            finally:
+                if _cancel is not None:
+                    _cancel.discard(client)
 
     def close(self) -> None:
         with self._lock:
@@ -693,7 +936,7 @@ class SSHSession:
         if client is not None:
             client.close()
 
-    def _connected_client(self) -> paramiko.SSHClient:
+    def _connected_client(self, *, _cancel: _WorkerCancellation | None = None) -> paramiko.SSHClient:
         client = self._client
         transport = client.get_transport() if client is not None else None
         if client is not None and transport is not None and transport.is_active():
@@ -701,7 +944,7 @@ class SSHSession:
         if client is not None:
             client.close()
             self._client = None
-        client = self._probe._client()
+        client = self._probe._client() if _cancel is None else self._probe._client(_cancel=_cancel)
         self._client = client
         self.connections += 1
         return client
