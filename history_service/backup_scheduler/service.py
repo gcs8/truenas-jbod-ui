@@ -189,6 +189,8 @@ class BackupScheduler:
         self._load_status()
         self.journal: ChangeJournal | None = None
         self.coalescer: ConfigBackupCoalescer | None = None
+        self._coalescer_error: str | None = None
+        self._coalescer_prior_run: dict[str, Any] | None = None
         if policy.config.enabled:
             self.journal = ChangeJournal(paths.journal_path, file_mode=0o660)
             self.coalescer = ConfigBackupCoalescer(
@@ -323,11 +325,35 @@ class BackupScheduler:
         """One scheduler step: config coalescer, then a due full backup."""
 
         if self.coalescer is not None:
-            result: CoalescerResult = self.coalescer.tick()
-            if result.status == "failed":
-                logger.warning("Config backup failed: %s", result.error)
-            elif result.status in {"backup", "noop"}:
-                logger.info("Config backup %s: %d change(s).", result.status, len(result.change_ids))
+            try:
+                result: CoalescerResult = self.coalescer.tick()
+            except Exception as exc:  # noqa: BLE001 - recorded in status; full backups still run
+                detail = f"Config changes could not be checked: {describe_error(exc)}"[:MAX_DETAIL_CHARS]
+                if detail != self._coalescer_error:
+                    if self._coalescer_error is None:
+                        with self._state_lock:
+                            self._coalescer_prior_run = self._status["classes"].get("config")
+                    self._coalescer_error = detail
+                    logger.error("%s", detail)
+                    self._record_class("config", RunRecord(at=_iso(self._clock()) or "", ok=False, detail=detail))
+            else:
+                if self._coalescer_error is not None:
+                    # Readable again: put back the last real run unless a backup replaced it.
+                    with self._state_lock:
+                        current = self._status["classes"].get("config")
+                        restore = isinstance(current, dict) and current.get("detail") == self._coalescer_error
+                        if restore and self._coalescer_prior_run is not None:
+                            self._status["classes"]["config"] = self._coalescer_prior_run
+                        elif restore:
+                            self._status["classes"].pop("config", None)
+                    self._coalescer_error = None
+                    self._coalescer_prior_run = None
+                    if restore:
+                        self._write_status()
+                if result.status == "failed":
+                    logger.warning("Config backup failed: %s", result.error)
+                elif result.status in {"backup", "noop"}:
+                    logger.info("Config backup %s: %d change(s).", result.status, len(result.change_ids))
         now = self._clock()
         if self.next_full_at is not None and now >= self.next_full_at:
             self.next_full_at = self._compute_next_full(now)
