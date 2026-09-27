@@ -77,7 +77,7 @@
     "test_public_doc_privacy": 7,
     "test_public_docs_contract": 19,
     "test_public_screenshots": 10,
-    "test_quantastor_api": 6,
+    "test_quantastor_api": 20,
     "test_read_ui_auth": 15,
     "test_release_changelog_coverage": 21,
     "test_release_status": 37,
