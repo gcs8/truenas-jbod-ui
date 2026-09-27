@@ -1104,6 +1104,15 @@ class PolicyEditorTests(unittest.TestCase):
                     self.save(self._target_payload(view, values))
                 self.assertEqual(self.config.read_bytes(), before)
 
+    def test_username_whitespace_change_is_a_different_endpoint(self) -> None:
+        self._rewrite_target(username="backup ")
+        view = self.view()
+        before = self.config.read_bytes()
+        values = dict(view["targets"][0]["values"], username="backup")  # the UI trims its text fields
+        with self.assertRaisesRegex(self.editor.PolicyEditError, "choose its .* again"):
+            self.save(self._target_payload(view, values))
+        self.assertEqual(self.config.read_bytes(), before)
+
     def test_numeric_bucket_saved_back_as_text_keeps_secret_files(self) -> None:
         document = yaml.safe_load(self.config.read_text())
         document["backups"]["targets"] = [{
