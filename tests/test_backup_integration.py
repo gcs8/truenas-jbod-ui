@@ -592,7 +592,20 @@ class SchedulerTests(SchedulerTestBase):
         self.broken_targets = {"nas"}
         scheduler = self.make({"full": {"enabled": True, "local_keep": 1, "remote_keep": 1}, "targets": [TARGET]})
         self.now = datetime(2026, 9, 24, 16, 0, tzinfo=UTC)
+        backup_dir = self._paths.history_backup_dir
+        sidecars: list[Path] = []
+        for age in range(14, 0, -1):
+            created = self.now - timedelta(days=age)
+            path = backup_dir / f"history-{created:%Y%m%dT%H%M%S}Z.sqlite3"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(f"sidecar {age}".encode())
+            stamp = created.timestamp()
+            os.utime(path, (stamp, stamp))
+            sidecars.append(path)
         scheduler.run_now("full")
+        # The remote outage must not block the local sidecar replacement cleanup.
+        self.assertFalse(sidecars[0].exists())
+        self.assertTrue(all(path.exists() for path in sidecars[1:]))
         self.assertEqual(len(scheduler.catalog.list(location="local")), 1)
         self.assertEqual(len(scheduler.catalog.list(location="nas")), 3)
         grooming = json.loads(self._paths.status_file.read_text())["grooming"]

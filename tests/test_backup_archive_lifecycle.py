@@ -17,6 +17,7 @@ from history_service.backup_archive.catalog import (
     CatalogError,
 )
 from history_service.backup_archive.lifecycle import (
+    ApplyResult,
     GroomingPlan,
     LifecycleManager,
     LocalBackupDirectory,
@@ -422,6 +423,29 @@ class LifecycleApplyTests(CatalogCase):
         self.assertEqual(self.remote.deleted, [])
         for item in remote_items:
             self.assertIsNotNone(self.catalog.get(item.record.artifact_id))
+
+    def test_location_complete_is_false_only_for_the_failed_location(self) -> None:
+        plan = self.manager.plan(NOW)
+        local_items = tuple(i for i in plan.items if i.record.location == "local")
+        remote_items = tuple(i for i in plan.items if i.record.location == "nas-1")
+        unreachable = ApplyResult(
+            deleted=local_items,
+            already_missing=(),
+            failed=remote_items[0],
+            error="OSError: synthetic connection refused",
+            not_attempted=remote_items[1:],
+            failed_locations={"nas-1": "OSError: synthetic connection refused"},
+        )
+        self.assertTrue(unreachable.location_complete("local"))
+        self.assertFalse(unreachable.location_complete("nas-1"))
+        stopped = ApplyResult(deleted=(), already_missing=(), failed=remote_items[0], error="RuntimeError: boom")
+        self.assertFalse(stopped.location_complete("nas-1"))
+        self.assertTrue(stopped.location_complete("local"))
+        stranded = ApplyResult(
+            deleted=(), already_missing=(), failed=remote_items[0], error="RuntimeError: boom", not_attempted=local_items
+        )
+        self.assertFalse(stranded.location_complete("local"))
+        self.assertTrue(ApplyResult(deleted=local_items, already_missing=()).location_complete("local"))
 
     def test_apply_refuses_item_pinned_after_planning(self) -> None:
         plan = self.manager.plan(NOW)

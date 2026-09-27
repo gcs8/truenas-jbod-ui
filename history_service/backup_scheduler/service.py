@@ -501,7 +501,7 @@ class BackupScheduler:
         grooming_succeeded = False
         try:
             grooming = self._groom_locked()
-            grooming_succeeded = grooming is None or not grooming.error
+            grooming_succeeded = grooming is None or grooming.location_complete(LOCAL_LOCATION)
         except Exception as exc:  # noqa: BLE001 - grooming failure never fails the backup
             logger.warning("Backup grooming failed after %s backup (%s).", backup_class, type(exc).__name__)
         if can_replace_history and grooming_succeeded:

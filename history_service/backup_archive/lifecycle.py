@@ -121,6 +121,15 @@ class ApplyResult:
     def complete(self) -> bool:
         return self.failed is None and not self.not_attempted
 
+    def location_complete(self, location: str) -> bool:
+        """True when every planned item for ``location`` was handled."""
+
+        if location in self.failed_locations:
+            return False
+        if self.failed is not None and self.failed.record.location == location:
+            return False
+        return not any(item.record.location == location for item in self.not_attempted)
+
 
 @dataclass(frozen=True, slots=True)
 class ReconcileReport:
