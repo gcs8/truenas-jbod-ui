@@ -90,6 +90,63 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
+
+
+function mappingGenerationFixture() {
+  const state = {selectedSystemId: "synthetic-system", selectedEnclosureId: "enc-a", refreshesInFlight: 0};
+  const values = {}, writes = [];
+  const mappingForm = {};
+  for (const name of ["serial", "device_name", "gptid", "notes"]) {
+    mappingForm[name] = {};
+    Object.defineProperty(mappingForm[name], "value", {
+      get() { return values[name]; },
+      set(value) { values[name] = value; writes.push(name); },
+    });
+  }
+  const mappingFormScopeKey = loadFunction("mappingFormScopeKey", {state});
+  const sync = loadFunction("syncMappingFormForSlot", {state, mappingForm, mappingFormScopeKey, scheduleAutoRefresh() {}});
+  const first = {slot: 0, serial: "SANITIZED-OLD", device_name: "sdx", gptid: "synthetic-old", notes: "Original", mapping_revision: "old-revision"};
+  sync(first);
+  writes.length = 0;
+  return {state, values, writes, sync, first};
+}
+
+test("mapping generation clean fields follow authoritative changes even with unchanged revision", () => {
+  const h = mappingGenerationFixture();
+  h.sync({...h.first, serial: null, device_name: null, gptid: null, notes: "Empty bay"});
+  assert.deepEqual(h.values, {serial: "", device_name: "", gptid: "", notes: "Empty bay"});
+  assert.equal(h.state.mappingFormBaseRevision, "old-revision");
+});
+
+test("mapping generation revision-only refresh advances a clean base without writing fields", () => {
+  const h = mappingGenerationFixture();
+  h.sync({...h.first, mapping_revision: "new-revision"});
+  assert.deepEqual(h.writes, []);
+  assert.equal(h.state.mappingFormBaseRevision, "new-revision");
+});
+
+test("mapping generation dirty values and original base survive repeated same-scope refresh", () => {
+  const h = mappingGenerationFixture();
+  h.state.mappingFormDirty = true;
+  h.values.notes = "Draft";
+  for (const revision of ["new-revision", null, "another-revision"]) {
+    h.sync({...h.first, serial: "SANITIZED-NEW", notes: "New notes", mapping_revision: revision});
+    assert.deepEqual(h.writes, []);
+    assert.equal(h.values.notes, "Draft");
+    assert.equal(h.state.mappingFormBaseRevision, "old-revision");
+  }
+});
+
+test("mapping generation new scope replaces draft values and base together", () => {
+  const h = mappingGenerationFixture();
+  h.state.mappingFormDirty = true;
+  h.state.selectedEnclosureId = "enc-b";
+  h.sync({...h.first, serial: "SANITIZED-OTHER", mapping_revision: "other-revision"});
+  assert.equal(h.values.serial, "SANITIZED-OTHER");
+  assert.equal(h.state.mappingFormBaseRevision, "other-revision");
+  assert.equal(h.state.mappingFormDirty, false);
+});
+
 test("auto refresh pause reason covers hidden documents and active mapping drafts", () => {
   const state = { mappingFormDirty: true };
   const mappingForm = { classList: visibleClassList(false) };
