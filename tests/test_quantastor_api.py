@@ -5,6 +5,7 @@ import io
 import json
 import socket
 import ssl
+import sys
 import threading
 import time
 import unittest
@@ -243,6 +244,70 @@ class QuantastorRESTClientTests(unittest.IsolatedAsyncioTestCase):
             transport.release_read.set()
             with self.assertRaises(asyncio.CancelledError):
                 await task
+
+    async def test_fetch_all_releases_raw_body_before_json_parse(self):
+        # Observe the real request frame, not a Mock intermediary. Keep only
+        # scalar measurements so the observer cannot extend the body lifetime.
+        original_loads = json.loads
+        for endpoint in ("physicalDiskEnum", "hwDiskEnum"):
+            for size in (4096, 65536):
+                for malformed in (False, True):
+                    with self.subTest(endpoint=endpoint, size=size, malformed=malformed):
+                        rows = [{"value": 37, "pad": "x" * size}]
+                        body = json.dumps(rows).encode() + (b"!" if malformed else b"")
+                        transport = SyntheticTransport(endpoint, body=body)
+                        observations = []
+
+                        def observe_parse(payload, *args, **kwargs):
+                            frame = sys._getframe(1)
+                            try:
+                                self.assertIs(frame.f_code, QuantastorRESTClient._request_json.__code__)
+                                if frame.f_locals["endpoint"] == endpoint:
+                                    observations.append({
+                                        "decoded_chars": len(payload),
+                                        "raw_bytes": sum(len(value) for value in frame.f_locals.values()
+                                                         if isinstance(value, bytes)),
+                                        "closed": transport.responses[endpoint].closed,
+                                    })
+                            finally:
+                                del frame
+                            return original_loads(payload, *args, **kwargs)
+
+                        with patch("app.services.quantastor_api.json.loads", new=observe_parse):
+                            if malformed and endpoint in REQUIRED_ENDPOINTS:
+                                with self.assertRaisesRegex(TrueNASAPIError, endpoint) as raised:
+                                    await self.fetch_transport(transport)
+                                self.assertIsInstance(raised.exception.__cause__, json.JSONDecodeError)
+                            elif malformed:
+                                with self.assertLogs("app.services.quantastor_api", level="WARNING") as logs:
+                                    data = await self.fetch_transport(transport)
+                                self.assert_bundle(data, missing=endpoint)
+                                self.assertIn("JSONDecodeError", logs.output[0])
+                            else:
+                                data = await self.fetch_transport(transport)
+                                for sibling, field in ENDPOINT_FIELDS.items():
+                                    self.assertEqual(getattr(data, field), rows if sibling == endpoint
+                                                     else [{"endpoint": sibling}])
+                        self.assertEqual(observations, [{
+                            "decoded_chars": len(body), "raw_bytes": 0, "closed": True,
+                        }])
+
+    async def test_fetch_all_parse_programmer_errors_and_cancellation_propagate(self):
+        original_loads = json.loads
+        for error_type in (RuntimeError, TypeError, ValueError, KeyError, IndexError,
+                           AssertionError, asyncio.CancelledError):
+            with self.subTest(error=error_type.__name__):
+                error = error_type("synthetic parse failure")
+
+                def fail_parse(payload, *args, **kwargs):
+                    if "hwDiskEnum" in payload:
+                        raise error
+                    return original_loads(payload, *args, **kwargs)
+
+                with patch("app.services.quantastor_api.json.loads", new=fail_parse):
+                    with self.assertRaises(error_type) as raised:
+                        await self.fetch_transport(SyntheticTransport())
+                self.assertIs(raised.exception, error)
 
     async def test_fetch_all_real_client_success_preserves_all_sources(self):
         self.assert_bundle(await self.fetch_transport(SyntheticTransport()))

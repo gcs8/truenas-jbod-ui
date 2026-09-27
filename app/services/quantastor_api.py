@@ -177,6 +177,9 @@ class QuantastorRESTClient:
             # Limit codec lookup handling to decode, not unrelated client code.
             raise TrueNASAPIError(f"Quantastor endpoint {endpoint} returned an undecodable response.") from exc
 
+        # Do not retain the raw response alongside decoded text during parsing.
+        del body
+
         try:
             return json.loads(payload)
         except json.JSONDecodeError as exc:
