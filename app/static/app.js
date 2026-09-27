@@ -4483,8 +4483,8 @@
   }
 
   function computeAnnualizedBytes(totalBytes, powerOnHours, minimumHours = ANNUALIZED_MIN_POWER_ON_HOURS) {
-    const bytes = Number(totalBytes);
-    const hours = Number(powerOnHours);
+    const bytes = nullableMetricNumber(totalBytes);
+    const hours = nullableMetricNumber(powerOnHours);
     if (!Number.isFinite(bytes) || !Number.isFinite(hours) || hours < minimumHours || hours <= 0) {
       return null;
     }
@@ -4803,13 +4803,23 @@
     return [];
   }
 
+  function nullableMetricNumber(value) {
+    // Missing observations and non-numeric types must not become measured zero.
+    if (typeof value !== "number" && typeof value !== "string") {
+      return null;
+    }
+    if (typeof value === "string" && value.trim() === "") {
+      return null;
+    }
+    const numeric = Number(value);
+    return Number.isFinite(numeric) ? numeric : null;
+  }
+
   function heatmapSmartNumber(entry, fieldName, fallback = null) {
     if (!entry || !heatmapEntryOccupied(entry)) {
       return null;
     }
-    const value = entry.smartEntry?.data?.[fieldName] ?? fallback;
-    const numeric = Number(value);
-    return Number.isFinite(numeric) ? numeric : null;
+    return nullableMetricNumber(entry.smartEntry?.data?.[fieldName]) ?? nullableMetricNumber(fallback);
   }
 
   function heatmapMetricNumber(entry, fieldName, fallback = null, evaluation = null) {
@@ -4867,7 +4877,7 @@
   }
 
   function formatReadWriteRatioValue(value) {
-    const numeric = Number(value);
+    const numeric = nullableMetricNumber(value);
     if (!Number.isFinite(numeric)) {
       return "n/a";
     }
@@ -4885,7 +4895,7 @@
   }
 
   function roundHeatmapValue(value) {
-    const numeric = Number(value);
+    const numeric = nullableMetricNumber(value);
     if (!Number.isFinite(numeric)) {
       return "n/a";
     }
@@ -4916,7 +4926,7 @@
     const prepared = heatmapTimelineMetricSamples(entry, metricName)
       .map((sample) => ({
         timestampMs: sampleTimestampMs(sample),
-        value: Number(sample?.value),
+        value: nullableMetricNumber(sample?.value),
       }))
       .filter((sample) => Number.isFinite(sample.timestampMs) && Number.isFinite(sample.value))
       .sort((left, right) => left.timestampMs - right.timestampMs);
@@ -5154,7 +5164,7 @@
   }
 
   function countRisk(value, lowStep, highStep, highCap) {
-    const numeric = Number(value);
+    const numeric = nullableMetricNumber(value);
     if (!Number.isFinite(numeric) || numeric <= 0) {
       return 0;
     }
@@ -5196,8 +5206,8 @@
     }
 
     const temperature = heatmapSmartNumber(entry, "temperature_c", entry.slot?.temperature_c);
-    const warningTemp = Number(data.warning_temperature_c);
-    const criticalTemp = Number(data.critical_temperature_c);
+    const warningTemp = nullableMetricNumber(data.warning_temperature_c);
+    const criticalTemp = nullableMetricNumber(data.critical_temperature_c);
     if (Number.isFinite(temperature) && Number.isFinite(criticalTemp) && temperature >= criticalTemp) {
       score += 40;
       reasons.push(`at critical temp ${Math.round(temperature)} C`);
@@ -5224,8 +5234,8 @@
       reasons.push(`${roundHeatmapValue(tempDelta)} C over view avg`);
     }
 
-    const used = Number(data.endurance_used_percent);
-    const remaining = Number(data.endurance_remaining_percent);
+    const used = nullableMetricNumber(data.endurance_used_percent);
+    const remaining = nullableMetricNumber(data.endurance_remaining_percent);
     if (Number.isFinite(used) && used >= 90) {
       score += 35;
       reasons.push(`${Math.round(used)}% endurance used`);
@@ -5259,8 +5269,8 @@
       score += nonMediumRisk;
       reasons.push(`${data.non_medium_errors} non-medium errors`);
     }
-    const readErrorValue = Number.isFinite(Number(data.read_error_count)) ? data.read_error_count : data.uncorrected_read_errors;
-    const writeErrorValue = Number.isFinite(Number(data.write_error_count)) ? data.write_error_count : data.uncorrected_write_errors;
+    const readErrorValue = nullableMetricNumber(data.read_error_count) ?? nullableMetricNumber(data.uncorrected_read_errors);
+    const writeErrorValue = nullableMetricNumber(data.write_error_count) ?? nullableMetricNumber(data.uncorrected_write_errors);
     const readErrorRisk = countRisk(readErrorValue, 8, 10, 18);
     if (readErrorRisk) {
       score += readErrorRisk;
@@ -5376,7 +5386,7 @@
       const isEmptySlot = heatmapSlotState(entry) === "empty" || String(entry?.storageViewSlot?.state || "").toLowerCase() === "empty";
       const rawResult = isEmptySlot ? null : metric.value(entry, entries, evaluation);
       const value = typeof rawResult === "object" && rawResult !== null ? rawResult.value : rawResult;
-      const numericValue = value === null || value === undefined || value === "" ? null : Number(value);
+      const numericValue = nullableMetricNumber(value);
       const hasDiskIdentity = Boolean(entry?.slot?.device_name || entry?.slot?.serial || entry?.slot?.pool_name || entry?.storageViewSlot?.device_name || entry?.storageViewSlot?.serial || entry?.storageViewSlot?.pool_name);
       const reasons = typeof rawResult === "object" && rawResult !== null && Array.isArray(rawResult.reasons)
         ? rawResult.reasons
@@ -6759,19 +6769,19 @@
   }
 
   function formatHistoryMetricValue(metricName, value) {
-    if (!Number.isFinite(Number(value))) {
+    const numericValue = nullableMetricNumber(value);
+    if (numericValue === null) {
       return "n/a";
     }
-    const numericValue = Number(value);
     switch (metricName) {
       case "temperature_c":
         return `${numericValue} C`;
       case "bytes_read":
       case "bytes_written":
-        return formatMetricBytes(numericValue) || "n/a";
+        return numericValue === 0 ? "0 B" : formatMetricBytes(numericValue) || "n/a";
       case "annualized_bytes_read":
       case "annualized_bytes_written": {
-        const formatted = formatMetricBytes(numericValue);
+        const formatted = numericValue === 0 ? "0 B" : formatMetricBytes(numericValue);
         return formatted ? `${formatted}/yr` : "n/a";
       }
       case "power_on_hours": {
@@ -6785,7 +6795,7 @@
 
   function sortHistorySamplesAscending(samples) {
     return [...(samples || [])]
-      .filter((sample) => Number.isFinite(Number(sample?.value)))
+      .filter((sample) => Number.isFinite(nullableMetricNumber(sample?.value)))
       .sort((left, right) => new Date(left.observed_at).getTime() - new Date(right.observed_at).getTime());
   }
 
@@ -7606,10 +7616,10 @@
   }
 
   function formatHistoryRateValue(value) {
-    if (!Number.isFinite(Number(value))) {
+    const numericValue = nullableMetricNumber(value);
+    if (numericValue === null) {
       return "n/a";
     }
-    const numericValue = Number(value);
     if (numericValue === 0) {
       return "0 B/hr";
     }
@@ -7805,7 +7815,7 @@
   function buildHistoryChartScale(sampleGroups) {
     const samples = sampleGroups
       .flat()
-      .filter((sample) => Number.isFinite(Number(sample?.value)) && Number.isFinite(sampleTimestampMs(sample)));
+      .filter((sample) => Number.isFinite(nullableMetricNumber(sample?.value)) && Number.isFinite(sampleTimestampMs(sample)));
     if (!samples.length) {
       return null;
     }
