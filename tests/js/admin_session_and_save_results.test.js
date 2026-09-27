@@ -358,6 +358,30 @@ test("a network failure after the expiry marks admin stopped; before the expiry 
   assert.match(functionSource("fetchJson"), /fetchOrReportStopped\(/);
 });
 
+test("the one-second countdown tick shows the auto-stop warning on an idle page", () => {
+  const banner = new FakeElement({ classes: ["hidden"] });
+  const countdown = new FakeElement();
+  const state = { admin: { expires_at: new Date(Date.now() + 4 * 60 * 1000).toISOString() }, sessionStopped: false };
+  const { tickCountdown } = loadFunctions(
+    [...SESSION_FUNCTIONS, "tickCountdown"],
+    { state, elements: sparseElements({ sessionBanner: banner, countdown }), document: fakeDocument() },
+    SESSION_CONSTANTS
+  );
+
+  for (let tick = 0; tick < 5; tick += 1) {
+    tickCountdown();
+  }
+
+  assert.equal(banner.textContent, "This admin session stops in 4 minutes. Save your work.");
+  assert.ok(!banner.classList.contains("hidden"));
+  assert.ok(banner.classList.contains("is-warning"));
+
+  state.admin.expires_at = new Date(Date.now() - 1000).toISOString();
+  tickCountdown();
+
+  assert.match(banner.textContent, /^The auto-stop time has passed\./);
+});
+
 // Debug bundle exports never pause production by default.
 
 test("debug bundle export defaults to not pausing services in the template, the state payload, and the route", () => {

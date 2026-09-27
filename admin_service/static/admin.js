@@ -73,6 +73,7 @@
     runtimeActionControllers: new Map(),
     countdownTimerId: null,
     sessionStopped: false,
+    sessionBannerPhase: null,
     sudoersPreviewTimerId: null,
     sudoersPreviewRequestSeq: 0,
     liveEnclosuresRequestSeq: 0,
@@ -647,7 +648,16 @@
   }
 
   function tickCountdown() {
-    // Only the countdown changes between ticks; the rest of the hero is rendered by refreshes.
+    // Only the countdown and the auto-stop banner change between ticks; the rest of the hero is
+    // rendered by refreshes. The banner is re-synced only when its wording would change.
+    const remainingMs = sessionRemainingMs();
+    const bannerPhase = remainingMs === null || remainingMs > SESSION_WARNING_MS
+      ? "hidden"
+      : remainingMs <= 0 ? "passed" : String(Math.ceil(remainingMs / 60000));
+    if (state.sessionBannerPhase !== bannerPhase) {
+      state.sessionBannerPhase = bannerPhase;
+      syncSessionBanner();
+    }
     if (!elements.countdown) {
       return;
     }
