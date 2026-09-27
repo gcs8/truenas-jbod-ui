@@ -293,6 +293,7 @@ function bayGridContext(layout, { impactedSlots = [], emptySlots = [], layoutRow
     getSelectedProfile: () => ({ row_groups: layout.profile.rowGroups }),
     currentLayoutSlotCount: () => slots.length,
     activeLayoutRows: () => rows,
+    getSelectedStorageViewRuntime: () => null,
     buildViewProfile: () => layout.profile,
     sasFabricSelectedSlotSet: () => new Set(impactedSlots),
   };
@@ -329,6 +330,40 @@ test("impacted bays are lit inside the enclosure shape, everything else is a pla
   );
   assert.doesNotMatch(markup, /sas-fabric-bay-overflow/, "a layout-shaped grid has no +N overflow");
   assert.match(markup, /SYSTEM FRONT \/ LATCH EDGE|System front \/ latch edge/, "the edge cue is explicit");
+});
+
+test("with a storage view selected the grid still draws every bay of the enclosure", () => {
+  const layout = CSE_946;
+  const context = bayGridContext(layout, { impactedSlots: [46] });
+  const bootView = { id: "boot", kind: "boot_devices", slot_layout: [[0, 1]], slot_count: 2 };
+  context.state.layoutRows = layout.layoutRows;
+  context.state.snapshot.selected_profile = {
+    id: layout.profile.profileId,
+    edge_label: layout.profile.edgeLabel,
+    face_style: layout.profile.faceStyle,
+    latch_edge: layout.profile.latchEdge,
+    bay_size: layout.profile.baySize,
+    row_groups: layout.profile.rowGroups,
+  };
+  context.getSelectedStorageViewRuntime = () => bootView;
+  context.activeLayoutRows = () => bootView.slot_layout;
+  context.buildViewProfile = () => ({ edgeLabel: "Storage view", faceStyle: "boot-devices", rowGroups: [], slotCount: 2 });
+  const loaded = loadFunctions([...LAYOUT_FUNCTIONS, ...RENDER_FUNCTIONS], {
+    ...context,
+    document: { createElement: fakeElement },
+    grid: fakeElement("div"),
+  });
+  const markup = loaded.renderSasFabricBayChips([0, 46], 72);
+
+  assert.equal(
+    (markup.match(/sas-fabric-bay-chip/g) || []).length,
+    60,
+    "every bay of the enclosure is drawn, not the view's two slots"
+  );
+  assert.match(markup, /data-sas-fabric-slot="0"/);
+  assert.match(markup, /data-sas-fabric-slot="46"/, "a bay outside the view does not disappear");
+  assert.equal((markup.match(/class="sas-fabric-bay-row"/g) || []).length, 4, "the enclosure rows, not the view rows");
+  assert.match(markup, /System front \/ latch edge/, "the enclosure edge cue, not the view's");
 });
 
 test("a layout with gaps draws the gaps, not a shifted row", () => {

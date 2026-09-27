@@ -2050,8 +2050,11 @@
       return '<span class="sas-fabric-empty-note">No mapped bays</span>';
     }
     const selectedSlots = sasFabricSelectedSlotSet();
-    const viewProfile = buildViewProfile();
-    const layoutRows = activeLayoutRows();
+    // Fabric slots are physical bays; a storage view numbers its own slots, so
+    // draw the layout of the backing enclosure while a view is selected.
+    const storageView = getSelectedStorageViewRuntime();
+    const viewProfile = storageView ? (state.snapshot.selected_profile || null) : buildViewProfile();
+    const layoutRows = storageView ? (state.layoutRows || []) : activeLayoutRows();
     const geometry = buildChassisGeometry(viewProfile, layoutRows);
     const gridRows = buildLayoutGridRows(layoutRows, geometry);
     if (!gridRows.length) {
@@ -2067,7 +2070,7 @@
       `).join('<span class="sas-fabric-bay-divider" aria-hidden="true"></span>');
       return `<div class="sas-fabric-bay-row">${groups}</div>`;
     }).join("");
-    const edgeLabel = viewProfile?.edgeLabel || "System front";
+    const edgeLabel = viewProfile?.edgeLabel || viewProfile?.edge_label || "System front";
     return `
       <div class="sas-fabric-bay-layout" data-layout-mode="${escapeHtml(geometry.layoutMode)}" data-latch-edge="${escapeHtml(geometry.latchEdge)}">
         ${rowsMarkup}
