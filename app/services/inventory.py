@@ -6361,7 +6361,14 @@ class InventoryService:
         return {
             "candidate_id": candidate_id,
             "label": normalize_text(disk.serial) or normalize_text(device_names[0] if device_names else None) or "Inventory candidate",
-            "snapshot_slot": disk.slot if isinstance(disk.slot, int) else None,
+            # A BMC bay number without its enclosure can match a disk in another
+            # enclosure, so such a candidate takes the synthetic SMART path.
+            "snapshot_slot": (
+                disk.slot
+                if isinstance(disk.slot, int)
+                and not (disk.raw.get("platform") == "bmc" and normalize_text(disk.enclosure_id) is None)
+                else None
+            ),
             "snapshot_enclosure_id": normalize_text(disk.enclosure_id),
             "serial": disk.serial,
             "identifier": disk.identifier,

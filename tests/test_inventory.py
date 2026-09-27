@@ -4264,7 +4264,7 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
     def _ipmi_storage_view_service_with_candidates(
         self,
         temp_dir: str,
-        disks: list[tuple[str, int, str]],
+        disks: list[tuple[str | None, int, str]],
     ) -> InventoryService:
         system = SystemConfig(
             id="bmc-host",
@@ -4281,7 +4281,7 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
         runtime_slots = []
         for slot_index, (enclosure_id, slot, serial) in enumerate(disks):
             disk = DiskRecord(
-                raw={},
+                raw={"platform": "bmc"},
                 device_name=None,
                 path_device_name=None,
                 multipath_name=None,
@@ -4346,6 +4346,24 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
         self.assertIs(summary, expected_summary)
         synthetic_slot = service._get_slot_smart_summary_for_slot_view.await_args.args[0]
         self.assertEqual(synthetic_slot.serial, "SANITIZED-REAR-3")
+
+    def test_storage_view_slot_smart_summary_does_not_request_a_bay_without_an_enclosure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._ipmi_storage_view_service_with_candidates(
+                temp_dir,
+                [(None, 3, "SANITIZED-REAR-3")],
+            )
+            expected_summary = SmartSummaryView(available=True, power_on_hours=77)
+            service.get_slot_smart_summary = AsyncMock(return_value=SmartSummaryView(available=True, power_on_hours=1))
+            service._get_slot_smart_summary_for_slot_view = AsyncMock(return_value=expected_summary)
+
+            summary = asyncio.run(
+                service.get_storage_view_slot_smart_summary("rear-bays", 0, selected_enclosure_id="front-a")
+            )
+
+        service.get_slot_smart_summary.assert_not_awaited()
+        self.assertIs(summary, expected_summary)
+        self.assertEqual(service._get_slot_smart_summary_for_slot_view.await_args.args[0].serial, "SANITIZED-REAR-3")
 
     def test_storage_view_slot_smart_batch_keeps_only_same_enclosure_bays_on_the_enclosure_path(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
