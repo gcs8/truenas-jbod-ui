@@ -1276,7 +1276,7 @@ class S3TargetTests(_TempCase):
             client = self.clients[0]
             client.objects["jbod-ui/archive/full/a.bin"] = {"data": data, "meta": {}, "etag": "e"}
             client.get_object = lambda Bucket, Key: {"Body": body}
-            with self.assertRaisesRegex(ArchiveVerificationError, "larger than expected"):
+            with self.assertRaisesRegex(transport.ArchiveDownloadTooLargeError, "larger than expected"):
                 target.get("full/a.bin", local, limit=transport.CHUNK_SIZE + 1)
         self.assertEqual(sum(reads), transport.CHUNK_SIZE * 2)
         self.assertFalse(local.exists())

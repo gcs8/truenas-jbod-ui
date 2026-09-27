@@ -90,6 +90,10 @@ class ArchiveVerificationError(ArchiveTransportError):
     """The readback check did not match what was sent."""
 
 
+class ArchiveDownloadTooLargeError(ArchiveVerificationError):
+    """A download grew past the catalogued size, so it cannot match the catalogue."""
+
+
 class NfsUnmountError(ArchiveTransportError):
     """The NFS export could not be confirmed unmounted; the mount point was left in place."""
 
@@ -237,7 +241,7 @@ def _copy_stream(source: Any, write: Callable[[bytes], Any], limit: int | None =
 
 def _check_download_limit(size: int, limit: int | None) -> None:
     if limit is not None and size > limit:
-        raise ArchiveVerificationError("Archive download is larger than expected; stopped before the catalogue check.")
+        raise ArchiveDownloadTooLargeError("Archive download is larger than expected; stopped before the catalogue check.")
 
 
 def _hash_stream(source: Any) -> tuple[int, str]:

@@ -661,6 +661,13 @@ class SchedulerTests(SchedulerTestBase):
         with self.assertRaisesRegex(ArchiveVerificationError, "larger than expected"), scheduler.materialize(remote.artifact_id):
             pass
         self.assertEqual(list(self._paths.state_dir.glob("backup-fetch-*")), [])
+        # A copy that grew past the cap no longer matches the catalogue, so verify
+        # must stop counting it as verified, like any other integrity mismatch.
+        self.assertTrue(scheduler.catalog.get(remote.artifact_id).verified)
+        failed = scheduler.verify(remote.artifact_id)
+        self.assertFalse(failed["ok"])
+        self.assertFalse(failed["artifact"]["verified"])
+        self.assertFalse(failed["artifact"]["restorable"])
 
     def test_start_run_reserves_before_returning(self) -> None:
         import threading
