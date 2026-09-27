@@ -713,6 +713,16 @@ class DiskRecord:
     lookup_keys: set[str]
 
 
+@dataclass(slots=True)
+class _QuantastorCliDiskHints:
+    # One bit per normalized identity group, not per row. Equal identities
+    # always have the same admission/rank for every primary disk. Different
+    # identities imply different payloads, so multiple winning bits conflict.
+    groups: list[tuple[dict[str, Any], bool]] = field(default_factory=list)
+    values: dict[tuple[str, str], int] = field(default_factory=dict)
+    populated: dict[str, int] = field(default_factory=dict)
+
+
 @dataclass(frozen=True, slots=True)
 class DiskResolution:
     disk: DiskRecord | None
@@ -7447,6 +7457,11 @@ class InventoryService:
                         "devicePath", "altDevicePath", "deviceName", "device", "name",
                         "storageSystemId", "systemId", "iofenceSystemId", "controllerId",
                     }}
+                # A missing primary SAS field is not corroboration. Preserve the
+                # CLI observation below for details, but do not promote it into
+                # the raw fields consumed by bay identity and slot candidates.
+                cli_hint = {key: value for key, value in cli_hint.items()
+                            if key not in {"sasAddress", "portSasAddress"}}
                 merged_raw = self._merge_quantastor_payloads(cli_hint, merged_raw)
                 merged_raw["quantastor_cli_disk"] = cli_evidence
                 for value in (
@@ -7739,22 +7754,37 @@ class InventoryService:
     def _build_quantastor_cli_disk_hints(
         cls,
         rows: list[dict[str, Any]],
-    ) -> dict[tuple[str, ...], list[dict[str, Any]]]:
-        hints: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+    ) -> _QuantastorCliDiskHints:
+        hints = _QuantastorCliDiskHints()
+        group_ids: dict[tuple[frozenset[str], ...], int] = {}
         for row in rows:
             identity = cls._quantastor_cli_identity(row)
-            keys = {(kind, value) for kind in ("id", "serial", "wwn", "scsiId", "wwid", "eui64") for value in identity[kind]}
-            # Device aliases are node-local, including their /dev-less spelling.
-            keys.update(("path", owner, path) for owner in identity["owner"] for path in identity["path"])
-            for key in keys:
-                hints.setdefault(key, []).append(row)
+            if len(identity["serial"]) > 1:
+                continue
+            signature = tuple(frozenset(values) for values in identity.values())
+            if signature in group_ids:
+                index = group_ids[signature]
+                representative, differs = hints.groups[index]
+                # Preserve sticky payload ambiguity, once per identity group.
+                hints.groups[index] = (representative, differs or not row == representative)
+                continue
+            index = len(hints.groups)
+            group_ids[signature] = index
+            hints.groups.append((row, False))
+            bit = 1 << index
+            for kind, values in identity.items():
+                if values:
+                    hints.populated[kind] = hints.populated.get(kind, 0) | bit
+                for value in values:
+                    key = (kind, value)
+                    hints.values[key] = hints.values.get(key, 0) | bit
         return hints
 
     @classmethod
     def _resolve_quantastor_cli_disk_hint(
         cls,
         disk: dict[str, Any],
-        hints: dict[tuple[str, ...], list[dict[str, Any]]],
+        hints: _QuantastorCliDiskHints,
     ) -> dict[str, Any] | None:
         identity = cls._quantastor_cli_identity(disk)
         # Serial spellings are fallbacks for the same physical property. Missing
@@ -7764,38 +7794,39 @@ class InventoryService:
         physical_kinds = ("serial", "wwn", "scsiId", "wwid", "eui64")
         # SAS hints may veto enrichment but do not grant new match authority.
         contradiction_kinds = (*physical_kinds, "sasAddress", "portSasAddress")
-        keys = {(kind, value) for kind in ("id", *physical_kinds) for value in identity[kind]}
-        keys.update(("path", owner, path) for owner in identity["owner"] for path in identity["path"])
-        candidates = {id(row): row for key in keys for row in hints.get(key, [])}
-        ranked: dict[tuple[int, bool], tuple[dict[str, Any], bool]] = {}
-        for row in candidates.values():
-            other = cls._quantastor_cli_identity(row)
-            if len(other["serial"]) > 1 or any(
-                identity[kind] and other[kind] and identity[kind].isdisjoint(other[kind])
-                for kind in contradiction_kinds
-            ):
+        matches: dict[str, int] = {}
+        for kind, values in identity.items():
+            mask = 0
+            for value in values:
+                mask |= hints.values.get((kind, value), 0)
+            matches[kind] = mask
+        id_matches = matches["id"]
+        physical_matches = 0
+        for kind in physical_kinds:
+            physical_matches |= matches[kind]
+        same_owner = matches["owner"]
+        path_matches = same_owner & matches["path"]
+        if identity["id"]:
+            path_matches &= ~hints.populated.get("id", 0)
+        candidates = id_matches | physical_matches | path_matches
+        for kind in contradiction_kinds:
+            if identity[kind]:
+                candidates &= ~(hints.populated.get(kind, 0) & ~matches[kind])
+        # Work on precomputed identity buckets, never rescan or renormalize a
+        # shared serial bucket for every REST disk. Bit operations scale with
+        # index width; this is not a fixed CPU/memory bound or a row cap.
+        for authority in (id_matches, physical_matches, path_matches):
+            ranked = candidates & authority
+            if not ranked:
                 continue
-            id_match = bool(identity["id"] & other["id"])
-            physical_match = any(identity[kind] & other[kind] for kind in physical_kinds)
-            same_owner = bool(identity["owner"] & other["owner"])
-            if not id_match and not physical_match:
-                if not same_owner or not identity["path"] & other["path"]:
-                    continue
-                if identity["id"] and other["id"]:
-                    continue
-            rank = (2 if id_match else 1 if physical_match else 0, same_owner)
-            if rank not in ranked:
-                ranked[rank] = (row, False)
-            else:
-                representative, differs = ranked[rank]
-                # Once a rank conflicts, later duplicates cannot resolve it.
-                # Compare at most once per row, not against every prior peer.
-                ranked[rank] = (representative, differs or not row == representative)
-        if not ranked:
-            return None
-        representative, differs = ranked[max(ranked)]
-        # Equal authority with different payloads is unresolved, not first-wins.
-        return None if differs else representative
+            local = ranked & same_owner
+            winning = local or ranked
+            if winning & (winning - 1):
+                return None
+            representative, differs = hints.groups[winning.bit_length() - 1]
+            # A conflict at the best rank cannot fall back to a weaker rank.
+            return None if differs else representative
+        return None
 
     def _build_quantastor_pool_slot_hints(
         self,
@@ -13240,6 +13271,12 @@ class InventoryService:
 
         for payload in raw_sources:
             for key in ("sasAddress", "portSasAddress", "scsiId", "wwid", "wwn"):
+                # Retained CLI disk rows are diagnostic evidence. Their SAS
+                # fields have no independent bay authority, including when the
+                # corresponding primary field is absent. Corroborated values
+                # remain available from the primary/hardware payloads above.
+                if payload is disk.raw.get("quantastor_cli_disk") and key in {"sasAddress", "portSasAddress"}:
+                    continue
                 value = payload.get(key)
                 sources.append(str(value) if value is not None else None)
 
