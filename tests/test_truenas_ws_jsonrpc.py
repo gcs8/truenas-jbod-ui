@@ -8,6 +8,8 @@ from unittest.mock import patch
 
 from pydantic import ValidationError
 
+from tests import test_truenas_ws as ddp_tests
+
 from app.config import TrueNASConfig
 from app.services.truenas_ws import (
     TrueNASAPIBusyError,
@@ -283,6 +285,14 @@ class JsonRpcTransportTests(unittest.IsolatedAsyncioTestCase):
         client = TrueNASWebsocketClient(TrueNASConfig(host="https://jsonrpc.invalid", api_key="token"))
 
         self.assertEqual(client._endpoint_url(), "wss://jsonrpc.invalid/websocket")
+
+
+class JsonRpcNormalOperationDeadlineTests(ddp_tests.NormalOperationDeadlineChecks, unittest.IsolatedAsyncioTestCase):
+    dialect = "jsonrpc"
+
+
+class JsonRpcRealWebsocketCloseTests(ddp_tests.RealWebsocketCloseChecks, unittest.IsolatedAsyncioTestCase):
+    dialect = "jsonrpc"
 
 
 if __name__ == "__main__":
