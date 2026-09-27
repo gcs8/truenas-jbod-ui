@@ -19,6 +19,7 @@ last result per class and per target; the main UI reads it for ``/healthz``.
 from __future__ import annotations
 
 import contextlib
+import copy
 import errno
 import hashlib
 import json
@@ -26,6 +27,7 @@ import logging
 import os
 import re
 import secrets
+import sqlite3
 import stat
 import tempfile
 import threading
@@ -45,6 +47,7 @@ from history_service.backup_archive.catalog import (
     ArtifactCatalog,
     ArtifactRecord,
     new_artifact_id,
+    validate_record,
 )
 from history_service.backup_archive.cron import CronSchedule
 from history_service.backup_archive.journal import ChangeJournal, ConfigBackupCoalescer, CoalescerResult
@@ -59,7 +62,7 @@ from history_service.backup_archive.policy import (
     BackupPolicy,
     validate_filesystem_target_roots,
 )
-from history_service.backup_archive.transport import open_target, transport_encrypted
+from history_service.backup_archive.transport import LocalDirectoryTarget, open_target, transport_encrypted
 from history_service.scheduled_backup import ScheduledBackupRunner
 
 logger = logging.getLogger(__name__)
@@ -185,7 +188,12 @@ class BackupScheduler:
         paths.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.catalog = ArtifactCatalog(paths.state_dir / "catalog.sqlite3")
         self._meta_path = paths.state_dir / "artifact-meta.json"
-        self._meta: dict[str, dict[str, Any]] = self._load_meta()
+        try:
+            self._meta: dict[str, dict[str, Any]] = self._load_meta()
+            self._recover_publications()
+        except BaseException:
+            self.catalog.close()
+            raise
         self._load_status()
         self.journal: ChangeJournal | None = None
         self.coalescer: ConfigBackupCoalescer | None = None
@@ -207,21 +215,159 @@ class BackupScheduler:
     def _load_meta(self) -> dict[str, dict[str, Any]]:
         try:
             payload = json.loads(self._meta_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        except FileNotFoundError:
             return {}
-        return payload if isinstance(payload, dict) else {}
+        # This file also holds publication ownership. Corruption or unreadable
+        # state must not turn pending generations into apparently foreign files.
+        if not isinstance(payload, dict) or any(not isinstance(meta, dict) for meta in payload.values()):
+            raise ValueError("Backup artifact metadata is invalid.")
+        return payload
+
+    def _metadata_snapshot(self, artifact_id: str | None = None) -> dict[str, Any]:
+        # Nested groups, verification results and publication identities must not
+        # remain aliases into live state after the lock is released.
+        with self._state_lock:
+            metadata = self._meta if artifact_id is None else self._meta.get(artifact_id) or {}
+            return copy.deepcopy(metadata)
 
     def _save_meta(self) -> None:
-        temporary = self._meta_path.with_name(f".{self._meta_path.name}.{uuid.uuid4().hex}.tmp")
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        # Serialize snapshots through rename and directory durability, so a
+        # concurrent verification cannot replace a newer ownership intent.
+        with self._state_lock:
+            temporary = self._meta_path.with_name(f".{self._meta_path.name}.{uuid.uuid4().hex}.tmp")
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                    json.dump(self._meta, handle, sort_keys=True)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, self._meta_path)
+                descriptor = os.open(self._meta_path.parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+            finally:
+                temporary.unlink(missing_ok=True)
+
+    def _remember_publication(
+        self, artifact_id: str, backup_class: str, created_at: datetime,
+        change_ids: tuple[str, ...], temporary: Path, target: Path,
+    ) -> None:
+        """Reuse private artifact metadata as a pre-publication ownership intent."""
+        metadata = temporary.lstat()
+        parent = target.parent.stat()
+        size, digest = _hash_file(temporary)
+        artifact_meta = {
+            "publication": {
+                "backup_class": backup_class,
+                "name": f"{backup_class}/{target.name}",
+                "created_at": _iso(created_at),
+                "size": size,
+                "sha256": digest,
+                "change_ids": list(change_ids),
+                "device": metadata.st_dev,
+                "inode": metadata.st_ino,
+                "parent_device": parent.st_dev,
+                "parent_inode": parent.st_ino,
+            },
+            "history_replacement": False,
+        }
+        with self._state_lock:
+            self._meta[artifact_id] = artifact_meta
+            self._save_meta()
+
+    def _pending_publications(self, metadata: Mapping[str, Any] | None = None) -> list[ArtifactRecord]:
+        if metadata is None:
+            metadata = self._metadata_snapshot()
+        records = []
+        for artifact_id, meta in metadata.items():
+            intent = meta.get("publication")
+            if intent is None:
+                continue
+            try:
+                record = validate_record(ArtifactRecord(
+                    artifact_id=artifact_id, backup_class=intent["backup_class"],
+                    location=LOCAL_LOCATION, name=intent["name"],
+                    created_at=datetime.fromisoformat(intent["created_at"]),
+                    size=intent["size"], sha256=intent["sha256"], verified=False,
+                    change_ids=tuple(intent["change_ids"]), preserved=True,
+                    preserve_reason="Interrupted publication; verify before releasing preservation.",
+                    preserved_by="scheduler-recovery",
+                ))
+                if record.name.split("/")[:1] != [record.backup_class] or len(record.name.split("/")) != 2:
+                    raise ValueError("Invalid publication path")
+                for key in ("device", "inode", "parent_device", "parent_inode"):
+                    if type(intent[key]) is not int or intent[key] < 0:
+                        raise ValueError("Invalid publication identity")
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("Backup publication ownership metadata is invalid.") from exc
+            records.append(record)
+        return records
+
+    def _publication_matches(self, record: ArtifactRecord, intent: Mapping[str, Any]) -> bool:
+        path = self._local_path(record)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                json.dump(self._meta, handle, sort_keys=True)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, self._meta_path)
+            parent = os.fstat(directory)
+            if (parent.st_dev, parent.st_ino) != (intent["parent_device"], intent["parent_inode"]):
+                return False
+            descriptor = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+            try:
+                metadata = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
+                    or metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) != 0o600
+                    or (metadata.st_dev, metadata.st_ino) != (intent["device"], intent["inode"])
+                    or metadata.st_size != record.size
+                ):
+                    return False
+                digest = hashlib.sha256()
+                remaining = record.size
+                while remaining:
+                    chunk = os.read(descriptor, min(_COPY_CHUNK, remaining))
+                    if not chunk:
+                        return False
+                    remaining -= len(chunk)
+                    digest.update(chunk)
+                return (
+                    not os.read(descriptor, 1) and digest.hexdigest() == record.sha256
+                    and self._snapshot_identity(os.fstat(descriptor)) == self._snapshot_identity(metadata)
+                    and self._snapshot_identity(os.stat(path.name, dir_fd=directory, follow_symlinks=False))
+                    == self._snapshot_identity(metadata)
+                )
+            finally:
+                os.close(descriptor)
         finally:
-            temporary.unlink(missing_ok=True)
+            os.close(directory)
+
+    def _recover_publications(self) -> None:
+        # Only exact intents are considered. Never enumerate or adopt files by
+        # filename. Recovered copies remain pinned and unverified, so interrupted
+        # directory barriers cannot supply replacement/retention credit.
+        metadata = self._metadata_snapshot()
+        pending = self._pending_publications(metadata)
+        if not pending:
+            return
+        deleted = {item.record.artifact_id for item in self.catalog.tombstones(location=LOCAL_LOCATION)}
+        for record in pending:
+            intent = metadata[record.artifact_id]["publication"]
+            try:
+                if self.catalog.get(record.artifact_id) is None and record.artifact_id not in deleted:
+                    if not self._publication_matches(record, intent):
+                        continue
+                    self.catalog.add(record)
+                with self._state_lock:
+                    self._meta[record.artifact_id].pop("publication")
+                    try:
+                        self._save_meta()
+                    except (OSError, ValueError, sqlite3.Error):
+                        # Restore under the same lock if clearing did not persist.
+                        # A catalog record or tombstone still wins on startup.
+                        self._meta[record.artifact_id]["publication"] = intent
+                        raise
+            except (OSError, ValueError, sqlite3.Error) as exc:
+                logger.warning("Backup publication recovery remains pending (%s).", type(exc).__name__)
 
     def _load_status(self) -> None:
         if self.paths.status_file is None:
@@ -256,13 +402,14 @@ class BackupScheduler:
         ):
             return None
         record = self.catalog.get(artifact_id)
+        meta = self._metadata_snapshot(artifact_id)
         if (
             record is None
             or record.backup_class != "full"
             or record.location != LOCAL_LOCATION
             or not record.verified
-            or self.artifact_state(record) != "ok"
-            or (self._meta.get(record.artifact_id) or {}).get("history_replacement") is not True
+            or self._artifact_state(record, meta) != "ok"
+            or meta.get("history_replacement") is not True
             or _iso(record.created_at) != created_at
         ):
             return None
@@ -433,7 +580,7 @@ class BackupScheduler:
         with self._job(backup_class):
             return self._run_class(backup_class, ())
 
-    def _runner(self, backup_class: str) -> Any:
+    def _runner(self, backup_class: str, *, before_publish: Callable[[Path, Path], None]) -> Any:
         status_file = (
             self.paths.full_status_file
             if backup_class == "full" and self.paths.full_status_file is not None
@@ -449,17 +596,24 @@ class BackupScheduler:
             app_gid=self.app_gid,
             clock=self._clock,
             apply_retention=False,
+            before_publish=before_publish,
             archive_format=self.policy.full.archive_format if backup_class == "full" else "7z",
         )
 
     def _run_class(self, backup_class: str, change_ids: tuple[str, ...]) -> ArtifactRecord:
         started = self._clock()
+        artifact_id = new_artifact_id()
         try:
-            runner = self._runner(backup_class)
+            runner = self._runner(
+                backup_class,
+                before_publish=lambda temporary, target: self._remember_publication(
+                    artifact_id, backup_class, started, change_ids, temporary, target
+                ),
+            )
             status = runner.run_once()
             name = f"{backup_class}/{status['last_artifact_name']}"
             record = ArtifactRecord(
-                artifact_id=new_artifact_id(),
+                artifact_id=artifact_id,
                 backup_class=backup_class,  # type: ignore[arg-type]
                 location=LOCAL_LOCATION,
                 name=name,
@@ -476,8 +630,9 @@ class BackupScheduler:
             manifest = getattr(runner, "last_manifest", None) or {}
             artifact_meta = _manifest_meta(manifest, self.groups[backup_class])
             artifact_meta["history_replacement"] = can_replace_history
-            self._meta[record.artifact_id] = artifact_meta
-            self._save_meta()
+            with self._state_lock:
+                self._meta[record.artifact_id] = artifact_meta
+                self._save_meta()
             if can_replace_history:
                 with self._state_lock:
                     self._status["verified_full"] = {
@@ -581,6 +736,7 @@ class BackupScheduler:
         )
 
     def _verified_local_full_count(self) -> int:
+        metadata = self._metadata_snapshot()
         return sum(
             1
             for artifact in self.catalog.list(
@@ -588,9 +744,9 @@ class BackupScheduler:
                 location=LOCAL_LOCATION,
             )
             if (
-                (self._meta.get(artifact.artifact_id) or {}).get("history_replacement")
+                (metadata.get(artifact.artifact_id) or {}).get("history_replacement")
                 is True
-                and self.artifact_state(artifact) == "ok"
+                and self._artifact_state(artifact, metadata.get(artifact.artifact_id) or {}) == "ok"
             )
         )
 
@@ -696,13 +852,18 @@ class BackupScheduler:
         # Recheck immediately before every operation. This catches a symlink or
         # bind-visible alias introduced after startup, before copy or retention
         # receives a second catalog identity for local bytes.
-        validate_filesystem_target_roots((target,), self.paths.local_dir)
+        if target.settings.provider == "filesystem":
+            validate_filesystem_target_roots(self.policy.targets, self.paths.local_dir)
         opened = (
             self._open_target(target.settings, local_archive_root=self.paths.local_dir)
             if self._open_target_is_default
             else self._open_target(target.settings)
         )
         with opened as remote:
+            if target.settings.provider == "filesystem" and isinstance(remote, LocalDirectoryTarget):
+                remote.before_mutation = lambda: validate_filesystem_target_roots(
+                    self.policy.targets, self.paths.local_dir
+                )
             yield remote
 
     def _ship(self, record: ArtifactRecord) -> list[str]:
@@ -727,8 +888,9 @@ class BackupScheduler:
                     change_ids=record.change_ids,
                 )
                 self.catalog.add(remote_record)
-                self._meta[remote_record.artifact_id] = dict(self._meta.get(record.artifact_id) or {})
-                self._save_meta()
+                with self._state_lock:
+                    self._meta[remote_record.artifact_id] = self._metadata_snapshot(record.artifact_id)
+                    self._save_meta()
                 self._record_target(target.target_id, RunRecord(at=at, ok=True, artifact_id=remote_record.artifact_id))
             except Exception as exc:  # noqa: BLE001 - one target failing must not stop the others
                 logger.warning("Remote backup copy to %s failed (%s).", target.target_id, type(exc).__name__)
@@ -824,7 +986,9 @@ class BackupScheduler:
         return record
 
     def artifact_state(self, record: ArtifactRecord) -> str:
-        meta = self._meta.get(record.artifact_id) or {}
+        return self._artifact_state(record, self._metadata_snapshot(record.artifact_id))
+
+    def _artifact_state(self, record: ArtifactRecord, meta: Mapping[str, Any]) -> str:
         schema = meta.get("schema_version")
         if schema is not None and schema not in (1, 2):
             return "unsupported"
@@ -840,8 +1004,10 @@ class BackupScheduler:
         return "ok"
 
     def serialize(self, record: ArtifactRecord) -> dict[str, Any]:
-        meta = self._meta.get(record.artifact_id) or {}
-        state = self.artifact_state(record)
+        return self._serialize(record, self._metadata_snapshot(record.artifact_id))
+
+    def _serialize(self, record: ArtifactRecord, meta: Mapping[str, Any]) -> dict[str, Any]:
+        state = self._artifact_state(record, meta)
         return {
             "id": record.artifact_id,
             "backup_class": record.backup_class,
@@ -861,7 +1027,8 @@ class BackupScheduler:
 
     def detail(self, artifact_id: str) -> dict[str, Any]:
         record = self.get(artifact_id)
-        payload = self.serialize(record)
+        meta = self._metadata_snapshot(record.artifact_id)
+        payload = self._serialize(record, meta)
         entries: dict[str, Any] = {}
         if record.change_ids and self.paths.journal_path.exists():
             try:
@@ -878,7 +1045,6 @@ class BackupScheduler:
             }
             for change_id in record.change_ids
         ]
-        meta = self._meta.get(record.artifact_id) or {}
         payload["inspect"] = (
             {
                 "groups": meta.get("groups") or [],
@@ -894,7 +1060,22 @@ class BackupScheduler:
         return payload
 
     def library(self) -> dict[str, Any]:
-        records = self.catalog.list()
+        # Prevent intent clearing between the catalog read and metadata copy.
+        # Lock order is state -> catalog; catalog methods never acquire state.
+        # Validation and filesystem inspection below use only the detached copy.
+        with self._state_lock:
+            records = self.catalog.list()
+            metadata = self._metadata_snapshot()
+            deleted = (
+                {item.record.artifact_id for item in self.catalog.tombstones(location=LOCAL_LOCATION)}
+                if any(meta.get("publication") is not None for meta in metadata.values()) else set()
+            )
+        known = {record.artifact_id for record in records}
+        pending_publications = self._pending_publications(metadata)
+        if pending_publications:
+            known.update(deleted)
+            pending_publications = [record for record in pending_publications if record.artifact_id not in known]
+        records.extend(pending_publications)
         storage: dict[str, dict[str, int]] = {}
         for record in records:
             bucket = storage.setdefault(record.location, {"config_bytes": 0, "full_bytes": 0, "count": 0})
@@ -913,7 +1094,10 @@ class BackupScheduler:
         full = self.policy.full
         return {
             "available": True,
-            "detail": None,
+            "detail": (
+                "Interrupted backup publications require recovery; pending sizes are recorded intent sizes."
+                if pending_publications else None
+            ),
             "running": self.running,
             "classes": {
                 "config": {
@@ -947,7 +1131,10 @@ class BackupScheduler:
                 }
                 for target in self.policy.targets
             ],
-            "artifacts": [self.serialize(record) for record in reversed(records)],
+            "artifacts": [
+                self._serialize(record, metadata.get(record.artifact_id) or {})
+                for record in reversed(records)
+            ],
             "storage": storage,
         }
 
@@ -1014,9 +1201,10 @@ class BackupScheduler:
             detail = str(exc)
         except Exception as exc:  # noqa: BLE001 - e.g. target unreachable; state unknown, keep flag
             detail = describe_error(exc)
-        meta = self._meta.setdefault(artifact_id, {})
-        meta["last_verify"] = {"at": at, "ok": ok, "detail": detail}
-        self._save_meta()
+        with self._state_lock:
+            meta = self._meta.setdefault(artifact_id, {})
+            meta["last_verify"] = {"at": at, "ok": ok, "detail": detail}
+            self._save_meta()
         # Re-publish (or clear) verified_full from the catalog's current flag so
         # the history sidecar never suppresses its own copy after a failed
         # readback of the replacement artifact.
