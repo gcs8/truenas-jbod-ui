@@ -74,6 +74,8 @@ BACKUP_CLASSES = ("config", "full")
 HISTORY_GROUP = "history_db"
 HISTORY_REPLACEMENT_COPIES = 14
 _COPY_CHUNK = 1024 * 1024
+# Marks the synthetic config run recorded when the change journal cannot be read.
+JOURNAL_CHECK_PREFIX = "Config changes could not be checked: "
 
 
 class SchedulerBusyError(RuntimeError):
@@ -108,6 +110,15 @@ def config_group_keys(all_backup_groups: tuple[str, ...], history_group: str) ->
     """Config class = every default backup group except the history database."""
 
     return [key for key in all_backup_groups if key != history_group]
+
+
+def _is_journal_check_record(record: Any) -> bool:
+    return (
+        isinstance(record, dict)
+        and record.get("ok") is False
+        and isinstance(record.get("detail"), str)
+        and record["detail"].startswith(JOURNAL_CHECK_PREFIX)
+    )
 
 
 @dataclass
@@ -191,6 +202,10 @@ class BackupScheduler:
         self.coalescer: ConfigBackupCoalescer | None = None
         self._coalescer_error: str | None = None
         self._coalescer_prior_run: dict[str, Any] | None = None
+        stored = self._status["classes"].get("config")
+        if _is_journal_check_record(stored):
+            # A check failure restored from the status file is never the last real run.
+            self._coalescer_error = stored["detail"]
         if policy.config.enabled:
             self.journal = ChangeJournal(paths.journal_path, file_mode=0o660)
             self.coalescer = ConfigBackupCoalescer(
@@ -328,11 +343,12 @@ class BackupScheduler:
             try:
                 result: CoalescerResult = self.coalescer.tick()
             except Exception as exc:  # noqa: BLE001 - recorded in status; full backups still run
-                detail = f"Config changes could not be checked: {describe_error(exc)}"[:MAX_DETAIL_CHARS]
+                detail = f"{JOURNAL_CHECK_PREFIX}{describe_error(exc)}"[:MAX_DETAIL_CHARS]
                 if detail != self._coalescer_error:
                     if self._coalescer_error is None:
                         with self._state_lock:
-                            self._coalescer_prior_run = self._status["classes"].get("config")
+                            prior = self._status["classes"].get("config")
+                            self._coalescer_prior_run = None if _is_journal_check_record(prior) else prior
                     self._coalescer_error = detail
                     logger.error("%s", detail)
                     self._record_class("config", RunRecord(at=_iso(self._clock()) or "", ok=False, detail=detail))

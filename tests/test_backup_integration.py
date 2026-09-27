@@ -627,6 +627,26 @@ class SchedulerTests(SchedulerTestBase):
         scheduler.tick()  # readable again: the check failure is withdrawn
         self.assertIsNone(scheduler.library()["classes"]["config"]["last_run"])
 
+    def test_journal_check_failure_persisted_across_restart_is_withdrawn_once_readable(self) -> None:
+        from history_service.backup_archive.journal import JournalError
+
+        policy = {"config": {"enabled": True}, "full": {"enabled": True, "schedule": "0 * * * *"}}
+        self.now = datetime(2026, 9, 24, 13, 0, tzinfo=UTC)
+        with patch.object(ChangeJournal, "pending", side_effect=JournalError("journal is not a regular file")):
+            scheduler = self.make(policy)
+            scheduler.tick()
+            scheduler.close()
+            # Still unreadable after a restart: the stored check failure is not
+            # taken for the last real run.
+            scheduler = self.make(policy)
+            scheduler.tick()
+        self.assertIn("journal is not a regular file", scheduler.library()["classes"]["config"]["last_run"]["detail"])
+        scheduler.close()
+        scheduler = self.make(policy)
+        scheduler.tick()  # readable again after a restart
+        self.assertIsNone(scheduler.library()["classes"]["config"]["last_run"])
+        self.assertNotIn("config", json.loads(self._paths.status_file.read_text())["classes"])
+
     def test_plan_token_preserve_verify_and_remote_materialize(self) -> None:
         scheduler = self.make({"full": {"enabled": True, "local_keep": 1, "remote_keep": 1}, "targets": [TARGET]})
         first = scheduler.run_now("full")
