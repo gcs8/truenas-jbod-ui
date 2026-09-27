@@ -1235,6 +1235,299 @@ class InventorySessionRunnerShutdownTests(unittest.TestCase):
             self.assertFalse(service._disk_inventory_sync_lock.locked())
 
 
+class ConnectionAdmissionTests(unittest.IsolatedAsyncioTestCase):
+    """Cancellation observed during preparation must stop the next SSH phase."""
+
+    entries = ("single", "batch", "planned", "groups", "session")
+
+    async def exercise_admission(self, entry, *, phase="host_keys", cancel=True, strict=True):
+        from app.services import ssh_probe as ssh
+
+        preparing = threading.Event()
+        release = threading.Event()
+        interrupted = threading.Event()
+        tokens = []
+        trace = []
+        case = self
+        synthetic_path = "/synthetic-only/known-hosts-not-opened"
+
+        def pause():
+            trace.append("preparation")
+            preparing.set()
+            if not release.wait(3):
+                raise AssertionError("preparation barrier was not released")
+
+        class Transport:
+            def auth_interactive(self, user, handler):
+                client.auth_calls += 1
+                trace.append("auth")
+                client.connected = True
+
+            def is_authenticated(self):
+                return client.connected
+
+            def is_active(self):
+                return client.connected
+
+        class Client:
+            connected = False
+            connect_calls = 0
+            auth_calls = 0
+            command_calls = 0
+
+            def load_host_keys(self, path):
+                case.assertEqual(path, synthetic_path)
+                case.assertIn(self, tokens[0]._clients)
+                if phase == "host_keys":
+                    pause()
+
+            def set_missing_host_key_policy(self, policy):
+                case.assertIsInstance(policy, paramiko.RejectPolicy if strict else AutoPinHostKeyPolicy)
+
+            def connect(self, **kwargs):
+                self.connect_calls += 1
+                trace.append("connect")
+                case.assertFalse(kwargs["allow_agent"])
+                case.assertFalse(kwargs["look_for_keys"])
+                case.assertIsNone(kwargs["key_filename"])
+                self.connected = True
+                if phase != "host_keys":
+                    if phase == "connect":
+                        pause()
+                    raise paramiko.BadAuthenticationType("synthetic auth fallback", ["keyboard-interactive"])
+
+            def get_transport(self):
+                if phase == "fallback" and not self.auth_calls:
+                    pause()
+                return transport
+
+            def exec_command(self, command, timeout):
+                self.command_calls += 1
+                case.assertTrue(self.connected)
+                return _memory_streams()
+
+            def close(self):
+                trace.append("close")
+                self.connected = False
+
+        client = Client()
+        transport = Transport()
+        register = ssh._WorkerCancellation.register
+        interrupt = ssh._WorkerCancellation.interrupt
+
+        def observe_register(token, target):
+            if token not in tokens:
+                tokens.append(token)
+            return register(token, target)
+
+        def observe_interrupt(token):
+            try:
+                return interrupt(token)
+            finally:
+                trace.append("interrupt_done")
+                interrupted.set()
+
+        async def wait_for(event):
+            async with asyncio.timeout(2):
+                while not event.is_set():
+                    await asyncio.sleep(0.001)
+
+        probe = SSHProbe(SSHConfig(
+            enabled=True, host="host.example.test", user="operator", key_path="",
+            password="" if phase == "host_keys" else "synthetic-password",
+            known_hosts_path=synthetic_path, strict_host_key_checking=strict,
+        ))
+        session = probe.open_session() if entry == "session" else None
+        original_is_file = Path.is_file
+        loop_errors = []
+        loop = asyncio.get_running_loop()
+        old_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+        self.addCleanup(loop.set_exception_handler, old_handler)
+        with patch.object(ssh.paramiko, "SSHClient", return_value=client), patch.object(
+            ssh._WorkerCancellation, "register", observe_register,
+        ), patch.object(ssh._WorkerCancellation, "interrupt", observe_interrupt), patch.object(
+            Path, "is_file", lambda path: True if str(path) == synthetic_path else original_is_file(path),
+        ), patch.object(probe, "_prepare_known_hosts_path", return_value=synthetic_path):
+            if entry == "single":
+                call = probe.run_command("true")
+            elif entry == "batch":
+                call = probe.run_commands(["true"])
+            elif entry == "planned":
+                call = probe.run_planned_commands(lambda _r: [], initial_commands=["true"])
+            elif entry == "groups":
+                call = probe.run_planned_command_groups([(lambda _r: [], ["true"])])
+            else:
+                assert session is not None
+                call = session.run_command_owned("true")
+            task = asyncio.create_task(call)
+            try:
+                await wait_for(preparing)
+                if cancel:
+                    task.cancel()
+                    await wait_for(interrupted)
+                    self.assertTrue(tokens[0].cancelled.is_set())
+                    self.assertIn(client, tokens[0]._clients)
+                    self.assertFalse(task.done(), "cancel abandoned preparation worker")
+                    if session:
+                        self.assertTrue(session._lock.locked())
+                    task.cancel()
+                    for _ in range(5):
+                        await asyncio.sleep(0)
+                    self.assertFalse(task.done(), "repeated cancel abandoned preparation")
+                release.set()
+                if cancel:
+                    with self.assertRaises(asyncio.CancelledError):
+                        await asyncio.wait_for(task, 2)
+                    # Observe public completion before fixture teardown can mask
+                    # a retained client or a prematurely released worker.
+                    self.assertFalse(client.connected)
+                    self.assertTrue(all(not token._clients for token in tokens))
+                    if session:
+                        self.assertIsNone(session._client)
+                        self.assertFalse(session._lock.locked())
+                else:
+                    result = await asyncio.wait_for(task, 2)
+                    results = result if isinstance(result, list) else [result]
+                    if entry == "groups":
+                        results = results[0]
+                    self.assertIsInstance(results, list)
+                    self.assertEqual(len(results), 1)
+                    self.assertIsInstance(results[0], SSHCommandResult)
+                    self.assertTrue(results[0].ok)
+            finally:
+                release.set()
+                await asyncio.gather(task, return_exceptions=True)
+                if session:
+                    await session.close_owned()
+            self.assertEqual(client.connect_calls, 0 if cancel and phase == "host_keys" else 1)
+            self.assertEqual(client.auth_calls, int(not cancel and phase != "host_keys"))
+            self.assertEqual(client.command_calls, int(not cancel))
+            self.assertFalse(client.connected)
+            self.assertTrue(all(not token._clients for token in tokens))
+            if session:
+                self.assertIsNone(session._client)
+                self.assertFalse(session._lock.locked())
+            if cancel:
+                after_interrupt = trace[trace.index("interrupt_done") + 1:]
+                self.assertNotIn("connect", after_interrupt)
+                self.assertNotIn("auth", after_interrupt)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        self.assertEqual(loop_errors, [])
+
+    async def test_cancel_during_host_keys_stops_all_public_connection_paths(self):
+        for entry in self.entries:
+            for strict in (True, False):
+                with self.subTest(entry=entry, strict=strict):
+                    await self.exercise_admission(entry, strict=strict)
+
+    async def test_uncancelled_preparation_preserves_all_public_connection_paths(self):
+        for entry in self.entries:
+            for strict in (True, False):
+                with self.subTest(entry=entry, strict=strict):
+                    await self.exercise_admission(entry, cancel=False, strict=strict)
+
+    async def test_cancel_during_connect_or_fallback_preparation_stops_authentication(self):
+        for entry in self.entries:
+            for phase in ("connect", "fallback"):
+                with self.subTest(entry=entry, phase=phase):
+                    await self.exercise_admission(entry, phase=phase)
+
+    async def test_uncancelled_keyboard_interactive_fallback_still_succeeds(self):
+        for entry in self.entries:
+            with self.subTest(entry=entry):
+                await self.exercise_admission(entry, phase="fallback", cancel=False)
+
+
+class SSHBenchmarkTests(unittest.TestCase):
+    def test_checked_in_benchmark_cli_one_and_multiple_bays(self):
+        import json
+        import subprocess
+        import sys
+
+        root = Path(__file__).resolve().parents[1]
+        result = subprocess.run([
+            sys.executable, "-B", str(root / "scripts/benchmark_ssh_smart_sessions.py"),
+            "--bays", "1", "4", "--concurrency", "1", "3", "--handshake-ms", "0",
+            "--command-ms", "0", "--commands-per-bay", "2", "--repeat", "1", "--json",
+        ], cwd=root, capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = json.loads(result.stdout)
+        self.assertEqual([(r["bays"], r["concurrency"]) for r in rows], [(1, 1), (1, 3), (4, 1), (4, 3)])
+        for row in rows:
+            self.assertEqual(row["commands"], row["bays"] * 2)
+            self.assertGreaterEqual(row["connections"], 1)
+            self.assertLessEqual(row["connections"], row["bays"])
+            if row["concurrency"] == 1:
+                self.assertEqual(row["connections"], row["bays"])
+            self.assertGreaterEqual(row["peak_channels"], 1)
+            self.assertLessEqual(row["peak_channels"], min(row["bays"], row["concurrency"]))
+
+    def test_benchmark_fails_closed_on_unsuccessful_results(self):
+        from scripts import benchmark_ssh_smart_sessions as benchmark
+
+        with patch.object(benchmark._Channel, "recv_exit_status", return_value=1) as status:
+            with self.assertRaisesRegex(RuntimeError, "expected 2 ok results, got 0"):
+                asyncio.run(benchmark.run_case(1, 1, 0, 0, 2))
+            self.assertEqual(status.call_count, 2, "benchmark failed before injected bad results")
+
+    def test_benchmark_channel_supports_production_reader_and_cleanup(self):
+        from scripts.benchmark_ssh_smart_sessions import FakeNAS
+
+        nas = FakeNAS(0, 0)
+        client = nas.client()
+        try:
+            probe = SSHProbe(SSHConfig(enabled=True, host="host.example.test"))
+            result = probe._run_single_command(client, "true")
+            self.assertTrue(result.ok, result.stderr)
+            self.assertEqual(result.stdout, '{"smart_status": {"passed": true}}')
+            self.assertEqual((nas.connections, nas.commands, nas.open_channels), (1, 1, 0))
+        finally:
+            client.close()
+
+    def test_benchmark_fake_tracks_channels_until_close_and_honours_cancellation(self):
+        from app.services.ssh_probe import _WorkerCancellation
+        from scripts.benchmark_ssh_smart_sessions import FakeNAS
+
+        nas = FakeNAS(0, 0)
+        cancellation = _WorkerCancellation()
+        cancellation.cancelled.set()
+        with self.assertRaises(asyncio.CancelledError):
+            nas.client(_cancel=cancellation)
+        self.assertEqual(nas.connections, 0)
+        self.assertEqual(cancellation._clients, set())
+        cancellation = _WorkerCancellation()
+        client = nas.client(_cancel=cancellation)
+        try:
+            self.assertIn(client, cancellation._clients)
+            streams = client.exec_command("true")
+            channel = streams[1].channel
+            self.assertEqual((nas.connections, nas.commands, nas.open_channels), (1, 1, 1))
+            self.assertTrue(channel.recv_ready())
+            output = bytearray()
+            while channel.recv_ready():
+                output.extend(channel.recv(3))
+            self.assertEqual(output, b'{"smart_status": {"passed": true}}')
+            self.assertFalse(channel.recv_stderr_ready())
+            self.assertEqual(channel.recv_stderr(3), b"")
+            self.assertTrue(channel.eof_received)
+            self.assertTrue(channel.exit_status_ready())
+            cancellation.cancelled.set()
+            cancellation.interrupt()
+            self.assertTrue(channel.closed)
+            self.assertEqual(nas.open_channels, 0)
+            self.assertFalse(client.get_transport().is_active())
+            channel.close()
+            self.assertEqual(nas.open_channels, 0)
+            with self.assertRaises(EOFError):
+                client.exec_command("not-after-close")
+            self.assertEqual(nas.commands, 1)
+        finally:
+            client.close()
+            cancellation.discard(client)
+
+
 class DiskSyncPollReusesOneConnectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_full_sync_polls_over_one_connection_and_locks_per_command(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

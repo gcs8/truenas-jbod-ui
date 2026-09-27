@@ -661,9 +661,15 @@ class SSHProbe:
 
         try:
             try:
+                # Host-key preparation can block after registration. Refuse a
+                # new connection phase if cancellation was observed meanwhile.
+                if _cancel is not None:
+                    _cancel.check()
                 client.connect(**connect_kwargs)
             except paramiko.BadAuthenticationType as exc:
-                if not self._try_keyboard_interactive(client, exc):
+                if _cancel is not None:
+                    _cancel.check()
+                if not self._try_keyboard_interactive(client, exc, _cancel=_cancel):
                     raise
         except BaseException:
             # A failed connect can leave a live transport thread and socket
@@ -687,6 +693,8 @@ class SSHProbe:
         self,
         client: paramiko.SSHClient,
         exc: paramiko.BadAuthenticationType,
+        *,
+        _cancel: _WorkerCancellation | None = None,
     ) -> bool:
         allowed_types = getattr(exc, "allowed_types", []) or []
         if not self.config.password or "keyboard-interactive" not in allowed_types:
@@ -710,6 +718,8 @@ class SSHProbe:
             self.config.user,
             self.config.host,
         )
+        if _cancel is not None:
+            _cancel.check()
         transport.auth_interactive(self.config.user, handler)
         return transport.is_authenticated()
 
