@@ -910,6 +910,39 @@ class InventoryRefreshWarningTests(unittest.TestCase):
         payload = self.fetch_inventory(checked_at=0.0, probe_lines=[])
         self.assertEqual(payload["warnings"], [self.KNOWN_HOSTS_WARNING, "SES data is partial"])
 
+    def test_concurrent_refreshes_after_expiry_run_the_probe_once(self) -> None:
+        state = SimpleNamespace(
+            writable_directories=("/app/data",),
+            startup_problems=(),
+            storage_checked_at_monotonic=0.0,
+        )
+        request = SimpleNamespace(app=SimpleNamespace(state=state))
+        calls: list[int] = []
+
+        def slow_probe(directories):
+            calls.append(1)
+            time.sleep(0.2)
+            return [CHOWN_SENTENCE]
+
+        start = threading.Barrier(2)
+        results: list[list[str]] = []
+
+        def refresh() -> None:
+            start.wait()
+            results.append(app_route_support.refresh_storage_problems(request))
+
+        with (
+            patch.object(app_route_support, "probe_writable_directories", side_effect=slow_probe),
+            patch.object(app_route_support, "check_known_hosts_files", return_value=([], [])),
+        ):
+            threads = [threading.Thread(target=refresh) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(results, [[CHOWN_SENTENCE], [CHOWN_SENTENCE]])
+
 
 if __name__ == "__main__":
     unittest.main()
