@@ -3368,7 +3368,7 @@ class HistoryStore:
         metric_limits: dict[str, int] | None = None,
         since: str | None = None,
     ) -> dict[int, dict[str, Any]]:
-        validate_store_scope_request(
+        since = validate_store_scope_request(
             slots=slots,
             event_limit=event_limit,
             metric_limits=metric_limits,

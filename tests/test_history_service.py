@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
+from fastapi import HTTPException
 from starlette.requests import Request
 
 from app.request_context import request_context
@@ -1127,6 +1128,54 @@ class HistoryDashboardRouteTests(unittest.TestCase):
                     all(thread_id != event_loop_thread_id for thread_id in store_thread_ids),
                     f"{route_path} executed a HistoryStore read on the event-loop thread",
                 )
+
+    def test_slot_history_routes_pass_since_to_the_store_as_utc(self) -> None:
+        route_cases = (
+            (
+                "/api/history/slots/{slot}/metrics",
+                "list_metric_samples",
+                [],
+                {"metric_name": None, "limit": 500},
+            ),
+            (
+                "/api/history/slots/{slot}/bundle",
+                "get_slot_history_bundle",
+                {"events": [], "metrics": {}},
+                {"event_limit": 12},
+            ),
+        )
+        for route_path, method_name, result, extra_kwargs in route_cases:
+            route = next(
+                route
+                for route in history_main.app.routes
+                if getattr(route, "path", None) == route_path
+            )
+            with self.subTest(route=route_path):
+                with patch.object(history_main.store, method_name, return_value=result) as store_call:
+                    asyncio.run(
+                        route.endpoint(
+                            slot=5,
+                            system_id="archive-core",
+                            enclosure_id="front",
+                            since="2026-04-16T23:00:00+02:00",
+                            **extra_kwargs,
+                        )
+                    )
+                self.assertEqual(store_call.call_args.kwargs["since"], "2026-04-16T21:00:00+00:00")
+
+                with patch.object(history_main.store, method_name, return_value=result) as store_call:
+                    with self.assertRaises(HTTPException) as caught:
+                        asyncio.run(
+                            route.endpoint(
+                                slot=5,
+                                system_id="archive-core",
+                                enclosure_id="front",
+                                since="2026-04-16T23:00:00",
+                                **extra_kwargs,
+                            )
+                        )
+                self.assertEqual(caught.exception.status_code, 422)
+                store_call.assert_not_called()
 
     def test_history_fetch_json_timeout_reports_url_and_timeout(self) -> None:
         collector = HistoryCollector(
@@ -4261,6 +4310,16 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertEqual([sample["value"] for sample in payload[5]["metrics"]["temperature_c"]], [31])
         self.assertEqual(payload[5]["sample_counts"]["temperature_c"], 1)
         self.assertEqual(payload[5]["latest_values"]["temperature_c"], 31)
+
+        offset_payload = store.list_scope_history(
+            "archive-core",
+            "enc-a",
+            slots=[5],
+            metric_limits={"temperature_c": 10},
+            since="2026-04-16T23:00:00+02:00",
+        )
+
+        self.assertEqual([sample["value"] for sample in offset_payload[5]["metrics"]["temperature_c"]], [31])
 
     def test_scope_history_can_skip_events_for_metric_only_reads(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())

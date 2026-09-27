@@ -127,7 +127,7 @@ def _strict_int(value: object, label: str, *, minimum: int, maximum: int) -> int
     return value
 
 
-def _normalize_since(value: object, *, now: datetime) -> tuple[str, int]:
+def _parse_since(value: object) -> datetime:
     if not isinstance(value, str) or not value.strip():
         raise HistoryRequestShapeError("since is required for bulk history reads.")
     try:
@@ -136,6 +136,16 @@ def _normalize_since(value: object, *, now: datetime) -> tuple[str, int]:
         raise HistoryRequestShapeError("since must be a valid timezone-aware timestamp.") from exc
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise HistoryRequestShapeError("since must be timezone-aware.")
+    return parsed
+
+
+def normalize_since_utc(value: object) -> str:
+    """Return a timezone-aware since as the UTC ISO text stored in observed_at."""
+    return _parse_since(value).astimezone(timezone.utc).isoformat()
+
+
+def _normalize_since(value: object, *, now: datetime) -> tuple[str, int]:
+    parsed = _parse_since(value)
     current = now
     if current.tzinfo is None or current.utcoffset() is None:
         current = current.replace(tzinfo=timezone.utc)
@@ -251,7 +261,7 @@ def validate_store_scope_request(
     event_limit: object,
     metric_limits: Mapping[str, int] | None,
     since: object,
-) -> None:
+) -> str:
     raw_slots = list(slots or [])
     if not raw_slots:
         raise HistoryRequestShapeError("Bulk history storage reads require explicit slots.")
@@ -276,13 +286,14 @@ def validate_store_scope_request(
             maximum=INTERNAL_HISTORY_METRIC_MAX_LIMITS[metric],
         )
         total_metric_rows += normalized_limit
-    _normalize_since(since, now=datetime.now(timezone.utc))
+    normalized_since, _window_hours = _normalize_since(since, now=datetime.now(timezone.utc))
     event_rows = len(normalized_slots) * normalized_event_limit
     if event_rows > MAX_EVENT_ROWS:
         raise HistoryBudgetExceeded("event_rows", event_rows, MAX_EVENT_ROWS)
     projected_rows = len(normalized_slots) * (normalized_event_limit + total_metric_rows)
     if projected_rows > MAX_RETURNED_ROWS:
         raise HistoryBudgetExceeded("projected_rows", projected_rows, MAX_RETURNED_ROWS)
+    return normalized_since
 
 
 def count_history_rows(histories: Iterable[Mapping[str, Any]]) -> int:
