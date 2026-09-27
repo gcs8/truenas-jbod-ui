@@ -150,6 +150,22 @@ class PolicyTests(unittest.TestCase):
         for problem in problems:
             self.assertNotIn("\n", problem)
 
+    def test_schedule_that_never_matches_is_refused(self) -> None:
+        # A parseable schedule with no real date used to pass validation and
+        # then stop the scheduler on start (restart loop).
+        for text in ("0 0 30 2 *", "0 0 31 4 *"):
+            with self.subTest(text=text):
+                self.write({"full": {"schedule": text}})
+                with self.assertRaises(ConfigurationError) as caught:
+                    load_backup_policy(self.config, {})
+                problems = caught.exception.problems
+                self.assertTrue(
+                    any("backups.full.schedule" in p and "never matches a real date" in p for p in problems),
+                    problems,
+                )
+        self.write({"full": {"schedule": "0 0 29 2 *"}})
+        self.assertEqual(load_backup_policy(self.config, {}).full.schedule, "0 0 29 2 *")
+
     def test_unknown_keys_and_delay_rule(self) -> None:
         self.write({"config": {"enabled": True, "debounce_seconds": 100, "max_delay_seconds": 10}})
         with self.assertRaises(ConfigurationError) as caught:
