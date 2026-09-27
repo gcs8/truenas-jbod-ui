@@ -936,6 +936,62 @@ class AdminProxyTests(unittest.TestCase):
         self.assertIn(("POST", "/internal/backups/abc123/verify", None), calls)
         self.assertIn(("POST", "/internal/backups/abc123/preserve", {"reason": "x"}), calls)
 
+    def test_download_to_rejects_short_body_and_wrong_digest(self) -> None:
+        import http.client
+        import io
+
+        from admin_service.services import backup_scheduler_client as client_module
+
+        archive = b"archive-bytes-" * 100
+        digest = hashlib.sha256(archive).hexdigest()
+
+        class FakeSocket:
+            def __init__(self, raw: bytes) -> None:
+                self.raw = raw
+
+            def makefile(self, *_args, **_kwargs):
+                return io.BytesIO(self.raw)
+
+        class FakeConnection:
+            def __init__(self, raw: bytes) -> None:
+                self.raw = raw
+
+            def request(self, *_args, **_kwargs) -> None:
+                return None
+
+            def getresponse(self):
+                response = http.client.HTTPResponse(FakeSocket(self.raw))
+                response.begin()
+                return response
+
+            def close(self) -> None:
+                return None
+
+        def raw_response(body: bytes, length: int, sha256: str) -> bytes:
+            head = (
+                "HTTP/1.1 200 OK\r\n"
+                f"Content-Length: {length}\r\n"
+                'Content-Disposition: attachment; filename="full.archive"\r\n'
+                f"X-Backup-Sha256: {sha256}\r\n\r\n"
+            )
+            return head.encode("ascii") + body
+
+        def download(raw: bytes):
+            client = client_module.BackupSchedulerClient("/nonexistent/scheduler.sock")
+            sink = io.BytesIO()
+            with patch.object(client, "_connection", return_value=FakeConnection(raw)):
+                return client.download_to("abc123", sink)
+
+        short = download(raw_response(archive[:-10], len(archive), digest))
+        self.assertNotEqual(short.status, 200)
+        self.assertIn("did not match", short.payload["detail"])
+        wrong = download(raw_response(archive, len(archive), "0" * 64))
+        self.assertNotEqual(wrong.status, 200)
+        self.assertIn("did not match", wrong.payload["detail"])
+        good = download(raw_response(archive, len(archive), digest))
+        self.assertEqual(good.status, 200)
+        self.assertEqual(good.payload, {"filename": "full.archive", "sha256": digest})
+
     def test_cross_origin_mutation_is_rejected(self) -> None:
         status, _ = asgi_call(self.admin_main.app, "POST", "/api/admin/backups/run", {"backup_class": "full"},
                               {"origin": "http://evil.example.test"})
