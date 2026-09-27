@@ -1055,6 +1055,8 @@ class SnapshotExportService:
             "redaction_label": rendered.export_meta.get("redaction_label"),
             "downsampling_label": rendered.export_meta.get("downsampling_label"),
             "downsampling_note": rendered.export_meta.get("downsampling_note"),
+            "history_coverage": rendered.export_meta.get("history_coverage"),
+            "history_coverage_note": rendered.export_meta.get("history_coverage_note"),
             "enclosure_count": rendered.export_meta.get("enclosure_count"),
             "storage_view_count": rendered.export_meta.get("storage_view_count"),
             "metric_sample_count": rendered.export_meta.get("metric_sample_count"),
@@ -1243,6 +1245,7 @@ class SnapshotExportService:
             for view_id, slot_cache in (storage_view_smart_summary_cache or {}).items()
         }
         redactor = None
+        storage_view_aliases: dict[str, str] = {}
         if redact_sensitive:
             redactor = SnapshotRedactor(
                 snapshot,
@@ -1260,6 +1263,17 @@ class SnapshotExportService:
                     base_storage_view_smart_summary_cache,
                 ],
             )
+            # Keep a structural virtual namespace shared by browser-derived
+            # targets and embedded history. Physical targets retain enc aliases.
+            for view in storage_view_runtime.views if storage_view_runtime else []:
+                scope = f"storage-view:{view.id}"
+                alias = redactor.redact_object({"enclosure_id": scope})["enclosure_id"]
+                storage_view_aliases[view.id] = alias
+            # Allocate every alias before replacing values with structural keys;
+            # otherwise a later view could reuse an earlier alias's bare name.
+            for view_id, alias in storage_view_aliases.items():
+                redactor.enclosure_aliases[f"storage-view:{view_id}"] = f"storage-view:{alias}"
+            redactor.token_replacements = redactor._build_token_replacements()
         template = self.templates.env.get_template("index.html")
 
         # Everything below is the same for every downsampling pass; only the history
@@ -1295,9 +1309,12 @@ class SnapshotExportService:
                 storage_view_runtime_for_export = StorageViewRuntimePayload.model_validate(
                     redactor.redact_object(storage_view_runtime_for_export.model_dump(mode="json"))
                 )
-            storage_view_smart_summary_cache_for_export = redactor.redact_object(
-                storage_view_smart_summary_cache_for_export
-            )
+                for original, exported in zip(storage_view_runtime.views, storage_view_runtime_for_export.views, strict=True):
+                    exported.id = storage_view_aliases[original.id]
+            storage_view_smart_summary_cache_for_export = {
+                storage_view_aliases.get(view_id, view_id): redactor.redact_object(slot_cache)
+                for view_id, slot_cache in storage_view_smart_summary_cache_for_export.items()
+            }
         storage_view_runtime_for_context = storage_view_runtime_for_export or StorageViewRuntimePayload(
             system_id=snapshot_for_export.selected_system_id,
             system_label=snapshot_for_export.selected_system_label,
@@ -1443,6 +1460,8 @@ class SnapshotExportService:
                 "event_count": event_count,
                 "downsampling_label": downsampling_meta["label"],
                 "downsampling_note": downsampling_meta["note"],
+                "history_coverage": downsampling_meta["coverage"],
+                "history_coverage_note": downsampling_meta["coverage_note"],
             }
             history_summary = {
                 "counts": {
@@ -1600,13 +1619,38 @@ class SnapshotExportService:
             }
             prepared_cache[cache_key] = exported_payload
 
-        return prepared_cache, self._build_downsampling_meta(
+        downsampling = self._build_downsampling_meta(
             history_window_hours=history_window_hours,
             rollup_seconds=rollup_seconds_used or None,
             metric_rollup_applied=metric_rollup_applied,
             event_trim_applied=event_trim_applied,
             max_events_per_slot=max_events_per_slot,
         )
+        statuses: list[str] = []
+        for payload in raw_history_cache.values():
+            coverage = payload.get("coverage")
+            if not payload.get("available") or not isinstance(coverage, dict):
+                statuses.append("unknown")
+                continue
+            metrics = coverage.get("metrics")
+            statuses.extend(metrics.values() if isinstance(metrics, dict) and metrics else ["unknown"])
+            statuses.append(coverage.get("events", "unknown"))
+        if "truncated" in statuses or event_trim_applied:
+            coverage_status = "truncated"
+            coverage_note = "History is incomplete: bounded reads or export limits omitted older samples or events."
+        elif not statuses or any(status != "complete" for status in statuses):
+            coverage_status = "unknown"
+            coverage_note = "History coverage is unverified; the source did not confirm all samples and events in the selected window."
+        elif metric_rollup_applied:
+            coverage_status = "aggregated"
+            coverage_note = "Selected-window history is included as averaged samples, not every recorded sample."
+        else:
+            coverage_status = "complete"
+            coverage_note = "All available samples and events in the selected window are included."
+        if coverage_status != "complete" and downsampling["label"] == "None":
+            downsampling["note"] = coverage_note
+        downsampling.update(coverage=coverage_status, coverage_note=coverage_note)
+        return prepared_cache, downsampling
 
     def _build_downsampling_meta(
         self,
