@@ -61,6 +61,62 @@ class _LoaderTestCase(unittest.TestCase):
             _clear_loader_caches()
 
 
+class SettingsAcquisitionTests(_LoaderTestCase):
+    def test_readonly_loader_uses_one_reader_for_all_yaml_without_changing_cache(self) -> None:
+        from app.config import load_settings
+
+        with self.main_ui_environment({"APP_REFRESH_INTERVAL": "51"}, "app: {refresh_interval_seconds: 32}\n") as config:
+            runtime = config.parent / "runtime-overrides.yaml"
+            profile = config.parent / "profiles.yaml"
+            runtime.write_text("app: {refresh_interval_seconds: 42}\n", encoding="utf-8")
+            profile.write_text("profiles: []\n", encoding="utf-8")
+            seen = []
+
+            def read_yaml(path):
+                seen.append(path)
+                return path.read_bytes() if path.exists() else None
+
+            settings = load_settings(create_directories=False, read_yaml_file=read_yaml)
+            self.assertEqual(seen, [config, runtime, profile])
+            self.assertEqual(settings.app.refresh_interval_seconds, 51)
+            self.assertFalse(Path(settings.paths.mapping_file).parent.exists())
+            self.assertFalse(Path(settings.paths.log_file).parent.exists())
+            cached = get_settings()
+            self.assertTrue(Path(cached.paths.mapping_file).parent.is_dir())
+            self.assertTrue(Path(cached.paths.log_file).parent.is_dir())
+            self.assertEqual(cached.model_dump(), settings.model_dump())
+            runtime.write_text("app: {snapshot_cache_ttl_seconds: 35}\n", encoding="utf-8")
+            fresh = load_settings(create_directories=False, read_yaml_file=read_yaml)
+            self.assertEqual(fresh.app.snapshot_cache_ttl_seconds, 35)
+            self.assertIs(get_settings(), cached)
+            get_settings.cache_clear()
+            self.assertEqual(get_settings().app.snapshot_cache_ttl_seconds, 35)
+
+    def test_readonly_loader_reader_covers_running_and_pending_profiles(self) -> None:
+        from app.config import load_settings
+
+        with self.main_ui_environment({}, "profiles: []\n") as config:
+            running_path = config.parent / "profiles.yaml"
+            running_path.write_text("profiles: []\n", encoding="utf-8")
+            running = get_settings()
+            pending_path = config.parent / "pending" / "profiles.txt"
+            config.write_text(yaml.safe_dump({"paths": {"profile_file": str(pending_path)}}), encoding="utf-8")
+            seen = []
+
+            def read_yaml(path):
+                seen.append(path)
+                if path == pending_path:
+                    return b"profiles: []\n"
+                return path.read_bytes() if path.exists() else None
+
+            loaded = load_settings(running_restart_only=running, create_directories=False,
+                                   read_yaml_file=read_yaml)
+            self.assertEqual(seen, [config, config.parent / "runtime-overrides.yaml", running_path, pending_path])
+            self.assertEqual(loaded.paths.profile_file, str(pending_path))
+            self.assertFalse(pending_path.parent.exists())
+            self.assertIs(get_settings(), running)
+
+
 class BlankAndTextValueTests(_LoaderTestCase):
     def test_blank_main_ui_values_are_unset(self) -> None:
         env = {

@@ -22,11 +22,11 @@ import time
 import uuid
 import zipfile
 import zlib
-from contextlib import closing, nullcontext
+from contextlib import closing, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Iterator, Literal
 from urllib.parse import urlsplit, urlunsplit
 
 import yaml
@@ -49,6 +49,7 @@ from app.config import (
     _derive_runtime_layout_paths,
     _normalize_systems,
     get_settings,
+    load_settings,
 )
 from app.models.domain import ManualMapping, SasFabricAlias
 from app.services.profile_registry import ProfileRegistry
@@ -706,6 +707,105 @@ class _PreparedSegmentedRestore:
     journal_payload: dict[str, Any]
 
 
+@dataclass(slots=True)
+class _ExportSourceSnapshot:
+    """Invocation-local admission for non-history source discovery and copying."""
+
+    root: Path | None = None
+    member_count: int = 1  # Reserve the manifest before discovering any sources.
+    total_bytes: int = 0
+
+    def admit_entry(self) -> None:
+        self.member_count += 1
+        if self.member_count > MAX_ARCHIVE_MEMBER_COUNT:
+            raise ValueError("Backup bundle archive contains too many members.")
+
+    @contextmanager
+    def _open_source(
+        self,
+        source_path: Path,
+        group_key: str,
+        archive_path: str,
+        *,
+        entry_admitted: bool = False,
+    ) -> Iterator[tuple[int, int] | None]:
+        try:
+            descriptor = os.open(
+                source_path,
+                os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0),
+            )
+        except FileNotFoundError:
+            yield None
+            return
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError("Backup export source must be a regular file.")
+            if not entry_admitted:
+                self.admit_entry()
+            size = metadata.st_size
+            if size > MAX_ARCHIVE_MEMBER_BYTES:
+                raise ValueError("Backup bundle archive member exceeds its expanded byte limit.")
+            if (
+                group_key in STRUCTURED_YAML_GROUP_KEYS
+                and PurePosixPath(archive_path).suffix in {".yaml", ".yml"}
+                and size > MAX_STRUCTURED_YAML_MEMBER_BYTES
+            ):
+                raise ValueError("Structured YAML member exceeds its size limit.")
+            if self.total_bytes + size > MAX_ARCHIVE_EXPANDED_BYTES:
+                raise ValueError("Backup bundle non-history members exceed the expanded byte limit.")
+            self.total_bytes += size
+            yield descriptor, size
+            after = os.fstat(descriptor)
+            if (metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns) != (
+                after.st_size, after.st_mtime_ns, after.st_ctime_ns
+            ):
+                raise ValueError("Backup export source changed during snapshot.")
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _source_chunks(descriptor: int, size: int) -> Iterator[bytes]:
+        remaining = size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, ARCHIVE_READ_CHUNK_BYTES))
+            if not chunk:
+                raise ValueError("Backup export source changed during snapshot.")
+            yield chunk
+            remaining -= len(chunk)
+        # One sentinel byte detects growth without allocating the new body.
+        if os.read(descriptor, 1):
+            raise ValueError("Backup export source changed during snapshot.")
+
+    def copy(
+        self,
+        source_path: Path,
+        group_key: str,
+        archive_path: str,
+        *,
+        entry_admitted: bool = False,
+    ) -> Path | None:
+        assert self.root is not None
+        with self._open_source(
+            source_path, group_key, archive_path, entry_admitted=entry_admitted
+        ) as source:
+            if source is None:
+                return None
+            self.root.mkdir(mode=0o700, exist_ok=True)
+            target = self.root / str(self.member_count)
+            target_descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(target_descriptor, "wb") as output:
+                for chunk in self._source_chunks(*source):
+                    output.write(chunk)
+            return target
+
+    def read_yaml_file(self, path: Path) -> bytes | None:
+        # Bootstrap content is YAML regardless of its configured filename.
+        # Reuse descriptor admission without creating a source-copy workspace.
+        with self._open_source(path, CONFIG_FILE_KEY, "settings.yaml") as source:
+            return b"".join(self._source_chunks(*source)) if source is not None else None
+
+
 class _ImportActivationTransaction:
     _MISSING_FILE_MODE = 0o660
     _MISSING_DIRECTORY_MODE = 0o770
@@ -719,8 +819,6 @@ class _ImportActivationTransaction:
         self.root = Path(tempfile.mkdtemp(prefix="truenas-jbod-ui-import-"))
         self.staging_root = self.root / "staged"
         self.rollback_root = self.root / "rollback"
-        self.staging_root.mkdir(parents=True, exist_ok=True)
-        self.rollback_root.mkdir(parents=True, exist_ok=True)
         self._staged_members: dict[str, Path] = {}
         self._journal: dict[str, _ImportRollbackEntry] = {}
         self._journal_order: list[str] = []
@@ -736,6 +834,8 @@ class _ImportActivationTransaction:
         self._prepared_segmented_restore: _PreparedSegmentedRestore | None = None
         self._preserve_segmented_evidence = False
         try:
+            self.staging_root.mkdir(parents=True, exist_ok=True)
+            self.rollback_root.mkdir(parents=True, exist_ok=True)
             for member_key, content in sorted(extracted_members.items()):
                 staged_path = self.staging_root / hashlib.sha256(
                     member_key.encode("utf-8")
@@ -2127,6 +2227,12 @@ class SystemBackupService:
                 app_settings,
                 history_snapshot_path,
                 selected_groups=selected_groups,
+                source_snapshot=_ExportSourceSnapshot(
+                    workspace / "sources",
+                    member_count=1 + int(history_snapshot_path is not None) + (
+                        len(segmented_snapshot.segment_paths) if segmented_snapshot else 0
+                    ),
+                ),
             )
             if segmented_snapshot is not None:
                 for segment_path in segmented_snapshot.segment_paths:
@@ -2532,6 +2638,28 @@ class SystemBackupService:
             f"Backup import expected {expected_label} content but inspected {observed_label} content."
         )
 
+    def _admit_restore(
+        self,
+        manifest: dict[str, Any],
+        group_entries: dict[str, dict[str, Any]],
+        extracted: dict[str, ExtractedMember],
+        *,
+        history_integrity_checked: bool = False,
+    ) -> tuple[dict[str, _ImportRestoreDestination], bytes | None]:
+        """Check current deployment admission without changing live or extracted files."""
+        self._validate_manifest_member_metadata(manifest, extracted)
+        self._preflight_selected_group_members(manifest, group_entries, extracted)
+        self._preflight_import_members(
+            manifest, group_entries, extracted,
+            history_integrity_checked=history_integrity_checked,
+        )
+        self._require_restore_free_space(manifest, group_entries, extracted)
+        destinations = self._build_restore_destination_graph(manifest, group_entries, extracted)
+        catalog = self._prepare_segmented_history_import(
+            manifest, extracted, history_integrity_checked=history_integrity_checked,
+        )
+        return destinations, catalog
+
     def inspect_bundle_file(
         self,
         archive_path: str | Path,
@@ -2565,10 +2693,7 @@ class SystemBackupService:
                 for key in selected_groups
                 if not self._manifest_group_present(group_entries.get(key))
             ]
-            self._validate_manifest_member_metadata(manifest, extracted)
-            self._preflight_selected_group_members(manifest, group_entries, extracted)
-            self._preflight_import_members(manifest, group_entries, extracted)
-            self._require_restore_free_space(manifest, group_entries, extracted)
+            self._admit_restore(manifest, group_entries, extracted)
             result = {
                 "ok": True,
                 "schema_version": manifest.get("schema_version"),
@@ -2624,12 +2749,7 @@ class SystemBackupService:
         try:
             self._enforce_expected_encryption(archive_meta, expected_encrypted)
             group_entries = self._manifest_group_entries(manifest)
-            self._validate_manifest_member_metadata(manifest, extracted)
-            self._preflight_selected_group_members(manifest, group_entries, extracted)
-            self._preflight_import_members(manifest, group_entries, extracted)
-            self._require_restore_free_space(manifest, group_entries, extracted)
-            self._build_restore_destination_graph(manifest, group_entries, extracted)
-            self._prepare_segmented_history_import(manifest, extracted)
+            self._admit_restore(manifest, group_entries, extracted)
             if identity_callback is not None:
                 if not isinstance(archive_digest, str):
                     raise RuntimeError("Backup archive identity is unavailable.")
@@ -2843,6 +2963,7 @@ class SystemBackupService:
                 runtime_payload=runtime_payload,
                 maintenance_payload=maintenance_payload,
                 exported_at=exported_at,
+                source_snapshot=_ExportSourceSnapshot(workspace / "sources"),
             )
             if segmented_snapshot is not None:
                 bundle_members.append(
@@ -3010,28 +3131,17 @@ class SystemBackupService:
         try:
             self._enforce_expected_encryption(archive_meta, expected_encrypted)
             group_entries = self._manifest_group_entries(manifest)
-            self._validate_manifest_member_metadata(manifest, extracted)
-            self._preflight_selected_group_members(manifest, group_entries, extracted)
-            self._preflight_import_members(
+            restore_destinations, catalog = self._admit_restore(
                 manifest,
                 group_entries,
                 extracted,
                 history_integrity_checked=history_integrity_checked,
             )
-            self._require_restore_free_space(manifest, group_entries, extracted)
+            if catalog is not None:
+                extracted[SEGMENTED_CATALOG_STAGING_KEY] = catalog
             version_note = self._app_version_note(manifest)
             if version_note is not None:
                 logger.warning("%s", version_note)
-            restore_destinations = self._build_restore_destination_graph(
-                manifest,
-                group_entries,
-                extracted,
-            )
-            self._prepare_segmented_history_import(
-                manifest,
-                extracted,
-                history_integrity_checked=history_integrity_checked,
-            )
             segmented_restore = manifest.get("schema_version") == SEGMENTED_BACKUP_SCHEMA_VERSION
             segmented_activation = (
                 self._segmented_history_activation_members(
@@ -3047,13 +3157,13 @@ class SystemBackupService:
                 if segmented_restore
                 else nullcontext()
             )
-            transaction = _ImportActivationTransaction(
-                extracted,
-                history_store=self.store,
-            )
             marker: tuple[Path, dict[str, Any]] | None = None
             try:
                 with lock_context:
+                    transaction = _ImportActivationTransaction(
+                        extracted,
+                        history_store=self.store,
+                    )
                     try:
                         with transaction:
                             if segmented_activation is not None:
@@ -3216,6 +3326,19 @@ class SystemBackupService:
             destinations[SEGMENTED_CATALOG_STAGING_KEY] = segmented_destination
             active_destinations.append(segmented_destination)
 
+        # Activation protects live history even when the archive omits it.
+        # Apply the same rule before inspection/preflight can issue an identity.
+        protected_history_key = _ImportActivationTransaction._journal_key(self.store.file_path)
+        for destination in active_destinations:
+            if destination.group_key != HISTORY_DB_KEY and (
+                _ImportActivationTransaction._journal_paths_overlap(
+                    _ImportActivationTransaction._journal_key(destination.target_path),
+                    protected_history_key,
+                )
+            ):
+                raise ValueError(
+                    f"Live restore target {destination.target_path} collides with the history database."
+                )
         self._validate_restore_destination_graph(active_destinations)
         return destinations
 
@@ -3313,9 +3436,9 @@ class SystemBackupService:
         extracted: dict[str, ExtractedMember],
         *,
         history_integrity_checked: bool = False,
-    ) -> None:
+    ) -> bytes | None:
         if manifest.get("schema_version") != SEGMENTED_BACKUP_SCHEMA_VERSION:
-            return
+            return None
         history_catalog = manifest.get("history_catalog")
         generation = manifest.get("generation")
         if not isinstance(history_catalog, dict) or not isinstance(generation, dict):
@@ -3356,7 +3479,7 @@ class SystemBackupService:
             "segments": local_segments,
             "tombstones": list(history_catalog.get("tombstones") or []),
         }
-        extracted[SEGMENTED_CATALOG_STAGING_KEY] = json.dumps(
+        return json.dumps(
             local_catalog,
             sort_keys=True,
             separators=(",", ":"),
@@ -3526,6 +3649,7 @@ class SystemBackupService:
             elif self._manifest_group_present(history_group):
                 raise ValueError("Backup bundle is missing the selected history database member.")
 
+        get_settings.cache_clear()
         imported_settings = self._load_app_settings()
         return {
             "ok": True,
@@ -3555,8 +3679,11 @@ class SystemBackupService:
         }
 
     def _load_app_settings(self) -> Settings:
-        get_settings.cache_clear()
-        return get_settings()
+        # Bootstrap must obey the same source admission as export, including
+        # unselected config/override/profile files, without activating paths or
+        # replacing the running application's cached settings.
+        snapshot = _ExportSourceSnapshot()
+        return load_settings(create_directories=False, read_yaml_file=snapshot.read_yaml_file)
 
     @staticmethod
     def _cleanup_extracted_archive(cleanup_root: Any) -> None:
@@ -4151,6 +4278,7 @@ class SystemBackupService:
         history_snapshot_path: Path | None,
         *,
         selected_groups: list[str],
+        source_snapshot: _ExportSourceSnapshot,
     ) -> tuple[list[BundleGroup], list[BundleMember]]:
         layout_paths = _derive_runtime_layout_paths(app_settings.config_file)
         config_root = Path(app_settings.config_file).parent
@@ -4167,36 +4295,42 @@ class SystemBackupService:
                     group_key,
                     Path(app_settings.config_file),
                     selected=selected,
+                    source_snapshot=source_snapshot,
                 )
             elif group_key == RUNTIME_OVERRIDES_FILE_KEY:
                 group, members = self._collect_file_group(
                     group_key,
                     Path(app_settings.paths.runtime_overrides_file),
                     selected=selected,
+                    source_snapshot=source_snapshot,
                 )
             elif group_key == PROFILE_FILE_KEY:
                 group, members = self._collect_file_group(
                     group_key,
                     Path(app_settings.paths.profile_file),
                     selected=selected,
+                    source_snapshot=source_snapshot,
                 )
             elif group_key == MAPPING_FILE_KEY:
                 group, members = self._collect_file_group(
                     group_key,
                     Path(app_settings.paths.mapping_file),
                     selected=selected,
+                    source_snapshot=source_snapshot,
                 )
             elif group_key == SAS_FABRIC_ALIAS_FILE_KEY:
                 group, members = self._collect_file_group(
                     group_key,
                     Path(app_settings.paths.sas_fabric_alias_file),
                     selected=selected,
+                    source_snapshot=source_snapshot,
                 )
             elif group_key == SLOT_DETAIL_FILE_KEY:
                 group, members = self._collect_file_group(
                     group_key,
                     Path(app_settings.paths.slot_detail_cache_file),
                     selected=selected,
+                    source_snapshot=source_snapshot,
                 )
             elif group_key == HISTORY_DB_KEY:
                 group, members = self._collect_generated_path_group(
@@ -4210,18 +4344,21 @@ class SystemBackupService:
                     group_key,
                     config_root / "ssh",
                     selected=selected,
+                    source_snapshot=source_snapshot,
                 )
             elif group_key == TLS_TRUST_KEY:
                 group, members = self._collect_directory_group(
                     group_key,
                     config_root / "tls",
                     selected=selected,
+                    source_snapshot=source_snapshot,
                 )
             elif group_key == KNOWN_HOSTS_KEY:
                 group, members = self._collect_file_group(
                     group_key,
                     Path(layout_paths["known_hosts_path"]),
                     selected=selected,
+                    source_snapshot=source_snapshot,
                 )
             else:
                 continue
@@ -4240,6 +4377,7 @@ class SystemBackupService:
         runtime_payload: dict[str, Any] | None,
         maintenance_payload: dict[str, Any] | None,
         exported_at: datetime,
+        source_snapshot: _ExportSourceSnapshot,
     ) -> tuple[list[BundleGroup], list[BundleMember]]:
         layout_paths = _derive_runtime_layout_paths(app_settings.config_file)
         config_root = Path(app_settings.config_file).parent
@@ -4252,7 +4390,14 @@ class SystemBackupService:
                 continue
             selected = group_key in selected_groups
             if group_key == CONFIG_FILE_KEY:
-                content_bytes = self._read_scrubbed_yaml_file(Path(app_settings.config_file), scrubber)
+                snapshot_path = (
+                    source_snapshot.copy(Path(app_settings.config_file), group_key, metadata["archive_root"])
+                    if selected else None
+                )
+                content_bytes = (
+                    self._read_scrubbed_yaml_file(snapshot_path, scrubber)
+                    if snapshot_path is not None else b""
+                )
                 group, members = self._collect_generated_file_group(
                     group_key,
                     content_bytes,
@@ -4260,7 +4405,14 @@ class SystemBackupService:
                     source_path=app_settings.config_file,
                 )
             elif group_key == RUNTIME_OVERRIDES_FILE_KEY:
-                content_bytes = self._read_scrubbed_yaml_file(Path(app_settings.paths.runtime_overrides_file), scrubber)
+                snapshot_path = (
+                    source_snapshot.copy(Path(app_settings.paths.runtime_overrides_file), group_key, metadata["archive_root"])
+                    if selected else None
+                )
+                content_bytes = (
+                    self._read_scrubbed_yaml_file(snapshot_path, scrubber)
+                    if snapshot_path is not None else b""
+                )
                 group, members = self._collect_generated_file_group(
                     group_key,
                     content_bytes,
@@ -4268,7 +4420,14 @@ class SystemBackupService:
                     source_path=app_settings.paths.runtime_overrides_file,
                 )
             elif group_key == PROFILE_FILE_KEY:
-                content_bytes = self._read_scrubbed_yaml_file(Path(app_settings.paths.profile_file), scrubber)
+                snapshot_path = (
+                    source_snapshot.copy(Path(app_settings.paths.profile_file), group_key, metadata["archive_root"])
+                    if selected else None
+                )
+                content_bytes = (
+                    self._read_scrubbed_yaml_file(snapshot_path, scrubber)
+                    if snapshot_path is not None else b""
+                )
                 group, members = self._collect_generated_file_group(
                     group_key,
                     content_bytes,
@@ -4276,7 +4435,14 @@ class SystemBackupService:
                     source_path=app_settings.paths.profile_file,
                 )
             elif group_key == MAPPING_FILE_KEY:
-                content_bytes = self._read_scrubbed_json_file(Path(app_settings.paths.mapping_file), scrubber)
+                snapshot_path = (
+                    source_snapshot.copy(Path(app_settings.paths.mapping_file), group_key, metadata["archive_root"])
+                    if selected else None
+                )
+                content_bytes = (
+                    self._read_scrubbed_json_file(snapshot_path, scrubber)
+                    if snapshot_path is not None else b""
+                )
                 group, members = self._collect_generated_file_group(
                     group_key,
                     content_bytes,
@@ -4284,7 +4450,14 @@ class SystemBackupService:
                     source_path=app_settings.paths.mapping_file,
                 )
             elif group_key == SAS_FABRIC_ALIAS_FILE_KEY:
-                content_bytes = self._read_scrubbed_json_file(Path(app_settings.paths.sas_fabric_alias_file), scrubber)
+                snapshot_path = (
+                    source_snapshot.copy(Path(app_settings.paths.sas_fabric_alias_file), group_key, metadata["archive_root"])
+                    if selected else None
+                )
+                content_bytes = (
+                    self._read_scrubbed_json_file(snapshot_path, scrubber)
+                    if snapshot_path is not None else b""
+                )
                 group, members = self._collect_generated_file_group(
                     group_key,
                     content_bytes,
@@ -4292,7 +4465,14 @@ class SystemBackupService:
                     source_path=app_settings.paths.sas_fabric_alias_file,
                 )
             elif group_key == SLOT_DETAIL_FILE_KEY:
-                content_bytes = self._read_scrubbed_json_file(Path(app_settings.paths.slot_detail_cache_file), scrubber)
+                snapshot_path = (
+                    source_snapshot.copy(Path(app_settings.paths.slot_detail_cache_file), group_key, metadata["archive_root"])
+                    if selected else None
+                )
+                content_bytes = (
+                    self._read_scrubbed_json_file(snapshot_path, scrubber)
+                    if snapshot_path is not None else b""
+                )
                 group, members = self._collect_generated_file_group(
                     group_key,
                     content_bytes,
@@ -4311,18 +4491,21 @@ class SystemBackupService:
                     group_key,
                     config_root / "ssh",
                     selected=selected,
+                    source_snapshot=source_snapshot,
                 )
             elif group_key == TLS_TRUST_KEY:
                 group, members = self._collect_directory_group(
                     group_key,
                     config_root / "tls",
                     selected=selected,
+                    source_snapshot=source_snapshot,
                 )
             elif group_key == KNOWN_HOSTS_KEY:
                 group, members = self._collect_file_group(
                     group_key,
                     Path(layout_paths["known_hosts_path"]),
                     selected=selected,
+                    source_snapshot=source_snapshot,
                 )
             elif group_key == DEBUG_STATE_KEY:
                 content_bytes = self._build_debug_state_bytes(
@@ -4363,6 +4546,7 @@ class SystemBackupService:
         source_path: Path,
         *,
         selected: bool,
+        source_snapshot: _ExportSourceSnapshot,
     ) -> tuple[BundleGroup, list[BundleMember]]:
         metadata = BACKUP_GROUP_METADATA[group_key]
         if not selected:
@@ -4380,14 +4564,16 @@ class SystemBackupService:
                 [],
             )
 
-        if source_path.exists() and source_path.is_file():
+        snapshot_path = source_snapshot.copy(source_path, group_key, metadata["archive_root"])
+        if snapshot_path is not None:
             member = BundleMember(
                 key=group_key,
                 group_key=group_key,
                 archive_path=metadata["archive_root"],
                 source_path=str(source_path),
                 present=True,
-                content=source_path.read_bytes(),
+                content=None,
+                file_path=snapshot_path,
             )
             return (
                 BundleGroup(
@@ -4518,6 +4704,7 @@ class SystemBackupService:
         source_dir: Path,
         *,
         selected: bool,
+        source_snapshot: _ExportSourceSnapshot,
     ) -> tuple[BundleGroup, list[BundleMember]]:
         metadata = BACKUP_GROUP_METADATA[group_key]
         if not selected:
@@ -4536,21 +4723,40 @@ class SystemBackupService:
             )
 
         members: list[BundleMember] = []
-        if source_dir.exists() and source_dir.is_dir():
-            for file_path in sorted(path for path in source_dir.rglob("*") if path.is_file()):
-                relative_path = file_path.relative_to(source_dir).as_posix()
-                member_key = f"{group_key}:{relative_path}"
-                archive_path = f"{metadata['archive_root']}/{relative_path}"
-                members.append(
-                    BundleMember(
-                        key=member_key,
-                        group_key=group_key,
-                        archive_path=archive_path,
-                        source_path=str(file_path),
-                        present=True,
-                        content=file_path.read_bytes(),
+        pending = [source_dir] if source_dir.exists() else []
+        while pending:
+            directory = pending.pop()
+            if directory.is_symlink() or not directory.is_dir():
+                raise ValueError("Backup export source must be a directory without symlinks.")
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    # Charge every entry, including directories, before retaining it.
+                    source_snapshot.admit_entry()
+                    file_path = Path(entry.path)
+                    if entry.is_symlink():
+                        raise ValueError("Backup export source must not be a symlink.")
+                    if entry.is_dir(follow_symlinks=False):
+                        pending.append(file_path)
+                        continue
+                    relative_path = file_path.relative_to(source_dir).as_posix()
+                    archive_path = f"{metadata['archive_root']}/{relative_path}"
+                    snapshot_path = source_snapshot.copy(
+                        file_path, group_key, archive_path, entry_admitted=True,
                     )
-                )
+                    if snapshot_path is None:
+                        raise ValueError("Backup export source changed during snapshot.")
+                    members.append(
+                        BundleMember(
+                            key=f"{group_key}:{relative_path}",
+                            group_key=group_key,
+                            archive_path=archive_path,
+                            source_path=str(file_path),
+                            present=True,
+                            content=None,
+                            file_path=snapshot_path,
+                        )
+                    )
+        members.sort(key=lambda member: member.archive_path)
 
         return (
             BundleGroup(
@@ -4754,12 +4960,8 @@ class SystemBackupService:
             if expanded_archive_size is None:
                 raise ValueError("Backup bundle TAR archive size could not be verified.")
             if stream_encrypted:
-                self._validate_declared_archive_limits(
-                    [(archive_size, expanded_archive_size)],
-                    compressed_total=archive_size,
-                    member_limit=MAX_FILE_BACKED_ARCHIVE_EXPANDED_BYTES + MAX_ARCHIVE_METADATA_BYTES,
-                    expanded_limit=MAX_FILE_BACKED_ARCHIVE_EXPANDED_BYTES + MAX_ARCHIVE_METADATA_BYTES,
-                )
+                # _write_stream_encrypted_zstd checked the exact compressed
+                # plaintext count. The outer encrypted byte cap is separate above.
                 return
             self._validate_declared_archive_limits(
                 [(archive_size, expanded_archive_size)],
@@ -4899,8 +5101,9 @@ class SystemBackupService:
             return tar_size
         raise ValueError(f"Unsupported backup packaging '{packaging}'.")
 
-    @staticmethod
+    @classmethod
     def _write_stream_encrypted_zstd(
+        cls,
         tar_path: Path,
         tar_size: int,
         output_path: Path,
@@ -4924,6 +5127,14 @@ class SystemBackupService:
                 )
                 with compressor.stream_writer(sealer, size=tar_size, closefd=False) as compressed:
                     shutil.copyfileobj(source, compressed, length=ARCHIVE_READ_CHUNK_BYTES)
+                # Reader admission divides by the decrypted compressed stream, not
+                # by the larger envelope with its header and authentication tags.
+                cls._validate_declared_archive_limits(
+                    [(sealer.bytes_in, tar_size)],
+                    compressed_total=sealer.bytes_in,
+                    member_limit=MAX_FILE_BACKED_ARCHIVE_EXPANDED_BYTES + MAX_ARCHIVE_METADATA_BYTES,
+                    expanded_limit=MAX_FILE_BACKED_ARCHIVE_EXPANDED_BYTES + MAX_ARCHIVE_METADATA_BYTES,
+                )
                 sealer.close()
                 output.flush()
                 os.fsync(output.fileno())
