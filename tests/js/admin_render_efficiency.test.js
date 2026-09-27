@@ -408,6 +408,161 @@ test("fetchJson returns normally when the response arrives in time", async () =>
   assert.deepEqual(await functions.fetchJson("/api/admin/state", { timeoutMs: 1000 }), { enclosures: [] });
 });
 
+// Headers are not completion: exercise the real JSON transport through decoding.
+function jsonLifetimeFixture({ method = "GET", ignoresAbort = false, names = [] } = {}) {
+  const timers = new Map();
+  let nextTimer = 0;
+  let signal;
+  let resolveBody;
+  let rejectBody;
+  let calls = 0;
+  let renders = 0;
+  const caller = new AbortController();
+  const listeners = new Set();
+  const trackedSignal = {
+    get aborted() { return caller.signal.aborted; },
+    addEventListener(type, listener, options) {
+      listeners.add(listener);
+      caller.signal.addEventListener(type, listener, options);
+    },
+    removeEventListener(type, listener) {
+      listeners.delete(listener);
+      caller.signal.removeEventListener(type, listener);
+    },
+  };
+  const state = { admin: {}, runtime: { original: true } };
+  const functions = loadFunctions([...FETCH_JSON_NAMES, ...names], {
+    DEFAULT_REQUEST_TIMEOUT_MS: 60000,
+    SERVER_REQUEST_ID_PATTERN: /^[0-9a-f]{32}$/,
+    AbortController, DOMException, state,
+    renderRuntimeCards: () => { renders += 1; },
+    setTimeout: (callback, ms) => { const id = ++nextTimer; timers.set(id, { callback, ms }); return id; },
+    clearTimeout: (id) => timers.delete(id),
+    fetch: async (_url, options) => {
+      calls += 1;
+      signal = options.signal;
+      return { ok: true, status: 200, json: () => new Promise((resolve, reject) => {
+        resolveBody = resolve;
+        rejectBody = reject;
+        if (!ignoresAbort) signal.addEventListener("abort", () => reject(new DOMException("body aborted", "AbortError")), { once: true });
+      }) };
+    },
+  });
+  return {
+    functions, state, timers, listeners, caller, trackedSignal,
+    start: () => functions.fetchJson("/api/admin/runtime", { method, signal: trackedSignal, timeoutMs: 50 }),
+    fire: (ms) => { for (const timer of [...timers.values()]) if (timer.ms === ms) timer.callback(); },
+    resolve: (value) => resolveBody(value), reject: (error) => rejectBody(error),
+    get signal() { return signal; }, get calls() { return calls; }, get renders() { return renders; },
+  };
+}
+
+const drainJsonLifetime = () => new Promise((resolve) => setImmediate(resolve));
+
+for (const method of ["GET", "POST"]) {
+  for (const ignoresAbort of [false, true]) {
+    for (const stop of ["deadline", "caller"]) {
+      test(`fetchJson ${method} body ${ignoresAbort ? "ignores" : "rejects on"} abort: ${stop}`, async () => {
+        const fixture = jsonLifetimeFixture({ method, ignoresAbort });
+        let error;
+        let settled = false;
+        fixture.start().then(() => { settled = true; }, (caught) => { error = caught; settled = true; });
+        await drainJsonLifetime();
+        assert.equal(fixture.signal.aborted, false);
+        if (stop === "caller") fixture.caller.abort();
+        else fixture.fire(50);
+        await drainJsonLifetime();
+        assert.equal(fixture.signal.aborted, true, "body transport remains owned after headers");
+        assert.equal(settled, true, "even an abort-ignoring body must not keep the caller pending");
+        if (stop === "caller") {
+          assert.equal(error.name, "AbortError");
+          assert.equal(Boolean(error.timedOut), false);
+        } else {
+          assert.equal(error.timedOut, true);
+          assert.equal(error.adminOutcome, method === "POST" ? "unknown" : "transport");
+          assert.match(error.message, /^Timed out after 1 second\./);
+        }
+        assert.equal(fixture.timers.size, 0);
+        assert.equal(fixture.listeners.size, 0);
+        let reads = 0;
+        fixture.resolve({ get ok() { reads += 1; return true; } });
+        await drainJsonLifetime();
+        assert.equal(reads, 0, "late decoded payload must not be validated or published");
+        assert.equal(fixture.calls, 1, "no automatic replay");
+      });
+    }
+  }
+}
+
+test("a late body rejection after timeout is observed without replacing the timeout", async () => {
+  const fixture = jsonLifetimeFixture({ ignoresAbort: true });
+  let error;
+  fixture.start().catch((caught) => { error = caught; });
+  await drainJsonLifetime();
+  fixture.fire(50);
+  await drainJsonLifetime();
+  assert.equal(error?.timedOut, true);
+  fixture.reject(new SyntaxError("late synthetic decode failure"));
+  await drainJsonLifetime();
+  assert.equal(error.timedOut, true);
+  assert.equal(fixture.timers.size, 0);
+  assert.equal(fixture.listeners.size, 0);
+});
+
+test("fetchJson retains cancellation until decoding succeeds, then removes its ownership", async () => {
+  const fixture = jsonLifetimeFixture();
+  const pending = fixture.start();
+  await drainJsonLifetime();
+  assert.equal(fixture.timers.size, 1);
+  assert.equal(fixture.listeners.size, 1);
+  fixture.resolve({ runtime: {} });
+  assert.deepEqual(await pending, { runtime: {} });
+  assert.equal(fixture.timers.size, 0);
+  assert.equal(fixture.listeners.size, 0);
+  fixture.caller.abort();
+  assert.equal(fixture.signal.aborted, false, "finished request has detached caller cancellation");
+});
+
+test("fetchJson pre-cancelled mutation does not dispatch", async () => {
+  const fixture = jsonLifetimeFixture({ method: "POST", ignoresAbort: true });
+  fixture.caller.abort();
+  let error;
+  fixture.start().catch((caught) => { error = caught; });
+  await drainJsonLifetime();
+  assert.equal(fixture.calls, 0);
+  assert.equal(error.name, "AbortError");
+  assert.equal(error.requestDispatched, false);
+  assert.equal(fixture.timers.size, 0);
+  assert.equal(fixture.listeners.size, 0);
+});
+
+for (const stop of ["deadline", "caller"]) {
+  test(`runtime poll ${stop} cancels a stalled JSON body without changing runtime state`, async () => {
+    const fixture = jsonLifetimeFixture({ ignoresAbort: true, names: [
+      "waitForRuntimeConvergence", "sleepForRuntimePoll", "runtimeContainerObservation",
+      "runtimeActionHasConverged", "describeRuntimeObservation",
+    ] });
+    let error;
+    fixture.functions.waitForRuntimeConvergence("ui", "start", {
+      maxAttempts: 1, pollTimeoutMs: 5, signal: fixture.trackedSignal,
+    }).catch((caught) => { error = caught; });
+    await drainJsonLifetime();
+    if (stop === "caller") fixture.caller.abort();
+    else fixture.fire(5);
+    await drainJsonLifetime();
+    assert.equal(fixture.signal.aborted, true);
+    assert.ok(error, "poll owner must settle without a body completion");
+    if (stop === "caller") assert.equal(error.name, "AbortError");
+    else assert.match(error.message, /Status request timed out after 5 ms/);
+    fixture.resolve({ runtime: { available: true, containers: [{ key: "ui", running: true }] } });
+    await drainJsonLifetime();
+    assert.deepEqual(fixture.state.runtime, { original: true });
+    assert.equal(fixture.renders, 0);
+    assert.equal(fixture.listeners.size, 0);
+    assert.equal(fixture.timers.size, 0);
+  });
+}
+
 test("the hero countdown tick only writes when the text changes", () => {
   let writes = 0;
   let text = "5m 00s";

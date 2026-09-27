@@ -618,9 +618,9 @@
     try {
       return await fetchWithTimeout(url, options);
     } catch (error) {
-      const remainingMs = sessionRemainingMs();
-      if (error?.name === "TypeError" && remainingMs !== null && remainingMs <= 0) {
-        markAdminStopped();
+      if (error?.name === "TypeError") {
+        const remainingMs = sessionRemainingMs();
+        if (remainingMs !== null && remainingMs <= 0) markAdminStopped();
       }
       throw error;
     }
@@ -5402,12 +5402,15 @@
     };
   }
 
-  async function readJsonResponse(response) {
+  async function readJsonResponse(response, signal) {
     let payload;
     try {
       payload = await response.json();
     } catch (_) {
       payload = null;
+    }
+    if (signal?.aborted) {
+      throw signal.reason;
     }
     if (!payload || typeof payload !== "object" || Array.isArray(payload) || !Object.keys(payload).length) {
       const rawId = validatedRequestId(response.headers?.get?.("X-Request-ID"));
@@ -5739,57 +5742,105 @@
 
   async function fetchJson(url, options = {}) {
     const mutating = isMutatingRequest(options);
-    // Sampled before dispatch: this is the only offline evidence that can
-    // show the request was never sent.
     const offlineBeforeDispatch = browserIsOffline();
-    let response;
+    if (offlineBeforeDispatch && !options.signal?.aborted) {
+      const error = adminRequestError(describeTransportFailure("transport", true), "transport");
+      error.requestDispatched = false;
+      throw error;
+    }
     try {
-      response = await fetchOrReportStopped(url, options);
+      const { body } = await fetchOrReportStopped(url, {
+        ...options,
+        readBody: async (response, signal) => {
+          let payload;
+          try {
+            payload = await readJsonResponse(response, signal);
+          } catch (protocolError) {
+            if (signal?.aborted || protocolError?.name === "AbortError") {
+              throw protocolError;
+            }
+            // Headers do not decide a mutation whose body is malformed.
+            const outcome = response?.ok
+              ? (mutating ? "unknown" : "error")
+              : classifyResponseFailure(response?.status, mutating);
+            const error = adminRequestError(describeResponseFailure(protocolError.message, outcome), outcome);
+            error.status = response?.status;
+            error.requestId = protocolError.requestId;
+            error.protocolError = true;
+            throw error;
+          }
+          if (!response.ok || payload.ok === false) {
+            const outcome = classifyResponseFailure(response?.status, mutating);
+            const error = adminRequestError(
+              describeResponseFailure(describeRequestFailure(payload, response), outcome), outcome
+            );
+            error.status = response.status;
+            throw error;
+          }
+          return payload;
+        },
+      });
+      return body;
     } catch (error) {
-      // An abort is the caller's own cancellation or timeout contract, which
-      // already describes its outcome. Leave it exactly as it was thrown.
-      if (error?.name === "AbortError") {
+      // Keep the caller's cancellation API, distinct from deadline expiry.
+      if (error?.name === "AbortError" || error?.adminOutcome) {
         throw error;
       }
-      // A client timeout on a mutation fires after dispatch, so the sidecar may
-      // still apply the change; a timed-out read changed nothing.
       if (error?.timedOut) {
         if (mutating) {
           const unknown = adminRequestError(`${error.message} The change may or may not have been applied; re-check the current state before retrying.`, "unknown");
           unknown.timedOut = true;
+          unknown.requestDispatched = error.requestDispatched;
           throw unknown;
         }
         error.adminOutcome = "transport";
         throw error;
       }
       const outcome = classifyTransportFailure(mutating, offlineBeforeDispatch);
-      throw adminRequestError(describeTransportFailure(outcome, offlineBeforeDispatch), outcome);
+      const failure = adminRequestError(describeTransportFailure(outcome, offlineBeforeDispatch), outcome);
+      failure.requestDispatched = error.requestDispatched;
+      throw failure;
     }
-    let payload;
+  }
+
+
+  // Both restore routes return import_archive's decided result. Maintenance
+  // failures mean the restore succeeded but services need operator attention.
+  function validBackupRestoreResult(result) {
+    const strings = (value) => Array.isArray(value) && value.every(isNonEmptyString);
+    return Boolean(result && result.ok === true
+      && Array.isArray(result.systems)
+      && result.systems.every((system) => system && isNonEmptyString(system.id) && typeof system.label === "string")
+      && (result.default_system_id === null || typeof result.default_system_id === "string")
+      && strings(result.restored_paths)
+      && typeof result.restored_history_database === "boolean"
+      && strings(result.stopped_containers) && strings(result.restarted_containers)
+      && result.restart_failures && typeof result.restart_failures === "object"
+      && !Array.isArray(result.restart_failures)
+      && Object.entries(result.restart_failures).every(([key, value]) => isNonEmptyString(key) && typeof value === "string"));
+  }
+
+  async function fetchBackupRestore(url, options) {
     try {
-      payload = await readJsonResponse(response);
-    } catch (protocolError) {
-      // A malformed or empty body carries no decided result. For a mutation
-      // that reached the sidecar the change may already be applied (#411).
-      const outcome = response?.ok
-        ? (mutating ? "unknown" : "error")
-        : classifyResponseFailure(response?.status, mutating);
-      const error = adminRequestError(describeResponseFailure(protocolError.message, outcome), outcome);
-      error.status = response?.status;
-      error.requestId = protocolError.requestId;
-      error.protocolError = true;
+      const payload = await fetchJson(url, options);
+      requireMutationResult(validBackupRestoreResult(payload), "backup restore");
+      return payload;
+    } catch (error) {
+      // An ok:false 2xx is not the route's documented pre-apply refusal.
+      if ((error.status >= 200 && error.status < 300)
+          || (error.name === "AbortError" && error.requestDispatched)) {
+        error.adminOutcome = "unknown";
+        error.outcomeUnknown = true;
+      }
       throw error;
     }
-    if (!response.ok || (payload && payload.ok === false)) {
-      const outcome = classifyResponseFailure(response?.status, mutating);
-      const error = adminRequestError(
-        describeResponseFailure(describeRequestFailure(payload, response), outcome),
-        outcome
-      );
-      error.status = response.status;
-      throw error;
+  }
+
+  function describeBackupRestoreFailure(error, source = "") {
+    if (error?.outcomeUnknown) {
+      return `It is unknown whether the restore${source ? ` from ${source}` : ""} finished. ${error.message} Refresh the page to check the current settings before restoring again. Check the backup again for a new inspection receipt.`;
     }
-    return payload || {};
+    return `Import failed: ${error.message || error}`;
   }
 
   const DEFAULT_REQUEST_TIMEOUT_MS = 60000;
@@ -5816,24 +5867,39 @@
     // headers arrive), and the call resolves to { response, body }.
     const { timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, signal: callerSignal, readBody, ...fetchOptions } = options;
     const controller = new AbortController();
-    const cancel = () => controller.abort();
-    let timedOut = false;
-    const timerId = setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-    }, Math.max(1, Number(timeoutMs) || DEFAULT_REQUEST_TIMEOUT_MS));
-    if (callerSignal?.aborted) {
-      controller.abort();
-    } else {
-      callerSignal?.addEventListener("abort", cancel, { once: true });
-    }
+    let dispatched = false;
+    let rejectStopped;
+    const stopped = new Promise((_resolve, reject) => { rejectStopped = reject; });
+    const stop = (error) => {
+      if (controller.signal.aborted) return;
+      // Reject first: a body reader may translate its abort into a protocol error.
+      rejectStopped(error);
+      controller.abort(error);
+    };
+    const cancel = () => {
+      const error = new Error("The operation was aborted.");
+      error.name = "AbortError";
+      stop(error);
+    };
+    const timerId = setTimeout(() => stop(requestTimeoutError(timeoutMs)),
+      Math.max(1, Number(timeoutMs) || DEFAULT_REQUEST_TIMEOUT_MS));
+    if (callerSignal?.aborted) cancel();
+    else callerSignal?.addEventListener("abort", cancel, { once: true });
     try {
-      const response = await fetch(url, { ...fetchOptions, signal: controller.signal });
-      return readBody ? { response, body: await readBody(response) } : response;
+      // Race the complete reader, not only fetch or the abort signal. Synthetic
+      // readers and broken transports may ignore abort indefinitely.
+      const operation = (async () => {
+        if (controller.signal.aborted) throw controller.signal.reason;
+        dispatched = true;
+        const response = await fetch(url, { ...fetchOptions, signal: controller.signal });
+        if (controller.signal.aborted) throw controller.signal.reason;
+        const body = readBody ? await readBody(response, controller.signal) : null;
+        if (controller.signal.aborted) throw controller.signal.reason;
+        return readBody ? { response, body } : response;
+      })();
+      return await Promise.race([stopped, operation]);
     } catch (error) {
-      if (timedOut && !callerSignal?.aborted) {
-        throw requestTimeoutError(timeoutMs);
-      }
+      error.requestDispatched = dispatched;
       throw error;
     } finally {
       clearTimeout(timerId);
@@ -6676,7 +6742,6 @@
   }
 
   async function runImportBackup() {
-    let importDispatched = false;
     const file = readSelectedImportFile();
     const passphrase = readOptionalSecretValue(elements.backupImportPassphrase);
     if (!file) {
@@ -6725,12 +6790,10 @@
       if (elements.backupImportResult) {
         elements.backupImportResult.textContent = `Importing inspected ${file.name}...`;
       }
-      importDispatched = true;
-      const { response, body: payload } = await fetchWithTimeout(
+      const payload = await fetchBackupRestore(
         `/api/admin/backup/import?stop_services=${String(stopServices)}&restart_services=${String(restartServices)}`,
         {
           timeoutMs: BACKUP_TRANSFER_TIMEOUT_MS,
-          readBody: readJsonResponse,
           method: "POST",
           headers: {
             "Content-Type": "application/octet-stream",
@@ -6741,11 +6804,8 @@
           body: archiveBytes,
         }
       );
-      if (!response.ok || payload?.ok === false) {
-        throw new Error(describeApiError(payload?.detail) || `Request failed with ${response.status}`);
-      }
       state.systems = Array.isArray(payload.systems) ? payload.systems : state.systems;
-      state.defaultSystemId = payload.default_system_id || state.defaultSystemId;
+      state.defaultSystemId = payload.default_system_id;
       const outcome = describeMaintenanceOutcome({
         stopped: payload.stopped_containers,
         restarted: payload.restarted_containers,
@@ -6768,23 +6828,17 @@
       } else {
         setBanner(`Full backup imported from ${file.name}.`, "success");
       }
-      await refreshState({ quiet: true });
+      try {
+        await refreshState({ quiet: true });
+      } catch (_) {
+        setBanner(`Full backup imported from ${file.name}, but the page could not refresh. Refresh to check the current settings and service status.`, "error");
+      }
     } catch (error) {
-      if (importDispatched && error?.timedOut) {
-        // The restore runs on the server after the upload, so a browser timeout
-        // does not stop it. Say the outcome is unknown instead of "failed" so
-        // nobody repeats a restore that may already have been applied.
-        const message = `It is unknown whether the restore from ${file.name} finished. ${error.message} Refresh the page to check the current settings before restoring again.`;
-        if (elements.backupImportResult) {
-          elements.backupImportResult.textContent = message;
-        }
-        setBanner(message, "error");
-        return;
-      }
+      const message = describeBackupRestoreFailure(error, file.name);
       if (elements.backupImportResult) {
-        elements.backupImportResult.textContent = `Import failed: ${error.message || error}`;
+        elements.backupImportResult.textContent = message;
       }
-      setBanner(`Full backup import failed: ${error.message || error}`, "error");
+      setBanner(message, "error");
     } finally {
       if (elements.backupImportButton) {
         elements.backupImportButton.disabled = false;
@@ -8057,6 +8111,8 @@
       editButton: document.getElementById("backup-library-edit-button"),
     },
     fetchJson,
+    fetchBackupRestore,
+    describeBackupRestoreFailure,
     formatBytes,
     formatLocalTimestamp,
     setBanner,
