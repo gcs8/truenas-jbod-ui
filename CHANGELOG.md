@@ -259,6 +259,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Preserved newer admin drafts when older saves complete, and kept discovered
+  storage-view candidates bound to the selected system and HA target. (#842)
 - Kept admin JSON response reads within request deadlines and cancellation,
   validated both restore callers' results, and preserved uncertain outcomes
   without retrying consumed inspection receipts. (#745)
