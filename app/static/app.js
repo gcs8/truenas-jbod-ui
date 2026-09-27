@@ -2195,7 +2195,7 @@
           <div class="sas-fabric-state-list">
             ${pathStates.map((pathState) => `
               <div class="sas-fabric-state-row status-${sasFabricClassToken(pathState.state)}">
-                <span>${escapeHtml(pathState.controller || "path")}</span>
+                <span>${escapeHtml(pathState.controller_label || pathState.controller || "path")}</span>
                 <strong>${escapeHtml(pathState.state || "unknown")}</strong>
                 <small>${escapeHtml(pathState.device_name || "")}</small>
               </div>

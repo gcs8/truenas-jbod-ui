@@ -3445,6 +3445,66 @@ class FabricPathRegressionTests(unittest.TestCase):
         for alias in aliases:
             self.assertIn(alias, fabric.aliases)
 
+    def test_platform_controller_labels_are_separate_from_canonical_joins(self):
+        for platform in ("linux", "scale", "esxi", "quantastor", "ipmi"):
+            with self.subTest(platform=platform):
+                fabric = self.build([self.slot(device_name="sda", health="healthy")], platform)
+                controller = fabric.controllers[0]
+                node = next(n for n in fabric.nodes if n.id == controller["id"])
+                member = next(t for t in fabric.traces if t.id == "bay:0").metrics["path_states"][0]
+                self.assertEqual(controller.get("label"), node.label)
+                self.assertEqual(member.get("controller_label"), node.label)
+                self.assertEqual(fabric.paths[0].get("controller_label"), node.label)
+                self.assertNotIn("storage-v2:", node.label)
+                self.assertEqual(controller["id"], f"controller:{controller['name']}")
+                self.assertEqual(member["controller"], controller["name"])
+                self.assertEqual(fabric.paths[0]["controller"], controller["name"])
+
+    def partial_mpr_build(self, rows, *, enclosures=None, controller="mpr0"):
+        slot = self.slot(5, device_name="da5",
+            multipath=MultipathView(name="synthetic", device_name="multipath/synthetic", members=[
+                MultipathMember(device_name="da5", controller_label=controller, state="ACTIVE")]),
+            raw_status={"enclosure_id": self.CORE_ENCLOSURE, "ses_slot_number": 5})
+        outputs = {
+            "mprutil show adapters": MPR_ADAPTERS,
+            "mprutil -u 0 show devices": rows,
+            CORE_MPR_DMESG_EVENTS_COMMAND: "mpr0: Controller reported scsi ioc terminated tgt 180 SMID 1 loginfo 31120302",
+        }
+        if enclosures is not None:
+            outputs["mprutil -u 0 show enclosures"] = enclosures
+        return self.build([slot], "core", outputs)
+
+    def test_named_mpr_partial_enclosure_evidence_keeps_proven_diagnostics(self):
+        for location in (5, 4):
+            row = self.mpr_row(location, "SAS Target da5")
+            for enclosures in (None, "", f"36 {3:016x} 0008 0012 SES", f"36 {self.CORE_ENCLOSURE} 0008 0002 SES"):
+                with self.subTest(location=location, enclosures=enclosures):
+                    fabric = self.partial_mpr_build(f"{row}\n{row}", enclosures=enclosures)
+                    members = next(t for t in fabric.traces if t.id == "bay:5").metrics["mpr_devices"]
+                    self.assertEqual(len(members), 1)
+                    self.assertEqual(members[0]["diagnostics"]["ioc_terminated_count"], 1)
+                    self.assertEqual(members[0]["mpr_slot"], str(location))
+
+    def test_partial_mpr_evidence_still_rejects_conflicts_and_unproven_offsets(self):
+        cases = [
+            (self.mpr_row(5, "SAS Target da5"), f"36 {3:016x} 0008 0002 SES", "mpr0"),
+            (self.mpr_row(5, "SAS Target da5"), None, "mpr1"),
+            (self.mpr_row(3, "SAS Target da5"), None, "mpr0"),
+            (self.mpr_row(4), None, "mpr0"),
+            (self.mpr_row(5, "SAS Target da6"), None, "mpr0"),
+            (self.mpr_row(4, "SAS Target da5") + "\n" + self.mpr_row(5, "SAS Target da5"), None, "mpr0"),
+            (self.mpr_row(5, "SAS Target da5") + "\n" + self.mpr_row(4, "SAS Target da5"), None, "mpr0"),
+        ]
+        for location in (5, 4):
+            first = self.mpr_row(location, "SAS Target da5")
+            other = self.mpr_row(location, "SAS Target da6", target=181)
+            for rows in ((first, other), (other, first), (first, other, first)):
+                cases.append(("\n".join(rows), None, "mpr0"))
+        for rows, enclosures, controller in cases:
+            with self.subTest(rows=rows, enclosures=enclosures, controller=controller):
+                fabric = self.partial_mpr_build(rows, enclosures=enclosures, controller=controller)
+                self.assertEqual(next(t for t in fabric.traces if t.id == "bay:5").metrics["mpr_devices"], [])
+
     def test_platform_shared_path_health_is_order_independent_member_evidence(self):
         from itertools import permutations
 
@@ -3472,7 +3532,7 @@ class FabricPathRegressionTests(unittest.TestCase):
                     self.assertEqual(path_trace.metrics["state"], expected)
                     for slot in slots:
                         bay = next(t for t in fabric.traces if t.id == f"bay:{slot.slot}")
-                        self.assertEqual(bay.metrics["path_states"][0]["state"], expected)
+                        self.assertEqual(bay.metrics["path_states"][0]["state"], slot.health)
                         self.assertEqual(bay.metrics["path_states"][0]["member_state"], slot.health)
                         self.assertEqual(nodes[f"bay:{slot.slot}"].status, slot.health)
                     # Member faults do not establish a controller/transport fault.

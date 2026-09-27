@@ -1227,6 +1227,7 @@ def _build_platform_storage_fabric_snapshot(context: SasFabricBuildContext) -> S
             {
                 "id": controller_id,
                 "name": controller_name,
+                "label": route["controller_label"],
                 "device": route.get("controller_device"),
                 "board": route.get("controller_label"),
                 "path_counts": Counter(),
@@ -1275,6 +1276,7 @@ def _build_platform_storage_fabric_snapshot(context: SasFabricBuildContext) -> S
             {
                 "id": path_id,
                 "controller": controller_name,
+                "controller_label": route["controller_label"],
                 "controller_id": controller_id,
                 "state": route["path_state"],
                 "member_state_counts": Counter(),
@@ -1438,6 +1440,7 @@ def _build_platform_storage_fabric_snapshot(context: SasFabricBuildContext) -> S
                 "path_states": [
                     {
                         "controller": controller_name,
+                        "controller_label": route["controller_label"],
                         "state": route["path_state"],
                         "member_state": route["path_state"],
                         "state_basis": "member-health-not-transport",
@@ -1491,10 +1494,6 @@ def _build_platform_storage_fabric_snapshot(context: SasFabricBuildContext) -> S
             link.status = paths_by_id[link.target]["state"]
         elif link.kind == "path-storage-enclosure":
             link.status = paths_by_id[link.source]["state"]
-    for trace in traces.values():
-        if trace.kind == "bay":
-            for member in trace.metrics.get("path_states", []):
-                member["state"] = paths_by_id[member["path_id"]]["state"]
 
     controllers = []
     for controller in controllers_by_name.values():
@@ -2306,6 +2305,7 @@ def _build_mpr_trace_index(
     }
     devices: dict[tuple[str, str], dict[str, Any] | None] = {}
     devices_by_location: dict[tuple[str, str, int], dict[str, Any] | None] = {}
+    devices_by_handle_location: dict[tuple[str, str, int], dict[str, Any] | None] = {}
     enclosures: dict[tuple[str, str], str] = {}
     enclosure_keys_by_handle: dict[tuple[str, str], str] = {}
     expanders: dict[tuple[str, str], list[str]] = defaultdict(list)
@@ -2351,6 +2351,14 @@ def _build_mpr_trace_index(
                 # the last row choose which bay receives their diagnostics.
                 devices[key] = context if key not in devices or devices[key] == context else None
             device_slot = _parse_mpr_slot_number(device.get("slot"))
+            # Provider-local handles still locate conflicting occupants when
+            # the optional enclosure logical-ID probe is absent.
+            if device_slot is not None and _is_mpr_disk_target(device.get("device")):
+                handle_location = (controller_name, enc_handle, device_slot)
+                devices_by_handle_location[handle_location] = (
+                    context if handle_location not in devices_by_handle_location
+                    or devices_by_handle_location[handle_location] == context else None
+                )
             if enclosure_key and device_slot is not None and _is_mpr_disk_target(device.get("device")):
                 location_key = (controller_name, enclosure_key, device_slot)
                 devices_by_location[location_key] = (
@@ -2360,6 +2368,8 @@ def _build_mpr_trace_index(
     return {
         "devices": devices,
         "devices_by_location": devices_by_location,
+        "devices_by_handle_location": devices_by_handle_location,
+        "enclosure_keys_by_handle": enclosure_keys_by_handle,
         "enclosures": enclosures,
         "expanders": {key: _dedupe_strings(value) for key, value in expanders.items()},
     }
@@ -2535,9 +2545,20 @@ def _lookup_mpr_device_context(
             # A named member on this controller is independent identity evidence.
             # Only that match can establish SES N -> MPR N-1; never infer it
             # from a nameless neighbouring SAS target or a shared SAS address.
-            if enclosure_keys and context.get("enclosure_key") not in enclosure_keys:
+            if enclosure_keys and context.get("enclosure_key") and context["enclosure_key"] not in enclosure_keys:
+                return None
+            known_handles = {
+                handle for (controller_id, handle), enclosure_key in trace_index.get("enclosure_keys_by_handle", {}).items()
+                if controller_id == context["controller_id"] and enclosure_key in enclosure_keys
+            }
+            enc_handle = str(context.get("enclosure_handle") or "")
+            if known_handles and enc_handle and enc_handle not in known_handles:
                 return None
             location = _parse_mpr_slot_number(context.get("slot"))
+            handle_location = (controller_name, enc_handle, location)
+            handle_locations = trace_index.get("devices_by_handle_location", {})
+            if handle_location in handle_locations and handle_locations[handle_location] is None:
+                return None
             location_key = (controller_name, context.get("enclosure_key"), location)
             locations = trace_index.get("devices_by_location", {})
             # An exact name cannot override contradictory occupants at its own

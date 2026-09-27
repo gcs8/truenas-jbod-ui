@@ -1638,7 +1638,7 @@
     return `
       <div class="fabric-path-cell" data-fabric-slot-cell="${escapeHtml(slotListOptions.expandKey)}" data-fabric-slot-limit="${slotListOptions.limit}">
         <button type="button" class="fabric-path-card status-${classToken(stateName)}${selected ? " is-selected" : ""}${related ? " is-related" : ""}${compact ? " compact" : ""}" data-fabric-trace="${escapeHtml(path.id)}">
-          <span>${escapeHtml(path.controller || "path")}</span>
+          <span>${escapeHtml(path.controller_label || path.controller || "path")}</span>
           <strong>${escapeHtml(displayLabel(path) || stateName)}</strong>
           <small>${escapeHtml(`${path.count || slots.length || 0} ${aggregateDiskNoun(slots, path.count || slots.length)}${(path.count || slots.length) === 1 ? "" : "s"}`)}</small>
           <em>${renderSlotList(slots, slotListOptions)}</em>
@@ -1788,7 +1788,7 @@
           return `
             <div class="fabric-impact-card status-${classToken(path.state)}${selected ? " is-selected" : ""}">
               <button type="button" class="fabric-node-card fabric-impact-card-head" data-fabric-trace="${escapeHtml(path.id)}">
-                <span class="fabric-node-kind">${escapeHtml(path.controller || "path")}</span>
+                <span class="fabric-node-kind">${escapeHtml(path.controller_label || path.controller || "path")}</span>
                 <strong>${escapeHtml(path.state || "unknown")}</strong>
                 <span>${escapeHtml(`${slots.length} affected ${aggregateDiskNoun(slots)}${slots.length === 1 ? "" : "s"}`)}</span>
               </button>
@@ -3255,7 +3255,7 @@
           return `
             <div class="fabric-path-member-card status-${classToken(stateName)}">
               <div>
-                <strong>${escapeHtml(pathState.controller || pathState.path_id || "path")}</strong>
+                <strong>${escapeHtml(pathState.controller_label || pathState.controller || pathState.path_id || "path")}</strong>
                 <span>${escapeHtml(stateName)}</span>
               </div>
               ${deviceName ? `<small title="${escapeHtml(deviceName)}">${escapeHtml(compactDeviceLabel(deviceName, 54))}</small>` : ""}
@@ -3301,7 +3301,7 @@
     ].filter(Boolean).join(" / ");
     const baySmartDevices = list(slot?.smart_device_names || trace.metrics?.smart_device_names).join(", ");
     const modelLine = [bayModel, baySize].filter(Boolean).join(" / ");
-    const sourceLabel = displayLabel(sourceNode) || pathStates[0]?.controller || fabric.system_label || "source";
+    const sourceLabel = displayLabel(sourceNode) || pathStates[0]?.controller_label || pathStates[0]?.controller || fabric.system_label || "source";
     const pathLabel = displayLabel(pathNode) || pathStates[0]?.ses_device || pathStates[0]?.path_id || pathStates[0]?.path_type;
     const smartSummary = smartSummaryForSlot(slotNumber);
     return `
@@ -3535,7 +3535,7 @@
             <div class="fabric-state-list">
               ${pathStates.map((pathState) => `
                 <div class="fabric-state-row status-${classToken(pathState.state)}">
-                  <span>${escapeHtml(pathState.controller || "path")}</span>
+                  <span>${escapeHtml(pathState.controller_label || pathState.controller || "path")}</span>
                   <strong>${escapeHtml(pathState.state || "unknown")}</strong>
                   <small>${escapeHtml(pathState.device_name || "")}</small>
                 </div>
