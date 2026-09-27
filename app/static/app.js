@@ -2558,6 +2558,8 @@
 
   function applySnapshot(snapshot) {
     rememberReusableSnapshot(snapshot);
+    const previousSmartKeys = (state.snapshot.slots || []).map(getSmartCacheKey).sort().join("\n");
+    const previousSmartScope = currentSmartPrefetchScopeKey();
     const nextSystemId = snapshot.selected_system_id || state.selectedSystemId;
     state.snapshot = snapshot;
     syncWritePolicyFromSnapshot(snapshot);
@@ -2566,6 +2568,10 @@
     state.selectedSystemId = nextSystemId;
     state.selectedEnclosureId = snapshot.selected_enclosure_id || null;
     advanceSnapshotExportSourceGeneration();
+    if (previousSmartScope !== currentSmartPrefetchScopeKey()
+      || previousSmartKeys !== (snapshot.slots || []).map(getSmartCacheKey).sort().join("\n")) {
+      invalidateSmartRequests();
+    }
     pruneSmartSummaryCache();
     if (state.selectedSlot !== null && !getSlotById(state.selectedSlot) && !getSelectedStorageViewRuntimeSlot(state.selectedSlot)) {
       state.selectedSlot = null;
@@ -2576,11 +2582,15 @@
     const validKeys = new Set(
       (state.snapshot.slots || []).map((slot) => getSmartCacheKey(slot))
     );
+    const systemPart = state.snapshot.selected_system_id || state.selectedSystemId || "system";
+    const savedPrefix = `${systemPart}|storage-view|`;
+    const savedKeys = new Set((state.storageViewsRuntime?.views || []).flatMap((view) => (view.slots || []).map((slot) => getStorageViewSmartCacheKey(view, slot))));
     const currentScopePrefix = `${currentSmartPrefetchScopeKey()}|`;
     Object.keys(state.smartSummaries).forEach((key) => {
       const entry = state.smartSummaries[key];
       const stale = smartSummaryAgeMs(entry) > SMART_SUMMARY_CACHE_TTL_MS && !isSmartEntryInFlight(entry);
-      const invalidForCurrentScope = key.startsWith(currentScopePrefix) && !validKeys.has(key);
+      const invalidForCurrentScope = (key.startsWith(currentScopePrefix) && !validKeys.has(key))
+        || (key.startsWith(savedPrefix) && !savedKeys.has(key));
       if (stale || invalidForCurrentScope) {
         delete state.smartSummaries[key];
       }
@@ -3488,10 +3498,37 @@
     return "the enclosure over SSH";
   }
 
+  function smartDiskIdentity(slot) {
+    if (!slot || slot.identity_state === "unknown" || slot.present === false || slot.occupied === false) return null;
+    // Device aliases and bay SAS addresses can be reused by another disk.
+    const identity = [slot.serial, slot.logical_unit_id, slot.gptid].map((value) => String(value || "").trim());
+    return identity.some(Boolean) ? JSON.stringify(identity) : null;
+  }
+
+  function invalidateSmartRequests() {
+    state.smartPrefetchToken += 1;
+    state.smartSummaryGeneration += 1;
+    if (state.smartPrefetchTimerId) window.clearTimeout(state.smartPrefetchTimerId);
+    state.smartPrefetchTimerId = null;
+    state.smartPrefetchRunning = false;
+    state.smartPrefetchScopeKey = null;
+    Object.keys(state.smartSummaries).forEach((key) => {
+      const entry = state.smartSummaries[key];
+      if (entry.loading || entry.refreshing || entry.queued) delete state.smartSummaries[key];
+    });
+  }
+
+  function smartSnapshotMatchesSelection() {
+    return (!state.selectedSystemId || state.selectedSystemId === state.snapshot.selected_system_id)
+      && (!state.selectedEnclosureId || state.selectedEnclosureId === state.snapshot.selected_enclosure_id);
+  }
+
   function getSmartCacheKey(slot) {
+    if (!smartSnapshotMatchesSelection()) return null;
     const systemPart = state.snapshot.selected_system_id || state.selectedSystemId || "system";
     const enclosurePart = state.snapshot.selected_enclosure_id || state.selectedEnclosureId || "all-enclosures";
-    return `${systemPart}|${enclosurePart}|${slot.slot}|${slot.device_name || "unknown"}`;
+    const identity = smartDiskIdentity(slot);
+    return identity ? `${systemPart}|${enclosurePart}|${slot.enclosure_id || enclosurePart}|${slot.slot}|${slot.device_name || ""}|${identity}` : null;
   }
 
   function getHistoryCacheKey(slot, options = {}) {
@@ -3666,9 +3703,31 @@
     return request;
   }
 
+  function savedSmartIdentityMatchesLive(slot, liveSlot) {
+    if (!smartDiskIdentity(slot) || !smartDiskIdentity(liveSlot)) return false;
+    // InventoryService._smart_disk_identity uses the first populated strong
+    // field, stripped and lowercased. Saved candidates can omit secondaries
+    // that the live snapshot independently backfills. Keep this compatibility
+    // check separate from the exact cache keys and request-generation fences.
+    const fields = ["serial", "logical_unit_id", "gptid"];
+    const saved = fields.map((field) => String(slot[field] || "").trim().toLowerCase());
+    const live = fields.map((field) => String(liveSlot[field] || "").trim().toLowerCase());
+    const primary = saved.findIndex(Boolean);
+    if (primary < 0 || primary !== live.findIndex(Boolean) || saved[primary] !== live[primary]) return false;
+    // An equal primary must not conceal contradictory populated strong fields.
+    return saved.every((value, index) => !value || !live[index] || value === live[index]);
+  }
+
   function getStorageViewSmartCacheKey(view, slot) {
+    if (!smartSnapshotMatchesSelection()) return null;
+    if (Number.isInteger(slot.snapshot_slot)
+      && (!view.backing_enclosure_id || view.backing_enclosure_id === state.snapshot.selected_enclosure_id)) {
+      const liveSlot = getSlotById(slot.snapshot_slot);
+      if (!savedSmartIdentityMatchesLive(slot, liveSlot)) return null;
+    }
     const systemPart = state.snapshot.selected_system_id || state.selectedSystemId || "system";
-    return `${systemPart}|storage-view|${view.id}|${slot.slot_index}|${slot.device_name || slot.serial || "unknown"}`;
+    const identity = smartDiskIdentity(slot);
+    return identity ? `${systemPart}|storage-view|${view.id}|${view.backing_enclosure_id || ""}|${slot.slot_index}|${slot.device_name || ""}|${identity}` : null;
   }
 
   function buildStorageViewHistoryContextSlot(view, slot) {
@@ -3728,7 +3787,7 @@
   }
 
   function getSmartSummaryEntry(slot) {
-    if (!slot) return null;
+    if (!slot || !getSmartCacheKey(slot)) return null;
     const liveEntry = state.smartSummaries[getSmartCacheKey(slot)] || null;
     if (liveEntry) {
       return liveEntry;
@@ -3751,7 +3810,7 @@
   }
 
   function getStorageViewSmartSummaryEntry(view, slot) {
-    if (!view || !slot) return null;
+    if (!view || !slot || !getStorageViewSmartCacheKey(view, slot)) return null;
     const liveEntry = state.smartSummaries[getStorageViewSmartCacheKey(view, slot)] || null;
     if (liveEntry) {
       return liveEntry;
@@ -3796,13 +3855,14 @@
     if (!entry || entry.queued || (!entry.loading && !entry.refreshing)) {
       return false;
     }
-    const requestedAt = Number(entry.requestedAt) || 0;
-    return requestedAt > 0 && Date.now() - requestedAt < SMART_PREFETCH_STALE_MS;
+    // The request deadline settles loading state. Wall-clock cache age must
+    // not release a live owner, including chunks reserved by an active batch.
+    return true;
   }
 
   function candidateSlotsForSmartPrefetch() {
     return (state.snapshot.slots || []).filter((slot) => {
-      if (!slot.present) {
+      if (!slot.present || !getSmartCacheKey(slot)) {
         return false;
       }
       if (!slot.device_name && !(Array.isArray(slot.smart_device_names) && slot.smart_device_names.length)) {
@@ -3856,6 +3916,7 @@
   async function requestSmartBatchForSlots(slots) {
     return sendScopedRequest("/api/slots/smart-batch", {
       method: "POST",
+      signal: AbortSignal.timeout(SMART_PREFETCH_STALE_MS),
       body: JSON.stringify({
         slots: slots.map((slot) => slot.slot),
         max_concurrency: Math.min(SMART_BATCH_REQUEST_MAX_CONCURRENCY, slots.length),
@@ -3864,50 +3925,23 @@
   }
 
   function applySmartPrefetchPayload(slots, payload) {
-    const seenSlots = new Set();
-    (payload.summaries || []).forEach((item) => {
-      const slot = getSlotById(item.slot);
-      if (!slot) {
-        return;
-      }
-      seenSlots.add(item.slot);
-      state.smartSummaries[getSmartCacheKey(slot)] = {
+    const summaries = new Map((payload.summaries || []).map((item) => [item.slot, item.summary]));
+    slots.forEach(({ slot, cacheKey, owner }) => {
+      if (state.smartSummaries[cacheKey] !== owner) return;
+      state.smartSummaries[cacheKey] = {
         loading: false,
         refreshing: false,
-        data: item.summary,
+        data: summaries.get(slot) || owner.data || { available: false, message: "SMART prefetch returned no data for this slot." },
         requestedAt: Date.now(),
-        generation: state.smartSummaryGeneration,
-      };
-    });
-    slots.forEach((slot) => {
-      if (seenSlots.has(slot.slot)) {
-        return;
-      }
-      const existingEntry = state.smartSummaries[getSmartCacheKey(slot)];
-      state.smartSummaries[getSmartCacheKey(slot)] = {
-        loading: false,
-        refreshing: false,
-        data: existingEntry?.data || { available: false, message: "SMART prefetch returned no data for this slot." },
-        requestedAt: Date.now(),
-        generation: state.smartSummaryGeneration,
+        generation: owner.generation,
       };
     });
   }
 
   function applySmartPrefetchError(slots, error) {
-    slots.forEach((slot) => {
-      const existingEntry = state.smartSummaries[getSmartCacheKey(slot)];
-      state.smartSummaries[getSmartCacheKey(slot)] = {
-        loading: false,
-        refreshing: false,
-        data: existingEntry?.data || {
-          available: false,
-          message: error.message || String(error),
-        },
-        requestedAt: Date.now(),
-        generation: state.smartSummaryGeneration,
-      };
-    });
+    applySmartPrefetchPayload(slots, { summaries: slots.map(({ slot, owner }) => ({
+      slot, summary: owner.data || { available: false, message: error.message || String(error) },
+    })) });
   }
 
   function logSmartPrefetchFailure(message, error, options = {}) {
@@ -3929,7 +3963,7 @@
       return;
     }
     state.smartPrefetchRunning = true;
-    const slots = candidateSlotsForSmartPrefetch();
+    const slots = candidateSlotsForSmartPrefetch().map((slot) => ({ slot: slot.slot, cacheKey: getSmartCacheKey(slot), owner: null }));
     if (!slots.length) {
       state.smartPrefetchRunning = false;
       return;
@@ -3937,7 +3971,7 @@
 
     try {
       slots.forEach((slot) => {
-        const cacheKey = getSmartCacheKey(slot);
+        const cacheKey = slot.cacheKey;
         const existingEntry = state.smartSummaries[cacheKey];
         state.smartSummaries[cacheKey] = {
           loading: !existingEntry?.data,
@@ -3946,6 +3980,7 @@
           requestedAt: Date.now(),
           generation: state.smartSummaryGeneration,
         };
+        slot.owner = state.smartSummaries[cacheKey];
       });
       updateSmartPrefetchViews();
 
@@ -4036,8 +4071,10 @@
       return Promise.resolve();
     }
     const cacheKey = getSmartCacheKey(slot);
+    if (!cacheKey) return;
     const entry = state.smartSummaries[cacheKey];
-    const settled = isSmartEntryCurrent(entry) && (entry?.data || isSmartEntryInFlight(entry));
+    if (isSmartEntryInFlight(entry)) return Promise.resolve();
+    const settled = isSmartEntryCurrent(entry);
     const coveredByPrefetch = !settled
       && smartPrefetchPending()
       && candidateSlotsForSmartPrefetch().some((candidate) => candidate.slot === slot.slot);
@@ -10010,11 +10047,15 @@
   }
 
   function applyStorageViewRuntime(payload) {
+    const previousSmartKeys = (state.storageViewsRuntime?.views || []).flatMap((view) => (view.slots || []).map((slot) => getStorageViewSmartCacheKey(view, slot))).sort().join("\n");
     state.storageViewsRuntime = payload || {
       system_id: state.selectedSystemId || state.snapshot.selected_system_id || null,
       system_label: state.snapshot.selected_system_label || state.selectedSystemId || null,
       views: [],
     };
+    const nextSmartKeys = (state.storageViewsRuntime.views || []).flatMap((view) => (view.slots || []).map((slot) => getStorageViewSmartCacheKey(view, slot))).sort().join("\n");
+    if (previousSmartKeys !== nextSmartKeys) invalidateSmartRequests();
+    pruneSmartSummaryCache();
     ensureStorageViewRuntimeSelection();
   }
 
@@ -10715,15 +10756,16 @@
       return;
     }
     const cacheKey = getSmartCacheKey(slot);
+    if (!cacheKey) return;
     const entry = state.smartSummaries[cacheKey];
-    if (isSmartEntryCurrent(entry) && (entry?.data || isSmartEntryInFlight(entry))) {
+    if (isSmartEntryInFlight(entry) || isSmartEntryCurrent(entry)) {
       if (state.hoveredSlot === slot.slot) {
         refreshHoveredTooltip();
       }
       return;
     }
 
-    state.smartSummaries[cacheKey] = {
+    const owner = state.smartSummaries[cacheKey] = {
       loading: !entry?.data,
       refreshing: Boolean(entry?.data),
       data: entry?.data || null,
@@ -10734,7 +10776,8 @@
       refreshHoveredTooltip();
     }
     try {
-      const payload = await sendScopedRequest(`/api/slots/${slot.slot}/smart`);
+      const payload = await sendScopedRequest(`/api/slots/${slot.slot}/smart`, { signal: AbortSignal.timeout(SMART_PREFETCH_STALE_MS) });
+      if (state.smartSummaries[cacheKey] !== owner) return;
       state.smartSummaries[cacheKey] = {
         loading: false,
         refreshing: false,
@@ -10743,6 +10786,7 @@
         generation: state.smartSummaryGeneration,
       };
     } catch (error) {
+      if (state.smartSummaries[cacheKey] !== owner) return;
       state.smartSummaries[cacheKey] = {
         loading: false,
         refreshing: false,
@@ -10768,12 +10812,13 @@
       return;
     }
     const cacheKey = getStorageViewSmartCacheKey(view, slot);
+    if (!cacheKey) return;
     const entry = state.smartSummaries[cacheKey];
-    if (isSmartEntryCurrent(entry) && (entry?.data || isSmartEntryInFlight(entry))) {
+    if (isSmartEntryInFlight(entry) || isSmartEntryCurrent(entry)) {
       return;
     }
 
-    state.smartSummaries[cacheKey] = {
+    const owner = state.smartSummaries[cacheKey] = {
       loading: !entry?.data,
       refreshing: Boolean(entry?.data),
       data: entry?.data || null,
@@ -10790,7 +10835,8 @@
       const scopedUrl = params.toString()
         ? `/api/storage-views/${encodeURIComponent(view.id)}/slots/${slot.slot_index}/smart?${params.toString()}`
         : `/api/storage-views/${encodeURIComponent(view.id)}/slots/${slot.slot_index}/smart`;
-      const payload = await fetchJson(scopedUrl);
+      const payload = await fetchJson(scopedUrl, { signal: AbortSignal.timeout(SMART_PREFETCH_STALE_MS) });
+      if (state.smartSummaries[cacheKey] !== owner) return;
       state.smartSummaries[cacheKey] = {
         loading: false,
         refreshing: false,
@@ -10799,6 +10845,7 @@
         generation: state.smartSummaryGeneration,
       };
     } catch (error) {
+      if (state.smartSummaries[cacheKey] !== owner) return;
       state.smartSummaries[cacheKey] = {
         loading: false,
         refreshing: false,
@@ -10961,6 +11008,7 @@
       const previousEstimateBasisKey = snapshotExportEstimateBasisKey();
       closeEnclosureAliasEditor(false);
       if (nextSystemId === state.selectedSystemId) return;
+      invalidateSmartRequests();
       state.selectionEpoch = (state.selectionEpoch || 0) + 1;
       state.storageViewsRuntimeRequestToken += 1;
       state.storageViewsRuntimeError = null;
@@ -10998,6 +11046,7 @@
         return;
       }
       if (rawValue === currentValue) return;
+      invalidateSmartRequests();
       state.selectionEpoch = (state.selectionEpoch || 0) + 1;
       const previousEstimateBasisKey = snapshotExportEstimateBasisKey();
       closeEnclosureAliasEditor(false);
