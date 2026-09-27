@@ -1937,7 +1937,30 @@ class HistoryStore:
         finally:
             os.close(descriptor)
 
+    @classmethod
+    def prepare_backup_directory(cls, directory: Path) -> None:
+        """Create loader-owned roots without losing their publication obligation.
+
+        Parent barriers stay with the backup operation: an archive barrier must
+        not become a condition of local snapshot success. The prepared marker
+        survives settings-cache eviction, failed loading, and fresh stores.
+        """
+        cls._ensure_directory_entry(
+            directory, prepare_only=True,
+            sync_directory=cls._fsync_directory, rename=cls._rename_at2,
+        )
+
     def _ensure_backup_directory(self, directory: Path) -> None:
+        self._ensure_directory_entry(
+            directory, prepare_only=False,
+            sync_directory=self._fsync_directory, rename=self._rename_at2,
+        )
+
+    @classmethod
+    def _ensure_directory_entry(
+        cls, directory: Path, *, prepare_only: bool,
+        sync_directory: Callable[[Path], None], rename: Callable[..., None],
+    ) -> None:
         """Persist only entries we create, including retries after a failed sync.
 
         Install each new directory with a pending marker already inside it. A
@@ -1947,7 +1970,10 @@ class HistoryStore:
         """
         marker_name = ".history-backup-directory-pending"
         if not directory.is_dir():
-            self._ensure_backup_directory(directory.parent)
+            cls._ensure_directory_entry(
+                directory.parent, prepare_only=prepare_only,
+                sync_directory=sync_directory, rename=rename,
+            )
             for _ in range(32):
                 staged = directory.parent / f".history-directory-{secrets.token_hex(8)}"
                 try:
@@ -1970,9 +1996,9 @@ class HistoryStore:
                     os.fsync(descriptor)
                 finally:
                     os.close(descriptor)
-                self._fsync_directory(staged)
+                sync_directory(staged)
                 try:
-                    self._rename_at2(staged, directory, flags=RENAME_NOREPLACE)
+                    rename(staged, directory, flags=RENAME_NOREPLACE)
                     installed = True
                 except FileExistsError:
                     if not directory.is_dir():
@@ -1995,7 +2021,16 @@ class HistoryStore:
             return
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_size != 0 or metadata.st_nlink != 1:
             raise ValueError(f"History backup refuses invalid directory marker {marker}.")
-        self._fsync_directory(directory.parent)
+        if prepare_only:
+            return
+        # Loading can prepare a whole chain before a store exists. Complete
+        # marked ancestors first, stopping at the first unmarked caller-owned
+        # directory; never infer authority to repair arbitrary ancestors.
+        cls._ensure_directory_entry(
+            directory.parent, prepare_only=False,
+            sync_directory=sync_directory, rename=rename,
+        )
+        sync_directory(directory.parent)
         # Only a successful parent barrier permits retirement. If this unlink
         # fails, the marker remains for retry; if it reappears after a crash, an
         # extra parent sync is harmless. No acknowledged data depends on unlink.
