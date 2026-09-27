@@ -232,8 +232,6 @@ class HistoryComposeMigrationTests(unittest.TestCase):
             compose = [binary]
         elif shutil.which("docker"):
             compose = ["docker", "compose"]
-            if subprocess.run(compose + ["version"], capture_output=True, timeout=30).returncode:
-                self.skipTest("Compose plugin unavailable; token migration not validated")
         else:
             self.skipTest("Compose unavailable; token migration not validated")
         document = (ROOT / "docs/HISTORY_COMPOSE_MIGRATION.md").read_text()
@@ -257,6 +255,14 @@ class HistoryComposeMigrationTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory(prefix="history-token-migration-") as temporary:
             root = Path(temporary)
+            clean = {"PATH": os.environ.get("PATH", ""), "HOME": temporary,
+                     "TMPDIR": temporary, "DOCKER_CONFIG": str(root / "docker-config"),
+                     "DOCKER_HOST": "tcp://127.0.0.1:1"}
+            # Probe the plugin with the render environment: a per-user plugin
+            # under the real HOME or DOCKER_CONFIG is not visible to render().
+            if compose == ["docker", "compose"] and subprocess.run(
+                    compose + ["version"], env=clean, capture_output=True, timeout=30).returncode:
+                self.skipTest("Compose plugin unavailable; token migration not validated")
             shutil.copyfile(self.LEGACY, root / "compose.yaml")
             shutil.copyfile(self.OVERLAY, root / self.OVERLAY.name)
             (root / "auth.yml").write_text(policy)
@@ -289,9 +295,6 @@ class HistoryComposeMigrationTests(unittest.TestCase):
             (root / "last.yml").write_text(yaml.safe_dump({"services": {
                 "enclosure-history": {"labels": {"fixture.order": "last"}, "mem_limit": "512m"},
             }}))
-            clean = {"PATH": os.environ.get("PATH", ""), "HOME": temporary,
-                     "TMPDIR": temporary, "DOCKER_CONFIG": str(root / "docker-config"),
-                     "DOCKER_HOST": "tcp://127.0.0.1:1"}
 
             def render(files, shell, chain):
                 command = compose + ["--project-name", "token-migration"]
