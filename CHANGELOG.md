@@ -259,6 +259,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Kept the default for a blank non-text value in `.env` when the admin service
+  starts, as the history service already did. (#798)
 - The main UI no longer reports itself down when a pinned known-hosts file sits
   on a read-only mount, such as the `/run/ssh` mount in the shipped Compose
   file. SSH still verifies hosts against the keys in it; `/healthz` now answers
