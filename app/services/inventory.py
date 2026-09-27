@@ -715,12 +715,12 @@ class DiskRecord:
 
 @dataclass(slots=True)
 class _QuantastorCliDiskHints:
-    # One bit per normalized identity group, not per row. Equal identities
-    # always have the same admission/rank for every primary disk. Different
-    # identities imply different payloads, so multiple winning bits conflict.
+    # One ordinal per normalized identity group, shared by sparse postings.
+    # Each identity field has bounded cardinality, so retained posting entries
+    # grow linearly with groups, without one widening bitmap per distinct key.
     groups: list[tuple[dict[str, Any], bool]] = field(default_factory=list)
-    values: dict[tuple[str, str], int] = field(default_factory=dict)
-    populated: dict[str, int] = field(default_factory=dict)
+    values: dict[tuple[str, str], set[int]] = field(default_factory=dict)
+    populated: dict[str, set[int]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -7446,40 +7446,21 @@ class InventoryService:
                 ):
                     lookup_keys.update(normalize_lookup_keys(str(value) if value is not None else None))
             if isinstance(cli_hint, dict):
-                cli_evidence = cli_hint
-                if not (
+                # Admission authorizes health enrichment, not new bay identity.
+                # Keep the complete CLI row source-labelled for diagnostics;
+                # project only explicit non-identity measurements into raw data.
+                merged_raw = self._merge_quantastor_payloads(
+                    self._quantastor_cli_health_fields(cli_hint), merged_raw)
+                merged_raw["quantastor_cli_disk"] = cli_hint
+                same_owner = (
                     self._quantastor_cli_identity(disk)["owner"]
                     & self._quantastor_cli_identity(cli_hint)["owner"]
-                ):
-                    # A shared physical identity permits health enrichment, not
-                    # execution of another node's local device aliases here.
-                    cli_hint = {key: value for key, value in cli_hint.items() if key not in {
-                        "devicePath", "altDevicePath", "deviceName", "device", "name",
-                        "storageSystemId", "systemId", "iofenceSystemId", "controllerId",
-                    }}
-                # A missing primary SAS field is not corroboration. Preserve the
-                # CLI observation below for details, but do not promote it into
-                # the raw fields consumed by bay identity and slot candidates.
-                cli_hint = {key: value for key, value in cli_hint.items()
-                            if key not in {"sasAddress", "portSasAddress"}}
-                merged_raw = self._merge_quantastor_payloads(cli_hint, merged_raw)
-                merged_raw["quantastor_cli_disk"] = cli_evidence
-                for value in (
-                    cli_hint.get("id"),
-                    cli_hint.get("hwDiskId"),
-                    cli_hint.get("serialNumber"),
-                    cli_hint.get("scsiId"),
-                    cli_hint.get("wwid"),
-                    cli_hint.get("devicePath"),
-                    cli_hint.get("altDevicePath"),
-                    cli_hint.get("multipathParentDiskId"),
-                ):
-                    lookup_keys.update(normalize_lookup_keys(str(value) if value is not None else None))
-                if not device_name:
-                    device_name = normalize_device_name(
-                        cli_hint.get("devicePath") or cli_hint.get("altDevicePath") or cli_hint.get("name")
-                    )
-                    path_device_name = device_name
+                )
+                # Node-local paths are permitted only for SMART on the same
+                # owner. They never enter lookup keys, raw identity or bay aliases.
+                cli_hint = ({key: cli_hint[key] for key in (
+                    "devicePath", "altDevicePath", "deviceName", "device", "name"
+                ) if key in cli_hint} if same_owner else None)
             if not pool_hint:
                 pool_hint = next((pool_slot_hints[key] for key in lookup_keys if key in pool_slot_hints), None)
             if pool_hint and isinstance(pool_hint.get("pool_device_raw"), dict):
@@ -7571,6 +7552,26 @@ class InventoryService:
                 return owner_option_ids[system_id][0]
 
         return option_ids[0]
+
+    @staticmethod
+    def _quantastor_cli_health_fields(row: dict[str, Any]) -> dict[str, Any]:
+        # Explicit measurement projection. Unknown fields stay diagnostic-only,
+        # including identity aliases and nested hardware/pool source payloads.
+        fields = {
+            "temperature", "currentTemperature", "currTemp", "driveTemp",
+            "powerOnHours", "powerOnTimeHours", "powerOnTime",
+            "bytesRead", "dataReadBytes", "logicalBytesRead",
+            "bytesWritten", "dataWrittenBytes", "logicalBytesWritten",
+            "rotationRate", "rotationRateRpm", "rpm", "isSsd", "formFactor", "diskFormFactor",
+            "smartHealthTest", "transportType", "protocol", "mediaInterface",
+            "logicalBlockSize", "sectorSize", "logSectorSize", "blockSize",
+            "physicalBlockSize", "phySectorSize", "ssdLifeLeft", "lifeLeftPercent",
+            "mediumErrors", "mediaErrors", "readErrors", "writeErrors",
+            "predictiveErrors", "errCountPredictive", "errCountNonMedium", "nonMediumErrors",
+            "errCountUncorrectedRead", "errCountUncorrectedWrite",
+            "firmwareVersion", "revisionLevel", "trimSupported", "isBlinking",
+        }
+        return {key: value for key, value in row.items() if key in fields}
 
     def _build_quantastor_smart_devices(
         self,
@@ -7771,13 +7772,11 @@ class InventoryService:
             index = len(hints.groups)
             group_ids[signature] = index
             hints.groups.append((row, False))
-            bit = 1 << index
             for kind, values in identity.items():
                 if values:
-                    hints.populated[kind] = hints.populated.get(kind, 0) | bit
+                    hints.populated.setdefault(kind, set()).add(index)
                 for value in values:
-                    key = (kind, value)
-                    hints.values[key] = hints.values.get(key, 0) | bit
+                    hints.values.setdefault((kind, value), set()).add(index)
         return hints
 
     @classmethod
@@ -7794,36 +7793,32 @@ class InventoryService:
         physical_kinds = ("serial", "wwn", "scsiId", "wwid", "eui64")
         # SAS hints may veto enrichment but do not grant new match authority.
         contradiction_kinds = (*physical_kinds, "sasAddress", "portSasAddress")
-        matches: dict[str, int] = {}
-        for kind, values in identity.items():
-            mask = 0
-            for value in values:
-                mask |= hints.values.get((kind, value), 0)
-            matches[kind] = mask
+        matches = {
+            kind: set().union(*(hints.values.get((kind, value), ()) for value in values))
+            for kind, values in identity.items()
+        }
         id_matches = matches["id"]
-        physical_matches = 0
-        for kind in physical_kinds:
-            physical_matches |= matches[kind]
+        physical_matches = set().union(*(matches[kind] for kind in physical_kinds))
         same_owner = matches["owner"]
         path_matches = same_owner & matches["path"]
         if identity["id"]:
-            path_matches &= ~hints.populated.get("id", 0)
+            path_matches.difference_update(hints.populated.get("id", ()))
         candidates = id_matches | physical_matches | path_matches
         for kind in contradiction_kinds:
             if identity[kind]:
-                candidates &= ~(hints.populated.get(kind, 0) & ~matches[kind])
-        # Work on precomputed identity buckets, never rescan or renormalize a
-        # shared serial bucket for every REST disk. Bit operations scale with
-        # index width; this is not a fixed CPU/memory bound or a row cap.
+                candidates.difference_update(hints.populated.get(kind, set()) - matches[kind])
+        # Set algebra visits precomputed ordinals, never candidate payloads or
+        # their normalization/equality per REST disk. This is linear retained
+        # index space, not a fixed work bound or a whole-request latency claim.
         for authority in (id_matches, physical_matches, path_matches):
             ranked = candidates & authority
             if not ranked:
                 continue
             local = ranked & same_owner
             winning = local or ranked
-            if winning & (winning - 1):
+            if len(winning) != 1:
                 return None
-            representative, differs = hints.groups[winning.bit_length() - 1]
+            representative, differs = hints.groups[next(iter(winning))]
             # A conflict at the best rank cannot fall back to a weaker rank.
             return None if differs else representative
         return None
@@ -8249,14 +8244,12 @@ class InventoryService:
                 continue
 
             lookup_keys = self._collect_quantastor_lookup_keys(raw_disk)
-            cli_disk = raw_disk.get("quantastor_cli_disk") if isinstance(raw_disk.get("quantastor_cli_disk"), dict) else None
             hw_disk = raw_disk.get("quantastor_hw_disk") if isinstance(raw_disk.get("quantastor_hw_disk"), dict) else None
             pool_device = raw_disk.get("quantastor_pool_device") if isinstance(raw_disk.get("quantastor_pool_device"), dict) else None
             physical_disk_obj = None
             if pool_device and isinstance(pool_device.get("physicalDiskObj"), dict):
                 physical_disk_obj = pool_device.get("physicalDiskObj")
 
-            lookup_keys.update(self._collect_quantastor_lookup_keys(cli_disk))
             lookup_keys.update(self._collect_quantastor_lookup_keys(hw_disk))
             lookup_keys.update(self._collect_quantastor_lookup_keys(pool_device))
             lookup_keys.update(self._collect_quantastor_lookup_keys(physical_disk_obj))
@@ -8293,15 +8286,15 @@ class InventoryService:
                 ) is not None
                 else None
             )
+            # Retained CLI diagnostics cannot grant host authority. This value
+            # also feeds SMART host selection, so use original API context only.
             fence_owner_id = normalize_text(
                 str(
                     raw_disk.get("iofenceSystemId")
-                    or (cli_disk.get("iofenceSystemId") if cli_disk else None)
                     or (physical_disk_obj.get("iofenceSystemId") if physical_disk_obj else None)
                 )
                 if (
                     raw_disk.get("iofenceSystemId")
-                    or (cli_disk.get("iofenceSystemId") if cli_disk else None)
                     or (physical_disk_obj.get("iofenceSystemId") if physical_disk_obj else None)
                 ) is not None
                 else None
@@ -13264,19 +13257,14 @@ class InventoryService:
         raw_sources: list[dict[str, Any]] = []
         if isinstance(disk.raw, dict):
             raw_sources.append(disk.raw)
-            for key in ("quantastor_hw_disk", "quantastor_cli_disk"):
-                payload = disk.raw.get(key)
-                if isinstance(payload, dict):
-                    raw_sources.append(payload)
+            # The retained CLI disk row is diagnostics only. Original API and
+            # independently matched hardware rows remain identity authorities.
+            payload = disk.raw.get("quantastor_hw_disk")
+            if isinstance(payload, dict):
+                raw_sources.append(payload)
 
         for payload in raw_sources:
             for key in ("sasAddress", "portSasAddress", "scsiId", "wwid", "wwn"):
-                # Retained CLI disk rows are diagnostic evidence. Their SAS
-                # fields have no independent bay authority, including when the
-                # corresponding primary field is absent. Corroborated values
-                # remain available from the primary/hardware payloads above.
-                if payload is disk.raw.get("quantastor_cli_disk") and key in {"sasAddress", "portSasAddress"}:
-                    continue
                 value = payload.get(key)
                 sources.append(str(value) if value is not None else None)
 

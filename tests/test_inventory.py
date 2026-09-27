@@ -17743,6 +17743,313 @@ class InventoryScopedIdentityRegressionTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(first["temperature"], 70 if expected else None)
                     self.assertEqual(first["firmware"], "CLI-FW" if expected else None)
 
+    async def test_quantastor_cli_aliases_never_create_bay_identity(self) -> None:
+        sas_a, sas_b = (f"5{counter:015x}" for counter in (16, 256))
+        for field in ("scsiId", "wwid", "wwn", "eui64", "sasAddress", "portSasAddress"):
+            typed_proof = "wwn" if field != "wwn" else "scsiId"
+            for missing in ("absent", "blank", "null"):
+                for proof in ("id", "serialNumber", typed_proof):
+                    disk = {"id": "disk-a", "storageSystemId": "node-a", "devicePath": "/dev/sda",
+                            "serialNumber": "SYNTHETIC-A", "slot": 0}
+                    if proof == typed_proof:
+                        disk[proof] = sas_a
+                    if missing != "absent":
+                        disk[field] = "" if missing == "blank" else None
+                    for owner in ("node-a", "node-b"):
+                        cli = {proof: disk[proof], field: sas_b, "storageSystemId": owner,
+                               "driveTemp": "70 C", "revisionLevel": "CLI-FW", "smartHealthTest": "[FAILED]"}
+                        for reverse in (False, True):
+                            with self.subTest(field=field, missing=missing, proof=proof, owner=owner, reverse=reverse):
+                                rows = [cli, {"id": "unrelated"}]
+                                result = await self._quantastor_two_bay_cli_observation(
+                                    disk, rows[::-1] if reverse else rows)
+                                first, second = result["slots"]
+                                self.assertIsNone(second["serial"])
+                                self.assertIsNone(second["device"])
+                                for key in ("temperature", "firmware", "health", "cli"):
+                                    self.assertIsNone(second[key])
+                                self.assertEqual(second["commands"], [])
+                                self.assertEqual(first["serial"], "SYNTHETIC-A")
+                                self.assertEqual(first["temperature"], 70)
+                                self.assertEqual(first["firmware"], "CLI-FW")
+                                self.assertEqual(first["health"], "FAILED")
+                                self.assertEqual(first["cli"], cli)
+                                self.assertEqual(first["raw"].get(field), disk.get(field))
+                                self.assertTrue(first["commands"])
+                                self.assertTrue(all(host == "node-a.example.test" and "/dev/sda" in command
+                                                    for host, command in first["commands"]))
+
+    def test_quantastor_cli_projection_preserves_all_source_identity_consumers(self) -> None:
+        # These fields exercise IDs, aliases, owners, slots, nested source rows,
+        # and future/unrecognized fields. CLI enrichment is a health projection,
+        # not an identity denylist that must anticipate each new source field.
+        fields = ("id", "hwDiskId", "physicalDiskId", "multipathParentDiskId",
+                  "serialNumber", "serial", "serialNum", "physicalDiskSerialNumber",
+                  "wwn", "scsiId", "wwid", "eui64", "sasAddress", "portSasAddress",
+                  "attachedSasAddress", "sas_address", "attached_sas_address", "lunid", "identifier",
+                  "devicePath", "altDevicePath", "deviceName", "device", "name",
+                  "storageSystemId", "systemId", "iofenceSystemId", "controllerId",
+                  "enclosureId", "enclosure_id", "slot", "slotNumber", "bay", "model",
+                  "storagePoolId", "poolId", "storagePoolDeviceId", "zfs_guid", "unknownIdentity",
+                  "quantastor_hw_disk", "quantastor_pool_device")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = build_inventory_service(Settings(), SystemConfig(
+                id="synthetic-qs-source", truenas=TrueNASConfig(platform="quantastor")),
+                AsyncMock(), AsyncMock(), temp_dir)
+            for field in fields:
+                for missing in ("absent", "blank", "null"):
+                    for owner in ("node-a", "node-b"):
+                        with self.subTest(field=field, missing=missing, owner=owner):
+                            disk = {"id": "disk-a", "storageSystemId": "node-a", "devicePath": "/dev/sda",
+                                    "serialNumber": "SYNTHETIC-A", "slot": 0}
+                            # WWN-only matching must not restore a missing serial or ID.
+                            proof = "wwn" if field in {"id", "serialNumber"} else "id"
+                            if proof == "wwn":
+                                disk[proof] = f"5{16:015x}"
+                            if field in {"serial", "serialNum"}:
+                                disk.pop("serialNumber")
+                            disk.pop(field, None)
+                            if missing != "absent":
+                                disk[field] = "" if missing == "blank" else None
+                            value = ({"sasAddress": f"5{256:015x}"} if field.startswith("quantastor_")
+                                     else f"5{256:015x}")
+                            cli = {proof: disk[proof], "storageSystemId": owner, field: value,
+                                   "driveTemp": "70 C", "revisionLevel": "CLI-FW"}
+                            raw = self._raw([disk])
+                            before = service._build_quantastor_disk_records(raw, None)[0]
+                            raw.cli_disks = [cli]
+                            after = service._build_quantastor_disk_records(raw, None)[0]
+                            self.assertEqual(after.raw.get("quantastor_cli_disk"), cli)
+                            self.assertEqual(after.raw.get(field), before.raw.get(field))
+                            self.assertEqual(after.lookup_keys, before.lookup_keys)
+                            self.assertEqual(after.serial, before.serial)
+                            self.assertEqual(after.identifier, before.identifier)
+                            self.assertEqual(after.lunid, before.lunid)
+                            self.assertEqual(after.device_name, before.device_name)
+                            self.assertEqual(after.enclosure_id, before.enclosure_id)
+                            self.assertEqual(after.slot, before.slot)
+                            self.assertEqual(service._disk_sas_alias_tiers(after), service._disk_sas_alias_tiers(before))
+                            self.assertEqual(service._collect_quantastor_lookup_keys(after.raw),
+                                             service._collect_quantastor_lookup_keys(before.raw))
+
+    def test_quantastor_retained_cli_rows_have_no_alias_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = build_inventory_service(Settings(), SystemConfig(
+                id="synthetic-qs-source", truenas=TrueNASConfig(platform="quantastor")),
+                AsyncMock(), AsyncMock(), temp_dir)
+            disk = {"id": "disk-a", "devicePath": "/dev/sda", "wwn": f"5{16:015x}"}
+            record = service._build_quantastor_disk_records(self._raw([disk]), None)[0]
+            baseline = service._disk_sas_alias_tiers(record)
+            for field in ("sasAddress", "portSasAddress", "scsiId", "wwid", "wwn"):
+                with self.subTest(field=field):
+                    record.raw["quantastor_cli_disk"] = {field: f"5{256:015x}"}
+                    self.assertEqual(service._disk_sas_alias_tiers(record), baseline)
+            record.raw["quantastor_hw_disk"] = {"sasAddress": f"5{512:015x}"}
+            self.assertNotEqual(service._disk_sas_alias_tiers(record), baseline)
+
+    async def test_quantastor_wwn_only_cli_admission_does_not_restore_identity(self) -> None:
+        disk = {"wwn": f"5{16:015x}", "devicePath": "/dev/sda", "storageSystemId": "node-a", "slot": 0}
+        for owner in ("node-a", "node-b"):
+            for reverse in (False, True):
+                with self.subTest(owner=owner, reverse=reverse):
+                    cli = {"wwn": disk["wwn"], "id": "cli-only-id", "serialNumber": "CLI-ONLY-SERIAL",
+                           "storageSystemId": owner, "scsiId": f"5{256:015x}", "devicePath": "/dev/sdz",
+                           "driveTemp": "70 C", "revisionLevel": "CLI-FW", "smartHealthTest": "[FAILED]"}
+                    rows = [cli, {"id": "unrelated"}]
+                    result = await self._quantastor_two_bay_cli_observation(disk, rows[::-1] if reverse else rows)
+                    first, second = result["slots"]
+                    self.assertIsNone(second["device"])
+                    self.assertEqual(second["commands"], [])
+                    self.assertEqual(first["device"], "sda")
+                    self.assertIsNone(first["serial"])
+                    self.assertNotIn("id", first["raw"])
+                    self.assertNotIn("serialNumber", first["raw"])
+                    self.assertNotIn("scsiId", first["raw"])
+                    self.assertEqual(first["cli"], cli)
+                    self.assertEqual(first["temperature"], 70)
+                    self.assertEqual(first["firmware"], "CLI-FW")
+                    self.assertEqual(first["health"], "FAILED")
+                    self.assertTrue(first["commands"])
+                    if owner == "node-b":
+                        self.assertTrue(all("/dev/sda" in command for _, command in first["commands"]))
+
+    def test_quantastor_cli_health_and_local_smart_paths_remain_available(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = build_inventory_service(Settings(), SystemConfig(
+                id="synthetic-qs-source", truenas=TrueNASConfig(platform="quantastor")),
+                AsyncMock(), AsyncMock(), temp_dir)
+            disk = {"id": "disk-a", "storageSystemId": "node-a", "devicePath": "/dev/sda",
+                    "wwn": f"5{16:015x}", "revisionLevel": "API-FW", "slot": 0}
+            health = {
+                "driveTemp": "70 C", "smartHealthTest": "[PASSED]", "revisionLevel": "CLI-FW",
+                "powerOnHours": 240, "bytesRead": 1024, "bytesWritten": 2048, "ssdLifeLeft": 90,
+                "mediumErrors": 1, "predictiveErrors": 2, "errCountNonMedium": 3,
+                "errCountUncorrectedRead": 4, "errCountUncorrectedWrite": 5,
+                "rotationRate": 7200, "formFactor": "3.5", "trimSupported": True,
+                "transportType": "SAS", "logicalBlockSize": 512, "physicalBlockSize": 4096,
+            }
+            for owner in ("node-a", "node-b", None):
+                with self.subTest(owner=owner):
+                    cli = dict(health, id="disk-a", storageSystemId=owner, devicePath="/dev/sdz")
+                    raw = self._raw([disk], cli_disks=[cli])
+                    record = service._build_quantastor_disk_records(raw, None)[0]
+                    self.assertEqual(record.raw["revisionLevel"], "API-FW")
+                    self.assertEqual(record.raw["quantastor_cli_disk"], cli)
+                    self.assertEqual(record.raw["wwn"], disk["wwn"])
+                    self.assertEqual(record.smart_devices, ["sda", "sdz"] if owner == "node-a" else ["sda"])
+                    slot = SlotView(slot=0, slot_label="Bay 0", row_index=0, column_index=0,
+                                    raw_status={"disk_raw": record.raw})
+                    summary = service._build_quantastor_smart_summary(slot)
+                    expected = {"temperature_c": 70, "smart_health_status": "PASSED", "firmware_version": "API-FW",
+                                "power_on_hours": 240, "bytes_read": 1024, "bytes_written": 2048,
+                                "endurance_remaining_percent": 90, "media_errors": 1, "predictive_errors": 2,
+                                "non_medium_errors": 3, "uncorrected_read_errors": 4, "uncorrected_write_errors": 5,
+                                "rotation_rate_rpm": 7200, "form_factor": "3.5", "trim_supported": True,
+                                "transport_protocol": "SAS", "logical_block_size": 512, "physical_block_size": 4096}
+                    for key, value in expected.items():
+                        self.assertEqual(getattr(summary, key), value, key)
+
+    async def _quantastor_fence_host_observation(self, disk, rows, *, configured_first="node-a"):
+        # Two nodes reuse /dev/sda. Only transport is synthetic; host selection,
+        # command planning, parsing, snapshot and public SMART are production.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            nodes = [configured_first, "node-b" if configured_first == "node-a" else "node-a"]
+            system = SystemConfig(
+                id="synthetic-qs-fence", truenas=TrueNASConfig(platform="quantastor"),
+                default_profile_id="supermicro-ssg-2028r-shared-front-24",
+                ssh=SSHConfig(enabled=True, host=f"{configured_first}.example.test", commands=[],
+                              ha_nodes=[{"system_id": node, "host": f"{node}.example.test"} for node in nodes]),
+            )
+            systems = [{"id": "node-a", "name": "Synthetic Node A"}]
+            api = AsyncMock()
+            api.fetch_all.return_value = self._raw([dict(disk)], enclosures=systems, systems=systems)
+            transport = AsyncMock()
+            transport.run_planned_commands.return_value = []
+            service = build_inventory_service(settings, system, api, transport, temp_dir)
+            service._fetch_quantastor_ses_overlay = AsyncMock(return_value=(ParsedSSHData(), []))
+            inventory_calls, smart_calls = [], []
+
+            async def inventory(batch, host=None, **kwargs):
+                inventory_calls.extend(batch)
+                return [SSHCommandResult(command=command, ok=True, exit_code=0,
+                                         stdout=json.dumps(rows if "disk-list" in command.split() else []))
+                        for command in batch]
+
+            async def planned(planner, initial_commands, host=None):
+                results, batch = [], initial_commands
+                for _ in range(20):
+                    if not batch:
+                        return results
+                    for command in batch:
+                        smart_calls.append((host, command))
+                        payload = {
+                            "smartctl": {"exit_status": 0}, "device": {"protocol": "ATA"},
+                            "serial_number": "SANITIZED-A" if host == "node-a.example.test" else "SANITIZED-B",
+                            "temperature": {"current": 31 if host == "node-a.example.test" else 91},
+                            "smart_status": {"passed": True}, "power_on_time": {"hours": 100},
+                            "model_name": "SYNTHETIC-DISK", "rotation_rate": 7200,
+                        }
+                        results.append(SSHCommandResult(command=command, ok=True, exit_code=0,
+                            stdout=json.dumps(payload) if " -j " in command else "", stderr=""))
+                    batch = planner(results)
+                self.fail("SMART planner did not terminate")
+
+            service._run_ssh_commands = AsyncMock(side_effect=inventory)
+            service._run_ssh_planned_commands = AsyncMock(side_effect=planned)
+            snapshot = await service.get_snapshot(selected_enclosure_id="node-a")
+            slot = next(slot for slot in snapshot.slots if slot.serial == "SANITIZED-A")
+            summary = await service.get_slot_smart_summary(slot.slot, selected_enclosure_id="node-a")
+            api.fetch_all.assert_awaited_once()
+            self.assertTrue(any("disk-list" in command.split() for command in inventory_calls))
+            self.assertTrue(smart_calls)
+            return slot, summary, smart_calls
+
+    async def test_quantastor_public_smart_ignores_retained_cli_fence_host(self) -> None:
+        for state in ("absent", "blank", "null", "populated"):
+            disk = {"id": "disk-a", "serialNumber": "SANITIZED-A", "devicePath": "/dev/sda", "slot": 0}
+            if state != "absent":
+                disk["storageSystemId"] = {"blank": "", "null": None, "populated": "node-a"}[state]
+            before_slot, before_summary, before_calls = await self._quantastor_fence_host_observation(disk, [])
+            self.assertEqual(before_calls[0][0], "node-a.example.test")
+            self.assertEqual(before_summary.temperature_c, 31)
+            for owner in ("node-a", "node-b", None):
+                for reverse in (False, True):
+                    with self.subTest(state=state, cli_owner=owner, reverse=reverse):
+                        cli = {"id": "disk-a", "storageSystemId": owner, "iofenceSystemId": "node-b"}
+                        rows = [cli, {"id": "unrelated-synthetic"}]
+                        slot, summary, calls = await self._quantastor_fence_host_observation(
+                            disk, rows[::-1] if reverse else rows)
+                        self.assertEqual(slot.serial, before_slot.serial)
+                        self.assertEqual(slot.raw_status["disk_raw"]["quantastor_cli_disk"], cli)
+                        self.assertEqual((calls[0][0], summary.temperature_c),
+                                         (before_calls[0][0], before_summary.temperature_c))
+                        self.assertTrue(all("/dev/sda" in command for _, command in calls))
+                        self.assertIsNone(slot.raw_status["quantastor_fence_owner_system_id"])
+
+    async def test_quantastor_public_smart_preserves_api_fence_host_fallback(self) -> None:
+        for source in ("api-owner", "api-fence", "physical-fence"):
+            for state in ("absent", "blank", "null"):
+                disk = {"id": "disk-a", "serialNumber": "SANITIZED-A", "devicePath": "/dev/sda", "slot": 0}
+                if state != "absent":
+                    disk["iofenceSystemId"] = "" if state == "blank" else None
+                    disk["storageSystemId"] = "" if state == "blank" else None
+                if source == "api-owner":
+                    disk["storageSystemId"] = "node-a"
+                elif source == "api-fence":
+                    disk["iofenceSystemId"] = "node-a"
+                else:
+                    disk["quantastor_pool_device"] = {"physicalDiskObj": {"iofenceSystemId": "node-a"}}
+                for reverse in (False, True):
+                    with self.subTest(source=source, state=state, reverse=reverse):
+                        cli = {"id": "disk-a", "storageSystemId": "node-a", "iofenceSystemId": "node-b",
+                               "devicePath": "/dev/sdz"}
+                        rows = [cli, {"id": "unrelated-synthetic"}]
+                        before_slot, before_summary, before_calls = await self._quantastor_fence_host_observation(
+                            disk, [], configured_first="node-b")
+                        slot, summary, calls = await self._quantastor_fence_host_observation(
+                            disk, rows[::-1] if reverse else rows, configured_first="node-b")
+                        self.assertEqual(before_calls[0][0], "node-a.example.test")
+                        self.assertEqual(before_summary.temperature_c, 31)
+                        self.assertEqual((calls[0][0], summary.temperature_c), ("node-a.example.test", 31))
+                        self.assertEqual(slot.serial, before_slot.serial)
+                        self.assertEqual(slot.raw_status["disk_raw"]["quantastor_cli_disk"], cli)
+                        self.assertEqual(slot.raw_status["quantastor_fence_owner_system_id"],
+                                         None if source == "api-owner" else "node-a")
+                        if source == "api-owner":
+                            self.assertIn("sdz", slot.smart_device_names)
+
+    def test_quantastor_cli_index_storage_growth_is_linear(self) -> None:
+        import dataclasses
+        import sys
+
+        def objects(value, found):
+            if id(value) in found:
+                return
+            found[id(value)] = sys.getsizeof(value)
+            if isinstance(value, dict):
+                children = [*value.keys(), *value.values()]
+            elif isinstance(value, (tuple, list, set, frozenset)):
+                children = value
+            elif dataclasses.is_dataclass(value):
+                children = [getattr(value, field.name) for field in dataclasses.fields(value)]
+            else:
+                children = ()
+            for child in children:
+                objects(child, found)
+
+        owned = []
+        for n in (64, 128, 256, 512, 1024, 2048):
+            rows = [{"id": f"synthetic-{i:06d}"} for i in range(n)]
+            index = InventoryService._build_quantastor_cli_disk_hints(rows)
+            inputs, retained = {}, {}
+            objects(rows, inputs)
+            objects(index, retained)
+            owned.append(sum(size for key, size in retained.items() if key not in inputs))
+        # Compare actual retained allocations, excluding the shared input graph.
+        # Allow allocator/container steps; widening per-key bitmaps exceed this.
+        self.assertLessEqual(owned[-1] / 2048, 1.5 * owned[0] / 64, owned)
+
     async def test_public_snapshot_refuses_cross_enclosure_bare_slots(self) -> None:
         for platform in ("core", "scale"):
             for case in ("foreign-owner", "ambiguous-unowned", "unowned-multi-shelf", "exact-owner", "single-shelf", "ses-device"):
