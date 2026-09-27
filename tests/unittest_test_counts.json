@@ -58,7 +58,7 @@
     "test_mapping_store": 105,
     "test_metrics": 25,
     "test_nonroot_cli": 3,
-    "test_nonroot_migration": 21,
+    "test_nonroot_migration": 26,
     "test_parsers": 127,
     "test_perf": 9,
     "test_perf_budgets": 19,

@@ -69,6 +69,9 @@ def _validate_entry(
             raise ValueError(f"runtime root is not a directory: {path}")
     elif not (stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)):
         raise ValueError(f"refusing non-file runtime entry: {path}")
+    # Ownership and modes belong to the inode, including aliases outside this tree.
+    if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink > 1:
+        raise ValueError(f"refusing multiply-linked regular file: {path}")
     if check_stale and (
         path.name.endswith((".restore", ".tmp"))
         or (path.name.startswith(".") and ".restore-" in path.name)
@@ -124,6 +127,9 @@ def _bind_child(
         raise
     try:
         opened = os.fstat(descriptor)
+        _validate_entry(
+            path, opened, directory_only=directory_only, check_stale=check_stale
+        )
         if not _same_inode(opened, inspected):
             raise ValueError(f"runtime entry changed during descriptor binding: {path}")
         if expected is not None and not _same_inode(opened, expected):
@@ -419,6 +425,7 @@ def apply_ownership(
 
         for descriptor, path, metadata in opened[1:]:
             current = os.fstat(descriptor)
+            _validate_entry(path, current)
             if not _same_inode(current, metadata):
                 raise ValueError(f"runtime descriptor changed before ownership migration: {path}")
 

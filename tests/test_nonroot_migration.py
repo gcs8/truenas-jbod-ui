@@ -103,6 +103,112 @@ class NonRootMigrationTests(unittest.TestCase):
             self.assertFalse(any(path.startswith("backups") for path in migrated))
             self.assertFalse(any(path.startswith("backup-status") for path in migrated))
 
+    def _assert_regular_file_alias_rejected(self, phase: str) -> None:
+        for selected_name in ("config/config.yaml", "data/nested/runtime.db"):
+            for excluded_root in ("config/backup-secrets", "backups", "backup-status"):
+                with (
+                    self.subTest(selected=selected_name, excluded=excluded_root),
+                    tempfile.TemporaryDirectory() as temp_dir,
+                ):
+                    root = Path(temp_dir)
+                    selected = root / selected_name
+                    selected.parent.mkdir(parents=True, mode=0o700)
+                    selected.write_bytes(b"synthetic runtime")
+                    selected.chmod(0o600)
+                    for name in ("config/backup-secrets", "backups", "backup-status"):
+                        directory = root / name
+                        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+                        sentinel = directory / "untouched"
+                        sentinel.write_bytes(b"synthetic excluded")
+                        sentinel.chmod(0o600)
+                    alias = root / excluded_root / "alias"
+
+                    def snapshot(path):
+                        metadata = path.stat()
+                        return (
+                            metadata.st_uid,
+                            metadata.st_gid,
+                            stat.S_IMODE(metadata.st_mode),
+                            path.read_bytes() if path.is_file() else None,
+                        )
+
+                    watched = [root, *root.rglob("*")]
+                    before = {path: snapshot(path) for path in watched}
+                    alias_before = snapshot(selected)
+                    self.assertEqual(alias_before[:2], (os.getuid(), os.getgid()))
+                    entries = MODULE.inventory(root) if phase.startswith("apply") else None
+                    linked = False
+                    opened = []
+                    closed = []
+                    real_open, real_close = os.open, os.close
+                    real_bind_child = MODULE._bind_child
+
+                    def add_alias():
+                        nonlocal linked
+                        os.link(selected, alias)
+                        linked = True
+                        self.assertEqual(selected.stat().st_nlink, 2)
+                        self.assertEqual(alias.stat().st_ino, selected.stat().st_ino)
+
+                    def recording_open(path, flags, mode=0o777, *, dir_fd=None):
+                        if phase.endswith("during_open") and path == selected.name and not linked:
+                            add_alias()
+                        descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+                        opened.append(descriptor)
+                        return descriptor
+
+                    def recording_close(descriptor):
+                        closed.append(descriptor)
+                        return real_close(descriptor)
+
+                    def link_after_bind(parent_descriptor, name, path, **requirements):
+                        result = real_bind_child(parent_descriptor, name, path, **requirements)
+                        if phase == "apply_after_bind" and path == selected and not linked:
+                            add_alias()
+                        return result
+
+                    if phase in {"inventory", "apply"}:
+                        add_alias()
+                    rejection = None
+                    with (
+                        patch.object(MODULE.os, "open", side_effect=recording_open),
+                        patch.object(MODULE.os, "close", side_effect=recording_close),
+                        patch.object(MODULE, "_bind_child", side_effect=link_after_bind),
+                        patch.object(MODULE.os, "fchown", wraps=os.fchown) as fchown,
+                        patch.object(MODULE.os, "fchmod", wraps=os.fchmod) as fchmod,
+                    ):
+                        try:
+                            if entries is None:
+                                MODULE.inventory(root)
+                            else:
+                                MODULE.apply_ownership(entries, uid=os.getuid(), gid=os.getgid())
+                        except ValueError as exc:
+                            rejection = exc
+
+                    self.assertTrue(linked)
+                    self.assertCountEqual(opened, closed)
+                    self.assertEqual({path: snapshot(path) for path in watched}, before)
+                    self.assertEqual(snapshot(alias), alias_before)
+                    fchown.assert_not_called()
+                    fchmod.assert_not_called()
+                    self.assertIsNotNone(rejection, "multiply-linked regular file was admitted")
+                    self.assertRegex(str(rejection), "multiply-linked regular file")
+
+    def test_inventory_rejects_multiply_linked_regular_file(self) -> None:
+        self._assert_regular_file_alias_rejected("inventory")
+
+    def test_inventory_rejects_regular_file_linked_during_descriptor_open(self) -> None:
+        self._assert_regular_file_alias_rejected("inventory_during_open")
+
+    def test_apply_rejects_regular_file_linked_after_inventory_before_any_change(self) -> None:
+        self._assert_regular_file_alias_rejected("apply")
+
+    def test_apply_rejects_regular_file_linked_during_descriptor_open(self) -> None:
+        self._assert_regular_file_alias_rejected("apply_during_open")
+
+    def test_apply_rechecks_regular_file_link_count_after_descriptor_binding(self) -> None:
+        self._assert_regular_file_alias_rejected("apply_after_bind")
+
     def test_inventory_rejects_symlink_without_following_it(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
