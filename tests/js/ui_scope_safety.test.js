@@ -56,6 +56,38 @@ for (const action of ["sendLedAction", "saveMapping", "clearMapping", "importMap
 }
 
 for (const outcome of ["success", "failure"]) {
+  test(`auto-refresh timer waits for an in-flight locate write (${outcome})`, async () => {
+    const pending = deferred();
+    const state = { snapshotMode:false, autoRefresh:true, refreshIntervalSeconds:30, refreshesInFlight:0, snapshot:{selected_system_id:"a",selected_enclosure_id:"one"}, selectedSystemId:"a", selectedEnclosureId:"one", selectedSlot:0, latestRefreshToken:1, mappingDraftRevision:0, snapshotReuseCache:{} };
+    const statuses = []; const timers = []; let rejections = 0, refreshes = 0;
+    const context = {state, URLSearchParams, Date, Number, Math, window:{setTimeout(cb){ timers.push(cb); return timers.length; }},
+      cancelAutoRefreshTimer(){}, autoRefreshPauseReason:()=>null, renderTimingSurfaces(){}, ensureTimingTick(){},
+      async refreshSnapshot(){ refreshes++; state.latestRefreshToken++; },
+      writeBlockedByPolicy:()=>false,
+      getSlotById:()=>({slot:0,slot_label:"00",led_supported:true}),
+      setStatus(m, tone){ statuses.push([m, tone||"info"]); },
+      sendScopedRequest:async ()=>pending.promise,
+      applySnapshot(){}, renderAll(){}, scheduleSmartPrefetch(){}, locateLightSourceLabel:()=>"synthetic",
+      handleWriteRejection(){ rejections++; } };
+    const c = load([...guardNames, "sendLedAction", "scheduleAutoRefresh"], context);
+    c.scheduleAutoRefresh();
+    const run = c.sendLedAction("IDENTIFY");
+    await new Promise(r => setImmediate(r));
+    await timers.shift()();
+    assert.equal(refreshes, 0, "the timer must not start a refresh while a write is in flight");
+    assert.equal(timers.length, 1, "the timer reschedules itself instead");
+    if (outcome === "success") pending.resolve({snapshot:{selected_system_id:"a",selected_enclosure_id:"one"}});
+    else { const err = new Error("Request failed with 403"); err.status = 403; pending.reject(err); }
+    await run;
+    const [message, tone] = statuses[statuses.length - 1];
+    if (outcome === "success") { assert.match(message, /Locate light on for slot 00/); assert.equal(rejections, 0); }
+    else { assert.match(message, /Could not change the locate light/); assert.equal(tone, "error"); assert.equal(rejections, 1); }
+    await timers.shift()();
+    assert.equal(refreshes, 1, "the next tick refreshes once the write has finished");
+  });
+}
+
+for (const outcome of ["success", "failure"]) {
  test(`storage runtime ignores old-scope ${outcome}`, async () => {
   const d=deferred(); let applied=0, statuses=0, renders=0;
   const state={snapshotMode:false, selectedSystemId:"a",selectedEnclosureId:"one",storageViewsRuntimeRequestToken:0};

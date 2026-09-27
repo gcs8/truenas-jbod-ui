@@ -10905,7 +10905,9 @@
         scheduleAutoRefresh();
         return;
       }
-      if (state.refreshesInFlight > 0) {
+      // A refresh during a write bumps the epoch and would drop the write's
+      // outcome, so wait for in-flight writes as well as reads.
+      if (state.refreshesInFlight > 0 || Object.keys(state.mutationsInFlight || {}).length > 0) {
         scheduleAutoRefresh();
         return;
       }
