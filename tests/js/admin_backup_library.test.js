@@ -548,6 +548,39 @@ test("back up now starts a run, shows it running, and polls until it finishes", 
   assert.ok(doc.elements.policies.querySelectorAll('[data-backup-action="run"]').every((node) => !node.disabled));
 });
 
+function pollingLibrary(api, { visible = () => true } = {}) {
+  const timers = [];
+  const doc = mount({ api });
+  const library = createBackupLibrary({
+    document: doc.doc, elements: doc.elements, fetchJson: api.fetchJson, formatBytes: String, formatLocalTimestamp: String,
+    setBanner: () => {}, setTimeout: (callback) => timers.push(callback), isVisible: visible, isStopped: () => false,
+  });
+  return { timers, library, elements: doc.elements };
+}
+
+test("a poll tick while the tab is hidden keeps polling so the run result shows on return", async () => {
+  const api = fakeApi();
+  api.data.running = { backup_class: "full", started_at: "2026-09-24T10:00:00Z" };
+  let visible = true;
+  const { timers, library, elements } = pollingLibrary(api, { visible: () => visible });
+  await library.load();
+  assert.equal(timers.length, 1);
+
+  visible = false;
+  timers.shift()();
+  await settle();
+  assert.equal(timers.length, 1, "a hidden tick reschedules instead of dropping the poll");
+
+  visible = true;
+  api.data.running = null;
+  timers.shift()();
+  await settle();
+  await settle();
+  assert.equal(timers.length, 0);
+  assert.doesNotMatch(elements.status.textContent, /is running/);
+  assert.ok(elements.policies.querySelectorAll('[data-backup-action="run"]').every((node) => !node.disabled));
+});
+
 test("an unavailable backup service says so and offers nothing to run", async () => {
   const api = fakeApi({ "GET /api/admin/backups": () => ({ available: false, detail: "The backup scheduler is not running.", classes: { config: { enabled: false }, full: { enabled: false } }, targets: [], artifacts: [], storage: {}, running: null }) });
   const { elements, library } = mount({ api });
