@@ -259,6 +259,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Keep automatic config-backup hashes, captured files and source-path selection
+  on the same generation so intervening edits cannot suppress a later backup. (#768)
 - The main UI no longer reports itself down when a pinned known-hosts file sits
   on a read-only mount, such as the `/run/ssh` mount in the shipped Compose
   file. SSH still verifies hosts against the keys in it; `/healthz` now answers
