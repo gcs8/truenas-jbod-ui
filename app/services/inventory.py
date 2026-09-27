@@ -784,6 +784,8 @@ def _warn_unmatched_mapping(
 def _index_disk_records(
     disk_records: Iterable[DiskRecord],
     platform: str,
+    *,
+    allow_unowned_slot_fallback: bool = True,
 ) -> tuple[
     dict[str, DiskRecord],
     dict[tuple[str | None, int], DiskRecord],
@@ -792,12 +794,21 @@ def _index_disk_records(
     records = list(disk_records)
     disks_by_key: dict[str, DiskRecord] = {}
     disks_by_slot: dict[tuple[str | None, int], DiskRecord] = {}
+    ambiguous_slots: set[tuple[str | None, int]] = set()
     for disk in records:
         for key in disk.lookup_keys:
             disks_by_key[key] = disk
         if disk.slot is not None:
-            disks_by_slot[(disk.enclosure_id, disk.slot)] = disk
-            disks_by_slot[(None, disk.slot)] = disk
+            for key in {(disk.enclosure_id, disk.slot), (None, disk.slot)}:
+                if key in ambiguous_slots:
+                    continue
+                if key in disks_by_slot and disks_by_slot[key] is not disk:
+                    disks_by_slot.pop(key)
+                    ambiguous_slots.add(key)
+                else:
+                    disks_by_slot[key] = disk
+    if not allow_unowned_slot_fallback:
+        disks_by_slot = {key: disk for key, disk in disks_by_slot.items() if disk.enclosure_id is not None}
     disks_by_sas = index_disks_by_sas(
         (disk, *lunid_alias_tier_sets(disk.lunid, platform))
         for disk in records
@@ -6017,6 +6028,9 @@ class InventoryService:
         disks_by_key, disks_by_slot, disks_by_sas = _index_disk_records(
             disk_records,
             self.system.truenas.platform,
+            allow_unowned_slot_fallback=len({
+                resolve_physical_mapping_scope(option.id) for option in available_enclosures
+            }) == 1,
         )
         bmc_disks_by_serial = self._build_bmc_serial_disk_index(bmc_inventory, disk_records)
         loaded_mappings = frame.loaded_mappings
@@ -6884,6 +6898,9 @@ class InventoryService:
         disks_by_key, disks_by_slot, disks_by_sas = _index_disk_records(
             disk_records,
             self.system.truenas.platform,
+            allow_unowned_slot_fallback=len({
+                resolve_physical_mapping_scope(option.id) for option in available_enclosures
+            }) == 1,
         )
         bmc_disks_by_serial = self._build_bmc_serial_disk_index(bmc_inventory, disk_records)
 
@@ -7315,7 +7332,7 @@ class InventoryService:
             selected_system_id,
             selected_enclosure_id,
         )
-        cli_disk_hints = self._build_quantastor_cli_disk_hints(raw_data.cli_disks, selected_system_id)
+        cli_disk_hints = self._build_quantastor_cli_disk_hints(raw_data.cli_disks)
         pool_slot_hints = self._build_quantastor_pool_slot_hints(raw_data, selected_system_id)
         pool_names = {
             normalize_value_text(pool.get("id")): normalize_text(
@@ -7403,7 +7420,7 @@ class InventoryService:
             )
             if selected_enclosure_id and disk_enclosure_id and disk_enclosure_id != selected_enclosure_id:
                 continue
-            cli_hint = next((cli_disk_hints[key] for key in lookup_keys if key in cli_disk_hints), None)
+            cli_hint = self._resolve_quantastor_cli_disk_hint(disk, cli_disk_hints)
             pool_hint = next((pool_slot_hints[key] for key in lookup_keys if key in pool_slot_hints), None)
             merged_raw = dict(disk)
             if hint and isinstance(hint.get("hw_raw"), dict):
@@ -7419,8 +7436,19 @@ class InventoryService:
                 ):
                     lookup_keys.update(normalize_lookup_keys(str(value) if value is not None else None))
             if isinstance(cli_hint, dict):
+                cli_evidence = cli_hint
+                if not (
+                    self._quantastor_cli_identity(disk)["owner"]
+                    & self._quantastor_cli_identity(cli_hint)["owner"]
+                ):
+                    # A shared physical identity permits health enrichment, not
+                    # execution of another node's local device aliases here.
+                    cli_hint = {key: value for key, value in cli_hint.items() if key not in {
+                        "devicePath", "altDevicePath", "deviceName", "device", "name",
+                        "storageSystemId", "systemId", "iofenceSystemId", "controllerId",
+                    }}
                 merged_raw = self._merge_quantastor_payloads(cli_hint, merged_raw)
-                merged_raw["quantastor_cli_disk"] = cli_hint
+                merged_raw["quantastor_cli_disk"] = cli_evidence
                 for value in (
                     cli_hint.get("id"),
                     cli_hint.get("hwDiskId"),
@@ -7674,30 +7702,91 @@ class InventoryService:
                         hints[key] = hint
         return hints
 
+    @staticmethod
+    def _quantastor_cli_identity(row: dict[str, Any]) -> dict[str, set[str]]:
+        # Serial numbers and object IDs are opaque. Do not lowercase them or
+        # strip punctuation to turn contradictory observations into a match.
+        fields = {
+            "id": ("id", "hwDiskId", "physicalDiskId", "multipathParentDiskId"),
+            "serial": ("serialNumber", "serial", "serialNum"),
+            # CLI/REST preserve these fields, not a canonical WWN encoding.
+            # A SCSI identifier can include a designator prefix; do not equate
+            # it with a bare WWN or require distinct types to have equal text.
+            "wwn": ("wwn",),
+            "scsiId": ("scsiId",),
+            "wwid": ("wwid",),
+            "eui64": ("eui64",),
+            "owner": ("storageSystemId", "systemId", "iofenceSystemId", "controllerId"),
+            "path": ("devicePath", "altDevicePath", "deviceName", "device", "name"),
+        }
+        identity = {
+            kind: {text for field in names if (text := normalize_value_text(row.get(field)))}
+            for kind, names in fields.items()
+        }
+        identity["path"] = {
+            normalized for value in identity["path"] if (normalized := normalize_device_name(value))
+        }
+        # These are fallbacks, not interchangeable owner aliases. An explicit
+        # storageSystemId must not be overridden by a controller or fence ID.
+        owner = next((value for field in fields["owner"] if (value := normalize_value_text(row.get(field)))), None)
+        identity["owner"] = {owner} if owner else set()
+        return identity
+
+    @classmethod
     def _build_quantastor_cli_disk_hints(
-        self,
+        cls,
         rows: list[dict[str, Any]],
-        selected_system_id: str | None,
-    ) -> dict[str, dict[str, Any]]:
-        hints: dict[str, tuple[int, dict[str, Any]]] = {}
+    ) -> dict[tuple[str, ...], list[dict[str, Any]]]:
+        hints: dict[tuple[str, ...], list[dict[str, Any]]] = {}
         for row in rows:
-            score = self._score_quantastor_cli_disk_row(row, selected_system_id)
-            for value in (
-                row.get("id"),
-                row.get("hwDiskId"),
-                row.get("serialNumber"),
-                row.get("scsiId"),
-                row.get("wwid"),
-                row.get("devicePath"),
-                row.get("altDevicePath"),
-                row.get("multipathParentDiskId"),
-                row.get("name"),
+            identity = cls._quantastor_cli_identity(row)
+            keys = {(kind, value) for kind in ("id", "serial", "wwn", "scsiId", "wwid", "eui64") for value in identity[kind]}
+            # Device aliases are node-local, including their /dev-less spelling.
+            keys.update(("path", owner, path) for owner in identity["owner"] for path in identity["path"])
+            for key in keys:
+                hints.setdefault(key, []).append(row)
+        return hints
+
+    @classmethod
+    def _resolve_quantastor_cli_disk_hint(
+        cls,
+        disk: dict[str, Any],
+        hints: dict[tuple[str, ...], list[dict[str, Any]]],
+    ) -> dict[str, Any] | None:
+        identity = cls._quantastor_cli_identity(disk)
+        # Serial spellings are fallbacks for the same physical property. Missing
+        # primaries may fall back, but contradictory populated aliases cannot.
+        if len(identity["serial"]) > 1:
+            return None
+        physical_kinds = ("serial", "wwn", "scsiId", "wwid", "eui64")
+        keys = {(kind, value) for kind in ("id", *physical_kinds) for value in identity[kind]}
+        keys.update(("path", owner, path) for owner in identity["owner"] for path in identity["path"])
+        candidates = {id(row): row for key in keys for row in hints.get(key, [])}
+        ranked: dict[tuple[int, bool], list[dict[str, Any]]] = {}
+        for row in candidates.values():
+            other = cls._quantastor_cli_identity(row)
+            if len(other["serial"]) > 1 or any(
+                identity[kind] and other[kind] and identity[kind].isdisjoint(other[kind])
+                for kind in physical_kinds
             ):
-                for key in normalize_lookup_keys(str(value) if value is not None else None):
-                    current = hints.get(key)
-                    if current is None or score > current[0]:
-                        hints[key] = (score, row)
-        return {key: value[1] for key, value in hints.items()}
+                continue
+            id_match = bool(identity["id"] & other["id"])
+            physical_match = any(identity[kind] & other[kind] for kind in physical_kinds)
+            same_owner = bool(identity["owner"] & other["owner"])
+            if not id_match and not physical_match:
+                if not same_owner or not identity["path"] & other["path"]:
+                    continue
+                if identity["id"] and other["id"]:
+                    continue
+            rank = (2 if id_match else 1 if physical_match else 0, same_owner)
+            peers = ranked.setdefault(rank, [])
+            if row not in peers:
+                peers.append(row)
+        if not ranked:
+            return None
+        best = ranked[max(ranked)]
+        # Equal authority with different payloads is unresolved, not first-wins.
+        return best[0] if len(best) == 1 else None
 
     def _build_quantastor_pool_slot_hints(
         self,
@@ -8393,6 +8482,14 @@ class InventoryService:
         except ValueError:
             return None
 
+    @staticmethod
+    def _esxi_wwn(value: Any) -> str | None:
+        text = normalize_value_text(value)
+        if not text:
+            return None
+        match = re.fullmatch(r"(?:naa\.|0x)?([0-9a-fA-F]{16}|[0-9a-fA-F]{32})", text)
+        return match.group(1).lower() if match else None
+
     @classmethod
     def _resolve_esxi_storage_path_for_drive(
         cls,
@@ -8402,29 +8499,82 @@ class InventoryService:
     ) -> dict[str, Any] | None:
         device_id = cls._int_like(drive.get("device_id"))
         transport = (normalize_text(drive.get("interface")) or "").lower()
-        matches: list[dict[str, Any]] = []
+        detail = drive.get("detail") if isinstance(drive.get("detail"), dict) else {}
+        raw_wwn = detail.get("WWN") or drive.get("wwn")
+        wwn = cls._esxi_wwn(raw_wwn)
+        serial = normalize_text(drive.get("serial"))
+        if raw_wwn and wwn is None:
+            return None
+
+        # StorCLI controller ordinals and vmhba ordinals are different namespaces.
+        # Qualify only with an observed controller SAS address, never c0 -> vmhba0.
+        controller = ssh_data.esxi_storcli_controller
+        basics = controller.get("Basics") if isinstance(controller, dict) else None
+        basics = basics if isinstance(basics, dict) else {}
+        controller_number = cls._int_like(basics.get("Controller"))
+        controller_sas = cls._esxi_wwn(basics.get("SAS Address"))
+        adapters: set[str] = set()
+        if controller_number is not None and drive.get("controller_id") == f"c{controller_number}" and controller_sas:
+            for adapter in ssh_data.esxi_sas_adapters:
+                if cls._esxi_wwn(adapter.get("sas_address")) == controller_sas:
+                    name = normalize_text(adapter.get("adapter") or adapter.get("id"))
+                    if name:
+                        adapters.add(name)
+
+        matches: list[tuple[dict[str, Any], str, str | None, bool]] = []
         for path in ssh_data.esxi_storage_paths:
             if not isinstance(path, dict):
                 continue
             path_transport = (normalize_text(path.get("transport")) or "").lower()
             if transport and path_transport and transport != path_transport:
                 continue
-            path_target = cls._int_like(path.get("target"))
-            if device_id is not None and path_target != device_id:
+            runtime = normalize_text(path.get("runtime_name")) or ""
+            adapter = normalize_text(path.get("adapter")) or (runtime.split(":", 1)[0] if ":" in runtime else None)
+            if adapters and adapter not in adapters:
                 continue
-            backing_device = cls._resolve_esxi_storage_device(storage_devices_by_key, path.get("device"))
-            if backing_device is not None and cls._esxi_storage_device_is_local(backing_device) is False:
+            backing = cls._resolve_esxi_storage_device(storage_devices_by_key, path.get("device"))
+            if backing is None or cls._esxi_storage_device_is_local(backing) is not True:
                 continue
-            matches.append(path)
+            backing_id = normalize_text(backing.get("id"))
+            if not backing_id:
+                continue
+            backing_wwn = cls._esxi_wwn(backing_id)
+            backing_serial = normalize_text(backing.get("serial_number") or backing.get("serial"))
+            if serial and backing_serial and serial != backing_serial:
+                continue
+            if wwn and wwn != backing_wwn:
+                continue
+            persistent_match = bool(wwn or (serial and serial == backing_serial))
+            if not persistent_match:
+                # A missing DID cannot mean "any target". A local target alone
+                # also cannot disambiguate disks on different controllers.
+                if device_id is None or cls._int_like(path.get("target")) != device_id:
+                    continue
+            matches.append((path, backing_id, adapter, persistent_match))
 
-        if not matches:
+        verified = [match for match in matches if match[3]]
+        if verified:
+            matches = verified
+        if not matches or len({match[1] for match in matches}) != 1:
             return None
-        if len(matches) == 1:
-            return matches[0]
-        for path in matches:
-            if normalize_text(path.get("state")) == "active":
-                return path
-        return matches[0]
+        if not verified and not adapters:
+            # Compatibility for a single observed adapter/controller, not a
+            # first-active shortcut when the host exposes competing scopes.
+            observed_adapters = {
+                normalize_text(path.get("adapter"))
+                or (str(path.get("runtime_name", "")).split(":", 1)[0] if ":" in str(path.get("runtime_name", "")) else None)
+                for path in ssh_data.esxi_storage_paths if isinstance(path, dict)
+            }
+            controllers = {row.get("controller_id") for row in ssh_data.esxi_storcli_physical_drives}
+            if None in observed_adapters or len(observed_adapters) != 1 or len(controllers) != 1:
+                return None
+        # Redundant paths are safe only after they converge on one device.
+        # Choose deterministically for displayed path metadata, not identity.
+        return min((match[0] for match in matches), key=lambda path: (
+            normalize_text(path.get("state")) != "active",
+            normalize_text(path.get("runtime_name")) or "",
+            normalize_text(path.get("id")) or "",
+        ))
 
     def _build_esxi_platform_context(self, ssh_data: ParsedSSHData) -> dict[str, Any]:
         sections: list[dict[str, Any]] = []
@@ -9915,26 +10065,6 @@ class InventoryService:
         if api_user and api_password:
             return f"localhost,{api_user},{api_password}"
         return None
-
-    def _score_quantastor_cli_disk_row(self, row: dict[str, Any], selected_system_id: str | None) -> int:
-        score = 0
-        owner_id = normalize_text(
-            str(row.get("storageSystemId") or row.get("iofenceSystemId") or row.get("controllerId"))
-            if (row.get("storageSystemId") or row.get("iofenceSystemId") or row.get("controllerId")) is not None
-            else None
-        )
-        if selected_system_id and owner_id == selected_system_id:
-            score += 8
-        if normalize_value_text(row.get("storagePoolId")):
-            score += 4
-        if normalize_value_text(row.get("hwDiskId")):
-            score += 3
-        if normalize_value_text(row.get("multipathParentDiskId")):
-            score += 2
-        device_path = normalize_text(row.get("devicePath"))
-        if device_path and "/dev/disk/by-dmuuid/" not in device_path:
-            score += 1
-        return score
 
     @staticmethod
     def _merge_quantastor_payloads(preferred: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
@@ -12136,12 +12266,13 @@ class InventoryService:
                     source = "enclosure-sysfs" if device_source == "enclosure_sysfs" else "device-name"
                     return DiskResolution(disk=hinted, source=source)
 
-        # The bare (None, slot) bucket is last-writer-wins across every
-        # enclosure on the system (TrueNAS disk.query carries no enclosure id
-        # the extractor recognises), so it may only break ties after the SES
-        # device name observed in this bay has had its say.
+        # Bare slots are admitted only when unambiguous. A known foreign
+        # owner can never be weakened into evidence for this physical bay.
         direct = disks_by_slot.get((None, slot))
-        if direct:
+        if direct and (
+            direct.enclosure_id is None
+            or resolve_physical_mapping_scope(direct.enclosure_id) == resolve_physical_mapping_scope(enclosure_id)
+        ):
             return DiskResolution(disk=direct, source="api-slot-fallback")
 
         for source, candidate in (
