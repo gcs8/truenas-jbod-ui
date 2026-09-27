@@ -36,6 +36,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import local as _ThreadLocal
+from types import MappingProxyType
 from typing import Any
 
 import yaml
@@ -194,7 +195,7 @@ class BackupScheduler:
             self.coalescer = ConfigBackupCoalescer(
                 self.journal,
                 snapshot_config=snapshot_config,
-                make_backup=lambda change_ids: self._run_class_locked_or_busy("config", change_ids),
+                make_backup=lambda change_ids, snapshot: self._run_class_locked_or_busy("config", change_ids, snapshot),
                 clock=monotonic,
                 quiet_period=float(policy.config.debounce_seconds),
                 max_delay=float(policy.config.max_delay_seconds),
@@ -407,10 +408,13 @@ class BackupScheduler:
             raise
         return thread
 
-    def _run_class_locked_or_busy(self, backup_class: str, change_ids: tuple[str, ...]) -> ArtifactRecord:
+    def _run_class_locked_or_busy(
+        self, backup_class: str, change_ids: tuple[str, ...],
+        snapshot: Mapping[str, Any] | None = None,
+    ) -> ArtifactRecord:
         # Called by the coalescer; a busy job lock is a failure it retries with backoff.
         with self._job(backup_class):
-            return self._run_class(backup_class, change_ids)
+            return self._run_class(backup_class, change_ids, snapshot)
 
     def run_now(self, backup_class: str) -> ArtifactRecord | None:
         """Run a backup of ``backup_class`` now (single-flight)."""
@@ -433,14 +437,17 @@ class BackupScheduler:
         with self._job(backup_class):
             return self._run_class(backup_class, ())
 
-    def _runner(self, backup_class: str) -> Any:
+    def _runner(self, backup_class: str, snapshot: Mapping[str, Any] | None = None) -> Any:
         status_file = (
             self.paths.full_status_file
             if backup_class == "full" and self.paths.full_status_file is not None
             else self.paths.runner_status_dir / f"archive-{backup_class}-backup.json"
         )
+        backup_service = self.backup_service
+        if isinstance(snapshot, ConfigFileSnapshot):
+            backup_service = backup_service.with_captured_config_files(snapshot.files)
         return self._runner_factory(
-            self.backup_service,
+            backup_service,
             destination_dir=self.paths.local_dir / backup_class,
             status_file=status_file,
             passphrase_file=self.paths.passphrase_file,
@@ -452,10 +459,13 @@ class BackupScheduler:
             archive_format=self.policy.full.archive_format if backup_class == "full" else "7z",
         )
 
-    def _run_class(self, backup_class: str, change_ids: tuple[str, ...]) -> ArtifactRecord:
+    def _run_class(
+        self, backup_class: str, change_ids: tuple[str, ...],
+        snapshot: Mapping[str, Any] | None = None,
+    ) -> ArtifactRecord:
         started = self._clock()
         try:
-            runner = self._runner(backup_class)
+            runner = self._runner(backup_class, snapshot)
             status = runner.run_once()
             name = f"{backup_class}/{status['last_artifact_name']}"
             record = ArtifactRecord(
@@ -1076,17 +1086,28 @@ def _hash_file(path: Path) -> tuple[int, str]:
 # -- config snapshot for the coalescer's content hash -------------------------------------
 
 
-def snapshot_config_files(paths: Mapping[str, Path]) -> dict[str, Any]:
-    """Parse each config document; a missing file is ``None`` (still hashed)."""
+class ConfigFileSnapshot(dict[str, Any]):
+    """Hash projection plus the exact source bytes used to build that projection."""
+
+    def __init__(self, documents: Mapping[str, Any], files: Mapping[Path, bytes | None]) -> None:
+        super().__init__(documents)
+        self.files = MappingProxyType(dict(files))
+
+
+def snapshot_config_files(paths: Mapping[str, Path]) -> ConfigFileSnapshot:
+    """Capture once for both hashing and export; missing documents remain hashed."""
 
     snapshot: dict[str, Any] = {}
+    files: dict[Path, bytes | None] = {}
     for logical, path in paths.items():
-        if not path.exists():
+        content = path.read_bytes() if path.exists() else None
+        files[path.absolute()] = content
+        if content is None:
             snapshot[logical] = None
             continue
-        text = path.read_text(encoding="utf-8")
+        text = content.decode("utf-8")
         snapshot[logical] = json.loads(text) if path.suffix == ".json" else yaml.safe_load(text)
-    return snapshot
+    return ConfigFileSnapshot(snapshot, files)
 
 
 # -- shared status file ---------------------------------------------------------------------
