@@ -1171,7 +1171,9 @@ class S3Target(_TargetBase):
             )
         try:
             verified = self._verify(key, size, sha_hex, _s3_expected_etag(part_md5s, whole_md5.hexdigest(), multipart=multipart))
-        except ArchiveVerificationError:
+        except Exception:
+            # Any readback failure (mismatch, timeout, reset) leaves an
+            # uncatalogued object that grooming never sees, so remove it.
             self._delete_quietly(key)
             raise
         return StoredObject(name=name, size=size, sha256=sha_hex, verified=verified)

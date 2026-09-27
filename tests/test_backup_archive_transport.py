@@ -1232,6 +1232,15 @@ class S3TargetTests(_TempCase):
                 target.put(self.source(b"payload"), "a.bin")
         self.assertEqual(client.objects, {})
 
+    def test_failed_re_read_deletes_object_and_raises(self) -> None:
+        with open_target(self.settings()) as target:
+            client = self.clients[0]
+            client.etag_override = "kms-opaque"
+            with mock.patch.object(client, "get_object", side_effect=OSError("connection reset")):
+                with self.assertRaises(OSError):
+                    target.put(self.source(b"payload"), "a.bin")
+        self.assertEqual(client.objects, {})
+
     def test_large_multipart_etag_verifies_without_download(self) -> None:
         size = transport.S3_MULTIPART_THRESHOLD + 3
         src = self.tmp / "big.bin"
