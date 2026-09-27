@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "modules": {
-    "test_account_bootstrap": 19,
+    "test_account_bootstrap": 28,
     "test_admin_auth": 24,
     "test_admin_command_state": 5,
     "test_admin_config": 6,
@@ -30,7 +30,7 @@
     "test_disk_retention_accounting": 10,
     "test_enclosure_aliases": 3,
     "test_enclosure_option_labels": 16,
-    "test_esxi_host_prep": 34,
+    "test_esxi_host_prep": 43,
     "test_full_backup_benchmark": 31,
     "test_ghcr_release_contract": 7,
     "test_heap_probe": 4,
