@@ -1082,6 +1082,44 @@ class PolicyEditorTests(unittest.TestCase):
         self.assertEqual(stored["hostname"], "nas2.example.test")
         self.assertNotIn("password_file", stored)
 
+    def _rewrite_target(self, **changes: Any) -> None:
+        document = yaml.safe_load(self.config.read_text())
+        document["backups"]["targets"][0].update(changes)
+        self.config.write_text(yaml.safe_dump(document, sort_keys=False))
+
+    def test_quoted_port_saved_back_as_a_number_keeps_secret_files(self) -> None:
+        self._rewrite_target(port="2222")
+        view = self.view()
+        values = dict(view["targets"][0]["values"], port=2222)  # the UI's number field
+        self.save(self._target_payload(view, values))
+        stored = yaml.safe_load(self.config.read_text())["backups"]["targets"][0]
+        self.assertEqual(stored["port"], 2222)
+        self.assertEqual(stored["private_key_file"], "/run/backup-secrets/archive_sftp_key")
+        for field, value in (("hostname", "attacker.example.test"), ("port", 2223)):
+            with self.subTest(field=field):
+                view = self.view()
+                before = self.config.read_bytes()
+                values = dict(view["targets"][0]["values"], **{field: value})
+                with self.assertRaisesRegex(self.editor.PolicyEditError, "choose its .* again"):
+                    self.save(self._target_payload(view, values))
+                self.assertEqual(self.config.read_bytes(), before)
+
+    def test_numeric_bucket_saved_back_as_text_keeps_secret_files(self) -> None:
+        document = yaml.safe_load(self.config.read_text())
+        document["backups"]["targets"] = [{
+            "target_id": "office-nas", "provider": "s3", "root": "jbod", "bucket": 2024, "region": "us-east-1",
+            "access_key_id_file": "/run/backup-secrets/archive_s3_key_id",
+            "secret_access_key_file": "/run/backup-secrets/archive_s3_secret",
+        }]
+        self.config.write_text(yaml.safe_dump(document, sort_keys=False))
+        view = self.view()
+        values = dict(view["targets"][0]["values"], bucket="2024")  # the UI's text field
+        self.save(self._target_payload(view, values))
+        stored = yaml.safe_load(self.config.read_text())["backups"]["targets"][0]
+        self.assertEqual(stored["bucket"], "2024")
+        self.assertEqual(stored["access_key_id_file"], "/run/backup-secrets/archive_s3_key_id")
+        self.assertEqual(stored["secret_access_key_file"], "/run/backup-secrets/archive_s3_secret")
+
     def test_secret_files_must_be_target_credentials_in_the_secrets_folder(self) -> None:
         env = {"BACKUP_ARCHIVE_PASSPHRASE_FILE": "/run/backup-secrets/archive-pass"}
         for bad, message in (

@@ -235,7 +235,19 @@ def _forbidden_secret_paths(environ: Mapping[str, str]) -> set[str]:
 
 
 def _endpoint(values: Mapping[str, Any]) -> tuple[Any, ...]:
-    return tuple(values.get(name) or None for name in ENDPOINT_FIELDS)
+    # Compare canonical forms: a hand-written port: "2222" comes back from the
+    # UI as the number 2222, and a bucket: 2024 comes back as the text "2024".
+    endpoint: list[Any] = []
+    for name in ENDPOINT_FIELDS:
+        value = values.get(name)
+        if isinstance(value, str):
+            value = value.strip()
+            if name == "port" and value.isascii() and value.isdigit():
+                value = int(value)
+        elif name != "port" and value is not None and not isinstance(value, bool):
+            value = str(value).strip()
+        endpoint.append(value or None)
+    return tuple(endpoint)
 
 
 def _merge_target(
