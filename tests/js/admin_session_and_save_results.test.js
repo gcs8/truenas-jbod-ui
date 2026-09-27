@@ -414,6 +414,114 @@ test("a refresh that finds admin stopped leaves the Refresh button disabled", as
   assert.match(banners[0][0], /^Unable to refresh admin state/);
 });
 
+function stoppedSessionState(extra = {}) {
+  return {
+    admin: { expires_at: new Date(Date.now() - 1000).toISOString(), auto_stop_seconds: 3600 },
+    sessionStopped: false,
+    countdownTimerId: null,
+    ...extra,
+  };
+}
+
+test("a profile builder render after admin stopped leaves Delete disabled", () => {
+  const deleteButton = new FakeElement();
+  const profile = { id: "custom-a", label: "Custom A", is_custom: true, reference_count: 0 };
+  const state = stoppedSessionState({ loadedBuilderProfileId: profile.id });
+  const draft = { rows: 1, columns: 1, slot_count: 1, ordering_preset: "source-layout", row_groups: [] };
+  const functions = loadFunctions(
+    [...SESSION_FUNCTIONS, "lockActionsIfStopped", "renderProfileBuilder", "profileReferenceCount", "describeProfileReferences"],
+    {
+      state,
+      elements: sparseElements({
+        sessionBanner: new FakeElement({ classes: ["hidden"] }),
+        profileBuilderPreviewSummary: new FakeElement(),
+        profileBuilderPreviewGrid: new FakeElement({ style: {} }),
+        profileBuilderPreviewMeta: new FakeElement(),
+        profileBuilderPreviewBadge: new FakeElement(),
+        profileBuilderDeleteButton: deleteButton,
+        profileBuilderBadge: new FakeElement(),
+        profileBuilderOrdering: new FakeElement({ dataset: {} }),
+        profileBuilderLayoutEditor: new FakeElement(),
+      }),
+      document: fakeDocument([deleteButton]),
+      window: { clearInterval() {} },
+      currentBuilderSourceProfile: () => profile,
+      readProfileBuilderDraft: () => draft,
+      resolveBuilderDraftLayout: () => ({ previewRows: [[1]], badge: "Draft", summary: "" }),
+      applyProfilePreviewGeometry() {},
+      buildProfilePreviewGeometry: () => ({}),
+      renderProfilePreviewCells: () => "",
+      escapeHtml: (value) => value,
+      getProfileById: () => profile,
+    },
+    SESSION_CONSTANTS
+  );
+
+  functions.markAdminStopped();
+  functions.renderProfileBuilder();
+
+  assert.equal(deleteButton.disabled, true);
+});
+
+test("a system delete that finds admin stopped leaves Delete disabled", async () => {
+  const deleteButton = new FakeElement();
+  const system = { id: "system-a", label: "System A" };
+  const state = stoppedSessionState({ selectedExistingSystemId: system.id });
+  let functions = null;
+  functions = loadFunctions(
+    [...SESSION_FUNCTIONS, "deleteSelectedSystem"],
+    {
+      state,
+      elements: sparseElements({ sessionBanner: new FakeElement({ classes: ["hidden"] }), existingSystemDeleteButton: deleteButton }),
+      document: fakeDocument([deleteButton]),
+      window: { clearInterval() {}, confirm: () => true },
+      getSystemById: () => system,
+      historyRowCountForSystem: () => 0,
+      setBanner() {},
+      fetchJson: async () => {
+        functions.markAdminStopped();
+        throw new TypeError("Failed to fetch");
+      },
+    },
+    SESSION_CONSTANTS
+  );
+
+  await functions.deleteSelectedSystem();
+
+  assert.equal(state.sessionStopped, true);
+  assert.equal(deleteButton.disabled, true);
+});
+
+test("a purge that finds admin stopped leaves Purge disabled", async () => {
+  const purgeButton = new FakeElement();
+  const state = stoppedSessionState({ historyPurgePending: false });
+  let functions = null;
+  functions = loadFunctions(
+    [...SESSION_FUNCTIONS, "purgeOrphanedHistory"],
+    {
+      state,
+      elements: sparseElements({
+        sessionBanner: new FakeElement({ classes: ["hidden"] }),
+        historyPurgeOrphanedButton: purgeButton,
+        historyPurgeOrphanedResult: new FakeElement(),
+      }),
+      document: fakeDocument([purgeButton]),
+      window: { clearInterval() {} },
+      setBanner() {},
+      fetchJson: async () => {
+        functions.markAdminStopped();
+        throw new TypeError("Failed to fetch");
+      },
+    },
+    SESSION_CONSTANTS
+  );
+
+  await functions.purgeOrphanedHistory();
+
+  assert.equal(state.sessionStopped, true);
+  assert.equal(purgeButton.disabled, true);
+});
+
 // Debug bundle exports never pause production by default.
 
 test("debug bundle export defaults to not pausing services in the template, the state payload, and the route", () => {

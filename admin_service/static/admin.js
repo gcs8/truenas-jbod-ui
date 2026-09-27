@@ -585,6 +585,16 @@
     });
   }
 
+  function lockActionsIfStopped() {
+    // Renders re-enable buttons from their own rules; once admin has stopped, keep every action locked.
+    if (!state.sessionStopped) {
+      return;
+    }
+    document.querySelectorAll("button:not(.admin-view-button)").forEach((button) => {
+      button.disabled = true;
+    });
+  }
+
   function syncSessionBanner() {
     if (!elements.sessionBanner || state.sessionStopped) {
       return;
@@ -2463,6 +2473,7 @@
     const referenceCount = profileReferenceCount(loadedProfile);
     elements.profileBuilderDeleteButton.disabled = !(loadedProfile && loadedProfile.is_custom) || referenceCount > 0;
     elements.profileBuilderDeleteButton.title = referenceCount > 0 ? describeProfileReferences(referenceCount) : "";
+    lockActionsIfStopped();
   }
 
   function profileReferenceCount(profile) {
@@ -6897,7 +6908,7 @@
     } finally {
       state.historyPurgePending = false;
       if (elements.historyPurgeOrphanedButton) {
-        elements.historyPurgeOrphanedButton.disabled = emptyPreview;
+        elements.historyPurgeOrphanedButton.disabled = emptyPreview || Boolean(state.sessionStopped);
       }
     }
   }
@@ -7318,7 +7329,7 @@
     } finally {
       const currentSelectedSystem = getSystemById(elements.existingSystemSelect?.value || state.selectedExistingSystemId);
       if (elements.existingSystemDeleteButton) {
-        elements.existingSystemDeleteButton.disabled = !currentSelectedSystem;
+        elements.existingSystemDeleteButton.disabled = !currentSelectedSystem || Boolean(state.sessionStopped);
       }
       if (elements.existingSystemDeleteHistoryToggle) {
         elements.existingSystemDeleteHistoryToggle.disabled = !currentSelectedSystem;
@@ -7494,6 +7505,7 @@
     syncSshFields();
     updateCreateButton();
     scheduleSudoersPreviewRefresh(0);
+    lockActionsIfStopped();
   }
 
   function bindEvents() {
