@@ -93,6 +93,36 @@ class BlankAndTextValueTests(_LoaderTestCase):
         self.assertEqual(settings.app.snapshot_cache_ttl_seconds, 10)
         self.assertEqual(settings.app.source_bundle_cache_ttl_seconds, 60)
 
+    def test_blank_credential_lines_keep_the_config_yaml_values(self) -> None:
+        yaml_text = (
+            "truenas:\n"
+            "  api_key: yaml-api-key\n"
+            "  api_user: yaml-api-user\n"
+            "ssh:\n"
+            "  user: yaml-ssh-user\n"
+            "  password: yaml-ssh-password\n"
+        )
+        env = {
+            "TRUENAS_API_KEY": "",
+            "TRUENAS_API_USER": "",
+            "SSH_USER": "",
+            "SSH_PASSWORD": "",
+        }
+        with self.main_ui_environment(env, yaml_text):
+            settings = get_settings()
+
+        self.assertEqual(settings.truenas.api_key, "yaml-api-key")
+        self.assertEqual(settings.truenas.api_user, "yaml-api-user")
+        self.assertEqual(settings.ssh.user, "yaml-ssh-user")
+        self.assertEqual(settings.ssh.password, "yaml-ssh-password")
+
+    def test_set_credential_lines_still_override_config_yaml(self) -> None:
+        yaml_text = "truenas:\n  api_key: yaml-api-key\n"
+        with self.main_ui_environment({"TRUENAS_API_KEY": "env-api-key"}, yaml_text):
+            settings = get_settings()
+
+        self.assertEqual(settings.truenas.api_key, "env-api-key")
+
 
 class PlainConfigurationErrorTests(_LoaderTestCase):
     def test_bad_admin_integer_names_the_variable_and_exits_non_zero(self) -> None:

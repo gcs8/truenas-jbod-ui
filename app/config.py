@@ -1396,6 +1396,10 @@ def load_settings(*, running_restart_only: Settings | None = None) -> Settings:
         if raw_value is None:
             continue
         if env_name in EXACT_STRING_ENV_OVERRIDES:
+            # A blank ``KEY=`` line copied from .env.example is unset, like
+            # every other key; a ``<KEY>_FILE`` secret is still used exactly.
+            if not raw_value.strip() and os.getenv(f"{env_name}_FILE") is None:
+                continue
             parsed_value = raw_value
         elif not raw_value.strip():
             continue
