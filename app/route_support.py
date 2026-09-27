@@ -896,8 +896,11 @@ def resolve_admin_launch_url(request: Request, settings: Settings) -> AdminLaunc
     public_url = str(settings.admin.public_url or "").strip()
     if public_url:
         return AdminLaunchState(url=public_url.rstrip("/"), stopped=False)
+    hostname = request.url.hostname
+    # URL.hostname strips the brackets required around an IPv6 authority.
+    authority_host = f"[{hostname}]" if hostname and ":" in hostname else hostname
     return AdminLaunchState(
-        url=f"{request.url.scheme}://{request.url.hostname}:{settings.admin.port}",
+        url=f"{request.url.scheme}://{authority_host}:{settings.admin.port}",
         stopped=False,
     )
 
