@@ -486,6 +486,8 @@
             ? "This admin version has no backup list."
             : `Couldn't load backups: ${errorText(error)}`;
           setStatus(state.loadError);
+          // A run known to be in progress keeps polling past one failed read.
+          scheduleRunningPoll();
         } finally {
           state.loading = false;
           state.loadPromise = null;

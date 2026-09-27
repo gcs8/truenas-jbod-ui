@@ -581,6 +581,37 @@ test("a poll tick while the tab is hidden keeps polling so the run result shows 
   assert.ok(elements.policies.querySelectorAll('[data-backup-action="run"]').every((node) => !node.disabled));
 });
 
+test("one failed poll during a run keeps the error visible and polls again", async () => {
+  let fail = false;
+  const api = fakeApi({
+    "GET /api/admin/backups": () => {
+      if (fail) {
+        fail = false;
+        return Object.assign(new Error("HTTP 502"), { status: 502 });
+      }
+      return api.data;
+    },
+  });
+  api.data.running = { backup_class: "full", started_at: "2026-09-24T10:00:00Z" };
+  const { timers, library, elements } = pollingLibrary(api);
+  await library.load();
+
+  fail = true;
+  timers.shift()();
+  await settle();
+  await settle();
+  assert.match(elements.status.textContent, /^Couldn't load backups/);
+  assert.equal(timers.length, 1, "a failed poll schedules another one");
+
+  api.data.running = null;
+  timers.shift()();
+  await settle();
+  await settle();
+  assert.equal(timers.length, 0);
+  assert.equal(library.state.data.running, null);
+  assert.ok(elements.policies.querySelectorAll('[data-backup-action="run"]').every((node) => !node.disabled));
+});
+
 test("an unavailable backup service says so and offers nothing to run", async () => {
   const api = fakeApi({ "GET /api/admin/backups": () => ({ available: false, detail: "The backup scheduler is not running.", classes: { config: { enabled: false }, full: { enabled: false } }, targets: [], artifacts: [], storage: {}, running: null }) });
   const { elements, library } = mount({ api });
