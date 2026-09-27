@@ -4252,7 +4252,10 @@ class SystemBackupService:
                 continue
             selected = group_key in selected_groups
             if group_key == CONFIG_FILE_KEY:
-                content_bytes = self._read_scrubbed_yaml_file(Path(app_settings.config_file), scrubber)
+                content_bytes = (
+                    self._read_scrubbed_yaml_file(Path(app_settings.config_file), scrubber)
+                    if selected else b""
+                )
                 group, members = self._collect_generated_file_group(
                     group_key,
                     content_bytes,
@@ -4260,7 +4263,10 @@ class SystemBackupService:
                     source_path=app_settings.config_file,
                 )
             elif group_key == RUNTIME_OVERRIDES_FILE_KEY:
-                content_bytes = self._read_scrubbed_yaml_file(Path(app_settings.paths.runtime_overrides_file), scrubber)
+                content_bytes = (
+                    self._read_scrubbed_yaml_file(Path(app_settings.paths.runtime_overrides_file), scrubber)
+                    if selected else b""
+                )
                 group, members = self._collect_generated_file_group(
                     group_key,
                     content_bytes,
@@ -4268,7 +4274,10 @@ class SystemBackupService:
                     source_path=app_settings.paths.runtime_overrides_file,
                 )
             elif group_key == PROFILE_FILE_KEY:
-                content_bytes = self._read_scrubbed_yaml_file(Path(app_settings.paths.profile_file), scrubber)
+                content_bytes = (
+                    self._read_scrubbed_yaml_file(Path(app_settings.paths.profile_file), scrubber)
+                    if selected else b""
+                )
                 group, members = self._collect_generated_file_group(
                     group_key,
                     content_bytes,
@@ -4276,7 +4285,10 @@ class SystemBackupService:
                     source_path=app_settings.paths.profile_file,
                 )
             elif group_key == MAPPING_FILE_KEY:
-                content_bytes = self._read_scrubbed_json_file(Path(app_settings.paths.mapping_file), scrubber)
+                content_bytes = (
+                    self._read_scrubbed_json_file(Path(app_settings.paths.mapping_file), scrubber)
+                    if selected else b""
+                )
                 group, members = self._collect_generated_file_group(
                     group_key,
                     content_bytes,
@@ -4284,7 +4296,10 @@ class SystemBackupService:
                     source_path=app_settings.paths.mapping_file,
                 )
             elif group_key == SAS_FABRIC_ALIAS_FILE_KEY:
-                content_bytes = self._read_scrubbed_json_file(Path(app_settings.paths.sas_fabric_alias_file), scrubber)
+                content_bytes = (
+                    self._read_scrubbed_json_file(Path(app_settings.paths.sas_fabric_alias_file), scrubber)
+                    if selected else b""
+                )
                 group, members = self._collect_generated_file_group(
                     group_key,
                     content_bytes,
@@ -4292,7 +4307,10 @@ class SystemBackupService:
                     source_path=app_settings.paths.sas_fabric_alias_file,
                 )
             elif group_key == SLOT_DETAIL_FILE_KEY:
-                content_bytes = self._read_scrubbed_json_file(Path(app_settings.paths.slot_detail_cache_file), scrubber)
+                content_bytes = (
+                    self._read_scrubbed_json_file(Path(app_settings.paths.slot_detail_cache_file), scrubber)
+                    if selected else b""
+                )
                 group, members = self._collect_generated_file_group(
                     group_key,
                     content_bytes,
@@ -4325,13 +4343,15 @@ class SystemBackupService:
                     selected=selected,
                 )
             elif group_key == DEBUG_STATE_KEY:
-                content_bytes = self._build_debug_state_bytes(
-                    app_settings,
-                    runtime_payload=runtime_payload,
-                    maintenance_payload=maintenance_payload,
-                    selected_groups=selected_groups,
-                    scrubber=scrubber,
-                    exported_at=exported_at,
+                content_bytes = (
+                    self._build_debug_state_bytes(
+                        app_settings,
+                        runtime_payload=runtime_payload,
+                        maintenance_payload=maintenance_payload,
+                        selected_groups=selected_groups,
+                        scrubber=scrubber,
+                        exported_at=exported_at,
+                    ) if selected else b""
                 )
                 group, members = self._collect_generated_file_group(
                     group_key,
@@ -4340,9 +4360,11 @@ class SystemBackupService:
                     source_path=None,
                 )
             elif group_key == DEBUG_README_KEY:
-                content_bytes = self._build_debug_readme_bytes(
-                    scrub_secrets=bool(scrubber and scrubber.scrub_secrets),
-                    scrub_disk_identifiers=bool(scrubber and scrubber.scrub_disk_identifiers),
+                content_bytes = (
+                    self._build_debug_readme_bytes(
+                        scrub_secrets=bool(scrubber and scrubber.scrub_secrets),
+                        scrub_disk_identifiers=bool(scrubber and scrubber.scrub_disk_identifiers),
+                    ) if selected else b""
                 )
                 group, members = self._collect_generated_file_group(
                     group_key,
