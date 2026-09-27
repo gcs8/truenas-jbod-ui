@@ -58,6 +58,7 @@ const RENDER_FUNCTIONS = [
   "formatSlotLabel",
   "sasFabricList",
   "sasFabricSortedSlots",
+  "sasFabricViewSlotForBay",
   "renderSasFabricFlatBayChips",
   "sasFabricBayGridCell",
   "renderSasFabricBayChips",
@@ -364,6 +365,61 @@ test("with a storage view selected the grid still draws every bay of the enclosu
   assert.match(markup, /data-sas-fabric-slot="46"/, "a bay outside the view does not disappear");
   assert.equal((markup.match(/class="sas-fabric-bay-row"/g) || []).length, 4, "the enclosure rows, not the view rows");
   assert.match(markup, /System front \/ latch edge/, "the enclosure edge cue, not the view's");
+});
+
+// A boot view whose two slots are backed by enclosure bays 03 and 07.
+const BOOT_VIEW_ON_BAYS = {
+  id: "boot",
+  kind: "boot_devices",
+  slot_layout: [[0, 1]],
+  slot_count: 2,
+  slots: [
+    { slot_index: 0, snapshot_slot: 3 },
+    { slot_index: 1, snapshot_slot: 7 },
+  ],
+};
+
+const BAY_TO_VIEW_SLOT_FUNCTIONS = ["sasFabricList", "sasFabricViewSlotForBay"];
+
+test("with a storage view selected a bay chip selects the view slot that bay backs", () => {
+  const selected = [];
+  const state = { selectedSlot: 0 };
+  const loaded = loadFunctions([...BAY_TO_VIEW_SLOT_FUNCTIONS, "selectSasFabricSlot"], {
+    Number,
+    state,
+    getSelectedStorageViewRuntime: () => BOOT_VIEW_ON_BAYS,
+    selectSlot(slotNumber) {
+      selected.push(slotNumber);
+      state.selectedSlot = slotNumber;
+      return true;
+    },
+  });
+
+  assert.equal(loaded.selectSasFabricSlot(46), false, "no view slot backs bay 46");
+  assert.equal(state.selectedSlot, 0, "a bay outside the view leaves the selection alone");
+  assert.equal(loaded.selectSasFabricSlot(7), true);
+  assert.equal(state.selectedSlot, 1, "bay 07 backs view slot 1");
+  assert.deepEqual(selected, [1]);
+});
+
+test("with a storage view selected the chip of the bay backing the selected view slot is lit", () => {
+  const layout = CSE_946;
+  const context = bayGridContext(layout, { impactedSlots: [1, 7, 46] });
+  context.state.layoutRows = layout.layoutRows;
+  context.state.snapshot.selected_profile = { edge_label: layout.profile.edgeLabel, row_groups: layout.profile.rowGroups };
+  context.state.selectedSlot = 1;
+  context.getSelectedStorageViewRuntime = () => BOOT_VIEW_ON_BAYS;
+  context.sasFabricSelectedSlotSet = () => new Set();
+  const loaded = loadFunctions([...LAYOUT_FUNCTIONS, ...RENDER_FUNCTIONS], {
+    ...context,
+    document: { createElement: fakeElement },
+    grid: fakeElement("div"),
+  });
+  const markup = loaded.renderSasFabricBayChips([1, 7, 46], 72);
+
+  assert.match(markup, /class="sas-fabric-bay-chip is-selected" data-sas-fabric-slot="7"/, "bay 07 backs view slot 1");
+  assert.match(markup, /class="sas-fabric-bay-chip" data-sas-fabric-slot="1"/, "bay 01 is not view slot 1");
+  assert.match(markup, /class="sas-fabric-bay-chip" data-sas-fabric-slot="46"/);
 });
 
 test("a layout with gaps draws the gaps, not a shifted row", () => {

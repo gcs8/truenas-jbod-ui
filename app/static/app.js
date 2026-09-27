@@ -1854,11 +1854,28 @@
     renderAll();
   }
 
+  // Fabric chips carry physical bay numbers. While a storage view is selected
+  // the selection is a view slot, so map the bay through the view slot
+  // snapshot_slot; null means no view slot is backed by that bay.
+  function sasFabricViewSlotForBay(bayNumber) {
+    const storageView = getSelectedStorageViewRuntime();
+    if (!storageView) {
+      return bayNumber;
+    }
+    const viewSlot = sasFabricList(storageView.slots).find((slot) => slot?.snapshot_slot === bayNumber);
+    const slotIndex = Number(viewSlot?.slot_index);
+    return viewSlot && Number.isInteger(slotIndex) ? slotIndex : null;
+  }
+
   function selectSasFabricSlot(slotNumber) {
     if (!Number.isInteger(slotNumber)) {
       return false;
     }
-    return selectSlot(slotNumber);
+    const viewSlot = sasFabricViewSlotForBay(slotNumber);
+    if (viewSlot === null) {
+      return false;
+    }
+    return selectSlot(viewSlot);
   }
 
   function sasFabricSelectionTouchesNode(nodeId) {
@@ -2019,7 +2036,8 @@
 
   function renderSasFabricFlatBayChips(sorted, selectedSlots, limit) {
     const chips = sorted.slice(0, limit).map((slotNumber) => {
-      const selected = selectedSlots.has(slotNumber) || state.selectedSlot === slotNumber;
+      const viewSlot = sasFabricViewSlotForBay(slotNumber);
+      const selected = selectedSlots.has(slotNumber) || (viewSlot !== null && state.selectedSlot === viewSlot);
       return `<button type="button" class="sas-fabric-bay-chip${selected ? " is-selected" : ""}" data-sas-fabric-slot="${slotNumber}">${escapeHtml(formatSlotLabel(slotNumber))}</button>`;
     }).join("");
     const overflow = sorted.length > limit ? `<span class="sas-fabric-bay-overflow">+${sorted.length - limit}</span>` : "";
@@ -2032,7 +2050,8 @@
     }
     const label = escapeHtml(formatSlotLabel(slotNumber));
     if (impactedSlots.has(slotNumber)) {
-      const selected = selectedSlots.has(slotNumber) || state.selectedSlot === slotNumber;
+      const viewSlot = sasFabricViewSlotForBay(slotNumber);
+      const selected = selectedSlots.has(slotNumber) || (viewSlot !== null && state.selectedSlot === viewSlot);
       return `<button type="button" class="sas-fabric-bay-chip${selected ? " is-selected" : ""}" data-sas-fabric-slot="${slotNumber}">${label}</button>`;
     }
     const slot = slotsByNumber.get(slotNumber);
