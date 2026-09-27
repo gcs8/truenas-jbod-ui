@@ -27,7 +27,7 @@ from app.config import (
     is_placeholder_known_hosts_path,
     known_hosts_placeholder_paths,
 )
-from app.settings_reload import SettingsGeneration, SettingsRuntime
+from app.settings_reload import SettingsGeneration, SettingsRuntime, config_reload_problems
 from app.services.profile_registry import build_profile_reference_warnings
 from app.http_auth import (
     basic_auth_matches,
@@ -1004,6 +1004,22 @@ def refresh_storage_problems(request: Request) -> list[str]:
     app_state.startup_problems = current
     app_state.storage_checked_at_monotonic = now
     return list(current)
+
+
+def runtime_warnings_for(request: Request) -> list[str]:
+    """Startup, known-hosts and reload lines shown above the inventory warnings.
+
+    The page and every ``/api/inventory`` refresh prepend the same list, so a
+    refresh does not drop them. The storage probe behind the first two is
+    re-run at most every ``STORAGE_REPROBE_SECONDS``.
+    """
+
+    refresh_storage_problems(request)
+    return [
+        *startup_problems_for(request),
+        *known_hosts_warnings_for(request),
+        *config_reload_problems(request),
+    ]
 
 
 @dataclass(slots=True)

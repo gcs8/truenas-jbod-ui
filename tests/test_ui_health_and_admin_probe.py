@@ -822,7 +822,9 @@ class IndexPageTests(unittest.TestCase):
         release_service.snapshot.return_value = {}
         route = _route("/")
         previous_problems = getattr(app_main.app.state, "startup_problems", ())
+        previous_checked_at = getattr(app_main.app.state, "storage_checked_at_monotonic", None)
         app_main.app.state.startup_problems = startup_problems
+        app_main.app.state.storage_checked_at_monotonic = time.monotonic()
         try:
             with (
                 patch.object(app_routes, "get_settings", return_value=settings),
@@ -833,6 +835,7 @@ class IndexPageTests(unittest.TestCase):
                 response = asyncio.run(route.endpoint(request=_request(), system_id=None, enclosure_id=None))
         finally:
             app_main.app.state.startup_problems = previous_problems
+            app_main.app.state.storage_checked_at_monotonic = previous_checked_at
         self.assertEqual(response.status_code, 200)
         return response.body.decode("utf-8")
 
@@ -859,6 +862,53 @@ class IndexPageTests(unittest.TestCase):
         self.assertIn(f'<div class="warning-item">{CHOWN_SENTENCE}</div>', page)
         self.assertIn("SES data is partial", page)
         self.assertLess(page.index(CHOWN_SENTENCE), page.index("SES data is partial"))
+
+
+class InventoryRefreshWarningTests(unittest.TestCase):
+    KNOWN_HOSTS_WARNING = "The known-hosts file /run/ssh/known_hosts is not writable by the app."
+
+    def fetch_inventory(self, *, checked_at: float, probe_lines: list[str]) -> dict:
+        state = app_main.app.state
+        names = ("startup_problems", "known_hosts_warnings", "storage_checked_at_monotonic", "writable_directories")
+        previous = {name: getattr(state, name, None) for name in names}
+        state.startup_problems = (CHOWN_SENTENCE,)
+        state.known_hosts_warnings = (self.KNOWN_HOSTS_WARNING,)
+        state.storage_checked_at_monotonic = checked_at
+        state.writable_directories = ("/app/data",)
+        try:
+            with (
+                patch.object(app_routes, "get_inventory_registry", return_value=_registry(_service())),
+                patch.object(app_route_support, "probe_writable_directories", return_value=probe_lines),
+                patch.object(
+                    app_route_support,
+                    "check_known_hosts_files",
+                    return_value=([], [self.KNOWN_HOSTS_WARNING]),
+                ),
+            ):
+                response = asyncio.run(
+                    _route("/api/inventory").endpoint(
+                        request=_request("/api/inventory"),
+                        force=False,
+                        system_id=None,
+                        enclosure_id=None,
+                    )
+                )
+        finally:
+            for name, value in previous.items():
+                setattr(state, name, value)
+        self.assertEqual(response.status_code, 200)
+        return json.loads(response.body)
+
+    def test_refresh_keeps_the_startup_and_known_hosts_warnings_the_page_shows(self) -> None:
+        payload = self.fetch_inventory(checked_at=time.monotonic(), probe_lines=[])
+        self.assertEqual(
+            payload["warnings"],
+            [CHOWN_SENTENCE, self.KNOWN_HOSTS_WARNING, "SES data is partial"],
+        )
+
+    def test_refresh_reprobes_a_stale_storage_check(self) -> None:
+        payload = self.fetch_inventory(checked_at=0.0, probe_lines=[])
+        self.assertEqual(payload["warnings"], [self.KNOWN_HOSTS_WARNING, "SES data is partial"])
 
 
 if __name__ == "__main__":
