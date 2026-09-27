@@ -259,6 +259,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Validate log levels before settings reload, use the configured runtime-overrides
+  file consistently, and serialize partial updates while preserving reader permissions. (#811)
 - The main UI no longer reports itself down when a pinned known-hosts file sits
   on a read-only mount, such as the `/run/ssh` mount in the shipped Compose
   file. SSH still verifies hosts against the keys in it; `/healthz` now answers
