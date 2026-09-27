@@ -68,9 +68,6 @@ CHUNK_SIZE = 1024 * 1024
 PARTIAL_SUFFIX = ".partial"
 MAX_NAME_LENGTH = 1024
 MAX_NAME_DEPTH = 8
-# S3: re-download objects up to this size to hash them; larger objects rely on
-# the stored SHA-256 metadata plus the ETag computed for our fixed part size.
-S3_REGET_LIMIT = 16 * 1024 * 1024
 S3_MULTIPART_THRESHOLD = 64 * 1024 * 1024
 S3_MULTIPART_CHUNKSIZE = 64 * 1024 * 1024
 SFTP_PREFETCH_MAX_REQUESTS = 64
@@ -1189,19 +1186,17 @@ class S3Target(_TargetBase):
         etag = str(head.get("ETag") or "").strip('"')
         if etag and etag == expected_etag:
             return True
-        if size <= S3_REGET_LIMIT:
-            body = self._client.get_object(Bucket=self._bucket, Key=key)["Body"]
-            try:
-                back_size, back_sha = _hash_stream(body)
-            finally:
-                close = getattr(body, "close", None)
-                if callable(close):
-                    close()
-            _check_readback("S3", size, sha_hex, back_size, back_sha)
-            return True
-        # Large object whose ETag is not a plain MD5 (for example SSE-KMS):
-        # size matched, content not independently confirmed.
-        return False
+        # ETag is not the MD5 we computed (for example SSE-KMS): stream the
+        # object back and hash it; this never buffers the whole object.
+        body = self._client.get_object(Bucket=self._bucket, Key=key)["Body"]
+        try:
+            back_size, back_sha = _hash_stream(body)
+        finally:
+            close = getattr(body, "close", None)
+            if callable(close):
+                close()
+        _check_readback("S3", size, sha_hex, back_size, back_sha)
+        return True
 
     def _delete_quietly(self, key: str) -> None:
         try:

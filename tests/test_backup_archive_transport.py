@@ -1253,12 +1253,15 @@ class S3TargetTests(_TempCase):
         self.assertEqual(self.clients[0].get_calls, 0)
         self.assertTrue(self.clients[0].objects["jbod-ui/archive/full/threshold.bin"]["etag"].endswith("-1"))
 
-    def test_large_opaque_etag_is_size_checked_but_unverified(self) -> None:
-        with mock.patch.object(transport, "S3_REGET_LIMIT", 4), open_target(self.settings()) as target:
+    def test_large_opaque_etag_is_verified_by_streaming_readback(self) -> None:
+        src = self.tmp / "large.bin"
+        with open(src, "wb") as handle:
+            handle.truncate(16 * 1024 * 1024 + 3)
+        with open_target(self.settings()) as target:
             self.clients[0].etag_override = "kms-opaque"
-            stored = target.put(self.source(b"payload"), "a.bin")
-        self.assertFalse(stored.verified)
-        self.assertEqual(self.clients[0].get_calls, 0)
+            stored = target.put(src, "full/large.bin")
+        self.assertTrue(stored.verified)
+        self.assertEqual(self.clients[0].get_calls, 1)
 
     def test_plain_http_endpoint_is_labelled_unencrypted(self) -> None:
         with open_target(self.settings(endpoint_url="http://minio.example.test:9000")) as target:
