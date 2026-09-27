@@ -17409,10 +17409,10 @@ class InventoryScopedIdentityRegressionTests(unittest.IsolatedAsyncioTestCase):
         wwn_a, wwn_b = (f"5{counter:015x}" for counter in (1, 2))
         disk = {"id": "disk-a", "storageSystemId": "node-a", "devicePath": "/dev/sda",
                 "serialNumber": "SANITIZED-A", "wwn": wwn_a, "scsiId": wwn_a,
-                "wwid": wwn_a, "eui64": wwn_a, "slot": 0}
-        for field in ("wwn", "scsiId", "wwid", "eui64"):
+                "wwid": wwn_a, "eui64": wwn_a, "sasAddress": wwn_a, "portSasAddress": wwn_b, "slot": 0}
+        for field in ("wwn", "scsiId", "wwid", "eui64", "sasAddress", "portSasAddress"):
             for side in ("cli", "rest"):
-                conflict = dict(disk, **{field: wwn_b})
+                conflict = dict(disk, **{field: wwn_a if field == "portSasAddress" else wwn_b})
                 rest, cli = (disk, conflict) if side == "cli" else (conflict, disk)
                 for owner in ("node-a", "node-b"):
                     for reverse in (False, True):
@@ -17441,6 +17441,155 @@ class InventoryScopedIdentityRegressionTests(unittest.IsolatedAsyncioTestCase):
                     with self.subTest(case=name, owner=owner, reverse=reverse):
                         await self._assert_quantastor_identity_admission(
                             rest, cli, accepted=accepted, reverse=reverse, owner=owner)
+
+    async def _quantastor_two_bay_cli_observation(self, disk, rows):
+        """Real CLI parsing, snapshot and SMART, with invented two-bay SES data."""
+        sas_a, sas_b = (f"5{counter:015x}" for counter in (16, 256))
+        comparisons = 0
+
+        class CountedRow(dict):
+            def __eq__(self, other):
+                nonlocal comparisons
+                comparisons += 1
+                return super().__eq__(other)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            systems = [{"id": "node-a", "name": "Synthetic Node A"}]
+            api, probe = AsyncMock(), AsyncMock()
+            api.fetch_all.return_value = self._raw([disk], enclosures=systems, systems=systems)
+            probe.run_planned_commands.return_value = []
+            system = SystemConfig(
+                id="synthetic-qs-two-bay", truenas=TrueNASConfig(platform="quantastor"),
+                default_profile_id="supermicro-ssg-2028r-shared-front-24",
+                ssh=SSHConfig(enabled=True, host="node-a.example.test", commands=[]),
+            )
+            service = build_inventory_service(Settings(), system, api, probe, temp_dir)
+            service._fetch_quantastor_ses_overlay = AsyncMock(return_value=(ParsedSSHData(
+                ses_slot_candidates={index: {
+                    "present": True, "sas_address_hint": sas, "sas_device_type": "end device",
+                    "ses_device": "/dev/sg1", "ses_element_id": index,
+                } for index, sas in enumerate((sas_a, sas_b))},
+            ), []))
+            commands = []
+
+            async def inventory_commands(batch, host=None, **kwargs):
+                commands.extend(batch)
+                return [SSHCommandResult(command=command, ok=True, exit_code=0,
+                                         stdout=json.dumps(rows if "disk-list" in command.split() else []))
+                        for command in batch]
+
+            service._run_ssh_commands = AsyncMock(side_effect=inventory_commands)
+            build_hints = service._build_quantastor_cli_disk_hints
+            resolve_hint = service._resolve_quantastor_cli_disk_hint
+            resolver_comparisons = []
+
+            def observe_hints(parsed_rows):
+                return build_hints([CountedRow(row) for row in parsed_rows])
+
+            def observe_resolver(row, hints):
+                before = comparisons
+                result = resolve_hint(row, hints)
+                resolver_comparisons.append(comparisons - before)
+                return result
+
+            service._build_quantastor_cli_disk_hints = observe_hints
+            service._resolve_quantastor_cli_disk_hint = observe_resolver
+            snapshot = await service.get_snapshot(selected_enclosure_id="node-a")
+            snapshot_comparisons = comparisons
+            snapshot_resolver_comparisons = list(resolver_comparisons)
+            self.assertTrue(any("disk-list" in command.split() for command in commands))
+            service._run_ssh_planned_commands = AsyncMock(return_value=[])
+            slots = []
+            for slot in snapshot.slots[:2]:
+                summary = await service.get_slot_smart_summary(slot.slot, selected_enclosure_id="node-a")
+                slots.append({
+                    "slot": slot.slot, "serial": slot.serial, "device": slot.device_name,
+                    "temperature": summary.temperature_c, "firmware": summary.firmware_version,
+                    "health": summary.smart_health_status,
+                    "source": slot.raw_status.get("mapping_resolution_source"),
+                    "cli": (slot.raw_status.get("disk_raw") or {}).get("quantastor_cli_disk"),
+                })
+            api.fetch_all.assert_awaited_once()
+            return {"slots": slots, "comparisons": snapshot_comparisons,
+                    "resolver_comparisons": snapshot_resolver_comparisons,
+                    "row_count": len(rows), "payload_bytes": len(json.dumps(rows).encode())}
+
+    async def test_quantastor_public_two_bay_sas_conflict_does_not_duplicate_disk_or_smart(self) -> None:
+        sas_a, sas_b = (f"5{counter:015x}" for counter in (16, 256))
+        for field in ("sasAddress", "portSasAddress"):
+            disk = {"id": "disk-a", "storageSystemId": "node-a", "devicePath": "/dev/sda",
+                    "serialNumber": "SYNTHETIC-A", "slot": 0, field: sas_a}
+            for mode in ("absent", "coherent", "conflict"):
+                cli = dict(disk, **{field: sas_b if mode == "conflict" else sas_a},
+                           driveTemp="70 C", revisionLevel="CLI-FW", smartHealthTest="[FAILED]")
+                unrelated = {"id": "unrelated", "storageSystemId": "node-b", "serialNumber": "SYNTHETIC-B"}
+                rows = [] if mode == "absent" else [cli, unrelated]
+                for reverse in (False, True):
+                    with self.subTest(field=field, mode=mode, reverse=reverse):
+                        result = await self._quantastor_two_bay_cli_observation(disk, rows[::-1] if reverse else rows)
+                        first, second = result["slots"]
+                        # Assert the wrong-bay attribution before checking enrichment refusal.
+                        self.assertIsNone(second["serial"], result)
+                        self.assertIsNone(second["device"], result)
+                        self.assertIsNone(second["temperature"], result)
+                        self.assertIsNone(second["firmware"], result)
+                        self.assertIsNone(second["health"], result)
+                        self.assertIsNone(second["cli"], result)
+                        self.assertEqual(first["serial"], "SYNTHETIC-A")
+                        self.assertEqual(first["device"], "sda")
+                        self.assertEqual(first["temperature"], 70 if mode == "coherent" else None)
+                        self.assertEqual(first["firmware"], "CLI-FW" if mode == "coherent" else None)
+                        self.assertEqual(first["health"], "FAILED" if mode == "coherent" else None)
+                        self.assertEqual(first["cli"], cli if mode == "coherent" else None)
+
+    async def test_quantastor_public_smart_preserves_distinct_sas_types_and_missing_fields(self) -> None:
+        sas_a, sas_b = (f"5{counter:015x}" for counter in (16, 256))
+        disk = {"id": "disk-a", "storageSystemId": "node-a", "devicePath": "/dev/sda",
+                "serialNumber": "SYNTHETIC-A", "slot": 0}
+        for rest_sas, cli_sas in (
+            ({"sasAddress": sas_a, "portSasAddress": sas_b}, {"sasAddress": sas_a, "portSasAddress": sas_b}),
+            ({"sasAddress": sas_a}, {"portSasAddress": sas_b}),
+            ({"portSasAddress": sas_b}, {"sasAddress": sas_a}),
+            ({}, {"sasAddress": sas_a}),
+            ({"portSasAddress": sas_b}, {}),
+        ):
+            for owner in ("node-a", "node-b"):
+                for reverse in (False, True):
+                    with self.subTest(rest=rest_sas, cli=cli_sas, owner=owner, reverse=reverse):
+                        await self._assert_quantastor_identity_admission(
+                            dict(disk, **rest_sas), dict(disk, **cli_sas, id="shared-peer"),
+                            accepted=True, reverse=reverse, owner=owner)
+
+    async def test_quantastor_public_snapshot_equal_rank_payload_comparisons_are_linear(self) -> None:
+        disk = {"id": "disk-a", "storageSystemId": "node-a", "devicePath": "/dev/sda",
+                "serialNumber": "SYNTHETIC-A", "slot": 0, "sasAddress": f"5{16:015x}"}
+        cli = dict(disk, driveTemp="70 C", revisionLevel="CLI-FW", smartHealthTest="[FAILED]")
+        for count in (32, 64, 128):
+            for mode in ("different", "identical", "one-different", "higher-rank"):
+                rows = [dict(cli, irrelevant=index if mode in {"different", "higher-rank"} else 0)
+                        for index in range(count)]
+                expected = None
+                if mode == "identical":
+                    expected = rows[0]
+                elif mode == "one-different":
+                    rows[count // 2]["irrelevant"] = 1
+                elif mode == "higher-rank":
+                    rows = [dict(row, id="shared-peer") for row in rows]
+                    rows.append(cli)
+                    expected = cli
+                for reverse in (False, True):
+                    with self.subTest(count=count, mode=mode, reverse=reverse):
+                        result = await self._quantastor_two_bay_cli_observation(disk, rows[::-1] if reverse else rows)
+                        first, second = result["slots"]
+                        self.assertEqual(first["cli"], expected)
+                        self.assertEqual(first["temperature"], 70 if expected else None)
+                        self.assertEqual(first["firmware"], "CLI-FW" if expected else None)
+                        self.assertIsNone(second["serial"])
+                        self.assertIsNone(second["temperature"])
+                        calls = result["resolver_comparisons"]
+                        self.assertTrue(calls)
+                        self.assertTrue(all(0 < value <= len(rows) - 1 for value in calls), result)
+                        self.assertEqual(result["comparisons"], sum(calls))
 
     async def test_public_snapshot_refuses_cross_enclosure_bare_slots(self) -> None:
         for platform in ("core", "scale"):

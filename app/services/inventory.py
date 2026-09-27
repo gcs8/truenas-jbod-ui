@@ -7716,6 +7716,9 @@ class InventoryService:
             "scsiId": ("scsiId",),
             "wwid": ("wwid",),
             "eui64": ("eui64",),
+            # Disk and port SAS addresses are distinct identifier types.
+            "sasAddress": ("sasAddress",),
+            "portSasAddress": ("portSasAddress",),
             "owner": ("storageSystemId", "systemId", "iofenceSystemId", "controllerId"),
             "path": ("devicePath", "altDevicePath", "deviceName", "device", "name"),
         }
@@ -7759,15 +7762,17 @@ class InventoryService:
         if len(identity["serial"]) > 1:
             return None
         physical_kinds = ("serial", "wwn", "scsiId", "wwid", "eui64")
+        # SAS hints may veto enrichment but do not grant new match authority.
+        contradiction_kinds = (*physical_kinds, "sasAddress", "portSasAddress")
         keys = {(kind, value) for kind in ("id", *physical_kinds) for value in identity[kind]}
         keys.update(("path", owner, path) for owner in identity["owner"] for path in identity["path"])
         candidates = {id(row): row for key in keys for row in hints.get(key, [])}
-        ranked: dict[tuple[int, bool], list[dict[str, Any]]] = {}
+        ranked: dict[tuple[int, bool], tuple[dict[str, Any], bool]] = {}
         for row in candidates.values():
             other = cls._quantastor_cli_identity(row)
             if len(other["serial"]) > 1 or any(
                 identity[kind] and other[kind] and identity[kind].isdisjoint(other[kind])
-                for kind in physical_kinds
+                for kind in contradiction_kinds
             ):
                 continue
             id_match = bool(identity["id"] & other["id"])
@@ -7779,14 +7784,18 @@ class InventoryService:
                 if identity["id"] and other["id"]:
                     continue
             rank = (2 if id_match else 1 if physical_match else 0, same_owner)
-            peers = ranked.setdefault(rank, [])
-            if row not in peers:
-                peers.append(row)
+            if rank not in ranked:
+                ranked[rank] = (row, False)
+            else:
+                representative, differs = ranked[rank]
+                # Once a rank conflicts, later duplicates cannot resolve it.
+                # Compare at most once per row, not against every prior peer.
+                ranked[rank] = (representative, differs or not row == representative)
         if not ranked:
             return None
-        best = ranked[max(ranked)]
+        representative, differs = ranked[max(ranked)]
         # Equal authority with different payloads is unresolved, not first-wins.
-        return best[0] if len(best) == 1 else None
+        return None if differs else representative
 
     def _build_quantastor_pool_slot_hints(
         self,
