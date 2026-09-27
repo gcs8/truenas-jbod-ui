@@ -87,6 +87,29 @@ for (const outcome of ["success", "failure"]) {
   });
 }
 
+test("a write started before a manual refresh does not hold the next auto-refresh tick", async () => {
+  const pending = deferred();
+  const state = { snapshotMode:false, autoRefresh:true, refreshIntervalSeconds:30, refreshesInFlight:0, snapshot:{selected_system_id:"a",selected_enclosure_id:"one"}, selectedSystemId:"a", selectedEnclosureId:"one", selectedSlot:0, latestRefreshToken:1, mappingDraftRevision:0, snapshotReuseCache:{} };
+  const timers = []; let refreshes = 0;
+  const context = {state, URLSearchParams, Date, Number, Math, window:{setTimeout(cb){ timers.push(cb); return timers.length; }},
+    cancelAutoRefreshTimer(){}, autoRefreshPauseReason:()=>null, renderTimingSurfaces(){}, ensureTimingTick(){},
+    async refreshSnapshot(){ refreshes++; state.latestRefreshToken++; },
+    writeBlockedByPolicy:()=>false,
+    getSlotById:()=>({slot:0,slot_label:"00",led_supported:true}),
+    setStatus(){}, sendScopedRequest:async ()=>pending.promise,
+    applySnapshot(){}, renderAll(){}, scheduleSmartPrefetch(){}, locateLightSourceLabel:()=>"synthetic",
+    handleWriteRejection(){} };
+  const c = load([...guardNames, "sendLedAction", "scheduleAutoRefresh"], context);
+  c.scheduleAutoRefresh();
+  const run = c.sendLedAction("IDENTIFY");
+  await new Promise(r => setImmediate(r));
+  state.latestRefreshToken++; // a manual refresh moved the epoch; the write is now stale
+  await timers.shift()();
+  assert.equal(refreshes, 1, "a stale write must not postpone auto-refresh for the new epoch");
+  pending.resolve({snapshot:{selected_system_id:"a",selected_enclosure_id:"one"}});
+  await run;
+});
+
 for (const outcome of ["success", "failure"]) {
  test(`storage runtime ignores old-scope ${outcome}`, async () => {
   const d=deferred(); let applied=0, statuses=0, renders=0;
