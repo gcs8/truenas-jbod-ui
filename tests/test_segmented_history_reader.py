@@ -855,6 +855,235 @@ class SegmentedHistoryReaderCliTests(unittest.TestCase):
             self.assertEqual(samples[1]["value_min"], 31.0)
             self.assertEqual(samples[1]["value_max"], 33.0)
 
+    def _assert_tight_rollup_limit(self, caller: str) -> None:
+        for interval in (3600, 86400):
+            for metric in ("temperature", "bytes_read", "bytes_written", "power_on_hours"):
+                for source_count in (2, 3):
+                    with self.subTest(caller=caller, interval=interval, metric=metric, sources=source_count):
+                        with tempfile.TemporaryDirectory() as temporary_directory:
+                            paths = [Path(temporary_directory) / f"source-{i}.sqlite3" for i in range(source_count)]
+                            bucket = "2025-01-01T00:00:00+00:00"
+                            for index, path in enumerate(paths):
+                                connection = sqlite3.connect(path)
+                                try:
+                                    connection.executescript(SCHEMA)
+                                    # Both competitors sort before the retained key in a sealed source.
+                                    if index:
+                                        competitors = [("enclosure-1", "disk-a"), ("enclosure-0", "disk-b")]
+                                        for enclosure, disk in competitors:
+                                            connection.execute(
+                                                """INSERT INTO metric_rollups (
+                                                    bucket_start, bucket_seconds, system_id, enclosure_key,
+                                                    slot, slot_label, metric_name, disk_identity_key,
+                                                    sample_count, value_sum, value_min, value_max,
+                                                    last_value, last_observed_at
+                                                ) VALUES (?, ?, 'system-1', ?, 1, 'slot-1', ?, ?,
+                                                          2, 200, 90, 110, 110, ?)""",
+                                                (bucket, interval, enclosure, metric, disk, bucket),
+                                            )
+                                    total, low, high, last, minute = (
+                                        (70, 34, 36, 36, 50), (62, 30, 32, 32, 30), (50, 24, 26, 26, 55)
+                                    )[index]
+                                    connection.execute(
+                                        """INSERT INTO metric_rollups (
+                                            bucket_start, bucket_seconds, system_id, enclosure_key,
+                                            slot, slot_label, metric_name, disk_identity_key,
+                                            sample_count, value_sum, value_min, value_max,
+                                            last_value, last_observed_at
+                                        ) VALUES (?, ?, 'system-1', 'enclosure-1', 1, 'slot-1', ?,
+                                                  'disk-b', 2, ?, ?, ?, ?, ?)""",
+                                        (bucket, interval, metric, total, low, high, last,
+                                         f"2025-01-01T00:{minute}:00+00:00"),
+                                    )
+                                    if index == 0 and caller == "followed_bundle":
+                                        connection.execute(
+                                            """INSERT INTO slot_state_current (
+                                                system_id, enclosure_key, slot, slot_label,
+                                                present, identify_active, last_seen_at, disk_identity_key
+                                            ) VALUES ('system-1', 'enclosure-1', 1, 'slot-1', 1, 0, ?, 'disk-b')""",
+                                            (bucket,),
+                                        )
+                                    connection.commit()
+                                finally:
+                                    connection.close()
+                            reader = SegmentedHistoryReader(hot_path=paths[0], segment_paths=paths[1:])
+
+                            def read(limit):
+                                options = {"metric_name": metric, "limit": limit, "since": bucket}
+                                if caller == "disk":
+                                    return reader.list_disk_metric_samples("disk-b", **options)
+                                if caller == "followed":
+                                    return reader.list_followed_metric_samples(
+                                        "system-1", "enclosure-1", 1, "disk-b", **options
+                                    )
+                                if caller in {"bundle", "followed_bundle"}:
+                                    bundle = reader.get_slot_history_bundle(
+                                        "system-1", "enclosure-1", 1, event_limit=1,
+                                        metric_limits={metric: limit}, since=bucket,
+                                    )
+                                    self.assertEqual(bundle["sample_counts"][metric], len(bundle["metrics"][metric]))
+                                    self.assertEqual(bundle["latest_values"][metric], bundle["metrics"][metric][0]["value"])
+                                    return bundle["metrics"][metric]
+                                return reader.list_metric_samples("system-1", "enclosure-1", 1, **options)
+
+                            wide = read(10)
+                            tight = read(1)
+                            self.assertEqual(len(tight), 1)
+                            target = [row for row in wide if row["disk_identity_key"] == "disk-b"
+                                      and row["enclosure_key"] == "enclosure-1"]
+                            self.assertEqual(len(target), 1, "followed paths must deduplicate complete fragments")
+                            self.assertEqual(tight[0], target[0])
+                            expected_sum = 132 if source_count == 2 else 182
+                            expected_count = source_count * 2
+                            expected_last = 36 if source_count == 2 else 26
+                            sample = tight[0]
+                            self.assertEqual(sample["sample_count"], expected_count)
+                            self.assertEqual(sample["value_min"], 30 if source_count == 2 else 24)
+                            self.assertEqual(sample["value_max"], 36)
+                            self.assertEqual(sample["rollup_seconds"], interval)
+                            if metric == "temperature":
+                                self.assertAlmostEqual(sample["value"] * sample["sample_count"], expected_sum)
+                                self.assertEqual(sample["observed_at"], bucket)
+                            else:
+                                self.assertEqual(sample["value"], expected_last)
+                                self.assertEqual(sample["observed_at"],
+                                                 f"2025-01-01T00:{50 if source_count == 2 else 55}:00+00:00")
+
+    def test_direct_rollup_limit_preserves_all_fragments(self) -> None:
+        self._assert_tight_rollup_limit("direct")
+
+    def test_disk_rollup_limit_preserves_all_fragments(self) -> None:
+        self._assert_tight_rollup_limit("disk")
+
+    def test_followed_rollup_limit_preserves_all_fragments(self) -> None:
+        self._assert_tight_rollup_limit("followed")
+
+    def test_bundle_rollup_limit_preserves_all_fragments(self) -> None:
+        self._assert_tight_rollup_limit("bundle")
+
+    def test_followed_bundle_rollup_limit_preserves_all_fragments(self) -> None:
+        self._assert_tight_rollup_limit("followed_bundle")
+
+    def test_direct_rollup_completion_is_bounded_at_maximum_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            paths = [Path(temporary_directory) / f"source-{i}.sqlite3" for i in range(2)]
+            for index, path in enumerate(paths):
+                connection = sqlite3.connect(path)
+                try:
+                    connection.executescript(SCHEMA)
+                    identities = [f"disk-b-{i:05d}" for i in range(MAX_HISTORY_QUERY_LIMIT)]
+                    if index:
+                        identities = [f"disk-a-{i:05d}" for i in range(200)] + identities
+                    connection.executemany(
+                        """INSERT INTO metric_rollups (
+                            bucket_start, bucket_seconds, system_id, enclosure_key, slot, slot_label,
+                            metric_name, disk_identity_key, sample_count, value_sum, value_min,
+                            value_max, last_value, last_observed_at
+                        ) VALUES ('2025-01-01T00:00:00+00:00', 3600, 'system-1', 'enclosure-1',
+                                  1, 'slot-1', 'temperature', ?, 2, ?, ?, ?, ?,
+                                  '2025-01-01T00:30:00+00:00')""",
+                        [(identity, 62 if index else 70, 30 if index else 34,
+                          32 if index else 36, 32 if index else 36) for identity in identities],
+                    )
+                    connection.commit()
+                finally:
+                    connection.close()
+            reader = SegmentedHistoryReader(hot_path=paths[0], segment_paths=paths[1:])
+            original = reader._query_connection
+            hydrated = {"keys": 0, "fragments": 0}
+            parameter_counts = []
+
+            @contextmanager
+            def observed_connection(path):
+                with original(path) as connection:
+                    connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
+
+                    def count_row(cursor, row):
+                        names = {column[0] for column in cursor.description}
+                        if "rollup_seconds" in names:
+                            hydrated["fragments" if "sample_count" in names else "keys"] += 1
+                        return sqlite3.Row(cursor, row)
+
+                    connection.row_factory = count_row
+
+                    class ObservedConnection:
+                        def execute(self, query, parameters=()):
+                            parameter_counts.append(len(parameters))
+                            return connection.execute(query, parameters)
+
+                        def __getattr__(self, name):
+                            return getattr(connection, name)
+
+                    yield ObservedConnection()
+
+            with patch.object(reader, "_query_connection", side_effect=observed_connection):
+                samples = reader.list_metric_samples(
+                    "system-1", "enclosure-1", 1, metric_name="temperature", limit=MAX_HISTORY_QUERY_LIMIT
+                )
+            self.assertEqual(len(samples), MAX_HISTORY_QUERY_LIMIT)
+            self.assertEqual({row["disk_identity_key"] for row in samples},
+                             {f"disk-b-{i:05d}" for i in range(MAX_HISTORY_QUERY_LIMIT)})
+            self.assertEqual({(row["sample_count"], row["value"]) for row in samples}, {(4, 33.0)})
+            self.assertEqual(hydrated["fragments"], 2 * MAX_HISTORY_QUERY_LIMIT)
+            self.assertLessEqual(hydrated["keys"], 2 * MAX_HISTORY_QUERY_LIMIT)
+            self.assertLessEqual(max(parameter_counts), 999)
+            for invalid in (0, MAX_HISTORY_QUERY_LIMIT + 1):
+                with self.assertRaisesRegex(ValueError, "limit"):
+                    reader.list_metric_samples("system-1", "enclosure-1", 1, limit=invalid)
+
+    def test_direct_rollup_completion_preserves_raw_hourly_daily_and_since_precedence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            paths = [Path(temporary_directory) / f"source-{i}.sqlite3" for i in range(2)]
+            for index, path in enumerate(paths):
+                connection = sqlite3.connect(path)
+                try:
+                    connection.executescript(SCHEMA)
+                    if index == 0:
+                        connection.execute(
+                            """INSERT INTO metric_samples (
+                                id, observed_at, system_id, enclosure_key, slot, slot_label,
+                                metric_name, value_integer
+                            ) VALUES (1, '2025-01-03T12:00:00+00:00', 'system-1', 'enclosure-1',
+                                      1, 'slot-1', 'temperature', 40)"""
+                        )
+                    for bucket, interval, total in (
+                        ("2025-01-02T10:00:00+00:00", 3600, 70 if index == 0 else 62),
+                        ("2025-01-02T00:00:00+00:00", 86400, 200),
+                        ("2025-01-01T00:00:00+00:00", 86400, 50 if index == 0 else 46),
+                    ):
+                        connection.execute(
+                            """INSERT INTO metric_rollups (
+                                bucket_start, bucket_seconds, system_id, enclosure_key, slot, slot_label,
+                                metric_name, sample_count, value_sum, value_min, value_max,
+                                last_value, last_observed_at
+                            ) VALUES (?, ?, 'system-1', 'enclosure-1', 1, 'slot-1', 'temperature',
+                                      2, ?, ?, ?, ?, ?)""",
+                            (bucket, interval, total, total / 2 - 1, total / 2 + 1, total / 2 + 1, bucket),
+                        )
+                    connection.commit()
+                finally:
+                    connection.close()
+            # Reverse chronological source content is intentional: selection must
+            # sort globally rather than treating the first source as newest.
+            reader = SegmentedHistoryReader(hot_path=paths[1], segment_paths=[paths[0]])
+            for metric in ("temperature", None):
+                for limit in (1, 2, 3, 10):
+                    with self.subTest(metric=metric, limit=limit):
+                        samples = reader.list_metric_samples(
+                            "system-1", "enclosure-1", 1, metric_name=metric, limit=limit
+                        )
+                        self.assertEqual([row["value"] for row in samples], [40, 33.0, 24.0][:limit])
+                        self.assertEqual([row.get("sample_count") for row in samples], [None, 4, 4][:limit])
+                ranged = reader.list_metric_samples(
+                    "system-1", "enclosure-1", 1, metric_name=metric, limit=10,
+                    since="2025-01-02T10:00:00+00:00",
+                )
+                self.assertEqual([row["value"] for row in ranged], [40, 33.0])
+                self.assertEqual(reader.list_metric_samples(
+                    "system-1", "enclosure-1", 1, metric_name=metric, limit=10,
+                    since="2025-01-04T00:00:00+00:00",
+                ), [])
+
     def test_reader_merges_partial_rollups_with_the_same_bucket_key(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
