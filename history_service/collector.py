@@ -380,6 +380,8 @@ class HistoryCollector:
             smart_started = time.perf_counter()
             try:
                 summaries = await self._fetch_smart_summaries(scope, present_slots, force_fresh=collect_slow)
+            except HistoryCollectionStopping:
+                raise
             except Exception as exc:  # noqa: BLE001 - one slow scope should not fail the whole fleet pass.
                 logger.warning(
                     "Skipping history SMART metrics for %s: %s",
@@ -786,7 +788,7 @@ class HistoryCollector:
                     service_name=HISTORY_METRICS_SERVICE_NAME,
                     result="success",
                     duration_seconds=time.perf_counter() - started_monotonic,
-                    status=self.status(),
+                    status=await asyncio.to_thread(self.status),
                     counts=await asyncio.to_thread(self.store.estimated_counts),
                 )
             except HistoryCollectionAlreadyRunning:
@@ -805,7 +807,7 @@ class HistoryCollector:
                     service_name=HISTORY_METRICS_SERVICE_NAME,
                     result="error",
                     duration_seconds=time.perf_counter() - started_monotonic,
-                    status=self.status(),
+                    status=await asyncio.to_thread(self.status),
                     counts=None,
                 )
 
@@ -1579,7 +1581,14 @@ class HistoryCollector:
         api_source = sources.get("api")
         if isinstance(api_source, dict) and api_source.get("enabled") and not api_source.get("ok"):
             return False
-        if normalize_text(snapshot.get("selected_system_platform")) == "quantastor":
+        platform = normalize_text(snapshot.get("selected_system_platform"))
+        if platform in {"linux", "esxi"}:
+            # These host inventories come from SSH, not the disabled API.
+            # SSH remains optional enrichment on API-backed platforms.
+            ssh_source = sources.get("ssh")
+            if isinstance(ssh_source, dict) and ssh_source.get("enabled") and not ssh_source.get("ok"):
+                return False
+        if platform == "quantastor":
             platform_context = snapshot.get("platform_context")
             if isinstance(platform_context, dict) and platform_context.get("topology_complete") is False:
                 return False
@@ -1690,7 +1699,8 @@ class HistoryCollector:
         force_inventory: bool = True,
         cached_root_only: bool = False,
     ) -> list[ScopeSnapshot]:
-        self._scope_enumeration_complete = True
+        # A selected root is not a fleet census, even when its sources are healthy.
+        self._scope_enumeration_complete = not cached_root_only
         root_started = time.perf_counter()
         root_snapshot = await self._fetch_inventory(force=force_inventory)
         self._record_collection_stage(
@@ -1756,6 +1766,8 @@ class HistoryCollector:
             system_scope_start = len(scopes)
             try:
                 system_snapshot = await self._fetch_inventory(system_id=system_id, force=force_inventory)
+            except HistoryCollectionStopping:
+                raise
             except Exception as exc:  # noqa: BLE001 - keep broad saved-fleet sweeps moving.
                 self._scope_enumeration_complete = False
                 self._clear_pending_topology_changes_for_system(system_id)
@@ -1820,6 +1832,8 @@ class HistoryCollector:
                             enclosure_id=enclosure_id,
                             force=force_inventory,
                         )
+                    except HistoryCollectionStopping:
+                        raise
                     except Exception as exc:  # noqa: BLE001 - preserve the rest of the full-fleet pass.
                         self._scope_enumeration_complete = False
                         self._clear_pending_topology_changes_for_scope(system_id, enclosure_id)
@@ -1882,6 +1896,8 @@ class HistoryCollector:
                 system_snapshot,
                 force_inventory=force_inventory,
             )
+        except HistoryCollectionStopping:
+            raise
         except Exception as exc:  # noqa: BLE001 - storage views should not kill the whole sweep.
             self._scope_enumeration_complete = False
             self._clear_pending_topology_changes_for_storage_views(system_id)
@@ -1954,7 +1970,6 @@ class HistoryCollector:
             if not view_id or not view_label:
                 continue
             slot_payloads = []
-            occupied_count = 0
             for slot_payload in view_payload.get("slots") or []:
                 if not isinstance(slot_payload, dict):
                     continue
@@ -1963,8 +1978,6 @@ class HistoryCollector:
                 except (TypeError, ValueError):
                     continue
                 occupied = bool(slot_payload.get("occupied"))
-                if occupied:
-                    occupied_count += 1
                 slot_payloads.append(
                     {
                         "slot": slot_index,
@@ -1988,7 +2001,7 @@ class HistoryCollector:
                         or normalize_text(slot_payload.get("placement_key")),
                     }
                 )
-            if not slot_payloads or occupied_count == 0:
+            if not slot_payloads:
                 continue
             scopes.append(
                 ScopeSnapshot(
@@ -2005,6 +2018,7 @@ class HistoryCollector:
                         "storage_view_id": view_id,
                         "storage_view_backing_enclosure_id": normalize_text(view_payload.get("backing_enclosure_id")),
                         "sources": sources,
+                        "platform_context": system_snapshot.get("platform_context"),
                         "slots": slot_payloads,
                     },
                 )
@@ -2113,15 +2127,21 @@ class HistoryCollector:
         headers: dict[str, str] | None = None,
         timeout_seconds: int | None = None,
     ) -> dict[str, Any]:
-        return await asyncio.to_thread(
-            self._fetch_json_sync,
-            path,
-            params or {},
-            method,
-            body,
-            headers or {},
-            timeout_seconds,
-        )
+        self._raise_if_stopping()
+        try:
+            return await asyncio.to_thread(
+                self._fetch_json_sync,
+                path,
+                params or {},
+                method,
+                body,
+                headers or {},
+                timeout_seconds,
+            )
+        finally:
+            # Finish the in-flight request, but do not start another request or
+            # treat shutdown as a recoverable failure of this source.
+            self._raise_if_stopping()
 
     def _fetch_json_sync(
         self,
@@ -2132,6 +2152,7 @@ class HistoryCollector:
         headers: dict[str, str],
         timeout_seconds: int | None = None,
     ) -> dict[str, Any]:
+        self._raise_if_stopping()
         filtered_params = {key: value for key, value in params.items() if value not in {None, ""}}
         query = urllib.parse.urlencode(filtered_params, doseq=True)
         url = f"{self.settings.source_base_url.rstrip('/')}{path}"

@@ -10030,6 +10030,459 @@ class HistoryCollectorTests(unittest.TestCase):
         self.assertEqual(loaded.topology_label, "HA-Pool-R10 > mirror-0 > data (Active on QSOSN-Right)")
 
 
+class HistoryCollectorContractTests(unittest.IsolatedAsyncioTestCase):
+    """Real synthetic stores and the public worker, with outbound HTTP replaced."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        self.store = HistoryStore(str(root / "history.db"))
+        self.collector = HistoryCollector(
+            HistorySettings(sqlite_path=str(root / "history.db"), backup_dir=str(root / "backups"),
+                            startup_grace_seconds=0, smart_batch_size=1),
+            self.store,
+        )
+        self.now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.omitted = "system"
+        self.failed = True
+        self.empty_root = False
+        self.empty_view = False
+        self.view_state = "trusted"
+        self.legacy_view = False
+        self.transport = patch.object(self.collector, "_fetch_json_sync", side_effect=self._source)
+        self.transport.start()
+        self.addCleanup(self.transport.stop)
+
+    def _snapshot(self, system: str, enclosure: str) -> dict[str, Any]:
+        return {
+            "selected_system_id": system, "selected_enclosure_id": enclosure,
+            "selected_system_label": "Synthetic system",
+            "selected_system_platform": "quantastor",
+            "platform_context": {"topology_complete": self.view_state != "topology-incomplete"},
+            "systems": [{"id": "system-a"}, {"id": "system-b"}],
+            "enclosures": [{"id": "enc-a"}, {"id": "enc-b"}],
+            "sources": {"api": {"enabled": True, "ok": self.view_state != "untrusted"}},
+            "slots": [] if self.empty_root else [
+                {"slot": n, "present": True, "state": "healthy",
+                 "serial": f"SANITIZED-{system}-{enclosure}-{n}"} for n in range(2)
+            ],
+        }
+
+    def _source(self, path, params, method, body, headers, timeout):
+        self.calls.append((path, dict(params)))
+        system = params.get("system_id", "system-a")
+        enclosure = params.get("enclosure_id", "enc-a")
+        if path == "/api/inventory":
+            return self._snapshot(system, enclosure)
+        if path == "/api/storage-views":
+            if self.view_state == "failed":
+                raise HistorySourceError.rejected("Synthetic source failure", status_code=503)
+            return {"views": [] if system != "system-a" or self.view_state == "missing" else [{
+                "id": "view-a", "label": "Synthetic view", "source": "inventory_binding",
+                "slots": [{"slot_index": n, "occupied": not self.empty_view,
+                           "serial": None if self.empty_view else f"SANITIZED-view-disk-{n}"}
+                          for n in range(2)],
+            }]}
+        if self.legacy_view and "storage-views" in path:
+            if path.endswith("smart-batch"):
+                raise HistorySourceError.rejected("Synthetic legacy route", status_code=404)
+            if path.endswith("/smart"):
+                return {"available": True, "smart_health_status": "PASSED", "temperature_c": 30}
+        if path.endswith("smart-batch"):
+            is_failed = self.failed and (
+                (self.omitted == "system" and system == "system-b")
+                or (self.omitted == "enclosure" and enclosure == "enc-b")
+                or (self.omitted == "view" and "storage-views" in path)
+            )
+            return {"summaries": [{"slot": n, "summary": {
+                "available": True, "smart_health_status": "FAILED" if is_failed else "PASSED",
+                "temperature_c": 65 if is_failed else 30,
+            }} for n in json.loads(body)["slots"]]}
+        raise AssertionError(f"Unexpected synthetic request: {path}")
+
+    async def _pass(self, *, root_only=False):
+        self.now += timedelta(minutes=5)
+        with patch("history_service.collector.utcnow", return_value=self.now):
+            await self.collector.run_once(force_fast=True, include_due_intervals=False,
+                                          cached_root_only=root_only)
+        return self.collector.status()
+
+    async def test_root_only_preserves_complete_fleet_evidence_and_recovery(self):
+        keys = ("last_smart_failure_evidence_disks", "last_max_temperature_celsius",
+                "last_smart_failure_evidence_at", "last_temperature_evidence_at", "last_smart_evidence_at")
+        for omitted in ("system", "enclosure", "view"):
+            for empty_root in (False, True):
+                with self.subTest(omitted=omitted, empty_root=empty_root):
+                    self.omitted, self.failed, self.empty_root = omitted, True, False
+                    complete = await self._pass()
+                    self.assertGreater(complete[keys[0]], 0)
+                    self.assertEqual(complete[keys[1]], 65)
+                    self.empty_root = empty_root
+                    self.calls.clear()
+                    partial = await self._pass(root_only=True)
+                    self.assertEqual({k: partial[k] for k in keys}, {k: complete[k] for k in keys})
+                    self.assertEqual(sum(path == "/api/inventory" for path, _ in self.calls), 1)
+                    self.assertFalse(any(path == "/api/storage-views" for path, _ in self.calls))
+                    self.assertTrue(all(not params.get("force") and not params.get("fresh")
+                                        for _, params in self.calls))
+                    self.failed, self.empty_root = False, False
+                    recovered = await self._pass()
+                    self.assertEqual(recovered[keys[0]], 0)
+                    self.assertEqual(recovered[keys[1]], 30)
+                    self.assertEqual(recovered[keys[4]], isoformat_utc(self.now))
+                    self.assertNotEqual(recovered[keys[4]], complete[keys[4]])
+
+    async def test_empty_view_records_removal_once_and_reinsertion(self):
+        await self._pass()
+        def events():
+            return self.store.list_slot_events("system-a", "storage-view:view-a", 0)
+        self.assertTrue(self.store.get_slot_state("system-a", "storage-view:view-a", 0).present)
+        self.empty_view = True
+        await self._pass()
+        self.assertEqual([e["event_type"] for e in events()], ["slot_state_changed"])
+        self.assertFalse(self.store.get_slot_state("system-a", "storage-view:view-a", 0).present)
+        await self._pass()
+        self.assertEqual([e["event_type"] for e in events()], ["slot_state_changed"])
+        self.empty_view = False
+        await self._pass()
+        self.assertEqual([e["event_type"] for e in events()], ["slot_state_changed", "slot_state_changed"])
+        transitions = [json.loads(e["details_json"])["present"] for e in events()]
+        self.assertCountEqual([(t["previous"], t["current"]) for t in transitions], [(True, False), (False, True)])
+
+    async def test_untrusted_failed_and_missing_views_do_not_remove_disks(self):
+        await self._pass()
+        self.empty_view = True
+        for state in ("untrusted", "topology-incomplete", "failed", "missing"):
+            with self.subTest(state=state):
+                self.view_state = state
+                await self._pass()
+                self.assertTrue(self.store.get_slot_state("system-a", "storage-view:view-a", 0).present)
+                self.assertEqual(self.store.list_slot_events("system-a", "storage-view:view-a", 0), [])
+
+    async def _producer_empty_view(self, platform, *, ssh_failed):
+        from app.config import Settings, SSHConfig, SystemConfig, TrueNASConfig
+        from app.models.domain import InventorySnapshot
+        from app.services.truenas_ws import TrueNASRawData
+        from tests.test_inventory import build_inventory_service
+
+        system = SystemConfig(
+            id=f"synthetic-{platform}", label="Synthetic system",
+            truenas=TrueNASConfig(platform=platform, host="https://host.example.test"),
+            ssh=SSHConfig(enabled=True, host="192.0.2.10", commands=[]),
+            storage_views=[{
+                "id": "synthetic-boot", "label": "Synthetic boot", "kind": "boot_devices",
+                "template_id": "embedded-boot-media-1", "enabled": True,
+                "binding": {"mode": "auto", "device_names": ["boot"]},
+            }],
+        )
+        api, ssh = AsyncMock(), AsyncMock()
+        api.fetch_all.return_value = TrueNASRawData(
+            enclosures=[], disks=[], pools=[], disk_temperatures={}, smart_test_results=[],
+        )
+        ssh.run_planned_commands.return_value = []
+        if ssh_failed:
+            ssh.run_planned_commands.side_effect = RuntimeError("Synthetic SSH source unavailable")
+        service = build_inventory_service(Settings(), system, api, ssh, self.temp.name)
+        # Keep the actual producer's status and empty data, replacing only transport.
+        if ssh_failed:
+            with self.assertLogs("app.services.inventory", level="ERROR"):
+                bundle = await service._collect_inventory_source_bundle()
+        else:
+            bundle = await service._collect_inventory_source_bundle()
+        ssh.run_planned_commands.assert_awaited_once()
+        api_enabled = platform not in {"linux", "esxi"}
+        self.assertEqual(bundle.sources["api"].enabled, api_enabled)
+        self.assertTrue(bundle.sources["api"].ok)
+        self.assertTrue(bundle.sources["ssh"].enabled)
+        self.assertEqual(bundle.sources["ssh"].ok, not ssh_failed)
+        if api_enabled:
+            api.fetch_all.assert_awaited_once()
+        else:
+            api.fetch_all.assert_not_awaited()
+        service._source_bundle = bundle
+        service._source_bundle_until = datetime.now(timezone.utc) + timedelta(hours=1)
+        snapshot = InventorySnapshot(
+            slots=[], refresh_interval_seconds=30,
+            selected_system_id=system.id, selected_system_label=system.label,
+            selected_system_platform=platform, sources=bundle.sources,
+        )
+        runtime = await service.get_storage_view_runtime(snapshot=snapshot)
+        self.assertEqual(len(runtime.views), 1)
+        self.assertEqual(runtime.views[0].source, "inventory_binding")
+        self.assertEqual(len(runtime.views[0].slots), 1)
+        self.assertFalse(runtime.views[0].slots[0].occupied)
+        return snapshot.model_dump(mode="json"), runtime.model_dump(mode="json")
+
+    async def _collect_producer_view(self, inventory, runtime):
+        calls = []
+        def transport(path, params, method, body, headers, timeout):
+            calls.append(path)
+            if path == "/api/inventory":
+                return inventory
+            if path == "/api/storage-views":
+                return runtime
+            raise AssertionError(f"Unexpected synthetic request: {path}")
+        with patch.object(self.collector, "_fetch_json_sync", side_effect=transport):
+            await self.collector.run_once(include_due_intervals=False)
+        self.assertIn("/api/inventory", calls)
+        self.assertIn("/api/storage-views", calls)
+
+    async def _seed_producer_view(self, inventory, runtime):
+        healthy_inventory = json.loads(json.dumps(inventory))
+        healthy_inventory["sources"]["ssh"]["ok"] = True
+        occupied_runtime = json.loads(json.dumps(runtime))
+        occupied_runtime["views"][0]["slots"][0].update(
+            occupied=True, state="matched", serial="SANITIZED-history-boot", device_name="boot",
+        )
+        await self._collect_producer_view(healthy_inventory, occupied_runtime)
+        key = (inventory["selected_system_id"], "storage-view:synthetic-boot", 0)
+        self.assertTrue(self.store.get_slot_state(*key).present)
+        self.assertEqual(self.store.list_slot_events(*key), [])
+        return key, healthy_inventory, occupied_runtime
+
+    async def test_failed_authoritative_ssh_empty_view_preserves_history(self):
+        for platform in ("linux", "esxi"):
+            with self.subTest(platform=platform):
+                inventory, runtime = await self._producer_empty_view(platform, ssh_failed=True)
+                key, healthy_inventory, occupied_runtime = await self._seed_producer_view(inventory, runtime)
+                previous = self.store.get_slot_state(*key)
+                await self._collect_producer_view(inventory, runtime)
+                self.assertEqual(self.store.get_slot_state(*key), previous,
+                                 "Failed authoritative SSH must preserve the occupied slot")
+                self.assertEqual(self.store.list_slot_events(*key), [])
+
+                # Recovery with genuinely empty producer data still records removal once.
+                empty_inventory, empty_runtime = await self._producer_empty_view(platform, ssh_failed=False)
+                for _ in range(2):
+                    await self._collect_producer_view(empty_inventory, empty_runtime)
+                    self.assertFalse(self.store.get_slot_state(*key).present)
+                    events = self.store.list_slot_events(*key)
+                    self.assertEqual([e["event_type"] for e in events], ["slot_state_changed"])
+                    self.assertEqual(json.loads(events[0]["details_json"])["present"],
+                                     {"label": "Present", "previous": True, "current": False})
+                await self._collect_producer_view(healthy_inventory, occupied_runtime)
+                self.assertTrue(self.store.get_slot_state(*key).present)
+                events = self.store.list_slot_events(*key)
+                self.assertEqual([e["event_type"] for e in events],
+                                 ["slot_state_changed", "slot_state_changed"])
+                transitions = [json.loads(e["details_json"])["present"] for e in events]
+                self.assertCountEqual(transitions, [{"label": "Present", "previous": True, "current": False},
+                                                     {"label": "Present", "previous": False, "current": True}])
+
+    async def test_api_backed_empty_view_allows_optional_ssh_failure(self):
+        for platform in ("core", "scale", "quantastor"):
+            with self.subTest(platform=platform):
+                inventory, runtime = await self._producer_empty_view(platform, ssh_failed=True)
+                key, _, _ = await self._seed_producer_view(inventory, runtime)
+                for _ in range(2):
+                    await self._collect_producer_view(inventory, runtime)
+                    self.assertFalse(self.store.get_slot_state(*key).present)
+                    events = self.store.list_slot_events(*key)
+                    self.assertEqual([e["event_type"] for e in events], ["slot_state_changed"])
+                    self.assertEqual(json.loads(events[0]["details_json"])["present"],
+                                     {"label": "Present", "previous": True, "current": False})
+
+    async def test_durable_status_does_not_block_liveness_under_lifecycle_lock(self):
+        self.store.record_quarantine_recovery(self.now)
+        for surface in ("health", "index", "overview", "metrics-success", "metrics-error"):
+            with self.subTest(surface=surface):
+                await self._check_status_off_loop(surface)
+
+    async def _check_status_off_loop(self, surface):
+        entered, locked, heartbeat = threading.Event(), threading.Event(), threading.Event()
+        holder_saw_heartbeat = []
+        reader_threads = []
+        loop_thread = threading.get_ident()
+        loop = asyncio.get_running_loop()
+        self.collector._stopping.clear()
+        reader = self.store.quarantine_recovery_status
+
+        def hold_lock():
+            if not entered.wait(3):
+                return
+            with history_write_lock(self.store.file_path, blocking=True):
+                locked.set()
+                holder_saw_heartbeat.append(heartbeat.wait(2))
+
+        def observed_read():
+            reader_threads.append(threading.get_ident())
+            entered.set()
+            if not locked.wait(3):
+                raise AssertionError("Lifecycle lock holder did not start")
+            result = reader()
+            if surface.startswith("metrics"):
+                loop.call_soon_threadsafe(self.collector._stopping.set)
+            return result
+
+        holder = threading.Thread(target=hold_lock)
+        holder.start()
+        request = Request({"type": "http", "method": "GET", "scheme": "http", "path": "/",
+                           "headers": [], "query_string": b"", "server": ("history.example.test", 80),
+                           "app": history_main.app, "router": history_main.app.router})
+        task = None
+        with (
+            patch.object(history_main, "collector", self.collector),
+            patch.object(history_main, "store", self.store),
+            patch.object(history_main, "settings", self.collector.settings),
+            patch.object(history_main, "startup_failure_reason", None),
+            patch.object(self.store, "quarantine_recovery_status", side_effect=observed_read),
+        ):
+            try:
+                if surface == "metrics-error":
+                    self.collector._fetch_json_sync.side_effect = HistorySourceError.unreachable("Synthetic offline source")
+                work = (history_main.healthz() if surface == "health" else
+                        history_main.index(request, exact_counts=False) if surface == "index" else
+                        history_main.overview(exact_counts=False) if surface == "overview" else
+                        self.collector._run_loop())
+                task = asyncio.create_task(work)
+                self.assertTrue(await asyncio.to_thread(locked.wait, 3))
+                live = await history_main.livez()
+                self.assertEqual(live.status_code, 200)
+                heartbeat.set()
+                result = await asyncio.wait_for(task, 3)
+                self.assertEqual(holder_saw_heartbeat, [True], "durable status blocked the event loop")
+                self.assertTrue(reader_threads)
+                self.assertTrue(all(t != loop_thread for t in reader_threads))
+                if surface == "health":
+                    self.assertEqual(json.loads(result.body)["status"], "degraded")
+                    self.assertTrue(json.loads(result.body)["collector"]["history_recovery_required"])
+                elif surface == "overview":
+                    self.assertTrue(result["collector"]["history_recovery_required"])
+                elif surface == "index":
+                    self.assertIn(b"quarantined", result.body.lower())
+            finally:
+                heartbeat.set()
+                self.collector._stopping.set()
+                if task:
+                    await asyncio.gather(task, return_exceptions=True)
+                await asyncio.to_thread(holder.join, 3)
+                self.assertFalse(holder.is_alive())
+                self.collector._fetch_json_sync.side_effect = self._source
+
+    async def test_cancelled_caller_late_source_error_remains_owned_until_shutdown(self):
+        entered, release = threading.Event(), threading.Event()
+        contexts = []
+        loop = asyncio.get_running_loop()
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: contexts.append(context))
+
+        def late_error(path, params, *_args):
+            self.calls.append((path, dict(params)))
+            entered.set()
+            if not release.wait(3):
+                raise AssertionError("Synthetic request was not released")
+            raise HistorySourceError.unreachable("Synthetic late failure")
+
+        with patch.object(self.collector, "_fetch_json_sync", side_effect=late_error):
+            worker = asyncio.create_task(self._pass())
+            stopping = None
+            try:
+                self.assertTrue(await asyncio.to_thread(entered.wait, 3))
+                worker.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await worker
+                self.assertTrue(self.collector.collection_running)
+                stopping = asyncio.create_task(self.collector.stop())
+                await asyncio.sleep(0)
+                self.assertFalse(stopping.done())
+                release.set()
+                await asyncio.wait_for(stopping, 3)
+                for _ in range(5):
+                    await asyncio.sleep(0)
+                self.assertFalse(self.collector.collection_running)
+                self.assertEqual(self.calls, [("/api/inventory", {})])
+                self.assertEqual(self.store.counts()["tracked_slots"], 0)
+                self.assertIsNone(self.collector.last_success_at)
+                self.assertIsNone(self.collector.last_smart_evidence_at)
+                self.assertEqual(contexts, [])
+            finally:
+                release.set()
+                await asyncio.gather(worker, *([stopping] if stopping else []), return_exceptions=True)
+                loop.set_exception_handler(previous_handler)
+
+    async def test_shutdown_stops_follow_on_requests_and_drains_worker(self):
+        self.collector._stopping.set()
+        with self.assertRaises(HistoryCollectionStopping):
+            await self.collector._fetch_inventory()
+        self.assertEqual(self.calls, [])
+        # The executor may pick up an already-admitted request after stop.
+        with patch("history_service.collector.urllib.request.urlopen", return_value=io.BytesIO(b"{}")) as outbound:
+            with self.assertRaises(HistoryCollectionStopping):
+                HistoryCollector._fetch_json_sync(self.collector, "/api/inventory", {}, "GET", None, {})
+            outbound.assert_not_called()
+        for boundary in ("root", "system", "enclosure", "view", "smart", "view-smart",
+                         "legacy-fallback", "legacy-smart", "root-error", "system-error",
+                         "enclosure-error", "view-error", "smart-error"):
+            with self.subTest(boundary=boundary):
+                self.legacy_view = boundary.startswith("legacy")
+                self.collector._stopping.clear()
+                self.calls.clear()
+                entered, release = threading.Event(), threading.Event()
+                original = self._source
+
+                def gated(path, params, *args):
+                    failure = None
+                    try:
+                        result = original(path, params, *args)
+                    except HistorySourceError as exc:
+                        failure, result = exc, None
+                    matches = {
+                        "root": path == "/api/inventory" and not params.get("system_id"),
+                        "system": path == "/api/inventory" and params.get("system_id") == "system-a"
+                                  and not params.get("enclosure_id"),
+                        "enclosure": path == "/api/inventory" and params.get("enclosure_id") == "enc-b",
+                        "view": path == "/api/storage-views",
+                        "smart": path.endswith("smart-batch"),
+                        "view-smart": "storage-views" in path and path.endswith("smart-batch"),
+                        "legacy-fallback": "storage-views" in path and path.endswith("smart-batch"),
+                        "legacy-smart": "storage-views" in path and path.endswith("/smart"),
+                    }
+                    if matches[boundary.removesuffix("-error")] and not entered.is_set():
+                        entered.set()
+                        if not release.wait(3):
+                            raise AssertionError("Synthetic request was not released")
+                        if boundary.endswith("-error"):
+                            failure = HistorySourceError.unreachable("Synthetic late failure")
+                    if failure:
+                        raise failure
+                    return result
+
+                with (
+                    patch.object(self.collector, "_fetch_json_sync", side_effect=gated),
+                    patch.object(self.store, "record_slot_updates", wraps=self.store.record_slot_updates) as slot_writes,
+                    patch.object(self.store, "insert_metric_samples", wraps=self.store.insert_metric_samples) as metric_writes,
+                    patch.object(self.store, "start_retention_wait", wraps=self.store.start_retention_wait) as retention_writes,
+                ):
+                    worker = asyncio.create_task(self._pass())
+                    stopping = None
+                    try:
+                        self.assertTrue(await asyncio.to_thread(entered.wait, 3))
+                        at_stop = list(self.calls)
+                        before = self.store.counts()
+                        writes_at_stop = (slot_writes.call_count, metric_writes.call_count, retention_writes.call_count)
+                        stopping = asyncio.create_task(self.collector.stop())
+                        await asyncio.sleep(0)
+                        self.assertTrue(self.collector._stopping.is_set())
+                        self.assertFalse(stopping.done())
+                        release.set()
+                        with self.assertRaises(HistoryCollectionStopping):
+                            await asyncio.wait_for(worker, 3)
+                        await asyncio.wait_for(stopping, 3)
+                        self.assertEqual(self.calls, at_stop)
+                        self.assertEqual(self.store.counts(), before)
+                        self.assertEqual((slot_writes.call_count, metric_writes.call_count, retention_writes.call_count),
+                                         writes_at_stop)
+                        self.assertIsNone(self.collector.last_success_at)
+                        self.assertFalse(self.collector.collection_running)
+                        self.assertFalse(any(stage["stage"].endswith("failed")
+                                             for stage in self.collector.last_collection_stage_timings))
+                    finally:
+                        release.set()
+                        await asyncio.gather(worker, *([stopping] if stopping else []), return_exceptions=True)
+
+
 class HistoryCollectorDiagnosticsTests(unittest.TestCase):
     @staticmethod
     def _collector() -> HistoryCollector:
