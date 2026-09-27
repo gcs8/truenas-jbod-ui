@@ -66,7 +66,7 @@
     "test_platform_parity_fixtures": 15,
     "test_private_qa_restore": 41,
     "test_process_secrets": 12,
-    "test_profile_builder": 12,
+    "test_profile_builder": 18,
     "test_profiles": 13,
     "test_prometheus_alert_rules": 4,
     "test_public_demo_deployment": 3,
