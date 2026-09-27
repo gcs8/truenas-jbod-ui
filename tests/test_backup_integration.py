@@ -921,6 +921,26 @@ class SchedulerApiTests(SchedulerTestBase):
             "at": "2026-09-24T12:00:00+00:00", "ok": False, "deleted": 2,
             "detail": "ConnectionRefusedError: refused", "failed_locations": {"nas": "refused"}})
 
+        # A location that opened but then failed a deletion is listed too, so
+        # the UI does not hide the error that stopped the run behind "nas".
+        from types import SimpleNamespace
+
+        from history_service.backup_archive.lifecycle import ApplyResult
+
+        stopped = SimpleNamespace(record=SimpleNamespace(location="local"))
+        manager = SimpleNamespace(
+            plan=lambda now: SimpleNamespace(items=(stopped,)),
+            apply=lambda plan, resolver, actor, now: ApplyResult(
+                deleted=(), already_missing=(), failed=stopped, error="PermissionError: denied",
+                failed_locations={"nas": "refused"},
+            ),
+        )
+        with patch.object(scheduler, "_manager", return_value=manager):
+            scheduler._groom_locked()
+        grooming = json.loads(asgi_call(app, "GET", "/internal/backups")[1])["grooming"]
+        self.assertEqual(grooming["detail"], "PermissionError: denied")
+        self.assertEqual(grooming["failed_locations"], {"nas": "refused", "local": "PermissionError: denied"})
+
 
 class AdminProxyTests(unittest.TestCase):
     def setUp(self) -> None:

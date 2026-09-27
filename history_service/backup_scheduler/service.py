@@ -789,11 +789,15 @@ class BackupScheduler:
             result = manager.apply(plan, resolver, actor="scheduler", now=self._clock)
         if result.error:
             logger.warning("Backup grooming stopped early (%s).", result.error.split(":", 1)[0])
+        failed_locations = dict(result.failed_locations)
+        if result.failed is not None and result.error and result.failed.record.location not in failed_locations:
+            # A location that opened but then failed a deletion or claim stopped the run.
+            failed_locations[result.failed.record.location] = result.error
         self._record_grooming(
             ok=not result.error,
             deleted=len(result.deleted) + len(result.already_missing),
             detail=result.error,
-            failed_locations=result.failed_locations,
+            failed_locations=failed_locations,
         )
         return result
 
