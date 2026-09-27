@@ -212,6 +212,16 @@ class HistoryOperationBoundsTests(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(HistoryRequestShapeError):
                 normalize_since_utc(invalid)
 
+    def test_since_outside_the_utc_range_is_a_shape_error(self) -> None:
+        for since in ("9999-12-31T23:59:59-23:59", "0001-01-01T00:00:00+23:59"):
+            with self.subTest(since=since):
+                with self.assertRaisesRegex(HistoryRequestShapeError, "valid timezone-aware timestamp"):
+                    normalize_since_utc(since)
+                with self.assertRaisesRegex(HistoryRequestShapeError, "valid timezone-aware timestamp"):
+                    self._validate_store(since=since)
+                with self.assertRaisesRegex(HistoryRequestShapeError, "valid timezone-aware timestamp"):
+                    self._plan(since=since)
+
     def test_store_window_preflight_returns_the_normalized_utc_since(self) -> None:
         since = NOW - timedelta(hours=24)
 

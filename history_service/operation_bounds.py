@@ -139,13 +139,20 @@ def _parse_since(value: object) -> datetime:
     return parsed
 
 
+def _since_as_utc(parsed: datetime) -> datetime:
+    try:
+        return parsed.astimezone(timezone.utc)
+    except (OverflowError, ValueError) as exc:
+        raise HistoryRequestShapeError("since must be a valid timezone-aware timestamp.") from exc
+
+
 def normalize_since_utc(value: object) -> str:
     """Return a timezone-aware since as the UTC ISO text stored in observed_at."""
-    return _parse_since(value).astimezone(timezone.utc).isoformat()
+    return _since_as_utc(_parse_since(value)).isoformat()
 
 
 def _normalize_since(value: object, *, now: datetime) -> tuple[str, int]:
-    parsed = _parse_since(value)
+    parsed = _since_as_utc(_parse_since(value))
     current = now
     if current.tzinfo is None or current.utcoffset() is None:
         current = current.replace(tzinfo=timezone.utc)
