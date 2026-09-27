@@ -74,7 +74,7 @@
     "test_public_demo_fixture": 22,
     "test_public_demo_history_consistency": 3,
     "test_public_demo_provenance": 9,
-    "test_public_doc_privacy": 7,
+    "test_public_doc_privacy": 8,
     "test_public_docs_contract": 19,
     "test_public_screenshots": 10,
     "test_quantastor_api": 6,
