@@ -259,6 +259,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Preserved history evidence across partial or failed collection, recorded
+  authoritative empty-view removals, kept status reads off the event loop,
+  stopped follow-on requests during shutdown, and rejected invalid refresh
+  modes with 422. (#744)
 - The main UI no longer reports itself down when a pinned known-hosts file sits
   on a read-only mount, such as the `/run/ssh` mount in the shipped Compose
   file. SSH still verifies hosts against the keys in it; `/healthz` now answers
