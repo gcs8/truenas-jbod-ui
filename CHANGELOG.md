@@ -259,6 +259,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Held the automatic refresh while a locate-light or bay-assignment write was
+  in flight, so the write's result and any sign-in rejection are shown instead
+  of being dropped by the refresh. (#829)
 - The main UI no longer reports itself down when a pinned known-hosts file sits
   on a read-only mount, such as the `/run/ssh` mount in the shipped Compose
   file. SSH still verifies hosts against the keys in it; `/healthz` now answers
