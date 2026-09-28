@@ -177,6 +177,14 @@ class SyntheticStagingOS:
 
 
 class OperatorRecipeTests(unittest.TestCase):
+    def _posix_bash(self) -> str:
+        if os.name != "posix":
+            self.skipTest("recipe stubs require POSIX executable semantics")
+        bash = shutil.which("bash")
+        if bash is None:
+            self.skipTest("recipe execution requires Bash")
+        return bash
+
     def test_core_standing_yaml_runs_two_read_only_probe_batches(self) -> None:
         from app.config import SSHConfig
         from app.services.ssh_probe import SSHProbe
@@ -256,6 +264,20 @@ class OperatorRecipeTests(unittest.TestCase):
         block = next(block for block in re.findall(r"```bash\n(.*?)\n```", preload, re.DOTALL)
                      if "ssh-keyscan " in block)
         scan = next(line for line in block.splitlines() if line.startswith("ssh-keyscan "))
+        self.assertTrue(scan)
+        approval = re.search(r"^read -r -p .*\n.*verified.*exit 1.*$", block, re.MULTILINE)
+        self.assertIsNotNone(approval, "installation must wait for operator fingerprint approval")
+
+    def test_strict_preload_and_approval_with_posix_bash(self) -> None:
+        bash = self._posix_bash()
+        import paramiko
+        from app.config import SSHConfig
+        from app.services.ssh_probe import SSHProbe
+
+        preload = (ROOT / "wiki/SSH-Setup-and-Sudo.md").read_text()
+        block = next(block for block in re.findall(r"```bash\n(.*?)\n```", preload, re.DOTALL)
+                     if "ssh-keyscan " in block)
+        scan = next(line for line in block.splitlines() if line.startswith("ssh-keyscan "))
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory)
             fake = target / "ssh-keyscan"
@@ -278,7 +300,7 @@ class OperatorRecipeTests(unittest.TestCase):
                         known_hosts = target / "known_hosts"
                         argv_path = target / "argv.json"
                         result = subprocess.run(
-                            [shutil.which("bash"), "-c", scan], cwd=target, capture_output=True,
+                            [bash, "-c", scan], cwd=target, capture_output=True,
                             text=True, timeout=10, env={
                                 "PATH": directory, "ssh_host": host, "ssh_port": str(port),
                                 "known_hosts_scan": str(known_hosts), "ARGV_PATH": str(argv_path),
@@ -304,7 +326,7 @@ class OperatorRecipeTests(unittest.TestCase):
             approval = re.search(r"^read -r -p .*\n.*verified.*exit 1.*$", block, re.MULTILINE)
             self.assertIsNotNone(approval, "installation must wait for operator fingerprint approval")
             for answer, expected in (("no\n", 1), ("", 1), ("yes\n", 0)):
-                result = subprocess.run([shutil.which("bash"), "-c", approval.group()],
+                result = subprocess.run([bash, "-c", approval.group()],
                                         input=answer, text=True, capture_output=True, timeout=10)
                 self.assertEqual(result.returncode, expected)
 
@@ -394,6 +416,9 @@ class OperatorRecipeTests(unittest.TestCase):
         except SystemExit as error:
             self.fail(f"documented helper rejects supported root owner: {error}")
         self.assertEqual(actual, 0)
+        namespace["os"].environ["APP_GID"] = "10001"
+        self.assertEqual(namespace["numeric_id"]("APP_GID"), 10001)
+        namespace["os"].environ["APP_GID"] = "0"
         with self.assertRaises(SystemExit):
             namespace["numeric_id"]("APP_GID")
         for raw in ("-1", "", "1.5", " 1"):
@@ -416,6 +441,20 @@ class OperatorRecipeTests(unittest.TestCase):
         commands = [block for block in re.findall(r"```bash\n(.*?)\n```", guide, re.DOTALL)
                     if "scripts/rotate_segmented_history.py" in block]
         self.assertEqual(len(commands), 3)
+        base = yaml.safe_load((ROOT / "docker-compose.yml").read_text())["services"]
+        overlay = yaml.safe_load((ROOT / "docker-compose.nonroot.yml").read_text())["services"]
+        self.assertEqual(base["enclosure-history"]["user"], "0:0")
+        self.assertEqual(base["enclosure-backup"]["user"], "${BACKUP_UID:-0}:${BACKUP_GID:-0}")
+        self.assertEqual(overlay["enclosure-history"]["user"], "${APP_UID:-10001}:${APP_GID:-10001}")
+        self.assertEqual(overlay["enclosure-backup"]["user"], "${BACKUP_UID:-1000}:${BACKUP_GID:-1000}")
+        self.assertIn("do not recursively chown", guide)
+
+    def test_rotation_commands_with_posix_bash(self) -> None:
+        bash = self._posix_bash()
+        guide = (ROOT / "docs/SEGMENTED_HISTORY_V2.md").read_text()
+        commands = [block for block in re.findall(r"```bash\n(.*?)\n```", guide, re.DOTALL)
+                    if "scripts/rotate_segmented_history.py" in block]
+        self.assertEqual(len(commands), 3)
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory)
             fake = target / "docker"
@@ -426,7 +465,7 @@ class OperatorRecipeTests(unittest.TestCase):
                 for command in commands:
                     with self.subTest(publisher=(uid, gid), command=command.splitlines()[-1]):
                         argv_path = target / "argv.json"
-                        result = subprocess.run([shutil.which("bash"), "-c", command], cwd=target,
+                        result = subprocess.run([bash, "-c", command], cwd=target,
                                                 capture_output=True, text=True, timeout=10, env={
                                                     "PATH": directory, "ARGV_PATH": str(argv_path),
                                                     "HISTORY_UID": str(uid), "HISTORY_GID": str(gid),
@@ -438,6 +477,10 @@ class OperatorRecipeTests(unittest.TestCase):
                         self.assertIn("--no-deps", argv)
                         self.assertIn("enclosure-history", argv)
                         self.assertIn("/app/history/history.db", argv)
+
+    def test_staging_source_owner_with_posix_geteuid(self) -> None:
+        if os.name != "posix" or not callable(getattr(os, "geteuid", None)):
+            self.skipTest("source ownership requires POSIX os.geteuid")
         from history_service.segment_sealer import _require_source_owner
 
         # Root service defaults do not grant root permission to publish app-owned history.
@@ -447,13 +490,6 @@ class OperatorRecipeTests(unittest.TestCase):
             with patch("history_service.segment_sealer.os.geteuid", return_value=owner + 1):
                 with self.assertRaisesRegex(ValueError, "must own"):
                     _require_source_owner(SimpleNamespace(st_uid=owner))
-        base = yaml.safe_load((ROOT / "docker-compose.yml").read_text())["services"]
-        overlay = yaml.safe_load((ROOT / "docker-compose.nonroot.yml").read_text())["services"]
-        self.assertEqual(base["enclosure-history"]["user"], "0:0")
-        self.assertEqual(base["enclosure-backup"]["user"], "${BACKUP_UID:-0}:${BACKUP_GID:-0}")
-        self.assertEqual(overlay["enclosure-history"]["user"], "${APP_UID:-10001}:${APP_GID:-10001}")
-        self.assertEqual(overlay["enclosure-backup"]["user"], "${BACKUP_UID:-1000}:${BACKUP_GID:-1000}")
-        self.assertIn("do not recursively chown", guide)
 
     @unittest.skipUnless(os.name == "posix", "literal staging requires POSIX descriptor semantics")
     def test_literal_staging_root_and_nonroot_ownership_labels_and_refusals(self) -> None:
@@ -591,6 +627,85 @@ class OperatorRecipeTests(unittest.TestCase):
                         # interpreter exit to close initial directory descriptors.
                         if fault is None:
                             self.assertEqual(leaked, set())
+
+
+class OperatorRecipePortabilityTests(unittest.TestCase):
+    PORTABLE_METHODS = (
+        "test_core_standing_yaml_runs_two_read_only_probe_batches",
+        "test_strict_reference_matches_rejection_and_separate_tofu_controls",
+        "test_admin_claims_match_base_and_overlay_yaml_sources",
+        "test_staging_numeric_helper_accepts_root_owners_but_not_root_status_group",
+    )
+
+    def _run_portable(self) -> None:
+        result = unittest.TestResult()
+        for name in self.PORTABLE_METHODS:
+            test = OperatorRecipeTests(name)
+            with patch.object(test, "assertIn", wraps=test.assertIn) as assertions:
+                test.run(result)
+            self.assertGreater(assertions.call_count, 0, f"{name} lost its portable assertions")
+        self.assertEqual(result.testsRun, len(self.PORTABLE_METHODS))
+        self.assertEqual(result.errors, [])
+        self.assertEqual(result.failures, [])
+        self.assertEqual(result.skipped, [], "portable assertions must execute, not skip")
+
+    def test_portable_assertions_run_without_bash_or_posix_identity(self) -> None:
+        # Replace only this module's os binding, never global os.name/Path behavior.
+        for platform in ("posix", "nt"):
+            with self.subTest(platform=platform), \
+                    patch.object(sys.modules[__name__], "os", SimpleNamespace(name=platform)), \
+                    patch.object(shutil, "which", return_value=None), \
+                    patch.object(subprocess, "run", side_effect=AssertionError("portable shell execution")):
+                self._run_portable()
+
+    SHELL_METHODS = (
+        "test_strict_preload_and_approval_with_posix_bash",
+        "test_rotation_commands_with_posix_bash",
+    )
+    OWNER_METHOD = "test_staging_source_owner_with_posix_geteuid"
+
+    def _assert_execution_skips(self, methods: tuple[str, ...], reason: str) -> None:
+        original_import = builtins.__import__
+
+        def guarded_import(name, *args, **kwargs):
+            if name == "history_service.segment_sealer":
+                raise AssertionError("protected ownership block reached")
+            return original_import(name, *args, **kwargs)
+
+        result = unittest.TestResult()
+        with patch.object(builtins, "__import__", side_effect=guarded_import), \
+                patch.object(tempfile, "TemporaryDirectory", side_effect=AssertionError("protected fixture reached")), \
+                patch.object(subprocess, "run", side_effect=AssertionError("protected shell reached")):
+            unittest.TestSuite(OperatorRecipeTests(name) for name in methods).run(result)
+        self.assertEqual(result.testsRun, len(methods))
+        self.assertEqual(result.errors, [])
+        self.assertEqual(result.failures, [])
+        self.assertEqual([(test._testMethodName, message) for test, message in result.skipped],
+                         [(name, reason) for name in methods])
+
+    def test_missing_bash_skips_only_shell_methods(self) -> None:
+        with patch.object(sys.modules[__name__], "os", SimpleNamespace(name="posix")), \
+                patch.object(shutil, "which", return_value=None) as lookup:
+            self._run_portable()
+            self._assert_execution_skips(self.SHELL_METHODS, "recipe execution requires Bash")
+            self.assertEqual(lookup.call_count, len(self.SHELL_METHODS))
+            for call in lookup.call_args_list:
+                self.assertEqual(call.args, ("bash",))
+
+    def test_nonposix_skips_executable_stubs_even_when_bash_is_available(self) -> None:
+        with patch.object(sys.modules[__name__], "os", SimpleNamespace(name="nt")), \
+                patch.object(shutil, "which", return_value="bash") as lookup:
+            self._run_portable()
+            self._assert_execution_skips(self.SHELL_METHODS, "recipe stubs require POSIX executable semantics")
+            self._assert_execution_skips((self.OWNER_METHOD,), "source ownership requires POSIX os.geteuid")
+            lookup.assert_not_called()
+
+    def test_missing_geteuid_skips_protected_ownership_not_portable_assertions(self) -> None:
+        for capabilities in (SimpleNamespace(name="posix"), SimpleNamespace(name="posix", geteuid=None)):
+            with self.subTest(capabilities=capabilities), \
+                    patch.object(sys.modules[__name__], "os", capabilities):
+                self._run_portable()
+                self._assert_execution_skips((self.OWNER_METHOD,), "source ownership requires POSIX os.geteuid")
 
 
 class PublicDocsContractTests(unittest.TestCase):
