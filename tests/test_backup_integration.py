@@ -578,6 +578,28 @@ class SchedulerTests(SchedulerTestBase):
         self.assertEqual(len(problems), 1)
         self.assertTrue(problems[0].startswith("Backup target Office NAS degraded:"))
 
+    def test_unverified_remote_copy_is_a_failed_run_and_never_catalogued(self) -> None:
+        import dataclasses
+
+        class UnverifiedTarget(LocalDirectoryTarget):
+            def put(self, local_path, name):
+                return dataclasses.replace(super().put(local_path, name), verified=False)
+
+        remote_dir = self.remote_root / "nas"
+
+        @contextlib.contextmanager
+        def opened(_settings):
+            yield UnverifiedTarget(remote_dir)
+
+        scheduler = self.make({"full": {"enabled": True}, "targets": [TARGET]})
+        scheduler._open_target = opened
+        record = scheduler.run_now("full")
+        self.assertEqual([r.location for r in scheduler.catalog.list()], ["local"])
+        status = json.loads(self._paths.status_file.read_text())
+        self.assertFalse(status["targets"]["nas"]["ok"])
+        self.assertIn("remote copy could not be verified", status["targets"]["nas"]["detail"])
+        self.assertFalse((remote_dir / record.name).exists())
+
     def test_failed_backup_recorded_and_single_flight(self) -> None:
         from history_service.backup_scheduler.service import SchedulerBusyError
 

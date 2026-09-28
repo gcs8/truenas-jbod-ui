@@ -713,6 +713,12 @@ class BackupScheduler:
             try:
                 with self._open_configured_target(target) as remote:
                     stored = remote.put(local_path, record.name)
+                    if not stored.verified:
+                        try:
+                            remote.delete(record.name)
+                        except Exception:  # noqa: BLE001 - cleanup must not mask the verify failure
+                            logger.warning("Unverified remote backup copy on %s could not be removed.", target.target_id)
+                        raise RuntimeError("remote copy could not be verified")
                 if stored.size != record.size or stored.sha256 != record.sha256:
                     raise RuntimeError("remote copy does not match the local archive")
                 remote_record = ArtifactRecord(
