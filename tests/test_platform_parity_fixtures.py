@@ -524,6 +524,19 @@ class PlatformParityFixtureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(parsed.ses_slot_to_device, {0: "sda", 1: "sdb", 3: "sdd"})
         self.assertFalse(candidates[2]["present"])
         self.assertFalse(candidates[2].get("device_names"))
+        # The invalid descriptor keeps its inferred display bay, not a verified
+        # SG control coordinate. Its explicit AES neighbours remain actionable.
+        self.assertEqual(candidates[2]["ses_element_id"], 2)
+        self.assertEqual(
+            {bay: candidate["slot_number_source"] for bay, candidate in candidates.items()},
+            {
+                0: "ses_device_slot_number",
+                1: "ses_device_slot_number",
+                2: "ses_element_index_invalid_descriptor",
+                3: "ses_device_slot_number",
+            },
+        )
+        self.assertIn("consistent offset", candidates[2]["slot_number_warning"])
         self.assertEqual(
             {bay: candidate["ses_targets"] for bay, candidate in candidates.items()},
             {
@@ -531,10 +544,10 @@ class PlatformParityFixtureTests(unittest.IsolatedAsyncioTestCase):
                     {
                         "ses_device": "/dev/sg9",
                         "ses_element_id": bay,
-                        "ses_slot_number": bay + 1,
+                        "ses_slot_number": control_slot,
                     }
                 ]
-                for bay in range(4)
+                for bay, control_slot in {0: 1, 1: 2, 2: None, 3: 4}.items()
             },
         )
 

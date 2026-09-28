@@ -10002,6 +10002,9 @@ class InventoryService:
             target["ses_element_id"] = ses_candidate.get("ses_element_id")
         if isinstance(ses_candidate.get("ses_targets"), list) and ses_candidate.get("ses_targets"):
             target["ses_targets"] = ses_candidate.get("ses_targets")
+        for field_name in ("ses_slot_number", "slot_number_source", "slot_number_warning"):
+            if field_name in ses_candidate:
+                target[field_name] = ses_candidate[field_name]
         if ses_candidate.get("sas_address_hint"):
             target["sas_address_hint"] = ses_candidate.get("sas_address_hint")
         if ses_candidate.get("sas_device_type"):
@@ -12590,6 +12593,10 @@ class InventoryService:
             target_device = normalize_text(item.get("ses_device"))
             target_element = item.get("ses_element_id")
             target_slot_number = item.get("ses_slot_number") if isinstance(item.get("ses_slot_number"), int) else None
+            if target_device and target_device.startswith("/dev/sg") and (
+                type(target_slot_number) is not int or target_slot_number < 0
+            ):
+                continue
             target_pair = (target_host, target_device, target_element if isinstance(target_element, int) else None)
             if target_pair in seen_ses_targets or not target_pair[1] or target_pair[2] is None:
                 continue
@@ -12602,12 +12609,19 @@ class InventoryService:
             if target_host:
                 target_payload["ssh_host"] = target_host
             ses_targets.append(target_payload)
-        if not ses_targets and ses_device and ses_element_id is not None:
+        raw_control_slot = raw_slot_status.get("ses_slot_number")
+        if (
+            not ses_targets and ses_device and ses_element_id is not None
+            and (
+                not ses_device.startswith("/dev/sg")
+                or (type(raw_control_slot) is int and raw_control_slot >= 0)
+            )
+        ):
             ses_targets.append(
                 {
                     "ses_device": ses_device,
                     "ses_element_id": ses_element_id,
-                    "ses_slot_number": slot,
+                    "ses_slot_number": raw_control_slot,
                 }
             )
 
@@ -12856,7 +12870,7 @@ class InventoryService:
                 {
                     "ses_device": slot_view.ssh_ses_device,
                     "ses_element_id": slot_view.ssh_ses_element_id,
-                    "ses_slot_number": slot_view.slot,
+                    "ses_slot_number": None,
                 }
             ]
 
@@ -12865,6 +12879,19 @@ class InventoryService:
                 slot_view.led_reason
                 or f"Bay {slot_view.slot_label} is missing the enclosure details needed to switch its light over SSH."
             )
+
+        # Validate the whole target set before any command, including API
+        # fallback and legacy slot views. Never substitute a UI bay index.
+        for target in ses_targets:
+            target_device = normalize_text(target.get("ses_device"))
+            coordinate = target.get("ses_slot_number")
+            if target_device and target_device.startswith("/dev/sg") and (
+                type(coordinate) is not int or coordinate < 0
+            ):
+                raise TrueNASAPIError(
+                    f"Bay {slot_view.slot_label} has no verified SES device slot number, "
+                    "so its light cannot be switched safely."
+                )
 
         if self.system.truenas.platform == "core":
             authentic_targets = [
@@ -12902,7 +12929,7 @@ class InventoryService:
                 else:
                     raise TrueNASAPIError("The enclosure can only turn the locate light on or off.")
 
-                target_slot = target_slot_number if isinstance(target_slot_number, int) else slot_view.slot
+                target_slot = target_slot_number
                 command = shlex.join(
                     [
                         "sudo",
