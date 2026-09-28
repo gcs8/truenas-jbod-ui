@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 
@@ -408,7 +409,7 @@ class SchedulerTestBase(unittest.TestCase):
 
         return opened()
 
-    def make(self, backups: dict[str, Any]):
+    def make(self, backups: dict[str, Any], *, local_tz: Any = UTC):
         config = self.root / "config.yaml"
         config.write_text(yaml.safe_dump({"backups": backups}))
         policy = load_backup_policy(config, {})
@@ -424,7 +425,7 @@ class SchedulerTestBase(unittest.TestCase):
             runner_factory=FakeRunner,
             clock=lambda: self.now,
             monotonic=lambda: self.mono[0],
-            local_tz=UTC,
+            local_tz=local_tz,
         )
         self.addCleanup(scheduler.close)
         return scheduler
@@ -486,6 +487,54 @@ class SchedulerTests(SchedulerTestBase):
         self.assertEqual(len(local), 2)
         self.assertEqual(len(list((self._paths.local_dir / "full").iterdir())), 2)
         self.assertEqual(len(scheduler.catalog.tombstones()), 1)
+
+    def test_full_schedule_keeps_local_wall_clock_across_dst(self) -> None:
+        try:
+            new_york = ZoneInfo("America/New_York")
+        except ZoneInfoNotFoundError:
+            self.skipTest("America/New_York time zone data is not available")
+        self.now = datetime(2026, 10, 31, 12, 0, tzinfo=UTC)
+        scheduler = self.make({"full": {"enabled": True, "schedule": "30 1 * * *"}}, local_tz=new_york)
+        self.assertEqual(scheduler.next_full_at, datetime(2026, 11, 1, 5, 30, tzinfo=UTC))  # 01:30 EDT
+        self.now = datetime(2026, 11, 1, 5, 30, tzinfo=UTC)
+        scheduler.tick()
+        self.assertEqual(len(FakeRunner.calls), 1)
+        # Fall back: 01:30 repeats; the next run is 01:30 EST on 11-02, not a second run on 11-01.
+        self.assertEqual(scheduler.next_full_at, datetime(2026, 11, 2, 6, 30, tzinfo=UTC))
+        # A start inside the repeated hour must not pick the already-past first 01:30.
+        self.assertEqual(
+            scheduler._compute_next_full(datetime(2026, 11, 1, 6, 10, tzinfo=UTC)),
+            datetime(2026, 11, 2, 6, 30, tzinfo=UTC),
+        )
+        # Spring forward: 01:30 EST on 03-08, then 01:30 EDT on 03-09 (not an hour late).
+        self.assertEqual(
+            scheduler._compute_next_full(datetime(2026, 3, 8, 6, 30, tzinfo=UTC)),
+            datetime(2026, 3, 9, 5, 30, tzinfo=UTC),
+        )
+
+    def test_scheduler_main_uses_the_tz_zone(self) -> None:
+        from history_service.backup_scheduler import main as scheduler_main
+
+        try:
+            new_york = ZoneInfo("America/New_York")
+        except ZoneInfoNotFoundError:
+            self.skipTest("America/New_York time zone data is not available")
+        config = self.root / "idle.yaml"
+        config.write_text("{}\n")
+        env = {"APP_CONFIG_PATH": str(config), "APP_GID": str(os.getegid()),
+               "BACKUP_ARCHIVE_PASSPHRASE_FILE": "", "SCHEDULED_BACKUP_PASSPHRASE_FILE": "",
+               "BACKUP_ARCHIVE_DIR": str(self.root / "a"),
+               "BACKUP_ARCHIVE_STATE_DIR": str(self.root / "s"), "TZ": "America/New_York"}
+        with patch.dict(os.environ, env):
+            with patch("history_service.system_backup.SystemBackupService"), patch("history_service.store.HistoryStore"):
+                scheduler = scheduler_main.build_scheduler(load_backup_policy(config, {}))
+            self.addCleanup(scheduler.close)
+            self.assertEqual(scheduler._local_tz, new_york)
+        for value in ("", "  "):
+            with self.subTest(tz=value), patch.dict(os.environ, {"TZ": value}):
+                self.assertIsNone(scheduler_main._local_tz())
+        with patch.dict(os.environ, {"TZ": "Not/AZone"}), self.assertLogs(scheduler_main.logger, "WARNING"):
+            self.assertIsNone(scheduler_main._local_tz())
 
     def test_verified_full_replaces_only_older_history_sidecar_copies(self) -> None:
         scheduler = self.make({"full": {"enabled": True}})

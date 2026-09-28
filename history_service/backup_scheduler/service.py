@@ -317,7 +317,12 @@ class BackupScheduler:
         if self._cron is None:
             return None
         local_now = now.astimezone(self._local_tz) if self._local_tz is not None else now.astimezone()
-        return self._cron.next_after(local_now).astimezone(timezone.utc)
+        following = self._cron.next_after(local_now)
+        # Inside a repeated (fall-back) hour a wall-clock match resolves to its
+        # first, already past, occurrence; skip it so a repeated time runs once.
+        while following.astimezone(timezone.utc) <= now:
+            following = self._cron.next_after(following)
+        return following.astimezone(timezone.utc)
 
     def tick(self) -> None:
         """One scheduler step: config coalescer, then a due full backup."""
