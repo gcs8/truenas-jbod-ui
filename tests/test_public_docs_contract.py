@@ -252,6 +252,62 @@ class OperatorRecipeTests(unittest.TestCase):
                         policy.missing_host_key(client, "core.example.test", key)
                         client.save_host_keys.assert_called_once_with(path)
 
+        preload = (ROOT / "wiki/SSH-Setup-and-Sudo.md").read_text()
+        block = next(block for block in re.findall(r"```bash\n(.*?)\n```", preload, re.DOTALL)
+                     if "ssh-keyscan " in block)
+        scan = next(line for line in block.splitlines() if line.startswith("ssh-keyscan "))
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory)
+            fake = target / "ssh-keyscan"
+            fake.write_text(
+                f"#!{sys.executable}\n"
+                "import json, os, sys\nfrom pathlib import Path\nimport paramiko\n"
+                "args = sys.argv[1:]\n"
+                "Path(os.environ['ARGV_PATH']).write_text(json.dumps(args))\n"
+                "port = args[args.index('-p') + 1] if '-p' in args else '22'\n"
+                "host = args[-1]\n"
+                "identity = host if port == '22' else f'[{host}]:{port}'\n"
+                "print(paramiko.HostKeys.hash_host(identity), os.environ['PUBLIC_KEY'])\n"
+            )
+            fake.chmod(0o700)
+            # Only a generated public host key is serialized. No SSH transport runs.
+            key = paramiko.RSAKey.generate(1024)
+            for host in ("storage-host.example.test", "2001:db8::1"):
+                for port in (22, 2222):
+                    with self.subTest(preload_host=host, port=port):
+                        known_hosts = target / "known_hosts"
+                        argv_path = target / "argv.json"
+                        result = subprocess.run(
+                            [shutil.which("bash"), "-c", scan], cwd=target, capture_output=True,
+                            text=True, timeout=10, env={
+                                "PATH": directory, "ssh_host": host, "ssh_port": str(port),
+                                "known_hosts_scan": str(known_hosts), "ARGV_PATH": str(argv_path),
+                                "PUBLIC_KEY": f"{key.get_name()} {key.get_base64()}",
+                            },
+                        )
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(json.loads(argv_path.read_text()), ["-H", "-p", str(port), host])
+                        identity = host if port == 22 else f"[{host}]:{port}"
+                        probe = SSHProbe(SSHConfig(host=host, port=port, strict_host_key_checking=True,
+                                                   known_hosts_path=str(known_hosts)))
+                        with patch.object(paramiko.SSHClient, "connect") as connect:
+                            client = probe._client()
+                        try:
+                            self.assertTrue(client.get_host_keys().check(identity, key))
+                            self.assertEqual(connect.call_args.kwargs["hostname"], host)
+                            self.assertEqual(connect.call_args.kwargs["port"], port)
+                            wrong = f"[{host}]:2222" if port == 22 else host
+                            self.assertIsNone(client.get_host_keys().lookup(wrong))
+                        finally:
+                            client.close()
+        with self.subTest(preload="explicit approval"):
+            approval = re.search(r"^read -r -p .*\n.*verified.*exit 1.*$", block, re.MULTILINE)
+            self.assertIsNotNone(approval, "installation must wait for operator fingerprint approval")
+            for answer, expected in (("no\n", 1), ("", 1), ("yes\n", 0)):
+                result = subprocess.run([shutil.which("bash"), "-c", approval.group()],
+                                        input=answer, text=True, capture_output=True, timeout=10)
+                self.assertEqual(result.returncode, expected)
+
     def test_admin_claims_match_base_and_overlay_yaml_sources(self) -> None:
         base = yaml.safe_load((ROOT / "docker-compose.yml").read_text())["services"]
         overlay = yaml.safe_load((ROOT / "docker-compose.nonroot.yml").read_text())["services"]
@@ -274,6 +330,16 @@ class OperatorRecipeTests(unittest.TestCase):
         for name, service in base.items():
             if name != "enclosure-admin":
                 self.assertFalse(any("docker.sock" in mount for mount in service["volumes"]))
+        self.assertEqual(admin["profiles"], ["admin"])
+        # Source intent remains checked when the installed-Compose integration skips.
+        module = ast.parse(Path(__file__).read_text())
+        method = next(node for node in ast.walk(module) if isinstance(node, ast.FunctionDef)
+                      and node.name == "test_admin_ordered_config_with_installed_compose_only")
+        option_lists = [[item.value for item in node.elts if isinstance(item, ast.Constant)]
+                        for node in ast.walk(method) if isinstance(node, ast.List)]
+        self.assertTrue(any(any(values[index:index + 2] == ["--profile", "admin"]
+                                for index in range(len(values) - 1)) for values in option_lists),
+                        "Compose config must explicitly select the profiled admin service")
         guide = (ROOT / "docs/ADMIN_TRUST_BOUNDARY.md").read_text()
         for text in ("base `docker-compose.yml`", "`0:0`", "does not declare",
                      "-f docker-compose.yml -f docker-compose.nonroot.yml", "`0:APP_GID`",
@@ -296,17 +362,27 @@ class OperatorRecipeTests(unittest.TestCase):
             for name in ("docker-compose.yml", "docker-compose.nonroot.yml"):
                 shutil.copyfile(ROOT / name, target / name)
             (target / ".env").write_text("")
-            env = {"PATH": os.environ.get("PATH", ""), "HOME": directory, "APP_GID": "12345"}
-            for hardened in (False, True):
-                argv = command + ["-f", "docker-compose.yml"]
-                if hardened:
-                    argv += ["-f", "docker-compose.nonroot.yml"]
-                result = subprocess.run(argv + ["config", "--format", "json"], cwd=target,
-                                        env=env, capture_output=True, text=True, timeout=30)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                admin = json.loads(result.stdout)["services"]["enclosure-admin"]
-                self.assertEqual(admin["user"], "0:12345" if hardened else "0:0")
-                self.assertEqual(admin.get("read_only", False), hardened)
+            for app_gid in (None, "12345"):
+                env = {"PATH": os.environ.get("PATH", ""), "HOME": directory}
+                if app_gid is not None:
+                    env["APP_UID"] = "12344"
+                    env["APP_GID"] = app_gid
+                for hardened in (False, True):
+                    with self.subTest(app_gid=app_gid, hardened=hardened):
+                        argv = command + ["--profile", "admin", "-f", "docker-compose.yml"]
+                        if hardened:
+                            argv += ["-f", "docker-compose.nonroot.yml"]
+                        result = subprocess.run(argv + ["config", "--format", "json"], cwd=target,
+                                                env=env, capture_output=True, text=True, timeout=30)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        services = json.loads(result.stdout)["services"]
+                        self.assertIn("enclosure-admin", services)
+                        admin = services["enclosure-admin"]
+                        self.assertEqual(admin["user"], f"0:{app_gid or '10001'}" if hardened else "0:0")
+                        self.assertEqual(admin.get("read_only", False), hardened)
+                        self.assertEqual(admin.get("cap_drop", []), ["ALL"] if hardened else [])
+                        self.assertEqual(set(admin.get("cap_add", [])), {"CHOWN", "FOWNER"} if hardened else set())
+                        self.assertEqual(admin.get("security_opt", []), ["no-new-privileges:true"] if hardened else [])
 
     def test_staging_numeric_helper_accepts_root_owners_but_not_root_status_group(self) -> None:
         tree = ast.parse(rotation_staging_code())
@@ -327,11 +403,50 @@ class OperatorRecipeTests(unittest.TestCase):
         guide = (ROOT / "docs/SEGMENTED_HISTORY_V2.md").read_text()
         shell = next(block for block in re.findall(r"```bash\n(.*?)\n```", guide, re.DOTALL)
                      if "STAGE_NAME =" in block).split("<<'PY'", 1)[0]
-        defaults = dict(re.findall(r"^([A-Z_]+)=([0-9]+)$", shell, re.MULTILINE))
-        self.assertEqual(defaults, {"HISTORY_UID": "0", "HISTORY_GID": "0", "APP_GID": "10001",
-                                    "BACKUP_UID": "0", "BACKUP_GID": "0"})
-        for name in defaults:
-            self.assertIn(f'{name}="${name}"', shell)
+        inputs = ("HISTORY_UID", "HISTORY_GID", "APP_GID", "BACKUP_UID", "BACKUP_GID")
+        with self.subTest(staging="observed owners, not service defaults"):
+            self.assertEqual(dict(re.findall(r"^([A-Z_]+)=([0-9]+)$", shell, re.MULTILINE)), {})
+            for name in inputs:
+                self.assertIn(f'${{{name}:?', shell)
+                self.assertIn(f'{name}="${name}"', shell)
+            self.assertIn("stat -c", guide)
+            self.assertIn("stored owner", guide)
+            self.assertIn("--no-deps", guide)
+            self.assertIn("HOLD", guide)
+        commands = [block for block in re.findall(r"```bash\n(.*?)\n```", guide, re.DOTALL)
+                    if "scripts/rotate_segmented_history.py" in block]
+        self.assertEqual(len(commands), 3)
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory)
+            fake = target / "docker"
+            fake.write_text(f"#!{sys.executable}\nimport json, os, sys\nfrom pathlib import Path\n"
+                            "Path(os.environ['ARGV_PATH']).write_text(json.dumps(sys.argv[1:]))\n")
+            fake.chmod(0o700)
+            for uid, gid in ((0, 0), (10001, 10001), (12001, 12002)):
+                for command in commands:
+                    with self.subTest(publisher=(uid, gid), command=command.splitlines()[-1]):
+                        argv_path = target / "argv.json"
+                        result = subprocess.run([shutil.which("bash"), "-c", command], cwd=target,
+                                                capture_output=True, text=True, timeout=10, env={
+                                                    "PATH": directory, "ARGV_PATH": str(argv_path),
+                                                    "HISTORY_UID": str(uid), "HISTORY_GID": str(gid),
+                                                })
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        argv = json.loads(argv_path.read_text())
+                        self.assertIn("--user", argv)
+                        self.assertEqual(argv[argv.index("--user") + 1], f"{uid}:{gid}")
+                        self.assertIn("--no-deps", argv)
+                        self.assertIn("enclosure-history", argv)
+                        self.assertIn("/app/history/history.db", argv)
+        from history_service.segment_sealer import _require_source_owner
+
+        # Root service defaults do not grant root permission to publish app-owned history.
+        for owner in (0, 10001, 12001):
+            with patch("history_service.segment_sealer.os.geteuid", return_value=owner):
+                _require_source_owner(SimpleNamespace(st_uid=owner))
+            with patch("history_service.segment_sealer.os.geteuid", return_value=owner + 1):
+                with self.assertRaisesRegex(ValueError, "must own"):
+                    _require_source_owner(SimpleNamespace(st_uid=owner))
         base = yaml.safe_load((ROOT / "docker-compose.yml").read_text())["services"]
         overlay = yaml.safe_load((ROOT / "docker-compose.nonroot.yml").read_text())["services"]
         self.assertEqual(base["enclosure-history"]["user"], "0:0")

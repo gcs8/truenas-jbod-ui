@@ -435,6 +435,8 @@ Strict mode uses `RejectPolicy`: an unknown host key is rejected, including on
 the first connection. Keep strict checking enabled. Obtain the fingerprint
 through a trusted channel, compare it with the scanned key, and preload the
 verified key using the [SSH trust preload procedure](../wiki/SSH-Setup-and-Sudo.md).
+Use that target's configured host and port, default `22`, for the scan. A custom
+port needs its own `[host]:port` trust entry; a port-22 scan does not preload it.
 Install it in the application's effective `ssh.known_hosts_path`, normally
 `/app/data/known_hosts` inside the container and `data/known_hosts` on the host.
 Accepting a key in a shell user's `~/.ssh/known_hosts` does not populate the

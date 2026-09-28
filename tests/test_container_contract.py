@@ -325,8 +325,9 @@ class ContainerResourceContractTests(unittest.TestCase):
         ordered_steps = (
             'known_hosts_scan="$(mktemp)"',
             'known_hosts_merged="$(mktemp)"',
-            'ssh-keyscan -H "$ssh_host" > "$known_hosts_scan"',
+            'ssh-keyscan -H -p "$ssh_port" "$ssh_host" > "$known_hosts_scan"',
             'ssh-keygen -lf "$known_hosts_scan"',
+            '[ "$verified" = yes ] || exit 1',
             'sudo cat data/known_hosts > "$known_hosts_merged"',
             'cat "$known_hosts_scan" >> "$known_hosts_merged"',
             'sudo install -o "$app_uid" -g "$app_gid" -m 0660 "$known_hosts_merged" data/known_hosts',
@@ -349,7 +350,7 @@ class ContainerResourceContractTests(unittest.TestCase):
             self.assertIn('app_gid="${APP_GID:-10001}"', guide)
 
         self.assertIn('ssh_host="storage-host.example.test"', ssh_guide)
-        self.assertIn('ssh-keyscan -H "$ssh_host"', ssh_guide)
+        self.assertIn('ssh-keyscan -H -p "$ssh_port" "$ssh_host"', ssh_guide)
         self.assertIn("host: storage-host.example.test", ssh_guide)
         self.assertNotIn(".local", ssh_guide)
         self.assertIn('-o "$app_uid" -g "$app_gid" -m 0660', ssh_guide)
@@ -609,8 +610,12 @@ class ContainerResourceContractTests(unittest.TestCase):
             runbook.count(f"{history_command_prefix}scripts/migrate_segmented_history.py"),
             6,
         )
+        rotation_command_prefix = (
+            'docker compose run --rm --no-deps --user "${HISTORY_UID:?}:${HISTORY_GID:?}" '
+            '--entrypoint python enclosure-history '
+        )
         self.assertEqual(
-            runbook.count(f"{history_command_prefix}scripts/rotate_segmented_history.py"),
+            runbook.count(f"{rotation_command_prefix}scripts/rotate_segmented_history.py"),
             3,
         )
 
@@ -689,7 +694,11 @@ class ContainerResourceContractTests(unittest.TestCase):
             script_index = arguments.index("scripts/rotate_segmented_history.py")
             with self.subTest(command=arguments[-1]):
                 self.assertEqual(arguments[script_index - 1], "enclosure-history")
-                self.assertNotIn("--user", arguments)
+                # The stored hot owner can differ from the service default.
+                self.assertEqual(arguments[arguments.index("--user") + 1],
+                                 "${HISTORY_UID:?}:${HISTORY_GID:?}")
+                self.assertIn("--no-deps", arguments)
+                self.assertNotIn("BACKUP_UID", " ".join(arguments))
                 self.assertNotIn("/app/backups", arguments)
                 if "--recover" not in arguments:
                     backup_dir_index = arguments.index("--scheduled-backup-dir")

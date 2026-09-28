@@ -311,40 +311,66 @@ No source, catalog, segment, or rollback cleanup occurs when backup evidence,
 headroom, path identity, timestamp validity, row accounting, fsync, or digest
 verification fails.
 
-The history owner must run the publisher. In the root-compatible base Compose
-file, history and backup both default to `0:0`. In the prepared non-root
-overlay, history defaults to `10001:10001` and backup to `1000:1000`. A separate
-backup UID owns the private `0600` archives but does not own the hot database;
-the history UID cannot directly read those archives. The staging helper below
-runs with host permission to read that one archive and assign its staged copy
-to the effective history owner. Rotation itself runs as the history service,
-not as a different backup UID or host root for a non-root history deployment.
-
-Use the effective identities from your complete ordered Compose chain, including
-explicit overrides. `HISTORY_UID` and `HISTORY_GID` below describe the history
-service and hot-state ownership; they are helper inputs, not Compose settings.
-`APP_GID` is the separate positive shared-status group, default `10001`, even
-when history and backup run as `0:0`. Do not set `APP_GID=0` or assume it equals
-the history GID. Keep existing ownership when rotating a supported deployment;
-do not recursively chown history or backups to make these examples fit.
+The publisher's effective UID must be the hot database's stored owner, not
+merely the configured history service UID. Base Compose runs history as `0:0`;
+the prepared non-root overlay defaults to `10001:10001`. Neither tells you who
+owns existing history. In particular, [dropping the non-root overlay](../wiki/Troubleshooting.md)
+leaves app-owned history readable by a root-run service. A root publisher still
+fails the hot-database owner check in that deployment.
 
 After a fresh scheduled FULL backup succeeds, stop the history service cleanly
 and verify that the one-shot backup container has exited. Confirm that
 `backup-status/scheduled-backup.json` reports the successful run and that the
 configured host destination is `backups/scheduled`, corresponding to
-`/app/backups/scheduled`. Then stage only its named archive into the existing
-history bind. Run from the deployment directory. Set these five numeric values
-to the effective identities before running the block. The values shown match
-the base Compose defaults. For the prepared non-root overlay defaults, use
-`HISTORY_UID=10001`, `HISTORY_GID=10001`, `BACKUP_UID=1000`, `BACKUP_GID=1000`,
-and retain `APP_GID=10001`. Custom deployments must use their actual IDs.
+`/app/backups/scheduled`. Keep writers stopped through staging, dry run, apply,
+and any recovery.
+
+From the deployment directory, inspect metadata without following leaf symlinks.
+These GNU `stat` arguments report names, types, numeric owners, modes, and link
+counts, not database or credential contents:
 
 ```bash
-HISTORY_UID=0
-HISTORY_GID=0
-APP_GID=10001
-BACKUP_UID=0
-BACKUP_GID=0
+stat -c '%n type=%F uid=%u gid=%g mode=%a links=%h' -- \
+  history history/history.db history/segments \
+  backups/scheduled backup-status backup-status/scheduled-backup.json
+```
+
+Use the actual bind source paths if the deployment overrides them. Inspect the
+status-named archive's metadata separately. Do not substitute the service's
+`user` value for these observations. Set the five shell inputs below explicitly:
+
+- `HISTORY_UID` and `HISTORY_GID` are the stored hot-database owner and group.
+  The existing history bind directory must have that same owner/group for this
+  staging recipe. Existing segments must retain their documented ownership and
+  modes. A mismatch is HOLD for owner investigation, not permission to chown.
+- `BACKUP_UID` and `BACKUP_GID` are the observed scheduled-archive owner/group,
+  which must agree with the backup worker identity and its private directory.
+  Base backup defaults to `0:0`; the non-root overlay defaults to `1000:1000`.
+  These are service defaults, not evidence of stored ownership.
+- `APP_GID` is the configured positive shared-status group, default `10001`.
+  Confirm it against the status directory/file group. Do not set `APP_GID=0`
+  or assume it equals `HISTORY_GID`, even for root-owned history.
+
+For example, an observed root-owned bind and hot database use `HISTORY_UID=0`
+and `HISTORY_GID=0`. An observed `10001:10001` bind and database use
+`HISTORY_UID=10001` and `HISTORY_GID=10001`, even after reverting the service to
+root. Custom IDs require the corresponding observed values. Keep existing
+ownership; do not recursively chown history or backups to make examples fit.
+Reject symlinks, unexpected file types, or ambiguous mounts before continuing.
+The staging block retains its descriptor, owner, mode, and link checks.
+
+A separate backup UID owns private `0600` archives that a non-root history owner
+cannot directly read. The staging block uses host permission to copy only the
+verified status-named archive and assigns only that new copy and its staging
+directory to the stored history owner. It does not change existing ownership.
+These required inputs are helper values, not new Compose settings:
+
+```bash
+: "${HISTORY_UID:?Set the observed hot-database owner UID}"
+: "${HISTORY_GID:?Set the observed hot-database group GID}"
+: "${APP_GID:?Set the positive shared-status group GID}"
+: "${BACKUP_UID:?Set the observed scheduled-backup owner UID}"
+: "${BACKUP_GID:?Set the observed scheduled-backup group GID}"
 sudo env HISTORY_UID="$HISTORY_UID" HISTORY_GID="$HISTORY_GID" APP_GID="$APP_GID" BACKUP_UID="$BACKUP_UID" BACKUP_GID="$BACKUP_GID" python3 - <<'PY'
 import hashlib
 import json
@@ -565,16 +591,38 @@ artifact name or digest. The rotation dry run performs the canonical status and
 freshness validation again. Staging alone does not authorize publication:
 stale status must still fail the rotation dry run and apply admission.
 
-Dry-run the next append transaction while the history service remains
-quiesced. `enclosure-history` keeps its effective history identity and uses only
-its existing history and read-only backup-status mounts. The commands below
-show the base chain. For a prepared non-root deployment, use
-`docker compose -f docker-compose.yml -f docker-compose.nonroot.yml` in place of
-`docker compose` in every dry-run, apply, and recovery command below, retaining
-any additional ordered overlays used by that deployment:
+Dry-run the next append transaction while the history service remains quiesced.
+Each command explicitly selects the stored `HISTORY_UID:HISTORY_GID` for this
+one-shot publisher. `--no-deps` prevents Compose from starting dependencies.
+This does not change the long-running service identity. Keep the same inspected
+values from staging for dry run, apply, and recovery.
+
+Before running, check the complete ordered Compose configuration. The publisher
+must use the same directory bind at `/app/history`, a writable history mount,
+and the existing read-only `/app/backup-status` mount. Its effective UID must
+match the hot owner; its primary GID must be the stored history GID so newly
+published files retain that group. A non-root publisher also needs status read
+and directory-traverse access through `APP_GID`, either as its primary GID or
+an already configured supplementary group. `--user` does not add supplementary
+groups. The base and non-root history services do not declare `group_add`.
+For ordinary app-owned history, `HISTORY_GID=APP_GID` supplies that access.
+Do not assume UID 0 bypasses permissions when the active overlay drops its
+capabilities. If the existing runtime cannot supply the required identity,
+groups, mounts, and access, HOLD for an owner-approved runtime configuration.
+Do not relax archive modes or path/link checks, add privileges, or migrate
+ownership as a workaround.
+
+The commands below show the base chain. For a prepared non-root deployment,
+use `docker compose -f docker-compose.yml -f docker-compose.nonroot.yml` in
+place of `docker compose` in every command below. Retain all other ordered
+files and runtime settings used by that deployment. A reverted root-run service
+with app-owned history still uses that stored owner's `--user` override.
+Actual root/separate-UID staging and container-runtime qualification remain
+open in [#736](https://github.com/gcs8/truenas-jbod-ui/issues/736); source and
+synthetic command checks do not qualify a deployment.
 
 ```bash
-docker compose run --rm --entrypoint python enclosure-history scripts/rotate_segmented_history.py \
+docker compose run --rm --no-deps --user "${HISTORY_UID:?}:${HISTORY_GID:?}" --entrypoint python enclosure-history scripts/rotate_segmented_history.py \
   --source /app/history/history.db \
   --segments-dir /app/history/segments \
   --cutoff 2026-08-01T00:00:00+00:00 \
@@ -589,7 +637,7 @@ transaction artifacts.
 Apply only after the dry run succeeds and the history service remains quiesced:
 
 ```bash
-docker compose run --rm --entrypoint python enclosure-history scripts/rotate_segmented_history.py \
+docker compose run --rm --no-deps --user "${HISTORY_UID:?}:${HISTORY_GID:?}" --entrypoint python enclosure-history scripts/rotate_segmented_history.py \
   --source /app/history/history.db \
   --segments-dir /app/history/segments \
   --cutoff 2026-08-01T00:00:00+00:00 \
@@ -603,7 +651,7 @@ Inspect a pending recovery without changing files, then repeat with `--apply`
 only after reviewing the reported phase:
 
 ```bash
-docker compose run --rm --entrypoint python enclosure-history scripts/rotate_segmented_history.py \
+docker compose run --rm --no-deps --user "${HISTORY_UID:?}:${HISTORY_GID:?}" --entrypoint python enclosure-history scripts/rotate_segmented_history.py \
   --source /app/history/history.db \
   --segments-dir /app/history/segments \
   --recover
