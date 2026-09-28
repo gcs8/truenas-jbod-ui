@@ -71,7 +71,7 @@
     "test_prometheus_alert_rules": 4,
     "test_public_demo_deployment": 3,
     "test_public_demo_deterministic": 12,
-    "test_public_demo_fixture": 22,
+    "test_public_demo_fixture": 40,
     "test_public_demo_history_consistency": 3,
     "test_public_demo_provenance": 9,
     "test_public_doc_privacy": 7,
