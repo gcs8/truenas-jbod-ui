@@ -299,6 +299,62 @@ Slot00 [0,0]  Element type: Array device slot
                 self.assertEqual(list(parsed.slots), [7])
                 self.assertEqual(parsed.enclosure_name, "ExampleCo GenericShelf 0001")
 
+    def test_sg_join_descriptor_label_is_display_not_control_coordinate(self) -> None:
+        for suffix in ("", "\nFan0 [1,0] Element type: Cooling\n  Ident=0\n"):
+            with self.subTest(next_header=bool(suffix)):
+                parsed = parse_sg_ses_join_filter(
+                    "ExampleCo EvidenceShelf 0001\n"
+                    "Slot02 [0,1] Element type: Array device slot\n"
+                    "  Predicted failure=0, Disabled=0, status: OK\n"
+                    "  Ident=1\n" + suffix,
+                    "sg_ses --join --filter /dev/sg9",
+                )
+                self.assertIsNotNone(parsed)
+                assert parsed is not None
+                slot = parsed.slots[2]
+                self.assertEqual(slot.control_targets, [{
+                    "ses_device": "/dev/sg9", "ses_element_id": 1, "ses_slot_number": None,
+                }])
+                self.assertEqual(slot.slot_number, 2)
+                self.assertEqual(slot.slot_number_source, "ses_description")
+                self.assertEqual(slot.description, "Slot02")
+                self.assertTrue(slot.present)
+                self.assertTrue(slot.identify_active)
+                candidates, _ = build_slot_candidates_from_ses_enclosures([parsed], 2, None)
+                self.assertEqual(candidates[1]["descriptor"], "Slot02")
+                self.assertIsNone(candidates[1]["ses_slot_number"])
+                self.assertIsNone(candidates[1]["ses_targets"][0]["ses_slot_number"])
+
+    def test_sg_aes_coordinate_replaces_descriptor_label_in_either_merge_order(self) -> None:
+        for reverse in (False, True):
+            with self.subTest(reverse=reverse):
+                joined = parse_sg_ses_join_filter(
+                    "ExampleCo EvidenceShelf 0001\n"
+                    "Slot17 [0,1] Element type: Array device slot\n"
+                    "  Predicted failure=0, Disabled=0, status: OK\n"
+                    "  Ident=1\n",
+                    "sg_ses --join --filter /dev/sg9",
+                )
+                aes = parse_sg_ses_aes(
+                    "ExampleCo EvidenceShelf 0001\n"
+                    "Additional element status diagnostic page:\n"
+                    "  Element type: Array device slot, subenclosure id: 0 [ti=0]\n"
+                    "    Element index: 1 eiioe=0\n"
+                    "      device slot number: 2\n",
+                    "sg_ses -p aes /dev/sg9",
+                )
+                assert joined is not None and aes is not None
+                pages = [joined, aes]
+                merged = _merge_ses_enclosures(list(reversed(pages)) if reverse else pages)
+                self.assertEqual(list(merged[0].slots), [2])
+                slot = merged[0].slots[2]
+                self.assertEqual(slot.slot_number_source, "ses_device_slot_number")
+                self.assertEqual(slot.control_targets[0]["ses_slot_number"], 2)
+                self.assertTrue(slot.identify_active)
+                candidates, _ = build_slot_candidates_from_ses_enclosures(merged, 2, None)
+                self.assertEqual(candidates[1]["ses_slot_number"], 2)
+                self.assertEqual(candidates[1]["ses_targets"][0]["ses_slot_number"], 2)
+
     def test_parse_sg_ses_join_filter_rekeys_to_reported_bay(self) -> None:
         output = """
 ExampleCo  GenericShelf  0001

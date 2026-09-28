@@ -15546,6 +15546,59 @@ Consumers:
                     )
                 self.assertEqual(service._run_ssh_command.await_count, 2)
 
+    async def test_descriptor_only_join_keeps_display_but_never_plans_led(self):
+        descriptor_only = "\n".join(
+            line for line in self.JOIN.splitlines() if "device slot number:" not in line
+        ) + "\n  Ident=1\n"
+        for platform, include_ec, reverse in itertools.product(
+            ("scale", "quantastor"), (False, True), (False, True)
+        ):
+            with self.subTest(platform=platform, include_ec=include_ec, reverse=reverse):
+                items = [("sg_ses --join --filter /dev/sg9", descriptor_only)]
+                if include_ec:
+                    items.append(("sg_ses -p ec /dev/sg9", self.EC))
+                service = self.make_service(platform, dict(reversed(items) if reverse else items))
+                snapshot = await service.get_snapshot()
+                slot = next(item for item in snapshot.slots if item.ssh_ses_element_id == 1)
+                for action in (LedAction.identify, LedAction.clear):
+                    with self.assertRaises(TrueNASAPIError):
+                        await service.set_slot_led(slot.slot, action, invalidate_snapshot=False)
+                service._run_ssh_command.assert_not_awaited()
+                service.truenas_client.set_slot_status.assert_not_awaited()
+                self.assertEqual(len(snapshot.slots), 2)
+                self.assertTrue(slot.present)
+                self.assertTrue(slot.identify_active)
+                self.assertEqual(slot.raw_status["descriptor"], "Slot02")
+                self.assertEqual(slot.raw_status["slot_number_source"], "ses_description")
+                self.assertIsNone(slot.raw_status["ses_slot_number"])
+                self.assertFalse(slot.led_supported)
+                self.assertTrue(slot.led_reason)
+
+    async def test_verified_coordinate_wins_over_different_descriptor_and_ui_slot(self):
+        for platform, separate_aes in itertools.product(("scale", "quantastor"), (False, True)):
+            with self.subTest(platform=platform, separate_aes=separate_aes):
+                joined = self.JOIN.replace("Slot02", "Slot17")
+                items = [("sg_ses -p ec /dev/sg9", self.EC)]
+                if separate_aes:
+                    joined = "\n".join(
+                        line for line in joined.splitlines() if "device slot number:" not in line
+                    )
+                    items.append(("sg_ses -p aes /dev/sg9", self.AES))
+                items.append(("sg_ses --join --filter /dev/sg9", joined))
+                service = self.make_service(platform, dict(items))
+                snapshot = await service.get_snapshot()
+                slot = next(item for item in snapshot.slots if item.ssh_ses_element_id == 1)
+                self.assertEqual(slot.slot, 1)
+                self.assertTrue(slot.led_supported)
+                self.assertEqual(slot.ssh_ses_targets[0]["ses_slot_number"], 2)
+                for action, flag in ((LedAction.identify, "--set=ident"), (LedAction.clear, "--clear=ident")):
+                    await service.set_slot_led(slot.slot, action, invalidate_snapshot=False)
+                    service._run_ssh_command.assert_awaited_with(
+                        f"sudo -n /usr/bin/sg_ses --dev-slot-num=2 {flag} /dev/sg9", None
+                    )
+                self.assertEqual(service._run_ssh_command.await_count, 2)
+                service.truenas_client.set_slot_status.assert_not_awaited()
+
     async def test_sg_dispatch_refuses_missing_coordinates_without_ui_fallback(self):
         target_sets = [[]]
         for coordinate in (None, -1, True, "2"):

@@ -854,7 +854,7 @@ def _merge_ses_slot_evidence(existing: SESMapSlot, slot: SESMapSlot) -> None:
         "ses_element_id_fallback": 1,
         "ses_element_index_invalid_descriptor": 1,
         "ses_description": 2,
-        "ses_device_slot_number": 2,
+        "ses_device_slot_number": 3,
     }
     existing_strength = source_strength.get(existing.slot_number_source, 0)
     incoming_strength = source_strength.get(slot.slot_number_source, 0)
@@ -1133,6 +1133,17 @@ def _finalize_ses_invalid_descriptor_evidence(
         )
 
 
+def _ses_control_slot_number(slot: SESMapSlot, ses_device: str | None) -> int | None:
+    # Display ordinals and SG descriptor labels are not --dev-slot-num
+    # coordinates. CORE descriptors still use their typed element target.
+    if slot.slot_number_source == "ses_element_id_fallback" or (
+        ses_device and ses_device.startswith("/dev/sg")
+        and slot.slot_number_source == "ses_description"
+    ):
+        return None
+    return slot.slot_number
+
+
 def _record_ses_slot(
     enclosure: SESMapEnclosure,
     slot: SESMapSlot,
@@ -1177,7 +1188,7 @@ def _record_ses_slot(
             {
                 "ses_device": slot.ses_device or enclosure.ses_device,
                 "ses_element_id": slot.element_id,
-                "ses_slot_number": reported_slot_number,
+                "ses_slot_number": _ses_control_slot_number(slot, slot.ses_device or enclosure.ses_device),
             }
         ],
     )
@@ -1785,6 +1796,7 @@ def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapE
                 slot_number=-1,
                 element_id=element_id,
                 ses_device=ses_device,
+                description=descriptor,
             )
             continue
 
@@ -2576,11 +2588,10 @@ def build_slot_candidates_from_ses_enclosures(
                 if combined_slot < 0 or combined_slot >= slot_count:
                     continue
 
-                # EC element order is useful display geometry, not an SG
-                # device-slot coordinate. Stronger AES/join evidence replaces
-                # this fallback when the pages are merged by element identity.
-                control_slot_number = (
-                    None if slot.slot_number_source == "ses_element_id_fallback" else slot.slot_number
+                # Keep display labels separate from control coordinates in
+                # both the target list and the inventory metadata fallback.
+                control_slot_number = _ses_control_slot_number(
+                    slot, slot.ses_device or enclosure.ses_device,
                 )
                 candidates[combined_slot] = {
                     "status": slot.status,
