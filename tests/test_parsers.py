@@ -3107,6 +3107,71 @@ Additional element status diagnostic page:
         self.assertIs(parsed.slots[0].present, True)
         self.assertEqual(parsed.slots[0].slot_number_source, "ses_device_slot_number")
 
+    INVALID_AES = """ExampleCo EvidenceShelf 0001
+  Primary enclosure logical identifier (hex): synthetic-enclosure
+Additional element status diagnostic page:
+  Element type: Array device slot, subenclosure id: 0 [ti=0]
+    Element index: 0 eiioe=0
+      device slot number: 1
+    Element index: 1 eiioe=0
+      flagged as invalid
+"""
+
+    def test_invalid_aes_inferred_geometry_has_no_sg_control_target(self) -> None:
+        parsed = parse_sg_ses_aes(self.INVALID_AES, "sg_ses -p aes /dev/sg9")
+        assert parsed is not None
+        self.assertEqual(sorted(parsed.slots), [1, 2])
+        slot = parsed.slots[2]
+        self.assertEqual(slot.slot_number, 2)
+        self.assertEqual(slot.element_id, 1)
+        self.assertIsNone(slot.reported_slot_number)
+        self.assertFalse(slot.present)
+        self.assertEqual(slot.slot_number_source, "ses_element_index_invalid_descriptor")
+        self.assertIn("consistent offset", slot.slot_number_warning or "")
+        self.assertEqual(slot.control_targets, [{
+            "ses_device": "/dev/sg9", "ses_element_id": 1, "ses_slot_number": None,
+        }])
+        self.assertEqual(parsed.slots[1].control_targets[0]["ses_slot_number"], 1)
+
+    def test_invalid_aes_candidate_metadata_cannot_restore_inferred_control(self) -> None:
+        parsed = parse_sg_ses_aes(self.INVALID_AES, "sg_ses -p aes /dev/sg9")
+        assert parsed is not None
+        # Isolate the typed metadata fallback from the recorded target list.
+        parsed.slots[2].control_targets.clear()
+        candidates, _ = build_slot_candidates_from_ses_enclosures([parsed], 2, None)
+        candidate = candidates[1]
+        self.assertEqual(candidate["ses_element_id"], 1)
+        self.assertEqual(candidate["slot_number_source"], "ses_element_index_invalid_descriptor")
+        self.assertIn("consistent offset", candidate["slot_number_warning"])
+        self.assertIsNone(candidate["ses_slot_number"])
+        self.assertEqual(candidate["ses_targets"], [{
+            "ses_device": "/dev/sg9", "ses_element_id": 1, "ses_slot_number": None,
+        }])
+
+    def test_verified_aes_wins_over_inferred_geometry_without_promoting_other_path(self) -> None:
+        for device in ("/dev/sg9", "/dev/sg8"):
+            for reverse in (False, True):
+                with self.subTest(device=device, reverse=reverse):
+                    inferred = parse_sg_ses_aes(self.INVALID_AES, "sg_ses -p aes /dev/sg9")
+                    verified = parse_sg_ses_aes(
+                        self.INVALID_AES.replace("flagged as invalid", "device slot number: 2"),
+                        f"sg_ses -p aes {device}",
+                    )
+                    assert inferred is not None and verified is not None
+                    pages = [inferred, verified]
+                    merged = _merge_ses_enclosures(list(reversed(pages)) if reverse else pages)
+                    slot = merged[0].slots[2]
+                    self.assertEqual(slot.slot_number_source, "ses_device_slot_number")
+                    self.assertEqual(slot.reported_slot_number, 2)
+                    candidates, _ = build_slot_candidates_from_ses_enclosures(merged, 2, None)
+                    self.assertEqual(candidates[1]["ses_slot_number"], 2)
+                    targets = {item["ses_device"]: item["ses_slot_number"]
+                               for item in candidates[1]["ses_targets"]}
+                    expected: dict[str, int | None] = {device: 2}
+                    if device != "/dev/sg9":
+                        expected["/dev/sg9"] = None
+                    self.assertEqual(targets, expected)
+
     def test_aes_invalid_descriptor_stays_unmapped_without_consistent_offset(self) -> None:
         output = """
   EXAMPLE  AMBIGUOUSOFFSET    0100

@@ -1134,11 +1134,11 @@ def _finalize_ses_invalid_descriptor_evidence(
 
 
 def _ses_control_slot_number(slot: SESMapSlot, ses_device: str | None) -> int | None:
-    # Display ordinals and SG descriptor labels are not --dev-slot-num
-    # coordinates. CORE descriptors still use their typed element target.
+    # Display ordinals, SG descriptor labels and inferred invalid-AES bays
+    # are not --dev-slot-num coordinates. CORE retains typed element control.
     if slot.slot_number_source == "ses_element_id_fallback" or (
         ses_device and ses_device.startswith("/dev/sg")
-        and slot.slot_number_source == "ses_description"
+        and slot.slot_number_source in {"ses_description", "ses_element_index_invalid_descriptor"}
     ):
         return None
     return slot.slot_number

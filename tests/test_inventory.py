@@ -15546,6 +15546,95 @@ Consumers:
                     )
                 self.assertEqual(service._run_ssh_command.await_count, 2)
 
+    def invalid_aes_outputs(self):
+        return self.AES.replace(
+            "      Transport protocol: SAS\n      number of phys: 0, device slot number: 2",
+            "      flagged as invalid",
+        )
+
+    async def test_invalid_aes_inference_is_display_only_in_public_led_path(self):
+        for platform, page_order in itertools.product(
+            ("scale", "quantastor"), ("aes-only", "ec-aes", "aes-ec"),
+        ):
+            with self.subTest(platform=platform, page_order=page_order):
+                items = [("sg_ses -p aes /dev/sg9", self.invalid_aes_outputs())]
+                if page_order == "ec-aes":
+                    items.insert(0, ("sg_ses -p ec /dev/sg9", self.EC))
+                elif page_order == "aes-ec":
+                    items.append(("sg_ses -p ec /dev/sg9", self.EC))
+                service = self.make_service(platform, dict(items))
+                snapshot = await service.get_snapshot()
+                slot = next(item for item in snapshot.slots if item.ssh_ses_element_id == 1)
+                self.assertEqual(len(snapshot.slots), 2)
+                self.assertEqual(slot.slot, 1)
+                self.assertEqual(slot.raw_status["slot_number_source"], "ses_element_index_invalid_descriptor")
+                self.assertIn("consistent offset", slot.raw_status["slot_number_warning"])
+                self.assertFalse(slot.present)
+                for action in (LedAction.identify, LedAction.clear):
+                    with self.assertRaises(TrueNASAPIError):
+                        await service.set_slot_led(slot.slot, action, invalidate_snapshot=False)
+                service._run_ssh_command.assert_not_awaited()
+                service.truenas_client.set_slot_status.assert_not_awaited()
+                self.assertFalse(slot.led_supported)
+                self.assertTrue(slot.led_reason)
+                self.assertEqual(slot.ssh_ses_targets, [])
+                self.assertIsNone(slot.raw_status["ses_slot_number"])
+                # The actual reported neighbor stays controllable, not a blanket LED disable.
+                anchor = next(item for item in snapshot.slots if item.ssh_ses_element_id == 0)
+                self.assertTrue(anchor.led_supported)
+                for action, flag in ((LedAction.identify, "--set=ident"), (LedAction.clear, "--clear=ident")):
+                    await service.set_slot_led(anchor.slot, action, invalidate_snapshot=False)
+                    service._run_ssh_command.assert_awaited_with(
+                        f"sudo -n /usr/bin/sg_ses --dev-slot-num=1 {flag} /dev/sg9", None,
+                    )
+                self.assertEqual(service._run_ssh_command.await_count, 2)
+
+    async def test_invalid_aes_without_offset_remains_unavailable(self):
+        invalid = self.invalid_aes_outputs().replace(
+            "      Transport protocol: SAS\n      number of phys: 0, device slot number: 1",
+            "      flagged as invalid",
+        )
+        for platform in ("scale", "quantastor"):
+            with self.subTest(platform=platform):
+                service = self.make_service(platform, {
+                    "sg_ses -p ec /dev/sg9": self.EC,
+                    "sg_ses -p aes /dev/sg9": invalid,
+                })
+                snapshot = await service.get_snapshot()
+                for slot in snapshot.slots:
+                    self.assertFalse(slot.led_supported)
+                    for action in (LedAction.identify, LedAction.clear):
+                        with self.assertRaises(TrueNASAPIError):
+                            await service.set_slot_led(slot.slot, action, invalidate_snapshot=False)
+                service._run_ssh_command.assert_not_awaited()
+                service.truenas_client.set_slot_status.assert_not_awaited()
+
+    async def test_verified_aes_path_does_not_promote_inferred_multipath_peer(self):
+        for platform, device, reverse in itertools.product(
+            ("scale", "quantastor"), ("/dev/sg9", "/dev/sg8"), (False, True),
+        ):
+            with self.subTest(platform=platform, device=device, reverse=reverse):
+                items = [
+                    ("sg_ses -p aes /dev/sg9", self.invalid_aes_outputs()),
+                    ("sg_ses --join --filter /dev/sg9", self.JOIN)
+                    if device == "/dev/sg9" else (f"sg_ses -p aes {device}", self.AES),
+                ]
+                service = self.make_service(platform, dict(reversed(items) if reverse else items))
+                snapshot = await service.get_snapshot()
+                slot = next(item for item in snapshot.slots if item.ssh_ses_element_id == 1)
+                self.assertTrue(slot.led_supported)
+                self.assertEqual(slot.raw_status["slot_number_source"], "ses_device_slot_number")
+                self.assertEqual(slot.ssh_ses_targets, [{
+                    "ses_device": device, "ses_element_id": 1, "ses_slot_number": 2,
+                }])
+                for action, flag in ((LedAction.identify, "--set=ident"), (LedAction.clear, "--clear=ident")):
+                    await service.set_slot_led(slot.slot, action, invalidate_snapshot=False)
+                    service._run_ssh_command.assert_awaited_with(
+                        f"sudo -n /usr/bin/sg_ses --dev-slot-num=2 {flag} {device}", None,
+                    )
+                self.assertEqual(service._run_ssh_command.await_count, 2)
+                service.truenas_client.set_slot_status.assert_not_awaited()
+
     async def test_descriptor_only_join_keeps_display_but_never_plans_led(self):
         descriptor_only = "\n".join(
             line for line in self.JOIN.splitlines() if "device slot number:" not in line
