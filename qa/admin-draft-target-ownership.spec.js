@@ -36,7 +36,7 @@ print(env.get_template('index.html').render(admin_bootstrap_json=sys.stdin.read(
 `, path.join(root, "admin_service/templates")], { input: JSON.stringify(bootstrap), encoding: "utf8" });
 
 async function openFixture(page) {
-  const pending = { saves: [], candidates: [], edits: [], states: 0, errors: [], unexpected: [], state: JSON.parse(JSON.stringify(bootstrap)) };
+  const pending = { saves: [], candidates: [], edits: [], states: 0, lists: 0, restores: [], inspections: 0, heldStates: [], holdState: false, errors: [], unexpected: [], state: JSON.parse(JSON.stringify(bootstrap)) };
   page.on("pageerror", (error) => pending.errors.push(error.message));
   await page.route("**/*", async (route) => {
     const url = new URL(route.request().url());
@@ -66,7 +66,25 @@ async function openFixture(page) {
       pending.edits.push({ path: url.pathname, body: route.request().postDataJSON(), respond: json });
       return;
     }
-    if (url.pathname === "/api/admin/state") { pending.states++; return json(pending.state); }
+    if (url.pathname === "/api/admin/state") {
+      pending.states++;
+      if (pending.holdState) { pending.heldStates.push({ respond: json }); return; }
+      return json(pending.state);
+    }
+    if (url.pathname === "/api/admin/backups") {
+      pending.lists++;
+      return json({ available: true, classes: {}, targets: [], artifacts: ["first", "second"].map(id => ({
+        id, backup_class: "config", state: "ok", restorable: true, verified: true,
+        created_at: "2026-01-01T00:00:00Z", size: 128, location: { provider: "local" }, encryption_mode: "plaintext",
+      })) });
+    }
+    if (url.pathname.endsWith("/restore/inspect")) {
+      return json({ encryption_mode: "plaintext", inspection_receipt: `synthetic-receipt-${++pending.inspections}`, systems: [] });
+    }
+    if (url.pathname.endsWith("/restore/import")) {
+      pending.restores.push({ path: url.pathname, headers: route.request().headers(), respond: json });
+      return;
+    }
     if (url.pathname === "/api/admin/storage-views/live-enclosures") return json({ enclosures: [], system_id: url.searchParams.get("system_id") });
     if (url.pathname === "/api/admin/history/orphaned") return json({ orphaned_systems: [] });
     if (url.pathname === "/api/admin/system-setup/sudoers-preview") return json({ content: "Synthetic preview" });
@@ -78,6 +96,8 @@ async function openFixture(page) {
   await expect(page.locator("#setup-system-id")).toHaveValue("system-a");
   await page.locator("details").evaluateAll((nodes) => nodes.forEach((node) => { node.open = true; }));
   await expect.poll(() => pending.candidates.length).toBeGreaterThan(0);
+  // Discovery dispatch can precede the queued storage-view paint.
+  await expect(page.locator('[data-storage-view-id="view-b"]')).toBeVisible();
   return pending;
 }
 async function save(page, pending) {
@@ -339,6 +359,344 @@ test("late target failure cannot clear the newer target candidates or publish it
   await expect(page.locator("#setup-storage-view-device-names")).toHaveValue("sdb");
   clean(pending);
 });
+
+// #842 successor corrections to inherited #745 transport and restore behavior.
+for (const online of [true, false]) {
+  test(`local request ignores advisory online=${online}`, async ({ page }) => {
+    const p = await openFixture(page);
+    await page.evaluate(value => Object.defineProperty(navigator, "onLine", { configurable: true, get: () => value }), online);
+    const before = p.states;
+    await page.locator("#refresh-state-button").click();
+    await expect.poll(() => p.states).toBe(before + 1);
+    await expect(page.locator("#refresh-state-button")).toBeEnabled();
+    const request = await save(page, p);
+    await acknowledge(request); await finished(page);
+    expect(p.saves).toHaveLength(1);
+    await expectCleanReset(page); clean(p);
+  });
+
+  test(`failed dispatched save online=${online} stays unknown without automatic retry`, async ({ page }) => {
+    const p = await openFixture(page);
+    let calls = 0;
+    await page.route("**/api/admin/system-setup", route => { calls++; return route.abort("connectionrefused"); });
+    await page.evaluate(value => Object.defineProperty(navigator, "onLine", { configurable: true, get: () => value }), online);
+    await page.locator("#setup-system-label").fill("Retained draft");
+    await page.locator("#setup-create-button").click();
+    await expect(page.locator("#setup-result")).toContainText("outcome is unknown");
+    await finished(page);
+    expect(calls).toBe(1);
+    await expect(page.locator("#setup-system-label")).toHaveValue("Retained draft");
+    await expectDiscard(page); clean(p);
+  });
+}
+
+const restoredResult = { ok: true, systems: [], default_system_id: null, restored_paths: [],
+  restored_history_database: false, stopped_containers: [], restarted_containers: [], restart_failures: {} };
+async function dispatchRestore(page, p) {
+  await page.locator('[data-admin-view-button="backups"]').click();
+  await page.locator('[data-backup-action="restore"][data-backup-id="first"]').click();
+  await page.locator('[data-backup-action="restore-inspect"]').click();
+  await page.locator('[data-backup-action="restore-import"]').click();
+  await expect.poll(() => p.restores.length).toBe(1);
+  expect(p.restores[0].headers["x-backup-inspection-receipt"]).toBe("synthetic-receipt-1");
+}
+
+for (const mode of ["open", "closed", "successor", "new draft", "refresh pending target switch"]) {
+  test(`dispatched restore ${mode} refreshes global state without stealing ownership`, async ({ page }) => {
+    const p = await openFixture(page);
+    await dispatchRestore(page, p);
+    const before = { states: p.states, lists: p.lists };
+    if (mode !== "open") await page.getByRole("button", { name: "Close", exact: true }).click();
+    if (mode === "successor") {
+      await page.locator('[data-backup-action="restore"][data-backup-id="second"]').click();
+      await page.locator('[data-backup-action="restore-inspect"]').click();
+      await expect(page.locator('[data-backup-action="restore-import"]')).toBeVisible();
+    }
+    const dialogText = await page.locator("#backup-library-dialog").textContent();
+    const bannerText = await page.locator("#admin-status-banner").textContent();
+    if (mode === "new draft" || mode === "refresh pending target switch") {
+      await page.locator('[data-admin-view-button="operations"]').click();
+      await page.locator("#setup-system-label").fill("Retained restore draft");
+      p.holdState = mode === "refresh pending target switch";
+    }
+    p.state.systems = p.state.systems.map(s => ({ ...s, label: `Restored ${s.id}` }));
+    await p.restores[0].respond(restoredResult);
+    await expect.poll(() => p.states).toBe(before.states + 1);
+    if (p.holdState) {
+      await expect.poll(() => p.heldStates.length).toBe(1);
+      page.once("dialog", dialog => dialog.accept());
+      await page.locator('[data-existing-system-id="system-b"]').click();
+      await page.locator('[data-storage-view-id="view-b"]').click();
+      await page.locator("#setup-system-label").fill("Later B");
+      p.holdState = false;
+      await p.heldStates[0].respond(p.state);
+    }
+    await expect.poll(() => p.lists).toBe(before.lists + 1);
+    await expect(page.locator('[data-existing-system-id="system-a"]')).toContainText("Restored system-a");
+    if (mode === "open") await expect(page.locator(".backup-dialog-result")).toContainText("Restored");
+    else {
+      await expect(page.locator("#backup-library-dialog")).toHaveText(dialogText);
+      await expect(page.locator("#admin-status-banner")).toHaveText(bannerText);
+      if (mode !== "successor") await expect(page.locator("#backup-library-dialog")).not.toBeVisible();
+    }
+    if (mode === "new draft" || mode === "refresh pending target switch") {
+      const switched = mode === "refresh pending target switch";
+      await expect(page.locator("#setup-system-id")).toHaveValue(switched ? "system-b" : "system-a");
+      await expect(page.locator("#setup-system-label")).toHaveValue(switched ? "Later B" : "Retained restore draft");
+      await expect(page.locator("#setup-storage-view-target-system")).toHaveValue(switched ? "node-b" : "node-a");
+      await expectDiscard(page, switched ? "Restored system-b" : "Restored system-a");
+      const request = await save(page, p);
+      expect(request.body.api_password).toBe(keep);
+      expect(request.body.storage_views.map(v => v.binding.target_system_id)).toEqual(["node-a", "node-b"]);
+      await acknowledge(request); await finished(page);
+    }
+    if (mode === "successor") {
+      // The successor's actual receipt must survive the stale first completion.
+      await page.locator('[data-backup-action="restore-import"]').click();
+      await expect.poll(() => p.restores.length).toBe(2);
+      expect(p.restores[1].path).toContain("/second/");
+      expect(p.restores[1].headers["x-backup-inspection-receipt"]).toBe("synthetic-receipt-2");
+      await p.restores[1].respond(restoredResult);
+      await expect(page.locator(".backup-dialog-result")).toContainText("Restored");
+    } else expect(p.restores).toHaveLength(1);
+    clean(p);
+  });
+}
+
+test('failed old refresh cannot overwrite a newer decided restore banner', async ({page}) => {
+  const p = await openFixture(page);
+  await dispatchRestore(page, p);
+  await page.getByRole('button', { name: 'Close', exact: true }).click();
+  p.holdState = true;
+  await p.restores[0].respond(restoredResult);
+  await expect.poll(() => p.heldStates.length).toBe(1);
+  await page.locator('[data-backup-action="restore"][data-backup-id="second"]').click();
+  await page.locator('[data-backup-action="restore-inspect"]').click();
+  await expect(page.locator('[data-backup-action="restore-import"]')).toBeVisible();
+  await page.locator('[data-backup-action="restore-import"]').click();
+  await expect.poll(() => p.restores.length).toBe(2);
+  expect(p.restores[1].headers['x-backup-inspection-receipt']).toBe('synthetic-receipt-2');
+  await p.restores[1].respond(restoredResult);
+  await expect(page.locator('#admin-status-banner')).toHaveText('Backup restored.');
+  await expect(page.locator('.backup-dialog-result')).toContainText('Restored');
+  const newerBanner = await page.locator('#admin-status-banner').textContent();
+  // Release the older restore's quiet state read only after the second restore is decided.
+  p.holdState = false;
+  await p.heldStates[0].respond({detail: 'Synthetic older refresh failure'}, 503);
+  await expect.poll(() => p.states).toBe(2);
+  await expect(page.locator('#refresh-state-button')).toBeEnabled();
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  expect(p.restores).toHaveLength(2);
+  clean(p);
+  await expect(page.locator('#admin-status-banner')).toHaveText(newerBanner);
+});
+
+
+
+// #842-TERMINAL-1: a refresh must keep its caller's notification ownership,
+// including while waiting behind another refresh. All requests remain synthetic.
+async function closedRestoreRefresh(page, p) {
+  await dispatchRestore(page, p);
+  await page.getByRole("button", { name: "Close", exact: true }).click();
+  p.holdState = true;
+  await p.restores[0].respond(restoredResult);
+  await expect.poll(() => p.heldStates.length).toBe(1);
+}
+async function secondRestore(page, p) {
+  await page.locator('[data-backup-action="restore"][data-backup-id="second"]').click();
+  await page.locator('[data-backup-action="restore-inspect"]').click();
+  await page.locator('[data-backup-action="restore-import"]').click();
+  await expect.poll(() => p.restores.length).toBe(2);
+  expect(p.restores[1].headers["x-backup-inspection-receipt"]).toBe("synthetic-receipt-2");
+}
+async function failHeldRefresh(page, p, index = 0) {
+  const response = page.waitForResponse(r => r.url().endsWith("/api/admin/state") && r.status() === 503);
+  await p.heldStates[index].respond({ detail: "Synthetic older refresh failure" }, 503);
+  await response;
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+}
+
+for (const successor of ["pending restore", "failed restore", "foreground refresh", "editor HA draft", "typing roundtrip"]) {
+  test(`late refresh error retains ${successor} ownership`, async ({ page }) => {
+    const p = await openFixture(page);
+    await closedRestoreRefresh(page, p);
+    const lists = p.lists;
+    if (successor.includes("restore")) {
+      await secondRestore(page, p);
+      if (successor === "failed restore") {
+        await p.restores[1].respond({ detail: "Synthetic newer restore refusal" }, 409);
+        await expect(page.locator("#admin-status-banner")).toContainText("Synthetic newer restore refusal");
+      }
+    } else {
+      await page.locator('[data-admin-view-button="operations"]').click();
+      if (successor === "foreground refresh") await page.locator("#setup-inspect-tls-button").click();
+      else if (successor === "editor HA draft") {
+        await page.locator('[data-existing-system-id="system-b"]').click();
+        await page.locator('[data-storage-view-id="view-b"]').click();
+        await page.locator("#setup-system-label").fill("Later B draft");
+      } else {
+        await page.locator("#setup-system-label").fill("Temporary draft");
+        await page.locator("#setup-system-label").fill("Synthetic A");
+      }
+      if (successor === "foreground refresh") await expect(page.locator("#admin-status-banner")).toContainText("Fetched the presented TLS certificate details");
+    }
+    const banner = await page.locator("#admin-status-banner").textContent();
+    const dialog = await page.locator("#backup-library-dialog").textContent();
+    p.holdState = false;
+    await failHeldRefresh(page, p);
+    await expect.poll(() => p.lists).toBe(lists + 1);
+    await expect(page.locator("#refresh-state-button")).toBeEnabled();
+    await expect(page.locator("#admin-status-banner")).toHaveText(banner);
+    await expect(page.locator("#backup-library-dialog")).toHaveText(dialog);
+    if (successor === "pending restore") {
+      await expect(page.locator(".backup-dialog-result")).toContainText("Restoring...");
+      await p.restores[1].respond(restoredResult);
+      await expect(page.locator("#admin-status-banner")).toHaveText("Backup restored.");
+      await expect.poll(() => p.states).toBe(2);
+      await expect.poll(() => p.lists).toBe(lists + 2);
+    } else if (successor === "editor HA draft" || successor === "typing roundtrip") {
+      const changedSystem = successor === "editor HA draft";
+      await expect(page.locator("#setup-system-id")).toHaveValue(changedSystem ? "system-b" : "system-a");
+      await expect(page.locator("#setup-storage-view-target-system")).toHaveValue(changedSystem ? "node-b" : "node-a");
+      await expectDiscard(page, changedSystem ? "Synthetic B" : "Synthetic A");
+      const r = await save(page, p);
+      expect(r.body.api_password).toBe(keep);
+      expect(r.body.storage_views.map(v => v.binding.target_system_id)).toEqual(["node-a", "node-b"]);
+      await acknowledge(r); await finished(page);
+    }
+    expect(p.restores.length).toBe(successor.includes("restore") ? 2 : 1);
+    clean(p);
+  });
+}
+
+test("current restore refresh failure stays observable without undoing its decided result", async ({ page }) => {
+  const p = await openFixture(page);
+  await dispatchRestore(page, p);
+  const lists = p.lists;
+  p.holdState = true;
+  await p.restores[0].respond(restoredResult);
+  await expect.poll(() => p.heldStates.length).toBe(1);
+  await expect(page.locator("#admin-status-banner")).toHaveText("Backup restored.");
+  await failHeldRefresh(page, p);
+  await expect(page.locator("#admin-status-banner")).toHaveText("Backup restored, but the page could not refresh. Refresh to check the current settings and service status.");
+  await expect(page.locator("#admin-status-banner")).toHaveClass(/is-error/);
+  await expect(page.locator(".backup-dialog-result")).toContainText("Restored");
+  await expect.poll(() => p.lists).toBe(lists + 1);
+  await expect(page.locator("#refresh-state-button")).toBeEnabled();
+  expect(p.restores).toHaveLength(1); clean(p);
+});
+
+test("current foreground refresh failure stays observable and can be refreshed explicitly", async ({ page }) => {
+  const p = await openFixture(page);
+  p.holdState = true;
+  await page.locator("#refresh-state-button").click();
+  await expect.poll(() => p.heldStates.length).toBe(1);
+  await failHeldRefresh(page, p);
+  await expect(page.locator("#admin-status-banner")).toHaveText("Unable to refresh admin state: Synthetic older refresh failure");
+  await expect(page.locator("#admin-status-banner")).toHaveClass(/is-error/);
+  await expect(page.locator("#refresh-state-button")).toBeEnabled();
+  expect(p.states).toBe(1);
+  p.holdState = false;
+  await page.locator("#refresh-state-button").click();
+  await expect(page.locator("#admin-status-banner")).toHaveText("Refreshed.");
+  expect(p.states).toBe(2); clean(p);
+});
+
+for (const laterAction of [false, true]) {
+  test(`queued restore refresh error ${laterAction ? "cannot claim a later foreground result" : "reports the current restore owner"}`, async ({ page }) => {
+    const p = await openFixture(page);
+    await closedRestoreRefresh(page, p);
+    const lists = p.lists;
+    await secondRestore(page, p);
+    await p.restores[1].respond(restoredResult);
+    await expect(page.locator("#admin-status-banner")).toHaveText("Backup restored.");
+    if (laterAction) {
+      await page.getByRole("button", { name: "Close", exact: true }).click();
+      await page.locator('[data-admin-view-button="operations"]').click();
+      await page.locator("#setup-inspect-tls-button").click();
+      await expect(page.locator("#admin-status-banner")).toContainText("Fetched the presented TLS certificate details");
+    }
+    const banner = await page.locator("#admin-status-banner").textContent();
+    await failHeldRefresh(page, p);
+    await expect.poll(() => p.heldStates.length).toBe(2);
+    await expect(page.locator("#refresh-state-button")).toBeDisabled();
+    await expect(page.locator("#admin-status-banner")).toHaveText(banner);
+    await failHeldRefresh(page, p, 1);
+    await expect(page.locator("#refresh-state-button")).toBeEnabled();
+    await expect(page.locator("#admin-status-banner")).toHaveText(laterAction ? banner : "Backup restored, but the page could not refresh. Refresh to check the current settings and service status.");
+    await expect.poll(() => p.lists).toBe(lists + 2);
+    expect(p.states).toBe(2); expect(p.restores).toHaveLength(2); clean(p);
+  });
+}
+
+for (const outcome of ["success", "failure"]) {
+  test(`older foreground refresh ${outcome} cannot replace a newer restore result`, async ({ page }) => {
+    const p = await openFixture(page);
+    p.holdState = true;
+    await page.locator("#refresh-state-button").click();
+    await expect.poll(() => p.heldStates.length).toBe(1);
+    await dispatchRestore(page, p);
+    await p.restores[0].respond(restoredResult);
+    await expect(page.locator("#admin-status-banner")).toHaveText("Backup restored.");
+    p.holdState = false;
+    if (outcome === "failure") await failHeldRefresh(page, p);
+    else await p.heldStates[0].respond(p.state);
+    await expect.poll(() => p.states).toBe(2);
+    await expect(page.locator("#refresh-state-button")).toBeEnabled();
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    await expect(page.locator("#admin-status-banner")).toHaveText("Backup restored.");
+    await expect(page.locator(".backup-dialog-result")).toContainText("Restored");
+    expect(p.restores).toHaveLength(1); clean(p);
+  });
+}
+
+
+test("late closed restore cannot silence the current queued restore refresh error", async ({ page }) => {
+  const p = await openFixture(page);
+  p.holdState = true;
+  await page.locator("#refresh-state-button").click();
+  await expect.poll(() => p.heldStates.length).toBe(1);
+  await dispatchRestore(page, p);
+  await page.getByRole("button", { name: "Close", exact: true }).click();
+  await secondRestore(page, p);
+  await p.restores[1].respond(restoredResult);
+  await expect(page.locator("#admin-status-banner")).toHaveText("Backup restored.");
+  // A finishes last, after B queued its refresh, but A no longer owns a dialog.
+  await p.restores[0].respond(restoredResult);
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  await p.heldStates[0].respond(p.state);
+  await expect.poll(() => p.heldStates.length).toBe(2);
+  await failHeldRefresh(page, p, 1);
+  await expect(page.locator("#admin-status-banner")).toHaveText("Backup restored, but the page could not refresh. Refresh to check the current settings and service status.");
+  await expect(page.locator(".backup-dialog-result")).toContainText("Restored");
+  await expect(page.locator("#refresh-state-button")).toBeEnabled();
+  expect(p.states).toBe(2); expect(p.restores).toHaveLength(2); clean(p);
+});
+
+for (const edit of ["editor", "HA target", "typing roundtrip", "programmatic profile"]) {
+  test(`foreground refresh error cannot replace later ${edit} intent`, async ({ page }) => {
+    const p = await openFixture(page);
+    p.holdState = true;
+    await page.locator("#refresh-state-button").click();
+    await expect.poll(() => p.heldStates.length).toBe(1);
+    if (edit === "editor") await page.locator('[data-existing-system-id="system-b"]').click();
+    else if (edit === "HA target") await page.locator('[data-storage-view-id="view-b"]').click();
+    else if (edit === "programmatic profile") await clickProfile(page);
+    else {
+      await page.locator("#setup-system-label").fill("Temporary draft");
+      await page.locator("#setup-system-label").fill("Synthetic A");
+    }
+    const banner = await page.locator("#admin-status-banner").textContent();
+    await failHeldRefresh(page, p);
+    await expect(page.locator("#refresh-state-button")).toBeEnabled();
+    await expect(page.locator("#admin-status-banner")).toHaveText(banner);
+    await expect(page.locator("#setup-system-id")).toHaveValue(edit === "editor" ? "system-b" : "system-a");
+    await expect(page.locator("#setup-storage-view-target-system")).toHaveValue(edit === "HA target" ? "node-b" : "node-a");
+    if (["typing roundtrip", "programmatic profile"].includes(edit)) await expectDiscard(page);
+    if (edit === "programmatic profile") await expect(page.locator("#setup-profile")).toHaveValue("synthetic-profile");
+    expect(p.states).toBe(1); clean(p);
+  });
+}
 
 // Independent ADM-DRAFT-R1 regressions and #693 controls.
 

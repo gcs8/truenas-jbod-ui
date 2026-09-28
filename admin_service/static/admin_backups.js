@@ -1201,21 +1201,27 @@
               timeoutMs: LONG_TIMEOUT_MS,
             }
           );
-          if (!scope.live()) return;
-          const outcome = deps.describeMaintenanceOutcome({
-            stopped: payload.stopped_containers,
-            restarted: payload.restarted_containers,
-            failures: payload.restart_failures && typeof payload.restart_failures === "object"
-              ? Object.keys(payload.restart_failures).join(",")
-              : "",
-          });
-          const node = scope.result("");
-          if (node) deps.renderMaintenanceResult(node, "Restored", outcome);
-          setBanner(outcome.ok ? "Backup restored." : `Backup restored, but ${outcome.sentence}`, outcome.ok ? "success" : "error");
-          const passphrase = els.dialog?.querySelector("#backup-restore-passphrase");
-          if (passphrase) passphrase.value = "";
+          // A decided restore changes global state even if its dialog closed.
+          // Only the matching dialog generation owns its result and passphrase.
+          if (scope.live()) {
+            const outcome = deps.describeMaintenanceOutcome({
+              stopped: payload.stopped_containers,
+              restarted: payload.restarted_containers,
+              failures: payload.restart_failures && typeof payload.restart_failures === "object"
+                ? Object.keys(payload.restart_failures).join(",")
+                : "",
+            });
+            const node = scope.result("");
+            if (node) deps.renderMaintenanceResult(node, "Restored", outcome);
+            setBanner(outcome.ok ? "Backup restored." : `Backup restored, but ${outcome.sentence}`, outcome.ok ? "success" : "error");
+            const passphrase = els.dialog?.querySelector("#backup-restore-passphrase");
+            if (passphrase) passphrase.value = "";
+          }
           try {
-            await deps.refreshAdminState?.();
+            await deps.refreshAdminState?.({
+              canPublish: scope.live,
+              failureMessage: "Backup restored, but the page could not refresh. Refresh to check the current settings and service status.",
+            });
             await load({ quiet: true });
           } catch (_) {
             if (scope.live()) {

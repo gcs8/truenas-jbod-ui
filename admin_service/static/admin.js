@@ -73,7 +73,8 @@
     runtimeBehaviorSaving: false,
     refreshPromise: null,
     refreshQueued: null,
-    refreshQueuedQuiet: true,
+    refreshQueuedOptions: null,
+    bannerRevision: 0,
     runtimeActionPromises: new Map(),
     runtimeActionControllers: new Map(),
     countdownTimerId: null,
@@ -340,6 +341,7 @@
   }
 
   function setBanner(message, tone = "info") {
+    state.bannerRevision = (state.bannerRevision || 0) + 1;
     if (!elements.banner) {
       return;
     }
@@ -5729,23 +5731,18 @@
     return error;
   }
 
-  function classifyTransportFailure(mutating, offlineBeforeDispatch) {
-    // Only the offline state observed *before* fetch was invoked proves the
-    // request never left the browser. Reading navigator.onLine at catch time
-    // cannot: the link may have dropped after the sidecar received the
-    // request, so a mutation that failed after dispatch stays unknown.
-    if (offlineBeforeDispatch) {
-      return "transport";
-    }
-    return mutating ? "unknown" : "transport";
+  function classifyTransportFailure(mutating, requestDispatched) {
+    // Only transport's dispatch marker can prove a request was not sent.
+    // navigator.onLine is advisory, including for reachable LAN services.
+    return mutating && requestDispatched !== false ? "unknown" : "transport";
   }
 
-  function describeTransportFailure(outcome, offlineBeforeDispatch) {
+  function describeTransportFailure(outcome, offlineHint) {
     if (outcome === "unknown") {
       return "Admin could not be reached after the request was sent, so it is unknown whether the change was applied. Refresh to check before retrying.";
     }
-    if (offlineBeforeDispatch) {
-      return "This browser is offline, so the request was not sent. Reconnect, then retry.";
+    if (offlineHint) {
+      return "Admin could not be reached. The browser reports being offline; check the local connection and that Admin is running, then retry.";
     }
     return "Admin could not be reached, so nothing was changed. Check that it is running, then retry.";
   }
@@ -5818,12 +5815,8 @@
 
   async function fetchJson(url, options = {}) {
     const mutating = isMutatingRequest(options);
-    const offlineBeforeDispatch = browserIsOffline();
-    if (offlineBeforeDispatch && !options.signal?.aborted) {
-      const error = adminRequestError(describeTransportFailure("transport", true), "transport");
-      error.requestDispatched = false;
-      throw error;
-    }
+    // An offline hint must not veto a request to a reachable local sidecar.
+    const offlineHint = browserIsOffline();
     try {
       const { body } = await fetchOrReportStopped(url, {
         ...options,
@@ -5872,8 +5865,8 @@
         error.adminOutcome = "transport";
         throw error;
       }
-      const outcome = classifyTransportFailure(mutating, offlineBeforeDispatch);
-      const failure = adminRequestError(describeTransportFailure(outcome, offlineBeforeDispatch), outcome);
+      const outcome = classifyTransportFailure(mutating, error.requestDispatched);
+      const failure = adminRequestError(describeTransportFailure(outcome, offlineHint), outcome);
       failure.requestDispatched = error.requestDispatched;
       throw failure;
     }
@@ -6299,28 +6292,40 @@
     }
   }
 
-  function refreshState({ quiet = false } = {}) {
+  function refreshState({ quiet = false, canPublish = null, failureMessage = null } = {}) {
+    // Capture notification ownership now, even if this read must queue. A quiet
+    // post-write refresh still runs after its dialog closes, but cannot borrow
+    // a successor's banner or editor intent when it eventually completes.
+    const admitted = !canPublish || canPublish();
+    if (admitted) state.bannerRevision = (state.bannerRevision || 0) + 1;
+    const options = { quiet, canPublish, failureMessage,
+      bannerRevision: state.bannerRevision,
+      editorGeneration: state.setupEditorGeneration,
+      draftRevision: state.setupDraftRevision,
+      storageViewId: state.selectedStorageViewId };
     if (state.refreshPromise) {
       // A refresh is already running. Instead of silently returning (which left callers
       // that awaited refreshState() after a save reading stale lists), queue exactly one
       // follow-up refresh that starts once the in-flight one settles, and hand every
       // caller that promise so their post-refresh lookups observe state at least as new
       // as their own write.
-      state.refreshQueuedQuiet = Boolean(state.refreshQueuedQuiet) && Boolean(quiet);
+      // A closed restore still requires the read, but cannot retire a live
+      // queued caller's notification. All callers await the same fresh read.
+      if (!state.refreshQueued || admitted) state.refreshQueuedOptions = options;
       if (!state.refreshQueued) {
         state.refreshQueued = state.refreshPromise
           .catch(() => {})
-          .then(() => startRefreshState({ quiet: state.refreshQueuedQuiet }));
+          .then(() => startRefreshState(state.refreshQueuedOptions));
       }
       return state.refreshQueued;
     }
-    return startRefreshState({ quiet });
+    return startRefreshState(options);
   }
 
-  function startRefreshState({ quiet = false } = {}) {
+  function startRefreshState(options = {}) {
     state.refreshQueued = null;
-    state.refreshQueuedQuiet = true;
-    const run = runRefreshState({ quiet }).finally(() => {
+    state.refreshQueuedOptions = null;
+    const run = runRefreshState(options).finally(() => {
       if (state.refreshPromise === run) {
         state.refreshPromise = null;
       }
@@ -6329,12 +6334,18 @@
     return run;
   }
 
-  async function runRefreshState({ quiet = false } = {}) {
+  async function runRefreshState({ quiet = false, canPublish = null, failureMessage = null,
+    bannerRevision = state.bannerRevision, editorGeneration = state.setupEditorGeneration,
+    draftRevision = state.setupDraftRevision, storageViewId = state.selectedStorageViewId } = {}) {
+    const ownsBanner = () => (!canPublish || canPublish()) && state.bannerRevision === bannerRevision
+      && state.setupEditorGeneration === editorGeneration && state.setupDraftRevision === draftRevision
+      && state.selectedStorageViewId === storageViewId;
     if (elements.refreshStateButton) {
       elements.refreshStateButton.disabled = true;
     }
-    if (!quiet) {
+    if (!quiet && ownsBanner()) {
       setBanner("Refreshing...");
+      bannerRevision = state.bannerRevision;
     }
     try {
       const payload = await fetchJson("/api/admin/state");
@@ -6376,11 +6387,13 @@
       // The scan can take minutes on large history; the history section shows its
       // own progress, so the refresh reports done without waiting on it.
       void loadOrphanedHistory({ quiet: true });
-      if (!quiet) {
+      if (!quiet && ownsBanner()) {
         setBanner("Refreshed.", "success");
       }
     } catch (error) {
-      setBanner(`Unable to refresh admin state: ${error.message || error}`, "error");
+      if (ownsBanner()) {
+        setBanner(failureMessage || `Unable to refresh admin state: ${error.message || error}`, "error");
+      }
     } finally {
       if (elements.refreshStateButton) {
         elements.refreshStateButton.disabled = false;
@@ -8242,7 +8255,7 @@
     describeBackupRestoreConfirmation,
     describeMaintenanceOutcome,
     renderMaintenanceResult,
-    refreshAdminState: () => refreshState({ quiet: true }),
+    refreshAdminState: (options = {}) => refreshState({ ...options, quiet: true }),
     isStopped: () => state.sessionStopped,
     isVisible: () => state.currentAdminView === "backups" && document.visibilityState !== "hidden",
     setTimeout: (callback, ms) => window.setTimeout(callback, ms),

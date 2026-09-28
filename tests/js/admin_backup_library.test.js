@@ -864,14 +864,14 @@ for (const status of [400, 403, 409, 422]) {
   });
 }
 
-test("library restore refuses locally offline without sending apply", async () => {
+test("library restore attempts reachable local apply despite offline hint", async () => {
   const fixture = restoreFixture();
   await fixture.prepare();
   fixture.navigator.onLine = false;
   await fixture.library.actions.restoreImport();
-  assert.equal(fixture.applies().length, 0);
-  assert.equal(fixture.refreshCount, 0);
-  assert.match(fixture.banners.at(-1)[0], /offline/i);
+  assert.equal(fixture.applies().length, 1);
+  assert.equal(fixture.refreshCount, 1);
+  assert.match(fixture.banners.at(-1)[0], /Backup restored/i);
   assert.doesNotMatch(fixture.banners.at(-1)[0], /unknown|may or may not/i);
   assert.equal(fixture.library.state.restoreInspection, null);
 });
@@ -968,7 +968,8 @@ for (const success of [true, false]) {
     assert.equal(fixture.elements.dialog.textContent, successorText);
     assert.equal(fixture.elements.dialog.querySelector("#backup-restore-passphrase").value, " synthetic phrase ");
     assert.equal(fixture.banners.length, 0, "stale dialog does not publish banners into a successor operation");
-    assert.equal(fixture.refreshCount, 0);
+    assert.equal(fixture.refreshCount, success ? 1 : 0);
+    assert.equal(fixture.calls.filter(({ url }) => url === "/api/admin/backups").length, success ? 2 : 1);
     assert.equal(fixture.applies().length, 1);
   });
 }
