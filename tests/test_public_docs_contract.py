@@ -1,10 +1,24 @@
 from __future__ import annotations
 
+import ast
+import builtins
+import hashlib
+import io
+import json
+import os
 import re
+import shutil
+import stat
 import subprocess
 import sys
+import tempfile
+from contextlib import redirect_stdout
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 import unittest
+from unittest.mock import MagicMock, patch
 
 import yaml
 
@@ -64,6 +78,404 @@ def run_checker(*args: str) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         check=False,
     )
+
+
+def rotation_staging_code() -> str:
+    """Extract the actual heredoc, never a rewritten staging implementation."""
+    guide = (ROOT / "docs/SEGMENTED_HISTORY_V2.md").read_text(encoding="utf-8")
+    blocks = re.findall(r"```bash\n(.*?)\n```", guide, re.DOTALL)
+    blocks = [block for block in blocks if "STAGE_NAME =" in block]
+    if len(blocks) != 1:
+        raise AssertionError("expected one literal staging recipe")
+    return blocks[0].split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+
+
+class SyntheticStagingOS:
+    """Real descriptor I/O; ownership labels only, NOT cross-UID access proof.
+
+    The literal docs import this narrow os replacement. Every descriptor and
+    path is confined to the fixture; fchown records labels without a host chown.
+    """
+
+    def __init__(self, root: Path, identities: dict[str, str], owners: dict,
+                 *, change_status: bool = False, change_source: bool = False) -> None:
+        self.root = root
+        self.environ = identities
+        self.owners = owners
+        self.descriptors: set[int] = set()
+        self.change_status = change_status
+        self.status_opens = 0
+        self.change_source = change_source
+        self.source_seeks = 0
+        self.source_path = None
+        for name in ("O_RDONLY", "O_WRONLY", "O_CREAT", "O_EXCL", "O_NOFOLLOW",
+                     "O_CLOEXEC", "O_DIRECTORY", "SEEK_SET"):
+            setattr(self, name, getattr(os, name))
+
+    def _fd(self, descriptor):
+        if descriptor not in self.descriptors:
+            raise AssertionError("descriptor escaped synthetic root")
+        return descriptor
+
+    def open(self, name, flags, mode=0o777, *, dir_fd=None):
+        if not isinstance(name, str) or name in ("", ".", "..") or "/" in name or "\\" in name:
+            raise AssertionError("path escaped synthetic root")
+        if dir_fd is None:
+            if name not in {"backup-status", "backups", "history"}:
+                raise AssertionError("unexpected staging root")
+            path = self.root / name
+        else:
+            self._fd(dir_fd)
+            path = name
+        if name == "scheduled-backup.json":
+            self.status_opens += 1
+            if self.change_status and self.status_opens == 2:
+                with (self.root / "backup-status" / name).open("ab") as stream:
+                    stream.write(b" ")
+        descriptor = os.open(path, flags, mode, dir_fd=dir_fd)
+        self.descriptors.add(descriptor)
+        if name.startswith("jbod-scheduled-backup-") and not flags & os.O_CREAT:
+            self.source_path = self.root / "backups/scheduled" / name
+        return descriptor
+
+    def fstat(self, descriptor):
+        metadata = os.fstat(self._fd(descriptor))
+        fields = {name: getattr(metadata, name) for name in dir(metadata) if name.startswith("st_")}
+        fields["st_uid"], fields["st_gid"] = self.owners.get(
+            (metadata.st_dev, metadata.st_ino), (metadata.st_uid, metadata.st_gid)
+        )
+        return SimpleNamespace(**fields)
+
+    def fchown(self, descriptor, uid, gid):
+        metadata = os.fstat(self._fd(descriptor))
+        self.owners[metadata.st_dev, metadata.st_ino] = (uid, gid)
+
+    def close(self, descriptor):
+        os.close(self._fd(descriptor))
+        self.descriptors.remove(descriptor)
+
+    def lseek(self, descriptor, offset, whence):
+        self._fd(descriptor)
+        self.source_seeks += 1
+        if self.change_source and self.source_seeks == 2:
+            assert self.source_path is not None
+            self.source_path.write_bytes(b"changed synthetic archive")
+        return os.lseek(descriptor, offset, whence)
+
+    def __getattr__(self, name):
+        if name in {"read", "write", "fsync", "fchmod", "listdir"}:
+            def descriptor_call(descriptor, *args):
+                return getattr(os, name)(self._fd(descriptor), *args)
+            return descriptor_call
+        if name in {"mkdir", "rmdir", "unlink"}:
+            def relative_call(path, *args, dir_fd):
+                if not isinstance(path, str) or path in ("", ".", "..") or "/" in path or "\\" in path:
+                    raise AssertionError("mutation escaped synthetic root")
+                return getattr(os, name)(path, *args, dir_fd=self._fd(dir_fd))
+            return relative_call
+        raise AttributeError(name)
+
+
+class OperatorRecipeTests(unittest.TestCase):
+    def test_core_standing_yaml_runs_two_read_only_probe_batches(self) -> None:
+        from app.config import SSHConfig
+        from app.services.ssh_probe import SSHProbe
+
+        guide = (ROOT / "docs/SSH_READ_ONLY_SETUP.md").read_text(encoding="utf-8")
+        section = guide.split("For this system, the preferred SSH command list is:", 1)[1]
+        section = section.split("`camcontrol devlist -v` labels", 1)[0]
+        commands = []
+        for block in re.findall(r"```yaml\n(.*?)\n```", section, re.DOTALL):
+            parsed = yaml.safe_load(block)
+            commands.extend(parsed["commands"] if isinstance(parsed, dict) else parsed)
+        self.assertTrue(commands)
+        batches = []
+
+        def client_factory():
+            recorded = []
+            batches.append(recorded)
+            client = MagicMock()
+            client.__enter__.return_value = client
+
+            def exec_command(command, **_kwargs):
+                recorded.append(command)
+                output = MagicMock()
+                output.read.return_value = b""
+                output.channel.recv_exit_status.return_value = 0
+                return io.BytesIO(), output, io.BytesIO(b"")
+
+            client.exec_command.side_effect = exec_command
+            return client
+
+        probe = SSHProbe(SSHConfig(enabled=True, host="core.example.test", user="jbodmap", commands=commands))
+        with patch.object(probe, "_client", side_effect=client_factory):
+            for _ in range(2):
+                results = probe._run_planned_commands_sync(lambda _results: [])
+                self.assertEqual(len(results), len(commands))
+                self.assertTrue(all(result.ok for result in results))
+        self.assertEqual(batches, [commands, commands])
+        self.assertFalse(any(" locate " in command for batch in batches for command in batch), batches)
+        self.assertIn("not a permission allowlist", guide)
+        self.assertIn("verified target", guide)
+        self.assertIn("explicit, capability-gated UI action", guide)
+
+    def test_strict_reference_matches_rejection_and_separate_tofu_controls(self) -> None:
+        import paramiko
+        from app.config import SSHConfig
+        from app.services.ssh_probe import AutoPinHostKeyPolicy, SSHProbe
+
+        guide = (ROOT / "docs/SSH_READ_ONLY_SETUP.md").read_text(encoding="utf-8")
+        self.assertNotIn("first successful SSH connection pins", guide)
+        for text in ("RejectPolicy", "trusted channel", "../wiki/SSH-Setup-and-Sudo.md",
+                     "~/.ssh/known_hosts", "SSH_STRICT_HOST_KEY_CHECKING=false", "TOFU"):
+            self.assertIn(text, guide)
+        with tempfile.TemporaryDirectory() as directory:
+            for strict in (True, False):
+                with self.subTest(strict=strict):
+                    client = MagicMock()
+                    path = str(Path(directory) / "known_hosts")
+                    probe = SSHProbe(SSHConfig(host="core.example.test", strict_host_key_checking=strict,
+                                               known_hosts_path=path))
+                    with patch("app.services.ssh_probe.paramiko.SSHClient", return_value=client):
+                        probe._client()
+                    policy = client.set_missing_host_key_policy.call_args.args[0]
+                    key = MagicMock()
+                    key.get_fingerprint.return_value = b"synthetic"
+                    key.get_name.return_value = "ssh-rsa"
+                    if strict:
+                        self.assertIsInstance(policy, paramiko.RejectPolicy)
+                        with self.assertRaises(paramiko.SSHException):
+                            policy.missing_host_key(client, "core.example.test", key)
+                        client.save_host_keys.assert_not_called()
+                    else:
+                        self.assertIsInstance(policy, AutoPinHostKeyPolicy)
+                        policy.missing_host_key(client, "core.example.test", key)
+                        client.save_host_keys.assert_called_once_with(path)
+
+    def test_admin_claims_match_base_and_overlay_yaml_sources(self) -> None:
+        base = yaml.safe_load((ROOT / "docker-compose.yml").read_text())["services"]
+        overlay = yaml.safe_load((ROOT / "docker-compose.nonroot.yml").read_text())["services"]
+        admin = base["enclosure-admin"]
+        self.assertEqual(admin["user"], "0:0")
+        for key in ("read_only", "cap_drop", "cap_add", "security_opt"):
+            self.assertNotIn(key, admin)
+        hardened = overlay["enclosure-admin"]
+        self.assertEqual(hardened["user"], "0:${APP_GID:-10001}")
+        self.assertIs(hardened["read_only"], True)
+        self.assertEqual(hardened["cap_drop"], ["ALL"])
+        self.assertEqual(hardened["cap_add"], ["CHOWN", "FOWNER"])
+        self.assertEqual(hardened["security_opt"], ["no-new-privileges:true"])
+        self.assertEqual(set(admin["volumes"]), {
+            "./config:/app/config", "./data:/app/data", "./history:/app/history",
+            "host-prep-staging:/app/host-prep", "./config/ssh:/run/ssh:ro",
+            "/var/run/docker.sock:/var/run/docker.sock", "./backup-journal:/app/backup-journal",
+            "./backup-api:/app/backup-api:ro",
+        })
+        for name, service in base.items():
+            if name != "enclosure-admin":
+                self.assertFalse(any("docker.sock" in mount for mount in service["volumes"]))
+        guide = (ROOT / "docs/ADMIN_TRUST_BOUNDARY.md").read_text()
+        for text in ("base `docker-compose.yml`", "`0:0`", "does not declare",
+                     "-f docker-compose.yml -f docker-compose.nonroot.yml", "`0:APP_GID`",
+                     "`./backup-journal`", "named volume", "`host-prep-staging`",
+                     "`/app/host-prep`", "root-equivalent", "CHOWN", "FOWNER"):
+            self.assertIn(text, guide)
+
+    def test_admin_ordered_config_with_installed_compose_only(self) -> None:
+        compose = shutil.which("docker-compose")
+        if compose:
+            command = [compose]
+        elif shutil.which("docker"):
+            command = [shutil.which("docker"), "compose"]
+            if subprocess.run(command + ["version"], capture_output=True, timeout=10).returncode:
+                self.skipTest("Compose plugin unavailable; YAML source contract only")
+        else:
+            self.skipTest("Compose unavailable; YAML source contract only, no merge/runtime proof")
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory)
+            for name in ("docker-compose.yml", "docker-compose.nonroot.yml"):
+                shutil.copyfile(ROOT / name, target / name)
+            (target / ".env").write_text("")
+            env = {"PATH": os.environ.get("PATH", ""), "HOME": directory, "APP_GID": "12345"}
+            for hardened in (False, True):
+                argv = command + ["-f", "docker-compose.yml"]
+                if hardened:
+                    argv += ["-f", "docker-compose.nonroot.yml"]
+                result = subprocess.run(argv + ["config", "--format", "json"], cwd=target,
+                                        env=env, capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                admin = json.loads(result.stdout)["services"]["enclosure-admin"]
+                self.assertEqual(admin["user"], "0:12345" if hardened else "0:0")
+                self.assertEqual(admin.get("read_only", False), hardened)
+
+    def test_staging_numeric_helper_accepts_root_owners_but_not_root_status_group(self) -> None:
+        tree = ast.parse(rotation_staging_code())
+        helper = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "numeric_id")
+        namespace: dict[str, Any] = {"os": SimpleNamespace(environ={"HISTORY_UID": "0", "APP_GID": "0"})}
+        exec(compile(ast.Module(body=[helper], type_ignores=[]), "<documented numeric_id>", "exec"), namespace)
+        try:
+            actual = namespace["numeric_id"]("HISTORY_UID")
+        except SystemExit as error:
+            self.fail(f"documented helper rejects supported root owner: {error}")
+        self.assertEqual(actual, 0)
+        with self.assertRaises(SystemExit):
+            namespace["numeric_id"]("APP_GID")
+        for raw in ("-1", "", "1.5", " 1"):
+            namespace["os"].environ["HISTORY_UID"] = raw
+            with self.assertRaises(SystemExit):
+                namespace["numeric_id"]("HISTORY_UID")
+        guide = (ROOT / "docs/SEGMENTED_HISTORY_V2.md").read_text()
+        shell = next(block for block in re.findall(r"```bash\n(.*?)\n```", guide, re.DOTALL)
+                     if "STAGE_NAME =" in block).split("<<'PY'", 1)[0]
+        defaults = dict(re.findall(r"^([A-Z_]+)=([0-9]+)$", shell, re.MULTILINE))
+        self.assertEqual(defaults, {"HISTORY_UID": "0", "HISTORY_GID": "0", "APP_GID": "10001",
+                                    "BACKUP_UID": "0", "BACKUP_GID": "0"})
+        for name in defaults:
+            self.assertIn(f'{name}="${name}"', shell)
+        base = yaml.safe_load((ROOT / "docker-compose.yml").read_text())["services"]
+        overlay = yaml.safe_load((ROOT / "docker-compose.nonroot.yml").read_text())["services"]
+        self.assertEqual(base["enclosure-history"]["user"], "0:0")
+        self.assertEqual(base["enclosure-backup"]["user"], "${BACKUP_UID:-0}:${BACKUP_GID:-0}")
+        self.assertEqual(overlay["enclosure-history"]["user"], "${APP_UID:-10001}:${APP_GID:-10001}")
+        self.assertEqual(overlay["enclosure-backup"]["user"], "${BACKUP_UID:-1000}:${BACKUP_GID:-1000}")
+        self.assertIn("do not recursively chown", guide)
+
+    @unittest.skipUnless(os.name == "posix", "literal staging requires POSIX descriptor semantics")
+    def test_literal_staging_root_and_nonroot_ownership_labels_and_refusals(self) -> None:
+        from history_service.segment_rotation import _validate_backup_evidence
+
+        code = rotation_staging_code()
+        # Only these imports may execute. No shell, sudo, network, or host paths.
+        allowed = {name: __import__(name) for name in ("hashlib", "json", "re", "stat")}
+        self.assertEqual({alias.name for node in ast.walk(ast.parse(code)) if isinstance(node, ast.Import)
+                          for alias in node.names}, set(allowed) | {"os"})
+        archive_name = "jbod-scheduled-backup-20260101T000000Z-00000000.tar.zst.enc"
+        payload = b"synthetic encrypted-archive-shaped bytes; staging does not decrypt"
+        for history_ids, backup_ids in (((0, 0), (0, 0)), ((10001, 10001), (1000, 1000)),
+                                         ((12001, 12002), (13001, 13002))):
+            for fault in (None, "history_owner", "backup_owner", "status_owner", "archive_owner",
+                          "history_group", "backup_group", "status_group", "archive_group",
+                          "backup_mode", "status_mode", "archive_mode", "digest", "size",
+                          "archive_symlink", "status_symlink", "backup_symlink", "hardlink",
+                          "changed_status", "changed_source", "missing_history"):
+                with self.subTest(history=history_ids, backup=backup_ids, fault=fault):
+                    with tempfile.TemporaryDirectory() as directory:
+                        root = Path(directory)
+                        for name in ("backup-status", "backups/scheduled", "history"):
+                            (root / name).mkdir(parents=True, mode=0o700)
+                        archive = root / "backups/scheduled" / archive_name
+                        archive.write_bytes(payload)
+                        archive.chmod(0o600)
+                        status_path = root / "backup-status/scheduled-backup.json"
+                        status_payload = {"schema_version": 1, "enabled": True, "success_count": 1,
+                                          "failure_count": 0, "last_retention_removed": 0,
+                                          "last_attempt_at": None, "last_failure_at": None,
+                                          "last_success_at": datetime.now(timezone.utc).isoformat(),
+                                          "last_error_code": None,
+                                          "included_groups": ["history_db"], "last_absent_groups": [],
+                                          "last_artifact_name": archive_name, "last_size_bytes": len(payload),
+                                          "last_sha256": hashlib.sha256(payload).hexdigest()}
+                        if fault == "digest":
+                            status_payload["last_sha256"] = "0" * 64
+                        if fault == "size":
+                            status_payload["last_size_bytes"] += 1
+                        if fault == "missing_history":
+                            status_payload["last_absent_groups"] = ["history_db"]
+                        status_path.write_text(json.dumps(status_payload))
+                        status_path.chmod(0o640)
+                        paths = {"history": root / "history", "backup": root / "backups/scheduled",
+                                 "archive": archive, "status": status_path}
+                        owners = {}
+                        for name, path in paths.items():
+                            ids = history_ids if name == "history" else backup_ids
+                            if name == "status":
+                                ids = (backup_ids[0], 10001)
+                            if fault == name + "_owner":
+                                ids = (99999, ids[1])
+                            if fault == name + "_group":
+                                ids = (ids[0], 99999)
+                            metadata = path.stat()
+                            owners[metadata.st_dev, metadata.st_ino] = ids
+                            if fault == name + "_mode":
+                                path.chmod(0o777)
+                            if fault == name + "_symlink":
+                                moved = path.with_name(path.name + ".real")
+                                path.rename(moved)
+                                path.symlink_to(moved)
+                        if fault == "hardlink":
+                            os.link(archive, archive.with_name("another-link"))
+                        env: dict[str, str] = dict(zip(("HISTORY_UID", "HISTORY_GID", "BACKUP_UID", "BACKUP_GID"),
+                                       map(str, (*history_ids, *backup_ids))))
+                        env["APP_GID"] = "10001"
+                        # APP_UID keeps the baseline executable; candidate must use HISTORY_UID.
+                        env["APP_UID"] = str(history_ids[0])
+                        fake_os = SyntheticStagingOS(root, env, owners, change_status=fault == "changed_status",
+                                                     change_source=fault == "changed_source")
+
+                        def safe_import(name, *args, **kwargs):
+                            if name == "os":
+                                return fake_os
+                            if name not in allowed:
+                                raise AssertionError("unexpected recipe import")
+                            return allowed[name]
+
+                        namespace = {"__builtins__": dict(vars(builtins), __import__=safe_import)}
+                        stage = root / "history/.segment-rotation-backup"
+                        output = io.StringIO()
+                        try:
+                            with redirect_stdout(output):
+                                exec(compile(code, "<literal staging recipe>", "exec"), namespace)
+                        except (SystemExit, OSError) as error:
+                            if fault is None:
+                                self.fail(f"supported ownership labels rejected: {error}")
+                            if fault.endswith("_symlink"):
+                                self.assertIsInstance(error, OSError)
+                            else:
+                                reason = {
+                                    "history": "history directory ownership",
+                                    "backup": "scheduled backup directory ownership or mode",
+                                    "status": "scheduled backup status ownership or mode",
+                                    "archive": "scheduled backup archive ownership or mode",
+                                    "digest": "integrity verification",
+                                    "size": "integrity verification",
+                                    "hardlink": "scheduled backup archive ownership or mode",
+                                    "changed": ("status changed" if fault == "changed_status"
+                                                else "integrity verification"),
+                                    "missing": "complete FULL backup evidence",
+                                }[fault.split("_", 1)[0]]
+                                self.assertIn(reason, str(error))
+                            self.assertFalse(stage.exists(), "refused staging left publishable evidence")
+                            self.assertNotIn("staged_backup=ok", output.getvalue())
+                        else:
+                            self.assertIsNone(fault, "unsafe evidence was staged")
+                            self.assertEqual(output.getvalue(), "staged_backup=ok\n")
+                            staged = stage / archive_name
+                            self.assertEqual(staged.read_bytes(), payload)
+                            self.assertEqual(stat.S_IMODE(staged.stat().st_mode), 0o600)
+                            self.assertEqual(stat.S_IMODE(stage.stat().st_mode), 0o700)
+                            metadata = staged.stat()
+                            self.assertEqual(owners[metadata.st_dev, metadata.st_ino], history_ids)
+                            record = _validate_backup_evidence(stage, status_path)
+                            self.assertEqual(record["sha256"], hashlib.sha256(payload).hexdigest())
+                            # Staging is not rotation authorization. The real rotation gate
+                            # must still reject stale status before catalog publication.
+                            before = staged.read_bytes()
+                            status_payload["last_success_at"] = (
+                                datetime.now(timezone.utc) - timedelta(days=3)
+                            ).isoformat()
+                            status_path.write_text(json.dumps(status_payload))
+                            with self.assertRaisesRegex(ValueError, "stale"):
+                                _validate_backup_evidence(stage, status_path)
+                            self.assertEqual(staged.read_bytes(), before)
+                            self.assertFalse((root / "history/segments/catalog.json").exists())
+                        finally:
+                            leaked = set(fake_os.descriptors)
+                            for descriptor in leaked:
+                                fake_os.close(descriptor)
+                        # An early SystemExit in this standalone heredoc relies on
+                        # interpreter exit to close initial directory descriptors.
+                        if fault is None:
+                            self.assertEqual(leaked, set())
 
 
 class PublicDocsContractTests(unittest.TestCase):

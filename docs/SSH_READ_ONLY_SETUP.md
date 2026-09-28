@@ -405,7 +405,7 @@ SSH_STRICT_HOST_KEY_CHECKING=true
 If the appliance only exposes password SSH, set `SSH_PASSWORD` and leave
 `SSH_KEY_PATH` empty.
 
-By default the app pins host keys in `known_hosts` in its own data directory
+By default the app checks host keys against `known_hosts` in its own data directory
 (`/app/data/known_hosts` in the container), derived from the runtime layout.
 To keep them somewhere else, such as a host bind mount instead of the data
 volume, set `ssh.known_hosts_path` in `config.yaml` (top level, or per system
@@ -431,9 +431,20 @@ The current default already uses:
 
 - `SSH_STRICT_HOST_KEY_CHECKING=true`
 
-That means the first successful SSH connection pins the observed host key into
-the app's writable data directory, and later connections must match it unless
-you intentionally remove or replace the saved entry.
+Strict mode uses `RejectPolicy`: an unknown host key is rejected, including on
+the first connection. Keep strict checking enabled. Obtain the fingerprint
+through a trusted channel, compare it with the scanned key, and preload the
+verified key using the [SSH trust preload procedure](../wiki/SSH-Setup-and-Sudo.md).
+Install it in the application's effective `ssh.known_hosts_path`, normally
+`/app/data/known_hosts` inside the container and `data/known_hosts` on the host.
+Accepting a key in a shell user's `~/.ssh/known_hosts` does not populate the
+application's trust file. Verify each configured host and HA node separately.
+
+`SSH_STRICT_HOST_KEY_CHECKING=false` is a separate opt-in TOFU mode. With a
+configured known-hosts path, it pins an unknown key on first use and checks
+later connections against the saved key. That first observation is not trusted
+fingerprint verification. Without a known-hosts path, it still rejects unknown
+keys. Do not disable strict checking as a substitute for verified preload.
 
 For this system, the preferred SSH command list is:
 
@@ -457,12 +468,9 @@ commands:
   - messages=$({ tail -n 4000 /var/log/messages 2>/dev/null || sudo -n /usr/bin/tail -n 4000 /var/log/messages 2>/dev/null || true; } | egrep '(mpr[0-9]+:|\(da[0-9]+:mpr[0-9]+:)' || true); if [ -n "$messages" ]; then printf '%s\n' "$messages" | tail -n 400; else dmesg -a | egrep '(mpr[0-9]+:|\(da[0-9]+:mpr[0-9]+:)' | tail -n 400; fi
 ```
 
-Optional:
-
-```yaml
-  - sudo -n /usr/sbin/sesutil locate -u /dev/ses4 16 on
-  - sudo -n /usr/sbin/sesutil locate -u /dev/ses4 16 off
-```
+`ssh.commands` is an execution list, not a permission allowlist. Every configured
+command runs during inventory collection and runs again on later refreshes.
+Keep this standing list read-only. Never append locator writes to it.
 
 `camcontrol devlist -v` labels multipath member paths with controller names
 such as `mpr0` and `mpr1`. `mprutil` adds the read-only controller, expander,
@@ -482,6 +490,24 @@ of `nopasswd`, keep the same command list and also set:
 
 ```env
 SSH_SUDO_PASSWORD=your-long-random-password
+```
+
+### On-demand locator actions only
+
+Prefer the explicit, capability-gated UI action for Identify. A manual locator
+command is a hardware write, not an inventory probe. Before each manual action,
+verify the current system, enclosure, SES device, and element against the
+intended physical disk. Stop if that mapping is uncertain or has changed.
+Use only the verified target, never a device or element copied from an example.
+
+For an operator-requested manual action, substitute that verified SES device
+and element in the command shape below. Run `on` only when requested, then
+`off` for the same verified target when finished. Do not put either command in
+`ssh.commands`, a refresh script, or a standing collection job.
+
+```text
+sudo -n /usr/sbin/sesutil locate -u <verified-SES-device> <verified-element> on
+sudo -n /usr/sbin/sesutil locate -u <verified-SES-device> <verified-element> off
 ```
 
 ## Practical Recommendation for Your System

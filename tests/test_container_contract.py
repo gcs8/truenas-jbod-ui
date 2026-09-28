@@ -759,7 +759,8 @@ class ContainerResourceContractTests(unittest.TestCase):
             group = str(os.getgid())
             environment = {
                 **os.environ,
-                "APP_UID": identity,
+                "HISTORY_UID": identity,
+                "HISTORY_GID": group,
                 "APP_GID": group,
                 "BACKUP_UID": identity,
                 "BACKUP_GID": group,

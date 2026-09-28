@@ -311,26 +311,41 @@ No source, catalog, segment, or rollback cleanup occurs when backup evidence,
 headroom, path identity, timestamp validity, row accounting, fsync, or digest
 verification fails.
 
-The scheduled archive and hot database have different owners. The backup UID
-owns each private `0600` archive, while the app UID owns the hot database and
-must run the publisher. Do not override `enclosure-backup` to run as the app UID.
-It cannot read the private archive. Do not run rotation as the backup UID either;
-it does not own the hot database.
+The history owner must run the publisher. In the root-compatible base Compose
+file, history and backup both default to `0:0`. In the prepared non-root
+overlay, history defaults to `10001:10001` and backup to `1000:1000`. A separate
+backup UID owns the private `0600` archives but does not own the hot database;
+the history UID cannot directly read those archives. The staging helper below
+runs with host permission to read that one archive and assign its staged copy
+to the effective history owner. Rotation itself runs as the history service,
+not as a different backup UID or host root for a non-root history deployment.
+
+Use the effective identities from your complete ordered Compose chain, including
+explicit overrides. `HISTORY_UID` and `HISTORY_GID` below describe the history
+service and hot-state ownership; they are helper inputs, not Compose settings.
+`APP_GID` is the separate positive shared-status group, default `10001`, even
+when history and backup run as `0:0`. Do not set `APP_GID=0` or assume it equals
+the history GID. Keep existing ownership when rotating a supported deployment;
+do not recursively chown history or backups to make these examples fit.
 
 After a fresh scheduled FULL backup succeeds, stop the history service cleanly
 and verify that the one-shot backup container has exited. Confirm that
 `backup-status/scheduled-backup.json` reports the successful run and that the
 configured host destination is `backups/scheduled`, corresponding to
 `/app/backups/scheduled`. Then stage only its named archive into the existing
-history bind. Set these four numeric values to the effective Compose identities
-before running the block. The defaults shown match the base Compose file.
+history bind. Run from the deployment directory. Set these five numeric values
+to the effective identities before running the block. The values shown match
+the base Compose defaults. For the prepared non-root overlay defaults, use
+`HISTORY_UID=10001`, `HISTORY_GID=10001`, `BACKUP_UID=1000`, `BACKUP_GID=1000`,
+and retain `APP_GID=10001`. Custom deployments must use their actual IDs.
 
 ```bash
-APP_UID=10001
+HISTORY_UID=0
+HISTORY_GID=0
 APP_GID=10001
-BACKUP_UID=1000
-BACKUP_GID=1000
-sudo env APP_UID="$APP_UID" APP_GID="$APP_GID" BACKUP_UID="$BACKUP_UID" BACKUP_GID="$BACKUP_GID" python3 - <<'PY'
+BACKUP_UID=0
+BACKUP_GID=0
+sudo env HISTORY_UID="$HISTORY_UID" HISTORY_GID="$HISTORY_GID" APP_GID="$APP_GID" BACKUP_UID="$BACKUP_UID" BACKUP_GID="$BACKUP_GID" python3 - <<'PY'
 import hashlib
 import json
 import os
@@ -353,8 +368,8 @@ def numeric_id(name):
     if not raw.isdecimal():
         raise SystemExit(f"{name} must be a numeric ID")
     value = int(raw)
-    if value <= 0:
-        raise SystemExit(f"{name} must be a non-root numeric ID")
+    if name == "APP_GID" and value == 0:
+        raise SystemExit("APP_GID must be a positive shared-status group ID")
     return value
 
 
@@ -393,8 +408,9 @@ def hash_descriptor(descriptor):
     return size, digest.hexdigest()
 
 
-app_uid = numeric_id("APP_UID")
-app_gid = numeric_id("APP_GID")
+history_uid = numeric_id("HISTORY_UID")
+history_gid = numeric_id("HISTORY_GID")
+status_gid = numeric_id("APP_GID")
 backup_uid = numeric_id("BACKUP_UID")
 backup_gid = numeric_id("BACKUP_GID")
 status_directory = os.open("backup-status", DIRECTORY_FLAGS)
@@ -413,7 +429,7 @@ try:
         or (backup_metadata.st_uid, backup_metadata.st_gid) != (backup_uid, backup_gid)
     ):
         raise SystemExit("scheduled backup directory ownership or mode is invalid")
-    if (history_metadata.st_uid, history_metadata.st_gid) != (app_uid, app_gid):
+    if (history_metadata.st_uid, history_metadata.st_gid) != (history_uid, history_gid):
         raise SystemExit("history directory ownership is invalid")
 
     status_bytes, status_metadata = read_regular(
@@ -421,7 +437,7 @@ try:
     )
     if (
         stat.S_IMODE(status_metadata.st_mode) != 0o640
-        or (status_metadata.st_uid, status_metadata.st_gid) != (backup_uid, app_gid)
+        or (status_metadata.st_uid, status_metadata.st_gid) != (backup_uid, status_gid)
     ):
         raise SystemExit("scheduled backup status ownership or mode is invalid")
     try:
@@ -476,7 +492,7 @@ try:
     os.mkdir(STAGE_NAME, 0o700, dir_fd=history_directory)
     stage_created = True
     stage_directory = os.open(STAGE_NAME, DIRECTORY_FLAGS, dir_fd=history_directory)
-    os.fchown(stage_directory, app_uid, app_gid)
+    os.fchown(stage_directory, history_uid, history_gid)
     os.fchmod(stage_directory, 0o700)
     destination = os.open(
         artifact_name,
@@ -498,7 +514,7 @@ try:
             while view:
                 view = view[os.write(destination, view):]
         os.fsync(destination)
-        os.fchown(destination, app_uid, app_gid)
+        os.fchown(destination, history_uid, history_gid)
         os.fchmod(destination, 0o600)
         staged_metadata = os.fstat(destination)
     finally:
@@ -512,7 +528,7 @@ try:
         or copied_digest.hexdigest() != expected_digest
         or staged_metadata.st_size != expected_size
         or stat.S_IMODE(staged_metadata.st_mode) != 0o600
-        or (staged_metadata.st_uid, staged_metadata.st_gid) != (app_uid, app_gid)
+        or (staged_metadata.st_uid, staged_metadata.st_gid) != (history_uid, history_gid)
     ):
         raise SystemExit("scheduled backup archive changed or failed integrity verification")
     current_status, _ = read_regular(status_directory, "scheduled-backup.json", 64 * 1024)
@@ -546,11 +562,16 @@ The staging block refuses an existing staging directory, unsafe names, symlinks,
 hard links, wrong owners or modes, incomplete FULL-backup status, source changes,
 or a size/SHA-256 mismatch. It does not read or copy the passphrase and prints no
 artifact name or digest. The rotation dry run performs the canonical status and
-freshness validation again.
+freshness validation again. Staging alone does not authorize publication:
+stale status must still fail the rotation dry run and apply admission.
 
 Dry-run the next append transaction while the history service remains
-quiesced. `enclosure-history` keeps its normal app identity and uses only its
-existing history and read-only backup-status mounts:
+quiesced. `enclosure-history` keeps its effective history identity and uses only
+its existing history and read-only backup-status mounts. The commands below
+show the base chain. For a prepared non-root deployment, use
+`docker compose -f docker-compose.yml -f docker-compose.nonroot.yml` in place of
+`docker compose` in every dry-run, apply, and recovery command below, retaining
+any additional ordered overlays used by that deployment:
 
 ```bash
 docker compose run --rm --entrypoint python enclosure-history scripts/rotate_segmented_history.py \
