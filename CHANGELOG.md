@@ -261,7 +261,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 - Verified large S3 copies by reading them back when the ETag is not a plain
   MD5, and never catalogued a copy that could not be verified, so grooming no
-  longer deletes it after a day. (#795)
+  longer deletes it after a day. Bounded S3 verification readback to the uploaded
+  size plus at most one chunk, retaining failed-copy cleanup. (#795)
 - The main UI no longer reports itself down when a pinned known-hosts file sits
   on a read-only mount, such as the `/run/ssh` mount in the shipped Compose
   file. SSH still verifies hosts against the keys in it; `/healthz` now answers

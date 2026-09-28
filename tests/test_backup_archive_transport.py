@@ -1262,6 +1262,51 @@ class S3TargetTests(_TempCase):
         self.assertEqual(self.clients[0].get_calls, 0)
         self.assertTrue(self.clients[0].objects["jbod-ui/archive/full/threshold.bin"]["etag"].endswith("-1"))
 
+    def test_opaque_readback_size_bound_and_cleanup(self) -> None:
+        # Finite excess makes the old EOF-only loop fail without a hanging test.
+        for size in (0, 7, transport.S3_MULTIPART_THRESHOLD + 3):
+            for delta in (-1, 0, 3 * transport.CHUNK_SIZE):
+                if size + delta < 0:
+                    continue
+                with self.subTest(size=size, delta=delta):
+                    class Body(io.BytesIO):
+                        consumed = 0
+
+                        def read(self, amount=-1):
+                            self_test.assertGreater(amount, 0)
+                            self_test.assertLessEqual(amount, transport.CHUNK_SIZE)
+                            chunk = super().read(amount)
+                            self.consumed += len(chunk)
+                            return chunk
+
+                    self_test = self
+                    body = Body(b"x" * (size + delta))
+                    with open_target(self.settings()) as target:
+                        client = self.clients[-1]
+                        client.etag_override = "kms-opaque"
+                        with mock.patch.object(client, "get_object", return_value={"Body": body}):
+                            if delta:
+                                with self.assertRaises(ArchiveVerificationError):
+                                    target.put(self.source(b"x" * size), "a.bin")
+                            else:
+                                self.assertTrue(target.put(self.source(b"x" * size), "a.bin").verified)
+                        self.assertTrue(body.closed)
+                        self.assertEqual(bool(client.objects), delta == 0)
+                        self.assertLessEqual(body.consumed, size + transport.CHUNK_SIZE)
+
+    def test_opaque_readback_io_failure_closes_body_and_deletes(self) -> None:
+        for size in (7, transport.S3_MULTIPART_THRESHOLD + 3):
+            with self.subTest(size=size), open_target(self.settings()) as target:
+                body = io.BytesIO()
+                client = self.clients[-1]
+                client.etag_override = "kms-opaque"
+                with mock.patch.object(client, "get_object", return_value={"Body": body}), \
+                        mock.patch.object(body, "read", side_effect=OSError("read failed")):
+                    with self.assertRaises(OSError):
+                        target.put(self.source(b"x" * size), "a.bin")
+                self.assertTrue(body.closed)
+                self.assertEqual(client.objects, {})
+
     def test_large_opaque_etag_is_verified_by_streaming_readback(self) -> None:
         src = self.tmp / "large.bin"
         with open(src, "wb") as handle:

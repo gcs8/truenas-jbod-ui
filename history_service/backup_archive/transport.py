@@ -231,8 +231,18 @@ def _copy_stream(source: Any, write: Callable[[bytes], Any]) -> tuple[int, str]:
     return size, digest.hexdigest()
 
 
-def _hash_stream(source: Any) -> tuple[int, str]:
-    return _copy_stream(source, lambda _chunk: None)
+def _hash_stream(source: Any, expected_size: int | None = None) -> tuple[int, str]:
+    size = 0
+
+    def check_size(chunk: bytes) -> None:
+        nonlocal size
+        size += len(chunk)
+        if expected_size is not None and size > expected_size:
+            # _copy_stream reads fixed-size chunks: at most one excess chunk
+            # is consumed, never the remainder of an oversized response.
+            raise ArchiveVerificationError("Archive readback is larger than the bytes sent.")
+
+    return _copy_stream(source, check_size)
 
 
 def _check_readback(label: str, expected_size: int, expected_sha: str, size: int, sha: str | None) -> None:
@@ -1192,7 +1202,7 @@ class S3Target(_TargetBase):
         # object back and hash it; this never buffers the whole object.
         body = self._client.get_object(Bucket=self._bucket, Key=key)["Body"]
         try:
-            back_size, back_sha = _hash_stream(body)
+            back_size, back_sha = _hash_stream(body, expected_size=size)
         finally:
             close = getattr(body, "close", None)
             if callable(close):
