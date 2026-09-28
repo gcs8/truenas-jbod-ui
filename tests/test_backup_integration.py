@@ -601,6 +601,203 @@ class SchedulerPreservationTests(SchedulerTestBase):
         self.assertEqual(reopened.library()["storage"]["local"]["count"], 1)
         self.assertTrue(reopened.library()["detail"])
 
+    @contextlib.contextmanager
+    def metadata_save_fault(self, scheduler, seam):
+        """Fail real metadata I/O, not the ownership or publication validators."""
+        import errno
+
+        hits = []
+        meta_path = scheduler._meta_path
+        real_open, real_fdopen = os.open, os.fdopen
+        real_dump, real_fsync = json.dump, os.fsync
+        real_replace, real_unlink, real_lstat = os.replace, Path.unlink, Path.lstat
+        real_save = scheduler._save_meta
+        temporary_fds = set()
+
+        def fail():
+            hits.append(seam)
+            raise OSError(errno.EIO, "synthetic metadata failure")
+
+        def is_temporary(path):
+            return (isinstance(path, (str, bytes, os.PathLike))
+                    and Path(os.fsdecode(path)).parent == meta_path.parent
+                    and Path(os.fsdecode(path)).name.startswith(".artifact-meta.json."))
+
+        def opened(path, flags, *args, **kwargs):
+            if not hits:
+                if seam == "temp_open" and is_temporary(path):
+                    fail()
+                if seam == "directory_open" and Path(path) == meta_path.parent and flags & os.O_DIRECTORY:
+                    fail()
+            descriptor = real_open(path, flags, *args, **kwargs)
+            temporary_fds.discard(descriptor)
+            if is_temporary(path):
+                temporary_fds.add(descriptor)
+            return descriptor
+
+        class Stream:
+            def __init__(self, handle):
+                self.handle = handle
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return self.handle.__exit__(*args)
+
+            def __getattr__(self, name):
+                return getattr(self.handle, name)
+
+            def write(self, data):
+                if seam == "write" and not hits:
+                    fail()
+                return self.handle.write(data)
+
+            def flush(self):
+                if seam == "flush" and not hits:
+                    fail()
+                return self.handle.flush()
+
+        def fdopened(fd, *args, **kwargs):
+            handle = real_fdopen(fd, *args, **kwargs)
+            return Stream(handle) if fd in temporary_fds else handle
+
+        def dumped(obj, handle, *args, **kwargs):
+            if seam == "json_partial" and isinstance(handle, Stream) and not hits:
+                handle.write("{")
+                fail()
+            return real_dump(obj, handle, *args, **kwargs)
+
+        def synced(fd):
+            if not hits:
+                if seam == "file_fsync" and fd in temporary_fds:
+                    fail()
+                metadata = os.fstat(fd)
+                parent = meta_path.parent.stat()
+                if (seam == "directory_fsync"
+                        and (metadata.st_dev, metadata.st_ino) == (parent.st_dev, parent.st_ino)):
+                    fail()
+            return real_fsync(fd)
+
+        def replaced(source, destination, *args, **kwargs):
+            targeted = Path(destination) == meta_path and not hits
+            if targeted and seam == "replace":
+                fail()
+            result = real_replace(source, destination, *args, **kwargs)
+            if targeted and seam in {"replace_ack_lost", "replace_ack_uninspectable"}:
+                fail()
+            return result
+
+        def inspected(path, *args, **kwargs):
+            if seam == "replace_ack_uninspectable" and hits and path == meta_path:
+                raise OSError(errno.EIO, "synthetic metadata inspection failure")
+            return real_lstat(path, *args, **kwargs)
+
+        def unlinked(path, *args, **kwargs):
+            if seam == "cleanup" and is_temporary(path) and not hits:
+                fail()
+            return real_unlink(path, *args, **kwargs)
+
+        def saved(*args, **kwargs):
+            if seam == "before_save" and not hits:
+                fail()
+            result = real_save(*args, **kwargs)
+            if seam == "after_save" and not hits:
+                fail()
+            return result
+
+        with contextlib.ExitStack() as stack:
+            for obj, name, side_effect in (
+                (os, "open", opened), (os, "fdopen", fdopened), (json, "dump", dumped),
+                (os, "fsync", synced), (os, "replace", replaced), (Path, "unlink", unlinked),
+                (scheduler, "_save_meta", saved), (Path, "lstat", inspected),
+            ):
+                stack.enter_context(patch.object(obj, name, side_effect=side_effect, autospec=True))
+            yield hits
+        self.assertEqual(hits, [seam], "the named real I/O seam must fail exactly once")
+
+    def check_failed_intent_save(self, seams, *, retained):
+        from dataclasses import replace
+
+        original_paths = self._paths
+        for seam in seams:
+            for later_verify in (False, True):
+                with self.subTest(seam=seam, later_verify=later_verify), \
+                        tempfile.TemporaryDirectory(dir=self.root) as directory:
+                    case = Path(directory)
+                    self._paths = replace(original_paths, local_dir=case / "local", state_dir=case / "state")
+                    scheduler = self.real_scheduler().service
+                    old = scheduler.run_now("full")
+                    scheduler.preserve(old.artifact_id, reason="synthetic preserved copy", actor="test")
+                    old_path = scheduler.paths.local_dir / old.name
+                    old_bytes = old_path.read_bytes()
+                    before = scheduler._meta_path.read_bytes()
+                    self.now += timedelta(hours=1)
+                    with self.metadata_save_fault(scheduler, seam):
+                        with self.assertRaisesRegex(OSError, "synthetic metadata failure"):
+                            scheduler.run_now("full")
+                    immediate = scheduler.library()
+                    self.assertFalse(immediate["classes"]["full"]["last_run"]["ok"])
+                    self.assertEqual(len(scheduler.catalog.list()), 1)
+                    self.assertEqual(immediate["storage"]["local"]["count"], 1 + int(retained))
+                    if not retained:
+                        self.assertEqual(scheduler._meta_path.read_bytes(), before)
+                    if later_verify:
+                        self.assertTrue(scheduler.verify(old.artifact_id)["ok"])
+                    scheduler.close()
+                    reopened = self.real_scheduler().service
+                    library = reopened.library()
+                    self.assertEqual(library["storage"]["local"]["count"], 1 + int(retained))
+                    self.assertEqual(library["storage"]["local"]["full_bytes"], len(old_bytes) * (1 + int(retained)))
+                    self.assertEqual(bool(library["detail"]), retained)
+                    extra = [item for item in library["artifacts"] if item["id"] != old.artifact_id]
+                    for item in extra:
+                        self.assertEqual(item["state"], "missing")
+                        self.assertTrue(item["preserved"])
+                        self.assertFalse(item["restorable"])
+                        self.assertFalse(item["verified"])
+                    self.assertEqual(old_path.read_bytes(), old_bytes)
+                    self.assertEqual(reopened._verified_local_full_count(), 1)
+                    self.assertEqual(reopened.plan()[2].items, ())
+                    reopened.close()
+        self._paths = original_paths
+
+    def test_pre_replace_metadata_failures_do_not_leave_phantom_intents(self):
+        self.check_failed_intent_save(
+            ("before_save", "temp_open", "write", "json_partial", "flush", "file_fsync", "replace"),
+            retained=False,
+        )
+
+    def test_post_replace_metadata_failures_retain_recovery_intents(self):
+        self.check_failed_intent_save(
+            ("directory_open", "directory_fsync", "cleanup", "replace_ack_lost",
+             "replace_ack_uninspectable", "after_save"),
+            retained=True,
+        )
+
+    def test_first_intent_save_failure_does_not_leak_into_successful_retry(self):
+        from dataclasses import replace
+
+        original_paths = self._paths
+        for seam in ("before_save", "temp_open", "write", "json_partial", "flush", "file_fsync", "replace"):
+            with self.subTest(seam=seam), tempfile.TemporaryDirectory(dir=self.root) as directory:
+                case = Path(directory)
+                self._paths = replace(original_paths, local_dir=case / "local", state_dir=case / "state")
+                scheduler = self.real_scheduler().service
+                with self.metadata_save_fault(scheduler, seam):
+                    with self.assertRaisesRegex(OSError, "synthetic metadata failure"):
+                        scheduler.run_now("full")
+                self.assertEqual(scheduler.library()["artifacts"], [])
+                self.assertFalse(scheduler._meta_path.exists())
+                self.now += timedelta(hours=1)
+                record = scheduler.run_now("full")
+                scheduler.close()
+                reopened = self.real_scheduler().service
+                self.assertEqual([item["id"] for item in reopened.library()["artifacts"]], [record.artifact_id])
+                self.assertFalse(reopened.library()["detail"])
+                reopened.close()
+        self._paths = original_paths
+
     def test_metadata_directory_eio_prevents_final_publication(self):
         import errno
 

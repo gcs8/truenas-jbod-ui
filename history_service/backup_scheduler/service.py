@@ -230,18 +230,36 @@ class BackupScheduler:
             metadata = self._meta if artifact_id is None else self._meta.get(artifact_id) or {}
             return copy.deepcopy(metadata)
 
-    def _save_meta(self) -> None:
+    def _save_meta(self, metadata: dict[str, dict[str, Any]] | None = None) -> None:
         # Serialize snapshots through rename and directory durability, so a
         # concurrent verification cannot replace a newer ownership intent.
         with self._state_lock:
+            payload = self._meta if metadata is None else metadata
             temporary = self._meta_path.with_name(f".{self._meta_path.name}.{uuid.uuid4().hex}.tmp")
             descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
             try:
                 with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                    json.dump(self._meta, handle, sort_keys=True)
+                    json.dump(payload, handle, sort_keys=True)
                     handle.flush()
                     os.fsync(handle.fileno())
-                os.replace(temporary, self._meta_path)
+                    written = os.fstat(handle.fileno())
+                try:
+                    os.replace(temporary, self._meta_path)
+                except BaseException:
+                    # A failed acknowledgement can follow a completed rename.
+                    # Retain ownership if installed, or if inspection cannot
+                    # rule it out. Never overwrite that intent with an old view.
+                    try:
+                        installed = self._meta_path.lstat()
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        self._meta = payload
+                    else:
+                        if (installed.st_dev, installed.st_ino) == (written.st_dev, written.st_ino):
+                            self._meta = payload
+                    raise
+                self._meta = payload
                 descriptor = os.open(self._meta_path.parent, os.O_RDONLY | os.O_DIRECTORY)
                 try:
                     os.fsync(descriptor)
@@ -274,8 +292,10 @@ class BackupScheduler:
             "history_replacement": False,
         }
         with self._state_lock:
-            self._meta[artifact_id] = artifact_meta
-            self._save_meta()
+            # Stage the new intent without exposing it to later unrelated saves
+            # when serialization, file durability or replacement fails. Once
+            # replaced, _save_meta keeps it even if directory durability fails.
+            self._save_meta({**self._meta, artifact_id: artifact_meta})
 
     def _pending_publications(self, metadata: Mapping[str, Any] | None = None) -> list[ArtifactRecord]:
         if metadata is None:
