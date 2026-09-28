@@ -18254,6 +18254,131 @@ class InventoryScopedIdentityRegressionTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(results[0], row if field in fields[:5] else None)
             self.assertIsNone(results[1])
 
+    def test_quantastor_cli_unqueried_projections_do_not_build_alias_aggregates(self) -> None:
+        import sys
+
+        fields = ("serial", "wwn", "scsiId", "wwid", "eui64", "sasAddress", "portSasAddress")
+        aliases = {"id": "a", "hwDiskId": "b", "physicalDiskId": "c", "multipathParentDiskId": "d",
+                   "devicePath": "/dev/sda", "altDevicePath": "/dev/sdb", "deviceName": "sdc",
+                   "device": "sdd", "name": "sde", "storageSystemId": "owner"}
+        code = InventoryService._resolve_quantastor_cli_disk_hints.__func__.__code__
+        add_code = next(c for c in code.co_consts if inspect.iscode(c) and c.co_name == "add")
+        for count in (16, 32):
+            rows = [dict(aliases, **{field: f"SANITIZED-{i}-{j}" for j, field in enumerate(fields)})
+                    for i in range(count)]
+            # Two query values at every mask prevent a first-query-only filter.
+            disks = [dict(aliases, **{field: rows[target][field] for j, field in enumerate(fields)
+                                     if mask & (1 << j)})
+                     for mask in range(128) for target in (0, count - 1)]
+            hints = InventoryService._build_quantastor_cli_disk_hints(rows)
+            updates = [0] * 128
+
+            def profile(frame, event, arg):
+                if frame.f_code is add_code and event == "call":
+                    updates[frame.f_back.f_locals["mask"]] += 1
+
+            previous = sys.getprofile()
+            sys.setprofile(profile)
+            try:
+                actual = InventoryService._resolve_quantastor_cli_disk_hints(disks, hints)
+            finally:
+                sys.setprofile(previous)
+            for index, result in enumerate(actual):
+                self.assertIs(result, None if index < 2 else rows[0 if index % 2 == 0 else -1])
+            # Count the real production aggregate updates, not mocked work or
+            # elapsed time. The empty projection must still retain every group;
+            # populated projections need only the two actually queried groups.
+            self.assertEqual(updates[0], 61 * count)
+            self.assertTrue(all(value > 0 for value in updates))
+            self.assertLessEqual(sum(updates[1:]), 63 * 2 * 127, (count, updates))
+
+    def test_quantastor_cli_projection_filter_matches_bounded_scan_oracle(self) -> None:
+        fields = ("serial", "wwn", "scsiId", "wwid", "eui64", "sasAddress", "portSasAddress")
+
+        def oracle(rows, disks):
+            # Deliberately independent straight scans: no presence masks,
+            # aggregate tables, subset expansion or ordinal sums.
+            groups = []
+            for row in rows:
+                identity = InventoryService._quantastor_cli_identity(row)
+                if len(identity["serial"]) > 1:
+                    continue
+                previous = next((entry for entry in groups if entry[0] == identity), None)
+                if previous is None:
+                    groups.append([identity, row, False])
+                elif row != previous[1]:
+                    previous[2] = True
+            results = []
+            for disk in disks:
+                query = InventoryService._quantastor_cli_identity(disk)
+                ranks = [[], [], []]
+                if len(query["serial"]) <= 1:
+                    for identity, row, differs in groups:
+                        if any(query[k] and identity[k] and not query[k] & identity[k] for k in fields):
+                            continue
+                        local = bool(query["owner"] & identity["owner"])
+                        entry = (row, differs, local)
+                        if query["id"] & identity["id"]:
+                            ranks[0].append(entry)
+                        if any(query[k] & identity[k] for k in fields[:5]):
+                            ranks[1].append(entry)
+                        if (local and query["path"] & identity["path"]
+                                and not (query["id"] and identity["id"])):
+                            ranks[2].append(entry)
+                result = None
+                for rank in ranks:
+                    if rank:
+                        preferred = [entry for entry in rank if entry[2]] or rank
+                        if len(preferred) == 1 and not preferred[0][1]:
+                            result = preferred[0][0]
+                        break
+                results.append(result)
+            return results
+
+        def check(rows, disks):
+            before = copy.deepcopy((rows, disks))
+            expected = oracle(rows, disks)
+            actual = InventoryService._resolve_quantastor_cli_disk_hints(
+                disks, InventoryService._build_quantastor_cli_disk_hints(rows))
+            self.assertEqual(len(actual), len(expected))
+            for result, wanted in zip(actual, expected):
+                self.assertIs(result, wanted)
+            self.assertEqual((rows, disks), before)
+
+        # Exhaust every group-presence/query-mask pair with each typed veto,
+        # absent/blank/null fields and two query values within the same mask.
+        for missing in (None, ""):
+            for veto in (None, *fields):
+                rows = [dict(id="shared", storageSystemId="owner", **{
+                    field: "SANITIZED-A" if mask & (1 << i) else missing
+                    for i, field in enumerate(fields)}) for mask in range(128)]
+                disks = [dict(id="shared", storageSystemId="owner", **{
+                    field: ("SANITIZED-B" if field == veto else "SANITIZED-A")
+                    for i, field in enumerate(fields) if mask & (1 << i)}) for mask in range(128)]
+                check(rows, disks + [dict(disk, serial="SANITIZED-C") for disk in disks[:8]])
+
+        row = {"id": "a", "hwDiskId": "b", "physicalDiskId": "c", "multipathParentDiskId": "d",
+               "devicePath": "/dev/sda", "altDevicePath": "sda", "deviceName": "sdb",
+               "device": "/dev/sdc", "name": "sdd", "storageSystemId": "owner", "serial": "SANITIZED-A"}
+        id_fields = ("id", "hwDiskId", "physicalDiskId", "multipathParentDiskId")
+        paths = ("devicePath", "altDevicePath", "deviceName", "device", "name")
+        disks = [dict(storageSystemId="owner", **{
+            **{k: row[k] for i, k in enumerate(id_fields) if im & (1 << i)},
+            **{k: row[k] for i, k in enumerate(paths) if pm & (1 << i)}})
+                 for im in range(16) for pm in range(32)]
+        for rows in ([row, dict(row, storageSystemId="remote")],
+                     [row, dict(row), {"serial": "SANITIZED-A", "storageSystemId": "owner"}],
+                     [row, dict(row, payload=True), row],
+                     [dict(row, serialNumber="SANITIZED-B"), row],
+                     [{"id": "a", "serial": "SANITIZED-B"}, row]):
+            check(rows, disks)
+            check(rows[::-1], disks[::-1])
+        # Fresh calls must see mutation, distinct owner and partial identity;
+        # no cache survives a resolution generation.
+        check([row], [dict(row)])
+        row["serial"] = "SANITIZED-CHANGED"
+        check([row], [dict(row, serial="SANITIZED-A"), dict(row, storageSystemId="remote"), {}])
+
     def test_quantastor_cli_index_storage_growth_is_linear(self) -> None:
         import dataclasses
         import sys

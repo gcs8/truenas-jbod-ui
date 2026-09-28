@@ -7799,6 +7799,10 @@ class InventoryService:
         Seven contradiction fields give at most 128 masks. Four ID and five
         path aliases give at most 63 updates per group per mask and 12,032
         lookups per query. Tables live for one mask only, at most 63*G keys.
+        Requested contradiction projections are shared by presence intersection;
+        groups no query can accept do not enumerate aliases or update the table.
+        The per-mask demand sets hold at most 128 projections per query. The
+        M*G group scan and worst-case compatible dense aggregate cost remain.
         These are expected Python hash-operation bounds for fixed schema,
         not adversarial-hash, input-byte, or whole-snapshot latency bounds.
         """
@@ -7833,6 +7837,7 @@ class InventoryService:
             # Visit only CLI presence submasks actually represented. This avoids
             # 128 empty probes per rank on ordinary fully populated inventories.
             projections: dict[int, tuple[int, ...]] = {}
+            needed_values: dict[int, set[tuple[str | None, ...]]] = {}
             # Index only alias subsets actually queried at this mask. This is
             # exact query projection, not candidate/result pruning: an unqueried
             # subset contributes to no inclusion-exclusion term. In particular,
@@ -7849,7 +7854,16 @@ class InventoryService:
                 part = presence & mask
                 if part not in projections:
                     projections[part] = tuple(i for i in range(len(kinds)) if part & (1 << i))
-                base = (part, tuple(values[i] for i in projections[part]))
+                    # Every lookup at this presence intersection uses one of
+                    # these exact values. Missing group fields project away,
+                    # including part=0: they must never become a veto.
+                    needed_values[part] = {
+                        tuple(query[1][i] for i in projections[part]) for _, query in items
+                    }
+                projected = tuple(values[i] for i in projections[part])
+                if projected not in needed_values[part]:
+                    continue
+                base = (part, projected)
                 for scope in (None, owner) if owner is not None else (None,):
                     if part & 31:  # SAS is veto-only, never physical authority.
                         add((base, "physical", (), scope, None), ordinal)
