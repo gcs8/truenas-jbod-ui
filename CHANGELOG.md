@@ -268,6 +268,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   start. (#793)
 - Followed the `TZ` zone for the full backup schedule so a daylight-saving
   change neither doubles nor delays a run. (#794)
+- Treat malformed UTF-8 slot-detail caches as corrupt without blocking
+  startup; preserve their bytes until a legitimate save rebuilds them. (#752)
+- Emit JSON log timestamps in UTC to match their `Z` suffix, while leaving
+  text log timestamps in local time. (#753)
 - The main UI no longer reports itself down when a pinned known-hosts file sits
   on a read-only mount, such as the `/run/ssh` mount in the shipped Compose
   file. SSH still verifies hosts against the keys in it; `/healthz` now answers
