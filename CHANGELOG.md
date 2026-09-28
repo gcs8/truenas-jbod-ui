@@ -265,6 +265,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   text log timestamps in local time. (#753)
 - Fixed public-demo validation rejecting UI labels as serial numbers, while
   retaining non-demo serial checks and rejecting ambiguous nested JSON. (#746)
+- Drew the Storage Fabric bay grid in the enclosure's physical layout while a
+  storage view is selected, so no bay disappears and a chip selects the
+  physical bay. (#805)
 - The main UI no longer reports itself down when a pinned known-hosts file sits
   on a read-only mount, such as the `/run/ssh` mount in the shipped Compose
   file. SSH still verifies hosts against the keys in it; `/healthz` now answers

@@ -58,6 +58,7 @@ const RENDER_FUNCTIONS = [
   "formatSlotLabel",
   "sasFabricList",
   "sasFabricSortedSlots",
+  "sasFabricViewSlotForBay",
   "renderSasFabricFlatBayChips",
   "sasFabricBayGridCell",
   "renderSasFabricBayChips",
@@ -194,7 +195,7 @@ function layoutContext(layout) {
     .filter((slotNumber) => Number.isInteger(slotNumber))
     .map((slotNumber) => ({ slot: slotNumber, state: "matched" }));
   return {
-    state: { snapshot: { slots, layout_slot_count: slots.length }, selectedSlot: null },
+    state: { snapshot: { slots, layout_slot_count: slots.length, selected_enclosure_id: "front" }, selectedSlot: null },
     getSmartSummaryEntry: () => null,
     getSelectedProfile: () => ({ row_groups: layout.profile.rowGroups }),
     currentLayoutSlotCount: () => slots.length,
@@ -288,11 +289,12 @@ function bayGridContext(layout, { impactedSlots = [], emptySlots = [], layoutRow
     }));
   const rows = layoutRows === null ? layout.layoutRows : layoutRows;
   return {
-    state: { snapshot: { slots, layout_slot_count: slots.length }, selectedSlot: null },
+    state: { snapshot: { slots, layout_slot_count: slots.length, selected_enclosure_id: "front" }, selectedSlot: null },
     getSmartSummaryEntry: () => null,
     getSelectedProfile: () => ({ row_groups: layout.profile.rowGroups }),
     currentLayoutSlotCount: () => slots.length,
     activeLayoutRows: () => rows,
+    getSelectedStorageViewRuntime: () => null,
     buildViewProfile: () => layout.profile,
     sasFabricSelectedSlotSet: () => new Set(impactedSlots),
   };
@@ -329,6 +331,145 @@ test("impacted bays are lit inside the enclosure shape, everything else is a pla
   );
   assert.doesNotMatch(markup, /sas-fabric-bay-overflow/, "a layout-shaped grid has no +N overflow");
   assert.match(markup, /SYSTEM FRONT \/ LATCH EDGE|System front \/ latch edge/, "the edge cue is explicit");
+});
+
+test("with a storage view selected the grid still draws every bay of the enclosure", () => {
+  const layout = CSE_946;
+  const context = bayGridContext(layout, { impactedSlots: [46] });
+  const bootView = { id: "boot", kind: "boot_devices", slot_layout: [[0, 1]], slot_count: 2 };
+  context.state.layoutRows = layout.layoutRows;
+  context.state.snapshot.selected_profile = {
+    id: layout.profile.profileId,
+    edge_label: layout.profile.edgeLabel,
+    face_style: layout.profile.faceStyle,
+    latch_edge: layout.profile.latchEdge,
+    bay_size: layout.profile.baySize,
+    row_groups: layout.profile.rowGroups,
+  };
+  context.getSelectedStorageViewRuntime = () => bootView;
+  context.activeLayoutRows = () => bootView.slot_layout;
+  context.buildViewProfile = () => ({ edgeLabel: "Storage view", faceStyle: "boot-devices", rowGroups: [], slotCount: 2 });
+  const loaded = loadFunctions([...LAYOUT_FUNCTIONS, ...RENDER_FUNCTIONS], {
+    ...context,
+    document: { createElement: fakeElement },
+    grid: fakeElement("div"),
+  });
+  const markup = loaded.renderSasFabricBayChips([0, 46], 72);
+
+  assert.equal(
+    (markup.match(/sas-fabric-bay-chip/g) || []).length,
+    60,
+    "every bay of the enclosure is drawn, not the view's two slots"
+  );
+  assert.match(markup, /data-sas-fabric-slot="0"/);
+  assert.match(markup, /data-sas-fabric-slot="46"/, "a bay outside the view does not disappear");
+  assert.equal((markup.match(/class="sas-fabric-bay-row"/g) || []).length, 4, "the enclosure rows, not the view rows");
+  assert.match(markup, /System front \/ latch edge/, "the enclosure edge cue, not the view's");
+});
+
+// A boot view whose two slots are backed by enclosure bays 03 and 07.
+const BOOT_VIEW_ON_BAYS = {
+  id: "boot",
+  kind: "boot_devices",
+  slot_layout: [[0, 1]],
+  slot_count: 2,
+  slots: [
+    { slot_index: 0, snapshot_slot: 3, snapshot_enclosure_id: "front" },
+    { slot_index: 1, snapshot_slot: 7, snapshot_enclosure_id: "front" },
+  ],
+};
+
+const BAY_TO_VIEW_SLOT_FUNCTIONS = ["sasFabricList", "sasFabricViewSlotForBay"];
+
+const frontBay = { slot_index: 1, snapshot_slot: 3, snapshot_enclosure_id: "front", source: "inventory_candidate" };
+const rearBay = { slot_index: 0, snapshot_slot: 3, snapshot_enclosure_id: "rear", source: "inventory_candidate" };
+for (const [name, enclosure, slots, expected, extraView = {}] of [
+  ["overlapping front and rear bays", "front", [rearBay, frontBay], 1],
+  ["overlapping bays in reverse order", "front", [frontBay, rearBay], 1],
+  ["rear snapshot rather than the view backing enclosure", "rear", [frontBay, rearBay], 0],
+  ["only a foreign bay", "front", [rearBay], null],
+  ["missing snapshot enclosure", undefined, [frontBay], null],
+  ["blank snapshot enclosure", "", [frontBay], null],
+  ["unknown candidate enclosure", "front", [{ ...frontBay, snapshot_enclosure_id: null }], null],
+  ["absent candidate enclosure", "front", [{ slot_index: 1, snapshot_slot: 3 }], null],
+  ["unknown candidate alongside a known match", "front", [frontBay, { ...rearBay, snapshot_enclosure_id: null }], null],
+  ["duplicate physical identity", "front", [frontBay, { ...frontBay, slot_index: 2 }], null],
+  ["identical duplicate rows", "front", [frontBay, frontBay], null],
+  ["duplicate view index on a foreign bay", "front", [frontBay, { ...rearBay, slot_index: 1 }], null],
+  ["null view index", "front", [{ ...frontBay, slot_index: null }], null],
+  ["empty view index", "front", [{ ...frontBay, slot_index: "" }], null],
+  ["snapshot-backed row with declared provenance", "front", [{ slot_index: 3, snapshot_slot: 3, source: "snapshot_slot" }], 3, { source: "selected_enclosure_snapshot" }],
+  ["candidate cannot borrow snapshot view identity", "front", [{ slot_index: 1, snapshot_slot: 3, source: "inventory_candidate" }], null, { source: "selected_enclosure_snapshot" }],
+  ["snapshot row cannot borrow candidate view identity", "front", [{ slot_index: 1, snapshot_slot: 3, source: "snapshot_slot" }], null],
+  ["foreign explicit identity overrides snapshot provenance", "front", [{ ...rearBay, source: "snapshot_slot" }], null, { source: "selected_enclosure_snapshot" }],
+]) {
+  test(`physical bay selection rejects ambiguity: ${name}`, () => {
+    const selected = [];
+    const state = { snapshot: { selected_enclosure_id: enclosure }, selectedSlot: 99 };
+    const view = { backing_enclosure_id: "front", source: "inventory_binding", slots, ...extraView };
+    const loaded = loadFunctions([...BAY_TO_VIEW_SLOT_FUNCTIONS, "selectSasFabricSlot"], {
+      state,
+      getSelectedStorageViewRuntime: () => view,
+      selectSlot(value) { selected.push(value); state.selectedSlot = value; return true; },
+    });
+    assert.equal(loaded.sasFabricViewSlotForBay(3), expected);
+    assert.equal(loaded.selectSasFabricSlot(3), expected !== null);
+    assert.deepEqual(selected, expected === null ? [] : [expected]);
+    assert.equal(state.selectedSlot, expected === null ? 99 : expected);
+  });
+}
+
+test("live enclosure bay selection remains direct and invalid inputs never select", () => {
+  const selected = [];
+  const loaded = loadFunctions([...BAY_TO_VIEW_SLOT_FUNCTIONS, "selectSasFabricSlot"], {
+    getSelectedStorageViewRuntime: () => null,
+    selectSlot(value) { selected.push(value); return true; },
+  });
+  for (const invalid of [null, undefined, "3", 3.5, NaN]) assert.equal(loaded.selectSasFabricSlot(invalid), false);
+  assert.equal(loaded.selectSasFabricSlot(3), true);
+  assert.deepEqual(selected, [3]);
+});
+
+
+test("with a storage view selected a bay chip selects the view slot that bay backs", () => {
+  const selected = [];
+  const state = { selectedSlot: 0, snapshot: { selected_enclosure_id: "front" } };
+  const loaded = loadFunctions([...BAY_TO_VIEW_SLOT_FUNCTIONS, "selectSasFabricSlot"], {
+    Number,
+    state,
+    getSelectedStorageViewRuntime: () => BOOT_VIEW_ON_BAYS,
+    selectSlot(slotNumber) {
+      selected.push(slotNumber);
+      state.selectedSlot = slotNumber;
+      return true;
+    },
+  });
+
+  assert.equal(loaded.selectSasFabricSlot(46), false, "no view slot backs bay 46");
+  assert.equal(state.selectedSlot, 0, "a bay outside the view leaves the selection alone");
+  assert.equal(loaded.selectSasFabricSlot(7), true);
+  assert.equal(state.selectedSlot, 1, "bay 07 backs view slot 1");
+  assert.deepEqual(selected, [1]);
+});
+
+test("with a storage view selected the chip of the bay backing the selected view slot is lit", () => {
+  const layout = CSE_946;
+  const context = bayGridContext(layout, { impactedSlots: [1, 7, 46] });
+  context.state.layoutRows = layout.layoutRows;
+  context.state.snapshot.selected_profile = { edge_label: layout.profile.edgeLabel, row_groups: layout.profile.rowGroups };
+  context.state.selectedSlot = 1;
+  context.getSelectedStorageViewRuntime = () => BOOT_VIEW_ON_BAYS;
+  context.sasFabricSelectedSlotSet = () => new Set();
+  const loaded = loadFunctions([...LAYOUT_FUNCTIONS, ...RENDER_FUNCTIONS], {
+    ...context,
+    document: { createElement: fakeElement },
+    grid: fakeElement("div"),
+  });
+  const markup = loaded.renderSasFabricBayChips([1, 7, 46], 72);
+
+  assert.match(markup, /class="sas-fabric-bay-chip is-selected" data-sas-fabric-slot="7"/, "bay 07 backs view slot 1");
+  assert.match(markup, /class="sas-fabric-bay-chip" data-sas-fabric-slot="1"/, "bay 01 is not view slot 1");
+  assert.match(markup, /class="sas-fabric-bay-chip" data-sas-fabric-slot="46"/);
 });
 
 test("a layout with gaps draws the gaps, not a shifted row", () => {
