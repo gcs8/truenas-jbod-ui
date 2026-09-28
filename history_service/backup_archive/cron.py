@@ -24,8 +24,10 @@ _SHORTCUTS = {
     "@monthly": "0 0 1 * *",
 }
 _FIELDS = (("minute", 0, 59), ("hour", 0, 23), ("day of month", 1, 31), ("month", 1, 12), ("day of week", 0, 7))
-# Upper bound on the search; every valid expression matches within ~4 years (Feb 29).
-_MAX_SEARCH_DAYS = 366 * 5
+# Gregorian dates and weekdays repeat every 400 years (146097 days).
+# Include the repeated starting date: its earlier minutes may still be due
+# when the first day's matching time has already passed.
+_MAX_SEARCH_DAYS = 146097 + 1
 
 
 class CronError(ValueError):

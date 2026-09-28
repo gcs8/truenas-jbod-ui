@@ -94,6 +94,29 @@ class CronTests(unittest.TestCase):
             runs.append(start.day)
         self.assertEqual(runs, [28, 1, 5, 12, 15])
 
+    def test_sparse_leap_sunday_beyond_five_years(self) -> None:
+        from zoneinfo import ZoneInfo
+
+        schedule = CronSchedule.parse("0 0 29 2 */7")
+        for zone in (UTC, ZoneInfo("America/New_York")):
+            with self.subTest(zone=zone):
+                first = schedule.next_after(datetime(2026, 9, 28, tzinfo=zone))
+                self.assertEqual(first, datetime(2032, 2, 29, tzinfo=zone))
+                self.assertIs(first.tzinfo, zone)
+                self.assertEqual(schedule.next_after(first), datetime(2060, 2, 29, tzinfo=zone))
+                self.assertEqual(
+                    schedule.next_after(datetime(2096, 3, 1, tzinfo=zone)),
+                    datetime(2128, 2, 29, tzinfo=zone),
+                )
+
+    def test_impossible_intersection_has_bounded_calendar_search(self) -> None:
+        schedule = CronSchedule.parse("0 0 31 2 */7")
+        original = CronSchedule._day_matches
+        with patch.object(CronSchedule, "_day_matches", autospec=True, side_effect=original) as matches:
+            with self.assertRaises(CronError):
+                schedule.next_after(datetime(2026, 1, 1, tzinfo=UTC))
+        self.assertLessEqual(matches.call_count, 146098)
+
     def test_invalid(self) -> None:
         for text in ("", "* * * *", "60 * * * *", "* * 0 * *", "a * * * *", "*/0 * * * *", "5-1 * * * *", "0 0 31 2 *"):
             with self.subTest(text=text), self.assertRaises(CronError):
