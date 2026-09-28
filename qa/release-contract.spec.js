@@ -302,6 +302,136 @@ for (const timing of [false, true]) {
   }
 }
 
+// A settled live selector must not accept a leftover saved-view URL key, even
+// when its value is empty. Mutate only browser location after real app settlement.
+for (const timing of [false, true]) {
+  for (const value of ["stale", ""]) {
+    test(`live enclosure: timing ${timing}: rejects storage_view_id=${JSON.stringify(value)}`, async ({ page }, testInfo) => {
+      const { diagnostics } = await installFixture(page, html, { timing });
+      await switching.context.gotoApp(page);
+      await switching.context.setAutoRefresh(page, false);
+      const readiness = require("./release-readiness");
+      const scope = { systemId: "synthetic-system", enclosureValue: "enclosure:enc-a", timeout: negativeTimeout };
+      try {
+        await readiness.waitForSelectedScope(page, scope);
+        expect(new URL(page.url()).searchParams.get("enclosure_id")).toBe("enc-a");
+        expect(new URL(page.url()).searchParams.has("storage_view_id")).toBe(false);
+        await page.evaluate(value => {
+          const url = new URL(location.href);
+          url.searchParams.set("storage_view_id", value);
+          history.replaceState({}, "", url);
+        }, value);
+        await expect(readiness.waitForSelectedScope(page, scope)).rejects.toThrow(predicateTimeout);
+        await page.evaluate(() => {
+          const url = new URL(location.href);
+          url.searchParams.delete("storage_view_id");
+          history.replaceState({}, "", url);
+        });
+        await readiness.waitForSelectedScope(page, scope);
+        expect(diagnostics.errors).toEqual([]);
+        expect(diagnostics.warnings).toEqual([]);
+        expect(diagnostics.unexpected).toEqual([]);
+      } finally {
+        await testInfo.attach("synthetic-diagnostics", { body: JSON.stringify(diagnostics), contentType: "application/json" });
+      }
+    });
+  }
+
+  test(`live enclosure: timing ${timing}: wrong enclosure URL remains rejected`, async ({ page }) => {
+    await installFixture(page, html, { timing });
+    await switching.context.gotoApp(page);
+    await switching.context.setAutoRefresh(page, false);
+    await page.evaluate(() => {
+      const url = new URL(location.href);
+      url.searchParams.set("enclosure_id", "enc-b");
+      history.replaceState({}, "", url);
+    });
+    await expect(require("./release-readiness").waitForSelectedScope(page, {
+      systemId: "synthetic-system", enclosureValue: "enclosure:enc-a", timeout: negativeTimeout,
+    })).rejects.toThrow(predicateTimeout);
+  });
+
+  test(`saved view: timing ${timing}: backing enclosure URL and return to live remain supported`, async ({ page }, testInfo) => {
+    const { diagnostics } = await installFixture(page, html, { timing });
+    const readiness = require("./release-readiness");
+    await switching.context.gotoApp(page);
+    await switching.context.setAutoRefresh(page, false);
+    try {
+      const inventoryCount = diagnostics.inventory.length;
+      await readiness.switchSelectedScope(page, "#enclosure-select", "view:saved-chassis");
+      await readiness.waitForSelectedScope(page, { enclosureValue: "view:saved-chassis", timeout: negativeTimeout });
+      expect(diagnostics.inventory).toHaveLength(inventoryCount);
+      const params = new URL(page.url()).searchParams;
+      expect(params.get("system_id")).toBe("synthetic-system");
+      expect(params.get("storage_view_id")).toBe("saved-chassis");
+      // buildSelectionParams retains currentLiveEnclosureId for this saved view.
+      expect(params.get("enclosure_id")).toBe("enc-a");
+      await page.evaluate(() => {
+        const url = new URL(location.href);
+        url.searchParams.set("storage_view_id", "stale");
+        history.replaceState({}, "", url);
+      });
+      await expect(readiness.waitForSelectedScope(page, {
+        enclosureValue: "view:saved-chassis", timeout: negativeTimeout,
+      })).rejects.toThrow(predicateTimeout);
+      await page.evaluate(() => {
+        const url = new URL(location.href);
+        url.searchParams.set("storage_view_id", "saved-chassis");
+        history.replaceState({}, "", url);
+      });
+      await readiness.switchSelectedScope(page, "#enclosure-select", "enclosure:enc-a");
+      expect(new URL(page.url()).searchParams.get("enclosure_id")).toBe("enc-a");
+      expect(new URL(page.url()).searchParams.has("storage_view_id")).toBe(false);
+      expect(diagnostics.errors).toEqual([]);
+      expect(diagnostics.warnings).toEqual([]);
+      expect(diagnostics.unexpected).toEqual([]);
+    } finally {
+      await testInfo.attach("synthetic-diagnostics", { body: JSON.stringify(diagnostics), contentType: "application/json" });
+    }
+  });
+
+  test(`helper timeout: timing ${timing}: explicit budget reaches final runtime settlement`, async ({ page }) => {
+    const { controls } = await installFixture(page, html, { timing });
+    await switching.context.gotoApp(page);
+    await switching.context.setAutoRefresh(page, false);
+    const runtime = gate();
+    let started = false;
+    controls.holdRuntime = async () => { started = true; await runtime.promise; };
+    const readiness = require("./release-readiness");
+    const listeners = page.listenerCount("request");
+    try {
+      await expect(readiness.refreshSelectedScope(page, () => page.locator("#refresh-button").click(), {
+        systemId: "synthetic-system", enclosureId: "enc-a", force: true, timeout: negativeTimeout,
+      })).rejects.toThrow(predicateTimeout);
+      expect(started).toBe(true);
+      expect(page.listenerCount("request")).toBe(listeners);
+    } finally {
+      runtime.release();
+      await readiness.waitForSelectedScope(page, { timeout: negativeTimeout });
+    }
+  });
+}
+
+for (const key of ["enclosure_id", "storage_view_id"]) {
+  test(`empty enclosure rejects empty-valued ${key} location`, async ({ page }) => {
+    await installEmptyInventory(page, false);
+    await page.evaluate(key => history.replaceState({}, "", `?system_id=synthetic-system&${key}=`), key);
+    await expect(require("./release-readiness").waitForSelectedScope(page, {
+      timeout: negativeTimeout,
+    })).rejects.toThrow(predicateTimeout);
+  });
+}
+
+for (const selector of ["system-select", "enclosure-select"]) {
+  test(`empty enclosure rejects missing ${selector}`, async ({ page }) => {
+    await installEmptyInventory(page, false);
+    await page.locator(`#${selector}`).evaluate(node => node.remove());
+    await expect(require("./release-readiness").waitForSelectedScope(page, {
+      systemId: "synthetic-system", enclosureValue: "", timeout: negativeTimeout,
+    })).rejects.toThrow(predicateTimeout);
+  });
+}
+
 for (const key of ["enclosure_id", "storage_view_id"]) {
   test(`empty enclosure rejects stale ${key} location`, async ({ page }) => {
     await installEmptyInventory(page, false);

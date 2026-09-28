@@ -28,8 +28,9 @@ async function waitForSelectedScope(page, { systemId, enclosureValue, timeout = 
         && params.get("system_id") === system
         && (enclosure === ""
           ? !params.has("enclosure_id") && !params.has("storage_view_id")
-          : (enclosure.startsWith("view:") ? `view:${params.get("storage_view_id")}`
-            : `enclosure:${params.get("enclosure_id")}`) === enclosure);
+          : enclosure.startsWith("view:")
+            ? `view:${params.get("storage_view_id")}` === enclosure
+            : `enclosure:${params.get("enclosure_id")}` === enclosure && !params.has("storage_view_id"));
     };
     if (!ready()) return false;
     // Recheck across a real paint opportunity, not a timer or network-idle guess.
