@@ -264,6 +264,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   path or slot matches while preserving verified shared-disk health. (#747)
 - Require verified SES device-slot coordinates for SG LED control and keep
   independent disks distinct when CAM model/target/LUN values match across controllers. (#809)
+- Bound SSH command execution and retain worker, channel and reusable-session
+  cleanup ownership through cancellation before releasing caller locks. (#765)
 - The main UI no longer reports itself down when a pinned known-hosts file sits
   on a read-only mount, such as the `/run/ssh` mount in the shipped Compose
   file. SSH still verifies hosts against the keys in it; `/healthz` now answers
