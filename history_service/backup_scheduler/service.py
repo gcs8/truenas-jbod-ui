@@ -59,7 +59,7 @@ from history_service.backup_archive.policy import (
     BackupPolicy,
     validate_filesystem_target_roots,
 )
-from history_service.backup_archive.transport import open_target, transport_encrypted
+from history_service.backup_archive.transport import ArchiveDownloadTooLargeError, open_target, transport_encrypted
 from history_service.scheduled_backup import ScheduledBackupRunner
 
 logger = logging.getLogger(__name__)
@@ -988,7 +988,7 @@ class BackupScheduler:
         try:
             local = workspace / "archive"
             with self._open_configured_target(target) as remote:
-                size, digest = remote.get(record.name, local)
+                size, digest = remote.get(record.name, local, limit=record.size + 1)
             # Never hand out bytes the catalogue did not record: a target (or an
             # on-path attacker for plain FTP/NFS) could substitute another backup.
             _require_match(record, size, digest)
@@ -1008,7 +1008,7 @@ class BackupScheduler:
             self.catalog.mark_verified(artifact_id, sha256=record.sha256, size=record.size, now=self._clock())
             ok = True
             detail = "Readback matched the catalogued size and SHA-256."
-        except ArchiveIntegrityError as exc:
+        except (ArchiveIntegrityError, ArchiveDownloadTooLargeError) as exc:
             # A copy that no longer matches must stop counting as verified, so it is
             # neither offered for restore nor protected as the newest verified copy.
             self.catalog.mark_unverified(artifact_id)

@@ -1317,6 +1317,27 @@ class S3TargetTests(_TempCase):
         self.assertTrue(stored.verified)
         self.assertEqual(self.clients[0].get_calls, 1)
 
+    def test_get_stops_once_download_exceeds_limit(self) -> None:
+        data = b"x" * (transport.CHUNK_SIZE * 3)
+        reads: list[int] = []
+
+        class Body(io.BytesIO):
+            def read(self, size=-1):
+                chunk = super().read(size)
+                reads.append(len(chunk))
+                return chunk
+
+        body = Body(data)
+        local = self.tmp / "fetched.bin"
+        with open_target(self.settings()) as target:
+            client = self.clients[0]
+            client.objects["jbod-ui/archive/full/a.bin"] = {"data": data, "meta": {}, "etag": "e"}
+            client.get_object = lambda Bucket, Key: {"Body": body}
+            with self.assertRaisesRegex(transport.ArchiveDownloadTooLargeError, "larger than expected"):
+                target.get("full/a.bin", local, limit=transport.CHUNK_SIZE + 1)
+        self.assertEqual(sum(reads), transport.CHUNK_SIZE * 2)
+        self.assertFalse(local.exists())
+
     def test_plain_http_endpoint_is_labelled_unencrypted(self) -> None:
         with open_target(self.settings(endpoint_url="http://minio.example.test:9000")) as target:
             self.assertFalse(target.transport_encrypted)

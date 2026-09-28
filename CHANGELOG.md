@@ -267,6 +267,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   MD5, and never catalogued a copy that could not be verified, so grooming no
   longer deletes it after a day. Bounded S3 verification readback to the uploaded
   size plus at most one chunk, retaining failed-copy cleanup. (#795)
+- Capped remote backup downloads at the catalogued size so a hostile or broken
+  remote cannot fill the state volume before the catalogue check. (#796)
 - The main UI no longer reports itself down when a pinned known-hosts file sits
   on a read-only mount, such as the `/run/ssh` mount in the shipped Compose
   file. SSH still verifies hosts against the keys in it; `/healthz` now answers

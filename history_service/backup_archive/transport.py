@@ -87,6 +87,10 @@ class ArchiveVerificationError(ArchiveTransportError):
     """The readback check did not match what was sent."""
 
 
+class ArchiveDownloadTooLargeError(ArchiveVerificationError):
+    """A download grew past the catalogued size, so it cannot match the catalogue."""
+
+
 class NfsUnmountError(ArchiveTransportError):
     """The NFS export could not be confirmed unmounted; the mount point was left in place."""
 
@@ -123,7 +127,7 @@ class ArchiveTarget(Protocol):
 
     def delete(self, name: str) -> None: ...
 
-    def get(self, name: str, local_path: Path) -> tuple[int, str]: ...
+    def get(self, name: str, local_path: Path, *, limit: int | None = None) -> tuple[int, str]: ...
 
     def test(self) -> dict[str, Any]: ...
 
@@ -218,17 +222,23 @@ class _HashingReader(io.RawIOBase):
         return len(chunk)
 
 
-def _copy_stream(source: Any, write: Callable[[bytes], Any]) -> tuple[int, str]:
+def _copy_stream(source: Any, write: Callable[[bytes], Any], limit: int | None = None) -> tuple[int, str]:
     digest = hashlib.sha256()
     size = 0
     while True:
         chunk = source.read(CHUNK_SIZE)
         if not chunk:
             break
+        size += len(chunk)
+        _check_download_limit(size, limit)
         write(chunk)
         digest.update(chunk)
-        size += len(chunk)
     return size, digest.hexdigest()
+
+
+def _check_download_limit(size: int, limit: int | None) -> None:
+    if limit is not None and size > limit:
+        raise ArchiveDownloadTooLargeError("Archive download is larger than expected; stopped before the catalogue check.")
 
 
 def _hash_stream(source: Any, expected_size: int | None = None) -> tuple[int, str]:
@@ -290,8 +300,11 @@ class _TargetBase:
     def delete(self, name: str) -> None:  # pragma: no cover - abstract
         raise NotImplementedError
 
-    def get(self, name: str, local_path: Path) -> tuple[int, str]:  # pragma: no cover - abstract
-        """Stream object ``name`` into a new private file; return (size, sha256)."""
+    def get(self, name: str, local_path: Path, *, limit: int | None = None) -> tuple[int, str]:  # pragma: no cover - abstract
+        """Stream object ``name`` into a new private file; return (size, sha256).
+
+        With ``limit``, fail once more than ``limit`` bytes arrive.
+        """
         raise NotImplementedError
 
     def test(self) -> dict[str, Any]:
@@ -462,10 +475,10 @@ class LocalDirectoryTarget(_TargetBase):
                 )
         return results
 
-    def get(self, name: str, local_path: Path) -> tuple[int, str]:
+    def get(self, name: str, local_path: Path, *, limit: int | None = None) -> tuple[int, str]:
         path = self._object_path(name, create_parents=False)
         with _open_local_source(path) as (source, _size), _download_destination(Path(local_path)) as target:
-            return _copy_stream(source, target.write)
+            return _copy_stream(source, target.write, limit)
 
     def delete(self, name: str) -> None:
         path = self._object_path(name, create_parents=False)
@@ -589,15 +602,16 @@ class FtpTarget(_TargetBase):
                     )
                 )
 
-    def get(self, name: str, local_path: Path) -> tuple[int, str]:
+    def get(self, name: str, local_path: Path, *, limit: int | None = None) -> tuple[int, str]:
         path = self._path(*validate_object_name(name))
         digest = hashlib.sha256()
         size = 0
         with _download_destination(Path(local_path)) as target:
             def write(chunk: bytes) -> None:
                 nonlocal size
-                digest.update(chunk)
                 size += len(chunk)
+                _check_download_limit(size, limit)
+                digest.update(chunk)
                 target.write(chunk)
 
             self._ftp.retrbinary(f"RETR {path}", write, blocksize=CHUNK_SIZE)
@@ -789,10 +803,10 @@ class SftpTarget(_TargetBase):
                 )
                 results.append(RemoteObject(name=child, size=int(entry.st_size or 0), modified=modified))
 
-    def get(self, name: str, local_path: Path) -> tuple[int, str]:
+    def get(self, name: str, local_path: Path, *, limit: int | None = None) -> tuple[int, str]:
         path = self._path(*validate_object_name(name))
         with self._sftp.open(path, "rb") as remote, _download_destination(Path(local_path)) as target:
-            return _copy_stream(remote, target.write)
+            return _copy_stream(remote, target.write, limit)
 
     def delete(self, name: str) -> None:
         parts = validate_object_name(name)
@@ -920,10 +934,10 @@ class SmbTarget(_TargetBase):
                     )
                 )
 
-    def get(self, name: str, local_path: Path) -> tuple[int, str]:
+    def get(self, name: str, local_path: Path, *, limit: int | None = None) -> tuple[int, str]:
         path = self._path(*validate_object_name(name))
         with self._client.open_file(path, mode="rb") as remote, _download_destination(Path(local_path)) as target:
-            return _copy_stream(remote, target.write)
+            return _copy_stream(remote, target.write, limit)
 
     def delete(self, name: str) -> None:
         parts = validate_object_name(name)
@@ -1241,12 +1255,12 @@ class S3Target(_TargetBase):
                 )
         return sorted(results, key=lambda item: item.name)
 
-    def get(self, name: str, local_path: Path) -> tuple[int, str]:
+    def get(self, name: str, local_path: Path, *, limit: int | None = None) -> tuple[int, str]:
         validate_object_name(name)
         body = self._client.get_object(Bucket=self._bucket, Key=self._key(name))["Body"]
         try:
             with _download_destination(Path(local_path)) as target:
-                return _copy_stream(body, target.write)
+                return _copy_stream(body, target.write, limit)
         finally:
             close = getattr(body, "close", None)
             if callable(close):
