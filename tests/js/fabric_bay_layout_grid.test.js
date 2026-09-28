@@ -195,7 +195,7 @@ function layoutContext(layout) {
     .filter((slotNumber) => Number.isInteger(slotNumber))
     .map((slotNumber) => ({ slot: slotNumber, state: "matched" }));
   return {
-    state: { snapshot: { slots, layout_slot_count: slots.length }, selectedSlot: null },
+    state: { snapshot: { slots, layout_slot_count: slots.length, selected_enclosure_id: "front" }, selectedSlot: null },
     getSmartSummaryEntry: () => null,
     getSelectedProfile: () => ({ row_groups: layout.profile.rowGroups }),
     currentLayoutSlotCount: () => slots.length,
@@ -289,7 +289,7 @@ function bayGridContext(layout, { impactedSlots = [], emptySlots = [], layoutRow
     }));
   const rows = layoutRows === null ? layout.layoutRows : layoutRows;
   return {
-    state: { snapshot: { slots, layout_slot_count: slots.length }, selectedSlot: null },
+    state: { snapshot: { slots, layout_slot_count: slots.length, selected_enclosure_id: "front" }, selectedSlot: null },
     getSmartSummaryEntry: () => null,
     getSelectedProfile: () => ({ row_groups: layout.profile.rowGroups }),
     currentLayoutSlotCount: () => slots.length,
@@ -374,16 +374,66 @@ const BOOT_VIEW_ON_BAYS = {
   slot_layout: [[0, 1]],
   slot_count: 2,
   slots: [
-    { slot_index: 0, snapshot_slot: 3 },
-    { slot_index: 1, snapshot_slot: 7 },
+    { slot_index: 0, snapshot_slot: 3, snapshot_enclosure_id: "front" },
+    { slot_index: 1, snapshot_slot: 7, snapshot_enclosure_id: "front" },
   ],
 };
 
 const BAY_TO_VIEW_SLOT_FUNCTIONS = ["sasFabricList", "sasFabricViewSlotForBay"];
 
+const frontBay = { slot_index: 1, snapshot_slot: 3, snapshot_enclosure_id: "front", source: "inventory_candidate" };
+const rearBay = { slot_index: 0, snapshot_slot: 3, snapshot_enclosure_id: "rear", source: "inventory_candidate" };
+for (const [name, enclosure, slots, expected, extraView = {}] of [
+  ["overlapping front and rear bays", "front", [rearBay, frontBay], 1],
+  ["overlapping bays in reverse order", "front", [frontBay, rearBay], 1],
+  ["rear snapshot rather than the view backing enclosure", "rear", [frontBay, rearBay], 0],
+  ["only a foreign bay", "front", [rearBay], null],
+  ["missing snapshot enclosure", undefined, [frontBay], null],
+  ["blank snapshot enclosure", "", [frontBay], null],
+  ["unknown candidate enclosure", "front", [{ ...frontBay, snapshot_enclosure_id: null }], null],
+  ["absent candidate enclosure", "front", [{ slot_index: 1, snapshot_slot: 3 }], null],
+  ["unknown candidate alongside a known match", "front", [frontBay, { ...rearBay, snapshot_enclosure_id: null }], null],
+  ["duplicate physical identity", "front", [frontBay, { ...frontBay, slot_index: 2 }], null],
+  ["identical duplicate rows", "front", [frontBay, frontBay], null],
+  ["duplicate view index on a foreign bay", "front", [frontBay, { ...rearBay, slot_index: 1 }], null],
+  ["null view index", "front", [{ ...frontBay, slot_index: null }], null],
+  ["empty view index", "front", [{ ...frontBay, slot_index: "" }], null],
+  ["snapshot-backed row with declared provenance", "front", [{ slot_index: 3, snapshot_slot: 3, source: "snapshot_slot" }], 3, { source: "selected_enclosure_snapshot" }],
+  ["candidate cannot borrow snapshot view identity", "front", [{ slot_index: 1, snapshot_slot: 3, source: "inventory_candidate" }], null, { source: "selected_enclosure_snapshot" }],
+  ["snapshot row cannot borrow candidate view identity", "front", [{ slot_index: 1, snapshot_slot: 3, source: "snapshot_slot" }], null],
+  ["foreign explicit identity overrides snapshot provenance", "front", [{ ...rearBay, source: "snapshot_slot" }], null, { source: "selected_enclosure_snapshot" }],
+]) {
+  test(`physical bay selection rejects ambiguity: ${name}`, () => {
+    const selected = [];
+    const state = { snapshot: { selected_enclosure_id: enclosure }, selectedSlot: 99 };
+    const view = { backing_enclosure_id: "front", source: "inventory_binding", slots, ...extraView };
+    const loaded = loadFunctions([...BAY_TO_VIEW_SLOT_FUNCTIONS, "selectSasFabricSlot"], {
+      state,
+      getSelectedStorageViewRuntime: () => view,
+      selectSlot(value) { selected.push(value); state.selectedSlot = value; return true; },
+    });
+    assert.equal(loaded.sasFabricViewSlotForBay(3), expected);
+    assert.equal(loaded.selectSasFabricSlot(3), expected !== null);
+    assert.deepEqual(selected, expected === null ? [] : [expected]);
+    assert.equal(state.selectedSlot, expected === null ? 99 : expected);
+  });
+}
+
+test("live enclosure bay selection remains direct and invalid inputs never select", () => {
+  const selected = [];
+  const loaded = loadFunctions([...BAY_TO_VIEW_SLOT_FUNCTIONS, "selectSasFabricSlot"], {
+    getSelectedStorageViewRuntime: () => null,
+    selectSlot(value) { selected.push(value); return true; },
+  });
+  for (const invalid of [null, undefined, "3", 3.5, NaN]) assert.equal(loaded.selectSasFabricSlot(invalid), false);
+  assert.equal(loaded.selectSasFabricSlot(3), true);
+  assert.deepEqual(selected, [3]);
+});
+
+
 test("with a storage view selected a bay chip selects the view slot that bay backs", () => {
   const selected = [];
-  const state = { selectedSlot: 0 };
+  const state = { selectedSlot: 0, snapshot: { selected_enclosure_id: "front" } };
   const loaded = loadFunctions([...BAY_TO_VIEW_SLOT_FUNCTIONS, "selectSasFabricSlot"], {
     Number,
     state,

@@ -1854,17 +1854,33 @@
     renderAll();
   }
 
-  // Fabric chips carry physical bay numbers. While a storage view is selected
-  // the selection is a view slot, so map the bay through the view slot
-  // snapshot_slot; null means no view slot is backed by that bay.
+  // Fabric bays belong to the rendered enclosure snapshot, not the storage
+  // view's backing enclosure (inventory candidates may come from other shelves).
+  // Unknown or ambiguous physical identity must not select a view slot.
   function sasFabricViewSlotForBay(bayNumber) {
     const storageView = getSelectedStorageViewRuntime();
     if (!storageView) {
       return bayNumber;
     }
-    const viewSlot = sasFabricList(storageView.slots).find((slot) => slot?.snapshot_slot === bayNumber);
-    const slotIndex = Number(viewSlot?.slot_index);
-    return viewSlot && Number.isInteger(slotIndex) ? slotIndex : null;
+    const enclosureId = state.snapshot?.selected_enclosure_id;
+    if (typeof enclosureId !== "string" || !enclosureId.trim()) return null;
+    const slots = sasFabricList(storageView.slots);
+    const matches = [];
+    for (const slot of slots) {
+      if (slot?.snapshot_slot !== bayNumber) continue;
+      // Only snapshot-produced rows have view-level enclosure provenance.
+      // Never borrow that identity for an inventory candidate lacking metadata.
+      const slotEnclosureId = slot.snapshot_enclosure_id ?? (
+        storageView.source === "selected_enclosure_snapshot" && slot.source === "snapshot_slot"
+          ? storageView.backing_enclosure_id : null
+      );
+      if (typeof slotEnclosureId !== "string" || !slotEnclosureId.trim()) return null;
+      if (slotEnclosureId === enclosureId) matches.push(slot);
+    }
+    if (matches.length !== 1) return null;
+    const slotIndex = matches[0].slot_index;
+    return Number.isInteger(slotIndex) && slots.filter((slot) => slot?.slot_index === slotIndex).length === 1
+      ? slotIndex : null;
   }
 
   function selectSasFabricSlot(slotNumber) {
