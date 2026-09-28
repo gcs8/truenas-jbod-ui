@@ -17261,6 +17261,102 @@ class InventoryScopedIdentityRegressionTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(summary.firmware_version, "A-FW")
                     probe.run_planned_commands.assert_awaited_once()
 
+    async def test_esxi_public_smart_distinguishes_failed_controller_mapping_from_absence(self) -> None:
+        # Exercise actual parser normalization and the public snapshot/SMART path.
+        wwn, controller_wwn, other_wwn = (f"5{counter:015x}" for counter in (1, 16, 32))
+        naa = f"naa.{wwn}"
+        cases = (
+            ("matching-sas", controller_wwn, 0, controller_wwn, None, True),
+            ("mismatching-sas", controller_wwn, 0, other_wwn, None, False),
+            ("missing-adapter-sas", controller_wwn, 0, None, None, False),
+            ("invalid-adapter-sas", controller_wwn, 0, "not-a-wwn", None, False),
+            ("invalid-controller-sas", "not-a-wwn", 0, controller_wwn, None, False),
+            ("missing-controller-number", controller_wwn, None, controller_wwn, None, False),
+            ("different-controller-number", controller_wwn, 1, controller_wwn, None, False),
+            ("absent-controller", None, None, None, None, True),
+            ("absent-controller-sas", None, 0, controller_wwn, None, True),
+            ("empty-controller-sas", "", 0, controller_wwn, None, True),
+            ("blank-controller-sas", "   ", 0, controller_wwn, None, True),
+            ("normalized-controller-sas", f"  0x{controller_wwn}  ", 0, controller_wwn, None, True),
+            ("persistent-wwn", controller_wwn, 0, other_wwn, wwn, True),
+            ("persistent-serial", controller_wwn, 0, other_wwn, None, True),
+            ("conflicting-wwn", controller_wwn, 0, other_wwn, other_wwn, False),
+            ("conflicting-serial", controller_wwn, 0, other_wwn, wwn, False),
+            ("mismatching-target", None, 0, None, None, False),
+            ("multiple-adapters", None, 0, None, None, False),
+            ("unknown-adapter", None, 0, None, None, False),
+        )
+        for name, controller_sas, controller_number, adapter_sas, drive_wwn, allowed in cases:
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as temp_dir:
+                system = SystemConfig(
+                    id="synthetic-esxi", truenas=TrueNASConfig(platform="esxi"),
+                    default_profile_id=SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID,
+                    ssh=SSHConfig(enabled=True, host="esxi.example.test", commands=[]),
+                )
+                detail = {"SN": "SANITIZED-A", "Firmware Revision": "A-FW"}
+                if drive_wwn:
+                    detail["WWN"] = drive_wwn
+                device = f"{naa}\n   Is Local: true\n   Drive Type: physical\n   RAID Level: NA\n"
+                if name in {"persistent-serial", "conflicting-serial"}:
+                    serial = "SANITIZED-B" if name == "conflicting-serial" else "SANITIZED-A"
+                    device += f"   Serial Number: {serial}\n"
+                target = 28 if name == "mismatching-target" else 27
+                path = (
+                    "path-0\n"
+                    + ("" if name == "unknown-adapter" else "   Runtime Name: vmhba2:C0:T27:L0\n   Adapter: vmhba2\n")
+                    + f"   Device: {naa}\n   Target: {target}\n   Transport: sas\n   State: active\n"
+                )
+                if name == "multiple-adapters":
+                    path += "\n" + path.replace("path-0", "path-1").replace("vmhba2", "vmhba3")
+                outputs = {
+                    "esxcli storage core device list": device,
+                    "esxcli storage core path list": path,
+                    "storcli /c0/eall/sall show all J": json.dumps({"Controllers": [{
+                        "Command Status": {"Controller": 0, "Status": "Success"},
+                        "Response Data": {
+                            "Drive Information": [{"EID:Slt": "252:0", "DID": "27",
+                                "State": "JBOD", "Intf": "SAS", "SeSz": "512B"}],
+                            "Drive /c0/e252/s0 - Detailed Information": detail,
+                        },
+                    }]}),
+                }
+                if name != "absent-controller":
+                    outputs["storcli /c0 show all J"] = json.dumps({"Controllers": [{
+                        "Command Status": {"Controller": 0, "Status": "Success"},
+                        "Response Data": {"Basics": {"Controller": controller_number, "SAS Address": controller_sas}},
+                    }]})
+                if adapter_sas is not None:
+                    outputs["esxcli storage san sas list"] = (
+                        f"vmhba2\n   Adapter: vmhba2\n   SAS Address: {adapter_sas}\n"
+                    )
+                probe = AsyncMock()
+                probe.run_planned_commands.return_value = [
+                    SSHCommandResult(command=command, ok=True, stdout=output, exit_code=0)
+                    for command, output in outputs.items()
+                ]
+                service = build_inventory_service(Settings(), system, AsyncMock(), probe, temp_dir)
+                commands = []
+
+                async def run_commands(batch, host=None):
+                    commands.extend(batch)
+                    return [SSHCommandResult(command=command, ok=True, exit_code=0, stdout=(
+                        "Parameter                 Value         Threshold  Worst  Raw\n"
+                        "------------------------  ------------  ---------  -----  ---\n"
+                        "Read Error Count          111           N/A        N/A    N/A\n"
+                    )) for command in batch]
+
+                service._run_ssh_commands = AsyncMock(side_effect=run_commands)
+                snapshot = await service.get_snapshot()
+                slot = next(slot for slot in snapshot.slots if slot.serial == "SANITIZED-A")
+                summary = await service.get_slot_smart_summary(slot.slot)
+                expected = naa if allowed else None
+                self.assertEqual(slot.raw_status.get("esxi_device_id"), expected)
+                self.assertEqual(slot.smart_device_names, [expected] if allowed else [])
+                self.assertEqual(commands, [f"esxcli storage core device smart get -d {expected}"] if allowed else [])
+                self.assertEqual(summary.read_error_count, 111 if allowed else None)
+                self.assertEqual(summary.firmware_version, "A-FW")
+                probe.run_planned_commands.assert_awaited_once()
+
     async def test_quantastor_public_snapshot_refuses_foreign_cli_aliases(self) -> None:
         wwn_a, wwn_b = (f"5{counter:015x}" for counter in (1, 2))
         disk_a = {"id": "disk-a", "storageSystemId": "node-a", "devicePath": "/dev/sda",

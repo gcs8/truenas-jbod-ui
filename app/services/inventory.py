@@ -8545,7 +8545,8 @@ class InventoryService:
         basics = controller.get("Basics") if isinstance(controller, dict) else None
         basics = basics if isinstance(basics, dict) else {}
         controller_number = cls._int_like(basics.get("Controller"))
-        controller_sas = cls._esxi_wwn(basics.get("SAS Address"))
+        raw_controller_sas = normalize_value_text(basics.get("SAS Address"))
+        controller_sas = cls._esxi_wwn(raw_controller_sas)
         adapters: set[str] = set()
         if controller_number is not None and drive.get("controller_id") == f"c{controller_number}" and controller_sas:
             for adapter in ssh_data.esxi_sas_adapters:
@@ -8591,6 +8592,10 @@ class InventoryService:
         if not matches or len({match[1] for match in matches}) != 1:
             return None
         if not verified and not adapters:
+            # Failed explicit SAS correlation is not absent controller evidence.
+            # Independent persistent identity remains eligible above.
+            if raw_controller_sas is not None:
+                return None
             # Compatibility for a single observed adapter/controller, not a
             # first-active shortcut when the host exposes competing scopes.
             observed_adapters = {
