@@ -259,6 +259,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Treat malformed UTF-8 slot-detail caches as corrupt without blocking
+  startup; preserve their bytes until a legitimate save rebuilds them. (#752)
 - Emit JSON log timestamps in UTC to match their `Z` suffix, while leaving
   text log timestamps in local time. (#753)
 - The main UI no longer reports itself down when a pinned known-hosts file sits
