@@ -134,11 +134,11 @@ def write_text_atomically(path: Path, text: str) -> None:
         # fsync the directory so the rename itself survives a power loss.
         try:
             directory = os.open(path.parent, os.O_RDONLY)
-        except OSError:
-            return
-        try:
-            os.fsync(directory)
-        except OSError:
-            pass
-        finally:
-            os.close(directory)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        except OSError as exc:
+            # Replacement has already happened. Do not claim either success
+            # or that the old bytes survived a failed durability barrier.
+            raise OSError(exc.errno, "File replaced; directory durability is uncertain.") from exc
