@@ -263,6 +263,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   `0 3 */2 * 1` now runs only on Mondays that fall on an odd day of the month,
   not on every Monday plus every second day. Searched a complete Gregorian
   calendar cycle so sparse leap-day intersections remain valid. (#817)
+- Refused a full backup schedule that never matches a real date (for example
+  `0 0 30 2 *`) at validation time, instead of letting the scheduler exit on
+  start. (#793)
 - The main UI no longer reports itself down when a pinned known-hosts file sits
   on a read-only mount, such as the `/run/ssh` mount in the shipped Compose
   file. SSH still verifies hosts against the keys in it; `/healthz` now answers
