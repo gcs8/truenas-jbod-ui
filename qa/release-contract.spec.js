@@ -23,13 +23,16 @@ function loadReleaseSpec(filename) {
   const localRequire = createRequire(absolute);
   const context = vm.createContext({
     require: name => name === "@playwright/test" ? { test: register, expect } : localRequire(name),
-    process: { env: { ...process.env, PLAYWRIGHT_SYSTEM_SETTLE_TIMEOUT_MS: "1500" } },
+    process: { env: { ...process.env } },
     URL, console,
   });
   vm.runInContext(fs.readFileSync(absolute, "utf8"), context, { filename: absolute });
   return { cases, context };
 }
 
+// Explicit per-call budgets reach the host-required helper, unlike VM-local env.
+const negativeTimeout = 1500;
+const predicateTimeout = /Timeout 1500ms exceeded while waiting on the predicate/;
 const switching = loadReleaseSpec("ui-switching.spec.js");
 const esxi = loadReleaseSpec("esxi-smoke.spec.js");
 const affectedCases = [
@@ -238,6 +241,77 @@ for (const timing of [false, true]) {
   });
 }
 
+
+// Supported empty inventory uses an empty selector and omits both URL scope keys.
+// Keep the real template/assets; change only synthetic bootstrap/HTTP data.
+async function installEmptyInventory(page, timing) {
+  const fixture = await installFixture(page, html, { timing });
+  await page.addInitScript(() => {
+    const bootstrap = Object.getOwnPropertyDescriptor(window, "APP_BOOTSTRAP");
+    Object.defineProperty(window, "APP_BOOTSTRAP", { configurable: true, set(value) {
+      bootstrap.set(value);
+      value.snapshot.enclosures = [];
+      value.snapshot.selected_enclosure_id = null;
+      value.snapshot.selected_enclosure_label = null;
+      value.snapshot.slots = [];
+      value.storageViewsRuntime = { system_id: "synthetic-system", views: [] };
+    } });
+  });
+  await page.route("**/api/storage-views?**", route => route.fulfill({
+    json: { system_id: "synthetic-system", views: [] },
+  }));
+  await page.route("**/api/inventory?**", async route => {
+    fixture.diagnostics.inventory.push(route.request().url());
+    await route.fulfill({ json: await page.evaluate(() => window.APP_BOOTSTRAP.snapshot) });
+  });
+  await page.goto(origin);
+  await expect(page.locator("#slot-grid")).toHaveAttribute("aria-busy", "false");
+  await switching.context.setAutoRefresh(page, false);
+  await expect(page.locator("#enclosure-select")).toHaveValue("");
+  expect(new URL(page.url()).searchParams.has("enclosure_id")).toBe(false);
+  expect(new URL(page.url()).searchParams.has("storage_view_id")).toBe(false);
+  return fixture;
+}
+
+for (const timing of [false, true]) {
+  for (const operation of ["initial", "refresh"]) {
+    test(`empty enclosure: timing ${timing}: ${operation} readiness`, async ({ page }, testInfo) => {
+      const { diagnostics } = await installEmptyInventory(page, timing);
+      const readiness = require("./release-readiness");
+      try {
+        if (operation === "initial") {
+          await readiness.waitForSelectedScope(page);
+        } else {
+          await readiness.refreshSelectedScope(page, () => page.locator("#refresh-button").click(), {
+            systemId: "synthetic-system", force: true,
+          });
+          expect(diagnostics.inventory).toHaveLength(1);
+          expect(new URL(diagnostics.inventory[0]).searchParams.has("enclosure_id")).toBe(false);
+        }
+        await paintCheckpoint(page);
+        await expect(page.locator("#enclosure-select")).toHaveValue("");
+        await expect(page.locator("#slot-grid")).toHaveAttribute("aria-busy", "false");
+        expect(await page.locator("#slot-grid").evaluate(grid => grid.inert)).toBe(false);
+        expect(diagnostics.errors).toEqual([]);
+        expect(diagnostics.warnings).toEqual([]);
+        expect(diagnostics.unexpected).toEqual([]);
+      } finally {
+        await testInfo.attach("synthetic-diagnostics", { body: JSON.stringify(diagnostics), contentType: "application/json" });
+      }
+    });
+  }
+}
+
+for (const key of ["enclosure_id", "storage_view_id"]) {
+  test(`empty enclosure rejects stale ${key} location`, async ({ page }) => {
+    await installEmptyInventory(page, false);
+    await page.evaluate(key => history.replaceState({}, "", `?system_id=synthetic-system&${key}=stale`), key);
+    await expect(require("./release-readiness").waitForSelectedScope(page, {
+      timeout: negativeTimeout,
+    })).rejects.toThrow(predicateTimeout);
+  });
+}
+
 for (const control of ["busy", "inert", "inventory-note", "runtime-note", "error", "system", "enclosure", "location"]) {
   test(`F1: settled-scope rejects ${control} at the completion boundary`, async ({ page }) => {
     await installFixture(page, html);
@@ -260,8 +334,8 @@ for (const control of ["busy", "inert", "inventory-note", "runtime-note", "error
       if (kind === "location") history.replaceState({}, "", "?system_id=synthetic-second&enclosure_id=enc-a");
     }, control);
     await expect(require("./release-readiness").waitForSelectedScope(page, {
-      systemId: "synthetic-system", enclosureValue: "enclosure:enc-a",
-    })).rejects.toThrow();
+      systemId: "synthetic-system", enclosureValue: "enclosure:enc-a", timeout: negativeTimeout,
+    })).rejects.toThrow(predicateTimeout);
   });
 }
 
@@ -276,7 +350,9 @@ test("F1: real in-flight countdown rejects settled-scope readiness", async ({ pa
     await page.locator("#refresh-button").click();
     await expect.poll(() => started).toBe(true);
     await expect(page.locator("#refresh-countdown-label")).toHaveText("Refreshing...");
-    await expect(require("./release-readiness").waitForSelectedScope(page)).rejects.toThrow();
+    await expect(require("./release-readiness").waitForSelectedScope(page, {
+      timeout: negativeTimeout,
+    })).rejects.toThrow(predicateTimeout);
   } finally {
     inventory.release();
     await require("./release-readiness").waitForSelectedScope(page);
@@ -287,6 +363,6 @@ test("F1: an action without a new request times out instead of borrowing settled
   await installFixture(page, html);
   await switching.context.gotoApp(page);
   await expect(require("./release-readiness").refreshSelectedScope(page, async () => {}, {
-    systemId: "synthetic-system", enclosureId: "enc-a", force: true,
-  })).rejects.toThrow(/Timeout/);
+    systemId: "synthetic-system", enclosureId: "enc-a", force: true, timeout: negativeTimeout,
+  })).rejects.toThrow(/page\.waitForResponse: Timeout 1500ms exceeded while waiting for event "response"/);
 });

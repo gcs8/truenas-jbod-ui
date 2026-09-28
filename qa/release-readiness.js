@@ -3,7 +3,7 @@
 const { expect } = require("@playwright/test");
 const settleTimeout = Number.parseInt(process.env.PLAYWRIGHT_SYSTEM_SETTLE_TIMEOUT_MS || "90000", 10);
 
-async function waitForSelectedScope(page, { systemId, enclosureValue } = {}) {
+async function waitForSelectedScope(page, { systemId, enclosureValue, timeout = settleTimeout } = {}) {
   systemId ??= await page.locator("#system-select").inputValue();
   enclosureValue ??= await page.locator("#enclosure-select").inputValue();
   // Read the complete visible contract together. Sequential locator assertions
@@ -26,17 +26,19 @@ async function waitForSelectedScope(page, { systemId, enclosureValue } = {}) {
         && status && status.getAttribute("data-tone") !== "error"
         // syncLocation is published by the real render, including local views.
         && params.get("system_id") === system
-        && (enclosure.startsWith("view:") ? `view:${params.get("storage_view_id")}`
-          : `enclosure:${params.get("enclosure_id")}`) === enclosure;
+        && (enclosure === ""
+          ? !params.has("enclosure_id") && !params.has("storage_view_id")
+          : (enclosure.startsWith("view:") ? `view:${params.get("storage_view_id")}`
+            : `enclosure:${params.get("enclosure_id")}`) === enclosure);
     };
     if (!ready()) return false;
     // Recheck across a real paint opportunity, not a timer or network-idle guess.
     await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
     return ready();
-  }, [systemId, enclosureValue]), { timeout: settleTimeout }).toBe(true);
+  }, [systemId, enclosureValue]), { timeout }).toBe(true);
 }
 
-async function refreshSelectedScope(page, action, { systemId, enclosureId, force = false, viewId = null }) {
+async function refreshSelectedScope(page, action, { systemId, enclosureId, force = false, viewId = null, timeout = settleTimeout }) {
   const origin = new URL(page.url()).origin;
   let ownedRequest;
   let latestRequest;
@@ -54,7 +56,7 @@ async function refreshSelectedScope(page, action, { systemId, enclosureId, force
   // afterward. An already-in-flight request with the identical URL is excluded.
   page.on("request", observeRequest);
   const responsePromise = page.waitForResponse(response => response.request() === ownedRequest,
-    { timeout: settleTimeout });
+    { timeout });
   try {
     const [, response] = await Promise.all([Promise.resolve().then(action), responsePromise]);
     expect(response.ok()).toBe(true);
@@ -63,8 +65,9 @@ async function refreshSelectedScope(page, action, { systemId, enclosureId, force
     expect(snapshot.selected_system_id).toBe(systemId);
     const requestedEnclosure = new URL(response.url()).searchParams.get("enclosure_id");
     if (requestedEnclosure) expect(snapshot.selected_enclosure_id).toBe(requestedEnclosure);
-    await waitForSelectedScope(page, { systemId, enclosureValue: viewId
-      ? `view:${viewId}` : `enclosure:${snapshot.selected_enclosure_id}` });
+    await waitForSelectedScope(page, { systemId, timeout, enclosureValue: viewId
+      ? `view:${viewId}` : snapshot.selected_enclosure_id == null || snapshot.selected_enclosure_id === ""
+        ? "" : `enclosure:${snapshot.selected_enclosure_id}` });
     // A later matching dispatch supersedes this operation, even if its final
     // selected scope happens to be identical. It must not borrow our response.
     expect(latestRequest, "readiness request was superseded").toBe(ownedRequest);
