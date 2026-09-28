@@ -680,6 +680,28 @@ class SchedulerTests(SchedulerTestBase):
         self.assertEqual(len(problems), 1)
         self.assertTrue(problems[0].startswith("Backup target Office NAS degraded:"))
 
+    def test_unverified_remote_copy_is_a_failed_run_and_never_catalogued(self) -> None:
+        import dataclasses
+
+        class UnverifiedTarget(LocalDirectoryTarget):
+            def put(self, local_path, name):
+                return dataclasses.replace(super().put(local_path, name), verified=False)
+
+        remote_dir = self.remote_root / "nas"
+
+        @contextlib.contextmanager
+        def opened(_settings):
+            yield UnverifiedTarget(remote_dir)
+
+        scheduler = self.make({"full": {"enabled": True}, "targets": [TARGET]})
+        scheduler._open_target = opened
+        record = scheduler.run_now("full")
+        self.assertEqual([r.location for r in scheduler.catalog.list()], ["local"])
+        status = json.loads(self._paths.status_file.read_text())
+        self.assertFalse(status["targets"]["nas"]["ok"])
+        self.assertIn("remote copy could not be verified", status["targets"]["nas"]["detail"])
+        self.assertFalse((remote_dir / record.name).exists())
+
     def test_failed_backup_recorded_and_single_flight(self) -> None:
         from history_service.backup_scheduler.service import SchedulerBusyError
 
@@ -752,6 +774,24 @@ class SchedulerTests(SchedulerTestBase):
         (self._paths.local_dir / first.name).write_bytes(b"x" * first.size)
         with self.assertRaises(ArchiveIntegrityError), scheduler.materialize(first.artifact_id):
             pass
+
+    def test_oversized_remote_download_stops_before_catalog_check(self) -> None:
+        from history_service.backup_archive.transport import ArchiveVerificationError
+
+        scheduler = self.make({"full": {"enabled": True}, "targets": [TARGET]})
+        scheduler.run_now("full")
+        (remote,) = scheduler.catalog.list(location="nas")
+        (self.remote_root / "nas" / remote.name).write_bytes(b"x" * (remote.size + 2))
+        with self.assertRaisesRegex(ArchiveVerificationError, "larger than expected"), scheduler.materialize(remote.artifact_id):
+            pass
+        self.assertEqual(list(self._paths.state_dir.glob("backup-fetch-*")), [])
+        # A copy that grew past the cap no longer matches the catalogue, so verify
+        # must stop counting it as verified, like any other integrity mismatch.
+        self.assertTrue(scheduler.catalog.get(remote.artifact_id).verified)
+        failed = scheduler.verify(remote.artifact_id)
+        self.assertFalse(failed["ok"])
+        self.assertFalse(failed["artifact"]["verified"])
+        self.assertFalse(failed["artifact"]["restorable"])
 
     def test_start_run_reserves_before_returning(self) -> None:
         import threading
