@@ -53,7 +53,7 @@
     "test_inventory": 352,
     "test_inventory_registry_routes": 15,
     "test_jbod_runner_trial": 15,
-    "test_logging_config": 16,
+    "test_logging_config": 17,
     "test_mapping_routes": 19,
     "test_mapping_store": 105,
     "test_metrics": 25,
