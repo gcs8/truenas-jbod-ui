@@ -259,6 +259,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Recovered default inventory selection after topology changes, fenced stale
+  source publication, drained cancelled collectors and moved mapping reads
+  off the event loop while preserving request-local versions. (#852)
+
 - Qualified ESXi, QuantaStor and enclosure disk correlations before SMART
   targeting and enrichment, rejecting conflicting identities and cross-owner
   path or slot matches while preserving verified shared-disk health. (#747)
