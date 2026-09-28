@@ -715,12 +715,10 @@ class DiskRecord:
 
 @dataclass(slots=True)
 class _QuantastorCliDiskHints:
-    # One ordinal per normalized identity group, shared by sparse postings.
-    # Each identity field has bounded cardinality, so retained posting entries
-    # grow linearly with groups, without one widening bitmap per distinct key.
+    # Original representatives and sticky payload ambiguity, normalized once.
+    # Batch aggregates retain counts and ordinal sums, never ordinal postings.
     groups: list[tuple[dict[str, Any], bool]] = field(default_factory=list)
-    values: dict[tuple[str, str], set[int]] = field(default_factory=dict)
-    populated: dict[str, set[int]] = field(default_factory=dict)
+    identities: list[dict[str, set[str]]] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -7342,7 +7340,9 @@ class InventoryService:
             selected_system_id,
             selected_enclosure_id,
         )
-        cli_disk_hints = self._build_quantastor_cli_disk_hints(raw_data.cli_disks)
+        cli_disk_hints = self._resolve_quantastor_cli_disk_hints(
+            raw_data.disks, self._build_quantastor_cli_disk_hints(raw_data.cli_disks)
+        )
         pool_slot_hints = self._build_quantastor_pool_slot_hints(raw_data, selected_system_id)
         pool_names = {
             normalize_value_text(pool.get("id")): normalize_text(
@@ -7355,7 +7355,7 @@ class InventoryService:
         }
 
         records: list[DiskRecord] = []
-        for disk in raw_data.disks:
+        for disk, cli_hint in zip(raw_data.disks, cli_disk_hints):
             owner_id = normalize_text(
                 str(disk.get("storageSystemId") or disk.get("systemId") or disk.get("controllerId"))
                 if (disk.get("storageSystemId") or disk.get("systemId") or disk.get("controllerId")) is not None
@@ -7430,7 +7430,6 @@ class InventoryService:
             )
             if selected_enclosure_id and disk_enclosure_id and disk_enclosure_id != selected_enclosure_id:
                 continue
-            cli_hint = self._resolve_quantastor_cli_disk_hint(disk, cli_disk_hints)
             pool_hint = next((pool_slot_hints[key] for key in lookup_keys if key in pool_slot_hints), None)
             merged_raw = dict(disk)
             if hint and isinstance(hint.get("hw_raw"), dict):
@@ -7772,11 +7771,7 @@ class InventoryService:
             index = len(hints.groups)
             group_ids[signature] = index
             hints.groups.append((row, False))
-            for kind, values in identity.items():
-                if values:
-                    hints.populated.setdefault(kind, set()).add(index)
-                for value in values:
-                    hints.values.setdefault((kind, value), set()).add(index)
+            hints.identities.append(identity)
         return hints
 
     @classmethod
@@ -7785,43 +7780,120 @@ class InventoryService:
         disk: dict[str, Any],
         hints: _QuantastorCliDiskHints,
     ) -> dict[str, Any] | None:
-        identity = cls._quantastor_cli_identity(disk)
-        # Serial spellings are fallbacks for the same physical property. Missing
-        # primaries may fall back, but contradictory populated aliases cannot.
-        if len(identity["serial"]) > 1:
-            return None
-        physical_kinds = ("serial", "wwn", "scsiId", "wwid", "eui64")
-        # SAS hints may veto enrichment but do not grant new match authority.
-        contradiction_kinds = (*physical_kinds, "sasAddress", "portSasAddress")
-        matches = {
-            kind: set().union(*(hints.values.get((kind, value), ()) for value in values))
-            for kind, values in identity.items()
-        }
-        id_matches = matches["id"]
-        physical_matches = set().union(*(matches[kind] for kind in physical_kinds))
-        same_owner = matches["owner"]
-        path_matches = same_owner & matches["path"]
-        if identity["id"]:
-            path_matches.difference_update(hints.populated.get("id", ()))
-        candidates = id_matches | physical_matches | path_matches
-        for kind in contradiction_kinds:
-            if identity[kind]:
-                candidates.difference_update(hints.populated.get(kind, set()) - matches[kind])
-        # Set algebra visits precomputed ordinals, never candidate payloads or
-        # their normalization/equality per REST disk. This is linear retained
-        # index space, not a fixed work bound or a whole-request latency claim.
-        for authority in (id_matches, physical_matches, path_matches):
-            ranked = candidates & authority
-            if not ranked:
-                continue
-            local = ranked & same_owner
-            winning = local or ranked
-            if len(winning) != 1:
-                return None
-            representative, differs = hints.groups[next(iter(winning))]
-            # A conflict at the best rank cannot fall back to a weaker rank.
-            return None if differs else representative
-        return None
+        # Compatibility for single-query callers. Inventory uses one batch.
+        return cls._resolve_quantastor_cli_disk_hints([disk], hints)[0]
+
+    @classmethod
+    def _resolve_quantastor_cli_disk_hints(
+        cls,
+        disks: list[dict[str, Any]],
+        hints: _QuantastorCliDiskHints,
+    ) -> list[dict[str, Any] | None]:
+        """Exact batch outcomes without expanding candidate postings per disk.
+
+        Process each demanded contradiction mask separately. Compatible groups
+        partition by their populated queried fields; missing fields do not veto.
+        Count and ordinal sum identify a sole winner, without retaining lists
+        of ordinals. Alias unions use exact inclusion-exclusion, not saturation.
+
+        Seven contradiction fields give at most 128 masks. Four ID and five
+        path aliases give at most 63 updates per group per mask and 12,032
+        lookups per query. Tables live for one mask only, at most 63*G keys.
+        These are expected Python hash-operation bounds for fixed schema,
+        not adversarial-hash, input-byte, or whole-snapshot latency bounds.
+        """
+        output: list[dict[str, Any] | None] = [None] * len(disks)
+        if not disks or not hints.groups:
+            return output
+        kinds = ("serial", "wwn", "scsiId", "wwid", "eui64", "sasAddress", "portSasAddress")
+
+        def subsets(values: set[str]) -> list[tuple[str, ...]]:
+            result: list[tuple[str, ...]] = [()]
+            for value in sorted(values):
+                result += [(*item, value) for item in result]
+            return result[1:]
+
+        def prepare(identity: dict[str, set[str]]) -> tuple:
+            values = tuple(next(iter(identity[kind]), None) for kind in kinds)
+            mask = sum(1 << i for i, value in enumerate(values) if value is not None)
+            return (mask, values, next(iter(identity["owner"]), None),
+                    subsets(identity["id"]), subsets(identity["path"]))
+
+        groups = [prepare(identity) for identity in hints.identities]
+        queries: dict[int, list[tuple[int, tuple]]] = {}
+        for index, disk in enumerate(disks):
+            identity = cls._quantastor_cli_identity(disk)
+            # Contradictory serial spellings are not interchangeable aliases.
+            if len(identity["serial"]) <= 1:
+                query = prepare(identity)
+                queries.setdefault(query[0], []).append((index, query))
+
+        for mask, items in queries.items():
+            table: dict[tuple, tuple[int, int]] = {}
+            # Visit only CLI presence submasks actually represented. This avoids
+            # 128 empty probes per rank on ordinary fully populated inventories.
+            projections: dict[int, tuple[int, ...]] = {}
+            # Index only alias subsets actually queried at this mask. This is
+            # exact query projection, not candidate/result pruning: an unqueried
+            # subset contributes to no inclusion-exclusion term. In particular,
+            # many distinct masks need not each index every unrelated alias.
+            needed_ids = {token for _, query in items for token in query[3]}
+            needed_paths = {(query[2], token) for _, query in items
+                            if query[2] is not None for token in query[4]}
+
+            def add(key: tuple, ordinal: int) -> None:
+                count, total = table.get(key, (0, 0))
+                table[key] = (count + 1, total + ordinal)
+
+            for ordinal, (presence, values, owner, ids, paths) in enumerate(groups):
+                part = presence & mask
+                if part not in projections:
+                    projections[part] = tuple(i for i in range(len(kinds)) if part & (1 << i))
+                base = (part, tuple(values[i] for i in projections[part]))
+                for scope in (None, owner) if owner is not None else (None,):
+                    if part & 31:  # SAS is veto-only, never physical authority.
+                        add((base, "physical", (), scope, None), ordinal)
+                    for token in ids:
+                        if token in needed_ids:
+                            add((base, "id", token, scope, None), ordinal)
+                if owner is not None:
+                    for token in paths:
+                        if (owner, token) in needed_paths:
+                            add((base, "path", token, owner, bool(ids)), ordinal)
+
+            for index, (_, values, owner, ids, paths) in items:
+                bases = [(part, tuple(values[i] for i in indexes)) for part, indexes in projections.items()]
+                for rank in ("id", "physical", "path"):
+                    if rank == "path" and owner is None:
+                        continue
+                    tokens = ids if rank == "id" else paths if rank == "path" else [()]
+                    if not tokens:
+                        continue
+                    scopes = (owner, None) if owner is not None and rank != "path" else (owner,)
+                    flags = (False,) if rank == "path" and ids else (False, True) if rank == "path" else (None,)
+                    count = total = 0
+                    for scope in scopes:
+                        count = total = 0
+                        for base in bases:
+                            if rank == "physical" and not base[0] & 31:
+                                continue
+                            for token in tokens:
+                                sign = 1 if rank == "physical" or len(token) % 2 else -1
+                                for flag in flags:
+                                    n, ordinal_sum = table.get((base, rank, token, scope, flag), (0, 0))
+                                    count += sign * n
+                                    total += sign * ordinal_sum
+                        if count:
+                            break  # A nonempty same-owner rank beats remote.
+                    if count:
+                        if count == 1:
+                            representative, differs = hints.groups[total]
+                            output[index] = None if differs else representative
+                        # Best-rank ambiguity never falls back to weaker proof.
+                        break
+            # Release before building the next mask, including the add closure.
+            table.clear()
+        return output
 
     def _build_quantastor_pool_slot_hints(
         self,

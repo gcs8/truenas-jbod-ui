@@ -17618,6 +17618,20 @@ class InventoryScopedIdentityRegressionTests(unittest.IsolatedAsyncioTestCase):
 
             service._build_quantastor_cli_disk_hints = observe_hints
             service._resolve_quantastor_cli_disk_hint = observe_resolver
+            if hasattr(service, "_resolve_quantastor_cli_disk_hints"):
+                resolve_batch = service._resolve_quantastor_cli_disk_hints
+
+                def observe_batch(disks, hints):
+                    nonlocal in_resolver
+                    before = comparisons
+                    in_resolver = True
+                    try:
+                        return resolve_batch(disks, hints)
+                    finally:
+                        in_resolver = False
+                        resolver_comparisons.extend([comparisons - before] + [0] * (len(disks) - 1))
+
+                service._resolve_quantastor_cli_disk_hints = observe_batch
             with patch.object(InventoryService, "_quantastor_cli_identity", side_effect=observe_identity):
                 snapshot = await service.get_snapshot(selected_enclosure_id="node-a")
             snapshot_comparisons = comparisons
@@ -17658,6 +17672,7 @@ class InventoryScopedIdentityRegressionTests(unittest.IsolatedAsyncioTestCase):
             return {"slots": slots, "comparisons": snapshot_comparisons,
                     "resolver_comparisons": snapshot_resolver_comparisons,
                     "hint_comparisons": snapshot_hint_comparisons, "hint_sizes": snapshot_hint_sizes,
+                    "total_hint_sizes": list(hint_sizes),
                     "normalizations": normalizations, "candidate_normalizations": candidate_normalizations,
                     "row_reads": snapshot_row_reads,
                     "snapshot_cli": [(slot.raw_status.get("disk_raw") or {}).get("quantastor_cli_disk")
@@ -18114,6 +18129,130 @@ class InventoryScopedIdentityRegressionTests(unittest.IsolatedAsyncioTestCase):
                                          None if source == "api-owner" else "node-a")
                         if source == "api-owner":
                             self.assertIn("sdz", slot.smart_device_names)
+
+    async def test_quantastor_public_correlation_posting_work_is_bounded(self) -> None:
+        # Count actual C-level set input/output cardinalities, not just Python
+        # calls. Broad unions and populated-minus-matches can hide quadratic
+        # work behind a linear number of resolver calls.
+        for count in (128, 256, 512):
+            for mode in ("shared-unmatched", "unique-serial", "unique-sas"):
+                work = 0
+
+                class CountedSet(set):
+                    def union(self, *others):
+                        nonlocal work
+                        result = CountedSet(super().union(*others))
+                        work += len(self) + sum(map(len, others)) + len(result)
+                        return result
+
+                    def __or__(self, other):
+                        nonlocal work
+                        result = CountedSet(super().__or__(other))
+                        work += len(self) + len(other) + len(result)
+                        return result
+
+                    def __and__(self, other):
+                        nonlocal work
+                        result = CountedSet(super().__and__(other))
+                        work += min(len(self), len(other)) + len(result)
+                        return result
+
+                    def __sub__(self, other):
+                        nonlocal work
+                        result = CountedSet(super().__sub__(other))
+                        work += len(self) + len(other) + len(result)
+                        return result
+
+                    def difference_update(self, other):
+                        nonlocal work
+                        work += len(other)
+                        return super().difference_update(other)
+
+                rows = [{"id": f"synthetic-{i}", "storageSystemId": "node-a",
+                         "driveTemp": "70 C"} for i in range(count)]
+                for i, row in enumerate(rows):
+                    if mode == "unique-sas":
+                        row["sasAddress"] = f"5{i + 1:015x}"
+                    else:
+                        row["serialNumber"] = f"SANITIZED-{i}" if mode == "unique-serial" else "SANITIZED-SHARED"
+                disks = [dict(row, devicePath=f"/dev/sd{i}", slot=i,
+                              id=f"rest-{i}" if mode == "shared-unmatched" else row["id"])
+                         for i, row in enumerate(rows)]
+                import sys
+
+                aggregates = {"updates": 0, "lookups": 0, "preparations": 0}
+                batch = getattr(InventoryService, "_resolve_quantastor_cli_disk_hints", None)
+                batch_code = batch.__func__.__code__ if batch is not None else None
+
+                def profile(frame, event, arg):
+                    if frame.f_code is batch_code and event == "c_call" and getattr(arg, "__name__", None) == "get":
+                        if getattr(arg, "__self__", None) is frame.f_locals.get("table"):
+                            aggregates["lookups"] += 1
+                    if event == "call" and frame.f_back is not None and frame.f_back.f_code is batch_code:
+                        if frame.f_code.co_name == "add":
+                            aggregates["updates"] += 1
+                        elif frame.f_code.co_name == "prepare":
+                            aggregates["preparations"] += 1
+
+                with self.subTest(count=count, mode=mode), patch.object(
+                    inventory_module, "set", CountedSet, create=True
+                ):
+                    previous_profile = sys.getprofile()
+                    sys.setprofile(profile)
+                    try:
+                        result = await self._quantastor_two_bay_cli_observation(disks[0], rows, disks=disks)
+                    finally:
+                        sys.setprofile(previous_profile)
+                # Profiling spans snapshot and the subsequent SMART public
+                # calls. Count every actual build, not only snapshot builds.
+                passes = len(result["total_hint_sizes"])
+                self.assertGreater(passes, 0)
+                self.assertTrue(result["snapshot_cli"])
+                self.assertTrue(all((row is None) == (mode == "shared-unmatched")
+                                    for row in result["snapshot_cli"]))
+                # A fixed-schema per-input allowance, not a hardware-time SLA.
+                self.assertLessEqual(work, 64 * passes * (len(rows) + len(disks)),
+                                     (count, mode, work, passes))
+                self.assertGreater(aggregates["updates"], 0)
+                self.assertGreater(aggregates["lookups"], 0)
+                self.assertEqual(aggregates["preparations"], passes * (len(rows) + len(disks)))
+                # Include preparation plus the fixed-schema alias terms.
+                self.assertLessEqual(sum(aggregates.values()), 16 * passes * (len(rows) + len(disks)), aggregates)
+
+    def test_quantastor_cli_batch_preserves_exact_object_rank_and_alias_unions(self) -> None:
+        row = {"id": "a", "hwDiskId": "b", "physicalDiskId": "c", "multipathParentDiskId": "d",
+               "devicePath": "/dev/sd0", "altDevicePath": "/dev/sd1", "deviceName": "sd2",
+               "device": "sd3", "name": "sd4", "storageSystemId": "owner", "serial": "SANITIZED-A"}
+        remote = dict(row, storageSystemId="remote")
+        fields = ("id", "hwDiskId", "physicalDiskId", "multipathParentDiskId")
+        paths = ("devicePath", "altDevicePath", "deviceName", "device", "name")
+        disks = [{**{k: row[k] for i, k in enumerate(fields) if im & (1 << i)},
+                  **{k: row[k] for i, k in enumerate(paths) if pm & (1 << i)},
+                  "storageSystemId": "owner"} for im in range(16) for pm in range(32)]
+        for rows in ([row, remote], [remote, row]):
+            hints = InventoryService._build_quantastor_cli_disk_hints(rows)
+            results = InventoryService._resolve_quantastor_cli_disk_hints(disks, hints)
+            for disk, result in zip(disks, results):
+                self.assertIs(result, row if any(k in disk for k in (*fields, *paths)) else None)
+        # Ambiguity at the strongest rank is sticky, including A/B/A order.
+        weak = {"serial": "SANITIZED-A", "storageSystemId": "owner"}
+        for rows in ([row, dict(row, extra=True), row, weak], [dict(row, extra=True), row, dict(row, extra=True), weak]):
+            hints = InventoryService._build_quantastor_cli_disk_hints(rows)
+            self.assertEqual(InventoryService._resolve_quantastor_cli_disk_hints([row], hints), [None])
+
+    def test_quantastor_cli_batch_all_masks_keep_missing_fields_and_sas_veto_only(self) -> None:
+        fields = ("serial", "wwn", "scsiId", "wwid", "eui64", "sasAddress", "portSasAddress")
+        rows = [{"id": f"synthetic-{mask}", **{k: "SANITIZED-A" for i, k in enumerate(fields) if mask & (1 << i)}}
+                for mask in range(128)]
+        hints = InventoryService._build_quantastor_cli_disk_hints(rows)
+        results = InventoryService._resolve_quantastor_cli_disk_hints(rows, hints)
+        self.assertTrue(all(a is b for a, b in zip(results, rows)))
+        for field in fields:
+            row = {field: "SANITIZED-A"}
+            hints = InventoryService._build_quantastor_cli_disk_hints([row])
+            results = InventoryService._resolve_quantastor_cli_disk_hints([row, {field: "SANITIZED-B"}], hints)
+            self.assertIs(results[0], row if field in fields[:5] else None)
+            self.assertIsNone(results[1])
 
     def test_quantastor_cli_index_storage_growth_is_linear(self) -> None:
         import dataclasses
