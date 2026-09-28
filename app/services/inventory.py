@@ -13,7 +13,7 @@ import threading
 from contextlib import contextmanager, nullcontext
 from collections import Counter, OrderedDict
 from collections.abc import Mapping
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Generic, Iterable, Literal, TypeVar
@@ -859,6 +859,11 @@ class InventorySourceBundle:
 
 
 RetainedResultT = TypeVar("RetainedResultT")
+# Set only around synchronous correlation, reset before any await. This avoids
+# changing standalone correlator callers or sharing a read across generations.
+_snapshot_read_inputs: ContextVar[tuple[Any, Any, list[SasFabricAlias]] | None] = ContextVar(
+    "snapshot_read_inputs", default=None,
+)
 
 
 async def _await_retained(future: asyncio.Future[RetainedResultT]) -> RetainedResultT:
@@ -873,6 +878,21 @@ async def _await_retained(future: asyncio.Future[RetainedResultT]) -> RetainedRe
         future.add_done_callback(lambda done: None if done.cancelled() else done.exception())
         raise
     return future.result()
+
+
+async def _drain_inventory_worker(worker: asyncio.Future[RetainedResultT]) -> RetainedResultT:
+    """Keep the caller's collection ownership until synchronous work finishes."""
+    cancelled = False
+    while not worker.done():
+        try:
+            await asyncio.wait({worker})
+        except asyncio.CancelledError:
+            cancelled = True
+    if cancelled:
+        if not worker.cancelled():
+            worker.exception()
+        raise asyncio.CancelledError
+    return worker.result()
 
 
 class SmartDetailBatch:
@@ -1086,6 +1106,7 @@ class InventoryService:
         self._smart_operation_semaphore = asyncio.Semaphore(self._smart_operation_limit)
         self._core_grid_reservation_lock = asyncio.Lock()
         self._source_bundle: InventorySourceBundle | None = None
+        self._source_bundle_generation = 0
         self._source_bundle_until: datetime = datetime.min.replace(tzinfo=timezone.utc)
         self._snapshot_locks: dict[str, asyncio.Lock] = {}
         self._snapshot_activity: dict[str, int] = {}
@@ -1315,7 +1336,7 @@ class InventoryService:
             self._touch_snapshot_key(cache_key)
             add_perf_metadata(snapshot_cache="stale-hit", snapshot_cache_key=cache_key)
             self._observe_inventory_snapshot_request("stale-hit")
-            self._schedule_background_snapshot_refresh(cache_key)
+            self._schedule_background_snapshot_refresh(cache_key, default_selection=selected_enclosure_id is None)
             return CacheResult(cached, "stale-hit")
 
         self._snapshot_activity[cache_key] = self._snapshot_activity.get(cache_key, 0) + 1
@@ -1345,7 +1366,7 @@ class InventoryService:
                 build_started = time.perf_counter()
                 with perf_stage("inventory.build_snapshot", system_id=self.system.id, enclosure_id=cache_key):
                     snapshot = await self._build_snapshot(
-                        selected_enclosure_id=None if cache_key == SNAPSHOT_NO_ENCLOSURE_KEY else cache_key,
+                        selected_enclosure_id=selected_enclosure_id,
                         force_source_refresh=refresh_sources,
                     )
                 topology_changed = topology_generation != self._snapshot_topology_generation
@@ -1367,18 +1388,21 @@ class InventoryService:
                         return CacheResult(cached, "trusted-fallback")
                     self._observe_inventory_snapshot_request(refresh_trigger)
                     return CacheResult(snapshot, refresh_trigger)
-                if cache_key != SNAPSHOT_NO_ENCLOSURE_KEY and snapshot.selected_enclosure_id != cache_key:
-                    if self._canonical_enclosure_options is not None:
-                        self._canonical_enclosure_options.pop(cache_key, None)
-                    self._snapshot_invalidated.add(cache_key)
-                    raise UnknownEnclosureError()
+                # Fresh trusted discovery retires obsolete options even when an
+                # explicit old selection must be rejected. An omitted selection
+                # follows the new default, not the cache key chosen before I/O.
                 if not topology_changed:
                     self._replace_canonical_options_from_trusted_snapshot(snapshot)
-                self._cache[cache_key] = snapshot
-                self._cache_until[cache_key] = utcnow() + timedelta(
+                if selected_enclosure_id is not None and snapshot.selected_enclosure_id != selected_enclosure_id:
+                    self._snapshot_invalidated.add(cache_key)
+                    raise UnknownEnclosureError()
+                publication_key = snapshot.selected_enclosure_id or SNAPSHOT_NO_ENCLOSURE_KEY
+                self._admit_snapshot_key(publication_key)
+                self._cache[publication_key] = snapshot
+                self._cache_until[publication_key] = utcnow() + timedelta(
                     seconds=max(0, int(self.settings.app.snapshot_cache_ttl_seconds))
                 )
-                self._touch_snapshot_key(cache_key)
+                self._touch_snapshot_key(publication_key)
                 self._observe_inventory_cache_metrics()
                 self._observe_inventory_snapshot_request(refresh_trigger)
                 return CacheResult(snapshot, refresh_trigger)
@@ -2442,6 +2466,7 @@ class InventoryService:
             if task is not None and not task.done():
                 task.cancel()
         if invalidate_source_bundle:
+            self._source_bundle_generation += 1
             self._source_bundle = None
             self._source_bundle_until = datetime.min.replace(tzinfo=timezone.utc)
         add_perf_metadata(snapshot_cache_invalidated=reason)
@@ -2564,7 +2589,12 @@ class InventoryService:
             )
             build_started = time.perf_counter()
             previous_bundle = self._source_bundle
+            generation = self._source_bundle_generation
             bundle = await self._collect_inventory_source_bundle()
+            if generation != self._source_bundle_generation:
+                # Never label a pre-mutation observation fresh. Reject this
+                # attempt; the next caller recollects under the same single flight.
+                raise SnapshotStateBusyError()
             if bundle.raw_data.enclosure_query_failed and previous_bundle is not None:
                 previous_api = previous_bundle.sources.get("api")
                 if previous_api is not None and previous_api.enabled and previous_bundle.raw_data.enclosures:
@@ -3134,11 +3164,36 @@ class InventoryService:
             if self.bmc_service is None:
                 raise TrueNASAPIError("BMC / IPMI access is not configured for this system.")
             with perf_stage("inventory.bmc.fetch"):
-                return await asyncio.to_thread(self.bmc_service.fetch_inventory)
+                # Retain the executor Future: cancelling an asyncio wrapper
+                # cannot stop this synchronous collector.
+                worker = asyncio.get_running_loop().run_in_executor(None, copy_context().run, self.bmc_service.fetch_inventory)
+                return await _drain_inventory_worker(worker)
 
         api_task = asyncio.create_task(load_api_data()) if api_enabled else None
         ssh_task = asyncio.create_task(load_ssh_payload()) if self.system.ssh.enabled else None
         bmc_task = asyncio.create_task(load_bmc_inventory()) if bmc_enabled else None
+
+        tasks = {task for task in (api_task, ssh_task, bmc_task) if task is not None}
+        pending = tasks.copy()
+        cancelled = False
+        while pending:
+            try:
+                _done, pending = await asyncio.wait(pending)
+            except asyncio.CancelledError:
+                if not cancelled:
+                    cancelled = True
+                    # Signal each sibling once. Repeated caller cancellation
+                    # must not interrupt SSH/BMC's retained worker drainage.
+                    for task in pending:
+                        task.cancel()
+        # Observe every settled outcome before awaiting individual sources.
+        # A source can itself be cancelled without cancelling this collector;
+        # propagating it must not abandon a later sibling's completed failure.
+        for task in tasks:
+            if not task.cancelled():
+                task.exception()
+        if cancelled:
+            raise asyncio.CancelledError
 
         if api_task is not None:
             try:
@@ -3292,12 +3347,12 @@ class InventoryService:
             bmc_inventory=bmc_inventory,
         )
 
-    def _schedule_background_snapshot_refresh(self, cache_key: str) -> None:
+    def _schedule_background_snapshot_refresh(self, cache_key: str, *, default_selection: bool = False) -> None:
         existing = self._snapshot_refresh_tasks.get(cache_key)
         if existing is not None and not existing.done():
             return
 
-        task = asyncio.create_task(self._background_snapshot_refresh(cache_key))
+        task = asyncio.create_task(self._background_snapshot_refresh(cache_key, default_selection=default_selection))
         self._snapshot_refresh_tasks[cache_key] = task
 
         def _cleanup(completed: asyncio.Task[None], *, key: str = cache_key) -> None:
@@ -3313,14 +3368,14 @@ class InventoryService:
 
         task.add_done_callback(_cleanup)
 
-    async def _background_snapshot_refresh(self, cache_key: str) -> None:
+    async def _background_snapshot_refresh(self, cache_key: str, *, default_selection: bool = False) -> None:
         try:
             source_refresh_succeeded = await _await_retained(self._schedule_background_source_bundle_refresh())
             if not source_refresh_succeeded:
                 return
             await self._get_snapshot_result(
                 force_refresh=True,
-                selected_enclosure_id=None if cache_key == SNAPSHOT_NO_ENCLOSURE_KEY else cache_key,
+                selected_enclosure_id=None if default_selection or cache_key == SNAPSHOT_NO_ENCLOSURE_KEY else cache_key,
                 force_source_refresh=False,
             )
         except Exception:  # noqa: BLE001 - background refreshes should stay best-effort.
@@ -5365,15 +5420,30 @@ class InventoryService:
                     "bay positions. Turn on SSH or set positions by hand to map bays."
                 )
 
-        with perf_stage("inventory.correlate"):
-            slots, available_enclosures, selected_meta, layout_rows, layout_slot_count, layout_columns = self._correlate(
-                raw_data,
-                ssh_data,
-                warnings,
-                selected_enclosure_id=selected_enclosure_id,
-                quantastor_ses_data=quantastor_ses_data,
-                bmc_inventory=bmc_inventory,
+        def read_inputs():
+            mappings = self.mapping_store.load_read_snapshot()
+            aliases = (
+                self.sas_fabric_alias_store.list_aliases(self.system.id)
+                if self.sas_fabric_alias_store is not None else []
             )
+            return mappings, aliases
+
+        mappings, aliases = await _drain_inventory_worker(
+            asyncio.get_running_loop().run_in_executor(None, copy_context().run, read_inputs)
+        )
+        token = _snapshot_read_inputs.set((self, mappings, aliases))
+        try:
+            with perf_stage("inventory.correlate"):
+                slots, available_enclosures, selected_meta, layout_rows, layout_slot_count, layout_columns = self._correlate(
+                    raw_data,
+                    ssh_data,
+                    warnings,
+                    selected_enclosure_id=selected_enclosure_id,
+                    quantastor_ses_data=quantastor_ses_data,
+                    bmc_inventory=bmc_inventory,
+                )
+        finally:
+            _snapshot_read_inputs.reset(token)
         option_by_id = {item.id: item for item in available_enclosures}
         resolved_enclosure_id = None
         if selected_enclosure_id and selected_enclosure_id in option_by_id:
@@ -5458,7 +5528,15 @@ class InventoryService:
 
         await self._apply_and_persist_snapshot_slot_details(slots)
 
-        slots = self._attach_mapping_revisions(slots)
+        def mapping_metadata():
+            return (
+                self._attach_mapping_revisions(slots, loaded_entries=mappings),
+                self.mapping_store.count_for_system(self.system.id, loaded_entries=mappings),
+            )
+
+        slots, manual_mapping_count = await _drain_inventory_worker(
+            asyncio.get_running_loop().run_in_executor(None, copy_context().run, mapping_metadata)
+        )
         with perf_stage("inventory.disk_retention_accounting"):
             retention = build_disk_retention_accounting(
                 source_disks=self._build_storage_view_candidate_records(
@@ -5478,7 +5556,7 @@ class InventoryService:
                 for slot in slots
                 if slot.device_name and not slot.raw_status.get("virtual_enclosure")
             ),
-            manual_mapping_count=self.mapping_store.count_for_system(self.system.id),
+            manual_mapping_count=manual_mapping_count,
             ssh_slot_hint_count=ssh_slot_hint_count,
             source_disk_count=retention.source_disk_count,
             rendered_unique_disk_count=retention.rendered_unique_disk_count,
@@ -5524,15 +5602,16 @@ class InventoryService:
             summary=summary,
         )
 
-    def _attach_mapping_revisions(self, slots: list[SlotView]) -> list[SlotView]:
+    def _attach_mapping_revisions(self, slots: list[SlotView], *, loaded_entries=None) -> list[SlotView]:
         targets = list({
             (resolve_physical_mapping_scope(slot.enclosure_id), slot.slot)
             for slot in slots
         })
-        save_revisions = self.mapping_store.save_revisions(self.system.id, targets)
+        save_revisions = self.mapping_store.save_revisions(self.system.id, targets, loaded_entries=loaded_entries)
         clear_revisions = self.mapping_store.clear_revisions(
             self.system.id,
             targets,
+            loaded_entries=loaded_entries,
         )
         return [
             slot.model_copy(
@@ -5898,7 +5977,7 @@ class InventoryService:
             )
         # One mapping load per correlation pass: the entries are
         # loaded here and read back off the frame by every caller.
-        loaded_mappings = self.mapping_store.load_all()
+        loaded_mappings = self._correlation_mapping_entries()
         if not allow_legacy_mapping_fallback:
             self._warn_unapplied_legacy_mappings(
                 warnings,
@@ -6122,7 +6201,7 @@ class InventoryService:
         }
         if VIRTUAL_INVENTORY_PHYSICAL_LOCATION_WARNING not in warnings:
             warnings.append(VIRTUAL_INVENTORY_PHYSICAL_LOCATION_WARNING)
-        loaded_mappings = self.mapping_store.load_all()
+        loaded_mappings = self._correlation_mapping_entries()
         self._warn_unapplied_legacy_mappings(
             warnings,
             None,
@@ -10819,7 +10898,16 @@ class InventoryService:
         )
         return self._finalize_enclosure_options(ordered) if finalize else ordered
 
+    def _correlation_mapping_entries(self) -> dict[str, ManualMapping]:
+        inputs = _snapshot_read_inputs.get()
+        if inputs is not None and inputs[0] is self:
+            return inputs[1]
+        return self.mapping_store.load_all()
+
     def _finalize_enclosure_options(self, options: list[EnclosureOption]) -> list[EnclosureOption]:
+        inputs = _snapshot_read_inputs.get()
+        if inputs is not None and inputs[0] is self:
+            return finalize_enclosure_option_labels(options, inputs[2])
         aliases = (
             self.sas_fabric_alias_store.list_aliases(self.system.id)
             if self.sas_fabric_alias_store is not None

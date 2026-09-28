@@ -18828,6 +18828,459 @@ class InventoryScopedIdentityRegressionTests(unittest.IsolatedAsyncioTestCase):
                         api.fetch_all.assert_awaited_once()
 
 
+
+
+class InventoryLifetimeTests(unittest.IsolatedAsyncioTestCase):
+    """Public snapshot lifetimes over invented transports and real stores."""
+
+    def fixture(self, directory, topology="physical"):
+        settings = Settings()
+        settings.app.snapshot_cache_ttl_seconds = 3600
+        settings.app.source_bundle_cache_ttl_seconds = 3600
+        system = SystemConfig(id="synthetic-lifetime", truenas=TrueNASConfig(
+            platform="core", host="core.example.test"), ssh=SSHConfig(enabled=False))
+        api = AsyncMock()
+        state = {"topology": topology, "calls": 0}
+
+        async def fetch():
+            state["calls"] += 1
+            enclosure = state["topology"]
+            return TrueNASRawData(
+                enclosures=[] if enclosure == "virtual" else [{
+                    "id": enclosure, "label": "Synthetic shelf",
+                    "elements": [{"slot": 0, "dev": "da0", "status": "OK"}]}],
+                disks=[{"name": "da0", "serial": "SANITIZED-LIFETIME",
+                        "model": enclosure, "enclosure": {"id": enclosure, "slot": 0}}],
+                pools=[], disk_temperatures={}, smart_test_results=[])
+
+        api.fetch_all.side_effect = fetch
+        service = build_inventory_service(settings, system, api, AsyncMock(), directory)
+        return service, state
+
+    async def test_optional_collector_failures_remain_independent(self):
+        for failed in ("ssh", "bmc", "both"):
+            with self.subTest(failed=failed), tempfile.TemporaryDirectory() as directory:
+                service, state = self.fixture(directory)
+                service.system.ssh.enabled = True
+                service.system.bmc.enabled = True
+                service.ssh_probe.run_planned_commands.return_value = []
+                service.bmc_service = MagicMock()
+                service.bmc_service.fetch_inventory.return_value = BMCInventory()
+                if failed in {"ssh", "both"}:
+                    service.ssh_probe.run_planned_commands.side_effect = RuntimeError("synthetic optional SSH failure")
+                if failed in {"bmc", "both"}:
+                    service.bmc_service.fetch_inventory.side_effect = RuntimeError("synthetic optional BMC failure")
+                snapshot = await service.get_snapshot()
+                self.assertEqual(snapshot.selected_enclosure_id, "physical")
+                self.assertTrue(snapshot.sources["api"].ok)
+                self.assertEqual(snapshot.sources["ssh"].ok, failed == "bmc")
+                self.assertEqual(snapshot.sources["bmc"].ok, failed == "ssh")
+                self.assertEqual(state["calls"], 1)
+
+    async def test_cancelled_collectors_drain_before_successor(self):
+        import threading
+        for threaded in (False, True):
+            for with_bmc in (False, True):
+                for fail in (False, True):
+                    with self.subTest(threaded=threaded, bmc=with_bmc, fail=fail), tempfile.TemporaryDirectory() as directory:
+                        service, state = self.fixture(directory)
+                        service.system.ssh.enabled = True
+                        service.system.bmc.enabled = with_bmc
+                        loop = asyncio.get_running_loop()
+                        errors = []
+                        old_handler = loop.get_exception_handler()
+                        loop.set_exception_handler(lambda _loop, context: errors.append(context))
+                        baseline = asyncio.all_tasks()
+                        entered = {key: asyncio.Event() for key in ("api", "ssh", "bmc")}
+                        cancelled = asyncio.Event()
+                        release_async, release_thread = asyncio.Event(), threading.Event()
+                        calls = {"ssh": 0, "bmc": 0}
+                        active = {"ssh": 0, "bmc": 0}
+                        peak = {"ssh": 0, "bmc": 0}
+                        fetch = service.truenas_client.fetch_all.side_effect
+
+                        async def api():
+                            raw = await fetch()
+                            if state["calls"] == 1:
+                                entered["api"].set()
+                                await asyncio.Event().wait()
+                            return raw
+
+                        async def ssh_async(*args, **kwargs):
+                            calls["ssh"] += 1
+                            active["ssh"] += 1
+                            peak["ssh"] = max(peak["ssh"], active["ssh"])
+                            try:
+                                if calls["ssh"] == 1:
+                                    entered["ssh"].set()
+                                    try:
+                                        await asyncio.Event().wait()
+                                    except asyncio.CancelledError:
+                                        cancelled.set()
+                                        await release_async.wait()
+                                    if fail:
+                                        raise RuntimeError("synthetic late SSH failure")
+                                return []
+                            finally:
+                                active["ssh"] -= 1
+
+                        def worker(key, _cancel=None):
+                            calls[key] += 1
+                            active[key] += 1
+                            peak[key] = max(peak[key], active[key])
+                            try:
+                                if calls[key] == 1:
+                                    loop.call_soon_threadsafe(entered[key].set)
+                                    if key == "ssh":
+                                        if not _cancel.cancelled.wait(3):
+                                            raise AssertionError("SSH ownership did not receive cancellation")
+                                        loop.call_soon_threadsafe(cancelled.set)
+                                    if not release_thread.wait(3):
+                                        raise AssertionError("synthetic worker release deadline")
+                                    if fail:
+                                        raise RuntimeError("synthetic late worker failure")
+                                return [] if key == "ssh" else BMCInventory()
+                            finally:
+                                active[key] -= 1
+
+                        service.truenas_client.fetch_all.side_effect = api
+                        if threaded:
+                            service.ssh_probe = SSHProbe(service.system.ssh)
+                            service.ssh_probe._run_planned_commands_sync = lambda *args, **kw: worker("ssh", kw["_cancel"])
+                        else:
+                            service.ssh_probe.run_planned_commands.side_effect = ssh_async
+                        service.bmc_service = MagicMock()
+                        service.bmc_service.fetch_inventory.side_effect = lambda: worker("bmc")
+                        owner = asyncio.create_task(service.get_snapshot())
+                        successor = None
+                        try:
+                            await asyncio.wait_for(entered["api"].wait(), 3)
+                            await asyncio.wait_for(entered["ssh"].wait(), 3)
+                            if with_bmc:
+                                await asyncio.wait_for(entered["bmc"].wait(), 3)
+                            owner.cancel()
+                            # An event-loop checkpoint, not a timing delay.
+                            await asyncio.sleep(0)
+                            owner.cancel()
+                            await asyncio.sleep(0)
+                            self.assertFalse(owner.done(), "snapshot released ownership before sibling drainage")
+                            await asyncio.wait_for(cancelled.wait(), 3)
+                            successor = asyncio.create_task(service.get_snapshot())
+                            await asyncio.sleep(0)
+                            self.assertEqual(state["calls"], 1)
+                            self.assertEqual(calls["ssh"], 1)
+                            release_async.set()
+                            release_thread.set()
+                            with self.assertRaises(asyncio.CancelledError):
+                                await asyncio.wait_for(owner, 3)
+                            snapshot = await asyncio.wait_for(successor, 3)
+                            self.assertEqual(snapshot.selected_enclosure_id, "physical")
+                            self.assertEqual(state["calls"], 2)
+                            self.assertEqual(calls["ssh"], 2)
+                            self.assertEqual(peak["ssh"], 1)
+                            if with_bmc:
+                                self.assertEqual(calls["bmc"], 2)
+                                self.assertEqual(peak["bmc"], 1)
+                            await asyncio.sleep(0)
+                            self.assertEqual(active, {"ssh": 0, "bmc": 0})
+                            self.assertEqual(asyncio.all_tasks() - baseline, set())
+                            self.assertEqual(errors, [])
+                        finally:
+                            release_async.set()
+                            release_thread.set()
+                            remaining = asyncio.all_tasks() - baseline
+                            for task in remaining:
+                                task.cancel()
+                            if remaining:
+                                await asyncio.wait_for(asyncio.gather(*remaining, return_exceptions=True), 4)
+                            loop.set_exception_handler(old_handler)
+
+    async def test_source_publication_fenced_by_successful_mutations(self):
+        for workflow, mode in (("sync", "cold"), ("led", "forced"),
+                               ("sync", "background"), ("led", "background")):
+            with self.subTest(workflow=workflow, mode=mode), tempfile.TemporaryDirectory() as directory:
+                service, state = self.fixture(directory)
+                if mode != "cold":
+                    original = await service.get_snapshot()
+                    self.assertTrue(original.slots[0].led_supported)
+                entered, release = asyncio.Event(), asyncio.Event()
+                fetch = service.truenas_client.fetch_all.side_effect
+                captured = []
+
+                async def blocked():
+                    raw = await fetch()
+                    captured.append(raw)
+                    if not entered.is_set():
+                        entered.set()
+                        await release.wait()
+                    return raw
+
+                service.truenas_client.fetch_all.side_effect = blocked
+                if mode == "background":
+                    service._cache_until[original.selected_enclosure_id] = datetime.min.replace(tzinfo=timezone.utc)
+                    self.assertIs(await service.get_snapshot(allow_stale_cache=True), original)
+                    owner = next(iter(service._snapshot_refresh_tasks.values()))
+                else:
+                    owner = asyncio.create_task(service.get_snapshot(force_refresh=True))
+                try:
+                    await asyncio.wait_for(entered.wait(), 3)
+                    if workflow == "sync":
+                        service.system.ssh.enabled = True
+                        service.ssh_probe.run_command.return_value = SSHCommandResult(
+                            command="synthetic sync", ok=True, stdout="null", exit_code=0)
+                        result = await service.sync_disk_inventory(inventory_module.DiskInventorySyncMode.multipath)
+                        self.assertEqual(result.state, "SUCCESS")
+                        service.ssh_probe.run_command.assert_awaited_once()
+                        service.system.ssh.enabled = False
+                    else:
+                        # Keep the prior snapshot warm for the successful LED lookup.
+                        service._cache_until[original.selected_enclosure_id] = datetime.now(timezone.utc) + timedelta(hours=1)
+                        await service.set_slot_led(original.slots[0].slot, LedAction.identify)
+                        service.truenas_client.set_slot_status.assert_awaited_once()
+                    state["topology"] = "replacement"
+                    release.set()
+                    if mode == "background":
+                        source_owner = service._source_bundle_refresh_task
+                        await asyncio.gather(owner, return_exceptions=True)
+                        if source_owner is not None:
+                            self.assertFalse(await asyncio.wait_for(source_owner, 3))
+                    else:
+                        with self.assertRaises(inventory_module.SnapshotStateBusyError):
+                            await asyncio.wait_for(owner, 3)
+                    self.assertIsNone(service._source_bundle)
+                    recovered = await service.get_snapshot()
+                    self.assertEqual(recovered.selected_enclosure_id, "replacement")
+                    self.assertIsNot(service._source_bundle.raw_data, captured[0])
+                    calls = state["calls"]
+                    self.assertIs(await service.get_snapshot(), recovered)
+                    self.assertEqual(state["calls"], calls)
+                finally:
+                    release.set()
+                    await asyncio.gather(owner, return_exceptions=True)
+
+    async def test_default_topology_transitions_public_matrix(self):
+        for before, after in (("physical", "virtual"), ("virtual", "physical"),
+                              ("physical", "replacement")):
+            for explicit in (False, True):
+                for mode in ("forced-warm", "forced-expired", "expired", "background"):
+                    with self.subTest(before=before, after=after, explicit=explicit, mode=mode):
+                        with tempfile.TemporaryDirectory() as directory:
+                            service, state = self.fixture(directory, before)
+                            original = await service.get_snapshot()
+                            old_id = original.selected_enclosure_id
+                            selection = old_id if explicit else None
+                            state["topology"] = after
+                            # A still-warm ordinary request keeps the admitted generation.
+                            self.assertIs(await service.get_snapshot(selected_enclosure_id=selection), original)
+                            if mode != "forced-warm":
+                                expired = datetime.min.replace(tzinfo=timezone.utc)
+                                service._cache_until[old_id] = expired
+                                service._source_bundle_until = expired
+                            if mode == "background":
+                                stale = await service.get_snapshot(selected_enclosure_id=selection, allow_stale_cache=True)
+                                self.assertIs(stale, original)
+                                tasks = list(service._snapshot_refresh_tasks.values())
+                                await asyncio.wait_for(asyncio.gather(*tasks), 3)
+                                if not explicit:
+                                    expected = "virtual-system:synthetic-lifetime" if after == "virtual" else after
+                                    self.assertIn(expected, service._cache)
+                            else:
+                                kwargs = dict(selected_enclosure_id=selection, force_refresh=mode.startswith("forced"))
+                                if explicit:
+                                    with self.assertRaises(inventory_module.UnknownEnclosureError):
+                                        await service.get_snapshot(**kwargs)
+                                else:
+                                    updated = await service.get_snapshot(**kwargs)
+                                    self.assertNotEqual(updated.selected_enclosure_id, old_id)
+                            updated = await service.get_snapshot()
+                            expected = "virtual-system:synthetic-lifetime" if after == "virtual" else after
+                            self.assertEqual(updated.selected_enclosure_id, expected)
+                            self.assertEqual(set(service._canonical_enclosure_options), {expected})
+                            with self.assertRaises(inventory_module.UnknownEnclosureError):
+                                await service.get_snapshot(selected_enclosure_id=old_id)
+                            calls = state["calls"]
+                            with self.assertRaises(inventory_module.UnknownEnclosureError):
+                                await service.get_snapshot(selected_enclosure_id="arbitrary-caller-key", force_refresh=True)
+                            self.assertEqual(state["calls"], calls)
+                            self.assertNotIn("arbitrary-caller-key", service._snapshot_state_keys())
+
+
+class InventorySourceOutcomeTests(unittest.IsolatedAsyncioTestCase):
+    """Source cancellation must not abandon already-settled sibling failures."""
+
+    fixture = InventoryLifetimeTests.fixture
+
+    async def check_source_outcomes(self, cancelled_source, failed_sources):
+        import gc
+        import threading
+        import weakref
+
+        loop = asyncio.get_running_loop()
+        errors, observed, retained = [], set(), {}
+        baseline = asyncio.all_tasks()
+        old_handler, old_factory = loop.get_exception_handler(), loop.get_task_factory()
+
+        class ObservedTask(asyncio.Task):
+            source: str
+
+            def exception(self):
+                observed.add(self.source)
+                return super().exception()
+
+            def __await__(self):
+                try:
+                    return (yield from super().__await__())
+                finally:
+                    if self.done():
+                        observed.add(self.source)
+
+        def factory(loop, coro, **kwargs):
+            source = {
+                "load_api_data": "api", "load_ssh_payload": "ssh",
+                "load_bmc_inventory": "bmc",
+            }.get(coro.__name__)
+            if source is None:
+                return asyncio.Task(coro, loop=loop, **kwargs)
+            task = ObservedTask(coro, loop=loop, **kwargs)
+            task.source = source
+            retained[source] = task
+            return task
+
+        loop.set_exception_handler(lambda _loop, context: errors.append(context))
+        loop.set_task_factory(factory)
+        release_async, release_thread = asyncio.Event(), threading.Event()
+        owner = None
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                service, _state = self.fixture(directory)
+                service.system.ssh.enabled = True
+                service.system.bmc.enabled = True
+                entered = {source: asyncio.Event() for source in ("api", "ssh", "bmc")}
+                finished, sibling_cancellations = set(), []
+                fetch = service.truenas_client.fetch_all.side_effect
+
+                async def api():
+                    entered["api"].set()
+                    try:
+                        if cancelled_source == "api":
+                            raise asyncio.CancelledError("synthetic API shutdown")
+                        try:
+                            await release_async.wait()
+                        except asyncio.CancelledError:
+                            sibling_cancellations.append("api")
+                            raise
+                        if "api" in failed_sources:
+                            raise RuntimeError("synthetic API failure")
+                        return await fetch()
+                    finally:
+                        finished.add("api")
+
+                async def ssh(*args, **kwargs):
+                    entered["ssh"].set()
+                    try:
+                        if cancelled_source == "ssh":
+                            raise asyncio.CancelledError("synthetic SSH shutdown")
+                        try:
+                            await release_async.wait()
+                        except asyncio.CancelledError:
+                            sibling_cancellations.append("ssh")
+                            raise
+                        if "ssh" in failed_sources:
+                            raise RuntimeError("synthetic SSH failure")
+                        return []
+                    finally:
+                        finished.add("ssh")
+
+                def bmc():
+                    loop.call_soon_threadsafe(entered["bmc"].set)
+                    try:
+                        if not release_thread.wait(3):
+                            raise AssertionError("synthetic BMC release watchdog")
+                        if cancelled_source == "bmc":
+                            raise asyncio.CancelledError("synthetic BMC shutdown")
+                        if "bmc" in failed_sources:
+                            raise RuntimeError("synthetic late BMC failure")
+                        return BMCInventory()
+                    finally:
+                        finished.add("bmc")
+
+                service.truenas_client.fetch_all.side_effect = api
+                service.ssh_probe.run_planned_commands.side_effect = ssh
+                service.bmc_service = MagicMock()
+                service.bmc_service.fetch_inventory.side_effect = bmc
+                owner = asyncio.create_task(service.get_snapshot())
+                for event in entered.values():
+                    await asyncio.wait_for(event.wait(), 3)
+                self.assertFalse(owner.done())
+                self.assertTrue(service._source_bundle_lock.locked())
+                release_async.set()
+                # Keep the final BMC outcome late relative to the async peers.
+                await asyncio.sleep(0)
+                self.assertFalse(owner.done())
+                release_thread.set()
+                if cancelled_source is not None:
+                    with self.assertRaises(asyncio.CancelledError):
+                        await asyncio.wait_for(owner, 3)
+                    self.assertIsNone(service._source_bundle)
+                    self.assertEqual(service._cache, {})
+                else:
+                    snapshot = await asyncio.wait_for(owner, 3)
+                    for source in entered:
+                        self.assertEqual(snapshot.sources[source].ok, source not in failed_sources)
+                self.assertEqual(finished, set(entered))
+                self.assertEqual(sibling_cancellations, [])
+                self.assertFalse(service._source_bundle_lock.locked())
+                self.assertEqual(set(retained), set(entered))
+                self.assertTrue(all(task.done() for task in retained.values()))
+                # Capture observation before cleanup. Strong references prevent GC
+                # timing from deciding whether the owner retrieved each outcome.
+                missing = set(entered) - {cancelled_source} - observed
+                unretrieved = [key for key, task in retained.items() if task._log_traceback]
+                references = [weakref.ref(task) for task in retained.values()]
+                retained.clear()
+                owner = None
+                for _ in range(4):
+                    await asyncio.sleep(0)
+                gc.collect()
+                for _ in range(4):
+                    await asyncio.sleep(0)
+                self.assertEqual(errors, [], "late GC reported an unobserved sibling failure")
+                self.assertEqual([ref() for ref in references], [None] * len(references))
+                self.assertEqual(asyncio.all_tasks() - baseline, set())
+                self.assertEqual(unretrieved, [])
+                if cancelled_source is not None:
+                    self.assertEqual(missing, set(), "owner skipped settled sibling exception retrieval")
+        finally:
+            release_async.set()
+            release_thread.set()
+            if owner is not None:
+                await asyncio.gather(owner, return_exceptions=True)
+            retained.clear()
+            gc.collect()
+            loop.set_task_factory(old_factory)
+            loop.set_exception_handler(old_handler)
+
+    async def test_api_child_cancellation_observes_late_siblings(self):
+        await self.check_source_outcomes("api", {"ssh", "bmc"})
+
+    async def test_ssh_child_cancellation_observes_late_bmc(self):
+        await self.check_source_outcomes("ssh", {"bmc"})
+
+    async def test_bmc_child_cancellation_observes_earlier_failures(self):
+        await self.check_source_outcomes("bmc", {"api", "ssh"})
+
+    async def test_source_cancellation_with_successful_siblings(self):
+        for source in ("api", "ssh", "bmc"):
+            with self.subTest(source=source):
+                await self.check_source_outcomes(source, set())
+
+    async def test_ordinary_source_failures_do_not_cancel_siblings(self):
+        for source in ("api", "ssh", "bmc"):
+            with self.subTest(source=source):
+                await self.check_source_outcomes(None, {source})
+
+
+
 class InventoryDefaultRegressionTests(unittest.IsolatedAsyncioTestCase):
     """CORE bay counts, small enclosures, SES notes, presence, and pool binding."""
 
