@@ -263,6 +263,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   startup; preserve their bytes until a legitimate save rebuilds them. (#752)
 - Emit JSON log timestamps in UTC to match their `Z` suffix, while leaving
   text log timestamps in local time. (#753)
+- Fixed public-demo validation rejecting UI labels as serial numbers, while
+  retaining non-demo serial checks and rejecting ambiguous nested JSON. (#746)
 - The main UI no longer reports itself down when a pinned known-hosts file sits
   on a read-only mount, such as the `/run/ssh` mount in the shipped Compose
   file. SSH still verifies hosts against the keys in it; `/healthz` now answers
