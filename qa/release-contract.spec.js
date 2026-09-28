@@ -496,3 +496,225 @@ test("F1: an action without a new request times out instead of borrowing settled
     systemId: "synthetic-system", enclosureId: "enc-a", force: true, timeout: negativeTimeout,
   })).rejects.toThrow(/page\.waitForResponse: Timeout 1500ms exceeded while waiting for event "response"/);
 });
+
+// Real application refreshes share one global token, not a scope/force token.
+// Hold only HTTP responses. Never replace refreshSnapshot or mutate its token.
+test.describe("F2: global inventory supersession", () => {
+  const readiness = require("./release-readiness");
+  const scope = { systemId: "synthetic-system", enclosureId: "enc-a", force: true, timeout: 3000 };
+  const markers = ["SANITIZED-OWNED-A", "SANITIZED-LATER-B", "SANITIZED-LATER-C"];
+  const click = page => page.locator("#refresh-button").click();
+
+  async function setup(page, timing) {
+    const fixture = await installFixture(page, html, { timing });
+    await switching.context.gotoApp(page);
+    await switching.context.setAutoRefresh(page, false);
+    const snapshot = await page.evaluate(() => structuredClone(window.APP_BOOTSTRAP.snapshot));
+    await page.evaluate(() => {
+      window.__refreshObservations = { consumed: [], renders: [] };
+      // Observation only: native fetch and JSON decoding still run unchanged.
+      const nativeFetch = window.fetch;
+      window.fetch = async function(...args) {
+        const response = await nativeFetch.apply(this, args);
+        if (new URL(response.url).pathname === "/api/inventory") {
+          const nativeJson = response.json.bind(response);
+          response.json = async function() {
+            const value = await nativeJson();
+            if (value.slots?.[0]) window.__refreshObservations.consumed.push(value.slots[0].device_name);
+            return value;
+          };
+        }
+        return response;
+      };
+      new MutationObserver(() => {
+        window.__refreshObservations.renders.push(document.getElementById("slot-grid").textContent);
+      }).observe(document.getElementById("slot-grid"), { subtree: true, childList: true, characterData: true });
+    });
+    const requests = [], gates = [gate(), gate(), gate()];
+    await page.route("**/api/inventory?**", async route => {
+      const url = new URL(route.request().url());
+      const index = requests.length;
+      requests.push({ url: url.href, force: url.searchParams.get("force"), system: url.searchParams.get("system_id") });
+      await gates[index].promise;
+      const payload = structuredClone(snapshot);
+      payload.selected_system_id = url.searchParams.get("system_id");
+      payload.selected_enclosure_id = url.searchParams.get("enclosure_id") || "enc-a";
+      payload.slots.forEach(slot => {
+        slot.serial = markers[index];
+        slot.device_name = markers[index];
+        slot.enclosure_id = payload.selected_enclosure_id;
+      });
+      await route.fulfill({ json: payload });
+    });
+    return { ...fixture, requests, gates };
+  }
+
+  async function nonforcedSameScope(page) {
+    // Saved view is local; returning to its backing live enclosure dispatches B.
+    await page.locator("#enclosure-select").selectOption("view:saved-chassis");
+    await page.locator("#enclosure-select").selectOption("enclosure:enc-a");
+  }
+
+  function start(page, action, options = scope) {
+    const outcome = { status: "pending" };
+    const pending = readiness.refreshSelectedScope(page, action, options).then(
+      () => { outcome.status = "resolved"; },
+      error => { outcome.status = "rejected"; outcome.error = error.message; });
+    return { pending, outcome };
+  }
+  const consumed = (page, marker) => expect.poll(() => page.evaluate(
+    marker => window.__refreshObservations.consumed.includes(marker), marker)).toBe(true);
+  const rendered = (page, marker) => expect(page.locator("#slot-grid")).toContainText(marker);
+  async function observations(page, fixture, operation, info) {
+    const browser = await page.evaluate(() => window.__refreshObservations);
+    await info.attach("refresh-ownership", { body: JSON.stringify({
+      browser, requests: fixture.requests, outcome: operation.outcome, diagnostics: fixture.diagnostics,
+    }), contentType: "application/json" });
+    expect(fixture.diagnostics.errors).toEqual([]);
+    expect(fixture.diagnostics.warnings).toEqual([]);
+    expect(fixture.diagnostics.unexpected).toEqual([]);
+    return browser;
+  }
+
+  for (const timing of [false, true]) {
+    for (const order of ["B-first", "B-last"]) {
+      test(`timing ${timing}: non-forced same-scope ${order} rejects discarded A`, async ({ page }, info) => {
+        const fixture = await setup(page, timing), listeners = page.listenerCount("request");
+        const operation = start(page, () => click(page));
+        try {
+          await expect.poll(() => fixture.requests.length).toBe(1);
+          await nonforcedSameScope(page);
+          await expect.poll(() => fixture.requests.length).toBe(2);
+          expect(fixture.requests.map(request => request.force)).toEqual(["true", "false"]);
+          const first = order === "B-first" ? 1 : 0;
+          fixture.gates[first].release();
+          await consumed(page, markers[first]);
+          if (first === 1) await rendered(page, markers[1]);
+          await paintCheckpoint(page);
+          expect(operation.outcome.status).toBe("pending");
+          expect(await page.locator("#slot-grid").textContent()).not.toContain(markers[0]);
+          fixture.gates[1 - first].release();
+          await operation.pending;
+          await consumed(page, markers[0]);
+          await rendered(page, markers[1]);
+          await paintCheckpoint(page);
+          const browser = await observations(page, fixture, operation, info);
+          expect(browser.renders.some(text => text.includes(markers[0]))).toBe(false);
+          expect(page.listenerCount("request")).toBe(listeners);
+          expect(operation.outcome.status, "discarded owned refresh must not report success").toBe("rejected");
+          expect(operation.outcome.error).toContain("readiness request was superseded");
+        } finally {
+          fixture.gates.forEach(gate => gate.release());
+          await operation.pending;
+        }
+      });
+    }
+
+    for (const kind of ["system", "enclosure"]) {
+      test(`timing ${timing}: ${kind} away-and-back cannot borrow C readiness`, async ({ page }, info) => {
+        const fixture = await setup(page, timing), listeners = page.listenerCount("request");
+        const operation = start(page, () => click(page));
+        try {
+          await expect.poll(() => fixture.requests.length).toBe(1);
+          const selector = page.locator(kind === "system" ? "#system-select" : "#enclosure-select");
+          await selector.selectOption(kind === "system" ? "synthetic-second" : "enclosure:enc-b");
+          await expect.poll(() => fixture.requests.length).toBe(2);
+          await selector.selectOption(kind === "system" ? "synthetic-system" : "enclosure:enc-a");
+          await expect.poll(() => fixture.requests.length).toBe(3);
+          fixture.gates[2].release();
+          await rendered(page, markers[2]);
+          fixture.gates[1].release(); fixture.gates[0].release();
+          await operation.pending;
+          await consumed(page, markers[0]); await consumed(page, markers[1]);
+          await paintCheckpoint(page);
+          const browser = await observations(page, fixture, operation, info);
+          expect(browser.renders.some(text => text.includes(markers[0]) || text.includes(markers[1]))).toBe(false);
+          expect(page.listenerCount("request")).toBe(listeners);
+          expect(operation.outcome.status, "scope roundtrip must not restore discarded ownership").toBe("rejected");
+          expect(operation.outcome.error).toContain("readiness request was superseded");
+        } finally {
+          fixture.gates.forEach(gate => gate.release());
+          await operation.pending;
+        }
+      });
+    }
+
+    test(`timing ${timing}: wrong-force dispatch before owned A is not selected`, async ({ page }, info) => {
+      const fixture = await setup(page, timing), listeners = page.listenerCount("request");
+      const operation = start(page, async () => {
+        await nonforcedSameScope(page);
+        await expect.poll(() => fixture.requests.length).toBe(1);
+        await click(page);
+      });
+      try {
+        await expect.poll(() => fixture.requests.length).toBe(2);
+        expect(fixture.requests.map(request => request.force)).toEqual(["false", "true"]);
+        fixture.gates[0].release();
+        await consumed(page, markers[0]); await paintCheckpoint(page);
+        expect(operation.outcome.status).toBe("pending");
+        fixture.gates[1].release(); await operation.pending;
+        await rendered(page, markers[1]);
+        await observations(page, fixture, operation, info);
+        expect(operation.outcome.status).toBe("resolved");
+        expect(page.listenerCount("request")).toBe(listeners);
+      } finally {
+        fixture.gates.forEach(gate => gate.release());
+        await operation.pending;
+      }
+    });
+
+    for (const traffic of ["none", "POST", "non-inventory", "foreign-origin"]) {
+      test(`timing ${timing}: A succeeds with ${traffic} unrelated traffic`, async ({ page }, info) => {
+        const fixture = await setup(page, timing), listeners = page.listenerCount("request");
+        const operation = start(page, () => click(page));
+        try {
+          await expect.poll(() => fixture.requests.length).toBe(1);
+          if (traffic !== "none") {
+            const url = traffic === "foreign-origin"
+              ? "https://foreign.example.test/api/inventory?system_id=synthetic-system&enclosure_id=enc-a&force=true"
+              : traffic === "non-inventory" ? `${origin}/api/release-status`
+                : `${origin}/api/inventory?system_id=synthetic-system&enclosure_id=enc-a&force=true`;
+            const method = traffic === "POST" ? "POST" : "GET";
+            let observed = 0;
+            // Explicitly fulfilled synthetic traffic, never a production refresh.
+            await page.route(url, async route => {
+              expect(route.request().method()).toBe(method);
+              observed += 1;
+              await route.fulfill({ json: { ok: true }, headers: { "access-control-allow-origin": "*" } });
+            });
+            await page.evaluate(async ({ url, method }) => {
+              const response = await fetch(url, { method });
+              if (!response.ok) throw new Error("Synthetic unrelated request failed");
+              await response.json();
+            }, { url, method });
+            expect(observed).toBe(1);
+          }
+          fixture.gates[0].release(); await operation.pending;
+          await rendered(page, markers[0]);
+          await observations(page, fixture, operation, info);
+          expect(operation.outcome.status).toBe("resolved");
+          expect(page.listenerCount("request")).toBe(listeners);
+        } finally {
+          fixture.gates.forEach(gate => gate.release());
+          await operation.pending;
+        }
+      });
+    }
+  }
+
+  for (const kind of ["rejected-action", "no-request", "wrong-force-only"]) {
+    test(`${kind} retains exact failure and restores request listener`, async ({ page }, info) => {
+      const fixture = await setup(page, false), listeners = page.listenerCount("request");
+      fixture.gates.forEach(gate => gate.release());
+      const action = kind === "rejected-action" ? async () => { throw new Error("synthetic action refusal"); }
+        : kind === "no-request" ? async () => {} : () => nonforcedSameScope(page);
+      const operation = start(page, action, { ...scope, timeout: negativeTimeout });
+      await operation.pending;
+      await observations(page, fixture, operation, info);
+      expect(operation.outcome.status).toBe("rejected");
+      expect(operation.outcome.error).toMatch(kind === "rejected-action" ? /^synthetic action refusal$/
+        : /page\.waitForResponse: Timeout 1500ms exceeded while waiting for event "response"/);
+      expect(page.listenerCount("request")).toBe(listeners);
+    });
+  }
+});

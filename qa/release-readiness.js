@@ -45,13 +45,18 @@ async function refreshSelectedScope(page, action, { systemId, enclosureId, force
   let latestRequest;
   const observeRequest = request => {
     const url = new URL(request.url());
-    if (url.origin === origin && url.pathname === "/api/inventory"
-      && request.method() === "GET" && url.searchParams.get("system_id") === systemId
+    if (url.origin !== origin || url.pathname !== "/api/inventory" || request.method() !== "GET") return;
+    // Select our request strictly. A wrong-force/scope dispatch before ownership
+    // cannot supply the response, even if it settles the expected visible scope.
+    if (!ownedRequest && url.searchParams.get("system_id") === systemId
       && (enclosureId === undefined || url.searchParams.get("enclosure_id") === enclosureId)
       && url.searchParams.get("force") === String(force)) {
-      ownedRequest ??= request;
-      latestRequest = request;
+      ownedRequest = request;
     }
+    // refreshSnapshot increments one global token before its inventory GET,
+    // regardless of force or selected scope. Observe that dispatch boundary,
+    // not just requests eligible to become ours. Unrelated endpoints are ignored.
+    if (ownedRequest) latestRequest = request;
   };
   // Own a request dispatched after registration, not just a response arriving
   // afterward. An already-in-flight request with the identical URL is excluded.
@@ -69,8 +74,8 @@ async function refreshSelectedScope(page, action, { systemId, enclosureId, force
     await waitForSelectedScope(page, { systemId, timeout, enclosureValue: viewId
       ? `view:${viewId}` : snapshot.selected_enclosure_id == null || snapshot.selected_enclosure_id === ""
         ? "" : `enclosure:${snapshot.selected_enclosure_id}` });
-    // A later matching dispatch supersedes this operation, even if its final
-    // selected scope happens to be identical. It must not borrow our response.
+    // Any later inventory refresh supersedes this operation, even if its final
+    // selected scope happens to be identical. We must not borrow its readiness.
     expect(latestRequest, "readiness request was superseded").toBe(ownedRequest);
   } finally {
     page.off("request", observeRequest);
