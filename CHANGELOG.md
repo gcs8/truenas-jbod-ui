@@ -259,9 +259,47 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Recovered default inventory selection after topology changes, fenced stale
+  source publication, drained cancelled collectors and moved mapping reads
+  off the event loop while preserving request-local versions. (#852)
+
 - Qualified ESXi, QuantaStor and enclosure disk correlations before SMART
   targeting and enrichment, rejecting conflicting identities and cross-owner
   path or slot matches while preserving verified shared-disk health. (#747)
+- Require verified SES device-slot coordinates for SG LED control and keep
+  independent disks distinct when CAM model/target/LUN values match across controllers. (#809)
+- Bound SSH command execution and retain worker, channel and reusable-session
+  cleanup ownership through cancellation before releasing caller locks. (#765)
+- Kept grooming the other locations when one remote target cannot be opened,
+  built retention rules only for enabled targets, and reported the grooming
+  outcome in the scheduler status and in backup health. (#797)
+- Matched cron schedules like classic cron when a day field starts with `*`:
+  `0 3 */2 * 1` now runs only on Mondays that fall on an odd day of the month,
+  not on every Monday plus every second day. Searched a complete Gregorian
+  calendar cycle so sparse leap-day intersections remain valid. (#817)
+- Refused a full backup schedule that never matches a real date (for example
+  `0 0 30 2 *`) at validation time, instead of letting the scheduler exit on
+  start. (#793)
+- Followed the `TZ` zone for the full backup schedule so a daylight-saving
+  change neither doubles nor delays a run. (#794)
+- Treat malformed UTF-8 slot-detail caches as corrupt without blocking
+  startup; preserve their bytes until a legitimate save rebuilds them. (#752)
+- Emit JSON log timestamps in UTC to match their `Z` suffix, while leaving
+  text log timestamps in local time. (#753)
+- Verified large S3 copies by reading them back when the ETag is not a plain
+  MD5, and never catalogued a copy that could not be verified, so grooming no
+  longer deletes it after a day. Bounded S3 verification readback to the uploaded
+  size plus at most one chunk, retaining failed-copy cleanup. (#795)
+- Capped remote backup downloads at the catalogued size so a hostile or broken
+  remote cannot fill the state volume before the catalogue check. (#796)
+- Fixed public-demo validation rejecting UI labels as serial numbers, while
+  retaining non-demo serial checks and rejecting ambiguous nested JSON. (#746)
+- Drew the Storage Fabric bay grid in the enclosure's physical layout while a
+  storage view is selected, so no bay disappears and a chip selects the
+  physical bay. (#805)
+- Stopped storage views on ESXi and IPMI hosts from showing the SMART summary
+  of the front enclosure's bay when the disk in the view sits in another
+  enclosure. (#834)
 - The main UI no longer reports itself down when a pinned known-hosts file sits
   on a read-only mount, such as the `/run/ssh` mount in the shipped Compose
   file. SSH still verifies hosts against the keys in it; `/healthz` now answers

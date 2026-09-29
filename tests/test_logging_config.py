@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import sys
+import time
 import unittest
 from typing import Any
 from unittest.mock import patch
@@ -111,6 +112,36 @@ class LoggingConfigTests(unittest.TestCase):
 
         self.assertIn('"service": "enclosure-ui"', payload)
         self.assertIn('"message": "hello world"', payload)
+
+    @unittest.skipUnless(hasattr(time, "tzset"), "process timezone switching requires time.tzset")
+    def test_json_timestamps_are_utc_while_text_timestamps_remain_local(self) -> None:
+        record = logging.LogRecord("app.test", logging.INFO, __file__, 1, "hello world", (), None)
+        record.created = 0.125
+        record.msecs = 125.0
+        json_formatter = JsonFormatter(service_name="enclosure-ui")
+        text_formatter = SafeTextFormatter(service_name="enclosure-ui")
+        previous_tz = os.environ.get("TZ")
+        timestamps = []
+        try:
+            # POSIX timezone strings do not depend on an installed zoneinfo database.
+            for zone, local_time in (
+                ("UTC0", "1970-01-01 00:00:00"),
+                ("EST5", "1969-12-31 19:00:00"),
+            ):
+                with self.subTest(timezone=zone):
+                    os.environ["TZ"] = zone
+                    time.tzset()
+                    self.assertTrue(text_formatter.format(record).startswith(local_time + " INFO "))
+                    timestamp = json.loads(json_formatter.format(record))["ts"]
+                    timestamps.append(timestamp)
+                    self.assertEqual(timestamp, "1970-01-01T00:00:00.125Z")
+            self.assertEqual(timestamps, ["1970-01-01T00:00:00.125Z"] * 2)
+        finally:
+            if previous_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = previous_tz
+            time.tzset()
 
     def test_safe_text_formatter_keeps_bounded_request_fields_without_exception_text(self) -> None:
         formatter = SafeTextFormatter(service_name="enclosure-admin")
