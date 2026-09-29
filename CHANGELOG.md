@@ -259,6 +259,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Let the admin Backups settings editor save again when config.yaml holds a
+  quoted port or a bare-number bucket; the endpoint comparison had treated the
+  retyped value as a different server. (#836)
 - Kept missing SMART and history metrics unknown instead of displaying zero or
   inventing critical heat and endurance warnings; preserved real zero values
   and fallback error counters. (#743)
