@@ -259,6 +259,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Confirm supported sudo policy inclusion before reporting bootstrap grants,
+  and distinguish StorCLI installation evidence from failed-command diagnostics. (#840)
 - Applied existing partial endpoint masking consistently to contextual addresses
   and serialized history details while preserving non-address text. (#851)
 
