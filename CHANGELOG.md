@@ -259,6 +259,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Kept the startup, storage-writability and known_hosts warnings on every
+  inventory refresh and re-probed the directories at most every 30 seconds, so
+  a warning no longer vanishes on the first refresh or outlives its fix.
+  (#806)
 - Treated a blank credential line in `.env` (as copied from `.env.example`) as
   unset instead of wiping the value set in config.yaml; a `_FILE` secret still
   wins. (#807)
