@@ -62,7 +62,13 @@ from history_service.backup_archive.policy import (
     BackupPolicy,
     validate_filesystem_target_roots,
 )
-from history_service.backup_archive.transport import LocalDirectoryTarget, open_target, transport_encrypted
+from history_service.backup_archive.transport import (
+    ArchivePublicationUncertainError,
+    LocalDirectoryTarget,
+    StoredObject,
+    open_target,
+    transport_encrypted,
+)
 from history_service.scheduled_backup import ScheduledBackupRunner
 
 logger = logging.getLogger(__name__)
@@ -288,6 +294,7 @@ class BackupScheduler:
                 "inode": metadata.st_ino,
                 "parent_device": parent.st_dev,
                 "parent_inode": parent.st_ino,
+                "temporary_name": temporary.name,
             },
             "history_replacement": False,
         }
@@ -320,42 +327,134 @@ class BackupScheduler:
                 for key in ("device", "inode", "parent_device", "parent_inode"):
                     if type(intent[key]) is not int or intent[key] < 0:
                         raise ValueError("Invalid publication identity")
+                temporary_name = intent.get("temporary_name")
+                target_name = record.name.split("/", 1)[1]
+                if (
+                    temporary_name is not None
+                    and (
+                        not isinstance(temporary_name, str)
+                        or re.fullmatch(
+                            rf"\.{re.escape(target_name)}\.[0-9a-f]{{32}}\.tmp",
+                            temporary_name,
+                        )
+                        is None
+                    )
+                ):
+                    raise ValueError("Invalid publication temporary name")
             except (KeyError, TypeError, ValueError) as exc:
                 raise ValueError("Backup publication ownership metadata is invalid.") from exc
             records.append(record)
         return records
 
-    def _publication_matches(self, record: ArtifactRecord, intent: Mapping[str, Any]) -> bool:
+    def _publication_descriptor(
+        self,
+        descriptor: int,
+        record: ArtifactRecord,
+        intent: Mapping[str, Any],
+    ) -> os.stat_result | None:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or (metadata.st_dev, metadata.st_ino) != (intent["device"], intent["inode"])
+            or metadata.st_size != record.size
+        ):
+            return None
+        digest = hashlib.sha256()
+        remaining = record.size
+        while remaining:
+            chunk = os.read(descriptor, min(_COPY_CHUNK, remaining))
+            if not chunk:
+                return None
+            remaining -= len(chunk)
+            digest.update(chunk)
+        if os.read(descriptor, 1) or digest.hexdigest() != record.sha256:
+            return None
+        if self._snapshot_identity(os.fstat(descriptor)) != self._snapshot_identity(metadata):
+            return None
+        return metadata
+
+    def _publication_state(self, record: ArtifactRecord, intent: Mapping[str, Any]) -> str:
         path = self._local_path(record)
         directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             parent = os.fstat(directory)
             if (parent.st_dev, parent.st_ino) != (intent["parent_device"], intent["parent_inode"]):
-                return False
-            descriptor = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+                return "mismatch"
+            temporary_name = intent.get("temporary_name")
             try:
-                metadata = os.fstat(descriptor)
-                if (
-                    not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
-                    or metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) != 0o600
-                    or (metadata.st_dev, metadata.st_ino) != (intent["device"], intent["inode"])
-                    or metadata.st_size != record.size
-                ):
-                    return False
-                digest = hashlib.sha256()
-                remaining = record.size
-                while remaining:
-                    chunk = os.read(descriptor, min(_COPY_CHUNK, remaining))
-                    if not chunk:
-                        return False
-                    remaining -= len(chunk)
-                    digest.update(chunk)
-                return (
-                    not os.read(descriptor, 1) and digest.hexdigest() == record.sha256
-                    and self._snapshot_identity(os.fstat(descriptor)) == self._snapshot_identity(metadata)
-                    and self._snapshot_identity(os.stat(path.name, dir_fd=directory, follow_symlinks=False))
-                    == self._snapshot_identity(metadata)
+                descriptor = os.open(
+                    path.name,
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                    dir_fd=directory,
                 )
+            except FileNotFoundError:
+                if temporary_name is None:
+                    return "missing"
+                try:
+                    temporary = os.open(
+                        temporary_name,
+                        os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                        dir_fd=directory,
+                    )
+                except FileNotFoundError:
+                    return "missing"
+                try:
+                    temporary_metadata = self._publication_descriptor(temporary, record, intent)
+                    if temporary_metadata is None or temporary_metadata.st_nlink != 1:
+                        return "mismatch"
+                    if (
+                        self._snapshot_identity(
+                            os.stat(temporary_name, dir_fd=directory, follow_symlinks=False)
+                        )
+                        != self._snapshot_identity(temporary_metadata)
+                    ):
+                        return "mismatch"
+                finally:
+                    os.close(temporary)
+                os.unlink(temporary_name, dir_fd=directory)
+                os.fsync(directory)
+                return "missing"
+            try:
+                metadata = self._publication_descriptor(descriptor, record, intent)
+                if metadata is None:
+                    return "mismatch"
+                if (
+                    self._snapshot_identity(os.stat(path.name, dir_fd=directory, follow_symlinks=False))
+                    != self._snapshot_identity(metadata)
+                ):
+                    return "mismatch"
+                if metadata.st_nlink == 1:
+                    if temporary_name is not None:
+                        try:
+                            os.stat(temporary_name, dir_fd=directory, follow_symlinks=False)
+                        except FileNotFoundError:
+                            pass
+                        else:
+                            return "mismatch"
+                    return "match"
+                if metadata.st_nlink != 2 or temporary_name is None:
+                    return "mismatch"
+                temporary_metadata = os.stat(
+                    temporary_name,
+                    dir_fd=directory,
+                    follow_symlinks=False,
+                )
+                if self._snapshot_identity(temporary_metadata) != self._snapshot_identity(metadata):
+                    return "mismatch"
+                os.unlink(temporary_name, dir_fd=directory)
+                os.fsync(directory)
+                published = os.fstat(descriptor)
+                if (
+                    published.st_nlink != 1
+                    or self._snapshot_identity(
+                        os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+                    )
+                    != self._snapshot_identity(published)
+                ):
+                    return "mismatch"
+                return "match"
             finally:
                 os.close(descriptor)
         finally:
@@ -374,9 +473,11 @@ class BackupScheduler:
             intent = metadata[record.artifact_id]["publication"]
             try:
                 if self.catalog.get(record.artifact_id) is None and record.artifact_id not in deleted:
-                    if not self._publication_matches(record, intent):
+                    state = self._publication_state(record, intent)
+                    if state == "mismatch":
                         continue
-                    self.catalog.add(record)
+                    if state == "match":
+                        self.catalog.add(record)
                 with self._state_lock:
                     self._meta[record.artifact_id].pop("publication")
                     try:
@@ -872,8 +973,14 @@ class BackupScheduler:
         # Recheck immediately before every operation. This catches a symlink or
         # bind-visible alias introduced after startup, before copy or retention
         # receives a second catalog identity for local bytes.
+        peers = (target,)
         if target.settings.provider == "filesystem":
-            validate_filesystem_target_roots(self.policy.targets, self.paths.local_dir)
+            validate_filesystem_target_roots((target,), self.paths.local_dir)
+            peers = (
+                target,
+                *(peer for peer in self.policy.enabled_targets() if peer.target_id != target.target_id),
+            )
+            validate_filesystem_target_roots(peers, self.paths.local_dir, allow_unavailable=True)
         opened = (
             self._open_target(target.settings, local_archive_root=self.paths.local_dir)
             if self._open_target_is_default
@@ -881,10 +988,45 @@ class BackupScheduler:
         )
         with opened as remote:
             if target.settings.provider == "filesystem" and isinstance(remote, LocalDirectoryTarget):
-                remote.before_mutation = lambda: validate_filesystem_target_roots(
-                    self.policy.targets, self.paths.local_dir
-                )
+                def validate_target() -> None:
+                    validate_filesystem_target_roots((target,), self.paths.local_dir)
+                    validate_filesystem_target_roots(peers, self.paths.local_dir, allow_unavailable=True)
+
+                remote.before_mutation = validate_target
             yield remote
+
+    def _remote_record(
+        self,
+        source: ArtifactRecord,
+        target: ArchiveTarget,
+        stored: StoredObject,
+        *,
+        preserved: bool = False,
+    ) -> ArtifactRecord:
+        return ArtifactRecord(
+            artifact_id=new_artifact_id(),
+            backup_class=source.backup_class,
+            location=target.target_id,
+            name=source.name,
+            created_at=source.created_at,
+            size=stored.size,
+            sha256=stored.sha256,
+            verified=bool(stored.verified),
+            change_ids=source.change_ids,
+            preserved=preserved,
+            preserve_reason=(
+                "Remote publication has uncertain directory durability; verify before releasing preservation."
+                if preserved
+                else ""
+            ),
+            preserved_by="scheduler-recovery" if preserved else "",
+        )
+
+    def _catalog_remote(self, source: ArtifactRecord, remote_record: ArtifactRecord) -> None:
+        self.catalog.add(remote_record)
+        with self._state_lock:
+            self._meta[remote_record.artifact_id] = self._metadata_snapshot(source.artifact_id)
+            self._save_meta()
 
     def _ship(self, record: ArtifactRecord) -> list[str]:
         failures: list[str] = []
@@ -896,22 +1038,35 @@ class BackupScheduler:
                     stored = remote.put(local_path, record.name)
                 if stored.size != record.size or stored.sha256 != record.sha256:
                     raise RuntimeError("remote copy does not match the local archive")
-                remote_record = ArtifactRecord(
-                    artifact_id=new_artifact_id(),
-                    backup_class=record.backup_class,
-                    location=target.target_id,
-                    name=record.name,
-                    created_at=record.created_at,
-                    size=stored.size,
-                    sha256=stored.sha256,
-                    verified=bool(stored.verified),
-                    change_ids=record.change_ids,
-                )
-                self.catalog.add(remote_record)
-                with self._state_lock:
-                    self._meta[remote_record.artifact_id] = self._metadata_snapshot(record.artifact_id)
-                    self._save_meta()
+                remote_record = self._remote_record(record, target, stored)
+                self._catalog_remote(record, remote_record)
                 self._record_target(target.target_id, RunRecord(at=at, ok=True, artifact_id=remote_record.artifact_id))
+            except ArchivePublicationUncertainError as exc:
+                remote_record = self._remote_record(record, target, exc.stored, preserved=True)
+                try:
+                    if remote_record.size != record.size or remote_record.sha256 != record.sha256:
+                        raise RuntimeError("uncertain remote copy does not match the local archive")
+                    self._catalog_remote(record, remote_record)
+                except Exception as catalog_exc:  # noqa: BLE001 - keep target failure isolated
+                    logger.warning(
+                        "Uncertain remote backup copy to %s could not be catalogued (%s).",
+                        target.target_id,
+                        type(catalog_exc).__name__,
+                    )
+                logger.warning(
+                    "Remote backup copy to %s has uncertain directory durability.",
+                    target.target_id,
+                )
+                self._record_target(
+                    target.target_id,
+                    RunRecord(
+                        at=at,
+                        ok=False,
+                        detail=describe_error(exc),
+                        artifact_id=remote_record.artifact_id,
+                    ),
+                )
+                failures.append(target.target_id)
             except Exception as exc:  # noqa: BLE001 - one target failing must not stop the others
                 logger.warning("Remote backup copy to %s failed (%s).", target.target_id, type(exc).__name__)
                 self._record_target(target.target_id, RunRecord(at=at, ok=False, detail=describe_error(exc)))

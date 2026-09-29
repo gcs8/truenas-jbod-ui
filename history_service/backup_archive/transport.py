@@ -113,6 +113,14 @@ class StoredObject:
     verified: bool
 
 
+class ArchivePublicationUncertainError(ArchiveTransportError):
+    """The object is visible, but its directory entry may not be durable."""
+
+    def __init__(self, stored: StoredObject) -> None:
+        super().__init__("Archive object was published, but directory durability could not be confirmed.")
+        self.stored = stored
+
+
 @runtime_checkable
 class ArchiveTarget(Protocol):
     provider: str
@@ -421,7 +429,11 @@ class LocalDirectoryTarget(_TargetBase):
                 except FileNotFoundError:
                     pass
                 raise
-        self._fsync_dir(final.parent)
+        stored = StoredObject(name=name, size=size, sha256=sha, verified=False)
+        try:
+            self._fsync_dir(final.parent)
+        except OSError as exc:
+            raise ArchivePublicationUncertainError(stored) from exc
         return StoredObject(name=name, size=size, sha256=sha, verified=True)
 
     @staticmethod

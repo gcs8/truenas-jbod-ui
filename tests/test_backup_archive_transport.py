@@ -31,6 +31,7 @@ from history_service.backup_archive.settings import (
     read_secret_file,
 )
 from history_service.backup_archive.transport import (
+    ArchivePublicationUncertainError,
     ArchiveTarget,
     ArchiveTransportError,
     ArchiveVerificationError,
@@ -215,9 +216,14 @@ class FilesystemTargetTests(_TempCase):
                         return original_fsync(fd)
 
                     with mock.patch.object(os, "open", side_effect=opened), mock.patch.object(os, "fsync", side_effect=synced):
-                        with self.assertRaises(OSError) as caught:
+                        with self.assertRaises(ArchivePublicationUncertainError) as caught:
                             target.put(self.source(b"synthetic archive"), "copy.enc")
-                    self.assertEqual(caught.exception.errno, error)
+                    cause = caught.exception.__cause__
+                    self.assertIsInstance(cause, OSError)
+                    assert isinstance(cause, OSError)
+                    self.assertEqual(cause.errno, error)
+                    self.assertEqual(caught.exception.stored.name, "copy.enc")
+                    self.assertFalse(caught.exception.stored.verified)
                     self.assertEqual((root / "copy.enc").read_bytes(), b"synthetic archive")
                     self.assertFalse((root / "copy.enc.partial").exists())
                     self.assertTrue(target.put(self.source(b"retry"), "retry.enc").verified)

@@ -480,6 +480,30 @@ class SchedulerPreservationTests(SchedulerTestBase):
         self.assertFalse(targets_by_id["second"]["last_run"]["ok"])
         self.assertTrue(targets_by_id["independent"]["last_run"]["ok"])
 
+    def test_unavailable_filesystem_target_does_not_block_healthy_peer(self):
+        from history_service.backup_archive import policy as policy_module
+        from history_service.backup_archive.settings import ArchiveRootUnavailableError
+
+        first, second, alias, targets = self.remote_pair()
+        scheduler = self.real_scheduler(targets).service
+        original = policy_module.filesystem_roots_overlap
+
+        def inspected(local_root, remote_root):
+            if Path(remote_root) == alias:
+                raise ArchiveRootUnavailableError("synthetic target unavailable")
+            return original(local_root, remote_root)
+
+        with patch.object(policy_module, "filesystem_roots_overlap", side_effect=inspected):
+            record = scheduler.run_now("full")
+
+        self.assertTrue((first / record.name).is_file())
+        self.assertFalse((second / record.name).exists())
+        self.assertEqual(len(scheduler.catalog.list(location="first")), 1)
+        self.assertEqual(scheduler.catalog.list(location="second"), [])
+        targets_by_id = {item["id"]: item for item in scheduler.library()["targets"]}
+        self.assertTrue(targets_by_id["first"]["last_run"]["ok"])
+        self.assertFalse(targets_by_id["second"]["last_run"]["ok"])
+
     def test_remote_alias_rechecked_at_each_delete_in_cached_target(self):
         from dataclasses import replace
 
@@ -531,8 +555,14 @@ class SchedulerPreservationTests(SchedulerTestBase):
 
         with patch.object(os, "fsync", side_effect=synced):
             scheduler.run_now("full")
-        self.assertEqual([r.name for r in scheduler.catalog.list(location="nas")], [old.name])
+        remote_records = scheduler.catalog.list(location="nas")
+        self.assertEqual(len(remote_records), 2)
+        uncertain = next(record for record in remote_records if record.name != old.name)
+        self.assertTrue(uncertain.preserved)
+        self.assertFalse(uncertain.verified)
+        self.assertIn("directory durability", uncertain.preserve_reason)
         self.assertTrue((remote / old.name).exists())
+        self.assertTrue((remote / uncertain.name).exists())
         self.assertFalse(scheduler.library()["targets"][0]["last_run"]["ok"])
         self.now += timedelta(hours=1)
         scheduler.run_now("full")
@@ -716,7 +746,7 @@ class SchedulerPreservationTests(SchedulerTestBase):
             yield hits
         self.assertEqual(hits, [seam], "the named real I/O seam must fail exactly once")
 
-    def check_failed_intent_save(self, seams, *, retained):
+    def check_failed_intent_save(self, seams, *, immediate_retained, recovered_retained):
         from dataclasses import replace
 
         original_paths = self._paths
@@ -739,17 +769,26 @@ class SchedulerPreservationTests(SchedulerTestBase):
                     immediate = scheduler.library()
                     self.assertFalse(immediate["classes"]["full"]["last_run"]["ok"])
                     self.assertEqual(len(scheduler.catalog.list()), 1)
-                    self.assertEqual(immediate["storage"]["local"]["count"], 1 + int(retained))
-                    if not retained:
+                    self.assertEqual(
+                        immediate["storage"]["local"]["count"],
+                        1 + int(immediate_retained),
+                    )
+                    if not immediate_retained:
                         self.assertEqual(scheduler._meta_path.read_bytes(), before)
                     if later_verify:
                         self.assertTrue(scheduler.verify(old.artifact_id)["ok"])
                     scheduler.close()
                     reopened = self.real_scheduler().service
                     library = reopened.library()
-                    self.assertEqual(library["storage"]["local"]["count"], 1 + int(retained))
-                    self.assertEqual(library["storage"]["local"]["full_bytes"], len(old_bytes) * (1 + int(retained)))
-                    self.assertEqual(bool(library["detail"]), retained)
+                    self.assertEqual(
+                        library["storage"]["local"]["count"],
+                        1 + int(recovered_retained),
+                    )
+                    self.assertEqual(
+                        library["storage"]["local"]["full_bytes"],
+                        len(old_bytes) * (1 + int(recovered_retained)),
+                    )
+                    self.assertEqual(bool(library["detail"]), recovered_retained)
                     extra = [item for item in library["artifacts"] if item["id"] != old.artifact_id]
                     for item in extra:
                         self.assertEqual(item["state"], "missing")
@@ -765,14 +804,16 @@ class SchedulerPreservationTests(SchedulerTestBase):
     def test_pre_replace_metadata_failures_do_not_leave_phantom_intents(self):
         self.check_failed_intent_save(
             ("before_save", "temp_open", "write", "json_partial", "flush", "file_fsync", "replace"),
-            retained=False,
+            immediate_retained=False,
+            recovered_retained=False,
         )
 
-    def test_post_replace_metadata_failures_retain_recovery_intents(self):
+    def test_post_replace_metadata_failures_clear_intents_after_absence_is_proven(self):
         self.check_failed_intent_save(
             ("directory_open", "directory_fsync", "cleanup", "replace_ack_lost",
              "replace_ack_uninspectable", "after_save"),
-            retained=True,
+            immediate_retained=True,
+            recovered_retained=False,
         )
 
     def test_first_intent_save_failure_does_not_leak_into_successful_retry(self):
@@ -1085,6 +1126,44 @@ class SchedulerPreservationTests(SchedulerTestBase):
         destination = self._paths.local_dir / "full"
         self.assertEqual([p.name for p in destination.iterdir() if p.name != ".scheduled-backup.lock"], [])
         self.assertEqual(scheduler.catalog.list(), [])
+
+    def test_recovery_clears_intent_when_final_publication_is_absent(self):
+        scheduler = self.real_scheduler().service
+        with patch.object(scheduler.catalog, "add", side_effect=OSError("synthetic catalog failure")):
+            with self.assertRaisesRegex(OSError, "catalog failure"):
+                scheduler.run_now("full")
+        pending = scheduler._pending_publications()
+        self.assertEqual(len(pending), 1)
+        (scheduler.paths.local_dir / pending[0].name).unlink()
+        scheduler.close()
+
+        reopened = self.real_scheduler().service
+        self.assertEqual(reopened.catalog.list(), [])
+        self.assertEqual(reopened._pending_publications(), [])
+        self.assertEqual(reopened.library()["artifacts"], [])
+
+    def test_recovery_removes_recorded_temporary_link_before_cataloguing(self):
+        scheduler = self.real_scheduler().service
+        with patch.object(scheduler.catalog, "add", side_effect=OSError("synthetic catalog failure")):
+            with self.assertRaisesRegex(OSError, "catalog failure"):
+                scheduler.run_now("full")
+        pending = scheduler._pending_publications()
+        self.assertEqual(len(pending), 1)
+        record = pending[0]
+        intent = scheduler._metadata_snapshot(record.artifact_id)["publication"]
+        target = scheduler.paths.local_dir / record.name
+        temporary = target.parent / intent["temporary_name"]
+        os.link(target, temporary)
+        self.assertEqual(target.stat().st_nlink, 2)
+        scheduler.close()
+
+        reopened = self.real_scheduler().service
+        recovered = reopened.catalog.get(record.artifact_id)
+        self.assertIsNotNone(recovered)
+        self.assertTrue(recovered.preserved)
+        self.assertFalse(temporary.exists())
+        self.assertEqual(target.stat().st_nlink, 1)
+        self.assertEqual(reopened._pending_publications(), [])
 
     def test_ownership_recovery_never_adopts_substituted_file(self):
         scheduler = self.real_scheduler().service
