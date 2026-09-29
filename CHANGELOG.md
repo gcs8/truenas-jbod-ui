@@ -259,6 +259,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Checked the length and SHA-256 of a backup copy the admin service downloads
+  from the scheduler and refused a short or altered transfer instead of
+  passing it on. (#818)
 - Kept scheduled full backups running when the config change journal cannot be
   read, and reported the journal problem as a failed config backup instead of
   stopping the scheduler. (#835)
