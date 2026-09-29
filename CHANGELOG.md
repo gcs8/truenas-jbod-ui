@@ -259,6 +259,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Reserved admin maintenance runtime ownership through restoration and retained
+  catalog download workers through cancellation before cleanup. (#847)
+
 - Reuse one immutable mapping classification per inventory correlation pass,
   preserving mapping conflicts, drawer aliases and revision checks. (#766)
 - Keep automatic config-backup hashes, captured files and source-path selection
