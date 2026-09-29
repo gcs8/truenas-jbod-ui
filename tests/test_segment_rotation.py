@@ -52,7 +52,7 @@ class LaterGenerationRotationRedTests(unittest.TestCase):
 
         self.assertTrue(callable(rotation.rotate_segmented_history))
         self.assertTrue(callable(rotation.recover_pending_rotation))
-        self.assertEqual(rotation.ROTATION_JOURNAL_PHASES, self.EXPECTED_PHASES)
+        self.assertEqual(rotation.ROTATION_JOURNAL_PHASES, (*self.EXPECTED_PHASES, "prior-restored"))
 
     def test_rotation_cli_supports_dry_run_and_apply(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -519,6 +519,302 @@ class LaterGenerationRotationRedTests(unittest.TestCase):
                         prior_catalog_sha256,
                     )
                     self.assertFalse((segments_directory / "segment-0002.sqlite3").exists())
+
+    def _pending_cleanup_fixture(self, root: Path, phase: str):
+        source = root / "history.db"
+        segments = root / "segments"
+        self._create_generation_0001(source, segments)
+        self._append_event(source, "generation-2-sealed", "2025-01-02T12:00:00+00:00")
+        self._append_event(source, "generation-2-hot", "2025-01-03T12:00:00+00:00")
+        backup_directory, backup_status = self._create_full_backup_evidence(root)
+        rotation = self._rotation_module()
+        writer = rotation._write_rotation_journal
+
+        def stop_publisher(path, payload):
+            record = writer(path, payload)
+            if payload["phase"] == phase:
+                raise SimulatedRotationCrash(phase)
+            return record
+
+        with patch.object(rotation, "_write_rotation_journal", side_effect=stop_publisher):
+            with self.assertRaises(SimulatedRotationCrash):
+                rotation.rotate_segmented_history(
+                    source=source, segments_directory=segments,
+                    cutoff="2025-01-03T00:00:00+00:00", key_id="generation-key-2",
+                    scheduled_backup_directory=backup_directory,
+                    scheduled_backup_status_path=backup_status, apply=True,
+                )
+        journal = json.loads(activation_pending_path(source).read_text())
+        selected = {segments / "catalog.json": (segments / "catalog.json").read_bytes()}
+        selected[segments / "segment-0001.sqlite3"] = (segments / "segment-0001.sqlite3").read_bytes()
+        if phase == "catalog-replaced":
+            selected[source] = source.read_bytes()
+            selected[segments / "segment-0002.sqlite3"] = (segments / "segment-0002.sqlite3").read_bytes()
+        else:
+            selected[source] = (root / journal["prior_hot_rollback"]["file_name"]).read_bytes()
+        return source, segments, journal, selected
+
+    def _restart_recovery(self, source: Path, segments: Path, *, pending: bool) -> None:
+        result = subprocess.run(
+            [sys.executable, "scripts/rotate_segmented_history.py", "--source", str(source),
+             "--segments-dir", str(segments), "--recover", "--apply"],
+            cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=20,
+        )
+        if pending:
+            self.assertEqual(result.returncode, 0, result.stderr)
+        else:
+            # Preserve the public no-pending contract, not a fabricated success.
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("recovery is not pending", result.stderr)
+
+    def _assert_selected_generation(self, source, segments, selected, *, candidate):
+        for path, content in selected.items():
+            self.assertEqual(self._sha256_file(path), hashlib.sha256(content).hexdigest(), path.name)
+        catalog = json.loads((segments / "catalog.json").read_text())
+        self.assertEqual(catalog["generation_id"], "generation-0002" if candidate else "generation-0001")
+        self.assertEqual(self._event_types(segments / "segment-0001.sqlite3"), ["generation-1-sealed"])
+        if candidate:
+            self.assertEqual(self._event_types(source), ["generation-2-hot"])
+            self.assertEqual(self._event_types(segments / "segment-0002.sqlite3"),
+                             ["generation-1-hot", "generation-2-sealed"])
+        else:
+            self.assertEqual(self._event_types(source),
+                             ["generation-1-hot", "generation-2-sealed", "generation-2-hot"])
+            self.assertFalse((segments / "segment-0002.sqlite3").exists())
+        self.assertFalse(activation_pending_path(source).exists())
+        reader = SegmentedHistoryReader.from_catalog(hot_path=source, catalog_path=segments / "catalog.json")
+        reader.verify_catalog_segments()
+        self.assertEqual(
+            [row["event_type"] for row in reader.list_slot_events("synthetic-system", "synthetic-enclosure", 1)],
+            ["generation-2-hot", "generation-2-sealed", "generation-1-hot", "generation-1-sealed"],
+        )
+        self.assertEqual(list(source.parent.glob(".*.rollback.sqlite3")), [])
+        self.assertEqual(list(segments.glob(".*.rollback.json")), [])
+        self.assertEqual(list(source.parent.glob(".history.db.segmented-*.sqlite3")), [])
+        self.assertEqual(list(segments.glob(".rotation-catalog-*.json")), [])
+
+    def test_recovery_cleanup_restarts_after_each_real_unlink(self) -> None:
+        for phase in ("hot-staged", "hot-replaced", "catalog-replaced"):
+            keys = ["prior_hot_rollback", "prior_catalog_rollback", "journal"]
+            if phase != "catalog-replaced":
+                keys += ["new_segment", "candidate_catalog"]
+            if phase == "hot-staged":
+                keys += ["staged_hot"]
+            for key in keys:
+                with self.subTest(phase=phase, removed=key), tempfile.TemporaryDirectory() as temporary:
+                    source, segments, journal, selected = self._pending_cleanup_fixture(Path(temporary), phase)
+                    marker = activation_pending_path(source)
+                    target = marker.name if key == "journal" else journal[key]["file_name"]
+                    unlink = os.unlink
+                    removed = []
+
+                    def unlink_then_crash(path, *args, **kwargs):
+                        unlink(path, *args, **kwargs)
+                        if Path(path).name == target:
+                            removed.append(target)
+                            raise SimulatedRotationCrash(target)
+
+                    with patch.object(os, "unlink", side_effect=unlink_then_crash):
+                        with self.assertRaises(SimulatedRotationCrash):
+                            self._rotation_module().recover_pending_rotation(
+                                source=source, segments_directory=segments, apply=True,
+                            )
+                    self.assertEqual(removed, [target])
+                    if marker.exists():
+                        with self.assertRaisesRegex(ValueError, "activation is pending"):
+                            SegmentedHistoryReader.from_catalog(hot_path=source, catalog_path=segments / "catalog.json")
+                    self._restart_recovery(source, segments, pending=key != "journal")
+                    self._assert_selected_generation(source, segments, selected, candidate=phase == "catalog-replaced")
+                    self._restart_recovery(source, segments, pending=False)
+                    self._assert_selected_generation(source, segments, selected, candidate=phase == "catalog-replaced")
+
+    def test_recovery_cleanup_survives_process_exit_at_each_mutating_syscall(self) -> None:
+        # Trace real cleanup calls after the terminal decision, then kill a fresh
+        # child at each observed boundary. os._exit deliberately skips finally.
+        script = """
+import json
+import os
+import sys
+from pathlib import Path
+from history_service import segment_rotation as rotation
+
+source, segments, stop = Path(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3])
+armed = False
+ordinal = 0
+
+def checkpoint(operation):
+    global ordinal
+    if armed:
+        print(json.dumps({"ordinal": ordinal, "operation": operation}), flush=True)
+        if ordinal == stop:
+            os._exit(73)
+        ordinal += 1
+
+writer = rotation._write_rotation_journal
+def write_terminal(path, payload):
+    global armed
+    record = writer(path, payload)
+    if payload["phase"] in {"cleanup", "prior-restored"}:
+        armed = True
+        checkpoint("terminal-journal")
+    return record
+rotation._write_rotation_journal = write_terminal
+
+def wrap(name):
+    original = getattr(os, name)
+    def observed(*args, **kwargs):
+        result = original(*args, **kwargs)
+        checkpoint(name)
+        return result
+    setattr(os, name, observed)
+for name in ("replace", "unlink", "rmdir", "fsync"):
+    wrap(name)
+rotation.recover_pending_rotation(source=source, segments_directory=segments, apply=True)
+"""
+        for phase in ("hot-replaced", "catalog-replaced"):
+            with self.subTest(phase=phase, boundary="trace"), tempfile.TemporaryDirectory() as temporary:
+                source, segments, _, selected = self._pending_cleanup_fixture(Path(temporary), phase)
+                traced = subprocess.run(
+                    [sys.executable, "-c", script, str(source), str(segments), "-1"],
+                    cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=20,
+                )
+                self.assertEqual(traced.returncode, 0, traced.stderr)
+                events = [json.loads(line) for line in traced.stdout.splitlines()]
+                self.assertEqual({event["operation"] for event in events},
+                                 {"terminal-journal", "replace", "unlink", "rmdir", "fsync"})
+                self.assertLess(len(events), 40, "keep the synthetic crash matrix bounded")
+                self._assert_selected_generation(source, segments, selected, candidate=phase == "catalog-replaced")
+            for event in events:
+                with self.subTest(phase=phase, boundary=event), tempfile.TemporaryDirectory() as temporary:
+                    source, segments, _, selected = self._pending_cleanup_fixture(Path(temporary), phase)
+                    crashed = subprocess.run(
+                        [sys.executable, "-c", script, str(source), str(segments), str(event["ordinal"])],
+                        cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=20,
+                    )
+                    self.assertEqual(crashed.returncode, 73, crashed.stderr)
+                    self.assertEqual(json.loads(crashed.stdout.splitlines()[-1]), event)
+                    self._restart_recovery(source, segments, pending=activation_pending_path(source).exists())
+                    self._assert_selected_generation(source, segments, selected, candidate=phase == "catalog-replaced")
+                    self._restart_recovery(source, segments, pending=False)
+                    self._assert_selected_generation(source, segments, selected, candidate=phase == "catalog-replaced")
+
+    def test_recovery_persists_selected_terminal_phase_before_cleanup(self) -> None:
+        for phase, terminal in (("hot-replaced", "prior-restored"), ("catalog-replaced", "cleanup")):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as temporary:
+                source, segments, journal, selected = self._pending_cleanup_fixture(Path(temporary), phase)
+                rotation = self._rotation_module()
+                writer = rotation._write_rotation_journal
+
+                def write_then_crash(path, payload):
+                    result = writer(path, payload)
+                    if payload["phase"] == terminal:
+                        raise SimulatedRotationCrash(terminal)
+                    return result
+
+                with patch.object(rotation, "_write_rotation_journal", side_effect=write_then_crash):
+                    with self.assertRaises(SimulatedRotationCrash):
+                        rotation.recover_pending_rotation(source=source, segments_directory=segments, apply=True)
+                self.assertEqual(json.loads(activation_pending_path(source).read_text())["phase"], terminal)
+                self.assertTrue((source.parent / journal["prior_hot_rollback"]["file_name"]).is_file())
+                self.assertTrue((segments / journal["prior_catalog_rollback"]["file_name"]).is_file())
+                self._restart_recovery(source, segments, pending=True)
+                self._assert_selected_generation(source, segments, selected, candidate=phase == "catalog-replaced")
+
+    def test_recovery_terminal_journal_fsync_failure_does_not_retire_evidence(self) -> None:
+        for phase in ("hot-staged", "catalog-replaced"):
+            for ordinal in (1, 2):
+                with self.subTest(phase=phase, fsync=ordinal), tempfile.TemporaryDirectory() as temporary:
+                    source, segments, journal, selected = self._pending_cleanup_fixture(Path(temporary), phase)
+                    sync = os.fsync
+                    calls = []
+                    before = {p: p.read_bytes() for p in Path(temporary).rglob("*") if p.is_file()}
+
+                    def fail_sync(fd):
+                        calls.append(fd)
+                        if len(calls) == ordinal:
+                            raise OSError("terminal fsync failed")
+                        return sync(fd)
+
+                    with patch.object(os, "fsync", side_effect=fail_sync):
+                        with self.assertRaisesRegex(OSError, "terminal fsync"):
+                            self._rotation_module().recover_pending_rotation(
+                                source=source, segments_directory=segments, apply=True,
+                            )
+                    self.assertEqual(len(calls), ordinal)
+                    for path, content in before.items():
+                        if path != activation_pending_path(source):
+                            self.assertTrue(path.is_file(), path.name)
+                            self.assertEqual(path.read_bytes(), content)
+                    self._restart_recovery(source, segments, pending=True)
+                    self._assert_selected_generation(source, segments, selected, candidate=phase == "catalog-replaced")
+
+    def test_recovery_terminal_replay_rejects_changed_selected_generation(self) -> None:
+        for phase in ("hot-replaced", "catalog-replaced"):
+            targets = ["hot", "catalog", "prior-segment", "remaining-rollback", "wrong-generation"]
+            if phase == "catalog-replaced":
+                targets += ["new-segment"]
+            for target in targets:
+                with self.subTest(phase=phase, target=target), tempfile.TemporaryDirectory() as temporary:
+                    source, segments, journal, selected = self._pending_cleanup_fixture(Path(temporary), phase)
+                    rotation = self._rotation_module()
+                    remove = rotation._remove_recorded_file
+                    other_hot = source.read_bytes() if phase == "hot-replaced" else (
+                        source.parent / journal["prior_hot_rollback"]["file_name"]
+                    ).read_bytes()
+                    other_catalog = (segments / journal["candidate_catalog"]["file_name"]).read_bytes() if phase == "hot-replaced" else (
+                        segments / journal["prior_catalog_rollback"]["file_name"]
+                    ).read_bytes()
+
+                    def remove_then_crash(root, record, *, label, allow_missing=False):
+                        remove(root, record, label=label, allow_missing=allow_missing)
+                        if label == "prior hot rollback":
+                            raise SimulatedRotationCrash(label)
+
+                    with patch.object(rotation, "_remove_recorded_file", side_effect=remove_then_crash):
+                        with self.assertRaises(SimulatedRotationCrash):
+                            rotation.recover_pending_rotation(source=source, segments_directory=segments, apply=True)
+                    if target == "wrong-generation":
+                        source.write_bytes(other_hot)
+                        (segments / "catalog.json").write_bytes(other_catalog)
+                    else:
+                        path = {
+                            "hot": source, "catalog": segments / "catalog.json",
+                            "prior-segment": segments / "segment-0001.sqlite3",
+                            "new-segment": segments / "segment-0002.sqlite3",
+                            "remaining-rollback": segments / journal["prior_catalog_rollback"]["file_name"],
+                        }[target]
+                        path.write_bytes(b"synthetic-divergent-evidence")
+                    before = {p: p.read_bytes() for p in Path(temporary).rglob("*") if p.is_file()}
+                    for apply in (False, True):
+                        with self.assertRaisesRegex(ValueError, "integrity|divergent|generation"):
+                            rotation.recover_pending_rotation(source=source, segments_directory=segments, apply=apply)
+                        self.assertEqual({p: p.read_bytes() for p in Path(temporary).rglob("*") if p.is_file()}, before)
+
+    def test_prior_recovery_revalidates_retained_segments_before_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source, segments, _, _ = self._pending_cleanup_fixture(Path(temporary), "hot-replaced")
+            (segments / "segment-0001.sqlite3").write_bytes(b"synthetic-corrupt-prior-segment")
+            before = {p: p.read_bytes() for p in Path(temporary).rglob("*") if p.is_file()}
+            with self.assertRaisesRegex(ValueError, "integrity"):
+                self._rotation_module().recover_pending_rotation(
+                    source=source, segments_directory=segments, apply=True,
+                )
+            self.assertEqual({p: p.read_bytes() for p in Path(temporary).rglob("*") if p.is_file()}, before)
+
+    def test_recovery_nonterminal_missing_rollbacks_remain_fail_closed(self) -> None:
+        for phase in ("hot-replaced", "catalog-replaced"):
+            for key in ("prior_hot_rollback", "prior_catalog_rollback"):
+                with self.subTest(phase=phase, key=key), tempfile.TemporaryDirectory() as temporary:
+                    source, segments, journal, _ = self._pending_cleanup_fixture(Path(temporary), phase)
+                    root = source.parent if key == "prior_hot_rollback" else segments
+                    (root / journal[key]["file_name"]).unlink()
+                    before = {p: p.read_bytes() for p in Path(temporary).rglob("*") if p.is_file()}
+                    for apply in (False, True):
+                        with self.assertRaisesRegex(ValueError, "rollback integrity"):
+                            self._rotation_module().recover_pending_rotation(
+                                source=source, segments_directory=segments, apply=apply,
+                            )
+                        self.assertEqual({p: p.read_bytes() for p in Path(temporary).rglob("*") if p.is_file()}, before)
 
     def test_recovery_refuses_divergent_hot_bytes_and_preserves_the_journal(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

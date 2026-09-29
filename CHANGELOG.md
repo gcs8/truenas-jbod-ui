@@ -262,6 +262,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Made interrupted rotation-recovery cleanup resumable by persisting its
+  selected generation before retiring rollback evidence. (#751)
 - Complete retained segmented rollup points across all eligible sources before
   returning bounded results, preserving counts, extrema and weighted values. (#755)
 - Keep required QuantaStor inventory available when optional REST endpoints
