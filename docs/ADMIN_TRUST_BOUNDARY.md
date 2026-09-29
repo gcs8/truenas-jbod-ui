@@ -63,12 +63,26 @@ authority over the Docker host. The Compose files therefore mount the socket
 only into the explicitly started, explicitly root `enclosure-admin` service;
 UI, history, and one-shot backup services receive no socket.
 
-The admin container's image filesystem is read-only. Compose drops every Linux
-capability, adds back only `CHOWN` and `FOWNER` for ownership-preserving restore,
-uses the app-data GID as its primary group, and enables `no-new-privileges`.
-Its writable host mounts are limited to config, data, and history state plus the
-Docker socket. These controls reduce accidental filesystem reach, but they do
-not weaken the socket's root-equivalent authority.
+The base `docker-compose.yml` runs admin as `0:0`. It does not declare
+`read_only`, `cap_drop`, `cap_add`, or `security_opt` for that service. Do not
+attribute the optional overlay's hardening to a base-only deployment.
+
+The ordered `-f docker-compose.yml -f docker-compose.nonroot.yml` chain makes
+admin's image filesystem read-only, drops every Linux capability, adds back
+only `CHOWN` and `FOWNER` for ownership-preserving restore, and enables
+`no-new-privileges`. Admin remains root with identity `0:APP_GID`, using the
+configured app-data group, default `10001`. The overlay also provides a writable
+`/tmp` tmpfs. This is optional hardening for a prepared deployment; keep the
+same ordered chain on later starts and updates.
+
+In both chains, admin has writable host binds for `./config`, `./data`,
+`./history`, and `./backup-journal`, plus the raw Docker socket. Upload staging
+uses the writable named volume `host-prep-staging` at `/app/host-prep`, not
+another host bind. `./config/ssh` is read-only at `/run/ssh`, and `./backup-api`
+is read-only at `/app/backup-api`. That read-only mount still permits requests
+through the scheduler's Unix socket; it is not an API authorization boundary.
+The optional hardening reduces accidental filesystem reach but does not weaken
+the Docker socket's root-equivalent authority.
 
 A generic Docker socket proxy was evaluated but is not enabled by default.
 Method/category switches broad enough to permit container start, stop, and

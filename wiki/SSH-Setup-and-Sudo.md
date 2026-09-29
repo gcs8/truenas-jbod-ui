@@ -45,18 +45,24 @@ before enabling the system. Get each fingerprint through a trusted channel, then
 compare it with the scan before installation. This example preserves the
 configured non-root service ownership and group readability. Run it from the
 deployment directory. If `.env` overrides `APP_UID` or `APP_GID`, export the
-same values in this shell first:
+same values in this shell first. Set `ssh_host` to the exact configured `ssh.host`
+and `ssh_port` to its configured `ssh.port`, default `22`. Use the bare address
+for IPv6, without brackets. Do not use a different hostname alias or scan port 22
+when the app connects to a custom port.
 
 ```bash
 app_uid="${APP_UID:-10001}"
 app_gid="${APP_GID:-10001}"
 ssh_host="storage-host.example.test"
+ssh_port=22  # Replace with the configured port, for example 2222.
 known_hosts_scan="$(mktemp)"
 known_hosts_merged="$(mktemp)"
 trap 'rm -f "$known_hosts_scan" "$known_hosts_merged"' EXIT
-ssh-keyscan -H "$ssh_host" > "$known_hosts_scan"
+ssh-keyscan -H -p "$ssh_port" "$ssh_host" > "$known_hosts_scan"
 ssh-keygen -lf "$known_hosts_scan"
-# Compare the fingerprint out of band before installing the file.
+# Compare every fingerprint with the trusted-channel value before approval.
+read -r -p 'Fingerprints verified through a trusted channel? Type yes: ' verified
+[ "$verified" = yes ] || exit 1
 if sudo test -f data/known_hosts; then
   sudo cat data/known_hosts > "$known_hosts_merged"
 fi
@@ -66,10 +72,17 @@ rm -f "$known_hosts_scan" "$known_hosts_merged"
 trap - EXIT
 ```
 
-Repeat the block for every configured host and HA node. Each run copies the
-existing pinned keys into the merged temporary file before appending the newly
-verified scan. Do not use a root-owned `0600` file; the non-root UI process
-cannot read it.
+Repeat the block for every configured host, port, and HA node. Port 22 uses the
+host name as the known-hosts identity; a non-default port uses `[host]:port`,
+including `[2001:db8::1]:2222` for IPv6. `ssh-keyscan -H -p` hashes that same
+identity; the app's SSH client looks it up using its configured host and port.
+The scan is not trusted by itself. Never automate the approval or install keys
+whose fingerprints have not been verified through a trusted channel.
+
+Each run copies the existing pinned keys into the merged temporary file before
+appending the newly verified scan. Install into the application's effective
+known-hosts file, not the shell user's `~/.ssh/known_hosts`. Do not use a
+root-owned `0600` file; the non-root UI process cannot read it.
 
 In app config:
 

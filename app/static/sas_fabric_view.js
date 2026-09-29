@@ -57,6 +57,8 @@
     smartRequests: {},
     aliasEditObjectId: null,
     aliasDraft: null,
+    aliasEditGeneration: 0,
+    fabricScopeReady: Boolean(bootstrap.fabric),
     writePolicy: normalizeFabricWritePolicy(bootstrap.writePolicy),
     writeAuthorization: null,
     writeAuthPending: false,
@@ -243,7 +245,16 @@
     render();
   }
 
+  function fabricScopeIsCurrent() {
+    return state.fabricScopeReady && !state.loading && Boolean(state.fabric)
+      && state.fabric.system_id === state.selectedSystemId
+      && (state.fabric.selected_enclosure_id || null) === state.selectedEnclosureId;
+  }
+
   function fabricAliasWriteAttributes() {
+    if (!fabricScopeIsCurrent()) {
+      return ' disabled title="Refresh the selected Storage Fabric scope before editing names."';
+    }
     if (fabricWritePolicyAllowsWrites()) {
       return "";
     }
@@ -1235,7 +1246,7 @@
     if (selectionRefEquals(ref, currentSelectionRef())) {
       return true;
     }
-    state.aliasEditObjectId = null;
+    closeAliasEditor();
     const trailIndex = state.selectionTrail.findIndex((trailRef) => selectionRefEquals(trailRef, ref));
     if (trailIndex >= 0) {
       state.selectionTrail = state.selectionTrail.slice(0, trailIndex);
@@ -3473,11 +3484,13 @@
   }
 
   function openAliasEditor(objectId) {
+    state.aliasEditGeneration += 1;
     state.aliasEditObjectId = objectId || null;
     state.aliasDraft = null;
   }
 
   function closeAliasEditor() {
+    state.aliasEditGeneration += 1;
     state.aliasEditObjectId = null;
     state.aliasDraft = null;
   }
@@ -3488,6 +3501,9 @@
   }
 
   async function saveAliasFromForm(form, { clear = false } = {}) {
+    if (!fabricScopeIsCurrent()) {
+      return;
+    }
     if (fabricWriteBlockedByPolicy()) {
       render();
       return;
@@ -3497,9 +3513,18 @@
       return;
     }
     const objectId = input.dataset.fabricAliasObject || "";
-    if (!objectId) {
+    if (!objectId || objectId !== state.aliasEditObjectId) {
       return;
     }
+    // Capture both URLs before awaiting. Navigation, refresh, or a newer draft
+    // retires this operation, including its error and follow-up readback.
+    const postUrl = scopedUrl("/api/sas-fabric/aliases");
+    const readbackUrl = scopedUrl("/api/sas-fabric");
+    const navigationGeneration = state.refreshRequestToken;
+    const editorGeneration = ++state.aliasEditGeneration;
+    const ownsCompletion = () => navigationGeneration === state.refreshRequestToken
+      && editorGeneration === state.aliasEditGeneration
+      && objectId === state.aliasEditObjectId && fabricScopeIsCurrent();
     const payload = {
       object_id: objectId,
       object_kind: input.dataset.fabricAliasKind || null,
@@ -3508,16 +3533,19 @@
     };
     form.classList.add("is-saving");
     try {
-      await fetchJson(scopedUrl("/api/sas-fabric/aliases"), {
+      await fetchJson(postUrl, {
         method: "POST",
         readUiAuth: true,
         body: JSON.stringify(payload),
       });
+      if (!ownsCompletion()) return;
+      const fabric = await fetchJson(readbackUrl);
+      if (!ownsCompletion()) return;
       closeAliasEditor();
-      const fabric = await fetchJson(scopedUrl("/api/sas-fabric"));
       applyFabric(fabric);
       render();
     } catch (error) {
+      if (!ownsCompletion()) return;
       if (!handleFabricWriteRejection(error)) {
         state.error = error.message || String(error);
       }
@@ -3845,6 +3873,10 @@
 
   function renderMap() {
     const fabric = state.fabric;
+    const inert = !fabricScopeIsCurrent();
+    elements.mapPanel.inert = inert;
+    elements.inspectorBody.inert = inert;
+    elements.focusStrip.inert = inert;
     state.diagnosticPayloads = {};
     if (!fabric) {
       elements.mapPanel.innerHTML = '<div class="warning-item muted compact">No Storage Fabric payload has been loaded yet.</div>';
@@ -4009,6 +4041,7 @@
 
   async function refreshFabric(force = false) {
     const requestToken = ++state.refreshRequestToken;
+    state.fabricScopeReady = false;
     state.loading = true;
     state.error = null;
     render();
@@ -4030,6 +4063,7 @@
         }
       });
       applyFabric(fabric);
+      state.fabricScopeReady = true;
     } catch (error) {
       if (requestToken === state.refreshRequestToken) {
         state.error = error.message || String(error);
@@ -4053,7 +4087,7 @@
         || (mode === "disk" && traceById(current?.id)?.kind !== "bay")
         || (mode === "impact" && (current?.kind !== "trace" || traceById(current?.id)?.kind !== "path"));
       state.mode = mode;
-      state.aliasEditObjectId = null;
+      closeAliasEditor();
       ensureSelectionForMode(state.fabric, { force: forceSelection, mode });
       render();
     });
@@ -4075,7 +4109,7 @@
     state.selectionTrail = [];
     state.expandedSlotLists = {};
     state.diagnosticTables = {};
-    state.aliasEditObjectId = null;
+    closeAliasEditor();
     void refreshFabric(false);
   });
 
@@ -4090,12 +4124,12 @@
     state.selectionTrail = [];
     state.expandedSlotLists = {};
     state.diagnosticTables = {};
-    state.aliasEditObjectId = null;
+    closeAliasEditor();
     void refreshFabric(false);
   });
 
   function handleFabricActivation(target) {
-    if (!target) {
+    if (!target || !fabricScopeIsCurrent()) {
       return;
     }
     const modeTargetButton = target.closest("[data-fabric-mode-target]");
@@ -4104,7 +4138,7 @@
       if (modeIds.has(mode)) {
         state.mode = mode;
       }
-      state.aliasEditObjectId = null;
+      closeAliasEditor();
       state.selectionTrail = [];
       const traceId = modeTargetButton.dataset.fabricTrace || "";
       const nodeId = modeTargetButton.dataset.fabricNode || "";
@@ -4178,7 +4212,7 @@
       state.selectionTrail = [];
       state.selectedNodeId = null;
       state.selectedTraceId = resolveTraceId(null);
-      state.aliasEditObjectId = null;
+      closeAliasEditor();
       render();
       return;
     }
@@ -4239,6 +4273,7 @@
     const target = event.target instanceof HTMLInputElement ? event.target : null;
     if (target?.matches("[data-fabric-alias-input]")) {
       if (state.aliasEditObjectId && target.dataset.fabricAliasObject === state.aliasEditObjectId) {
+        state.aliasEditGeneration += 1;
         state.aliasDraft = target.value;
       }
       return;

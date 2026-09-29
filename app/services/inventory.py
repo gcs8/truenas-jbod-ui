@@ -741,7 +741,7 @@ class _LayoutFrame:
     layout_columns: int
     slot_positions: dict[int, tuple[int, int]]
     allow_legacy_mapping_fallback: bool
-    loaded_mappings: dict[str, ManualMapping]
+    loaded_mappings: Mapping[str, ManualMapping]
 
     def actual_slot_ids(self) -> list[int]:
         """Return rendered physical slot ids in ascending order."""
@@ -1745,10 +1745,11 @@ class InventoryService:
         if not runtime_slot:
             raise TrueNASAPIError(f"Storage view slot {slot_index} is not present in {runtime_view.label}.")
 
-        if runtime_slot.snapshot_slot is not None:
+        smart_enclosure_id = selected_enclosure_id or runtime_view.backing_enclosure_id
+        if runtime_slot.snapshot_slot is not None and runtime_slot.snapshot_enclosure_id in {None, smart_enclosure_id}:
             return await self.get_slot_smart_summary(
                 runtime_slot.snapshot_slot,
-                selected_enclosure_id=selected_enclosure_id or runtime_view.backing_enclosure_id,
+                selected_enclosure_id=smart_enclosure_id,
                 allow_stale_cache=allow_stale_cache,
                 bypass_negative_cache=bypass_negative_cache,
             )
@@ -1799,16 +1800,20 @@ class InventoryService:
         if not ordered:
             return []
 
+        smart_enclosure_id = selected_enclosure_id or runtime_view.backing_enclosure_id
+        # A bay number only means something in its own enclosure; a candidate
+        # from another enclosure (a rear BMC disk) goes through the synthetic path.
         snapshot_slot_by_index = {
             slot_index: runtime_slots[slot_index].snapshot_slot
             for slot_index in ordered
             if runtime_slots[slot_index].snapshot_slot is not None
+            and runtime_slots[slot_index].snapshot_enclosure_id in {None, smart_enclosure_id}
         }
         summaries: dict[int, SmartSummaryView] = {}
         if snapshot_slot_by_index:
             batch = await self.get_slot_smart_summaries(
                 list(dict.fromkeys(snapshot_slot_by_index.values())),
-                selected_enclosure_id=selected_enclosure_id or runtime_view.backing_enclosure_id,
+                selected_enclosure_id=smart_enclosure_id,
                 max_concurrency=max_concurrency,
                 allow_stale_cache=allow_stale_cache,
                 bypass_negative_cache=bypass_negative_cache,
@@ -2182,6 +2187,7 @@ class InventoryService:
             placement_key=placement_key,
             assignment_rank=assignment_rank,
             snapshot_slot=candidate.get("snapshot_slot") if isinstance(candidate.get("snapshot_slot"), int) else None,
+            snapshot_enclosure_id=normalize_text(candidate.get("snapshot_enclosure_id")),
             device_name=(candidate.get("device_names") or [None])[0],
             smart_device_names=list(candidate.get("smart_device_names") or []),
             smart_device_type=normalize_text(candidate.get("smartctl_device_type")),
@@ -5877,9 +5883,9 @@ class InventoryService:
                 f"This enclosure reports {reported_slot_count} bays but the selected layout draws "
                 f"{layout_slot_count}, so the extra bays are not shown. Choose a matching layout in System Setup."
             )
-        # One mapping load per correlation pass: the entries are
+        # One immutable classification per correlation pass: the entries are
         # loaded here and read back off the frame by every caller.
-        loaded_mappings = self.mapping_store.load_all()
+        loaded_mappings = self.mapping_store.load_lookup_snapshot()
         if not allow_legacy_mapping_fallback:
             self._warn_unapplied_legacy_mappings(
                 warnings,
@@ -6100,7 +6106,7 @@ class InventoryService:
         }
         if VIRTUAL_INVENTORY_PHYSICAL_LOCATION_WARNING not in warnings:
             warnings.append(VIRTUAL_INVENTORY_PHYSICAL_LOCATION_WARNING)
-        loaded_mappings = self.mapping_store.load_all()
+        loaded_mappings = self.mapping_store.load_lookup_snapshot()
         self._warn_unapplied_legacy_mappings(
             warnings,
             None,
@@ -6156,7 +6162,7 @@ class InventoryService:
         if self.system.truenas.platform == "esxi":
             records = self._build_esxi_disk_records(
                 ssh_data,
-                enclosure_id=self.system.default_profile_id,
+                enclosure_id=selected_enclosure_id or self.system.default_profile_id,
             )
             if bmc_inventory is not None:
                 records.extend(self._build_bmc_disk_records(bmc_inventory))
@@ -6355,7 +6361,15 @@ class InventoryService:
         return {
             "candidate_id": candidate_id,
             "label": normalize_text(disk.serial) or normalize_text(device_names[0] if device_names else None) or "Inventory candidate",
-            "snapshot_slot": disk.slot if isinstance(disk.slot, int) else None,
+            # A BMC bay number without its enclosure can match a disk in another
+            # enclosure, so such a candidate takes the synthetic SMART path.
+            "snapshot_slot": (
+                disk.slot
+                if isinstance(disk.slot, int)
+                and not (disk.raw.get("platform") == "bmc" and normalize_text(disk.enclosure_id) is None)
+                else None
+            ),
+            "snapshot_enclosure_id": normalize_text(disk.enclosure_id),
             "serial": disk.serial,
             "identifier": disk.identifier,
             "storage_system_id": storage_system_id,
@@ -10575,7 +10589,7 @@ class InventoryService:
         warnings: list[str],
         enclosure_id: str | None,
         slot_ids: Iterable[int],
-        loaded_mappings: dict[str, ManualMapping],
+        loaded_mappings: Mapping[str, ManualMapping],
         *,
         no_identified_physical_enclosure: bool = False,
     ) -> None:

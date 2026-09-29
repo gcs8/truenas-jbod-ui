@@ -56,7 +56,7 @@ from app.services.inventory import (
     parse_size_to_bytes,
     resolve_persistent_id,
 )
-from app.services.mapping_store import MappingRevisionConflict, MappingStore
+from app.services.mapping_store import MappingRevisionConflict, MappingScopeConflict, MappingStore
 from app.services.parsers import (
     LinuxScsiDevice,
     ParsedSSHData,
@@ -1561,7 +1561,7 @@ class InventoryHelpersTests(unittest.TestCase):
             settings = Settings(systems=[system])
             service = build_inventory_service(settings, system, MagicMock(), MagicMock(), temp_dir)
             loaded_mappings: dict[str, ManualMapping] = {}
-            service.mapping_store.load_all = MagicMock(return_value=loaded_mappings)  # type: ignore[method-assign]
+            service.mapping_store.load_lookup_snapshot = MagicMock(return_value=loaded_mappings)  # type: ignore[method-assign]
             service.mapping_store.get_mapping = MagicMock(return_value=None)  # type: ignore[method-assign]
             ssh_data = ParsedSSHData(
                 esxi_storcli_virtual_drives=[
@@ -1644,7 +1644,7 @@ class InventoryHelpersTests(unittest.TestCase):
             self.assertEqual(slots[0].device_name, "13:0")
             self.assertEqual(slots[0].pool_name, "ESXi + VMs")
             self.assertEqual(slots[0].temperature_c, 34)
-            service.mapping_store.load_all.assert_called_once_with()
+            service.mapping_store.load_lookup_snapshot.assert_called_once_with()
             self.assertEqual(service.mapping_store.get_mapping.call_count, slot_count)
             self.assertTrue(
                 all(call.kwargs["loaded_entries"] is loaded_mappings for call in service.mapping_store.get_mapping.call_args_list)
@@ -1948,7 +1948,6 @@ class InventoryHelpersTests(unittest.TestCase):
             system = SystemConfig(
                 id="generic-esxi",
                 truenas=TrueNASConfig(platform="esxi"),
-                default_profile_id=SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID,
                 ssh=SSHConfig(enabled=True),
             )
             service = build_inventory_service(
@@ -1976,6 +1975,18 @@ class InventoryHelpersTests(unittest.TestCase):
             )
 
             self.assertEqual(records[0].enclosure_id, SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID)
+            candidates = service._build_storage_view_candidate_records(
+                TrueNASRawData(
+                    enclosures=[],
+                    disks=[],
+                    pools=[],
+                    disk_temperatures={},
+                    smart_test_results=[],
+                ),
+                ssh_data,
+                SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID,
+            )
+            self.assertEqual(candidates[0].enclosure_id, SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID)
 
     def test_build_esxi_topology_members_uses_parsed_virtual_drive_raid_level(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -4261,6 +4272,134 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
         self.assertEqual(synthetic_slot.logical_block_size, 512)
         self.assertEqual(synthetic_slot.physical_block_size, 4096)
 
+    def _ipmi_storage_view_service_with_candidates(
+        self,
+        temp_dir: str,
+        disks: list[tuple[str | None, int, str]],
+    ) -> InventoryService:
+        system = SystemConfig(
+            id="bmc-host",
+            label="BMC Host",
+            truenas=TrueNASConfig(platform="ipmi"),
+        )
+        service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir)
+        storage_view = StorageViewConfig(
+            id="rear-bays",
+            label="Rear Bays",
+            kind="boot_devices",
+            template_id="satadom-pair-2",
+        )
+        runtime_slots = []
+        for slot_index, (enclosure_id, slot, serial) in enumerate(disks):
+            disk = DiskRecord(
+                raw={"platform": "bmc"},
+                device_name=None,
+                path_device_name=None,
+                multipath_name=None,
+                multipath_member=None,
+                serial=serial,
+                model="M",
+                size_bytes=1,
+                identifier=serial,
+                health="OK",
+                pool_name="tank",
+                lunid=None,
+                bus=None,
+                temperature_c=None,
+                last_smart_test_type=None,
+                last_smart_test_status=None,
+                last_smart_test_lifetime_hours=None,
+                logical_block_size=None,
+                physical_block_size=None,
+                enclosure_id=enclosure_id,
+                slot=slot,
+                smart_devices=[],
+                lookup_keys={serial.lower()},
+            )
+            self.assertFalse(service._disk_record_has_physical_slot_assignment(disk))
+            candidate = service._serialize_storage_view_candidate(disk)
+            runtime_slots.append(
+                service._build_candidate_runtime_slot(storage_view, slot_index, f"R{slot_index}", slot_index + 1, candidate)
+            )
+        service.get_storage_view_runtime = AsyncMock(
+            return_value=StorageViewRuntimePayload(
+                system_id="bmc-host",
+                views=[
+                    StorageViewRuntimeView(
+                        id="rear-bays",
+                        label="Rear Bays",
+                        kind="boot_devices",
+                        template_id="satadom-pair-2",
+                        source="inventory_binding",
+                        backing_enclosure_id="front-a",
+                        slots=runtime_slots,
+                    )
+                ],
+            )
+        )
+        return service
+
+    def test_storage_view_slot_smart_summary_ignores_bay_number_from_another_enclosure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._ipmi_storage_view_service_with_candidates(
+                temp_dir,
+                [("bmc-encl-2", 3, "SANITIZED-REAR-3")],
+            )
+            expected_summary = SmartSummaryView(available=True, power_on_hours=77)
+            service.get_slot_smart_summary = AsyncMock(return_value=SmartSummaryView(available=True, power_on_hours=1))
+            service._get_slot_smart_summary_for_slot_view = AsyncMock(return_value=expected_summary)
+
+            summary = asyncio.run(
+                service.get_storage_view_slot_smart_summary("rear-bays", 0, selected_enclosure_id="front-a")
+            )
+
+        service.get_slot_smart_summary.assert_not_awaited()
+        self.assertIs(summary, expected_summary)
+        synthetic_slot = service._get_slot_smart_summary_for_slot_view.await_args.args[0]
+        self.assertEqual(synthetic_slot.serial, "SANITIZED-REAR-3")
+
+    def test_storage_view_slot_smart_summary_does_not_request_a_bay_without_an_enclosure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._ipmi_storage_view_service_with_candidates(
+                temp_dir,
+                [(None, 3, "SANITIZED-REAR-3")],
+            )
+            expected_summary = SmartSummaryView(available=True, power_on_hours=77)
+            service.get_slot_smart_summary = AsyncMock(return_value=SmartSummaryView(available=True, power_on_hours=1))
+            service._get_slot_smart_summary_for_slot_view = AsyncMock(return_value=expected_summary)
+
+            summary = asyncio.run(
+                service.get_storage_view_slot_smart_summary("rear-bays", 0, selected_enclosure_id="front-a")
+            )
+
+        service.get_slot_smart_summary.assert_not_awaited()
+        self.assertIs(summary, expected_summary)
+        self.assertEqual(service._get_slot_smart_summary_for_slot_view.await_args.args[0].serial, "SANITIZED-REAR-3")
+
+    def test_storage_view_slot_smart_batch_keeps_only_same_enclosure_bays_on_the_enclosure_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._ipmi_storage_view_service_with_candidates(
+                temp_dir,
+                [("bmc-encl-2", 3, "SANITIZED-REAR-3"), ("front-a", 5, "SANITIZED-FRONT-5")],
+            )
+            front_summary = SmartSummaryView(available=True, power_on_hours=5)
+            rear_summary = SmartSummaryView(available=True, power_on_hours=77)
+            service.get_slot_smart_summaries = AsyncMock(
+                side_effect=lambda slots, **kwargs: [
+                    inventory_module.SmartBatchItem(slot=slot, summary=front_summary) for slot in slots
+                ]
+            )
+            service._get_slot_smart_summary_for_slot_view = AsyncMock(return_value=rear_summary)
+
+            items = asyncio.run(
+                service.get_storage_view_slot_smart_summaries("rear-bays", [0, 1], selected_enclosure_id="front-a")
+            )
+
+        self.assertEqual(service.get_slot_smart_summaries.await_args.args[0], [5])
+        self.assertEqual(service.get_slot_smart_summaries.await_args.kwargs["selected_enclosure_id"], "front-a")
+        self.assertEqual([(item.slot, item.summary) for item in items], [(0, rear_summary), (1, front_summary)])
+        self.assertEqual(service._get_slot_smart_summary_for_slot_view.await_args.args[0].serial, "SANITIZED-REAR-3")
+
     def test_resolve_storage_view_slot_history_target_reuses_snapshot_slot_when_available(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()
@@ -4828,7 +4967,7 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
                 temp_dir,
             )
             loaded_mappings: dict[str, ManualMapping] = {}
-            service.mapping_store.load_all = MagicMock(return_value=loaded_mappings)  # type: ignore[method-assign]
+            service.mapping_store.load_lookup_snapshot = MagicMock(return_value=loaded_mappings)  # type: ignore[method-assign]
             service.mapping_store.get_mapping = MagicMock(return_value=None)  # type: ignore[method-assign]
             ssh_data = ParsedSSHData(
                 linux_blockdevices=[
@@ -4886,7 +5025,7 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             self.assertEqual(slot_count, 7)
             self.assertEqual(slot_views[0].device_name, "sdb")
             self.assertEqual(slot_views[1].device_name, "sda")
-            service.mapping_store.load_all.assert_called_once_with()
+            service.mapping_store.load_lookup_snapshot.assert_called_once_with()
             self.assertEqual(service.mapping_store.get_mapping.call_count, slot_count)
             self.assertTrue(
                 all(call.kwargs["loaded_entries"] is loaded_mappings for call in service.mapping_store.get_mapping.call_args_list)
@@ -6078,7 +6217,7 @@ class InventoryBmcCorrelationTests(unittest.TestCase):
                 bmc_service=MagicMock(),
             )
             loaded_mappings: dict[str, ManualMapping] = {}
-            service.mapping_store.load_all = MagicMock(return_value=loaded_mappings)  # type: ignore[method-assign]
+            service.mapping_store.load_lookup_snapshot = MagicMock(return_value=loaded_mappings)  # type: ignore[method-assign]
             service.mapping_store.get_mapping = MagicMock(return_value=None)  # type: ignore[method-assign]
             warnings: list[str] = []
             bmc_inventory = BMCInventory(
@@ -6109,7 +6248,7 @@ class InventoryBmcCorrelationTests(unittest.TestCase):
             self.assertEqual(enclosures[0].id, SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID)
             self.assertEqual(selected_meta["id"], SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID)
             self.assertEqual(layout_slot_count, 6)
-            service.mapping_store.load_all.assert_called_once_with()
+            service.mapping_store.load_lookup_snapshot.assert_called_once_with()
             self.assertEqual(service.mapping_store.get_mapping.call_count, layout_slot_count)
             self.assertTrue(
                 all(call.kwargs["loaded_entries"] is loaded_mappings for call in service.mapping_store.get_mapping.call_args_list)
@@ -16069,6 +16208,137 @@ Enclosure Status diagnostic page:
             self.assertNotIn(inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY, service._cache)
 
 
+class MappingCorrelationCostTests(unittest.TestCase):
+    """Real public snapshots, with only source transport replaced by fixture data."""
+
+    @staticmethod
+    def make_fixture(root, bays, rows, version, *, legacy=False):
+        profile = EnclosureProfileConfig(
+            id="synthetic-cost", label="Synthetic cost", rows=1, columns=bays,
+            slot_layout=[list(range(bays))],
+        )
+        system = SystemConfig(id="synthetic-cost", default_profile_id=profile.id,
+                              truenas=TrueNASConfig(platform="core"))
+        settings = Settings(systems=[system], profiles=[profile])
+        service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), root)
+        store = service.mapping_store
+        mappings = {}
+        for slot in range(rows):
+            mapping = ManualMapping(
+                system_id=None if legacy else system.id,
+                enclosure_id=None if legacy else "synthetic-shelf",
+                slot=slot, serial=f"SYNTHETIC-{slot}",
+                updated_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            )
+            key = (store._encode_v2_key(mapping.system_id, mapping.enclosure_id, slot)
+                   if version == 2 else f"default:{slot}" if legacy
+                   else store._slot_key(system.id, "synthetic-shelf", slot))
+            mappings[key] = mapping.model_dump(mode="json")
+        store.file_path.write_text(json.dumps({"version": version, "slot_mappings": mappings}))
+        enclosures = [{"id": "synthetic-shelf", "label": "Synthetic shelf", "elements": []}]
+        if legacy:
+            enclosures.append({"id": "synthetic-other", "elements": []})
+        raw = TrueNASRawData(
+            enclosures=enclosures,
+            disks=[{"name": f"da{i}", "serial": f"SYNTHETIC-{i}", "status": "ONLINE"}
+                   for i in range(bays)],
+            pools=[], disk_temperatures={}, smart_test_results=[],
+        )
+        service._get_inventory_source_bundle = AsyncMock(return_value=InventorySourceBundle(
+            raw_data=raw, ssh_outputs={}, ssh_collected=False, warnings=[],
+            sources={"api": SourceStatus(enabled=True, ok=True)},
+            scale_ses_data=ParsedSSHData(), quantastor_ses_data=ParsedSSHData(),
+        ))
+        return service
+
+    @staticmethod
+    def snapshot(service):
+        return asyncio.run(service.get_snapshot(force_refresh=True,
+                                                selected_enclosure_id="synthetic-shelf"))
+
+    def test_public_snapshot_classification_is_proportional_to_store_and_bays(self):
+        for bays, rows in ((24, 24), (60, 240), (84, 347)):
+            for version in (1, 2):
+                for legacy in (False, True):
+                    with self.subTest(bays=bays, rows=rows, version=version, legacy=legacy), \
+                         tempfile.TemporaryDirectory() as root:
+                        service = self.make_fixture(root, bays, rows, version, legacy=legacy)
+                        store = service.mapping_store
+                        before = store.file_path.read_bytes()
+                        correlation_counts = []
+                        correlate = service._correlate
+                        with patch.object(store, "_classify_row", wraps=store._classify_row) as classify, \
+                             patch.object(store, "_digest", wraps=store._digest) as digest, \
+                             patch.object(store, "_read_document", wraps=store._read_document) as reads:
+                            def counted_correlate(*args, **kwargs):
+                                start = (classify.call_count, digest.call_count, reads.call_count)
+                                result = correlate(*args, **kwargs)
+                                correlation_counts.append(tuple(end - begin for end, begin in zip(
+                                    (classify.call_count, digest.call_count, reads.call_count), start)))
+                                return result
+                            with patch.object(service, "_correlate", side_effect=counted_correlate):
+                                snapshot = self.snapshot(service)
+                        self.assertEqual(len(snapshot.slots), bays)
+                        self.assertEqual(store.file_path.read_bytes(), before)
+                        self.assertEqual(snapshot.summary.manual_mapping_count, rows)
+                        legacy_warnings = [w for w in snapshot.warnings if "older version" in w]
+                        if legacy:
+                            self.assertEqual(len(legacy_warnings), 1)
+                            self.assertIn(f"{bays} saved bay assignments", legacy_warnings[0])
+                            self.assertTrue(all(s.mapping_source != "manual" for s in snapshot.slots))
+                        else:
+                            self.assertEqual(legacy_warnings, [])
+                            self.assertEqual([s.serial for s in snapshot.slots],
+                                             [f"SYNTHETIC-{i}" for i in range(bays)])
+                            self.assertTrue(all(s.mapping_source == "manual" for s in snapshot.slots))
+                        self.assertEqual(len(correlation_counts), 1)
+                        self.assertEqual(correlation_counts[0], (rows, rows, 1))
+                        # Two revision batches and summary classification remain separate.
+                        self.assertEqual(classify.call_count, 4 * rows)
+
+    def test_public_snapshot_rejects_mapping_conflicts_without_publishing(self):
+        for kind in ("invalid-v1", "invalid-v2", "duplicate", "legacy-drawer"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as root:
+                version = 2 if kind == "invalid-v2" else 1
+                service = self.make_fixture(root, 24, 24, version)
+                store = service.mapping_store
+                document = json.loads(store.file_path.read_text())
+                mappings = document["slot_mappings"]
+                key = (store._encode_v2_key(service.system.id, "synthetic-shelf", 0) if version == 2
+                       else store._slot_key(service.system.id, "synthetic-shelf", 0))
+                if kind.startswith("invalid"):
+                    mappings[key]["enclosure_id"] = "synthetic-wrong"
+                else:
+                    drawer = "synthetic-shelf::dell-md1280-drawer-top-42"
+                    alias_key = f"{drawer}:0" if kind == "legacy-drawer" else f"{service.system.id}:{drawer}:0"
+                    mappings[alias_key] = {**mappings[key], "enclosure_id": drawer, "serial": "DIVERGENT"}
+                    if kind == "legacy-drawer":
+                        mappings[alias_key]["system_id"] = None
+                store.file_path.write_text(json.dumps(document))
+                before = store.file_path.read_bytes()
+                with self.assertRaises(MappingScopeConflict):
+                    self.snapshot(service)
+                self.assertEqual(store.file_path.read_bytes(), before)
+                self.assertEqual(service._cache, {})
+
+    def test_public_snapshot_refresh_uses_new_mapping_generation(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = self.make_fixture(root, 24, 24, 1)
+            first = self.snapshot(service)
+            store = service.mapping_store
+            store.save_mapping(ManualMapping(system_id=service.system.id,
+                                             enclosure_id="synthetic-shelf", slot=0,
+                                             serial="SYNTHETIC-1"),
+                               expected_revision=first.slots[0].mapping_revision)
+            second = self.snapshot(service)
+            self.assertEqual(first.slots[0].serial, "SYNTHETIC-0")
+            self.assertEqual(second.slots[0].serial, "SYNTHETIC-1")
+            self.assertNotEqual(first.slots[0].mapping_revision, second.slots[0].mapping_revision)
+            with self.assertRaises(MappingRevisionConflict):
+                store.clear_mapping(service.system.id, "synthetic-shelf", 0,
+                                    expected_revision=first.slots[0].mapping_clear_revision)
+
+
 class ReviewRegressionTests(unittest.TestCase):
     def test_generic_correlator_zero_columns_does_not_evaluate_division_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -16077,7 +16347,7 @@ class ReviewRegressionTests(unittest.TestCase):
             system = SystemConfig(id="zero-column-generic", truenas=TrueNASConfig(platform="scale"))
             service = build_inventory_service(settings, system, MagicMock(), MagicMock(), temp_dir)
             loaded_mappings: dict[str, ManualMapping] = {}
-            service.mapping_store.load_all = MagicMock(return_value=loaded_mappings)  # type: ignore[method-assign]
+            service.mapping_store.load_lookup_snapshot = MagicMock(return_value=loaded_mappings)  # type: ignore[method-assign]
             service.mapping_store.get_mapping = MagicMock(return_value=None)  # type: ignore[method-assign]
             profile = MagicMock()
             profile.columns = 0
@@ -16097,7 +16367,7 @@ class ReviewRegressionTests(unittest.TestCase):
             )
 
             self.assertEqual(columns, 0)
-            service.mapping_store.load_all.assert_called_once_with()
+            service.mapping_store.load_lookup_snapshot.assert_called_once_with()
             self.assertEqual(service.mapping_store.get_mapping.call_count, 1)
             self.assertIs(service.mapping_store.get_mapping.call_args.kwargs["loaded_entries"], loaded_mappings)
             self.assertEqual((slots[0].row_index, slots[0].column_index), (0, 0))
@@ -16143,7 +16413,7 @@ class ReviewRegressionTests(unittest.TestCase):
             system = SystemConfig(id="sparse-scale", truenas=TrueNASConfig(platform="scale"))
             service = build_inventory_service(settings, system, MagicMock(), MagicMock(), temp_dir)
             loaded_mappings: dict[str, ManualMapping] = {}
-            service.mapping_store.load_all = MagicMock(return_value=loaded_mappings)  # type: ignore[method-assign]
+            service.mapping_store.load_lookup_snapshot = MagicMock(return_value=loaded_mappings)  # type: ignore[method-assign]
             service.mapping_store.get_mapping = MagicMock(return_value=None)  # type: ignore[method-assign]
             selected_option = EnclosureOption(
                 id="enc-a",
@@ -16175,7 +16445,7 @@ class ReviewRegressionTests(unittest.TestCase):
 
             self.assertEqual([slot.slot for slot in slots], [0, 2])
             self.assertEqual(slot_count, 3)
-            service.mapping_store.load_all.assert_called_once_with()
+            service.mapping_store.load_lookup_snapshot.assert_called_once_with()
             self.assertEqual(service.mapping_store.get_mapping.call_count, len(slots))
             self.assertTrue(
                 all(call.kwargs["loaded_entries"] is loaded_mappings for call in service.mapping_store.get_mapping.call_args_list)
@@ -16507,7 +16777,7 @@ class ReviewRegressionTests(unittest.TestCase):
             )
             service = build_inventory_service(settings, system, MagicMock(), MagicMock(), temp_dir)
             loaded_mappings: dict[str, ManualMapping] = {}
-            service.mapping_store.load_all = MagicMock(return_value=loaded_mappings)  # type: ignore[method-assign]
+            service.mapping_store.load_lookup_snapshot = MagicMock(return_value=loaded_mappings)  # type: ignore[method-assign]
             service.mapping_store.get_mapping = MagicMock(return_value=None)  # type: ignore[method-assign]
             raw_data = TrueNASRawData(
                 enclosures=[],
@@ -16599,7 +16869,7 @@ class ReviewRegressionTests(unittest.TestCase):
             )
 
             slot0 = slots[0]
-            service.mapping_store.load_all.assert_called_once_with()
+            service.mapping_store.load_lookup_snapshot.assert_called_once_with()
             self.assertEqual(service.mapping_store.get_mapping.call_count, len(slots))
             self.assertTrue(
                 all(call.kwargs["loaded_entries"] is loaded_mappings for call in service.mapping_store.get_mapping.call_args_list)
