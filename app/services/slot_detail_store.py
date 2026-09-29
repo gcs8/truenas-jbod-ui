@@ -55,7 +55,7 @@ class SlotDetailStore:
         try:
             with self.file_path.open("r", encoding="utf-8") as handle:
                 payload = json.load(handle)
-        except (OSError, json.JSONDecodeError):
+        except (OSError, UnicodeError, json.JSONDecodeError):
             return {}
 
         if not isinstance(payload, dict):
