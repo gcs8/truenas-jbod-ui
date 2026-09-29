@@ -846,10 +846,12 @@ class ProductionPathCaptureTests(unittest.TestCase):
             self.due(scheduler, clock)
             self.assert_capture_archive(scheduler, state, raw)
             from app.config import get_settings
+            cached = get_settings()
             live = scheduler.backup_service._load_app_settings()
             captured_service = scheduler.backup_service.with_captured_config_files(state["capture"].files)
             settings = captured_service._load_app_settings()
-            self.assertIs(get_settings(), live)
+            self.assertIsNot(live, cached)
+            self.assertIs(get_settings(), cached)
             self.assertEqual(settings.app.source_bundle_cache_ttl_seconds, 41)
             self.assertEqual([profile.id for profile in settings.profiles], ["synthetic-a"])
             self.assertEqual(Path(settings.paths.mapping_file), layout["mapping_file"])

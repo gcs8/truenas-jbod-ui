@@ -262,6 +262,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Enforced backup source-read and encrypted-export admission limits, cleaned up
+  failed restore staging, and aligned inspection with restore admission. (#850)
+
 - Preserved history evidence across partial or failed collection, recorded
   authoritative empty-view removals, kept status reads off the event loop,
   stopped follow-on requests during shutdown, and rejected invalid refresh
