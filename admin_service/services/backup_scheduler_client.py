@@ -8,6 +8,7 @@ directory only the scheduler and admin sidecars mount
 
 from __future__ import annotations
 
+import hashlib
 import http.client
 import json
 import os
@@ -112,8 +113,21 @@ class BackupSchedulerClient:
                 except ValueError:
                     payload = {"detail": "The backup could not be read."}
                 return SchedulerResponse(status=response.status, payload=payload)
+            digest = hashlib.sha256()
+            received = 0
             while chunk := response.read(CHUNK_SIZE):
                 destination.write(chunk)
+                digest.update(chunk)
+                received += len(chunk)
+            expected_length = response.getheader("Content-Length")
+            expected_sha256 = response.getheader("X-Backup-Sha256")
+            if (expected_length is not None and expected_length.strip() != str(received)) or (
+                expected_sha256 and expected_sha256.strip().lower() != digest.hexdigest()
+            ):
+                return SchedulerResponse(
+                    status=502,
+                    payload={"detail": "The downloaded backup did not match its recorded checksum."},
+                )
             return SchedulerResponse(
                 status=200,
                 payload={

@@ -525,7 +525,7 @@ class ChangeJournal:
             if len(raw) <= MAX_LINE_BYTES:
                 try:
                     record = json.loads(raw)
-                except (ValueError, UnicodeDecodeError):
+                except (ValueError, UnicodeDecodeError, RecursionError):
                     record = None
             if not isinstance(record, dict) or not self._apply_record(state, record):
                 self._add_recovered_placeholder(state, number, raw)
@@ -536,7 +536,7 @@ class ChangeJournal:
             if len(tail) <= MAX_LINE_BYTES:
                 try:
                     record = json.loads(tail)
-                except (ValueError, UnicodeDecodeError):
+                except (ValueError, UnicodeDecodeError, RecursionError):
                     record = None
             if isinstance(record, dict) and self._apply_record(state, record):
                 state.torn_tail_bytes = len(tail)
@@ -876,8 +876,13 @@ class ConfigBackupCoalescer:
         self._fingerprint: tuple[int, int, int] | None | bool = False
         self.last_error: str | None = None
         # Entries left uncommitted by a previous run (crash, restart, failed
-        # backup) start a quiet period now, so they are backed up soon.
-        self.poll()
+        # backup) start a quiet period now, so they are backed up soon. An
+        # unreadable journal must not stop the caller from starting: the first
+        # tick() polls again and raises it there.
+        try:
+            self.poll()
+        except Exception:  # noqa: BLE001 - reported by the next tick()
+            pass
 
     # -- change intake --------------------------------------------------------------------
 
