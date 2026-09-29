@@ -262,6 +262,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Keep required QuantaStor inventory available when optional REST endpoints
+  fail while opening or reading a response, retaining typed required errors. (#756)
 - Apply operation deadlines to normal TrueNAS inventory, slot-status and SMART
   calls while retaining WebSocket close ownership through cancellation. (#757)
 - Correct QA mapping revisions, retain recovery files until verified cleanup,
