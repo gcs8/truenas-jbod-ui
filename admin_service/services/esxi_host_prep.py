@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import io
 import json
 import logging
 import os
@@ -815,51 +817,85 @@ class ESXiHostPrepService:
 
     def _run_verification_commands(self, client: Any, timeout_seconds: int) -> dict[str, Any]:
         command_map = {
-            "component_list": "esxcli software component list | grep -i storcli || true",
-            "vib_list": "esxcli software vib list | grep -i storcli || true",
-            "storcli_paths": "find /opt/lsi -name 'storcli*' 2>/dev/null || true",
-            "storcli_show": "/opt/lsi/storcli64/storcli64 show J 2>&1 || true",
-            "adapter_list": "esxcli storage core adapter list 2>&1 || true",
-            "pcipassthru_list": "esxcli hardware pci pcipassthru list 2>&1 || true",
-            "megaraid_pci": "lspci 2>&1 | grep -i 'MegaRAID' || true",
+            "component_list": "esxcli --formatter=csv software component list",
+            "vib_list": "esxcli --formatter=csv software vib list",
+            "storcli_paths": (
+                "if [ -f /opt/lsi/storcli64/storcli64 ] && [ -x /opt/lsi/storcli64/storcli64 ]; then "
+                "printf 'executable\\n'; "
+                "elif [ -d /opt/lsi/storcli64 ] && [ -r /opt/lsi/storcli64 ] && [ -x /opt/lsi/storcli64 ]; then "
+                "printf 'absent\\n'; else exit 1; fi"
+            ),
+            "storcli_show": "/opt/lsi/storcli64/storcli64 show J",
+            "adapter_list": "esxcli storage core adapter list",
+            "pcipassthru_list": "esxcli hardware pci pcipassthru list",
+            "megaraid_pci": "lspci",
         }
         results = {
             name: self._serialize_command_result(self._run_remote_command(client, command, timeout_seconds))
             for name, command in command_map.items()
         }
-        storcli_text = "\n".join(
-            [
-                str(results["component_list"].get("stdout") or ""),
-                str(results["vib_list"].get("stdout") or ""),
-                str(results["storcli_paths"].get("stdout") or ""),
-                str(results["storcli_show"].get("stdout") or ""),
-                str(results["storcli_show"].get("stderr") or ""),
-            ]
-        )
-        controller_count = self._extract_controller_count(storcli_text)
-        megaraid_pci_addresses = self._extract_megaraid_pci_addresses(str(results["megaraid_pci"].get("stdout") or ""))
+
+        def successful_stdout(name: str) -> str | None:
+            result = results[name]
+            return result["stdout"] if result["ok"] and result["exit_code"] == 0 else None
+
+        package_states = [
+            self._package_listing_evidence(successful_stdout(name))
+            for name in ("component_list", "vib_list")
+        ]
+        package_installed = self._combine_presence(package_states)
+        executable_output = successful_stdout("storcli_paths")
+        executable_available = {"executable": True, "absent": False}.get(executable_output)
+        controller_count = self._extract_controller_count(successful_stdout("storcli_show") or "")
+        installed = self._combine_presence([package_installed, executable_available])
+        if controller_count is not None:
+            installed = True
+        megaraid_pci_addresses = self._extract_megaraid_pci_addresses(successful_stdout("megaraid_pci") or "")
         passthrough_enabled_addresses = self._extract_enabled_passthrough_addresses(
-            str(results["pcipassthru_list"].get("stdout") or "")
+            successful_stdout("pcipassthru_list") or ""
         )
         megaraid_passthrough_addresses = [
-            address
-            for address in megaraid_pci_addresses
-            if address in passthrough_enabled_addresses
+            address for address in megaraid_pci_addresses if address in passthrough_enabled_addresses
         ]
         results["summary"] = {
-            "storcli_installed": "storcli" in storcli_text.lower(),
+            "storcli_installed": installed,
+            "package_installed": package_installed,
+            "executable_available": executable_available,
             "controller_count": controller_count,
             "controller_visible": bool(controller_count and controller_count > 0),
             "megaraid_pci_addresses": megaraid_pci_addresses,
             "passthrough_enabled_addresses": passthrough_enabled_addresses,
             "megaraid_passthrough_addresses": megaraid_passthrough_addresses,
-            "detail": self._build_verification_detail(
-                storcli_text,
-                controller_count,
-                megaraid_passthrough_addresses,
-            ),
+            "detail": self._build_verification_detail(installed, controller_count, megaraid_passthrough_addresses),
         }
         return results
+
+    @staticmethod
+    def _combine_presence(states: list[bool | None]) -> bool | None:
+        if any(state is True for state in states):
+            return True
+        return False if all(state is False for state in states) else None
+
+    @staticmethod
+    def _package_listing_evidence(output: str | None) -> bool | None:
+        if output is None:
+            return None
+        try:
+            reader = csv.DictReader(io.StringIO(output), strict=True)
+            fields = reader.fieldnames
+            if not fields or fields.count("Name") != 1 or len(set(fields)) != len(fields):
+                return None
+            names = []
+            for row in reader:
+                name = row.get("Name")
+                if (None in row or any(value is None for value in row.values())
+                        or not isinstance(name, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name) is None):
+                    return None
+                names.append(name.lower())
+        except (csv.Error, TypeError):
+            return None
+        # Match package names, never descriptions, shell errors or substrings.
+        return any(re.fullmatch(r"(?:bcm-)?(?:vmware-)?storcli(?:64)?", name) for name in names)
 
     @staticmethod
     def _serialize_command_result(result: SSHCommandResult) -> dict[str, Any]:
@@ -873,18 +909,37 @@ class ESXiHostPrepService:
 
     @staticmethod
     def _extract_controller_count(output: str) -> int | None:
-        match = re.search(r'"Number of Controllers"\s*:\s*(\d+)', output)
-        if match:
-            return int(match.group(1))
-        match = re.search(r"Number of Controllers\s*=\s*(\d+)", output)
-        if match:
-            return int(match.group(1))
-        return None
+        try:
+            payload = json.loads(output)
+        except ValueError:
+            # Some supported StorCLI versions emit text despite the J argument.
+            matches = re.findall(r"^Number of Controllers\s*=\s*([0-9]+)\s*$", output, re.MULTILINE)
+            return int(matches[0]) if len(matches) == 1 else None
+        if not isinstance(payload, dict):
+            return None
+        controllers = payload.get("Controllers")
+        if not isinstance(controllers, list) or not controllers:
+            return None
+        counts = []
+        for controller in controllers:
+            if not isinstance(controller, dict):
+                return None
+            status = controller.get("Command Status")
+            data = controller.get("Response Data")
+            if not isinstance(status, dict) or status.get("Status") != "Success" or not isinstance(data, dict):
+                return None
+            count = data.get("Number of Controllers")
+            if type(count) is not int or count < 0:
+                return None
+            counts.append(count)
+        return counts[0] if len(set(counts)) == 1 else None
 
     @classmethod
     def _extract_megaraid_pci_addresses(cls, output: str) -> list[str]:
         addresses: list[str] = []
         for raw_line in output.splitlines():
+            if "megaraid" not in raw_line.lower():
+                continue
             match = re.search(r"(?im)^\s*([0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7])\b", raw_line)
             if not match:
                 continue
@@ -911,27 +966,28 @@ class ESXiHostPrepService:
     @classmethod
     def _build_verification_detail(
         cls,
-        storcli_text: str,
+        installed: bool | None,
         controller_count: int | None,
         megaraid_passthrough_addresses: list[str] | None = None,
     ) -> str:
-        normalized = storcli_text.lower()
         if controller_count and controller_count > 0:
             return f"StorCLI can see {controller_count} controller(s) on this ESXi host."
+        if installed is True and controller_count == 0:
+            detail = "StorCLI is present, but no compatible MegaRAID controller is currently visible to it on this ESXi host."
+        elif installed is True:
+            detail = "StorCLI package or executable evidence is present; controller visibility is unknown."
+        elif installed is False:
+            detail = "StorCLI verification found no supported package or executable; controller visibility is unknown."
+        else:
+            detail = "StorCLI installation and controller visibility could not be verified."
         if megaraid_passthrough_addresses:
             address_list = ", ".join(megaraid_passthrough_addresses)
-            return (
-                "StorCLI is present, but the Broadcom MegaRAID controller is currently configured for "
-                f"PCI passthrough on this ESXi host ({address_list}). ESXi will not bind that device to "
-                "lsi_mr3 or expose it to StorCLI until passthrough is disabled and the host is rebooted."
+            detail += (
+                f" A Broadcom MegaRAID device is configured for PCI passthrough ({address_list}). "
+                "ESXi will not bind that device to lsi_mr3 or expose it to StorCLI until passthrough "
+                "is disabled and the host is rebooted."
             )
-        if "controller 0 not found" in normalized or "no controller found" in normalized or controller_count == 0:
-            return (
-                "StorCLI is present, but no compatible MegaRAID controller is currently visible to it on this ESXi host."
-            )
-        if "storcli" in normalized:
-            return "StorCLI package or binary paths are visible on this ESXi host."
-        return "StorCLI verification did not find a visible package, binary, or controller yet."
+        return detail
 
     @classmethod
     def _build_install_detail(

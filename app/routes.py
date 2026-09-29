@@ -81,7 +81,7 @@ from app.route_support import (
     resolve_layout_slots,
     resolve_read_layout_slots,
     resolve_read_ui_write_policy,
-    startup_problems_for,
+    runtime_warnings_for,
     known_hosts_warnings_for,
     templates,
     upgrade_notice_data_dir,
@@ -338,11 +338,7 @@ def build_router() -> APIRouter:
             selected_enclosure_id=enclosure_id,
             snapshot=snapshot,
         )
-        startup_problems = [
-            *startup_problems_for(request),
-            *known_hosts_warnings_for(request),
-            *config_reload_problems(request),
-        ]
+        startup_problems = await asyncio.to_thread(runtime_warnings_for, request)
         if startup_problems:
             snapshot = snapshot.model_copy(update={"warnings": [*startup_problems, *snapshot.warnings]})
         upgrade_notice_payload = await asyncio.to_thread(
@@ -458,9 +454,9 @@ def build_router() -> APIRouter:
             allow_stale_cache=not force,
         )
         payload = snapshot.model_dump(mode="json")
-        reload_problems = config_reload_problems(request)
-        if reload_problems:
-            payload["warnings"] = [*reload_problems, *payload.get("warnings", [])]
+        runtime_warnings = await asyncio.to_thread(runtime_warnings_for, request)
+        if runtime_warnings:
+            payload["warnings"] = [*runtime_warnings, *payload.get("warnings", [])]
         # The browser re-syncs its write controls and its cached page from
         # every refresh, so a rejected write or a container upgrade never
         # leaves the page stuck on stale policy or stale JavaScript.
