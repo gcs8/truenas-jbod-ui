@@ -406,6 +406,8 @@ def parse_mpr_dmesg_events(text: str) -> dict[str, Any]:
         event_id = f"mpr-dmesg-{len(recent_events) + 1:04d}"
         event["event_id"] = event_id
         decoded_record = make_decoded_event_record(event, event_id=event_id, sequence=len(recent_events))
+        if event["event_type"] == "scsi_status":
+            event["severity"] = decoded_record["severity"]
         recent_events.append(bound_diagnostic_value(event))
         record_mpr_event_summary(summaries["by_controller"][event["controller"]], event, decoded_record)
         if event.get("device"):
