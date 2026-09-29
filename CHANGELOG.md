@@ -259,6 +259,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Showed the admin auto-stop warning on an idle page again, and kept every
+  button disabled once the page reports that admin has stopped. (#831)
 - Kept the admin Backups page following a running backup while the tab is
   hidden and after one failed list read, so the run buttons come back when the
   backup ends. (#832)
