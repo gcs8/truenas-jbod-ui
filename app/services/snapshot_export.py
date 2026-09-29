@@ -64,8 +64,19 @@ AOC_SLG4_2H8M2_TEMPLATE_ID = "aoc-slg4-2h8m2-2"
 AOC_SLG4_2H8M2_PROFILE_ID = "supermicro-aoc-slg4-2h8m2"
 SATADOM_PAIR_TEMPLATE_ID = "satadom-pair-2"
 NVME_CARRIER_FACE_STYLE = "nvme-carrier"
-IPV4_PATTERN = re.compile(r"(?<![\dA-Fa-f:])(?P<ip>(?:\d{1,3}\.){3}\d{1,3})(?![\dA-Fa-f:])")
-IPV6_PATTERN = re.compile(r"(?<![:\w])(?P<ip>(?:[0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f]{1,4})(?![:\w])")
+# Locate whole address candidates; ip_address validates them before masking.
+# IPv6 comes first so an embedded IPv4 tail is not masked independently.
+IPV4_ADDRESS_BODY = r"(?:[0-9]{1,3}\.){3}[0-9]{1,3}"
+IP_ADDRESS_PATTERN = re.compile(
+    r"(?<![\w.:%-])"
+    r"(?P<ip>(?:[A-Za-z_][A-Za-z_-]*:)?"
+    r"(?:[0-9A-Fa-f]*:[0-9A-Fa-f:.]+(?!:)(?:%[A-Za-z0-9_.~-]+)?"
+    rf"|{IPV4_ADDRESS_BODY}\.*))"
+    r"(?![\w.%-])"
+)
+IPV4_RANGE_PATTERN = re.compile(
+    rf"(?<![\w.:%-])(?P<start>{IPV4_ADDRESS_BODY})-(?P<end>{IPV4_ADDRESS_BODY})(?P<suffix>\.*)(?![\w.%-])"
+)
 # Trailing DNS labels appended to a hostname token, so a redacted host swallows
 # its own domain suffix instead of leaving it behind.
 FQDN_CONTINUATION_PATTERN = r"(?:\.[A-Za-z0-9-]+)*"
@@ -439,8 +450,33 @@ class SnapshotRedactor:
         if isinstance(value, list):
             return [self.redact_object(item, path + (index,)) for index, item in enumerate(value)]
         if isinstance(value, str):
+            if path and path[-1] == "details_json":
+                return self._redact_details_json(value, path)
             return self._redact_string(value, path)
         return value
+
+    def _redact_details_json(self, value: str, path: tuple[Any, ...]) -> str:
+        # SlotEvent producers JSON-encode changes; the browser decodes them.
+        # Mask decoded text so JSON escapes cannot change address boundaries.
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return self._redact_string(value, path)
+
+        def redact_text(item: Any) -> Any:
+            # This field previously received general text replacement, including
+            # keys, not path-based serial masking or identifier alias minting.
+            # Keep that policy and do not parse arbitrary nested string values.
+            if isinstance(item, dict):
+                return {self._redact_string(key, ()): redact_text(child) for key, child in item.items()}
+            if isinstance(item, list):
+                return [redact_text(child) for child in item]
+            if isinstance(item, str):
+                return self._redact_string(item, ())
+            return item
+
+        redacted = redact_text(parsed)
+        return value if redacted == parsed else json.dumps(redacted)
 
     def _collect_known_values(self, value: Any, path: tuple[Any, ...] = ()) -> None:
         if isinstance(value, dict):
@@ -738,9 +774,61 @@ class SnapshotRedactor:
                     rf"(?<![A-Za-z0-9]){re.escape(original)}{continuation}(?![A-Za-z0-9])"
                 )
                 redacted = pattern.sub(lambda _match: replacement, redacted)
-        redacted = IPV4_PATTERN.sub(lambda match: self._mask_ipv4(match.group("ip")), redacted)
-        redacted = IPV6_PATTERN.sub(lambda match: self._mask_ipv6(match.group("ip")), redacted)
-        return redacted
+        redacted = IPV4_RANGE_PATTERN.sub(self._redact_ipv4_range_match, redacted)
+        return IP_ADDRESS_PATTERN.sub(self._redact_address_match, redacted)
+
+    def _redact_ipv4_range_match(self, match: re.Match[str]) -> str:
+        start_text = match.group("start")
+        end_text = match.group("end")
+        try:
+            start = ip_address(start_text)
+            end = ip_address(end_text)
+        except ValueError:
+            return match.group(0)
+        if start.version != 4 or end.version != 4 or int(start) == 0 or int(end) == 0:
+            return match.group(0)
+        return f"{self._mask_ipv4(start_text)}-{self._mask_ipv4(end_text)}{match.group('suffix')}"
+
+    def _redact_address_match(self, match: re.Match[str]) -> str:
+        value = match.group("ip")
+        # A non-hexadecimal word label is prose, never an IPv6 component.
+        # Do not search for a valid suffix inside an invalid address token.
+        prefix = ""
+        label, separator, remainder = value.partition(":")
+        if (
+            separator and re.fullmatch(r"[A-Za-z_][A-Za-z_-]*", label)
+            and (
+                re.search(r"[^a-fA-F]", label)
+                or re.fullmatch(rf"{IPV4_ADDRESS_BODY}\.*", remainder)
+            )
+        ):
+            prefix = label + separator
+            value = remainder
+        # A sentence-ending period belongs to the prose, not the address.
+        address_text = value.rstrip(".")
+        suffix = value[len(address_text):]
+        if (
+            address_text.endswith(":") and not address_text.endswith("::")
+            and (
+                re.match(r"\s+[A-Za-z0-9]", match.string[match.end():])
+                or match.string.startswith("/", match.end())
+            )
+        ):
+            address_text = address_text[:-1]
+            suffix = ":" + suffix
+        try:
+            address = ip_address(address_text)
+        except ValueError:
+            # Times, MACs and other colon-delimited identifiers are not IPs.
+            return match.group(0)
+        if int(address) == 0:
+            return match.group(0)
+        masked = (
+            self._mask_ipv4(address_text)
+            if address.version == 4
+            else self._mask_ipv6(address_text)
+        )
+        return prefix + masked + suffix
 
     def _alias_for_identifier(
         self,
@@ -1055,6 +1143,8 @@ class SnapshotExportService:
             "redaction_label": rendered.export_meta.get("redaction_label"),
             "downsampling_label": rendered.export_meta.get("downsampling_label"),
             "downsampling_note": rendered.export_meta.get("downsampling_note"),
+            "history_coverage": rendered.export_meta.get("history_coverage"),
+            "history_coverage_note": rendered.export_meta.get("history_coverage_note"),
             "enclosure_count": rendered.export_meta.get("enclosure_count"),
             "storage_view_count": rendered.export_meta.get("storage_view_count"),
             "metric_sample_count": rendered.export_meta.get("metric_sample_count"),
@@ -1243,6 +1333,7 @@ class SnapshotExportService:
             for view_id, slot_cache in (storage_view_smart_summary_cache or {}).items()
         }
         redactor = None
+        storage_view_aliases: dict[str, str] = {}
         if redact_sensitive:
             redactor = SnapshotRedactor(
                 snapshot,
@@ -1260,6 +1351,17 @@ class SnapshotExportService:
                     base_storage_view_smart_summary_cache,
                 ],
             )
+            # Keep a structural virtual namespace shared by browser-derived
+            # targets and embedded history. Physical targets retain enc aliases.
+            for view in storage_view_runtime.views if storage_view_runtime else []:
+                scope = f"storage-view:{view.id}"
+                alias = redactor.redact_object({"enclosure_id": scope})["enclosure_id"]
+                storage_view_aliases[view.id] = alias
+            # Allocate every alias before replacing values with structural keys;
+            # otherwise a later view could reuse an earlier alias's bare name.
+            for view_id, alias in storage_view_aliases.items():
+                redactor.enclosure_aliases[f"storage-view:{view_id}"] = f"storage-view:{alias}"
+            redactor.token_replacements = redactor._build_token_replacements()
         template = self.templates.env.get_template("index.html")
 
         # Everything below is the same for every downsampling pass; only the history
@@ -1295,9 +1397,12 @@ class SnapshotExportService:
                 storage_view_runtime_for_export = StorageViewRuntimePayload.model_validate(
                     redactor.redact_object(storage_view_runtime_for_export.model_dump(mode="json"))
                 )
-            storage_view_smart_summary_cache_for_export = redactor.redact_object(
-                storage_view_smart_summary_cache_for_export
-            )
+                for original, exported in zip(storage_view_runtime.views, storage_view_runtime_for_export.views, strict=True):
+                    exported.id = storage_view_aliases[original.id]
+            storage_view_smart_summary_cache_for_export = {
+                storage_view_aliases.get(view_id, view_id): redactor.redact_object(slot_cache)
+                for view_id, slot_cache in storage_view_smart_summary_cache_for_export.items()
+            }
         storage_view_runtime_for_context = storage_view_runtime_for_export or StorageViewRuntimePayload(
             system_id=snapshot_for_export.selected_system_id,
             system_label=snapshot_for_export.selected_system_label,
@@ -1443,6 +1548,8 @@ class SnapshotExportService:
                 "event_count": event_count,
                 "downsampling_label": downsampling_meta["label"],
                 "downsampling_note": downsampling_meta["note"],
+                "history_coverage": downsampling_meta["coverage"],
+                "history_coverage_note": downsampling_meta["coverage_note"],
             }
             history_summary = {
                 "counts": {
@@ -1600,13 +1707,40 @@ class SnapshotExportService:
             }
             prepared_cache[cache_key] = exported_payload
 
-        return prepared_cache, self._build_downsampling_meta(
+        downsampling = self._build_downsampling_meta(
             history_window_hours=history_window_hours,
             rollup_seconds=rollup_seconds_used or None,
             metric_rollup_applied=metric_rollup_applied,
             event_trim_applied=event_trim_applied,
             max_events_per_slot=max_events_per_slot,
         )
+        statuses: list[str] = []
+        for payload in raw_history_cache.values():
+            coverage = payload.get("coverage")
+            if not payload.get("available") or not isinstance(coverage, dict):
+                statuses.append("unknown")
+                continue
+            metrics = coverage.get("metrics")
+            statuses.extend(metrics.values() if isinstance(metrics, dict) and metrics else ["unknown"])
+            statuses.append(coverage.get("events", "unknown"))
+        if "truncated" in statuses or event_trim_applied:
+            coverage_status = "truncated"
+            coverage_note = "History is incomplete: bounded reads or export limits omitted older samples or events."
+        elif not statuses or any(status != "complete" for status in statuses):
+            coverage_status = "unknown"
+            coverage_note = "History coverage is unverified; the source did not confirm all samples and events in the selected window."
+        elif metric_rollup_applied:
+            coverage_status = "aggregated"
+            coverage_note = "Selected-window history is included as averaged samples, not every recorded sample."
+        else:
+            coverage_status = "complete"
+            coverage_note = "All available samples and events in the selected window are included."
+        if metric_rollup_applied and coverage_status in {"truncated", "unknown"}:
+            coverage_note += " Displayed metric history uses averaged samples, not every recorded sample."
+        if coverage_status != "complete" and downsampling["label"] == "None":
+            downsampling["note"] = coverage_note
+        downsampling.update(coverage=coverage_status, coverage_note=coverage_note)
+        return prepared_cache, downsampling
 
     def _build_downsampling_meta(
         self,

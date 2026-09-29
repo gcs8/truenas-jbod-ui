@@ -57,16 +57,47 @@ class _Stream:
 
 
 class _Channel:
+    def __init__(self, nas: FakeNAS) -> None:
+        self.nas = nas
+        self.output = b'{"smart_status": {"passed": true}}'
+        self.eof_received = True
+        self.closed = False
+
+    def recv_ready(self) -> bool:
+        return bool(self.output)
+
+    def recv(self, size: int) -> bytes:
+        data, self.output = self.output[:size], self.output[size:]
+        return data
+
+    def recv_stderr_ready(self) -> bool:
+        return False
+
+    def recv_stderr(self, size: int) -> bytes:
+        return b""
+
+    def exit_status_ready(self) -> bool:
+        return True
+
     def recv_exit_status(self) -> int:
         return 0
 
     def shutdown_write(self) -> None:
         return None
 
+    def close(self) -> None:
+        with self.nas.lock:
+            if not self.closed:
+                self.closed = True
+                self.nas.open_channels -= 1
+
 
 class _Transport:
+    def __init__(self, closed: threading.Event) -> None:
+        self.closed = closed
+
     def is_active(self) -> bool:
-        return True
+        return not self.closed.is_set()
 
 
 class FakeNAS:
@@ -81,13 +112,14 @@ class FakeNAS:
         self.open_channels = 0
         self.peak_channels = 0
 
-    def client(self) -> Any:
+    def client(self, *, _cancel=None) -> Any:
         nas = self
-        time.sleep(self.handshake_seconds)
-        with self.lock:
-            self.connections += 1
 
         class Client:
+            def __init__(self):
+                self.closed = threading.Event()
+                self.channels: list[_Channel] = []
+
             def __enter__(self):
                 return self
 
@@ -95,25 +127,47 @@ class FakeNAS:
                 self.close()
 
             def close(self) -> None:
-                return None
+                with nas.lock:
+                    self.closed.set()
+                    channels = list(self.channels)
+                for channel in channels:
+                    channel.close()
 
             def get_transport(self):
-                return _Transport()
+                return _Transport(self.closed)
 
             def exec_command(self, _command: str, timeout: float | None = None):
                 with nas.lock:
+                    if self.closed.is_set():
+                        raise EOFError("synthetic connection closed")
+                    channel = _Channel(nas)
+                    self.channels.append(channel)
                     nas.commands += 1
                     nas.open_channels += 1
                     nas.peak_channels = max(nas.peak_channels, nas.open_channels)
-                try:
-                    time.sleep(nas.command_seconds)
-                finally:
-                    with nas.lock:
-                        nas.open_channels -= 1
-                channel = _Channel()
-                return _Stream(channel=channel), _Stream(b'{"smart_status": {"passed": true}}', channel), _Stream(b"", channel)
+                # Keep capacity charged until production closes the channel,
+                # not merely until the modeled command delay has elapsed.
+                if self.closed.wait(nas.command_seconds):
+                    channel.close()
+                    raise EOFError("synthetic connection closed")
+                return _Stream(channel=channel), _Stream(channel=channel), _Stream(channel=channel)
 
-        return Client()
+        client = Client()
+        try:
+            if _cancel is not None:
+                _cancel.register(client)
+                _cancel.check()
+            with nas.lock:
+                self.connections += 1
+            client.closed.wait(self.handshake_seconds)
+            if _cancel is not None:
+                _cancel.check()
+            return client
+        except BaseException:
+            client.close()
+            if _cancel is not None:
+                _cancel.discard(client)
+            raise
 
 
 async def run_case(bays: int, concurrency: int, handshake: float, command: float, commands_per_bay: int) -> dict[str, Any]:

@@ -122,6 +122,24 @@ test("cache countdown chips only render when the UI Timing panel is enabled", ()
   assert.match(shownStrip.innerHTML, /data-cache-timing-key="snapshot"/);
 });
 
+
+test("export estimates disclose bounded and unverified history independently of downsampling", () => {
+  const { buildEstimateAdvice } = loadFunctions(["buildEstimateAdvice"]);
+  for (const history_coverage of ["truncated", "unknown"]) {
+    for (const selected_packaging of ["auto", "html", "zip"]) {
+      for (const selected_within_limit of [true, false]) {
+        const history_coverage_note = "History is incomplete or unverified.";
+        assert.match(buildEstimateAdvice({
+          selected_packaging, auto_packaging: "html", selected_within_limit,
+          selected_allowed: false, downsampling_label: "None", history_coverage, history_coverage_note,
+        }), /History is incomplete or unverified/);
+      }
+    }
+  }
+  assert.match(APP_SOURCE, /estimate.history_coverage === "truncated"/);
+  assert.match(APP_SOURCE, /state.export.estimate.data\?\.history_coverage_note/);
+});
+
 test("header, bay status, and status-line copy avoids developer vocabulary", () => {
   const banned = /enrichment|calibrat|evidence|payload|gmultipath|middleware|sanitized|rollup|first-pass|artifact/i;
   for (const name of [
