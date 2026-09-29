@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 
@@ -79,6 +80,43 @@ class CronTests(unittest.TestCase):
         either = CronSchedule.parse("0 0 1 * 1")  # 1st of month OR Monday
         self.assertEqual(either.next_after(datetime(2026, 9, 24, tzinfo=UTC)), datetime(2026, 9, 28, tzinfo=UTC))
         self.assertEqual(CronSchedule.parse("0 12 29 2 *").next_after(datetime(2026, 3, 1, tzinfo=UTC)).year, 2028)
+
+    def test_star_step_day_field_is_not_restricted(self) -> None:
+        # Classic cron: a day field that starts with "*" does not count as restricted,
+        # so "*/2" day-of-month with a weekday means both must match.
+        odd_mondays = CronSchedule.parse("0 3 */2 * 1")
+        self.assertEqual(odd_mondays.next_after(datetime(2026, 9, 24, tzinfo=UTC)), datetime(2026, 10, 5, 3, 0, tzinfo=UTC))
+        self.assertEqual(odd_mondays.next_after(datetime(2026, 10, 5, 3, 0, tzinfo=UTC)), datetime(2026, 10, 19, 3, 0, tzinfo=UTC))
+        either = CronSchedule.parse("0 3 1,15 * 1")  # 1st, 15th, or any Monday
+        start = datetime(2026, 9, 24, tzinfo=UTC)
+        runs = []
+        for _ in range(5):
+            start = either.next_after(start)
+            runs.append(start.day)
+        self.assertEqual(runs, [28, 1, 5, 12, 15])
+
+    def test_sparse_leap_sunday_beyond_five_years(self) -> None:
+        from zoneinfo import ZoneInfo
+
+        schedule = CronSchedule.parse("0 0 29 2 */7")
+        for zone in (UTC, ZoneInfo("America/New_York")):
+            with self.subTest(zone=zone):
+                first = schedule.next_after(datetime(2026, 9, 28, tzinfo=zone))
+                self.assertEqual(first, datetime(2032, 2, 29, tzinfo=zone))
+                self.assertIs(first.tzinfo, zone)
+                self.assertEqual(schedule.next_after(first), datetime(2060, 2, 29, tzinfo=zone))
+                self.assertEqual(
+                    schedule.next_after(datetime(2096, 3, 1, tzinfo=zone)),
+                    datetime(2128, 2, 29, tzinfo=zone),
+                )
+
+    def test_impossible_intersection_has_bounded_calendar_search(self) -> None:
+        schedule = CronSchedule.parse("0 0 31 2 */7")
+        original = CronSchedule._day_matches
+        with patch.object(CronSchedule, "_day_matches", autospec=True, side_effect=original) as matches:
+            with self.assertRaises(CronError):
+                schedule.next_after(datetime(2026, 1, 1, tzinfo=UTC))
+        self.assertLessEqual(matches.call_count, 146098)
 
     def test_invalid(self) -> None:
         for text in ("", "* * * *", "60 * * * *", "* * 0 * *", "a * * * *", "*/0 * * * *", "5-1 * * * *", "0 0 31 2 *"):
@@ -149,6 +187,22 @@ class PolicyTests(unittest.TestCase):
         self.assertTrue(any("backups.full.schedule" in p and "cron" in p for p in problems), problems)
         for problem in problems:
             self.assertNotIn("\n", problem)
+
+    def test_schedule_that_never_matches_is_refused(self) -> None:
+        # A parseable schedule with no real date used to pass validation and
+        # then stop the scheduler on start (restart loop).
+        for text in ("0 0 30 2 *", "0 0 31 4 *"):
+            with self.subTest(text=text):
+                self.write({"full": {"schedule": text}})
+                with self.assertRaises(ConfigurationError) as caught:
+                    load_backup_policy(self.config, {})
+                problems = caught.exception.problems
+                self.assertTrue(
+                    any("backups.full.schedule" in p and "never matches a real date" in p for p in problems),
+                    problems,
+                )
+        self.write({"full": {"schedule": "0 0 29 2 *"}})
+        self.assertEqual(load_backup_policy(self.config, {}).full.schedule, "0 0 29 2 *")
 
     def test_unknown_keys_and_delay_rule(self) -> None:
         self.write({"config": {"enabled": True, "debounce_seconds": 100, "max_delay_seconds": 10}})
@@ -355,7 +409,7 @@ class SchedulerTestBase(unittest.TestCase):
 
         return opened()
 
-    def make(self, backups: dict[str, Any]):
+    def make(self, backups: dict[str, Any], *, local_tz: Any = UTC):
         config = self.root / "config.yaml"
         config.write_text(yaml.safe_dump({"backups": backups}))
         policy = load_backup_policy(config, {})
@@ -371,7 +425,7 @@ class SchedulerTestBase(unittest.TestCase):
             runner_factory=FakeRunner,
             clock=lambda: self.now,
             monotonic=lambda: self.mono[0],
-            local_tz=UTC,
+            local_tz=local_tz,
         )
         self.addCleanup(scheduler.close)
         return scheduler
@@ -433,6 +487,64 @@ class SchedulerTests(SchedulerTestBase):
         self.assertEqual(len(local), 2)
         self.assertEqual(len(list((self._paths.local_dir / "full").iterdir())), 2)
         self.assertEqual(len(scheduler.catalog.tombstones()), 1)
+
+    def test_full_schedule_keeps_local_wall_clock_across_dst(self) -> None:
+        try:
+            new_york = ZoneInfo("America/New_York")
+        except ZoneInfoNotFoundError:
+            self.skipTest("America/New_York time zone data is not available")
+        self.now = datetime(2026, 10, 31, 12, 0, tzinfo=UTC)
+        scheduler = self.make({"full": {"enabled": True, "schedule": "30 1 * * *"}}, local_tz=new_york)
+        self.assertEqual(scheduler.next_full_at, datetime(2026, 11, 1, 5, 30, tzinfo=UTC))  # 01:30 EDT
+        self.now = datetime(2026, 11, 1, 5, 30, tzinfo=UTC)
+        scheduler.tick()
+        self.assertEqual(len(FakeRunner.calls), 1)
+        # Fall back: 01:30 repeats; the next run is 01:30 EST on 11-02, not a second run on 11-01.
+        self.assertEqual(scheduler.next_full_at, datetime(2026, 11, 2, 6, 30, tzinfo=UTC))
+        # A start inside the repeated hour must not pick the already-past first 01:30.
+        self.assertEqual(
+            scheduler._compute_next_full(datetime(2026, 11, 1, 6, 10, tzinfo=UTC)),
+            datetime(2026, 11, 2, 6, 30, tzinfo=UTC),
+        )
+        # Spring forward: 01:30 EST on 03-08, then 01:30 EDT on 03-09 (not an hour late).
+        self.assertEqual(
+            scheduler._compute_next_full(datetime(2026, 3, 8, 6, 30, tzinfo=UTC)),
+            datetime(2026, 3, 9, 5, 30, tzinfo=UTC),
+        )
+        # Spring forward: 02:30 does not exist on 03-08, so do not run at
+        # 03:30 EDT; wait for 02:30 EDT on 03-09.
+        gap_scheduler = self.make(
+            {"full": {"enabled": True, "schedule": "30 2 * * *"}},
+            local_tz=new_york,
+        )
+        self.assertEqual(
+            gap_scheduler._compute_next_full(datetime(2026, 3, 8, 6, 0, tzinfo=UTC)),
+            datetime(2026, 3, 9, 6, 30, tzinfo=UTC),
+        )
+
+    def test_scheduler_main_uses_the_tz_zone(self) -> None:
+        from history_service.backup_scheduler import main as scheduler_main
+
+        try:
+            new_york = ZoneInfo("America/New_York")
+        except ZoneInfoNotFoundError:
+            self.skipTest("America/New_York time zone data is not available")
+        config = self.root / "idle.yaml"
+        config.write_text("{}\n")
+        env = {"APP_CONFIG_PATH": str(config), "APP_GID": str(os.getegid()),
+               "BACKUP_ARCHIVE_PASSPHRASE_FILE": "", "SCHEDULED_BACKUP_PASSPHRASE_FILE": "",
+               "BACKUP_ARCHIVE_DIR": str(self.root / "a"),
+               "BACKUP_ARCHIVE_STATE_DIR": str(self.root / "s"), "TZ": "America/New_York"}
+        with patch.dict(os.environ, env):
+            with patch("history_service.system_backup.SystemBackupService"), patch("history_service.store.HistoryStore"):
+                scheduler = scheduler_main.build_scheduler(load_backup_policy(config, {}))
+            self.addCleanup(scheduler.close)
+            self.assertEqual(scheduler._local_tz, new_york)
+        for value in ("", "  "):
+            with self.subTest(tz=value), patch.dict(os.environ, {"TZ": value}):
+                self.assertIsNone(scheduler_main._local_tz())
+        with patch.dict(os.environ, {"TZ": "Not/AZone"}), self.assertLogs(scheduler_main.logger, "WARNING"):
+            self.assertIsNone(scheduler_main._local_tz())
 
     def test_verified_full_replaces_only_older_history_sidecar_copies(self) -> None:
         scheduler = self.make({"full": {"enabled": True}})
@@ -619,6 +731,28 @@ class SchedulerTests(SchedulerTestBase):
         problems = backup_archive_problems(self._paths.status_file)
         self.assertTrue(any(p.startswith("Backup grooming stopped: ConnectionRefusedError") for p in problems))
 
+    def test_unverified_remote_copy_is_a_failed_run_and_never_catalogued(self) -> None:
+        import dataclasses
+
+        class UnverifiedTarget(LocalDirectoryTarget):
+            def put(self, local_path, name):
+                return dataclasses.replace(super().put(local_path, name), verified=False)
+
+        remote_dir = self.remote_root / "nas"
+
+        @contextlib.contextmanager
+        def opened(_settings):
+            yield UnverifiedTarget(remote_dir)
+
+        scheduler = self.make({"full": {"enabled": True}, "targets": [TARGET]})
+        scheduler._open_target = opened
+        record = scheduler.run_now("full")
+        self.assertEqual([r.location for r in scheduler.catalog.list()], ["local"])
+        status = json.loads(self._paths.status_file.read_text())
+        self.assertFalse(status["targets"]["nas"]["ok"])
+        self.assertIn("remote copy could not be verified", status["targets"]["nas"]["detail"])
+        self.assertFalse((remote_dir / record.name).exists())
+
     def test_failed_backup_recorded_and_single_flight(self) -> None:
         from history_service.backup_scheduler.service import SchedulerBusyError
 
@@ -691,6 +825,24 @@ class SchedulerTests(SchedulerTestBase):
         (self._paths.local_dir / first.name).write_bytes(b"x" * first.size)
         with self.assertRaises(ArchiveIntegrityError), scheduler.materialize(first.artifact_id):
             pass
+
+    def test_oversized_remote_download_stops_before_catalog_check(self) -> None:
+        from history_service.backup_archive.transport import ArchiveVerificationError
+
+        scheduler = self.make({"full": {"enabled": True}, "targets": [TARGET]})
+        scheduler.run_now("full")
+        (remote,) = scheduler.catalog.list(location="nas")
+        (self.remote_root / "nas" / remote.name).write_bytes(b"x" * (remote.size + 2))
+        with self.assertRaisesRegex(ArchiveVerificationError, "larger than expected"), scheduler.materialize(remote.artifact_id):
+            pass
+        self.assertEqual(list(self._paths.state_dir.glob("backup-fetch-*")), [])
+        # A copy that grew past the cap no longer matches the catalogue, so verify
+        # must stop counting it as verified, like any other integrity mismatch.
+        self.assertTrue(scheduler.catalog.get(remote.artifact_id).verified)
+        failed = scheduler.verify(remote.artifact_id)
+        self.assertFalse(failed["ok"])
+        self.assertFalse(failed["artifact"]["verified"])
+        self.assertFalse(failed["artifact"]["restorable"])
 
     def test_start_run_reserves_before_returning(self) -> None:
         import threading
