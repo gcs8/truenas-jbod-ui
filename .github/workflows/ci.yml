@@ -995,6 +995,7 @@ jobs:
         run: |
           set -euo pipefail
           npx playwright test \
+            qa/admin-draft-target-ownership.spec.js \
             qa/offline-snapshot.spec.js \
             qa/saved-view-selection.spec.js \
             qa/ui-scope-safety.spec.js \
