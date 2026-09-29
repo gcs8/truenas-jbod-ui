@@ -84,7 +84,7 @@ APP_PUBLIC_ORIGIN=https://storage-ui.example.test
 ADMIN_PUBLIC_ORIGIN=https://storage-admin.example.test
 ```
 
-`ADMIN_PUBLIC_ORIGIN` is required whenever the admin sidecar runs. Basic mode
+`ADMIN_PUBLIC_ORIGIN` is required whenever the Admin service runs. Basic mode
 requires an origin for each enabled UI, so `APP_PUBLIC_ORIGIN` is required too.
 Both must match the addresses shown in the browser. Use HTTPS through a reverse
 proxy or an encrypted network path, and restrict port reachability with firewall
