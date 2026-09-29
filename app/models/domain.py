@@ -887,6 +887,7 @@ class StorageViewRuntimeSlot(BaseModel):
     placement_key: str | None = None
     assignment_rank: int | None = None
     snapshot_slot: int | None = None
+    snapshot_enclosure_id: str | None = None
     device_name: str | None = None
     smart_device_names: list[str] = Field(default_factory=list)
     smart_device_type: str | None = None
