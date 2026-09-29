@@ -22,10 +22,13 @@ import time
 import uuid
 import zipfile
 import zlib
+from collections.abc import Mapping
 from contextlib import closing, contextmanager, nullcontext
+from copy import copy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from types import MappingProxyType
 from typing import Any, Callable, Iterator, Literal
 from urllib.parse import urlsplit, urlunsplit
 
@@ -720,6 +723,29 @@ class _ExportSourceSnapshot:
         if self.member_count > MAX_ARCHIVE_MEMBER_COUNT:
             raise ValueError("Backup bundle archive contains too many members.")
 
+    def admit_bytes(
+        self,
+        content: bytes,
+        group_key: str,
+        archive_path: str,
+        *,
+        entry_admitted: bool = False,
+    ) -> None:
+        if not entry_admitted:
+            self.admit_entry()
+        size = len(content)
+        if size > MAX_ARCHIVE_MEMBER_BYTES:
+            raise ValueError("Backup bundle archive member exceeds its expanded byte limit.")
+        if (
+            group_key in STRUCTURED_YAML_GROUP_KEYS
+            and PurePosixPath(archive_path).suffix in {".yaml", ".yml"}
+            and size > MAX_STRUCTURED_YAML_MEMBER_BYTES
+        ):
+            raise ValueError("Structured YAML member exceeds its size limit.")
+        if self.total_bytes + size > MAX_ARCHIVE_EXPANDED_BYTES:
+            raise ValueError("Backup bundle non-history members exceed the expanded byte limit.")
+        self.total_bytes += size
+
     @contextmanager
     def _open_source(
         self,
@@ -798,6 +824,28 @@ class _ExportSourceSnapshot:
                 for chunk in self._source_chunks(*source):
                     output.write(chunk)
             return target
+
+    def copy_bytes(
+        self,
+        content: bytes,
+        group_key: str,
+        archive_path: str,
+        *,
+        entry_admitted: bool = False,
+    ) -> Path:
+        assert self.root is not None
+        self.admit_bytes(
+            content,
+            group_key,
+            archive_path,
+            entry_admitted=entry_admitted,
+        )
+        self.root.mkdir(mode=0o700, exist_ok=True)
+        target = self.root / str(self.member_count)
+        target_descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(target_descriptor, "wb") as output:
+            output.write(content)
+        return target
 
     def read_yaml_file(self, path: Path) -> bytes | None:
         # Bootstrap content is YAML regardless of its configured filename.
@@ -2128,6 +2176,19 @@ class SystemBackupService:
     def __init__(self, history_settings: HistorySettings, store: HistoryStore) -> None:
         self.history_settings = history_settings
         self.store = store
+        self._captured_config_files: Mapping[Path, bytes | None] = {}
+
+    def with_captured_config_files(self, files: Mapping[Path, bytes | None]) -> SystemBackupService:
+        """Use one scheduler capture without changing the shared export service.
+
+        Only the hashed documents are pinned; unselected groups and unhashed
+        caches retain the normal collection and validation behavior. ``None``
+        pins an absent document even if it appears before archive construction.
+        """
+
+        captured = copy(self)
+        captured._captured_config_files = MappingProxyType(dict(files))
+        return captured
 
     def validate_scheduled_backup_scope(self, included_paths: list[str]) -> None:
         selected_groups = self._resolve_selected_groups(
@@ -3704,7 +3765,14 @@ class SystemBackupService:
         # unselected config/override/profile files, without activating paths or
         # replacing the running application's cached settings.
         snapshot = _ExportSourceSnapshot()
-        return load_settings(create_directories=False, read_yaml_file=snapshot.read_yaml_file)
+        for content in self._captured_config_files.values():
+            if content is not None:
+                snapshot.admit_bytes(content, CONFIG_FILE_KEY, "settings.yaml")
+        return load_settings(
+            create_directories=False,
+            read_yaml_file=snapshot.read_yaml_file,
+            captured_files=self._captured_config_files,
+        )
 
     @staticmethod
     def _cleanup_extracted_archive(cleanup_root: Any) -> None:
@@ -4087,8 +4155,23 @@ class SystemBackupService:
             TLS_TRUST_KEY: config_root / "tls",
         }
         total = 0
+        member_count = 1  # Reserve the manifest while bounding source discovery.
+
+        def admit_entry() -> None:
+            nonlocal member_count
+            member_count += 1
+            if member_count > MAX_ARCHIVE_MEMBER_COUNT:
+                raise ValueError("Backup bundle archive contains too many members.")
+
         for group_key, source_path in file_sources.items():
             if group_key not in selected_groups:
+                continue
+            captured_path = source_path.absolute()
+            if captured_path in self._captured_config_files:
+                content = self._captured_config_files[captured_path]
+                if content is not None:
+                    admit_entry()
+                    total += len(content)
                 continue
             try:
                 metadata = source_path.stat(follow_symlinks=False)
@@ -4096,6 +4179,7 @@ class SystemBackupService:
                 continue
             if not stat.S_ISREG(metadata.st_mode):
                 raise ValueError("Backup export source must be a regular file.")
+            admit_entry()
             total += metadata.st_size
         for group_key, source_dir in directory_sources.items():
             if group_key not in selected_groups:
@@ -4111,6 +4195,7 @@ class SystemBackupService:
                 directory = pending.pop()
                 with os.scandir(directory) as entries:
                     for entry in entries:
+                        admit_entry()
                         if entry.is_symlink():
                             raise ValueError("Backup export source must not be a symlink.")
                         if entry.is_dir(follow_symlinks=False):
@@ -4650,7 +4735,16 @@ class SystemBackupService:
                 [],
             )
 
-        snapshot_path = source_snapshot.copy(source_path, group_key, metadata["archive_root"])
+        captured_path = source_path.absolute()
+        if captured_path in self._captured_config_files:
+            content = self._captured_config_files[captured_path]
+            snapshot_path = (
+                source_snapshot.copy_bytes(content, group_key, metadata["archive_root"])
+                if content is not None
+                else None
+            )
+        else:
+            snapshot_path = source_snapshot.copy(source_path, group_key, metadata["archive_root"])
         if snapshot_path is not None:
             member = BundleMember(
                 key=group_key,

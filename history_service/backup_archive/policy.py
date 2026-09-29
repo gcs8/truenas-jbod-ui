@@ -42,7 +42,7 @@ import logging
 import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -99,6 +99,9 @@ class _ClassPolicyBase(BaseModel):
         return value
 
 
+_CRON_PROBE_FROM = datetime(2000, 1, 1, tzinfo=timezone.utc)
+
+
 class ConfigClassPolicy(_ClassPolicyBase):
     local_keep: int = Field(default=30, ge=1, le=10_000)
     debounce_seconds: int = Field(default=30, ge=0, le=86_400)
@@ -128,7 +131,11 @@ class FullClassPolicy(_ClassPolicyBase):
     @classmethod
     def _valid_cron(cls, value: str) -> str:
         try:
-            return CronSchedule.parse(value).expression
+            schedule = CronSchedule.parse(value)
+            # Refuse a schedule with no real date (0 0 30 2 *) here: the
+            # scheduler computes the next run on start and would exit.
+            schedule.next_after(_CRON_PROBE_FROM)
+            return schedule.expression
         except CronError as exc:
             raise ValueError(f"is not a cron schedule ({exc})") from exc
 

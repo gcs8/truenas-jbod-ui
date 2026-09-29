@@ -2683,6 +2683,21 @@ class SystemBackupServiceTests(unittest.TestCase):
                             packaging=packaging,
                         )
 
+    def test_non_history_space_budget_uses_captured_bytes_without_touching_live_path(self) -> None:
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            app_settings = get_settings()
+        for content, expected in ((b"app: {refresh_interval_seconds: 47}\n", 36), (None, 0)):
+            with self.subTest(content=content):
+                service = self.backup_service.with_captured_config_files(
+                    {self.config_path.absolute(): content}
+                )
+                with patch.object(Path, "stat", side_effect=AssertionError("late live stat")):
+                    self.assertEqual(
+                        service._non_history_source_bytes(app_settings, [CONFIG_FILE_KEY]),
+                        expected,
+                    )
+
     def test_import_skips_second_quick_check_only_for_the_preflighted_digest(self) -> None:
         artifact = self.backup_service.export_bundle_to_file(
             packaging="zip",

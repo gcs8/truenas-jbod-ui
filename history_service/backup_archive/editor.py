@@ -30,7 +30,7 @@ import stat
 from collections.abc import Callable, Mapping
 from dataclasses import fields
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, get_args
 
 import yaml
 
@@ -186,6 +186,7 @@ def load_editor_view(config_path: str | Path, environ: Mapping[str, str]) -> dic
         "targets": targets,
         "targets_locked_by": targets_lock,
         "providers": list(PROVIDERS),
+        "archive_formats": list(get_args(FullClassPolicy.model_fields["archive_format"].annotation)),
         "target_fields": list(TARGET_PLAIN_FIELDS),
         "secret_fields": list(SECRET_FILE_FIELDS),
         "problems": problems,
@@ -235,7 +236,19 @@ def _forbidden_secret_paths(environ: Mapping[str, str]) -> set[str]:
 
 
 def _endpoint(values: Mapping[str, Any]) -> tuple[Any, ...]:
-    return tuple(values.get(name) or None for name in ENDPOINT_FIELDS)
+    # Compare canonical forms: a hand-written port: "2222" comes back from the
+    # UI as the number 2222, and a bucket: 2024 comes back as the text "2024".
+    # Strings are not stripped: a changed username is a different endpoint.
+    endpoint: list[Any] = []
+    for name in ENDPOINT_FIELDS:
+        value = values.get(name)
+        if isinstance(value, str):
+            if name == "port" and value.isascii() and value.isdigit():
+                value = int(value)
+        elif name != "port" and value is not None and not isinstance(value, bool):
+            value = str(value)
+        endpoint.append(value or None)
+    return tuple(endpoint)
 
 
 def _merge_target(

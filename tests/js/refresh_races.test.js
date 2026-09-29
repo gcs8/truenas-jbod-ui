@@ -278,6 +278,10 @@ test("mapping draft survives repeated renders for the same selected slot", () =>
   syncMappingFormForSlot({ slot: 7, serial: "server-old", device_name: "da7", gptid: "gpt-old", notes: "old" });
   mappingForm.serial.value = "operator draft";
   mappingForm.notes.value = "typed while SMART loaded";
+  const { fn: markMappingFormDirty } = loadFunction(APP_SOURCE, "markMappingFormDirty", {
+    state, scheduleAutoRefresh() {}, renderTimingSurfaces() {},
+  });
+  markMappingFormDirty();
 
   syncMappingFormForSlot({ slot: 7, serial: "server-new", device_name: "da7", gptid: "gpt-new", notes: "new" });
 
@@ -317,7 +321,8 @@ test("mapping form initializes from the newly selected slot scope", () => {
 });
 
 test("successful mapping save renders the authoritative snapshot instead of the old draft", async () => {
-  const state = { snapshotMode: false, selectedSlot: 7, mappingFormScopeKey: "system|enc||7" };
+  const state = { snapshotMode: false, selectedSystemId: "system", selectedEnclosureId: "enc", selectedSlot: 7, mappingFormScopeKey: "system|enc||7", mappingFormBaseRevision: "a".repeat(64) };
+  const { fn: mappingFormScopeKey } = loadFunction(APP_SOURCE, "mappingFormScopeKey", {state});
   let renderedScopeKey = "not-rendered";
   let appliedSnapshot = null;
   const events = [];
@@ -331,6 +336,7 @@ test("successful mapping save renders the authoritative snapshot instead of the 
     state,
     FormData: FakeFormData,
     mappingForm: {},
+    mappingFormScopeKey,
     getSlotById() { return { slot: 7, slot_label: "07", mapping_revision: "a".repeat(64) }; },
     setStatus() {},
     writeBlockedByPolicy: () => false,
@@ -477,6 +483,7 @@ test("mapping clear final fetch URL carries separate revision and selection para
 
 test("mapping mutations without a scope revision fail closed before any request", async () => {
   const state = { snapshotMode: false, selectedSlot: 7 };
+  const { fn: mappingFormScopeKey } = loadFunction(APP_SOURCE, "mappingFormScopeKey", {state});
   const statuses = [];
   let requestCount = 0;
   let confirmCount = 0;
@@ -488,6 +495,7 @@ test("mapping mutations without a scope revision fail closed before any request"
     FormData: FakeFormData,
     mappingForm: {},
     window: { confirm() { confirmCount += 1; return true; } },
+    mappingFormScopeKey,
     getSlotById() { return { slot: 7, slot_label: "07" }; },
     setStatus(message) { statuses.push(message); },
     writeBlockedByPolicy: () => false,
@@ -895,6 +903,8 @@ test("dedicated fabric refresh ignores a response for an older selection", async
     error: null,
     snapshot: {},
     fabric: null,
+    smartSummaries: {},
+    smartSummaryTimes: {},
     refreshRequestToken: 0,
   };
   function scopedUrl(endpoint, { force = false } = {}) {
@@ -961,6 +971,8 @@ test("storage-view SMART completion cannot mutate a different active view", asyn
     "ensureStorageViewSmartSummary",
     {
       state,
+      AbortSignal,
+      SMART_PREFETCH_STALE_MS: 15000,
       getStorageViewSmartCacheKey: () => cacheKey,
       isSmartEntryCurrent: () => false,
       isSmartEntryInFlight: () => false,
@@ -1012,6 +1024,8 @@ test("storage-view SMART completion cannot mutate the same view ID in a differen
     "ensureStorageViewSmartSummary",
     {
       state,
+      AbortSignal,
+      SMART_PREFETCH_STALE_MS: 15000,
       getStorageViewSmartCacheKey: () => cacheKey,
       isSmartEntryCurrent: () => false,
       isSmartEntryInFlight: () => false,
