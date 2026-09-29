@@ -262,6 +262,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Preserved history evidence across partial or failed collection, recorded
+  authoritative empty-view removals, kept status reads off the event loop,
+  stopped follow-on requests during shutdown, and rejected invalid refresh
+  modes with 422. (#744)
 - Made interrupted rotation-recovery cleanup resumable by persisting its
   selected generation before retiring rollback evidence. (#751)
 - Complete retained segmented rollup points across all eligible sources before
