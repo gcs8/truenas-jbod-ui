@@ -1937,6 +1937,105 @@ class HistoryStore:
         finally:
             os.close(descriptor)
 
+    @classmethod
+    def prepare_backup_directory(cls, directory: Path) -> None:
+        """Create loader-owned roots without losing their publication obligation.
+
+        Parent barriers stay with the backup operation: an archive barrier must
+        not become a condition of local snapshot success. The prepared marker
+        survives settings-cache eviction, failed loading, and fresh stores.
+        """
+        cls._ensure_directory_entry(
+            directory, prepare_only=True,
+            sync_directory=cls._fsync_directory, rename=cls._rename_at2,
+        )
+
+    def _ensure_backup_directory(self, directory: Path) -> None:
+        self._ensure_directory_entry(
+            directory, prepare_only=False,
+            sync_directory=self._fsync_directory, rename=self._rename_at2,
+        )
+
+    @classmethod
+    def _ensure_directory_entry(
+        cls, directory: Path, *, prepare_only: bool,
+        sync_directory: Callable[[Path], None], rename: Callable[..., None],
+    ) -> None:
+        """Persist only entries we create, including retries after a failed sync.
+
+        Install each new directory with a pending marker already inside it. A
+        failed parent barrier must not turn that directory into an apparently
+        durable pre-existing ancestor on the next call or in a fresh store.
+        Existing unmarked directories are provisioned by the caller, not repaired.
+        """
+        marker_name = ".history-backup-directory-pending"
+        if not directory.is_dir():
+            cls._ensure_directory_entry(
+                directory.parent, prepare_only=prepare_only,
+                sync_directory=sync_directory, rename=rename,
+            )
+            for _ in range(32):
+                staged = directory.parent / f".history-directory-{secrets.token_hex(8)}"
+                try:
+                    staged.mkdir()
+                    break
+                except FileExistsError:
+                    continue
+            else:
+                raise FileExistsError("Unable to allocate a history backup directory.")
+            installed = False
+            try:
+                # Prepare the marker before the public name can exist. Even a
+                # failure creating/syncing the marker leaves no unmarked target.
+                descriptor = os.open(
+                    staged / marker_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
+                )
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+                sync_directory(staged)
+                try:
+                    rename(staged, directory, flags=RENAME_NOREPLACE)
+                    installed = True
+                except FileExistsError:
+                    if not directory.is_dir():
+                        raise
+                    # Another creator won. Its pending marker, if present,
+                    # carries the same parent barrier obligation below.
+            finally:
+                if not installed:
+                    try:
+                        (staged / marker_name).unlink(missing_ok=True)
+                        staged.rmdir()
+                    except OSError:
+                        # Never adopt an abandoned private staging name as a
+                        # backup root, and never recursively remove its contents.
+                        logger.warning("History backup directory staging cleanup failed for %s", staged)
+        marker = directory / marker_name
+        try:
+            metadata = marker.lstat()
+        except FileNotFoundError:
+            return
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size != 0 or metadata.st_nlink != 1:
+            raise ValueError(f"History backup refuses invalid directory marker {marker}.")
+        if prepare_only:
+            return
+        # Loading can prepare a whole chain before a store exists. Complete
+        # marked ancestors first, stopping at the first unmarked caller-owned
+        # directory; never infer authority to repair arbitrary ancestors.
+        cls._ensure_directory_entry(
+            directory.parent, prepare_only=False,
+            sync_directory=sync_directory, rename=rename,
+        )
+        sync_directory(directory.parent)
+        # Only a successful parent barrier permits retirement. If this unlink
+        # fails, the marker remains for retry; if it reappears after a crash, an
+        # extra parent sync is harmless. No acknowledged data depends on unlink.
+        marker.unlink(missing_ok=True)
+
     def create_backup(
         self,
         backup_dir: str | Path,
@@ -1949,7 +2048,7 @@ class HistoryStore:
     ) -> Path | None:
         self._require_unsegmented_operation("v1 backup")
         backup_root = Path(backup_dir)
-        backup_root.mkdir(parents=True, exist_ok=True)
+        self._ensure_backup_directory(backup_root)
         self._normalize_shared_path_permissions(backup_root, is_dir=True)
         backup_name = f"{self.file_path.stem}-{self._backup_stamp(snapshot_label)}.sqlite3"
         final_path = backup_root / backup_name
@@ -2176,7 +2275,7 @@ class HistoryStore:
 
         observed_at = self._parse_snapshot_label(snapshot_label)
         long_term_root = Path(long_term_backup_dir)
-        long_term_root.mkdir(parents=True, exist_ok=True)
+        self._ensure_backup_directory(long_term_root)
         self._normalize_shared_path_permissions(long_term_root, is_dir=True)
 
         if weekly_retention_count > 0:
@@ -2199,7 +2298,7 @@ class HistoryStore:
             )
 
     def _refresh_backup_copy(self, source_backup_path: Path, target_path: Path) -> None:
-        target_path.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_backup_directory(target_path.parent)
         self._normalize_shared_path_permissions(target_path.parent, is_dir=True)
         temp_fd, temp_path = self._create_private_replacement_file(
             target_path.parent,
@@ -3975,6 +4074,9 @@ class HistoryStore:
             if target_mode is not None and stat.S_IMODE(temp_metadata.st_mode) != target_mode:
                 os.fchmod(temp_descriptor, target_mode)
                 temp_metadata = os.fstat(temp_descriptor)
+            # SQLite/copy completion is not a publication barrier. Flush the
+            # final file metadata too, after mode and restore-owner changes.
+            os.fsync(temp_descriptor)
             if not self._path_matches_metadata(temp_path, temp_metadata):
                 raise ValueError(f"History replacement refuses changed temporary path {temp_path}.")
 
@@ -4063,6 +4165,22 @@ class HistoryStore:
         if target_mode is not None and stat.S_IMODE(published_metadata.st_mode) != target_mode:
             self._unlink_owned_path(target_path, temp_metadata)
             raise ValueError(f"History replacement refuses changed temporary mode for {temp_path}.")
+        try:
+            self._sync_replacement_parents(temp_path, target_path)
+        except Exception:
+            # Do not leave an unacknowledged timestamp discoverable as a recent
+            # backup by the collector. Never overwrite a reappeared temp name.
+            if self._path_matches_metadata(target_path, temp_metadata):
+                self._rename_at2(target_path, temp_path, flags=RENAME_NOREPLACE)
+                self._sync_replacement_parents(temp_path, target_path)
+            raise
+
+    def _sync_replacement_parents(self, temp_path: Path, target_path: Path) -> None:
+        # The private staging directory and public destination are normally
+        # distinct. Both name changes must be durable before evidence retirement.
+        self._fsync_directory(temp_path.parent)
+        if target_path.parent != temp_path.parent:
+            self._fsync_directory(target_path.parent)
 
     def _exchange_existing_target(
         self,
@@ -4082,6 +4200,7 @@ class HistoryStore:
                 raise ValueError(f"History replacement refuses changed target path {target_path}.")
             if target_mode is not None and stat.S_IMODE(published_metadata.st_mode) != target_mode:
                 raise ValueError(f"History replacement refuses changed temporary mode for {temp_path}.")
+            self._sync_replacement_parents(temp_path, target_path)
             self._unlink_owned_path(temp_path, target_metadata)
         except Exception:
             self._rollback_exchange(
@@ -4104,6 +4223,7 @@ class HistoryStore:
         if not target_is_published_temp or not temp_is_displaced_target:
             return
         self._rename_at2(target_path, temp_path, flags=RENAME_EXCHANGE)
+        self._sync_replacement_parents(temp_path, target_path)
         self._discard_owned_path(temp_path, temp_metadata)
 
     @staticmethod

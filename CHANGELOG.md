@@ -262,6 +262,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Sync snapshot publication directories before retiring prior backups or
+  reporting success, preserving prior evidence when publication fails. (#763)
 - Validate log levels before settings reload, use the configured runtime-overrides
   file consistently, and serialize partial updates while preserving reader permissions. (#811)
 - Preserved newer admin drafts when older saves complete, and kept discovered
