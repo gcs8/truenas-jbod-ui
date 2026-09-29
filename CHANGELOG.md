@@ -259,6 +259,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Preserved physical bay-label numbering when cloning or editing enclosure
+  profiles without changing internal slot IDs or hardware targets. (#762)
 - Refresh history recovery warnings and quarantine time on accepted dashboard
   polls without presenting missing or stale evidence as a fresh healthy state. (#764)
 - Give supported numeric and textual SCSI statuses the same canonical severity
