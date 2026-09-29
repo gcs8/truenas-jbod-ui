@@ -858,7 +858,7 @@ class BackupScheduler:
             raise LookupError("The grooming plan expired or was already used; preview it again.")
         with self._job("lifecycle"), self._resolver() as resolver:
             result = self._manager().apply(entry.plan, resolver, actor="admin", now=self._clock)
-        self._record_grooming_result(result)
+            self._record_grooming_result(result)
         return result
 
     # -- library queries ---------------------------------------------------------------

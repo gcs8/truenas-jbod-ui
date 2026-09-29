@@ -1114,8 +1114,16 @@ class SchedulerApiTests(SchedulerTestBase):
             plan=lambda now: SimpleNamespace(items=(failed,), guarded=()),
             apply=lambda plan, resolver, actor, now: result,
         )
+        record_grooming_result = scheduler._record_grooming_result
 
-        with patch.object(scheduler, "_manager", return_value=manager):
+        def assert_single_flight(applied_result: ApplyResult) -> None:
+            self.assertTrue(scheduler._job_lock.locked())
+            record_grooming_result(applied_result)
+
+        with (
+            patch.object(scheduler, "_manager", return_value=manager),
+            patch.object(scheduler, "_record_grooming_result", side_effect=assert_single_flight),
+        ):
             token, _, _ = scheduler.plan()
             self.assertIs(scheduler.apply(token), result)
 
