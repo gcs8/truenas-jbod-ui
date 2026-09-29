@@ -1,4 +1,5 @@
 const { test, expect } = require("@playwright/test");
+const { waitForSelectedScope, switchSelectedScope } = require("./release-readiness");
 
 const liveApplianceQaEnabled = process.env.PLAYWRIGHT_LIVE_APPLIANCE_QA === "1";
 
@@ -13,6 +14,7 @@ async function gotoApp(page) {
   await expect(page.locator("#system-select")).toBeVisible();
   await expect(page.locator("#enclosure-select")).toBeVisible();
   await expect(page.locator("#slot-grid")).toBeVisible();
+  await waitForSelectedScope(page);
 }
 
 async function setAutoRefresh(page, enabled) {
@@ -42,11 +44,7 @@ test.describe("ESXi smoke", () => {
     test.skip(!fatTwinSystemId && !hasAocSystem, "Need a saved ESXi system for ESXi smoke coverage.");
 
     if (fatTwinSystemId) {
-      await page.locator("#system-select").selectOption(fatTwinSystemId);
-      await expect(page.locator("#system-select")).toHaveValue(fatTwinSystemId);
-      await expect(page.locator("#status-text")).toHaveText(/Inventory updated\.|Ready\./, {
-        timeout: 30_000,
-      });
+      await switchSelectedScope(page, "#system-select", fatTwinSystemId);
       await expect(page.locator("#enclosure-select")).toHaveValue("enclosure:supermicro-fat-twin-front-6");
 
       const tiles = page.locator("#slot-grid .slot-tile");
@@ -75,11 +73,7 @@ test.describe("ESXi smoke", () => {
       return;
     }
 
-    await page.locator("#system-select").selectOption("cryostorage-esxi");
-    await expect(page.locator("#system-select")).toHaveValue("cryostorage-esxi");
-    await expect(page.locator("#status-text")).toHaveText(/Inventory updated\.|Ready\./, {
-      timeout: 30_000,
-    });
+    await switchSelectedScope(page, "#system-select", "cryostorage-esxi");
     await expect(page.locator("#enclosure-select")).toHaveValue("enclosure:supermicro-aoc-slg4-2h8m2");
     await expect(page.locator(".nvme-carrier-board-image")).toHaveAttribute("src", /aoc-slg4-2h8m2\.jpg$/);
 
