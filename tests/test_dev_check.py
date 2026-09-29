@@ -15,6 +15,19 @@ WINDOWS_NPM_SHIM = r"C:\Program Files\nodejs\npm.cmd"
 
 
 class DevCheckPlanTests(unittest.TestCase):
+    def test_operator_recipes_remain_in_windows_portable_plan(self) -> None:
+        for mode in ("safe", "full"):
+            with self.subTest(mode=mode):
+                plan = dev_check.build_plan(
+                    mode, platform="win32", root=ROOT, python_executable="python",
+                    environment={}, find_executable=lambda _name: None,
+                )
+                check = next(check for check in plan.checks
+                             if check.name == "Python unittest (Windows portable suite)")
+                self.assertIn("tests.test_public_docs_contract", check.argv)
+                self.assertFalse(any("tests.test_public_docs_contract" in skip.details
+                                     for skip in plan.skips))
+
     def test_nonroot_cli_is_portable_without_posix_ownership_suite(self) -> None:
         check, skips = dev_check._windows_test_check(ROOT, "python")
         self.assertIn("tests.test_nonroot_cli", check.argv)

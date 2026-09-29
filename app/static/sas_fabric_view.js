@@ -53,9 +53,12 @@
     diagnosticPayloads: {},
     openEvidencePanels: new Set(),
     smartSummaries: {},
+    smartSummaryTimes: {},
     smartRequests: {},
     aliasEditObjectId: null,
     aliasDraft: null,
+    aliasEditGeneration: 0,
+    fabricScopeReady: Boolean(bootstrap.fabric),
     writePolicy: normalizeFabricWritePolicy(bootstrap.writePolicy),
     writeAuthorization: null,
     writeAuthPending: false,
@@ -242,7 +245,16 @@
     render();
   }
 
+  function fabricScopeIsCurrent() {
+    return state.fabricScopeReady && !state.loading && Boolean(state.fabric)
+      && state.fabric.system_id === state.selectedSystemId
+      && (state.fabric.selected_enclosure_id || null) === state.selectedEnclosureId;
+  }
+
   function fabricAliasWriteAttributes() {
+    if (!fabricScopeIsCurrent()) {
+      return ' disabled title="Refresh the selected Storage Fabric scope before editing names."';
+    }
     if (fabricWritePolicyAllowsWrites()) {
       return "";
     }
@@ -1234,7 +1246,7 @@
     if (selectionRefEquals(ref, currentSelectionRef())) {
       return true;
     }
-    state.aliasEditObjectId = null;
+    closeAliasEditor();
     const trailIndex = state.selectionTrail.findIndex((trailRef) => selectionRefEquals(trailRef, ref));
     if (trailIndex >= 0) {
       state.selectionTrail = state.selectionTrail.slice(0, trailIndex);
@@ -1428,14 +1440,30 @@
   }
 
   function smartCacheKey(slotNumber) {
-    return [state.selectedSystemId || "", state.selectedEnclosureId || "", String(slotNumber)].join("|");
+    const slot = slotByNumber(slotNumber);
+    if (!slot || slot.identity_state === "unknown" || slot.present === false) return null;
+    const identity = [slot.serial, slot.logical_unit_id, slot.gptid].map((value) => String(value || "").trim());
+    if (!identity.some(Boolean)) return null;
+    return JSON.stringify([state.selectedSystemId, state.selectedEnclosureId, slot.enclosure_id, slotNumber, slot.device_name, identity]);
+  }
+
+  function pruneSmartCache() {
+    const keys = new Set(list(state.snapshot?.slots).map((slot) => smartCacheKey(slot.slot)).filter(Boolean));
+    for (const key of new Set([...Object.keys(state.smartSummaries), ...Object.keys(state.smartRequests)])) {
+      if (!keys.has(key)) {
+        delete state.smartSummaries[key];
+        delete state.smartSummaryTimes[key];
+        delete state.smartRequests[key];
+      }
+    }
   }
 
   function smartSummaryForSlot(slotNumber) {
     if (!Number.isInteger(Number(slotNumber))) {
       return null;
     }
-    return state.smartSummaries[smartCacheKey(slotNumber)] || null;
+    const key = smartCacheKey(slotNumber);
+    return key ? state.smartSummaries[key] || null : null;
   }
 
   function selectedSmartSlotNumber() {
@@ -1537,7 +1565,7 @@
 
   function ensureSelectedSmartSummary() {
     const slotNumber = selectedSmartSlotNumber();
-    if (!Number.isInteger(slotNumber) || !state.fabric || state.fabric.available === false) {
+    if (state.loading || !Number.isInteger(slotNumber) || !state.fabric || state.fabric.available === false) {
       return;
     }
     const slot = slotByNumber(slotNumber);
@@ -1545,18 +1573,25 @@
       return;
     }
     const key = smartCacheKey(slotNumber);
-    if (state.smartSummaries[key] || state.smartRequests[key]) {
+    if (!key || state.smartRequests[key]
+      || (state.smartSummaries[key] && Date.now() - state.smartSummaryTimes[key] < 300000)) {
       return;
     }
-    state.smartRequests[key] = true;
-    fetchJson(scopedUrl(`/api/slots/${slotNumber}/smart`))
+    const owner = {};
+    state.smartRequests[key] = owner;
+    fetchJson(scopedUrl(`/api/slots/${slotNumber}/smart`), { signal: AbortSignal.timeout(15000) })
       .then((summary) => {
+        if (state.smartRequests[key] !== owner) return;
+        state.smartSummaryTimes[key] = Date.now();
         state.smartSummaries[key] = summary || { available: false, message: "SMART detail returned an empty payload." };
       })
       .catch((error) => {
+        if (state.smartRequests[key] !== owner) return;
+        state.smartSummaryTimes[key] = Date.now();
         state.smartSummaries[key] = { available: false, message: error.message || String(error) };
       })
       .finally(() => {
+        if (state.smartRequests[key] !== owner) return;
         delete state.smartRequests[key];
         if (state.aliasEditObjectId) {
           return;
@@ -3449,11 +3484,13 @@
   }
 
   function openAliasEditor(objectId) {
+    state.aliasEditGeneration += 1;
     state.aliasEditObjectId = objectId || null;
     state.aliasDraft = null;
   }
 
   function closeAliasEditor() {
+    state.aliasEditGeneration += 1;
     state.aliasEditObjectId = null;
     state.aliasDraft = null;
   }
@@ -3464,6 +3501,9 @@
   }
 
   async function saveAliasFromForm(form, { clear = false } = {}) {
+    if (!fabricScopeIsCurrent()) {
+      return;
+    }
     if (fabricWriteBlockedByPolicy()) {
       render();
       return;
@@ -3473,9 +3513,18 @@
       return;
     }
     const objectId = input.dataset.fabricAliasObject || "";
-    if (!objectId) {
+    if (!objectId || objectId !== state.aliasEditObjectId) {
       return;
     }
+    // Capture both URLs before awaiting. Navigation, refresh, or a newer draft
+    // retires this operation, including its error and follow-up readback.
+    const postUrl = scopedUrl("/api/sas-fabric/aliases");
+    const readbackUrl = scopedUrl("/api/sas-fabric");
+    const navigationGeneration = state.refreshRequestToken;
+    const editorGeneration = ++state.aliasEditGeneration;
+    const ownsCompletion = () => navigationGeneration === state.refreshRequestToken
+      && editorGeneration === state.aliasEditGeneration
+      && objectId === state.aliasEditObjectId && fabricScopeIsCurrent();
     const payload = {
       object_id: objectId,
       object_kind: input.dataset.fabricAliasKind || null,
@@ -3484,16 +3533,19 @@
     };
     form.classList.add("is-saving");
     try {
-      await fetchJson(scopedUrl("/api/sas-fabric/aliases"), {
+      await fetchJson(postUrl, {
         method: "POST",
         readUiAuth: true,
         body: JSON.stringify(payload),
       });
+      if (!ownsCompletion()) return;
+      const fabric = await fetchJson(readbackUrl);
+      if (!ownsCompletion()) return;
       closeAliasEditor();
-      const fabric = await fetchJson(scopedUrl("/api/sas-fabric"));
       applyFabric(fabric);
       render();
     } catch (error) {
+      if (!ownsCompletion()) return;
       if (!handleFabricWriteRejection(error)) {
         state.error = error.message || String(error);
       }
@@ -3821,6 +3873,10 @@
 
   function renderMap() {
     const fabric = state.fabric;
+    const inert = !fabricScopeIsCurrent();
+    elements.mapPanel.inert = inert;
+    elements.inspectorBody.inert = inert;
+    elements.focusStrip.inert = inert;
     state.diagnosticPayloads = {};
     if (!fabric) {
       elements.mapPanel.innerHTML = '<div class="warning-item muted compact">No Storage Fabric payload has been loaded yet.</div>';
@@ -3966,6 +4022,7 @@
     state.snapshot = snapshot || state.snapshot;
     state.selectedSystemId = state.snapshot.selected_system_id || state.selectedSystemId;
     state.selectedEnclosureId = state.snapshot.selected_enclosure_id || state.selectedEnclosureId;
+    pruneSmartCache();
   }
 
   function applyFabric(fabric) {
@@ -3984,6 +4041,7 @@
 
   async function refreshFabric(force = false) {
     const requestToken = ++state.refreshRequestToken;
+    state.fabricScopeReady = false;
     state.loading = true;
     state.error = null;
     render();
@@ -3996,7 +4054,16 @@
         return;
       }
       applySnapshot(snapshot);
+      // A completed inventory refresh is an explicit retry opportunity. Avoid a
+      // render/failure loop while still bounding warm results on later renders.
+      Object.keys(state.smartSummaries).forEach((key) => {
+        if (state.smartSummaries[key]?.available === false) {
+          delete state.smartSummaries[key];
+          delete state.smartSummaryTimes[key];
+        }
+      });
       applyFabric(fabric);
+      state.fabricScopeReady = true;
     } catch (error) {
       if (requestToken === state.refreshRequestToken) {
         state.error = error.message || String(error);
@@ -4020,7 +4087,7 @@
         || (mode === "disk" && traceById(current?.id)?.kind !== "bay")
         || (mode === "impact" && (current?.kind !== "trace" || traceById(current?.id)?.kind !== "path"));
       state.mode = mode;
-      state.aliasEditObjectId = null;
+      closeAliasEditor();
       ensureSelectionForMode(state.fabric, { force: forceSelection, mode });
       render();
     });
@@ -4031,6 +4098,9 @@
   });
 
   elements.systemSelect.addEventListener("change", () => {
+    state.smartRequests = {};
+    state.smartSummaries = {};
+    state.smartSummaryTimes = {};
     state.selectedSystemId = elements.systemSelect.value || null;
     state.selectedEnclosureId = null;
     state.selectedTraceId = null;
@@ -4039,11 +4109,14 @@
     state.selectionTrail = [];
     state.expandedSlotLists = {};
     state.diagnosticTables = {};
-    state.aliasEditObjectId = null;
+    closeAliasEditor();
     void refreshFabric(false);
   });
 
   elements.enclosureSelect.addEventListener("change", () => {
+    state.smartRequests = {};
+    state.smartSummaries = {};
+    state.smartSummaryTimes = {};
     state.selectedEnclosureId = elements.enclosureSelect.value || null;
     state.selectedTraceId = null;
     state.selectedNodeId = null;
@@ -4051,12 +4124,12 @@
     state.selectionTrail = [];
     state.expandedSlotLists = {};
     state.diagnosticTables = {};
-    state.aliasEditObjectId = null;
+    closeAliasEditor();
     void refreshFabric(false);
   });
 
   function handleFabricActivation(target) {
-    if (!target) {
+    if (!target || !fabricScopeIsCurrent()) {
       return;
     }
     const modeTargetButton = target.closest("[data-fabric-mode-target]");
@@ -4065,7 +4138,7 @@
       if (modeIds.has(mode)) {
         state.mode = mode;
       }
-      state.aliasEditObjectId = null;
+      closeAliasEditor();
       state.selectionTrail = [];
       const traceId = modeTargetButton.dataset.fabricTrace || "";
       const nodeId = modeTargetButton.dataset.fabricNode || "";
@@ -4139,7 +4212,7 @@
       state.selectionTrail = [];
       state.selectedNodeId = null;
       state.selectedTraceId = resolveTraceId(null);
-      state.aliasEditObjectId = null;
+      closeAliasEditor();
       render();
       return;
     }
@@ -4200,6 +4273,7 @@
     const target = event.target instanceof HTMLInputElement ? event.target : null;
     if (target?.matches("[data-fabric-alias-input]")) {
       if (state.aliasEditObjectId && target.dataset.fabricAliasObject === state.aliasEditObjectId) {
+        state.aliasEditGeneration += 1;
         state.aliasDraft = target.value;
       }
       return;
