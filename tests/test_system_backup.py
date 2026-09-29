@@ -1264,7 +1264,14 @@ class SystemBackupServiceTests(unittest.TestCase):
     ) -> None:
         history_before = service.store.file_path.read_bytes()
         archive_before = archive.read_bytes()
-        roots_before = set(Path(tempfile.gettempdir()).iterdir())
+        workspaces: list[Path] = []
+        real_mkdtemp = tempfile.mkdtemp
+
+        def record_workspace(*args, **kwargs):
+            path = Path(real_mkdtemp(*args, **kwargs))
+            workspaces.append(path)
+            return str(path)
+
         files_before = {
             path: path.read_bytes() for path in self.temp_dir.rglob("*")
             if path.is_file() and not path.is_symlink()
@@ -1279,12 +1286,15 @@ class SystemBackupServiceTests(unittest.TestCase):
             }
             with self.subTest(operation=name):
                 try:
-                    with self.assertRaisesRegex(ValueError, message):
+                    with (
+                        patch("history_service.system_backup.tempfile.mkdtemp", side_effect=record_workspace),
+                        self.assertRaisesRegex(ValueError, message),
+                    ):
                         getattr(service, name)(archive, passphrase=passphrase, **kwargs)
                 finally:
                     self.assertEqual(service.store.file_path.read_bytes(), history_before)
                     self.assertEqual(archive.read_bytes(), archive_before)
-                    self.assertEqual(set(Path(tempfile.gettempdir()).iterdir()), roots_before)
+                    self.assertEqual([path for path in workspaces if path.exists()], [])
                     self.assertEqual(set(self.temp_dir.rglob("*")), paths_before)
                     self.assertEqual({path: path.read_bytes() for path in files_before}, files_before)
                     self.assertEqual(callbacks, [], "refused admission issued an identity")
