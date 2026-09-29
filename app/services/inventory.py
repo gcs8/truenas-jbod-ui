@@ -741,7 +741,7 @@ class _LayoutFrame:
     layout_columns: int
     slot_positions: dict[int, tuple[int, int]]
     allow_legacy_mapping_fallback: bool
-    loaded_mappings: dict[str, ManualMapping]
+    loaded_mappings: Mapping[str, ManualMapping]
 
     def actual_slot_ids(self) -> list[int]:
         """Return rendered physical slot ids in ascending order."""
@@ -5883,9 +5883,9 @@ class InventoryService:
                 f"This enclosure reports {reported_slot_count} bays but the selected layout draws "
                 f"{layout_slot_count}, so the extra bays are not shown. Choose a matching layout in System Setup."
             )
-        # One mapping load per correlation pass: the entries are
+        # One immutable classification per correlation pass: the entries are
         # loaded here and read back off the frame by every caller.
-        loaded_mappings = self.mapping_store.load_all()
+        loaded_mappings = self.mapping_store.load_lookup_snapshot()
         if not allow_legacy_mapping_fallback:
             self._warn_unapplied_legacy_mappings(
                 warnings,
@@ -6106,7 +6106,7 @@ class InventoryService:
         }
         if VIRTUAL_INVENTORY_PHYSICAL_LOCATION_WARNING not in warnings:
             warnings.append(VIRTUAL_INVENTORY_PHYSICAL_LOCATION_WARNING)
-        loaded_mappings = self.mapping_store.load_all()
+        loaded_mappings = self.mapping_store.load_lookup_snapshot()
         self._warn_unapplied_legacy_mappings(
             warnings,
             None,
@@ -10589,7 +10589,7 @@ class InventoryService:
         warnings: list[str],
         enclosure_id: str | None,
         slot_ids: Iterable[int],
-        loaded_mappings: dict[str, ManualMapping],
+        loaded_mappings: Mapping[str, ManualMapping],
         *,
         no_identified_physical_enclosure: bool = False,
     ) -> None:

@@ -259,6 +259,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Reuse one immutable mapping classification per inventory correlation pass,
+  preserving mapping conflicts, drawer aliases and revision checks. (#766)
 - Keep automatic config-backup hashes, captured files and source-path selection
   on the same generation so intervening edits cannot suppress a later backup. (#768)
 - Compared per-slot history `since` filters in UTC so a non-UTC offset no
