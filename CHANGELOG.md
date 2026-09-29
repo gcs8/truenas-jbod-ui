@@ -259,6 +259,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Refresh history recovery warnings and quarantine time on accepted dashboard
+  polls without presenting missing or stale evidence as a fresh healthy state. (#764)
 - Give supported numeric and textual SCSI statuses the same canonical severity
   in diagnostic rows and summaries, preserving unknown-status fallback. (#767)
 - Keep Fabric alias actions bound to the displayed scope and prevent stale
