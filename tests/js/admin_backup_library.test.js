@@ -557,6 +557,30 @@ test("an unavailable backup service says so and offers nothing to run", async ()
   assert.equal(elements.cleanupButton.disabled, true);
 });
 
+test("the status line shows the last clean-up, and a warning naming each place it failed", async () => {
+  const okApi = fakeApi();
+  okApi.data.grooming = { at: "2026-09-24T12:00:00Z", ok: true, deleted: 3, detail: null, failed_locations: {} };
+  const ok = mount({ api: okApi });
+  await ok.library.load();
+  assert.match(ok.elements.status.textContent, /5 backup copies\. Last clean-up: T\(2026-09-24T12:00:00Z\), 3 removed\.$/);
+  assert.equal(ok.elements.status.querySelector("span.backup-run-status.is-ok").textContent, "Last clean-up: T(2026-09-24T12:00:00Z), 3 removed.");
+
+  const badApi = fakeApi();
+  badApi.data.grooming = { at: "2026-09-24T12:00:00Z", ok: false, deleted: 1, detail: "ConnectionRefusedError: refused",
+    failed_locations: { "offsite-sftp": "connect to sftp://svc:pw@sftp.example.test/srv/x failed", local: "PermissionError: denied" } };
+  const bad = mount({ api: badApi });
+  await bad.library.load();
+  const warning = bad.elements.status.querySelector("span.backup-run-status.is-bad");
+  assert.ok(warning, "a failed clean-up renders a warning span");
+  assert.equal(warning.textContent,
+    "Last clean-up T(2026-09-24T12:00:00Z) didn't finish: Offsite SFTP: connect to sftp://sftp.example.test failed; This server: PermissionError: denied.");
+  assert.equal(bad.elements.status.querySelector("span.backup-run-status.is-ok"), null);
+
+  const none = mount();
+  await none.library.load();
+  assert.equal(none.elements.status.textContent, "5 backup copies.");
+});
+
 test("back up now reports that the run started", async () => {
   const { library, banners } = mount();
   await library.load();

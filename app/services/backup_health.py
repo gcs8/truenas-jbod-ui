@@ -48,4 +48,7 @@ def backup_archive_problems(path: str | Path | None = None) -> list[str]:
         if isinstance(run, dict) and run.get("ok") is False:
             label = _short(run.get("label") or target_id)
             problems.append(f"Backup target {label} degraded: {_short(run.get('detail'))}")
+    grooming = payload.get("grooming")
+    if isinstance(grooming, dict) and grooming.get("ok") is False:
+        problems.append(f"Backup grooming stopped: {_short(grooming.get('detail'))}")
     return problems
