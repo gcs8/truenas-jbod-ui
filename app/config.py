@@ -15,7 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, f
 
 from app.config_errors import ConfigurationError, describe_validation_error, format_location
 from app.env_values import annotation_is_text, env_is_set
-from app.secret_files import load_secret_environment_value
+from app.secret_files import load_secret_environment_value, write_text_atomically
 from app.slot_layout import normalize_slot_layout, validate_slot_layout
 
 logger = logging.getLogger(__name__)
@@ -1070,10 +1070,7 @@ def save_runtime_behavior_overrides(settings: Settings, values: dict[str, Any]) 
     app_payload.update(clean_values)
 
     runtime_overrides_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = runtime_overrides_path.with_suffix(".tmp")
-    with temp_path.open("w", encoding="utf-8", newline="\n") as handle:
-        yaml.safe_dump(runtime_overrides, handle, sort_keys=False)
-    temp_path.replace(runtime_overrides_path)
+    write_text_atomically(runtime_overrides_path, yaml.safe_dump(runtime_overrides, sort_keys=False))
     get_settings.cache_clear()
     return runtime_behavior_settings_payload(get_settings())
 

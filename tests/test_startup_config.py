@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import stat
 import tempfile
 import unittest
 from collections.abc import Iterator
@@ -12,7 +13,7 @@ import yaml
 
 from admin_service.config import get_admin_settings
 from app.config import ENV_OVERRIDES as APP_ENV_OVERRIDES
-from app.config import AppConfig, build_unknown_config_key_warnings, get_settings
+from app.config import AppConfig, build_unknown_config_key_warnings, get_settings, save_runtime_behavior_overrides
 from app.config_errors import ConfigurationError
 from app.read_ui_auth_config import load_read_ui_auth_settings
 from history_service.config import get_history_settings
@@ -122,6 +123,33 @@ class BlankAndTextValueTests(_LoaderTestCase):
             settings = get_settings()
 
         self.assertEqual(settings.truenas.api_key, "env-api-key")
+
+
+@unittest.skipIf(os.name == "nt", "POSIX file modes")
+class RuntimeOverridesFileModeTests(_LoaderTestCase):
+    def _save(self, existing_mode: int | None) -> tuple[int, object]:
+        with self.main_ui_environment({}, "app: {}\n"):
+            settings = get_settings()
+            overrides_path = Path(settings.paths.runtime_overrides_file)
+            if existing_mode is not None:
+                overrides_path.parent.mkdir(parents=True, exist_ok=True)
+                overrides_path.write_text("app: {}\n", encoding="utf-8")
+                overrides_path.chmod(existing_mode)
+            save_runtime_behavior_overrides(settings, {"refresh_interval_seconds": 45})
+            saved = yaml.safe_load(overrides_path.read_text(encoding="utf-8"))
+            return stat.S_IMODE(overrides_path.stat().st_mode), saved
+
+    def test_a_new_runtime_overrides_file_is_owner_only(self) -> None:
+        mode, saved = self._save(None)
+
+        self.assertEqual(mode, 0o600)
+        self.assertEqual(saved, {"app": {"refresh_interval_seconds": 45}})
+
+    def test_a_saved_runtime_overrides_file_keeps_its_mode(self) -> None:
+        mode, saved = self._save(0o640)
+
+        self.assertEqual(mode, 0o640)
+        self.assertEqual(saved, {"app": {"refresh_interval_seconds": 45}})
 
 
 class PlainConfigurationErrorTests(_LoaderTestCase):
