@@ -741,7 +741,7 @@ class _LayoutFrame:
     layout_columns: int
     slot_positions: dict[int, tuple[int, int]]
     allow_legacy_mapping_fallback: bool
-    loaded_mappings: dict[str, ManualMapping]
+    loaded_mappings: Mapping[str, ManualMapping]
 
     def actual_slot_ids(self) -> list[int]:
         """Return rendered physical slot ids in ascending order."""
@@ -1745,10 +1745,11 @@ class InventoryService:
         if not runtime_slot:
             raise TrueNASAPIError(f"Storage view slot {slot_index} is not present in {runtime_view.label}.")
 
-        if runtime_slot.snapshot_slot is not None:
+        smart_enclosure_id = selected_enclosure_id or runtime_view.backing_enclosure_id
+        if runtime_slot.snapshot_slot is not None and runtime_slot.snapshot_enclosure_id in {None, smart_enclosure_id}:
             return await self.get_slot_smart_summary(
                 runtime_slot.snapshot_slot,
-                selected_enclosure_id=selected_enclosure_id or runtime_view.backing_enclosure_id,
+                selected_enclosure_id=smart_enclosure_id,
                 allow_stale_cache=allow_stale_cache,
                 bypass_negative_cache=bypass_negative_cache,
             )
@@ -1799,16 +1800,20 @@ class InventoryService:
         if not ordered:
             return []
 
+        smart_enclosure_id = selected_enclosure_id or runtime_view.backing_enclosure_id
+        # A bay number only means something in its own enclosure; a candidate
+        # from another enclosure (a rear BMC disk) goes through the synthetic path.
         snapshot_slot_by_index = {
             slot_index: runtime_slots[slot_index].snapshot_slot
             for slot_index in ordered
             if runtime_slots[slot_index].snapshot_slot is not None
+            and runtime_slots[slot_index].snapshot_enclosure_id in {None, smart_enclosure_id}
         }
         summaries: dict[int, SmartSummaryView] = {}
         if snapshot_slot_by_index:
             batch = await self.get_slot_smart_summaries(
                 list(dict.fromkeys(snapshot_slot_by_index.values())),
-                selected_enclosure_id=selected_enclosure_id or runtime_view.backing_enclosure_id,
+                selected_enclosure_id=smart_enclosure_id,
                 max_concurrency=max_concurrency,
                 allow_stale_cache=allow_stale_cache,
                 bypass_negative_cache=bypass_negative_cache,
@@ -2182,6 +2187,7 @@ class InventoryService:
             placement_key=placement_key,
             assignment_rank=assignment_rank,
             snapshot_slot=candidate.get("snapshot_slot") if isinstance(candidate.get("snapshot_slot"), int) else None,
+            snapshot_enclosure_id=normalize_text(candidate.get("snapshot_enclosure_id")),
             device_name=(candidate.get("device_names") or [None])[0],
             smart_device_names=list(candidate.get("smart_device_names") or []),
             smart_device_type=normalize_text(candidate.get("smartctl_device_type")),
@@ -5877,9 +5883,9 @@ class InventoryService:
                 f"This enclosure reports {reported_slot_count} bays but the selected layout draws "
                 f"{layout_slot_count}, so the extra bays are not shown. Choose a matching layout in System Setup."
             )
-        # One mapping load per correlation pass: the entries are
+        # One immutable classification per correlation pass: the entries are
         # loaded here and read back off the frame by every caller.
-        loaded_mappings = self.mapping_store.load_all()
+        loaded_mappings = self.mapping_store.load_lookup_snapshot()
         if not allow_legacy_mapping_fallback:
             self._warn_unapplied_legacy_mappings(
                 warnings,
@@ -6100,7 +6106,7 @@ class InventoryService:
         }
         if VIRTUAL_INVENTORY_PHYSICAL_LOCATION_WARNING not in warnings:
             warnings.append(VIRTUAL_INVENTORY_PHYSICAL_LOCATION_WARNING)
-        loaded_mappings = self.mapping_store.load_all()
+        loaded_mappings = self.mapping_store.load_lookup_snapshot()
         self._warn_unapplied_legacy_mappings(
             warnings,
             None,
@@ -6156,7 +6162,7 @@ class InventoryService:
         if self.system.truenas.platform == "esxi":
             records = self._build_esxi_disk_records(
                 ssh_data,
-                enclosure_id=self.system.default_profile_id,
+                enclosure_id=selected_enclosure_id or self.system.default_profile_id,
             )
             if bmc_inventory is not None:
                 records.extend(self._build_bmc_disk_records(bmc_inventory))
@@ -6355,7 +6361,15 @@ class InventoryService:
         return {
             "candidate_id": candidate_id,
             "label": normalize_text(disk.serial) or normalize_text(device_names[0] if device_names else None) or "Inventory candidate",
-            "snapshot_slot": disk.slot if isinstance(disk.slot, int) else None,
+            # A BMC bay number without its enclosure can match a disk in another
+            # enclosure, so such a candidate takes the synthetic SMART path.
+            "snapshot_slot": (
+                disk.slot
+                if isinstance(disk.slot, int)
+                and not (disk.raw.get("platform") == "bmc" and normalize_text(disk.enclosure_id) is None)
+                else None
+            ),
+            "snapshot_enclosure_id": normalize_text(disk.enclosure_id),
             "serial": disk.serial,
             "identifier": disk.identifier,
             "storage_system_id": storage_system_id,
@@ -9728,6 +9742,9 @@ class InventoryService:
             target["ses_element_id"] = ses_candidate.get("ses_element_id")
         if isinstance(ses_candidate.get("ses_targets"), list) and ses_candidate.get("ses_targets"):
             target["ses_targets"] = ses_candidate.get("ses_targets")
+        for field_name in ("ses_slot_number", "slot_number_source", "slot_number_warning"):
+            if field_name in ses_candidate:
+                target[field_name] = ses_candidate[field_name]
         if ses_candidate.get("sas_address_hint"):
             target["sas_address_hint"] = ses_candidate.get("sas_address_hint")
         if ses_candidate.get("sas_device_type"):
@@ -10575,7 +10592,7 @@ class InventoryService:
         warnings: list[str],
         enclosure_id: str | None,
         slot_ids: Iterable[int],
-        loaded_mappings: dict[str, ManualMapping],
+        loaded_mappings: Mapping[str, ManualMapping],
         *,
         no_identified_physical_enclosure: bool = False,
     ) -> None:
@@ -12335,6 +12352,10 @@ class InventoryService:
             target_device = normalize_text(item.get("ses_device"))
             target_element = item.get("ses_element_id")
             target_slot_number = item.get("ses_slot_number") if isinstance(item.get("ses_slot_number"), int) else None
+            if target_device and target_device.startswith("/dev/sg") and (
+                type(target_slot_number) is not int or target_slot_number < 0
+            ):
+                continue
             target_pair = (target_host, target_device, target_element if isinstance(target_element, int) else None)
             if target_pair in seen_ses_targets or not target_pair[1] or target_pair[2] is None:
                 continue
@@ -12347,12 +12368,19 @@ class InventoryService:
             if target_host:
                 target_payload["ssh_host"] = target_host
             ses_targets.append(target_payload)
-        if not ses_targets and ses_device and ses_element_id is not None:
+        raw_control_slot = raw_slot_status.get("ses_slot_number")
+        if (
+            not ses_targets and ses_device and ses_element_id is not None
+            and (
+                not ses_device.startswith("/dev/sg")
+                or (type(raw_control_slot) is int and raw_control_slot >= 0)
+            )
+        ):
             ses_targets.append(
                 {
                     "ses_device": ses_device,
                     "ses_element_id": ses_element_id,
-                    "ses_slot_number": slot,
+                    "ses_slot_number": raw_control_slot,
                 }
             )
 
@@ -12601,7 +12629,7 @@ class InventoryService:
                 {
                     "ses_device": slot_view.ssh_ses_device,
                     "ses_element_id": slot_view.ssh_ses_element_id,
-                    "ses_slot_number": slot_view.slot,
+                    "ses_slot_number": None,
                 }
             ]
 
@@ -12610,6 +12638,19 @@ class InventoryService:
                 slot_view.led_reason
                 or f"Bay {slot_view.slot_label} is missing the enclosure details needed to switch its light over SSH."
             )
+
+        # Validate the whole target set before any command, including API
+        # fallback and legacy slot views. Never substitute a UI bay index.
+        for target in ses_targets:
+            target_device = normalize_text(target.get("ses_device"))
+            coordinate = target.get("ses_slot_number")
+            if target_device and target_device.startswith("/dev/sg") and (
+                type(coordinate) is not int or coordinate < 0
+            ):
+                raise TrueNASAPIError(
+                    f"Bay {slot_view.slot_label} has no verified SES device slot number, "
+                    "so its light cannot be switched safely."
+                )
 
         if self.system.truenas.platform == "core":
             authentic_targets = [
@@ -12647,7 +12688,7 @@ class InventoryService:
                 else:
                     raise TrueNASAPIError("The enclosure can only turn the locate light on or off.")
 
-                target_slot = target_slot_number if isinstance(target_slot_number, int) else slot_view.slot
+                target_slot = target_slot_number
                 command = shlex.join(
                     [
                         "sudo",

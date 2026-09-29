@@ -72,7 +72,11 @@ from admin_service.services.esxi_host_prep import (
     STAGING_QUOTA_ERROR,
     HostPrepStagingQuotaError,
 )
-from admin_service.services.runtime_control import DockerRuntimeError
+from admin_service.services.runtime_control import (
+    DockerRuntimeError,
+    RuntimeBusyError,
+    reserve_runtime_targets,
+)
 from admin_service.services.tls_trust import TLSTrustStoreService
 from app import __version__
 from app.config import (
@@ -191,8 +195,14 @@ def build_router(admin_settings: Any) -> APIRouter:
         if container_key == "admin":
             raise HTTPException(status_code=400, detail=admin_detail)
         runtime_service = get_runtime_service()
+        def control() -> None:
+            with reserve_runtime_targets((container_key,)):
+                getattr(runtime_service, f"{action}_container")(container_key)
+
         try:
-            await asyncio.to_thread(getattr(runtime_service, f"{action}_container"), container_key)
+            await run_retained_thread_worker(control)
+        except RuntimeBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except DockerRuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         return JSONResponse({"ok": True, "runtime": await build_runtime_payload(runtime_service)})
@@ -358,6 +368,8 @@ def build_router(admin_settings: Any) -> APIRouter:
                 stop_services=stop_services,
                 restart_services=restart_services,
             )
+        except RuntimeBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except (ValueError, DockerRuntimeError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -394,6 +406,8 @@ def build_router(admin_settings: Any) -> APIRouter:
                 stop_services=stop_services,
                 restart_services=restart_services,
             )
+        except RuntimeBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except (ValueError, DockerRuntimeError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -546,6 +560,8 @@ def build_router(admin_settings: Any) -> APIRouter:
                     result, maintenance = await run_retained_thread_worker(
                         admitted_import,
                     )
+                except RuntimeBusyError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
                 except (ValueError, DockerRuntimeError) as exc:
                     raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1512,7 +1528,7 @@ def build_router(admin_settings: Any) -> APIRouter:
                 return result
 
             try:
-                result = await asyncio.to_thread(fetch)
+                result = await run_retained_thread_worker(fetch)
             except SchedulerUnavailableError:
                 archive_path.unlink(missing_ok=True)
                 workspace.rmdir()

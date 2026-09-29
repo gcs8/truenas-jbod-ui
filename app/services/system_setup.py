@@ -24,6 +24,7 @@ from app.config import (
     normalize_text,
 )
 from app.models.domain import SystemSetupRequest
+from app.secret_files import write_text_atomically
 from app.services.config_change_journal import record_config_change
 from app.services.credential_authority import (
     api_credential_authority,
@@ -654,13 +655,12 @@ class SystemSetupService:
         return loaded
 
     def _write_config(self, payload: dict[str, Any]) -> None:
-        temp_path = self.config_path.with_suffix(".tmp")
-        with temp_path.open("w", encoding="utf-8", newline="\n") as handle:
+        write_text_atomically(
+            self.config_path,
             yaml.safe_dump(
                 payload,
-                handle,
                 default_flow_style=False,
                 sort_keys=False,
                 allow_unicode=False,
-            )
-        temp_path.replace(self.config_path)
+            ),
+        )
