@@ -3248,6 +3248,22 @@ class HistoryResponseContractTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(meta["coverage"], "unknown")
                 self.assertNotIn("Every recorded sample", meta["note"])
 
+        reference_time = datetime(2026, 1, 1, 0, 4, tzinfo=timezone.utc)
+        samples = [
+            {"observed_at": reference_time.replace(minute=minute).isoformat(), "value": minute}
+            for minute in (1, 2, 3)
+        ]
+        exporter = SnapshotExportService(Settings(), self.client, templates)
+        _, meta = exporter._prepare_history_cache_for_export(
+            {"synthetic|front|0": {"available": True, "metrics": {"temperature_c": samples}}},
+            history_window_hours=24,
+            reference_time=reference_time,
+            target_points_per_series=1,
+            max_events_per_slot=None,
+        )
+        self.assertEqual(meta["coverage"], "unknown")
+        self.assertIn("averaged", meta["coverage_note"])
+
     async def test_bounded_history_coverage_real_export_and_estimate(self) -> None:
         for scope_kind in ("single", "multiple", "virtual"):
             for metric_count, event_count in ((14, 10), (15, 11), (16, 11), (15, 12), (16, 12), (0, 0)):

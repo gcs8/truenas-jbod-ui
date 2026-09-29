@@ -1735,6 +1735,8 @@ class SnapshotExportService:
         else:
             coverage_status = "complete"
             coverage_note = "All available samples and events in the selected window are included."
+        if metric_rollup_applied and coverage_status in {"truncated", "unknown"}:
+            coverage_note += " Displayed metric history uses averaged samples, not every recorded sample."
         if coverage_status != "complete" and downsampling["label"] == "None":
             downsampling["note"] = coverage_note
         downsampling.update(coverage=coverage_status, coverage_note=coverage_note)
