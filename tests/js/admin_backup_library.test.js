@@ -7,6 +7,8 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const test = require("node:test");
+const vm = require("node:vm");
+const { loadAdminFunctions, transportNames, restoreNames, restoreResult, jsonResponse } = require("./helpers/admin_transport");
 
 const ROOT = path.resolve(__dirname, "../..");
 const { createBackupLibrary, model } = require(path.join(ROOT, "admin_service/static/admin_backups.js"));
@@ -225,7 +227,7 @@ function fakeApi(overrides = {}) {
     "POST /api/admin/backups/targets/legacy-ftp/test": () => ({ ok: true, detail: "ftp archive destination is writable", duration_ms: 42, provider: "ftp", transport_encrypted: false }),
     "POST /api/admin/backups/targets/offsite-sftp/test": () => ({ ok: false, detail: "connect to sftp://svc:pw@sftp.example.test/srv/x failed" }),
     "POST /api/admin/backups/full-new/restore/inspect": () => ({ ok: true, encryption_mode: "plaintext", inspection_receipt: "receipt-1", aggregate_counts: { systems: 2, profiles: 1 }, exported_at: "2026-09-21T03:00:00Z" }),
-    "POST /api/admin/backups/full-new/restore/import": () => ({ ok: true, stopped_containers: ["ui"], restarted_containers: ["ui"], restart_failures: {} }),
+    "POST /api/admin/backups/full-new/restore/import": () => restoreResult({ stopped_containers: ["ui"], restarted_containers: ["ui"] }),
     "GET /api/admin/backups/lifecycle/plan": () => ({ plan_token: "plan-token-1", expires_at: "2026-09-24T12:00:00Z", items: [
       { id: "cfg-old", location: "offsite-sftp", backup_class: "config", reason: "beyond keep_count 1 (newest #2)", kind: "retention" },
       { id: "full-part", location: "local", backup_class: "full", reason: "unverified for longer than grace 1d (age 2d)", kind: "unverified" },
@@ -250,7 +252,7 @@ function fakeApi(overrides = {}) {
   return { fetchJson, calls, data };
 }
 
-function mount({ api = fakeApi(), confirm = () => true, stopped = false } = {}) {
+function mount({ api = fakeApi(), confirm = () => true, stopped = false, deps = {} } = {}) {
   const doc = fakeDocument();
   const ids = ["root", "heading", "status", "policies", "targets", "storage", "artifacts", "refreshButton", "cleanupButton", "editButton"];
   const elements = {};
@@ -266,10 +268,13 @@ function mount({ api = fakeApi(), confirm = () => true, stopped = false } = {}) 
   root.append(elements.dialog); // nested in the section, as the template does
   const banners = [];
   const refreshes = [];
+  const restoreTransport = loadAdminFunctions(restoreNames, { fetchJson: api.fetchJson });
   const library = createBackupLibrary({
     document: doc,
     elements,
     fetchJson: api.fetchJson,
+    fetchBackupRestore: restoreTransport.fetchBackupRestore,
+    describeBackupRestoreFailure: restoreTransport.describeBackupRestoreFailure,
     formatBytes: (value) => `${value}B`,
     formatLocalTimestamp: (value) => (value ? `T(${value})` : "-"),
     setBanner: (message, tone) => banners.push([message, tone]),
@@ -280,6 +285,7 @@ function mount({ api = fakeApi(), confirm = () => true, stopped = false } = {}) 
     renderMaintenanceResult: (node, lead) => { node.textContent = `${lead}.`; },
     refreshAdminState: async () => { refreshes.push(true); },
     isStopped: () => stopped,
+    ...deps,
   });
   library.bind();
   return { doc, elements, library, api, banners, refreshes };
@@ -831,6 +837,243 @@ test("library copy stays plain and the module has no framework or innerHTML", ()
   }
   assert.doesNotMatch(LIBRARY_SOURCE, /innerHTML|insertAdjacentHTML|\beval\(|new Function/);
   assert.doesNotMatch(LIBRARY_SOURCE, /require\(|import /);
+});
+
+// Restore acceptance uses the actual controller and complete production transport.
+function restoreFixture({ imported = () => jsonResponse(200, restoreResult()), refreshError = false, listError = false, signal } = {}) {
+  const calls = [];
+  const timers = new Map();
+  const navigator = { onLine: true };
+  let timerId = 0;
+  let inspections = 0;
+  let refreshes = 0;
+  let mounted;
+  const receiptAtDispatch = [];
+  const transport = loadAdminFunctions([
+    ...transportNames, ...restoreNames,
+    "describeMaintenanceOutcome", "maintenanceKeys", "describeServices", "serviceName",
+  ], {
+    navigator,
+    setTimeout(callback, ms) { const id = ++timerId; timers.set(id, { callback, ms }); return id; },
+    clearTimeout: (id) => timers.delete(id),
+    fetch: async (url, options) => {
+      calls.push({ url, options });
+      if (url.endsWith("/restore/inspect")) {
+        return jsonResponse(200, { ok: true, encryption_mode: "plaintext", inspection_receipt: `receipt-${++inspections}` });
+      }
+      if (url.includes("/restore/import")) {
+        receiptAtDispatch.push(mounted.library.state.restoreInspection);
+        return imported(url, options);
+      }
+      assert.equal(url, "/api/admin/backups");
+      return listError && refreshes ? jsonResponse(503, { detail: "Synthetic list refresh failed" }) : jsonResponse(200, syntheticLibrary());
+    },
+  });
+  // Caller-signal injection exercises cancellation without replacing transport.
+  const withSignal = (fn) => (url, options = {}) => fn(url, { ...options, signal });
+  mounted = mount({ deps: {
+    fetchJson: withSignal(transport.fetchJson),
+    fetchBackupRestore: withSignal(transport.fetchBackupRestore),
+    describeBackupRestoreFailure: transport.describeBackupRestoreFailure,
+    describeMaintenanceOutcome: transport.describeMaintenanceOutcome,
+    renderMaintenanceResult: (node, lead, outcome) => { node.textContent = `${lead}${outcome.ok ? "." : `, but ${outcome.sentence}`}`; },
+    refreshAdminState: async () => { refreshes++; if (refreshError) throw new Error("Synthetic refresh failed"); },
+  } });
+  return { ...mounted, calls, timers, navigator, receiptAtDispatch,
+    get refreshCount() { return refreshes; },
+    applies: () => calls.filter(({ url }) => url.includes("/restore/import")),
+    expire() { for (const { callback } of [...timers.values()]) callback(); },
+    async prepare(id = "full-new") {
+      if (!mounted.library.state.data) await mounted.library.load();
+      mounted.library.actions.openRestore(id);
+      mounted.elements.dialog.querySelector("#backup-restore-passphrase").value = " synthetic phrase ";
+      await mounted.library.actions.restoreInspect();
+    },
+  };
+}
+
+for (const [name, imported] of [
+  ["transport loss", () => { throw new TypeError("Failed to fetch"); }],
+  ["bad JSON", () => ({ ...jsonResponse(200), json: async () => { throw new SyntaxError("private raw body"); } })],
+  ["wrong-shaped 2xx", () => jsonResponse(200, { unexpected: "value" })],
+  ["ok-only 2xx", () => jsonResponse(200, { ok: true })],
+  ["refused 2xx", () => jsonResponse(200, { ok: false, detail: "No decided restore result" })],
+  ["undecided 5xx", () => jsonResponse(503, { detail: "Service unavailable" })],
+  ["body deadline", () => ({ ...jsonResponse(200), json: () => new Promise(() => {}) })],
+  ["body abort", () => ({ ...jsonResponse(200), json: () => new Promise(() => {}) })],
+]) {
+  test(`library restore preserves unknown outcome after ${name}`, async () => {
+    const controller = new AbortController();
+    const fixture = restoreFixture({ imported, signal: controller.signal });
+    await fixture.prepare();
+    let done = false;
+    const pending = fixture.library.actions.restoreImport().then(() => { done = true; });
+    await settle();
+    if (name === "body deadline") {
+      assert.deepEqual([...fixture.timers.values()].map(({ ms }) => ms), [15 * 60 * 1000]);
+      fixture.expire();
+    }
+    if (name === "body abort") controller.abort();
+    await settle();
+    assert.equal(done, true, "body readers ignoring abort must not retain the restore owner");
+    await pending;
+    const message = fixture.elements.dialog.querySelector(".backup-dialog-result").textContent;
+    assert.match(message, /unknown whether the restore/i);
+    assert.match(message, /check.*before.*restor/i);
+    assert.match(message, /new inspection receipt/i);
+    assert.doesNotMatch(message, /Import failed|Restore failed|private raw body|scheduler isn't running/i);
+    assert.equal(fixture.banners.at(-1)[0], message);
+    assert.equal(fixture.banners.at(-1)[1], "error");
+    assert.equal(fixture.applies().length, 1);
+    assert.equal(fixture.refreshCount, 0);
+    assert.equal(fixture.library.state.restoreInspection, null);
+    assert.deepEqual(fixture.receiptAtDispatch, [null], "receipt retired before transport dispatch");
+    assert.equal(fixture.elements.dialog.querySelector("#backup-restore-passphrase").value, " synthetic phrase ");
+    assert.equal(action(fixture.elements.dialog, "restore-import"), undefined);
+    assert.ok(action(fixture.elements.dialog, "restore-inspect"), "manual retry starts with inspection");
+    await fixture.library.actions.restoreImport();
+    assert.equal(fixture.applies().length, 1, "no direct replay with the consumed receipt");
+    assert.equal(fixture.timers.size, 0);
+    assert.equal(fixture.library.state.pending.size, 0);
+  });
+}
+
+for (const status of [400, 403, 409, 422]) {
+  test(`library restore preserves definite HTTP ${status} refusal and scrubs detail`, async () => {
+    const fixture = restoreFixture({ imported: () => jsonResponse(status, { detail: "Synthetic admission refused at /srv/synthetic/archive" }) });
+    await fixture.prepare();
+    await fixture.library.actions.restoreImport();
+    const message = fixture.banners.at(-1)[0];
+    assert.match(message, /Import failed:.*Synthetic admission refused.*\[path\]/);
+    assert.doesNotMatch(message, /unknown|may or may not|\/srv\//);
+    assert.equal(fixture.refreshCount, 0);
+    assert.equal(fixture.library.state.restoreInspection, null);
+    assert.equal(fixture.applies().length, 1);
+  });
+}
+
+test("library restore refuses locally offline without sending apply", async () => {
+  const fixture = restoreFixture();
+  await fixture.prepare();
+  fixture.navigator.onLine = false;
+  await fixture.library.actions.restoreImport();
+  assert.equal(fixture.applies().length, 0);
+  assert.equal(fixture.refreshCount, 0);
+  assert.match(fixture.banners.at(-1)[0], /offline/i);
+  assert.doesNotMatch(fixture.banners.at(-1)[0], /unknown|may or may not/i);
+  assert.equal(fixture.library.state.restoreInspection, null);
+});
+
+test("library restore deliberate retry requires a fresh inspection and confirmation", async () => {
+  const fixture = restoreFixture({ imported: () => { throw new TypeError("Failed to fetch"); } });
+  await fixture.prepare();
+  await fixture.library.actions.restoreImport();
+  await fixture.library.actions.restoreImport();
+  assert.equal(fixture.applies().length, 1);
+  action(fixture.elements.dialog, "restore-inspect").click();
+  await settle();
+  assert.equal(fixture.applies().length, 1, "inspection does not automatically replay apply");
+  assert.match(fixture.elements.dialog.textContent, /Continue\?/);
+  action(fixture.elements.dialog, "restore-import").click();
+  await settle();
+  assert.deepEqual(fixture.applies().map(({ options }) => options.headers["X-Backup-Inspection-Receipt"]), ["receipt-1", "receipt-2"]);
+});
+
+for (const failures of [{}, { ui: "Synthetic start failure" }]) {
+  test(`library restore accepts decided success with restart failures ${JSON.stringify(failures)}`, async () => {
+    const fixture = restoreFixture({ imported: () => jsonResponse(200, restoreResult({ systems: [], default_system_id: null, stopped_containers: ["ui"], restarted_containers: Object.keys(failures).length ? [] : ["ui"], restart_failures: failures })) });
+    await fixture.prepare();
+    await fixture.library.actions.restoreImport();
+    assert.match(fixture.banners.at(-1)[0], /^Backup restored/);
+    assert.equal(fixture.banners.at(-1)[1], Object.keys(failures).length ? "error" : "success");
+    assert.match(fixture.elements.dialog.querySelector(".backup-dialog-result").textContent, /^Restored/);
+    assert.equal(fixture.refreshCount, 1);
+    assert.equal(fixture.elements.dialog.querySelector("#backup-restore-passphrase").value, "");
+    assert.deepEqual(fixture.receiptAtDispatch, [null]);
+    assert.equal(fixture.applies().length, 1);
+  });
+}
+
+for (const failure of ["refreshError", "listError"]) {
+  test(`library decided restore survives ${failure}`, async () => {
+    const fixture = restoreFixture({ [failure]: true });
+    await fixture.prepare();
+    await fixture.library.actions.restoreImport();
+    assert.match(fixture.elements.dialog.querySelector(".backup-dialog-result").textContent, /^Restored/);
+    assert.match(fixture.banners.at(-1)[0], /^Backup restored/);
+    assert.doesNotMatch(fixture.banners.at(-1)[0], /Restore failed|Import failed|unknown whether/i);
+    if (failure === "refreshError") assert.match(fixture.banners.at(-1)[0], /refresh/i);
+    else assert.match(fixture.elements.status.textContent, /unavailable|running/i);
+    assert.equal(fixture.applies().length, 1);
+  });
+}
+
+test("library restore holds duplicate requests to one admitted apply and retires receipt first", async () => {
+  let release;
+  const fixture = restoreFixture({ imported: () => new Promise((resolve) => { release = resolve; }) });
+  await fixture.prepare();
+  const first = fixture.library.actions.restoreImport();
+  const second = fixture.library.actions.restoreImport();
+  assert.equal(first, second);
+  await settle();
+  assert.equal(fixture.applies().length, 1);
+  assert.equal(fixture.library.state.restoreInspection, null);
+  assert.deepEqual(fixture.receiptAtDispatch, [null]);
+  const third = fixture.library.actions.restoreImport();
+  assert.equal(first, third, "pending ownership remains after receipt retirement");
+  release(jsonResponse(200, restoreResult()));
+  await first;
+  assert.equal(fixture.refreshCount, 1);
+});
+
+for (const timing of ["before queuing", "after queuing"]) {
+  test(`library restore cancelled ${timing} cannot dispatch from a closed dialog`, async () => {
+    const fixture = restoreFixture();
+    await fixture.prepare();
+    if (timing === "before queuing") fixture.library.actions.closeDialog();
+    const pending = fixture.library.actions.restoreImport();
+    if (timing === "after queuing") fixture.library.actions.closeDialog();
+    await pending;
+    assert.equal(fixture.applies().length, 0);
+    assert.equal(fixture.banners.length, 0);
+  });
+}
+
+for (const success of [true, false]) {
+  test(`library stale restore ${success ? "success" : "failure"} cannot overwrite a successor dialog`, async () => {
+    let release;
+    const fixture = restoreFixture({ imported: () => new Promise((resolve) => { release = resolve; }) });
+    await fixture.prepare();
+    const pending = fixture.library.actions.restoreImport();
+    await settle();
+    fixture.library.actions.closeDialog();
+    await fixture.prepare("cfg-new");
+    const successorInspection = fixture.library.state.restoreInspection;
+    const successorText = fixture.elements.dialog.textContent;
+    release(success ? jsonResponse(200, restoreResult()) : jsonResponse(503, { detail: "Service unavailable" }));
+    await pending;
+    assert.equal(fixture.library.state.restoreInspection, successorInspection);
+    assert.equal(fixture.elements.dialog.textContent, successorText);
+    assert.equal(fixture.elements.dialog.querySelector("#backup-restore-passphrase").value, " synthetic phrase ");
+    assert.equal(fixture.banners.length, 0, "stale dialog does not publish banners into a successor operation");
+    assert.equal(fixture.refreshCount, 0);
+    assert.equal(fixture.applies().length, 1);
+  });
+}
+
+test("admin library mount injects the production restore transport and outcome formatter", () => {
+  const context = loadAdminFunctions([...transportNames, ...restoreNames], {
+    document: { getElementById: () => null },
+    formatBytes() {}, formatLocalTimestamp() {}, setBanner() {}, encodeUtf8Base64() {},
+    describeBackupRestoreConfirmation() {}, describeMaintenanceOutcome() {}, renderMaintenanceResult() {},
+    window: { AdminBackupLibrary: { createBackupLibrary(deps) { context.captured = deps; return null; } } },
+  });
+  const start = ADMIN_SOURCE.indexOf("  const backupLibrary = window.AdminBackupLibrary");
+  const end = ADMIN_SOURCE.indexOf("  backupLibrary?.bind();", start);
+  assert.ok(start > 0 && end > start);
+  vm.runInContext(ADMIN_SOURCE.slice(start, end), context);
+  assert.equal(context.captured.fetchBackupRestore, context.fetchBackupRestore);
+  assert.equal(context.captured.describeBackupRestoreFailure, context.describeBackupRestoreFailure);
 });
 
 // ------------------------------------------------ settings editor (#573) --

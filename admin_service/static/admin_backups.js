@@ -1200,14 +1200,19 @@
       const id = state.dialogArtifactId;
       const scope = dialogScope();
       const inspection = state.restoreInspection;
-      if (!inspection) return Promise.resolve();
+      if (isPending(`restore:${id}`)) return state.pending.get(`restore:${id}`);
+      if (!inspection || !scope.live()) return Promise.resolve();
       return once(`restore:${id}`, async () => {
+        if (!scope.live() || state.restoreInspection !== inspection) return;
+        // An admitted apply may consume the receipt even if its reply is lost.
+        // Never retain it for a retry; the operator must check the backup again.
+        state.restoreInspection = null;
         const stopServices = Boolean(els.dialog?.querySelector("#backup-restore-stop")?.checked);
         const restartServices = stopServices && Boolean(els.dialog?.querySelector("#backup-restore-restart")?.checked);
         scope.result("Restoring...");
         scope.actions(cancelButton("Close"));
         try {
-          const payload = await deps.fetchJson(
+          const payload = await deps.fetchBackupRestore(
             `${artifactUrl(id, "/restore/import")}?stop_services=${String(stopServices)}&restart_services=${String(restartServices)}`,
             {
               method: "POST",
@@ -1219,7 +1224,7 @@
               timeoutMs: LONG_TIMEOUT_MS,
             }
           );
-          state.restoreInspection = null;
+          if (!scope.live()) return;
           const outcome = deps.describeMaintenanceOutcome({
             stopped: payload.stopped_containers,
             restarted: payload.restarted_containers,
@@ -1232,11 +1237,20 @@
           setBanner(outcome.ok ? "Backup restored." : `Backup restored, but ${outcome.sentence}`, outcome.ok ? "success" : "error");
           const passphrase = els.dialog?.querySelector("#backup-restore-passphrase");
           if (passphrase) passphrase.value = "";
-          await deps.refreshAdminState?.();
-          await load({ quiet: true });
+          try {
+            await deps.refreshAdminState?.();
+            await load({ quiet: true });
+          } catch (_) {
+            if (scope.live()) {
+              setBanner("Backup restored, but the page could not refresh. Refresh to check the current settings and service status.", "error");
+            }
+          }
         } catch (error) {
-          scope.result(`Restore failed: ${errorText(error)}`);
-          setBanner(`Restore failed: ${errorText(error)}`, "error");
+          if (!scope.live()) return;
+          const message = scrubText(deps.describeBackupRestoreFailure(error));
+          scope.result(message);
+          scope.actions(primary("Check backup", "restore-inspect"), cancelButton("Close"));
+          setBanner(message, "error");
         }
       });
     }

@@ -259,6 +259,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Kept admin JSON response reads within request deadlines and cancellation,
+  validated both restore callers' results, and preserved uncertain outcomes
+  without retrying consumed inspection receipts. (#745)
 - Refuse unsupported SQLite schemas before segmented migration creates output,
   and preserve rollback authority so interrupted cleanup can resume. (#754)
 - Exclude display labels from disk-retention identity so distinct disks sharing
