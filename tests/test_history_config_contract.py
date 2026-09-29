@@ -228,8 +228,12 @@ class HistoryComposeMigrationTests(unittest.TestCase):
         from app.services.history_backend import HistoryBackendClient
 
         binary = os.environ.get("COMPOSE_BINARY") or shutil.which("docker-compose")
-        if not binary:
-            self.skipTest("Standalone Compose unavailable; token migration not validated")
+        if binary:
+            compose = [binary]
+        elif shutil.which("docker"):
+            compose = ["docker", "compose"]
+        else:
+            self.skipTest("Compose unavailable; token migration not validated")
         document = (ROOT / "docs/HISTORY_COMPOSE_MIGRATION.md").read_text()
         policy = next(block for block in re.findall(r"```yaml\n(.*?)```", document, re.S)
                       if "HISTORY_REFRESH_AUTH_MODE" in block)
@@ -251,6 +255,14 @@ class HistoryComposeMigrationTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory(prefix="history-token-migration-") as temporary:
             root = Path(temporary)
+            clean = {"PATH": os.environ.get("PATH", ""), "HOME": temporary,
+                     "TMPDIR": temporary, "DOCKER_CONFIG": str(root / "docker-config"),
+                     "DOCKER_HOST": "tcp://127.0.0.1:1"}
+            # Probe the plugin with the render environment: a per-user plugin
+            # under the real HOME or DOCKER_CONFIG is not visible to render().
+            if compose == ["docker", "compose"] and subprocess.run(
+                    compose + ["version"], env=clean, capture_output=True, timeout=30).returncode:
+                self.skipTest("Compose plugin unavailable; token migration not validated")
             shutil.copyfile(self.LEGACY, root / "compose.yaml")
             shutil.copyfile(self.OVERLAY, root / self.OVERLAY.name)
             (root / "auth.yml").write_text(policy)
@@ -283,12 +295,9 @@ class HistoryComposeMigrationTests(unittest.TestCase):
             (root / "last.yml").write_text(yaml.safe_dump({"services": {
                 "enclosure-history": {"labels": {"fixture.order": "last"}, "mem_limit": "512m"},
             }}))
-            clean = {"PATH": os.environ.get("PATH", ""), "HOME": temporary,
-                     "TMPDIR": temporary, "DOCKER_CONFIG": str(root / "docker-config"),
-                     "DOCKER_HOST": "tcp://127.0.0.1:1"}
 
             def render(files, shell, chain):
-                command = [binary, "--project-name", "token-migration"]
+                command = compose + ["--project-name", "token-migration"]
                 for name in files:
                     command.extend(["--env-file", str(root / name)])
                 for name in chain:

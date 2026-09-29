@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -16,7 +18,7 @@ from admin_service import routes as admin_routes
 from app import main as app_main
 from app import routes as app_routes
 from app import route_support as app_route_support
-from app.config import Settings, SystemConfig
+from app.config import PathConfig, Settings, SystemConfig, TrueNASConfig
 from app.models.domain import (
     InventorySnapshot,
     StorageViewRuntimePayload,
@@ -25,6 +27,7 @@ from app.models.domain import (
     SystemOption,
 )
 from app.services.inventory_registry import InventoryRegistry, SystemNotConfiguredError
+from app.services.truenas_ws import TrueNASRawData, TrueNASWebsocketClient
 
 
 UNKNOWN_SYSTEM_ID = "retired-nas"
@@ -92,6 +95,68 @@ def _request(path: str = "/") -> Request:
             "app": app_main.app,
         }
     )
+
+
+class CorruptCacheRouteTests(unittest.TestCase):
+    def test_fresh_registry_serves_inventory_and_health_with_invalid_utf8_cache(self) -> None:
+        for original in (b"\xff", b'{"slot_details": "\xe2\x82'):
+            for path in ("/api/inventory", "/healthz"):
+                with self.subTest(original=original, path=path), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    cache = root / "slot_detail_cache.json"
+                    cache.write_bytes(original)
+                    settings = Settings(
+                        systems=[SystemConfig(id="system-a", truenas=TrueNASConfig(platform="core"))],
+                        default_system_id="system-a",
+                        paths=PathConfig(
+                            mapping_file=str(root / "mappings.json"),
+                            sas_fabric_alias_file=str(root / "aliases.json"),
+                            slot_detail_cache_file=str(cache),
+                            profile_file=str(root / "profiles.yaml"),
+                            log_file=str(root / "app.log"),
+                        ),
+                    )
+                    # No predecessor: construction must really prune the malformed cache.
+                    registry = InventoryRegistry(settings)
+                    self.assertEqual(cache.read_bytes(), original)
+                    # Real service and snapshot builder, only invented transport answers.
+                    # SSH/BMC stay disabled; health's unrelated probes never reach live state.
+                    raw = TrueNASRawData(
+                        enclosures=[], disks=[], pools=[], disk_temperatures={}, smart_test_results=[],
+                    )
+                    with (
+                        patch.object(TrueNASWebsocketClient, "fetch_all", new_callable=AsyncMock, return_value=raw) as fetch,
+                        patch.object(app_routes, "get_inventory_registry", return_value=registry),
+                        patch.object(app_routes, "get_settings", return_value=settings),
+                        patch.object(app_routes, "refresh_storage_problems", return_value=[]),
+                        patch.object(app_routes, "history_service_problem", return_value=None),
+                        patch.object(app_routes, "backup_archive_problems", return_value=[]),
+                        patch.object(app_routes, "known_hosts_warnings_for", return_value=[]),
+                        patch.object(app_routes, "config_reload_problems", return_value=[]),
+                    ):
+                        async def request_routes():
+                            if path == "/api/inventory":
+                                response = await _route(app_main.app, path).endpoint(
+                                    request=_request(path), force=False, system_id=None, enclosure_id=None,
+                                )
+                                self.assertEqual(response.status_code, 200)
+                                payload = json.loads(bytes(response.body))
+                                self.assertEqual(payload["selected_system_id"], "system-a")
+                                self.assertTrue(payload["sources"]["api"]["ok"])
+                            return await _route(app_main.app, "/healthz").endpoint(request=_request("/healthz"))
+
+                        health = asyncio.run(request_routes())
+                    self.assertEqual(health.status_code, 200)
+                    payload = json.loads(bytes(health.body))
+                    self.assertEqual(payload["status"], "ok")
+                    self.assertEqual(payload["problems"], [])
+                    if path == "/api/inventory":
+                        fetch.assert_awaited_once()
+                        self.assertEqual(payload["dependency_status"], "ok")
+                    else:
+                        fetch.assert_not_awaited()
+                        self.assertEqual(payload["cache_state"], "empty")
+                    self.assertEqual(cache.read_bytes(), original)
 
 
 class InventoryRegistrySelectionTests(unittest.TestCase):

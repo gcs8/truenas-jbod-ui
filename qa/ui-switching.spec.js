@@ -1,4 +1,5 @@
 const { test, expect } = require("@playwright/test");
+const { waitForSelectedScope, refreshSelectedScope, switchSelectedScope } = require("./release-readiness");
 
 const liveApplianceQaEnabled = process.env.PLAYWRIGHT_LIVE_APPLIANCE_QA === "1";
 
@@ -17,6 +18,7 @@ async function gotoApp(page) {
   await page.goto("/", { waitUntil: "domcontentloaded" });
   await expect(page.locator("#system-select")).toBeVisible();
   await expect(page.locator("#slot-grid")).toBeVisible();
+  await waitForSelectedScope(page);
 }
 
 function isLiveEnclosureValue(value) {
@@ -65,43 +67,23 @@ async function setAutoRefresh(page, enabled) {
 
 async function waitForRefreshToSettle(page, reason, previousRunId = null) {
   if (await uiPerfEnabled(page)) {
-    try {
-      await page.waitForFunction(
-        ([expectedReason, previousId]) => {
-          const latest = window.__JBOD_UI_PERF?.recentRuns?.[0];
-          return Boolean(
-            latest &&
-              latest.reason === expectedReason &&
-              latest.status === "done" &&
-              latest.id !== previousId
-          );
-        },
-        [reason, previousRunId],
-        { timeout: SYSTEM_SETTLE_TIMEOUT_MS }
-      );
-    } catch (error) {
-      // Fall back to the visible UI settled state when perf telemetry misses a run.
-    }
+    await page.waitForFunction(
+      ([expectedReason, previousId]) => {
+        const latest = window.__JBOD_UI_PERF?.recentRuns?.[0];
+        return Boolean(latest && latest.reason === expectedReason && latest.status === "done"
+          && latest.id !== previousId && latest.systemId === document.getElementById("system-select").value);
+      },
+      [reason, previousRunId],
+      { timeout: SYSTEM_SETTLE_TIMEOUT_MS }
+    );
   }
-}
-
-async function waitForSelectorScopeToSettle(page, selector, value) {
-  await expect(page.locator(selector)).toHaveValue(value);
-  await expect(page.locator("#slot-grid")).toBeVisible();
-  await expect(page.locator("#status-text")).toHaveText(/Inventory updated\.|Ready\./, {
-    timeout: SYSTEM_SETTLE_TIMEOUT_MS,
-  });
 }
 
 async function switchSelect(page, selector, value, reason = null) {
-  const previousRunId = reason ? (await latestUiPerfRun(page))?.id || null : null;
-  await page.locator(selector).selectOption(value);
-  if (reason) {
-    await waitForRefreshToSettle(page, reason, previousRunId);
-    await waitForSelectorScopeToSettle(page, selector, value);
-    return;
-  }
-  await waitForSelectorScopeToSettle(page, selector, value);
+  const changed = (await page.locator(selector).inputValue()) !== value;
+  const previousRunId = (await latestUiPerfRun(page))?.id || null;
+  await switchSelectedScope(page, selector, value);
+  if (reason && changed) await waitForRefreshToSettle(page, reason, previousRunId);
 }
 
 async function switchSystem(page, value) {
@@ -236,14 +218,10 @@ test.describe("browser qa smoke", () => {
     const previousRunId = (await latestUiPerfRun(page))?.id || null;
     await tile.focus();
 
-    const inventoryResponse = page.waitForResponse((response) => {
-      const url = new URL(response.url());
-      return url.pathname === "/api/inventory" && url.searchParams.get("force") === "true";
-    });
-    await page.evaluate(() => document.getElementById("refresh-button").click());
-    await inventoryResponse;
-    await expect(page.locator("#status-text")).toContainText("Inventory updated", {
-      timeout: SYSTEM_SETTLE_TIMEOUT_MS,
+    const systemId = await page.locator("#system-select").inputValue();
+    const params = new URL(page.url()).searchParams;
+    await refreshSelectedScope(page, () => page.evaluate(() => document.getElementById("refresh-button").click()), {
+      systemId, enclosureId: params.get("enclosure_id"), viewId: params.get("storage_view_id"), force: true,
     });
     await waitForRefreshToSettle(page, "manual-refresh", previousRunId);
     if (await uiPerfEnabled(page)) {
@@ -262,12 +240,17 @@ test.describe("browser qa smoke", () => {
     await gotoApp(page);
 
     await expect(page.locator("#refresh-timing-strip")).toBeVisible();
-    await expect(page.locator("#cache-timing-chips")).toBeVisible();
-    await expect(page.locator('[data-cache-timing-key="snapshot"]')).toContainText("Snapshot");
-    await expect(page.locator('[data-cache-timing-key="sources"]')).toContainText("Sources");
-    await expect(page.locator('[data-cache-timing-key="smart"]')).toContainText("SMART");
-    await expect(page.locator('[data-cache-timing-key="ses"]')).toContainText("SES Paths");
-    await expect(page.locator(".cache-timing-chip-bar")).toHaveCount(4);
+    if (await uiPerfEnabled(page)) {
+      await expect(page.locator("#cache-timing-chips")).toBeVisible();
+      await expect(page.locator('[data-cache-timing-key="snapshot"]')).toContainText("Snapshot");
+      await expect(page.locator('[data-cache-timing-key="sources"]')).toContainText("Sources");
+      await expect(page.locator('[data-cache-timing-key="smart"]')).toContainText("SMART");
+      await expect(page.locator('[data-cache-timing-key="ses"]')).toContainText("Enclosure paths");
+      await expect(page.locator(".cache-timing-chip-bar")).toHaveCount(4);
+    } else {
+      await expect(page.locator("#cache-timing-chips")).toBeHidden();
+      await expect(page.locator(".cache-timing-chip-bar")).toHaveCount(0);
+    }
 
     await page.locator("#refresh-interval-select").selectOption("15");
     await expect(page.locator("#refresh-countdown-label")).toContainText(/Next refresh/);
@@ -666,9 +649,7 @@ test.describe("browser qa smoke", () => {
         }
         await expect(page.locator("#enclosure-select")).toHaveValue(enclosureId);
         await expect(page.locator("#slot-grid")).toBeVisible();
-        await expect(page.locator("#status-text")).toHaveText(/Inventory updated\.|Ready\./, {
-          timeout: SYSTEM_SETTLE_TIMEOUT_MS,
-        });
+        await waitForSelectedScope(page, { systemId, enclosureValue: enclosureId });
       }
     }
   });
@@ -774,7 +755,7 @@ test.describe("browser qa smoke", () => {
     await switchEnclosure(page, `view:${target.viewId}`);
     await expect(page.locator("#slot-grid .slot-tile.selected")).toHaveCount(0);
     await expect(page.locator("#detail-empty")).toBeVisible();
-    await expect(page.locator("#detail-empty")).toContainText("Select a slot tile");
+    await expect(page.locator("#detail-empty")).toHaveText("Click a bay to see its disk.");
     await expect(page.locator("#detail-content")).toBeHidden();
     await expect(page.locator("#detail-secondary")).toBeVisible();
     await expect(page.locator("#history-toggle-button")).toBeHidden();
@@ -812,7 +793,7 @@ test.describe("browser qa smoke", () => {
     await page.locator(".enclosure-face").click({ position: { x: 40, y: 40 } });
     await expect(page.locator("#slot-grid .slot-tile.selected")).toHaveCount(0);
     await expect(page.locator("#detail-empty")).toBeVisible();
-    await expect(page.locator("#detail-empty")).toContainText("Select a slot tile");
+    await expect(page.locator("#detail-empty")).toHaveText("Click a bay to see its disk.");
     await expect(page.locator("#detail-content")).toBeHidden();
     await expect(page.locator("#detail-secondary")).toBeVisible();
     await expect(page.locator("#history-toggle-button")).toBeHidden();
