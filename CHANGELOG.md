@@ -259,6 +259,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Keep automatic config-backup hashes, captured files and source-path selection
+  on the same generation so intervening edits cannot suppress a later backup. (#768)
 - Compared per-slot history `since` filters in UTC so a non-UTC offset no
   longer excludes later rows. (#799)
 - Made the backup archive format a choice in the admin Backups settings editor

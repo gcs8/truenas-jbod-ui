@@ -5,8 +5,9 @@ profile, rename) appends one entry to a small append-only journal. A
 :class:`ConfigBackupCoalescer` waits for a quiet period after the last change
 (capped by a maximum delay so a constant stream of edits still gets backed up),
 hashes the canonical config set, and only when that hash differs from the last
-config backup calls the injected ``make_backup(change_ids)`` callback. The
-entries are then marked committed to that backup id, or committed as ``noop``
+config backup calls the injected ``make_backup(change_ids, snapshot)`` callback,
+which must archive that captured generation rather than reread live config.
+Entries are then marked committed to that backup id, or committed as ``noop``
 when the content hash did not change (an edit and its revert, or a re-save that
 only moved a timestamp). A burst of twenty edits makes one backup, never twenty
 identical copies.
@@ -849,7 +850,7 @@ class ConfigBackupCoalescer:
         journal: ChangeJournal,
         *,
         snapshot_config: Callable[[], Mapping[str, Any]],
-        make_backup: Callable[[tuple[str, ...]], Any],
+        make_backup: Callable[[tuple[str, ...], Mapping[str, Any]], Any],
         clock: Callable[[], float] = time.monotonic,
         quiet_period: float = DEFAULT_QUIET_PERIOD_SECONDS,
         max_delay: float = DEFAULT_MAX_DELAY_SECONDS,
@@ -990,7 +991,8 @@ class ConfigBackupCoalescer:
             return CoalescerResult(status="idle")
         change_ids = tuple(entry.change_id for entry in pending)
         try:
-            config_hash = canonical_config_hash(self._snapshot_config(), self.volatile_keys)
+            snapshot = self._snapshot_config()
+            config_hash = canonical_config_hash(snapshot, self.volatile_keys)
         except Exception as exc:  # the snapshot callback is integration code
             return self._record_failure(change_ids, f"config snapshot failed: {type(exc).__name__}")
         last_hash, _ = self.journal.last_backup()
@@ -1002,7 +1004,8 @@ class ConfigBackupCoalescer:
             self._record_success(change_ids)
             return CoalescerResult(status="noop", change_ids=change_ids, config_hash=config_hash)
         try:
-            record = self._make_backup(change_ids)
+            # The builder must consume this capture, not reread the live config.
+            record = self._make_backup(change_ids, snapshot)
             backup_id = _artifact_id(record)
         except Exception as exc:  # the backup callback is integration code
             return self._record_failure(change_ids, f"config backup failed: {type(exc).__name__}")

@@ -7,6 +7,7 @@ import os
 import re
 import threading
 import types
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal, Union, get_args, get_origin
 
@@ -887,19 +888,28 @@ def _set_path_value(target: dict[str, Any], path: tuple[str, ...], value: Any) -
     cursor[path[-1]] = value
 
 
-def _load_yaml_config(config_path: Path) -> dict[str, Any]:
-    if not config_path.exists():
-        return {}
+def _load_yaml_config(
+    config_path: Path, *, captured_files: Mapping[Path, bytes | None] | None = None,
+) -> dict[str, Any]:
+    if captured_files is not None and config_path.absolute() in captured_files:
+        content = captured_files[config_path.absolute()]
+        if content is None:
+            return {}
+        loaded = yaml.safe_load(content.decode("utf-8")) or {}
+    else:
+        if not config_path.exists():
+            return {}
+        with config_path.open("r", encoding="utf-8") as handle:
+            loaded = yaml.safe_load(handle) or {}
+    if not isinstance(loaded, dict):
+        raise ValueError(f"Config file {config_path} must contain a YAML mapping.")
+    return loaded
 
-    with config_path.open("r", encoding="utf-8") as handle:
-        loaded = yaml.safe_load(handle) or {}
-        if not isinstance(loaded, dict):
-            raise ValueError(f"Config file {config_path} must contain a YAML mapping.")
-        return loaded
 
-
-def _load_runtime_overrides_config(config_path: Path) -> dict[str, Any]:
-    loaded = _load_yaml_config(config_path)
+def _load_runtime_overrides_config(
+    config_path: Path, *, captured_files: Mapping[Path, bytes | None] | None = None,
+) -> dict[str, Any]:
+    loaded = _load_yaml_config(config_path, captured_files=captured_files)
     app_payload = loaded.get("app")
     if not isinstance(app_payload, dict):
         return {}
@@ -1075,12 +1085,19 @@ def save_runtime_behavior_overrides(settings: Settings, values: dict[str, Any]) 
     return runtime_behavior_settings_payload(get_settings())
 
 
-def _load_profile_yaml(profile_path: Path) -> dict[str, Any]:
-    if not profile_path.exists():
-        return {}
-
-    with profile_path.open("r", encoding="utf-8") as handle:
-        loaded = yaml.safe_load(handle) or {}
+def _load_profile_yaml(
+    profile_path: Path, *, captured_files: Mapping[Path, bytes | None] | None = None,
+) -> dict[str, Any]:
+    if captured_files is not None and profile_path.absolute() in captured_files:
+        content = captured_files[profile_path.absolute()]
+        if content is None:
+            return {}
+        loaded = yaml.safe_load(content.decode("utf-8")) or {}
+    else:
+        if not profile_path.exists():
+            return {}
+        with profile_path.open("r", encoding="utf-8") as handle:
+            loaded = yaml.safe_load(handle) or {}
 
     if isinstance(loaded, list):
         return {"profiles": loaded}
@@ -1366,19 +1383,27 @@ def replace_settings(settings: Settings) -> None:
 get_settings.cache_clear = _clear_settings_cache  # type: ignore[attr-defined]
 
 
-def load_settings(*, running_restart_only: Settings | None = None) -> Settings:
+def load_settings(
+    *, running_restart_only: Settings | None = None,
+    captured_files: Mapping[Path, bytes | None] | None = None,
+) -> Settings:
     """Read and validate config.yaml, runtime-overrides.yaml, profiles.yaml and .env.
 
     During live reload, dependent profile content stays on the running
     restart-only path. The pending path is still validated and reported as a
     restart-only change, but its content is not combined with the old process's
     open stores and paths.
+
+    A scheduled config export can supply its hashed documents, including absent
+    files, so path selection and profile validation use that same generation.
+    Other files remain live; this does not expand the scheduler's hash set.
+    This uncached load does not publish captured settings to the running app.
     """
     defaults = Settings().model_dump()
     config_path = Path(os.getenv("APP_CONFIG_PATH", defaults["config_file"]))
-    yaml_config = _load_yaml_config(config_path)
+    yaml_config = _load_yaml_config(config_path, captured_files=captured_files)
     runtime_overrides_path = Path(_derive_runtime_layout_paths(config_path)["runtime_overrides_file"])
-    runtime_overrides = _load_runtime_overrides_config(runtime_overrides_path)
+    runtime_overrides = _load_runtime_overrides_config(runtime_overrides_path, captured_files=captured_files)
     for key, suggestion in collect_unknown_config_key_suggestions(yaml_config):
         logger.warning("%s", _unknown_key_message(config_path, key, suggestion))
     merged = _deep_merge(defaults, yaml_config)
@@ -1423,8 +1448,13 @@ def load_settings(*, running_restart_only: Settings | None = None) -> Settings:
     # as-is so validation reports it as a configuration error.
     inline_raw = merged.get("profiles") or []
     inline_profiles = list(inline_raw) if isinstance(inline_raw, list) else None
-    if profile_path.exists() and inline_profiles is not None:
-        profile_config = _load_profile_yaml(profile_path)
+    profile_present = (
+        captured_files[profile_path.absolute()] is not None
+        if captured_files is not None and profile_path.absolute() in captured_files
+        else profile_path.exists()
+    )
+    if profile_present and inline_profiles is not None:
+        profile_config = _load_profile_yaml(profile_path, captured_files=captured_files)
         merged["profiles"] = [*inline_profiles, *(profile_config.get("profiles") or [])]
     # A pending restart-only profile path never supplies live profiles, but
     # the next start will read it. Refuse the edit now if that file would
@@ -1437,7 +1467,7 @@ def load_settings(*, running_restart_only: Settings | None = None) -> Settings:
         and inline_profiles is not None
     ):
         try:
-            pending_config = _load_profile_yaml(pending_profile_path)
+            pending_config = _load_profile_yaml(pending_profile_path, captured_files=captured_files)
         except (OSError, yaml.YAMLError, ValueError) as exc:
             raise ConfigurationError(
                 [f"paths.profile_file in {config_path}: the new profile file cannot be loaded ({type(exc).__name__})."]
