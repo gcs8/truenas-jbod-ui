@@ -259,6 +259,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Prevented a delayed page load from restoring a dismissed upgrade notice
+  by serializing notice state transitions within the server process. (#761)
 - Preserved physical bay-label numbering when cloning or editing enclosure
   profiles without changing internal slot IDs or hardware targets. (#762)
 - Refresh history recovery warnings and quarantine time on accepted dashboard
