@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import stat
 import tempfile
 import unittest
 from collections.abc import Iterator
@@ -12,7 +13,7 @@ import yaml
 
 from admin_service.config import get_admin_settings
 from app.config import ENV_OVERRIDES as APP_ENV_OVERRIDES
-from app.config import AppConfig, build_unknown_config_key_warnings, get_settings
+from app.config import AppConfig, build_unknown_config_key_warnings, get_settings, save_runtime_behavior_overrides
 from app.config_errors import ConfigurationError
 from app.read_ui_auth_config import load_read_ui_auth_settings
 from history_service.config import get_history_settings
@@ -61,6 +62,96 @@ class _LoaderTestCase(unittest.TestCase):
             _clear_loader_caches()
 
 
+class SettingsAcquisitionTests(_LoaderTestCase):
+    def test_captured_yaml_wins_while_uncaptured_paths_use_the_admitted_reader(self) -> None:
+        from app.config import load_settings
+
+        with self.main_ui_environment({}, "app: {refresh_interval_seconds: 12}\n") as config:
+            runtime = config.parent / "runtime-overrides.yaml"
+            profile = config.parent / "profiles.yaml"
+            runtime.write_text("app: {snapshot_cache_ttl_seconds: 33}\n", encoding="utf-8")
+            profile.write_text("profiles: []\n", encoding="utf-8")
+            captured_config = b"app: {refresh_interval_seconds: 47}\n"
+            seen = []
+
+            def read_yaml(path):
+                seen.append(path)
+                return path.read_bytes() if path.exists() else None
+
+            settings = load_settings(
+                create_directories=False,
+                read_yaml_file=read_yaml,
+                captured_files={config.absolute(): captured_config, runtime.absolute(): None},
+            )
+            self.assertEqual(settings.app.refresh_interval_seconds, 47)
+            self.assertEqual(settings.app.snapshot_cache_ttl_seconds, 10)
+            self.assertEqual(seen, [profile])
+            self.assertFalse(Path(settings.paths.mapping_file).parent.exists())
+
+            seen.clear()
+            settings = load_settings(
+                create_directories=False,
+                read_yaml_file=read_yaml,
+                captured_files={config.absolute(): captured_config},
+            )
+            self.assertEqual(settings.app.snapshot_cache_ttl_seconds, 33)
+            self.assertEqual(seen, [runtime, profile])
+
+    def test_readonly_loader_uses_one_reader_for_all_yaml_without_changing_cache(self) -> None:
+        from app.config import load_settings
+
+        with self.main_ui_environment({"APP_REFRESH_INTERVAL": "51"}, "app: {refresh_interval_seconds: 32}\n") as config:
+            runtime = config.parent / "runtime-overrides.yaml"
+            profile = config.parent / "profiles.yaml"
+            runtime.write_text("app: {refresh_interval_seconds: 42}\n", encoding="utf-8")
+            profile.write_text("profiles: []\n", encoding="utf-8")
+            seen = []
+
+            def read_yaml(path):
+                seen.append(path)
+                return path.read_bytes() if path.exists() else None
+
+            settings = load_settings(create_directories=False, read_yaml_file=read_yaml)
+            self.assertEqual(seen, [config, runtime, profile])
+            self.assertEqual(settings.app.refresh_interval_seconds, 51)
+            self.assertFalse(Path(settings.paths.mapping_file).parent.exists())
+            self.assertFalse(Path(settings.paths.log_file).parent.exists())
+            cached = get_settings()
+            self.assertTrue(Path(cached.paths.mapping_file).parent.is_dir())
+            self.assertTrue(Path(cached.paths.log_file).parent.is_dir())
+            self.assertEqual(cached.model_dump(), settings.model_dump())
+            runtime.write_text("app: {snapshot_cache_ttl_seconds: 35}\n", encoding="utf-8")
+            fresh = load_settings(create_directories=False, read_yaml_file=read_yaml)
+            self.assertEqual(fresh.app.snapshot_cache_ttl_seconds, 35)
+            self.assertIs(get_settings(), cached)
+            get_settings.cache_clear()
+            self.assertEqual(get_settings().app.snapshot_cache_ttl_seconds, 35)
+
+    def test_readonly_loader_reader_covers_running_and_pending_profiles(self) -> None:
+        from app.config import load_settings
+
+        with self.main_ui_environment({}, "profiles: []\n") as config:
+            running_path = config.parent / "profiles.yaml"
+            running_path.write_text("profiles: []\n", encoding="utf-8")
+            running = get_settings()
+            pending_path = config.parent / "pending" / "profiles.txt"
+            config.write_text(yaml.safe_dump({"paths": {"profile_file": str(pending_path)}}), encoding="utf-8")
+            seen = []
+
+            def read_yaml(path):
+                seen.append(path)
+                if path == pending_path:
+                    return b"profiles: []\n"
+                return path.read_bytes() if path.exists() else None
+
+            loaded = load_settings(running_restart_only=running, create_directories=False,
+                                   read_yaml_file=read_yaml)
+            self.assertEqual(seen, [config, config.parent / "runtime-overrides.yaml", running_path, pending_path])
+            self.assertEqual(loaded.paths.profile_file, str(pending_path))
+            self.assertFalse(pending_path.parent.exists())
+            self.assertIs(get_settings(), running)
+
+
 class BlankAndTextValueTests(_LoaderTestCase):
     def test_blank_main_ui_values_are_unset(self) -> None:
         env = {
@@ -92,6 +183,63 @@ class BlankAndTextValueTests(_LoaderTestCase):
 
         self.assertEqual(settings.app.snapshot_cache_ttl_seconds, 10)
         self.assertEqual(settings.app.source_bundle_cache_ttl_seconds, 60)
+
+    def test_blank_credential_lines_keep_the_config_yaml_values(self) -> None:
+        yaml_text = (
+            "truenas:\n"
+            "  api_key: yaml-api-key\n"
+            "  api_user: yaml-api-user\n"
+            "ssh:\n"
+            "  user: yaml-ssh-user\n"
+            "  password: yaml-ssh-password\n"
+        )
+        env = {
+            "TRUENAS_API_KEY": "",
+            "TRUENAS_API_USER": "",
+            "SSH_USER": "",
+            "SSH_PASSWORD": "",
+        }
+        with self.main_ui_environment(env, yaml_text):
+            settings = get_settings()
+
+        self.assertEqual(settings.truenas.api_key, "yaml-api-key")
+        self.assertEqual(settings.truenas.api_user, "yaml-api-user")
+        self.assertEqual(settings.ssh.user, "yaml-ssh-user")
+        self.assertEqual(settings.ssh.password, "yaml-ssh-password")
+
+    def test_set_credential_lines_still_override_config_yaml(self) -> None:
+        yaml_text = "truenas:\n  api_key: yaml-api-key\n"
+        with self.main_ui_environment({"TRUENAS_API_KEY": "env-api-key"}, yaml_text):
+            settings = get_settings()
+
+        self.assertEqual(settings.truenas.api_key, "env-api-key")
+
+
+@unittest.skipIf(os.name == "nt", "POSIX file modes")
+class RuntimeOverridesFileModeTests(_LoaderTestCase):
+    def _save(self, existing_mode: int | None) -> tuple[int, object]:
+        with self.main_ui_environment({}, "app: {}\n"):
+            settings = get_settings()
+            overrides_path = Path(settings.paths.runtime_overrides_file)
+            if existing_mode is not None:
+                overrides_path.parent.mkdir(parents=True, exist_ok=True)
+                overrides_path.write_text("app: {}\n", encoding="utf-8")
+                overrides_path.chmod(existing_mode)
+            save_runtime_behavior_overrides(settings, {"refresh_interval_seconds": 45})
+            saved = yaml.safe_load(overrides_path.read_text(encoding="utf-8"))
+            return stat.S_IMODE(overrides_path.stat().st_mode), saved
+
+    def test_a_new_runtime_overrides_file_is_owner_only(self) -> None:
+        mode, saved = self._save(None)
+
+        self.assertEqual(mode, 0o600)
+        self.assertEqual(saved, {"app": {"refresh_interval_seconds": 45}})
+
+    def test_a_saved_runtime_overrides_file_keeps_its_mode(self) -> None:
+        mode, saved = self._save(0o640)
+
+        self.assertEqual(mode, 0o640)
+        self.assertEqual(saved, {"app": {"refresh_interval_seconds": 45}})
 
 
 class PlainConfigurationErrorTests(_LoaderTestCase):

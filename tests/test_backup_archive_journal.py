@@ -61,7 +61,7 @@ class JournalTestCase(unittest.TestCase):
         self.config = ConfigFixture()
         self.backups: list[FakeArtifact] = []
 
-    def make_backup(self, change_ids):
+    def make_backup(self, change_ids, snapshot):
         artifact = FakeArtifact(artifact_id=f"cfg-{len(self.backups) + 1}", change_ids=tuple(change_ids))
         self.backups.append(artifact)
         return artifact
@@ -416,7 +416,7 @@ class CoalescerTests(JournalTestCase):
     def test_failed_backup_keeps_entries_pending_and_retries_with_backoff(self) -> None:
         calls = []
 
-        def flaky(change_ids):
+        def flaky(change_ids, snapshot):
             calls.append(change_ids)
             if len(calls) == 1:
                 raise OSError("disk full")
@@ -437,7 +437,7 @@ class CoalescerTests(JournalTestCase):
         self.assertIsNone(co.last_error)
 
     def test_retry_delay_does_not_overflow_after_many_failures(self) -> None:
-        def always_fail(change_ids):
+        def always_fail(change_ids, snapshot):
             raise OSError("target down")
 
         co = self.coalescer(make_backup=always_fail)
@@ -448,7 +448,7 @@ class CoalescerTests(JournalTestCase):
         self.assertEqual(co.seconds_until_due(), 600)
 
     def test_backup_without_artifact_id_is_a_failure(self) -> None:
-        co = self.coalescer(make_backup=lambda ids: {"name": "x"})
+        co = self.coalescer(make_backup=lambda ids, snapshot: {"name": "x"})
         co.record_change("mapping.save", "slot-1")
         self.clock.advance(30)
         self.assertEqual(co.tick().status, "failed")
@@ -457,7 +457,7 @@ class CoalescerTests(JournalTestCase):
     def test_oversized_or_unsafe_artifact_id_is_a_failure_not_a_poisoned_commit(self) -> None:
         for bad in ("x" * 70000, "a" * 129, "../cfg", "cfg\nid"):
             with self.subTest(length=len(bad)):
-                co = self.coalescer(make_backup=lambda ids, bad=bad: {"artifact_id": bad})
+                co = self.coalescer(make_backup=lambda ids, snapshot, bad=bad: {"artifact_id": bad})
                 co.record_change("mapping.save", "slot-1")
                 self.clock.advance(30)
                 self.assertEqual(co.run().status, "failed")
@@ -471,7 +471,7 @@ class CoalescerTests(JournalTestCase):
         release = threading.Event()
         made = []
 
-        def slow_backup(change_ids):
+        def slow_backup(change_ids, snapshot):
             made.append(change_ids)
             started.set()
             release.wait(5)
@@ -514,11 +514,11 @@ class CoalescerTests(JournalTestCase):
         self.assertEqual(len(self.backups), 1)
 
     def test_change_during_a_run_is_not_lost(self) -> None:
-        def backup_that_sees_a_new_edit(change_ids):
+        def backup_that_sees_a_new_edit(change_ids, snapshot):
             if not self.backups:  # another writer edits while the first backup runs
                 ChangeJournal(self.path).append("mapping.save", "slot-late")
                 self.config.docs["profiles.yaml"]["profiles"].append({"id": "late"})
-            return self.make_backup(change_ids)
+            return self.make_backup(change_ids, snapshot)
 
         co = self.coalescer(make_backup=backup_that_sees_a_new_edit)
         co.record_change("mapping.save", "slot-1")

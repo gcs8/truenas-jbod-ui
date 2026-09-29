@@ -314,7 +314,7 @@ jobs:
         run: python -m pip install -r requirements-dev.txt
 
       - name: Download shard results
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: python-unittest-${{ matrix.python-version }}-shard-*
           path: shard-results
@@ -997,6 +997,7 @@ jobs:
           npx playwright test \
             qa/admin-draft-target-ownership.spec.js \
             qa/offline-snapshot.spec.js \
+            qa/release-contract.spec.js \
             qa/saved-view-selection.spec.js \
             qa/ui-scope-safety.spec.js \
             qa/upgrade-notice.spec.js \

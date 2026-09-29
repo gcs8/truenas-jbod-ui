@@ -1514,8 +1514,38 @@ class SegmentedHistoryReader:
                 )
                 rollup_where.append("julianday(bucket_start) < julianday(?)")
                 rollup_parameters.append(boundary)
-            rollup_parameters.append(remaining)
-            query = f"""
+            paths = (self.hot_path, *self._selected_segment_paths(since=since))
+            # Select logical points before hydrating fragments. As in the scope
+            # reader, filling the quota must not stop completion of retained keys.
+            # Each source contributes at most `remaining` keys, and the retained
+            # set is trimmed after each source. Ties retain source precedence.
+            retained_keys: dict[tuple[Any, ...], None] = {}
+            for path in paths:
+                with self._query_connection(path) as connection:
+                    rows = connection.execute(
+                        f"""
+                        SELECT bucket_seconds AS rollup_seconds,
+                               bucket_start AS _bucket_start, system_id,
+                               enclosure_key, slot, metric_name, disk_identity_key
+                        FROM metric_rollups
+                        WHERE {' AND '.join(rollup_where)}
+                        ORDER BY julianday(bucket_start) DESC, bucket_start,
+                                 system_id, enclosure_key, slot, metric_name, disk_identity_key
+                        LIMIT ?
+                        """,
+                        [*rollup_parameters, remaining],
+                    ).fetchall()
+                for row in rows:
+                    retained_keys[self._rollup_key(dict(row))] = None
+                retained_keys = dict.fromkeys(sorted(
+                    retained_keys, key=lambda key: _parse_catalog_timestamp(key[1]), reverse=True
+                )[:remaining])
+            if not retained_keys:
+                continue
+            # Drive hydration from retained keys. Tuple IN can scan the whole
+            # interval on SQLite 3.45; CROSS JOIN keeps full primary-key lookups.
+            query = """
+                WITH retained(k0, k1, k2, k3, k4, k5, k6) AS (VALUES {key_values})
                 SELECT
                     NULL AS id,
                     CASE
@@ -1554,15 +1584,39 @@ class SegmentedHistoryReader:
                     value_sum AS _value_sum,
                     last_value AS _last_value,
                     last_observed_at AS _last_observed_at
-                FROM metric_rollups
-                WHERE {' AND '.join(rollup_where)}
-                ORDER BY julianday(bucket_start) DESC
+                FROM retained
+                CROSS JOIN metric_rollups
+                    ON metric_rollups.bucket_seconds = retained.k0
+                   AND metric_rollups.bucket_start = retained.k1
+                   AND metric_rollups.system_id = retained.k2
+                   AND metric_rollups.enclosure_key = retained.k3
+                   AND metric_rollups.slot = retained.k4
+                   AND metric_rollups.metric_name = retained.k5
+                   AND metric_rollups.disk_identity_key = retained.k6
                 LIMIT ?
             """
             rollups: list[dict[str, Any]] = []
-            for path in (self.hot_path, *self._selected_segment_paths(since=since)):
+            keys = list(retained_keys)
+            for path in paths:
                 with self._query_connection(path) as connection:
-                    rollups.extend(dict(row) for row in connection.execute(query, rollup_parameters).fetchall())
+                    # Seven primary-key fields plus the LIMIT bind. Keep each
+                    # statement compatible with SQLite's legacy 999-variable cap
+                    # and with a lower connection-specific limit.
+                    variable_limit = min(999, connection.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER))
+                    chunk_size = (variable_limit - 1) // 7
+                    if chunk_size < 1:
+                        raise ValueError("Segmented history query SQLite variable limit is too small.")
+                    for offset in range(0, len(keys), chunk_size):
+                        chunk = keys[offset:offset + chunk_size]
+                        key_values = ", ".join("(?, ?, ?, ?, ?, ?, ?)" for _ in chunk)
+                        # The primary key guarantees at most one fragment per
+                        # selected key per source. Unselected identities cannot
+                        # consume this quota, even in the same bucket.
+                        rows = connection.execute(
+                            query.format(key_values=key_values),
+                            [*(value for key in chunk for value in key), len(chunk)],
+                        ).fetchall()
+                        rollups.extend(dict(row) for row in rows)
             rollups = self._merge_rollup_rows(rollups)
             rollups.sort(
                 key=lambda row: _parse_catalog_timestamp(row["_bucket_start"]),
