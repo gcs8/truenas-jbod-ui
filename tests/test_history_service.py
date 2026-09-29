@@ -7005,6 +7005,17 @@ def _storage_view_smart_batch_reply(summary: dict[str, object]):
 
 
 class HistoryCollectorTests(unittest.TestCase):
+    def test_ipmi_snapshot_requires_healthy_bmc_source(self) -> None:
+        snapshot = {
+            "selected_system_platform": "ipmi",
+            "sources": {"bmc": {"enabled": True, "ok": False}},
+        }
+
+        self.assertFalse(HistoryCollector._should_record_scope_snapshot(snapshot))
+
+        snapshot["sources"]["bmc"]["ok"] = True
+        self.assertTrue(HistoryCollector._should_record_scope_snapshot(snapshot))
+
     @staticmethod
     def _topology_history_fixture(
         *,

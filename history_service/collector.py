@@ -1588,6 +1588,10 @@ class HistoryCollector:
             ssh_source = sources.get("ssh")
             if isinstance(ssh_source, dict) and ssh_source.get("enabled") and not ssh_source.get("ok"):
                 return False
+        if platform == "ipmi":
+            bmc_source = sources.get("bmc")
+            if isinstance(bmc_source, dict) and bmc_source.get("enabled") and not bmc_source.get("ok"):
+                return False
         if platform == "quantastor":
             platform_context = snapshot.get("platform_context")
             if isinstance(platform_context, dict) and platform_context.get("topology_complete") is False:
