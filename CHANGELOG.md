@@ -187,6 +187,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Docs
 
+- Corrected standing SSH command and strict-trust guidance, scoped admin
+  hardening to its Compose chain, and separated staging ownership identities;
+  real root/separate-UID staging qualification remains pending. (#844)
 - The backup scheduler and NFS instructions now say they apply to a
   current-source checkout only: the beginner install's `compose.yaml` has no
   scheduler service, and an image-only update cannot add one. The architecture
