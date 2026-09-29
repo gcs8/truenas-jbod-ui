@@ -6,8 +6,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
-from pydantic import ValidationError
-
 from app.models.domain import SasFabricAlias
 from app.services.config_change_journal import record_config_change
 from app.services.storage_writability import (
@@ -33,25 +31,34 @@ class SasFabricAliasStore:
     def _key(self, system_id: str | None, enclosure_id: str | None, object_id: str) -> str:
         return f"{system_id or 'default_system'}:{enclosure_id or 'system'}:{object_id}"
 
-    def load_all(self) -> dict[str, SasFabricAlias]:
-        if not self.file_path.exists():
-            return {}
-
+    def _load_authoritative(self) -> dict[str, SasFabricAlias]:
         try:
-            with self.file_path.open("r", encoding="utf-8") as handle:
-                payload = json.load(handle)
-            if not isinstance(payload, dict):
-                return {}
-            raw_aliases = payload.get("sas_fabric_aliases", {})
-            if not isinstance(raw_aliases, dict):
-                return {}
-            loaded = {
-                key: SasFabricAlias.model_validate(value)
-                for key, value in raw_aliases.items()
-            }
-        except (OSError, json.JSONDecodeError, ValidationError):
+            handle = self.file_path.open("r", encoding="utf-8")
+        except FileNotFoundError:
             return {}
-        return loaded
+        except OSError as exc:
+            raise ValueError("Cannot read the authoritative SAS Fabric alias store; no changes were saved.") from exc
+        try:
+            with handle:
+                payload = json.load(handle)
+        except (OSError, ValueError) as exc:
+            raise ValueError("Cannot read the authoritative SAS Fabric alias store; no changes were saved.") from exc
+        try:
+            if not isinstance(payload, dict) or not isinstance(payload.get("sas_fabric_aliases"), dict):
+                raise ValueError("Invalid alias store shape")
+            return {
+                key: SasFabricAlias.model_validate(value)
+                for key, value in payload["sas_fabric_aliases"].items()
+            }
+        except ValueError as exc:
+            raise ValueError("Invalid authoritative SAS Fabric alias store; no changes were saved.") from exc
+
+    def load_all(self) -> dict[str, SasFabricAlias]:
+        """Tolerant display read. Mutations must use the strict reader under lock."""
+        try:
+            return self._load_authoritative()
+        except ValueError:
+            return {}
 
     def list_aliases(self, system_id: str | None = None, enclosure_id: str | None = None) -> list[SasFabricAlias]:
         aliases = self.load_all()
@@ -68,17 +75,50 @@ class SasFabricAliasStore:
             selected[alias.object_id] = alias
         return sorted(selected.values(), key=lambda item: (item.object_kind or "", item.object_id))
 
+    def _mutation_keys(
+        self,
+        current: dict[str, SasFabricAlias],
+        system_id: str | None,
+        enclosure_id: str | None,
+        object_id: str,
+        compatible_object_ids: Iterable[str],
+        legacy_owners: dict[str, set[str]] | None,
+    ) -> list[str]:
+        compatible = set(compatible_object_ids)
+        keys = []
+        for candidate_id in sorted({object_id, *compatible}):
+            key = self._key(system_id, enclosure_id, candidate_id)
+            existing = current.get(key)
+            if existing is None:
+                continue
+            if existing.source == "operator-canonical-v1":
+                if candidate_id == object_id:
+                    keys.append(key)
+                continue
+            # Even an exact key may be a legacy token shared by distinct
+            # canonical objects. No provenance means no destructive guess.
+            if candidate_id in compatible or (legacy_owners is not None and candidate_id in legacy_owners):
+                if existing.source != "operator" or (legacy_owners or {}).get(candidate_id) != {object_id}:
+                    raise ValueError("SAS Fabric alias ownership is ambiguous or unavailable; no changes were saved.")
+            keys.append(key)
+        return keys
+
     def save_alias(
         self,
         alias: SasFabricAlias,
         compatible_object_ids: Iterable[str] = (),
+        *,
+        legacy_owners: dict[str, set[str]] | None = None,
     ) -> SasFabricAlias:
         with self._lock:
-            current = self.load_all()
+            current = self._load_authoritative()
+            keys = self._mutation_keys(
+                current, alias.system_id, alias.enclosure_id, alias.object_id,
+                compatible_object_ids, legacy_owners,
+            )
             saved = alias.model_copy(update={"updated_at": datetime.now(timezone.utc)})
-            for object_id in compatible_object_ids:
-                if object_id != saved.object_id:
-                    current.pop(self._key(saved.system_id, saved.enclosure_id, object_id), None)
+            for key in keys:
+                current.pop(key)
             current[self._key(saved.system_id, saved.enclosure_id, saved.object_id)] = saved
             self._write(current)
         record_config_change("sas_alias.save", f"{saved.system_id or ''}:{saved.object_id}")
@@ -90,20 +130,23 @@ class SasFabricAliasStore:
         enclosure_id: str | None,
         object_id: str,
         compatible_object_ids: Iterable[str] = (),
+        *,
+        legacy_owners: dict[str, set[str]] | None = None,
     ) -> bool:
         with self._lock:
-            current = self.load_all()
-            removed = False
-            candidate_ids = {object_id, *compatible_object_ids}
-            for candidate_id in candidate_ids:
-                if current.pop(self._key(system_id, enclosure_id, candidate_id), None) is not None:
-                    removed = True
-            if not removed and enclosure_id is not None:
-                for candidate_id in candidate_ids:
-                    if current.pop(self._key(system_id, None, candidate_id), None) is not None:
-                        removed = True
-            if not removed:
+            current = self._load_authoritative()
+            compatible_object_ids = tuple(compatible_object_ids)
+            keys = self._mutation_keys(
+                current, system_id, enclosure_id, object_id, compatible_object_ids, legacy_owners,
+            )
+            if not keys and enclosure_id is not None:
+                keys = self._mutation_keys(
+                    current, system_id, None, object_id, compatible_object_ids, legacy_owners,
+                )
+            if not keys:
                 return False
+            for key in keys:
+                current.pop(key)
             self._write(current)
         record_config_change("sas_alias.clear", f"{system_id or ''}:{object_id}")
         return True

@@ -3,6 +3,9 @@ from __future__ import annotations
 import http.client
 import json
 import socket
+import threading
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -14,6 +17,34 @@ from app.request_context import request_id_headers
 
 class DockerRuntimeError(RuntimeError):
     pass
+
+
+class RuntimeBusyError(DockerRuntimeError):
+    """Another admin operation owns an affected runtime target."""
+
+
+_runtime_reservation_lock = threading.Lock()
+_reserved_runtime_targets: set[str] = set()
+
+
+@contextmanager
+def reserve_runtime_targets(keys: Iterable[str]) -> Iterator[None]:
+    """Reserve process-local admin targets without waiting for blocking work.
+
+    Keep the reservation in the worker that performs control/maintenance, not
+    in its cancellable caller. Disjoint targets may proceed independently.
+    This coordinates this sidecar, not external Docker clients or processes.
+    """
+    targets = frozenset(keys)
+    with _runtime_reservation_lock:
+        if targets & _reserved_runtime_targets:
+            raise RuntimeBusyError("Runtime is busy with another admin operation. Try again after it finishes.")
+        _reserved_runtime_targets.update(targets)
+    try:
+        yield
+    finally:
+        with _runtime_reservation_lock:
+            _reserved_runtime_targets.difference_update(targets)
 
 
 # Docker only answers a stop/restart request after the container has actually stopped,

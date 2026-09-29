@@ -16,6 +16,7 @@ from history_service.operation_bounds import (
     HistoryBudgetExceeded,
     HistoryRequestShapeError,
     build_history_read_plan,
+    normalize_since_utc,
     validate_store_scope_request,
 )
 
@@ -50,7 +51,7 @@ class HistoryOperationBoundsTests(unittest.TestCase):
             patch.object(FrozenDateTime, "current", now),
             patch("history_service.operation_bounds.datetime", FrozenDateTime),
         ):
-            validate_store_scope_request(
+            return validate_store_scope_request(
                 slots=[0],
                 event_limit=0,
                 metric_limits={"temperature_c": 1},
@@ -196,6 +197,37 @@ class HistoryOperationBoundsTests(unittest.TestCase):
         for since in invalid_since_values:
             with self.subTest(since=since), self.assertRaises(HistoryRequestShapeError):
                 self._validate_store(since=since)
+
+    def test_since_normalizes_to_the_stored_utc_iso_form(self) -> None:
+        cases = (
+            ("2030-01-01T14:30:00+02:00", "2030-01-01T12:30:00+00:00"),
+            ("2030-01-01T07:30:00.250000-05:00", "2030-01-01T12:30:00.250000+00:00"),
+            ("2030-01-01T12:30:00Z", "2030-01-01T12:30:00+00:00"),
+            (" 2030-01-01T12:30:00+00:00 ", "2030-01-01T12:30:00+00:00"),
+        )
+        for raw, expected in cases:
+            with self.subTest(raw=raw):
+                self.assertEqual(normalize_since_utc(raw), expected)
+        for invalid in ("2030-01-01T12:30:00", "not-a-timestamp", "", None):
+            with self.subTest(invalid=invalid), self.assertRaises(HistoryRequestShapeError):
+                normalize_since_utc(invalid)
+
+    def test_since_outside_the_utc_range_is_a_shape_error(self) -> None:
+        for since in ("9999-12-31T23:59:59-23:59", "0001-01-01T00:00:00+23:59"):
+            with self.subTest(since=since):
+                with self.assertRaisesRegex(HistoryRequestShapeError, "valid timezone-aware timestamp"):
+                    normalize_since_utc(since)
+                with self.assertRaisesRegex(HistoryRequestShapeError, "valid timezone-aware timestamp"):
+                    self._validate_store(since=since)
+                with self.assertRaisesRegex(HistoryRequestShapeError, "valid timezone-aware timestamp"):
+                    self._plan(since=since)
+
+    def test_store_window_preflight_returns_the_normalized_utc_since(self) -> None:
+        since = NOW - timedelta(hours=24)
+
+        normalized = self._validate_store(since=since.astimezone(timezone(timedelta(hours=9))).isoformat())
+
+        self.assertEqual(normalized, since.isoformat())
 
     def test_metric_and_event_ranges_are_strict(self) -> None:
         for metric_limit in (0, 97, True):

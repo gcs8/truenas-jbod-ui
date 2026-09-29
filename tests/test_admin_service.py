@@ -148,6 +148,545 @@ def make_streaming_request(
     return request, receive_probe
 
 
+class AdminLifecycleOwnershipTests(unittest.TestCase):
+    """Real public handlers and maintenance, with bounded, socket-free workers."""
+
+    @staticmethod
+    def _endpoint(path):
+        return next(route.endpoint for route in admin_app.routes if route.path == path)
+
+    async def _turn(self):
+        turn = asyncio.Event()
+        asyncio.get_running_loop().call_soon(turn.set)
+        await turn.wait()
+
+    def _fixture(self, directory):
+        from admin_service.services.maintenance import AdminMaintenanceService
+        from tests.test_admin_maintenance import FakeRuntimeService
+
+        case = self
+
+        class Runtime(FakeRuntimeService):
+            def __init__(self):
+                super().__init__(["ui", "history"])
+                self.samples = []
+                self.managed_containers = {"ui": {}, "history": {}}
+                self.hook = lambda phase, key: None
+
+            def running_container_keys(self, keys=None):
+                self.hook("sample", None)
+                result = super().running_container_keys(keys)
+                self.samples.append(list(result))
+                return result
+
+            def start_container(self, key):
+                self.hook("start", key)
+                if key not in self.running or key in self.start_failures:
+                    super().start_container(key)
+
+            def stop_container(self, key):
+                self.hook("stop", key)
+                if key in self.running or key in self.stop_failures:
+                    super().stop_container(key)
+
+            def restart_container(self, key):
+                self.hook("restart", key)
+                self.calls.append(("restart", key))
+                if key not in self.running:
+                    self.running.append(key)
+
+            def clear_restart_required(self, keys):
+                pass
+
+            def mark_restart_required(self, keys):
+                pass
+
+        runtime = Runtime()
+
+        class Backup:
+            def __init__(self):
+                self.operations = []
+                self.hook = lambda kind: None
+                self.artifacts = []
+
+            def inspect_bundle_file(self, path, **kwargs):
+                case.assertEqual(path.read_bytes(), b"synthetic lifecycle archive")
+                callback = kwargs.get("identity_callback")
+                if callback:
+                    callback(hashlib.sha256(path.read_bytes()).hexdigest(), "plaintext")
+                return {"ok": True, "encrypted": False}
+
+            preflight_import_bundle_file = inspect_bundle_file
+
+            def _operation(self, kind):
+                self.operations.append((kind, list(runtime.running)))
+                self.hook(kind)
+                case.assertEqual(runtime.running, [], "runtime started during owned operation")
+
+            def export_bundle_to_file(self, **kwargs):
+                self._operation("export")
+                workspace = Path(tempfile.mkdtemp(dir=directory))
+                path = workspace / "bundle.archive"
+                path.write_bytes(b"synthetic lifecycle archive")
+                artifact = FileBackupArtifact(
+                    filename="bundle.archive", path=path, manifest={},
+                    media_type="application/octet-stream", cleanup_root=workspace,
+                )
+                self.artifacts.append(artifact)
+                return artifact
+
+            def export_debug_bundle_to_file(self, **kwargs):
+                return self.export_bundle_to_file(**kwargs)
+
+            def import_bundle_from_file(self, path, **kwargs):
+                self._operation("import")
+                return {"ok": True}
+
+        backup = Backup()
+        service = AdminMaintenanceService(backup, runtime, clean_backup_targets=("ui", "history"))
+        receipts = BackupInspectionReceiptStore(signing_key=b"s" * 32)
+        return runtime, backup, service, receipts
+
+    def _patches(self, runtime, backup, service, receipts):
+        from contextlib import ExitStack
+        stack = ExitStack()
+        for name, value in (
+            ("get_runtime_service", runtime), ("get_backup_service", backup),
+            ("get_maintenance_service", service), ("get_backup_receipt_store", receipts),
+            ("reload_app_settings", Settings()),
+        ):
+            stack.enter_context(patch(f"admin_service.routes.{name}", return_value=value))
+        stack.enter_context(patch("admin_service.routes.record_config_change"))
+        stack.enter_context(patch("admin_service.routes.build_runtime_payload", new=AsyncMock(return_value={})))
+        return stack
+
+    async def _maintenance(self, kind, receipts, *, stop=True):
+        if kind in ("export", "debug"):
+            from app.models.domain import DebugBundleExportRequest
+            payload = (DebugBundleExportRequest() if kind == "debug" else
+                       SystemBackupExportRequest(encrypt=True, passphrase="synthetic-passphrase"))
+            path = "/api/admin/debug/export" if kind == "debug" else "/api/admin/backup/export"
+            return await self._endpoint(path)(payload, stop_services=stop, restart_services=True)
+        request, _ = make_streaming_request([b"synthetic lifecycle archive"])
+        issued = receipts.issue_digest(
+            hashlib.sha256(b"synthetic lifecycle archive").hexdigest(),
+            observed_encryption_mode="plaintext",
+        )
+        request.scope["headers"].extend([
+            (b"x-backup-expected-encryption", b"plaintext"),
+            (b"x-backup-inspection-receipt", issued["receipt"].encode()),
+        ])
+        return await self._endpoint("/api/admin/backup/import")(
+            request, stop_services=stop, restart_services=True,
+        )
+
+    async def _busy(self, operation):
+        with self.assertRaises(HTTPException) as raised:
+            await asyncio.wait_for(operation, 2)
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn("busy", raised.exception.detail.lower())
+
+    def test_public_maintenance_rejects_overlap_then_resamples_its_own_interval(self):
+        async def exercise(first, second, contender_stop):
+            with tempfile.TemporaryDirectory() as directory:
+                runtime, backup, service, receipts = self._fixture(directory)
+                entered, release = threading.Event(), threading.Event()
+                def hold(kind):
+                    if entered.is_set():
+                        return
+                    entered.set()
+                    self.assertTrue(release.wait(5), "owner release timed out")
+                backup.hook = hold
+                with self._patches(runtime, backup, service, receipts):
+                    owner = asyncio.create_task(self._maintenance(first, receipts))
+                    try:
+                        self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+                        samples = list(runtime.samples)
+                        await self._busy(self._maintenance(second, receipts, stop=contender_stop))
+                        self.assertEqual(runtime.samples, samples, "busy contender sampled runtime")
+                        self.assertEqual(len(backup.operations), 1)
+                        self.assertEqual(runtime.running, [])
+                    finally:
+                        release.set()
+                        await asyncio.gather(owner, return_exceptions=True)
+                    self.assertIsNone(owner.exception())
+                    self.assertEqual(runtime.running, ["ui", "history"])
+                    backup.hook = lambda kind: None
+                    before = len(runtime.calls)
+                    response = await self._maintenance(second, receipts)
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(runtime.calls[before:], [
+                        ("stop", "ui"), ("stop", "history"), ("start", "ui"), ("start", "history"),
+                    ])
+                    self.assertEqual(backup.operations[-1][1], [])
+                for artifact in backup.artifacts:
+                    artifact.cleanup()
+        for first, second in (("export", "export"), ("export", "import"), ("import", "export"),
+                              ("import", "import"), ("debug", "export"), ("export", "debug")):
+            for stop in (True, False):
+                with self.subTest(first=first, second=second, contender_stop=stop):
+                    asyncio.run(exercise(first, second, stop))
+
+    def test_public_maintenance_reserves_before_initial_state_sampling(self):
+        async def exercise():
+            with tempfile.TemporaryDirectory() as directory:
+                runtime, backup, service, receipts = self._fixture(directory)
+                entered, release = threading.Event(), threading.Event()
+                def hold(phase, key):
+                    if phase == "sample" and not entered.is_set():
+                        entered.set()
+                        self.assertTrue(release.wait(5))
+                runtime.hook = hold
+                with self._patches(runtime, backup, service, receipts):
+                    owner = asyncio.create_task(self._maintenance("export", receipts))
+                    try:
+                        self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+                        await self._busy(self._maintenance("export", receipts))
+                        self.assertEqual(runtime.calls, [])
+                        self.assertEqual(backup.operations, [])
+                    finally:
+                        release.set()
+                        await asyncio.gather(owner, return_exceptions=True)
+                    self.assertIsNone(owner.exception())
+                for artifact in backup.artifacts:
+                    artifact.cleanup()
+        asyncio.run(exercise())
+
+    def test_public_direct_controls_cannot_start_a_maintenance_owned_runtime(self):
+        async def exercise(action, key):
+            with tempfile.TemporaryDirectory() as directory:
+                runtime, backup, service, receipts = self._fixture(directory)
+                entered, release = threading.Event(), threading.Event()
+                def hold(kind):
+                    if entered.is_set():
+                        return
+                    entered.set()
+                    self.assertTrue(release.wait(5))
+                backup.hook = hold
+                control = self._endpoint(f"/api/admin/runtime/containers/{{container_key}}/{action}")
+                with self._patches(runtime, backup, service, receipts):
+                    owner = asyncio.create_task(self._maintenance("export", receipts))
+                    try:
+                        self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+                        calls = list(runtime.calls)
+                        await self._busy(control(key))
+                        self.assertEqual(runtime.calls, calls)
+                        self.assertEqual(runtime.running, [])
+                    finally:
+                        release.set()
+                        await asyncio.gather(owner, return_exceptions=True)
+                    self.assertIsNone(owner.exception())
+                    self.assertEqual((await control(key)).status_code, 200)
+                for artifact in backup.artifacts:
+                    artifact.cleanup()
+        for action in ("start", "restart", "stop"):
+            for key in ("ui", "history"):
+                with self.subTest(action=action, key=key):
+                    asyncio.run(exercise(action, key))
+
+    def test_cancelled_direct_control_retains_runtime_until_worker_settles(self):
+        async def exercise(action):
+            with tempfile.TemporaryDirectory() as directory:
+                runtime, backup, service, receipts = self._fixture(directory)
+                entered, release = threading.Event(), threading.Event()
+                def hold(phase, key):
+                    if phase == action:
+                        entered.set()
+                        self.assertTrue(release.wait(5))
+                runtime.hook = hold
+                control = self._endpoint(f"/api/admin/runtime/containers/{{container_key}}/{action}")
+                with self._patches(runtime, backup, service, receipts):
+                    owner = asyncio.create_task(control("ui"))
+                    try:
+                        self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+                        for _ in range(2):
+                            owner.cancel()
+                            await self._turn()
+                            self.assertFalse(owner.done(), "direct worker abandoned on cancellation")
+                            await self._busy(self._maintenance("export", receipts))
+                        self.assertEqual(backup.operations, [])
+                    finally:
+                        release.set()
+                        await asyncio.gather(owner, return_exceptions=True)
+                    self.assertTrue(owner.cancelled())
+                    runtime.hook = lambda phase, key: None
+                    self.assertEqual((await self._maintenance("export", receipts)).status_code, 200)
+                for artifact in backup.artifacts:
+                    artifact.cleanup()
+        for action in ("start", "restart"):
+            with self.subTest(action=action):
+                asyncio.run(exercise(action))
+
+    def test_cancelled_maintenance_retains_runtime_until_operation_and_restore_finish(self):
+        async def exercise(kind):
+            with tempfile.TemporaryDirectory() as directory:
+                runtime, backup, service, receipts = self._fixture(directory)
+                entered, release = threading.Event(), threading.Event()
+                def hold(kind):
+                    if entered.is_set():
+                        return
+                    entered.set()
+                    self.assertTrue(release.wait(5))
+                backup.hook = hold
+                with self._patches(runtime, backup, service, receipts):
+                    owner = asyncio.create_task(self._maintenance(kind, receipts))
+                    try:
+                        self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+                        for _ in range(2):
+                            owner.cancel()
+                            await self._turn()
+                            self.assertFalse(owner.done())
+                            await self._busy(self._maintenance("export", receipts))
+                    finally:
+                        release.set()
+                        await asyncio.gather(owner, return_exceptions=True)
+                    self.assertTrue(owner.cancelled())
+                    self.assertEqual(runtime.running, ["ui", "history"])
+                    backup.hook = lambda kind: None
+                    self.assertEqual((await self._maintenance("export", receipts)).status_code, 200)
+                for artifact in backup.artifacts:
+                    artifact.cleanup()
+        for kind in ("export", "import"):
+            with self.subTest(kind=kind):
+                asyncio.run(exercise(kind))
+
+    def test_failed_stop_or_operation_keeps_gate_through_failed_restoration(self):
+        from admin_service.services.runtime_control import DockerRuntimeError
+        async def exercise(failure):
+            with tempfile.TemporaryDirectory() as directory:
+                runtime, backup, service, receipts = self._fixture(directory)
+                entered, release = threading.Event(), threading.Event()
+                if failure == "stop":
+                    runtime.stop_failures["history"] = "synthetic stop failure"
+                if failure == "operation":
+                    def fail(kind):
+                        raise DockerRuntimeError("synthetic operation failure")
+                    backup.hook = fail
+                runtime.start_failures["ui"] = "synthetic restart failure"
+                def hold(phase, key):
+                    if phase == "start" and key == "ui" and not entered.is_set():
+                        entered.set()
+                        self.assertTrue(release.wait(5))
+                runtime.hook = hold
+                with self._patches(runtime, backup, service, receipts):
+                    owner = asyncio.create_task(self._maintenance("export", receipts))
+                    try:
+                        self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+                        await self._busy(self._maintenance("import", receipts))
+                        await self._busy(self._endpoint(
+                            "/api/admin/runtime/containers/{container_key}/start")("ui"))
+                    finally:
+                        release.set()
+                        await asyncio.gather(owner, return_exceptions=True)
+                    if failure in ("stop", "operation"):
+                        error = owner.exception()
+                        self.assertIsInstance(error, HTTPException)
+                        self.assertEqual(error.status_code, 400)
+                        self.assertIn("synthetic restart failure", error.detail)
+                    else:
+                        self.assertEqual(owner.result().headers["X-Admin-Restart-Failures"], "ui")
+                    self.assertEqual(runtime.running, ["history"])
+                    if failure == "stop":
+                        self.assertEqual(backup.operations, [])
+                    runtime.hook = lambda phase, key: None
+                    runtime.stop_failures.clear()
+                    runtime.start_failures.clear()
+                    backup.hook = lambda kind: None
+                    await self._endpoint("/api/admin/runtime/containers/{container_key}/start")("ui")
+                    self.assertEqual((await self._maintenance("export", receipts)).status_code, 200)
+                for artifact in backup.artifacts:
+                    artifact.cleanup()
+        for failure in ("stop", "operation", "restore"):
+            with self.subTest(failure=failure):
+                asyncio.run(exercise(failure))
+
+    def test_disjoint_direct_control_is_available_while_another_target_is_owned(self):
+        async def exercise():
+            with tempfile.TemporaryDirectory() as directory:
+                runtime, backup, service, receipts = self._fixture(directory)
+                entered, release = threading.Event(), threading.Event()
+                def hold(phase, key):
+                    if phase == "restart" and key == "ui":
+                        entered.set()
+                        self.assertTrue(release.wait(5))
+                runtime.hook = hold
+                control = self._endpoint("/api/admin/runtime/containers/{container_key}/restart")
+                with self._patches(runtime, backup, service, receipts):
+                    owner = asyncio.create_task(control("ui"))
+                    try:
+                        self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+                        self.assertEqual((await asyncio.wait_for(control("history"), 2)).status_code, 200)
+                        await self._busy(self._endpoint(
+                            "/api/admin/runtime/containers/{container_key}/start")("ui"))
+                        await self._busy(self._maintenance("import", receipts))
+                    finally:
+                        release.set()
+                        await asyncio.gather(owner, return_exceptions=True)
+                    self.assertIsNone(owner.exception())
+        asyncio.run(exercise())
+
+    def test_catalog_inspect_import_preserves_receipts_and_acquisition_error_cleanup(self):
+        from admin_service.services.backup_scheduler_client import SchedulerUnavailableError
+        async def exercise():
+            with tempfile.TemporaryDirectory() as directory:
+                runtime, backup, service, receipts = self._fixture(directory)
+                handles, workspaces = [], []
+                outcome = "ok"
+                def download(artifact_id, handle):
+                    handles.append(handle)
+                    # The production handle is fd-backed; the acquisition prefix
+                    # is private and this test redirects only that workspace.
+                    handle.write(b"synthetic lifecycle archive")
+                    if outcome == "unavailable":
+                        raise SchedulerUnavailableError("synthetic acquisition failure")
+                    return SimpleNamespace(status=404 if outcome == "missing" else 200, payload={})
+                original_mkdtemp = tempfile.mkdtemp
+                def make_workspace(*args, **kwargs):
+                    if kwargs.get("prefix") == "truenas-jbod-ui-admin-catalog-":
+                        path = original_mkdtemp(dir=directory, prefix="catalog-")
+                        workspaces.append(Path(path))
+                        return path
+                    return original_mkdtemp(*args, **kwargs)
+                with self._patches(runtime, backup, service, receipts), patch(
+                    "admin_service.routes.get_backup_scheduler_client",
+                    return_value=SimpleNamespace(download_to=download),
+                ), patch("admin_service.routes.tempfile.mkdtemp", side_effect=make_workspace):
+                    inspect_route = self._endpoint("/api/admin/backups/{artifact_id}/restore/inspect")
+                    import_route = self._endpoint("/api/admin/backups/{artifact_id}/restore/import")
+                    response = await inspect_route("a" * 32, make_request())
+                    inspection = json.loads(response.body)
+                    self.assertEqual(inspection["encryption_mode"], "plaintext")
+                    request, _ = make_streaming_request([])
+                    request.scope["headers"].extend([
+                        (b"x-backup-expected-encryption", b"plaintext"),
+                        (b"x-backup-inspection-receipt", inspection["inspection_receipt"].encode()),
+                    ])
+                    response = await import_route("a" * 32, request, stop_services=True, restart_services=True)
+                    self.assertEqual(json.loads(response.body)["restarted_containers"], ["ui", "history"])
+                    with self.assertRaises(HTTPException) as rejected:
+                        await import_route("a" * 32, request, stop_services=True, restart_services=True)
+                    self.assertEqual(rejected.exception.status_code, 400)
+                    self.assertEqual(len(handles), 2, "receipt replay reached catalog acquisition")
+                    for outcome, status in (("missing", 404), ("unavailable", 503)):
+                        for kind in ("inspect", "import"):
+                            request, _ = make_streaming_request([])
+                            issued = receipts.issue_digest(
+                                hashlib.sha256(b"synthetic lifecycle archive").hexdigest(),
+                                observed_encryption_mode="plaintext",
+                            )
+                            request.scope["headers"].extend([
+                                (b"x-backup-expected-encryption", b"plaintext"),
+                                (b"x-backup-inspection-receipt", issued["receipt"].encode()),
+                            ])
+                            with self.assertRaises(HTTPException) as rejected:
+                                if kind == "inspect":
+                                    await inspect_route("a" * 32, request)
+                                else:
+                                    await import_route("a" * 32, request, stop_services=True, restart_services=True)
+                            self.assertEqual(rejected.exception.status_code, status)
+                            admission = receipts.begin_admission(issued["receipt"], expected_encryption_mode="plaintext")
+                            receipts.release_admission(admission)
+                            self.assertTrue(all(handle.closed for handle in handles))
+                            self.assertTrue(all(not path.exists() for path in workspaces))
+                    self.assertEqual(backup.operations, [("import", [])])
+        asyncio.run(exercise())
+
+    def test_catalog_restore_cancellation_drains_acquisition_before_cleanup(self):
+        import os
+        from admin_service.services.backup_scheduler_client import SchedulerUnavailableError
+
+        async def exercise(kind, phase, late_error):
+            with tempfile.TemporaryDirectory() as directory:
+                runtime, backup, service, receipts = self._fixture(directory)
+                entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+                paths, handles, errors = [], [], []
+                original_open = os.open
+                original_mkdtemp = tempfile.mkdtemp
+                workspace = Path(directory) / "catalog"
+                def make_workspace(*args, **kwargs):
+                    if kwargs.get("prefix") == "truenas-jbod-ui-admin-catalog-":
+                        workspace.mkdir(mode=0o700)
+                        return str(workspace)
+                    return original_mkdtemp(*args, **kwargs)
+                def open_archive(path, flags, *args, **kwargs):
+                    if Path(path) == workspace / "bundle.archive":
+                        paths.append(Path(path))
+                        if phase == "before-open":
+                            entered.set()
+                            if not release.wait(5):
+                                raise AssertionError("catalog open release timed out")
+                    return original_open(path, flags, *args, **kwargs)
+                def download(artifact_id, handle):
+                    handles.append(handle)
+                    try:
+                        if phase == "download":
+                            entered.set()
+                            self.assertTrue(release.wait(5))
+                        self.assertEqual(os.fstat(handle.fileno()).st_nlink, 1)
+                        handle.write(b"synthetic lifecycle archive")
+                        if late_error:
+                            raise SchedulerUnavailableError("synthetic late failure")
+                        return SimpleNamespace(status=200, payload={})
+                    finally:
+                        finished.set()
+                scheduler = SimpleNamespace(download_to=download)
+                request, _ = make_streaming_request([])
+                issued = receipts.issue_digest(
+                    hashlib.sha256(b"synthetic lifecycle archive").hexdigest(),
+                    observed_encryption_mode="plaintext",
+                )
+                request.scope["headers"].extend([
+                    (b"x-backup-expected-encryption", b"plaintext"),
+                    (b"x-backup-inspection-receipt", issued["receipt"].encode()),
+                ])
+                loop = asyncio.get_running_loop()
+                old_handler = loop.get_exception_handler()
+                loop.set_exception_handler(lambda loop, context: errors.append(context))
+                tasks_before = asyncio.all_tasks()
+                with self._patches(runtime, backup, service, receipts), patch(
+                    "admin_service.routes.get_backup_scheduler_client", return_value=scheduler,
+                ), patch("admin_service.routes.tempfile.mkdtemp", side_effect=make_workspace), patch(
+                    "admin_service.routes.os.open", side_effect=open_archive,
+                ):
+                    endpoint = self._endpoint(f"/api/admin/backups/{{artifact_id}}/restore/{kind}")
+                    kwargs = {"stop_services": True, "restart_services": True} if kind == "import" else {}
+                    owner = asyncio.create_task(endpoint("a" * 32, request, **kwargs))
+                    try:
+                        self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+                        for _ in range(2):
+                            owner.cancel()
+                            await self._turn()
+                            self.assertFalse(owner.done(), "catalog request returned before acquisition settled")
+                            self.assertTrue(workspace.exists())
+                            self.assertFalse(finished.is_set())
+                            if phase == "download":
+                                self.assertFalse(handles[0].closed)
+                                self.assertEqual(os.fstat(handles[0].fileno()).st_nlink, 1)
+                    finally:
+                        release.set()
+                        await asyncio.gather(owner, return_exceptions=True)
+                        at_return = (finished.is_set(), bool(handles) and handles[0].closed,
+                                     workspace.exists(), asyncio.all_tasks() - tasks_before)
+                        # Teardown also drains broken-baseline workers; acceptance
+                        # uses the snapshot at request return, never this later wait.
+                        await asyncio.to_thread(finished.wait, 2)
+                    self.assertTrue(owner.cancelled())
+                    self.assertEqual(at_return, (True, True, False, set()))
+                    admission = receipts.begin_admission(issued["receipt"], expected_encryption_mode="plaintext")
+                    receipts.release_admission(admission)
+                    self.assertEqual(backup.operations, [])
+                    self.assertEqual(runtime.calls, [])
+                    await self._turn()
+                    self.assertEqual(asyncio.all_tasks() - tasks_before, set())
+                    loop.set_exception_handler(old_handler)
+                    self.assertEqual(errors, [])
+        for kind in ("inspect", "import"):
+            for phase in ("before-open", "download"):
+                for late_error in (False, True):
+                    with self.subTest(kind=kind, phase=phase, late_error=late_error):
+                        asyncio.run(exercise(kind, phase, late_error))
+
+
 class BackupInspectionReceiptTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
