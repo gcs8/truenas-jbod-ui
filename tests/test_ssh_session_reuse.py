@@ -18,6 +18,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import paramiko
 
+from tests.test_ssh_probe import _memory_streams
+
 from app.config import AppConfig, Settings, SSHConfig, SystemConfig, TrueNASConfig
 from app.models.domain import DiskInventorySyncMode, EnclosureOption, SlotView
 from app.services.inventory import InventoryService, utcnow
@@ -44,18 +46,19 @@ def _exec_ok(delay: float = 0.0, counters: dict | None = None):
             with lock:
                 counters["open"] += 1
                 counters["peak"] = max(counters["peak"], counters["open"])
-        try:
-            if delay:
-                time.sleep(delay)
-        finally:
-            if counters is not None:
-                with lock:
+        if delay:
+            time.sleep(delay)
+        streams = _memory_streams(f"{command} output".encode())
+        channel = streams[1].channel
+        close = channel.close
+        def close_counted():
+            with lock:
+                was_closed = channel.closed
+                close()
+                if counters is not None and not was_closed and channel.closed:
                     counters["open"] -= 1
-        stdin, stdout, stderr = MagicMock(), MagicMock(), MagicMock()
-        stdout.read.return_value = f"{command} output".encode()
-        stderr.read.return_value = b""
-        stdout.channel.recv_exit_status.return_value = 0
-        return stdin, stdout, stderr
+        channel.close = close_counted
+        return streams
 
     return exec_command
 
@@ -196,11 +199,17 @@ class HostKeyPolicyIsUnchangedTests(unittest.TestCase):
                     raise paramiko.ChannelException(1, "Administratively prohibited")
                 state["open"] += 1
                 state["peak"] = max(state["peak"], state["open"])
-            try:
-                return ok_exec(command, timeout)
-            finally:
+            streams = ok_exec(command, timeout)
+            channel = streams[1].channel
+            close = channel.close
+            def close_counted():
                 with lock:
-                    state["open"] -= 1
+                    was_closed = channel.closed
+                    close()
+                    if not was_closed and channel.closed:
+                        state["open"] -= 1
+            channel.close = close_counted
+            return streams
 
         client = _fake_ssh_client()
         client.exec_command.side_effect = exec_command
@@ -473,6 +482,1052 @@ class PerHostPlanCoalescingTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.service._ssh_session_lock_for_host(HOST).locked())
 
 
+class OwnedSSHWorkerTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.service = _service(self.temp.name)
+        self.probe = self.service.ssh_probe
+        self.loop_errors = []
+        self.loop = asyncio.get_running_loop()
+        self.old_handler = self.loop.get_exception_handler()
+        self.loop.set_exception_handler(lambda _loop, context: self.loop_errors.append(context))
+
+    async def asyncTearDown(self):
+        for _ in range(10):
+            await asyncio.sleep(0)
+        self.loop.set_exception_handler(self.old_handler)
+        self.assertEqual(self.loop_errors, [])
+
+    async def wait_until(self, predicate):
+        async with asyncio.timeout(2):
+            while not predicate():
+                await asyncio.sleep(0.001)
+
+    async def exercise_cancel(self, kind, *, late_error=False):
+        from tests.test_ssh_probe import MemorySSHWire
+        opened = threading.Event()
+        worker_cleanup = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        issued = []
+        planners = []
+        late_failure = threading.Event()
+        wire = MemorySSHWire(lambda _channel, _command: opened.set())
+        original = self.probe._run_single_command
+
+        def command(*args, **kwargs):
+            issued.append(args[1])
+            try:
+                return original(*args, **kwargs)
+            finally:
+                worker_cleanup.set()
+                if not release.wait(3):
+                    raise AssertionError("test worker cleanup was not released")
+                finished.set()
+
+        def planner(results):
+            planners.append(len(results))
+            return ["planned-after-cancel"]
+
+        if kind == "direct":
+            call = self.service._run_ssh_commands(["first", "queued"], HOST)
+        elif kind == "single":
+            call = self.service._run_ssh_command("first", HOST)
+        elif kind == "plan":
+            call = self.service._run_ssh_planned_commands(planner, initial_commands=["first", "queued"], host=HOST)
+        else:
+            call = self.probe.run_planned_command_groups([
+                (planner, ["first", "queued"]), (planner, ["other", "other-queued"]),
+            ], max_parallel_channels=1)
+
+        original_batch = self.probe._run_commands_sync
+        def batch(*args, **kwargs):
+            try:
+                return original_batch(*args, **kwargs)
+            finally:
+                if late_error:
+                    late_failure.set()
+                    raise RuntimeError("synthetic late worker failure")
+
+        with patch.object(self.probe, "_client", return_value=wire.client), patch.object(self.probe, "_run_single_command", side_effect=command), patch.object(self.probe, "_run_commands_sync", side_effect=batch):
+            task = asyncio.create_task(call)
+            contender = None
+            try:
+                await self.wait_until(opened.is_set)
+                owner = self.service._ssh_plan_drains[HOST] if kind == "plan" else task
+                owner.cancel()
+                for _ in range(10):
+                    await asyncio.sleep(0)
+                self.assertFalse(owner.done(), "cancel released ownership before worker teardown")
+                if kind != "groups":
+                    self.assertTrue(self.service._ssh_session_lock_for_host(HOST).locked())
+                    contender = asyncio.create_task(self.service._ssh_session_lock_for_host(HOST).acquire())
+                await self.wait_until(worker_cleanup.is_set)
+                self.assertTrue(wire.closed.is_set(), "cancel did not interrupt active transport")
+                owner.cancel()
+                for _ in range(10):
+                    await asyncio.sleep(0)
+                self.assertFalse(owner.done(), "repeated cancel abandoned worker drain")
+                if contender:
+                    self.assertFalse(contender.done())
+                release.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                self.assertTrue(finished.is_set())
+                self.assertEqual(issued, ["first"])
+                self.assertEqual(planners, [])
+                self.assertEqual(late_failure.is_set(), late_error)
+                self.assertTrue(all(channel.closed for channel in wire.channels))
+                if contender:
+                    await asyncio.wait_for(contender, 1)
+                    self.service._ssh_session_lock_for_host(HOST).release()
+            finally:
+                release.set()
+                wire.close()
+                await asyncio.gather(task, return_exceptions=True)
+                for drain in list(self.service._ssh_plan_drains.values()):
+                    drain.cancel()
+                    await asyncio.gather(drain, return_exceptions=True)
+                if contender:
+                    if not contender.done():
+                        contender.cancel()
+                    await asyncio.gather(contender, return_exceptions=True)
+                    lock = self.service._ssh_session_lock_for_host(HOST)
+                    if lock.locked():
+                        lock.release()
+                await self.wait_until(finished.is_set)
+
+    async def test_direct_batch_cancel_retains_host_lock_and_stops_queued_command(self):
+        await self.exercise_cancel("direct")
+
+    async def test_single_command_cancel_retains_host_lock(self):
+        await self.exercise_cancel("single")
+
+    async def test_plan_drain_shutdown_cancel_retains_host_lock(self):
+        await self.exercise_cancel("plan")
+
+    async def test_group_cancel_stops_queued_groups_and_planner_batches(self):
+        await self.exercise_cancel("groups")
+
+    async def test_repeated_cancel_observes_late_worker_failure(self):
+        await self.exercise_cancel("direct", late_error=True)
+
+    async def test_coalesced_parallel_drain_retains_both_workers_through_cancel(self):
+        from tests.test_ssh_probe import MemorySSHWire
+        release = threading.Event()
+        cleanup = set()
+        finished = set()
+        issued = []
+        original = self.probe._run_single_command
+        wire = MemorySSHWire(lambda _channel, _command: None)
+        def command(*args, **kwargs):
+            name = args[1]
+            issued.append(name)
+            try:
+                return original(*args, **kwargs)
+            finally:
+                cleanup.add(name)
+                if not release.wait(3):
+                    raise AssertionError("parallel cleanup was not released")
+                finished.add(name)
+        with patch.object(self.probe, "_client", return_value=wire.client), patch.object(self.probe, "_run_single_command", side_effect=command):
+            tasks = [asyncio.create_task(self.service._run_ssh_planned_commands(
+                lambda _results: ["later-planner"], initial_commands=[name, name + "-queued"], host=HOST,
+            )) for name in ("first", "other")]
+            queued = None
+            try:
+                await self.wait_until(lambda: len(wire.commands) == 2)
+                queued = asyncio.create_task(self.service._run_ssh_planned_commands(
+                    lambda _results: [], initial_commands=["next-round"], host=HOST,
+                ))
+                await self.wait_until(lambda: bool(self.service._ssh_plan_queues[HOST]))
+                drain = self.service._ssh_plan_drains[HOST]
+                drain.cancel()
+                for _ in range(10):
+                    await asyncio.sleep(0)
+                self.assertFalse(drain.done(), "parallel drain abandoned its workers")
+                await self.wait_until(lambda: len(cleanup) == 2)
+                drain.cancel()
+                for _ in range(10):
+                    await asyncio.sleep(0)
+                self.assertFalse(drain.done())
+                self.assertTrue(self.service._ssh_session_lock_for_host(HOST).locked())
+                self.assertFalse(queued.done())
+                self.assertTrue(all(channel.closed for channel in wire.channels))
+                release.set()
+                outcomes = await asyncio.gather(*tasks, queued, return_exceptions=True)
+                self.assertTrue(all(isinstance(item, asyncio.CancelledError) for item in outcomes))
+                self.assertEqual(set(issued), {"first", "other"})
+                self.assertEqual(finished, {"first", "other"})
+                self.assertEqual(self.service._ssh_plan_drains, {})
+                self.assertFalse(self.service._ssh_session_lock_for_host(HOST).locked())
+            finally:
+                release.set()
+                wire.close()
+                await asyncio.gather(*tasks, *([queued] if queued else []), return_exceptions=True)
+                await asyncio.gather(*list(self.service._ssh_plan_drains.values()), return_exceptions=True)
+
+    async def test_cancel_during_initial_planner_prevents_connection_and_commands(self):
+        started = threading.Event()
+        release = threading.Event()
+        done = threading.Event()
+        def planner(_results):
+            started.set()
+            try:
+                if not release.wait(3):
+                    raise AssertionError("planner was not released")
+                return ["not-authorized-after-cancel"]
+            finally:
+                done.set()
+        with patch.object(self.probe, "_client") as client:
+            task = asyncio.create_task(self.probe.run_planned_commands(planner, initial_commands=[]))
+            try:
+                await self.wait_until(started.is_set)
+                task.cancel()
+                for _ in range(10):
+                    await asyncio.sleep(0)
+                self.assertFalse(task.done())
+                release.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                self.assertTrue(done.is_set())
+                client.assert_not_called()
+            finally:
+                release.set()
+                await asyncio.gather(task, return_exceptions=True)
+
+    async def test_cancel_interrupts_exec_wait_with_saturated_default_executor(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from tests.test_ssh_probe import MemorySSHWire
+        self.loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+        wire = MemorySSHWire(lambda _channel, _command: None)
+        wire.acknowledge = False
+        with patch.object(self.probe, "_client", return_value=wire.client):
+            task = asyncio.create_task(self.service._run_ssh_commands(["first", "queued"], HOST))
+            try:
+                await self.wait_until(lambda: bool(wire.commands))
+                task.cancel()
+                try:
+                    async with asyncio.timeout(0.4):
+                        while not wire.closed.is_set():
+                            await asyncio.sleep(0.001)
+                except TimeoutError:
+                    self.fail("cancellation interrupt queued behind its blocked SSH worker")
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                self.assertEqual(wire.commands, ["first"])
+                self.assertFalse(self.service._ssh_session_lock_for_host(HOST).locked())
+            finally:
+                wire.close()
+                await asyncio.gather(task, return_exceptions=True)
+
+    async def test_ordinary_plan_waiter_cancel_does_not_stop_shared_worker(self):
+        from tests.test_ssh_probe import MemorySSHWire
+        wire = MemorySSHWire(lambda _channel, _command: None)
+        with patch.object(self.probe, "_client", return_value=wire.client):
+            task = asyncio.create_task(self.service._run_ssh_planned_commands(
+                lambda _results: [], initial_commands=["first"], host=HOST,
+            ))
+            try:
+                await self.wait_until(lambda: bool(wire.commands))
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                self.assertFalse(wire.closed.is_set())
+                self.assertTrue(self.service._ssh_session_lock_for_host(HOST).locked())
+                wire.feed(wire.channels[0], b"ok", eof=True, status=0)
+                await asyncio.gather(*list(self.service._ssh_plan_drains.values()))
+                self.assertTrue(wire.closed.is_set())
+                self.assertFalse(self.service._ssh_session_lock_for_host(HOST).locked())
+            finally:
+                wire.close()
+                await asyncio.gather(task, *list(self.service._ssh_plan_drains.values()), return_exceptions=True)
+
+
+class SSHRunnerShutdownTests(unittest.TestCase):
+    def test_runner_shutdown_drains_real_workers_and_observes_late_errors(self):
+        from tests.test_ssh_probe import MemorySSHWire
+        for planned in (False, True):
+            with self.subTest(planned=planned), tempfile.TemporaryDirectory() as temp_dir:
+                service = _service(temp_dir)
+                probe = service.ssh_probe
+                # Also bounds exact-predecessor replay, whose worker ignores
+                # runner cancellation and reaches only its channel read timeout.
+                probe.config = probe.config.model_copy(update={"timeout_seconds": 0.2})
+                wire = MemorySSHWire(lambda _channel, _command: None)
+                observations = []
+                loop_errors = []
+                completed = threading.Event()
+                issued = []
+                loop_holder = []
+                original = probe._run_single_command
+                def command(*args, **kwargs):
+                    issued.append(args[1])
+                    try:
+                        return original(*args, **kwargs)
+                    finally:
+                        observed = threading.Event()
+                        def observe():
+                            observations.append(service._ssh_session_lock_for_host(HOST).locked())
+                            # A second shutdown cancellation must not release it.
+                            owner = service._ssh_plan_drains.get(HOST) if planned else task_holder[0]
+                            if owner is not None:
+                                owner.cancel()
+                            observed.set()
+                        loop_holder[0].call_soon_threadsafe(observe)
+                        if not observed.wait(2):
+                            raise AssertionError("shutdown loop stopped before worker cleanup")
+                        completed.set()
+                        raise RuntimeError("synthetic shutdown worker error")
+                task_holder = []
+                async def main():
+                    loop = asyncio.get_running_loop()
+                    loop_holder.append(loop)
+                    loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+                    if planned:
+                        call = service._run_ssh_planned_commands(
+                            lambda _r: ["later"], initial_commands=["first", "queued"], host=HOST,
+                        )
+                    else:
+                        call = service._run_ssh_commands(["first", "queued"], HOST)
+                    task_holder.append(asyncio.create_task(call))
+                    async with asyncio.timeout(2):
+                        while not wire.commands:
+                            await asyncio.sleep(0.001)
+                    # Returning enters asyncio.Runner's real all-task cancellation.
+                with patch.object(probe, "_client", return_value=wire.client), patch.object(probe, "_run_single_command", side_effect=command):
+                    try:
+                        asyncio.run(main())
+                    finally:
+                        wire.close()
+                self.assertEqual(observations, [True])
+                self.assertTrue(completed.is_set())
+                self.assertEqual(issued, ["first"])
+                self.assertEqual(loop_errors, [])
+                self.assertFalse(service._ssh_session_lock_for_host(HOST).locked())
+                self.assertEqual(service._ssh_plan_drains, {})
+                self.assertTrue(all(channel.closed for channel in wire.channels))
+
+
+class InventoryOwnedSessionTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.service = _service(self.temp.name)
+        self.probe = self.service.ssh_probe
+        self.loop = asyncio.get_running_loop()
+        self.loop_errors = []
+        self.old_handler = self.loop.get_exception_handler()
+        self.loop.set_exception_handler(lambda _loop, context: self.loop_errors.append(context))
+
+    async def asyncTearDown(self):
+        for _ in range(10):
+            await asyncio.sleep(0)
+        self.loop.set_exception_handler(self.old_handler)
+        self.assertEqual(self.loop_errors, [])
+
+    async def wait_until(self, predicate):
+        async with asyncio.timeout(2):
+            while not predicate():
+                await asyncio.sleep(0.001)
+
+    async def exercise_session_cancel(self, *, acknowledge=True, late_worker=False, late_close=False):
+        from app.services.inventory import _ssh_command_session
+        from tests.test_ssh_probe import MemorySSHWire
+
+        wire = MemorySSHWire(lambda _channel, _command: None)
+        wire.acknowledge = acknowledge
+        session = self.probe.open_session()
+        worker_cleanup = threading.Event()
+        release_worker = threading.Event()
+        worker_done = threading.Event()
+        close_started = threading.Event()
+        release_close = threading.Event()
+        close_done = threading.Event()
+        original_command = self.probe._run_single_command
+        original_close = session.close
+        late_failures = []
+
+        def command(*args, **kwargs):
+            try:
+                return original_command(*args, **kwargs)
+            finally:
+                worker_cleanup.set()
+                if not release_worker.wait(3):
+                    raise AssertionError("session worker was not released")
+                worker_done.set()
+                if late_worker:
+                    late_failures.append("worker")
+                    raise RuntimeError("synthetic session worker failure")
+
+        def close():
+            close_started.set()
+            try:
+                if not release_close.wait(3):
+                    raise AssertionError("session close was not released")
+                original_close()
+                if late_close:
+                    late_failures.append("close")
+                    raise RuntimeError("synthetic session close failure")
+            finally:
+                close_done.set()
+
+        async def operation():
+            token = _ssh_command_session.set(session)
+            try:
+                await self.service._run_ssh_command("first", HOST)
+                await self.service._run_ssh_command("not-after-cancel", HOST)
+            finally:
+                _ssh_command_session.reset(token)
+
+        with patch.object(self.probe, "_client", return_value=wire.client), patch.object(
+            self.probe, "_run_single_command", side_effect=command,
+        ), patch.object(session, "close", side_effect=close):
+            task = asyncio.create_task(operation())
+            contender = None
+            try:
+                await self.wait_until(lambda: bool(wire.commands))
+                task.cancel()
+                for _ in range(10):
+                    await asyncio.sleep(0)
+                self.assertFalse(task.done(), "session cancellation abandoned the running worker")
+                lock = self.service._ssh_session_lock_for_host(HOST)
+                self.assertTrue(lock.locked())
+                contender = asyncio.create_task(lock.acquire())
+                await self.wait_until(worker_cleanup.is_set)
+                self.assertTrue(wire.closed.is_set(), "session cancellation did not interrupt Paramiko")
+                task.cancel()
+                for _ in range(10):
+                    await asyncio.sleep(0)
+                self.assertFalse(task.done())
+                self.assertFalse(contender.done())
+                release_worker.set()
+                await self.wait_until(close_started.is_set)
+                self.assertTrue(worker_done.is_set())
+                task.cancel()
+                for _ in range(10):
+                    await asyncio.sleep(0)
+                self.assertFalse(task.done(), "repeated cancellation abandoned session close")
+                self.assertFalse(contender.done(), "host lock released before session close drained")
+                release_close.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                self.assertTrue(close_done.is_set())
+                self.assertEqual(wire.commands, ["first"])
+                self.assertEqual(late_failures, (["worker"] if late_worker else []) + (["close"] if late_close else []))
+                self.assertTrue(all(channel.closed for channel in wire.channels))
+                await asyncio.wait_for(contender, 1)
+                lock.release()
+            finally:
+                release_worker.set()
+                release_close.set()
+                wire.close()
+                await asyncio.gather(task, return_exceptions=True)
+                if contender is not None:
+                    if not contender.done():
+                        contender.cancel()
+                    await asyncio.gather(contender, return_exceptions=True)
+                    if self.service._ssh_session_lock_for_host(HOST).locked():
+                        self.service._ssh_session_lock_for_host(HOST).release()
+                # Drain the old implementation's abandoned default-executor work
+                # before the patch and private fixture go out of scope on RED.
+                await self.wait_until(worker_done.is_set)
+                original_close()
+
+    async def test_session_output_cancel_retains_host_lock_through_worker_and_close(self):
+        await self.exercise_session_cancel()
+
+    async def test_session_exec_ack_cancel_interrupts_real_paramiko_and_drains(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        self.loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+        await self.exercise_session_cancel(acknowledge=False)
+
+    async def test_session_connect_cancel_interrupts_registered_client_before_admission(self):
+        from app.services.inventory import _ssh_command_session
+        from tests.test_ssh_probe import MemorySSHWire
+
+        wire = MemorySSHWire()
+        connected = threading.Event()
+        finished = threading.Event()
+        session = self.probe.open_session()
+
+        def connect(**kwargs):
+            self.assertEqual(kwargs["hostname"], HOST)
+            connected.set()
+            try:
+                if not wire.closed.wait(3):
+                    raise AssertionError("connecting client was not interrupted")
+                raise EOFError("synthetic interrupted handshake")
+            finally:
+                finished.set()
+
+        async def operation():
+            token = _ssh_command_session.set(session)
+            try:
+                await self.service._run_ssh_command("not-after-connect-cancel", HOST)
+            finally:
+                _ssh_command_session.reset(token)
+
+        with patch("app.services.ssh_probe.paramiko.SSHClient", return_value=wire.client), patch.object(
+            wire.client, "connect", side_effect=connect,
+        ):
+            task = asyncio.create_task(operation())
+            try:
+                await self.wait_until(connected.is_set)
+                task.cancel()
+                for _ in range(10):
+                    await asyncio.sleep(0)
+                self.assertFalse(task.done() and not finished.is_set(), "connect owner released before handshake stopped")
+                await self.wait_until(wire.closed.is_set)
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                self.assertTrue(finished.is_set())
+                self.assertEqual(wire.commands, [])
+                self.assertFalse(self.service._ssh_session_lock_for_host(HOST).locked())
+            finally:
+                wire.close()
+                await asyncio.gather(task, return_exceptions=True)
+                await self.wait_until(finished.is_set)
+                session.close()
+
+    async def test_session_cancel_before_executor_admission_starts_no_connection(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from app.services.inventory import _ssh_command_session
+
+        self.loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+        occupied = threading.Event()
+        release = threading.Event()
+        def occupy():
+            occupied.set()
+            if not release.wait(3):
+                raise AssertionError("occupied executor was not released")
+        blocker = self.loop.run_in_executor(None, occupy)
+        session = self.probe.open_session()
+
+        async def operation():
+            token = _ssh_command_session.set(session)
+            try:
+                await self.service._run_ssh_command("not-after-queued-cancel", HOST)
+            finally:
+                _ssh_command_session.reset(token)
+
+        with patch.object(self.probe, "_client", return_value=_fake_ssh_client()) as new_client:
+            task = asyncio.create_task(operation())
+            try:
+                await self.wait_until(occupied.is_set)
+                await self.wait_until(self.service._ssh_session_lock_for_host(HOST).locked)
+                task.cancel()
+                for _ in range(10):
+                    await asyncio.sleep(0)
+                self.assertFalse(task.done(), "queued executor ownership was abandoned")
+                self.assertTrue(self.service._ssh_session_lock_for_host(HOST).locked())
+                release.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                new_client.assert_not_called()
+                self.assertFalse(self.service._ssh_session_lock_for_host(HOST).locked())
+            finally:
+                release.set()
+                await asyncio.gather(task, blocker, return_exceptions=True)
+                session.close()
+
+    async def test_successful_disk_sync_reuses_real_paramiko_session_between_polls(self):
+        from tests.test_ssh_probe import MemorySSHWire
+
+        answers = iter([b"268071\n", b'[{"id": 268071, "state": "RUNNING"}]', b'[{"id": 268071, "state": "SUCCESS"}]'])
+        held = []
+        between = []
+        def respond(channel, _command):
+            observed = threading.Event()
+            def on_loop():
+                held.append(self.service._ssh_session_lock_for_host(None).locked())
+                observed.set()
+            self.loop.call_soon_threadsafe(on_loop)
+            if not observed.wait(2):
+                raise AssertionError("poll command lost event loop")
+            wire.feed(channel, next(answers), eof=True, status=0)
+        wire = MemorySSHWire(respond)
+        async def pause(_seconds):
+            between.append(self.service._ssh_session_lock_for_host(None).locked())
+        self.service._disk_inventory_sync_sleep = pause
+        with patch.object(self.probe, "_client", return_value=wire.client) as new_client:
+            try:
+                result = await self.service.sync_disk_inventory(DiskInventorySyncMode.full)
+                self.assertEqual(result.state, "SUCCESS")
+                self.assertEqual(new_client.call_count, 1)
+                self.assertEqual(held, [True, True, True])
+                self.assertEqual(between, [False])
+                self.assertEqual(len(wire.commands), 3)
+                self.assertTrue(wire.closed.is_set())
+                self.assertTrue(all(channel.closed for channel in wire.channels))
+                self.assertIsNone(self.service._disk_inventory_sync_active_job_id)
+            finally:
+                wire.close()
+
+    async def test_session_cancel_observes_late_worker_and_close_exceptions(self):
+        await self.exercise_session_cancel(late_worker=True, late_close=True)
+
+    async def test_disk_sync_poll_cancel_stops_followups_and_retains_both_locks(self):
+        from tests.test_ssh_probe import MemorySSHWire
+
+        cleanup_started = threading.Event()
+        release = threading.Event()
+        cleanup_done = threading.Event()
+        session = self.probe.open_session()
+        original_close = session.close
+
+        def respond(channel, command):
+            if "disk.sync_all" in command:
+                wire.feed(channel, b"268071\n", eof=True, status=0)
+
+        wire = MemorySSHWire(respond)
+
+        def close():
+            cleanup_started.set()
+            try:
+                if not release.wait(3):
+                    raise AssertionError("disk sync cleanup was not released")
+                original_close()
+            finally:
+                cleanup_done.set()
+
+        with patch.object(self.probe, "_client", return_value=wire.client), patch.object(
+            self.probe, "open_session", return_value=session,
+        ), patch.object(session, "close", side_effect=close):
+            task = asyncio.create_task(self.service.sync_disk_inventory(DiskInventorySyncMode.full))
+            try:
+                await self.wait_until(lambda: len(wire.commands) == 2)
+                task.cancel()
+                await self.wait_until(cleanup_started.is_set)
+                self.assertTrue(self.service._ssh_session_lock_for_host(None).locked(), "poll released host before cleanup")
+                self.assertTrue(self.service._disk_inventory_sync_lock.locked())
+                task.cancel()
+                for _ in range(10):
+                    await asyncio.sleep(0)
+                self.assertFalse(task.done())
+                release.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                self.assertTrue(cleanup_done.is_set())
+                self.assertEqual(len(wire.commands), 2)
+                self.assertEqual(self.service._disk_inventory_sync_active_job_id, 268071)
+                self.assertFalse(self.service._ssh_session_lock_for_host(None).locked())
+                self.assertFalse(self.service._disk_inventory_sync_lock.locked())
+            finally:
+                release.set()
+                wire.close()
+                await asyncio.gather(task, return_exceptions=True)
+                await self.wait_until(cleanup_done.is_set)
+                original_close()
+
+    async def test_cancel_during_successful_disk_sync_close_retains_sync_owner(self):
+        from tests.test_ssh_probe import MemorySSHWire
+
+        answers = iter([b"268071\n", b'[{"id": 268071, "state": "SUCCESS"}]'])
+        wire = MemorySSHWire(lambda channel, _command: wire.feed(channel, next(answers), eof=True, status=0))
+        session = self.probe.open_session()
+        close_started = threading.Event()
+        release = threading.Event()
+        close_done = threading.Event()
+        original_close = session.close
+
+        def close():
+            close_started.set()
+            try:
+                if not release.wait(3):
+                    raise AssertionError("successful sync close was not released")
+                original_close()
+                raise RuntimeError("synthetic late sync close failure")
+            finally:
+                close_done.set()
+
+        with patch.object(self.probe, "_client", return_value=wire.client), patch.object(
+            self.probe, "open_session", return_value=session,
+        ), patch.object(session, "close", side_effect=close):
+            task = asyncio.create_task(self.service.sync_disk_inventory(DiskInventorySyncMode.full))
+            try:
+                await self.wait_until(close_started.is_set)
+                task.cancel()
+                for _ in range(10):
+                    await asyncio.sleep(0)
+                self.assertFalse(task.done(), "disk sync abandoned its close worker")
+                self.assertTrue(self.service._disk_inventory_sync_lock.locked())
+                task.cancel()
+                for _ in range(10):
+                    await asyncio.sleep(0)
+                self.assertFalse(task.done())
+                release.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                self.assertTrue(close_done.is_set())
+                self.assertEqual(len(wire.commands), 2)
+                self.assertTrue(wire.closed.is_set())
+                self.assertFalse(self.service._disk_inventory_sync_lock.locked())
+            finally:
+                release.set()
+                wire.close()
+                await asyncio.gather(task, return_exceptions=True)
+                await self.wait_until(close_done.is_set)
+
+
+class InventorySessionRunnerShutdownTests(unittest.TestCase):
+    def test_runner_shutdown_retains_session_worker_close_and_late_errors(self):
+        from tests.test_ssh_probe import MemorySSHWire
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = _service(temp_dir)
+            probe = service.ssh_probe
+            probe.config = probe.config.model_copy(update={"timeout_seconds": 0.2})
+            wire = MemorySSHWire(lambda _channel, _command: None)
+            session = probe.open_session()
+            observations = []
+            loop_errors = []
+            task_holder = []
+            loop_holder = []
+            original_command = probe._run_single_command
+            original_close = session.close
+
+            def observe(phase):
+                observed = threading.Event()
+                def on_loop():
+                    observations.append((phase, service._ssh_session_lock_for_host(None).locked(), service._disk_inventory_sync_lock.locked()))
+                    task_holder[0].cancel()
+                    observed.set()
+                loop_holder[0].call_soon_threadsafe(on_loop)
+                if not observed.wait(2):
+                    raise AssertionError("runner stopped before session teardown")
+
+            def command(*args, **kwargs):
+                try:
+                    return original_command(*args, **kwargs)
+                finally:
+                    observe("worker")
+                    raise RuntimeError("synthetic shutdown session worker error")
+
+            def close():
+                if session._client is not None:
+                    observe("close")
+                original_close()
+
+            async def main():
+                loop = asyncio.get_running_loop()
+                loop_holder.append(loop)
+                loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+                task_holder.append(asyncio.create_task(service.sync_disk_inventory(DiskInventorySyncMode.full)))
+                async with asyncio.timeout(2):
+                    while not wire.commands:
+                        await asyncio.sleep(0.001)
+
+            with patch.object(probe, "_client", return_value=wire.client), patch.object(
+                probe, "open_session", return_value=session,
+            ), patch.object(probe, "_run_single_command", side_effect=command), patch.object(session, "close", side_effect=close):
+                try:
+                    asyncio.run(main())
+                finally:
+                    wire.close()
+            self.assertEqual(observations, [("worker", True, True), ("close", True, True)])
+            self.assertEqual(len(wire.commands), 1)
+            self.assertEqual(loop_errors, [])
+            self.assertTrue(all(channel.closed for channel in wire.channels))
+            self.assertFalse(service._ssh_session_lock_for_host(None).locked())
+            self.assertFalse(service._disk_inventory_sync_lock.locked())
+
+
+class ConnectionAdmissionTests(unittest.IsolatedAsyncioTestCase):
+    """Cancellation observed during preparation must stop the next SSH phase."""
+
+    entries = ("single", "batch", "planned", "groups", "session")
+
+    async def exercise_admission(self, entry, *, phase="host_keys", cancel=True, strict=True):
+        from app.services import ssh_probe as ssh
+
+        preparing = threading.Event()
+        release = threading.Event()
+        interrupted = threading.Event()
+        tokens = []
+        trace = []
+        case = self
+        synthetic_path = "/synthetic-only/known-hosts-not-opened"
+
+        def pause():
+            trace.append("preparation")
+            preparing.set()
+            if not release.wait(3):
+                raise AssertionError("preparation barrier was not released")
+
+        class Transport:
+            def auth_interactive(self, user, handler):
+                client.auth_calls += 1
+                trace.append("auth")
+                client.connected = True
+
+            def is_authenticated(self):
+                return client.connected
+
+            def is_active(self):
+                return client.connected
+
+        class Client:
+            connected = False
+            connect_calls = 0
+            auth_calls = 0
+            command_calls = 0
+
+            def load_host_keys(self, path):
+                case.assertEqual(path, synthetic_path)
+                case.assertIn(self, tokens[0]._clients)
+                if phase == "host_keys":
+                    pause()
+
+            def set_missing_host_key_policy(self, policy):
+                case.assertIsInstance(policy, paramiko.RejectPolicy if strict else AutoPinHostKeyPolicy)
+
+            def connect(self, **kwargs):
+                self.connect_calls += 1
+                trace.append("connect")
+                case.assertFalse(kwargs["allow_agent"])
+                case.assertFalse(kwargs["look_for_keys"])
+                case.assertIsNone(kwargs["key_filename"])
+                self.connected = True
+                if phase != "host_keys":
+                    if phase == "connect":
+                        pause()
+                    raise paramiko.BadAuthenticationType("synthetic auth fallback", ["keyboard-interactive"])
+
+            def get_transport(self):
+                if phase == "fallback" and not self.auth_calls:
+                    pause()
+                return transport
+
+            def exec_command(self, command, timeout):
+                self.command_calls += 1
+                case.assertTrue(self.connected)
+                return _memory_streams()
+
+            def close(self):
+                trace.append("close")
+                self.connected = False
+
+        client = Client()
+        transport = Transport()
+        register = ssh._WorkerCancellation.register
+        interrupt = ssh._WorkerCancellation.interrupt
+
+        def observe_register(token, target):
+            if token not in tokens:
+                tokens.append(token)
+            return register(token, target)
+
+        def observe_interrupt(token):
+            try:
+                return interrupt(token)
+            finally:
+                trace.append("interrupt_done")
+                interrupted.set()
+
+        async def wait_for(event):
+            async with asyncio.timeout(2):
+                while not event.is_set():
+                    await asyncio.sleep(0.001)
+
+        probe = SSHProbe(SSHConfig(
+            enabled=True, host="host.example.test", user="operator", key_path="",
+            password="" if phase == "host_keys" else "synthetic-password",
+            known_hosts_path=synthetic_path, strict_host_key_checking=strict,
+        ))
+        session = probe.open_session() if entry == "session" else None
+        original_is_file = Path.is_file
+        loop_errors = []
+        loop = asyncio.get_running_loop()
+        old_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+        self.addCleanup(loop.set_exception_handler, old_handler)
+        with patch.object(ssh.paramiko, "SSHClient", return_value=client), patch.object(
+            ssh._WorkerCancellation, "register", observe_register,
+        ), patch.object(ssh._WorkerCancellation, "interrupt", observe_interrupt), patch.object(
+            Path, "is_file", lambda path: True if str(path) == synthetic_path else original_is_file(path),
+        ), patch.object(probe, "_prepare_known_hosts_path", return_value=synthetic_path):
+            if entry == "single":
+                call = probe.run_command("true")
+            elif entry == "batch":
+                call = probe.run_commands(["true"])
+            elif entry == "planned":
+                call = probe.run_planned_commands(lambda _r: [], initial_commands=["true"])
+            elif entry == "groups":
+                call = probe.run_planned_command_groups([(lambda _r: [], ["true"])])
+            else:
+                assert session is not None
+                call = session.run_command_owned("true")
+            task = asyncio.create_task(call)
+            try:
+                await wait_for(preparing)
+                if cancel:
+                    task.cancel()
+                    await wait_for(interrupted)
+                    self.assertTrue(tokens[0].cancelled.is_set())
+                    self.assertIn(client, tokens[0]._clients)
+                    self.assertFalse(task.done(), "cancel abandoned preparation worker")
+                    if session:
+                        self.assertTrue(session._lock.locked())
+                    task.cancel()
+                    for _ in range(5):
+                        await asyncio.sleep(0)
+                    self.assertFalse(task.done(), "repeated cancel abandoned preparation")
+                release.set()
+                if cancel:
+                    with self.assertRaises(asyncio.CancelledError):
+                        await asyncio.wait_for(task, 2)
+                    # Observe public completion before fixture teardown can mask
+                    # a retained client or a prematurely released worker.
+                    self.assertFalse(client.connected)
+                    self.assertTrue(all(not token._clients for token in tokens))
+                    if session:
+                        self.assertIsNone(session._client)
+                        self.assertFalse(session._lock.locked())
+                else:
+                    result = await asyncio.wait_for(task, 2)
+                    results = result if isinstance(result, list) else [result]
+                    if entry == "groups":
+                        results = results[0]
+                    self.assertIsInstance(results, list)
+                    self.assertEqual(len(results), 1)
+                    self.assertIsInstance(results[0], SSHCommandResult)
+                    self.assertTrue(results[0].ok)
+            finally:
+                release.set()
+                await asyncio.gather(task, return_exceptions=True)
+                if session:
+                    await session.close_owned()
+            self.assertEqual(client.connect_calls, 0 if cancel and phase == "host_keys" else 1)
+            self.assertEqual(client.auth_calls, int(not cancel and phase != "host_keys"))
+            self.assertEqual(client.command_calls, int(not cancel))
+            self.assertFalse(client.connected)
+            self.assertTrue(all(not token._clients for token in tokens))
+            if session:
+                self.assertIsNone(session._client)
+                self.assertFalse(session._lock.locked())
+            if cancel:
+                after_interrupt = trace[trace.index("interrupt_done") + 1:]
+                self.assertNotIn("connect", after_interrupt)
+                self.assertNotIn("auth", after_interrupt)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        self.assertEqual(loop_errors, [])
+
+    async def test_cancel_during_host_keys_stops_all_public_connection_paths(self):
+        for entry in self.entries:
+            for strict in (True, False):
+                with self.subTest(entry=entry, strict=strict):
+                    await self.exercise_admission(entry, strict=strict)
+
+    async def test_uncancelled_preparation_preserves_all_public_connection_paths(self):
+        for entry in self.entries:
+            for strict in (True, False):
+                with self.subTest(entry=entry, strict=strict):
+                    await self.exercise_admission(entry, cancel=False, strict=strict)
+
+    async def test_cancel_during_connect_or_fallback_preparation_stops_authentication(self):
+        for entry in self.entries:
+            for phase in ("connect", "fallback"):
+                with self.subTest(entry=entry, phase=phase):
+                    await self.exercise_admission(entry, phase=phase)
+
+    async def test_uncancelled_keyboard_interactive_fallback_still_succeeds(self):
+        for entry in self.entries:
+            with self.subTest(entry=entry):
+                await self.exercise_admission(entry, phase="fallback", cancel=False)
+
+
+class SSHBenchmarkTests(unittest.TestCase):
+    def test_checked_in_benchmark_cli_one_and_multiple_bays(self):
+        import json
+        import subprocess
+        import sys
+
+        root = Path(__file__).resolve().parents[1]
+        result = subprocess.run([
+            sys.executable, "-B", str(root / "scripts/benchmark_ssh_smart_sessions.py"),
+            "--bays", "1", "4", "--concurrency", "1", "3", "--handshake-ms", "0",
+            "--command-ms", "0", "--commands-per-bay", "2", "--repeat", "1", "--json",
+        ], cwd=root, capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = json.loads(result.stdout)
+        self.assertEqual([(r["bays"], r["concurrency"]) for r in rows], [(1, 1), (1, 3), (4, 1), (4, 3)])
+        for row in rows:
+            self.assertEqual(row["commands"], row["bays"] * 2)
+            self.assertGreaterEqual(row["connections"], 1)
+            self.assertLessEqual(row["connections"], row["bays"])
+            if row["concurrency"] == 1:
+                self.assertEqual(row["connections"], row["bays"])
+            self.assertGreaterEqual(row["peak_channels"], 1)
+            self.assertLessEqual(row["peak_channels"], min(row["bays"], row["concurrency"]))
+
+    def test_benchmark_fails_closed_on_unsuccessful_results(self):
+        from scripts import benchmark_ssh_smart_sessions as benchmark
+
+        with patch.object(benchmark._Channel, "recv_exit_status", return_value=1) as status:
+            with self.assertRaisesRegex(RuntimeError, "expected 2 ok results, got 0"):
+                asyncio.run(benchmark.run_case(1, 1, 0, 0, 2))
+            self.assertEqual(status.call_count, 2, "benchmark failed before injected bad results")
+
+    def test_benchmark_channel_supports_production_reader_and_cleanup(self):
+        from scripts.benchmark_ssh_smart_sessions import FakeNAS
+
+        nas = FakeNAS(0, 0)
+        client = nas.client()
+        try:
+            probe = SSHProbe(SSHConfig(enabled=True, host="host.example.test"))
+            result = probe._run_single_command(client, "true")
+            self.assertTrue(result.ok, result.stderr)
+            self.assertEqual(result.stdout, '{"smart_status": {"passed": true}}')
+            self.assertEqual((nas.connections, nas.commands, nas.open_channels), (1, 1, 0))
+        finally:
+            client.close()
+
+    def test_benchmark_fake_tracks_channels_until_close_and_honours_cancellation(self):
+        from app.services.ssh_probe import _WorkerCancellation
+        from scripts.benchmark_ssh_smart_sessions import FakeNAS
+
+        nas = FakeNAS(0, 0)
+        cancellation = _WorkerCancellation()
+        cancellation.cancelled.set()
+        with self.assertRaises(asyncio.CancelledError):
+            nas.client(_cancel=cancellation)
+        self.assertEqual(nas.connections, 0)
+        self.assertEqual(cancellation._clients, set())
+        cancellation = _WorkerCancellation()
+        client = nas.client(_cancel=cancellation)
+        try:
+            self.assertIn(client, cancellation._clients)
+            streams = client.exec_command("true")
+            channel = streams[1].channel
+            self.assertEqual((nas.connections, nas.commands, nas.open_channels), (1, 1, 1))
+            self.assertTrue(channel.recv_ready())
+            output = bytearray()
+            while channel.recv_ready():
+                output.extend(channel.recv(3))
+            self.assertEqual(output, b'{"smart_status": {"passed": true}}')
+            self.assertFalse(channel.recv_stderr_ready())
+            self.assertEqual(channel.recv_stderr(3), b"")
+            self.assertTrue(channel.eof_received)
+            self.assertTrue(channel.exit_status_ready())
+            cancellation.cancelled.set()
+            cancellation.interrupt()
+            self.assertTrue(channel.closed)
+            self.assertEqual(nas.open_channels, 0)
+            self.assertFalse(client.get_transport().is_active())
+            channel.close()
+            self.assertEqual(nas.open_channels, 0)
+            with self.assertRaises(EOFError):
+                client.exec_command("not-after-close")
+            self.assertEqual(nas.commands, 1)
+        finally:
+            client.close()
+            cancellation.discard(client)
+
+
 class DiskSyncPollReusesOneConnectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_full_sync_polls_over_one_connection_and_locks_per_command(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -487,15 +1542,11 @@ class DiskSyncPollReusesOneConnectionTests(unittest.IsolatedAsyncioTestCase):
                 lock_held.append(
                     asyncio.run_coroutine_threadsafe(self._locked(service), loop).result(2)
                 )
-                stdin, stdout, stderr = MagicMock(), MagicMock(), MagicMock()
-                stdout.read.return_value = next(answers).encode()
-                stderr.read.return_value = b""
-                stdout.channel.recv_exit_status.return_value = 0
-                return stdin, stdout, stderr
+                return _memory_streams(next(answers).encode())
 
             clients: list[MagicMock] = []
 
-            def new_client():
+            def new_client(*, _cancel=None):
                 client = _fake_ssh_client()
                 client.exec_command.side_effect = exec_command
                 clients.append(client)
