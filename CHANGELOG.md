@@ -259,6 +259,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Ran each click inside the admin Backups dialog once; two listeners had
+  doubled every add, remove and close. (#804)
 - Kept the startup, storage-writability and known_hosts warnings on every
   inventory refresh and re-probed the directories at most every 30 seconds, so
   a warning no longer vanishes on the first refresh or outlives its fix.

@@ -263,7 +263,7 @@ function mount({ api = fakeApi(), confirm = () => true, stopped = false } = {}) 
   });
   elements.root = root;
   elements.dialog = doc.createElement("dialog");
-  doc.body.append(elements.dialog);
+  root.append(elements.dialog); // nested in the section, as the template does
   const banners = [];
   const refreshes = [];
   const library = createBackupLibrary({
@@ -908,6 +908,29 @@ test("saving sends edits, file-path secret changes and clears, never locked valu
   }
   assert.match(elements.dialog.textContent, /Restart the backup scheduler/);
   assert.match(banners.at(-1)[0], /Backup settings saved/);
+});
+
+test("one click on Add a target or Remove this target acts once, with the dialog inside the section", async () => {
+  const base = syntheticPolicyView();
+  const three = ["alpha", "bravo", "charlie"].map((name) => ({
+    ...base.targets[0],
+    values: { ...base.targets[0].values, target_id: name, label: name },
+    original_target_id: name,
+  }));
+  const api = fakeApi({ "GET /api/admin/backups/policy": () => syntheticPolicyView({ targets: three }) });
+  const { elements, library } = mount({ api });
+  assert.match(TEMPLATE, /<section id="backup-library"(?:(?!<\/section>)[\s\S])*<dialog id="backup-library-dialog"/, "the template nests the dialog in the section");
+  assert.equal(elements.dialog.parentNode, elements.root, "the harness nests the dialog as the template does");
+  await library.load();
+  await library.actions.openPolicyEditor(elements.editButton);
+  await settle();
+  const targetIds = () => elements.dialog.querySelectorAll("[data-target-key]")
+    .filter((input) => input.dataset.targetKey === "target_id")
+    .map((input) => input.value);
+  action(elements.dialog, "policy-remove-target", "0").click();
+  assert.deepEqual(targetIds(), ["bravo", "charlie"]);
+  action(elements.dialog, "policy-add-target").click();
+  assert.deepEqual(targetIds(), ["bravo", "charlie", ""]);
 });
 
 test("adding and removing targets keeps what was typed; a stale revision says reload", async () => {

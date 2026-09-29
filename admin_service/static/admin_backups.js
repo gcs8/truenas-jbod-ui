@@ -1382,8 +1382,8 @@
     }
 
     function bind() {
+      // The dialog sits inside the section, so its clicks bubble to this one listener.
       els.root?.addEventListener("click", handleClick);
-      els.dialog?.addEventListener("click", handleClick);
       // Escape (the dialog's native cancel) must also restore focus.
       els.dialog?.addEventListener("cancel", (event) => {
         event.preventDefault?.();
