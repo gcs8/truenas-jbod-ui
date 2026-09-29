@@ -23,6 +23,16 @@ runtime service rather than a dev-only helper.
 Use the same folder you created in [[Quick Start|Quick-Start]], where
 `compose.yaml` and `.env` live.
 
+Before running any launch command, set `ADMIN_PUBLIC_ORIGIN` in `.env` to the
+exact address operators will open in their browsers:
+
+```dotenv
+ADMIN_PUBLIC_ORIGIN=http://your-docker-host:8082
+```
+
+The admin sidecar requires this fixed origin in both network and Basic modes.
+Basic mode also requires `APP_PUBLIC_ORIGIN` for the main UI.
+
 If the main UI is already running and you only want to add the admin sidecar:
 
 ```bash
@@ -55,8 +65,8 @@ The default setup has no login. Anyone who can reach port `8082` can change
 configuration and control the app's containers. The mounted Docker socket gives
 the sidecar host-level container authority. Auto-stop limits exposure; it is not
 authentication. Confirm the page loads, then stop the sidecar or continue with
-the optional hardening below. Cross-site browser mutations are rejected
-automatically and require no first-run setting.
+the optional hardening below. Browser mutation checks use the fixed
+`ADMIN_PUBLIC_ORIGIN`; they never trust the request `Host` header.
 
 Read the
 [Admin trust boundary](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/ADMIN_TRUST_BOUNDARY.md)
@@ -74,10 +84,11 @@ APP_PUBLIC_ORIGIN=https://storage-ui.example.test
 ADMIN_PUBLIC_ORIGIN=https://storage-admin.example.test
 ```
 
-`ADMIN_PUBLIC_ORIGIN` is required whenever the admin sidecar runs. In Basic
-mode, `APP_PUBLIC_ORIGIN` is required too. Both must match the addresses shown
-in the browser. Use HTTPS through a reverse proxy or an encrypted network path,
-and restrict port reachability with firewall rules or segmentation.
+`ADMIN_PUBLIC_ORIGIN` is required whenever the admin sidecar runs. Basic mode
+requires an origin for each enabled UI, so `APP_PUBLIC_ORIGIN` is required too.
+Both must match the addresses shown in the browser. Use HTTPS through a reverse
+proxy or an encrypted network path, and restrict port reachability with firewall
+rules or segmentation.
 Segmentation limits reachability but does not authenticate a client. See
 [[Advanced Configuration|Advanced-Configuration]] for the full explanation.
 

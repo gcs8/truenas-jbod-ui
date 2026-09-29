@@ -51,18 +51,6 @@ an entry below.
 
 - Restored unauthenticated main and admin controls in default `network` mode
   and made TLS certificate verification opt-in for new connections (#392)
-
-### Upgrade notes
-
-- `ADMIN_PUBLIC_ORIGIN`: set the exact admin address operators use before
-  starting the admin profile; the setting is now required in every auth mode
-  (#393).
-
-### Security
-
-- Required a fixed admin browser origin in network mode instead of trusting the
-  request `Host` header, preventing DNS-rebinding access to privileged APIs
-  (#393).
 - Required local authentication for mutating main-UI requests and hardened the
   default Compose runtime contract (#245 and #246).
 - Required a configured admin public origin for browser-initiated admin
@@ -77,6 +65,9 @@ an entry below.
 These changes are visible to operators after upgrading from `v0.22.2`. Read
 them before starting the new images.
 
+- `ADMIN_PUBLIC_ORIGIN`: set the exact admin address operators use before
+  starting the admin profile; the setting is now required in every auth mode
+  (#393).
 - `ADMIN_AUTO_STOP_SECONDS` now defaults to `0`, which means auto-stop is
   disabled: the admin sidecar no longer stops itself after an hour unless a
   deployment says so. The published `docker-compose.yml` and
@@ -158,6 +149,9 @@ them before starting the new images.
 
 ### Security
 
+- Required a fixed admin browser origin in network mode instead of trusting the
+  request `Host` header, preventing DNS-rebinding access to privileged APIs
+  (#393).
 - Reset skipped-scope topology confirmation state, bounded anonymous bulk
   history reads, and capped persistent host-prep staging (#381)
 - Restricted generated storage-discovery sudo grants, rejected malformed or
