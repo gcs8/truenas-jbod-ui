@@ -259,6 +259,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Refuse unsupported SQLite schemas before segmented migration creates output,
+  and preserve rollback authority so interrupted cleanup can resume. (#754)
 - Exclude display labels from disk-retention identity so distinct disks sharing
   a label remain separate while genuine persistent aliases still deduplicate. (#758)
 - Prevented a delayed page load from restoring a dismissed upgrade notice
