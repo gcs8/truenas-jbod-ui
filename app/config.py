@@ -8,6 +8,7 @@ import re
 import tempfile
 import threading
 import types
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, Literal, Union, get_args, get_origin
 from weakref import WeakValueDictionary
@@ -897,19 +898,43 @@ def _set_path_value(target: dict[str, Any], path: tuple[str, ...], value: Any) -
     cursor[path[-1]] = value
 
 
-def _load_yaml_config(config_path: Path) -> dict[str, Any]:
-    if not config_path.exists():
+def _load_yaml_document(
+    path: Path,
+    read_yaml_file: Callable[[Path], bytes | None] | None = None,
+    captured_files: Mapping[Path, bytes | None] | None = None,
+) -> Any:
+    absolute_path = path.absolute()
+    if captured_files is not None and absolute_path in captured_files:
+        content = captured_files[absolute_path]
+        return None if content is None else (yaml.safe_load(content.decode("utf-8")) or {})
+    if read_yaml_file is not None:
+        content = read_yaml_file(path)
+        return None if content is None else (yaml.safe_load(content.decode("utf-8")) or {})
+    if not path.exists():
+        return None
+    with path.open("r", encoding="utf-8") as handle:
+        return yaml.safe_load(handle) or {}
+
+
+def _load_yaml_config(
+    config_path: Path,
+    read_yaml_file: Callable[[Path], bytes | None] | None = None,
+    captured_files: Mapping[Path, bytes | None] | None = None,
+) -> dict[str, Any]:
+    loaded = _load_yaml_document(config_path, read_yaml_file, captured_files)
+    if loaded is None:
         return {}
-
-    with config_path.open("r", encoding="utf-8") as handle:
-        loaded = yaml.safe_load(handle) or {}
-        if not isinstance(loaded, dict):
-            raise ValueError(f"Config file {config_path} must contain a YAML mapping.")
-        return loaded
+    if not isinstance(loaded, dict):
+        raise ValueError(f"Config file {config_path} must contain a YAML mapping.")
+    return loaded
 
 
-def _load_runtime_overrides_config(config_path: Path) -> dict[str, Any]:
-    loaded = _load_yaml_config(config_path)
+def _load_runtime_overrides_config(
+    config_path: Path,
+    read_yaml_file: Callable[[Path], bytes | None] | None = None,
+    captured_files: Mapping[Path, bytes | None] | None = None,
+) -> dict[str, Any]:
+    loaded = _load_yaml_config(config_path, read_yaml_file, captured_files)
     app_payload = loaded.get("app")
     if not isinstance(app_payload, dict):
         return {}
@@ -1111,8 +1136,8 @@ def _save_runtime_behavior_overrides(
 
     runtime_overrides_path.parent.mkdir(parents=True, exist_ok=True)
     # Replacement must retain the readers of an existing file, including a
-    # private file owned by the UI rather than the admin writer. New files use
-    # the ordinary 0644 config-file reader mode, not mkstemp's private mode.
+    # private file owned by the UI rather than the admin writer. New files stay
+    # owner-only so credentials cannot pass through a broader umask default.
     # Only POSIX has the UID/GID and permission-bit contract handled here.
     existing_metadata = None
     if os.name == "posix":
@@ -1132,7 +1157,7 @@ def _save_runtime_behavior_overrides(
             handle.flush()
             if os.name == "posix":
                 descriptor = handle.fileno()
-                mode = 0o644
+                mode = 0o600
                 if existing_metadata is not None:
                     staged_metadata = os.fstat(descriptor)
                     owner = (existing_metadata.st_uid, existing_metadata.st_gid)
@@ -1144,7 +1169,20 @@ def _save_runtime_behavior_overrides(
                 # Serialize and flush privately; admit final metadata before
                 # replace so a permissions failure cannot publish or succeed.
                 os.fchmod(descriptor, mode)
+                os.fsync(descriptor)
         temp_path.replace(runtime_overrides_path)
+        if os.name == "posix":
+            try:
+                directory = os.open(runtime_overrides_path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+            except OSError as exc:
+                raise OSError(
+                    exc.errno,
+                    "Runtime overrides replaced; directory durability is uncertain.",
+                ) from exc
     finally:
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
@@ -1156,12 +1194,14 @@ def _save_runtime_behavior_overrides(
     return runtime_behavior_settings_payload(effective)
 
 
-def _load_profile_yaml(profile_path: Path) -> dict[str, Any]:
-    if not profile_path.exists():
+def _load_profile_yaml(
+    profile_path: Path,
+    read_yaml_file: Callable[[Path], bytes | None] | None = None,
+    captured_files: Mapping[Path, bytes | None] | None = None,
+) -> dict[str, Any]:
+    loaded = _load_yaml_document(profile_path, read_yaml_file, captured_files)
+    if loaded is None:
         return {}
-
-    with profile_path.open("r", encoding="utf-8") as handle:
-        loaded = yaml.safe_load(handle) or {}
 
     if isinstance(loaded, list):
         return {"profiles": loaded}
@@ -1454,17 +1494,31 @@ def replace_settings(settings: Settings) -> None:
 get_settings.cache_clear = _clear_settings_cache  # type: ignore[attr-defined]
 
 
-def load_settings(*, running_restart_only: Settings | None = None) -> Settings:
+def load_settings(
+    *,
+    running_restart_only: Settings | None = None,
+    create_directories: bool = True,
+    read_yaml_file: Callable[[Path], bytes | None] | None = None,
+    captured_files: Mapping[Path, bytes | None] | None = None,
+) -> Settings:
     """Read and validate config.yaml, runtime-overrides.yaml, profiles.yaml and .env.
 
     During live reload, dependent override and profile content stays on the running
     restart-only path. The pending path is still validated and reported as a
     restart-only change, but its content is not combined with the old process's
     open stores and paths.
+
+    Read-only callers can disable directory creation and supply an admitted
+    YAML reader (bytes, or None for a missing file). A scheduled config export
+    can also supply its hashed documents; captured paths take precedence,
+    including authoritative absence, while uncaptured paths use the admitted
+    reader. All settings parsing and merging remains shared, and these controls
+    do not change the process cache.
+    Secret-file environment overrides retain their own bounded reader.
     """
     defaults = Settings().model_dump()
     config_path = Path(os.getenv("APP_CONFIG_PATH", defaults["config_file"]))
-    yaml_config = _load_yaml_config(config_path)
+    yaml_config = _load_yaml_config(config_path, read_yaml_file, captured_files)
     merged = _deep_merge(defaults, yaml_config)
     raw_paths = merged.get("paths")
     configured_overrides_path = (
@@ -1484,10 +1538,14 @@ def load_settings(*, running_restart_only: Settings | None = None) -> Settings:
         if running_restart_only is not None
         else configured_overrides_path
     )
-    runtime_overrides = _load_runtime_overrides_config(runtime_overrides_path)
+    runtime_overrides = _load_runtime_overrides_config(
+        runtime_overrides_path, read_yaml_file, captured_files
+    )
     if running_restart_only is not None and Path(configured_overrides_path) != runtime_overrides_path:
         try:
-            pending_runtime_overrides = _load_runtime_overrides_config(Path(configured_overrides_path))
+            pending_runtime_overrides = _load_runtime_overrides_config(
+                Path(configured_overrides_path), read_yaml_file, captured_files
+            )
             Settings.model_validate(_deep_merge(defaults, pending_runtime_overrides))
         except (OSError, yaml.YAMLError, ValueError, ValidationError) as exc:
             raise ConfigurationError(
@@ -1496,6 +1554,7 @@ def load_settings(*, running_restart_only: Settings | None = None) -> Settings:
                     f"the new runtime override file is invalid ({type(exc).__name__})."
                 ]
             ) from None
+
     for key, suggestion in collect_unknown_config_key_suggestions(yaml_config):
         logger.warning("%s", _unknown_key_message(config_path, key, suggestion))
     merged = _deep_merge(merged, runtime_overrides)
@@ -1509,6 +1568,10 @@ def load_settings(*, running_restart_only: Settings | None = None) -> Settings:
         if raw_value is None:
             continue
         if env_name in EXACT_STRING_ENV_OVERRIDES:
+            # A blank ``KEY=`` line copied from .env.example is unset, like
+            # every other key; a ``<KEY>_FILE`` secret is still used exactly.
+            if not raw_value.strip() and os.getenv(f"{env_name}_FILE") is None:
+                continue
             parsed_value = raw_value
         elif not raw_value.strip():
             continue
@@ -1540,8 +1603,8 @@ def load_settings(*, running_restart_only: Settings | None = None) -> Settings:
     # as-is so validation reports it as a configuration error.
     inline_raw = merged.get("profiles") or []
     inline_profiles = list(inline_raw) if isinstance(inline_raw, list) else None
-    if profile_path.exists() and inline_profiles is not None:
-        profile_config = _load_profile_yaml(profile_path)
+    if inline_profiles is not None:
+        profile_config = _load_profile_yaml(profile_path, read_yaml_file, captured_files)
         merged["profiles"] = [*inline_profiles, *(profile_config.get("profiles") or [])]
     # A pending restart-only profile path never supplies live profiles, but
     # the next start will read it. Refuse the edit now if that file would
@@ -1554,7 +1617,9 @@ def load_settings(*, running_restart_only: Settings | None = None) -> Settings:
         and inline_profiles is not None
     ):
         try:
-            pending_config = _load_profile_yaml(pending_profile_path)
+            pending_config = _load_profile_yaml(
+                pending_profile_path, read_yaml_file, captured_files
+            )
         except (OSError, yaml.YAMLError, ValueError) as exc:
             raise ConfigurationError(
                 [f"paths.profile_file in {config_path}: the new profile file cannot be loaded ({type(exc).__name__})."]
@@ -1580,9 +1645,10 @@ def load_settings(*, running_restart_only: Settings | None = None) -> Settings:
             describe_validation_error(exc, resolve_location=resolve_location, default_source=str(config_path))
         ) from None
     settings = _normalize_systems(validated)
-    Path(settings.paths.mapping_file).parent.mkdir(parents=True, exist_ok=True)
-    Path(settings.paths.sas_fabric_alias_file).parent.mkdir(parents=True, exist_ok=True)
-    Path(settings.paths.log_file).parent.mkdir(parents=True, exist_ok=True)
-    Path(settings.paths.profile_file).parent.mkdir(parents=True, exist_ok=True)
-    Path(settings.paths.slot_detail_cache_file).parent.mkdir(parents=True, exist_ok=True)
+    if create_directories:
+        Path(settings.paths.mapping_file).parent.mkdir(parents=True, exist_ok=True)
+        Path(settings.paths.sas_fabric_alias_file).parent.mkdir(parents=True, exist_ok=True)
+        Path(settings.paths.log_file).parent.mkdir(parents=True, exist_ok=True)
+        Path(settings.paths.profile_file).parent.mkdir(parents=True, exist_ok=True)
+        Path(settings.paths.slot_detail_cache_file).parent.mkdir(parents=True, exist_ok=True)
     return settings

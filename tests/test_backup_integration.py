@@ -1,7 +1,8 @@
 """Backup integration (#398/#573): policy, cron, journal hooks, scheduler, API, health, Compose.
 
 No network: remote targets are filesystem targets from the real transport
-module, and the archive builder is a fake runner that writes a file.
+module. Scheduler unit tests use a fake runner; captured-generation regressions
+use the real encrypted archive builder over synthetic config files.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 
@@ -79,6 +81,43 @@ class CronTests(unittest.TestCase):
         either = CronSchedule.parse("0 0 1 * 1")  # 1st of month OR Monday
         self.assertEqual(either.next_after(datetime(2026, 9, 24, tzinfo=UTC)), datetime(2026, 9, 28, tzinfo=UTC))
         self.assertEqual(CronSchedule.parse("0 12 29 2 *").next_after(datetime(2026, 3, 1, tzinfo=UTC)).year, 2028)
+
+    def test_star_step_day_field_is_not_restricted(self) -> None:
+        # Classic cron: a day field that starts with "*" does not count as restricted,
+        # so "*/2" day-of-month with a weekday means both must match.
+        odd_mondays = CronSchedule.parse("0 3 */2 * 1")
+        self.assertEqual(odd_mondays.next_after(datetime(2026, 9, 24, tzinfo=UTC)), datetime(2026, 10, 5, 3, 0, tzinfo=UTC))
+        self.assertEqual(odd_mondays.next_after(datetime(2026, 10, 5, 3, 0, tzinfo=UTC)), datetime(2026, 10, 19, 3, 0, tzinfo=UTC))
+        either = CronSchedule.parse("0 3 1,15 * 1")  # 1st, 15th, or any Monday
+        start = datetime(2026, 9, 24, tzinfo=UTC)
+        runs = []
+        for _ in range(5):
+            start = either.next_after(start)
+            runs.append(start.day)
+        self.assertEqual(runs, [28, 1, 5, 12, 15])
+
+    def test_sparse_leap_sunday_beyond_five_years(self) -> None:
+        from zoneinfo import ZoneInfo
+
+        schedule = CronSchedule.parse("0 0 29 2 */7")
+        for zone in (UTC, ZoneInfo("America/New_York")):
+            with self.subTest(zone=zone):
+                first = schedule.next_after(datetime(2026, 9, 28, tzinfo=zone))
+                self.assertEqual(first, datetime(2032, 2, 29, tzinfo=zone))
+                self.assertIs(first.tzinfo, zone)
+                self.assertEqual(schedule.next_after(first), datetime(2060, 2, 29, tzinfo=zone))
+                self.assertEqual(
+                    schedule.next_after(datetime(2096, 3, 1, tzinfo=zone)),
+                    datetime(2128, 2, 29, tzinfo=zone),
+                )
+
+    def test_impossible_intersection_has_bounded_calendar_search(self) -> None:
+        schedule = CronSchedule.parse("0 0 31 2 */7")
+        original = CronSchedule._day_matches
+        with patch.object(CronSchedule, "_day_matches", autospec=True, side_effect=original) as matches:
+            with self.assertRaises(CronError):
+                schedule.next_after(datetime(2026, 1, 1, tzinfo=UTC))
+        self.assertLessEqual(matches.call_count, 146098)
 
     def test_invalid(self) -> None:
         for text in ("", "* * * *", "60 * * * *", "* * 0 * *", "a * * * *", "*/0 * * * *", "5-1 * * * *", "0 0 31 2 *"):
@@ -149,6 +188,22 @@ class PolicyTests(unittest.TestCase):
         self.assertTrue(any("backups.full.schedule" in p and "cron" in p for p in problems), problems)
         for problem in problems:
             self.assertNotIn("\n", problem)
+
+    def test_schedule_that_never_matches_is_refused(self) -> None:
+        # A parseable schedule with no real date used to pass validation and
+        # then stop the scheduler on start (restart loop).
+        for text in ("0 0 30 2 *", "0 0 31 4 *"):
+            with self.subTest(text=text):
+                self.write({"full": {"schedule": text}})
+                with self.assertRaises(ConfigurationError) as caught:
+                    load_backup_policy(self.config, {})
+                problems = caught.exception.problems
+                self.assertTrue(
+                    any("backups.full.schedule" in p and "never matches a real date" in p for p in problems),
+                    problems,
+                )
+        self.write({"full": {"schedule": "0 0 29 2 *"}})
+        self.assertEqual(load_backup_policy(self.config, {}).full.schedule, "0 0 29 2 *")
 
     def test_unknown_keys_and_delay_rule(self) -> None:
         self.write({"config": {"enabled": True, "debounce_seconds": 100, "max_delay_seconds": 10}})
@@ -355,7 +410,7 @@ class SchedulerTestBase(unittest.TestCase):
 
         return opened()
 
-    def make(self, backups: dict[str, Any]):
+    def make(self, backups: dict[str, Any], *, local_tz: Any = UTC):
         config = self.root / "config.yaml"
         config.write_text(yaml.safe_dump({"backups": backups}))
         policy = load_backup_policy(config, {})
@@ -371,13 +426,542 @@ class SchedulerTestBase(unittest.TestCase):
             runner_factory=FakeRunner,
             clock=lambda: self.now,
             monotonic=lambda: self.mono[0],
-            local_tz=UTC,
+            local_tz=local_tz,
         )
         self.addCleanup(scheduler.close)
         return scheduler
 
 
 TARGET = {"target_id": "nas", "label": "Office NAS", "provider": "filesystem", "root": "/unused"}
+
+
+class CapturedConfigSchedulerTests(SchedulerTestBase):
+    """Automatic ticks with real encrypted archives and disposable config files."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        from app.config import get_settings
+        from history_service.backup_scheduler.service import BackupScheduler, snapshot_config_files
+        from history_service.config import HistorySettings
+        from history_service.system_backup import SystemBackupService
+        from types import SimpleNamespace
+
+        self.config_path = self.root / "config.yaml"
+        self.config_path.write_text("systems: []\n")
+        self.mapping_path = self.root / "slot_mappings.json"
+        self.mapping_path.write_text('{"version": 1, "slot_mappings": {}}')
+        self.slot_path = self.root / "slot_detail_cache.json"
+        self.slot_path.write_text('{"version": 1, "slot_details": {}}')
+        self.hashed = {"config": self.config_path, "mappings": self.mapping_path}
+        self.passphrase = "synthetic-capture-test"
+        self._paths.passphrase_file.write_text(self.passphrase)
+        self._paths.passphrase_file.chmod(0o600)
+        env = patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)})
+        env.start()
+        self.addCleanup(env.stop)
+        get_settings.cache_clear()
+        self.addCleanup(get_settings.cache_clear)
+        self.service = SystemBackupService(
+            HistorySettings(sqlite_path=str(self.root / "unused.db")),
+            SimpleNamespace(file_path=self.root / "unused.db", segment_catalog_path=None),
+        )
+        self.after_snapshot = lambda: None
+
+        def snapshot():
+            captured = snapshot_config_files(self.hashed)
+            self.after_snapshot()
+            return captured
+
+        policy_path = self.root / "policy.yaml"
+        policy_path.write_text(yaml.safe_dump({"backups": {"config": {
+            "enabled": True, "debounce_seconds": 10, "max_delay_seconds": 60,
+            "local_keep": 20,
+        }}}))
+        self.scheduler = BackupScheduler(
+            load_backup_policy(policy_path, {}), self.service, self._paths,
+            app_gid=os.getegid(),
+            config_groups=["config_file", "mapping_file", "slot_detail_file"],
+            full_groups=["config_file", "mapping_file", "slot_detail_file", "history_db"],
+            snapshot_config=snapshot, clock=lambda: self.now,
+            monotonic=lambda: self.mono[0],
+        )
+        self.addCleanup(self.scheduler.close)
+        self.journal = self.scheduler.journal
+
+    def due_tick(self) -> None:
+        self.scheduler.tick()  # observe the externally journalled change
+        self.mono[0] += 11
+        self.now += timedelta(seconds=11)
+        self.scheduler.tick()
+
+    def archive_bytes(self, record) -> dict[str, bytes]:
+        _manifest, members, _packaging, metadata = self.service._read_archive_file(
+            self._paths.local_dir / record.name, passphrase=self.passphrase,
+        )
+        try:
+            self.assertTrue(metadata["encrypted"])
+            return {key: self.service._extracted_member_bytes(member) for key, member in members.items()}
+        finally:
+            self.service._cleanup_extracted_archive(metadata.get("_cleanup_root"))
+
+    def archive_documents(self, record) -> dict[str, Any]:
+        members = self.archive_bytes(record)
+        documents = {}
+        for logical, group in (("config", "config_file"), ("mappings", "mapping_file")):
+            content = members.get(group)
+            if content is None:
+                documents[logical] = None
+            else:
+                text = content.decode("utf-8")
+                documents[logical] = json.loads(text) if logical == "mappings" else yaml.safe_load(text)
+        return documents
+
+    def test_captured_bytes_preserve_formatting_volatile_fields_and_deleted_document(self) -> None:
+        from history_service.backup_archive.journal import canonical_config_hash
+        from history_service.backup_scheduler.service import snapshot_config_files
+
+        config_bytes = b"# Preserve this comment\r\nsystems: []\r\nupdated_at: captured\r\n"
+        mapping_bytes = b'{ "version": 1, "slot_mappings": {}, "updated_at": "captured" }\n'
+        self.config_path.write_bytes(config_bytes)
+        self.mapping_path.write_bytes(mapping_bytes)
+        expected_hash = canonical_config_hash(snapshot_config_files(self.hashed))
+
+        def replace_after_snapshot():
+            self.config_path.write_text("systems: []\nupdated_at: replaced\n")
+            self.mapping_path.unlink()
+            self.slot_path.write_text('{"version": 1, "slot_details": {}, "updated_at": "live-cache"}')
+            self.journal.append("mapping.save", "deleted")
+            self.after_snapshot = lambda: None
+
+        self.after_snapshot = replace_after_snapshot
+        self.journal.append("mapping.save", "initial")
+        self.due_tick()
+        members = self.archive_bytes(self.scheduler.catalog.list()[0])
+        self.assertEqual(members["config_file"], config_bytes)
+        self.assertEqual(members["mapping_file"], mapping_bytes)
+        self.assertEqual(members["slot_detail_file"], self.slot_path.read_bytes())
+        self.assertEqual(self.journal.last_backup()[0], expected_hash)
+        self.assertEqual([entry.subject for entry in self.journal.pending()], ["deleted"])
+        self.mono[0] += 11
+        self.now += timedelta(seconds=11)
+        self.scheduler.tick()
+        records = self.scheduler.catalog.list()
+        self.assertEqual(len(records), 2)
+        self.assertNotIn("mapping_file", self.archive_bytes(records[-1]))
+        self.assertEqual(self.journal.pending(), [])
+
+    def test_automatic_hash_a_capture_b_revert_a_never_consumes_unbacked_a(self) -> None:
+        generation_a = self.config_path.read_bytes()
+        first = self.journal.append("system.save", "generation-a")
+        late = []
+
+        def change_after_snapshot():
+            self.config_path.write_text("systems: []\napp: {source_bundle_cache_ttl_seconds: 123}\n")
+            late.append(self.journal.append("system.save", "generation-b"))
+            self.after_snapshot = lambda: None
+
+        self.after_snapshot = change_after_snapshot
+        self.scheduler.tick()
+        self.assertEqual(self.scheduler.catalog.list(), [])  # debounce still applies
+        self.mono[0] += 11
+        self.scheduler.tick()
+        initial = self.scheduler.catalog.list()
+        self.assertEqual(len(initial), 1)
+        self.assertEqual(initial[0].change_ids, (first.change_id,))
+        self.assertEqual([entry.change_id for entry in self.journal.pending()], [late[0].change_id])
+        self.scheduler.tick()
+        self.assertEqual(len(self.scheduler.catalog.list()), 1)  # late edit has its own debounce
+
+        self.config_path.write_bytes(generation_a)
+        self.journal.append("system.save", "revert-a")
+        self.due_tick()
+        self.assertEqual(self.journal.pending(), [])
+        latest = self.scheduler.catalog.list()[-1]
+        self.assertEqual(self.archive_documents(latest)["config"], yaml.safe_load(generation_a))
+        from history_service.backup_archive.journal import canonical_config_hash
+        self.assertEqual(self.journal.last_backup()[0], canonical_config_hash(self.archive_documents(latest)))
+
+    def test_late_generation_gets_its_own_automatic_archive(self) -> None:
+        from history_service.backup_archive.journal import canonical_config_hash
+
+        def change_after_snapshot():
+            self.config_path.write_text("systems: []\napp: {source_bundle_cache_ttl_seconds: 123}\n")
+            self.journal.append("system.save", "generation-b")
+            self.after_snapshot = lambda: None
+
+        self.after_snapshot = change_after_snapshot
+        self.journal.append("system.save", "generation-a")
+        self.due_tick()
+        first = self.scheduler.catalog.list()[0]
+        first_docs = self.archive_documents(first)
+        self.assertEqual(first_docs["config"], {"systems": []})
+        self.assertEqual(self.journal.last_backup()[0], canonical_config_hash(first_docs))
+        self.mono[0] += 11
+        self.now += timedelta(seconds=11)
+        self.scheduler.tick()
+        records = self.scheduler.catalog.list()
+        self.assertEqual(len(records), 2)
+        last_docs = self.archive_documents(records[-1])
+        self.assertEqual(last_docs["config"]["app"]["source_bundle_cache_ttl_seconds"], 123)
+        self.assertEqual(self.journal.last_backup()[0], canonical_config_hash(last_docs))
+        self.assertEqual(self.journal.pending(), [])
+
+    def test_missing_captured_file_stays_absent_when_created_before_export(self) -> None:
+        self.mapping_path.unlink()
+
+        def create_after_snapshot():
+            self.mapping_path.write_text('{"version": 1, "slot_mappings": {}}')
+            self.journal.append("mapping.save", "created")
+            self.after_snapshot = lambda: None
+
+        self.after_snapshot = create_after_snapshot
+        self.journal.append("mapping.save", "removed")
+        self.due_tick()
+        self.assertIsNone(self.archive_documents(self.scheduler.catalog.list()[0])["mappings"])
+        self.mono[0] += 11
+        self.now += timedelta(seconds=11)
+        self.scheduler.tick()
+        self.assertIsNotNone(self.archive_documents(self.scheduler.catalog.list()[-1])["mappings"])
+        self.assertEqual(self.journal.pending(), [])
+
+    def test_volatile_fields_and_unhashed_cache_do_not_trigger_automatic_archive(self) -> None:
+        self.journal.append("system.save", "initial")
+        self.due_tick()
+        self.config_path.write_text("systems: []\nupdated_at: later\n")
+        self.slot_path.write_text('{"version": 1, "slot_details": {}, "updated_at": "later"}')
+        self.journal.append("system.save", "volatile")
+        self.due_tick()
+        self.assertEqual(len(self.scheduler.catalog.list()), 1)
+        self.assertEqual(self.journal.pending(), [])
+        self.assertEqual(self.journal.entries()[0].status, "noop")
+
+    def test_failed_capture_export_retries_current_generation(self) -> None:
+        from history_service.system_backup import SystemBackupService
+
+        entry = self.journal.append("system.save", "generation-a")
+        with patch.object(SystemBackupService, "_build_archive_to_path", side_effect=OSError("synthetic failure")):
+            self.due_tick()
+        self.assertEqual(self.scheduler.catalog.list(), [])
+        self.assertEqual(self.journal.last_backup(), (None, None))
+        self.assertEqual([item.change_id for item in self.journal.pending()], [entry.change_id])
+        self.config_path.write_text("systems: []\napp: {source_bundle_cache_ttl_seconds: 456}\n")
+        self.scheduler.tick()
+        self.assertEqual(self.scheduler.catalog.list(), [])  # retry backoff
+        self.mono[0] += 11
+        self.scheduler.tick()
+        record = self.scheduler.catalog.list()[0]
+        self.assertEqual(self.archive_documents(record)["config"]["app"]["source_bundle_cache_ttl_seconds"], 456)
+        self.assertEqual(self.journal.pending(), [])
+
+    def test_manual_run_now_still_archives_after_noop_and_idle(self) -> None:
+        self.journal.append("system.save", "initial")
+        self.due_tick()
+        self.journal.append("system.save", "unchanged")
+        after_noop = self.scheduler.run_now("config")
+        self.config_path.write_text("systems: []\napp: {source_bundle_cache_ttl_seconds: 789}\n")
+        after_idle = self.scheduler.run_now("config")
+        self.assertIsNotNone(after_noop)
+        self.assertIsNotNone(after_idle)
+        self.assertNotEqual(after_noop.artifact_id, after_idle.artifact_id)
+        self.assertEqual(len(self.scheduler.catalog.list()), 3)
+        self.assertEqual(self.archive_documents(after_noop)["config"], {"systems": []})
+        self.assertEqual(self.archive_documents(after_idle)["config"]["app"]["source_bundle_cache_ttl_seconds"], 789)
+
+
+class ProductionPathCaptureTests(unittest.TestCase):
+    """Production constructor, runner and encrypted members; only the unused history store is stubbed."""
+
+    @contextlib.contextmanager
+    def built(self, *, nested=True, initial=None, mutate=None):
+        from types import SimpleNamespace
+        from app.config import _derive_runtime_layout_paths, get_settings
+        from history_service.backup_scheduler import service as scheduler_service
+        from history_service.backup_scheduler.main import build_scheduler
+        from history_service.config import HistorySettings
+
+        with tempfile.TemporaryDirectory(prefix="capture-paths-") as name:
+            root = Path(name)
+            config = root / "config" / "config.yaml" if nested else root / "config.yaml"
+            config.parent.mkdir(parents=True, exist_ok=True)
+            layout = {k: Path(v) for k, v in _derive_runtime_layout_paths(config).items()}
+            raw = {
+                "config_file": b"# synthetic UTF-8 caf\xc3\xa9\r\nsystems: []\r\n",
+                "runtime_overrides_file": b"{}\n",
+                "profile_file": b"profiles: []\n",
+                "mapping_file": b'{"version":1,"slot_mappings":{}}\n',
+                "sas_fabric_alias_file": b'{"version":1,"sas_fabric_aliases":{}}\n',
+                "slot_detail_cache_file": b'{"version":1,"slot_details":{}}\n',
+            }
+            for key, content in raw.items():
+                layout[key].parent.mkdir(parents=True, exist_ok=True)
+                layout[key].write_bytes(content)
+            if initial is not None:
+                initial(layout, raw)
+            phrase = root / "synthetic-passphrase"
+            phrase.write_text("synthetic-capture-only")
+            phrase.chmod(0o600)
+            status = root / "status"
+            status.mkdir(mode=0o2750)
+            status.chmod(0o2750)
+            journal_dir = root / "journal"
+            journal_dir.mkdir(mode=0o2770)
+            journal_dir.chmod(0o2770)
+            settings = HistorySettings(sqlite_path=str(root / "history.db"),
+                                       backup_dir=str(root / "history-backups"),
+                                       long_term_backup_dir=str(root / "history-longterm"))
+            environment = {
+                "APP_CONFIG_PATH": str(config), "APP_GID": str(os.getegid()),
+                "BACKUP_ARCHIVE_DIR": str(root / "archives"),
+                "BACKUP_ARCHIVE_STATE_DIR": str(root / "state"),
+                "BACKUP_JOURNAL_PATH": str(journal_dir / "changes.jsonl"),
+                "BACKUP_ARCHIVE_STATUS_FILE": str(status / "archive.json"),
+                "BACKUP_ARCHIVE_PASSPHRASE_FILE": str(phrase),
+                "SCHEDULED_BACKUP_STATUS_FILE": "",
+            }
+            original_capture = scheduler_service.snapshot_config_files
+            state: dict[str, Any] = {"armed": True}
+
+            def capture(paths):
+                result = original_capture(paths)
+                state["capture"] = result
+                self.assertEqual(set(result), {"config", "runtime_overrides", "profiles", "mappings", "sas_fabric_aliases"})
+                if state["armed"]:
+                    state["armed"] = False
+                    if mutate is not None:
+                        mutate(layout, raw, state)
+                    state["late"] = state["scheduler"].journal.append("system.save", "synthetic-late-b")
+                return result
+
+            with patch.dict(os.environ, environment), patch("history_service.config.get_history_settings", return_value=settings), patch("history_service.store.HistoryStore", return_value=SimpleNamespace(file_path=root / "history.db", segment_catalog_path=None)), patch.object(scheduler_service, "snapshot_config_files", capture):
+                get_settings.cache_clear()
+                policy = load_backup_policy(config, {"BACKUP_CONFIG_ENABLED": "true"})
+                scheduler = build_scheduler(policy)
+                state["scheduler"] = scheduler
+                clock = [1000.0]
+                scheduler.coalescer._clock = lambda: clock[0]
+                try:
+                    yield scheduler, state, layout, raw, clock
+                finally:
+                    scheduler.close()
+                    get_settings.cache_clear()
+
+    def decrypt(self, scheduler, record):
+        service = scheduler.backup_service
+        manifest, members, packaging, metadata = service._read_archive_file(
+            scheduler.paths.local_dir / record.name, passphrase="synthetic-capture-only")
+        try:
+            self.assertTrue(metadata["encrypted"])
+            self.assertEqual(packaging, "tar.zst")
+            return {key: service._extracted_member_bytes(value) for key, value in members.items()}
+        finally:
+            service._cleanup_extracted_archive(metadata.get("_cleanup_root"))
+
+    def due(self, scheduler, clock):
+        scheduler.tick()
+        clock[0] += scheduler.coalescer.quiet_period + 1
+        scheduler.tick()
+
+    def projection(self, members):
+        docs = {}
+        for logical, group in {"config": "config_file", "runtime_overrides": "runtime_overrides_file", "profiles": "profile_file", "mappings": "mapping_file", "sas_fabric_aliases": "sas_fabric_alias_file"}.items():
+            content = members.get(group)
+            docs[logical] = None if content is None else (json.loads(content) if logical in {"mappings", "sas_fabric_aliases"} else yaml.safe_load(content))
+        return docs
+
+    def assert_capture_archive(self, scheduler, state, raw, *, omitted=()):
+        from history_service.backup_archive.journal import canonical_config_hash
+
+        records = scheduler.catalog.list()
+        self.assertEqual(len(records), 1, scheduler._status)
+        members = self.decrypt(scheduler, records[0])
+        for key in ("config_file", "runtime_overrides_file", "profile_file",
+                    "mapping_file", "sas_fabric_alias_file"):
+            if key in omitted:
+                self.assertNotIn(key, members)
+            else:
+                self.assertEqual(members[key], raw[key], key)
+        self.assertEqual(scheduler.journal.last_backup()[0], canonical_config_hash(state["capture"]))
+        self.assertEqual(scheduler.journal.last_backup()[0], canonical_config_hash(self.projection(members)))
+        self.assertEqual([x.change_id for x in scheduler.journal.pending()], [state["late"].change_id])
+        self.assertEqual(dict(scheduler.backup_service._captured_config_files), {})
+        return members
+
+    @staticmethod
+    def redirect_paths(layout, raw, state):
+        paths = {}
+        for key in ("runtime_overrides_file", "profile_file", "mapping_file", "sas_fabric_alias_file"):
+            target = layout[key].with_name("alternate-" + layout[key].name)
+            # Valid, semantically distinct documents exercise real archive validation.
+            redirected = {
+                "runtime_overrides_file": {"app": {"source_bundle_cache_ttl_seconds": 97}},
+                "profile_file": {"profiles": [{"id": "synthetic-b", "label": "Synthetic B", "rows": 1, "columns": 1}]},
+                "mapping_file": {"version": 1, "slot_mappings": {"synthetic-s:synthetic-e:1": {
+                    "system_id": "synthetic-s", "enclosure_id": "synthetic-e", "slot": 1, "serial": "SANITIZED-CAPTURE-B",
+                }}},
+                "sas_fabric_alias_file": {"version": 1, "sas_fabric_aliases": {"synthetic-port": {
+                    "object_id": "synthetic-port", "label": "Synthetic B",
+                }}},
+            }[key]
+            text = json.dumps(redirected) if key.endswith("mapping_file") or key == "sas_fabric_alias_file" else yaml.safe_dump(redirected)
+            target.write_text(text)
+            paths[key] = str(target)
+        layout["config_file"].write_text(yaml.safe_dump({"systems": [], "paths": paths}))
+        state["redirected"] = paths
+
+    def test_config_redirects_cannot_bypass_capture_and_revert_noop(self):
+        for nested in (True, False):
+            with self.subTest(nested=nested), self.built(nested=nested, mutate=self.redirect_paths) as (
+                scheduler, state, layout, raw, clock
+            ):
+                first = scheduler.journal.append("system.save", "synthetic-a")
+                self.due(scheduler, clock)
+                self.assert_capture_archive(scheduler, state, raw)
+                self.assertEqual(scheduler.catalog.list()[0].change_ids, (first.change_id,))
+                layout["config_file"].write_bytes(raw["config_file"])
+                scheduler.journal.append("system.save", "synthetic-revert-a")
+                self.due(scheduler, clock)
+                self.assertEqual(len(scheduler.catalog.list()), 1)
+                self.assertEqual(scheduler.journal.pending(), [])
+
+    def test_runtime_overrides_remain_filtered_and_captured(self):
+        def initial(layout, raw):
+            raw["runtime_overrides_file"] = yaml.safe_dump({
+                "app": {"source_bundle_cache_ttl_seconds": 41},
+                "paths": {"mapping_file": str(layout["mapping_file"].with_name("ignored.json"))},
+            }).encode()
+            layout["runtime_overrides_file"].write_bytes(raw["runtime_overrides_file"])
+            # The list form is an existing profile-loader contract.
+            raw["profile_file"] = b"- {id: synthetic-a, label: Synthetic A, rows: 1, columns: 1}\n"
+            layout["profile_file"].write_bytes(raw["profile_file"])
+
+        def mutate(layout, raw, state):
+            layout["runtime_overrides_file"].write_text(yaml.safe_dump({
+                "app": {"source_bundle_cache_ttl_seconds": 97},
+                "paths": {"profile_file": str(layout["profile_file"].with_name("ignored.yaml"))},
+            }))
+            layout["profile_file"].unlink()  # retained profile still supplies settings
+
+        with self.built(initial=initial, mutate=mutate) as (scheduler, state, layout, raw, clock):
+            scheduler.journal.append("system.save", "synthetic-a")
+            self.due(scheduler, clock)
+            self.assert_capture_archive(scheduler, state, raw)
+            from app.config import get_settings
+            cached = get_settings()
+            live = scheduler.backup_service._load_app_settings()
+            captured_service = scheduler.backup_service.with_captured_config_files(state["capture"].files)
+            settings = captured_service._load_app_settings()
+            self.assertIsNot(live, cached)
+            self.assertIs(get_settings(), cached)
+            self.assertEqual(settings.app.source_bundle_cache_ttl_seconds, 41)
+            self.assertEqual([profile.id for profile in settings.profiles], ["synthetic-a"])
+            self.assertEqual(Path(settings.paths.mapping_file), layout["mapping_file"])
+            self.assertEqual(Path(settings.paths.profile_file), layout["profile_file"])
+            self.assertEqual(scheduler.backup_service._load_app_settings().app.source_bundle_cache_ttl_seconds, 97)
+
+    def test_legacy_path_defaults_are_normalized_before_captured_selection(self):
+        def initial(layout, raw):
+            from app.config import _legacy_container_layout_paths
+            legacy = _legacy_container_layout_paths()
+            raw["config_file"] = yaml.safe_dump({"systems": [], "paths": {
+                key: legacy[key] for key in ("mapping_file", "profile_file", "runtime_overrides_file",
+                                             "sas_fabric_alias_file")
+            }}).encode()
+            layout["config_file"].write_bytes(raw["config_file"])
+
+        with self.built(initial=initial, mutate=self.redirect_paths) as (scheduler, state, _, raw, clock):
+            scheduler.journal.append("system.save", "synthetic-a")
+            self.due(scheduler, clock)
+            self.assert_capture_archive(scheduler, state, raw)
+
+    def test_absent_captured_settings_do_not_read_late_path_redirects(self):
+        def initial(layout, raw):
+            for key in ("config_file", "runtime_overrides_file", "profile_file"):
+                layout[key].unlink()
+
+        def mutate(layout, raw, state):
+            self.redirect_paths(layout, raw, state)
+            layout["runtime_overrides_file"].write_text("app: {source_bundle_cache_ttl_seconds: 97}\n")
+            layout["profile_file"].write_text("profiles: invalid\n")
+
+        with self.built(initial=initial, mutate=mutate) as (scheduler, state, _, raw, clock):
+            scheduler.journal.append("system.save", "synthetic-a")
+            self.due(scheduler, clock)
+            self.assert_capture_archive(scheduler, state, raw,
+                                        omitted=("config_file", "runtime_overrides_file", "profile_file"))
+
+    def test_custom_path_scope_and_selected_groups_are_not_expanded(self):
+        def initial(layout, raw):
+            custom = layout["mapping_file"].with_name("custom-mapping.json")
+            custom.write_bytes(raw["mapping_file"])
+            raw["config_file"] = yaml.safe_dump({"systems": [], "paths": {"mapping_file": str(custom)}}).encode()
+            layout["config_file"].write_bytes(raw["config_file"])
+
+        def mutate(layout, raw, state):
+            custom = layout["mapping_file"].with_name("custom-mapping.json")
+            custom.write_bytes(raw["mapping_file"] + b" \n")
+            state["custom"] = custom
+
+        with self.built(initial=initial, mutate=mutate) as (scheduler, state, layout, raw, clock):
+            scheduler.groups["config"].remove("profile_file")
+            scheduler.journal.append("system.save", "synthetic-a")
+            self.due(scheduler, clock)
+            record, = scheduler.catalog.list()
+            members = self.decrypt(scheduler, record)
+            self.assertNotIn("profile_file", members)
+            self.assertEqual(members["mapping_file"], state["custom"].read_bytes())
+            self.assertNotIn(state["custom"], state["capture"].files)
+            self.assertIn(layout["mapping_file"], state["capture"].files)
+
+    def test_environment_path_override_keeps_existing_precedence(self):
+        with self.built(mutate=self.redirect_paths) as (scheduler, state, layout, raw, clock):
+            custom = layout["mapping_file"].with_name("environment-mapping.json")
+            custom_bytes = raw["mapping_file"] + b" \n"
+            custom.write_bytes(custom_bytes)
+            with patch.dict(os.environ, {"PATH_MAPPING_FILE": str(custom)}):
+                scheduler.journal.append("system.save", "synthetic-a")
+                self.due(scheduler, clock)
+                record, = scheduler.catalog.list()
+                members = self.decrypt(scheduler, record)
+                self.assertEqual(members["config_file"], raw["config_file"])
+                self.assertEqual(members["mapping_file"], custom_bytes)
+                self.assertNotIn(custom, state["capture"].files)
+                captured = scheduler.backup_service.with_captured_config_files(state["capture"].files)
+                self.assertEqual(Path(captured._load_app_settings().paths.mapping_file), custom)
+
+    def test_manual_noop_and_idle_read_current_path_selection(self):
+        with self.built() as (scheduler, state, layout, raw, clock):
+            scheduler.journal.append("system.save", "synthetic-a")
+            self.due(scheduler, clock)
+            # The late unchanged entry makes run_now take its live noop branch.
+            after_noop = scheduler.run_now("config")
+            self.assertEqual(self.decrypt(scheduler, after_noop)["mapping_file"], raw["mapping_file"])
+            self.redirect_paths(layout, raw, state)
+            after_idle = scheduler.run_now("config")
+            members = self.decrypt(scheduler, after_idle)
+            self.assertEqual(members["config_file"], layout["config_file"].read_bytes())
+            self.assertEqual(members["mapping_file"], Path(state["redirected"]["mapping_file"]).read_bytes())
+            self.assertEqual(dict(scheduler.backup_service._captured_config_files), {})
+
+    def test_invalid_captured_settings_preserve_journal_and_retry_live_generation(self):
+        def initial(layout, raw):
+            raw["config_file"] = b"systems: []\npaths: {mapping_file: null}\n"
+            layout["config_file"].write_bytes(raw["config_file"])
+
+        def mutate(layout, raw, state):
+            layout["config_file"].write_text("systems: []\n")
+
+        with self.built(initial=initial, mutate=mutate) as (scheduler, state, layout, raw, clock):
+            first = scheduler.journal.append("system.save", "synthetic-invalid-a")
+            self.due(scheduler, clock)
+            self.assertEqual(scheduler.catalog.list(), [])
+            self.assertEqual(scheduler.journal.last_backup(), (None, None))
+            self.assertEqual({x.change_id for x in scheduler.journal.pending()},
+                             {first.change_id, state["late"].change_id})
+            clock[0] += 3600
+            scheduler.tick()
+            record, = scheduler.catalog.list()
+            self.assertEqual(self.decrypt(scheduler, record)["config_file"], layout["config_file"].read_bytes())
+            self.assertEqual(scheduler.journal.pending(), [])
 
 
 class SchedulerTests(SchedulerTestBase):
@@ -433,6 +1017,64 @@ class SchedulerTests(SchedulerTestBase):
         self.assertEqual(len(local), 2)
         self.assertEqual(len(list((self._paths.local_dir / "full").iterdir())), 2)
         self.assertEqual(len(scheduler.catalog.tombstones()), 1)
+
+    def test_full_schedule_keeps_local_wall_clock_across_dst(self) -> None:
+        try:
+            new_york = ZoneInfo("America/New_York")
+        except ZoneInfoNotFoundError:
+            self.skipTest("America/New_York time zone data is not available")
+        self.now = datetime(2026, 10, 31, 12, 0, tzinfo=UTC)
+        scheduler = self.make({"full": {"enabled": True, "schedule": "30 1 * * *"}}, local_tz=new_york)
+        self.assertEqual(scheduler.next_full_at, datetime(2026, 11, 1, 5, 30, tzinfo=UTC))  # 01:30 EDT
+        self.now = datetime(2026, 11, 1, 5, 30, tzinfo=UTC)
+        scheduler.tick()
+        self.assertEqual(len(FakeRunner.calls), 1)
+        # Fall back: 01:30 repeats; the next run is 01:30 EST on 11-02, not a second run on 11-01.
+        self.assertEqual(scheduler.next_full_at, datetime(2026, 11, 2, 6, 30, tzinfo=UTC))
+        # A start inside the repeated hour must not pick the already-past first 01:30.
+        self.assertEqual(
+            scheduler._compute_next_full(datetime(2026, 11, 1, 6, 10, tzinfo=UTC)),
+            datetime(2026, 11, 2, 6, 30, tzinfo=UTC),
+        )
+        # Spring forward: 01:30 EST on 03-08, then 01:30 EDT on 03-09 (not an hour late).
+        self.assertEqual(
+            scheduler._compute_next_full(datetime(2026, 3, 8, 6, 30, tzinfo=UTC)),
+            datetime(2026, 3, 9, 5, 30, tzinfo=UTC),
+        )
+        # Spring forward: 02:30 does not exist on 03-08, so do not run at
+        # 03:30 EDT; wait for 02:30 EDT on 03-09.
+        gap_scheduler = self.make(
+            {"full": {"enabled": True, "schedule": "30 2 * * *"}},
+            local_tz=new_york,
+        )
+        self.assertEqual(
+            gap_scheduler._compute_next_full(datetime(2026, 3, 8, 6, 0, tzinfo=UTC)),
+            datetime(2026, 3, 9, 6, 30, tzinfo=UTC),
+        )
+
+    def test_scheduler_main_uses_the_tz_zone(self) -> None:
+        from history_service.backup_scheduler import main as scheduler_main
+
+        try:
+            new_york = ZoneInfo("America/New_York")
+        except ZoneInfoNotFoundError:
+            self.skipTest("America/New_York time zone data is not available")
+        config = self.root / "idle.yaml"
+        config.write_text("{}\n")
+        env = {"APP_CONFIG_PATH": str(config), "APP_GID": str(os.getegid()),
+               "BACKUP_ARCHIVE_PASSPHRASE_FILE": "", "SCHEDULED_BACKUP_PASSPHRASE_FILE": "",
+               "BACKUP_ARCHIVE_DIR": str(self.root / "a"),
+               "BACKUP_ARCHIVE_STATE_DIR": str(self.root / "s"), "TZ": "America/New_York"}
+        with patch.dict(os.environ, env):
+            with patch("history_service.system_backup.SystemBackupService"), patch("history_service.store.HistoryStore"):
+                scheduler = scheduler_main.build_scheduler(load_backup_policy(config, {}))
+            self.addCleanup(scheduler.close)
+            self.assertEqual(scheduler._local_tz, new_york)
+        for value in ("", "  "):
+            with self.subTest(tz=value), patch.dict(os.environ, {"TZ": value}):
+                self.assertIsNone(scheduler_main._local_tz())
+        with patch.dict(os.environ, {"TZ": "Not/AZone"}), self.assertLogs(scheduler_main.logger, "WARNING"):
+            self.assertIsNone(scheduler_main._local_tz())
 
     def test_verified_full_replaces_only_older_history_sidecar_copies(self) -> None:
         scheduler = self.make({"full": {"enabled": True}})
@@ -578,6 +1220,69 @@ class SchedulerTests(SchedulerTestBase):
         self.assertEqual(len(problems), 1)
         self.assertTrue(problems[0].startswith("Backup target Office NAS degraded:"))
 
+    def test_disabled_target_gets_no_retention_rule(self) -> None:
+        disabled = {**TARGET, "target_id": "cloud", "label": "Cloud", "enabled": False}
+        scheduler = self.make({"full": {"enabled": True, "remote_keep": 3}, "targets": [TARGET, disabled]})
+        self.assertEqual({rule.location for rule in scheduler.retention_rules()}, {"local", "nas"})
+
+    def test_unreachable_target_still_grooms_local_and_reports_grooming(self) -> None:
+        scheduler = self.make({"full": {"enabled": True, "local_keep": 3, "remote_keep": 3}, "targets": [TARGET]})
+        for hour in (13, 14, 15):
+            self.now = datetime(2026, 9, 24, hour, 0, tzinfo=UTC)
+            scheduler.run_now("full")
+        scheduler.close()
+        self.broken_targets = {"nas"}
+        scheduler = self.make({"full": {"enabled": True, "local_keep": 1, "remote_keep": 1}, "targets": [TARGET]})
+        self.now = datetime(2026, 9, 24, 16, 0, tzinfo=UTC)
+        backup_dir = self._paths.history_backup_dir
+        sidecars: list[Path] = []
+        for age in range(14, 0, -1):
+            created = self.now - timedelta(days=age)
+            path = backup_dir / f"history-{created:%Y%m%dT%H%M%S}Z.sqlite3"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(f"sidecar {age}".encode())
+            stamp = created.timestamp()
+            os.utime(path, (stamp, stamp))
+            sidecars.append(path)
+        scheduler.run_now("full")
+        # The remote outage must not block the local sidecar replacement cleanup.
+        self.assertFalse(sidecars[0].exists())
+        self.assertTrue(all(path.exists() for path in sidecars[1:]))
+        self.assertEqual(len(scheduler.catalog.list(location="local")), 1)
+        self.assertEqual(len(scheduler.catalog.list(location="nas")), 3)
+        grooming = json.loads(self._paths.status_file.read_text())["grooming"]
+        self.assertFalse(grooming["ok"])
+        self.assertEqual(grooming["deleted"], 3)
+        self.assertEqual(sorted(grooming["failed_locations"]), ["nas"])
+        self.assertIn("connection refused", grooming["failed_locations"]["nas"])
+
+        from app.services.backup_health import backup_archive_problems
+
+        problems = backup_archive_problems(self._paths.status_file)
+        self.assertTrue(any(p.startswith("Backup grooming stopped: ConnectionRefusedError") for p in problems))
+
+    def test_unverified_remote_copy_is_a_failed_run_and_never_catalogued(self) -> None:
+        import dataclasses
+
+        class UnverifiedTarget(LocalDirectoryTarget):
+            def put(self, local_path, name):
+                return dataclasses.replace(super().put(local_path, name), verified=False)
+
+        remote_dir = self.remote_root / "nas"
+
+        @contextlib.contextmanager
+        def opened(_settings):
+            yield UnverifiedTarget(remote_dir)
+
+        scheduler = self.make({"full": {"enabled": True}, "targets": [TARGET]})
+        scheduler._open_target = opened
+        record = scheduler.run_now("full")
+        self.assertEqual([r.location for r in scheduler.catalog.list()], ["local"])
+        status = json.loads(self._paths.status_file.read_text())
+        self.assertFalse(status["targets"]["nas"]["ok"])
+        self.assertIn("remote copy could not be verified", status["targets"]["nas"]["detail"])
+        self.assertFalse((remote_dir / record.name).exists())
+
     def test_failed_backup_recorded_and_single_flight(self) -> None:
         from history_service.backup_scheduler.service import SchedulerBusyError
 
@@ -593,6 +1298,59 @@ class SchedulerTests(SchedulerTestBase):
             scheduler.run_now("full")
         with self.assertRaises(ValueError):
             scheduler.run_now("everything")
+
+    def test_deeply_nested_journal_line_is_a_pending_change_and_full_still_runs(self) -> None:
+        scheduler = self.make({
+            "config": {"enabled": True},
+            "full": {"enabled": True, "schedule": "0 * * * *"},
+        })
+        with open(self._paths.journal_path, "ab") as handle:
+            handle.write(b"[" * 60000 + b"\n")
+        self.now = datetime(2026, 9, 24, 13, 0, tzinfo=UTC)
+        scheduler.tick()
+        self.assertEqual([call["groups"] for call in FakeRunner.calls], [["config_file", "mapping_file", "history_db"]])
+        self.assertEqual(scheduler.library()["classes"]["config"]["pending_changes"], 1)
+
+    def test_unreadable_journal_is_recorded_once_and_never_blocks_start_or_full(self) -> None:
+        from history_service.backup_archive.journal import JournalError
+
+        with patch.object(ChangeJournal, "pending", side_effect=JournalError("journal is not a regular file")):
+            scheduler = self.make({
+                "config": {"enabled": True},
+                "full": {"enabled": True, "schedule": "0 * * * *"},
+            })
+            self.now = datetime(2026, 9, 24, 13, 0, tzinfo=UTC)
+            with self.assertLogs("history_service.backup_scheduler.service", "WARNING") as logs:
+                scheduler.tick()
+                scheduler.tick()
+        self.assertEqual(len(FakeRunner.calls), 1)
+        self.assertIn("history_db", FakeRunner.calls[0]["groups"])
+        self.assertEqual(len([line for line in logs.output if "journal is not a regular file" in line]), 1)
+        config_run = scheduler.library()["classes"]["config"]["last_run"]
+        self.assertIs(config_run["ok"], False)
+        self.assertIn("journal is not a regular file", config_run["detail"])
+        scheduler.tick()  # readable again: the check failure is withdrawn
+        self.assertIsNone(scheduler.library()["classes"]["config"]["last_run"])
+
+    def test_journal_check_failure_persisted_across_restart_is_withdrawn_once_readable(self) -> None:
+        from history_service.backup_archive.journal import JournalError
+
+        policy = {"config": {"enabled": True}, "full": {"enabled": True, "schedule": "0 * * * *"}}
+        self.now = datetime(2026, 9, 24, 13, 0, tzinfo=UTC)
+        with patch.object(ChangeJournal, "pending", side_effect=JournalError("journal is not a regular file")):
+            scheduler = self.make(policy)
+            scheduler.tick()
+            scheduler.close()
+            # Still unreadable after a restart: the stored check failure is not
+            # taken for the last real run.
+            scheduler = self.make(policy)
+            scheduler.tick()
+        self.assertIn("journal is not a regular file", scheduler.library()["classes"]["config"]["last_run"]["detail"])
+        scheduler.close()
+        scheduler = self.make(policy)
+        scheduler.tick()  # readable again after a restart
+        self.assertIsNone(scheduler.library()["classes"]["config"]["last_run"])
+        self.assertNotIn("config", json.loads(self._paths.status_file.read_text())["classes"])
 
     def test_plan_token_preserve_verify_and_remote_materialize(self) -> None:
         scheduler = self.make({"full": {"enabled": True, "local_keep": 1, "remote_keep": 1}, "targets": [TARGET]})
@@ -650,6 +1408,24 @@ class SchedulerTests(SchedulerTestBase):
         (self._paths.local_dir / first.name).write_bytes(b"x" * first.size)
         with self.assertRaises(ArchiveIntegrityError), scheduler.materialize(first.artifact_id):
             pass
+
+    def test_oversized_remote_download_stops_before_catalog_check(self) -> None:
+        from history_service.backup_archive.transport import ArchiveVerificationError
+
+        scheduler = self.make({"full": {"enabled": True}, "targets": [TARGET]})
+        scheduler.run_now("full")
+        (remote,) = scheduler.catalog.list(location="nas")
+        (self.remote_root / "nas" / remote.name).write_bytes(b"x" * (remote.size + 2))
+        with self.assertRaisesRegex(ArchiveVerificationError, "larger than expected"), scheduler.materialize(remote.artifact_id):
+            pass
+        self.assertEqual(list(self._paths.state_dir.glob("backup-fetch-*")), [])
+        # A copy that grew past the cap no longer matches the catalogue, so verify
+        # must stop counting it as verified, like any other integrity mismatch.
+        self.assertTrue(scheduler.catalog.get(remote.artifact_id).verified)
+        failed = scheduler.verify(remote.artifact_id)
+        self.assertFalse(failed["ok"])
+        self.assertFalse(failed["artifact"]["verified"])
+        self.assertFalse(failed["artifact"]["restorable"])
 
     def test_start_run_reserves_before_returning(self) -> None:
         import threading
@@ -865,6 +1641,88 @@ class SchedulerApiTests(SchedulerTestBase):
         with scheduler._job("full"):
             self.assertEqual(asgi_call(app, "POST", "/internal/backups/run", {"backup_class": "full"})[0], 409)
 
+    def test_library_carries_the_last_grooming_outcome(self) -> None:
+        from history_service.backup_scheduler.api import build_app
+
+        scheduler = self.make({"full": {"enabled": True}, "targets": [TARGET]})
+        app = build_app(scheduler)
+        self.assertIsNone(json.loads(asgi_call(app, "GET", "/internal/backups")[1])["grooming"])
+        scheduler._record_grooming(
+            ok=False, deleted=2, detail="ConnectionRefusedError: refused", failed_locations={"nas": "refused"}
+        )
+        status, body = asgi_call(app, "GET", "/internal/backups")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["grooming"], {
+            "at": "2026-09-24T12:00:00+00:00", "ok": False, "deleted": 2,
+            "detail": "ConnectionRefusedError: refused", "failed_locations": {"nas": "refused"}})
+
+        # A location that opened but then failed a deletion is listed too, so
+        # the UI does not hide the error that stopped the run behind "nas".
+        from types import SimpleNamespace
+
+        from history_service.backup_archive.lifecycle import ApplyResult
+
+        stopped = SimpleNamespace(record=SimpleNamespace(location="local"))
+        manager = SimpleNamespace(
+            plan=lambda now: SimpleNamespace(items=(stopped,)),
+            apply=lambda plan, resolver, actor, now: ApplyResult(
+                deleted=(), already_missing=(), failed=stopped, error="PermissionError: denied",
+                failed_locations={"nas": "refused"},
+            ),
+        )
+        with patch.object(scheduler, "_manager", return_value=manager):
+            scheduler._groom_locked()
+        grooming = json.loads(asgi_call(app, "GET", "/internal/backups")[1])["grooming"]
+        self.assertEqual(grooming["detail"], "PermissionError: denied")
+        self.assertEqual(grooming["failed_locations"], {"nas": "refused", "local": "PermissionError: denied"})
+
+    def test_manual_lifecycle_apply_records_the_latest_grooming_outcome(self) -> None:
+        from types import SimpleNamespace
+
+        from history_service.backup_archive.lifecycle import ApplyResult
+        from history_service.backup_scheduler.api import build_app
+
+        scheduler = self.make({"full": {"enabled": True}, "targets": [TARGET]})
+        app = build_app(scheduler)
+        scheduler._record_grooming(ok=True, deleted=4, detail=None, failed_locations={})
+        failed: Any = SimpleNamespace(record=SimpleNamespace(location="local"))
+        result = ApplyResult(
+            deleted=(),
+            already_missing=(),
+            failed=failed,
+            error="PermissionError: denied",
+            failed_locations={"nas": "ConnectionError: unavailable"},
+        )
+        manager = SimpleNamespace(
+            plan=lambda now: SimpleNamespace(items=(failed,), guarded=()),
+            apply=lambda plan, resolver, actor, now: result,
+        )
+        record_grooming_result = scheduler._record_grooming_result
+
+        def assert_single_flight(applied_result: ApplyResult) -> None:
+            self.assertTrue(scheduler._job_lock.locked())
+            record_grooming_result(applied_result)
+
+        with (
+            patch.object(scheduler, "_manager", return_value=manager),
+            patch.object(scheduler, "_record_grooming_result", side_effect=assert_single_flight),
+        ):
+            token, _, _ = scheduler.plan()
+            self.assertIs(scheduler.apply(token), result)
+
+        status, body = asgi_call(app, "GET", "/internal/backups")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["grooming"], {
+            "at": "2026-09-24T12:00:00+00:00",
+            "ok": False,
+            "deleted": 0,
+            "detail": "PermissionError: denied",
+            "failed_locations": {
+                "nas": "ConnectionError: unavailable",
+                "local": "PermissionError: denied",
+            },
+        })
+
 
 class AdminProxyTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -936,6 +1794,62 @@ class AdminProxyTests(unittest.TestCase):
         self.assertIn(("POST", "/internal/backups/abc123/verify", None), calls)
         self.assertIn(("POST", "/internal/backups/abc123/preserve", {"reason": "x"}), calls)
 
+    def test_download_to_rejects_short_body_and_wrong_digest(self) -> None:
+        import http.client
+        import io
+
+        from admin_service.services import backup_scheduler_client as client_module
+
+        archive = b"archive-bytes-" * 100
+        digest = hashlib.sha256(archive).hexdigest()
+
+        class FakeSocket:
+            def __init__(self, raw: bytes) -> None:
+                self.raw = raw
+
+            def makefile(self, *_args, **_kwargs):
+                return io.BytesIO(self.raw)
+
+        class FakeConnection:
+            def __init__(self, raw: bytes) -> None:
+                self.raw = raw
+
+            def request(self, *_args, **_kwargs) -> None:
+                return None
+
+            def getresponse(self):
+                response = http.client.HTTPResponse(FakeSocket(self.raw))
+                response.begin()
+                return response
+
+            def close(self) -> None:
+                return None
+
+        def raw_response(body: bytes, length: int, sha256: str) -> bytes:
+            head = (
+                "HTTP/1.1 200 OK\r\n"
+                f"Content-Length: {length}\r\n"
+                'Content-Disposition: attachment; filename="full.archive"\r\n'
+                f"X-Backup-Sha256: {sha256}\r\n\r\n"
+            )
+            return head.encode("ascii") + body
+
+        def download(raw: bytes):
+            client = client_module.BackupSchedulerClient("/nonexistent/scheduler.sock")
+            sink = io.BytesIO()
+            with patch.object(client, "_connection", return_value=FakeConnection(raw)):
+                return client.download_to("abc123", sink)
+
+        short = download(raw_response(archive[:-10], len(archive), digest))
+        self.assertNotEqual(short.status, 200)
+        self.assertIn("did not match", short.payload["detail"])
+        wrong = download(raw_response(archive, len(archive), "0" * 64))
+        self.assertNotEqual(wrong.status, 200)
+        self.assertIn("did not match", wrong.payload["detail"])
+        good = download(raw_response(archive, len(archive), digest))
+        self.assertEqual(good.status, 200)
+        self.assertEqual(good.payload, {"filename": "full.archive", "sha256": digest})
+
     def test_cross_origin_mutation_is_rejected(self) -> None:
         status, _ = asgi_call(self.admin_main.app, "POST", "/api/admin/backups/run", {"backup_class": "full"},
                               {"origin": "http://evil.example.test"})
@@ -996,6 +1910,11 @@ class PolicyEditorTests(unittest.TestCase):
         self.assertEqual(secrets["access_key_id_file"], {"configured": False, "present": None})
         self.assertEqual(view["classes"]["config"]["values"]["local_keep"], 30)
         self.assertEqual(view["problems"], [])
+
+    def test_view_lists_the_allowed_archive_formats_for_the_editor_choice(self) -> None:
+        view = self.view()
+        self.assertEqual(view["archive_formats"], ["7z", "tar.zst"])
+        self.assertIn(view["classes"]["full"]["values"]["archive_format"], view["archive_formats"])
 
     def test_group_readable_secret_file_is_reported_missing(self) -> None:
         (self.root / "backup-secrets" / "archive_sftp_key").chmod(0o640)
@@ -1081,6 +2000,53 @@ class PolicyEditorTests(unittest.TestCase):
         stored = yaml.safe_load(self.config.read_text())["backups"]["targets"][0]
         self.assertEqual(stored["hostname"], "nas2.example.test")
         self.assertNotIn("password_file", stored)
+
+    def _rewrite_target(self, **changes: Any) -> None:
+        document = yaml.safe_load(self.config.read_text())
+        document["backups"]["targets"][0].update(changes)
+        self.config.write_text(yaml.safe_dump(document, sort_keys=False))
+
+    def test_quoted_port_saved_back_as_a_number_keeps_secret_files(self) -> None:
+        self._rewrite_target(port="2222")
+        view = self.view()
+        values = dict(view["targets"][0]["values"], port=2222)  # the UI's number field
+        self.save(self._target_payload(view, values))
+        stored = yaml.safe_load(self.config.read_text())["backups"]["targets"][0]
+        self.assertEqual(stored["port"], 2222)
+        self.assertEqual(stored["private_key_file"], "/run/backup-secrets/archive_sftp_key")
+        for field, value in (("hostname", "attacker.example.test"), ("port", 2223)):
+            with self.subTest(field=field):
+                view = self.view()
+                before = self.config.read_bytes()
+                values = dict(view["targets"][0]["values"], **{field: value})
+                with self.assertRaisesRegex(self.editor.PolicyEditError, "choose its .* again"):
+                    self.save(self._target_payload(view, values))
+                self.assertEqual(self.config.read_bytes(), before)
+
+    def test_username_whitespace_change_is_a_different_endpoint(self) -> None:
+        self._rewrite_target(username="backup ")
+        view = self.view()
+        before = self.config.read_bytes()
+        values = dict(view["targets"][0]["values"], username="backup")  # the UI trims its text fields
+        with self.assertRaisesRegex(self.editor.PolicyEditError, "choose its .* again"):
+            self.save(self._target_payload(view, values))
+        self.assertEqual(self.config.read_bytes(), before)
+
+    def test_numeric_bucket_saved_back_as_text_keeps_secret_files(self) -> None:
+        document = yaml.safe_load(self.config.read_text())
+        document["backups"]["targets"] = [{
+            "target_id": "office-nas", "provider": "s3", "root": "jbod", "bucket": 2024, "region": "us-east-1",
+            "access_key_id_file": "/run/backup-secrets/archive_s3_key_id",
+            "secret_access_key_file": "/run/backup-secrets/archive_s3_secret",
+        }]
+        self.config.write_text(yaml.safe_dump(document, sort_keys=False))
+        view = self.view()
+        values = dict(view["targets"][0]["values"], bucket="2024")  # the UI's text field
+        self.save(self._target_payload(view, values))
+        stored = yaml.safe_load(self.config.read_text())["backups"]["targets"][0]
+        self.assertEqual(stored["bucket"], "2024")
+        self.assertEqual(stored["access_key_id_file"], "/run/backup-secrets/archive_s3_key_id")
+        self.assertEqual(stored["secret_access_key_file"], "/run/backup-secrets/archive_s3_secret")
 
     def test_secret_files_must_be_target_credentials_in_the_secrets_folder(self) -> None:
         env = {"BACKUP_ARCHIVE_PASSPHRASE_FILE": "/run/backup-secrets/archive-pass"}

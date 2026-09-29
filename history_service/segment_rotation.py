@@ -47,6 +47,7 @@ ROTATION_JOURNAL_PHASES = (
     "hot-replaced",
     "catalog-replaced",
     "cleanup",
+    "prior-restored",
 )
 
 _GENERATION_ID = re.compile(r"generation-(?P<sequence>[0-9]{4})\Z")
@@ -994,7 +995,14 @@ def _recover_pending_rotation_locked(
     if active_catalog_is_prior == active_catalog_is_candidate:
         raise ValueError("Segment rotation catalog integrity check failed.")
 
-    if active_catalog_is_candidate and phase == "cleanup":
+    # A terminal cleanup decision selects exactly one generation. Never switch
+    # branches on replay merely because the other recorded bytes reappear.
+    if (phase == "cleanup" and not active_catalog_is_candidate) or (
+        phase == "prior-restored" and not active_catalog_is_prior
+    ):
+        raise ValueError("Segment rotation selected generation integrity check failed.")
+    terminal_cleanup = phase in {"cleanup", "prior-restored"}
+    if terminal_cleanup:
         if path_entry_exists(rollback_hot_path):
             _require_file_matches(
                 rollback_hot_path,
@@ -1049,17 +1057,23 @@ def _recover_pending_rotation_locked(
                 "recovery_state": "candidate-ready-to-finalize",
                 "phase": phase,
             }
+        # Refresh even on replay: a prior journal replace may have succeeded
+        # while its directory fsync failed. No evidence is retired until this
+        # selected decision has completed both durability barriers.
+        _require_file_matches(journal_path, journal_record, label="journal")
+        journal["phase"] = "cleanup"
+        journal_record = _write_rotation_journal(journal_path, journal)
         _remove_recorded_file(
             source.parent,
             rollback_hot_record,
             label="prior hot rollback",
-            allow_missing=phase == "cleanup",
+            allow_missing=True,
         )
         _remove_recorded_file(
             segments_directory,
             rollback_catalog_record,
             label="prior catalog rollback",
-            allow_missing=phase == "cleanup",
+            allow_missing=True,
         )
         if isinstance(staged_hot_record, dict):
             _remove_recorded_file(
@@ -1082,16 +1096,31 @@ def _recover_pending_rotation_locked(
             "phase": phase,
         }
 
-    if not live_hot_is_prior and not live_hot_is_candidate:
+    if (phase == "prior-restored" and not live_hot_is_prior) or (
+        not live_hot_is_prior and not live_hot_is_candidate
+    ):
         raise ValueError("Segment rotation live hot database is divergent.")
+    try:
+        SegmentedHistoryReader.from_catalog(
+            hot_path=source,
+            catalog_path=catalog_path,
+            allow_pending_activation=True,
+        ).verify_catalog_segments()
+    except ValueError as exc:
+        raise ValueError("Segment rotation prior generation integrity check failed.") from exc
     if not apply:
         return {
             "apply": False,
             "recovery_state": "prior-generation-ready-to-restore",
             "phase": phase,
         }
-    if live_hot_is_candidate:
+    if not live_hot_is_prior:
         _restore_hot(source, rollback_hot_record, mode=int(source_record["mode"]))
+    _require_file_matches(source, source_record, label="restored hot")
+    _require_file_matches(catalog_path, prior_catalog_record, label="prior catalog")
+    _require_file_matches(journal_path, journal_record, label="journal")
+    journal["phase"] = "prior-restored"
+    journal_record = _write_rotation_journal(journal_path, journal)
     if isinstance(new_segment_record, dict):
         _remove_authenticated_orphan_segment(segments_directory, new_segment_record)
     else:
@@ -1122,11 +1151,13 @@ def _recover_pending_rotation_locked(
         source.parent,
         rollback_hot_record,
         label="prior hot rollback",
+        allow_missing=True,
     )
     _remove_recorded_file(
         segments_directory,
         rollback_catalog_record,
         label="prior catalog rollback",
+        allow_missing=True,
     )
     _remove_journal(journal_path, journal_record)
     return {

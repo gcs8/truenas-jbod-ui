@@ -335,7 +335,7 @@ test("fetchStorageViewCandidates ignores a slow response for a system the operat
     storageViewCandidatesSystemId: null,
     storageViewCandidates: [],
   };
-  const { fetchStorageViewCandidates } = loadFunctions(["fetchStorageViewCandidates"], {
+  const { fetchStorageViewCandidates } = loadFunctions(["fetchStorageViewCandidates", "currentStorageViewCandidateScope"], {
     state,
     currentStorageViewSystemId() {
       return systemId;
@@ -386,7 +386,7 @@ test("clearing the selected system invalidates in-flight live-enclosure and cand
     storageViewCandidates: [],
   };
   const { fetchLiveEnclosures, fetchStorageViewCandidates, resetLiveEnclosureState, resetStorageViewCandidateState } = loadFunctions(
-    ["resetLiveEnclosureState", "resetStorageViewCandidateState", "fetchLiveEnclosures", "fetchStorageViewCandidates"],
+    ["resetLiveEnclosureState", "resetStorageViewCandidateState", "fetchLiveEnclosures", "fetchStorageViewCandidates", "currentStorageViewCandidateScope"],
     {
       state,
       currentStorageViewSystemId() {
@@ -445,9 +445,13 @@ test("backup export, debug export, and import errors are described instead of st
     /throw new Error\(payload\?\.detail \|\|/,
     "every raw payload?.detail throw must route through describeApiError"
   );
-  for (const name of ["runExportBackup", "runExportDebugBundle", "runImportBackup"]) {
+  for (const name of ["runExportBackup", "runExportDebugBundle"]) {
     assert.match(functionSource(name), /describeApiError\((?:payload|download)\?\.detail\)/, `${name} must describe API errors`);
   }
+  assert.match(functionSource("runImportBackup"), /fetchBackupRestore\(/);
+  assert.match(functionSource("fetchBackupRestore"), /fetchJson\(/);
+  assert.match(functionSource("fetchJson"), /describeRequestFailure\(payload, response\)/);
+  assert.match(functionSource("describeRequestFailure"), /describeApiError\(payload\?\.detail\)/);
 });
 
 test("backup import reports source-absent groups whose live data was preserved", () => {

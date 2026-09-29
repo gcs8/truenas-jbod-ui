@@ -974,8 +974,8 @@ class RuntimeOverrideTransactionTests(ConfigReloadTestCase):
                 real_load = app_config._load_runtime_overrides_config
                 real_payload = app_config.runtime_behavior_settings_payload
 
-                def load(path: Path) -> dict[str, Any]:
-                    result = real_load(path)
+                def load(path: Path, *args: Any) -> dict[str, Any]:
+                    result = real_load(path, *args)
                     if threading.current_thread().name == "second":
                         second_read.set()
                     if phase == "read" and threading.current_thread().name == "first" and not entered.is_set():
@@ -1090,12 +1090,12 @@ class RuntimeOverridePermissionTests(ConfigReloadTestCase):
 
         def replace(source: Path, target: Path) -> Path:
             if target == self.overrides_path:
-                self.assertEqual(stat.S_IMODE(source.stat().st_mode), 0o644)
+                self.assertEqual(stat.S_IMODE(source.stat().st_mode), 0o600)
                 self.assertEqual(yaml.safe_load(source.read_text())["app"]["smart_cache_ttl_seconds"], 777)
             return real_replace(source, target)
 
         # No process-wide umask change is needed in production. The publication
-        # mode is explicit, even when the writer's inherited umask is private.
+        # Owner-only mode is explicit, even when the writer's inherited umask is private.
         previous = os.umask(0o077)
         try:
             with patch.object(yaml, "safe_dump", side_effect=dump), patch.object(Path, "replace", replace):
@@ -1103,7 +1103,7 @@ class RuntimeOverridePermissionTests(ConfigReloadTestCase):
         finally:
             os.umask(previous)
         metadata = self.overrides_path.stat()
-        self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o644)
+        self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
         self.assertEqual(metadata.st_uid, os.geteuid())
         self.assertEqual(metadata.st_gid, os.getegid())
         self.assertEqual(len(stages), 1)
@@ -1154,7 +1154,7 @@ class RuntimeOverridePermissionTests(ConfigReloadTestCase):
         metadata = self.overrides_path.stat()
         self.assertEqual(metadata.st_uid, os.geteuid())
         self.assertEqual(metadata.st_gid, groups[0])
-        self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o644)
+        self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
         after = parent.stat()
         self.assertEqual((after.st_uid, after.st_gid, after.st_mode), (before.st_uid, before.st_gid, before.st_mode))
 
