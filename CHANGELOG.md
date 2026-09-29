@@ -34,11 +34,9 @@ an entry below.
 
 ### Highlights
 
-- The main and admin UIs now work without application authentication or public
-  origin settings by default. Browser mutations still receive an automatic
-  same-origin check. Basic authentication, explicit public-origin settings, and
-  verified private TLS are optional hardening steps (#392, superseding the
-  defaults introduced by #245 and #201).
+- The main and admin UIs work without application authentication by default;
+  the privileged admin service still requires a fixed browser origin to prevent
+  DNS-rebinding attacks (#392 and #393).
 - Dell MD1280 shelves render with full-chassis and per-drawer profiles built
   from the validated 84-bay layout (#157).
 - Segmented history gained crash-safe later-generation rotation, recovery of
@@ -53,6 +51,18 @@ an entry below.
 
 - Restored unauthenticated main and admin controls in default `network` mode
   and made TLS certificate verification opt-in for new connections (#392)
+
+### Upgrade notes
+
+- `ADMIN_PUBLIC_ORIGIN`: set the exact admin address operators use before
+  starting the admin profile; the setting is now required in every auth mode
+  (#393).
+
+### Security
+
+- Required a fixed admin browser origin in network mode instead of trusting the
+  request `Host` header, preventing DNS-rebinding access to privileged APIs
+  (#393).
 - Required local authentication for mutating main-UI requests and hardened the
   default Compose runtime contract (#245 and #246).
 - Required a configured admin public origin for browser-initiated admin

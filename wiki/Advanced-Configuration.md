@@ -8,10 +8,10 @@ API-only startup works.
 The default setup has no login. Anyone who can reach the published main or
 admin port can use the controls available there.
 
-Browser mutation requests must come from the same origin in both modes. Network
-mode derives that origin from the requested address, so it needs no extra
-setting. Use the explicit public-origin settings when a reverse proxy changes
-the address seen by the services.
+Admin browser mutation requests must come from the fixed `ADMIN_PUBLIC_ORIGIN`
+in both modes, and the admin service refuses to start without it. Set it to the
+exact address operators use. `APP_PUBLIC_ORIGIN` remains optional in network
+mode and is required for main-UI mutations in Basic mode.
 
 Enable built-in Basic authentication when reachability is broader than the
 people who should control the app:

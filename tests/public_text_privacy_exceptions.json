@@ -231,7 +231,6 @@
     },
     "reason": "Deterministic clean-room QA fixture; exact detector counts are pinned."
   },
-
   "scripts/run_private_qa_restore.py": {
     "findings": {
       "sas_wwn_identifier": {
@@ -381,6 +380,14 @@
       }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
+  },
+  "tests/test_admin_auth.py": {
+    "findings": {
+      "internal_hostname": {
+        "sha256:4f8cd65fb3bbf748d403472a1f5b450fcf1d7113e41ca2ab3b27135ac170b7e8": 1
+      }
+    },
+    "reason": "Reviewed synthetic DNS-rebinding regression hostname; exact detector counts are pinned."
   },
   "tests/test_admin_runtime_routes.py": {
     "findings": {
@@ -649,7 +656,6 @@
     },
     "reason": "Reviewed operator-documentation example; exact detector counts are pinned."
   },
-
   "wiki/Profiles-and-Custom-Layouts.md": {
     "findings": {
       "sas_wwn_identifier": {
@@ -658,7 +664,6 @@
     },
     "reason": "Reviewed operator-documentation example; exact detector counts are pinned."
   },
-
   "wiki/Troubleshooting.md": {
     "findings": {
       "sas_wwn_identifier": {

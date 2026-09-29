@@ -10,8 +10,8 @@ Internet.
 ## Network-boundary mode
 
 `ADMIN_AUTH_MODE=network` is the default. The application does not ask for
-credentials, require a configured browser origin, or restrict write controls in
-this mode. Network reachability is authorization.
+credentials or restrict write controls in this mode. Network reachability is
+authorization, while a fixed browser origin remains mandatory.
 
 RFC1918 describes private IPv4 address ranges. It does not establish trust. A
 guest network, shared office LAN, compromised device, or broad VPN can use
@@ -29,16 +29,14 @@ in this mode.
 
 ## Admin browser origin
 
-`ADMIN_PUBLIC_ORIGIN` is optional in the default network mode. Without it,
-browser mutations must match the request's own scheme, host, and port. Basic
-mode requires an explicit value. Set it to the exact origin the browser shows
-for the admin UI, with no path. For example,
+`ADMIN_PUBLIC_ORIGIN` is required in both authentication modes. Set it to the
+exact origin the browser shows for the admin UI, with no path. For example,
 `http://jbod-admin.example.test:8082` uses the default port, while
 `https://jbod-admin.example.test` could be served by a reverse proxy.
 
 Browser-initiated admin changes are accepted only when their `Origin` or
-`Referer` header matches the effective origin. The admin service refuses to
-start in Basic mode until the configured value is valid. A mismatch returns
+`Referer` header matches the configured origin. The admin service refuses to
+start until the configured value is valid. A mismatch returns
 `403 Cross-origin admin mutation rejected.` Headerless CLI and automation
 requests remain available.
 
@@ -144,6 +142,6 @@ Before starting the admin profile:
 1. Confirm who can route to the published admin port.
 2. Use the default network mode only when everyone who can reach the port may control containers and read or replace application state.
 3. Otherwise select `basic` or place an authenticated reverse proxy in front of the service and block direct port access.
-4. In Basic mode, set both public origins to the exact addresses operators will use in their browsers.
+4. Set `ADMIN_PUBLIC_ORIGIN` to the exact admin address operators will use; in Basic mode, set `APP_PUBLIC_ORIGIN` too.
 5. Keep health and metrics reachability separate from privileged route reachability where the network design permits it.
 6. Leave plaintext backup export disabled unless its risk is accepted for that deployment.

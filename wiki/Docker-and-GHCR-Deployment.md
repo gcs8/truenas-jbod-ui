@@ -86,10 +86,11 @@ APP_PUBLIC_ORIGIN=https://storage-ui.example.local
 ADMIN_PUBLIC_ORIGIN=https://storage-admin.example.local
 ```
 
-In Basic mode, both origin settings are required. Basic mode protects all admin
-pages and persistent or hardware-changing main-UI writes while reads remain
-anonymous. Use HTTPS through a reverse proxy or an encrypted private network;
-Basic credentials are not encrypted by HTTP itself.
+`ADMIN_PUBLIC_ORIGIN` is required whenever the admin sidecar runs. In Basic
+mode, `APP_PUBLIC_ORIGIN` is required too. Basic mode protects all admin pages
+and persistent or hardware-changing main-UI writes while reads remain anonymous.
+Use HTTPS through a reverse proxy or an encrypted private network; Basic
+credentials are not encrypted by HTTP itself.
 
 Each live page starts signed out. Use its in-page sign-in before a write. The
 browser holds the credentials only in page memory, sends them only to

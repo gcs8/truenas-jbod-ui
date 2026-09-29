@@ -74,9 +74,10 @@ APP_PUBLIC_ORIGIN=https://storage-ui.example.test
 ADMIN_PUBLIC_ORIGIN=https://storage-admin.example.test
 ```
 
-In Basic mode, both origin settings are required and must match the addresses
-shown in the browser. Use HTTPS through a reverse proxy or an encrypted network
-path, and restrict port reachability with firewall rules or segmentation.
+`ADMIN_PUBLIC_ORIGIN` is required whenever the admin sidecar runs. In Basic
+mode, `APP_PUBLIC_ORIGIN` is required too. Both must match the addresses shown
+in the browser. Use HTTPS through a reverse proxy or an encrypted network path,
+and restrict port reachability with firewall rules or segmentation.
 Segmentation limits reachability but does not authenticate a client. See
 [[Advanced Configuration|Advanced-Configuration]] for the full explanation.
 

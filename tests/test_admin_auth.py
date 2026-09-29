@@ -36,6 +36,7 @@ async def invoke_asgi(
     *,
     authorization: str | None = None,
     method: str = "GET",
+    host: bytes = b"admin" + bytes((46,)) + b"example" + bytes((46,)) + b"test",
     origin: str | None = None,
     referer: str | None = None,
 ) -> tuple[int, dict[str, str], bytes]:
@@ -52,7 +53,7 @@ async def invoke_asgi(
     async def send(message: dict[str, Any]) -> None:
         messages.append(message)
 
-    headers = [(b"host", b"admin.example.test")]
+    headers = [(b"host", host)]
     if authorization is not None:
         headers.append((b"authorization", authorization.encode("ascii")))
     if origin is not None:
@@ -92,13 +93,13 @@ def basic_header(username: str, password: str) -> str:
 
 
 class AdminAuthenticationTests(unittest.TestCase):
-    def test_network_mode_needs_no_configured_origin_but_rejects_cross_site_browser_mutations(self) -> None:
-        settings = AdminSettings()
+    def test_network_mode_uses_configured_origin_for_browser_mutations(self) -> None:
+        settings = AdminSettings(public_origin=ADMIN_TEST_PUBLIC_ORIGIN)
 
         self.assertEqual(settings.auth_mode, "network")
         self.assertIsNone(settings.auth_username)
         self.assertIsNone(settings.auth_password)
-        self.assertIsNone(settings.public_origin)
+        self.assertEqual(settings.public_origin, ADMIN_TEST_PUBLIC_ORIGIN)
 
         with patch("admin_service.main.get_admin_settings", return_value=settings):
             app = create_app()
@@ -332,6 +333,7 @@ class AdminAuthenticationTests(unittest.TestCase):
     def test_network_boundary_mode_preserves_remote_unauthenticated_contract(self) -> None:
         settings = AdminSettings(
             auth_mode="network",
+            public_origin=ADMIN_TEST_PUBLIC_ORIGIN,
             auto_stop_seconds=0,
         )
         with patch("admin_service.main.get_admin_settings", return_value=settings):
@@ -357,23 +359,22 @@ class AdminAuthenticationTests(unittest.TestCase):
             b'{"detail":"Cross-origin admin mutation rejected."}',
         )
 
-    def test_default_admin_app_starts_without_an_origin_or_authentication(self) -> None:
+    def test_default_admin_app_refuses_to_start_without_an_origin(self) -> None:
         inherited = dict(os.environ)
         try:
             with patch.dict("os.environ", {}, clear=True):
                 get_admin_settings.cache_clear()
                 settings = get_admin_settings()
-                app = create_app()
+                with self.assertRaisesRegex(ValueError, "ADMIN_PUBLIC_ORIGIN"):
+                    create_app()
             self.assertEqual(settings.auth_mode, "network")
             self.assertIsNone(settings.public_origin)
-            status, _headers, _body = asyncio.run(invoke_asgi(app, "/missing"))
-            self.assertEqual(status, 404)
         finally:
             os.environ.clear()
             os.environ.update(inherited)
             get_admin_settings.cache_clear()
 
-    def test_basic_mode_refuses_to_start_without_a_valid_public_origin(self) -> None:
+    def test_every_auth_mode_refuses_to_start_without_a_valid_public_origin(self) -> None:
         for public_origin in (
             None,
             "",
@@ -386,16 +387,41 @@ class AdminAuthenticationTests(unittest.TestCase):
             "https://admin.example.test#fragment",
         ):
             with self.subTest(public_origin=public_origin):
-                settings = AdminSettings(
-                    auth_mode="basic",
-                    auth_username="operator",
-                    auth_password=SecretStr(MARKER_ALPHA),
-                    public_origin=public_origin,
-                    auto_stop_seconds=0,
-                )
-                with patch("admin_service.main.get_admin_settings", return_value=settings):
-                    with self.assertRaisesRegex(ValueError, "ADMIN_PUBLIC_ORIGIN"):
-                        create_app()
+                for auth_mode in ("network", "basic"):
+                    with self.subTest(auth_mode=auth_mode):
+                        settings = AdminSettings(
+                            auth_mode=auth_mode,
+                            auth_username="operator" if auth_mode == "basic" else None,
+                            auth_password=(
+                                SecretStr(MARKER_ALPHA) if auth_mode == "basic" else None
+                            ),
+                            public_origin=public_origin,
+                            auto_stop_seconds=0,
+                        )
+                        with patch("admin_service.main.get_admin_settings", return_value=settings):
+                            with self.assertRaisesRegex(ValueError, "ADMIN_PUBLIC_ORIGIN"):
+                                create_app()
+
+    def test_network_mode_does_not_trust_host_header_as_public_origin(self) -> None:
+        settings = AdminSettings(
+            auth_mode="network",
+            public_origin="https://admin.example.test:9443",
+            auto_stop_seconds=0,
+        )
+        with patch("admin_service.main.get_admin_settings", return_value=settings):
+            app = create_app()
+
+        status, _headers, body = asyncio.run(
+            invoke_asgi(
+                app,
+                "/missing",
+                method="POST",
+                origin="http://admin.example.test",
+            )
+        )
+
+        self.assertEqual(status, 403)
+        self.assertEqual(body, b'{"detail":"Cross-origin admin mutation rejected."}')
 
     def test_configured_public_origin_gates_browser_mutations_on_a_real_route(self) -> None:
         settings = AdminSettings(
@@ -639,14 +665,13 @@ class AdminAuthenticationTests(unittest.TestCase):
             self.assertIn(marker, env_example)
             self.assertIn(marker, compose)
         self.assertIn("The default setup has no login", readme)
-        self.assertIn("Browser mutations must come from the same origin automatically", readme)
-        self.assertIn("explicit public-origin settings are optional", readme)
+        self.assertIn("requires a fixed browser origin", readme)
         self.assertIn("ADMIN_AUTH_MODE=basic", advanced)
         self.assertIn("ADMIN_PUBLIC_ORIGIN", advanced)
         self.assertIn("APP_PUBLIC_ORIGIN", advanced)
-        self.assertIn("needs no extra setting", advanced_prose)
+        self.assertIn("refuses to start without it", advanced_prose)
         self.assertIn("Anyone who can reach", security_doc)
-        self.assertIn("request's own scheme, host, and port", security_doc)
+        self.assertIn("required in both authentication modes", security_doc)
         self.assertIn("firewall", security_doc.lower())
         self.assertIn("VPN", security_doc)
         self.assertIn("Basic authentication", security_doc)

@@ -199,8 +199,7 @@ def _basic_auth_matches(authorization: str | None, settings: AdminSettings) -> b
 
 
 def _request_origin_allowed(request: Request, settings: AdminSettings) -> bool:
-    public_origin = settings.public_origin or f"{request.url.scheme}://{request.url.netloc}"
-    return request_origin_allowed(request, public_origin)
+    return request_origin_allowed(request, settings.public_origin)
 
 
 def validate_admin_export_policy(
@@ -411,14 +410,11 @@ def format_history_system_summary(summary: dict[str, Any]) -> str:
 
 
 def validate_admin_public_origin(admin_settings: AdminSettings) -> None:
-    if (
-        admin_settings.auth_mode == "basic"
-        and configured_origin_identity(admin_settings.public_origin) is None
-    ):
+    if configured_origin_identity(admin_settings.public_origin) is None:
         raise ValueError(
             "ADMIN_PUBLIC_ORIGIN must be an absolute HTTP(S) origin that matches the address "
             "shown in the browser for the admin UI, for example http://jbod-admin.example.test:8082. "
-            "Basic authentication requires this origin check."
+            "Browser-initiated admin changes are rejected without it, so the admin service refuses to start."
         )
 
 
