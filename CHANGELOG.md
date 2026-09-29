@@ -259,6 +259,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Wrote config.yaml and runtime-overrides.yaml through a fsynced temporary
+  file that keeps the existing mode (0600 for a new file) instead of the umask
+  default. (#808)
 - Held the automatic refresh while a locate-light or bay-assignment write was
   in flight, so the write's result and any sign-in rejection are shown instead
   of being dropped by the refresh. (#829)

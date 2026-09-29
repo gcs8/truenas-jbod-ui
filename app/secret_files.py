@@ -94,3 +94,51 @@ def load_secret_environment_value(env_name: str) -> str | None:
     if value.endswith("\n"):
         return value[:-1]
     return value
+
+
+def write_text_atomically(path: Path, text: str) -> None:
+    """Replace ``path`` with ``text`` through a fsynced temporary file.
+
+    The temporary file is created with the existing file's mode, or 0o600
+    for a new file, so a config file that holds credentials never passes
+    through the umask default and a tighter mode set by the operator is kept.
+    """
+
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except FileNotFoundError:
+        mode = 0o600
+    temp_path = path.with_suffix(".tmp")
+    temp_path.unlink(missing_ok=True)
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    descriptor = os.open(temp_path, flags, mode)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            if hasattr(os, "fchmod"):
+                # os.open applies the umask; set the intended mode exactly.
+                os.fchmod(handle.fileno(), mode)
+            handle.write(text.encode("utf-8"))
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        temp_path.unlink(missing_ok=True)
+        raise
+    os.replace(temp_path, path)
+    if os.name == "posix":
+        # fsync the directory so the rename itself survives a power loss.
+        try:
+            directory = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        except OSError as exc:
+            # Replacement has already happened. Do not claim either success
+            # or that the old bytes survived a failed durability barrier.
+            raise OSError(exc.errno, "File replaced; directory durability is uncertain.") from exc
