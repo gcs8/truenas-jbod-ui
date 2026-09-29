@@ -64,8 +64,19 @@ AOC_SLG4_2H8M2_TEMPLATE_ID = "aoc-slg4-2h8m2-2"
 AOC_SLG4_2H8M2_PROFILE_ID = "supermicro-aoc-slg4-2h8m2"
 SATADOM_PAIR_TEMPLATE_ID = "satadom-pair-2"
 NVME_CARRIER_FACE_STYLE = "nvme-carrier"
-IPV4_PATTERN = re.compile(r"(?<![\dA-Fa-f:])(?P<ip>(?:\d{1,3}\.){3}\d{1,3})(?![\dA-Fa-f:])")
-IPV6_PATTERN = re.compile(r"(?<![:\w])(?P<ip>(?:[0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f]{1,4})(?![:\w])")
+# Locate whole address candidates; ip_address validates them before masking.
+# IPv6 comes first so an embedded IPv4 tail is not masked independently.
+IPV4_ADDRESS_BODY = r"(?:[0-9]{1,3}\.){3}[0-9]{1,3}"
+IP_ADDRESS_PATTERN = re.compile(
+    r"(?<![\w.:%-])"
+    r"(?P<ip>(?:[A-Za-z_][A-Za-z_-]*:)?"
+    r"(?:[0-9A-Fa-f]*:[0-9A-Fa-f:.]+(?!:)(?:%[A-Za-z0-9_.~-]+)?"
+    rf"|{IPV4_ADDRESS_BODY}\.*))"
+    r"(?![\w.%-])"
+)
+IPV4_RANGE_PATTERN = re.compile(
+    rf"(?<![\w.:%-])(?P<start>{IPV4_ADDRESS_BODY})-(?P<end>{IPV4_ADDRESS_BODY})(?P<suffix>\.*)(?![\w.%-])"
+)
 # Trailing DNS labels appended to a hostname token, so a redacted host swallows
 # its own domain suffix instead of leaving it behind.
 FQDN_CONTINUATION_PATTERN = r"(?:\.[A-Za-z0-9-]+)*"
@@ -439,8 +450,33 @@ class SnapshotRedactor:
         if isinstance(value, list):
             return [self.redact_object(item, path + (index,)) for index, item in enumerate(value)]
         if isinstance(value, str):
+            if path and path[-1] == "details_json":
+                return self._redact_details_json(value, path)
             return self._redact_string(value, path)
         return value
+
+    def _redact_details_json(self, value: str, path: tuple[Any, ...]) -> str:
+        # SlotEvent producers JSON-encode changes; the browser decodes them.
+        # Mask decoded text so JSON escapes cannot change address boundaries.
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return self._redact_string(value, path)
+
+        def redact_text(item: Any) -> Any:
+            # This field previously received general text replacement, including
+            # keys, not path-based serial masking or identifier alias minting.
+            # Keep that policy and do not parse arbitrary nested string values.
+            if isinstance(item, dict):
+                return {self._redact_string(key, ()): redact_text(child) for key, child in item.items()}
+            if isinstance(item, list):
+                return [redact_text(child) for child in item]
+            if isinstance(item, str):
+                return self._redact_string(item, ())
+            return item
+
+        redacted = redact_text(parsed)
+        return value if redacted == parsed else json.dumps(redacted)
 
     def _collect_known_values(self, value: Any, path: tuple[Any, ...] = ()) -> None:
         if isinstance(value, dict):
@@ -738,9 +774,61 @@ class SnapshotRedactor:
                     rf"(?<![A-Za-z0-9]){re.escape(original)}{continuation}(?![A-Za-z0-9])"
                 )
                 redacted = pattern.sub(lambda _match: replacement, redacted)
-        redacted = IPV4_PATTERN.sub(lambda match: self._mask_ipv4(match.group("ip")), redacted)
-        redacted = IPV6_PATTERN.sub(lambda match: self._mask_ipv6(match.group("ip")), redacted)
-        return redacted
+        redacted = IPV4_RANGE_PATTERN.sub(self._redact_ipv4_range_match, redacted)
+        return IP_ADDRESS_PATTERN.sub(self._redact_address_match, redacted)
+
+    def _redact_ipv4_range_match(self, match: re.Match[str]) -> str:
+        start_text = match.group("start")
+        end_text = match.group("end")
+        try:
+            start = ip_address(start_text)
+            end = ip_address(end_text)
+        except ValueError:
+            return match.group(0)
+        if start.version != 4 or end.version != 4 or int(start) == 0 or int(end) == 0:
+            return match.group(0)
+        return f"{self._mask_ipv4(start_text)}-{self._mask_ipv4(end_text)}{match.group('suffix')}"
+
+    def _redact_address_match(self, match: re.Match[str]) -> str:
+        value = match.group("ip")
+        # A non-hexadecimal word label is prose, never an IPv6 component.
+        # Do not search for a valid suffix inside an invalid address token.
+        prefix = ""
+        label, separator, remainder = value.partition(":")
+        if (
+            separator and re.fullmatch(r"[A-Za-z_][A-Za-z_-]*", label)
+            and (
+                re.search(r"[^a-fA-F]", label)
+                or re.fullmatch(rf"{IPV4_ADDRESS_BODY}\.*", remainder)
+            )
+        ):
+            prefix = label + separator
+            value = remainder
+        # A sentence-ending period belongs to the prose, not the address.
+        address_text = value.rstrip(".")
+        suffix = value[len(address_text):]
+        if (
+            address_text.endswith(":") and not address_text.endswith("::")
+            and (
+                re.match(r"\s+[A-Za-z0-9]", match.string[match.end():])
+                or match.string.startswith("/", match.end())
+            )
+        ):
+            address_text = address_text[:-1]
+            suffix = ":" + suffix
+        try:
+            address = ip_address(address_text)
+        except ValueError:
+            # Times, MACs and other colon-delimited identifiers are not IPs.
+            return match.group(0)
+        if int(address) == 0:
+            return match.group(0)
+        masked = (
+            self._mask_ipv4(address_text)
+            if address.version == 4
+            else self._mask_ipv6(address_text)
+        )
+        return prefix + masked + suffix
 
     def _alias_for_identifier(
         self,

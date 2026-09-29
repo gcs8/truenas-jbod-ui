@@ -921,6 +921,239 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(rendered.history_cache[redacted_cache_key]["available"])
         self.assertEqual(rendered.history_cache[redacted_cache_key]["sample_counts"]["temperature_c"], 2)
 
+    async def test_endpoint_text_is_consistent_across_rendered_export_payloads(self) -> None:
+        # Invented documentation addresses, not captured appliance output.
+        endpoints = {
+            "192.0.2.173": "x.x.x.173",
+            "192.0.2.173.": "x.x.x.173.",
+            "Request to 192.0.2.173... retrying": "Request to x.x.x.173... retrying",
+            "192.0.2.10-192.0.2.20": "x.x.x.10-x.x.x.20",
+            "192.0.2.10-192.0.2.20.": "x.x.x.10-x.x.x.20.",
+            "2001:DB8::A7.": "x:x:DB8:A7.",
+            "192.0.2.173:9443": "x.x.x.173:9443",
+            "https://192.0.2.173:9443/api": "https://x.x.x.173:9443/api",
+            "2001:db8:42:53:64:75:86:97": "x:x:86:97",
+            "2001:db8:42::97": "x:x:42:97",
+            "[2001:db8:42::97]:9443": "[x:x:42:97]:9443",
+            "https://[2001:db8:42::97]:9443/api": "https://[x:x:42:97]:9443/api",
+            "[2001:db8::97%eth7]:9443": "[x:x:db8:97%eth7]:9443",
+            "[2001:db8::97%25eth7]:9443": "[x:x:db8:97%25eth7]:9443",
+            "::ffff:192.0.2.173": "x:x:ffff:192.0.2.173",
+            "::97": "x:x:97",
+            "2001:db8::": "x:x:2001:db8",
+        }
+        text = " | ".join(f"endpoint=({value})" for value in endpoints)
+        expected = " | ".join(f"endpoint=({value})" for value in endpoints.values())
+        await self._assert_rendered_endpoint_text(text, expected)
+
+    async def test_endpoint_redaction_preserves_nonaddresses_and_zero_sentinels(self) -> None:
+        text = (
+            "2026-04-17T12:34:56+00:00 | 12:34:56 | 01:23:45:67:89:ab | "
+            "abcdef12-3456-7890-abcd-1234567890ab | SANITIZED-DRIVE-740Q | "
+            "999.0.2.173 | v192.0.2.173suffix | 1.2.3.4.5 | "
+            "0 | 0x0 | 0.0.0.0 | :: | 0:0:0:0:0:0:0:0 | "
+            "http://0.0.0.0:9443/ | [::]:9443"
+        )
+        await self._assert_rendered_endpoint_text(text, text)
+
+    async def test_colon_adjacent_endpoints_across_rendered_export_payloads(self) -> None:
+        endpoints = {
+            "peer:198.51.100.219": "peer:x.x.x.219",
+            "face:198.51.100.219": "face:x.x.x.219",
+            "bad:198.51.100.219": "bad:x.x.x.219",
+            "peer:2001:db8:91::ab:cd": "peer:x:x:ab:cd",
+            "2001:db8:91::ab:cd: unavailable": "x:x:ab:cd: unavailable",
+            "2001:db8::1: 404": "x:x:db8:1: 404",
+            "2001:db8::1: 2 failures": "x:x:db8:1: 2 failures",
+            "2001:db8::1:/dev/sda: failed": "x:x:db8:1:/dev/sda: failed",
+            "peer:198.51.100.219:8443": "peer:x.x.x.219:8443",
+            "peer:2001:db8:91::ab:cd: unavailable": "peer:x:x:ab:cd: unavailable",
+            "peer:::ab:cd": "peer:x:x:ab:cd",
+            "peer:2001:db8::": "peer:x:x:2001:db8",
+            "peer:::ffff:198.51.100.219": "peer:x:x:ffff:198.51.100.219",
+            "peer:2001:db8::ab:cd%eth9.2": "peer:x:x:ab:cd%eth9.2",
+            "face:2001:db8::ab:cd": "x:x:ab:cd",
+        }
+        await self._assert_rendered_endpoint_text(
+            " | ".join(endpoints), " | ".join(endpoints.values()),
+        )
+
+    async def test_colon_context_preserves_invalid_whole_tokens(self) -> None:
+        text = " | ".join((
+            "peer:198.51.100.999", "peer:v198.51.100.219tag",
+            "peer:2001:db8:::91", "2001:db8:::198.51.100.219",
+            "12345:2001:db8::ab:cd", "abcd:2001:db8:::ab:cd",
+            "peer:2001:db8::ab:cdZ", "peer:2001:db8::ab:cd::",
+            "x2001:db8::ab:cd", "2001:db8::ab:cdZ",
+            "peer:2001:db8::ab:cd:", "peer:15:32:41",
+            "peer:02:11:22:33:44:55", "2026-09-28T15:32:41Z",
+            "abcdef01-2345-6789-abcd-0123456789ab", "SANITIZED-DRIVE-219Q",
+            "peer:0.0.0.0", "peer:::", "peer:0:0:0:0:0:0:0:0",
+        ))
+        await self._assert_rendered_endpoint_text(text, text)
+
+    async def test_history_json_whitespace_matches_raw_rendered_text(self) -> None:
+        endpoints = {
+            f'"2001:db8:72::be:ef:{space}Unavailable"':
+            f'"x:x:be:ef:{space}Unavailable"'
+            for space in ("\t", "\n", "\r", " ")
+        }
+        # A literal backslash plus t is not whitespace, even inside JSON.
+        literal = r"2001:db8:72::be:ef:\tUnavailable"
+        endpoints[literal] = literal
+        await self._assert_rendered_endpoint_text(
+            " | ".join(endpoints), " | ".join(endpoints.values()),
+        )
+
+    async def test_history_json_representation_preserves_types_and_text_key_policy(self) -> None:
+        text = "2001:db8:72::be:ef:\tUnavailable"
+        wanted = "x:x:be:ef:\tUnavailable"
+        redactor = SnapshotRedactor(build_snapshot(), {}, {})
+        details = {
+            "message": text,
+            "serial": "tiny",
+            "system_id": "unregistered",
+            "enclosure_id": "unregistered",
+            text: {"previous": [text, 42, 1.25, True, False, None], "current": '"quoted"'},
+            "literal": r"2001:db8:72::be:ef:\tUnavailable",
+        }
+        expected = {
+            "message": wanted,
+            "serial": "tiny",
+            "system_id": "unregistered",
+            "enclosure_id": "unregistered",
+            wanted: {"previous": [wanted, 42, 1.25, True, False, None], "current": '"quoted"'},
+            "literal": r"2001:db8:72::be:ef:\tUnavailable",
+        }
+        # Details used general text replacement, not path-based alias minting.
+        # A parsed serial/system_id key must not introduce stronger masking.
+        aliases = (dict(redactor.system_aliases), dict(redactor.enclosure_aliases))
+        for raw in (
+            json.dumps(details), json.dumps(details, ensure_ascii=False, indent=2),
+            json.dumps(details).replace(r":\t", r":\u0009"),
+        ):
+            with self.subTest(representation=raw):
+                result = redactor.redact_object({"details_json": raw})["details_json"]
+                decoded = json.loads(result)
+                self.assertEqual(decoded, expected)
+                self.assertEqual(
+                    [type(value) for value in decoded[wanted]["previous"]],
+                    [str, int, float, bool, bool, type(None)],
+                )
+        self.assertEqual((redactor.system_aliases, redactor.enclosure_aliases), aliases)
+        # The declared JSON field may contain a scalar/list, but arbitrary text
+        # fields must not be parsed or have their literal escapes interpreted.
+        for value in (text, [text, None, False, 7], None, True, 42, 1.25):
+            raw = json.dumps(value)
+            expected_value = wanted if isinstance(value, str) else (
+                [wanted, None, False, 7] if isinstance(value, list) else value
+            )
+            self.assertEqual(json.loads(redactor.redact_object({"details_json": raw})["details_json"]), expected_value)
+        raw = json.dumps({"message": text})
+        self.assertEqual(redactor.redact_object({"note": raw})["note"], redactor._redact_string(raw, ("note",)))
+
+    async def test_history_json_malformed_fallback_and_known_aliases_are_unchanged(self) -> None:
+        details = {"system_id": "retired.example.test", "serial": "SANITIZED-HISTORY-740Q"}
+        history = {"scope": {"events": [{"details_json": json.dumps(details)}]}}
+        redactor = SnapshotRedactor(build_snapshot(), history, {})
+        raw = json.dumps(details)
+        legacy = redactor._redact_string(raw, ("details_json",))
+        self.assertEqual(
+            json.loads(redactor.redact_history_cache(history)["scope"]["events"][0]["details_json"]),
+            json.loads(legacy),
+        )
+        for raw in ('{"message": "192.0.2.173",', '{"message": "2001:db8:72::be:ef:\tUnavailable"}'):
+            self.assertEqual(
+                redactor.redact_object({"details_json": raw})["details_json"],
+                redactor._redact_string(raw, ("details_json",)),
+            )
+
+    async def _assert_rendered_endpoint_text(self, text: str, expected: str) -> None:
+        snapshot = build_snapshot_with_rear_option()
+        snapshot.warnings = [text]
+        rear = build_rear_snapshot()
+        rear.warnings = [text]
+        smart = build_smart_summary_cache()
+        smart["0"]["detail"] = text
+        rear_smart = build_rear_smart_summary_cache()
+        rear_smart["0"]["detail"] = text
+        runtime = build_storage_view_runtime()
+        runtime.views[0].notes = [text]
+        view_smart = build_storage_view_smart_summary_cache()
+        view_smart["boot-doms"]["0"]["detail"] = text
+
+        class EndpointHistory(FakeHistoryBackend):
+            async def get_scope_history(self, **kwargs: Any) -> dict[int, dict[str, object]]:
+                histories = await super().get_scope_history(**kwargs)
+                for history in histories.values():
+                    history["detail"] = text
+                    history["events"] = [{
+                        "observed_at": datetime.now(timezone.utc).isoformat(),
+                        "event_type": "note", "details_json": json.dumps({
+                            "message": text,
+                            "change": {"previous": text, "current": [text, 0, True, None]},
+                        }),
+                    }]
+                return histories
+
+        exporter = SnapshotExportService(Settings(), EndpointHistory(), templates)
+        kwargs: dict[str, Any] = dict(
+            request=build_request(), snapshot=snapshot, smart_summary_cache=smart,
+            live_enclosure_snapshots={"front": snapshot, "rear": rear},
+            live_enclosure_smart_summary_cache={"front": smart, "rear": rear_smart},
+            storage_view_runtime=runtime, storage_view_smart_summary_cache=view_smart,
+            selected_slot=0, history_window_hours=None, io_chart_mode="total",
+        )
+        original_snapshot = snapshot.model_dump(mode="json")
+        for redact in (True, False):
+            with self.subTest(redact=redact):
+                # Estimate and download receive the same inputs and masking flag.
+                estimate = await exporter.estimate_enclosure_snapshot_export(
+                    **kwargs, redact_sensitive=redact, packaging="html",
+                )
+                rendered = await exporter.build_enclosure_snapshot_html(
+                    **kwargs, redact_sensitive=redact,
+                )
+                self.assertTrue(estimate["ok"])
+                wanted = expected if redact else text
+                if redact:
+                    for original, masked in zip(text.split(" | "), expected.split(" | "), strict=True):
+                        if original != masked:
+                            self.assertFalse(original in rendered.html, "Unmasked contextual endpoint in HTML")
+
+                def embedded(name: str) -> Any:
+                    marker = f"    {name}: "
+                    offset = rendered.html.index(marker) + len(marker)
+                    return json.JSONDecoder().raw_decode(rendered.html[offset:])[0]
+
+                self.assertEqual(embedded("snapshot")["warnings"], [wanted])
+                self.assertEqual(rendered.snapshot.warnings, [wanted])
+                self.assertEqual(embedded("preloadedSmartSummariesBySlot")["0"]["detail"], wanted)
+                for item in embedded("preloadedSnapshotsByEnclosure").values():
+                    self.assertEqual(item["warnings"], [wanted])
+                for name in ("preloadedSnapshotSmartSummaries", "preloadedStorageViewSmartSummaries"):
+                    for cache in embedded(name).values():
+                        self.assertEqual(cache["0"]["detail"], wanted)
+                self.assertEqual(embedded("storageViewsRuntime")["views"][0]["notes"], [wanted])
+                histories = embedded("preloadedHistoryBySlot")
+                self.assertEqual(histories, rendered.history_cache)
+                for history in histories.values():
+                    self.assertEqual(history["detail"], wanted)
+                    details_raw = history["events"][0]["details_json"]
+                    self.assertEqual(json.loads(details_raw), {
+                        "message": wanted,
+                        "change": {"previous": wanted, "current": [wanted, 0, True, None]},
+                    })
+                    if not redact:
+                        self.assertEqual(details_raw, json.dumps({
+                            "message": text,
+                            "change": {"previous": text, "current": [text, 0, True, None]},
+                        }))
+                self.assertEqual(rendered.export_meta["redaction"], "partial" if redact else "none")
+                self.assertEqual(rendered.export_meta["downsampling_label"], "None")
+        self.assertEqual(snapshot.model_dump(mode="json"), original_snapshot)
+        self.assertEqual(smart["0"]["detail"], text)
+
     async def test_partial_export_redacts_configured_hostnames_from_all_embedded_payloads(self) -> None:
         hostnames = {
             "api": "api206.redact.invalid",
