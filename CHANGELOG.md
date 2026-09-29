@@ -259,6 +259,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Compared per-slot history `since` filters in UTC so a non-UTC offset no
+  longer excludes later rows. (#799)
 - Made the backup archive format a choice in the admin Backups settings editor
   so the editor can save again; a number input had turned the value into null.
   (#803)
