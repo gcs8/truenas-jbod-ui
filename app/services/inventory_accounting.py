@@ -69,6 +69,9 @@ def logical_disk_identity_tokens(
     Two records belong to the same logical disk when they share any token: a
     multipath view and its member, or two enclosure views of one disk, agree on
     at least one identifier even when the rest differ.
+
+    ``persistent_id_label`` is accepted for caller compatibility but ignored:
+    labels such as "GPTID" describe an identifier type, not a disk identity.
     """
     tokens: set[str] = set()
     serial_value = _clean(serial)
@@ -77,10 +80,8 @@ def logical_disk_identity_tokens(
     lun_value = _clean(logical_unit_id)
     if lun_value:
         tokens.add(f"lun:{lun_value}")
-    for raw_gptid in (gptid, persistent_id_label):
-        gptid_value = _clean(raw_gptid)
-        if not gptid_value:
-            continue
+    gptid_value = _clean(gptid)
+    if gptid_value:
         normalized_gptid = normalize_gptid(gptid_value)
         tokens.add(f"gptid:{(normalized_gptid or gptid_value).lower()}")
     for raw_device in device_names:
@@ -102,7 +103,6 @@ def slot_identity_tokens(slot: Any) -> frozenset[str]:
         serial=getattr(slot, "serial", None),
         logical_unit_id=getattr(slot, "logical_unit_id", None),
         gptid=getattr(slot, "gptid", None),
-        persistent_id_label=getattr(slot, "persistent_id_label", None),
         device_names=(
             getattr(slot, "device_name", None),
             *(getattr(slot, "smart_device_names", None) or ()),

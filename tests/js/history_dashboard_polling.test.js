@@ -5,23 +5,110 @@ const fs = require("node:fs");
 const path = require("node:path");
 const test = require("node:test");
 const vm = require("node:vm");
+const { spawnSync } = require("node:child_process");
 const source = fs.readFileSync(path.resolve(__dirname, "../../history_service/static/dashboard.js"), "utf8");
 
 async function flush() {
   for (let i = 0; i < 20; i += 1) await Promise.resolve();
 }
 
-function dashboard({ hidden = false, buttons = true, initial = { collector_running: true } } = {}) {
+// Render the complete production template without importing service startup or
+// opening a database. The DOM adapter below supports only this asset's APIs;
+// these are offline DOM behavior tests, not browser layout or live-service QA.
+function templateDocument(initial, buttons) {
+  const rendered = spawnSync(process.env.PYTHON || "python", ["-c", `
+import json, sys
+from html.parser import HTMLParser
+from jinja2 import Environment, FileSystemLoader
+from app.script_json import register_script_json_filters
+payload = json.load(sys.stdin)
+env = Environment(loader=FileSystemLoader("history_service/templates"), autoescape=True)
+register_script_json_filters(env)
+html = env.get_template("dashboard.html").render(
+    app_name="Synthetic history", app_version="test", status=payload["initial"],
+    status_json=json.dumps(payload["initial"]), direct_refresh_enabled=payload["buttons"],
+    refresh={}, counts={}, scopes=[], collector_state_label="Running",
+    collector_banner_text="", url_for=lambda name, path: "/static/" + path,
+)
+class DOM(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.root = {"tag": "document", "attrs": {}, "children": []}
+        self.stack = [self.root]
+    def handle_starttag(self, tag, attrs):
+        node = {"tag": tag, "attrs": dict(attrs), "children": []}
+        self.stack[-1]["children"].append(node)
+        if tag not in {"meta", "link", "br", "hr", "img", "input"}:
+            self.stack.append(node)
+    def handle_endtag(self, tag):
+        assert self.stack[-1]["tag"] == tag, (tag, self.stack[-1]["tag"])
+        self.stack.pop()
+    def handle_data(self, text):
+        self.stack[-1]["children"].append(text)
+dom = DOM()
+dom.feed(html)
+assert len(dom.stack) == 1
+print(json.dumps(dom.root))
+`], {
+    cwd: path.resolve(__dirname, "../.."),
+    input: JSON.stringify({ initial, buttons }), encoding: "utf8", timeout: 10000,
+  });
+  assert.equal(rendered.status, 0, rendered.stderr);
+  const elements = new Map();
+  const times = [];
+  function node(record) {
+    if (typeof record === "string") return { textContent: record };
+    const attrs = { ...record.attrs };
+    const classes = new Set((attrs.class || "").split(/\s+/).filter(Boolean));
+    const value = {
+      children: record.children.map(node),
+      disabled: Object.hasOwn(attrs, "disabled"), hidden: Object.hasOwn(attrs, "hidden"),
+      get textContent() { return this.children.map(child => child.textContent).join(""); },
+      set textContent(text) { this.children = [{ textContent: String(text) }]; },
+      set innerHTML(html) { this.textContent = html; },
+      getAttribute(name) { return Object.hasOwn(attrs, name) ? attrs[name] : null; },
+      setAttribute(name, text) { attrs[name] = String(text); },
+      removeAttribute(name) { delete attrs[name]; },
+      addEventListener(event, callback) { this[event] = callback; },
+      replaceChildren(...children) { this.children = children; },
+      appendChild(child) { this.children.push(child); },
+      classList: {
+        toggle(name, force) { if (force) classes.add(name); else classes.delete(name); },
+        contains(name) { return classes.has(name); },
+      },
+    };
+    if (attrs.id) {
+      assert.ok(!elements.has(attrs.id), `duplicate template id ${attrs.id}`);
+      elements.set(attrs.id, value);
+    }
+    if (record.tag === "time" && attrs.datetime) times.push(value);
+    return value;
+  }
+  node(JSON.parse(rendered.stdout));
+  return { elements, times, createElement: () => node({ attrs: {}, children: [] }) };
+}
+
+function dashboard({ hidden = false, buttons = true, initial = { collector_running: true }, template = false } = {}) {
   let now = 0;
   let nextTimer = 0;
   const timers = new Map();
   const requests = [];
   const listeners = {};
-  const elements = new Map();
+  const dom = template ? templateDocument(initial, buttons) : null;
+  const elements = dom?.elements || new Map();
   function element(id) {
+    if (dom) {
+      assert.ok(elements.has(id), `missing template hook ${id}`);
+      return elements.get(id);
+    }
     if (!elements.has(id)) elements.set(id, {
       textContent: id === "collector-state-value" ? "Running" : "",
-      disabled: false, hidden: false, classList: { toggle() {} },
+      disabled: false, hidden: false,
+      classList: {
+        names: new Set(),
+        toggle(name, force) { if (force) this.names.add(name); else this.names.delete(name); },
+        contains(name) { return this.names.has(name); },
+      },
       addEventListener(event, callback) { this[event] = callback; },
       setAttribute(name, value) { this[name] = value; },
       removeAttribute(name) { delete this[name]; },
@@ -32,12 +119,13 @@ function dashboard({ hidden = false, buttons = true, initial = { collector_runni
   const document = {
     hidden,
     getElementById(id) {
+      if (dom) return elements.get(id) || null;
       if (id === "history-dashboard-bootstrap") return { textContent: JSON.stringify(initial) };
       if (!buttons && /history-refresh-(fast|full|status)/.test(id)) return null;
       return element(id);
     },
-    querySelectorAll() { return []; },
-    createElement() { return { textContent: "", children: [], setAttribute(name, value) { this[name] = value; }, appendChild(child) { this.children.push(child); } }; },
+    querySelectorAll() { return dom?.times || []; },
+    createElement() { return dom ? dom.createElement() : { textContent: "", children: [], setAttribute(name, value) { this[name] = value; }, appendChild(child) { this.children.push(child); } }; },
     addEventListener(event, callback) { listeners[event] = callback; },
   };
   const window = {
@@ -75,6 +163,142 @@ function dashboard({ hidden = false, buttons = true, initial = { collector_runni
     async click(mode) { element(`history-refresh-${mode}`).click(); await flush(); },
   };
 }
+
+// The standalone npm job is Node-only. It still runs every behavior assertion
+// against the asset DOM. PYTHON selects the stronger complete-template fixture
+// using the project's installed Jinja environment; failures never fall back.
+const recoveryDashboard = options => dashboard({ ...options, template: Boolean(process.env.PYTHON) });
+const recoveryFixture = process.env.PYTHON ? "complete template" : "asset DOM";
+
+const quarantineA = "2026-09-09T12:00:00+00:00";
+const quarantineB = "2026-09-10T13:00:00+00:00";
+const recoveryWarning = "yes, earlier history was quarantined and this database started empty";
+const recoveryCollector = (required, stamp) => ({
+  collector_running: true, history_recovery_required: required, history_quarantined_at: stamp,
+});
+const recoveryPayload = (collector, channel) => channel === "health"
+  ? { collector, status: collector.history_recovery_required ? "degraded" : "ok" }
+  : { collector, ok: true, counts: { tracked_slots: 7 } };
+
+async function sendRecovery(d, channel, collector, code = 200) {
+  const index = d.requests.length;
+  if (channel === "health") d.poll.pollCollectorStatus();
+  else if (channel === "overview") d.poll.pollOverviewStatus();
+  else await d.click("fast");
+  assert.equal(d.requests[index].url, channel === "health" ? "/healthz" : `/api/history/${channel}`);
+  await d.reply(index, recoveryPayload(collector, channel), code);
+  // Failed refresh resumes reads too. Fail those checks before the next
+  // explicit check. On success leave reads pending: assertions must prove
+  // the refresh response itself updated the DOM, not a follow-up GET.
+  if (channel === "refresh" && code !== 200) {
+    for (let i = index + 1; i < d.requests.length; i += 1) {
+      await d.reply(i, recoveryPayload(collector, "overview"), code);
+    }
+  }
+}
+
+function assertRecovery(d, required, stamp, warning = required !== false) {
+  assert.equal(d.element("status-history-recovery-required").textContent,
+    required === true ? recoveryWarning : required === false ? "no" : "unknown");
+  assert.equal(d.element("status-history-recovery-required").classList.contains("status-error"), warning);
+  assert.equal(d.element("status-history-quarantined-at").textContent, stamp);
+}
+
+for (const channel of ["health", "overview", "refresh"]) {
+  test(`recovery ${recoveryFixture}: ${channel} updates both transitions and quarantine time`, async () => {
+    const d = recoveryDashboard({ initial: recoveryCollector(false, null) });
+    assertRecovery(d, false, "never");
+    await sendRecovery(d, channel, recoveryCollector(true, quarantineA));
+    assertRecovery(d, true, new Date(quarantineA).toLocaleString());
+    assert.equal(d.element("history-collector-freshness").textContent, "Collector status checked successfully.");
+    await sendRecovery(d, channel, recoveryCollector(true, quarantineB));
+    assertRecovery(d, true, new Date(quarantineB).toLocaleString());
+    await sendRecovery(d, channel, recoveryCollector(false, null));
+    assertRecovery(d, false, "never");
+  });
+
+  test(`recovery ${recoveryFixture}: ${channel} does not coerce unknown evidence to no or never`, async () => {
+    for (const prior of [false, true]) {
+      const d = recoveryDashboard({ initial: recoveryCollector(prior, prior ? quarantineA : null) });
+      for (const unknown of [undefined, null, "false", "true", 0, 1, {}, []]) {
+        await sendRecovery(d, channel, { collector_running: true, history_recovery_required: unknown });
+        assertRecovery(d, undefined, "not recorded");
+      }
+      for (const stamp of [undefined, "", "bad", 0, false, {}, []]) {
+        await sendRecovery(d, channel, recoveryCollector(false, stamp));
+        assertRecovery(d, false, "not recorded");
+      }
+      await sendRecovery(d, channel, recoveryCollector(true, null));
+      assertRecovery(d, true, "not recorded");
+      await sendRecovery(d, channel, recoveryCollector(false, quarantineB));
+      assertRecovery(d, false, new Date(quarantineB).toLocaleString());
+      await sendRecovery(d, channel, recoveryCollector(false, null));
+      assertRecovery(d, false, "never");
+    }
+  });
+}
+
+test(`recovery ${recoveryFixture}: missing bootstrap fields become unknown, not a fresh negative`, () => {
+  const d = recoveryDashboard();
+  assertRecovery(d, undefined, "not recorded");
+  assert.doesNotMatch(d.element("history-collector-freshness").textContent, /checked successfully/);
+});
+
+for (const older of ["health", "overview"]) {
+  test(`recovery ${recoveryFixture}: older ${older} cannot repaint newer state or warning`, async () => {
+    for (const required of [true, false]) {
+      const d = recoveryDashboard({ initial: recoveryCollector(!required, quarantineA) });
+      const polls = older === "health"
+        ? [d.poll.pollCollectorStatus, d.poll.pollOverviewStatus]
+        : [d.poll.pollOverviewStatus, d.poll.pollCollectorStatus];
+      polls.forEach(poll => poll());
+      await d.reply(1, recoveryPayload(recoveryCollector(required, quarantineB), "overview"));
+      assertRecovery(d, required, new Date(quarantineB).toLocaleString());
+      await d.reply(0, recoveryPayload(recoveryCollector(!required, quarantineA), "overview"));
+      assertRecovery(d, required, new Date(quarantineB).toLocaleString());
+    }
+  });
+}
+
+test(`recovery ${recoveryFixture}: failed checks retain values but mark them stale until a known response`, async () => {
+  for (const required of [true, false]) {
+    const d = recoveryDashboard({ initial: recoveryCollector(required, required ? quarantineA : null) });
+    const label = required ? new Date(quarantineA).toLocaleString() : "never";
+    for (const channel of ["health", "overview", "refresh"]) {
+      await sendRecovery(d, channel, recoveryCollector(!required, quarantineB), 503);
+      assertRecovery(d, required, label);
+      assert.match(d.element("history-collector-freshness").textContent, /stale/i);
+    }
+    await sendRecovery(d, "health", recoveryCollector(!required, quarantineB));
+    assertRecovery(d, !required, new Date(quarantineB).toLocaleString());
+  }
+});
+
+test(`recovery ${recoveryFixture}: manual refresh fences canceled reads in both directions`, async () => {
+  for (const required of [true, false]) {
+    const d = recoveryDashboard({ initial: recoveryCollector(!required, quarantineA) });
+    d.poll.pollCollectorStatus();
+    d.poll.pollOverviewStatus();
+    await d.click("fast");
+    await d.reply(2, recoveryPayload(recoveryCollector(required, quarantineB), "refresh"));
+    assertRecovery(d, required, new Date(quarantineB).toLocaleString());
+    await d.reply(0, recoveryPayload(recoveryCollector(!required, quarantineA), "health"));
+    await d.reply(1, recoveryPayload(recoveryCollector(!required, quarantineA), "overview"));
+    assertRecovery(d, required, new Date(quarantineB).toLocaleString());
+  }
+});
+
+test(`recovery ${recoveryFixture}: hidden refresh completion cannot replace the snapshot`, async () => {
+  const d = recoveryDashboard({ initial: recoveryCollector(true, quarantineA) });
+  await d.click("fast");
+  await d.visibility(true);
+  await d.reply(0, recoveryPayload(recoveryCollector(false, null), "refresh"));
+  assertRecovery(d, true, new Date(quarantineA).toLocaleString());
+  assert.match(d.element("history-collector-freshness").textContent, /stale/i);
+  await d.visibility(false);
+  await d.reply(2, recoveryPayload(recoveryCollector(false, null), "overview"));
+  assertRecovery(d, false, "never");
+});
 
 test("presentation formats initial and polled times and does not invent startup", async () => {
   const stamp = "2026-09-09T12:00:00+00:00";

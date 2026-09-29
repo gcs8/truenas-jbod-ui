@@ -575,14 +575,19 @@ test("the hero countdown tick only writes when the text changes", () => {
       this.stored = value;
     },
   };
+  let bannerSyncs = 0;
   const functions = loadFunctions(["tickCountdown"], {
     elements: { countdown },
     formatCountdown: () => text,
+    sessionRemainingMs: () => 10 * 60 * 1000,
+    SESSION_WARNING_MS: 5 * 60 * 1000,
+    syncSessionBanner: () => { bannerSyncs += 1; },
   });
   functions.tickCountdown();
   functions.tickCountdown();
   functions.tickCountdown();
   assert.equal(writes, 1);
+  assert.equal(bannerSyncs, 1);
   text = "4m 59s";
   functions.tickCountdown();
   assert.equal(writes, 2);
