@@ -262,6 +262,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Apply operation deadlines to normal TrueNAS inventory, slot-status and SMART
+  calls while retaining WebSocket close ownership through cancellation. (#757)
 - Correct QA mapping revisions, retain recovery files until verified cleanup,
   finalize truthful receipts, and constrain Compose-matrix child runtimes. (#759)
 - Preserve Storage Fabric path identity, diagnostic placement, complete path
