@@ -1073,6 +1073,14 @@ class FakeS3ConnectionError(RuntimeError):
     pass
 
 
+class FakeS3ProxyConnectionError(RuntimeError):
+    pass
+
+
+class FakeS3SSLError(RuntimeError):
+    pass
+
+
 class FakeS3Client:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
@@ -1173,6 +1181,8 @@ def _fake_boto_modules(clients: list[FakeS3Client]) -> dict[str, types.ModuleTyp
         "HTTPClientError",
     ):
         setattr(botocore_exceptions, name, FakeS3ConnectionError)
+    setattr(botocore_exceptions, "ProxyConnectionError", FakeS3ProxyConnectionError)
+    setattr(botocore_exceptions, "SSLError", FakeS3SSLError)
     setattr(botocore, "exceptions", botocore_exceptions)
     return {
         "boto3": boto3,
@@ -1211,6 +1221,16 @@ class S3TargetTests(_TempCase):
             with self.assertRaisesRegex(ConnectionError, "S3 archive location is unavailable") as caught:
                 target.delete("full/backup.tar.zst")
         self.assertIs(caught.exception.__cause__, failure)
+
+    def test_delete_proxy_and_tls_failures_are_location_unavailable(self) -> None:
+        for error_type in (FakeS3ProxyConnectionError, FakeS3SSLError):
+            with self.subTest(error_type=error_type.__name__):
+                with open_target(self.settings()) as target:
+                    failure = error_type("synthetic connection setup failure")
+                    self.clients[-1].delete_error = failure
+                    with self.assertRaises(ConnectionError) as caught:
+                        target.delete("full/backup.tar.zst")
+                self.assertIs(caught.exception.__cause__, failure)
 
     def test_missing_dependency_has_install_hint(self) -> None:
         with mock.patch.dict(sys.modules, {"boto3": None}):
