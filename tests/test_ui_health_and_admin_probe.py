@@ -14,6 +14,7 @@ import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
+from urllib.parse import urlsplit
 
 from fastapi import Request
 from fastapi.routing import APIRoute
@@ -49,17 +50,17 @@ def _route(path: str, method: str = "GET") -> APIRoute:
     )
 
 
-def _request(path: str = "/") -> Request:
+def _request(path: str = "/", *, host: str | None = None, scheme: str = "http") -> Request:
     return Request(
         {
             "type": "http",
             "http_version": "1.1",
             "method": "GET",
-            "scheme": "http",
+            "scheme": scheme,
             "path": path,
             "raw_path": path.encode("ascii"),
             "query_string": b"",
-            "headers": [],
+            "headers": [(b"host", host.encode("ascii"))] if host is not None else [],
             "client": ("testclient", 123),
             "server": ("testserver", 80),
             "root_path": "",
@@ -669,6 +670,112 @@ class AdminProbeCacheTests(unittest.TestCase):
         with patch.object(app_route_support, "_probe_admin_service") as probe:
             self.assertIsNone(app_route_support.resolve_admin_launch_url(_request(), Settings()))
         probe.assert_not_called()
+
+
+class AdminLaunchURLTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.settings = Settings()
+        self.settings.admin.service_url = "http://admin.example.test:8002"
+
+    def test_ipv6_derived_authority_has_brackets_and_the_admin_port(self) -> None:
+        for host in ("[2001:db8::1]", "[2001:db8::1]:8080"):
+            for scheme in ("http", "https"):
+                for port in (8082, 9443):
+                    with self.subTest(host=host, scheme=scheme, port=port):
+                        request = _request("/ignored-path", host=host, scheme=scheme)
+                        self.assertEqual(request.url.hostname, "2001:db8::1")
+                        self.settings.admin.port = port
+                        with patch.object(app_route_support, "admin_service_reachable", return_value=True) as probe:
+                            state = app_route_support.resolve_admin_launch_url(request, self.settings)
+                        probe.assert_called_once_with(
+                            self.settings.admin.service_url, self.settings.admin.timeout_seconds,
+                        )
+                        self.assertEqual(
+                            state,
+                            app_route_support.AdminLaunchState(url=f"{scheme}://[2001:db8::1]:{port}", stopped=False),
+                        )
+                        assert state is not None
+                        parsed = urlsplit(state.url)
+                        self.assertEqual((parsed.scheme, parsed.hostname, parsed.port), (scheme, "2001:db8::1", port))
+                        self.assertEqual((parsed.path, parsed.query, parsed.fragment), ("", "", ""))
+
+    def test_dns_and_ipv4_derived_authorities_keep_existing_behavior(self) -> None:
+        for hostname in ("ui.example.test", "192.0.2.1"):
+            for suffix in ("", ":8080"):
+                for scheme in ("http", "https"):
+                    with self.subTest(hostname=hostname, suffix=suffix, scheme=scheme):
+                        self.settings.admin.port = 9443
+                        with patch.object(app_route_support, "admin_service_reachable", return_value=True):
+                            state = app_route_support.resolve_admin_launch_url(
+                                _request(host=hostname + suffix, scheme=scheme), self.settings,
+                            )
+                        self.assertEqual(
+                            state,
+                            app_route_support.AdminLaunchState(url=f"{scheme}://{hostname}:9443", stopped=False),
+                        )
+                        assert state is not None
+                        parsed = urlsplit(state.url)
+                        self.assertEqual((parsed.hostname, parsed.port), (hostname, 9443))
+
+    def test_explicit_public_url_overrides_request_scheme_host_and_admin_port(self) -> None:
+        for public_url in ("https://[2001:db8::2]:9443/setup", "https://admin.example.test/setup"):
+            with self.subTest(public_url=public_url):
+                self.settings.admin.public_url = f" {public_url}/ "
+                with patch.object(app_route_support, "admin_service_reachable", return_value=True) as probe:
+                    state = app_route_support.resolve_admin_launch_url(
+                        _request(host="[2001:db8::1]:8080"), self.settings,
+                    )
+                probe.assert_called_once_with(
+                    self.settings.admin.service_url, self.settings.admin.timeout_seconds,
+                )
+                self.assertEqual(state, app_route_support.AdminLaunchState(url=public_url, stopped=False))
+
+    def test_stopped_admin_does_not_expose_derived_or_explicit_ipv6_url(self) -> None:
+        for public_url in (None, "https://[2001:db8::2]:9443/setup"):
+            with self.subTest(public_url=public_url):
+                self.settings.admin.public_url = public_url
+                with patch.object(app_route_support, "admin_service_reachable", return_value=False) as probe:
+                    state = app_route_support.resolve_admin_launch_url(
+                        _request(host="[2001:db8::1]", scheme="https"), self.settings,
+                    )
+                probe.assert_called_once_with(
+                    self.settings.admin.service_url, self.settings.admin.timeout_seconds,
+                )
+                self.assertEqual(state, app_route_support.AdminLaunchState(url=None, stopped=True))
+
+    def test_missing_service_does_not_probe_or_expose_an_ipv6_url(self) -> None:
+        self.settings.admin.service_url = ""
+        for public_url in (None, "https://[2001:db8::2]:9443/setup"):
+            with self.subTest(public_url=public_url):
+                self.settings.admin.public_url = public_url
+                with patch.object(app_route_support, "admin_service_reachable") as probe:
+                    self.assertIsNone(app_route_support.resolve_admin_launch_url(
+                        _request(host="[2001:db8::1]"), self.settings,
+                    ))
+                probe.assert_not_called()
+
+    def test_index_renders_the_real_derived_ipv6_system_setup_link(self) -> None:
+        self.settings.systems = [SystemConfig(id="system-a", label="System A")]
+        self.settings.default_system_id = "system-a"
+        self.settings.admin.port = 9443
+        release_service = Mock()
+        release_service.snapshot.return_value = {}
+        with (
+            patch.object(app_routes, "get_settings", return_value=self.settings),
+            patch.object(app_routes, "get_inventory_registry", return_value=_registry(_service())),
+            patch.object(app_routes, "get_release_status_service", return_value=release_service),
+            patch.object(app_route_support, "admin_service_reachable", return_value=True) as probe,
+        ):
+            response = asyncio.run(_route("/").endpoint(
+                request=_request(host="[2001:db8::1]:8080", scheme="https"),
+                system_id=None, enclosure_id=None,
+            ))
+        probe.assert_called_once_with(self.settings.admin.service_url, self.settings.admin.timeout_seconds)
+        self.assertEqual(response.status_code, 200)
+        page = response.body.decode("utf-8")
+        self.assertIn('href="https://[2001:db8::1]:9443"', page)
+        self.assertIn(">System Setup</a>", page)
+        self.assertNotIn('id="admin-launch-stopped"', page)
 
 
 class AdminProbeHotPathTests(unittest.TestCase):

@@ -259,6 +259,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Preserve IPv6 brackets in derived System Setup links while retaining explicit
+  public-URL precedence and existing admin reachability behavior. (#771)
 - Ran each click inside the admin Backups dialog once; two listeners had
   doubled every add, remove and close. (#804)
 - Kept the startup, storage-writability and known_hosts warnings on every
