@@ -282,6 +282,20 @@
     };
   }
 
+  // The last scheduled clean-up, for the status line: a summary when it
+  // worked, otherwise each place it could not finish and why.
+  function cleanupSummary(grooming, targets, formatTime = (value) => String(value)) {
+    if (!grooming || typeof grooming !== "object") return null;
+    const when = grooming.at ? formatTime(grooming.at) : "";
+    if (grooming.ok) {
+      return { tone: "is-ok", text: `Last clean-up: ${when || "-"}, ${Number(grooming.deleted) || 0} removed.` };
+    }
+    const failed = grooming.failed_locations && typeof grooming.failed_locations === "object" ? grooming.failed_locations : {};
+    const places = Object.keys(failed).map((location) => `${locationLabel(location, targets)}: ${scrubText(failed[location] || "no detail")}`);
+    const reason = places.length ? places.join("; ") : scrubText(grooming.detail || "no detail");
+    return { tone: "is-bad", text: `Last clean-up${when ? ` ${when}` : ""} didn't finish: ${reason}.` };
+  }
+
   function shortHash(value) {
     const text = String(value || "");
     return /^[0-9a-f]{64}$/i.test(text) ? `${text.slice(0, 12)}…` : "";
@@ -352,6 +366,7 @@
     humanizePlanReason,
     normalizePlan,
     lastRunSummary,
+    cleanupSummary,
   };
 
   // ------------------------------------------------------------ controller --
@@ -480,12 +495,16 @@
             parts.push(`A ${CLASS_SHORT[state.data.running.backup_class].toLowerCase()} backup is running.`);
           }
           setStatus(parts.join(" "));
+          const cleanup = state.data.available ? cleanupSummary(payload.grooming, state.data.targets, fmtTime) : null;
+          if (cleanup && els.status) els.status.append(" ", el("span", { className: `backup-run-status ${cleanup.tone}`, text: cleanup.text }));
           scheduleRunningPoll();
         } catch (error) {
           state.loadError = error?.status === 404
             ? "This admin version has no backup list."
             : `Couldn't load backups: ${errorText(error)}`;
           setStatus(state.loadError);
+          // A run known to be in progress keeps polling past one failed read.
+          scheduleRunningPoll();
         } finally {
           state.loading = false;
           state.loadPromise = null;
@@ -502,7 +521,11 @@
       if (state.pollTimer || !state.data?.running || isStopped() || !deps.setTimeout) return;
       state.pollTimer = deps.setTimeout(() => {
         state.pollTimer = null;
-        if (deps.isVisible && !deps.isVisible()) return;
+        // A hidden tab skips the request but keeps polling, so returning to it shows the result.
+        if (deps.isVisible && !deps.isVisible()) {
+          scheduleRunningPoll();
+          return;
+        }
         void load({ quiet: true });
       }, POLL_MS);
     }
@@ -1187,14 +1210,19 @@
       const id = state.dialogArtifactId;
       const scope = dialogScope();
       const inspection = state.restoreInspection;
-      if (!inspection) return Promise.resolve();
+      if (isPending(`restore:${id}`)) return state.pending.get(`restore:${id}`);
+      if (!inspection || !scope.live()) return Promise.resolve();
       return once(`restore:${id}`, async () => {
+        if (!scope.live() || state.restoreInspection !== inspection) return;
+        // An admitted apply may consume the receipt even if its reply is lost.
+        // Never retain it for a retry; the operator must check the backup again.
+        state.restoreInspection = null;
         const stopServices = Boolean(els.dialog?.querySelector("#backup-restore-stop")?.checked);
         const restartServices = stopServices && Boolean(els.dialog?.querySelector("#backup-restore-restart")?.checked);
         scope.result("Restoring...");
         scope.actions(cancelButton("Close"));
         try {
-          const payload = await deps.fetchJson(
+          const payload = await deps.fetchBackupRestore(
             `${artifactUrl(id, "/restore/import")}?stop_services=${String(stopServices)}&restart_services=${String(restartServices)}`,
             {
               method: "POST",
@@ -1206,7 +1234,7 @@
               timeoutMs: LONG_TIMEOUT_MS,
             }
           );
-          state.restoreInspection = null;
+          if (!scope.live()) return;
           const outcome = deps.describeMaintenanceOutcome({
             stopped: payload.stopped_containers,
             restarted: payload.restarted_containers,
@@ -1219,11 +1247,20 @@
           setBanner(outcome.ok ? "Backup restored." : `Backup restored, but ${outcome.sentence}`, outcome.ok ? "success" : "error");
           const passphrase = els.dialog?.querySelector("#backup-restore-passphrase");
           if (passphrase) passphrase.value = "";
-          await deps.refreshAdminState?.();
-          await load({ quiet: true });
+          try {
+            await deps.refreshAdminState?.();
+            await load({ quiet: true });
+          } catch (_) {
+            if (scope.live()) {
+              setBanner("Backup restored, but the page could not refresh. Refresh to check the current settings and service status.", "error");
+            }
+          }
         } catch (error) {
-          scope.result(`Restore failed: ${errorText(error)}`);
-          setBanner(`Restore failed: ${errorText(error)}`, "error");
+          if (!scope.live()) return;
+          const message = scrubText(deps.describeBackupRestoreFailure(error));
+          scope.result(message);
+          scope.actions(primary("Check backup", "restore-inspect"), cancelButton("Close"));
+          setBanner(message, "error");
         }
       });
     }
@@ -1369,8 +1406,8 @@
     }
 
     function bind() {
+      // The dialog sits inside the section, so its clicks bubble to this one listener.
       els.root?.addEventListener("click", handleClick);
-      els.dialog?.addEventListener("click", handleClick);
       // Escape (the dialog's native cancel) must also restore focus.
       els.dialog?.addEventListener("cancel", (event) => {
         event.preventDefault?.();

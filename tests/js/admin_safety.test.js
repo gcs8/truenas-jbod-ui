@@ -183,7 +183,7 @@ test("duplicate restore calls share one file read and pending operation", async 
   let reads = 0, reject;
   const bindings = controls();
   Object.assign(bindings, {readSelectedImportFile: () => ({name: "synthetic.zip", arrayBuffer() {reads++; return new Promise((_resolve, fail) => {reject = fail;});}}), readOptionalSecretValue: () => null, setBanner() {}});
-  const names = ["importBackup", "syncBackupControls"];
+  const names = ["importBackup", "syncBackupControls", "describeBackupRestoreFailure"];
   if (source.includes("function runImportBackup(")) names.push("runImportBackup", "runBackupOperation");
   const api = load(names, bindings);
   const first = api.importBackup(), second = api.importBackup();

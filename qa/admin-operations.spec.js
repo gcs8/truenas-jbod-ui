@@ -385,7 +385,7 @@ test.describe("admin backups library", () => {
         case "GET /api/admin/backups": return json(library());
         case "GET /api/admin/backups/cfg-1": return json({ ...library().artifacts[0], changes: [{ change_id: "c1", at: "2026-09-21T09:59:00Z", action: "system saved", subject: "nas-a.example.test" }] });
         case "POST /api/admin/backups/full-1/restore/inspect": return json({ ok: true, encryption_mode: "plaintext", inspection_receipt: "synthetic-receipt", aggregate_counts: { systems: 1 } });
-        case "POST /api/admin/backups/full-1/restore/import": return json({ ok: true, systems: [], stopped_containers: [], restarted_containers: [], restart_failures: {} });
+        case "POST /api/admin/backups/full-1/restore/import": return json({ ok: true, systems: [], default_system_id: null, restored_paths: [], restored_history_database: false, stopped_containers: [], restarted_containers: [], restart_failures: {} });
         case "GET /api/admin/backups/lifecycle/plan": return json({ plan_token: "synthetic-plan", expires_at: "2026-09-24T12:00:00Z", items: [{ id: "full-2", location: "offsite", backup_class: "full", kind: "unverified", reason: "unverified for longer than grace 1d (age 2d)" }], guarded: [] });
         case "POST /api/admin/backups/lifecycle/apply": return json({ ok: true, deleted: ["full-2"], already_missing: [], failed: null, not_attempted: [] });
         case "POST /api/admin/backups/targets/plain-ftp/test": return json({ ok: true, detail: "writable", duration_ms: 12 });
