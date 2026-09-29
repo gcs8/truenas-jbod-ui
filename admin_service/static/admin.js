@@ -73,6 +73,7 @@
     runtimeActionControllers: new Map(),
     countdownTimerId: null,
     sessionStopped: false,
+    sessionBannerPhase: null,
     sudoersPreviewTimerId: null,
     sudoersPreviewRequestSeq: 0,
     liveEnclosuresRequestSeq: 0,
@@ -584,6 +585,16 @@
     });
   }
 
+  function lockActionsIfStopped() {
+    // Renders re-enable buttons from their own rules; once admin has stopped, keep every action locked.
+    if (!state.sessionStopped) {
+      return;
+    }
+    document.querySelectorAll("button:not(.admin-view-button)").forEach((button) => {
+      button.disabled = true;
+    });
+  }
+
   function syncSessionBanner() {
     if (!elements.sessionBanner || state.sessionStopped) {
       return;
@@ -647,7 +658,16 @@
   }
 
   function tickCountdown() {
-    // Only the countdown changes between ticks; the rest of the hero is rendered by refreshes.
+    // Only the countdown and the auto-stop banner change between ticks; the rest of the hero is
+    // rendered by refreshes. The banner is re-synced only when its wording would change.
+    const remainingMs = sessionRemainingMs();
+    const bannerPhase = remainingMs === null || remainingMs > SESSION_WARNING_MS
+      ? "hidden"
+      : remainingMs <= 0 ? "passed" : String(Math.ceil(remainingMs / 60000));
+    if (state.sessionBannerPhase !== bannerPhase) {
+      state.sessionBannerPhase = bannerPhase;
+      syncSessionBanner();
+    }
     if (!elements.countdown) {
       return;
     }
@@ -1126,7 +1146,7 @@
       setBanner(message, "error");
     } finally {
       state.runtimeBehaviorSaving = false;
-      elements.runtimeBehaviorSaveButton.disabled = false;
+      elements.runtimeBehaviorSaveButton.disabled = Boolean(state.sessionStopped);
     }
   }
 
@@ -2453,6 +2473,7 @@
     const referenceCount = profileReferenceCount(loadedProfile);
     elements.profileBuilderDeleteButton.disabled = !(loadedProfile && loadedProfile.is_custom) || referenceCount > 0;
     elements.profileBuilderDeleteButton.title = referenceCount > 0 ? describeProfileReferences(referenceCount) : "";
+    lockActionsIfStopped();
   }
 
   function profileReferenceCount(profile) {
@@ -5460,7 +5481,7 @@
     button.addEventListener("click", () => {
       button.disabled = true;
       void runRuntimeAction(containerKey, action).finally(() => {
-        button.disabled = false;
+        button.disabled = Boolean(state.sessionStopped);
       });
     });
     return button;
@@ -5937,7 +5958,7 @@
       setBanner(`ESXi package upload failed: ${error.message || error}`, "error");
     } finally {
       if (elements.setupEsxiHostPrepUploadButton) {
-        elements.setupEsxiHostPrepUploadButton.disabled = false;
+        elements.setupEsxiHostPrepUploadButton.disabled = Boolean(state.sessionStopped);
       }
     }
   }
@@ -6031,7 +6052,7 @@
       setBanner(`TLS inspection failed: ${error.message || error}`, "error");
     } finally {
       if (elements.setupInspectTlsButton) {
-        elements.setupInspectTlsButton.disabled = false;
+        elements.setupInspectTlsButton.disabled = Boolean(state.sessionStopped);
       }
     }
   }
@@ -6091,7 +6112,7 @@
       setBanner(`Saving the remote certificate material failed: ${error.message || error}`, "error");
     } finally {
       if (elements.setupTrustRemoteTlsButton) {
-        elements.setupTrustRemoteTlsButton.disabled = false;
+        elements.setupTrustRemoteTlsButton.disabled = Boolean(state.sessionStopped);
       }
     }
   }
@@ -6148,7 +6169,7 @@
       setBanner(`TLS bundle import failed: ${error.message || error}`, "error");
     } finally {
       if (elements.setupTlsImportCaButton) {
-        elements.setupTlsImportCaButton.disabled = false;
+        elements.setupTlsImportCaButton.disabled = Boolean(state.sessionStopped);
       }
     }
   }
@@ -6237,7 +6258,7 @@
       setBanner(`Unable to refresh admin state: ${error.message || error}`, "error");
     } finally {
       if (elements.refreshStateButton) {
-        elements.refreshStateButton.disabled = false;
+        elements.refreshStateButton.disabled = Boolean(state.sessionStopped);
       }
     }
   }
@@ -6282,7 +6303,7 @@
     const buttons = elements.runtimeCards?.querySelectorAll("[data-runtime-action][data-container-key]") || [];
     buttons.forEach((button) => {
       if (String(button.dataset.containerKey || "") === String(containerKey || "")) {
-        button.disabled = Boolean(pending);
+        button.disabled = Boolean(pending || state.sessionStopped);
       }
     });
   }
@@ -6787,7 +6808,7 @@
       setBanner(`Full backup import failed: ${error.message || error}`, "error");
     } finally {
       if (elements.backupImportButton) {
-        elements.backupImportButton.disabled = false;
+        elements.backupImportButton.disabled = Boolean(state.sessionStopped);
       }
     }
   }
@@ -6836,7 +6857,7 @@
       setBanner(message, "error");
     } finally {
       if (elements.setupCreateDemoButton) {
-        elements.setupCreateDemoButton.disabled = false;
+        elements.setupCreateDemoButton.disabled = Boolean(state.sessionStopped);
       }
     }
   }
@@ -6887,7 +6908,7 @@
     } finally {
       state.historyPurgePending = false;
       if (elements.historyPurgeOrphanedButton) {
-        elements.historyPurgeOrphanedButton.disabled = emptyPreview;
+        elements.historyPurgeOrphanedButton.disabled = emptyPreview || Boolean(state.sessionStopped);
       }
     }
   }
@@ -7146,7 +7167,7 @@
       setBanner(`Bootstrap failed: ${error.message || error}`, "error");
     } finally {
       if (elements.setupBootstrapButton) {
-        elements.setupBootstrapButton.disabled = false;
+        elements.setupBootstrapButton.disabled = Boolean(state.sessionStopped);
       }
     }
   }
@@ -7202,7 +7223,7 @@
       setBanner(message, "error");
     } finally {
       if (elements.setupCreateButton) {
-        elements.setupCreateButton.disabled = false;
+        elements.setupCreateButton.disabled = Boolean(state.sessionStopped);
       }
     }
   }
@@ -7308,7 +7329,7 @@
     } finally {
       const currentSelectedSystem = getSystemById(elements.existingSystemSelect?.value || state.selectedExistingSystemId);
       if (elements.existingSystemDeleteButton) {
-        elements.existingSystemDeleteButton.disabled = !currentSelectedSystem;
+        elements.existingSystemDeleteButton.disabled = !currentSelectedSystem || Boolean(state.sessionStopped);
       }
       if (elements.existingSystemDeleteHistoryToggle) {
         elements.existingSystemDeleteHistoryToggle.disabled = !currentSelectedSystem;
@@ -7403,7 +7424,7 @@
       setBanner(message, "error");
     } finally {
       if (elements.profileBuilderSaveButton) {
-        elements.profileBuilderSaveButton.disabled = false;
+        elements.profileBuilderSaveButton.disabled = Boolean(state.sessionStopped);
       }
     }
   }
@@ -7484,6 +7505,7 @@
     syncSshFields();
     updateCreateButton();
     scheduleSudoersPreviewRefresh(0);
+    lockActionsIfStopped();
   }
 
   function bindEvents() {

@@ -263,7 +263,7 @@ function mount({ api = fakeApi(), confirm = () => true, stopped = false } = {}) 
   });
   elements.root = root;
   elements.dialog = doc.createElement("dialog");
-  doc.body.append(elements.dialog);
+  root.append(elements.dialog); // nested in the section, as the template does
   const banners = [];
   const refreshes = [];
   const library = createBackupLibrary({
@@ -548,6 +548,70 @@ test("back up now starts a run, shows it running, and polls until it finishes", 
   assert.ok(doc.elements.policies.querySelectorAll('[data-backup-action="run"]').every((node) => !node.disabled));
 });
 
+function pollingLibrary(api, { visible = () => true } = {}) {
+  const timers = [];
+  const doc = mount({ api });
+  const library = createBackupLibrary({
+    document: doc.doc, elements: doc.elements, fetchJson: api.fetchJson, formatBytes: String, formatLocalTimestamp: String,
+    setBanner: () => {}, setTimeout: (callback) => timers.push(callback), isVisible: visible, isStopped: () => false,
+  });
+  return { timers, library, elements: doc.elements };
+}
+
+test("a poll tick while the tab is hidden keeps polling so the run result shows on return", async () => {
+  const api = fakeApi();
+  api.data.running = { backup_class: "full", started_at: "2026-09-24T10:00:00Z" };
+  let visible = true;
+  const { timers, library, elements } = pollingLibrary(api, { visible: () => visible });
+  await library.load();
+  assert.equal(timers.length, 1);
+
+  visible = false;
+  timers.shift()();
+  await settle();
+  assert.equal(timers.length, 1, "a hidden tick reschedules instead of dropping the poll");
+
+  visible = true;
+  api.data.running = null;
+  timers.shift()();
+  await settle();
+  await settle();
+  assert.equal(timers.length, 0);
+  assert.doesNotMatch(elements.status.textContent, /is running/);
+  assert.ok(elements.policies.querySelectorAll('[data-backup-action="run"]').every((node) => !node.disabled));
+});
+
+test("one failed poll during a run keeps the error visible and polls again", async () => {
+  let fail = false;
+  const api = fakeApi({
+    "GET /api/admin/backups": () => {
+      if (fail) {
+        fail = false;
+        return Object.assign(new Error("HTTP 502"), { status: 502 });
+      }
+      return api.data;
+    },
+  });
+  api.data.running = { backup_class: "full", started_at: "2026-09-24T10:00:00Z" };
+  const { timers, library, elements } = pollingLibrary(api);
+  await library.load();
+
+  fail = true;
+  timers.shift()();
+  await settle();
+  await settle();
+  assert.match(elements.status.textContent, /^Couldn't load backups/);
+  assert.equal(timers.length, 1, "a failed poll schedules another one");
+
+  api.data.running = null;
+  timers.shift()();
+  await settle();
+  await settle();
+  assert.equal(timers.length, 0);
+  assert.equal(library.state.data.running, null);
+  assert.ok(elements.policies.querySelectorAll('[data-backup-action="run"]').every((node) => !node.disabled));
+});
+
 test("an unavailable backup service says so and offers nothing to run", async () => {
   const api = fakeApi({ "GET /api/admin/backups": () => ({ available: false, detail: "The backup scheduler is not running.", classes: { config: { enabled: false }, full: { enabled: false } }, targets: [], artifacts: [], storage: {}, running: null }) });
   const { elements, library } = mount({ api });
@@ -555,6 +619,30 @@ test("an unavailable backup service says so and offers nothing to run", async ()
   assert.equal(elements.status.textContent, "Backups aren't available: The backup scheduler is not running.");
   assert.ok(elements.policies.querySelectorAll('[data-backup-action="run"]').every((node) => node.disabled));
   assert.equal(elements.cleanupButton.disabled, true);
+});
+
+test("the status line shows the last clean-up, and a warning naming each place it failed", async () => {
+  const okApi = fakeApi();
+  okApi.data.grooming = { at: "2026-09-24T12:00:00Z", ok: true, deleted: 3, detail: null, failed_locations: {} };
+  const ok = mount({ api: okApi });
+  await ok.library.load();
+  assert.match(ok.elements.status.textContent, /5 backup copies\. Last clean-up: T\(2026-09-24T12:00:00Z\), 3 removed\.$/);
+  assert.equal(ok.elements.status.querySelector("span.backup-run-status.is-ok").textContent, "Last clean-up: T(2026-09-24T12:00:00Z), 3 removed.");
+
+  const badApi = fakeApi();
+  badApi.data.grooming = { at: "2026-09-24T12:00:00Z", ok: false, deleted: 1, detail: "ConnectionRefusedError: refused",
+    failed_locations: { "offsite-sftp": "connect to sftp://svc:pw@sftp.example.test/srv/x failed", local: "PermissionError: denied" } };
+  const bad = mount({ api: badApi });
+  await bad.library.load();
+  const warning = bad.elements.status.querySelector("span.backup-run-status.is-bad");
+  assert.ok(warning, "a failed clean-up renders a warning span");
+  assert.equal(warning.textContent,
+    "Last clean-up T(2026-09-24T12:00:00Z) didn't finish: Offsite SFTP: connect to sftp://sftp.example.test failed; This server: PermissionError: denied.");
+  assert.equal(bad.elements.status.querySelector("span.backup-run-status.is-ok"), null);
+
+  const none = mount();
+  await none.library.load();
+  assert.equal(none.elements.status.textContent, "5 backup copies.");
 });
 
 test("back up now reports that the run started", async () => {
@@ -820,6 +908,29 @@ test("saving sends edits, file-path secret changes and clears, never locked valu
   }
   assert.match(elements.dialog.textContent, /Restart the backup scheduler/);
   assert.match(banners.at(-1)[0], /Backup settings saved/);
+});
+
+test("one click on Add a target or Remove this target acts once, with the dialog inside the section", async () => {
+  const base = syntheticPolicyView();
+  const three = ["alpha", "bravo", "charlie"].map((name) => ({
+    ...base.targets[0],
+    values: { ...base.targets[0].values, target_id: name, label: name },
+    original_target_id: name,
+  }));
+  const api = fakeApi({ "GET /api/admin/backups/policy": () => syntheticPolicyView({ targets: three }) });
+  const { elements, library } = mount({ api });
+  assert.match(TEMPLATE, /<section id="backup-library"(?:(?!<\/section>)[\s\S])*<dialog id="backup-library-dialog"/, "the template nests the dialog in the section");
+  assert.equal(elements.dialog.parentNode, elements.root, "the harness nests the dialog as the template does");
+  await library.load();
+  await library.actions.openPolicyEditor(elements.editButton);
+  await settle();
+  const targetIds = () => elements.dialog.querySelectorAll("[data-target-key]")
+    .filter((input) => input.dataset.targetKey === "target_id")
+    .map((input) => input.value);
+  action(elements.dialog, "policy-remove-target", "0").click();
+  assert.deepEqual(targetIds(), ["bravo", "charlie"]);
+  action(elements.dialog, "policy-add-target").click();
+  assert.deepEqual(targetIds(), ["bravo", "charlie", ""]);
 });
 
 test("adding and removing targets keeps what was typed; a stale revision says reload", async () => {
