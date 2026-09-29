@@ -259,6 +259,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Finished the storage view reload after a system or enclosure switch even
+  when the refresh result was set aside for a bay edit, so the view options no
+  longer stay disabled as "(previous)". (#830)
 - Showed the admin auto-stop warning on an idle page again, and kept every
   button disabled once the page reports that admin has stopped. (#831)
 - Kept the admin Backups page following a running backup while the tab is

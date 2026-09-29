@@ -10186,6 +10186,11 @@
           archiveUiPerfRun(perfRun, "mapping-draft");
         }
         setStatus("Refresh result set aside because you started editing a bay while it ran.");
+        // A system or enclosure switch left the storage views loading; finish
+        // that reload so the selector does not stay on "(previous)".
+        if (state.storageViewsRuntimeLoading) {
+          void fetchStorageViewRuntime(force, true);
+        }
         return;
       }
       if (perfRun && state.uiPerf.currentRun?.id === perfRun.id) {
