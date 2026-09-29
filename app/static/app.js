@@ -1854,11 +1854,44 @@
     renderAll();
   }
 
+  // Fabric bays belong to the rendered enclosure snapshot, not the storage
+  // view's backing enclosure (inventory candidates may come from other shelves).
+  // Unknown or ambiguous physical identity must not select a view slot.
+  function sasFabricViewSlotForBay(bayNumber) {
+    const storageView = getSelectedStorageViewRuntime();
+    if (!storageView) {
+      return bayNumber;
+    }
+    const enclosureId = state.snapshot?.selected_enclosure_id;
+    if (typeof enclosureId !== "string" || !enclosureId.trim()) return null;
+    const slots = sasFabricList(storageView.slots);
+    const matches = [];
+    for (const slot of slots) {
+      if (slot?.snapshot_slot !== bayNumber) continue;
+      // Only snapshot-produced rows have view-level enclosure provenance.
+      // Never borrow that identity for an inventory candidate lacking metadata.
+      const slotEnclosureId = slot.snapshot_enclosure_id ?? (
+        storageView.source === "selected_enclosure_snapshot" && slot.source === "snapshot_slot"
+          ? storageView.backing_enclosure_id : null
+      );
+      if (typeof slotEnclosureId !== "string" || !slotEnclosureId.trim()) return null;
+      if (slotEnclosureId === enclosureId) matches.push(slot);
+    }
+    if (matches.length !== 1) return null;
+    const slotIndex = matches[0].slot_index;
+    return Number.isInteger(slotIndex) && slots.filter((slot) => slot?.slot_index === slotIndex).length === 1
+      ? slotIndex : null;
+  }
+
   function selectSasFabricSlot(slotNumber) {
     if (!Number.isInteger(slotNumber)) {
       return false;
     }
-    return selectSlot(slotNumber);
+    const viewSlot = sasFabricViewSlotForBay(slotNumber);
+    if (viewSlot === null) {
+      return false;
+    }
+    return selectSlot(viewSlot, { sasFabricSlot: slotNumber });
   }
 
   function sasFabricSelectionTouchesNode(nodeId) {
@@ -2019,7 +2052,8 @@
 
   function renderSasFabricFlatBayChips(sorted, selectedSlots, limit) {
     const chips = sorted.slice(0, limit).map((slotNumber) => {
-      const selected = selectedSlots.has(slotNumber) || state.selectedSlot === slotNumber;
+      const viewSlot = sasFabricViewSlotForBay(slotNumber);
+      const selected = selectedSlots.has(slotNumber) || (viewSlot !== null && state.selectedSlot === viewSlot);
       return `<button type="button" class="sas-fabric-bay-chip${selected ? " is-selected" : ""}" data-sas-fabric-slot="${slotNumber}">${escapeHtml(formatSlotLabel(slotNumber))}</button>`;
     }).join("");
     const overflow = sorted.length > limit ? `<span class="sas-fabric-bay-overflow">+${sorted.length - limit}</span>` : "";
@@ -2032,7 +2066,8 @@
     }
     const label = escapeHtml(formatSlotLabel(slotNumber));
     if (impactedSlots.has(slotNumber)) {
-      const selected = selectedSlots.has(slotNumber) || state.selectedSlot === slotNumber;
+      const viewSlot = sasFabricViewSlotForBay(slotNumber);
+      const selected = selectedSlots.has(slotNumber) || (viewSlot !== null && state.selectedSlot === viewSlot);
       return `<button type="button" class="sas-fabric-bay-chip${selected ? " is-selected" : ""}" data-sas-fabric-slot="${slotNumber}">${label}</button>`;
     }
     const slot = slotsByNumber.get(slotNumber);
@@ -2050,8 +2085,11 @@
       return '<span class="sas-fabric-empty-note">No mapped bays</span>';
     }
     const selectedSlots = sasFabricSelectedSlotSet();
-    const viewProfile = buildViewProfile();
-    const layoutRows = activeLayoutRows();
+    // Fabric slots are physical bays; a storage view numbers its own slots, so
+    // draw the layout of the backing enclosure while a view is selected.
+    const storageView = getSelectedStorageViewRuntime();
+    const viewProfile = storageView ? (state.snapshot.selected_profile || null) : buildViewProfile();
+    const layoutRows = storageView ? (state.layoutRows || []) : activeLayoutRows();
     const geometry = buildChassisGeometry(viewProfile, layoutRows);
     const gridRows = buildLayoutGridRows(layoutRows, geometry);
     if (!gridRows.length) {
@@ -2067,7 +2105,7 @@
       `).join('<span class="sas-fabric-bay-divider" aria-hidden="true"></span>');
       return `<div class="sas-fabric-bay-row">${groups}</div>`;
     }).join("");
-    const edgeLabel = viewProfile?.edgeLabel || "System front";
+    const edgeLabel = viewProfile?.edgeLabel || viewProfile?.edge_label || "System front";
     return `
       <div class="sas-fabric-bay-layout" data-layout-mode="${escapeHtml(geometry.layoutMode)}" data-latch-edge="${escapeHtml(geometry.latchEdge)}">
         ${rowsMarkup}
@@ -7040,8 +7078,9 @@
       return "Live estimate is unavailable right now. Export can still run with the current settings.";
     }
     const targetLabel = estimate.size_limit_label || "24 MiB";
-    const downsamplingPart =
-      estimate.downsampling_label && estimate.downsampling_label !== "None"
+    const downsamplingPart = estimate.history_coverage_note
+      ? ` ${estimate.history_coverage_note}`
+      : estimate.downsampling_label && estimate.downsampling_label !== "None"
         ? ` ${estimate.downsampling_note || `History will be thinned to fit (${estimate.downsampling_label}).`}`
         : "";
     const tooLargeAdvice = "Shorten the history window, mask serial numbers, or allow a larger file.";
@@ -7056,7 +7095,7 @@
       if (estimate.allow_oversize) {
         return `Both HTML and ZIP are over ${targetLabel}. Larger files are allowed, so a ZIP file of about ${estimate.zip_size_label || "n/a"} will be saved.${downsamplingPart}`;
       }
-      return `Too large: both HTML and ZIP are over ${targetLabel}. ${tooLargeAdvice}`;
+      return `Too large: both HTML and ZIP are over ${targetLabel}. ${tooLargeAdvice}${downsamplingPart}`;
     }
 
     if (estimate.selected_packaging === "html") {
@@ -7066,7 +7105,7 @@
       if (estimate.selected_allowed) {
         return `The HTML file is estimated at ${estimate.selected_size_label || estimate.html_size_label} and is over ${targetLabel}. Larger files are allowed, so it can still be saved.${downsamplingPart}`;
       }
-      return `Too large: the HTML file is estimated at ${estimate.selected_size_label || estimate.html_size_label}, over ${targetLabel}. Choose Automatic or ZIP file, shorten the history window, mask serial numbers, or allow a larger file.`;
+      return `Too large: the HTML file is estimated at ${estimate.selected_size_label || estimate.html_size_label}, over ${targetLabel}. Choose Automatic or ZIP file, shorten the history window, mask serial numbers, or allow a larger file.${downsamplingPart}`;
     }
 
     if (estimate.selected_packaging === "zip") {
@@ -7076,7 +7115,7 @@
       if (estimate.selected_allowed) {
         return `The ZIP file is estimated at ${estimate.selected_size_label || estimate.zip_size_label} and is over ${targetLabel}. Larger files are allowed, so it can still be saved.${downsamplingPart}`;
       }
-      return `Too large: the ZIP file is estimated at ${estimate.selected_size_label || estimate.zip_size_label}, over ${targetLabel}. ${tooLargeAdvice}`;
+      return `Too large: the ZIP file is estimated at ${estimate.selected_size_label || estimate.zip_size_label}, over ${targetLabel}. ${tooLargeAdvice}${downsamplingPart}`;
     }
 
     return "Estimate ready.";
@@ -7184,7 +7223,7 @@
         </div>
         <div class="snapshot-export-estimate-card">
           <span class="snapshot-export-estimate-label">History detail</span>
-          <span class="snapshot-export-estimate-value">${escapeHtml(estimate.downsampling_label && estimate.downsampling_label !== "None" ? estimate.downsampling_label : "Full")}</span>
+          <span class="snapshot-export-estimate-value">${escapeHtml(estimate.history_coverage === "truncated" ? "Incomplete" : estimate.history_coverage === "unknown" ? "Unverified" : estimate.downsampling_label && estimate.downsampling_label !== "None" ? estimate.downsampling_label : "Full")}</span>
           <span class="snapshot-export-estimate-meta">${escapeHtml(`${estimate.metric_sample_count ?? 0} samples / ${estimate.event_count ?? 0} events`)}</span>
         </div>
       </div>
@@ -7375,6 +7414,9 @@
     ];
     parts.push(snapshotExportSelectionDescription());
     if (!isHistoryAvailable()) parts.push("History is unavailable and will be omitted.");
+    if (state.export.estimate.data?.history_coverage_note) {
+      parts.push(state.export.estimate.data.history_coverage_note);
+    }
     if (state.export.estimate.data?.downsampling_label && state.export.estimate.data.downsampling_label !== "None") {
       parts.push(`History will be thinned (${state.export.estimate.data.downsampling_label.toLowerCase()}) to get closer to the size limit.`);
     }
@@ -9936,7 +9978,7 @@
     renderStorageViewRuntimeStatus();
   }
 
-  function selectSlot(slotNumber) {
+  function selectSlot(slotNumber, { sasFabricSlot = slotNumber } = {}) {
     if (!inventoryScopeMatchesSelection() || (state.selectedStorageViewRuntimeId
       && (state.storageViewsRuntimeLoading || state.storageViewsRuntimeError))) return false;
     if (state.selectedSlot !== slotNumber && !confirmMappingDraftDiscard()) {
@@ -9945,7 +9987,7 @@
     if (state.selectedSlot !== slotNumber) state.selectionEpoch = (state.selectionEpoch || 0) + 1;
     state.selectedSlot = slotNumber;
     state.history.panelError = null;
-    syncSasFabricTraceToSlot(slotNumber);
+    syncSasFabricTraceToSlot(sasFabricSlot);
     refreshGridSelectionState();
     renderSasFabric();
     renderDetail();
@@ -10144,6 +10186,11 @@
           archiveUiPerfRun(perfRun, "mapping-draft");
         }
         setStatus("Refresh result set aside because you started editing a bay while it ran.");
+        // A system or enclosure switch left the storage views loading; finish
+        // that reload so the selector does not stay on "(previous)".
+        if (state.storageViewsRuntimeLoading) {
+          void fetchStorageViewRuntime(force, true);
+        }
         return;
       }
       if (perfRun && state.uiPerf.currentRun?.id === perfRun.id) {
