@@ -59,7 +59,7 @@ from history_service.backup_archive.policy import (
     BackupPolicy,
     validate_filesystem_target_roots,
 )
-from history_service.backup_archive.transport import open_target, transport_encrypted
+from history_service.backup_archive.transport import ArchiveDownloadTooLargeError, open_target, transport_encrypted
 from history_service.scheduled_backup import ScheduledBackupRunner
 
 logger = logging.getLogger(__name__)
@@ -74,6 +74,8 @@ BACKUP_CLASSES = ("config", "full")
 HISTORY_GROUP = "history_db"
 HISTORY_REPLACEMENT_COPIES = 14
 _COPY_CHUNK = 1024 * 1024
+# Marks the synthetic config run recorded when the change journal cannot be read.
+JOURNAL_CHECK_PREFIX = "Config changes could not be checked: "
 
 
 class SchedulerBusyError(RuntimeError):
@@ -108,6 +110,15 @@ def config_group_keys(all_backup_groups: tuple[str, ...], history_group: str) ->
     """Config class = every default backup group except the history database."""
 
     return [key for key in all_backup_groups if key != history_group]
+
+
+def _is_journal_check_record(record: Any) -> bool:
+    return (
+        isinstance(record, dict)
+        and record.get("ok") is False
+        and isinstance(record.get("detail"), str)
+        and record["detail"].startswith(JOURNAL_CHECK_PREFIX)
+    )
 
 
 @dataclass
@@ -189,6 +200,12 @@ class BackupScheduler:
         self._load_status()
         self.journal: ChangeJournal | None = None
         self.coalescer: ConfigBackupCoalescer | None = None
+        self._coalescer_error: str | None = None
+        self._coalescer_prior_run: dict[str, Any] | None = None
+        stored = self._status["classes"].get("config")
+        if _is_journal_check_record(stored):
+            # A check failure restored from the status file is never the last real run.
+            self._coalescer_error = stored["detail"]
         if policy.config.enabled:
             self.journal = ChangeJournal(paths.journal_path, file_mode=0o660)
             self.coalescer = ConfigBackupCoalescer(
@@ -230,6 +247,8 @@ class BackupScheduler:
         if payload:
             self._status["classes"] = dict(payload.get("classes") or {})
             self._status["targets"] = dict(payload.get("targets") or {})
+            if isinstance(payload.get("grooming"), dict):
+                self._status["grooming"] = payload["grooming"]
             persisted_receipt = payload.get("verified_full")
             verified_full = self._validated_verified_full_receipt(persisted_receipt)
             if verified_full is not None:
@@ -290,6 +309,8 @@ class BackupScheduler:
                     if self._status["targets"].get(target.target_id)
                 },
             }
+            if self._status.get("grooming"):
+                payload["grooming"] = self._status["grooming"]
             verified_full = self._validated_verified_full_receipt(
                 self._status.get("verified_full")
             )
@@ -317,17 +338,54 @@ class BackupScheduler:
         if self._cron is None:
             return None
         local_now = now.astimezone(self._local_tz) if self._local_tz is not None else now.astimezone()
-        return self._cron.next_after(local_now).astimezone(timezone.utc)
+        following = self._cron.next_after(local_now)
+        while True:
+            following_utc = following.astimezone(timezone.utc)
+            round_trip = following_utc.astimezone(following.tzinfo)
+            # Reject a wall-clock time that the zone skips during spring-forward.
+            # Inside a repeated fall-back hour, also skip the first occurrence
+            # once it is already past so a repeated time runs only once.
+            if (
+                round_trip.replace(tzinfo=None) == following.replace(tzinfo=None)
+                and following_utc > now
+            ):
+                return following_utc
+            following = self._cron.next_after(following)
 
     def tick(self) -> None:
         """One scheduler step: config coalescer, then a due full backup."""
 
         if self.coalescer is not None:
-            result: CoalescerResult = self.coalescer.tick()
-            if result.status == "failed":
-                logger.warning("Config backup failed: %s", result.error)
-            elif result.status in {"backup", "noop"}:
-                logger.info("Config backup %s: %d change(s).", result.status, len(result.change_ids))
+            try:
+                result: CoalescerResult = self.coalescer.tick()
+            except Exception as exc:  # noqa: BLE001 - recorded in status; full backups still run
+                detail = f"{JOURNAL_CHECK_PREFIX}{describe_error(exc)}"[:MAX_DETAIL_CHARS]
+                if detail != self._coalescer_error:
+                    if self._coalescer_error is None:
+                        with self._state_lock:
+                            prior = self._status["classes"].get("config")
+                            self._coalescer_prior_run = None if _is_journal_check_record(prior) else prior
+                    self._coalescer_error = detail
+                    logger.error("%s", detail)
+                    self._record_class("config", RunRecord(at=_iso(self._clock()) or "", ok=False, detail=detail))
+            else:
+                if self._coalescer_error is not None:
+                    # Readable again: put back the last real run unless a backup replaced it.
+                    with self._state_lock:
+                        current = self._status["classes"].get("config")
+                        restore = isinstance(current, dict) and current.get("detail") == self._coalescer_error
+                        if restore and self._coalescer_prior_run is not None:
+                            self._status["classes"]["config"] = self._coalescer_prior_run
+                        elif restore:
+                            self._status["classes"].pop("config", None)
+                    self._coalescer_error = None
+                    self._coalescer_prior_run = None
+                    if restore:
+                        self._write_status()
+                if result.status == "failed":
+                    logger.warning("Config backup failed: %s", result.error)
+                elif result.status in {"backup", "noop"}:
+                    logger.info("Config backup %s: %d change(s).", result.status, len(result.change_ids))
         now = self._clock()
         if self.next_full_at is not None and now >= self.next_full_at:
             self.next_full_at = self._compute_next_full(now)
@@ -497,7 +555,7 @@ class BackupScheduler:
         grooming_succeeded = False
         try:
             grooming = self._groom_locked()
-            grooming_succeeded = grooming is None or not grooming.error
+            grooming_succeeded = grooming is None or grooming.location_complete(LOCAL_LOCATION)
         except Exception as exc:  # noqa: BLE001 - grooming failure never fails the backup
             logger.warning("Backup grooming failed after %s backup (%s).", backup_class, type(exc).__name__)
         if can_replace_history and grooming_succeeded:
@@ -713,6 +771,12 @@ class BackupScheduler:
             try:
                 with self._open_configured_target(target) as remote:
                     stored = remote.put(local_path, record.name)
+                    if not stored.verified:
+                        try:
+                            remote.delete(record.name)
+                        except Exception:  # noqa: BLE001 - cleanup must not mask the verify failure
+                            logger.warning("Unverified remote backup copy on %s could not be removed.", target.target_id)
+                        raise RuntimeError("remote copy could not be verified")
                 if stored.size != record.size or stored.sha256 != record.sha256:
                     raise RuntimeError("remote copy does not match the local archive")
                 remote_record = ArtifactRecord(
@@ -746,7 +810,7 @@ class BackupScheduler:
             rules.append(RetentionRule(backup_class, LOCAL_LOCATION, keep_count=class_policy.local_keep))
             if class_policy.remote_keep is None and class_policy.remote_max_age_days is None:
                 continue
-            for target in self.policy.targets:
+            for target in self.policy.enabled_targets():
                 rules.append(
                     RetentionRule(
                         backup_class,
@@ -779,12 +843,42 @@ class BackupScheduler:
         manager = self._manager()
         plan = manager.plan(self._clock())
         if not plan.items:
+            self._record_grooming(ok=True, deleted=0, detail=None, failed_locations={})
             return None
         with self._resolver() as resolver:
             result = manager.apply(plan, resolver, actor="scheduler", now=self._clock)
         if result.error:
             logger.warning("Backup grooming stopped early (%s).", result.error.split(":", 1)[0])
+        self._record_grooming_result(result)
         return result
+
+    def _record_grooming_result(self, result: Any) -> None:
+        failed_locations = dict(result.failed_locations)
+        if result.failed is not None and result.error and result.failed.record.location not in failed_locations:
+            # A location that opened but then failed a deletion or claim stopped the run.
+            failed_locations[result.failed.record.location] = result.error
+        self._record_grooming(
+            ok=not result.error,
+            deleted=len(result.deleted) + len(result.already_missing),
+            detail=result.error,
+            failed_locations=failed_locations,
+        )
+
+    def _record_grooming(
+        self, *, ok: bool, deleted: int, detail: str | None, failed_locations: Mapping[str, str]
+    ) -> None:
+        def short(text: str | None) -> str | None:
+            return None if text is None else " ".join(text.split())[:MAX_DETAIL_CHARS]
+
+        with self._state_lock:
+            self._status["grooming"] = {
+                "at": _iso(self._clock()),
+                "ok": ok,
+                "deleted": deleted,
+                "detail": short(detail),
+                "failed_locations": {location: short(text) for location, text in failed_locations.items()},
+            }
+        self._write_status()
 
     def plan(self) -> tuple[str, datetime, GroomingPlan]:
         plan = self._manager().plan(self._clock())
@@ -805,7 +899,9 @@ class BackupScheduler:
         if entry is None or entry.expires_at < self._monotonic():
             raise LookupError("The grooming plan expired or was already used; preview it again.")
         with self._job("lifecycle"), self._resolver() as resolver:
-            return self._manager().apply(entry.plan, resolver, actor="admin", now=self._clock)
+            result = self._manager().apply(entry.plan, resolver, actor="admin", now=self._clock)
+            self._record_grooming_result(result)
+        return result
 
     # -- library queries ---------------------------------------------------------------
 
@@ -903,6 +999,7 @@ class BackupScheduler:
         with self._state_lock:
             class_runs = dict(self._status["classes"])
             target_runs = dict(self._status["targets"])
+            grooming = self._status.get("grooming")
         pending = 0
         if self.coalescer is not None:
             try:
@@ -949,6 +1046,7 @@ class BackupScheduler:
             ],
             "artifacts": [self.serialize(record) for record in reversed(records)],
             "storage": storage,
+            "grooming": grooming,
         }
 
     # -- per-artifact actions ----------------------------------------------------------
@@ -982,7 +1080,7 @@ class BackupScheduler:
         try:
             local = workspace / "archive"
             with self._open_configured_target(target) as remote:
-                size, digest = remote.get(record.name, local)
+                size, digest = remote.get(record.name, local, limit=record.size + 1)
             # Never hand out bytes the catalogue did not record: a target (or an
             # on-path attacker for plain FTP/NFS) could substitute another backup.
             _require_match(record, size, digest)
@@ -1002,7 +1100,7 @@ class BackupScheduler:
             self.catalog.mark_verified(artifact_id, sha256=record.sha256, size=record.size, now=self._clock())
             ok = True
             detail = "Readback matched the catalogued size and SHA-256."
-        except ArchiveIntegrityError as exc:
+        except (ArchiveIntegrityError, ArchiveDownloadTooLargeError) as exc:
             # A copy that no longer matches must stop counting as verified, so it is
             # neither offered for restore nor protected as the newest verified copy.
             self.catalog.mark_unverified(artifact_id)

@@ -14,6 +14,7 @@ import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
+from urllib.parse import urlsplit
 
 from fastapi import Request
 from fastapi.routing import APIRoute
@@ -49,17 +50,17 @@ def _route(path: str, method: str = "GET") -> APIRoute:
     )
 
 
-def _request(path: str = "/") -> Request:
+def _request(path: str = "/", *, host: str | None = None, scheme: str = "http") -> Request:
     return Request(
         {
             "type": "http",
             "http_version": "1.1",
             "method": "GET",
-            "scheme": "http",
+            "scheme": scheme,
             "path": path,
             "raw_path": path.encode("ascii"),
             "query_string": b"",
-            "headers": [],
+            "headers": [(b"host", host.encode("ascii"))] if host is not None else [],
             "client": ("testclient", 123),
             "server": ("testserver", 80),
             "root_path": "",
@@ -671,6 +672,112 @@ class AdminProbeCacheTests(unittest.TestCase):
         probe.assert_not_called()
 
 
+class AdminLaunchURLTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.settings = Settings()
+        self.settings.admin.service_url = "http://admin.example.test:8002"
+
+    def test_ipv6_derived_authority_has_brackets_and_the_admin_port(self) -> None:
+        for host in ("[2001:db8::1]", "[2001:db8::1]:8080"):
+            for scheme in ("http", "https"):
+                for port in (8082, 9443):
+                    with self.subTest(host=host, scheme=scheme, port=port):
+                        request = _request("/ignored-path", host=host, scheme=scheme)
+                        self.assertEqual(request.url.hostname, "2001:db8::1")
+                        self.settings.admin.port = port
+                        with patch.object(app_route_support, "admin_service_reachable", return_value=True) as probe:
+                            state = app_route_support.resolve_admin_launch_url(request, self.settings)
+                        probe.assert_called_once_with(
+                            self.settings.admin.service_url, self.settings.admin.timeout_seconds,
+                        )
+                        self.assertEqual(
+                            state,
+                            app_route_support.AdminLaunchState(url=f"{scheme}://[2001:db8::1]:{port}", stopped=False),
+                        )
+                        assert state is not None
+                        parsed = urlsplit(state.url)
+                        self.assertEqual((parsed.scheme, parsed.hostname, parsed.port), (scheme, "2001:db8::1", port))
+                        self.assertEqual((parsed.path, parsed.query, parsed.fragment), ("", "", ""))
+
+    def test_dns_and_ipv4_derived_authorities_keep_existing_behavior(self) -> None:
+        for hostname in ("ui.example.test", "192.0.2.1"):
+            for suffix in ("", ":8080"):
+                for scheme in ("http", "https"):
+                    with self.subTest(hostname=hostname, suffix=suffix, scheme=scheme):
+                        self.settings.admin.port = 9443
+                        with patch.object(app_route_support, "admin_service_reachable", return_value=True):
+                            state = app_route_support.resolve_admin_launch_url(
+                                _request(host=hostname + suffix, scheme=scheme), self.settings,
+                            )
+                        self.assertEqual(
+                            state,
+                            app_route_support.AdminLaunchState(url=f"{scheme}://{hostname}:9443", stopped=False),
+                        )
+                        assert state is not None
+                        parsed = urlsplit(state.url)
+                        self.assertEqual((parsed.hostname, parsed.port), (hostname, 9443))
+
+    def test_explicit_public_url_overrides_request_scheme_host_and_admin_port(self) -> None:
+        for public_url in ("https://[2001:db8::2]:9443/setup", "https://admin.example.test/setup"):
+            with self.subTest(public_url=public_url):
+                self.settings.admin.public_url = f" {public_url}/ "
+                with patch.object(app_route_support, "admin_service_reachable", return_value=True) as probe:
+                    state = app_route_support.resolve_admin_launch_url(
+                        _request(host="[2001:db8::1]:8080"), self.settings,
+                    )
+                probe.assert_called_once_with(
+                    self.settings.admin.service_url, self.settings.admin.timeout_seconds,
+                )
+                self.assertEqual(state, app_route_support.AdminLaunchState(url=public_url, stopped=False))
+
+    def test_stopped_admin_does_not_expose_derived_or_explicit_ipv6_url(self) -> None:
+        for public_url in (None, "https://[2001:db8::2]:9443/setup"):
+            with self.subTest(public_url=public_url):
+                self.settings.admin.public_url = public_url
+                with patch.object(app_route_support, "admin_service_reachable", return_value=False) as probe:
+                    state = app_route_support.resolve_admin_launch_url(
+                        _request(host="[2001:db8::1]", scheme="https"), self.settings,
+                    )
+                probe.assert_called_once_with(
+                    self.settings.admin.service_url, self.settings.admin.timeout_seconds,
+                )
+                self.assertEqual(state, app_route_support.AdminLaunchState(url=None, stopped=True))
+
+    def test_missing_service_does_not_probe_or_expose_an_ipv6_url(self) -> None:
+        self.settings.admin.service_url = ""
+        for public_url in (None, "https://[2001:db8::2]:9443/setup"):
+            with self.subTest(public_url=public_url):
+                self.settings.admin.public_url = public_url
+                with patch.object(app_route_support, "admin_service_reachable") as probe:
+                    self.assertIsNone(app_route_support.resolve_admin_launch_url(
+                        _request(host="[2001:db8::1]"), self.settings,
+                    ))
+                probe.assert_not_called()
+
+    def test_index_renders_the_real_derived_ipv6_system_setup_link(self) -> None:
+        self.settings.systems = [SystemConfig(id="system-a", label="System A")]
+        self.settings.default_system_id = "system-a"
+        self.settings.admin.port = 9443
+        release_service = Mock()
+        release_service.snapshot.return_value = {}
+        with (
+            patch.object(app_routes, "get_settings", return_value=self.settings),
+            patch.object(app_routes, "get_inventory_registry", return_value=_registry(_service())),
+            patch.object(app_routes, "get_release_status_service", return_value=release_service),
+            patch.object(app_route_support, "admin_service_reachable", return_value=True) as probe,
+        ):
+            response = asyncio.run(_route("/").endpoint(
+                request=_request(host="[2001:db8::1]:8080", scheme="https"),
+                system_id=None, enclosure_id=None,
+            ))
+        probe.assert_called_once_with(self.settings.admin.service_url, self.settings.admin.timeout_seconds)
+        self.assertEqual(response.status_code, 200)
+        page = response.body.decode("utf-8")
+        self.assertIn('href="https://[2001:db8::1]:9443"', page)
+        self.assertIn(">System Setup</a>", page)
+        self.assertNotIn('id="admin-launch-stopped"', page)
+
+
 class AdminProbeHotPathTests(unittest.TestCase):
     """A page load never waits for an admin probe once there is an answer (#453)."""
 
@@ -822,7 +929,9 @@ class IndexPageTests(unittest.TestCase):
         release_service.snapshot.return_value = {}
         route = _route("/")
         previous_problems = getattr(app_main.app.state, "startup_problems", ())
+        previous_checked_at = getattr(app_main.app.state, "storage_checked_at_monotonic", None)
         app_main.app.state.startup_problems = startup_problems
+        app_main.app.state.storage_checked_at_monotonic = time.monotonic()
         try:
             with (
                 patch.object(app_routes, "get_settings", return_value=settings),
@@ -833,6 +942,7 @@ class IndexPageTests(unittest.TestCase):
                 response = asyncio.run(route.endpoint(request=_request(), system_id=None, enclosure_id=None))
         finally:
             app_main.app.state.startup_problems = previous_problems
+            app_main.app.state.storage_checked_at_monotonic = previous_checked_at
         self.assertEqual(response.status_code, 200)
         return response.body.decode("utf-8")
 
@@ -859,6 +969,86 @@ class IndexPageTests(unittest.TestCase):
         self.assertIn(f'<div class="warning-item">{CHOWN_SENTENCE}</div>', page)
         self.assertIn("SES data is partial", page)
         self.assertLess(page.index(CHOWN_SENTENCE), page.index("SES data is partial"))
+
+
+class InventoryRefreshWarningTests(unittest.TestCase):
+    KNOWN_HOSTS_WARNING = "The known-hosts file /run/ssh/known_hosts is not writable by the app."
+
+    def fetch_inventory(self, *, checked_at: float, probe_lines: list[str]) -> dict:
+        state = app_main.app.state
+        names = ("startup_problems", "known_hosts_warnings", "storage_checked_at_monotonic", "writable_directories")
+        previous = {name: getattr(state, name, None) for name in names}
+        state.startup_problems = (CHOWN_SENTENCE,)
+        state.known_hosts_warnings = (self.KNOWN_HOSTS_WARNING,)
+        state.storage_checked_at_monotonic = checked_at
+        state.writable_directories = ("/app/data",)
+        try:
+            with (
+                patch.object(app_routes, "get_inventory_registry", return_value=_registry(_service())),
+                patch.object(app_route_support, "probe_writable_directories", return_value=probe_lines),
+                patch.object(
+                    app_route_support,
+                    "check_known_hosts_files",
+                    return_value=([], [self.KNOWN_HOSTS_WARNING]),
+                ),
+            ):
+                response = asyncio.run(
+                    _route("/api/inventory").endpoint(
+                        request=_request("/api/inventory"),
+                        force=False,
+                        system_id=None,
+                        enclosure_id=None,
+                    )
+                )
+        finally:
+            for name, value in previous.items():
+                setattr(state, name, value)
+        self.assertEqual(response.status_code, 200)
+        return json.loads(response.body)
+
+    def test_refresh_keeps_the_startup_and_known_hosts_warnings_the_page_shows(self) -> None:
+        payload = self.fetch_inventory(checked_at=time.monotonic(), probe_lines=[])
+        self.assertEqual(
+            payload["warnings"],
+            [CHOWN_SENTENCE, self.KNOWN_HOSTS_WARNING, "SES data is partial"],
+        )
+
+    def test_refresh_reprobes_a_stale_storage_check(self) -> None:
+        payload = self.fetch_inventory(checked_at=0.0, probe_lines=[])
+        self.assertEqual(payload["warnings"], [self.KNOWN_HOSTS_WARNING, "SES data is partial"])
+
+    def test_concurrent_refreshes_after_expiry_run_the_probe_once(self) -> None:
+        state = SimpleNamespace(
+            writable_directories=("/app/data",),
+            startup_problems=(),
+            storage_checked_at_monotonic=0.0,
+        )
+        request = SimpleNamespace(app=SimpleNamespace(state=state))
+        calls: list[int] = []
+
+        def slow_probe(directories):
+            calls.append(1)
+            time.sleep(0.2)
+            return [CHOWN_SENTENCE]
+
+        start = threading.Barrier(2)
+        results: list[list[str]] = []
+
+        def refresh() -> None:
+            start.wait()
+            results.append(app_route_support.refresh_storage_problems(request))
+
+        with (
+            patch.object(app_route_support, "probe_writable_directories", side_effect=slow_probe),
+            patch.object(app_route_support, "check_known_hosts_files", return_value=([], [])),
+        ):
+            threads = [threading.Thread(target=refresh) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(results, [[CHOWN_SENTENCE], [CHOWN_SENTENCE]])
 
 
 if __name__ == "__main__":

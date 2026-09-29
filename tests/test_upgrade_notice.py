@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 import json
+import threading
 from pathlib import Path
 import tempfile
 import unittest
@@ -26,6 +28,211 @@ def read_state(data_dir: Path) -> dict:
 
 
 class UpgradeNoticeServiceTests(unittest.TestCase):
+    @contextmanager
+    def worker(self, action):
+        errors = []
+
+        def run():
+            try:
+                action()
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        try:
+            yield thread
+        finally:
+            thread.join(timeout=5)
+            self.assertFalse(thread.is_alive(), "notice worker did not terminate")
+            if errors:
+                raise errors[0]
+
+    def test_delayed_upgrade_read_cannot_restore_a_successfully_dismissed_notice(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir)
+            upgrade_notice.current_notice(data_dir, version="0.22.2")
+            old_read = threading.Event()
+            resume = threading.Event()
+            competing_progress = threading.Event()
+            contended = threading.Event()
+            dismissed = threading.Event()
+            real_read = upgrade_notice._read_state
+            # The inherited implementation has no transaction lock. Observe real
+            # contention when available so the same RED schedule cannot deadlock
+            # once the complete read/decision/write operation is serialized.
+            real_lock = getattr(upgrade_notice, "_state_lock", None)
+
+            @contextmanager
+            def observed_lock(path):
+                if real_lock is None:
+                    yield
+                    return
+                lock = real_lock(path)
+                acquired = lock.acquire(blocking=False)
+                if not acquired:
+                    contended.set()
+                    competing_progress.set()
+                    lock.acquire()
+                try:
+                    yield
+                finally:
+                    lock.release()
+
+            def delayed_read(path):
+                state = real_read(path)
+                if not old_read.is_set():
+                    self.assertEqual(state["last_seen_version"], "0.22.2")
+                    old_read.set()
+                    self.assertTrue(resume.wait(5), "old reader was not released")
+                else:
+                    competing_progress.set()
+                return state
+
+            def create_and_dismiss():
+                notice = upgrade_notice.current_notice(data_dir, version="0.23.0")
+                self.assertEqual(notice["previous"], "0.22.2")
+                self.assertTrue(upgrade_notice.dismiss_notice(
+                    data_dir, notice_version="0.23.0", version="0.23.0",
+                ))
+                self.assertEqual(read_state(data_dir), {"last_seen_version": "0.23.0"})
+                dismissed.set()
+
+            with (
+                patch.object(upgrade_notice, "_read_state", side_effect=delayed_read),
+                patch.object(upgrade_notice, "_state_lock", observed_lock, create=True),
+                self.worker(lambda: upgrade_notice.current_notice(data_dir, version="0.23.0")),
+            ):
+                try:
+                    self.assertTrue(old_read.wait(5), "old reader did not read the real file")
+                    with self.worker(create_and_dismiss):
+                        try:
+                            self.assertTrue(competing_progress.wait(5), "competitor made no progress")
+                            if contended.is_set():
+                                # Fixed implementation: release the holder before
+                                # waiting for the now-serialized dismissal.
+                                self.assertFalse(dismissed.is_set())
+                                resume.set()
+                            self.assertTrue(dismissed.wait(5), "dismissal did not complete")
+                        finally:
+                            resume.set()
+                finally:
+                    resume.set()
+
+            self.assertEqual(read_state(data_dir), {"last_seen_version": "0.23.0"})
+            self.assertIsNone(upgrade_notice.current_notice(data_dir, version="0.23.0"))
+
+    def test_independent_state_paths_can_progress_while_a_read_is_paused(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            first_dir = Path(temp_dir) / "first"
+            second_dir = Path(temp_dir) / "second"
+            paused = threading.Event()
+            resume = threading.Event()
+            completed = threading.Event()
+            real_read = upgrade_notice._read_state
+
+            def delayed_read(path):
+                state = real_read(path)
+                if path == upgrade_notice.state_path(first_dir):
+                    paused.set()
+                    self.assertTrue(resume.wait(5), "independent-path holder was not released")
+                return state
+
+            def independent_call():
+                self.assertIsNotNone(upgrade_notice.current_notice(second_dir, version="0.23.0"))
+                self.assertTrue(upgrade_notice.dismiss_notice(
+                    second_dir, notice_version="0.23.0", version="0.23.0",
+                ))
+                completed.set()
+
+            with (
+                patch.object(upgrade_notice, "_read_state", side_effect=delayed_read),
+                self.worker(lambda: upgrade_notice.current_notice(first_dir, version="0.23.0")),
+            ):
+                try:
+                    self.assertTrue(paused.wait(5))
+                    with self.worker(independent_call):
+                        try:
+                            self.assertTrue(completed.wait(5), "independent state path was blocked")
+                        finally:
+                            resume.set()
+                finally:
+                    resume.set()
+            self.assertIsNone(upgrade_notice.current_notice(second_dir, version="0.23.0"))
+
+    def test_publication_failure_keeps_state_and_releases_the_transaction(self) -> None:
+        for operation in ("current", "dismiss"):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as temp_dir:
+                data_dir = Path(temp_dir)
+                initial_version = "0.22.2" if operation == "current" else "0.23.0"
+                upgrade_notice.current_notice(data_dir, version=initial_version)
+                path = upgrade_notice.state_path(data_dir)
+                before = path.read_bytes()
+                with (
+                    patch.object(Path, "replace", side_effect=OSError("synthetic publication failure")),
+                    self.assertLogs(upgrade_notice.logger, level="WARNING") as logs,
+                ):
+                    if operation == "current":
+                        self.assertIsNotNone(upgrade_notice.current_notice(data_dir, version="0.23.0"))
+                    else:
+                        self.assertFalse(upgrade_notice.dismiss_notice(
+                            data_dir, notice_version="0.23.0", version="0.23.0",
+                        ))
+                self.assertIn("synthetic publication failure", logs.output[0])
+                self.assertEqual(path.read_bytes(), before)
+
+                def retry():
+                    self.assertIsNotNone(upgrade_notice.current_notice(data_dir, version="0.23.0"))
+                    self.assertTrue(upgrade_notice.dismiss_notice(
+                        data_dir, notice_version="0.23.0", version="0.23.0",
+                    ))
+
+                with self.worker(retry):
+                    pass
+                self.assertEqual(path.read_bytes(), b'{\n  "last_seen_version": "0.23.0"\n}\n')
+                self.assertFalse(path.with_suffix(".tmp").exists())
+
+    def test_repeat_reads_and_idempotent_dismissal_preserve_json_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir)
+            path = upgrade_notice.state_path(data_dir)
+            notice = upgrade_notice.current_notice(data_dir, version="0.23.0")
+            expected = {
+                "last_seen_version": "0.23.0",
+                "notice": {"version": "0.23.0", "previous": ""},
+            }
+            self.assertEqual(path.read_bytes(), (json.dumps(expected, sort_keys=True, indent=2) + "\n").encode())
+            before = path.read_bytes()
+            with patch.object(upgrade_notice, "_write_state", wraps=upgrade_notice._write_state) as write:
+                self.assertEqual(upgrade_notice.current_notice(data_dir, version="0.23.0"), notice)
+                write.assert_not_called()
+            self.assertEqual(path.read_bytes(), before)
+            self.assertTrue(upgrade_notice.dismiss_notice(
+                data_dir, notice_version="0.23.0", version="0.23.0",
+            ))
+            before = path.read_bytes()
+            with patch.object(upgrade_notice, "_write_state", wraps=upgrade_notice._write_state) as write:
+                self.assertTrue(upgrade_notice.dismiss_notice(
+                    data_dir, notice_version="0.23.0", version="0.23.0",
+                ))
+                self.assertIsNone(upgrade_notice.current_notice(data_dir, version="0.23.0"))
+                write.assert_not_called()
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_dismiss_rejects_stale_persisted_versions_without_writing(self) -> None:
+        for state in (
+            {"last_seen_version": "0.24.0"},
+            {"last_seen_version": "0.23.0", "notice": {"version": "0.24.0"}},
+        ):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as temp_dir:
+                data_dir = Path(temp_dir)
+                path = upgrade_notice.state_path(data_dir)
+                path.write_text(json.dumps(state), encoding="utf-8")
+                before = path.read_bytes()
+                with self.assertRaises(upgrade_notice.UpgradeNoticeVersionConflict):
+                    upgrade_notice.dismiss_notice(data_dir, notice_version="0.23.0", version="0.23.0")
+                self.assertEqual(path.read_bytes(), before)
+
     def test_absent_record_reports_unknown_previous_even_for_fresh_install(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             data_dir = Path(temp_dir) / "data"
