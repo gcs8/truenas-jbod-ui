@@ -3811,6 +3811,31 @@ class MappingLookupSnapshotTests(unittest.TestCase):
             self.assertEqual(store.get_mapping(BATCH_SYSTEM, BATCH_DRAWER, 1, loaded_entries=snapshot), expected)
             self.assertEqual(snapshot[key], mapping)
 
+    def test_read_snapshot_keeps_revision_state_without_exposing_mutable_lookup_models(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.make_store(root)
+            mapping = batch_mapping(slot=1)
+            key = store._slot_key(BATCH_SYSTEM, BATCH_SHELF, 1)
+            write_v1_mappings(store, {key: mapping})
+
+            snapshot = store.load_read_snapshot()
+            expected = store.get_mapping(BATCH_SYSTEM, BATCH_DRAWER, 1, loaded_entries=snapshot)
+            snapshot[key].serial = "POISONED"
+
+            self.assertEqual(
+                store.get_mapping(BATCH_SYSTEM, BATCH_DRAWER, 1, loaded_entries=snapshot),
+                expected,
+            )
+            self.assertEqual(store.count_for_system(BATCH_SYSTEM, loaded_entries=snapshot), 1)
+            self.assertIn(
+                (BATCH_SHELF, 1),
+                store.save_revisions(
+                    BATCH_SYSTEM,
+                    [(BATCH_SHELF, 1)],
+                    loaded_entries=snapshot,
+                ),
+            )
+
     def test_mutable_preloads_are_never_cached(self):
         with tempfile.TemporaryDirectory() as root:
             store = self.make_store(root)

@@ -154,6 +154,19 @@ class _MappingLookupSnapshot(Mapping[str, ManualMapping]):
         return ManualMapping.model_validate_json(payload) if payload is not None else None
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class _SnapshotEntries(_MappingLookupSnapshot):
+    """One immutable invocation read plus its authoritative revision state."""
+
+    snapshot: _ScopedStoreSnapshot
+    display_state: _ClassifiedStore | MappingScopeConflict
+
+    def get_identity(self, identity: Identity) -> ManualMapping | None:
+        if isinstance(self.display_state, MappingScopeConflict):
+            raise self.display_state
+        return _MappingLookupSnapshot.get_identity(self, identity)
+
+
 class MappingStore:
     """Persist slot-to-disk calibration in a small JSON file on a bind mount."""
 
@@ -608,6 +621,10 @@ class MappingStore:
         self,
         entries: Mapping[str, ManualMapping],
     ) -> _ClassifiedStore:
+        if isinstance(entries, _SnapshotEntries):
+            if isinstance(entries.display_state, MappingScopeConflict):
+                raise entries.display_state
+            return entries.display_state
         if isinstance(entries, _VersionedEntries):
             return self._classify_entries(entries.store_version, entries)
         if not entries:
@@ -616,6 +633,33 @@ class MappingStore:
         if len(prefixes) != 1:
             raise MappingScopeConflict()
         return self._classify_entries(2 if True in prefixes else 1, entries)
+
+    def load_read_snapshot(self) -> _SnapshotEntries:
+        """Read/classify one version for display, counts and revision issuance.
+
+        Strict document admission matches counts/revisions. Legacy classification
+        failures remain deferred to the display/scope consumer, as before. Every
+        mutator still reloads under its own lock and checks the submitted revision.
+        """
+        with self._lock:
+            snapshot = self._load_scoped_snapshot()
+            try:
+                display_state = self._classify_entries(snapshot.state.version, snapshot.state.entries)
+            except MappingScopeConflict as exc:
+                if snapshot.state.version == 2:
+                    raise
+                display_state = exc
+            mappings = display_state.mappings if isinstance(display_state, _ClassifiedStore) else {}
+            return _SnapshotEntries(
+                MappingProxyType(
+                    {key: value.model_dump_json() for key, value in snapshot.state.entries.items()}
+                ),
+                MappingProxyType(
+                    {identity: value.model_dump_json() for identity, value in mappings.items()}
+                ),
+                snapshot,
+                display_state,
+            )
 
     def load_all(self) -> dict[str, ManualMapping]:
         """Load for historical read-only display, tolerating corrupt v1-era stores."""
@@ -743,11 +787,15 @@ class MappingStore:
                 selected[scope_identity] = (rank, mapping)
         return {identity: ranked[1] for identity, ranked in selected.items()}
 
-    def count_for_system(self, system_id: str | None) -> int:
+    def count_for_system(
+        self, system_id: str | None, *, loaded_entries: _SnapshotEntries | None = None,
+    ) -> int:
         if system_id is None:
-            state = self._load_state()
+            state = self._load_state() if loaded_entries is None else self._state_from_entries(loaded_entries)
             return len(state.mappings)
-        state = self._load_state_for_scope(system_id, None)
+        state = self._load_state_for_scope(
+            system_id, None, snapshot=None if loaded_entries is None else loaded_entries.snapshot,
+        )
         return len(self._scope_entries(state, system_id, None))
 
     def list_mappings(
@@ -1105,11 +1153,13 @@ class MappingStore:
         self,
         system_id: str | None,
         targets: list[tuple[str | None, int]],
+        *,
+        loaded_entries: _SnapshotEntries | None = None,
     ) -> dict[tuple[str | None, int], str]:
         with self._lock:
             if not targets:
                 return {}
-            snapshot = self._load_scoped_snapshot()
+            snapshot = self._load_scoped_snapshot() if loaded_entries is None else loaded_entries.snapshot
             canonical_targets = {
                 target: (resolve_physical_mapping_scope(target[0]), target[1])
                 for target in targets
@@ -1133,11 +1183,13 @@ class MappingStore:
         self,
         system_id: str | None,
         targets: list[tuple[str | None, int]],
+        *,
+        loaded_entries: _SnapshotEntries | None = None,
     ) -> dict[tuple[str | None, int], str]:
         with self._lock:
             if not targets:
                 return {}
-            snapshot = self._load_scoped_snapshot()
+            snapshot = self._load_scoped_snapshot() if loaded_entries is None else loaded_entries.snapshot
             return {
                 target: self._clear_revision_from_state(
                     self._load_state_for_scope(

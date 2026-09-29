@@ -262,6 +262,17 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Recovered default inventory selection after topology changes, fenced stale
+  source publication, drained cancelled collectors and moved mapping reads
+  off the event loop while preserving request-local versions. (#852)
+
+- Qualified ESXi, QuantaStor and enclosure disk correlations before SMART
+  targeting and enrichment, rejecting conflicting identities and cross-owner
+  path or slot matches while preserving verified shared-disk health. (#747)
+- Require verified SES device-slot coordinates for SG LED control and keep
+  independent disks distinct when CAM model/target/LUN values match across controllers. (#809)
+- Bound SSH command execution and retain worker, channel and reusable-session
+  cleanup ownership through cancellation before releasing caller locks. (#765)
 - Sync snapshot publication directories before retiring prior backups or
   reporting success, preserving prior evidence when publication fails. (#763)
 - Validate log levels before settings reload, use the configured runtime-overrides
@@ -290,10 +301,6 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   finalize truthful receipts, and constrain Compose-matrix child runtimes. (#759)
 - Preserve Storage Fabric path identity, diagnostic placement, complete path
   health and scoped aliases; refuse unsafe alias-store mutations. (#760)
-- Bound SSH command execution and retain worker, channel and reusable-session
-  cleanup ownership through cancellation before releasing caller locks. (#765)
-- Require verified SES device-slot coordinates for SG LED control and keep
-  independent disks distinct when CAM model/target/LUN values match across controllers. (#809)
 - Bound SMART requests and cached results to the selected disk identity,
   preserving compatible saved views and coalescing duplicate pending requests. (#843)
 - Reserved admin maintenance runtime ownership through restoration and retained
