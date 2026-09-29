@@ -46,6 +46,7 @@ from history_service.operation_bounds import (
     HistoryRequestShapeError,
     build_history_read_plan,
     count_history_rows,
+    normalize_since_utc,
 )
 from history_service.refresh_auth import (
     ManualRefreshAdmission,
@@ -216,6 +217,15 @@ def _history_error_response(exc: Exception) -> JSONResponse:
             status_code=413,
         )
     return JSONResponse({"detail": "History request shape is invalid."}, status_code=422)
+
+
+def _normalized_optional_since(since: str | None) -> str | None:
+    if not since:
+        return since
+    try:
+        return normalize_since_utc(since)
+    except HistoryRequestShapeError as exc:
+        raise HTTPException(status_code=422, detail="History request shape is invalid.") from exc
 
 
 def _json_string_size(value: str) -> int:
@@ -727,7 +737,7 @@ async def slot_metrics(
             slot,
             metric_name=metric_name,
             limit=limit,
-            since=since,
+            since=_normalized_optional_since(since),
         ),
     }
 
@@ -747,7 +757,7 @@ async def slot_history_bundle(
         slot,
         event_limit=event_limit,
         metric_limits=SLOT_HISTORY_METRIC_LIMITS,
-        since=since,
+        since=_normalized_optional_since(since),
     )
 
 

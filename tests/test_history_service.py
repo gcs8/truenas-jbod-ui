@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
+from fastapi import HTTPException
 from starlette.requests import Request
 
 from app.request_context import request_context
@@ -1127,6 +1128,54 @@ class HistoryDashboardRouteTests(unittest.TestCase):
                     all(thread_id != event_loop_thread_id for thread_id in store_thread_ids),
                     f"{route_path} executed a HistoryStore read on the event-loop thread",
                 )
+
+    def test_slot_history_routes_pass_since_to_the_store_as_utc(self) -> None:
+        route_cases = (
+            (
+                "/api/history/slots/{slot}/metrics",
+                "list_metric_samples",
+                [],
+                {"metric_name": None, "limit": 500},
+            ),
+            (
+                "/api/history/slots/{slot}/bundle",
+                "get_slot_history_bundle",
+                {"events": [], "metrics": {}},
+                {"event_limit": 12},
+            ),
+        )
+        for route_path, method_name, result, extra_kwargs in route_cases:
+            route = next(
+                route
+                for route in history_main.app.routes
+                if getattr(route, "path", None) == route_path
+            )
+            with self.subTest(route=route_path):
+                with patch.object(history_main.store, method_name, return_value=result) as store_call:
+                    asyncio.run(
+                        route.endpoint(
+                            slot=5,
+                            system_id="archive-core",
+                            enclosure_id="front",
+                            since="2026-04-16T23:00:00+02:00",
+                            **extra_kwargs,
+                        )
+                    )
+                self.assertEqual(store_call.call_args.kwargs["since"], "2026-04-16T21:00:00+00:00")
+
+                with patch.object(history_main.store, method_name, return_value=result) as store_call:
+                    with self.assertRaises(HTTPException) as caught:
+                        asyncio.run(
+                            route.endpoint(
+                                slot=5,
+                                system_id="archive-core",
+                                enclosure_id="front",
+                                since="2026-04-16T23:00:00",
+                                **extra_kwargs,
+                            )
+                        )
+                self.assertEqual(caught.exception.status_code, 422)
+                store_call.assert_not_called()
 
     def test_history_fetch_json_timeout_reports_url_and_timeout(self) -> None:
         collector = HistoryCollector(
@@ -3210,7 +3259,9 @@ class HistoryStoreTests(unittest.TestCase):
                 rows = self._cursor.fetchall()
                 if "FROM metric_samples" in self._query:
                     materialized["raw"] = materialized.get("raw", 0) + len(rows)
-                if "FROM metric_rollups" in self._query:
+                if self._query.startswith("SELECT slot, metric_name FROM metric_rollups"):
+                    materialized["coverage_pairs"] = materialized.get("coverage_pairs", 0) + len(rows)
+                elif "FROM metric_rollups" in self._query:
                     materialized["rollup"] = materialized.get("rollup", 0) + len(rows)
                 return rows
 
@@ -3269,6 +3320,114 @@ class HistoryStoreTests(unittest.TestCase):
                 payload = reader.list_scope_history("archive-core", "enc-a", **arguments)
         return payload, materialized
 
+    def _coverage_window_fixture(self) -> tuple[HistoryStore, list[tuple[int, int]], dict[str, Any]]:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        store = HistoryStore(str(Path(temp_dir.name) / "history.db"))
+        now = datetime.now(timezone.utc)
+        counts = [(0, 0), (1, 1), (14, 10), (15, 11), (16, 12), (200, 200)]
+        with closing(store._connect()) as connection:
+            for scope in ("front", "other"):
+                for slot, (metrics, events) in enumerate(counts):
+                    # Tied timestamps exercise the id tie-break as well as the cap.
+                    connection.executemany(
+                        "INSERT INTO metric_samples (observed_at, system_id, enclosure_key, "
+                        "enclosure_id, slot, slot_label, metric_name, value_real) "
+                        "VALUES (?, 'coverage.example.test', ?, ?, ?, '00', 'temperature_c', ?)",
+                        [(now.isoformat(), scope, scope, slot, i) for i in range(metrics)],
+                    )
+                    connection.executemany(
+                        "INSERT INTO slot_events (observed_at, system_id, enclosure_key, "
+                        "enclosure_id, slot, slot_label, event_type, details_json) "
+                        "VALUES (?, 'coverage.example.test', ?, ?, ?, '00', 'slot_state_changed', '{}')",
+                        [(now.isoformat(), scope, scope, slot) for _ in range(events)],
+                    )
+                # An old row must not turn the exact-cap target into truncation.
+                old = (now - timedelta(days=2)).isoformat()
+                connection.execute(
+                    "INSERT INTO metric_samples (observed_at, system_id, enclosure_key, "
+                    "enclosure_id, slot, slot_label, metric_name, value_real) "
+                    "VALUES (?, 'coverage.example.test', ?, ?, 3, '00', 'temperature_c', 999)",
+                    (old, scope, scope),
+                )
+                connection.execute(
+                    "INSERT INTO slot_events (observed_at, system_id, enclosure_key, "
+                    "enclosure_id, slot, slot_label, event_type, details_json) "
+                    "VALUES (?, 'coverage.example.test', ?, ?, 3, '00', 'slot_state_changed', '{}')",
+                    (old, scope, scope),
+                )
+            connection.commit()
+        arguments: dict[str, Any] = dict(
+            slots=list(range(len(counts))), event_limit=11,
+            metric_limits={"temperature_c": 15},
+            since=(now - timedelta(hours=24)).isoformat(),
+        )
+        return store, counts, arguments
+
+    def test_scope_coverage_counts_only_bounded_window_inputs(self) -> None:
+        store, counts, arguments = self._coverage_window_fixture()
+        windows = []
+
+        class ObservedCount:
+            # Instrument SQLite's actual aggregate input, not Python fetch counts.
+            # The unbounded COUNT window receives every omitted row before fetch.
+            def __init__(self):
+                self.count = 0
+                self.peak = 0
+                windows.append(self)
+
+            def step(self, *args):
+                self.count += 1
+                self.peak = max(self.peak, self.count)
+
+            def inverse(self, *args):
+                self.count -= 1
+
+            def value(self):
+                return self.count
+
+            def finalize(self):
+                return self.count
+
+        original_connect = store._connect
+
+        def observed_connect():
+            connection = original_connect()
+            connection.create_window_function("count", 0, ObservedCount)
+            return connection
+
+        with patch.object(store, "_connect", side_effect=observed_connect):
+            payload = store.list_scope_history("coverage.example.test", "front", **arguments)
+        self.assertEqual(payload[5]["coverage"], {
+            "metrics": {"temperature_c": "truncated"}, "events": "truncated",
+        })
+        self.assertEqual(len(payload[5]["metrics"]["temperature_c"]), 15)
+        self.assertEqual(len(payload[5]["events"]), 11)
+        self.assertTrue(windows, "No real SQLite coverage aggregate was observed")
+        self.assertEqual(
+            sorted(window.peak for window in windows),
+            sorted(min(n, cap + 1) for m, e in counts for n, cap in ((m, 15), (e, 11)) if n),
+            "Coverage aggregate input must stop at cap + one sentinel per partition",
+        )
+
+    def test_scope_coverage_sentinel_is_not_a_total_or_returned_row(self) -> None:
+        store, counts, arguments = self._coverage_window_fixture()
+        payload = store.list_scope_history("coverage.example.test", "front", **arguments)
+        for slot, (metrics, events) in enumerate(counts):
+            with self.subTest(slot=slot):
+                history = payload[slot]
+                self.assertEqual(history["coverage"], {
+                    "metrics": {"temperature_c": "truncated" if metrics > 15 else "complete"},
+                    "events": "truncated" if events > 11 else "complete",
+                })
+                self.assertEqual(len(history["events"]), min(events, 11))
+                samples = history["metrics"]["temperature_c"]
+                self.assertEqual(history["sample_counts"], {"temperature_c": len(samples)})
+                self.assertEqual(len(samples), min(metrics, 15))
+                self.assertEqual([s["value"] for s in samples], list(reversed(range(metrics)))[:15])
+                for row in [*samples, *history["events"]]:
+                    self.assertTrue({"bounded_count", "available_count", "row_number"}.isdisjoint(row))
+
     def test_scope_bulk_materializes_only_one_rollup_after_nine_raw_rows(self) -> None:
         for segmented in (False, True):
             with self.subTest(segmented=segmented):
@@ -3281,7 +3440,7 @@ class HistoryStoreTests(unittest.TestCase):
                 )
 
                 samples = payload[5]["metrics"]["temperature_c"]
-                self.assertEqual(materialized, {"raw": 9, "rollup": 1})
+                self.assertEqual(materialized, {"raw": 9, "rollup": 1, **({} if segmented else {"coverage_pairs": 1})})
                 self.assertEqual(len(samples), 10)
                 self.assertNotIn("rollup_seconds", samples[8])
                 self.assertEqual(samples[9]["rollup_seconds"], 3600)
@@ -3303,7 +3462,7 @@ class HistoryStoreTests(unittest.TestCase):
                     metric_limits={"temperature_c": 10, "bytes_read": 10},
                 )
 
-                self.assertEqual(materialized, {"raw": 34, "rollup": 6})
+                self.assertEqual(materialized, {"raw": 34, "rollup": 6, **({} if segmented else {"coverage_pairs": 4})})
                 for slot in (5, 6):
                     for metric_name in ("temperature_c", "bytes_read"):
                         samples = payload[slot]["metrics"][metric_name]
@@ -3327,7 +3486,9 @@ class HistoryStoreTests(unittest.TestCase):
                     metric_limits={"temperature_c": 10},
                 )
 
-                self.assertEqual(materialized, {"raw": 10})
+                self.assertEqual(materialized, {"raw": 10, **({} if segmented else {"coverage_pairs": 1})})
+                if not segmented:
+                    self.assertEqual(payload[5]["coverage"]["metrics"]["temperature_c"], "unknown")
                 self.assertEqual(len(payload[5]["metrics"]["temperature_c"]), 10)
 
     @staticmethod
@@ -4261,6 +4422,16 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertEqual([sample["value"] for sample in payload[5]["metrics"]["temperature_c"]], [31])
         self.assertEqual(payload[5]["sample_counts"]["temperature_c"], 1)
         self.assertEqual(payload[5]["latest_values"]["temperature_c"], 31)
+
+        offset_payload = store.list_scope_history(
+            "archive-core",
+            "enc-a",
+            slots=[5],
+            metric_limits={"temperature_c": 10},
+            since="2026-04-16T23:00:00+02:00",
+        )
+
+        self.assertEqual([sample["value"] for sample in offset_payload[5]["metrics"]["temperature_c"]], [31])
 
     def test_scope_history_can_skip_events_for_metric_only_reads(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())

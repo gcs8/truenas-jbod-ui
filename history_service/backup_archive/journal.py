@@ -5,8 +5,9 @@ profile, rename) appends one entry to a small append-only journal. A
 :class:`ConfigBackupCoalescer` waits for a quiet period after the last change
 (capped by a maximum delay so a constant stream of edits still gets backed up),
 hashes the canonical config set, and only when that hash differs from the last
-config backup calls the injected ``make_backup(change_ids)`` callback. The
-entries are then marked committed to that backup id, or committed as ``noop``
+config backup calls the injected ``make_backup(change_ids, snapshot)`` callback,
+which must archive that captured generation rather than reread live config.
+Entries are then marked committed to that backup id, or committed as ``noop``
 when the content hash did not change (an edit and its revert, or a re-save that
 only moved a timestamp). A burst of twenty edits makes one backup, never twenty
 identical copies.
@@ -524,7 +525,7 @@ class ChangeJournal:
             if len(raw) <= MAX_LINE_BYTES:
                 try:
                     record = json.loads(raw)
-                except (ValueError, UnicodeDecodeError):
+                except (ValueError, UnicodeDecodeError, RecursionError):
                     record = None
             if not isinstance(record, dict) or not self._apply_record(state, record):
                 self._add_recovered_placeholder(state, number, raw)
@@ -535,7 +536,7 @@ class ChangeJournal:
             if len(tail) <= MAX_LINE_BYTES:
                 try:
                     record = json.loads(tail)
-                except (ValueError, UnicodeDecodeError):
+                except (ValueError, UnicodeDecodeError, RecursionError):
                     record = None
             if isinstance(record, dict) and self._apply_record(state, record):
                 state.torn_tail_bytes = len(tail)
@@ -849,7 +850,7 @@ class ConfigBackupCoalescer:
         journal: ChangeJournal,
         *,
         snapshot_config: Callable[[], Mapping[str, Any]],
-        make_backup: Callable[[tuple[str, ...]], Any],
+        make_backup: Callable[[tuple[str, ...], Mapping[str, Any]], Any],
         clock: Callable[[], float] = time.monotonic,
         quiet_period: float = DEFAULT_QUIET_PERIOD_SECONDS,
         max_delay: float = DEFAULT_MAX_DELAY_SECONDS,
@@ -875,8 +876,13 @@ class ConfigBackupCoalescer:
         self._fingerprint: tuple[int, int, int] | None | bool = False
         self.last_error: str | None = None
         # Entries left uncommitted by a previous run (crash, restart, failed
-        # backup) start a quiet period now, so they are backed up soon.
-        self.poll()
+        # backup) start a quiet period now, so they are backed up soon. An
+        # unreadable journal must not stop the caller from starting: the first
+        # tick() polls again and raises it there.
+        try:
+            self.poll()
+        except Exception:  # noqa: BLE001 - reported by the next tick()
+            pass
 
     # -- change intake --------------------------------------------------------------------
 
@@ -985,7 +991,8 @@ class ConfigBackupCoalescer:
             return CoalescerResult(status="idle")
         change_ids = tuple(entry.change_id for entry in pending)
         try:
-            config_hash = canonical_config_hash(self._snapshot_config(), self.volatile_keys)
+            snapshot = self._snapshot_config()
+            config_hash = canonical_config_hash(snapshot, self.volatile_keys)
         except Exception as exc:  # the snapshot callback is integration code
             return self._record_failure(change_ids, f"config snapshot failed: {type(exc).__name__}")
         last_hash, _ = self.journal.last_backup()
@@ -997,7 +1004,8 @@ class ConfigBackupCoalescer:
             self._record_success(change_ids)
             return CoalescerResult(status="noop", change_ids=change_ids, config_hash=config_hash)
         try:
-            record = self._make_backup(change_ids)
+            # The builder must consume this capture, not reread the live config.
+            record = self._make_backup(change_ids, snapshot)
             backup_id = _artifact_id(record)
         except Exception as exc:  # the backup callback is integration code
             return self._record_failure(change_ids, f"config backup failed: {type(exc).__name__}")

@@ -46,7 +46,7 @@ function load(data = fixture(2), instrument = false) {
   const end = source.indexOf("  elements.modeButtons.forEach((button) => {", source.indexOf("  function render()"));
   assert.ok(end > 0);
   vm.runInContext(`${source.slice(0, end)}
-    window.api = { state, diskLocation, slotByNumber, traceMap, renderPathButton, renderLanesMode, renderImpactMode, renderTraceMode, renderBayChips, renderSlotList, renderInspector };
+    window.api = { state, diskLocation, slotByNumber, traceMap, renderPathButton, renderLanesMode, renderImpactMode, renderTraceMode, renderBayChips, renderSlotList, renderInspector, renderDiskPathMode, branchSeedsForDiskTrace, renderDiskPathBranch };
   })();`, sandbox);
   window.api.state.selectedTraceId = "bay:0";
   return { ...window.api, elements, stats };
@@ -102,5 +102,59 @@ if (require.main === module) {
     const data = fixture(2);
     data.fabric.paths[0].count = 4;
     assert.match(text(load(data).renderPathButton(data.fabric.paths[0])), /4 disks/);
+  });
+}
+
+if (require.main === module) for (const label of ["Friendly source", '<img src=x onerror="alert(1)">', undefined, ""]) for (const view of ["active", "generic"]) {
+  test(`controller display label is text only in ${view} view: ${label}`, () => {
+    const data = fixture(2);
+    const escaped = label ? label.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;") : "storage-v2:synthetic-1";
+    // Two identical human labels must not merge canonical routes. Put the wrong
+    // controller/enclosure first so fallback-to-first cannot conceal a bad join.
+    for (let c = 0; c < 2; c++) {
+      const name = `storage-v2:synthetic-${c}`, id = `controller:${name}`;
+      const old = `controller:mpr${c}`;
+      data.fabric.controllers[c] = {id, name, label, related_slots: [c]};
+      for (const node of data.fabric.nodes) {
+        if (node.id === old) { node.id = id; node.label = label || name; }
+        if (node.controller_id === old) node.controller_id = id;
+      }
+      for (const p of data.fabric.paths.filter(p => p.controller === `mpr${c}`)) {
+        p.controller = name; p.controller_label = label;
+      }
+      for (const trace of data.fabric.traces) trace.node_ids = trace.node_ids.map(x => x === old ? id : x);
+    }
+    const bay = data.fabric.traces.find(t => t.id === "bay:0");
+    bay.node_ids = ["host", ...data.fabric.nodes.filter(n => ["controller", "ses-enclosure"].includes(n.kind)).map(n => n.id), "bay:0"];
+    bay.metrics.path_states = [0, 1].map(c => ({controller: `storage-v2:synthetic-${c}`, controller_label: label, state: c ? "fault" : "healthy", device_name: `da${c}`, path_id: data.fabric.paths[c * 2].id}));
+    const generic = {...bay, id: "synthetic-trace", kind: "path"};
+    data.fabric.traces.push(generic);
+    const ui = load(data);
+    ui.renderInspector(data.fabric);
+    const active = ui.elements.get("fabric-inspector-body").innerHTML;
+    if (view === "active") assert.ok(active.split("<h4>Path Members</h4>")[1].split("</section>")[0].includes(`<strong>${escaped}</strong>`));
+    assert.match(active, /status-healthy/);
+    assert.match(active, /status-fault/);
+    if (label) assert.ok(!active.includes(label) || label === "Friendly source");
+    ui.state.selectedTraceId = generic.id;
+    ui.renderInspector(data.fabric);
+    if (view === "generic") assert.ok(ui.elements.get("fabric-inspector-body").innerHTML.includes(`<span>${escaped}</span>`));
+    const seeds = ui.branchSeedsForDiskTrace(bay, data.fabric);
+    assert.equal(seeds.length, 2);
+    const branch = ui.renderDiskPathBranch(seeds[1], bay, data.fabric, 0);
+    assert.match(branch, /data-fabric-node="controller:storage-v2:synthetic-1"/);
+    assert.match(branch, /data-fabric-node="ses-enclosure:1:0"/);
+    assert.doesNotMatch(branch, /data-fabric-node="ses-enclosure:0:0"/);
+    ui.state.selectedDiskTraceId = bay.id;
+    const diskMode = ui.renderDiskPathMode(data.fabric);
+    const secondBranch = diskMode.split('<section class="disk-path-branch status-fault">')[1].split("</section>")[0];
+    assert.match(secondBranch, /data-fabric-node="controller:storage-v2:synthetic-1"/);
+    assert.match(secondBranch, /data-fabric-node="ses-enclosure:1:0"/);
+    assert.doesNotMatch(secondBranch, /data-fabric-node="ses-enclosure:0:0"/);
+    const lanes = ui.renderLanesMode(data.fabric);
+    for (const p of data.fabric.paths) assert.ok(lanes.includes(`data-fabric-trace="${p.id}"`));
+    const buttons = ui.renderPathButton(data.fabric.paths[2]);
+    assert.ok(buttons.includes(`<span>${escaped}</span>`));
+    assert.ok(ui.renderImpactMode(data.fabric).includes(escaped));
   });
 }

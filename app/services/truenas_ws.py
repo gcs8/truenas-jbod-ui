@@ -13,6 +13,7 @@ from typing import Any, Awaitable, Callable, Iterator
 from urllib.parse import urlsplit, urlunsplit
 
 from websockets.asyncio.client import ClientConnection, connect
+from websockets.exceptions import ConnectionClosed
 
 from app.config import TRUENAS_API_VERSION_PATTERN, TrueNASConfig
 from app.services.tls_context import build_tls_client_context, resolve_tls_server_name
@@ -340,7 +341,45 @@ class TrueNASWebsocketClient:
             return _JsonRpcCallDispatcher(ws, request_ids=self._jsonrpc_request_ids)
         return _MiddlewareCallDispatcher(ws)
 
+    async def _run_operation(self, operation: Awaitable[Any]) -> Any:
+        """One monotonic budget for connect, authentication and all replies.
+
+        Transport ping_timeout only measures WebSocket keepalive. Neither those
+        frames nor application pings extend this operation's lifetime. Keep a
+        separate owner so repeated caller cancellation cannot interrupt drainage,
+        and a late send/close error cannot replace the timeout or cancellation.
+        """
+        owner = asyncio.ensure_future(operation)
+        try:
+            done, _ = await asyncio.wait({owner}, timeout=self.config.timeout_seconds)
+            if not done:
+                raise TimeoutError(
+                    f"TrueNAS operation did not complete within {self.config.timeout_seconds:g}s."
+                )
+            return owner.result()
+        except BaseException:
+            owner.cancel()
+            await self._drain_owned(owner)
+            raise
+
+    @staticmethod
+    async def _drain_owned(owner: asyncio.Future[Any]) -> asyncio.CancelledError | None:
+        cancelled = None
+        while not owner.done():
+            try:
+                # wait() neither forwards cancellation nor abandons shield
+                # futures which can report unobserved late failures.
+                await asyncio.wait({owner})
+            except asyncio.CancelledError as exc:
+                cancelled = exc
+        if not owner.cancelled():
+            owner.exception()
+        return cancelled
+
     async def fetch_all(self) -> TrueNASRawData:
+        return await self._run_operation(self._fetch_all())
+
+    async def _fetch_all(self) -> TrueNASRawData:
         async with self._session() as ws:
             dispatcher = self._make_dispatcher(ws)
 
@@ -360,19 +399,40 @@ class TrueNASWebsocketClient:
                 asyncio.create_task(self._fetch_disk_temperatures(dispatcher.call)),
                 asyncio.create_task(self._fetch_smart_test_results(dispatcher.call)),
             ]
+            gathered = asyncio.gather(*fetch_tasks)
+            primary: BaseException | None = None
             try:
-                enclosure_result, disks, pools, disk_temperatures, smart_test_results = await asyncio.gather(*fetch_tasks)
-            except BaseException:
-                # gather() propagates the first failure but leaves its siblings running.
-                # Their futures live in the dispatcher, whose reader is about to be
-                # cancelled, so nothing would ever resolve them; cancel them explicitly
-                # so a failed refresh does not leave middleware calls pending forever.
-                for task in fetch_tasks:
-                    task.cancel()
-                await asyncio.gather(*fetch_tasks, return_exceptions=True)
+                # A reader failure must also interrupt calls blocked in send().
+                await asyncio.wait({gathered, dispatcher._reader_task}, return_when=asyncio.FIRST_COMPLETED)
+                if dispatcher._reader_task.done():
+                    try:
+                        dispatcher._reader_task.result()
+                    except ConnectionClosed:
+                        # A peer may close after delivering every reply. Only
+                        # completed consumers can decide the operation outcome;
+                        # incomplete calls (including blocked sends) still fail.
+                        if not all(task.done() for task in fetch_tasks):
+                            raise
+                enclosure_result, disks, pools, disk_temperatures, smart_test_results = await gathered
+            except BaseException as exc:
+                primary = exc
                 raise
             finally:
-                await dispatcher.close()
+                async def cleanup() -> None:
+                    # gather() leaves siblings running after its first failure.
+                    for task in fetch_tasks:
+                        task.cancel()
+                    await asyncio.gather(*fetch_tasks, gathered, return_exceptions=True)
+                    await dispatcher.close()
+
+                # Retain teardown even if cancellation arrives after an ordinary
+                # failure has already started closing the reader.
+                closing = asyncio.create_task(cleanup())
+                cancelled = await self._drain_owned(closing)
+                if cancelled is not None:
+                    raise cancelled
+                if primary is None:
+                    closing.result()
             enclosures, enclosure_query_failed = enclosure_result
             return TrueNASRawData(
                 enclosures=self._ensure_list(enclosures),
@@ -384,6 +444,9 @@ class TrueNASWebsocketClient:
             )
 
     async def fetch_disk_smartctl(self, disk_name: str, args: list[str] | None = None) -> str:
+        return await self._run_operation(self._fetch_disk_smartctl(disk_name, args))
+
+    async def _fetch_disk_smartctl(self, disk_name: str, args: list[str] | None = None) -> str:
         command_args = args or ["-a", "-j"]
         async with self._session() as ws:
             try:
@@ -531,7 +594,13 @@ class TrueNASWebsocketClient:
             # batch immediately rather than waiting for that worker's deadline.
             await asyncio.wait({gathered, dispatcher._reader_task}, return_when=asyncio.FIRST_COMPLETED)
             if dispatcher._reader_task.done():
-                dispatcher._reader_task.result()
+                try:
+                    dispatcher._reader_task.result()
+                except ConnectionClosed:
+                    # Completed positions retain their results or application
+                    # error; transport loss cannot complete unfinished workers.
+                    if not all(task.done() for task in tasks):
+                        raise
             await gathered
         except BaseException as exc:
             primary = exc
@@ -568,6 +637,9 @@ class TrueNASWebsocketClient:
         return results
 
     async def set_slot_status(self, enclosure_id: str, slot_number: int, status: str) -> None:
+        await self._run_operation(self._set_slot_status(enclosure_id, slot_number, status))
+
+    async def _set_slot_status(self, enclosure_id: str, slot_number: int, status: str) -> None:
         async with self._session() as ws:
             await self._call(ws, "enclosure.set_slot_status", [enclosure_id, slot_number, status])
 
@@ -719,29 +791,39 @@ class TrueNASWebsocketClient:
         if not self.config.api_key:
             raise TrueNASAPIError("TRUENAS_API_KEY is required for API access.")
 
+        connection = connect(
+            websocket_url,
+            ssl=ssl_context,
+            server_hostname=resolve_tls_server_name(self.config) if ssl_context else None,
+            open_timeout=self.config.timeout_seconds,
+            close_timeout=self.config.timeout_seconds,
+            ping_interval=20,
+            ping_timeout=self.config.timeout_seconds,
+        )
+        ws = await connection.__aenter__()
         primary: BaseException | None = None
         try:
-            async with connect(
-                websocket_url,
-                ssl=ssl_context,
-                server_hostname=resolve_tls_server_name(self.config) if ssl_context else None,
-                open_timeout=self.config.timeout_seconds,
-                close_timeout=self.config.timeout_seconds,
-                ping_interval=20,
-                ping_timeout=self.config.timeout_seconds,
-            ) as ws:
-                try:
-                    await self._perform_handshake(ws)
-                    yield ws
-                except BaseException as exc:
-                    primary = exc
-                    raise
-        except BaseException:
-            # Connection teardown must not replace authentication, method or
-            # cancellation failures, including failures before the session yields.
-            if primary is not None:
-                raise primary
+            await self._perform_handshake(ws)
+            yield ws
+        except BaseException as exc:
+            primary = exc
             raise
+        finally:
+            # Own context exit separately BEFORE awaiting it. The first cancel
+            # can arrive after a result/error has already started close; letting
+            # it reach close() would cancel the library's timeout/abort path.
+            closing = asyncio.create_task(connection.__aexit__(
+                type(primary) if primary is not None else None, primary,
+                primary.__traceback__ if primary is not None else None,
+            ))
+            cancelled = await self._drain_owned(closing)
+            if cancelled is not None:
+                raise cancelled
+            # Drain observes late close failures without replacing the original
+            # authentication, method or cancellation error. Successful calls
+            # still report an otherwise unmasked close failure.
+            if primary is None:
+                closing.result()
 
     async def _call(self, ws: ClientConnection, method: str, params: list[Any]) -> Any:
         if self._uses_jsonrpc:
