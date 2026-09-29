@@ -75,7 +75,7 @@ IP_ADDRESS_PATTERN = re.compile(
     r"(?![\w.%-])"
 )
 IPV4_RANGE_PATTERN = re.compile(
-    rf"(?<![\w.:%-])(?P<start>{IPV4_ADDRESS_BODY})-(?P<end>{IPV4_ADDRESS_BODY})(?![\w.%-])"
+    rf"(?<![\w.:%-])(?P<start>{IPV4_ADDRESS_BODY})-(?P<end>{IPV4_ADDRESS_BODY})(?P<suffix>\.*)(?![\w.%-])"
 )
 # Trailing DNS labels appended to a hostname token, so a redacted host swallows
 # its own domain suffix instead of leaving it behind.
@@ -787,7 +787,7 @@ class SnapshotRedactor:
             return match.group(0)
         if start.version != 4 or end.version != 4 or int(start) == 0 or int(end) == 0:
             return match.group(0)
-        return f"{self._mask_ipv4(start_text)}-{self._mask_ipv4(end_text)}"
+        return f"{self._mask_ipv4(start_text)}-{self._mask_ipv4(end_text)}{match.group('suffix')}"
 
     def _redact_address_match(self, match: re.Match[str]) -> str:
         value = match.group("ip")
@@ -809,7 +809,10 @@ class SnapshotRedactor:
         suffix = value[len(address_text):]
         if (
             address_text.endswith(":") and not address_text.endswith("::")
-            and re.match(r"\s+[A-Za-z0-9]", match.string[match.end():])
+            and (
+                re.match(r"\s+[A-Za-z0-9]", match.string[match.end():])
+                or match.string.startswith("/", match.end())
+            )
         ):
             address_text = address_text[:-1]
             suffix = ":" + suffix
