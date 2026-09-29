@@ -503,6 +503,8 @@
             ? "This admin version has no backup list."
             : `Couldn't load backups: ${errorText(error)}`;
           setStatus(state.loadError);
+          // A run known to be in progress keeps polling past one failed read.
+          scheduleRunningPoll();
         } finally {
           state.loading = false;
           state.loadPromise = null;
@@ -519,7 +521,11 @@
       if (state.pollTimer || !state.data?.running || isStopped() || !deps.setTimeout) return;
       state.pollTimer = deps.setTimeout(() => {
         state.pollTimer = null;
-        if (deps.isVisible && !deps.isVisible()) return;
+        // A hidden tab skips the request but keeps polling, so returning to it shows the result.
+        if (deps.isVisible && !deps.isVisible()) {
+          scheduleRunningPoll();
+          return;
+        }
         void load({ quiet: true });
       }, POLL_MS);
     }

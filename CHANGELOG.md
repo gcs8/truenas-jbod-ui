@@ -259,6 +259,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Kept the admin Backups page following a running backup while the tab is
+  hidden and after one failed list read, so the run buttons come back when the
+  backup ends. (#832)
 - Confirm supported sudo policy inclusion before reporting bootstrap grants,
   and distinguish StorCLI installation evidence from failed-command diagnostics. (#840)
 - Applied existing partial endpoint masking consistently to contextual addresses
