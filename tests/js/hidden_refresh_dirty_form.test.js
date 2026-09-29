@@ -329,6 +329,50 @@ test("a draft started during an automatic refresh blocks its response render", a
   assert.equal(events.filter((event) => event === "schedule").length, 1);
 });
 
+for (const loading of [true, false]) {
+  test(`a set-aside refresh ${loading ? "still finishes" : "does not start"} a storage view reload`, async () => {
+    const request = deferred();
+    const events = [];
+    const state = {
+      snapshotMode: false,
+      mappingFormDirty: false,
+      latestRefreshToken: 0,
+      refreshesInFlight: 0,
+      selectedSystemId: "system-b",
+      selectedEnclosureId: null,
+      storageViewsRuntimeLoading: loading,
+      sasFabric: { open: false },
+      history: { configured: false },
+      uiPerf: { currentRun: null },
+    };
+    const refreshSnapshot = loadFunction("refreshSnapshot", {
+      state,
+      cancelAutoRefreshTimer() {},
+      beginUiPerfRun() { return null; },
+      refreshStatusMessage() { return "refreshing"; },
+      setStatus(message) { events.push(`status:${message}`); },
+      buildSelectionParams() { return new URLSearchParams(); },
+      URLSearchParams,
+      fetchJson() { return request.promise; },
+      applySnapshot() { events.push("apply"); },
+      renderAll() { events.push("render"); },
+      fetchStorageViewRuntime() { events.push("storage-views"); return Promise.resolve(); },
+      archiveUiPerfRun() {},
+      scheduleAutoRefresh() {},
+    });
+
+    const refresh = refreshSnapshot(false, "system-switch");
+    state.mappingFormDirty = true;
+    request.resolve({ selected_system_id: "system-b", slots: [] });
+    await refresh;
+
+    assert.equal(events.includes("apply"), false);
+    assert.equal(events.includes("render"), false);
+    assert.equal(events.some((event) => /set aside.*editing a bay/i.test(event)), true);
+    assert.equal(events.filter((event) => event === "storage-views").length, loading ? 1 : 0);
+  });
+}
+
 test("discard confirmation keeps or releases a dirty calibration draft explicitly", () => {
   const state = {
     mappingFormDirty: true,
@@ -427,6 +471,7 @@ test("fabric slot controls do not synchronize trace state before dirty navigatio
   const selectSasFabricSlot = loadFunction("selectSasFabricSlot", {
     Number,
     syncSasFabricTraceToSlot(slot) { events.push(`sync:${slot}`); },
+    sasFabricViewSlotForBay: (slot) => slot,
     selectSlot(slot) {
       events.push(`select:${slot}`);
       return false;
