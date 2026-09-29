@@ -103,6 +103,8 @@
     enclosureAliasEditorOpen: false,
     enclosureAliasEditorScopeKey: null,
     mappingFormScopeKey: null,
+    mappingFormValuesKey: null,
+    mappingFormBaseRevision: null,
     mappingFormDirty: false,
     snapshotReuseCache: {},
     search: "",
@@ -8529,6 +8531,8 @@
       return false;
     }
     state.mappingFormScopeKey = null;
+    state.mappingFormValuesKey = null;
+    state.mappingFormBaseRevision = null;
     state.mappingFormDirty = false;
     if (state.refreshesInFlight === 0) {
       scheduleAutoRefresh();
@@ -8539,15 +8543,25 @@
 
   function syncMappingFormForSlot(slot) {
     const scopeKey = mappingFormScopeKey(slot);
-    if (state.mappingFormScopeKey === scopeKey) {
+    const sameScope = state.mappingFormScopeKey === scopeKey;
+    // A retained draft keeps the revision that owned its original values, even
+    // when a confirmed manual refresh updates the inventory behind the form.
+    if (sameScope && state.mappingFormDirty) {
       return;
     }
     const wasDirty = state.mappingFormDirty;
-    mappingForm.serial.value = slot.serial || "";
-    mappingForm.device_name.value = slot.device_name || "";
-    mappingForm.gptid.value = slot.gptid || "";
-    mappingForm.notes.value = slot.notes || "";
+    const valuesKey = JSON.stringify([
+      slot.serial || "", slot.device_name || "", slot.gptid || "", slot.notes || "",
+    ]);
+    if (!sameScope || state.mappingFormValuesKey !== valuesKey) {
+      mappingForm.serial.value = slot.serial || "";
+      mappingForm.device_name.value = slot.device_name || "";
+      mappingForm.gptid.value = slot.gptid || "";
+      mappingForm.notes.value = slot.notes || "";
+    }
     state.mappingFormScopeKey = scopeKey;
+    state.mappingFormValuesKey = valuesKey;
+    state.mappingFormBaseRevision = slot.mapping_revision || null;
     state.mappingFormDirty = false;
     if (wasDirty && state.refreshesInFlight === 0) {
       scheduleAutoRefresh();
@@ -10473,13 +10487,13 @@
       );
       return;
     }
-    if (!slot.mapping_revision) {
+    if (state.mappingFormScopeKey !== mappingFormScopeKey(slot) || !state.mappingFormBaseRevision) {
       setStatus("Mapping revision is unavailable. Refresh inventory before saving.", "error");
       return;
     }
     const formData = new FormData(mappingForm);
     const payload = {
-      expected_revision: slot.mapping_revision,
+      expected_revision: state.mappingFormBaseRevision,
       serial: formData.get("serial") || null,
       device_name: formData.get("device_name") || null,
       gptid: formData.get("gptid") || null,
@@ -10733,6 +10747,8 @@
     mappingForm.gptid.value = "";
     mappingForm.notes.value = "";
     state.mappingFormScopeKey = null;
+    state.mappingFormValuesKey = null;
+    state.mappingFormBaseRevision = null;
     state.mappingFormDirty = false;
     if (wasDirty && state.refreshesInFlight === 0) {
       scheduleAutoRefresh();

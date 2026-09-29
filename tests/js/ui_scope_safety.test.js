@@ -32,12 +32,12 @@ for (const action of ["sendLedAction", "saveMapping", "clearMapping", "importMap
   for (const transition of ["system", "enclosure", "refresh-epoch", "slot", "draft", "same"]) {
     test(`${action} completion respects ${transition}`, async () => {
       const pending = deferred();
-      const state = { snapshotMode:false, snapshot:{selected_system_id:"a",selected_enclosure_id:"one"}, selectedSystemId:"a", selectedEnclosureId:"one", selectedSlot:0, latestRefreshToken:1, mappingDraftRevision:0, snapshotReuseCache:{}, mappingFormScopeKey:"original" };
+      const state = { snapshotMode:false, snapshot:{selected_system_id:"a",selected_enclosure_id:"one"}, selectedSystemId:"a", selectedEnclosureId:"one", selectedSlot:0, latestRefreshToken:1, mappingDraftRevision:0, snapshotReuseCache:{}, mappingFormScopeKey:"a|one||0", mappingFormBaseRevision:"r" };
       let applied=0, requests=0;
       const context = {state, URLSearchParams, mappingForm:{}, FormData:class { get() { return "draft"; } }, window:{confirm:()=>true}, mappingImportFile:{value:""}, mappingImportUnavailableReason:()=>"", mappingImportPreviewMessage:()=>"confirm", writeBlockedByPolicy:()=>false, getSlotById:()=>({slot:0,slot_label:"00",led_supported:true,mapping_revision:"r",mapping_clear_revision:"r"}), setStatus(){}, sendScopedRequest:async url=>{requests++; return url.endsWith("preview") ? {revision:"r"} : pending.promise;}, applySnapshot(){applied++;}, invalidateHistoryCaches(){}, renderAll(){}, scheduleSmartPrefetch(){}, locateLightSourceLabel:()=>"synthetic", handleWriteRejection(){} };
       // Before the fix the handlers have no completion guard. Load new helpers only once present.
       const available = guardNames.filter(n => source.includes(`function ${n}(`));
-      const c=load([...available, action],context);
+      const c=load([...available, "mappingFormScopeKey", action],context);
       const args = action === "saveMapping" ? [{preventDefault(){}}] : action === "importMappingsFromFile" ? [{name:"synthetic.json",text:async()=>"{}"}] : ["IDENTIFY"];
       const run=c[action](...args);
       await new Promise(resolve=>setImmediate(resolve));
@@ -50,7 +50,7 @@ for (const action of ["sendLedAction", "saveMapping", "clearMapping", "importMap
       await run;
       assert.ok(requests > 0);
       assert.equal(applied, transition === "same" ? 1 : 0);
-      if (transition !== "same") assert.equal(state.mappingFormScopeKey,"original");
+      if (transition !== "same") assert.equal(state.mappingFormScopeKey,"a|one||0");
     });
   }
 }
