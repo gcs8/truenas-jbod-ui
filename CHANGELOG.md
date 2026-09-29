@@ -262,6 +262,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Bound SMART requests and cached results to the selected disk identity,
+  preserving compatible saved views and coalescing duplicate pending requests. (#843)
 - Reserved admin maintenance runtime ownership through restoration and retained
   catalog download workers through cancellation before cleanup. (#847)
 

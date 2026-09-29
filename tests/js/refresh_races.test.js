@@ -903,6 +903,8 @@ test("dedicated fabric refresh ignores a response for an older selection", async
     error: null,
     snapshot: {},
     fabric: null,
+    smartSummaries: {},
+    smartSummaryTimes: {},
     refreshRequestToken: 0,
   };
   function scopedUrl(endpoint, { force = false } = {}) {
@@ -969,6 +971,8 @@ test("storage-view SMART completion cannot mutate a different active view", asyn
     "ensureStorageViewSmartSummary",
     {
       state,
+      AbortSignal,
+      SMART_PREFETCH_STALE_MS: 15000,
       getStorageViewSmartCacheKey: () => cacheKey,
       isSmartEntryCurrent: () => false,
       isSmartEntryInFlight: () => false,
@@ -1020,6 +1024,8 @@ test("storage-view SMART completion cannot mutate the same view ID in a differen
     "ensureStorageViewSmartSummary",
     {
       state,
+      AbortSignal,
+      SMART_PREFETCH_STALE_MS: 15000,
       getStorageViewSmartCacheKey: () => cacheKey,
       isSmartEntryCurrent: () => false,
       isSmartEntryInFlight: () => false,

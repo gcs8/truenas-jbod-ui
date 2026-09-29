@@ -53,6 +53,7 @@
     diagnosticPayloads: {},
     openEvidencePanels: new Set(),
     smartSummaries: {},
+    smartSummaryTimes: {},
     smartRequests: {},
     aliasEditObjectId: null,
     aliasDraft: null,
@@ -1439,14 +1440,30 @@
   }
 
   function smartCacheKey(slotNumber) {
-    return [state.selectedSystemId || "", state.selectedEnclosureId || "", String(slotNumber)].join("|");
+    const slot = slotByNumber(slotNumber);
+    if (!slot || slot.identity_state === "unknown" || slot.present === false) return null;
+    const identity = [slot.serial, slot.logical_unit_id, slot.gptid].map((value) => String(value || "").trim());
+    if (!identity.some(Boolean)) return null;
+    return JSON.stringify([state.selectedSystemId, state.selectedEnclosureId, slot.enclosure_id, slotNumber, slot.device_name, identity]);
+  }
+
+  function pruneSmartCache() {
+    const keys = new Set(list(state.snapshot?.slots).map((slot) => smartCacheKey(slot.slot)).filter(Boolean));
+    for (const key of new Set([...Object.keys(state.smartSummaries), ...Object.keys(state.smartRequests)])) {
+      if (!keys.has(key)) {
+        delete state.smartSummaries[key];
+        delete state.smartSummaryTimes[key];
+        delete state.smartRequests[key];
+      }
+    }
   }
 
   function smartSummaryForSlot(slotNumber) {
     if (!Number.isInteger(Number(slotNumber))) {
       return null;
     }
-    return state.smartSummaries[smartCacheKey(slotNumber)] || null;
+    const key = smartCacheKey(slotNumber);
+    return key ? state.smartSummaries[key] || null : null;
   }
 
   function selectedSmartSlotNumber() {
@@ -1548,7 +1565,7 @@
 
   function ensureSelectedSmartSummary() {
     const slotNumber = selectedSmartSlotNumber();
-    if (!Number.isInteger(slotNumber) || !state.fabric || state.fabric.available === false) {
+    if (state.loading || !Number.isInteger(slotNumber) || !state.fabric || state.fabric.available === false) {
       return;
     }
     const slot = slotByNumber(slotNumber);
@@ -1556,18 +1573,25 @@
       return;
     }
     const key = smartCacheKey(slotNumber);
-    if (state.smartSummaries[key] || state.smartRequests[key]) {
+    if (!key || state.smartRequests[key]
+      || (state.smartSummaries[key] && Date.now() - state.smartSummaryTimes[key] < 300000)) {
       return;
     }
-    state.smartRequests[key] = true;
-    fetchJson(scopedUrl(`/api/slots/${slotNumber}/smart`))
+    const owner = {};
+    state.smartRequests[key] = owner;
+    fetchJson(scopedUrl(`/api/slots/${slotNumber}/smart`), { signal: AbortSignal.timeout(15000) })
       .then((summary) => {
+        if (state.smartRequests[key] !== owner) return;
+        state.smartSummaryTimes[key] = Date.now();
         state.smartSummaries[key] = summary || { available: false, message: "SMART detail returned an empty payload." };
       })
       .catch((error) => {
+        if (state.smartRequests[key] !== owner) return;
+        state.smartSummaryTimes[key] = Date.now();
         state.smartSummaries[key] = { available: false, message: error.message || String(error) };
       })
       .finally(() => {
+        if (state.smartRequests[key] !== owner) return;
         delete state.smartRequests[key];
         if (state.aliasEditObjectId) {
           return;
@@ -3998,6 +4022,7 @@
     state.snapshot = snapshot || state.snapshot;
     state.selectedSystemId = state.snapshot.selected_system_id || state.selectedSystemId;
     state.selectedEnclosureId = state.snapshot.selected_enclosure_id || state.selectedEnclosureId;
+    pruneSmartCache();
   }
 
   function applyFabric(fabric) {
@@ -4029,6 +4054,14 @@
         return;
       }
       applySnapshot(snapshot);
+      // A completed inventory refresh is an explicit retry opportunity. Avoid a
+      // render/failure loop while still bounding warm results on later renders.
+      Object.keys(state.smartSummaries).forEach((key) => {
+        if (state.smartSummaries[key]?.available === false) {
+          delete state.smartSummaries[key];
+          delete state.smartSummaryTimes[key];
+        }
+      });
       applyFabric(fabric);
       state.fabricScopeReady = true;
     } catch (error) {
@@ -4065,6 +4098,9 @@
   });
 
   elements.systemSelect.addEventListener("change", () => {
+    state.smartRequests = {};
+    state.smartSummaries = {};
+    state.smartSummaryTimes = {};
     state.selectedSystemId = elements.systemSelect.value || null;
     state.selectedEnclosureId = null;
     state.selectedTraceId = null;
@@ -4078,6 +4114,9 @@
   });
 
   elements.enclosureSelect.addEventListener("change", () => {
+    state.smartRequests = {};
+    state.smartSummaries = {};
+    state.smartSummaryTimes = {};
     state.selectedEnclosureId = elements.enclosureSelect.value || null;
     state.selectedTraceId = null;
     state.selectedNodeId = null;

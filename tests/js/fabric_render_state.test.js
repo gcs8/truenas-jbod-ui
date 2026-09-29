@@ -181,7 +181,7 @@ function loadFabricPage({ baseURI = "http://nas.example.test/sas-fabric", backLi
     },
   };
   const sandbox = vm.createContext({
-    URLSearchParams, URL, TextEncoder, console, Date, Math, Number, String, Array, Object, Set, Map, WeakMap, JSON, Boolean, Error, Promise,
+    AbortSignal, URLSearchParams, URL, TextEncoder, console, Date, Math, Number, String, Array, Object, Set, Map, WeakMap, JSON, Boolean, Error, Promise,
     encodeURIComponent,
     btoa: (value) => Buffer.from(value, "binary").toString("base64"),
     setTimeout,
