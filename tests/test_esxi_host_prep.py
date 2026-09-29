@@ -736,21 +736,24 @@ class ESXiHostPrepServiceTests(unittest.TestCase):
                 {
                     f"rm -f {remote_path}": (0, "", ""),
                     install_command: (0, "Installation Result\nMessage: Operation finished successfully.\n", ""),
-                    "esxcli software component list | grep -i storcli || true": (0, "BCM-vmware-storcli64\n", ""),
-                    "esxcli software vib list | grep -i storcli || true": (0, "vmware-storcli64\n", ""),
-                    "find /opt/lsi -name 'storcli*' 2>/dev/null || true": (0, "/opt/lsi/storcli64/storcli64\n", ""),
-                    "/opt/lsi/storcli64/storcli64 show J 2>&1 || true": (
+                    "esxcli --formatter=csv software component list": (0, 'Name,Version\nBCM-vmware-storcli64,1\n', ""),
+                    "esxcli --formatter=csv software vib list": (0, 'Name,Version\nvmware-storcli64,1\n', ""),
+                    ("if [ -f /opt/lsi/storcli64/storcli64 ] && [ -x /opt/lsi/storcli64/storcli64 ]; then "
+                     "printf 'executable\\n'; "
+                     "elif [ -d /opt/lsi/storcli64 ] && [ -r /opt/lsi/storcli64 ] && [ -x /opt/lsi/storcli64 ]; then "
+                     "printf 'absent\\n'; else exit 1; fi"): (0, "executable", ""),
+                    "/opt/lsi/storcli64/storcli64 show J": (
                         0,
                         "CLI Version = 007.2705.0000.0000\nNumber of Controllers = 0\n",
                         "",
                     ),
-                    "esxcli storage core adapter list 2>&1 || true": (0, "vmhba0 vmw_ahci\n", ""),
-                    "esxcli hardware pci pcipassthru list 2>&1 || true": (
+                    "esxcli storage core adapter list": (0, "vmhba0 vmw_ahci\n", ""),
+                    "esxcli hardware pci pcipassthru list": (
                         0,
                         "Device ID     Enabled\n------------  -------\n0000:3b:00.0     true\n",
                         "",
                     ),
-                    "lspci 2>&1 | grep -i 'MegaRAID' || true": (
+                    "lspci": (
                         0,
                         "0000:3b:00.0 RAID bus controller: Broadcom MegaRAID SAS Invader Controller [vmhba2]\n",
                         "",
@@ -771,6 +774,9 @@ class ESXiHostPrepServiceTests(unittest.TestCase):
             self.assertEqual(result["install_command"], install_command)
             self.assertEqual(result["remote_path"], remote_path)
             self.assertIn("PCI passthrough", result["detail"])
+            self.assertTrue(result["verification"]["summary"]["storcli_installed"])
+            self.assertTrue(result["verification"]["summary"]["package_installed"])
+            self.assertTrue(result["verification"]["summary"]["executable_available"])
             self.assertFalse(result["verification"]["summary"]["controller_visible"])
             self.assertEqual(result["verification"]["summary"]["controller_count"], 0)
             self.assertEqual(
@@ -792,13 +798,16 @@ class ESXiHostPrepServiceTests(unittest.TestCase):
                 {
                     f"rm -f {remote_path}": (0, "", ""),
                     install_command: (0, "Message: Operation finished successfully.\n", ""),
-                    "esxcli software component list | grep -i storcli || true": (0, "", ""),
-                    "esxcli software vib list | grep -i storcli || true": (0, "vmware-storcli64\n", ""),
-                    "find /opt/lsi -name 'storcli*' 2>/dev/null || true": (0, "/opt/lsi/storcli64/storcli64\n", ""),
-                    "/opt/lsi/storcli64/storcli64 show J 2>&1 || true": (0, "Number of Controllers = 1\n", ""),
-                    "esxcli storage core adapter list 2>&1 || true": (0, "vmhba2 lsi_mr3\n", ""),
-                    "esxcli hardware pci pcipassthru list 2>&1 || true": (0, "", ""),
-                    "lspci 2>&1 | grep -i 'MegaRAID' || true": (0, "", ""),
+                    "esxcli --formatter=csv software component list": (0, "", ""),
+                    "esxcli --formatter=csv software vib list": (0, 'Name,Version\nvmware-storcli64,1\n', ""),
+                    ("if [ -f /opt/lsi/storcli64/storcli64 ] && [ -x /opt/lsi/storcli64/storcli64 ]; then "
+                     "printf 'executable\\n'; "
+                     "elif [ -d /opt/lsi/storcli64 ] && [ -r /opt/lsi/storcli64 ] && [ -x /opt/lsi/storcli64 ]; then "
+                     "printf 'absent\\n'; else exit 1; fi"): (0, "executable", ""),
+                    "/opt/lsi/storcli64/storcli64 show J": (0, "Number of Controllers = 1\n", ""),
+                    "esxcli storage core adapter list": (0, "vmhba2 lsi_mr3\n", ""),
+                    "esxcli hardware pci pcipassthru list": (0, "", ""),
+                    "lspci": (0, "", ""),
                 }
             )
 
@@ -1110,6 +1119,146 @@ class ESXiHostPrepServiceTests(unittest.TestCase):
             self.assertFalse(first_install_thread.is_alive())
             self.assertEqual(first_install_errors, [])
             self.assertFalse(package_dir.exists())
+
+
+class StorCLIVerificationEvidenceTests(unittest.TestCase):
+    def verify(self, *, component=(0, 'Name,Version\n', ''), vib=(0, 'Name,Version\n', ''),
+               executable=(0, 'absent', ''), show=(127, '', 'storcli64: not found'),
+               pci=(0, '', ''), passthrough=(0, '', '')):
+        commands = []
+
+        def run(client, command, timeout):
+            commands.append(command)
+            if 'component list' in command:
+                value = component
+            elif 'vib list' in command:
+                value = vib
+            elif 'show J' in command:
+                value = show
+            elif 'pcipassthru list' in command:
+                value = passthrough
+            elif 'lspci' in command:
+                value = pci
+            elif 'adapter list' in command:
+                value = (0, '', '')
+            else:
+                value = executable
+            code, out, err = value
+            return SSHCommandResult(command=command, ok=code == 0, stdout=out, stderr=err, exit_code=code)
+
+        with tempfile.TemporaryDirectory() as temp:
+            service = ESXiHostPrepService(temp, probe_factory=FakeProbe)
+            with patch.object(service, '_run_remote_command', side_effect=run):
+                result = service._run_verification_commands(object(), 15)
+        return result['summary'], commands
+
+    def test_absent_binary_diagnostics_do_not_prove_installation(self):
+        summary, _ = self.verify()
+        self.assertIs(summary['storcli_installed'], False)
+        self.assertIs(summary['controller_count'], None)
+        self.assertIs(summary['package_installed'], False)
+        self.assertIs(summary['executable_available'], False)
+        self.assertFalse(summary['controller_visible'])
+        self.assertNotIn('are visible', summary['detail'])
+        self.assertNotIn('is present', summary['detail'])
+
+    def test_permission_and_failed_listing_diagnostics_remain_unknown(self):
+        for code, diagnostic in [(126, 'storcli64: Permission denied'),
+                                 (1, 'Failed listing storcli packages'),
+                                 (127, 'storcli64: not found')]:
+            with self.subTest(code=code):
+                failed = (code, diagnostic, diagnostic)
+                summary, _ = self.verify(component=failed, vib=failed, executable=failed, show=failed)
+                self.assertIs(summary['storcli_installed'], None)
+                self.assertIs(summary['package_installed'], None)
+                self.assertIs(summary['executable_available'], None)
+                self.assertIs(summary['controller_count'], None)
+                self.assertNotIn('is present', summary['detail'])
+
+    def test_package_executable_and_controller_evidence_are_independent(self):
+        summary, _ = self.verify(component=(0, 'Name,Version\nvmware-storcli64,1\n', ''))
+        self.assertIs(summary.get('package_installed'), True)
+        self.assertIs(summary.get('executable_available'), False)
+        self.assertIs(summary['storcli_installed'], True)
+        self.assertIsNone(summary['controller_count'])
+        summary, _ = self.verify(executable=(0, 'executable', ''))
+        self.assertIs(summary.get('package_installed'), False)
+        self.assertIs(summary.get('executable_available'), True)
+        self.assertIs(summary['storcli_installed'], True)
+        self.assertIsNone(summary['controller_count'])
+
+    def test_malformed_successful_listing_does_not_prove_package_presence_or_absence(self):
+        for text in ('storcli: permission denied', '{"error":"storcli"}',
+                     '[{"Description":"storcli"}]', '[{"Name":"not-storcli-error"}]',
+                     'Name,Version\nstorcli64\n', 'Name,Name\nstorcli64,storcli64\n',
+                     'Name,Version\nstorcli: denied,1\n', 'Name,Version\n"storcli64,1\n'):
+            with self.subTest(text=text):
+                summary, _ = self.verify(component=(0, text, ''), vib=(1, '', 'failed'))
+                self.assertIsNone(summary.get('package_installed'))
+                self.assertIsNone(summary['storcli_installed'])
+
+    def test_controller_evidence_only_comes_from_successful_show_stdout(self):
+        for values in (
+            dict(component=(0, 'Number of Controllers = 4\nstorcli', '')),
+            dict(show=(1, 'Number of Controllers = 4', 'storcli failed')),
+            dict(show=(0, '', 'Number of Controllers = 4')),
+            dict(show=(0, '{"Controllers":[{"Command Status":{"Status":"Failure"},'
+                             '"Response Data":{"Number of Controllers":4}}]}', '')),
+        ):
+            with self.subTest(values=values):
+                summary, _ = self.verify(**values)
+                self.assertIsNone(summary['controller_count'])
+                self.assertFalse(summary['controller_visible'])
+
+    def test_successful_zero_and_positive_controller_results(self):
+        for count in (0, 2):
+            for output in (f'Number of Controllers = {count}\n', json.dumps({
+                'Controllers': [{'Command Status': {'Status': 'Success'},
+                                 'Response Data': {'Number of Controllers': count}}]
+            })):
+                with self.subTest(count=count, output=output):
+                    summary, _ = self.verify(show=(0, output, 'unrelated storcli diagnostic'))
+                    self.assertEqual(summary['controller_count'], count)
+                    self.assertEqual(summary['controller_visible'], count > 0)
+                    self.assertTrue(summary['storcli_installed'])
+
+    def test_passthrough_evidence_requires_success_and_does_not_imply_storcli(self):
+        pci = '0000:01:00.0 RAID bus controller: Broadcom MegaRAID\n'
+        passthrough = '0000:01:00.0 true\n'
+        summary, _ = self.verify(pci=(0, pci, ''), passthrough=(0, passthrough, ''))
+        self.assertEqual(summary['megaraid_passthrough_addresses'], ['0000:01:00.0'])
+        self.assertFalse(summary['storcli_installed'])
+        self.assertNotIn('is present', summary['detail'])
+        for failed in ('pci', 'passthrough'):
+            kwargs = dict(pci=(0, pci, ''), passthrough=(0, passthrough, ''))
+            kwargs[failed] = (1, kwargs[failed][1], 'failed')
+            summary, _ = self.verify(**kwargs)
+            self.assertEqual(summary['megaraid_passthrough_addresses'], [])
+
+    def test_verification_commands_preserve_exit_status(self):
+        _, commands = self.verify()
+        for command in commands:
+            self.assertNotIn('|| true', command)
+            self.assertNotIn('| grep', command)
+            self.assertNotIn('2>&1', command)
+        self.assertTrue(any('--formatter=csv' in c and 'component list' in c for c in commands))
+
+    def test_failed_install_remains_top_level_failure_despite_positive_verification(self):
+        with tempfile.TemporaryDirectory() as temp:
+            service = ESXiHostPrepService(temp, probe_factory=FakeProbe)
+            staged = service.stage_package('synthetic.vib', b'synthetic')
+            remote = f"/tmp/truenas-jbod-ui-{staged['token'][:12]}-synthetic.vib"
+            FakeProbe.next_client = FakeClient({
+                service._build_install_command(remote, '.vib'): (1, '', 'install failed')
+            })
+            with patch.object(service, '_run_verification_commands', return_value={
+                'summary': {'storcli_installed': True, 'detail': 'Earlier package is present.'}
+            }):
+                result = service.install_package(ESXiHostPrepInstallRequest(
+                    host='esxi.example.test', user='root', password='synthetic-password',
+                    upload_token=staged['token']))
+            self.assertFalse(result['ok'])
+            self.assertIn('install command failed', result['detail'])
 
 
 if __name__ == "__main__":

@@ -386,6 +386,78 @@ asyncio.run(main())
   return outputPath;
 }
 
+
+function buildBoundedVirtualHistoryFixture({ redact, selectedView }) {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "jbod-bounded-history-"));
+  const outputPath = path.join(tempDir, "snapshot.html");
+  const script = `
+import asyncio
+import pathlib
+import sys
+from tests.test_snapshot_export import build_bounded_history_fixture
+async def main():
+    rendered, estimate, wire = await build_bounded_history_fixture(
+        redact=sys.argv[2] == "true", selected_view=sys.argv[3])
+    pathlib.Path(sys.argv[1]).write_text(rendered.html, encoding="utf-8")
+asyncio.run(main())
+`;
+  const result = spawnSync(process.env.PYTHON || "python3", ["-c", script, outputPath, String(redact), selectedView], {
+    cwd: path.resolve(__dirname, ".."), encoding: "utf8",
+  });
+  if (result.status !== 0) throw new Error(`Bounded history fixture failed: ${result.stdout} ${result.stderr}`);
+  return outputPath;
+}
+
+for (const redact of [false, true]) {
+  for (const selectedView of ["boot", "nvme", "bound"]) {
+    test(`bounded virtual history ${selectedView} ${redact ? "partial" : "plain"}`, async ({ page }, testInfo) => {
+      const snapshotPath = buildBoundedVirtualHistoryFixture({ redact, selectedView });
+      const network = [];
+      const errors = [];
+      page.on("request", request => { if (/^https?:/.test(request.url())) network.push(request.url()); });
+      page.on("pageerror", error => errors.push(error.message));
+      page.on("console", message => { if (message.type() === "error") errors.push(message.text()); });
+      await page.route(/^https?:/, route => route.abort());
+      try {
+        await page.goto(pathToFileURL(snapshotPath).href, { waitUntil: "load" });
+        const raw = await page.evaluate(() => {
+          const b = window.APP_BOOTSTRAP;
+          const targets = b.storageViewsRuntime.views.map(view => {
+            const slot = view.slots[0];
+            const enclosure = Number.isInteger(slot.snapshot_slot) ? view.backing_enclosure_id : `storage-view:${view.id}`;
+            const key = `${b.snapshot.selected_system_id}|${enclosure}|${slot.snapshot_slot ?? slot.slot_index}`;
+            return { id: view.id, key, history: b.preloadedHistoryBySlot[key] || null };
+          });
+          return { targets, selected: b.initialSelectedStorageViewId, meta: b.snapshotExportMeta };
+        });
+        expect(raw.targets.map(target => Boolean(target.history))).toEqual([true, true, true]);
+        expect(new Set(raw.targets.map(target => target.key)).size).toBe(3);
+        expect(raw.targets.map(target => target.history.latest_values.temperature_c)).toEqual([41, 42, 37]);
+        expect(raw.selected).toBe(raw.targets[["boot", "nvme", "bound"].indexOf(selectedView)].id);
+        await expect(page.locator("#detail-history-panel")).toBeVisible();
+        await expect(page.locator("#detail-history-empty")).toBeHidden();
+        await expect(page.locator("#detail-history-content")).toBeVisible();
+        await expect(page.locator("#history-metric-grid")).toContainText(`${{ boot: 41, nvme: 42, bound: 37 }[selectedView]} C`);
+        await page.locator("#heatmap-toggle-button").click();
+        await page.locator("#heatmap-metric-select").selectOption("temperature_c");
+        await expect(page.locator("#slot-grid .slot-heatmap-value").first()).toContainText(String({ boot: 41, nvme: 42, bound: 37 }[selectedView]));
+        await page.locator(".snapshot-banner-about > summary").click();
+        await expect(page.locator(".snapshot-banner-about")).toContainText("History is incomplete");
+        await expect(page.locator(".snapshot-banner-about")).not.toContainText("full history detail");
+        expect(raw.meta.history_coverage).toBe("truncated");
+        expect(network).toEqual([]);
+        expect(errors).toEqual([]);
+        await testInfo.attach("synthetic-snapshot", { path: snapshotPath, contentType: "text/html" });
+        await testInfo.attach("cache-agreement", { body: JSON.stringify(raw), contentType: "application/json" });
+        await page.screenshot({ path: testInfo.outputPath("history.png"), fullPage: true });
+      } finally {
+        console.log(JSON.stringify({ selectedView, redact, httpRequests: network.length, pageErrors: errors.length }));
+        fs.rmSync(path.dirname(snapshotPath), { recursive: true, force: true });
+      }
+    });
+  }
+}
+
 test("offline snapshot renders preloaded slot history without a live backend", async ({ page }) => {
   const snapshotPath = buildOfflineSnapshotFixture();
 

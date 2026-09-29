@@ -25,6 +25,18 @@ MAX_DIAGNOSTIC_TEXT_LENGTH = 384
 MAX_DIAGNOSTIC_COLLECTION_ITEMS = 64
 MAX_DIAGNOSTIC_NUMERIC_TOKEN_LENGTH = 32
 
+# Application severity follows the decoded status, not its numeric/text spelling.
+SCSI_STATUS_SEVERITIES = {
+    "GOOD": "info",
+    "CHECK CONDITION": "warning",
+    "CONDITION MET": "info",
+    "BUSY": "warning",
+    "RESERVATION CONFLICT": "warning",
+    "TASK SET FULL": "warning",
+    "ACA ACTIVE": "warning",
+    "TASK ABORTED": "error",
+}
+
 FREEBSD_ERRNO_SOURCE = {
     "name": "FreeBSD intro(2) errno list",
     "url": "https://man.freebsd.org/cgi/man.cgi?apropos=0&manpath=freebsd&query=intro&sektion=2",
@@ -157,6 +169,9 @@ def make_decoded_event_record(event: dict[str, Any], *, event_id: str, sequence:
         record["label"] = event.get("reason") or event.get("message") or "Kernel event"
     if record.get("event_type") == "scsi_sense" and record.get("family") in FAULT_FAMILY_SEVERITIES:
         record["severity"] = fault_family_severity(str(record["family"]))
+    if record.get("event_type") == "scsi_status":
+        status = str(decoded.get("scsi_status") or "").upper()
+        record["severity"] = SCSI_STATUS_SEVERITIES.get(status, record["severity"])
     if not record.get("likely_layer") and record.get("family"):
         record["likely_layer"] = fault_family_likely_layer(str(record["family"]))
     fingerprint = _finding_fingerprint(record)
