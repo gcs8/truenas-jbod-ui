@@ -12,7 +12,7 @@
   const SMART_PREFETCH_SINGLE_THRESHOLD = Math.max(1, Number(bootstrap.smartPrefetchSingleThreshold) || 128);
   const SMART_PREFETCH_CHUNK_SIZE = Math.max(1, Number(bootstrap.smartPrefetchChunkSize) || 24);
   const SMART_PREFETCH_BATCH_CONCURRENCY = Math.max(1, Number(bootstrap.smartPrefetchBatchConcurrency) || 2);
-  const SMART_PREFETCH_STALE_MS = 15000;
+
   const SNAPSHOT_CACHE_TTL_SECONDS = positiveSeconds(refreshTiming.snapshotCacheTtlSeconds, 10);
   const SOURCE_BUNDLE_CACHE_TTL_SECONDS = positiveSeconds(refreshTiming.sourceBundleCacheTtlSeconds, 60);
   const SMART_CACHE_TTL_SECONDS = positiveSeconds(refreshTiming.smartCacheTtlSeconds, 300);
@@ -3916,7 +3916,6 @@
   async function requestSmartBatchForSlots(slots) {
     return sendScopedRequest("/api/slots/smart-batch", {
       method: "POST",
-      signal: AbortSignal.timeout(SMART_PREFETCH_STALE_MS),
       body: JSON.stringify({
         slots: slots.map((slot) => slot.slot),
         max_concurrency: Math.min(SMART_BATCH_REQUEST_MAX_CONCURRENCY, slots.length),
@@ -10776,7 +10775,7 @@
       refreshHoveredTooltip();
     }
     try {
-      const payload = await sendScopedRequest(`/api/slots/${slot.slot}/smart`, { signal: AbortSignal.timeout(SMART_PREFETCH_STALE_MS) });
+      const payload = await sendScopedRequest(`/api/slots/${slot.slot}/smart`);
       if (state.smartSummaries[cacheKey] !== owner) return;
       state.smartSummaries[cacheKey] = {
         loading: false,
@@ -10835,7 +10834,7 @@
       const scopedUrl = params.toString()
         ? `/api/storage-views/${encodeURIComponent(view.id)}/slots/${slot.slot_index}/smart?${params.toString()}`
         : `/api/storage-views/${encodeURIComponent(view.id)}/slots/${slot.slot_index}/smart`;
-      const payload = await fetchJson(scopedUrl, { signal: AbortSignal.timeout(SMART_PREFETCH_STALE_MS) });
+      const payload = await fetchJson(scopedUrl);
       if (state.smartSummaries[cacheKey] !== owner) return;
       state.smartSummaries[cacheKey] = {
         loading: false,
