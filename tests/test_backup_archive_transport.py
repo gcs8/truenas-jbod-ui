@@ -1069,6 +1069,10 @@ class NfsTargetTests(_TempCase):
 # --------------------------------------------------------------------------
 
 
+class FakeS3ConnectionError(RuntimeError):
+    pass
+
+
 class FakeS3Client:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
@@ -1078,6 +1082,7 @@ class FakeS3Client:
         self.corrupt_get = False
         self.get_calls = 0
         self.closed = False
+        self.delete_error: Exception | None = None
 
     def upload_fileobj(self, fileobj, bucket, key, ExtraArgs=None, Config=None):
         chunks = []
@@ -1115,6 +1120,8 @@ class FakeS3Client:
         return {"Body": io.BytesIO(data[:-1] + b"?" if self.corrupt_get else data)}
 
     def delete_object(self, Bucket, Key):
+        if self.delete_error is not None:
+            raise self.delete_error
         self.objects.pop(Key, None)
 
     def get_paginator(self, name):
@@ -1157,12 +1164,23 @@ def _fake_boto_modules(clients: list[FakeS3Client]) -> dict[str, types.ModuleTyp
     botocore = types.ModuleType("botocore")
     botocore_config = types.ModuleType("botocore.config")
     botocore_config.Config = lambda **kwargs: ("Config", kwargs)
+    botocore_exceptions = types.ModuleType("botocore.exceptions")
+    for name in (
+        "EndpointConnectionError",
+        "ConnectTimeoutError",
+        "ReadTimeoutError",
+        "ConnectionClosedError",
+        "HTTPClientError",
+    ):
+        setattr(botocore_exceptions, name, FakeS3ConnectionError)
+    setattr(botocore, "exceptions", botocore_exceptions)
     return {
         "boto3": boto3,
         "boto3.s3": s3,
         "boto3.s3.transfer": s3_transfer,
         "botocore": botocore,
         "botocore.config": botocore_config,
+        "botocore.exceptions": botocore_exceptions,
     }
 
 
@@ -1185,6 +1203,14 @@ class S3TargetTests(_TempCase):
             secret_access_key_file=self.secret("s3-secret", "secretexample"),
             **kw,
         )
+
+    def test_delete_connection_failure_is_reported_as_location_unavailable(self) -> None:
+        with open_target(self.settings()) as target:
+            failure = FakeS3ConnectionError("synthetic endpoint unavailable")
+            self.clients[0].delete_error = failure
+            with self.assertRaisesRegex(ConnectionError, "S3 archive location is unavailable") as caught:
+                target.delete("full/backup.tar.zst")
+        self.assertIs(caught.exception.__cause__, failure)
 
     def test_missing_dependency_has_install_hint(self) -> None:
         with mock.patch.dict(sys.modules, {"boto3": None}):

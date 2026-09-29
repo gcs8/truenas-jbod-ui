@@ -17,9 +17,10 @@ candidate, oldest first. The guarantees, in order:
 
 ``LifecycleManager.plan(now)`` is a dry run. ``apply(plan, resolver)`` deletes
 exactly the planned items, tombstoning each in the catalog. A location whose
-target cannot be opened is skipped (recorded in ``ApplyResult.failed_locations``)
-while the other locations are still groomed; any other unexpected error stops
-the run with the partial progress in the result.
+target cannot be opened, or whose deletion reports a connection/timeout
+failure, is skipped (recorded in ``ApplyResult.failed_locations``) while the
+other locations are still groomed; any other unexpected error stops the run
+with the partial progress in the result.
 """
 
 from __future__ import annotations
@@ -55,7 +56,8 @@ class GroomableTarget(Protocol):
     ``delete`` may either return quietly (the transport targets in
     ``transport.py`` are idempotent) or raise ``FileNotFoundError`` when the
     object is already gone; only the latter is reported as ``already_missing``.
-    Any other exception is treated as unexpected and stops ``apply``.
+    Connection and timeout errors make that location unavailable. Any other
+    exception is treated as unexpected and stops ``apply``.
     """
 
     def list(self, prefix: str = "") -> list[Any]: ...
@@ -256,8 +258,9 @@ class LifecycleManager:
         deleted) and must not have become the newest verified copy, and while
         the claim is held it cannot be pinned. An object already gone from its
         location is tombstoned as missing. When a location's target cannot be
-        resolved, that location's items are skipped and the others continue.
-        Any other failure releases the claim and stops the run.
+        resolved, or deletion reports a connection/timeout failure, that
+        location's items are skipped and the others continue. Any other failure
+        releases the claim and stops the run.
         """
 
         clock = now or (lambda: datetime.now(timezone.utc))
@@ -302,6 +305,13 @@ class LifecycleManager:
                 target.delete(record.name)
             except FileNotFoundError:
                 gone = True
+            except (ConnectionError, TimeoutError) as exc:
+                self.catalog.release_deletion(record.artifact_id)
+                message = f"{type(exc).__name__}: {exc}"
+                failed_locations[record.location] = message
+                first_failure = first_failure or (item, message)
+                skipped.append(item)
+                continue
             except Exception as exc:  # noqa: BLE001 - reported, not swallowed
                 self.catalog.release_deletion(record.artifact_id)
                 return stop(f"{type(exc).__name__}: {exc}")

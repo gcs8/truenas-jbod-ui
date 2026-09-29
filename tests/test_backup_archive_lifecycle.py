@@ -424,6 +424,32 @@ class LifecycleApplyTests(CatalogCase):
         for item in remote_items:
             self.assertIsNotNone(self.catalog.get(item.record.artifact_id))
 
+    def test_delete_connection_failure_skips_only_its_own_location(self) -> None:
+        plan = self.manager.plan(NOW)
+        local_items = tuple(i for i in plan.items if i.record.location == "local")
+        remote_items = tuple(i for i in plan.items if i.record.location == "nas-1")
+        self.assertLess(plan.items.index(remote_items[0]), plan.items.index(local_items[-1]))
+
+        class LazyUnavailableTarget(FakeTarget):
+            def delete(self, name: str) -> None:
+                raise ConnectionRefusedError("synthetic lazy connection refused")
+
+        unavailable = LazyUnavailableTarget({r.name: r.size for r in self.remote_records})
+        resolver = local_target_resolver(self.backup_dir, remote={"nas-1": unavailable}.__getitem__)
+        result = self.manager.apply(plan, resolver)
+
+        self.assertEqual(result.deleted, local_items)
+        self.assertEqual(
+            dict(result.failed_locations),
+            {"nas-1": "ConnectionRefusedError: synthetic lazy connection refused"},
+        )
+        self.assertEqual(result.failed, remote_items[0])
+        self.assertEqual(result.not_attempted, remote_items[1:])
+        self.assertFalse(result.location_complete("nas-1"))
+        self.assertTrue(result.location_complete("local"))
+        for item in remote_items:
+            self.assertIsNotNone(self.catalog.get(item.record.artifact_id))
+
     def test_location_complete_is_false_only_for_the_failed_location(self) -> None:
         plan = self.manager.plan(NOW)
         local_items = tuple(i for i in plan.items if i.record.location == "local")
