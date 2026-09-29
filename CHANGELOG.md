@@ -259,6 +259,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Made the backup archive format a choice in the admin Backups settings editor
+  so the editor can save again; a number input had turned the value into null.
+  (#803)
 - Checked the length and SHA-256 of a backup copy the admin service downloads
   from the scheduler and refused a short or altered transfer instead of
   passing it on. (#818)

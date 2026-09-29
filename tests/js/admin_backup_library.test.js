@@ -1083,8 +1083,9 @@ function syntheticPolicyView(overrides = {}) {
     revision: "rev-1",
     classes: {
       config: { values: { enabled: true, local_keep: 30, remote_keep: null, remote_max_age_days: null, debounce_seconds: 30, max_delay_seconds: 600 }, locked: {} },
-      full: { values: { enabled: false, local_keep: 7, remote_keep: null, remote_max_age_days: 90, schedule: "0 3 * * *" }, locked: { schedule: "BACKUP_FULL_SCHEDULE" } },
+      full: { values: { enabled: false, local_keep: 7, remote_keep: null, remote_max_age_days: 90, schedule: "0 3 * * *", archive_format: "tar.zst" }, locked: { schedule: "BACKUP_FULL_SCHEDULE" } },
     },
+    archive_formats: ["7z", "tar.zst"],
     targets: [{
       values: { target_id: "office-nas", label: "Office NAS", enabled: true, provider: "sftp", root: "/srv/backups/jbod", hostname: "nas.example.test", username: "backup", known_hosts_path: "/run/backup-secrets/archive_known_hosts" },
       original_target_id: "office-nas",
@@ -1151,6 +1152,48 @@ test("saving sends edits, file-path secret changes and clears, never locked valu
   }
   assert.match(elements.dialog.textContent, /Restart the backup scheduler/);
   assert.match(banners.at(-1)[0], /Backup settings saved/);
+});
+
+test("the archive format is a choice of the allowed values and saves as a string", async () => {
+  const sent = [];
+  const api = fakeApi({
+    "GET /api/admin/backups/policy": () => syntheticPolicyView(),
+    "PUT /api/admin/backups/policy": ({ options }) => {
+      sent.push(JSON.parse(options.body));
+      return { ...syntheticPolicyView({ revision: "rev-2" }), ok: true, restart_required: true };
+    },
+  });
+  const { elements, library } = mount({ api });
+  await library.load();
+  await library.actions.openPolicyEditor(elements.editButton);
+  await settle();
+  const select = elements.dialog.querySelector("#backup-edit-full-archive_format");
+  assert.equal(select.tagName, "SELECT");
+  assert.deepEqual(select.querySelectorAll("option").map((option) => option.getAttribute("value")), ["7z", "tar.zst"]);
+  assert.equal(select.value, "tar.zst");
+  await library.actions.savePolicy();
+  assert.equal(sent[0].classes.full.archive_format, "tar.zst", "an untouched format round-trips as the string, not null");
+  elements.dialog.querySelector("#backup-edit-full-archive_format").value = "7z";
+  await library.actions.savePolicy();
+  assert.equal(sent[1].classes.full.archive_format, "7z");
+});
+
+test("an archive format set in the environment renders disabled and is never sent", async () => {
+  let sent = null;
+  const locked = syntheticPolicyView();
+  locked.classes.full.locked.archive_format = "BACKUP_FULL_ARCHIVE_FORMAT";
+  const api = fakeApi({
+    "GET /api/admin/backups/policy": () => locked,
+    "PUT /api/admin/backups/policy": ({ options }) => { sent = JSON.parse(options.body); return syntheticPolicyView(); },
+  });
+  const { elements, library } = mount({ api });
+  await library.load();
+  await library.actions.openPolicyEditor(elements.editButton);
+  await settle();
+  assert.equal(elements.dialog.querySelector("#backup-edit-full-archive_format").disabled, true);
+  assert.match(elements.dialog.textContent, /Set by BACKUP_FULL_ARCHIVE_FORMAT in the environment/);
+  await library.actions.savePolicy();
+  assert.equal("archive_format" in sent.classes.full, false);
 });
 
 test("one click on Add a target or Remove this target acts once, with the dialog inside the section", async () => {

@@ -30,7 +30,7 @@ import stat
 from collections.abc import Callable, Mapping
 from dataclasses import fields
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, get_args
 
 import yaml
 
@@ -186,6 +186,7 @@ def load_editor_view(config_path: str | Path, environ: Mapping[str, str]) -> dic
         "targets": targets,
         "targets_locked_by": targets_lock,
         "providers": list(PROVIDERS),
+        "archive_formats": list(get_args(FullClassPolicy.model_fields["archive_format"].annotation)),
         "target_fields": list(TARGET_PLAIN_FIELDS),
         "secret_fields": list(SECRET_FILE_FIELDS),
         "problems": problems,
