@@ -151,7 +151,7 @@ for (const status of [400, 403, 409, 422]) {
   });
 }
 
-for (const options of [{ confirm: false }, { offline: true }, { fileError: true }]) {
+for (const options of [{ confirm: false }, { fileError: true }]) {
   test(`uploaded restore local refusal never dispatches apply: ${JSON.stringify(options)}`, async () => {
     const fixture = uploadFixture(options);
     await fixture.api.runImportBackup();
@@ -163,6 +163,15 @@ for (const options of [{ confirm: false }, { offline: true }, { fileError: true 
     else assert.equal(fixture.banners.at(-1).tone, "error");
   });
 }
+
+test("uploaded restore reaches local service despite offline hint", async () => {
+  const fixture = uploadFixture({ offline: true });
+  await fixture.api.runImportBackup();
+  assert.equal(fixture.calls.length, 2);
+  assert.equal(fixture.refreshes, 1);
+  assert.match(fixture.elements.backupImportResult.textContent, /^Imported synthetic/);
+  assert.equal(fixture.timers.size, 0);
+});
 
 for (const failures of [{}, { ui: "Synthetic start failure" }]) {
   test(`uploaded restore accepts decided success with restart failures ${JSON.stringify(failures)}`, async () => {
