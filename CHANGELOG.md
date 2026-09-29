@@ -262,6 +262,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Correct QA mapping revisions, retain recovery files until verified cleanup,
+  finalize truthful receipts, and constrain Compose-matrix child runtimes. (#759)
 - Preserve Storage Fabric path identity, diagnostic placement, complete path
   health and scoped aliases; refuse unsafe alias-store mutations. (#760)
 - Bound SSH command execution and retain worker, channel and reusable-session
