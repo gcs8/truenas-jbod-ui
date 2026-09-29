@@ -13441,11 +13441,19 @@ class InventoryServiceSnapshotStateBoundsTests(unittest.IsolatedAsyncioTestCase)
             await older_started.wait()
             await service.get_snapshot(force_refresh=True, selected_enclosure_id="enc-b")
             self.assertTrue(service._remove_snapshot_state_key("enc-b"))
+            survivor = older.model_copy(update={"selected_enclosure_id": "enc-a"})
+            survivor_keys = {"enc-a", *(f"survivor-{index}" for index in range(63))}
+            for key in survivor_keys:
+                service._cache[key] = survivor
+                service._cache_until[key] = datetime.now(timezone.utc) + timedelta(minutes=1)
+                service._snapshot_published_sequence[key] = service._snapshot_request_sequence
+                service._touch_snapshot_key(key)
+            self.assertEqual(service._snapshot_state_keys(), survivor_keys)
             release_older.set()
 
             with self.assertRaises(inventory_module.SnapshotStateBusyError):
                 await older_request
-            self.assertNotIn("enc-b", service._snapshot_state_keys())
+            self.assertEqual(service._snapshot_state_keys(), survivor_keys)
 
     async def test_perf_metadata_uses_only_canonical_snapshot_keys(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

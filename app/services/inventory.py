@@ -1422,6 +1422,13 @@ class InventoryService:
             # the old key before taking the destination lock so opposite redirects
             # cannot deadlock. Request ordering prevents an older redirected build
             # from overwriting a newer explicit refresh that won the destination.
+            if request_sequence < self._canonical_options_request_sequence and not (
+                self._snapshot_published_sequence.get(publication_key, -1) > request_sequence
+                and publication_key in self._cache
+            ):
+                # Reject before admission so a stale redirect cannot evict an
+                # unrelated valid key merely to fail the sequence fence below.
+                raise SnapshotStateBusyError()
             self._admit_snapshot_key(publication_key)
             redirected_publication = publication_key != cache_key
             if redirected_publication:
