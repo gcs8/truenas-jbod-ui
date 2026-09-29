@@ -259,10 +259,25 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Matched cron schedules like classic cron when a day field starts with `*`:
+  `0 3 */2 * 1` now runs only on Mondays that fall on an odd day of the month,
+  not on every Monday plus every second day. Searched a complete Gregorian
+  calendar cycle so sparse leap-day intersections remain valid. (#817)
+- Refused a full backup schedule that never matches a real date (for example
+  `0 0 30 2 *`) at validation time, instead of letting the scheduler exit on
+  start. (#793)
+- Followed the `TZ` zone for the full backup schedule so a daylight-saving
+  change neither doubles nor delays a run. (#794)
 - Treat malformed UTF-8 slot-detail caches as corrupt without blocking
   startup; preserve their bytes until a legitimate save rebuilds them. (#752)
 - Emit JSON log timestamps in UTC to match their `Z` suffix, while leaving
   text log timestamps in local time. (#753)
+- Verified large S3 copies by reading them back when the ETag is not a plain
+  MD5, and never catalogued a copy that could not be verified, so grooming no
+  longer deletes it after a day. Bounded S3 verification readback to the uploaded
+  size plus at most one chunk, retaining failed-copy cleanup. (#795)
+- Capped remote backup downloads at the catalogued size so a hostile or broken
+  remote cannot fill the state volume before the catalogue check. (#796)
 - Fixed public-demo validation rejecting UI labels as serial numbers, while
   retaining non-demo serial checks and rejecting ambiguous nested JSON. (#746)
 - Drew the Storage Fabric bay grid in the enclosure's physical layout while a
