@@ -11,6 +11,7 @@ from typing import Any, Callable
 
 from admin_service.services.runtime_control import DockerRuntimeError, reserve_runtime_targets
 from app.models.domain import DebugBundleExportRequest, SystemBackupExportRequest
+from history_service.system_backup import DEBUG_STATE_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -318,10 +319,11 @@ class AdminMaintenanceService:
         restart_services: bool = True,
     ) -> tuple[Any, MaintenanceOutcome]:
         with reserve_runtime_targets(self._reservation_targets):
-            runtime_before = self.runtime_service.status_payload()
+            include_debug_state = not payload.included_paths or DEBUG_STATE_KEY in payload.included_paths
+            runtime_before = self.runtime_service.status_payload() if include_debug_state else None
 
             def operation(stopped_containers: list[str]) -> Any:
-                runtime_after_stop = self.runtime_service.status_payload()
+                runtime_after_stop = self.runtime_service.status_payload() if include_debug_state else None
                 return self.backup_service.export_debug_bundle_to_file(
                     encrypt=payload.encrypt,
                     passphrase=payload.passphrase,
@@ -329,15 +331,20 @@ class AdminMaintenanceService:
                     included_paths=payload.included_paths,
                     scrub_secrets=payload.scrub_secrets,
                     scrub_disk_identifiers=payload.scrub_disk_identifiers,
-                    runtime_payload={
-                        "before_stop": runtime_before,
-                        "after_stop": runtime_after_stop,
-                    },
-                    maintenance_payload={
-                        "stop_services": stop_services,
-                        "restart_services": restart_services,
-                        "stopped_containers": list(stopped_containers),
-                    },
+                    runtime_payload=(
+                        {"before_stop": runtime_before, "after_stop": runtime_after_stop}
+                        if include_debug_state
+                        else None
+                    ),
+                    maintenance_payload=(
+                        {
+                            "stop_services": stop_services,
+                            "restart_services": restart_services,
+                            "stopped_containers": list(stopped_containers),
+                        }
+                        if include_debug_state
+                        else None
+                    ),
                 )
 
             return self._run_with_quiesced_services(

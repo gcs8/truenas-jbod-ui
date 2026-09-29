@@ -399,7 +399,7 @@ def resolve_saved_secondary_secret(
 @lru_cache
 def get_backup_service() -> SystemBackupService:
     history_settings = get_history_settings()
-    return SystemBackupService(history_settings, get_history_store())
+    return SystemBackupService(history_settings, get_history_store(), get_settings())
 
 
 @lru_cache

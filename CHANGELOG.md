@@ -262,6 +262,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Skipped excluded debug-export sources before reading or parsing them while
+  preserving selected-source validation and unselected manifest metadata. (#849)
+
 - Enforced backup source-read and encrypted-export admission limits, cleaned up
   failed restore staging, and aligned inspection with restore admission. (#850)
 

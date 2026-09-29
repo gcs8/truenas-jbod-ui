@@ -2173,9 +2173,15 @@ class _PreadView:
 
 
 class SystemBackupService:
-    def __init__(self, history_settings: HistorySettings, store: HistoryStore) -> None:
+    def __init__(
+        self,
+        history_settings: HistorySettings,
+        store: HistoryStore,
+        app_settings: Settings | None = None,
+    ) -> None:
         self.history_settings = history_settings
         self.store = store
+        self.app_settings = app_settings
         self._captured_config_files: Mapping[Path, bytes | None] = {}
 
     def with_captured_config_files(self, files: Mapping[Path, bytes | None]) -> SystemBackupService:
@@ -2975,9 +2981,9 @@ class SystemBackupService:
         runtime_payload: dict[str, Any] | None = None,
         maintenance_payload: dict[str, Any] | None = None,
     ) -> FileBackupArtifact:
-        app_settings = self._load_app_settings()
-        exported_at = datetime.now(timezone.utc)
         selected_groups = self._resolve_selected_groups(included_paths, bundle_type="debug")
+        app_settings = self.app_settings if self.app_settings is not None else self._load_app_settings()
+        exported_at = datetime.now(timezone.utc)
         sensitive_selection = [key for key in selected_groups if key in SENSITIVE_GROUP_KEYS]
         if scrub_secrets and sensitive_selection:
             labels = ", ".join(BACKUP_GROUP_METADATA[key]["label"] for key in sensitive_selection)
@@ -4679,13 +4685,15 @@ class SystemBackupService:
                     source_snapshot=source_snapshot,
                 )
             elif group_key == DEBUG_STATE_KEY:
-                content_bytes = self._build_debug_state_bytes(
-                    app_settings,
-                    runtime_payload=runtime_payload,
-                    maintenance_payload=maintenance_payload,
-                    selected_groups=selected_groups,
-                    scrubber=scrubber,
-                    exported_at=exported_at,
+                content_bytes = (
+                    self._build_debug_state_bytes(
+                        app_settings,
+                        runtime_payload=runtime_payload,
+                        maintenance_payload=maintenance_payload,
+                        selected_groups=selected_groups,
+                        scrubber=scrubber,
+                        exported_at=exported_at,
+                    ) if selected else b""
                 )
                 group, members = self._collect_generated_file_group(
                     group_key,
@@ -4694,9 +4702,11 @@ class SystemBackupService:
                     source_path=None,
                 )
             elif group_key == DEBUG_README_KEY:
-                content_bytes = self._build_debug_readme_bytes(
-                    scrub_secrets=bool(scrubber and scrubber.scrub_secrets),
-                    scrub_disk_identifiers=bool(scrubber and scrubber.scrub_disk_identifiers),
+                content_bytes = (
+                    self._build_debug_readme_bytes(
+                        scrub_secrets=bool(scrubber and scrubber.scrub_secrets),
+                        scrub_disk_identifiers=bool(scrubber and scrubber.scrub_disk_identifiers),
+                    ) if selected else b""
                 )
                 group, members = self._collect_generated_file_group(
                     group_key,
