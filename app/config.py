@@ -1053,6 +1053,13 @@ _RUNTIME_OVERRIDE_LOCKS_GUARD = threading.Lock()
 _RUNTIME_OVERRIDE_LOCKS: WeakValueDictionary[Path, Any] = WeakValueDictionary()
 
 
+def _runtime_override_lock_key(path: Path) -> Path:
+    # Resolve dot segments and relative roots without following the final
+    # symlink. Atomic replacement may turn that symlink into a regular file;
+    # the pathname must retain the same process-local transaction lock.
+    return Path(os.path.abspath(os.fspath(path)))
+
+
 def save_runtime_behavior_overrides(settings: Settings, values: dict[str, Any]) -> dict[str, Any]:
     """Serialize partial updates from this process through response construction.
 
@@ -1062,7 +1069,7 @@ def save_runtime_behavior_overrides(settings: Settings, values: dict[str, Any]) 
         raise ValueError("Runtime behavior settings payload must be a mapping.")
 
     runtime_overrides_path = Path(settings.paths.runtime_overrides_file)
-    lock_key = runtime_overrides_path.resolve()
+    lock_key = _runtime_override_lock_key(runtime_overrides_path)
     with _RUNTIME_OVERRIDE_LOCKS_GUARD:
         lock = _RUNTIME_OVERRIDE_LOCKS.get(lock_key)
         if lock is None:
@@ -1178,7 +1185,11 @@ def _apply_config_path_relative_defaults(
     legacy = _legacy_container_layout_paths()
     merged["config_file"] = derived["config_file"]
 
-    merged_paths = merged.setdefault("paths", {})
+    merged_paths = merged.get("paths")
+    if not isinstance(merged_paths, dict):
+        # Preserve the invalid shape for Settings validation and its
+        # source-aware ConfigurationError instead of indexing it here.
+        return merged
     for key in (
         "mapping_file",
         "sas_fabric_alias_file",
@@ -1187,7 +1198,10 @@ def _apply_config_path_relative_defaults(
         "slot_detail_cache_file",
         "runtime_overrides_file",
     ):
-        if key not in merged_paths or merged_paths.get(key) in {defaults["paths"][key], legacy[key]}:
+        current = merged_paths.get(key)
+        if key not in merged_paths or (
+            isinstance(current, str) and current in {defaults["paths"][key], legacy[key]}
+        ):
             merged_paths[key] = derived[key]
 
     # A known-hosts path the operator chose (config file, per system, or
@@ -1452,7 +1466,14 @@ def load_settings(*, running_restart_only: Settings | None = None) -> Settings:
     config_path = Path(os.getenv("APP_CONFIG_PATH", defaults["config_file"]))
     yaml_config = _load_yaml_config(config_path)
     merged = _deep_merge(defaults, yaml_config)
-    configured_overrides_path = merged["paths"]["runtime_overrides_file"]
+    raw_paths = merged.get("paths")
+    configured_overrides_path = (
+        raw_paths.get("runtime_overrides_file")
+        if isinstance(raw_paths, dict)
+        else defaults["paths"]["runtime_overrides_file"]
+    )
+    if not isinstance(configured_overrides_path, str):
+        configured_overrides_path = defaults["paths"]["runtime_overrides_file"]
     if configured_overrides_path in {
         defaults["paths"]["runtime_overrides_file"],
         _legacy_container_layout_paths()["runtime_overrides_file"],
@@ -1464,6 +1485,17 @@ def load_settings(*, running_restart_only: Settings | None = None) -> Settings:
         else configured_overrides_path
     )
     runtime_overrides = _load_runtime_overrides_config(runtime_overrides_path)
+    if running_restart_only is not None and Path(configured_overrides_path) != runtime_overrides_path:
+        try:
+            pending_runtime_overrides = _load_runtime_overrides_config(Path(configured_overrides_path))
+            Settings.model_validate(_deep_merge(defaults, pending_runtime_overrides))
+        except (OSError, yaml.YAMLError, ValueError, ValidationError) as exc:
+            raise ConfigurationError(
+                [
+                    f"paths.runtime_overrides_file in {config_path}: "
+                    f"the new runtime override file is invalid ({type(exc).__name__})."
+                ]
+            ) from None
     for key, suggestion in collect_unknown_config_key_suggestions(yaml_config):
         logger.warning("%s", _unknown_key_message(config_path, key, suggestion))
     merged = _deep_merge(merged, runtime_overrides)
@@ -1493,7 +1525,12 @@ def load_settings(*, running_restart_only: Settings | None = None) -> Settings:
         defaults=defaults,
     )
 
-    configured_profile_path = merged.get("paths", {}).get("profile_file", defaults["paths"]["profile_file"])
+    current_paths = merged.get("paths")
+    configured_profile_path = (
+        current_paths.get("profile_file", defaults["paths"]["profile_file"])
+        if isinstance(current_paths, dict)
+        else defaults["paths"]["profile_file"]
+    )
     profile_path = Path(
         running_restart_only.paths.profile_file
         if running_restart_only is not None

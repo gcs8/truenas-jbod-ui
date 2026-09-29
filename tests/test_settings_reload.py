@@ -869,6 +869,41 @@ class RuntimeOverrideOwnershipTests(ConfigReloadTestCase):
         self.assertEqual(app_config.load_settings().app.smart_cache_ttl_seconds, 999)
         self.assertEqual(app_config.load_settings().paths.runtime_overrides_file, str(pending))
 
+    def test_pending_custom_path_is_validated_before_restart(self) -> None:
+        from app.config_errors import ConfigurationError
+
+        self._custom_path()
+        running = get_settings()
+        pending = self.root / "pending-invalid.yaml"
+        pending.write_text("app:\n  smart_cache_ttl_seconds: invalid\n", encoding="utf-8")
+        self.config["paths"]["runtime_overrides_file"] = str(pending)
+        self._write_config()
+
+        with self.assertRaises(ConfigurationError):
+            app_config.load_settings(running_restart_only=running)
+
+    def test_malformed_paths_report_configuration_error(self) -> None:
+        from app.config_errors import ConfigurationError
+
+        for paths in (None, [], {"runtime_overrides_file": []}):
+            with self.subTest(paths=paths):
+                self.config["paths"] = paths
+                self._write_config()
+                with self.assertRaises(ConfigurationError):
+                    app_config.load_settings()
+
+    def test_lock_key_survives_symlink_replacement(self) -> None:
+        target = self.root / "target-overrides.yaml"
+        target.write_text("{}\n", encoding="utf-8")
+        link = self.root / "linked-overrides.yaml"
+        link.symlink_to(target)
+        before = app_config._runtime_override_lock_key(link)
+
+        link.unlink()
+        link.write_text("{}\n", encoding="utf-8")
+
+        self.assertEqual(app_config._runtime_override_lock_key(link), before)
+
     def test_save_with_pending_path_returns_the_written_running_file(self) -> None:
         custom = self._custom_path()
         running = get_settings()
