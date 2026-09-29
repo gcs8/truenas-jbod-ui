@@ -12,7 +12,9 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+import threading
 from typing import Any
+from weakref import WeakValueDictionary
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -22,6 +24,23 @@ from app import __version__
 logger = logging.getLogger(__name__)
 
 STATE_FILENAME = "last_seen_version.json"
+
+# The shipped single-process server calls both operations in worker threads.
+# Keep each transaction serialized, not just its write; unrelated paths can
+# proceed independently. Weak values retain only locks held by active callers.
+# This is process-local coordination, not a cross-process file lock.
+_state_locks: WeakValueDictionary[Path, threading.Lock] = WeakValueDictionary()
+_state_locks_guard = threading.Lock()
+
+
+def _state_lock(path: Path) -> threading.Lock:
+    key = path.resolve()
+    with _state_locks_guard:
+        lock = _state_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _state_locks[key] = lock
+        return lock
 
 
 class UpgradeNoticeDismissRequest(BaseModel):
@@ -106,20 +125,21 @@ def current_notice(
     is running now: a stale record for an older version is replaced.
     """
     path = state_path(data_dir)
-    state = _read_state(path)
-    last_seen = state.get("last_seen_version")
-    pending = state.get("notice") if isinstance(state.get("notice"), dict) else None
+    with _state_lock(path):
+        state = _read_state(path)
+        last_seen = state.get("last_seen_version")
+        pending = state.get("notice") if isinstance(state.get("notice"), dict) else None
 
-    if not isinstance(last_seen, str) or not last_seen:
-        # Absence cannot distinguish a fresh install from an uninstrumented upgrade.
-        pending = {"version": version, "previous": ""}
-        _write_state(path, {"last_seen_version": version, "notice": pending})
-    elif last_seen != version:
-        pending = {"version": version, "previous": last_seen}
-        _write_state(path, {"last_seen_version": version, "notice": pending})
-    elif pending is not None and pending.get("version") != version:
-        pending = None
-        _write_state(path, {"last_seen_version": version})
+        if not isinstance(last_seen, str) or not last_seen:
+            # Absence cannot distinguish a fresh install from an uninstrumented upgrade.
+            pending = {"version": version, "previous": ""}
+            _write_state(path, {"last_seen_version": version, "notice": pending})
+        elif last_seen != version:
+            pending = {"version": version, "previous": last_seen}
+            _write_state(path, {"last_seen_version": version, "notice": pending})
+        elif pending is not None and pending.get("version") != version:
+            pending = None
+            _write_state(path, {"last_seen_version": version})
 
     if pending is None:
         return None
@@ -140,13 +160,14 @@ def dismiss_notice(
     if notice_version != version:
         raise UpgradeNoticeVersionConflict
     path = state_path(data_dir)
-    state = _read_state(path)
-    last_seen = state.get("last_seen_version")
-    pending = state.get("notice") if isinstance(state.get("notice"), dict) else None
-    if (isinstance(last_seen, str) and last_seen and last_seen != version) or (
-        pending is not None and pending.get("version") != notice_version
-    ):
-        raise UpgradeNoticeVersionConflict
-    if "notice" not in state and state.get("last_seen_version") == version:
-        return True
-    return _write_state(path, {"last_seen_version": version})
+    with _state_lock(path):
+        state = _read_state(path)
+        last_seen = state.get("last_seen_version")
+        pending = state.get("notice") if isinstance(state.get("notice"), dict) else None
+        if (isinstance(last_seen, str) and last_seen and last_seen != version) or (
+            pending is not None and pending.get("version") != notice_version
+        ):
+            raise UpgradeNoticeVersionConflict
+        if "notice" not in state and state.get("last_seen_version") == version:
+            return True
+        return _write_state(path, {"last_seen_version": version})

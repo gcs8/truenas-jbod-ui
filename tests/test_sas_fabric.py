@@ -67,6 +67,7 @@ from app.services.sas_fabric import (
     parse_mpr_adapter_summary,
     parse_mpr_devices,
     parse_mpr_dmesg_events,
+    parse_mpr_enclosures,
     parse_mpr_expanders,
     parse_mpr_sysctl_locations,
     parse_pciconf_sas_controllers,
@@ -838,6 +839,133 @@ May 19 21:16:03 The-Archive (da44:mpr0:0:180:0): CAM status: CCB request complet
         self.assertEqual(rows[1]["timestamp_raw"], "May 19 21:14:06")
         self.assertEqual(rows[2]["timestamp_raw"], "May 19 21:16:03")
         self.assertEqual(rows[3]["timestamp_raw"], "[12345.678901]")
+
+    # Pin application severity independently of the decoder's label/code tables.
+    SCSI_STATUS_CASES = (
+        (0x00, "GOOD", "info"),
+        (0x02, "CHECK CONDITION", "warning"),
+        (0x04, "CONDITION MET", "info"),
+        (0x08, "BUSY", "warning"),
+        (0x18, "RESERVATION CONFLICT", "warning"),
+        (0x28, "TASK SET FULL", "warning"),
+        (0x30, "ACA ACTIVE", "warning"),
+        (0x40, "TASK ABORTED", "error"),
+    )
+
+    def test_scsi_status_rows_have_canonical_severity_for_all_supported_forms(self) -> None:
+        self.assertEqual(dict((code, text) for code, text, _ in self.SCSI_STATUS_CASES), scsi_module.SCSI_STATUS_CODES)
+        self.assertEqual({text for _, text, _ in self.SCSI_STATUS_CASES}, set(scsi_module.SCSI_STATUS_LABELS))
+        for code, text, severity in self.SCSI_STATUS_CASES:
+            forms = (text, text.lower(), text.replace(" ", "_"), text.replace(" ", "-"),
+                     f"0x{code:02x}", f"{code:02x}", f"{code:02x}h", f"{code:x}")
+            for form in forms:
+                for prefix in ("(da60:mpr0:0:180:0):", "mpr0:"):
+                    with self.subTest(status=text, form=form, prefix=prefix):
+                        events = parse_mpr_dmesg_events(f"{prefix} SCSI status: {form}")
+                        row = events["by_controller"]["mpr0"]["event_table"]["rows"][0]
+                        self.assertEqual(row["severity"], severity)
+                        self.assertEqual(events["recent_events"][0]["severity"], severity)
+                        self.assertEqual(row["family"], "aborted_command" if code == 0x40 else "scsi_status")
+                        self.assertEqual(row["scsi_status"].upper(), text)
+                        self.assertEqual(row["decode_confidence"], "standard")
+                        self.assertEqual(row["decode_source"], "t10_scsi_status")
+
+    def test_scsi_status_summaries_use_canonical_severity_before_aggregation(self) -> None:
+        for code, text, severity in self.SCSI_STATUS_CASES:
+            for form in (text, f"0x{code:02x}", f"{code:02x}", f"{code:02x}h"):
+                events = parse_mpr_dmesg_events(f"(da60:mpr0:0:180:0): SCSI status: {form}")
+                for scope, key in (("by_controller", "mpr0"), ("by_device", "da60"),
+                                   ("by_controller_target", "mpr0:180")):
+                    with self.subTest(status=text, form=form, scope=scope):
+                        summary = events[scope][key]
+                        self.assertEqual(summary["event_count"], 1)
+                        self.assertEqual(summary["error_count"], int(severity == "error"))
+                        self.assertEqual(summary["primary_fault"]["severity"], severity)
+                        self.assertEqual(summary["top_findings"][0]["severity"], severity)
+                        self.assertEqual(summary["top_findings"][0]["count"], 1)
+                        self.assertEqual(summary["recent_events"][0]["severity"], severity)
+                        self.assertEqual(summary["event_table"]["rows"][0]["severity"], severity)
+                        family = "aborted_command" if code == 0x40 else "scsi_status"
+                        self.assertEqual(summary["fault_family_counts"], {family: 1})
+                        self.assertIn(f"{int(severity == 'error')} errors, 0 retries", summary["operator_summary"])
+
+    def test_scsi_status_full_snapshot_preserves_numeric_text_severity_parity(self) -> None:
+        system = SystemConfig(id="synthetic-core", label="Synthetic CORE", truenas=TrueNASConfig(platform="core"))
+        snapshot = InventorySnapshot(
+            slots=[SlotView(
+                slot=0, slot_label="00", row_index=0, column_index=0, present=True,
+                state=SlotState.healthy, device_name="da60",
+                raw_status={
+                    "enclosure_id": parse_mpr_enclosures(MPR0_ENCLOSURES)[0]["logical_id"],
+                    "ses_slot_number": 1,
+                },
+                multipath=MultipathView(
+                    name="mpath0", device_name="multipath/disk0",
+                    members=[MultipathMember(device_name="da60", state="ACTIVE", controller_label="mpr0")],
+                ),
+            )],
+            refresh_interval_seconds=30,
+        )
+        expected_severities = [severity for _, _, severity in self.SCSI_STATUS_CASES]
+        expected_labels = [f"SCSI status: {text.title()}".replace("Aca", "ACA") for _, text, _ in self.SCSI_STATUS_CASES]
+        for form_kind in ("text", "prefixed", "bare", "suffixed", "mixed"):
+            statuses = []
+            for index, (code, text, _) in enumerate(self.SCSI_STATUS_CASES):
+                forms = {"text": text, "prefixed": f"0x{code:02x}", "bare": f"{code:02x}",
+                         "suffixed": f"{code:02x}h", "mixed": text if index % 2 else f"0x{code:02x}"}
+                statuses.append(forms[form_kind])
+            event_output = "\n".join(f"(da60:mpr0:0:180:0): SCSI status: {value}" for value in statuses)
+            fabric = build_sas_fabric_snapshot(system=system, snapshot=snapshot, ssh_outputs={
+                "sudo -n /usr/sbin/mprutil show adapters": MPR_ADAPTERS,
+                "sudo -n /usr/sbin/mprutil -u 0 show adapter": MPR0_ADAPTER,
+                "sudo -n /usr/sbin/mprutil -u 0 show expanders": MPR0_EXPANDERS,
+                "sudo -n /usr/sbin/mprutil -u 0 show enclosures": MPR0_ENCLOSURES,
+                "sudo -n /usr/sbin/mprutil -u 0 show devices": MPR0_DEVICES,
+                CORE_MPR_DMESG_EVENTS_COMMAND: event_output,
+            })
+            serialized = json.loads(fabric.model_dump_json())
+            summaries = [(node["id"], node["metrics"]["kernel_diagnostics"])
+                         for node in serialized["nodes"] if node.get("metrics", {}).get("kernel_diagnostics")]
+            bay_trace = next(trace for trace in serialized["traces"] if trace["id"] == "bay:0")
+            members = bay_trace["metrics"]["mpr_devices"]
+            self.assertEqual(len(members), 1)
+            self.assertEqual(members[0]["member_device_name"], "da60")
+            summaries.append(("bay:0/da60", members[0]["diagnostics"]))
+            self.assertEqual(len(summaries), 2)  # Controller and mapped member, not helper-only output.
+            self.assertIn("controller:mpr0", [node_id for node_id, _ in summaries])
+            for node_id, summary in summaries:
+                with self.subTest(form=form_kind, node=node_id):
+                    self.assertEqual(summary["event_count"], 8)
+                    self.assertEqual(summary["error_count"], 1)
+                    self.assertEqual(summary["fault_family_counts"], {"scsi_status": 7, "aborted_command": 1})
+                    table = summary["event_table"]
+                    self.assertEqual(table["total_count"], 8)
+                    self.assertFalse(table["truncated"])
+                    self.assertEqual([row["severity"] for row in table["rows"]], expected_severities)
+                    self.assertEqual([row["label"] for row in table["rows"]], expected_labels)
+                    self.assertEqual(summary["primary_fault"]["label"], "SCSI status: Task Aborted")
+                    self.assertEqual(summary["primary_fault"]["severity"], "error")
+                    self.assertEqual([finding["severity"] for finding in summary["top_findings"]],
+                                     ["error", "warning", "warning", "warning", "warning", "warning"])
+                    self.assertIn("1 errors, 0 retries", summary["operator_summary"])
+
+    def test_scsi_status_unknown_values_preserve_parser_fallback(self) -> None:
+        # Bare numerals remain hexadecimal, not decimal; do not broaden accepted syntax.
+        for value, severity in (("0xff", "info"), ("ffh", "info"), ("64", "info"),
+                                ("0X40", "info"), ("unlisted status", "info"), ("unlisted error", "error")):
+            with self.subTest(value=value):
+                events = parse_mpr_dmesg_events(f"(da60:mpr0:0:180:0): SCSI status: {value}")
+                row = events["by_device"]["da60"]["event_table"]["rows"][0]
+                self.assertEqual(row["severity"], severity)
+                self.assertEqual(row["scsi_status"], value)
+                self.assertEqual(row["decode_confidence"], "observed")
+                self.assertEqual(row["decode_source"], "kernel_message")
+                self.assertIn("not in the current local status-code table", row["decoder_note"])
+                self.assertNotIn("scsi_status_code", row)
+                for scope, key in (("by_controller", "mpr0"), ("by_device", "da60"),
+                                   ("by_controller_target", "mpr0:180")):
+                    self.assertEqual(events[scope][key]["error_count"], int(severity == "error"))
+                    self.assertEqual(events[scope][key]["primary_fault"]["severity"], severity)
 
     def test_parse_mpr_dmesg_events_decodes_cam_and_scsi_status_examples(self) -> None:
         events = parse_mpr_dmesg_events(
