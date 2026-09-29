@@ -262,6 +262,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Complete retained segmented rollup points across all eligible sources before
+  returning bounded results, preserving counts, extrema and weighted values. (#755)
 - Keep required QuantaStor inventory available when optional REST endpoints
   fail while opening or reading a response, retaining typed required errors. (#756)
 - Apply operation deadlines to normal TrueNAS inventory, slot-status and SMART
