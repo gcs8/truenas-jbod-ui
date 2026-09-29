@@ -1058,6 +1058,88 @@ class SchedulerApiTests(SchedulerTestBase):
         with scheduler._job("full"):
             self.assertEqual(asgi_call(app, "POST", "/internal/backups/run", {"backup_class": "full"})[0], 409)
 
+    def test_library_carries_the_last_grooming_outcome(self) -> None:
+        from history_service.backup_scheduler.api import build_app
+
+        scheduler = self.make({"full": {"enabled": True}, "targets": [TARGET]})
+        app = build_app(scheduler)
+        self.assertIsNone(json.loads(asgi_call(app, "GET", "/internal/backups")[1])["grooming"])
+        scheduler._record_grooming(
+            ok=False, deleted=2, detail="ConnectionRefusedError: refused", failed_locations={"nas": "refused"}
+        )
+        status, body = asgi_call(app, "GET", "/internal/backups")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["grooming"], {
+            "at": "2026-09-24T12:00:00+00:00", "ok": False, "deleted": 2,
+            "detail": "ConnectionRefusedError: refused", "failed_locations": {"nas": "refused"}})
+
+        # A location that opened but then failed a deletion is listed too, so
+        # the UI does not hide the error that stopped the run behind "nas".
+        from types import SimpleNamespace
+
+        from history_service.backup_archive.lifecycle import ApplyResult
+
+        stopped = SimpleNamespace(record=SimpleNamespace(location="local"))
+        manager = SimpleNamespace(
+            plan=lambda now: SimpleNamespace(items=(stopped,)),
+            apply=lambda plan, resolver, actor, now: ApplyResult(
+                deleted=(), already_missing=(), failed=stopped, error="PermissionError: denied",
+                failed_locations={"nas": "refused"},
+            ),
+        )
+        with patch.object(scheduler, "_manager", return_value=manager):
+            scheduler._groom_locked()
+        grooming = json.loads(asgi_call(app, "GET", "/internal/backups")[1])["grooming"]
+        self.assertEqual(grooming["detail"], "PermissionError: denied")
+        self.assertEqual(grooming["failed_locations"], {"nas": "refused", "local": "PermissionError: denied"})
+
+    def test_manual_lifecycle_apply_records_the_latest_grooming_outcome(self) -> None:
+        from types import SimpleNamespace
+
+        from history_service.backup_archive.lifecycle import ApplyResult
+        from history_service.backup_scheduler.api import build_app
+
+        scheduler = self.make({"full": {"enabled": True}, "targets": [TARGET]})
+        app = build_app(scheduler)
+        scheduler._record_grooming(ok=True, deleted=4, detail=None, failed_locations={})
+        failed: Any = SimpleNamespace(record=SimpleNamespace(location="local"))
+        result = ApplyResult(
+            deleted=(),
+            already_missing=(),
+            failed=failed,
+            error="PermissionError: denied",
+            failed_locations={"nas": "ConnectionError: unavailable"},
+        )
+        manager = SimpleNamespace(
+            plan=lambda now: SimpleNamespace(items=(failed,), guarded=()),
+            apply=lambda plan, resolver, actor, now: result,
+        )
+        record_grooming_result = scheduler._record_grooming_result
+
+        def assert_single_flight(applied_result: ApplyResult) -> None:
+            self.assertTrue(scheduler._job_lock.locked())
+            record_grooming_result(applied_result)
+
+        with (
+            patch.object(scheduler, "_manager", return_value=manager),
+            patch.object(scheduler, "_record_grooming_result", side_effect=assert_single_flight),
+        ):
+            token, _, _ = scheduler.plan()
+            self.assertIs(scheduler.apply(token), result)
+
+        status, body = asgi_call(app, "GET", "/internal/backups")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["grooming"], {
+            "at": "2026-09-24T12:00:00+00:00",
+            "ok": False,
+            "deleted": 0,
+            "detail": "PermissionError: denied",
+            "failed_locations": {
+                "nas": "ConnectionError: unavailable",
+                "local": "PermissionError: denied",
+            },
+        })
+
 
 class AdminProxyTests(unittest.TestCase):
     def setUp(self) -> None:

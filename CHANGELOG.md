@@ -259,6 +259,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Showed the last backup clean-up on the admin Backups page: when it ran, how
+  many copies it removed, and which target stopped it when it did not finish.
+  (#819)
 - Kept grooming the other locations when one remote target cannot be opened,
   built retention rules only for enabled targets, and reported the grooming
   outcome in the scheduler status and in backup health. (#797)

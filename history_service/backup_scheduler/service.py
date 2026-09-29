@@ -807,13 +807,20 @@ class BackupScheduler:
             result = manager.apply(plan, resolver, actor="scheduler", now=self._clock)
         if result.error:
             logger.warning("Backup grooming stopped early (%s).", result.error.split(":", 1)[0])
+        self._record_grooming_result(result)
+        return result
+
+    def _record_grooming_result(self, result: Any) -> None:
+        failed_locations = dict(result.failed_locations)
+        if result.failed is not None and result.error and result.failed.record.location not in failed_locations:
+            # A location that opened but then failed a deletion or claim stopped the run.
+            failed_locations[result.failed.record.location] = result.error
         self._record_grooming(
             ok=not result.error,
             deleted=len(result.deleted) + len(result.already_missing),
             detail=result.error,
-            failed_locations=result.failed_locations,
+            failed_locations=failed_locations,
         )
-        return result
 
     def _record_grooming(
         self, *, ok: bool, deleted: int, detail: str | None, failed_locations: Mapping[str, str]
@@ -850,7 +857,9 @@ class BackupScheduler:
         if entry is None or entry.expires_at < self._monotonic():
             raise LookupError("The grooming plan expired or was already used; preview it again.")
         with self._job("lifecycle"), self._resolver() as resolver:
-            return self._manager().apply(entry.plan, resolver, actor="admin", now=self._clock)
+            result = self._manager().apply(entry.plan, resolver, actor="admin", now=self._clock)
+            self._record_grooming_result(result)
+        return result
 
     # -- library queries ---------------------------------------------------------------
 
@@ -948,6 +957,7 @@ class BackupScheduler:
         with self._state_lock:
             class_runs = dict(self._status["classes"])
             target_runs = dict(self._status["targets"])
+            grooming = self._status.get("grooming")
         pending = 0
         if self.coalescer is not None:
             try:
@@ -994,6 +1004,7 @@ class BackupScheduler:
             ],
             "artifacts": [self.serialize(record) for record in reversed(records)],
             "storage": storage,
+            "grooming": grooming,
         }
 
     # -- per-artifact actions ----------------------------------------------------------
