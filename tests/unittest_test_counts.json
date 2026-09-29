@@ -102,7 +102,7 @@
     "test_ssh_failure_contexts": 4,
     "test_ssh_probe": 29,
     "test_ssh_session_reuse": 23,
-    "test_startup_config": 20,
+    "test_startup_config": 22,
     "test_startup_migration_recovery": 13,
     "test_startup_writability": 20,
     "test_storage_view_smart_batch": 10,

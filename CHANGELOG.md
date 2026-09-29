@@ -259,6 +259,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Treated a blank credential line in `.env` (as copied from `.env.example`) as
+  unset instead of wiping the value set in config.yaml; a `_FILE` secret still
+  wins. (#807)
 - Wrote config.yaml and runtime-overrides.yaml through a fsynced temporary
   file that keeps the existing mode (0600 for a new file) instead of the umask
   default. (#808)
