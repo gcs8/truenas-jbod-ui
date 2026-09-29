@@ -30,6 +30,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Upgrade notes
 
+- `ADMIN_PUBLIC_ORIGIN`: set the exact admin address operators use before
+  starting the admin profile; the setting is now required in every auth mode
+  (#854).
 - config.yaml: `app.host` and `app.port` are gone, and the `APP_HOST`
   environment variable is no longer read. They never changed where the UI
   answers. Set the port with `APP_PORT` and the address with
@@ -63,6 +66,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Security
 
+- Required a fixed admin browser origin in network mode instead of trusting the
+  request `Host` header, preventing DNS-rebinding access to privileged APIs
+  (#854).
 - Backup-scheduler connection failures no longer copy exception text into the
   admin API response; the public answer is a fixed message. (#621)
 - Restored the read-only `./config:/app/config:ro` mount for the read UI in the
@@ -963,9 +969,11 @@ v0.23.0 release candidate.
 
 ### Highlights
 
-- The main and admin UIs work without application authentication by default;
-  the privileged admin service still requires a fixed browser origin to prevent
-  DNS-rebinding attacks (#392 and #393).
+- The main and admin UIs now work without application authentication or public
+  origin settings by default. Browser mutations still receive an automatic
+  same-origin check. Basic authentication, explicit public-origin settings, and
+  verified private TLS are optional hardening steps (#392, superseding the
+  defaults introduced by #245 and #201).
 - Dell MD1280 shelves render with full-chassis and per-drawer profiles built
   from the validated 84-bay layout (#157).
 - Segmented history gained crash-safe later-generation rotation, recovery of
@@ -995,9 +1003,6 @@ v0.23.0 release candidate.
 These changes are visible to operators after upgrading from `v0.22.2`. Read
 them before starting the new images.
 
-- `ADMIN_PUBLIC_ORIGIN`: set the exact admin address operators use before
-  starting the admin profile; the setting is now required in every auth mode
-  (#393).
 - `ADMIN_AUTO_STOP_SECONDS` now defaults to `0`, which means auto-stop is
   disabled: the admin sidecar no longer stops itself after an hour unless a
   deployment says so. The published `docker-compose.yml` and
@@ -1118,9 +1123,6 @@ them before starting the new images.
 
 ### Security
 
-- Required a fixed admin browser origin in network mode instead of trusting the
-  request `Host` header, preventing DNS-rebinding access to privileged APIs
-  (#393).
 - Reset skipped-scope topology confirmation state, bounded anonymous bulk
   history reads, and capped persistent host-prep staging (#381)
 - Restricted generated storage-discovery sudo grants, rejected malformed or
