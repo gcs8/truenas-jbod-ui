@@ -10952,7 +10952,11 @@
         scheduleAutoRefresh();
         return;
       }
-      if (state.refreshesInFlight > 0) {
+      // A refresh during a write bumps the epoch and would drop the write's
+      // outcome, so wait for in-flight writes as well as reads. Writes left
+      // stale by a manual refresh or scope change do not hold the new scope.
+      if (state.refreshesInFlight > 0
+        || Object.values(state.mutationsInFlight || {}).some(mutationContextIsCurrent)) {
         scheduleAutoRefresh();
         return;
       }

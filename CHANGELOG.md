@@ -259,6 +259,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Held the automatic refresh while a locate-light or bay-assignment write was
+  in flight, so the write's result and any sign-in rejection are shown instead
+  of being dropped by the refresh. (#829)
 - Finished the storage view reload after a system or enclosure switch even
   when the refresh result was set aside for a bay edit, so the view options no
   longer stay disabled as "(previous)". (#830)
