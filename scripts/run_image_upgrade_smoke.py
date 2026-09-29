@@ -290,7 +290,9 @@ from history_service.segment_migration import migrate_segmented_history
 receipt = migrate_segmented_history(
     source=Path("/app/history/history.db"),
     segments_directory=Path("/app/history/segments"),
-    cutoff=(datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
+    # v0.23.0+ rounds the cutoff down to midnight UTC; two days ahead keeps
+    # every freshly seeded row before it either way.
+    cutoff=(datetime.now(timezone.utc) + timedelta(days=2)).isoformat(),
     key_id="upgrade-smoke-key",
     apply=True,
 )

@@ -730,6 +730,33 @@ class UpgradeScenarioContractTests(unittest.TestCase):
         self.assertIn("history_api_view((1, 2, 3, 4))", source)
         self.assertIn("catalog_identity=ok", source)
 
+    def test_segmented_catalog_cutoff_survives_midnight_rounding(self):
+        # Since v0.23.0 the migration rounds its cutoff down to midnight UTC.
+        # The rounded cutoff must still fall after every row seeded just before.
+        import contextlib
+        import io
+        import sys
+        import types
+        from datetime import datetime, timezone
+
+        from history_service.segment_sealer import normalize_history_cutoff
+
+        smoke = self.load_smoke()
+        captured = {}
+
+        def migrate_segmented_history(**kwargs):
+            captured.update(kwargs)
+            return {"apply": True, "segment": {"segment_id": "segment-0001"}}
+
+        stub = types.ModuleType("history_service.segment_migration")
+        stub.migrate_segmented_history = migrate_segmented_history
+        seeded_by = datetime.now(timezone.utc)
+        with mock.patch.dict(sys.modules, {"history_service.segment_migration": stub}):
+            with contextlib.redirect_stdout(io.StringIO()):
+                exec(compile(smoke.CREATE_SEGMENTED_CATALOG, "create_segmented_catalog", "exec"), {})
+        rounded = datetime.fromisoformat(normalize_history_cutoff(captured["cutoff"]))
+        self.assertGreater(rounded, seeded_by)
+
     def test_hardened_scenario_requires_the_overlay_fixture(self):
         smoke = self.load_smoke()
         base = ["--root", "/nonexistent", "--compose-fixture", "a", "--config-fixture", "b",
