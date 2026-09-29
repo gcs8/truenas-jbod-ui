@@ -262,6 +262,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Refuse aliased filesystem backup targets and failed directory persistence,
+  and recover or account for scheduler-owned publications after catalog failure. (#839)
 - Recovered default inventory selection after topology changes, fenced stale
   source publication, drained cancelled collectors and moved mapping reads
   off the event loop while preserving request-local versions. (#852)

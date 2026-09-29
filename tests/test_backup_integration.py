@@ -435,6 +435,878 @@ class SchedulerTestBase(unittest.TestCase):
 TARGET = {"target_id": "nas", "label": "Office NAS", "provider": "filesystem", "root": "/unused"}
 
 
+class SchedulerPreservationTests(SchedulerTestBase):
+    """Synthetic files through the public scheduler and real publication transport."""
+
+    def real_scheduler(self, targets=()):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from history_service.backup_archive.policy import policy_from_section
+        from history_service.system_backup import FileBackupArtifact
+
+        self._paths.passphrase_file.write_text("synthetic-test-passphrase\n")
+        self._paths.passphrase_file.chmod(0o600)
+        producer = Mock()
+
+        def export(**kwargs):
+            workspace = Path(tempfile.mkdtemp(dir=self.root))
+            source = workspace / "synthetic.tar.zst.enc"
+            source.write_bytes(b"synthetic archive payload")
+            return FileBackupArtifact(source.name, source, "application/octet-stream",
+                                      {"schema_version": 1}, workspace)
+
+        producer.export_scheduled_bundle_to_file.side_effect = export
+        producer.preflight_scheduled_bundle_file.return_value = {"absent_groups": []}
+        policy = policy_from_section({"full": {"enabled": True, "local_keep": 1, "remote_keep": 1},
+                                      "targets": list(targets)}, source="synthetic", environ={})
+        scheduler = self._BackupScheduler(
+            policy, producer, self._paths, app_gid=os.getegid(),
+            config_groups=["config_file"], full_groups=["config_file", "history_db"],
+            snapshot_config=lambda: {}, clock=lambda: self.now,
+        )
+        self.addCleanup(scheduler.close)
+        return SimpleNamespace(service=scheduler, producer=producer)
+
+    def remote_pair(self):
+        first, second = self.root / "first", self.root / "second"
+        first.mkdir()
+        second.mkdir()
+        alias = self.root / "second-alias"
+        alias.symlink_to(second, target_is_directory=True)
+        targets = [{**TARGET, "target_id": "first", "root": str(first)},
+                   {**TARGET, "target_id": "second", "root": str(alias)}]
+        return first, second, alias, targets
+
+    def test_remote_same_root_policy_refuses_enabled_plain_and_symlink_aliases(self):
+        from history_service.backup_archive.policy import policy_from_section
+
+        first, _, alias, targets = self.remote_pair()
+        alias.unlink()
+        alias.symlink_to(first, target_is_directory=True)
+        for root in (first, alias):
+            with self.subTest(root=root):
+                duplicate = {**targets[1], "root": str(root)}
+                with self.assertRaisesRegex(ConfigurationError, "same physical root"):
+                    policy_from_section({"targets": [targets[0], duplicate]}, source="synthetic", environ={})
+
+    def test_remote_alias_rechecked_before_shipping_and_both_preserved_copies_survive(self):
+        first, second, alias, targets = self.remote_pair()
+        scheduler = self.real_scheduler(targets).service
+        old = scheduler.run_now("full")
+        for record in scheduler.catalog.list():
+            if record.location != "local":
+                scheduler.preserve(record.artifact_id, reason="retain old bytes", actor="test")
+        old_bytes = (first / old.name).read_bytes()
+        alias.unlink()
+        alias.symlink_to(first, target_is_directory=True)
+        # Filesystem admission must not impose a cross-protocol alias policy.
+        # The independent provider is a synthetic local target, never a network.
+        from dataclasses import replace
+        from history_service.backup_archive.policy import ArchiveTarget
+        from history_service.backup_archive.settings import ArchiveTargetSettings
+
+        independent = ArchiveTarget(ArchiveTargetSettings(
+            target_id="independent", provider="s3", root="synthetic", bucket="synthetic",
+            access_key_id_file=str(self.root / "unused-access-key"),
+            secret_access_key_file=str(self.root / "unused-secret-key"),
+        ), label="Synthetic independent provider")
+        scheduler.policy = replace(scheduler.policy, targets=(*scheduler.policy.targets, independent))
+        original_open = scheduler._open_target
+
+        @contextlib.contextmanager
+        def opened(settings, **kwargs):
+            if settings.target_id == "independent":
+                yield LocalDirectoryTarget(self.root / "independent", provider="s3")
+            else:
+                with original_open(settings, **kwargs) as remote:
+                    yield remote
+
+        scheduler._open_target = opened
+        self.now += timedelta(hours=1)
+        new = scheduler.run_now("full")
+        self.assertEqual([r.name for r in scheduler.catalog.list(location="first")], [old.name])
+        self.assertEqual([r.name for r in scheduler.catalog.list(location="second")], [old.name])
+        self.assertFalse((first / new.name).exists())
+        self.assertEqual((first / old.name).read_bytes(), old_bytes)
+        self.assertEqual((second / old.name).read_bytes(), old_bytes)
+        targets_by_id = {t["id"]: t for t in scheduler.library()["targets"]}
+        self.assertFalse(targets_by_id["first"]["last_run"]["ok"])
+        self.assertFalse(targets_by_id["second"]["last_run"]["ok"])
+        self.assertTrue(targets_by_id["independent"]["last_run"]["ok"])
+
+    def test_unavailable_filesystem_target_does_not_block_healthy_peer(self):
+        from history_service.backup_archive import policy as policy_module
+        from history_service.backup_archive.settings import ArchiveRootUnavailableError
+
+        first, second, alias, targets = self.remote_pair()
+        scheduler = self.real_scheduler(targets).service
+        original = policy_module.filesystem_roots_overlap
+
+        def inspected(local_root, remote_root):
+            if Path(remote_root) == alias:
+                raise ArchiveRootUnavailableError("synthetic target unavailable")
+            return original(local_root, remote_root)
+
+        with patch.object(policy_module, "filesystem_roots_overlap", side_effect=inspected):
+            record = scheduler.run_now("full")
+
+        self.assertTrue((first / record.name).is_file())
+        self.assertFalse((second / record.name).exists())
+        self.assertEqual(len(scheduler.catalog.list(location="first")), 1)
+        self.assertEqual(scheduler.catalog.list(location="second"), [])
+        targets_by_id = {item["id"]: item for item in scheduler.library()["targets"]}
+        self.assertTrue(targets_by_id["first"]["last_run"]["ok"])
+        self.assertFalse(targets_by_id["second"]["last_run"]["ok"])
+
+    def test_remote_alias_rechecked_at_each_delete_in_cached_target(self):
+        from dataclasses import replace
+
+        first, second, alias, targets = self.remote_pair()
+        scheduler = self.real_scheduler(targets).service
+        scheduler.policy = replace(scheduler.policy, full=scheduler.policy.full.model_copy(update={"remote_keep": 3}))
+        records = []
+        for _ in range(3):
+            records.append(scheduler.run_now("full"))
+            self.now += timedelta(hours=1)
+        for record in scheduler.catalog.list(location="second"):
+            scheduler.preserve(record.artifact_id, reason="retain physical copy", actor="test")
+        scheduler.policy = replace(scheduler.policy, full=scheduler.policy.full.model_copy(update={"remote_keep": 1}))
+        token, _, _ = scheduler.plan()
+        original = scheduler.catalog.record_deletion
+
+        def tombstone(*args, **kwargs):
+            result = original(*args, **kwargs)
+            # A second target becomes an alias after the first deletion, while
+            # LifecycleManager and the scheduler both cache the opened target.
+            alias.unlink()
+            alias.symlink_to(first, target_is_directory=True)
+            return result
+
+        with patch.object(scheduler.catalog, "record_deletion", side_effect=tombstone):
+            result = scheduler.apply(token)
+        self.assertFalse(result.complete)
+        self.assertIn("same physical root", result.error)
+        self.assertTrue((first / records[1].name).exists())
+        self.assertTrue((second / records[1].name).exists())
+        self.assertEqual(len(result.deleted), 1)
+
+    def test_directory_eio_does_not_replace_remote_retention_copy(self):
+        import errno
+
+        remote = self.root / "remote-real"
+        target = {**TARGET, "root": str(remote)}
+        scheduler = self.real_scheduler([target]).service
+        old = scheduler.run_now("full")
+        self.now += timedelta(hours=1)
+        original = os.fsync
+
+        def synced(fd):
+            metadata = os.fstat(fd)
+            parent = remote / "full"
+            if stat.S_ISDIR(metadata.st_mode) and (metadata.st_dev, metadata.st_ino) == (parent.stat().st_dev, parent.stat().st_ino):
+                raise OSError(errno.EIO, "synthetic directory EIO")
+            return original(fd)
+
+        with patch.object(os, "fsync", side_effect=synced):
+            scheduler.run_now("full")
+        remote_records = scheduler.catalog.list(location="nas")
+        self.assertEqual(len(remote_records), 2)
+        uncertain = next(record for record in remote_records if record.name != old.name)
+        self.assertTrue(uncertain.preserved)
+        self.assertFalse(uncertain.verified)
+        self.assertIn("directory durability", uncertain.preserve_reason)
+        self.assertTrue((remote / old.name).exists())
+        self.assertTrue((remote / uncertain.name).exists())
+        self.assertFalse(scheduler.library()["targets"][0]["last_run"]["ok"])
+        self.now += timedelta(hours=1)
+        scheduler.run_now("full")
+        self.assertTrue(scheduler.library()["targets"][0]["last_run"]["ok"])
+        self.assertFalse((remote / old.name).exists())
+
+    def test_remote_alias_introduced_during_copy_refuses_final_publication(self):
+        from history_service.backup_archive import transport
+
+        first, _, alias, targets = self.remote_pair()
+        scheduler = self.real_scheduler(targets).service
+        original = transport._check_readback
+        changed = False
+
+        def readback(*args):
+            nonlocal changed
+            original(*args)
+            if not changed:
+                alias.unlink()
+                alias.symlink_to(first, target_is_directory=True)
+                changed = True
+
+        with patch.object(transport, "_check_readback", side_effect=readback):
+            record = scheduler.run_now("full")
+        self.assertTrue(changed)
+        self.assertFalse((first / record.name).exists())
+        self.assertEqual(scheduler.catalog.list(location="first"), [])
+        self.assertEqual(scheduler.catalog.list(location="second"), [])
+
+    def test_real_catalog_insert_failure_is_recovered_without_enumerating_files(self):
+        import sqlite3
+        from history_service.backup_archive.catalog import CatalogError
+
+        scheduler = self.real_scheduler().service
+        database = self._paths.state_dir / "catalog.sqlite3"
+        with contextlib.closing(sqlite3.connect(database)) as connection, connection:
+            connection.execute("CREATE TRIGGER synthetic_failure BEFORE INSERT ON artifacts "
+                               "BEGIN SELECT RAISE(ABORT, 'synthetic insertion failure'); END")
+        with self.assertRaises(CatalogError):
+            scheduler.run_now("full")
+        self.assertEqual(scheduler.catalog.list(), [])
+        scheduler.close()
+        still_failed = self.real_scheduler().service
+        self.assertEqual(still_failed.library()["storage"]["local"]["count"], 1)
+        self.assertTrue(still_failed.library()["detail"])
+        still_failed.close()
+        with contextlib.closing(sqlite3.connect(database)) as connection, connection:
+            connection.execute("DROP TRIGGER synthetic_failure")
+        with patch.object(Path, "glob", side_effect=AssertionError("no discovery")), \
+                patch.object(Path, "iterdir", side_effect=AssertionError("no discovery")):
+            recovered = self.real_scheduler().service
+        self.assertEqual(len(recovered.catalog.list()), 1)
+        self.assertTrue(recovered.catalog.list()[0].preserved)
+
+    def test_sqlite_operational_error_during_recovery_keeps_library_accounting(self):
+        import sqlite3
+        from history_service.backup_archive.catalog import ArtifactCatalog
+
+        scheduler = self.real_scheduler().service
+        with patch.object(scheduler.catalog, "add", side_effect=sqlite3.OperationalError("synthetic disk I/O")):
+            with self.assertRaises(sqlite3.OperationalError):
+                scheduler.run_now("full")
+        scheduler.close()
+        with patch.object(ArtifactCatalog, "add", side_effect=sqlite3.OperationalError("synthetic disk I/O")):
+            reopened = self.real_scheduler().service
+        self.assertEqual(reopened.library()["storage"]["local"]["count"], 1)
+        self.assertTrue(reopened.library()["detail"])
+
+    @contextlib.contextmanager
+    def metadata_save_fault(self, scheduler, seam):
+        """Fail real metadata I/O, not the ownership or publication validators."""
+        import errno
+
+        hits = []
+        meta_path = scheduler._meta_path
+        real_open, real_fdopen = os.open, os.fdopen
+        real_dump, real_fsync = json.dump, os.fsync
+        real_replace, real_unlink, real_lstat = os.replace, Path.unlink, Path.lstat
+        real_save = scheduler._save_meta
+        temporary_fds = set()
+
+        def fail():
+            hits.append(seam)
+            raise OSError(errno.EIO, "synthetic metadata failure")
+
+        def is_temporary(path):
+            return (isinstance(path, (str, bytes, os.PathLike))
+                    and Path(os.fsdecode(path)).parent == meta_path.parent
+                    and Path(os.fsdecode(path)).name.startswith(".artifact-meta.json."))
+
+        def opened(path, flags, *args, **kwargs):
+            if not hits:
+                if seam == "temp_open" and is_temporary(path):
+                    fail()
+                if seam == "directory_open" and Path(path) == meta_path.parent and flags & os.O_DIRECTORY:
+                    fail()
+            descriptor = real_open(path, flags, *args, **kwargs)
+            temporary_fds.discard(descriptor)
+            if is_temporary(path):
+                temporary_fds.add(descriptor)
+            return descriptor
+
+        class Stream:
+            def __init__(self, handle):
+                self.handle = handle
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return self.handle.__exit__(*args)
+
+            def __getattr__(self, name):
+                return getattr(self.handle, name)
+
+            def write(self, data):
+                if seam == "write" and not hits:
+                    fail()
+                return self.handle.write(data)
+
+            def flush(self):
+                if seam == "flush" and not hits:
+                    fail()
+                return self.handle.flush()
+
+        def fdopened(fd, *args, **kwargs):
+            handle = real_fdopen(fd, *args, **kwargs)
+            return Stream(handle) if fd in temporary_fds else handle
+
+        def dumped(obj, handle, *args, **kwargs):
+            if seam == "json_partial" and isinstance(handle, Stream) and not hits:
+                handle.write("{")
+                fail()
+            return real_dump(obj, handle, *args, **kwargs)
+
+        def synced(fd):
+            if not hits:
+                if seam == "file_fsync" and fd in temporary_fds:
+                    fail()
+                metadata = os.fstat(fd)
+                parent = meta_path.parent.stat()
+                if (seam == "directory_fsync"
+                        and (metadata.st_dev, metadata.st_ino) == (parent.st_dev, parent.st_ino)):
+                    fail()
+            return real_fsync(fd)
+
+        def replaced(source, destination, *args, **kwargs):
+            targeted = Path(destination) == meta_path and not hits
+            if targeted and seam == "replace":
+                fail()
+            result = real_replace(source, destination, *args, **kwargs)
+            if targeted and seam in {"replace_ack_lost", "replace_ack_uninspectable"}:
+                fail()
+            return result
+
+        def inspected(path, *args, **kwargs):
+            if seam == "replace_ack_uninspectable" and hits and path == meta_path:
+                raise OSError(errno.EIO, "synthetic metadata inspection failure")
+            return real_lstat(path, *args, **kwargs)
+
+        def unlinked(path, *args, **kwargs):
+            if seam == "cleanup" and is_temporary(path) and not hits:
+                fail()
+            return real_unlink(path, *args, **kwargs)
+
+        def saved(*args, **kwargs):
+            if seam == "before_save" and not hits:
+                fail()
+            result = real_save(*args, **kwargs)
+            if seam == "after_save" and not hits:
+                fail()
+            return result
+
+        with contextlib.ExitStack() as stack:
+            for obj, name, side_effect in (
+                (os, "open", opened), (os, "fdopen", fdopened), (json, "dump", dumped),
+                (os, "fsync", synced), (os, "replace", replaced), (Path, "unlink", unlinked),
+                (scheduler, "_save_meta", saved), (Path, "lstat", inspected),
+            ):
+                stack.enter_context(patch.object(obj, name, side_effect=side_effect, autospec=True))
+            yield hits
+        self.assertEqual(hits, [seam], "the named real I/O seam must fail exactly once")
+
+    def check_failed_intent_save(self, seams, *, immediate_retained, recovered_retained):
+        from dataclasses import replace
+
+        original_paths = self._paths
+        for seam in seams:
+            for later_verify in (False, True):
+                with self.subTest(seam=seam, later_verify=later_verify), \
+                        tempfile.TemporaryDirectory(dir=self.root) as directory:
+                    case = Path(directory)
+                    self._paths = replace(original_paths, local_dir=case / "local", state_dir=case / "state")
+                    scheduler = self.real_scheduler().service
+                    old = scheduler.run_now("full")
+                    scheduler.preserve(old.artifact_id, reason="synthetic preserved copy", actor="test")
+                    old_path = scheduler.paths.local_dir / old.name
+                    old_bytes = old_path.read_bytes()
+                    before = scheduler._meta_path.read_bytes()
+                    self.now += timedelta(hours=1)
+                    with self.metadata_save_fault(scheduler, seam):
+                        with self.assertRaisesRegex(OSError, "synthetic metadata failure"):
+                            scheduler.run_now("full")
+                    immediate = scheduler.library()
+                    self.assertFalse(immediate["classes"]["full"]["last_run"]["ok"])
+                    self.assertEqual(len(scheduler.catalog.list()), 1)
+                    self.assertEqual(
+                        immediate["storage"]["local"]["count"],
+                        1 + int(immediate_retained),
+                    )
+                    if not immediate_retained:
+                        self.assertEqual(scheduler._meta_path.read_bytes(), before)
+                    if later_verify:
+                        self.assertTrue(scheduler.verify(old.artifact_id)["ok"])
+                    scheduler.close()
+                    reopened = self.real_scheduler().service
+                    library = reopened.library()
+                    self.assertEqual(
+                        library["storage"]["local"]["count"],
+                        1 + int(recovered_retained),
+                    )
+                    self.assertEqual(
+                        library["storage"]["local"]["full_bytes"],
+                        len(old_bytes) * (1 + int(recovered_retained)),
+                    )
+                    self.assertEqual(bool(library["detail"]), recovered_retained)
+                    extra = [item for item in library["artifacts"] if item["id"] != old.artifact_id]
+                    for item in extra:
+                        self.assertEqual(item["state"], "missing")
+                        self.assertTrue(item["preserved"])
+                        self.assertFalse(item["restorable"])
+                        self.assertFalse(item["verified"])
+                    self.assertEqual(old_path.read_bytes(), old_bytes)
+                    self.assertEqual(reopened._verified_local_full_count(), 1)
+                    self.assertEqual(reopened.plan()[2].items, ())
+                    reopened.close()
+        self._paths = original_paths
+
+    def test_pre_replace_metadata_failures_do_not_leave_phantom_intents(self):
+        self.check_failed_intent_save(
+            ("before_save", "temp_open", "write", "json_partial", "flush", "file_fsync", "replace"),
+            immediate_retained=False,
+            recovered_retained=False,
+        )
+
+    def test_post_replace_metadata_failures_clear_intents_after_absence_is_proven(self):
+        self.check_failed_intent_save(
+            ("directory_open", "directory_fsync", "cleanup", "replace_ack_lost",
+             "replace_ack_uninspectable", "after_save"),
+            immediate_retained=True,
+            recovered_retained=False,
+        )
+
+    def test_first_intent_save_failure_does_not_leak_into_successful_retry(self):
+        from dataclasses import replace
+
+        original_paths = self._paths
+        for seam in ("before_save", "temp_open", "write", "json_partial", "flush", "file_fsync", "replace"):
+            with self.subTest(seam=seam), tempfile.TemporaryDirectory(dir=self.root) as directory:
+                case = Path(directory)
+                self._paths = replace(original_paths, local_dir=case / "local", state_dir=case / "state")
+                scheduler = self.real_scheduler().service
+                with self.metadata_save_fault(scheduler, seam):
+                    with self.assertRaisesRegex(OSError, "synthetic metadata failure"):
+                        scheduler.run_now("full")
+                self.assertEqual(scheduler.library()["artifacts"], [])
+                self.assertFalse(scheduler._meta_path.exists())
+                self.now += timedelta(hours=1)
+                record = scheduler.run_now("full")
+                scheduler.close()
+                reopened = self.real_scheduler().service
+                self.assertEqual([item["id"] for item in reopened.library()["artifacts"]], [record.artifact_id])
+                self.assertFalse(reopened.library()["detail"])
+                reopened.close()
+        self._paths = original_paths
+
+    def test_metadata_directory_eio_prevents_final_publication(self):
+        import errno
+
+        scheduler = self.real_scheduler().service
+        original = os.fsync
+        state = self._paths.state_dir.stat()
+
+        def synced(fd):
+            metadata = os.fstat(fd)
+            if (metadata.st_dev, metadata.st_ino) == (state.st_dev, state.st_ino):
+                raise OSError(errno.EIO, "synthetic ownership barrier failure")
+            return original(fd)
+
+        with patch.object(os, "fsync", side_effect=synced):
+            with self.assertRaisesRegex(OSError, "ownership barrier"):
+                scheduler.run_now("full")
+        self.assertEqual(scheduler.catalog.list(), [])
+        self.assertEqual([p.name for p in (self._paths.local_dir / "full").iterdir()
+                          if p.name != ".scheduled-backup.lock"], [])
+
+    def test_concurrent_verify_cannot_overwrite_durable_publication_intent(self):
+        import threading
+
+        scheduler = self.real_scheduler().service
+        old = scheduler.run_now("full")
+        old_save_ready = threading.Event()
+        backup_done = threading.Event()
+        errors = []
+        original = os.replace
+
+        def replaced(source, destination, *args, **kwargs):
+            if Path(destination) == scheduler._meta_path and threading.current_thread().name == "synthetic-verify":
+                old_save_ready.set()
+                # Without serialization the newer intent is published while this
+                # older snapshot waits, then the older replacement erases it.
+                # With serialization, releasing this writer lets the intent save
+                # proceed next. Both waits and worker joins are bounded.
+                backup_done.wait(1)
+            return original(source, destination, *args, **kwargs)
+
+        def verify():
+            try:
+                scheduler.verify(old.artifact_id)
+            except BaseException as exc:
+                errors.append(exc)
+
+        with patch.object(os, "replace", side_effect=replaced):
+            worker = threading.Thread(target=verify, name="synthetic-verify")
+            worker.start()
+            try:
+                self.assertTrue(old_save_ready.wait(5))
+                with patch.object(scheduler.catalog, "add", side_effect=OSError("catalog failure")):
+                    with self.assertRaisesRegex(OSError, "catalog failure"):
+                        scheduler.run_now("full")
+            finally:
+                backup_done.set()
+                worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        scheduler.close()
+        recovered = self.real_scheduler().service
+        self.assertEqual(recovered.library()["storage"]["local"]["count"], 2)
+        self.assertEqual(sum(record.preserved for record in recovered.catalog.list()), 1)
+
+    def test_library_snapshot_survives_concurrent_failed_publication(self):
+        import sqlite3
+        import threading
+        from history_service.backup_archive.catalog import CatalogError
+        from history_service.backup_scheduler import service as module
+
+        scheduler = self.real_scheduler().service
+        with contextlib.closing(sqlite3.connect(self._paths.state_dir / "catalog.sqlite3")) as db, db:
+            db.execute("CREATE TRIGGER synthetic_failure BEFORE INSERT ON artifacts "
+                       "BEGIN SELECT RAISE(ABORT, 'synthetic insertion failure'); END")
+        with self.assertRaises(CatalogError):
+            scheduler.run_now("full")
+        entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+        results, errors, writer_errors = [], [], []
+        original = module.validate_record
+
+        def validated(record):
+            value = original(record)
+            if threading.current_thread().name == "synthetic-library":
+                entered.set()
+                if not release.wait(5):
+                    raise AssertionError("library validation barrier timed out")
+            return value
+
+        def reader():
+            try:
+                results.append(scheduler.library())
+            except BaseException as exc:
+                errors.append(exc)
+
+        def writer():
+            try:
+                scheduler.run_now("full")
+            except BaseException as exc:
+                writer_errors.append(exc)
+            finally:
+                finished.set()
+
+        self.now += timedelta(hours=1)
+        with patch.object(module, "validate_record", side_effect=validated):
+            reading = threading.Thread(target=reader, name="synthetic-library")
+            writing = threading.Thread(target=writer, name="synthetic-publication")
+            reading.start()
+            try:
+                self.assertTrue(entered.wait(5))
+                writing.start()
+                # Validation uses detached metadata, not a held writer lock.
+                self.assertTrue(finished.wait(5))
+            finally:
+                release.set()
+                reading.join(5)
+                if writing.ident is not None:
+                    writing.join(5)
+        self.assertFalse(reading.is_alive())
+        self.assertFalse(writing.is_alive())
+        self.assertEqual(len(writer_errors), 1)
+        self.assertIsInstance(writer_errors[0], CatalogError)
+        self.assertEqual(errors, [], "library must remain available during publication")
+        self.assertEqual(results[0]["storage"]["local"]["count"], 1)
+        current = scheduler.library()
+        self.assertEqual(current["storage"]["local"], {
+            "count": 2, "config_bytes": 0, "full_bytes": 2 * len(b"synthetic archive payload"),
+        })
+        self.assertEqual(len(json.loads(scheduler._meta_path.read_text())), 2)
+        self.assertEqual(scheduler.plan()[2].items, ())
+
+    def test_detail_uses_one_metadata_snapshot_during_verify(self):
+        import threading
+
+        scheduler = self.real_scheduler().service
+        record = scheduler.run_now("full")
+        entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+        results, errors = [], []
+        original = scheduler._local_path
+
+        def local_path(value):
+            path = original(value)
+            if threading.current_thread().name == "synthetic-detail":
+                entered.set()
+                if not release.wait(5):
+                    raise AssertionError("detail stat barrier timed out")
+            return path
+
+        def reader():
+            try:
+                results.append(scheduler.detail(record.artifact_id))
+            except BaseException as exc:
+                errors.append(exc)
+
+        def writer():
+            try:
+                self.assertTrue(scheduler.verify(record.artifact_id)["ok"])
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                finished.set()
+
+        with patch.object(scheduler, "_local_path", side_effect=local_path):
+            reading = threading.Thread(target=reader, name="synthetic-detail")
+            writing = threading.Thread(target=writer, name="synthetic-verify")
+            reading.start()
+            try:
+                self.assertTrue(entered.wait(5))
+                writing.start()
+                self.assertTrue(finished.wait(5), "file inspection must not hold the metadata lock")
+            finally:
+                release.set()
+                reading.join(5)
+                if writing.ident is not None:
+                    writing.join(5)
+        self.assertFalse(reading.is_alive())
+        self.assertFalse(writing.is_alive())
+        self.assertEqual(errors, [])
+        self.assertIsNone(results[0]["last_verify"])
+        self.assertTrue(scheduler.detail(record.artifact_id)["last_verify"]["ok"])
+
+    def test_detail_nested_metadata_is_detached_from_scheduler(self):
+        import copy
+
+        scheduler = self.real_scheduler().service
+        record = scheduler.run_now("full")
+        self.assertTrue(scheduler.verify(record.artifact_id)["ok"])
+        before = copy.deepcopy(scheduler.detail(record.artifact_id))
+        changed = scheduler.detail(record.artifact_id)
+        changed["inspect"]["groups"].append("synthetic-not-a-group")
+        changed["last_verify"]["ok"] = False
+        self.assertEqual(scheduler.detail(record.artifact_id), before)
+
+    def test_all_metadata_access_uses_state_lock(self):
+        import copy
+
+        target = self.root / "remote-metadata"
+        scheduler = self.real_scheduler([{**TARGET, "root": str(target)}]).service
+        violations = []
+
+        class AuditedDict(dict):
+            # Record accesses rather than raising inside fault-handling paths.
+            def check(self, operation):
+                if not scheduler._state_lock._is_owned():
+                    violations.append(operation)
+
+            def __getitem__(self, key):
+                self.check("getitem")
+                return super().__getitem__(key)
+
+            def __setitem__(self, key, value):
+                self.check("setitem")
+                super().__setitem__(key, wrap(value))
+
+            def get(self, key, default=None):
+                self.check("get")
+                return super().get(key, default)
+
+            def items(self):
+                self.check("items")
+                return super().items()
+
+            def setdefault(self, key, default=None):
+                self.check("setdefault")
+                return super().setdefault(key, wrap(default))
+
+            def pop(self, key, *args):
+                self.check("pop")
+                return super().pop(key, *args)
+
+            def __deepcopy__(self, memo):
+                self.check("snapshot")
+                return {key: copy.deepcopy(value, memo) for key, value in self.items()}
+
+        def wrap(value):
+            if isinstance(value, dict):
+                return AuditedDict({key: wrap(child) for key, child in value.items()})
+            return value
+
+        scheduler._meta = AuditedDict()
+        with patch.object(scheduler.catalog, "add", side_effect=OSError("synthetic pending")):
+            with self.assertRaises(OSError):
+                scheduler.run_now("full")
+        self.assertEqual(scheduler.library()["storage"]["local"]["count"], 1)
+        scheduler._recover_publications()
+        recovered = scheduler.catalog.list()[0]
+        self.assertTrue(scheduler.verify(recovered.artifact_id)["ok"])
+        scheduler.unpreserve(recovered.artifact_id, actor="test")
+        self.now += timedelta(hours=1)
+        record = scheduler.run_now("full")
+        self.assertTrue(scheduler.verify(record.artifact_id)["ok"])
+        self.assertEqual(scheduler.detail(record.artifact_id)["state"], "ok")
+        scheduler.library()
+        scheduler._verified_local_full_count()
+        self.assertEqual(violations, [], "all live metadata access must share the snapshot/write lock")
+
+    def test_stale_intent_cannot_resurrect_tombstoned_generation(self):
+        from history_service.backup_scheduler.service import BackupScheduler
+
+        scheduler = self.real_scheduler().service
+        with patch.object(scheduler.catalog, "add", side_effect=OSError("synthetic failure")):
+            with self.assertRaises(OSError):
+                scheduler.run_now("full")
+        scheduler.close()
+        with patch.object(BackupScheduler, "_save_meta", side_effect=OSError("intent clear failed")):
+            recovered = self.real_scheduler().service
+        old = recovered.catalog.list()[0]
+        self.assertTrue(recovered.verify(old.artifact_id)["ok"])
+        self.now += timedelta(hours=1)
+        recovered.run_now("full")
+        recovered.unpreserve(old.artifact_id, actor="test")
+        token, _, _ = recovered.plan()
+        self.assertTrue(recovered.apply(token).complete)
+        self.assertEqual(recovered.library()["storage"]["local"]["count"], 1)
+        recovered.close()
+        reopened = self.real_scheduler().service
+        self.assertEqual(reopened.library()["storage"]["local"]["count"], 1)
+        self.assertIsNone(reopened.catalog.get(old.artifact_id))
+        self.assertFalse((self._paths.local_dir / old.name).exists())
+
+    def test_ownership_intent_failure_prevents_final_publication(self):
+        scheduler = self.real_scheduler().service
+        with patch.object(scheduler, "_save_meta", side_effect=OSError("intent unavailable")):
+            with self.assertRaisesRegex(OSError, "intent unavailable"):
+                scheduler.run_now("full")
+        destination = self._paths.local_dir / "full"
+        self.assertEqual([p.name for p in destination.iterdir() if p.name != ".scheduled-backup.lock"], [])
+        self.assertEqual(scheduler.catalog.list(), [])
+
+    def test_recovery_clears_intent_when_final_publication_is_absent(self):
+        scheduler = self.real_scheduler().service
+        with patch.object(scheduler.catalog, "add", side_effect=OSError("synthetic catalog failure")):
+            with self.assertRaisesRegex(OSError, "catalog failure"):
+                scheduler.run_now("full")
+        pending = scheduler._pending_publications()
+        self.assertEqual(len(pending), 1)
+        (scheduler.paths.local_dir / pending[0].name).unlink()
+        scheduler.close()
+
+        reopened = self.real_scheduler().service
+        self.assertEqual(reopened.catalog.list(), [])
+        self.assertEqual(reopened._pending_publications(), [])
+        self.assertEqual(reopened.library()["artifacts"], [])
+
+    def test_recovery_removes_recorded_temporary_link_before_cataloguing(self):
+        scheduler = self.real_scheduler().service
+        with patch.object(scheduler.catalog, "add", side_effect=OSError("synthetic catalog failure")):
+            with self.assertRaisesRegex(OSError, "catalog failure"):
+                scheduler.run_now("full")
+        pending = scheduler._pending_publications()
+        self.assertEqual(len(pending), 1)
+        record = pending[0]
+        intent = scheduler._metadata_snapshot(record.artifact_id)["publication"]
+        target = scheduler.paths.local_dir / record.name
+        temporary = target.parent / intent["temporary_name"]
+        os.link(target, temporary)
+        self.assertEqual(target.stat().st_nlink, 2)
+        scheduler.close()
+
+        reopened = self.real_scheduler().service
+        recovered = reopened.catalog.get(record.artifact_id)
+        self.assertIsNotNone(recovered)
+        self.assertTrue(recovered.preserved)
+        self.assertFalse(temporary.exists())
+        self.assertEqual(target.stat().st_nlink, 1)
+        self.assertEqual(reopened._pending_publications(), [])
+
+    def test_ownership_recovery_never_adopts_substituted_file(self):
+        scheduler = self.real_scheduler().service
+        names = []
+
+        def failed(record, **kwargs):
+            names.append(record.name)
+            raise OSError("catalog unavailable")
+
+        with patch.object(scheduler.catalog, "add", side_effect=failed):
+            with self.assertRaises(OSError):
+                scheduler.run_now("full")
+        path = self._paths.local_dir / names[0]
+        # Keep the owned inode alive to rule out immediate inode reuse.
+        owned = path.with_suffix(".held")
+        path.rename(owned)
+        path.write_bytes(owned.read_bytes())
+        path.chmod(0o600)
+        scheduler.close()
+        reopened = self.real_scheduler().service
+        self.assertEqual(reopened.catalog.list(), [])
+        self.assertTrue(reopened.library()["detail"])
+        self.assertEqual(reopened.plan()[2].items, ())
+        self.assertEqual(path.read_bytes(), b"synthetic archive payload")
+        self.assertTrue(owned.exists())
+
+    def test_corrupt_ownership_metadata_is_not_silently_discarded(self):
+        scheduler = self.real_scheduler().service
+        scheduler.run_now("full")
+        scheduler.close()
+        (self._paths.state_dir / "artifact-meta.json").write_text("{broken")
+        with self.assertRaises(ValueError):
+            self.real_scheduler()
+
+    def test_completed_uncatalogued_generations_recover_after_restart_and_retry(self):
+        from history_service.backup_archive.catalog import ArtifactCatalog
+
+        scheduler = self.real_scheduler().service
+        foreign = self._paths.local_dir / "full" / "jbod-scheduled-backup-20260924T000000Z-deadbeef.tar.zst.enc"
+        foreign.parent.mkdir(mode=0o700)
+        foreign.write_bytes(b"foreign backup-looking bytes")
+        observed = []
+
+        def fail_after_publication(record, **kwargs):
+            path = self._paths.local_dir / record.name
+            self.assertTrue(path.is_file())
+            self.assertEqual(path.read_bytes(), b"synthetic archive payload")
+            observed.append((record.name, path.stat().st_ino))
+            raise OSError("synthetic catalog failure")
+
+        with patch.object(scheduler.catalog, "add", side_effect=fail_after_publication):
+            for _ in range(2):
+                with self.assertRaisesRegex(OSError, "synthetic catalog failure"):
+                    scheduler.run_now("full")
+                self.now += timedelta(hours=1)
+        self.assertEqual(len(observed), 2)
+        scheduler.close()
+        # Persisting the catalog remains unavailable at first restart. Library
+        # reads must still account for both exact, owned completed generations.
+        with patch.object(ArtifactCatalog, "add", side_effect=OSError("still unavailable")):
+            held = self.real_scheduler().service
+            library = held.library()
+            self.assertEqual(library["storage"].get("local", {}).get("count", 0), 2)
+            self.assertEqual(library["storage"]["local"]["full_bytes"], 2 * len(b"synthetic archive payload"))
+            self.assertTrue(library["detail"])
+        held.close()
+        recovered = self.real_scheduler().service
+        records = recovered.catalog.list()
+        self.assertEqual({r.name for r in records}, {name for name, _ in observed})
+        self.assertTrue(all(r.preserved and not r.verified for r in records))
+        self.assertEqual(recovered.library()["storage"]["local"]["count"], 2)
+        self.assertEqual(recovered.plan()[2].items, ())
+        recovered.run_now("full")
+        self.assertEqual(recovered.library()["storage"]["local"]["count"], 3)
+        for name, inode in observed:
+            self.assertEqual((self._paths.local_dir / name).stat().st_ino, inode)
+        self.assertEqual(foreign.read_bytes(), b"foreign backup-looking bytes")
+        # Explicit verification/unpreservation uses the existing lifecycle.
+        for record in records:
+            self.assertTrue(recovered.verify(record.artifact_id)["ok"])
+            recovered.unpreserve(record.artifact_id, actor="test")
+        token, _, _ = recovered.plan()
+        self.assertTrue(recovered.apply(token).complete)
+        recovered.close()
+        final = self.real_scheduler().service
+        self.assertEqual(final.library()["storage"]["local"]["count"], 1)
+        self.assertEqual(foreign.read_bytes(), b"foreign backup-looking bytes")
+
+
 class CapturedConfigSchedulerTests(SchedulerTestBase):
     """Automatic ticks with real encrypted archives and disposable config files."""
 
@@ -1203,7 +2075,7 @@ class SchedulerTests(SchedulerTestBase):
         self.assertNotIn("verified_full", restarted._status)
 
     def test_target_failure_is_degraded_status_and_other_targets_still_ship(self) -> None:
-        second = {**TARGET, "target_id": "cloud", "label": "Cloud"}
+        second = {**TARGET, "target_id": "cloud", "label": "Cloud", "root": "/unused-cloud"}
         scheduler = self.make({"full": {"enabled": True}, "targets": [TARGET, second]})
         self.broken_targets = {"nas"}
         scheduler.run_now("full")

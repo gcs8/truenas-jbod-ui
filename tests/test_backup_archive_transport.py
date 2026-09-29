@@ -31,6 +31,7 @@ from history_service.backup_archive.settings import (
     read_secret_file,
 )
 from history_service.backup_archive.transport import (
+    ArchivePublicationUncertainError,
     ArchiveTarget,
     ArchiveTransportError,
     ArchiveVerificationError,
@@ -192,6 +193,41 @@ class SettingsTests(_TempCase):
 
 
 class FilesystemTargetTests(_TempCase):
+    def test_directory_persistence_errors_refuse_publication(self) -> None:
+        import errno
+
+        for operation in ("open", "fsync"):
+            # No documented weaker barrier policy: unsupported is also a refusal.
+            for error in (errno.EIO, errno.EINVAL, errno.ENOTSUP):
+                with self.subTest(operation=operation, error=error):
+                    root = self.tmp / f"target-{operation}-{error}"
+                    root.mkdir()
+                    target = transport.LocalDirectoryTarget(root)
+                    original_open, original_fsync = os.open, os.fsync
+
+                    def opened(path, flags, *args, **kwargs):
+                        if operation == "open" and Path(path) == root and flags & os.O_DIRECTORY:
+                            raise OSError(error, "synthetic directory barrier failure")
+                        return original_open(path, flags, *args, **kwargs)
+
+                    def synced(fd):
+                        if operation == "fsync" and stat.S_ISDIR(os.fstat(fd).st_mode):
+                            raise OSError(error, "synthetic directory barrier failure")
+                        return original_fsync(fd)
+
+                    with mock.patch.object(os, "open", side_effect=opened), mock.patch.object(os, "fsync", side_effect=synced):
+                        with self.assertRaises(ArchivePublicationUncertainError) as caught:
+                            target.put(self.source(b"synthetic archive"), "copy.enc")
+                    cause = caught.exception.__cause__
+                    self.assertIsInstance(cause, OSError)
+                    assert isinstance(cause, OSError)
+                    self.assertEqual(cause.errno, error)
+                    self.assertEqual(caught.exception.stored.name, "copy.enc")
+                    self.assertFalse(caught.exception.stored.verified)
+                    self.assertEqual((root / "copy.enc").read_bytes(), b"synthetic archive")
+                    self.assertFalse((root / "copy.enc.partial").exists())
+                    self.assertTrue(target.put(self.source(b"retry"), "retry.enc").verified)
+
     def settings(self) -> ArchiveTargetSettings:
         return ArchiveTargetSettings(target_id="local", provider="filesystem", root=str(self.tmp / "archive"))
 

@@ -114,6 +114,14 @@ class StoredObject:
     verified: bool
 
 
+class ArchivePublicationUncertainError(ArchiveTransportError):
+    """The object is visible, but its directory entry may not be durable."""
+
+    def __init__(self, stored: StoredObject) -> None:
+        super().__init__("Archive object was published, but directory durability could not be confirmed.")
+        self.stored = stored
+
+
 @runtime_checkable
 class ArchiveTarget(Protocol):
     provider: str
@@ -359,6 +367,9 @@ class LocalDirectoryTarget(_TargetBase):
         self._confine_to = Path(confine_to) if confine_to is not None else None
         self._local_archive_root = Path(local_archive_root) if local_archive_root is not None else None
         self._root_real: Path | None = None
+        # The scheduler supplies policy-wide identity admission. It must run at
+        # each mutation, including when lifecycle reuses an already-open target.
+        self.before_mutation: Callable[[], None] = lambda: None
 
     @property
     def transport_encrypted(self) -> bool:
@@ -410,6 +421,7 @@ class LocalDirectoryTarget(_TargetBase):
         return root.joinpath(*parts)
 
     def put(self, local_path: Path, name: str) -> StoredObject:
+        self.before_mutation()
         final = self._object_path(name, create_parents=True)
         partial = final.with_name(final.name + PARTIAL_SUFFIX)
         flags = (
@@ -429,6 +441,7 @@ class LocalDirectoryTarget(_TargetBase):
                 with open(partial, "rb") as readback:
                     back_size, back_sha = _hash_stream(readback)
                 _check_readback(self.provider, size, sha, back_size, back_sha)
+                self.before_mutation()
                 os.replace(partial, final)
             except BaseException:
                 try:
@@ -436,19 +449,21 @@ class LocalDirectoryTarget(_TargetBase):
                 except FileNotFoundError:
                     pass
                 raise
-        self._fsync_dir(final.parent)
+        stored = StoredObject(name=name, size=size, sha256=sha, verified=False)
+        try:
+            self._fsync_dir(final.parent)
+        except OSError as exc:
+            raise ArchivePublicationUncertainError(stored) from exc
         return StoredObject(name=name, size=size, sha256=sha, verified=True)
 
     @staticmethod
     def _fsync_dir(path: Path) -> None:
-        try:
-            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        except OSError:
-            return
+        # Content verification does not establish directory-entry durability.
+        # There is no weaker-barrier mode: unsupported barriers also refuse
+        # success, leaving the published bytes in place for operator inspection.
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         try:
             os.fsync(descriptor)
-        except OSError:
-            pass
         finally:
             os.close(descriptor)
 
@@ -481,6 +496,7 @@ class LocalDirectoryTarget(_TargetBase):
             return _copy_stream(source, target.write, limit)
 
     def delete(self, name: str) -> None:
+        self.before_mutation()
         path = self._object_path(name, create_parents=False)
         try:
             metadata = os.lstat(path)
@@ -488,6 +504,7 @@ class LocalDirectoryTarget(_TargetBase):
             return
         if stat.S_ISDIR(metadata.st_mode):
             raise ArchiveTransportError("Archive delete refuses to remove a directory.")
+        self.before_mutation()
         os.unlink(path)
 
 
