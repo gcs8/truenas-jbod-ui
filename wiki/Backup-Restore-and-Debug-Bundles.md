@@ -283,7 +283,9 @@ written, the UI logs a warning and the save goes ahead.
 day-of-week`) or one of `@hourly`, `@daily`, `@midnight`, `@weekly` and
 `@monthly`. Ranges (`1-5`), lists (`1,15`) and steps (`*/15`) work, and Sunday
 is `0` or `7`. When both day-of-month and day-of-week are set, either one
-matching runs the backup, as in classic cron. Times are in the container's
+matching runs the backup, as in classic cron. A field that starts with `*`
+(such as `*/2`) counts as not set, so `0 3 */2 * 1` runs only on Mondays that
+fall on an odd day of the month. Times are in the container's
 time zone, set with `TZ` (default `UTC`).
 
 #### Full backup archive format
