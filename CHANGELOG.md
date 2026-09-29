@@ -259,6 +259,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Give supported numeric and textual SCSI statuses the same canonical severity
+  in diagnostic rows and summaries, preserving unknown-status fallback. (#767)
 - Keep Fabric alias actions bound to the displayed scope and prevent stale
   save/readback completions from replacing newer graphs or editor drafts. (#769)
 - Refresh clean mapping forms with current values while keeping dirty drafts
