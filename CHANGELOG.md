@@ -259,6 +259,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Kept missing SMART and history metrics unknown instead of displaying zero or
+  inventing critical heat and endurance warnings; preserved real zero values
+  and fallback error counters. (#743)
 - Kept admin JSON response reads within request deadlines and cancellation,
   validated both restore callers' results, and preserved uncertain outcomes
   without retrying consumed inspection receipts. (#745)
