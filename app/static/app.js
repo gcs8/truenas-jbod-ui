@@ -103,6 +103,8 @@
     enclosureAliasEditorOpen: false,
     enclosureAliasEditorScopeKey: null,
     mappingFormScopeKey: null,
+    mappingFormValuesKey: null,
+    mappingFormBaseRevision: null,
     mappingFormDirty: false,
     snapshotReuseCache: {},
     search: "",
@@ -1854,11 +1856,44 @@
     renderAll();
   }
 
+  // Fabric bays belong to the rendered enclosure snapshot, not the storage
+  // view's backing enclosure (inventory candidates may come from other shelves).
+  // Unknown or ambiguous physical identity must not select a view slot.
+  function sasFabricViewSlotForBay(bayNumber) {
+    const storageView = getSelectedStorageViewRuntime();
+    if (!storageView) {
+      return bayNumber;
+    }
+    const enclosureId = state.snapshot?.selected_enclosure_id;
+    if (typeof enclosureId !== "string" || !enclosureId.trim()) return null;
+    const slots = sasFabricList(storageView.slots);
+    const matches = [];
+    for (const slot of slots) {
+      if (slot?.snapshot_slot !== bayNumber) continue;
+      // Only snapshot-produced rows have view-level enclosure provenance.
+      // Never borrow that identity for an inventory candidate lacking metadata.
+      const slotEnclosureId = slot.snapshot_enclosure_id ?? (
+        storageView.source === "selected_enclosure_snapshot" && slot.source === "snapshot_slot"
+          ? storageView.backing_enclosure_id : null
+      );
+      if (typeof slotEnclosureId !== "string" || !slotEnclosureId.trim()) return null;
+      if (slotEnclosureId === enclosureId) matches.push(slot);
+    }
+    if (matches.length !== 1) return null;
+    const slotIndex = matches[0].slot_index;
+    return Number.isInteger(slotIndex) && slots.filter((slot) => slot?.slot_index === slotIndex).length === 1
+      ? slotIndex : null;
+  }
+
   function selectSasFabricSlot(slotNumber) {
     if (!Number.isInteger(slotNumber)) {
       return false;
     }
-    return selectSlot(slotNumber);
+    const viewSlot = sasFabricViewSlotForBay(slotNumber);
+    if (viewSlot === null) {
+      return false;
+    }
+    return selectSlot(viewSlot, { sasFabricSlot: slotNumber });
   }
 
   function sasFabricSelectionTouchesNode(nodeId) {
@@ -2019,7 +2054,8 @@
 
   function renderSasFabricFlatBayChips(sorted, selectedSlots, limit) {
     const chips = sorted.slice(0, limit).map((slotNumber) => {
-      const selected = selectedSlots.has(slotNumber) || state.selectedSlot === slotNumber;
+      const viewSlot = sasFabricViewSlotForBay(slotNumber);
+      const selected = selectedSlots.has(slotNumber) || (viewSlot !== null && state.selectedSlot === viewSlot);
       return `<button type="button" class="sas-fabric-bay-chip${selected ? " is-selected" : ""}" data-sas-fabric-slot="${slotNumber}">${escapeHtml(formatSlotLabel(slotNumber))}</button>`;
     }).join("");
     const overflow = sorted.length > limit ? `<span class="sas-fabric-bay-overflow">+${sorted.length - limit}</span>` : "";
@@ -2032,7 +2068,8 @@
     }
     const label = escapeHtml(formatSlotLabel(slotNumber));
     if (impactedSlots.has(slotNumber)) {
-      const selected = selectedSlots.has(slotNumber) || state.selectedSlot === slotNumber;
+      const viewSlot = sasFabricViewSlotForBay(slotNumber);
+      const selected = selectedSlots.has(slotNumber) || (viewSlot !== null && state.selectedSlot === viewSlot);
       return `<button type="button" class="sas-fabric-bay-chip${selected ? " is-selected" : ""}" data-sas-fabric-slot="${slotNumber}">${label}</button>`;
     }
     const slot = slotsByNumber.get(slotNumber);
@@ -2050,8 +2087,11 @@
       return '<span class="sas-fabric-empty-note">No mapped bays</span>';
     }
     const selectedSlots = sasFabricSelectedSlotSet();
-    const viewProfile = buildViewProfile();
-    const layoutRows = activeLayoutRows();
+    // Fabric slots are physical bays; a storage view numbers its own slots, so
+    // draw the layout of the backing enclosure while a view is selected.
+    const storageView = getSelectedStorageViewRuntime();
+    const viewProfile = storageView ? (state.snapshot.selected_profile || null) : buildViewProfile();
+    const layoutRows = storageView ? (state.layoutRows || []) : activeLayoutRows();
     const geometry = buildChassisGeometry(viewProfile, layoutRows);
     const gridRows = buildLayoutGridRows(layoutRows, geometry);
     if (!gridRows.length) {
@@ -2067,7 +2107,7 @@
       `).join('<span class="sas-fabric-bay-divider" aria-hidden="true"></span>');
       return `<div class="sas-fabric-bay-row">${groups}</div>`;
     }).join("");
-    const edgeLabel = viewProfile?.edgeLabel || "System front";
+    const edgeLabel = viewProfile?.edgeLabel || viewProfile?.edge_label || "System front";
     return `
       <div class="sas-fabric-bay-layout" data-layout-mode="${escapeHtml(geometry.layoutMode)}" data-latch-edge="${escapeHtml(geometry.latchEdge)}">
         ${rowsMarkup}
@@ -4483,8 +4523,8 @@
   }
 
   function computeAnnualizedBytes(totalBytes, powerOnHours, minimumHours = ANNUALIZED_MIN_POWER_ON_HOURS) {
-    const bytes = Number(totalBytes);
-    const hours = Number(powerOnHours);
+    const bytes = nullableMetricNumber(totalBytes);
+    const hours = nullableMetricNumber(powerOnHours);
     if (!Number.isFinite(bytes) || !Number.isFinite(hours) || hours < minimumHours || hours <= 0) {
       return null;
     }
@@ -4803,13 +4843,23 @@
     return [];
   }
 
+  function nullableMetricNumber(value) {
+    // Missing observations and non-numeric types must not become measured zero.
+    if (typeof value !== "number" && typeof value !== "string") {
+      return null;
+    }
+    if (typeof value === "string" && value.trim() === "") {
+      return null;
+    }
+    const numeric = Number(value);
+    return Number.isFinite(numeric) ? numeric : null;
+  }
+
   function heatmapSmartNumber(entry, fieldName, fallback = null) {
     if (!entry || !heatmapEntryOccupied(entry)) {
       return null;
     }
-    const value = entry.smartEntry?.data?.[fieldName] ?? fallback;
-    const numeric = Number(value);
-    return Number.isFinite(numeric) ? numeric : null;
+    return nullableMetricNumber(entry.smartEntry?.data?.[fieldName]) ?? nullableMetricNumber(fallback);
   }
 
   function heatmapMetricNumber(entry, fieldName, fallback = null, evaluation = null) {
@@ -4867,7 +4917,7 @@
   }
 
   function formatReadWriteRatioValue(value) {
-    const numeric = Number(value);
+    const numeric = nullableMetricNumber(value);
     if (!Number.isFinite(numeric)) {
       return "n/a";
     }
@@ -4885,7 +4935,7 @@
   }
 
   function roundHeatmapValue(value) {
-    const numeric = Number(value);
+    const numeric = nullableMetricNumber(value);
     if (!Number.isFinite(numeric)) {
       return "n/a";
     }
@@ -4916,7 +4966,7 @@
     const prepared = heatmapTimelineMetricSamples(entry, metricName)
       .map((sample) => ({
         timestampMs: sampleTimestampMs(sample),
-        value: Number(sample?.value),
+        value: nullableMetricNumber(sample?.value),
       }))
       .filter((sample) => Number.isFinite(sample.timestampMs) && Number.isFinite(sample.value))
       .sort((left, right) => left.timestampMs - right.timestampMs);
@@ -5154,7 +5204,7 @@
   }
 
   function countRisk(value, lowStep, highStep, highCap) {
-    const numeric = Number(value);
+    const numeric = nullableMetricNumber(value);
     if (!Number.isFinite(numeric) || numeric <= 0) {
       return 0;
     }
@@ -5196,8 +5246,8 @@
     }
 
     const temperature = heatmapSmartNumber(entry, "temperature_c", entry.slot?.temperature_c);
-    const warningTemp = Number(data.warning_temperature_c);
-    const criticalTemp = Number(data.critical_temperature_c);
+    const warningTemp = nullableMetricNumber(data.warning_temperature_c);
+    const criticalTemp = nullableMetricNumber(data.critical_temperature_c);
     if (Number.isFinite(temperature) && Number.isFinite(criticalTemp) && temperature >= criticalTemp) {
       score += 40;
       reasons.push(`at critical temp ${Math.round(temperature)} C`);
@@ -5224,8 +5274,8 @@
       reasons.push(`${roundHeatmapValue(tempDelta)} C over view avg`);
     }
 
-    const used = Number(data.endurance_used_percent);
-    const remaining = Number(data.endurance_remaining_percent);
+    const used = nullableMetricNumber(data.endurance_used_percent);
+    const remaining = nullableMetricNumber(data.endurance_remaining_percent);
     if (Number.isFinite(used) && used >= 90) {
       score += 35;
       reasons.push(`${Math.round(used)}% endurance used`);
@@ -5259,8 +5309,8 @@
       score += nonMediumRisk;
       reasons.push(`${data.non_medium_errors} non-medium errors`);
     }
-    const readErrorValue = Number.isFinite(Number(data.read_error_count)) ? data.read_error_count : data.uncorrected_read_errors;
-    const writeErrorValue = Number.isFinite(Number(data.write_error_count)) ? data.write_error_count : data.uncorrected_write_errors;
+    const readErrorValue = nullableMetricNumber(data.read_error_count) ?? nullableMetricNumber(data.uncorrected_read_errors);
+    const writeErrorValue = nullableMetricNumber(data.write_error_count) ?? nullableMetricNumber(data.uncorrected_write_errors);
     const readErrorRisk = countRisk(readErrorValue, 8, 10, 18);
     if (readErrorRisk) {
       score += readErrorRisk;
@@ -5376,7 +5426,7 @@
       const isEmptySlot = heatmapSlotState(entry) === "empty" || String(entry?.storageViewSlot?.state || "").toLowerCase() === "empty";
       const rawResult = isEmptySlot ? null : metric.value(entry, entries, evaluation);
       const value = typeof rawResult === "object" && rawResult !== null ? rawResult.value : rawResult;
-      const numericValue = value === null || value === undefined || value === "" ? null : Number(value);
+      const numericValue = nullableMetricNumber(value);
       const hasDiskIdentity = Boolean(entry?.slot?.device_name || entry?.slot?.serial || entry?.slot?.pool_name || entry?.storageViewSlot?.device_name || entry?.storageViewSlot?.serial || entry?.storageViewSlot?.pool_name);
       const reasons = typeof rawResult === "object" && rawResult !== null && Array.isArray(rawResult.reasons)
         ? rawResult.reasons
@@ -6759,19 +6809,19 @@
   }
 
   function formatHistoryMetricValue(metricName, value) {
-    if (!Number.isFinite(Number(value))) {
+    const numericValue = nullableMetricNumber(value);
+    if (numericValue === null) {
       return "n/a";
     }
-    const numericValue = Number(value);
     switch (metricName) {
       case "temperature_c":
         return `${numericValue} C`;
       case "bytes_read":
       case "bytes_written":
-        return formatMetricBytes(numericValue) || "n/a";
+        return numericValue === 0 ? "0 B" : formatMetricBytes(numericValue) || "n/a";
       case "annualized_bytes_read":
       case "annualized_bytes_written": {
-        const formatted = formatMetricBytes(numericValue);
+        const formatted = numericValue === 0 ? "0 B" : formatMetricBytes(numericValue);
         return formatted ? `${formatted}/yr` : "n/a";
       }
       case "power_on_hours": {
@@ -6785,7 +6835,7 @@
 
   function sortHistorySamplesAscending(samples) {
     return [...(samples || [])]
-      .filter((sample) => Number.isFinite(Number(sample?.value)))
+      .filter((sample) => Number.isFinite(nullableMetricNumber(sample?.value)))
       .sort((left, right) => new Date(left.observed_at).getTime() - new Date(right.observed_at).getTime());
   }
 
@@ -7040,8 +7090,9 @@
       return "Live estimate is unavailable right now. Export can still run with the current settings.";
     }
     const targetLabel = estimate.size_limit_label || "24 MiB";
-    const downsamplingPart =
-      estimate.downsampling_label && estimate.downsampling_label !== "None"
+    const downsamplingPart = estimate.history_coverage_note
+      ? ` ${estimate.history_coverage_note}`
+      : estimate.downsampling_label && estimate.downsampling_label !== "None"
         ? ` ${estimate.downsampling_note || `History will be thinned to fit (${estimate.downsampling_label}).`}`
         : "";
     const tooLargeAdvice = "Shorten the history window, mask serial numbers, or allow a larger file.";
@@ -7056,7 +7107,7 @@
       if (estimate.allow_oversize) {
         return `Both HTML and ZIP are over ${targetLabel}. Larger files are allowed, so a ZIP file of about ${estimate.zip_size_label || "n/a"} will be saved.${downsamplingPart}`;
       }
-      return `Too large: both HTML and ZIP are over ${targetLabel}. ${tooLargeAdvice}`;
+      return `Too large: both HTML and ZIP are over ${targetLabel}. ${tooLargeAdvice}${downsamplingPart}`;
     }
 
     if (estimate.selected_packaging === "html") {
@@ -7066,7 +7117,7 @@
       if (estimate.selected_allowed) {
         return `The HTML file is estimated at ${estimate.selected_size_label || estimate.html_size_label} and is over ${targetLabel}. Larger files are allowed, so it can still be saved.${downsamplingPart}`;
       }
-      return `Too large: the HTML file is estimated at ${estimate.selected_size_label || estimate.html_size_label}, over ${targetLabel}. Choose Automatic or ZIP file, shorten the history window, mask serial numbers, or allow a larger file.`;
+      return `Too large: the HTML file is estimated at ${estimate.selected_size_label || estimate.html_size_label}, over ${targetLabel}. Choose Automatic or ZIP file, shorten the history window, mask serial numbers, or allow a larger file.${downsamplingPart}`;
     }
 
     if (estimate.selected_packaging === "zip") {
@@ -7076,7 +7127,7 @@
       if (estimate.selected_allowed) {
         return `The ZIP file is estimated at ${estimate.selected_size_label || estimate.zip_size_label} and is over ${targetLabel}. Larger files are allowed, so it can still be saved.${downsamplingPart}`;
       }
-      return `Too large: the ZIP file is estimated at ${estimate.selected_size_label || estimate.zip_size_label}, over ${targetLabel}. ${tooLargeAdvice}`;
+      return `Too large: the ZIP file is estimated at ${estimate.selected_size_label || estimate.zip_size_label}, over ${targetLabel}. ${tooLargeAdvice}${downsamplingPart}`;
     }
 
     return "Estimate ready.";
@@ -7184,7 +7235,7 @@
         </div>
         <div class="snapshot-export-estimate-card">
           <span class="snapshot-export-estimate-label">History detail</span>
-          <span class="snapshot-export-estimate-value">${escapeHtml(estimate.downsampling_label && estimate.downsampling_label !== "None" ? estimate.downsampling_label : "Full")}</span>
+          <span class="snapshot-export-estimate-value">${escapeHtml(estimate.history_coverage === "truncated" ? "Incomplete" : estimate.history_coverage === "unknown" ? "Unverified" : estimate.downsampling_label && estimate.downsampling_label !== "None" ? estimate.downsampling_label : "Full")}</span>
           <span class="snapshot-export-estimate-meta">${escapeHtml(`${estimate.metric_sample_count ?? 0} samples / ${estimate.event_count ?? 0} events`)}</span>
         </div>
       </div>
@@ -7375,6 +7426,9 @@
     ];
     parts.push(snapshotExportSelectionDescription());
     if (!isHistoryAvailable()) parts.push("History is unavailable and will be omitted.");
+    if (state.export.estimate.data?.history_coverage_note) {
+      parts.push(state.export.estimate.data.history_coverage_note);
+    }
     if (state.export.estimate.data?.downsampling_label && state.export.estimate.data.downsampling_label !== "None") {
       parts.push(`History will be thinned (${state.export.estimate.data.downsampling_label.toLowerCase()}) to get closer to the size limit.`);
     }
@@ -7606,10 +7660,10 @@
   }
 
   function formatHistoryRateValue(value) {
-    if (!Number.isFinite(Number(value))) {
+    const numericValue = nullableMetricNumber(value);
+    if (numericValue === null) {
       return "n/a";
     }
-    const numericValue = Number(value);
     if (numericValue === 0) {
       return "0 B/hr";
     }
@@ -7805,7 +7859,7 @@
   function buildHistoryChartScale(sampleGroups) {
     const samples = sampleGroups
       .flat()
-      .filter((sample) => Number.isFinite(Number(sample?.value)) && Number.isFinite(sampleTimestampMs(sample)));
+      .filter((sample) => Number.isFinite(nullableMetricNumber(sample?.value)) && Number.isFinite(sampleTimestampMs(sample)));
     if (!samples.length) {
       return null;
     }
@@ -8487,6 +8541,8 @@
       return false;
     }
     state.mappingFormScopeKey = null;
+    state.mappingFormValuesKey = null;
+    state.mappingFormBaseRevision = null;
     state.mappingFormDirty = false;
     if (state.refreshesInFlight === 0) {
       scheduleAutoRefresh();
@@ -8497,15 +8553,25 @@
 
   function syncMappingFormForSlot(slot) {
     const scopeKey = mappingFormScopeKey(slot);
-    if (state.mappingFormScopeKey === scopeKey) {
+    const sameScope = state.mappingFormScopeKey === scopeKey;
+    // A retained draft keeps the revision that owned its original values, even
+    // when a confirmed manual refresh updates the inventory behind the form.
+    if (sameScope && state.mappingFormDirty) {
       return;
     }
     const wasDirty = state.mappingFormDirty;
-    mappingForm.serial.value = slot.serial || "";
-    mappingForm.device_name.value = slot.device_name || "";
-    mappingForm.gptid.value = slot.gptid || "";
-    mappingForm.notes.value = slot.notes || "";
+    const valuesKey = JSON.stringify([
+      slot.serial || "", slot.device_name || "", slot.gptid || "", slot.notes || "",
+    ]);
+    if (!sameScope || state.mappingFormValuesKey !== valuesKey) {
+      mappingForm.serial.value = slot.serial || "";
+      mappingForm.device_name.value = slot.device_name || "";
+      mappingForm.gptid.value = slot.gptid || "";
+      mappingForm.notes.value = slot.notes || "";
+    }
     state.mappingFormScopeKey = scopeKey;
+    state.mappingFormValuesKey = valuesKey;
+    state.mappingFormBaseRevision = slot.mapping_revision || null;
     state.mappingFormDirty = false;
     if (wasDirty && state.refreshesInFlight === 0) {
       scheduleAutoRefresh();
@@ -9936,7 +10002,7 @@
     renderStorageViewRuntimeStatus();
   }
 
-  function selectSlot(slotNumber) {
+  function selectSlot(slotNumber, { sasFabricSlot = slotNumber } = {}) {
     if (!inventoryScopeMatchesSelection() || (state.selectedStorageViewRuntimeId
       && (state.storageViewsRuntimeLoading || state.storageViewsRuntimeError))) return false;
     if (state.selectedSlot !== slotNumber && !confirmMappingDraftDiscard()) {
@@ -9945,7 +10011,7 @@
     if (state.selectedSlot !== slotNumber) state.selectionEpoch = (state.selectionEpoch || 0) + 1;
     state.selectedSlot = slotNumber;
     state.history.panelError = null;
-    syncSasFabricTraceToSlot(slotNumber);
+    syncSasFabricTraceToSlot(sasFabricSlot);
     refreshGridSelectionState();
     renderSasFabric();
     renderDetail();
@@ -10144,6 +10210,11 @@
           archiveUiPerfRun(perfRun, "mapping-draft");
         }
         setStatus("Refresh result set aside because you started editing a bay while it ran.");
+        // A system or enclosure switch left the storage views loading; finish
+        // that reload so the selector does not stay on "(previous)".
+        if (state.storageViewsRuntimeLoading) {
+          void fetchStorageViewRuntime(force, true);
+        }
         return;
       }
       if (perfRun && state.uiPerf.currentRun?.id === perfRun.id) {
@@ -10426,13 +10497,13 @@
       );
       return;
     }
-    if (!slot.mapping_revision) {
+    if (state.mappingFormScopeKey !== mappingFormScopeKey(slot) || !state.mappingFormBaseRevision) {
       setStatus("Mapping revision is unavailable. Refresh inventory before saving.", "error");
       return;
     }
     const formData = new FormData(mappingForm);
     const payload = {
-      expected_revision: slot.mapping_revision,
+      expected_revision: state.mappingFormBaseRevision,
       serial: formData.get("serial") || null,
       device_name: formData.get("device_name") || null,
       gptid: formData.get("gptid") || null,
@@ -10686,6 +10757,8 @@
     mappingForm.gptid.value = "";
     mappingForm.notes.value = "";
     state.mappingFormScopeKey = null;
+    state.mappingFormValuesKey = null;
+    state.mappingFormBaseRevision = null;
     state.mappingFormDirty = false;
     if (wasDirty && state.refreshesInFlight === 0) {
       scheduleAutoRefresh();
@@ -10905,7 +10978,11 @@
         scheduleAutoRefresh();
         return;
       }
-      if (state.refreshesInFlight > 0) {
+      // A refresh during a write bumps the epoch and would drop the write's
+      // outcome, so wait for in-flight writes as well as reads. Writes left
+      // stale by a manual refresh or scope change do not hold the new scope.
+      if (state.refreshesInFlight > 0
+        || Object.values(state.mutationsInFlight || {}).some(mutationContextIsCurrent)) {
         scheduleAutoRefresh();
         return;
       }

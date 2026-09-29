@@ -262,6 +262,112 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Reserved admin maintenance runtime ownership through restoration and retained
   catalog download workers through cancellation before cleanup. (#847)
 
+- Reuse one immutable mapping classification per inventory correlation pass,
+  preserving mapping conflicts, drawer aliases and revision checks. (#766)
+- Keep automatic config-backup hashes, captured files and source-path selection
+  on the same generation so intervening edits cannot suppress a later backup. (#768)
+- Compared per-slot history `since` filters in UTC so a non-UTC offset no
+  longer excludes later rows. (#799)
+- Made the backup archive format a choice in the admin Backups settings editor
+  so the editor can save again; a number input had turned the value into null.
+  (#803)
+- Checked the length and SHA-256 of a backup copy the admin service downloads
+  from the scheduler and refused a short or altered transfer instead of
+  passing it on. (#818)
+- Kept scheduled full backups running when the config change journal cannot be
+  read, and reported the journal problem as a failed config backup instead of
+  stopping the scheduler. (#835)
+- Let the admin Backups settings editor save again when config.yaml holds a
+  quoted port or a bare-number bucket; the endpoint comparison had treated the
+  retyped value as a different server. (#836)
+- Kept missing SMART and history metrics unknown instead of displaying zero or
+  inventing critical heat and endurance warnings; preserved real zero values
+  and fallback error counters. (#743)
+- Kept admin JSON response reads within request deadlines and cancellation,
+  validated both restore callers' results, and preserved uncertain outcomes
+  without retrying consumed inspection receipts. (#745)
+- Refuse unsupported SQLite schemas before segmented migration creates output,
+  and preserve rollback authority so interrupted cleanup can resume. (#754)
+- Exclude display labels from disk-retention identity so distinct disks sharing
+  a label remain separate while genuine persistent aliases still deduplicate. (#758)
+- Prevented a delayed page load from restoring a dismissed upgrade notice
+  by serializing notice state transitions within the server process. (#761)
+- Preserved physical bay-label numbering when cloning or editing enclosure
+  profiles without changing internal slot IDs or hardware targets. (#762)
+- Refresh history recovery warnings and quarantine time on accepted dashboard
+  polls without presenting missing or stale evidence as a fresh healthy state. (#764)
+- Give supported numeric and textual SCSI statuses the same canonical severity
+  in diagnostic rows and summaries, preserving unknown-status fallback. (#767)
+- Keep Fabric alias actions bound to the displayed scope and prevent stale
+  save/readback completions from replacing newer graphs or editor drafts. (#769)
+- Refresh clean mapping forms with current values while keeping dirty drafts
+  bound to their original revision, preventing stale values from gaining a fresh CAS token. (#770)
+- Preserve IPv6 brackets in derived System Setup links while retaining explicit
+  public-URL precedence and existing admin reachability behavior. (#771)
+- Ran each click inside the admin Backups dialog once; two listeners had
+  doubled every add, remove and close. (#804)
+- Kept the startup, storage-writability and known_hosts warnings on every
+  inventory refresh and re-probed the directories at most every 30 seconds, so
+  a warning no longer vanishes on the first refresh or outlives its fix.
+  (#806)
+- Treated a blank credential line in `.env` (as copied from `.env.example`) as
+  unset instead of wiping the value set in config.yaml; a `_FILE` secret still
+  wins. (#807)
+- Wrote config.yaml and runtime-overrides.yaml through a fsynced temporary
+  file that keeps the existing mode (0600 for a new file) instead of the umask
+  default. (#808)
+- Held the automatic refresh while a locate-light or bay-assignment write was
+  in flight, so the write's result and any sign-in rejection are shown instead
+  of being dropped by the refresh. (#829)
+- Finished the storage view reload after a system or enclosure switch even
+  when the refresh result was set aside for a bay edit, so the view options no
+  longer stay disabled as "(previous)". (#830)
+- Showed the admin auto-stop warning on an idle page again, and kept every
+  button disabled once the page reports that admin has stopped. (#831)
+- Kept the admin Backups page following a running backup while the tab is
+  hidden and after one failed list read, so the run buttons come back when the
+  backup ends. (#832)
+- Confirm supported sudo policy inclusion before reporting bootstrap grants,
+  and distinguish StorCLI installation evidence from failed-command diagnostics. (#840)
+- Applied existing partial endpoint masking consistently to contextual addresses
+  and serialized history details while preserving non-address text. (#851)
+
+- Disclosed capped or unknown history coverage in exports and estimates, and
+  preserved virtual-view history keys in partially redacted saved copies. (#848)
+
+- Showed the last backup clean-up on the admin Backups page: when it ran, how
+  many copies it removed, and which target stopped it when it did not finish.
+  (#819)
+- Kept grooming the other locations when one remote target cannot be opened,
+  built retention rules only for enabled targets, and reported the grooming
+  outcome in the scheduler status and in backup health. (#797)
+- Matched cron schedules like classic cron when a day field starts with `*`:
+  `0 3 */2 * 1` now runs only on Mondays that fall on an odd day of the month,
+  not on every Monday plus every second day. Searched a complete Gregorian
+  calendar cycle so sparse leap-day intersections remain valid. (#817)
+- Refused a full backup schedule that never matches a real date (for example
+  `0 0 30 2 *`) at validation time, instead of letting the scheduler exit on
+  start. (#793)
+- Followed the `TZ` zone for the full backup schedule so a daylight-saving
+  change neither doubles nor delays a run. (#794)
+- Treat malformed UTF-8 slot-detail caches as corrupt without blocking
+  startup; preserve their bytes until a legitimate save rebuilds them. (#752)
+- Emit JSON log timestamps in UTC to match their `Z` suffix, while leaving
+  text log timestamps in local time. (#753)
+- Verified large S3 copies by reading them back when the ETag is not a plain
+  MD5, and never catalogued a copy that could not be verified, so grooming no
+  longer deletes it after a day. Bounded S3 verification readback to the uploaded
+  size plus at most one chunk, retaining failed-copy cleanup. (#795)
+- Capped remote backup downloads at the catalogued size so a hostile or broken
+  remote cannot fill the state volume before the catalogue check. (#796)
+- Fixed public-demo validation rejecting UI labels as serial numbers, while
+  retaining non-demo serial checks and rejecting ambiguous nested JSON. (#746)
+- Drew the Storage Fabric bay grid in the enclosure's physical layout while a
+  storage view is selected, so no bay disappears and a chip selects the
+  physical bay. (#805)
+- Stopped storage views on ESXi and IPMI hosts from showing the SMART summary
+  of the front enclosure's bay when the disk in the view sits in another
+  enclosure. (#834)
 - The main UI no longer reports itself down when a pinned known-hosts file sits
   on a read-only mount, such as the `/run/ssh` mount in the shipped Compose
   file. SSH still verifies hosts against the keys in it; `/healthz` now answers

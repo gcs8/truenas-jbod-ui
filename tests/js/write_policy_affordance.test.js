@@ -451,6 +451,13 @@ test("Storage Fabric bootstrap and alias markup carry the same write policy", ()
 
 test("Storage Fabric rejects blocked alias writes and adopts 401/403 details", () => {
   const state = {
+    fabric: { system_id: "synthetic-system", selected_enclosure_id: "enc-a" },
+    selectedSystemId: "synthetic-system",
+    selectedEnclosureId: "enc-a",
+    fabricScopeReady: true,
+    loading: false,
+    refreshRequestToken: 0,
+    aliasEditGeneration: 0,
     writePolicy: { enabled: false, mode: "network", reason: NETWORK_REASON },
     error: null,
   };
@@ -458,6 +465,7 @@ test("Storage Fabric rejects blocked alias writes and adopts 401/403 details", (
     "normalizeFabricWritePolicy",
     "fabricWritePolicyAllowsWrites",
     "fabricWritePolicyReason",
+    "fabricScopeIsCurrent",
     "fabricAliasWriteAttributes",
     "fabricWriteBlockedByPolicy",
     "clearFabricAuthorization",
@@ -481,6 +489,26 @@ test("Storage Fabric rejects blocked alias writes and adopts 401/403 details", (
   assert.equal(state.writePolicy.mode, "basic");
   assert.equal(state.writePolicy.reason, "Main UI authentication required.");
   assert.equal(state.error, "Main UI authentication required.");
+
+  state.writePolicy = fns.normalizeFabricWritePolicy({ enabled: true, mode: "network", reason: "" });
+  assert.equal(fns.fabricScopeIsCurrent(), true);
+  assert.equal(fns.fabricAliasWriteAttributes(), "");
+  state.loading = true;
+  assert.equal(fns.fabricScopeIsCurrent(), false);
+  assert.match(fns.fabricAliasWriteAttributes(), /disabled/);
+  state.loading = false;
+  state.selectedEnclosureId = "enc-b";
+  assert.equal(fns.fabricScopeIsCurrent(), false);
+  assert.match(fns.fabricAliasWriteAttributes(), /disabled/);
+  assert.equal(state.writePolicy.enabled, true, "scope admission does not rewrite auth policy");
+  state.selectedEnclosureId = "enc-a";
+  const forbidden = new Error("Synthetic origin refusal.");
+  forbidden.status = 403;
+  forbidden.detail = "Synthetic origin refusal.";
+  assert.equal(fns.handleFabricWriteRejection(forbidden), true);
+  assert.equal(state.writePolicy.enabled, false);
+  assert.equal(state.writePolicy.reason, "Synthetic origin refusal.");
+  assert.equal(state.error, "Synthetic origin refusal.");
 });
 
 test("main UI Basic credentials stay in memory and are sent only on explicit same-origin auth requests", async () => {
