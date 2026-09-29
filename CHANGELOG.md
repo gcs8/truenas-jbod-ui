@@ -301,10 +301,6 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   finalize truthful receipts, and constrain Compose-matrix child runtimes. (#759)
 - Preserve Storage Fabric path identity, diagnostic placement, complete path
   health and scoped aliases; refuse unsafe alias-store mutations. (#760)
-- Bound SSH command execution and retain worker, channel and reusable-session
-  cleanup ownership through cancellation before releasing caller locks. (#765)
-- Require verified SES device-slot coordinates for SG LED control and keep
-  independent disks distinct when CAM model/target/LUN values match across controllers. (#809)
 - Bound SMART requests and cached results to the selected disk identity,
   preserving compatible saved views and coalescing duplicate pending requests. (#843)
 - Reserved admin maintenance runtime ownership through restoration and retained

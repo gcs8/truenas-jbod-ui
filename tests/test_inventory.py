@@ -16860,19 +16860,11 @@ class MappingCorrelationCostTests(unittest.TestCase):
                         service = self.make_fixture(root, bays, rows, version, legacy=legacy)
                         store = service.mapping_store
                         before = store.file_path.read_bytes()
-                        correlation_counts = []
-                        correlate = service._correlate
                         with patch.object(store, "_classify_row", wraps=store._classify_row) as classify, \
                              patch.object(store, "_digest", wraps=store._digest) as digest, \
-                             patch.object(store, "_read_document", wraps=store._read_document) as reads:
-                            def counted_correlate(*args, **kwargs):
-                                start = (classify.call_count, digest.call_count, reads.call_count)
-                                result = correlate(*args, **kwargs)
-                                correlation_counts.append(tuple(end - begin for end, begin in zip(
-                                    (classify.call_count, digest.call_count, reads.call_count), start)))
-                                return result
-                            with patch.object(service, "_correlate", side_effect=counted_correlate):
-                                snapshot = self.snapshot(service)
+                             patch.object(store, "_read_document", wraps=store._read_document) as reads, \
+                             patch.object(service, "_correlate", wraps=service._correlate) as correlate:
+                            snapshot = self.snapshot(service)
                         self.assertEqual(len(snapshot.slots), bays)
                         self.assertEqual(store.file_path.read_bytes(), before)
                         self.assertEqual(snapshot.summary.manual_mapping_count, rows)
@@ -16886,10 +16878,12 @@ class MappingCorrelationCostTests(unittest.TestCase):
                             self.assertEqual([s.serial for s in snapshot.slots],
                                              [f"SYNTHETIC-{i}" for i in range(bays)])
                             self.assertTrue(all(s.mapping_source == "manual" for s in snapshot.slots))
-                        self.assertEqual(len(correlation_counts), 1)
-                        self.assertEqual(correlation_counts[0], (rows, rows, 1))
-                        # Two revision batches and summary classification remain separate.
-                        self.assertEqual(classify.call_count, 4 * rows)
+                        self.assertEqual(correlate.call_count, 1)
+                        # The immutable generation is loaded before correlation,
+                        # then reused for correlation, counts and both revision batches.
+                        self.assertEqual(reads.call_count, 1)
+                        self.assertEqual(classify.call_count, 2 * rows)
+                        self.assertLessEqual(digest.call_count, 8 * rows)
 
     def test_public_snapshot_rejects_mapping_conflicts_without_publishing(self):
         for kind in ("invalid-v1", "invalid-v2", "duplicate", "legacy-drawer"):
