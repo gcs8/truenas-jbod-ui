@@ -262,6 +262,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Require verified SES device-slot coordinates for SG LED control and keep
+  independent disks distinct when CAM model/target/LUN values match across controllers. (#809)
 - Bound SMART requests and cached results to the selected disk identity,
   preserving compatible saved views and coalescing duplicate pending requests. (#843)
 - Reserved admin maintenance runtime ownership through restoration and retained
