@@ -175,6 +175,7 @@ VIRTUAL_INVENTORY_PHYSICAL_LOCATION_WARNING = (
 
 logger = logging.getLogger(__name__)
 METRICS_SERVICE_NAME = "enclosure-ui"
+QUANTASTOR_CLI_CORRELATION_WORK_LIMIT = 1_000_000
 HCTL_NAME_REGEX = re.compile(r"^\d+:\d+:\d+:\d+$")
 BMC_SLOT_HINT_REGEX = re.compile(r"^bmc-slot:(\d+)$", re.IGNORECASE)
 SERIAL_LUNID_IDENTIFIER_REGEX = re.compile(r"^\{\$?serial_lunid\}\$?(?P<identifier>.+)$", re.IGNORECASE)
@@ -7933,6 +7934,10 @@ class InventoryService:
             kind: {text for field in names if (text := normalize_value_text(row.get(field)))}
             for kind, names in fields.items()
         }
+        for kind in ("wwn", "eui64", "sasAddress", "portSasAddress"):
+            identity[kind] = {
+                normalize_hex_identifier(value.lower()) or value for value in identity[kind]
+            }
         identity["path"] = {
             normalized for value in identity["path"] if (normalized := normalize_device_name(value))
         }
@@ -8024,81 +8029,106 @@ class InventoryService:
                 query = prepare(identity)
                 queries.setdefault(query[0], []).append((index, query))
 
-        for mask, items in queries.items():
-            table: dict[tuple, tuple[int, int]] = {}
+        work = 0
+
+        class CorrelationWorkLimitExceeded(Exception):
+            pass
+
+        def charge() -> None:
+            nonlocal work
+            work += 1
+            if work > QUANTASTOR_CLI_CORRELATION_WORK_LIMIT:
+                raise CorrelationWorkLimitExceeded
+
+        try:
+            for mask, items in queries.items():
+                table: dict[tuple, tuple[int, int]] = {}
             # Visit only CLI presence submasks actually represented. This avoids
             # 128 empty probes per rank on ordinary fully populated inventories.
-            projections: dict[int, tuple[int, ...]] = {}
-            needed_values: dict[int, set[tuple[str | None, ...]]] = {}
+                projections: dict[int, tuple[int, ...]] = {}
+                needed_values: dict[int, set[tuple[str | None, ...]]] = {}
             # Index only alias subsets actually queried at this mask. This is
             # exact query projection, not candidate/result pruning: an unqueried
             # subset contributes to no inclusion-exclusion term. In particular,
             # many distinct masks need not each index every unrelated alias.
-            needed_ids = {token for _, query in items for token in query[3]}
-            needed_paths = {(query[2], token) for _, query in items
-                            if query[2] is not None for token in query[4]}
+                needed_ids = {token for _, query in items for token in query[3]}
+                needed_paths = {(query[2], token) for _, query in items
+                                if query[2] is not None for token in query[4]}
 
-            def add(key: tuple, ordinal: int) -> None:
-                count, total = table.get(key, (0, 0))
-                table[key] = (count + 1, total + ordinal)
+                def add(key: tuple, ordinal: int) -> None:
+                    charge()
+                    count, total = table.get(key, (0, 0))
+                    table[key] = (count + 1, total + ordinal)
 
-            for ordinal, (presence, values, owner, ids, paths) in enumerate(groups):
-                part = presence & mask
-                if part not in projections:
-                    projections[part] = tuple(i for i in range(len(kinds)) if part & (1 << i))
+                for ordinal, (presence, values, owner, ids, paths) in enumerate(groups):
+                    charge()
+                    part = presence & mask
+                    if part not in projections:
+                        projections[part] = tuple(i for i in range(len(kinds)) if part & (1 << i))
                     # Every lookup at this presence intersection uses one of
                     # these exact values. Missing group fields project away,
                     # including part=0: they must never become a veto.
-                    needed_values[part] = {
-                        tuple(query[1][i] for i in projections[part]) for _, query in items
-                    }
-                projected = tuple(values[i] for i in projections[part])
-                if projected not in needed_values[part]:
-                    continue
-                base = (part, projected)
-                for scope in (None, owner) if owner is not None else (None,):
-                    if part & 31:  # SAS is veto-only, never physical authority.
-                        add((base, "physical", (), scope, None), ordinal)
-                    for token in ids:
-                        if token in needed_ids:
-                            add((base, "id", token, scope, None), ordinal)
-                if owner is not None:
-                    for token in paths:
-                        if (owner, token) in needed_paths:
-                            add((base, "path", token, owner, bool(ids)), ordinal)
+                        needed_values[part] = {
+                            tuple(query[1][i] for i in projections[part]) for _, query in items
+                        }
+                    projected = tuple(values[i] for i in projections[part])
+                    if projected not in needed_values[part]:
+                        continue
+                    base = (part, projected)
+                    for scope in (None, owner) if owner is not None else (None,):
+                        if part & 31:  # SAS is veto-only, never physical authority.
+                            add((base, "physical", (), scope, None), ordinal)
+                        for token in ids:
+                            if token in needed_ids:
+                                add((base, "id", token, scope, None), ordinal)
+                    if owner is not None:
+                        for token in paths:
+                            if (owner, token) in needed_paths:
+                                add((base, "path", token, owner, bool(ids)), ordinal)
 
-            for index, (_, values, owner, ids, paths) in items:
-                bases = [(part, tuple(values[i] for i in indexes)) for part, indexes in projections.items()]
-                for rank in ("id", "physical", "path"):
-                    if rank == "path" and owner is None:
-                        continue
-                    tokens = ids if rank == "id" else paths if rank == "path" else [()]
-                    if not tokens:
-                        continue
-                    scopes = (owner, None) if owner is not None and rank != "path" else (owner,)
-                    flags = (False,) if rank == "path" and ids else (False, True) if rank == "path" else (None,)
-                    count = total = 0
-                    for scope in scopes:
+                for index, (_, values, owner, ids, paths) in items:
+                    bases = [(part, tuple(values[i] for i in indexes)) for part, indexes in projections.items()]
+                    for rank in ("id", "physical", "path"):
+                        if rank == "path" and owner is None:
+                            continue
+                        tokens = ids if rank == "id" else paths if rank == "path" else [()]
+                        if not tokens:
+                            continue
+                        scopes = (owner, None) if owner is not None and rank != "path" else (owner,)
+                        flags = (False,) if rank == "path" and ids else (False, True) if rank == "path" else (None,)
                         count = total = 0
-                        for base in bases:
-                            if rank == "physical" and not base[0] & 31:
-                                continue
-                            for token in tokens:
-                                sign = 1 if rank == "physical" or len(token) % 2 else -1
-                                for flag in flags:
-                                    n, ordinal_sum = table.get((base, rank, token, scope, flag), (0, 0))
-                                    count += sign * n
-                                    total += sign * ordinal_sum
+                        for scope in scopes:
+                            count = total = 0
+                            for base in bases:
+                                if rank == "physical" and not base[0] & 31:
+                                    continue
+                                for token in tokens:
+                                    sign = 1 if rank == "physical" or len(token) % 2 else -1
+                                    for flag in flags:
+                                        charge()
+                                        n, ordinal_sum = table.get((base, rank, token, scope, flag), (0, 0))
+                                        count += sign * n
+                                        total += sign * ordinal_sum
+                            if count:
+                                break  # A nonempty same-owner rank beats remote.
                         if count:
-                            break  # A nonempty same-owner rank beats remote.
-                    if count:
-                        if count == 1:
-                            representative, differs = hints.groups[total]
-                            output[index] = None if differs else representative
-                        # Best-rank ambiguity never falls back to weaker proof.
-                        break
-            # Release before building the next mask, including the add closure.
-            table.clear()
+                            if count == 1:
+                                representative, differs = hints.groups[total]
+                                output[index] = None if differs else representative
+                            # Best-rank ambiguity never falls back to weaker proof.
+                            break
+                # Release before building the next mask, including the add closure.
+                table.clear()
+        except CorrelationWorkLimitExceeded:
+            logger.warning(
+                "QuantaStor CLI correlation work budget exhausted "
+                "(groups=%s queries=%s masks=%s operations=%s); skipping CLI enrichment",
+                len(groups),
+                len(disks),
+                len(queries),
+                work,
+            )
+            return [None] * len(disks)
         return output
 
     def _build_quantastor_pool_slot_hints(

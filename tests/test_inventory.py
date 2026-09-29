@@ -18981,6 +18981,58 @@ class InventoryScopedIdentityRegressionTests(unittest.IsolatedAsyncioTestCase):
             hints = InventoryService._build_quantastor_cli_disk_hints(rows)
             self.assertEqual(InventoryService._resolve_quantastor_cli_disk_hints([row], hints), [None])
 
+    def test_quantastor_cli_correlation_budget_discards_partial_results(self) -> None:
+        rows = [
+            {"id": "a", "serial": "SANITIZED-A"},
+            {"id": "b", "serial": "SANITIZED-B", "wwn": "1"},
+        ]
+        disks = [
+            {"id": "a", "serial": "SANITIZED-A"},
+            {"id": "b", "serial": "SANITIZED-B"},
+            {"id": "b", "serial": "SANITIZED-B", "wwn": "1"},
+        ]
+        hints = InventoryService._build_quantastor_cli_disk_hints(rows)
+
+        with patch.object(inventory_module, "QUANTASTOR_CLI_CORRELATION_WORK_LIMIT", 8):
+            with self.assertLogs("app.services.inventory", level="WARNING") as logs:
+                actual = InventoryService._resolve_quantastor_cli_disk_hints(disks, hints)
+        self.assertEqual(actual, [None, None, None])
+        self.assertTrue(any("work budget exhausted" in line for line in logs.output))
+
+        with patch.object(inventory_module, "QUANTASTOR_CLI_CORRELATION_WORK_LIMIT", 100):
+            actual = InventoryService._resolve_quantastor_cli_disk_hints(disks, hints)
+        self.assertIs(actual[0], rows[0])
+        self.assertIs(actual[1], rows[1])
+        self.assertIs(actual[2], rows[1])
+
+    def test_quantastor_cli_identity_canonicalizes_typed_hex_only(self) -> None:
+        row = {
+            "wwn": "0x000ABC",
+            "eui64": "0000DEF",
+            "sasAddress": "000123",
+            "portSasAddress": "0X000456",
+            "scsiId": "0x000ABC",
+            "wwid": "0000DEF",
+            "id": "0x000123",
+        }
+        identity = InventoryService._quantastor_cli_identity(row)
+        self.assertEqual(identity["wwn"], {"abc"})
+        self.assertEqual(identity["eui64"], {"def"})
+        self.assertEqual(identity["sasAddress"], {"123"})
+        self.assertEqual(identity["portSasAddress"], {"456"})
+        self.assertEqual(identity["scsiId"], {"0x000ABC"})
+        self.assertEqual(identity["wwid"], {"0000DEF"})
+        self.assertEqual(identity["id"], {"0x000123"})
+
+        cli = {"id": "shared", "sasAddress": "0x000ABC"}
+        hints = InventoryService._build_quantastor_cli_disk_hints([cli])
+        actual = InventoryService._resolve_quantastor_cli_disk_hints(
+            [{"id": "shared", "sasAddress": "abc"}, {"id": "shared", "sasAddress": "abd"}],
+            hints,
+        )
+        self.assertIs(actual[0], cli)
+        self.assertIsNone(actual[1])
+
     def test_quantastor_cli_batch_all_masks_keep_missing_fields_and_sas_veto_only(self) -> None:
         fields = ("serial", "wwn", "scsiId", "wwid", "eui64", "sasAddress", "portSasAddress")
         rows = [{"id": f"synthetic-{mask}", **{k: "SANITIZED-A" for i, k in enumerate(fields) if mask & (1 << i)}}
