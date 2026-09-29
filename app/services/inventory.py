@@ -750,7 +750,7 @@ class _LayoutFrame:
     layout_columns: int
     slot_positions: dict[int, tuple[int, int]]
     allow_legacy_mapping_fallback: bool
-    loaded_mappings: dict[str, ManualMapping]
+    loaded_mappings: Mapping[str, ManualMapping]
 
     def actual_slot_ids(self) -> list[int]:
         """Return rendered physical slot ids in ascending order."""
@@ -1714,6 +1714,43 @@ class InventoryService:
             }
         )
 
+    def _sas_fabric_alias_mutation_context(
+        self, object_id: str, object_kind: str | None,
+    ) -> tuple[list[str], dict[str, set[str]]]:
+        # This synchronous mutation must not fetch live topology or guess the
+        # components of a digest. Rebuild from the already observed snapshots
+        # and source bundle, including other cached views to detect collisions.
+        from app.services.sas_fabric import sas_fabric_legacy_alias_targets
+
+        compatible = set(storage_node_legacy_alias_ids(object_id, object_kind))
+        bundle = getattr(self, "_source_bundle", None)
+        snapshots = [
+            snapshot for key, snapshot in getattr(self, "_cache", {}).items()
+            if key not in getattr(self, "_snapshot_invalidated", set())
+            and self._snapshot_has_trusted_topology(snapshot)
+        ]
+        nodes = []
+        if bundle is not None:
+            for snapshot in snapshots:
+                fabric = build_sas_fabric_snapshot(
+                    system=self.system, snapshot=snapshot, ssh_outputs=bundle.ssh_outputs,
+                    sources=bundle.sources, warnings=bundle.warnings,
+                    command_failures=bundle.ssh_failure_details,
+                )
+                nodes.extend(fabric.nodes)
+        targets = sas_fabric_legacy_alias_targets(nodes)
+        compatible.update(key for key, owners in targets.items() if object_id in owners)
+        if ":storage-v2:" in object_id and not any(node.id == object_id for node in nodes):
+            raise ValueError("Storage Fabric alias topology is unavailable; refresh the view before renaming.")
+        # A partial set of known enclosures cannot establish system-wide unique
+        # legacy ownership. Preserve the compatibility IDs but withhold proof.
+        known_enclosures = {option.id for snapshot in snapshots for option in snapshot.enclosures}
+        known_enclosures.update(getattr(self, "_canonical_enclosure_options", None) or {})
+        observed_enclosures = {snapshot.selected_enclosure_id for snapshot in snapshots}
+        if not known_enclosures.issubset(observed_enclosures):
+            targets = {}
+        return sorted(compatible), targets
+
     def save_sas_fabric_alias(
         self,
         *,
@@ -1746,13 +1783,14 @@ class InventoryService:
                 else None
             )
 
-        compatible_object_ids = storage_node_legacy_alias_ids(object_text, kind_name)
+        compatible_object_ids, legacy_owners = self._sas_fabric_alias_mutation_context(object_text, kind_name)
         if not label_text:
             cleared = self.sas_fabric_alias_store.clear_alias(
                 self.system.id,
                 enclosure_id,
                 object_text,
                 compatible_object_ids,
+                legacy_owners=legacy_owners,
             )
             if cleared and kind_name == "enclosure":
                 self.invalidate_physical_enclosure_snapshot_cache(
@@ -1770,11 +1808,12 @@ class InventoryService:
                 label=label_text,
                 source=(
                     SAS_FABRIC_CANONICAL_ALIAS_SOURCE
-                    if kind_name in {"pool", "vdev"}
+                    if kind_name in {"pool", "vdev"} or ":storage-v2:" in object_text
                     else "operator"
                 ),
             ),
             compatible_object_ids,
+            legacy_owners=legacy_owners,
         )
         if kind_name == "enclosure":
             self.invalidate_physical_enclosure_snapshot_cache(
@@ -6081,7 +6120,7 @@ class InventoryService:
                 f"This enclosure reports {reported_slot_count} bays but the selected layout draws "
                 f"{layout_slot_count}, so the extra bays are not shown. Choose a matching layout in System Setup."
             )
-        # One mapping load per correlation pass: the entries are
+        # One immutable classification per correlation pass: the entries are
         # loaded here and read back off the frame by every caller.
         loaded_mappings = self._correlation_mapping_entries()
         if not allow_legacy_mapping_fallback:
@@ -11041,11 +11080,11 @@ class InventoryService:
         )
         return self._finalize_enclosure_options(ordered) if finalize else ordered
 
-    def _correlation_mapping_entries(self) -> dict[str, ManualMapping]:
+    def _correlation_mapping_entries(self) -> Mapping[str, ManualMapping]:
         inputs = _snapshot_read_inputs.get()
         if inputs is not None and inputs[0] is self:
             return inputs[1]
-        return self.mapping_store.load_all()
+        return self.mapping_store.load_lookup_snapshot()
 
     def _finalize_enclosure_options(self, options: list[EnclosureOption]) -> list[EnclosureOption]:
         inputs = _snapshot_read_inputs.get()
@@ -11063,7 +11102,7 @@ class InventoryService:
         warnings: list[str],
         enclosure_id: str | None,
         slot_ids: Iterable[int],
-        loaded_mappings: dict[str, ManualMapping],
+        loaded_mappings: Mapping[str, ManualMapping],
         *,
         no_identified_physical_enclosure: bool = False,
     ) -> None:

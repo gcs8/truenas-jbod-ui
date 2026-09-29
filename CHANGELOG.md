@@ -187,6 +187,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Docs
 
+- Corrected standing SSH command and strict-trust guidance, scoped admin
+  hardening to its Compose chain, and separated staging ownership identities;
+  real root/separate-UID staging qualification remains pending. (#844)
 - The backup scheduler and NFS instructions now say they apply to a
   current-source checkout only: the beginner install's `compose.yaml` has no
   scheduler service, and an image-only update cannot add one. The architecture
@@ -270,6 +273,119 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   independent disks distinct when CAM model/target/LUN values match across controllers. (#809)
 - Bound SSH command execution and retain worker, channel and reusable-session
   cleanup ownership through cancellation before releasing caller locks. (#765)
+- Sync snapshot publication directories before retiring prior backups or
+  reporting success, preserving prior evidence when publication fails. (#763)
+- Validate log levels before settings reload, use the configured runtime-overrides
+  file consistently, and serialize partial updates while preserving reader permissions. (#811)
+- Preserved newer admin drafts when older saves complete, and kept discovered
+  storage-view candidates bound to the selected system and HA target. (#842)
+- Skipped excluded debug-export sources before reading or parsing them while
+  preserving selected-source validation and unselected manifest metadata. (#849)
+
+- Enforced backup source-read and encrypted-export admission limits, cleaned up
+  failed restore staging, and aligned inspection with restore admission. (#850)
+
+- Preserved history evidence across partial or failed collection, recorded
+  authoritative empty-view removals, kept status reads off the event loop,
+  stopped follow-on requests during shutdown, and rejected invalid refresh
+  modes with 422. (#744)
+- Made interrupted rotation-recovery cleanup resumable by persisting its
+  selected generation before retiring rollback evidence. (#751)
+- Complete retained segmented rollup points across all eligible sources before
+  returning bounded results, preserving counts, extrema and weighted values. (#755)
+- Keep required QuantaStor inventory available when optional REST endpoints
+  fail while opening or reading a response, retaining typed required errors. (#756)
+- Apply operation deadlines to normal TrueNAS inventory, slot-status and SMART
+  calls while retaining WebSocket close ownership through cancellation. (#757)
+- Correct QA mapping revisions, retain recovery files until verified cleanup,
+  finalize truthful receipts, and constrain Compose-matrix child runtimes. (#759)
+- Preserve Storage Fabric path identity, diagnostic placement, complete path
+  health and scoped aliases; refuse unsafe alias-store mutations. (#760)
+- Bound SSH command execution and retain worker, channel and reusable-session
+  cleanup ownership through cancellation before releasing caller locks. (#765)
+- Require verified SES device-slot coordinates for SG LED control and keep
+  independent disks distinct when CAM model/target/LUN values match across controllers. (#809)
+- Bound SMART requests and cached results to the selected disk identity,
+  preserving compatible saved views and coalescing duplicate pending requests. (#843)
+- Reserved admin maintenance runtime ownership through restoration and retained
+  catalog download workers through cancellation before cleanup. (#847)
+
+- Reuse one immutable mapping classification per inventory correlation pass,
+  preserving mapping conflicts, drawer aliases and revision checks. (#766)
+- Keep automatic config-backup hashes, captured files and source-path selection
+  on the same generation so intervening edits cannot suppress a later backup. (#768)
+- Compared per-slot history `since` filters in UTC so a non-UTC offset no
+  longer excludes later rows. (#799)
+- Made the backup archive format a choice in the admin Backups settings editor
+  so the editor can save again; a number input had turned the value into null.
+  (#803)
+- Checked the length and SHA-256 of a backup copy the admin service downloads
+  from the scheduler and refused a short or altered transfer instead of
+  passing it on. (#818)
+- Kept scheduled full backups running when the config change journal cannot be
+  read, and reported the journal problem as a failed config backup instead of
+  stopping the scheduler. (#835)
+- Let the admin Backups settings editor save again when config.yaml holds a
+  quoted port or a bare-number bucket; the endpoint comparison had treated the
+  retyped value as a different server. (#836)
+- Kept missing SMART and history metrics unknown instead of displaying zero or
+  inventing critical heat and endurance warnings; preserved real zero values
+  and fallback error counters. (#743)
+- Kept admin JSON response reads within request deadlines and cancellation,
+  validated both restore callers' results, and preserved uncertain outcomes
+  without retrying consumed inspection receipts. (#745)
+- Refuse unsupported SQLite schemas before segmented migration creates output,
+  and preserve rollback authority so interrupted cleanup can resume. (#754)
+- Exclude display labels from disk-retention identity so distinct disks sharing
+  a label remain separate while genuine persistent aliases still deduplicate. (#758)
+- Prevented a delayed page load from restoring a dismissed upgrade notice
+  by serializing notice state transitions within the server process. (#761)
+- Preserved physical bay-label numbering when cloning or editing enclosure
+  profiles without changing internal slot IDs or hardware targets. (#762)
+- Refresh history recovery warnings and quarantine time on accepted dashboard
+  polls without presenting missing or stale evidence as a fresh healthy state. (#764)
+- Give supported numeric and textual SCSI statuses the same canonical severity
+  in diagnostic rows and summaries, preserving unknown-status fallback. (#767)
+- Keep Fabric alias actions bound to the displayed scope and prevent stale
+  save/readback completions from replacing newer graphs or editor drafts. (#769)
+- Refresh clean mapping forms with current values while keeping dirty drafts
+  bound to their original revision, preventing stale values from gaining a fresh CAS token. (#770)
+- Preserve IPv6 brackets in derived System Setup links while retaining explicit
+  public-URL precedence and existing admin reachability behavior. (#771)
+- Ran each click inside the admin Backups dialog once; two listeners had
+  doubled every add, remove and close. (#804)
+- Kept the startup, storage-writability and known_hosts warnings on every
+  inventory refresh and re-probed the directories at most every 30 seconds, so
+  a warning no longer vanishes on the first refresh or outlives its fix.
+  (#806)
+- Treated a blank credential line in `.env` (as copied from `.env.example`) as
+  unset instead of wiping the value set in config.yaml; a `_FILE` secret still
+  wins. (#807)
+- Wrote config.yaml and runtime-overrides.yaml through a fsynced temporary
+  file that keeps the existing mode (0600 for a new file) instead of the umask
+  default. (#808)
+- Held the automatic refresh while a locate-light or bay-assignment write was
+  in flight, so the write's result and any sign-in rejection are shown instead
+  of being dropped by the refresh. (#829)
+- Finished the storage view reload after a system or enclosure switch even
+  when the refresh result was set aside for a bay edit, so the view options no
+  longer stay disabled as "(previous)". (#830)
+- Showed the admin auto-stop warning on an idle page again, and kept every
+  button disabled once the page reports that admin has stopped. (#831)
+- Kept the admin Backups page following a running backup while the tab is
+  hidden and after one failed list read, so the run buttons come back when the
+  backup ends. (#832)
+- Confirm supported sudo policy inclusion before reporting bootstrap grants,
+  and distinguish StorCLI installation evidence from failed-command diagnostics. (#840)
+- Applied existing partial endpoint masking consistently to contextual addresses
+  and serialized history details while preserving non-address text. (#851)
+
+- Disclosed capped or unknown history coverage in exports and estimates, and
+  preserved virtual-view history keys in partially redacted saved copies. (#848)
+
+- Showed the last backup clean-up on the admin Backups page: when it ran, how
+  many copies it removed, and which target stopped it when it did not finish.
+  (#819)
 - Kept grooming the other locations when one remote target cannot be opened,
   built retention rules only for enabled targets, and reported the grooming
   outcome in the scheduler status and in backup health. (#797)

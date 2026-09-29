@@ -12,7 +12,7 @@
   const SMART_PREFETCH_SINGLE_THRESHOLD = Math.max(1, Number(bootstrap.smartPrefetchSingleThreshold) || 128);
   const SMART_PREFETCH_CHUNK_SIZE = Math.max(1, Number(bootstrap.smartPrefetchChunkSize) || 24);
   const SMART_PREFETCH_BATCH_CONCURRENCY = Math.max(1, Number(bootstrap.smartPrefetchBatchConcurrency) || 2);
-  const SMART_PREFETCH_STALE_MS = 15000;
+
   const SNAPSHOT_CACHE_TTL_SECONDS = positiveSeconds(refreshTiming.snapshotCacheTtlSeconds, 10);
   const SOURCE_BUNDLE_CACHE_TTL_SECONDS = positiveSeconds(refreshTiming.sourceBundleCacheTtlSeconds, 60);
   const SMART_CACHE_TTL_SECONDS = positiveSeconds(refreshTiming.smartCacheTtlSeconds, 300);
@@ -103,6 +103,8 @@
     enclosureAliasEditorOpen: false,
     enclosureAliasEditorScopeKey: null,
     mappingFormScopeKey: null,
+    mappingFormValuesKey: null,
+    mappingFormBaseRevision: null,
     mappingFormDirty: false,
     snapshotReuseCache: {},
     search: "",
@@ -2233,7 +2235,7 @@
           <div class="sas-fabric-state-list">
             ${pathStates.map((pathState) => `
               <div class="sas-fabric-state-row status-${sasFabricClassToken(pathState.state)}">
-                <span>${escapeHtml(pathState.controller || "path")}</span>
+                <span>${escapeHtml(pathState.controller_label || pathState.controller || "path")}</span>
                 <strong>${escapeHtml(pathState.state || "unknown")}</strong>
                 <small>${escapeHtml(pathState.device_name || "")}</small>
               </div>
@@ -2596,6 +2598,8 @@
 
   function applySnapshot(snapshot) {
     rememberReusableSnapshot(snapshot);
+    const previousSmartKeys = (state.snapshot.slots || []).map(getSmartCacheKey).sort().join("\n");
+    const previousSmartScope = currentSmartPrefetchScopeKey();
     const nextSystemId = snapshot.selected_system_id || state.selectedSystemId;
     state.snapshot = snapshot;
     syncWritePolicyFromSnapshot(snapshot);
@@ -2604,6 +2608,10 @@
     state.selectedSystemId = nextSystemId;
     state.selectedEnclosureId = snapshot.selected_enclosure_id || null;
     advanceSnapshotExportSourceGeneration();
+    if (previousSmartScope !== currentSmartPrefetchScopeKey()
+      || previousSmartKeys !== (snapshot.slots || []).map(getSmartCacheKey).sort().join("\n")) {
+      invalidateSmartRequests();
+    }
     pruneSmartSummaryCache();
     if (state.selectedSlot !== null && !getSlotById(state.selectedSlot) && !getSelectedStorageViewRuntimeSlot(state.selectedSlot)) {
       state.selectedSlot = null;
@@ -2614,11 +2622,15 @@
     const validKeys = new Set(
       (state.snapshot.slots || []).map((slot) => getSmartCacheKey(slot))
     );
+    const systemPart = state.snapshot.selected_system_id || state.selectedSystemId || "system";
+    const savedPrefix = `${systemPart}|storage-view|`;
+    const savedKeys = new Set((state.storageViewsRuntime?.views || []).flatMap((view) => (view.slots || []).map((slot) => getStorageViewSmartCacheKey(view, slot))));
     const currentScopePrefix = `${currentSmartPrefetchScopeKey()}|`;
     Object.keys(state.smartSummaries).forEach((key) => {
       const entry = state.smartSummaries[key];
       const stale = smartSummaryAgeMs(entry) > SMART_SUMMARY_CACHE_TTL_MS && !isSmartEntryInFlight(entry);
-      const invalidForCurrentScope = key.startsWith(currentScopePrefix) && !validKeys.has(key);
+      const invalidForCurrentScope = (key.startsWith(currentScopePrefix) && !validKeys.has(key))
+        || (key.startsWith(savedPrefix) && !savedKeys.has(key));
       if (stale || invalidForCurrentScope) {
         delete state.smartSummaries[key];
       }
@@ -3526,10 +3538,37 @@
     return "the enclosure over SSH";
   }
 
+  function smartDiskIdentity(slot) {
+    if (!slot || slot.identity_state === "unknown" || slot.present === false || slot.occupied === false) return null;
+    // Device aliases and bay SAS addresses can be reused by another disk.
+    const identity = [slot.serial, slot.logical_unit_id, slot.gptid].map((value) => String(value || "").trim());
+    return identity.some(Boolean) ? JSON.stringify(identity) : null;
+  }
+
+  function invalidateSmartRequests() {
+    state.smartPrefetchToken += 1;
+    state.smartSummaryGeneration += 1;
+    if (state.smartPrefetchTimerId) window.clearTimeout(state.smartPrefetchTimerId);
+    state.smartPrefetchTimerId = null;
+    state.smartPrefetchRunning = false;
+    state.smartPrefetchScopeKey = null;
+    Object.keys(state.smartSummaries).forEach((key) => {
+      const entry = state.smartSummaries[key];
+      if (entry.loading || entry.refreshing || entry.queued) delete state.smartSummaries[key];
+    });
+  }
+
+  function smartSnapshotMatchesSelection() {
+    return (!state.selectedSystemId || state.selectedSystemId === state.snapshot.selected_system_id)
+      && (!state.selectedEnclosureId || state.selectedEnclosureId === state.snapshot.selected_enclosure_id);
+  }
+
   function getSmartCacheKey(slot) {
+    if (!smartSnapshotMatchesSelection()) return null;
     const systemPart = state.snapshot.selected_system_id || state.selectedSystemId || "system";
     const enclosurePart = state.snapshot.selected_enclosure_id || state.selectedEnclosureId || "all-enclosures";
-    return `${systemPart}|${enclosurePart}|${slot.slot}|${slot.device_name || "unknown"}`;
+    const identity = smartDiskIdentity(slot);
+    return identity ? `${systemPart}|${enclosurePart}|${slot.enclosure_id || enclosurePart}|${slot.slot}|${slot.device_name || ""}|${identity}` : null;
   }
 
   function getHistoryCacheKey(slot, options = {}) {
@@ -3704,9 +3743,31 @@
     return request;
   }
 
+  function savedSmartIdentityMatchesLive(slot, liveSlot) {
+    if (!smartDiskIdentity(slot) || !smartDiskIdentity(liveSlot)) return false;
+    // InventoryService._smart_disk_identity uses the first populated strong
+    // field, stripped and lowercased. Saved candidates can omit secondaries
+    // that the live snapshot independently backfills. Keep this compatibility
+    // check separate from the exact cache keys and request-generation fences.
+    const fields = ["serial", "logical_unit_id", "gptid"];
+    const saved = fields.map((field) => String(slot[field] || "").trim().toLowerCase());
+    const live = fields.map((field) => String(liveSlot[field] || "").trim().toLowerCase());
+    const primary = saved.findIndex(Boolean);
+    if (primary < 0 || primary !== live.findIndex(Boolean) || saved[primary] !== live[primary]) return false;
+    // An equal primary must not conceal contradictory populated strong fields.
+    return saved.every((value, index) => !value || !live[index] || value === live[index]);
+  }
+
   function getStorageViewSmartCacheKey(view, slot) {
+    if (!smartSnapshotMatchesSelection()) return null;
+    if (Number.isInteger(slot.snapshot_slot)
+      && (!view.backing_enclosure_id || view.backing_enclosure_id === state.snapshot.selected_enclosure_id)) {
+      const liveSlot = getSlotById(slot.snapshot_slot);
+      if (!savedSmartIdentityMatchesLive(slot, liveSlot)) return null;
+    }
     const systemPart = state.snapshot.selected_system_id || state.selectedSystemId || "system";
-    return `${systemPart}|storage-view|${view.id}|${slot.slot_index}|${slot.device_name || slot.serial || "unknown"}`;
+    const identity = smartDiskIdentity(slot);
+    return identity ? `${systemPart}|storage-view|${view.id}|${view.backing_enclosure_id || ""}|${slot.slot_index}|${slot.device_name || ""}|${identity}` : null;
   }
 
   function buildStorageViewHistoryContextSlot(view, slot) {
@@ -3766,7 +3827,7 @@
   }
 
   function getSmartSummaryEntry(slot) {
-    if (!slot) return null;
+    if (!slot || !getSmartCacheKey(slot)) return null;
     const liveEntry = state.smartSummaries[getSmartCacheKey(slot)] || null;
     if (liveEntry) {
       return liveEntry;
@@ -3789,7 +3850,7 @@
   }
 
   function getStorageViewSmartSummaryEntry(view, slot) {
-    if (!view || !slot) return null;
+    if (!view || !slot || !getStorageViewSmartCacheKey(view, slot)) return null;
     const liveEntry = state.smartSummaries[getStorageViewSmartCacheKey(view, slot)] || null;
     if (liveEntry) {
       return liveEntry;
@@ -3834,13 +3895,14 @@
     if (!entry || entry.queued || (!entry.loading && !entry.refreshing)) {
       return false;
     }
-    const requestedAt = Number(entry.requestedAt) || 0;
-    return requestedAt > 0 && Date.now() - requestedAt < SMART_PREFETCH_STALE_MS;
+    // The request deadline settles loading state. Wall-clock cache age must
+    // not release a live owner, including chunks reserved by an active batch.
+    return true;
   }
 
   function candidateSlotsForSmartPrefetch() {
     return (state.snapshot.slots || []).filter((slot) => {
-      if (!slot.present) {
+      if (!slot.present || !getSmartCacheKey(slot)) {
         return false;
       }
       if (!slot.device_name && !(Array.isArray(slot.smart_device_names) && slot.smart_device_names.length)) {
@@ -3902,50 +3964,23 @@
   }
 
   function applySmartPrefetchPayload(slots, payload) {
-    const seenSlots = new Set();
-    (payload.summaries || []).forEach((item) => {
-      const slot = getSlotById(item.slot);
-      if (!slot) {
-        return;
-      }
-      seenSlots.add(item.slot);
-      state.smartSummaries[getSmartCacheKey(slot)] = {
+    const summaries = new Map((payload.summaries || []).map((item) => [item.slot, item.summary]));
+    slots.forEach(({ slot, cacheKey, owner }) => {
+      if (state.smartSummaries[cacheKey] !== owner) return;
+      state.smartSummaries[cacheKey] = {
         loading: false,
         refreshing: false,
-        data: item.summary,
+        data: summaries.get(slot) || owner.data || { available: false, message: "SMART prefetch returned no data for this slot." },
         requestedAt: Date.now(),
-        generation: state.smartSummaryGeneration,
-      };
-    });
-    slots.forEach((slot) => {
-      if (seenSlots.has(slot.slot)) {
-        return;
-      }
-      const existingEntry = state.smartSummaries[getSmartCacheKey(slot)];
-      state.smartSummaries[getSmartCacheKey(slot)] = {
-        loading: false,
-        refreshing: false,
-        data: existingEntry?.data || { available: false, message: "SMART prefetch returned no data for this slot." },
-        requestedAt: Date.now(),
-        generation: state.smartSummaryGeneration,
+        generation: owner.generation,
       };
     });
   }
 
   function applySmartPrefetchError(slots, error) {
-    slots.forEach((slot) => {
-      const existingEntry = state.smartSummaries[getSmartCacheKey(slot)];
-      state.smartSummaries[getSmartCacheKey(slot)] = {
-        loading: false,
-        refreshing: false,
-        data: existingEntry?.data || {
-          available: false,
-          message: error.message || String(error),
-        },
-        requestedAt: Date.now(),
-        generation: state.smartSummaryGeneration,
-      };
-    });
+    applySmartPrefetchPayload(slots, { summaries: slots.map(({ slot, owner }) => ({
+      slot, summary: owner.data || { available: false, message: error.message || String(error) },
+    })) });
   }
 
   function logSmartPrefetchFailure(message, error, options = {}) {
@@ -3967,7 +4002,7 @@
       return;
     }
     state.smartPrefetchRunning = true;
-    const slots = candidateSlotsForSmartPrefetch();
+    const slots = candidateSlotsForSmartPrefetch().map((slot) => ({ slot: slot.slot, cacheKey: getSmartCacheKey(slot), owner: null }));
     if (!slots.length) {
       state.smartPrefetchRunning = false;
       return;
@@ -3975,7 +4010,7 @@
 
     try {
       slots.forEach((slot) => {
-        const cacheKey = getSmartCacheKey(slot);
+        const cacheKey = slot.cacheKey;
         const existingEntry = state.smartSummaries[cacheKey];
         state.smartSummaries[cacheKey] = {
           loading: !existingEntry?.data,
@@ -3984,6 +4019,7 @@
           requestedAt: Date.now(),
           generation: state.smartSummaryGeneration,
         };
+        slot.owner = state.smartSummaries[cacheKey];
       });
       updateSmartPrefetchViews();
 
@@ -4074,8 +4110,10 @@
       return Promise.resolve();
     }
     const cacheKey = getSmartCacheKey(slot);
+    if (!cacheKey) return;
     const entry = state.smartSummaries[cacheKey];
-    const settled = isSmartEntryCurrent(entry) && (entry?.data || isSmartEntryInFlight(entry));
+    if (isSmartEntryInFlight(entry)) return Promise.resolve();
+    const settled = isSmartEntryCurrent(entry);
     const coveredByPrefetch = !settled
       && smartPrefetchPending()
       && candidateSlotsForSmartPrefetch().some((candidate) => candidate.slot === slot.slot);
@@ -4521,8 +4559,8 @@
   }
 
   function computeAnnualizedBytes(totalBytes, powerOnHours, minimumHours = ANNUALIZED_MIN_POWER_ON_HOURS) {
-    const bytes = Number(totalBytes);
-    const hours = Number(powerOnHours);
+    const bytes = nullableMetricNumber(totalBytes);
+    const hours = nullableMetricNumber(powerOnHours);
     if (!Number.isFinite(bytes) || !Number.isFinite(hours) || hours < minimumHours || hours <= 0) {
       return null;
     }
@@ -4841,13 +4879,23 @@
     return [];
   }
 
+  function nullableMetricNumber(value) {
+    // Missing observations and non-numeric types must not become measured zero.
+    if (typeof value !== "number" && typeof value !== "string") {
+      return null;
+    }
+    if (typeof value === "string" && value.trim() === "") {
+      return null;
+    }
+    const numeric = Number(value);
+    return Number.isFinite(numeric) ? numeric : null;
+  }
+
   function heatmapSmartNumber(entry, fieldName, fallback = null) {
     if (!entry || !heatmapEntryOccupied(entry)) {
       return null;
     }
-    const value = entry.smartEntry?.data?.[fieldName] ?? fallback;
-    const numeric = Number(value);
-    return Number.isFinite(numeric) ? numeric : null;
+    return nullableMetricNumber(entry.smartEntry?.data?.[fieldName]) ?? nullableMetricNumber(fallback);
   }
 
   function heatmapMetricNumber(entry, fieldName, fallback = null, evaluation = null) {
@@ -4905,7 +4953,7 @@
   }
 
   function formatReadWriteRatioValue(value) {
-    const numeric = Number(value);
+    const numeric = nullableMetricNumber(value);
     if (!Number.isFinite(numeric)) {
       return "n/a";
     }
@@ -4923,7 +4971,7 @@
   }
 
   function roundHeatmapValue(value) {
-    const numeric = Number(value);
+    const numeric = nullableMetricNumber(value);
     if (!Number.isFinite(numeric)) {
       return "n/a";
     }
@@ -4954,7 +5002,7 @@
     const prepared = heatmapTimelineMetricSamples(entry, metricName)
       .map((sample) => ({
         timestampMs: sampleTimestampMs(sample),
-        value: Number(sample?.value),
+        value: nullableMetricNumber(sample?.value),
       }))
       .filter((sample) => Number.isFinite(sample.timestampMs) && Number.isFinite(sample.value))
       .sort((left, right) => left.timestampMs - right.timestampMs);
@@ -5192,7 +5240,7 @@
   }
 
   function countRisk(value, lowStep, highStep, highCap) {
-    const numeric = Number(value);
+    const numeric = nullableMetricNumber(value);
     if (!Number.isFinite(numeric) || numeric <= 0) {
       return 0;
     }
@@ -5234,8 +5282,8 @@
     }
 
     const temperature = heatmapSmartNumber(entry, "temperature_c", entry.slot?.temperature_c);
-    const warningTemp = Number(data.warning_temperature_c);
-    const criticalTemp = Number(data.critical_temperature_c);
+    const warningTemp = nullableMetricNumber(data.warning_temperature_c);
+    const criticalTemp = nullableMetricNumber(data.critical_temperature_c);
     if (Number.isFinite(temperature) && Number.isFinite(criticalTemp) && temperature >= criticalTemp) {
       score += 40;
       reasons.push(`at critical temp ${Math.round(temperature)} C`);
@@ -5262,8 +5310,8 @@
       reasons.push(`${roundHeatmapValue(tempDelta)} C over view avg`);
     }
 
-    const used = Number(data.endurance_used_percent);
-    const remaining = Number(data.endurance_remaining_percent);
+    const used = nullableMetricNumber(data.endurance_used_percent);
+    const remaining = nullableMetricNumber(data.endurance_remaining_percent);
     if (Number.isFinite(used) && used >= 90) {
       score += 35;
       reasons.push(`${Math.round(used)}% endurance used`);
@@ -5297,8 +5345,8 @@
       score += nonMediumRisk;
       reasons.push(`${data.non_medium_errors} non-medium errors`);
     }
-    const readErrorValue = Number.isFinite(Number(data.read_error_count)) ? data.read_error_count : data.uncorrected_read_errors;
-    const writeErrorValue = Number.isFinite(Number(data.write_error_count)) ? data.write_error_count : data.uncorrected_write_errors;
+    const readErrorValue = nullableMetricNumber(data.read_error_count) ?? nullableMetricNumber(data.uncorrected_read_errors);
+    const writeErrorValue = nullableMetricNumber(data.write_error_count) ?? nullableMetricNumber(data.uncorrected_write_errors);
     const readErrorRisk = countRisk(readErrorValue, 8, 10, 18);
     if (readErrorRisk) {
       score += readErrorRisk;
@@ -5414,7 +5462,7 @@
       const isEmptySlot = heatmapSlotState(entry) === "empty" || String(entry?.storageViewSlot?.state || "").toLowerCase() === "empty";
       const rawResult = isEmptySlot ? null : metric.value(entry, entries, evaluation);
       const value = typeof rawResult === "object" && rawResult !== null ? rawResult.value : rawResult;
-      const numericValue = value === null || value === undefined || value === "" ? null : Number(value);
+      const numericValue = nullableMetricNumber(value);
       const hasDiskIdentity = Boolean(entry?.slot?.device_name || entry?.slot?.serial || entry?.slot?.pool_name || entry?.storageViewSlot?.device_name || entry?.storageViewSlot?.serial || entry?.storageViewSlot?.pool_name);
       const reasons = typeof rawResult === "object" && rawResult !== null && Array.isArray(rawResult.reasons)
         ? rawResult.reasons
@@ -6797,19 +6845,19 @@
   }
 
   function formatHistoryMetricValue(metricName, value) {
-    if (!Number.isFinite(Number(value))) {
+    const numericValue = nullableMetricNumber(value);
+    if (numericValue === null) {
       return "n/a";
     }
-    const numericValue = Number(value);
     switch (metricName) {
       case "temperature_c":
         return `${numericValue} C`;
       case "bytes_read":
       case "bytes_written":
-        return formatMetricBytes(numericValue) || "n/a";
+        return numericValue === 0 ? "0 B" : formatMetricBytes(numericValue) || "n/a";
       case "annualized_bytes_read":
       case "annualized_bytes_written": {
-        const formatted = formatMetricBytes(numericValue);
+        const formatted = numericValue === 0 ? "0 B" : formatMetricBytes(numericValue);
         return formatted ? `${formatted}/yr` : "n/a";
       }
       case "power_on_hours": {
@@ -6823,7 +6871,7 @@
 
   function sortHistorySamplesAscending(samples) {
     return [...(samples || [])]
-      .filter((sample) => Number.isFinite(Number(sample?.value)))
+      .filter((sample) => Number.isFinite(nullableMetricNumber(sample?.value)))
       .sort((left, right) => new Date(left.observed_at).getTime() - new Date(right.observed_at).getTime());
   }
 
@@ -7078,8 +7126,9 @@
       return "Live estimate is unavailable right now. Export can still run with the current settings.";
     }
     const targetLabel = estimate.size_limit_label || "24 MiB";
-    const downsamplingPart =
-      estimate.downsampling_label && estimate.downsampling_label !== "None"
+    const downsamplingPart = estimate.history_coverage_note
+      ? ` ${estimate.history_coverage_note}`
+      : estimate.downsampling_label && estimate.downsampling_label !== "None"
         ? ` ${estimate.downsampling_note || `History will be thinned to fit (${estimate.downsampling_label}).`}`
         : "";
     const tooLargeAdvice = "Shorten the history window, mask serial numbers, or allow a larger file.";
@@ -7094,7 +7143,7 @@
       if (estimate.allow_oversize) {
         return `Both HTML and ZIP are over ${targetLabel}. Larger files are allowed, so a ZIP file of about ${estimate.zip_size_label || "n/a"} will be saved.${downsamplingPart}`;
       }
-      return `Too large: both HTML and ZIP are over ${targetLabel}. ${tooLargeAdvice}`;
+      return `Too large: both HTML and ZIP are over ${targetLabel}. ${tooLargeAdvice}${downsamplingPart}`;
     }
 
     if (estimate.selected_packaging === "html") {
@@ -7104,7 +7153,7 @@
       if (estimate.selected_allowed) {
         return `The HTML file is estimated at ${estimate.selected_size_label || estimate.html_size_label} and is over ${targetLabel}. Larger files are allowed, so it can still be saved.${downsamplingPart}`;
       }
-      return `Too large: the HTML file is estimated at ${estimate.selected_size_label || estimate.html_size_label}, over ${targetLabel}. Choose Automatic or ZIP file, shorten the history window, mask serial numbers, or allow a larger file.`;
+      return `Too large: the HTML file is estimated at ${estimate.selected_size_label || estimate.html_size_label}, over ${targetLabel}. Choose Automatic or ZIP file, shorten the history window, mask serial numbers, or allow a larger file.${downsamplingPart}`;
     }
 
     if (estimate.selected_packaging === "zip") {
@@ -7114,7 +7163,7 @@
       if (estimate.selected_allowed) {
         return `The ZIP file is estimated at ${estimate.selected_size_label || estimate.zip_size_label} and is over ${targetLabel}. Larger files are allowed, so it can still be saved.${downsamplingPart}`;
       }
-      return `Too large: the ZIP file is estimated at ${estimate.selected_size_label || estimate.zip_size_label}, over ${targetLabel}. ${tooLargeAdvice}`;
+      return `Too large: the ZIP file is estimated at ${estimate.selected_size_label || estimate.zip_size_label}, over ${targetLabel}. ${tooLargeAdvice}${downsamplingPart}`;
     }
 
     return "Estimate ready.";
@@ -7222,7 +7271,7 @@
         </div>
         <div class="snapshot-export-estimate-card">
           <span class="snapshot-export-estimate-label">History detail</span>
-          <span class="snapshot-export-estimate-value">${escapeHtml(estimate.downsampling_label && estimate.downsampling_label !== "None" ? estimate.downsampling_label : "Full")}</span>
+          <span class="snapshot-export-estimate-value">${escapeHtml(estimate.history_coverage === "truncated" ? "Incomplete" : estimate.history_coverage === "unknown" ? "Unverified" : estimate.downsampling_label && estimate.downsampling_label !== "None" ? estimate.downsampling_label : "Full")}</span>
           <span class="snapshot-export-estimate-meta">${escapeHtml(`${estimate.metric_sample_count ?? 0} samples / ${estimate.event_count ?? 0} events`)}</span>
         </div>
       </div>
@@ -7413,6 +7462,9 @@
     ];
     parts.push(snapshotExportSelectionDescription());
     if (!isHistoryAvailable()) parts.push("History is unavailable and will be omitted.");
+    if (state.export.estimate.data?.history_coverage_note) {
+      parts.push(state.export.estimate.data.history_coverage_note);
+    }
     if (state.export.estimate.data?.downsampling_label && state.export.estimate.data.downsampling_label !== "None") {
       parts.push(`History will be thinned (${state.export.estimate.data.downsampling_label.toLowerCase()}) to get closer to the size limit.`);
     }
@@ -7644,10 +7696,10 @@
   }
 
   function formatHistoryRateValue(value) {
-    if (!Number.isFinite(Number(value))) {
+    const numericValue = nullableMetricNumber(value);
+    if (numericValue === null) {
       return "n/a";
     }
-    const numericValue = Number(value);
     if (numericValue === 0) {
       return "0 B/hr";
     }
@@ -7843,7 +7895,7 @@
   function buildHistoryChartScale(sampleGroups) {
     const samples = sampleGroups
       .flat()
-      .filter((sample) => Number.isFinite(Number(sample?.value)) && Number.isFinite(sampleTimestampMs(sample)));
+      .filter((sample) => Number.isFinite(nullableMetricNumber(sample?.value)) && Number.isFinite(sampleTimestampMs(sample)));
     if (!samples.length) {
       return null;
     }
@@ -8525,6 +8577,8 @@
       return false;
     }
     state.mappingFormScopeKey = null;
+    state.mappingFormValuesKey = null;
+    state.mappingFormBaseRevision = null;
     state.mappingFormDirty = false;
     if (state.refreshesInFlight === 0) {
       scheduleAutoRefresh();
@@ -8535,15 +8589,25 @@
 
   function syncMappingFormForSlot(slot) {
     const scopeKey = mappingFormScopeKey(slot);
-    if (state.mappingFormScopeKey === scopeKey) {
+    const sameScope = state.mappingFormScopeKey === scopeKey;
+    // A retained draft keeps the revision that owned its original values, even
+    // when a confirmed manual refresh updates the inventory behind the form.
+    if (sameScope && state.mappingFormDirty) {
       return;
     }
     const wasDirty = state.mappingFormDirty;
-    mappingForm.serial.value = slot.serial || "";
-    mappingForm.device_name.value = slot.device_name || "";
-    mappingForm.gptid.value = slot.gptid || "";
-    mappingForm.notes.value = slot.notes || "";
+    const valuesKey = JSON.stringify([
+      slot.serial || "", slot.device_name || "", slot.gptid || "", slot.notes || "",
+    ]);
+    if (!sameScope || state.mappingFormValuesKey !== valuesKey) {
+      mappingForm.serial.value = slot.serial || "";
+      mappingForm.device_name.value = slot.device_name || "";
+      mappingForm.gptid.value = slot.gptid || "";
+      mappingForm.notes.value = slot.notes || "";
+    }
     state.mappingFormScopeKey = scopeKey;
+    state.mappingFormValuesKey = valuesKey;
+    state.mappingFormBaseRevision = slot.mapping_revision || null;
     state.mappingFormDirty = false;
     if (wasDirty && state.refreshesInFlight === 0) {
       scheduleAutoRefresh();
@@ -10038,11 +10102,15 @@
   }
 
   function applyStorageViewRuntime(payload) {
+    const previousSmartKeys = (state.storageViewsRuntime?.views || []).flatMap((view) => (view.slots || []).map((slot) => getStorageViewSmartCacheKey(view, slot))).sort().join("\n");
     state.storageViewsRuntime = payload || {
       system_id: state.selectedSystemId || state.snapshot.selected_system_id || null,
       system_label: state.snapshot.selected_system_label || state.selectedSystemId || null,
       views: [],
     };
+    const nextSmartKeys = (state.storageViewsRuntime.views || []).flatMap((view) => (view.slots || []).map((slot) => getStorageViewSmartCacheKey(view, slot))).sort().join("\n");
+    if (previousSmartKeys !== nextSmartKeys) invalidateSmartRequests();
+    pruneSmartSummaryCache();
     ensureStorageViewRuntimeSelection();
   }
 
@@ -10182,6 +10250,11 @@
           archiveUiPerfRun(perfRun, "mapping-draft");
         }
         setStatus("Refresh result set aside because you started editing a bay while it ran.");
+        // A system or enclosure switch left the storage views loading; finish
+        // that reload so the selector does not stay on "(previous)".
+        if (state.storageViewsRuntimeLoading) {
+          void fetchStorageViewRuntime(force, true);
+        }
         return;
       }
       if (perfRun && state.uiPerf.currentRun?.id === perfRun.id) {
@@ -10464,13 +10537,13 @@
       );
       return;
     }
-    if (!slot.mapping_revision) {
+    if (state.mappingFormScopeKey !== mappingFormScopeKey(slot) || !state.mappingFormBaseRevision) {
       setStatus("Mapping revision is unavailable. Refresh inventory before saving.", "error");
       return;
     }
     const formData = new FormData(mappingForm);
     const payload = {
-      expected_revision: slot.mapping_revision,
+      expected_revision: state.mappingFormBaseRevision,
       serial: formData.get("serial") || null,
       device_name: formData.get("device_name") || null,
       gptid: formData.get("gptid") || null,
@@ -10724,6 +10797,8 @@
     mappingForm.gptid.value = "";
     mappingForm.notes.value = "";
     state.mappingFormScopeKey = null;
+    state.mappingFormValuesKey = null;
+    state.mappingFormBaseRevision = null;
     state.mappingFormDirty = false;
     if (wasDirty && state.refreshesInFlight === 0) {
       scheduleAutoRefresh();
@@ -10743,15 +10818,16 @@
       return;
     }
     const cacheKey = getSmartCacheKey(slot);
+    if (!cacheKey) return;
     const entry = state.smartSummaries[cacheKey];
-    if (isSmartEntryCurrent(entry) && (entry?.data || isSmartEntryInFlight(entry))) {
+    if (isSmartEntryInFlight(entry) || isSmartEntryCurrent(entry)) {
       if (state.hoveredSlot === slot.slot) {
         refreshHoveredTooltip();
       }
       return;
     }
 
-    state.smartSummaries[cacheKey] = {
+    const owner = state.smartSummaries[cacheKey] = {
       loading: !entry?.data,
       refreshing: Boolean(entry?.data),
       data: entry?.data || null,
@@ -10763,6 +10839,7 @@
     }
     try {
       const payload = await sendScopedRequest(`/api/slots/${slot.slot}/smart`);
+      if (state.smartSummaries[cacheKey] !== owner) return;
       state.smartSummaries[cacheKey] = {
         loading: false,
         refreshing: false,
@@ -10771,6 +10848,7 @@
         generation: state.smartSummaryGeneration,
       };
     } catch (error) {
+      if (state.smartSummaries[cacheKey] !== owner) return;
       state.smartSummaries[cacheKey] = {
         loading: false,
         refreshing: false,
@@ -10796,12 +10874,13 @@
       return;
     }
     const cacheKey = getStorageViewSmartCacheKey(view, slot);
+    if (!cacheKey) return;
     const entry = state.smartSummaries[cacheKey];
-    if (isSmartEntryCurrent(entry) && (entry?.data || isSmartEntryInFlight(entry))) {
+    if (isSmartEntryInFlight(entry) || isSmartEntryCurrent(entry)) {
       return;
     }
 
-    state.smartSummaries[cacheKey] = {
+    const owner = state.smartSummaries[cacheKey] = {
       loading: !entry?.data,
       refreshing: Boolean(entry?.data),
       data: entry?.data || null,
@@ -10819,6 +10898,7 @@
         ? `/api/storage-views/${encodeURIComponent(view.id)}/slots/${slot.slot_index}/smart?${params.toString()}`
         : `/api/storage-views/${encodeURIComponent(view.id)}/slots/${slot.slot_index}/smart`;
       const payload = await fetchJson(scopedUrl);
+      if (state.smartSummaries[cacheKey] !== owner) return;
       state.smartSummaries[cacheKey] = {
         loading: false,
         refreshing: false,
@@ -10827,6 +10907,7 @@
         generation: state.smartSummaryGeneration,
       };
     } catch (error) {
+      if (state.smartSummaries[cacheKey] !== owner) return;
       state.smartSummaries[cacheKey] = {
         loading: false,
         refreshing: false,
@@ -10943,7 +11024,11 @@
         scheduleAutoRefresh();
         return;
       }
-      if (state.refreshesInFlight > 0) {
+      // A refresh during a write bumps the epoch and would drop the write's
+      // outcome, so wait for in-flight writes as well as reads. Writes left
+      // stale by a manual refresh or scope change do not hold the new scope.
+      if (state.refreshesInFlight > 0
+        || Object.values(state.mutationsInFlight || {}).some(mutationContextIsCurrent)) {
         scheduleAutoRefresh();
         return;
       }
@@ -10989,6 +11074,7 @@
       const previousEstimateBasisKey = snapshotExportEstimateBasisKey();
       closeEnclosureAliasEditor(false);
       if (nextSystemId === state.selectedSystemId) return;
+      invalidateSmartRequests();
       state.selectionEpoch = (state.selectionEpoch || 0) + 1;
       state.storageViewsRuntimeRequestToken += 1;
       state.storageViewsRuntimeError = null;
@@ -11026,6 +11112,7 @@
         return;
       }
       if (rawValue === currentValue) return;
+      invalidateSmartRequests();
       state.selectionEpoch = (state.selectionEpoch || 0) + 1;
       const previousEstimateBasisKey = snapshotExportEstimateBasisKey();
       closeEnclosureAliasEditor(false);

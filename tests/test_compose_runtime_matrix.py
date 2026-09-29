@@ -135,6 +135,7 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
             text=True,
             timeout=30,
             check=False,
+            env=module._child_environment(),
         )
         mismatch = Mock(returncode=0, stdout=f"{image_id}\n{'c' * 40}\n")
         with (
@@ -502,9 +503,12 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
             running = Mock(stdout="\n".join(variant.services) + "\n")
             with self.subTest(variant=name), contextlib.ExitStack() as stack:
                 stack.enter_context(patch.object(module, "_prepare_variant_root"))
-                stack.enter_context(patch.object(module, "_compose_prefix", return_value=["docker", "compose"]))
+                stack.enter_context(patch.object(module, "_compose_prefix", return_value=["docker", "compose", "-p", "synthetic"]))
                 stack.enter_context(patch.object(module, "_run", return_value=running))
                 stack.enter_context(patch.object(module, "_cleanup_variant"))
+                stack.enter_context(patch.object(module, "_assert_compose_resources_removed"))
+                stack.enter_context(patch.object(module, "_verify_rendered_contract"))
+                stack.enter_context(patch.object(module, "_verify_runtime_contract"))
                 stack.enter_context(patch.object(module, "_verify_admin"))
                 mocks = {
                     helper: stack.enter_context(patch.object(module, helper))
@@ -518,6 +522,7 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
                     config_fixture=Path("/private/config.yaml"),
                     image="sha256:" + "a" * 64,
                     ports=module.Ports(19080, 19081, 19082),
+                    source_commit="b" * 40,
                 )
                 mocks[called].assert_called_once()
                 mocks[skipped].assert_not_called()
@@ -1029,48 +1034,25 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
         module = self.load_matrix_module()
         prefix = ["docker", "compose", "-p", "synthetic"]
         root = Path("/private/scratch/variant")
-        with patch.object(
-            module.subprocess,
-            "run",
-            side_effect=[Mock(returncode=1), Mock(returncode=0)],
-        ) as run:
-            with self.assertRaisesRegex(RuntimeError, "cleanup failed"):
-                module._cleanup_variant(prefix, root)
-        self.assertEqual(run.call_count, 2)
-
-        with patch.object(
-            module.subprocess,
-            "run",
-            side_effect=[Mock(returncode=0), Mock(returncode=1)],
-        ):
-            with self.assertRaisesRegex(RuntimeError, "cleanup failed"):
-                module._cleanup_variant(prefix, root)
+        for down_code, remove_code in ((1, 0), (0, 1)):
+            with self.subTest(down=down_code), patch.object(module, "_assert_compose_resources_removed") as readback:
+                with patch.object(module.subprocess, "run", side_effect=[Mock(returncode=down_code), Mock(returncode=remove_code)]) as run:
+                    with self.assertRaisesRegex(RuntimeError, "cleanup failed"):
+                        module._cleanup_variant(prefix, root)
+                readback.assert_called_once()
+                self.assertEqual(run.call_count, 1 if down_code else 2)
 
     def test_variant_cleanup_readback_requires_reserved_resources_absent(self) -> None:
         module = self.load_matrix_module()
-        absent = Mock(returncode=1)
-        with patch.object(module.subprocess, "run", return_value=absent) as run:
+        with patch.object(module.subprocess, "run", return_value=Mock(returncode=0, stdout="")) as run:
             module._assert_compose_resources_removed("tjui-matrix-ui-only")
-        inspected = [call.args[0] for call in run.call_args_list]
-        for name in module.MATRIX_CONTAINER_NAMES:
-            self.assertIn(["docker", "container", "inspect", name], inspected)
-        self.assertIn(
-            ["docker", "container", "inspect", "tjui-matrix-ui-only-enclosure-backup-scheduler-1"],
-            inspected,
-        )
-        self.assertIn(
-            ["docker", "network", "inspect", "tjui-matrix-ui-only_default"],
-            inspected,
-        )
-        with (
-            patch.object(
-                module.subprocess,
-                "run",
-                return_value=Mock(returncode=0),
-            ),
-            self.assertRaisesRegex(RuntimeError, "cleanup readback"),
-        ):
-            module._assert_compose_resources_removed("tjui-matrix-ui-only")
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual([command[1] for command in commands], ["container", "container", "network", "volume"])
+        self.assertTrue(all("label=com.docker.compose.project=tjui-matrix-ui-only" in c for c in commands[1:]))
+        for result in (Mock(returncode=1, stdout=""), Mock(returncode=0, stdout="truenas-jbod-ui")):
+            with patch.object(module.subprocess, "run", return_value=result):
+                with self.assertRaisesRegex(RuntimeError, "cleanup readback"):
+                    module._assert_compose_resources_removed("tjui-matrix-ui-only")
 
     def test_app_owned_json_readback_uses_bounded_privileged_reader(self) -> None:
         module = self.load_matrix_module()
@@ -1157,6 +1139,223 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
                 module.main()
 
         self.assertIn("compose matrix runtime-root cleanup", stderr.getvalue())
+
+    def _synthetic_controller(self, *, failure="", variant_index=0):
+        """Execute main and variant lifecycle with only OS/HTTP transport replaced."""
+        import shutil
+        from types import SimpleNamespace
+
+        module = self.load_matrix_module()
+        with tempfile.TemporaryDirectory() as temp:
+            scratch = Path(temp)
+            scratch.chmod(0o700)
+            runtime = scratch / "runtime"
+            variant = module.VARIANTS[variant_index]
+            project = f"tjui-matrix-{variant.name}"
+            image, revision = "sha256:" + "a" * 64, "b" * 40
+            args = SimpleNamespace(
+                ack="I_APPROVE_DISPOSABLE_COMPOSE_QA", image=image, source_commit=revision,
+                ui_port=19080, history_port=19081, admin_port=19082,
+                scratch_root=scratch, runtime_root=runtime,
+                compose=ROOT / "docker-compose.yml", config_fixture=ROOT / "config" / "config.example.yaml",
+            )
+            events, children = [], []
+            original = RuntimeError("original variant failure")
+            state = {"started": False, "down": False}
+            expected_services = set(variant.services)
+            services = {}
+            port_map = {"enclosure-ui": (19080, 8000), "enclosure-history": (19081, 8001), "enclosure-admin": (19082, 8002)}
+            for service in expected_services | ({"enclosure-ui"} if variant.admin_initial_setup else set()):
+                env = {"BACKUP_TARGETS_JSON": "[]", "BACKUP_FULL_ENABLED": "false", "METRICS_PATH": "/metrics"}
+                if service in {"enclosure-ui", "enclosure-admin"}:
+                    env.update(ADMIN_AUTH_MODE="basic", ADMIN_AUTH_USERNAME=module.AUTH_USERNAME,
+                               ADMIN_AUTH_PASSWORD=module.AUTH_PASSWORD, READ_UI_AUTH_MODE="basic",
+                               READ_UI_AUTH_USERNAME=module.AUTH_USERNAME, READ_UI_AUTH_PASSWORD=module.AUTH_PASSWORD)
+                services[service] = {
+                    "image": image, "environment": env,
+                    "volumes": [{"type": "bind", "source": str(runtime / variant.name / "data"), "target": "/app/data"}],
+                    "ports": [{"host_ip": "127.0.0.1", "published": str(port_map[service][0]),
+                               "target": port_map[service][1], "protocol": "tcp"}] if service in port_map else [],
+                }
+            volumes = {}
+            if "enclosure-admin" in services:
+                volumes["host-prep-staging"] = {"name": project + "_host-prep-staging", "driver": "local"}
+                services["enclosure-admin"]["volumes"].append({"type": "volume", "source": "host-prep-staging", "target": "/app/host-prep"})
+            if failure == "render-volume-driver":
+                volumes["host-prep-staging"]["driver"] = "unreviewed-remote-plugin"
+            if failure == "render-image":
+                services[variant.services[0]]["image"] = "unreviewed:latest"
+            if failure == "render-port":
+                services[variant.services[0]]["ports"][0]["host_ip"] = "0.0.0.0"
+            if failure == "render-mount":
+                services[variant.services[0]]["volumes"][0]["source"] = str(scratch / "outside")
+            if failure == "render-target":
+                services[variant.services[0]]["environment"]["BACKUP_TARGETS_JSON"] = '[{"type":"sftp"}]'
+            if failure == "render-auth":
+                services[variant.services[0]]["environment"]["ADMIN_AUTH_MODE"] = "network"
+
+            def prepare(root, **kwargs):
+                root.mkdir()
+                (root / "compose.yaml").write_text("synthetic recovery configuration")
+                module._write_environment(root, image, kwargs["ports"], variant=variant)
+
+            def transport(command, **kwargs):
+                command = list(command)
+                children.append((command, kwargs))
+                if command[:3] == ["docker", "image", "inspect"]:
+                    return Mock(returncode=0, stdout=f"{image}\n{revision}\n")
+                if command[:2] == ["sudo", "rm"]:
+                    events.append("remove")
+                    shutil.rmtree(command[-1])
+                    return Mock(returncode=0, stdout="")
+                if "compose" in command:
+                    if "config" in command:
+                        events.append("config")
+                        return Mock(returncode=0, stdout=json.dumps({"services": services, "volumes": volumes}))
+                    if "up" in command:
+                        events.append("up")
+                        state["started"] = True
+                        if variant.admin_initial_setup and command[-1] == "enclosure-ui":
+                            expected_services.add("enclosure-ui")
+                        if failure.startswith("cleanup-"):
+                            raise original
+                    if "down" in command:
+                        events.append("down")
+                        state["down"] = True
+                        if failure in {"cleanup-down", "cleanup-down-absent"}:
+                            return Mock(returncode=1, stdout="")
+                    if "ps" in command:
+                        if "--services" in command:
+                            return Mock(returncode=0, stdout="\n".join(expected_services))
+                        if failure == "cleanup-diagnostics":
+                            raise RuntimeError("diagnostics must not mask original")
+                    return Mock(returncode=0, stdout="")
+                if "inspect" in command and state["down"]:
+                    events.append("readback")
+                    return Mock(returncode=0 if failure in {"cleanup-down", "cleanup-residual"} else 2 if failure == "cleanup-unknown" else 1, stdout="")
+                if "container" in command and "inspect" in command:
+                    events.append("inspect")
+                    records = []
+                    for service, spec in services.items():
+                        if service not in expected_services:
+                            continue
+                        ports = {f"{p['target']}/tcp": [{"HostIp": p["host_ip"], "HostPort": p["published"]}] for p in spec["ports"]}
+                        record = {"Image": image, "State": {"Running": True},
+                                  "Config": {"Labels": {"com.docker.compose.project": project,
+                                             "com.docker.compose.service": service,
+                                             "org.opencontainers.image.revision": revision},
+                                             "Env": [f"{k}={v}" for k, v in spec["environment"].items()]},
+                                  "Mounts": [{"Type": m["type"], "Source": m["source"],
+                                              "Name": volumes[m["source"]]["name"] if m["type"] == "volume" else None,
+                                              "Destination": m["target"], "RW": True} for m in spec["volumes"]],
+                                  "HostConfig": {"PortBindings": ports or None, "NetworkMode": project + "_default"},
+                                  "NetworkSettings": {"Ports": ports}}
+                        if failure == "runtime-image":
+                            record["Image"] = "sha256:" + "c" * 64
+                        if failure == "runtime-revision":
+                            record["Config"]["Labels"]["org.opencontainers.image.revision"] = "c" * 40
+                        if failure == "runtime-port":
+                            record["NetworkSettings"]["Ports"] = {"8000/tcp": [{"HostIp": "0.0.0.0", "HostPort": "19080"}]}
+                        if failure == "runtime-mount":
+                            record["Mounts"][0]["Source"] = str(scratch / "outside")
+                        if failure == "runtime-target":
+                            record["Config"]["Env"].append('BACKUP_TARGETS_JSON=[{"type":"sftp"}]')
+                        records.append(record)
+                    return Mock(returncode=0, stdout=json.dumps(records))
+                if command[:2] == ["docker", "container"]:
+                    if not state["started"]:
+                        return Mock(returncode=0, stdout="preexisting" if failure == "preexisting" and "--filter" in command else "")
+                    if state["down"]:
+                        events.append("readback")
+                        if failure == "cleanup-unknown":
+                            return Mock(returncode=1, stdout="")
+                        return Mock(returncode=0, stdout="residual" if failure in {"cleanup-down", "cleanup-residual"} else "")
+                    return Mock(returncode=0, stdout="\n".join("id-" + s for s in expected_services))
+                if "network" in command or "volume" in command:
+                    events.append("readback")
+                return Mock(returncode=0, stdout="")
+
+            hostile = {"DOCKER_HOST": "tcp://example.test:2375", "COMPOSE_FILE": "/unreviewed/compose.yml",
+                       "COMPOSE_PROFILES": "backup", "JBOD_UI_IMAGE": "unreviewed:latest",
+                       "APP_BIND_ADDRESS": "0.0.0.0", "ADMIN_AUTH_MODE": "network",
+                       "BACKUP_TARGETS_JSON": '[{"type":"sftp"}]', "HISTORY_BACKUP_DIR": "/unreviewed"}
+            error = None
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(patch.dict(os.environ, hostile))
+                stack.enter_context(patch.object(module, "parse_args", return_value=args))
+                stack.enter_context(patch.object(module, "VARIANTS", (variant,)))
+                stack.enter_context(patch.object(module, "_prepare_variant_root", side_effect=prepare))
+                stack.enter_context(patch.object(module.subprocess, "run", side_effect=transport))
+                stack.enter_context(patch.object(module, "_require_status", return_value=b'{"ok": true, "system": {"id": "demo-builder-lab"}}'))
+                stack.enter_context(patch.object(module, "_read_app_owned_text", return_value="demo-builder-lab demo-builder-lab-chassis"))
+                for name in ("validate_ports_available", "validate_available_memory", "validate_free_disk",
+                             "_verify_ui", "_verify_history", "_verify_admin", "_verify_pencil_cycle",
+                             "_verify_mapping_cycle", "_verify_scheduler_disabled", "_verify_scheduler_enabled"):
+                    stack.enter_context(patch.object(module, name))
+                stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                stderr = stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+                try:
+                    module.main()
+                except BaseException as exc:
+                    error = exc
+            retained = (runtime / variant.name / "compose.yaml").exists()
+            environment = (runtime / variant.name / ".env").read_text() if retained else ""
+            return error, original, events, children, retained, environment, stderr.getvalue()
+
+    def test_main_retains_recovery_config_until_verified_absence(self) -> None:
+        for failure in ("cleanup-down", "cleanup-down-absent", "cleanup-residual", "cleanup-unknown", "cleanup-absent", "cleanup-diagnostics"):
+            with self.subTest(failure=failure):
+                error, original, events, _, retained, environment, stderr = self._synthetic_controller(failure=failure)
+                self.assertIs(error, original)
+                self.assertIn("down", events)
+                self.assertIn("readback", events)
+                expected_retained = failure in {"cleanup-down", "cleanup-down-absent", "cleanup-residual", "cleanup-unknown"}
+                self.assertEqual(retained, expected_retained)
+                if expected_retained:
+                    self.assertNotIn("remove", events)
+                    self.assertIn("JBOD_UI_IMAGE=sha256:", environment)
+                    self.assertIn("retained", stderr)
+                else:
+                    self.assertLess(events.index("readback"), events.index("remove"))
+
+    def test_main_constrains_all_children_and_verifies_actual_runtime(self) -> None:
+        for variant_index in range(7):
+            with self.subTest(variant=variant_index):
+                error, _, events, children, retained, _, _ = self._synthetic_controller(variant_index=variant_index)
+                self.assertIsNone(error)
+                self.assertFalse(retained)
+                self.assertIn("config", events)
+                self.assertIn("inspect", events)
+                self.assertLess(events.index("config"), events.index("up"))
+                for command, kwargs in children:
+                    env = kwargs.get("env")
+                    self.assertIsInstance(env, dict, command)
+                    self.assertNotIn("COMPOSE_FILE", env)
+                    self.assertNotIn("BACKUP_TARGETS_JSON", env)
+                    self.assertNotIn("HISTORY_BACKUP_DIR", env)
+                    self.assertNotIn("JBOD_UI_IMAGE", env)
+                    self.assertEqual(env["DOCKER_HOST"], "unix:///var/run/docker.sock")
+                    if "compose" in command:
+                        self.assertIn("--env-file", command)
+
+    def test_main_refuses_preexisting_project_without_teardown(self) -> None:
+        error, _, events, _, _, _, _ = self._synthetic_controller(failure="preexisting")
+        self.assertIsInstance(error, RuntimeError)
+        self.assertNotIn("up", events)
+        self.assertNotIn("down", events)
+
+    def test_main_refuses_rendered_and_runtime_contract_drift(self) -> None:
+        for failure in ("render-image", "render-port", "render-mount", "render-target", "render-auth",
+                        "runtime-image", "runtime-revision", "runtime-port", "runtime-mount", "runtime-target", "render-volume-driver"):
+            with self.subTest(failure=failure):
+                error, _, events, _, retained, _, _ = self._synthetic_controller(failure=failure, variant_index=3 if failure == "render-volume-driver" else 0)
+                self.assertIsInstance(error, RuntimeError)
+                self.assertIn("contract", str(error))
+                if failure.startswith("render-"):
+                    self.assertNotIn("up", events)
+                else:
+                    self.assertIn("inspect", events)
+                self.assertFalse(retained)
 
     def test_cleanup_failure_raises_when_it_is_the_first_failure(self) -> None:
         module = self.load_matrix_module()

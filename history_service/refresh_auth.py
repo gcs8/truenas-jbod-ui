@@ -98,7 +98,12 @@ async def read_refresh_document(request: Request) -> str:
         payload = json.loads(body, object_pairs_hook=_reject_duplicate_keys)
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise HTTPException(status_code=422, detail="Refresh request must be valid JSON.") from exc
-    if not isinstance(payload, dict) or set(payload) != {"mode"} or payload["mode"] not in {"fast", "full"}:
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"mode"}
+        or not isinstance(payload["mode"], str)
+        or payload["mode"] not in {"fast", "full"}
+    ):
         raise HTTPException(status_code=422, detail="Refresh request must contain exactly mode 'fast' or 'full'.")
     return str(payload["mode"])
 

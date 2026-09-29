@@ -46,6 +46,7 @@ from history_service.operation_bounds import (
     HistoryRequestShapeError,
     build_history_read_plan,
     count_history_rows,
+    normalize_since_utc,
 )
 from history_service.refresh_auth import (
     ManualRefreshAdmission,
@@ -216,6 +217,15 @@ def _history_error_response(exc: Exception) -> JSONResponse:
             status_code=413,
         )
     return JSONResponse({"detail": "History request shape is invalid."}, status_code=422)
+
+
+def _normalized_optional_since(since: str | None) -> str | None:
+    if not since:
+        return since
+    try:
+        return normalize_since_utc(since)
+    except HistoryRequestShapeError as exc:
+        raise HTTPException(status_code=422, detail="History request shape is invalid.") from exc
 
 
 def _json_string_size(value: str) -> int:
@@ -466,7 +476,7 @@ async def _refuse_while_storage_is_unavailable(request: Request, call_next):
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request, exact_counts: bool = Query(default=False)) -> HTMLResponse:
-    status = public_collector_status(collector.status())
+    status = public_collector_status(await asyncio.to_thread(collector.status))
     counts = cast(
         dict[str, object],
         await asyncio.to_thread(store.counts if exact_counts else store.estimated_counts),
@@ -511,7 +521,7 @@ async def healthz() -> JSONResponse:
             },
             status_code=503,
         )
-    collector_status = public_collector_status(collector.status())
+    collector_status = public_collector_status(await asyncio.to_thread(collector.status))
     # A quarantine replaces an unreadable database with a fresh empty one. That
     # database works, so nothing sets last_error, but the service is running on
     # history it lost: grade it degraded until the recovery is acknowledged so
@@ -527,7 +537,7 @@ async def healthz() -> JSONResponse:
         if collector_status.get("history_collection_paused")
         else "Earlier history was quarantined; recovery is required."
         if recovery_required
-        else collector.degraded_reason()
+        else await asyncio.to_thread(collector.degraded_reason)
     )
     # Segmented history reads its catalog to size the database. A fresh
     # segmented deployment has no catalog until a migration or restore
@@ -573,7 +583,7 @@ async def livez() -> JSONResponse:
 async def overview(exact_counts: bool = Query(default=False)) -> dict[str, object]:
     counts = await asyncio.to_thread(store.counts if exact_counts else store.estimated_counts)
     return {
-        "collector": public_collector_status(collector.status()),
+        "collector": public_collector_status(await asyncio.to_thread(collector.status)),
         "refresh": refresh_cooldown_status(),
         "counts": counts,
         "counts_exact": exact_counts or counts.get("estimated") is False,
@@ -666,7 +676,7 @@ async def refresh_history(request: Request) -> dict[str, object] | JSONResponse:
         except Exception:  # noqa: BLE001 - keep the original refresh failure visible even if summary loading also fails.
             logger.exception("Manual history %s refresh failed while loading summary payload", normalized_mode)
             payload = {
-                "collector": public_collector_status(collector.status(), last_error_detail=failure_detail),
+                "collector": public_collector_status(await asyncio.to_thread(collector.status), last_error_detail=failure_detail),
                 "counts": {},
                 "counts_exact": False,
                 "scopes": [],
@@ -727,7 +737,7 @@ async def slot_metrics(
             slot,
             metric_name=metric_name,
             limit=limit,
-            since=since,
+            since=_normalized_optional_since(since),
         ),
     }
 
@@ -747,7 +757,7 @@ async def slot_history_bundle(
         slot,
         event_limit=event_limit,
         metric_limits=SLOT_HISTORY_METRIC_LIMITS,
-        since=since,
+        since=_normalized_optional_since(since),
     )
 
 

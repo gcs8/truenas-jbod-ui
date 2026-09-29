@@ -6,10 +6,11 @@ import os
 import secrets
 import stat
 import threading
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, BinaryIO, TypeAlias
 
 from pydantic import ValidationError
@@ -132,13 +133,38 @@ class _VersionedEntries(dict[str, ManualMapping]):
         return self.__store_version
 
 
-class _SnapshotEntries(_VersionedEntries):
-    """Invocation-local classified read; never used as mutation authority."""
+@dataclass(frozen=True, slots=True, eq=False)
+class _MappingLookupSnapshot(Mapping[str, ManualMapping]):
+    """One display pass, with no caller-mutable models in the classified index."""
 
-    def __init__(self, snapshot: _ScopedStoreSnapshot, display_state):
-        super().__init__(snapshot.state.entries, store_version=snapshot.state.version)
-        self.snapshot = snapshot
-        self.display_state = display_state
+    _entries: Mapping[str, str]
+    _mappings: Mapping[Identity, str]
+
+    def __getitem__(self, key: str) -> ManualMapping:
+        return ManualMapping.model_validate_json(self._entries[key])
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._entries)
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def get_identity(self, identity: Identity) -> ManualMapping | None:
+        payload = self._mappings.get(identity)
+        return ManualMapping.model_validate_json(payload) if payload is not None else None
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class _SnapshotEntries(_MappingLookupSnapshot):
+    """One immutable invocation read plus its authoritative revision state."""
+
+    snapshot: _ScopedStoreSnapshot
+    display_state: _ClassifiedStore | MappingScopeConflict
+
+    def get_identity(self, identity: Identity) -> ManualMapping | None:
+        if isinstance(self.display_state, MappingScopeConflict):
+            raise self.display_state
+        return _MappingLookupSnapshot.get_identity(self, identity)
 
 
 class MappingStore:
@@ -623,7 +649,17 @@ class MappingStore:
                 if snapshot.state.version == 2:
                     raise
                 display_state = exc
-            return _SnapshotEntries(snapshot, display_state)
+            mappings = display_state.mappings if isinstance(display_state, _ClassifiedStore) else {}
+            return _SnapshotEntries(
+                MappingProxyType(
+                    {key: value.model_dump_json() for key, value in snapshot.state.entries.items()}
+                ),
+                MappingProxyType(
+                    {identity: value.model_dump_json() for identity, value in mappings.items()}
+                ),
+                snapshot,
+                display_state,
+            )
 
     def load_all(self) -> dict[str, ManualMapping]:
         """Load for historical read-only display, tolerating corrupt v1-era stores."""
@@ -634,6 +670,23 @@ class MappingStore:
         if version == 2:
             self._classify_entries(version, entries)
         return _VersionedEntries(entries, store_version=version)
+
+    def load_lookup_snapshot(self) -> Mapping[str, ManualMapping]:
+        """Read and classify once for a correlation pass, never cache on the store.
+
+        Preserve the display preload's v1 tolerance and all-row classification
+        policy. Direct scoped reads and authoritative mutation/revision reads
+        deliberately keep their existing, separate conflict policies.
+        """
+        version, entries = self._read_document(
+            strict=False,
+            tolerate_invalid_models=True,
+        )
+        state = self._classify_entries(version, entries)
+        return _MappingLookupSnapshot(
+            MappingProxyType({key: value.model_dump_json() for key, value in entries.items()}),
+            MappingProxyType({identity: value.model_dump_json() for identity, value in state.mappings.items()}),
+        )
 
     @staticmethod
     def _query_identities(
@@ -663,6 +716,14 @@ class MappingStore:
         loaded_entries: Mapping[str, ManualMapping] | None = None,
     ) -> ManualMapping | None:
         enclosure_id = resolve_physical_mapping_scope(enclosure_id)
+        if isinstance(loaded_entries, _MappingLookupSnapshot):
+            for identity in self._query_identities(
+                system_id, enclosure_id, slot, allow_legacy_fallback
+            ):
+                mapping = loaded_entries.get_identity(identity)
+                if mapping is not None:
+                    return mapping
+            return None
         state = (
             self._load_state_for_scope(system_id, enclosure_id, slot=slot)
             if loaded_entries is None

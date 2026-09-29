@@ -113,20 +113,45 @@ test("an unreachable sidecar on a read is a transport outcome, not a plain Error
   assert.ok(/nothing was changed/i.test(error.message), error.message);
 });
 
-test("an offline browser reports offline even for a mutation", async () => {
-  const { fetchJson } = loadFetchJson({
-    fetch: async () => {
-      throw new TypeError("Failed to fetch");
-    },
-    navigator: { onLine: false },
+for (const method of ["GET", "POST"]) {
+  test(`offline hint does not veto reachable local ${method}`, async () => {
+    let calls = 0;
+    const { fetchJson } = loadFetchJson({
+      fetch: async () => { calls++; return jsonResponse(200, { ok: true }); },
+      navigator: { onLine: false },
+    });
+    assert.deepEqual(await fetchJson("/api/admin/profiles", { method }), { ok: true });
+    assert.equal(calls, 1);
   });
 
-  const error = await captureError(fetchJson("/api/admin/profiles", { method: "POST" }));
+  test(`offline hint with failed ${method} uses actual dispatch, without retry`, async () => {
+    let calls = 0;
+    const { fetchJson } = loadFetchJson({
+      fetch: async () => { calls++; throw new TypeError("Failed to fetch"); },
+      navigator: { onLine: false },
+    });
+    const error = await captureError(fetchJson("/api/admin/profiles", { method }));
+    assert.equal(calls, 1);
+    assert.equal(error.requestDispatched, true);
+    assert.equal(error.adminOutcome, method === "POST" ? "unknown" : "transport");
+    assert.equal(error.outcomeUnknown, method === "POST");
+    assert.doesNotMatch(error.message, /not sent/i);
+    if (method === "POST") assert.match(error.message, /check before retrying/i);
+  });
+}
 
-  assert.equal(error.adminOutcome, "transport");
-  assert.equal(error.outcomeUnknown, false);
-  assert.ok(/offline/i.test(error.message), error.message);
-  assert.ok(/not sent/i.test(error.message), error.message);
+test("offline hint does not change pre-dispatch cancellation or dispatch a retry", async () => {
+  let calls = 0;
+  const controller = new AbortController();
+  controller.abort();
+  const { fetchJson } = loadFetchJson({
+    fetch: async () => { calls++; return jsonResponse(200, { ok: true }); },
+    navigator: { onLine: false },
+  });
+  const error = await captureError(fetchJson("/api/admin/profiles", { method: "POST", signal: controller.signal }));
+  assert.equal(error.name, "AbortError");
+  assert.equal(error.requestDispatched, false);
+  assert.equal(calls, 0);
 });
 
 test("a mutation dispatched online that fails once the browser is offline is an unknown outcome", async () => {
@@ -256,3 +281,80 @@ test("an aborted request keeps its own cancellation contract", async () => {
   assert.equal(error, abortError);
   assert.equal(error.adminOutcome, undefined);
 });
+
+
+// Refresh publication belongs to the admitted caller, not the eventual queue dispatch.
+function refreshPublicationFixture() {
+  const { loadAdminFunctions } = require("./helpers/admin_transport");
+  const requests = [];
+  const state = { bannerRevision: 0, setupEditorGeneration: 0, setupDraftRevision: 0,
+    refreshPromise: null, refreshQueued: null, selectedBackupPaths: [], selectedDebugPaths: [],
+    systems: [], profiles: [] };
+  const elements = { refreshStateButton: { disabled: false },
+    banner: { textContent: "Ready.", classList: { add() {}, remove() {} } } };
+  const api = loadAdminFunctions(["setBanner", "refreshState", "startRefreshState", "runRefreshState"], {
+    state, elements,
+    fetchJson: () => new Promise((resolve, reject) => requests.push({ resolve, reject })),
+    currentStagedEsxiHostPrepPackages: () => [], renderAll() {}, loadOrphanedHistory() {},
+  });
+  return { api, state, elements, requests };
+}
+
+for (const quiet of [false, true]) {
+  test(`current refresh quiet=${quiet} publishes a real failure and releases busy ownership`, async () => {
+    const f = refreshPublicationFixture();
+    const run = f.api.refreshState({ quiet });
+    f.requests[0].reject(new Error("Synthetic current refresh failure"));
+    await run;
+    assert.match(f.elements.banner.textContent, /Unable to refresh admin state: Synthetic current refresh failure/);
+    assert.equal(f.elements.refreshStateButton.disabled, false);
+    assert.equal(f.requests.length, 1, "no automatic retry");
+  });
+}
+
+test("queued foreground refresh owns failure publication before its read dispatches", async () => {
+  const f = refreshPublicationFixture();
+  const first = f.api.refreshState();
+  const second = f.api.refreshState();
+  f.requests[0].reject(new Error("Synthetic superseded read failure"));
+  await first;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.requests.length, 2, "required queued read still dispatches");
+  assert.equal(f.elements.refreshStateButton.disabled, true);
+  assert.doesNotMatch(f.elements.banner.textContent, /superseded/);
+  f.requests[1].reject(new Error("Synthetic current queued failure"));
+  await second;
+  assert.match(f.elements.banner.textContent, /Synthetic current queued failure/);
+  assert.equal(f.elements.refreshStateButton.disabled, false);
+});
+
+test("closed restore cannot replace a live queued refresh notification owner", async () => {
+  const f = refreshPublicationFixture();
+  const first = f.api.refreshState();
+  f.api.setBanner("Backup restored.", "success");
+  const live = f.api.refreshState({ quiet: true, canPublish: () => true, failureMessage: "Backup restored, but refresh failed." });
+  const closed = f.api.refreshState({ quiet: true, canPublish: () => false });
+  assert.equal(live, closed, "both restores still await the shared fresh read");
+  f.requests[0].resolve({ systems: [], profiles: [] });
+  await first;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.requests.length, 2);
+  f.requests[1].reject(new Error("Synthetic read failure"));
+  await live;
+  assert.equal(f.elements.banner.textContent, "Backup restored, but refresh failed.");
+});
+
+for (const changed of ["banner", "setupEditorGeneration", "setupDraftRevision"]) {
+  test(`refresh error cannot replace a later ${changed} intent`, async () => {
+    const f = refreshPublicationFixture();
+    const run = f.api.refreshState();
+    const banner = f.elements.banner.textContent;
+    if (changed === "banner") f.api.setBanner(banner); // Same text, new owner.
+    else f.state[changed]++;
+    f.requests[0].reject(new Error("Synthetic superseded failure"));
+    await run;
+    assert.equal(f.elements.banner.textContent, banner);
+    assert.equal(f.elements.refreshStateButton.disabled, false);
+    assert.equal(f.requests.length, 1);
+  });
+}

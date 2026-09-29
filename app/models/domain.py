@@ -672,6 +672,9 @@ class EnclosureProfileRequest(BaseModel):
     row_groups: list[int] = Field(default_factory=list)
     slot_layout: list[list[int | None]] | None = None
     slot_hints: dict[int, list[str]] = Field(default_factory=dict)
+    # Match EnclosureProfileConfig: omission preserves the existing/source base;
+    # explicit null clears the override and restores the layout fallback.
+    slot_number_base: int | None = None
 
     @field_validator(
         "source_profile_id",

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import re
 import shutil
 import socket
@@ -230,6 +231,13 @@ def _read_available_memory_kib() -> int:
     raise RuntimeError("MemAvailable is missing from /proc/meminfo.")
 
 
+def _child_environment() -> dict[str, str]:
+    # Never inherit Compose interpolation, remote Docker contexts, credentials,
+    # or user config. The owned --env-file is the sole interpolation input.
+    return {"PATH": os.defpath, "HOME": "/nonexistent", "DOCKER_CONFIG": "/dev/null",
+            "DOCKER_HOST": "unix:///var/run/docker.sock"}
+
+
 def _run(
     command: Sequence[str],
     *,
@@ -238,6 +246,7 @@ def _run(
     return subprocess.run(
         list(command),
         check=True,
+        env=_child_environment(),
         capture_output=capture_output,
         text=True,
     )
@@ -312,6 +321,7 @@ def validate_exact_image(image: str, source_commit: str) -> None:
         text=True,
         timeout=30,
         check=False,
+        env=_child_environment(),
     )
     if result.returncode != 0:
         raise RuntimeError("Exact matrix image is not present on the local Docker host.")
@@ -332,6 +342,8 @@ def _compose_prefix(root: Path, variant: Variant) -> list[str]:
         str(root),
         "-f",
         str(root / "compose.yaml"),
+        "--env-file",
+        str(root / ".env"),
     ]
     for profile in variant.profiles:
         command.extend(("--profile", profile))
@@ -353,6 +365,8 @@ def _write_environment(
         f"BACKUP_UID={BACKUP_UID}",
         f"BACKUP_GID={BACKUP_GID}",
         f"APP_PORT={ports.ui}",
+        "APP_BIND_ADDRESS=127.0.0.1",
+        "RELEASE_CHECK_ENABLED=false",
         f"HISTORY_PORT={ports.history}",
         "HISTORY_BIND_ADDRESS=127.0.0.1",
         f"ADMIN_PORT={ports.admin}",
@@ -1057,29 +1071,30 @@ def _verify_admin_initial_setup(root: Path, prefix: Sequence[str], ports: Ports)
 
 
 def _safe_diagnostics(prefix: Sequence[str]) -> None:
-    subprocess.run((*prefix, "ps", "--all"), check=False)
+    subprocess.run((*prefix, "ps", "--all"), check=False, env=_child_environment())
     subprocess.run(
         (*prefix, "logs", "--no-color", "--timestamps", "--tail", "200"),
         check=False,
+        env=_child_environment(),
     )
 
 
 def _assert_compose_resources_removed(project: str) -> None:
-    # The scheduler service has no container_name, so Compose names it
-    # <project>-<service>-1.
-    for resource_type, name in (
-        *(("container", name) for name in MATRIX_CONTAINER_NAMES),
-        ("container", f"{project}-enclosure-backup-scheduler-1"),
-        ("network", f"{project}_default"),
-    ):
-        result = subprocess.run(
-            ["docker", resource_type, "inspect", name],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=30,
-            check=False,
-        )
-        if result.returncode != 1:
+    commands = [
+        ["docker", "container", "ls", "--all", "--format", "{{.Names}}"],
+        ["docker", "container", "ls", "--all", "--filter",
+         f"label=com.docker.compose.project={project}", "--format", "{{.ID}}"],
+        *(["docker", kind, "ls", "--filter", f"label=com.docker.compose.project={project}",
+           "--format", "{{.Name}}"] for kind in ("network", "volume")),
+    ]
+    for index, command in enumerate(commands):
+        result = subprocess.run(command, capture_output=True, text=True, timeout=30,
+                                check=False, env=_child_environment())
+        if result.returncode != 0:
+            raise RuntimeError("Compose matrix cleanup readback is unavailable.")
+        names = set(result.stdout.splitlines())
+        remaining = names & MATRIX_CONTAINER_NAMES if index == 0 else names
+        if remaining:
             raise RuntimeError("Compose matrix cleanup readback found a remaining resource.")
 
 
@@ -1114,27 +1129,170 @@ def _cleanup_after_run(step: Callable[[], None], description: str) -> bool:
     return True
 
 
-def _remove_runtime_root(runtime_root: Path) -> None:
+def _remove_runtime_root(runtime_root: Path, *, require_empty: bool = False) -> None:
+    if require_empty and runtime_root.exists() and next(runtime_root.iterdir(), None) is not None:
+        raise RuntimeError(f"Compose matrix recovery configuration retained at {runtime_root}")
     cleanup = subprocess.run(
         ("sudo", "rm", "-rf", str(runtime_root)),
         check=False,
+        env=_child_environment(),
     )
     if cleanup.returncode != 0 or runtime_root.exists():
         raise RuntimeError("Compose matrix runtime-root cleanup failed.")
 
 
 def _cleanup_variant(prefix: Sequence[str], root: Path) -> None:
-    compose_cleanup = subprocess.run(
-        (*prefix, "down", "--volumes", "--remove-orphans"),
-        check=False,
-    )
-    scratch_cleanup = subprocess.run(
-        ("sudo", "rm", "-rf", str(root)),
-        check=False,
-    )
-    if compose_cleanup.returncode != 0 or scratch_cleanup.returncode != 0 or root.exists():
-        raise RuntimeError("Compose matrix variant cleanup failed.")
-    _assert_compose_resources_removed(_compose_project_name(prefix))
+    down_error: BaseException | None = None
+    try:
+        result = subprocess.run((*prefix, "down", "--volumes", "--remove-orphans"),
+                                check=False, env=_child_environment())
+        if result.returncode != 0:
+            raise RuntimeError("Compose matrix variant cleanup failed.")
+    except BaseException as error:
+        down_error = error
+    try:
+        _assert_compose_resources_removed(_compose_project_name(prefix))
+    except BaseException:
+        if down_error is not None:
+            raise down_error
+        raise
+    if down_error is not None:
+        raise down_error
+    _remove_runtime_root(root)
+
+
+def _verify_rendered_contract(
+    prefix: Sequence[str], root: Path, image: str, ports: Ports,
+) -> dict[str, object]:
+    model = json.loads(_run((*prefix, "config", "--format", "json"), capture_output=True).stdout)
+    services = model.get("services")
+    if not isinstance(services, dict) or not services:
+        raise RuntimeError("Compose rendered contract has no services.")
+    port_map = {"enclosure-ui": (ports.ui, 8000), "enclosure-history": (ports.history, 8001),
+                "enclosure-admin": (ports.admin, 8002), "enclosure-backup-scheduler": None}
+    bind_paths = {"/app/" + name: root / name for name in (
+        "config", "data", "logs", "history", "backups", "backup-status", "backup-journal", "backup-api")}
+    bind_paths.update({"/run/ssh": root / "config/ssh",
+                       "/run/backup-secrets": root / "config/backup-secrets"})
+    project = _compose_project_name(prefix)
+    for name, service in services.items():
+        if name not in port_map or not isinstance(service, dict) or service.get("image") != image:
+            raise RuntimeError("Compose rendered image/service contract mismatch.")
+        if any(service.get(key) for key in ("build", "privileged", "devices", "volumes_from",
+                                            "network_mode", "pid", "ipc", "env_file", "extends")):
+            raise RuntimeError("Compose rendered isolation contract mismatch.")
+        expected_port = port_map[name]
+        bindings = service.get("ports", [])
+        if expected_port is None:
+            valid_ports = bindings == []
+        else:
+            valid_ports = len(bindings) == 1 and all(
+                isinstance(binding, dict) and binding.get("host_ip") == "127.0.0.1"
+                and str(binding.get("published")) == str(expected_port[0])
+                and binding.get("target") == expected_port[1] and binding.get("protocol", "tcp") == "tcp"
+                for binding in bindings
+            )
+        if not valid_ports:
+            raise RuntimeError("Compose rendered loopback binding contract mismatch.")
+        for mount in service.get("volumes", []):
+            target = mount.get("target")
+            source = mount.get("source")
+            if mount.get("type") == "bind":
+                allowed = bind_paths.get(target)
+                if name == "enclosure-admin" and target == "/var/run/docker.sock":
+                    allowed = Path("/var/run/docker.sock")
+                if allowed is None or source != str(allowed):
+                    raise RuntimeError("Compose rendered isolated mount contract mismatch.")
+                if allowed != Path("/var/run/docker.sock") and Path(source).resolve() != allowed.absolute():
+                    raise RuntimeError("Compose rendered mount contract crosses a symlink.")
+            elif mount.get("type") == "volume":
+                declaration = model.get("volumes", {}).get(source, {})
+                if (name != "enclosure-admin" or target != "/app/host-prep"
+                        or source != "host-prep-staging" or declaration.get("external")
+                        or declaration.get("driver", "local") != "local"
+                        or declaration.get("driver_opts")
+                        or declaration.get("name") != f"{project}_host-prep-staging"):
+                    raise RuntimeError("Compose rendered isolated volume contract mismatch.")
+            else:
+                raise RuntimeError("Compose rendered mount type contract mismatch.")
+        environment = service.get("environment", {})
+        if name in {"enclosure-ui", "enclosure-admin", "enclosure-backup-scheduler"}:
+            if environment.get("BACKUP_TARGETS_JSON") != "[]" or environment.get("BACKUP_FULL_ENABLED") != "false":
+                raise RuntimeError("Compose rendered backup destination contract mismatch.")
+        for key, value in environment.items():
+            if value and key != "METRICS_PATH" and key.endswith(("_DIR", "_PATH", "_FILE")):
+                if not isinstance(value, str) or not value.startswith(("/app/", "/run/backup-secrets/")) or ".." in Path(value).parts:
+                    raise RuntimeError("Compose rendered destination path contract mismatch.")
+        auth_prefixes = ("ADMIN", "READ_UI") if name in {"enclosure-ui", "enclosure-admin"} else ()
+        for auth in auth_prefixes:
+            if any(environment.get(f"{auth}_AUTH_{key}") != value for key, value in (
+                ("MODE", "basic"), ("USERNAME", AUTH_USERNAME), ("PASSWORD", AUTH_PASSWORD),
+            )):
+                raise RuntimeError("Compose rendered authentication contract mismatch.")
+    for network in model.get("networks", {}).values():
+        if network.get("external") or network.get("driver", "bridge") != "bridge" or network.get("driver_opts"):
+            raise RuntimeError("Compose rendered network contract mismatch.")
+    return model
+
+
+def _verify_runtime_contract(
+    prefix: Sequence[str], model: dict[str, object], services: Sequence[str], source_commit: str,
+) -> None:
+    project = _compose_project_name(prefix)
+    ids = _run(["docker", "container", "ls", "--all", "--filter",
+                f"label=com.docker.compose.project={project}", "--format", "{{.ID}}"],
+               capture_output=True).stdout.splitlines()
+    if not ids:
+        raise RuntimeError("Compose runtime container contract is empty.")
+    records = json.loads(_run(["docker", "container", "inspect", *ids], capture_output=True).stdout)
+    observed = set()
+    for record in records:
+        labels = record.get("Config", {}).get("Labels", {}) or {}
+        name = labels.get("com.docker.compose.service")
+        if (name not in services or name in observed or labels.get("com.docker.compose.project") != project
+                or labels.get("org.opencontainers.image.revision") != source_commit
+                or record.get("State", {}).get("Running") is not True):
+            raise RuntimeError("Compose runtime identity/revision contract mismatch.")
+        observed.add(name)
+        expected = model["services"][name]
+        if record.get("Image") != expected["image"]:
+            raise RuntimeError("Compose runtime image contract mismatch.")
+        expected_ports = {
+            f"{port['target']}/tcp": [{"HostIp": "127.0.0.1", "HostPort": str(port["published"])}]
+            for port in expected.get("ports", [])
+        }
+        for bindings in (record.get("HostConfig", {}).get("PortBindings"), record.get("NetworkSettings", {}).get("Ports")):
+            # Docker includes exposed but unpublished image ports as null.
+            if {key: value for key, value in (bindings or {}).items() if value} != expected_ports:
+                raise RuntimeError("Compose runtime loopback binding contract mismatch.")
+        if record.get("HostConfig", {}).get("NetworkMode") in {"host", "none"}:
+            raise RuntimeError("Compose runtime network contract mismatch.")
+        environment = {}
+        for entry in record.get("Config", {}).get("Env", []):
+            key, separator, value = entry.partition("=")
+            if not separator or key in environment:
+                raise RuntimeError("Compose runtime environment contract is ambiguous.")
+            environment[key] = value
+        if any(environment.get(key) != str(value) for key, value in expected.get("environment", {}).items()):
+            raise RuntimeError("Compose runtime environment contract mismatch.")
+        expected_mounts = {}
+        for mount in expected.get("volumes", []):
+            source = mount["source"]
+            if mount["type"] == "volume":
+                source = model["volumes"][source]["name"]
+            expected_mounts[mount["target"]] = (mount["type"], source, not mount.get("read_only", False))
+        actual_mounts = {}
+        for mount in record.get("Mounts", []):
+            if mount.get("Type") == "tmpfs" and mount.get("Destination") in expected.get("tmpfs", []):
+                continue
+            destination = mount.get("Destination")
+            if destination in actual_mounts:
+                raise RuntimeError("Compose runtime mount contract is ambiguous.")
+            actual_mounts[destination] = (mount.get("Type"), mount.get("Name") if mount.get("Type") == "volume" else mount.get("Source"), mount.get("RW"))
+        if actual_mounts != expected_mounts:
+            raise RuntimeError("Compose runtime isolated mount contract mismatch.")
+    if observed != set(services):
+        raise RuntimeError("Compose runtime service set contract mismatch.")
 
 
 def _run_variant(
@@ -1145,8 +1303,12 @@ def _run_variant(
     config_fixture: Path,
     image: str,
     ports: Ports,
+    source_commit: str,
 ) -> None:
     root = runtime_root / variant.name
+    prefix = _compose_prefix(root, variant)
+    # Refuse an existing project before acquiring any teardown authority.
+    _assert_compose_resources_removed(_compose_project_name(prefix))
     _prepare_variant_root(
         root,
         variant=variant,
@@ -1155,8 +1317,8 @@ def _run_variant(
         image=image,
         ports=ports,
     )
-    prefix = _compose_prefix(root, variant)
     try:
+        model = _verify_rendered_contract(prefix, root, image, ports)
         up = [*prefix, "up", "-d", "--wait", "--wait-timeout", "90"]
         if variant.admin_initial_setup:
             up.append("--no-deps")
@@ -1168,6 +1330,7 @@ def _run_variant(
         )
         if running != set(variant.services):
             raise RuntimeError(f"{variant.name} started an unexpected service set")
+        _verify_runtime_contract(prefix, model, variant.services, source_commit)
         if variant.ui_enabled:
             _verify_ui(ports)
             _verify_pencil_cycle(root, variant, ports, prefix)
@@ -1183,6 +1346,8 @@ def _run_variant(
                 _verify_scheduler_enabled(ports, prefix)
             else:
                 _verify_scheduler_disabled(prefix)
+        final_services = (*variant.services, "enclosure-ui") if variant.admin_initial_setup else variant.services
+        _verify_runtime_contract(prefix, model, final_services, source_commit)
         print(
             json.dumps(
                 {
@@ -1199,7 +1364,7 @@ def _run_variant(
             )
         )
     except BaseException:
-        _safe_diagnostics(prefix)
+        _cleanup_after_run(lambda: _safe_diagnostics(prefix), "compose matrix diagnostics")
         raise
     finally:
         _cleanup_after_run(
@@ -1237,10 +1402,11 @@ def main() -> int:
                 config_fixture=config_fixture,
                 image=args.image,
                 ports=ports,
+                source_commit=args.source_commit,
             )
     finally:
         _cleanup_after_run(
-            lambda: _remove_runtime_root(runtime_root),
+            lambda: _remove_runtime_root(runtime_root, require_empty=True),
             "compose matrix runtime-root cleanup",
         )
     print(SUCCESS_MARKER)

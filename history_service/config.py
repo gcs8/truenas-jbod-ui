@@ -279,8 +279,13 @@ def get_history_settings() -> HistorySettings:
             default_source=".env",
         )
         raise ConfigurationError(problems) from None
-    Path(settings.sqlite_path).parent.mkdir(parents=True, exist_ok=True)
-    Path(settings.backup_dir).mkdir(parents=True, exist_ok=True)
-    if settings.long_term_backup_dir:
-        Path(settings.long_term_backup_dir).mkdir(parents=True, exist_ok=True)
+    # Keep required runtime-path creation inside the startup retry boundary,
+    # but carry its new-entry obligations to the operation that publishes
+    # backups. Long-term archive roots are intentionally prepared later by
+    # _promote_long_term_backups(), inside its best-effort failure boundary.
+    # Include the database parent: it can also be an ancestor of a backup root.
+    from history_service.store import HistoryStore
+
+    HistoryStore.prepare_backup_directory(Path(settings.sqlite_path).parent)
+    HistoryStore.prepare_backup_directory(Path(settings.backup_dir))
     return settings

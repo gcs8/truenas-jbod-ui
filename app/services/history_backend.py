@@ -323,6 +323,18 @@ class HistoryBackendClient:
             or not isinstance(disk_history, dict)
         ):
             raise HistoryBackendResponseError(0, "History backend returned a malformed slot history payload.")
+        coverage = history.get("coverage")
+        coverage = coverage if isinstance(coverage, dict) else {}
+        metric_coverage = coverage.get("metrics")
+        metric_coverage = metric_coverage if isinstance(metric_coverage, dict) else {}
+        statuses = ("complete", "truncated", "unknown")
+        coverage = {
+            "metrics": {
+                name: metric_coverage.get(name) if metric_coverage.get(name) in statuses else "unknown"
+                for name in metrics
+            },
+            "events": coverage.get("events") if coverage.get("events") in statuses else "unknown",
+        }
         layers = (*parents, history)
         configured = self.configured and all(layer.get("configured", True) is True for layer in layers)
         available = configured and present and all(layer.get("available", True) is True for layer in layers)
@@ -331,6 +343,7 @@ class HistoryBackendClient:
             detail = HISTORY_BACKEND_FAILURE_DETAIL if configured else "History backend is not configured."
         return {
             **history,
+            "coverage": coverage,
             "configured": configured,
             "available": available,
             "detail": detail,

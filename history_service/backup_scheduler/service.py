@@ -36,6 +36,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import local as _ThreadLocal
+from types import MappingProxyType
 from typing import Any
 
 import yaml
@@ -74,6 +75,8 @@ BACKUP_CLASSES = ("config", "full")
 HISTORY_GROUP = "history_db"
 HISTORY_REPLACEMENT_COPIES = 14
 _COPY_CHUNK = 1024 * 1024
+# Marks the synthetic config run recorded when the change journal cannot be read.
+JOURNAL_CHECK_PREFIX = "Config changes could not be checked: "
 
 
 class SchedulerBusyError(RuntimeError):
@@ -108,6 +111,15 @@ def config_group_keys(all_backup_groups: tuple[str, ...], history_group: str) ->
     """Config class = every default backup group except the history database."""
 
     return [key for key in all_backup_groups if key != history_group]
+
+
+def _is_journal_check_record(record: Any) -> bool:
+    return (
+        isinstance(record, dict)
+        and record.get("ok") is False
+        and isinstance(record.get("detail"), str)
+        and record["detail"].startswith(JOURNAL_CHECK_PREFIX)
+    )
 
 
 @dataclass
@@ -189,12 +201,18 @@ class BackupScheduler:
         self._load_status()
         self.journal: ChangeJournal | None = None
         self.coalescer: ConfigBackupCoalescer | None = None
+        self._coalescer_error: str | None = None
+        self._coalescer_prior_run: dict[str, Any] | None = None
+        stored = self._status["classes"].get("config")
+        if _is_journal_check_record(stored):
+            # A check failure restored from the status file is never the last real run.
+            self._coalescer_error = stored["detail"]
         if policy.config.enabled:
             self.journal = ChangeJournal(paths.journal_path, file_mode=0o660)
             self.coalescer = ConfigBackupCoalescer(
                 self.journal,
                 snapshot_config=snapshot_config,
-                make_backup=lambda change_ids: self._run_class_locked_or_busy("config", change_ids),
+                make_backup=lambda change_ids, snapshot: self._run_class_locked_or_busy("config", change_ids, snapshot),
                 clock=monotonic,
                 quiet_period=float(policy.config.debounce_seconds),
                 max_delay=float(policy.config.max_delay_seconds),
@@ -339,11 +357,36 @@ class BackupScheduler:
         """One scheduler step: config coalescer, then a due full backup."""
 
         if self.coalescer is not None:
-            result: CoalescerResult = self.coalescer.tick()
-            if result.status == "failed":
-                logger.warning("Config backup failed: %s", result.error)
-            elif result.status in {"backup", "noop"}:
-                logger.info("Config backup %s: %d change(s).", result.status, len(result.change_ids))
+            try:
+                result: CoalescerResult = self.coalescer.tick()
+            except Exception as exc:  # noqa: BLE001 - recorded in status; full backups still run
+                detail = f"{JOURNAL_CHECK_PREFIX}{describe_error(exc)}"[:MAX_DETAIL_CHARS]
+                if detail != self._coalescer_error:
+                    if self._coalescer_error is None:
+                        with self._state_lock:
+                            prior = self._status["classes"].get("config")
+                            self._coalescer_prior_run = None if _is_journal_check_record(prior) else prior
+                    self._coalescer_error = detail
+                    logger.error("%s", detail)
+                    self._record_class("config", RunRecord(at=_iso(self._clock()) or "", ok=False, detail=detail))
+            else:
+                if self._coalescer_error is not None:
+                    # Readable again: put back the last real run unless a backup replaced it.
+                    with self._state_lock:
+                        current = self._status["classes"].get("config")
+                        restore = isinstance(current, dict) and current.get("detail") == self._coalescer_error
+                        if restore and self._coalescer_prior_run is not None:
+                            self._status["classes"]["config"] = self._coalescer_prior_run
+                        elif restore:
+                            self._status["classes"].pop("config", None)
+                    self._coalescer_error = None
+                    self._coalescer_prior_run = None
+                    if restore:
+                        self._write_status()
+                if result.status == "failed":
+                    logger.warning("Config backup failed: %s", result.error)
+                elif result.status in {"backup", "noop"}:
+                    logger.info("Config backup %s: %d change(s).", result.status, len(result.change_ids))
         now = self._clock()
         if self.next_full_at is not None and now >= self.next_full_at:
             self.next_full_at = self._compute_next_full(now)
@@ -423,10 +466,13 @@ class BackupScheduler:
             raise
         return thread
 
-    def _run_class_locked_or_busy(self, backup_class: str, change_ids: tuple[str, ...]) -> ArtifactRecord:
+    def _run_class_locked_or_busy(
+        self, backup_class: str, change_ids: tuple[str, ...],
+        snapshot: Mapping[str, Any] | None = None,
+    ) -> ArtifactRecord:
         # Called by the coalescer; a busy job lock is a failure it retries with backoff.
         with self._job(backup_class):
-            return self._run_class(backup_class, change_ids)
+            return self._run_class(backup_class, change_ids, snapshot)
 
     def run_now(self, backup_class: str) -> ArtifactRecord | None:
         """Run a backup of ``backup_class`` now (single-flight)."""
@@ -449,14 +495,17 @@ class BackupScheduler:
         with self._job(backup_class):
             return self._run_class(backup_class, ())
 
-    def _runner(self, backup_class: str) -> Any:
+    def _runner(self, backup_class: str, snapshot: Mapping[str, Any] | None = None) -> Any:
         status_file = (
             self.paths.full_status_file
             if backup_class == "full" and self.paths.full_status_file is not None
             else self.paths.runner_status_dir / f"archive-{backup_class}-backup.json"
         )
+        backup_service = self.backup_service
+        if isinstance(snapshot, ConfigFileSnapshot):
+            backup_service = backup_service.with_captured_config_files(snapshot.files)
         return self._runner_factory(
-            self.backup_service,
+            backup_service,
             destination_dir=self.paths.local_dir / backup_class,
             status_file=status_file,
             passphrase_file=self.paths.passphrase_file,
@@ -468,10 +517,13 @@ class BackupScheduler:
             archive_format=self.policy.full.archive_format if backup_class == "full" else "7z",
         )
 
-    def _run_class(self, backup_class: str, change_ids: tuple[str, ...]) -> ArtifactRecord:
+    def _run_class(
+        self, backup_class: str, change_ids: tuple[str, ...],
+        snapshot: Mapping[str, Any] | None = None,
+    ) -> ArtifactRecord:
         started = self._clock()
         try:
-            runner = self._runner(backup_class)
+            runner = self._runner(backup_class, snapshot)
             status = runner.run_once()
             name = f"{backup_class}/{status['last_artifact_name']}"
             record = ArtifactRecord(
@@ -807,13 +859,20 @@ class BackupScheduler:
             result = manager.apply(plan, resolver, actor="scheduler", now=self._clock)
         if result.error:
             logger.warning("Backup grooming stopped early (%s).", result.error.split(":", 1)[0])
+        self._record_grooming_result(result)
+        return result
+
+    def _record_grooming_result(self, result: Any) -> None:
+        failed_locations = dict(result.failed_locations)
+        if result.failed is not None and result.error and result.failed.record.location not in failed_locations:
+            # A location that opened but then failed a deletion or claim stopped the run.
+            failed_locations[result.failed.record.location] = result.error
         self._record_grooming(
             ok=not result.error,
             deleted=len(result.deleted) + len(result.already_missing),
             detail=result.error,
-            failed_locations=result.failed_locations,
+            failed_locations=failed_locations,
         )
-        return result
 
     def _record_grooming(
         self, *, ok: bool, deleted: int, detail: str | None, failed_locations: Mapping[str, str]
@@ -850,7 +909,9 @@ class BackupScheduler:
         if entry is None or entry.expires_at < self._monotonic():
             raise LookupError("The grooming plan expired or was already used; preview it again.")
         with self._job("lifecycle"), self._resolver() as resolver:
-            return self._manager().apply(entry.plan, resolver, actor="admin", now=self._clock)
+            result = self._manager().apply(entry.plan, resolver, actor="admin", now=self._clock)
+            self._record_grooming_result(result)
+        return result
 
     # -- library queries ---------------------------------------------------------------
 
@@ -948,6 +1009,7 @@ class BackupScheduler:
         with self._state_lock:
             class_runs = dict(self._status["classes"])
             target_runs = dict(self._status["targets"])
+            grooming = self._status.get("grooming")
         pending = 0
         if self.coalescer is not None:
             try:
@@ -994,6 +1056,7 @@ class BackupScheduler:
             ],
             "artifacts": [self.serialize(record) for record in reversed(records)],
             "storage": storage,
+            "grooming": grooming,
         }
 
     # -- per-artifact actions ----------------------------------------------------------
@@ -1121,17 +1184,28 @@ def _hash_file(path: Path) -> tuple[int, str]:
 # -- config snapshot for the coalescer's content hash -------------------------------------
 
 
-def snapshot_config_files(paths: Mapping[str, Path]) -> dict[str, Any]:
-    """Parse each config document; a missing file is ``None`` (still hashed)."""
+class ConfigFileSnapshot(dict[str, Any]):
+    """Hash projection plus the exact source bytes used to build that projection."""
+
+    def __init__(self, documents: Mapping[str, Any], files: Mapping[Path, bytes | None]) -> None:
+        super().__init__(documents)
+        self.files = MappingProxyType(dict(files))
+
+
+def snapshot_config_files(paths: Mapping[str, Path]) -> ConfigFileSnapshot:
+    """Capture once for both hashing and export; missing documents remain hashed."""
 
     snapshot: dict[str, Any] = {}
+    files: dict[Path, bytes | None] = {}
     for logical, path in paths.items():
-        if not path.exists():
+        content = path.read_bytes() if path.exists() else None
+        files[path.absolute()] = content
+        if content is None:
             snapshot[logical] = None
             continue
-        text = path.read_text(encoding="utf-8")
+        text = content.decode("utf-8")
         snapshot[logical] = json.loads(text) if path.suffix == ".json" else yaml.safe_load(text)
-    return snapshot
+    return ConfigFileSnapshot(snapshot, files)
 
 
 # -- shared status file ---------------------------------------------------------------------
