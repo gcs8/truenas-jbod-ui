@@ -16,6 +16,7 @@ import asyncio
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from app.config import Settings, SystemConfig, TrueNASConfig
@@ -25,6 +26,7 @@ from app.services.inventory import InventoryService, InventorySourceBundle
 from app.services.inventory_accounting import (
     build_disk_retention_accounting,
     disk_record_identity_tokens,
+    logical_disk_identity_tokens,
     slot_identity_tokens,
 )
 from app.services.mapping_store import MappingStore
@@ -88,7 +90,9 @@ def build_service(settings: Settings, system: SystemConfig, temp_dir: str) -> In
     )
 
 
-def synthetic_enclosure_rows() -> list[dict[str, object]]:
+def synthetic_enclosure_rows(
+    disks: list[dict[str, object]] = MIXED_IDENTITY_DISKS,
+) -> list[dict[str, object]]:
     """One physical enclosure that renders a bay per source disk."""
     return [
         {
@@ -104,7 +108,7 @@ def synthetic_enclosure_rows() -> list[dict[str, object]]:
                         "status": "OK",
                         "dev": disk["name"],
                     }
-                    for index, disk in enumerate(MIXED_IDENTITY_DISKS)
+                    for index, disk in enumerate(disks)
                 ]
             },
         }
@@ -122,7 +126,7 @@ def raw_data_for(disks: list[dict[str, object]], *, enclosures: list | None = No
 
 
 def build_snapshot(service: InventoryService, raw_data: TrueNASRawData):
-    service._get_inventory_source_bundle = AsyncMock(
+    source_bundle = AsyncMock(
         return_value=InventorySourceBundle(
             raw_data=raw_data,
             ssh_outputs={},
@@ -133,7 +137,10 @@ def build_snapshot(service: InventoryService, raw_data: TrueNASRawData):
             quantastor_ses_data=ParsedSSHData(),
         )
     )
-    return asyncio.run(service._build_snapshot())
+    service._get_inventory_source_bundle = source_bundle
+    snapshot = asyncio.run(service.get_snapshot(force_refresh=True))
+    source_bundle.assert_awaited_once()
+    return snapshot
 
 
 class DiskRetentionAccountingUnitTests(unittest.TestCase):
@@ -194,6 +201,58 @@ class DiskRetentionAccountingUnitTests(unittest.TestCase):
         accounting = build_disk_retention_accounting(source_disks=[], slots=[unknown])
         self.assertEqual(accounting.rendered_unique_disk_count, 0)
 
+    def test_display_labels_never_become_identity_tokens(self) -> None:
+        for label in ("GPTID", "WWN", "Disk ID", "Serial/LUN ID", "da9"):
+            with self.subTest(label=label):
+                self.assertEqual(
+                    logical_disk_identity_tokens(
+                        serial="SANITIZED-RETENTION-A",
+                        logical_unit_id="SANITIZED-LUN-A",
+                        gptid="/dev/gptid/00000000-0000-4000-8000-000000000001",
+                        persistent_id_label=label,
+                        device_names=("/dev/da0",),
+                    ),
+                    frozenset({
+                        "serial:sanitized-retention-a",
+                        "lun:sanitized-lun-a",
+                        "gptid:gptid/00000000-0000-4000-8000-000000000001",
+                        "dev:da0",
+                    }),
+                )
+
+    def test_label_only_occupied_bay_is_not_a_logical_disk(self) -> None:
+        slot = self._slot(present=True, identity_state="unknown", persistent_id_label="GPTID")
+        self.assertEqual(slot_identity_tokens(slot), frozenset())
+        self.assertEqual(
+            build_disk_retention_accounting(source_disks=[], slots=[slot]).rendered_unique_disk_count,
+            0,
+        )
+
+    def test_real_persistent_aliases_still_deduplicate_without_serial_or_device(self) -> None:
+        slots = [
+            self._slot(
+                gptid="/dev/gptid/00000000-0000-4000-8000-000000000001",
+                persistent_id_label="GPTID",
+            ),
+            self._slot(
+                slot=1,
+                gptid="gptid/00000000-0000-4000-8000-000000000001",
+                persistent_id_label="Disk ID",
+            ),
+        ]
+        accounting = build_disk_retention_accounting(source_disks=[], slots=slots)
+        self.assertEqual(accounting.rendered_unique_disk_count, 1)
+        self.assertEqual(accounting.duplicate_disk_view_count, 1)
+
+    def test_unknown_source_identity_remains_unplaced(self) -> None:
+        accounting = build_disk_retention_accounting(
+            source_disks=[SimpleNamespace()],
+            slots=[self._slot(present=True, persistent_id_label="GPTID")],
+        )
+        self.assertEqual(accounting.source_disk_count, 1)
+        self.assertEqual(accounting.unplaced_disk_count, 1)
+        self.assertEqual(accounting.rendered_unique_disk_count, 0)
+
     def test_aggregate_totals_expose_no_identifier_values(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             system = SystemConfig(id="system-a", truenas=TrueNASConfig(platform="core"))
@@ -211,6 +270,78 @@ class DiskRetentionAccountingUnitTests(unittest.TestCase):
 
 class VirtualFallbackRetentionTests(unittest.TestCase):
     """End-to-end aggregates across a physical-to-virtual inventory change."""
+
+    def _assert_distinct_gptid_classes(self, *, physical: bool) -> None:
+        # Independent fixture oracle: da0 and da1 are different disks, even
+        # though both public slot producers give them the display label GPTID.
+        # Do not derive these expected classes from production token helpers.
+        expected = {
+            "da0": ("SANITIZED-RETENTION-A", "gptid/00000000-0000-4000-8000-000000000001"),
+            "da1": (None, "gptid/00000000-0000-4000-8000-000000000002"),
+        }
+        disks = [
+            {
+                "name": name,
+                "serial": serial,
+                "identifier": gptid,
+                "model": "Synthetic retention disk",
+                "size": 1_000_000_000,
+                "status": "ONLINE",
+            }
+            for name, (serial, gptid) in expected.items()
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(
+                id="system-a",
+                default_profile_id="supermicro-cse-946-top-60",
+                truenas=TrueNASConfig(platform="core"),
+            )
+            service = build_service(Settings(systems=[system]), system, temp_dir)
+            snapshot = build_snapshot(
+                service,
+                raw_data_for(disks, enclosures=synthetic_enclosure_rows(disks) if physical else []),
+            )
+            source_disks = service._build_disk_records(disks, ParsedSSHData(), {}, {})
+
+        occupied = [slot for slot in snapshot.slots if slot.device_name]
+        self.assertCountEqual([slot.device_name for slot in occupied], expected)
+        for name, identity in expected.items():
+            group = [slot for slot in occupied if slot.device_name == name]
+            self.assertEqual(len(group), 1)
+            self.assertEqual((group[0].serial, group[0].gptid), identity)
+            self.assertEqual(group[0].persistent_id_label, "GPTID")
+            if physical:
+                self.assertFalse(group[0].raw_status.get("virtual_enclosure", False))
+            else:
+                self.assertTrue(group[0].raw_status["virtual_enclosure"])
+                self.assertFalse(group[0].physical_location_known)
+                self.assertFalse(group[0].mapping_supported)
+                self.assertFalse(group[0].led_supported)
+            # Each separately selected class represents only its own source
+            # disk. A shared label must not give credit for the other disk.
+            with self.subTest(only_rendered_class=name):
+                accounting = build_disk_retention_accounting(source_disks=source_disks, slots=group)
+                self.assertEqual(accounting.source_disk_count, 2)
+                self.assertEqual(accounting.rendered_unique_disk_count, 1)
+                self.assertEqual(accounting.duplicate_disk_view_count, 0)
+                self.assertEqual(accounting.unplaced_disk_count, 1)
+
+        summary = snapshot.summary
+        self.assertEqual(
+            (
+                summary.source_disk_count,
+                summary.rendered_unique_disk_count,
+                summary.duplicate_disk_view_count,
+                summary.unplaced_disk_count,
+            ),
+            (2, 2, 0, 0),
+        )
+
+    def test_public_physical_snapshot_keeps_shared_gptid_labels_in_distinct_classes(self) -> None:
+        self._assert_distinct_gptid_classes(physical=True)
+
+    def test_public_virtual_snapshot_keeps_shared_gptid_labels_in_distinct_classes(self) -> None:
+        self._assert_distinct_gptid_classes(physical=False)
 
     def test_multi_system_virtual_fallback_retains_every_source_disk(self) -> None:
         systems = [

@@ -3467,7 +3467,7 @@ class HistoryStore:
         metric_limits: dict[str, int] | None = None,
         since: str | None = None,
     ) -> dict[int, dict[str, Any]]:
-        validate_store_scope_request(
+        since = validate_store_scope_request(
             slots=slots,
             event_limit=event_limit,
             metric_limits=metric_limits,
@@ -3487,7 +3487,13 @@ class HistoryStore:
         slot_numbers = sorted({int(slot) for slot in (slots or [])})
         metric_limits = metric_limits or {}
         payload_by_slot: dict[int, dict[str, Any]] = {
-            slot: self._empty_slot_history_payload(metric_limits)
+            slot: {
+                **self._empty_slot_history_payload(metric_limits),
+                "coverage": {
+                    "metrics": {name: "complete" for name in metric_limits},
+                    "events": "complete" if event_limit > 0 else "unknown",
+                },
+            }
             for slot in slot_numbers
         }
 
@@ -3497,25 +3503,37 @@ class HistoryStore:
             placeholders = ", ".join("?" for _ in slot_numbers)
             where_clauses.append(f"slot IN ({placeholders})")
             parameters.extend(slot_numbers)
-        scope_where = " AND ".join(where_clauses)
-
         with closing(self._connect()) as connection:
-            slot_rows = connection.execute(
-                f"""
-                SELECT slot
-                FROM slot_state_current
-                WHERE {scope_where}
-                ORDER BY slot
-                """,
-                parameters,
-            ).fetchall()
-            for row in slot_rows:
-                slot = int(row["slot"])
-                payload_by_slot.setdefault(
-                    slot,
-                    self._empty_slot_history_payload(metric_limits),
-                )
+            # Coverage and samples describe one SQLite read snapshot.
+            connection.execute("BEGIN")
+            # Explicit slots already initialize every target; use the former
+            # slot-discovery query budget for bounded coverage metadata instead.
+            # Retained rollups can overlap raw/hourly/daily representations. Do
+            # not infer complete source coverage from their returned row count.
+            # This metadata query hydrates at most targets * selected metrics
+            # pairs, never extra history rows or an unbounded count result.
+            rollup_where = [*where_clauses]
+            rollup_parameters = [*parameters]
+            if since:
+                rollup_where.append("bucket_start >= ?")
+                rollup_parameters.append(since)
+            if metric_limits:
+                rollup_where.append(f"metric_name IN ({', '.join('?' for _ in metric_limits)})")
+                rollup_parameters.extend(metric_limits)
+                for row in connection.execute(
+                    f"SELECT slot, metric_name FROM metric_rollups WHERE {' AND '.join(rollup_where)} "
+                    "GROUP BY slot, metric_name", rollup_parameters,
+                ).fetchall():
+                    coverage = payload_by_slot[int(row["slot"])]["coverage"]["metrics"]
+                    if coverage[row["metric_name"]] != "truncated":
+                        coverage[row["metric_name"]] = "unknown"
 
+            # Rank with the existing streaming window, then bound its output
+            # BEFORE counting. A full-partition COUNT would retain all omitted
+            # rows in SQLite's MEMORY temp store. Only cap + one sentinel per
+            # partition enters either count window below; the outer filter
+            # keeps the sentinel out of hydration and the response row budget.
+            # bounded_count is overflow evidence, never an exact source total.
             if event_limit > 0:
                 event_where_clauses = [*where_clauses]
                 event_parameters = [*parameters]
@@ -3526,28 +3544,30 @@ class HistoryStore:
                     f"""
                     SELECT *
                     FROM (
-                        SELECT
-                            *,
-                            ROW_NUMBER() OVER (
+                        SELECT *, COUNT(*) OVER (PARTITION BY slot) AS bounded_count
+                        FROM (
+                            SELECT *, ROW_NUMBER() OVER (
                                 PARTITION BY slot
                                 ORDER BY observed_at DESC, id DESC
                             ) AS row_number
-                        FROM slot_events
-                        WHERE {' AND '.join(event_where_clauses)}
+                            FROM slot_events
+                            WHERE {' AND '.join(event_where_clauses)}
+                        )
+                        WHERE row_number <= ?
                     )
                     WHERE row_number <= ?
                     ORDER BY slot, observed_at DESC, id DESC
                     """,
-                    [*event_parameters, event_limit],
+                    [*event_parameters, event_limit + 1, event_limit],
                 ).fetchall()
                 for row in event_rows:
                     item = dict(row)
                     slot = int(item["slot"])
                     item.pop("row_number", None)
-                    payload_by_slot.setdefault(
-                        slot,
-                        self._empty_slot_history_payload(metric_limits),
-                    )["events"].append(item)
+                    payload_by_slot[slot]["coverage"]["events"] = (
+                        "truncated" if item.pop("bounded_count") > event_limit else "complete"
+                    )
+                    payload_by_slot[slot]["events"].append(item)
 
             for metric_name, limit in metric_limits.items():
                 metric_where_clauses = [*where_clauses, "metric_name = ?"]
@@ -3559,29 +3579,30 @@ class HistoryStore:
                     f"""
                     SELECT *
                     FROM (
-                        SELECT
-                            *,
-                            ROW_NUMBER() OVER (
+                        SELECT *, COUNT(*) OVER (PARTITION BY slot, metric_name) AS bounded_count
+                        FROM (
+                            SELECT *, ROW_NUMBER() OVER (
                                 PARTITION BY slot, metric_name
-                            ORDER BY observed_at DESC, id DESC
-                        ) AS row_number
-                        FROM metric_samples
-                        WHERE {' AND '.join(metric_where_clauses)}
+                                ORDER BY observed_at DESC, id DESC
+                            ) AS row_number
+                            FROM metric_samples
+                            WHERE {' AND '.join(metric_where_clauses)}
+                        )
+                        WHERE row_number <= ?
                     )
                     WHERE row_number <= ?
                     ORDER BY slot, observed_at DESC, id DESC
                     """,
-                    [*metric_parameters, limit],
+                    [*metric_parameters, limit + 1, limit],
                 ).fetchall()
                 for row in metric_rows:
                     item = dict(row)
                     slot = int(item["slot"])
                     item["value"] = item["value_integer"] if item["value_integer"] is not None else item["value_real"]
                     item.pop("row_number", None)
-                    payload_by_slot.setdefault(
-                        slot,
-                        self._empty_slot_history_payload(metric_limits),
-                    )["metrics"].setdefault(metric_name, []).append(item)
+                    if item.pop("bounded_count") > limit:
+                        payload_by_slot[slot]["coverage"]["metrics"][metric_name] = "truncated"
+                    payload_by_slot[slot]["metrics"][metric_name].append(item)
                 self._append_scope_metric_rollups(
                     connection,
                     payload_by_slot,
@@ -3591,7 +3612,6 @@ class HistoryStore:
                     limit=limit,
                     since=since,
                 )
-
         for slot, payload in payload_by_slot.items():
             metrics = payload.setdefault("metrics", {})
             for metric_name in metric_limits:

@@ -113,6 +113,23 @@ class HistoryRefreshRequestTests(unittest.IsolatedAsyncioTestCase):
                 await read_refresh_document(self._request(body))
             self.assertEqual(raised.exception.status_code, 422 if len(body) <= 256 else 413)
 
+    async def test_non_string_modes_are_rejected_before_admission(self) -> None:
+        admission = ManualRefreshAdmission(cooldown_seconds=900)
+        with (
+            patch.object(history_main, "settings", HistorySettings()),
+            patch.object(history_main, "refresh_admission", admission),
+            patch.object(admission, "try_acquire", wraps=admission.try_acquire) as acquire,
+            patch.object(history_main.collector, "run_once", AsyncMock()) as run_once,
+        ):
+            for mode in ([], {}, None, True, False, 0, 1, 1.5, "unknown"):
+                with self.subTest(mode=mode):
+                    with self.assertRaises(HTTPException) as raised:
+                        await history_main.refresh_history(self._request(json.dumps({"mode": mode}).encode()))
+                    self.assertEqual(raised.exception.status_code, 422)
+                    self.assertEqual(raised.exception.detail, "Refresh request must contain exactly mode 'fast' or 'full'.")
+                    acquire.assert_not_awaited()
+                    run_once.assert_not_awaited()
+
     async def test_token_auth_and_origin_are_both_required_for_browser_calls(self) -> None:
         settings = HistorySettings(
             refresh_auth_mode="token",

@@ -180,6 +180,16 @@ class CIWorkflowContractTests(unittest.TestCase):
         self.assertEqual(spec.count("test.skip("), 1)
         self.assertIn('test.skip(process.env.PLAYWRIGHT_ADMIN_SYNTHETIC_MUTATIONS !== "1"', spec)
 
+    def test_ci_runs_admin_draft_target_ownership_fixture(self) -> None:
+        workflow = yaml.safe_load(self.read(CI_WORKFLOW))
+        fixture_step = next(
+            step
+            for step in workflow["jobs"]["public-demo-artifact"]["steps"]
+            if step.get("name") == "Run fixture-only browser specs"
+        )
+
+        self.assertIn("qa/admin-draft-target-ownership.spec.js", fixture_step["run"])
+
     def test_appliance_browser_specs_are_explicit_and_portable(self) -> None:
         contributing = self.read(ROOT / "CONTRIBUTING.md")
         ui_spec = self.read(LIVE_UI_SPEC)
