@@ -14,6 +14,8 @@ from app.models.domain import DebugBundleExportRequest, SystemBackupExportReques
 
 logger = logging.getLogger(__name__)
 
+_MAINTENANCE_RESERVATION_TARGET = "\0admin-maintenance"
+
 
 @dataclass(slots=True)
 class MaintenanceOutcome:
@@ -87,6 +89,10 @@ class AdminMaintenanceService:
         self.backup_service = backup_service
         self.runtime_service = runtime_service
         self.clean_backup_targets = tuple(clean_backup_targets)
+        self._reservation_targets = (
+            *self.clean_backup_targets,
+            _MAINTENANCE_RESERVATION_TARGET,
+        )
 
     # ------------------------------------------------------------------ helpers
 
@@ -289,7 +295,7 @@ class AdminMaintenanceService:
         stop_services: bool = False,
         restart_services: bool = True,
     ) -> tuple[Any, MaintenanceOutcome]:
-        with reserve_runtime_targets(self.clean_backup_targets):
+        with reserve_runtime_targets(self._reservation_targets):
             def operation(_stopped: list[str]) -> Any:
                 return self.backup_service.export_bundle_to_file(
                     encrypt=payload.encrypt,
@@ -311,7 +317,7 @@ class AdminMaintenanceService:
         stop_services: bool = True,
         restart_services: bool = True,
     ) -> tuple[Any, MaintenanceOutcome]:
-        with reserve_runtime_targets(self.clean_backup_targets):
+        with reserve_runtime_targets(self._reservation_targets):
             runtime_before = self.runtime_service.status_payload()
 
             def operation(stopped_containers: list[str]) -> Any:
@@ -350,7 +356,7 @@ class AdminMaintenanceService:
         restart_services: bool = True,
         admission_callback: Callable[[str, str], None] | None = None,
     ) -> tuple[dict[str, Any], MaintenanceOutcome]:
-        with reserve_runtime_targets(self.clean_backup_targets):
+        with reserve_runtime_targets(self._reservation_targets):
             snapshot, workspace = self._stage_archive_snapshot(archive_path)
             primary_error: Exception | None = None
             try:
