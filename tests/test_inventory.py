@@ -13092,6 +13092,130 @@ class InventoryServiceSnapshotStateBoundsTests(unittest.IsolatedAsyncioTestCase)
                 with self.assertRaisesRegex(Exception, "Requested enclosure is not available"):
                     await service.get_snapshot(selected_enclosure_id=alias)
 
+    async def test_redirected_default_refresh_cannot_overwrite_a_newer_destination_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            service._canonical_enclosure_options = {
+                "enc-a": EnclosureOption(id="enc-a", label="Shelf A"),
+                "enc-b": EnclosureOption(id="enc-b", label="Shelf B"),
+            }
+            service._canonical_default_enclosure_id = "enc-a"
+            older = self._snapshot("enc-b").model_copy(update={"warnings": ["older default refresh"]})
+            newer = self._snapshot("enc-b").model_copy(update={"warnings": ["newer explicit refresh"]})
+            older_started = asyncio.Event()
+            release_older = asyncio.Event()
+
+            async def build_snapshot(
+                selected_enclosure_id: str | None = None,
+                *,
+                force_source_refresh: bool = False,
+            ) -> InventorySnapshot:
+                if selected_enclosure_id is None:
+                    older_started.set()
+                    await release_older.wait()
+                    return older
+                self.assertEqual(selected_enclosure_id, "enc-b")
+                return newer
+
+            service._build_snapshot = AsyncMock(side_effect=build_snapshot)
+            default_refresh = asyncio.create_task(service.get_snapshot(force_refresh=True))
+            await older_started.wait()
+            explicit_result = await service.get_snapshot(
+                force_refresh=True,
+                selected_enclosure_id="enc-b",
+            )
+            release_older.set()
+            default_result = await default_refresh
+
+            self.assertIs(explicit_result, newer)
+            self.assertIs(default_result, newer)
+            self.assertIs(service._cache["enc-b"], newer)
+
+    async def test_redirected_refresh_is_fenced_when_destination_is_invalidated_while_waiting(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            service._canonical_enclosure_options = {
+                "enc-a": EnclosureOption(id="enc-a", label="Shelf A"),
+                "enc-b": EnclosureOption(id="enc-b", label="Shelf B"),
+            }
+            service._canonical_default_enclosure_id = "enc-a"
+            redirected = self._snapshot("enc-b")
+            build_completed = asyncio.Event()
+
+            async def build_snapshot(
+                selected_enclosure_id: str | None = None,
+                *,
+                force_source_refresh: bool = False,
+            ) -> InventorySnapshot:
+                build_completed.set()
+                return redirected
+
+            service._build_snapshot = AsyncMock(side_effect=build_snapshot)
+            destination_lock = service._get_snapshot_lock("enc-b")
+            await destination_lock.acquire()
+            request = asyncio.create_task(service.get_snapshot(force_refresh=True))
+            await build_completed.wait()
+            await asyncio.sleep(0)
+            service.invalidate_physical_enclosure_snapshot_cache(
+                reason="test.redirected.destination",
+                enclosure_id="enc-b",
+            )
+            destination_lock.release()
+
+            with self.assertRaises(inventory_module.SnapshotStateBusyError):
+                await request
+            self.assertNotIn("enc-b", service._snapshot_state_keys())
+
+    async def test_older_redirect_cannot_restore_canonical_options_from_before_a_newer_other_key_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            initial_options = [
+                EnclosureOption(id="enc-a", label="Shelf A"),
+                EnclosureOption(id="enc-b", label="Shelf B"),
+                EnclosureOption(id="enc-c", label="Shelf C"),
+            ]
+            service._canonical_enclosure_options = {option.id: option for option in initial_options}
+            service._canonical_default_enclosure_id = "enc-a"
+            older = InventorySnapshot(
+                slots=[],
+                refresh_interval_seconds=30,
+                selected_enclosure_id="enc-b",
+                enclosures=initial_options[:2],
+            )
+            newer = InventorySnapshot(
+                slots=[],
+                refresh_interval_seconds=30,
+                selected_enclosure_id="enc-c",
+                enclosures=initial_options,
+            )
+            older_started = asyncio.Event()
+            release_older = asyncio.Event()
+
+            async def build_snapshot(
+                selected_enclosure_id: str | None = None,
+                *,
+                force_source_refresh: bool = False,
+            ) -> InventorySnapshot:
+                if selected_enclosure_id is None:
+                    older_started.set()
+                    await release_older.wait()
+                    return older
+                self.assertEqual(selected_enclosure_id, "enc-c")
+                return newer
+
+            service._build_snapshot = AsyncMock(side_effect=build_snapshot)
+            older_request = asyncio.create_task(service.get_snapshot(force_refresh=True))
+            await older_started.wait()
+            self.assertIs(
+                await service.get_snapshot(force_refresh=True, selected_enclosure_id="enc-c"),
+                newer,
+            )
+            release_older.set()
+            await older_request
+
+            self.assertEqual(set(service._canonical_enclosure_options or {}), {"enc-a", "enc-b", "enc-c"})
+            self.assertEqual(service._canonical_default_enclosure_id, "enc-c")
+
     async def test_perf_metadata_uses_only_canonical_snapshot_keys(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = self._service(temp_dir)
@@ -13545,7 +13669,8 @@ class InventoryServiceSnapshotStateBoundsTests(unittest.IsolatedAsyncioTestCase)
                         EnclosureOption(id=key, label=key)
                         for key in current_ids
                     ],
-                )
+                ),
+                request_sequence=1,
             )
 
             service._parsed_ssh_data_for_enclosure(bundle, current_ids[-1])

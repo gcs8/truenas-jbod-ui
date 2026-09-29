@@ -1112,9 +1112,12 @@ class InventoryService:
         self._snapshot_activity: dict[str, int] = {}
         self._snapshot_lru: OrderedDict[str, None] = OrderedDict()
         self._snapshot_invalidated: set[str] = set()
+        self._snapshot_request_sequence = 0
+        self._snapshot_published_sequence: dict[str, int] = {}
         self._snapshot_discovery_lock = asyncio.Lock()
         self._canonical_enclosure_options: dict[str, EnclosureOption] | None = None
         self._canonical_default_enclosure_id: str | None = None
+        self._canonical_options_request_sequence = 0
         self._snapshot_topology_generation = 0
         self._source_bundle_lock = asyncio.Lock()
         self._ssh_session_locks: dict[str, asyncio.Lock] = {}
@@ -1304,22 +1307,37 @@ class InventoryService:
         allow_stale_cache: bool = False,
         force_source_refresh: bool | None = None,
     ) -> CacheResult[InventorySnapshot]:
+        self._snapshot_request_sequence += 1
+        request_sequence = self._snapshot_request_sequence
         refresh_sources = force_refresh if force_source_refresh is None else force_source_refresh
         cache_key, discovered_snapshot = await self._resolve_snapshot_cache_key(
             selected_enclosure_id,
             force_source_refresh=bool(refresh_sources),
+            request_sequence=request_sequence,
         )
         topology_generation = self._snapshot_topology_generation
         self._admit_snapshot_key(cache_key)
         if discovered_snapshot is not None:
             if cache_key != SNAPSHOT_NO_ENCLOSURE_KEY and discovered_snapshot.selected_enclosure_id != cache_key:
                 raise UnknownEnclosureError()
-            self._cache[cache_key] = discovered_snapshot
-            self._cache_until[cache_key] = utcnow() + timedelta(
-                seconds=max(0, int(self.settings.app.snapshot_cache_ttl_seconds))
-            )
-            self._touch_snapshot_key(cache_key)
             cache_state: CacheState = "forced-refresh" if force_refresh else "miss"
+            self._begin_snapshot_activity(cache_key)
+            try:
+                async with self._get_snapshot_lock(cache_key):
+                    if (
+                        topology_generation != self._snapshot_topology_generation
+                        or cache_key in self._snapshot_invalidated
+                    ):
+                        raise SnapshotStateBusyError()
+                    discovered_snapshot, published = self._publish_snapshot_locked(
+                        cache_key,
+                        discovered_snapshot,
+                        request_sequence=request_sequence,
+                    )
+            finally:
+                self._finish_snapshot_activity(cache_key)
+            if not published:
+                cache_state = "hit-after-wait"
             add_perf_metadata(snapshot_cache=cache_state, snapshot_cache_key=cache_key)
             self._observe_inventory_cache_metrics()
             self._observe_inventory_snapshot_request(cache_state)
@@ -1339,7 +1357,7 @@ class InventoryService:
             self._schedule_background_snapshot_refresh(cache_key, default_selection=selected_enclosure_id is None)
             return CacheResult(cached, "stale-hit")
 
-        self._snapshot_activity[cache_key] = self._snapshot_activity.get(cache_key, 0) + 1
+        self._begin_snapshot_activity(cache_key)
         try:
             async with self._get_snapshot_lock(cache_key):
                 if (
@@ -1391,29 +1409,51 @@ class InventoryService:
                 # Fresh trusted discovery retires obsolete options even when an
                 # explicit old selection must be rejected. An omitted selection
                 # follows the new default, not the cache key chosen before I/O.
-                if not topology_changed:
-                    self._replace_canonical_options_from_trusted_snapshot(snapshot)
                 if selected_enclosure_id is not None and snapshot.selected_enclosure_id != selected_enclosure_id:
+                    if not topology_changed:
+                        self._replace_canonical_options_from_trusted_snapshot(
+                            snapshot,
+                            request_sequence=request_sequence,
+                        )
                     self._snapshot_invalidated.add(cache_key)
                     raise UnknownEnclosureError()
                 publication_key = snapshot.selected_enclosure_id or SNAPSHOT_NO_ENCLOSURE_KEY
-                self._admit_snapshot_key(publication_key)
-                self._cache[publication_key] = snapshot
-                self._cache_until[publication_key] = utcnow() + timedelta(
-                    seconds=max(0, int(self.settings.app.snapshot_cache_ttl_seconds))
-                )
-                self._touch_snapshot_key(publication_key)
-                self._observe_inventory_cache_metrics()
-                self._observe_inventory_snapshot_request(refresh_trigger)
-                return CacheResult(snapshot, refresh_trigger)
+            # A default refresh can discover a different publication key. Release
+            # the old key before taking the destination lock so opposite redirects
+            # cannot deadlock. Request ordering prevents an older redirected build
+            # from overwriting a newer explicit refresh that won the destination.
+            self._admit_snapshot_key(publication_key)
+            redirected_publication = publication_key != cache_key
+            if redirected_publication:
+                self._begin_snapshot_activity(publication_key)
+            try:
+                async with self._get_snapshot_lock(publication_key):
+                    publication_topology_changed = topology_generation != self._snapshot_topology_generation
+                    if (
+                        publication_topology_changed
+                        or cache_key in self._snapshot_invalidated
+                        or publication_key in self._snapshot_invalidated
+                    ):
+                        raise SnapshotStateBusyError()
+                    snapshot, published = self._publish_snapshot_locked(
+                        publication_key,
+                        snapshot,
+                        request_sequence=request_sequence,
+                    )
+                    if published:
+                        self._replace_canonical_options_from_trusted_snapshot(
+                            snapshot,
+                            request_sequence=request_sequence,
+                        )
+            finally:
+                if redirected_publication:
+                    self._finish_snapshot_activity(publication_key)
+            cache_state = refresh_trigger if published else "hit-after-wait"
+            self._observe_inventory_cache_metrics()
+            self._observe_inventory_snapshot_request(cache_state)
+            return CacheResult(snapshot, cache_state)
         finally:
-            remaining = self._snapshot_activity.get(cache_key, 1) - 1
-            if remaining:
-                self._snapshot_activity[cache_key] = remaining
-            else:
-                self._snapshot_activity.pop(cache_key, None)
-                if cache_key in self._snapshot_invalidated or cache_key not in self._cache:
-                    self._remove_snapshot_state_key(cache_key)
+            self._finish_snapshot_activity(cache_key)
 
     def _snapshot_state_keys(self) -> set[str]:
         return (
@@ -1423,15 +1463,48 @@ class InventoryService:
             | set(self._snapshot_refresh_tasks)
             | set(self._snapshot_activity)
             | set(self._snapshot_lru)
+            | set(self._snapshot_published_sequence)
         )
 
     def _snapshot_key_is_active(self, cache_key: str) -> bool:
         task = self._snapshot_refresh_tasks.get(cache_key)
         return bool(self._snapshot_activity.get(cache_key) or (task is not None and not task.done()))
 
+    def _begin_snapshot_activity(self, cache_key: str) -> None:
+        self._snapshot_activity[cache_key] = self._snapshot_activity.get(cache_key, 0) + 1
+
+    def _finish_snapshot_activity(self, cache_key: str) -> None:
+        remaining = self._snapshot_activity.get(cache_key, 1) - 1
+        if remaining:
+            self._snapshot_activity[cache_key] = remaining
+            return
+        self._snapshot_activity.pop(cache_key, None)
+        if cache_key in self._snapshot_invalidated or cache_key not in self._cache:
+            self._remove_snapshot_state_key(cache_key)
+
     def _touch_snapshot_key(self, cache_key: str) -> None:
         self._snapshot_lru[cache_key] = None
         self._snapshot_lru.move_to_end(cache_key)
+
+    def _publish_snapshot_locked(
+        self,
+        cache_key: str,
+        snapshot: InventorySnapshot,
+        *,
+        request_sequence: int,
+    ) -> tuple[InventorySnapshot, bool]:
+        if self._snapshot_published_sequence.get(cache_key, -1) > request_sequence:
+            current = self._cache.get(cache_key)
+            if current is not None:
+                self._touch_snapshot_key(cache_key)
+                return current, False
+        self._cache[cache_key] = snapshot
+        self._cache_until[cache_key] = utcnow() + timedelta(
+            seconds=max(0, int(self.settings.app.snapshot_cache_ttl_seconds))
+        )
+        self._snapshot_published_sequence[cache_key] = request_sequence
+        self._touch_snapshot_key(cache_key)
+        return snapshot, True
 
     def _remove_snapshot_state_key(self, cache_key: str, *, cancel_task: bool = False) -> bool:
         if self._snapshot_activity.get(cache_key):
@@ -1461,6 +1534,7 @@ class InventoryService:
         self._snapshot_refresh_tasks.pop(cache_key, None)
         self._snapshot_activity.pop(cache_key, None)
         self._snapshot_lru.pop(cache_key, None)
+        self._snapshot_published_sequence.pop(cache_key, None)
         self._snapshot_invalidated.discard(cache_key)
         return True
 
@@ -1491,6 +1565,7 @@ class InventoryService:
         selected_enclosure_id: str | None,
         *,
         force_source_refresh: bool,
+        request_sequence: int,
     ) -> tuple[str, InventorySnapshot | None]:
         self._learn_canonical_options_from_cache()
         options = self._canonical_enclosure_options
@@ -1521,6 +1596,7 @@ class InventoryService:
                         if discovered_snapshot.selected_enclosure_id in options
                         else next(iter(options), None)
                     )
+                    self._canonical_options_request_sequence = request_sequence
                     if not trusted_topology:
                         discovered_snapshot = None
         if selected_enclosure_id is None:
@@ -1559,10 +1635,17 @@ class InventoryService:
             next(iter(options), None),
         )
 
-    def _replace_canonical_options_from_trusted_snapshot(self, snapshot: InventorySnapshot) -> None:
+    def _replace_canonical_options_from_trusted_snapshot(
+        self,
+        snapshot: InventorySnapshot,
+        *,
+        request_sequence: int,
+    ) -> bool:
+        if request_sequence < self._canonical_options_request_sequence:
+            return False
         options = {option.id: option for option in snapshot.enclosures}
         if not options and snapshot.selected_enclosure_id is not None:
-            return
+            return False
         removed_keys = set(self._canonical_enclosure_options or {}) - set(options)
         self._canonical_enclosure_options = options
         self._canonical_default_enclosure_id = (
@@ -1570,8 +1653,10 @@ class InventoryService:
             if snapshot.selected_enclosure_id in options
             else next(iter(options), None)
         )
+        self._canonical_options_request_sequence = request_sequence
         for key in removed_keys:
             self._remove_snapshot_state_key(key, cancel_task=True)
+        return True
 
     async def get_sas_fabric_snapshot(
         self,
