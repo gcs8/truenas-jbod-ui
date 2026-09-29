@@ -1127,6 +1127,8 @@ def _import_boto3() -> tuple[Any, Any, Any, tuple[type[BaseException], ...]]:
         botocore_exceptions.ReadTimeoutError,
         botocore_exceptions.ConnectionClosedError,
         botocore_exceptions.HTTPClientError,
+        botocore_exceptions.ProxyConnectionError,
+        botocore_exceptions.SSLError,
     )
     return boto3, TransferConfig, Config, connection_errors
 
