@@ -1498,6 +1498,13 @@ class InventoryService:
             if current is not None:
                 self._touch_snapshot_key(cache_key)
                 return current, False
+            raise SnapshotStateBusyError()
+        if request_sequence < self._canonical_options_request_sequence:
+            # Another request published trusted topology after this build began.
+            # If its destination watermark survived, the branch above returns the
+            # newer value. Otherwise fail closed: canonical retirement or LRU may
+            # have removed the destination while this request was still building.
+            raise SnapshotStateBusyError()
         self._cache[cache_key] = snapshot
         self._cache_until[cache_key] = utcnow() + timedelta(
             seconds=max(0, int(self.settings.app.snapshot_cache_ttl_seconds))
