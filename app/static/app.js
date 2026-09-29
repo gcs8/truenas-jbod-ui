@@ -7078,8 +7078,9 @@
       return "Live estimate is unavailable right now. Export can still run with the current settings.";
     }
     const targetLabel = estimate.size_limit_label || "24 MiB";
-    const downsamplingPart =
-      estimate.downsampling_label && estimate.downsampling_label !== "None"
+    const downsamplingPart = estimate.history_coverage_note
+      ? ` ${estimate.history_coverage_note}`
+      : estimate.downsampling_label && estimate.downsampling_label !== "None"
         ? ` ${estimate.downsampling_note || `History will be thinned to fit (${estimate.downsampling_label}).`}`
         : "";
     const tooLargeAdvice = "Shorten the history window, mask serial numbers, or allow a larger file.";
@@ -7094,7 +7095,7 @@
       if (estimate.allow_oversize) {
         return `Both HTML and ZIP are over ${targetLabel}. Larger files are allowed, so a ZIP file of about ${estimate.zip_size_label || "n/a"} will be saved.${downsamplingPart}`;
       }
-      return `Too large: both HTML and ZIP are over ${targetLabel}. ${tooLargeAdvice}`;
+      return `Too large: both HTML and ZIP are over ${targetLabel}. ${tooLargeAdvice}${downsamplingPart}`;
     }
 
     if (estimate.selected_packaging === "html") {
@@ -7104,7 +7105,7 @@
       if (estimate.selected_allowed) {
         return `The HTML file is estimated at ${estimate.selected_size_label || estimate.html_size_label} and is over ${targetLabel}. Larger files are allowed, so it can still be saved.${downsamplingPart}`;
       }
-      return `Too large: the HTML file is estimated at ${estimate.selected_size_label || estimate.html_size_label}, over ${targetLabel}. Choose Automatic or ZIP file, shorten the history window, mask serial numbers, or allow a larger file.`;
+      return `Too large: the HTML file is estimated at ${estimate.selected_size_label || estimate.html_size_label}, over ${targetLabel}. Choose Automatic or ZIP file, shorten the history window, mask serial numbers, or allow a larger file.${downsamplingPart}`;
     }
 
     if (estimate.selected_packaging === "zip") {
@@ -7114,7 +7115,7 @@
       if (estimate.selected_allowed) {
         return `The ZIP file is estimated at ${estimate.selected_size_label || estimate.zip_size_label} and is over ${targetLabel}. Larger files are allowed, so it can still be saved.${downsamplingPart}`;
       }
-      return `Too large: the ZIP file is estimated at ${estimate.selected_size_label || estimate.zip_size_label}, over ${targetLabel}. ${tooLargeAdvice}`;
+      return `Too large: the ZIP file is estimated at ${estimate.selected_size_label || estimate.zip_size_label}, over ${targetLabel}. ${tooLargeAdvice}${downsamplingPart}`;
     }
 
     return "Estimate ready.";
@@ -7222,7 +7223,7 @@
         </div>
         <div class="snapshot-export-estimate-card">
           <span class="snapshot-export-estimate-label">History detail</span>
-          <span class="snapshot-export-estimate-value">${escapeHtml(estimate.downsampling_label && estimate.downsampling_label !== "None" ? estimate.downsampling_label : "Full")}</span>
+          <span class="snapshot-export-estimate-value">${escapeHtml(estimate.history_coverage === "truncated" ? "Incomplete" : estimate.history_coverage === "unknown" ? "Unverified" : estimate.downsampling_label && estimate.downsampling_label !== "None" ? estimate.downsampling_label : "Full")}</span>
           <span class="snapshot-export-estimate-meta">${escapeHtml(`${estimate.metric_sample_count ?? 0} samples / ${estimate.event_count ?? 0} events`)}</span>
         </div>
       </div>
@@ -7413,6 +7414,9 @@
     ];
     parts.push(snapshotExportSelectionDescription());
     if (!isHistoryAvailable()) parts.push("History is unavailable and will be omitted.");
+    if (state.export.estimate.data?.history_coverage_note) {
+      parts.push(state.export.estimate.data.history_coverage_note);
+    }
     if (state.export.estimate.data?.downsampling_label && state.export.estimate.data.downsampling_label !== "None") {
       parts.push(`History will be thinned (${state.export.estimate.data.downsampling_label.toLowerCase()}) to get closer to the size limit.`);
     }

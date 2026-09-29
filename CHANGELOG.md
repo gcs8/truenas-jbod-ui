@@ -259,6 +259,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Applied existing partial endpoint masking consistently to contextual addresses
+  and serialized history details while preserving non-address text. (#851)
+
+- Disclosed capped or unknown history coverage in exports and estimates, and
+  preserved virtual-view history keys in partially redacted saved copies. (#848)
+
 - Showed the last backup clean-up on the admin Backups page: when it ran, how
   many copies it removed, and which target stopped it when it did not finish.
   (#819)
