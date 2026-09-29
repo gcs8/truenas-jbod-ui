@@ -188,6 +188,7 @@ class OperatorRecipeTests(unittest.TestCase):
     def test_core_standing_yaml_runs_two_read_only_probe_batches(self) -> None:
         from app.config import SSHConfig
         from app.services.ssh_probe import SSHProbe
+        from tests.test_ssh_probe import MemorySSHWire
 
         guide = (ROOT / "docs/SSH_READ_ONLY_SETUP.md").read_text(encoding="utf-8")
         section = guide.split("For this system, the preferred SSH command list is:", 1)[1]
@@ -199,21 +200,14 @@ class OperatorRecipeTests(unittest.TestCase):
         self.assertTrue(commands)
         batches = []
 
-        def client_factory():
-            recorded = []
-            batches.append(recorded)
-            client = MagicMock()
-            client.__enter__.return_value = client
-
-            def exec_command(command, **_kwargs):
-                recorded.append(command)
-                output = MagicMock()
-                output.read.return_value = b""
-                output.channel.recv_exit_status.return_value = 0
-                return io.BytesIO(), output, io.BytesIO(b"")
-
-            client.exec_command.side_effect = exec_command
-            return client
+        def client_factory(*, _cancel=None):
+            wire = MemorySSHWire(
+                lambda channel, _command: MemorySSHWire.feed(
+                    channel, eof=True, status=0,
+                )
+            )
+            batches.append(wire.commands)
+            return wire.client
 
         probe = SSHProbe(SSHConfig(enabled=True, host="core.example.test", user="jbodmap", commands=commands))
         with patch.object(probe, "_client", side_effect=client_factory):

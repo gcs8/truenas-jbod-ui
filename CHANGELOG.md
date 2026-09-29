@@ -262,6 +262,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Bound SSH command execution and retain worker, channel and reusable-session
+  cleanup ownership through cancellation before releasing caller locks. (#765)
 - Require verified SES device-slot coordinates for SG LED control and keep
   independent disks distinct when CAM model/target/LUN values match across controllers. (#809)
 - Bound SMART requests and cached results to the selected disk identity,

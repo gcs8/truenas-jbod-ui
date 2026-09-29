@@ -10,10 +10,21 @@ from typing import cast
 from unittest.mock import MagicMock, patch
 
 import paramiko
+from paramiko.client import SSHClient as RealSSHClient
 
 from app.config import ENV_OVERRIDES, SSHConfig, get_settings
 from app.services import ssh_probe
 from app.services.ssh_probe import AutoPinHostKeyPolicy, SSHCommandResult, SSHProbe, redact_ssh_command
+
+
+def _memory_streams(output=b"ok", error=b""):
+    wire = MemorySSHWire(lambda channel, _command: MemorySSHWire.feed(
+        channel, output, error, eof=True, status=0,
+    ))
+    _stdin, stdout, stderr = wire.client.exec_command("synthetic")
+    # Existing input tests assert exact writes without copying synthetic secrets
+    # into channel internals; deadline/output tests use real stdin too.
+    return MagicMock(), stdout, stderr
 
 
 class SSHProbeTests(unittest.TestCase):
@@ -321,12 +332,7 @@ class SSHProbeTests(unittest.TestCase):
         ssh_client = MagicMock()
         ssh_client.__enter__.return_value = ssh_client
         ssh_client_cls.return_value = ssh_client
-        stdout = MagicMock()
-        stdout.read.return_value = b"null\n"
-        stdout.channel.recv_exit_status.return_value = 0
-        stderr = MagicMock()
-        stderr.read.return_value = b""
-        ssh_client.exec_command.return_value = MagicMock(), stdout, stderr
+        ssh_client.exec_command.return_value = _memory_streams(b"null\n")
         probe = SSHProbe(
             SSHConfig(
                 enabled=True,
@@ -389,12 +395,7 @@ class SSHProbeTests(unittest.TestCase):
         ssh_client.connect.return_value = None
 
         def exec_command(command: str, timeout: int):
-            stdin = MagicMock()
-            stdout = MagicMock()
-            stderr = MagicMock()
-            stdout.read.return_value = f"{command} output".encode()
-            stderr.read.return_value = b""
-            stdout.channel.recv_exit_status.return_value = 0
+            stdin, stdout, stderr = _memory_streams(f"{command} output".encode())
             return stdin, stdout, stderr
 
         ssh_client.exec_command.side_effect = exec_command
@@ -427,12 +428,7 @@ class SSHProbeTests(unittest.TestCase):
         streams: list[MagicMock] = []
 
         def exec_command(command: str, timeout: int):
-            stdin = MagicMock()
-            stdout = MagicMock()
-            stderr = MagicMock()
-            stdout.read.return_value = b"ok"
-            stderr.read.return_value = b""
-            stdout.channel.recv_exit_status.return_value = 0
+            stdin, stdout, stderr = _memory_streams(b"ok")
             streams.append(stdin)
             return stdin, stdout, stderr
 
@@ -455,7 +451,7 @@ class SSHProbeTests(unittest.TestCase):
             stream.write.assert_called_once_with(stdin_data)
             stream.flush.assert_called_once_with()
             stream.channel.shutdown_write.assert_called_once_with()
-            stream.close.assert_not_called()
+            stream.close.assert_called_once_with()
         for call in ssh_client.exec_command.call_args_list:
             self.assertNotIn(stdin_data.strip(), call.args[0])
 
@@ -533,12 +529,7 @@ class SSHProbeTests(unittest.TestCase):
         ssh_client.connect.return_value = None
 
         def exec_command(command: str, timeout: int):
-            stdin = MagicMock()
-            stdout = MagicMock()
-            stderr = MagicMock()
-            stdout.read.return_value = b"ok"
-            stderr.read.return_value = b""
-            stdout.channel.recv_exit_status.return_value = 0
+            stdin, stdout, stderr = _memory_streams(b"ok")
             return stdin, stdout, stderr
 
         ssh_client.exec_command.side_effect = exec_command
@@ -558,11 +549,7 @@ class SSHProbeTests(unittest.TestCase):
 
     def test_single_command_rejects_oversized_stdout_with_a_bounded_read(self) -> None:
         client = MagicMock()
-        stdin = MagicMock()
-        stdout = MagicMock()
-        stderr = MagicMock()
-        stdout.read.return_value = b"x" * (ssh_probe.MAX_SSH_OUTPUT_BYTES + 1)
-        stderr.read.return_value = b""
+        stdin, stdout, stderr = _memory_streams(b"x" * (ssh_probe.MAX_SSH_OUTPUT_BYTES + 1))
         client.exec_command.return_value = stdin, stdout, stderr
         probe = SSHProbe(
             SSHConfig(
@@ -578,7 +565,9 @@ class SSHProbeTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual(result.stdout, "")
         self.assertIn("output exceeded", result.stderr)
-        stdout.read.assert_called_once_with(ssh_probe.MAX_SSH_OUTPUT_BYTES + 1)
+        self.assertTrue(stdout.channel.closed)
+        self.assertTrue(stdout.closed)
+        self.assertTrue(stderr.closed)
 
     @patch("app.services.ssh_probe.paramiko.SSHClient")
     def test_run_planned_commands_reuses_one_connection_for_dynamic_batches(
@@ -591,12 +580,7 @@ class SSHProbeTests(unittest.TestCase):
         ssh_client.connect.return_value = None
 
         def exec_command(command: str, timeout: int):
-            stdin = MagicMock()
-            stdout = MagicMock()
-            stderr = MagicMock()
-            stdout.read.return_value = f"{command} output".encode()
-            stderr.read.return_value = b""
-            stdout.channel.recv_exit_status.return_value = 0
+            stdin, stdout, stderr = _memory_streams(f"{command} output".encode())
             return stdin, stdout, stderr
 
         ssh_client.exec_command.side_effect = exec_command
@@ -689,6 +673,290 @@ class SSHProbeTests(unittest.TestCase):
         self.assertTrue(all(item.exit_code == 255 for item in results))
         self.assertTrue(all("timed out" in item.stderr for item in results))
         ssh_client.connect.assert_called_once()
+
+
+class MemorySSHWire:
+    """Socket-free peer for the installed SSHClient/Channel framing and buffers."""
+
+    server_object = None
+
+    def __init__(self, respond=None):
+        self.respond = respond or self.success
+        self.channels = []
+        self.commands = []
+        self.before_open = None
+        self.acknowledge = True
+        self.closed = threading.Event()
+        self.client = RealSSHClient()
+        self.client._transport = self
+
+    def get_log_channel(self):
+        return "paramiko.synthetic"
+
+    def _sanitize_packet_size(self, size):
+        return size
+
+    def is_active(self):
+        return not self.closed.is_set()
+
+    def get_exception(self):
+        return None
+
+    def open_session(self, timeout=None):
+        if self.closed.is_set():
+            raise EOFError("synthetic transport closed")
+        if self.before_open:
+            self.before_open()
+        channel = paramiko.Channel(len(self.channels))
+        channel._set_transport(self)
+        channel._set_window(32768, 32768)
+        channel._set_remote_channel(channel.chanid, 32768, 32768)
+        self.channels.append(channel)
+        return channel
+
+    def _unlink_channel(self, _chanid):
+        pass
+
+    def _send_user_message(self, message):
+        from paramiko.common import MSG_CHANNEL_REQUEST
+        incoming = paramiko.Message(message.asbytes())
+        kind = ord(incoming.get_byte())
+        channel = self.channels[incoming.get_int()]
+        if kind == MSG_CHANNEL_REQUEST and incoming.get_text() == "exec":
+            incoming.get_boolean()
+            command = incoming.get_text()
+            self.commands.append(command)
+            if self.acknowledge:
+                channel._request_success(paramiko.Message())
+            self.respond(channel, command)
+
+    @staticmethod
+    def feed(channel, output=b"", error=b"", *, eof=False, status=None):
+        if output:
+            channel._feed(output)
+        if error:
+            message = paramiko.Message()
+            message.add_int(1)
+            message.add_string(error)
+            channel._feed_extended(paramiko.Message(message.asbytes()))
+        if eof:
+            channel._handle_eof(paramiko.Message())
+        if status is not None:
+            message = paramiko.Message()
+            message.add_string("exit-status")
+            message.add_boolean(False)
+            message.add_int(status)
+            channel._handle_request(paramiko.Message(message.asbytes()))
+
+    def success(self, channel, command):
+        self.feed(channel, (command + " output").encode(), eof=True, status=0)
+
+    def close(self):
+        self.closed.set()
+        for channel in self.channels:
+            channel.close()
+
+
+class SSHCommandLifetimeTests(unittest.TestCase):
+    def setUp(self):
+        self.probe = SSHProbe(SSHConfig(enabled=True, host="synthetic.example.test"))
+
+    def run_bounded(self, wire, command="first", timeout=0.06):
+        results = []
+        worker = threading.Thread(target=lambda: results.append(
+            self.probe._run_single_command(wire.client, command, timeout_seconds=timeout)
+        ))
+        worker.start()
+        worker.join(0.8)
+        completed_without_release = not worker.is_alive()
+        closed_at_return = all(channel.closed for channel in wire.channels)
+        # Rescue only failed baseline runs; never supply a status to make GREEN pass.
+        wire.close()
+        worker.join(1)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(completed_without_release, "deadline required an external channel release")
+        self.assertTrue(closed_at_return, "command returned with an open channel")
+        return results[0]
+
+    def test_eof_without_exit_status_times_out_without_external_release(self):
+        wire = MemorySSHWire(lambda channel, _command: MemorySSHWire.feed(channel, eof=True))
+        result = self.run_bounded(wire)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.exit_code, 255)
+        self.assertIn("timed out", result.stderr.lower())
+
+    def test_timeout_and_output_cap_close_before_session_reuse(self):
+        for mode in ("timeout", "stdout-cap", "stderr-cap"):
+            with self.subTest(mode=mode):
+                def respond(channel, command):
+                    if command == "next":
+                        wire.success(channel, command)
+                    elif mode == "timeout":
+                        MemorySSHWire.feed(channel, eof=True)
+                    else:
+                        MemorySSHWire.feed(
+                            channel, b"x" * 65 if mode == "stdout-cap" else b"",
+                            b"x" * 65 if mode == "stderr-cap" else b"", eof=True, status=0,
+                        )
+                wire = MemorySSHWire(respond)
+                session = self.probe.open_session()
+                with patch.object(self.probe, "_client", return_value=wire.client), patch.object(ssh_probe, "MAX_SSH_OUTPUT_BYTES", 64):
+                    results = []
+                    worker = threading.Thread(target=lambda: results.extend([
+                        session.run_command("first", timeout_seconds=0.05),
+                        session.run_command("next", timeout_seconds=0.05),
+                    ]))
+                    prior_closed = []
+                    wire.before_open = lambda: prior_closed.append(all(c.closed for c in wire.channels))
+                    worker.start()
+                    worker.join(0.8)
+                    finished = not worker.is_alive()
+                    closed = all(c.closed for c in wire.channels)
+                    wire.close()
+                    worker.join(1)
+                    session.close()
+                self.assertTrue(finished, "reused command needed external release")
+                self.assertTrue(closed)
+                self.assertEqual(prior_closed, [True, True])
+                self.assertFalse(results[0].ok)
+                self.assertTrue(results[1].ok)
+
+    def test_stderr_window_is_drained_while_stdout_waits(self):
+        threads = []
+        errors = []
+        def respond(channel, _command):
+            def peer():
+                try:
+                    # Each bounded stderr window must drain before stdout/EOF arrive.
+                    for _ in range(4):
+                        MemorySSHWire.feed(channel, error=b"e" * 32768)
+                        deadline = time.monotonic() + 0.5
+                        while len(channel.in_stderr_buffer) and not channel.closed:
+                            if time.monotonic() >= deadline:
+                                raise AssertionError("stderr window was not drained")
+                            time.sleep(0.001)
+                    if not channel.closed:
+                        MemorySSHWire.feed(channel, b"done", eof=True, status=0)
+                except BaseException as exc:
+                    errors.append(exc)
+            thread = threading.Thread(target=peer)
+            threads.append(thread)
+            thread.start()
+        wire = MemorySSHWire(respond)
+        try:
+            result = self.run_bounded(wire, timeout=0.3)
+        finally:
+            wire.close()
+            for thread in threads:
+                thread.join(1)
+        self.assertEqual(errors, [])
+        self.assertTrue(result.ok, result.stderr)
+        self.assertEqual(result.stdout, "done")
+        self.assertEqual(result.stderr, "e" * (4 * 32768))
+
+    def test_exec_acknowledgement_wait_obeys_deadline(self):
+        wire = MemorySSHWire(lambda _channel, _command: None)
+        wire.acknowledge = False
+        result = self.run_bounded(wire)
+        self.assertFalse(result.ok)
+        self.assertIn("timed out", result.stderr.lower())
+        self.assertTrue(wire.closed.is_set())
+
+    def test_combined_output_budget_exact_boundary_and_one_over(self):
+        for error in (b"e" * 32, b"e" * 33):
+            with self.subTest(error_bytes=len(error)), patch.object(ssh_probe, "MAX_SSH_OUTPUT_BYTES", 64):
+                wire = MemorySSHWire(lambda channel, _command: MemorySSHWire.feed(
+                    channel, b"o" * 32, error, eof=True, status=0,
+                ))
+                result = self.run_bounded(wire)
+                self.assertEqual(result.ok, len(error) == 32)
+                if result.ok:
+                    self.assertEqual(result.stdout, "o" * 32)
+                    self.assertEqual(result.stderr, "e" * 32)
+                else:
+                    self.assertEqual(result.stdout, "")
+                    self.assertIn("output exceeded", result.stderr)
+
+    def test_exit_status_before_final_output_does_not_truncate_output(self):
+        workers = []
+        def respond(channel, _command):
+            MemorySSHWire.feed(channel, status=0)
+            def peer():
+                time.sleep(0.02)
+                MemorySSHWire.feed(channel, b"late stdout", b"late stderr", eof=True)
+            worker = threading.Thread(target=peer)
+            workers.append(worker)
+            worker.start()
+        wire = MemorySSHWire(respond)
+        try:
+            result = self.run_bounded(wire, timeout=0.3)
+        finally:
+            wire.close()
+            for worker in workers:
+                worker.join(1)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.stdout, "late stdout")
+        self.assertEqual(result.stderr, "late stderr")
+
+    def test_read_error_and_nonzero_exit_close_channel(self):
+        for mode in ("read-error", "nonzero"):
+            with self.subTest(mode=mode):
+                def respond(channel, _command):
+                    MemorySSHWire.feed(channel, b"data", b"failure", eof=True, status=7)
+                    if mode == "read-error":
+                        def fail(_size):
+                            raise OSError("synthetic read failure")
+                        channel.recv = fail
+                wire = MemorySSHWire(respond)
+                result = self.run_bounded(wire)
+                self.assertFalse(result.ok)
+                if mode == "nonzero":
+                    self.assertEqual(result.exit_code, 7)
+                    self.assertEqual(result.stdout, "data")
+                    self.assertEqual(result.stderr, "failure")
+                else:
+                    self.assertIn("synthetic read failure", result.stderr)
+
+    def test_group_gate_does_not_release_a_channel_whose_close_failed(self):
+        def respond(channel, command):
+            MemorySSHWire.feed(channel, b"ok", eof=True, status=0)
+            if command == "first":
+                def failed_close():
+                    raise OSError("synthetic channel close failure")
+                channel.close = failed_close
+        wire = MemorySSHWire(respond)
+        try:
+            with patch.object(self.probe, "_client", return_value=wire.client):
+                with self.assertRaisesRegex(OSError, "synthetic channel close failure"):
+                    self.probe._run_planned_command_groups_sync([
+                        (lambda _r: [], ["first"]), (lambda _r: [], ["must-not-open"]),
+                    ], max_parallel_channels=1)
+            self.assertEqual(wire.commands, ["first"])
+            self.assertFalse(wire.channels[0].closed)
+        finally:
+            for channel in wire.channels:
+                channel.close = paramiko.Channel.close.__get__(channel)
+            wire.close()
+
+    def test_trickling_output_does_not_renew_absolute_deadline(self):
+        stop = threading.Event()
+        threads = []
+        def respond(channel, _command):
+            def peer():
+                while not stop.wait(0.01) and not channel.closed:
+                    MemorySSHWire.feed(channel, b"x")
+            thread = threading.Thread(target=peer)
+            threads.append(thread)
+            thread.start()
+        wire = MemorySSHWire(respond)
+        try:
+            result = self.run_bounded(wire)
+            self.assertFalse(result.ok)
+            self.assertIn("timed out", result.stderr.lower())
+        finally:
+            stop.set()
+            for thread in threads:
+                thread.join(1)
 
 
 class KnownHostsPathSettingsTests(unittest.TestCase):
