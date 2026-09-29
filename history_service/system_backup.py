@@ -824,10 +824,8 @@ class _ImportActivationTransaction:
         self._journal_order: list[str] = []
         self._created_parents: list[Path] = []
         self._sibling_artifacts: dict[Path, Literal["file", "directory"]] = {}
-        self._protected_history_key = (
-            self._journal_key(history_store.file_path)
-            if history_store is not None
-            else None
+        self._protected_history_keys = (
+            self._history_artifact_keys(history_store) if history_store is not None else frozenset()
         )
         self._committed = False
         self._rollback_completed = False
@@ -1027,6 +1025,7 @@ class _ImportActivationTransaction:
         segments_entry = self._record_target(
             catalog_path.parent,
             expected_kind="directory",
+            allow_history=True,
         )
         if hot_entry.kind not in {"file", "missing"}:
             raise ValueError("Live segmented history hot target is invalid.")
@@ -1484,9 +1483,9 @@ class _ImportActivationTransaction:
         allow_history: bool = False,
     ) -> _ImportRollbackEntry:
         journal_key = self._journal_key(target_path)
-        if not allow_history and self._protected_history_key and self._journal_paths_overlap(
-            journal_key,
-            self._protected_history_key,
+        if not allow_history and any(
+            self._journal_paths_overlap(journal_key, protected_key)
+            for protected_key in self._protected_history_keys
         ):
             raise ValueError(
                 f"Live restore target {target_path} collides with the history database."
@@ -1789,6 +1788,20 @@ class _ImportActivationTransaction:
     def _apply_owner(path: Path, owner: tuple[int, int] | None) -> None:
         if owner is not None:
             os.chown(path, owner[0], owner[1], follow_symlinks=False)
+
+    @classmethod
+    def _history_artifact_keys(cls, store: HistoryStore) -> frozenset[str]:
+        hot_path = store.file_path
+        paths = {
+            hot_path,
+            Path(f"{hot_path}-wal"),
+            Path(f"{hot_path}-shm"),
+            Path(f"{hot_path}-journal"),
+            activation_pending_path(hot_path),
+        }
+        if store.segment_catalog_path is not None:
+            paths.add(store.segment_catalog_path.parent)
+        return frozenset(cls._journal_key(path) for path in paths)
 
     @staticmethod
     def _journal_key(target_path: Path) -> str:
@@ -2206,9 +2219,11 @@ class SystemBackupService:
         normalized_packaging: ArchivePackaging = (
             "tar.zst" if stream_encrypted else ("7z" if encrypt else requested_packaging)
         )
-        # A fast encrypted export briefly holds the snapshot, the plain TAR and
-        # the growing encrypted output together, so it reserves three copies.
-        self._require_export_free_space(selected_groups, copies=3 if stream_encrypted else 2)
+        self._require_export_free_space(
+            selected_groups,
+            app_settings=app_settings,
+            packaging=normalized_packaging,
+        )
         workspace = Path(tempfile.mkdtemp(prefix="truenas-jbod-ui-export-"))
         try:
             segmented_snapshot: _SegmentedExportSnapshot | None = None
@@ -2913,7 +2928,12 @@ class SystemBackupService:
         if encrypt and not passphrase:
             raise ValueError(EXPORT_PASSPHRASE_REQUIRED_MESSAGE)
         normalized_packaging: ArchivePackaging = "7z" if encrypt else requested_packaging
-        self._require_export_free_space(selected_groups, copies=3 if scrub_disk_identifiers or scrub_secrets else 2)
+        self._require_export_free_space(
+            selected_groups,
+            app_settings=app_settings,
+            packaging=normalized_packaging,
+            scrub_history=scrub_disk_identifiers or scrub_secrets,
+        )
         scrubber = (
             DebugScrubber(
                 scrub_secrets=scrub_secrets,
@@ -3328,13 +3348,14 @@ class SystemBackupService:
 
         # Activation protects live history even when the archive omits it.
         # Apply the same rule before inspection/preflight can issue an identity.
-        protected_history_key = _ImportActivationTransaction._journal_key(self.store.file_path)
+        protected_history_keys = _ImportActivationTransaction._history_artifact_keys(self.store)
         for destination in active_destinations:
-            if destination.group_key != HISTORY_DB_KEY and (
+            if destination.group_key not in {HISTORY_DB_KEY, SEGMENTED_CATALOG_STAGING_KEY} and any(
                 _ImportActivationTransaction._journal_paths_overlap(
                     _ImportActivationTransaction._journal_key(destination.target_path),
                     protected_history_key,
                 )
+                for protected_history_key in protected_history_keys
             ):
                 raise ValueError(
                     f"Live restore target {destination.target_path} collides with the history database."
@@ -4045,17 +4066,82 @@ class SystemBackupService:
                 pass
         return total
 
-    def _require_export_free_space(self, selected_groups: Any, *, copies: int = 2) -> None:
+    def _non_history_source_bytes(
+        self,
+        app_settings: Settings,
+        selected_groups: Any,
+    ) -> int:
+        layout_paths = _derive_runtime_layout_paths(app_settings.config_file)
+        config_root = Path(app_settings.config_file).parent
+        file_sources = {
+            CONFIG_FILE_KEY: Path(app_settings.config_file),
+            RUNTIME_OVERRIDES_FILE_KEY: Path(app_settings.paths.runtime_overrides_file),
+            PROFILE_FILE_KEY: Path(app_settings.paths.profile_file),
+            MAPPING_FILE_KEY: Path(app_settings.paths.mapping_file),
+            SAS_FABRIC_ALIAS_FILE_KEY: Path(app_settings.paths.sas_fabric_alias_file),
+            SLOT_DETAIL_FILE_KEY: Path(app_settings.paths.slot_detail_cache_file),
+            KNOWN_HOSTS_KEY: Path(layout_paths["known_hosts_path"]),
+        }
+        directory_sources = {
+            SSH_KEYS_KEY: config_root / "ssh",
+            TLS_TRUST_KEY: config_root / "tls",
+        }
+        total = 0
+        for group_key, source_path in file_sources.items():
+            if group_key not in selected_groups:
+                continue
+            try:
+                metadata = source_path.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError("Backup export source must be a regular file.")
+            total += metadata.st_size
+        for group_key, source_dir in directory_sources.items():
+            if group_key not in selected_groups:
+                continue
+            try:
+                root_metadata = source_dir.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISDIR(root_metadata.st_mode):
+                raise ValueError("Backup export source must be a directory without symlinks.")
+            pending = [source_dir]
+            while pending:
+                directory = pending.pop()
+                with os.scandir(directory) as entries:
+                    for entry in entries:
+                        if entry.is_symlink():
+                            raise ValueError("Backup export source must not be a symlink.")
+                        if entry.is_dir(follow_symlinks=False):
+                            pending.append(Path(entry.path))
+                            continue
+                        metadata = entry.stat(follow_symlinks=False)
+                        if not stat.S_ISREG(metadata.st_mode):
+                            raise ValueError("Backup export source must be a regular file.")
+                        total += metadata.st_size
+        return total
+
+    def _require_export_free_space(
+        self,
+        selected_groups: Any,
+        *,
+        app_settings: Settings,
+        packaging: ArchivePackaging,
+        scrub_history: bool = False,
+    ) -> None:
         """Fail before writing anything when the temp folder cannot hold the export.
 
-        A backup export holds a consistent snapshot of the history database and
-        the archive built from it at the same time, so it needs about twice the
-        history size (compression usually makes this an overestimate). A debug
-        export can also hold a scrubbed copy of the snapshot, so it asks for three.
+        ZIP holds source snapshots and output together. TAR and 7z packaging can
+        additionally hold an uncompressed staging archive. Debug history
+        scrubbing adds one more history-sized file.
         """
-        if HISTORY_DB_KEY not in selected_groups:
-            return
-        needed_bytes = copies * self._history_source_bytes()
+        history_bytes = self._history_source_bytes() if HISTORY_DB_KEY in selected_groups else 0
+        payload_bytes = history_bytes + self._non_history_source_bytes(app_settings, selected_groups)
+        copies = 2 if packaging == "zip" else 3
+        needed_bytes = copies * payload_bytes
+        if scrub_history:
+            needed_bytes += history_bytes
         if needed_bytes == 0:
             return
         folder = Path(tempfile.gettempdir())

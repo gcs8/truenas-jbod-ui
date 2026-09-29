@@ -1341,6 +1341,93 @@ class SystemBackupServiceTests(unittest.TestCase):
                 self.config_path.write_bytes(config_before)
                 artifact.cleanup()
 
+    def test_non_history_admission_protects_all_live_history_artifacts(self) -> None:
+        segment_root = self.temp_dir / "history-segments"
+        segment_root.mkdir()
+        catalog_path = segment_root / "catalog.json"
+        store = HistoryStore(
+            str(self.history_db_path),
+            recover_unreadable_database=False,
+            segment_catalog_path=catalog_path,
+        )
+        service = SystemBackupService(
+            HistorySettings(
+                sqlite_path=str(self.history_db_path),
+                segment_catalog_path=str(catalog_path),
+                backup_dir=str(self.history_backup_dir),
+                startup_grace_seconds=0,
+            ),
+            store,
+        )
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=True):
+            artifact = self.backup_service.export_bundle_to_file(
+                packaging="zip", included_paths=[MAPPING_FILE_KEY],
+            )
+            config_before = self.config_path.read_bytes()
+            try:
+                targets = (
+                    Path(f"{self.history_db_path}-wal"),
+                    Path(f"{self.history_db_path}-shm"),
+                    Path(f"{self.history_db_path}-journal"),
+                    system_backup_module.activation_pending_path(self.history_db_path),
+                    catalog_path,
+                    segment_root / "segment-0001.sqlite3",
+                )
+                for target in targets:
+                    with self.subTest(target=target):
+                        config = yaml.safe_load(config_before)
+                        config["paths"]["mapping_file"] = str(target)
+                        write_yaml(self.config_path, config)
+                        self._assert_public_history_collision_refusal(service, artifact.path)
+                with _ImportActivationTransaction({}, history_store=store) as transaction:
+                    for target in targets:
+                        with self.subTest(runtime_target=target):
+                            with self.assertRaisesRegex(ValueError, "history database"):
+                                transaction._record_target(target, expected_kind="file")
+                    transaction._record_target(
+                        self.history_db_path,
+                        expected_kind="file",
+                        allow_history=True,
+                    )
+                    transaction._record_target(
+                        segment_root,
+                        expected_kind="directory",
+                        allow_history=True,
+                    )
+            finally:
+                self.config_path.write_bytes(config_before)
+                artifact.cleanup()
+
+    def test_directory_admission_protects_segment_root(self) -> None:
+        passphrase = "synthetic segment-root collision regression"
+        catalog_path = self.ssh_dir / "catalog.json"
+        store = HistoryStore(
+            str(self.history_db_path),
+            recover_unreadable_database=False,
+            segment_catalog_path=catalog_path,
+        )
+        service = SystemBackupService(
+            HistorySettings(
+                sqlite_path=str(self.history_db_path),
+                segment_catalog_path=str(catalog_path),
+                backup_dir=str(self.history_backup_dir),
+                startup_grace_seconds=0,
+            ),
+            store,
+        )
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=True):
+            artifact = self.backup_service.export_scheduled_bundle_to_file(
+                included_paths=[SSH_KEYS_KEY], passphrase=passphrase,
+            )
+            try:
+                self._assert_public_history_collision_refusal(
+                    service,
+                    artifact.path,
+                    passphrase=passphrase,
+                )
+            finally:
+                artifact.cleanup()
+
     def test_public_non_mapping_admission_protects_unselected_history(self) -> None:
         alias_path = self.temp_dir / "sas-aliases.json"
         alias_path.write_text('{"sas_fabric_aliases": {}}\n', encoding="utf-8")
@@ -2101,16 +2188,29 @@ class SystemBackupServiceTests(unittest.TestCase):
         return path
 
     def test_stream_full_export_reserves_snapshot_tar_and_output_space(self) -> None:
-        calls: list[int] = []
+        calls: list[tuple[str, bool]] = []
         real = SystemBackupService._require_export_free_space
 
-        def spy(service: Any, groups: Any, *, copies: int = 2) -> None:
-            calls.append(copies)
-            real(service, groups, copies=copies)
+        def spy(
+            service: Any,
+            groups: Any,
+            *,
+            app_settings: Settings,
+            packaging: str,
+            scrub_history: bool = False,
+        ) -> None:
+            calls.append((packaging, scrub_history))
+            real(
+                service,
+                groups,
+                app_settings=app_settings,
+                packaging=packaging,
+                scrub_history=scrub_history,
+            )
 
         with patch.object(SystemBackupService, "_require_export_free_space", spy):
             self._export_stream_full("space passphrase").cleanup()
-        self.assertEqual(calls, [3])
+        self.assertEqual(calls, [("tar.zst", False)])
 
     def test_stream_full_backup_is_the_default_and_rejects_unknown_format(self) -> None:
         # #397: new FULL backups default to tar.zst in the TJBENC02 envelope.
@@ -2503,14 +2603,21 @@ class SystemBackupServiceTests(unittest.TestCase):
             )
         mkdtemp.assert_not_called()
         source_bytes = self.backup_service._history_source_bytes()
-        with patch.object(self.backup_service, "_history_source_bytes", return_value=source_bytes):
+        with (
+            patch.object(self.backup_service, "_history_source_bytes", return_value=source_bytes),
+            patch.object(self.backup_service, "_non_history_source_bytes", return_value=0),
+        ):
             roomy = type(usage)(usage.total, usage.used, 3 * source_bytes)
             with patch("history_service.system_backup.shutil.disk_usage", return_value=roomy):
-                self.backup_service._require_export_free_space([HISTORY_DB_KEY], copies=3)
+                self.backup_service._require_export_free_space(
+                    [HISTORY_DB_KEY], app_settings=Settings(), packaging="zip", scrub_history=True,
+                )
             tight = type(usage)(usage.total, usage.used, 3 * source_bytes - 1)
             with patch("history_service.system_backup.shutil.disk_usage", return_value=tight):
                 with self.assertRaisesRegex(ValueError, "Export needs about"):
-                    self.backup_service._require_export_free_space([HISTORY_DB_KEY], copies=3)
+                    self.backup_service._require_export_free_space(
+                        [HISTORY_DB_KEY], app_settings=Settings(), packaging="zip", scrub_history=True,
+                    )
 
     def test_export_refuses_when_temp_folder_cannot_hold_the_history_snapshot(self) -> None:
         usage = shutil.disk_usage(self.temp_dir)
@@ -2528,12 +2635,43 @@ class SystemBackupServiceTests(unittest.TestCase):
         self.assertIn("1 bytes is available.", str(raised.exception))
         mkdtemp.assert_not_called()
 
-        with patch("history_service.system_backup.shutil.disk_usage", return_value=short):
-            artifact = self.backup_service.export_bundle_to_file(
-                packaging="zip",
-                included_paths=[CONFIG_FILE_KEY],
-            )
-        artifact.cleanup()
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            with (
+                patch("history_service.system_backup.shutil.disk_usage", return_value=short),
+                patch("history_service.system_backup.tempfile.mkdtemp") as mkdtemp,
+                self.assertRaisesRegex(ValueError, "Export needs about"),
+            ):
+                self.backup_service.export_bundle_to_file(
+                    packaging="zip", included_paths=[CONFIG_FILE_KEY],
+                )
+        mkdtemp.assert_not_called()
+
+    def test_non_history_export_space_budget_includes_files_directories_and_packaging(self) -> None:
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            app_settings = get_settings()
+        selected = [CONFIG_FILE_KEY, SSH_KEYS_KEY]
+        payload_bytes = self.backup_service._non_history_source_bytes(app_settings, selected)
+        self.assertGreater(payload_bytes, self.config_path.stat().st_size)
+        usage = shutil.disk_usage(self.temp_dir)
+        for packaging, copies in (("zip", 2), ("tar.gz", 3), ("tar.zst", 3), ("7z", 3)):
+            with self.subTest(packaging=packaging):
+                roomy = type(usage)(usage.total, usage.used, copies * payload_bytes)
+                with patch("history_service.system_backup.shutil.disk_usage", return_value=roomy):
+                    self.backup_service._require_export_free_space(
+                        selected,
+                        app_settings=app_settings,
+                        packaging=packaging,
+                    )
+                tight = type(usage)(usage.total, usage.used, copies * payload_bytes - 1)
+                with patch("history_service.system_backup.shutil.disk_usage", return_value=tight):
+                    with self.assertRaisesRegex(ValueError, "Export needs about"):
+                        self.backup_service._require_export_free_space(
+                            selected,
+                            app_settings=app_settings,
+                            packaging=packaging,
+                        )
 
     def test_import_skips_second_quick_check_only_for_the_preflighted_digest(self) -> None:
         artifact = self.backup_service.export_bundle_to_file(
