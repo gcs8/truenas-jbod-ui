@@ -9,10 +9,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from admin_service.services.runtime_control import DockerRuntimeError
+from admin_service.services.runtime_control import DockerRuntimeError, reserve_runtime_targets
 from app.models.domain import DebugBundleExportRequest, SystemBackupExportRequest
 
 logger = logging.getLogger(__name__)
+
+_MAINTENANCE_RESERVATION_TARGET = "\0admin-maintenance"
 
 
 @dataclass(slots=True)
@@ -87,6 +89,10 @@ class AdminMaintenanceService:
         self.backup_service = backup_service
         self.runtime_service = runtime_service
         self.clean_backup_targets = tuple(clean_backup_targets)
+        self._reservation_targets = (
+            *self.clean_backup_targets,
+            _MAINTENANCE_RESERVATION_TARGET,
+        )
 
     # ------------------------------------------------------------------ helpers
 
@@ -289,19 +295,20 @@ class AdminMaintenanceService:
         stop_services: bool = False,
         restart_services: bool = True,
     ) -> tuple[Any, MaintenanceOutcome]:
-        def operation(_stopped: list[str]) -> Any:
-            return self.backup_service.export_bundle_to_file(
-                encrypt=payload.encrypt,
-                passphrase=payload.passphrase,
-                packaging=payload.packaging,
-                included_paths=payload.included_paths,
-            )
+        with reserve_runtime_targets(self._reservation_targets):
+            def operation(_stopped: list[str]) -> Any:
+                return self.backup_service.export_bundle_to_file(
+                    encrypt=payload.encrypt,
+                    passphrase=payload.passphrase,
+                    packaging=payload.packaging,
+                    included_paths=payload.included_paths,
+                )
 
-        return self._run_with_quiesced_services(
-            operation,
-            stop_services=stop_services,
-            restart_services=restart_services,
-        )
+            return self._run_with_quiesced_services(
+                operation,
+                stop_services=stop_services,
+                restart_services=restart_services,
+            )
 
     def export_debug_bundle(
         self,
@@ -310,33 +317,34 @@ class AdminMaintenanceService:
         stop_services: bool = True,
         restart_services: bool = True,
     ) -> tuple[Any, MaintenanceOutcome]:
-        runtime_before = self.runtime_service.status_payload()
+        with reserve_runtime_targets(self._reservation_targets):
+            runtime_before = self.runtime_service.status_payload()
 
-        def operation(stopped_containers: list[str]) -> Any:
-            runtime_after_stop = self.runtime_service.status_payload()
-            return self.backup_service.export_debug_bundle_to_file(
-                encrypt=payload.encrypt,
-                passphrase=payload.passphrase,
-                packaging=payload.packaging,
-                included_paths=payload.included_paths,
-                scrub_secrets=payload.scrub_secrets,
-                scrub_disk_identifiers=payload.scrub_disk_identifiers,
-                runtime_payload={
-                    "before_stop": runtime_before,
-                    "after_stop": runtime_after_stop,
-                },
-                maintenance_payload={
-                    "stop_services": stop_services,
-                    "restart_services": restart_services,
-                    "stopped_containers": list(stopped_containers),
-                },
+            def operation(stopped_containers: list[str]) -> Any:
+                runtime_after_stop = self.runtime_service.status_payload()
+                return self.backup_service.export_debug_bundle_to_file(
+                    encrypt=payload.encrypt,
+                    passphrase=payload.passphrase,
+                    packaging=payload.packaging,
+                    included_paths=payload.included_paths,
+                    scrub_secrets=payload.scrub_secrets,
+                    scrub_disk_identifiers=payload.scrub_disk_identifiers,
+                    runtime_payload={
+                        "before_stop": runtime_before,
+                        "after_stop": runtime_after_stop,
+                    },
+                    maintenance_payload={
+                        "stop_services": stop_services,
+                        "restart_services": restart_services,
+                        "stopped_containers": list(stopped_containers),
+                    },
+                )
+
+            return self._run_with_quiesced_services(
+                operation,
+                stop_services=stop_services,
+                restart_services=restart_services,
             )
-
-        return self._run_with_quiesced_services(
-            operation,
-            stop_services=stop_services,
-            restart_services=restart_services,
-        )
 
     def import_bundle_from_file(
         self,
@@ -348,50 +356,51 @@ class AdminMaintenanceService:
         restart_services: bool = True,
         admission_callback: Callable[[str, str], None] | None = None,
     ) -> tuple[dict[str, Any], MaintenanceOutcome]:
-        snapshot, workspace = self._stage_archive_snapshot(archive_path)
-        primary_error: Exception | None = None
-        try:
-            preflight = getattr(
-                self.backup_service,
-                "preflight_import_bundle_file",
-                self.backup_service.inspect_bundle_file,
-            )
-            preflighted = preflight(
-                snapshot,
-                passphrase=passphrase,
-                expected_encrypted=expected_encrypted,
-                identity_callback=admission_callback,
-            )
-            # The staged snapshot is read-only, so a matching digest at import time
-            # means the history integrity check already covered these bytes.
-            preflighted_digest = preflighted if isinstance(preflighted, str) else None
-
-            def operation(_stopped: list[str]) -> dict[str, Any]:
-                return self.backup_service.import_bundle_from_file(
+        with reserve_runtime_targets(self._reservation_targets):
+            snapshot, workspace = self._stage_archive_snapshot(archive_path)
+            primary_error: Exception | None = None
+            try:
+                preflight = getattr(
+                    self.backup_service,
+                    "preflight_import_bundle_file",
+                    self.backup_service.inspect_bundle_file,
+                )
+                preflighted = preflight(
                     snapshot,
                     passphrase=passphrase,
                     expected_encrypted=expected_encrypted,
-                    preflighted_archive_sha256=preflighted_digest,
+                    identity_callback=admission_callback,
                 )
+                # The staged snapshot is read-only, so a matching digest at import time
+                # means the history integrity check already covered these bytes.
+                preflighted_digest = preflighted if isinstance(preflighted, str) else None
 
-            return self._run_with_quiesced_services(
-                operation,
-                stop_services=stop_services,
-                restart_services=restart_services,
-            )
-        except Exception as exc:
-            primary_error = exc
-            raise
-        finally:
-            try:
-                workspace.chmod(0o700)
-                # The staged copy is read-only; make it writable again so the
-                # removal also works where a read-only file cannot be unlinked.
-                snapshot.chmod(0o600)
-                shutil.rmtree(workspace)
-            except Exception:
-                if primary_error is not None:
-                    raise RuntimeError(
-                        f"{primary_error} Backup admission snapshot cleanup also failed."
-                    ) from primary_error
-                raise RuntimeError("Backup admission snapshot cleanup failed.")
+                def operation(_stopped: list[str]) -> dict[str, Any]:
+                    return self.backup_service.import_bundle_from_file(
+                        snapshot,
+                        passphrase=passphrase,
+                        expected_encrypted=expected_encrypted,
+                        preflighted_archive_sha256=preflighted_digest,
+                    )
+
+                return self._run_with_quiesced_services(
+                    operation,
+                    stop_services=stop_services,
+                    restart_services=restart_services,
+                )
+            except Exception as exc:
+                primary_error = exc
+                raise
+            finally:
+                try:
+                    workspace.chmod(0o700)
+                    # The staged copy is read-only; make it writable again so the
+                    # removal also works where a read-only file cannot be unlinked.
+                    snapshot.chmod(0o600)
+                    shutil.rmtree(workspace)
+                except Exception:
+                    if primary_error is not None:
+                        raise RuntimeError(
+                            f"{primary_error} Backup admission snapshot cleanup also failed."
+                        ) from primary_error
+                    raise RuntimeError("Backup admission snapshot cleanup failed.")

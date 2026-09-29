@@ -59,7 +59,8 @@ test("every admin.js request has a timeout; backup transfers get the long one", 
   for (const route of ["/api/admin/backup/export", "/api/admin/debug/export", "/api/admin/backup/inspect", "/api/admin/backup/import"]) {
     const at = code.indexOf(route);
     assert.ok(at > 0, `${route} must be requested`);
-    const call = code.slice(code.lastIndexOf("fetchWithTimeout(", at), at + 400);
+    const callStart = Math.max(code.lastIndexOf("fetchWithTimeout(", at), code.lastIndexOf("fetchBackupRestore(", at));
+    const call = code.slice(callStart, at + 400);
     assert.match(call, /timeoutMs: BACKUP_TRANSFER_TIMEOUT_MS/, `${route} needs the long transfer timeout`);
   }
   assert.match(code, /const BACKUP_TRANSFER_TIMEOUT_MS = 30 \* 60 \* 1000;/);
@@ -113,15 +114,11 @@ test("fetchWithTimeout keeps the timer running while readBody reads a stalled bo
   assert.equal(bodyAborted, true, "the stalled download must be aborted");
 });
 
-test("a restore that times out after upload is reported as unknown, not failed", () => {
+test("upload restore uses the shared decided-result and uncertainty contract", () => {
   const code = fs.readFileSync(path.join(ROOT, FILES[0]), "utf8");
   const source = extractFunction(code, "runImportBackup");
-  const dispatched = source.indexOf("importDispatched = true;");
-  assert.ok(dispatched > source.indexOf("window.confirm"), "the flag is set only once the restore is sent");
-  assert.ok(dispatched < source.indexOf("/api/admin/backup/import"));
-  const catchBlock = source.slice(source.lastIndexOf("} catch (error) {"));
-  const unknownBranch = catchBlock.indexOf("if (importDispatched && error?.timedOut)");
-  assert.ok(unknownBranch >= 0 && unknownBranch < catchBlock.indexOf("Import failed:"));
-  assert.match(catchBlock, /It is unknown whether the restore from \$\{file\.name\} finished\./);
-  assert.match(catchBlock, /before restoring again/);
+  assert.ok(source.indexOf("fetchBackupRestore(") > source.indexOf("window.confirm"));
+  assert.match(source, /describeBackupRestoreFailure\(error, file.name\)/);
+  assert.match(extractFunction(code, "fetchBackupRestore"), /requireMutationResult\(validBackupRestoreResult\(payload\)/);
+  assert.match(extractFunction(code, "describeBackupRestoreFailure"), /before restoring again/);
 });

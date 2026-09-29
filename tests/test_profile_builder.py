@@ -1,17 +1,158 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from app.config import EnclosureProfileConfig, PathConfig, Settings, SystemConfig, TrueNASConfig
+import yaml
+
+from app.config import (
+    EnclosureProfileConfig, PathConfig, Settings, StorageViewConfig, SystemConfig,
+    TrueNASConfig, load_settings,
+)
 from app.models.domain import EnclosureProfileRequest
 from app.services.profile_builder import ProfileBuilderService
 from app.services.profile_registry import ProfileRegistry
-from app.services.profile_registry import GENERIC_FRONT_24_1X24_PROFILE_ID
+from app.services.profile_registry import DELL_MD1280_DRAWER_BOTTOM_PROFILE_ID, GENERIC_FRONT_24_1X24_PROFILE_ID
+from app.services.storage_views import storage_view_slot_label
 
 
 class ProfileBuilderServiceTests(unittest.TestCase):
+    def _reload_saved_profile(
+        self, service: ProfileBuilderService, profile: EnclosureProfileConfig,
+    ) -> EnclosureProfileConfig:
+        # Use the production settings loader, not a model copy of the saved return value.
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(service.config_path)}, clear=True):
+            settings = load_settings()
+        reloaded = next(item for item in settings.profiles if item.id == profile.id)
+        self.assertEqual(reloaded.model_dump(), profile.model_dump())
+        view = ProfileRegistry(settings).get(profile.id)
+        assert view is not None
+        assert profile.slot_layout is not None
+        self.assertEqual(view.model_dump(mode="json")["slot_number_base"], profile.slot_number_base)
+        self.assertEqual(view.slot_layout, profile.slot_layout)
+        storage_view = StorageViewConfig(
+            id="synthetic-shelf", label="Synthetic shelf", kind="ses_enclosure",
+            template_id="ses-auto", profile_id=profile.id,
+        )
+        for row in profile.slot_layout:
+            for slot in row:
+                if slot is not None:
+                    self.assertEqual(
+                        storage_view_slot_label(storage_view, slot, selected_profile=view),
+                        f"{slot + (profile.slot_number_base or 0):02d}",
+                    )
+        return reloaded
+
+    def test_clone_preserves_one_based_drawer_through_save_reload(self) -> None:
+        source = ProfileRegistry(Settings()).get(DELL_MD1280_DRAWER_BOTTOM_PROFILE_ID)
+        assert source is not None
+        source_before = source.model_dump()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = ProfileBuilderService(str(Path(temp_dir) / "config.yaml"), str(Path(temp_dir) / "profiles.yaml"))
+            payload = source.model_dump(exclude={"slot_number_base"})
+            payload.update(id="custom-drawer", label="Custom drawer", source_profile_id=source.id)
+            saved, updated = service.save_profile(EnclosureProfileRequest.model_validate(payload), Settings())
+            self.assertFalse(updated)
+            self.assertEqual(saved.slot_number_base, 1)
+            expected = dict(source_before, id="custom-drawer", label="Custom drawer")
+            self.assertEqual(saved.model_dump(), expected)
+            self._reload_saved_profile(service, saved)
+            self.assertEqual(source.model_dump(), source_before)
+            unchanged_source = ProfileRegistry(Settings()).get(source.id)
+            assert unchanged_source is not None
+            self.assertEqual(unchanged_source.model_dump(), source_before)
+            # Drawer 43-84 still addresses internal slots 42-83.
+            assert saved.slot_layout is not None
+            self.assertEqual(
+                sorted(slot for row in saved.slot_layout for slot in row if slot is not None), list(range(42, 84)),
+            )
+
+    def test_label_edit_preserves_existing_base_instead_of_clone_source(self) -> None:
+        for base in (None, 0, 1, -2, 7):
+            with self.subTest(base=base), tempfile.TemporaryDirectory() as temp_dir:
+                service = ProfileBuilderService(str(Path(temp_dir) / "config.yaml"), str(Path(temp_dir) / "profiles.yaml"))
+                existing = EnclosureProfileConfig(
+                    id="custom", label="Original", rows=1, columns=2,
+                    slot_layout=[[9, 3]], slot_hints={9: ["synthetic-hint"]}, slot_number_base=base,
+                )
+                unrelated = existing.model_copy(update={"id": "unrelated", "label": "Unrelated"})
+                service._write_profiles([existing, unrelated])
+                payload = existing.model_dump(exclude={"slot_number_base"})
+                payload.update(label="Renamed", source_profile_id=DELL_MD1280_DRAWER_BOTTOM_PROFILE_ID)
+                saved, updated = service.save_profile(EnclosureProfileRequest.model_validate(payload), Settings())
+                self.assertTrue(updated)
+                self.assertEqual(saved.model_dump(), dict(existing.model_dump(), label="Renamed"))
+                self._reload_saved_profile(service, saved)
+                self.assertEqual(service._load_profiles()[1].model_dump(), unrelated.model_dump())
+
+    def test_explicit_base_updates_and_null_clears_saved_override(self) -> None:
+        # Match the existing config's int-or-null domain, not a new zero/one-only restriction.
+        for base in (None, 0, 1, -2, 7, "1"):
+            with self.subTest(base=base), tempfile.TemporaryDirectory() as temp_dir:
+                service = ProfileBuilderService(str(Path(temp_dir) / "config.yaml"), str(Path(temp_dir) / "profiles.yaml"))
+                existing = EnclosureProfileConfig(
+                    id="custom", label="Custom", rows=1, columns=2, slot_layout=[[9, 3]], slot_number_base=1,
+                )
+                service._write_profiles([existing])
+                payload = dict(existing.model_dump(), slot_number_base=base)
+                expected = EnclosureProfileConfig.model_validate(payload)
+                saved, updated = service.save_profile(EnclosureProfileRequest.model_validate(payload), Settings())
+                self.assertTrue(updated)
+                self.assertEqual(saved.model_dump(), expected.model_dump())
+                self._reload_saved_profile(service, saved)
+                on_disk = yaml.safe_load(service.profile_path.read_text(encoding="utf-8"))["profiles"][0]
+                if base is None:
+                    self.assertNotIn("slot_number_base", on_disk)
+                else:
+                    self.assertEqual(on_disk["slot_number_base"], expected.slot_number_base)
+
+    def test_new_profile_base_controls_and_omission(self) -> None:
+        for supplied in ({}, {"slot_number_base": None}, {"slot_number_base": 0}, {"slot_number_base": 1}):
+            with self.subTest(supplied=supplied), tempfile.TemporaryDirectory() as temp_dir:
+                service = ProfileBuilderService(str(Path(temp_dir) / "config.yaml"), str(Path(temp_dir) / "profiles.yaml"))
+                request = EnclosureProfileRequest.model_validate(dict(label="New", rows=1, columns=2, **supplied))
+                self.assertEqual("slot_number_base" in request.model_fields_set, "slot_number_base" in supplied)
+                saved, updated = service.save_profile(request, Settings())
+                self.assertFalse(updated)
+                self.assertEqual(saved.slot_number_base, supplied.get("slot_number_base"))
+                self._reload_saved_profile(service, saved)
+
+    def test_base_survives_geometry_change_for_clone_and_edit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = ProfileBuilderService(str(Path(temp_dir) / "config.yaml"), str(Path(temp_dir) / "profiles.yaml"))
+            saved, _ = service.save_profile(EnclosureProfileRequest(
+                id="resized", label="Resized", rows=1, columns=2,
+                source_profile_id=DELL_MD1280_DRAWER_BOTTOM_PROFILE_ID,
+            ), Settings())
+            self.assertEqual(saved.slot_number_base, 1)
+            self.assertEqual(saved.slot_layout, [[0, 1]])
+            self._reload_saved_profile(service, saved)
+            saved, updated = service.save_profile(EnclosureProfileRequest(
+                id="resized", label="Resized again", rows=1, columns=3,
+            ), Settings())
+            self.assertTrue(updated)
+            self.assertEqual(saved.slot_number_base, 1)
+            self.assertEqual(saved.slot_layout, [[0, 1, 2]])
+            self._reload_saved_profile(service, saved)
+
+    def test_invalid_base_is_rejected_before_profile_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = ProfileBuilderService(str(Path(temp_dir) / "config.yaml"), str(Path(temp_dir) / "profiles.yaml"))
+            original = EnclosureProfileConfig(id="custom", label="Original", rows=1, columns=1, slot_number_base=1)
+            service._write_profiles([original])
+            before = service.profile_path.read_bytes()
+            for base in ("invalid", "", 1.5, [], {}):
+                payload = dict(original.model_dump(), slot_number_base=base)
+                with self.subTest(base=base):
+                    with self.assertRaises(ValueError):
+                        EnclosureProfileConfig.model_validate(payload)
+                    with self.assertRaises(ValueError):
+                        service.save_profile(EnclosureProfileRequest.model_validate(payload), Settings())
+                    self.assertEqual(service.profile_path.read_bytes(), before)
+
     def test_enclosure_profile_config_accepts_sparse_layout_holes(self) -> None:
         profile = EnclosureProfileConfig(
             id="sparse",
