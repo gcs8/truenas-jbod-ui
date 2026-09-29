@@ -1644,6 +1644,51 @@ class HistoryPublicationDurabilityTests(unittest.TestCase):
                         self.assertEqual(self._value(self._loaded_backup(settings, store)), "prior")
                         self.assertEqual(list(root.glob(".history-directory-*")), [])
 
+    def test_long_term_invalid_marker_is_contained_by_best_effort_promotion(self):
+        marker_name = ".history-backup-directory-pending"
+        for kind in ("contents", "directory", "symlink", "hardlink"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self._seed(root)
+                local = root / "local"
+                archive = root / "archive"
+                archive.mkdir()
+                marker = archive / marker_name
+                source = root / "synthetic-marker"
+                if kind == "contents":
+                    marker.write_bytes(b"invalid")
+                elif kind == "directory":
+                    marker.mkdir()
+                else:
+                    source.write_bytes(b"synthetic")
+                    if kind == "symlink":
+                        marker.symlink_to(source)
+                    else:
+                        os.link(source, marker)
+                before = marker.lstat()
+                env = {
+                    "HISTORY_SQLITE_PATH": str(root / "history.db"),
+                    "HISTORY_BACKUP_DIR": str(local),
+                    "HISTORY_LONG_TERM_BACKUP_DIR": str(archive),
+                    "RELEASE_CHECK_ENABLED": "false",
+                }
+
+                with patch.dict(os.environ, env, clear=True):
+                    settings, store = self._production_runtime()
+                    with patch.object(store, "_prune_named_backups", wraps=store._prune_named_backups) as prune:
+                        with self.assertLogs("history_service.store", level="WARNING") as logs:
+                            result = self._loaded_backup(settings, store)
+
+                self.assertEqual(self._value(result), "prior")
+                self.assertTrue(any("long-term backup promotion failed" in line for line in logs.output))
+                self.assertEqual(marker.lstat(), before)
+                if kind == "contents":
+                    self.assertEqual(marker.read_bytes(), b"invalid")
+                elif kind in {"symlink", "hardlink"}:
+                    self.assertEqual(source.read_bytes(), b"synthetic")
+                self.assertEqual(list(archive.rglob("*.sqlite3")), [])
+                prune.assert_not_called()
+
     def test_public_backup_persists_only_new_directory_entry_chains(self):
         cases = (
             (0, None, (), False),
