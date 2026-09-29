@@ -6,7 +6,7 @@
     "test_admin_command_state": 5,
     "test_admin_config": 6,
     "test_admin_error_correlation": 10,
-    "test_admin_maintenance": 23,
+    "test_admin_maintenance": 24,
     "test_admin_runtime_routes": 3,
     "test_admin_safety": 10,
     "test_admin_secret_models": 4,

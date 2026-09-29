@@ -4731,19 +4731,32 @@ sys.stdout.flush()
                     artifact.cleanup()
 
     def test_debug_readme_only_skips_yaml_materialization(self) -> None:
-        with self._debug_selection_fixture_unchanged(), patch.object(
-            self.backup_service, "_read_scrubbed_yaml_file", wraps=self.backup_service._read_scrubbed_yaml_file,
-        ) as reader:
-            artifact = self.backup_service.export_debug_bundle_to_file(
-                packaging="zip", included_paths=[DEBUG_README_KEY],
-            )
-            try:
-                reader.assert_not_called()
-                with zipfile.ZipFile(artifact.path) as archive:
-                    self.assertEqual(sorted(archive.namelist()), ["debug/README.txt", "manifest.json"])
-                    self.assertIn(b"debug bundle", archive.read("debug/README.txt"))
-            finally:
-                artifact.cleanup()
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            self.backup_service.app_settings = get_settings()
+        originals = {
+            path: path.read_bytes()
+            for path in (self.config_path, self.runtime_overrides_path, self.profile_path)
+        }
+        try:
+            for path in originals:
+                path.write_bytes(b"not: [valid")
+            with self._debug_selection_fixture_unchanged(), patch.object(
+                self.backup_service, "_read_scrubbed_yaml_file", wraps=self.backup_service._read_scrubbed_yaml_file,
+            ) as reader:
+                artifact = self.backup_service.export_debug_bundle_to_file(
+                    packaging="zip", included_paths=[DEBUG_README_KEY],
+                )
+                try:
+                    reader.assert_not_called()
+                    with zipfile.ZipFile(artifact.path) as archive:
+                        self.assertEqual(sorted(archive.namelist()), ["debug/README.txt", "manifest.json"])
+                        self.assertIn(b"debug bundle", archive.read("debug/README.txt"))
+                finally:
+                    artifact.cleanup()
+        finally:
+            for path, content in originals.items():
+                path.write_bytes(content)
 
     def test_debug_selected_malformed_json_still_rejected(self) -> None:
         for key, path in (

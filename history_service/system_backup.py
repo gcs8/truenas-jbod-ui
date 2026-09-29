@@ -2012,9 +2012,15 @@ class _PreadView:
 
 
 class SystemBackupService:
-    def __init__(self, history_settings: HistorySettings, store: HistoryStore) -> None:
+    def __init__(
+        self,
+        history_settings: HistorySettings,
+        store: HistoryStore,
+        app_settings: Settings | None = None,
+    ) -> None:
         self.history_settings = history_settings
         self.store = store
+        self.app_settings = app_settings
 
     def validate_scheduled_backup_scope(self, included_paths: list[str]) -> None:
         selected_groups = self._resolve_selected_groups(
@@ -2779,9 +2785,9 @@ class SystemBackupService:
         runtime_payload: dict[str, Any] | None = None,
         maintenance_payload: dict[str, Any] | None = None,
     ) -> FileBackupArtifact:
-        app_settings = self._load_app_settings()
-        exported_at = datetime.now(timezone.utc)
         selected_groups = self._resolve_selected_groups(included_paths, bundle_type="debug")
+        app_settings = self.app_settings if self.app_settings is not None else get_settings()
+        exported_at = datetime.now(timezone.utc)
         sensitive_selection = [key for key in selected_groups if key in SENSITIVE_GROUP_KEYS]
         if scrub_secrets and sensitive_selection:
             labels = ", ".join(BACKUP_GROUP_METADATA[key]["label"] for key in sensitive_selection)

@@ -471,6 +471,22 @@ class MaintenanceQuiesceTests(unittest.TestCase):
         runtime_payload = backup.debug_calls[0]["runtime_payload"]
         self.assertEqual(runtime_payload["before_stop"]["running"], ["ui", "history"])
         self.assertEqual(runtime_payload["after_stop"]["running"], [])
+        self.assertEqual(runtime.status_calls, 2)
+
+    def test_debug_export_without_debug_state_skips_runtime_snapshots(self) -> None:
+        runtime = FakeRuntimeService(["ui", "history"])
+        backup = FakeBackupService()
+
+        _, outcome = build_service(runtime, backup).export_debug_bundle(
+            DebugBundleExportRequest(included_paths=["debug_readme"]),
+            stop_services=False,
+        )
+
+        self.assertEqual(outcome.stopped_containers, [])
+        self.assertEqual(runtime.status_calls, 0)
+        self.assertEqual(runtime.calls, [])
+        self.assertIsNone(backup.debug_calls[0]["runtime_payload"])
+        self.assertIsNone(backup.debug_calls[0]["maintenance_payload"])
 
 
 class DockerControlTimeoutTests(unittest.TestCase):
