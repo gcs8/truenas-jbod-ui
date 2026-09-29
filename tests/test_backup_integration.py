@@ -511,6 +511,16 @@ class SchedulerTests(SchedulerTestBase):
             scheduler._compute_next_full(datetime(2026, 3, 8, 6, 30, tzinfo=UTC)),
             datetime(2026, 3, 9, 5, 30, tzinfo=UTC),
         )
+        # Spring forward: 02:30 does not exist on 03-08, so do not run at
+        # 03:30 EDT; wait for 02:30 EDT on 03-09.
+        gap_scheduler = self.make(
+            {"full": {"enabled": True, "schedule": "30 2 * * *"}},
+            local_tz=new_york,
+        )
+        self.assertEqual(
+            gap_scheduler._compute_next_full(datetime(2026, 3, 8, 6, 0, tzinfo=UTC)),
+            datetime(2026, 3, 9, 6, 30, tzinfo=UTC),
+        )
 
     def test_scheduler_main_uses_the_tz_zone(self) -> None:
         from history_service.backup_scheduler import main as scheduler_main

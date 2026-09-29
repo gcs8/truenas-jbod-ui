@@ -318,11 +318,18 @@ class BackupScheduler:
             return None
         local_now = now.astimezone(self._local_tz) if self._local_tz is not None else now.astimezone()
         following = self._cron.next_after(local_now)
-        # Inside a repeated (fall-back) hour a wall-clock match resolves to its
-        # first, already past, occurrence; skip it so a repeated time runs once.
-        while following.astimezone(timezone.utc) <= now:
+        while True:
+            following_utc = following.astimezone(timezone.utc)
+            round_trip = following_utc.astimezone(following.tzinfo)
+            # Reject a wall-clock time that the zone skips during spring-forward.
+            # Inside a repeated fall-back hour, also skip the first occurrence
+            # once it is already past so a repeated time runs only once.
+            if (
+                round_trip.replace(tzinfo=None) == following.replace(tzinfo=None)
+                and following_utc > now
+            ):
+                return following_utc
             following = self._cron.next_after(following)
-        return following.astimezone(timezone.utc)
 
     def tick(self) -> None:
         """One scheduler step: config coalescer, then a due full backup."""
