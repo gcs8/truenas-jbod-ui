@@ -262,6 +262,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Preserve Storage Fabric path identity, diagnostic placement, complete path
+  health and scoped aliases; refuse unsafe alias-store mutations. (#760)
 - Bound SSH command execution and retain worker, channel and reusable-session
   cleanup ownership through cancellation before releasing caller locks. (#765)
 - Require verified SES device-slot coordinates for SG LED control and keep
