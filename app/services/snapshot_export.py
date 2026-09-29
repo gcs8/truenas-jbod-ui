@@ -66,12 +66,16 @@ SATADOM_PAIR_TEMPLATE_ID = "satadom-pair-2"
 NVME_CARRIER_FACE_STYLE = "nvme-carrier"
 # Locate whole address candidates; ip_address validates them before masking.
 # IPv6 comes first so an embedded IPv4 tail is not masked independently.
+IPV4_ADDRESS_BODY = r"(?:[0-9]{1,3}\.){3}[0-9]{1,3}"
 IP_ADDRESS_PATTERN = re.compile(
     r"(?<![\w.:%-])"
     r"(?P<ip>(?:[A-Za-z_][A-Za-z_-]*:)?"
     r"(?:[0-9A-Fa-f]*:[0-9A-Fa-f:.]+(?!:)(?:%[A-Za-z0-9_.~-]+)?"
-    r"|(?:[0-9]{1,3}\.){3}[0-9]{1,3}\.?))"
+    rf"|{IPV4_ADDRESS_BODY}\.*))"
     r"(?![\w.%-])"
+)
+IPV4_RANGE_PATTERN = re.compile(
+    rf"(?<![\w.:%-])(?P<start>{IPV4_ADDRESS_BODY})-(?P<end>{IPV4_ADDRESS_BODY})(?![\w.%-])"
 )
 # Trailing DNS labels appended to a hostname token, so a redacted host swallows
 # its own domain suffix instead of leaving it behind.
@@ -770,7 +774,20 @@ class SnapshotRedactor:
                     rf"(?<![A-Za-z0-9]){re.escape(original)}{continuation}(?![A-Za-z0-9])"
                 )
                 redacted = pattern.sub(lambda _match: replacement, redacted)
+        redacted = IPV4_RANGE_PATTERN.sub(self._redact_ipv4_range_match, redacted)
         return IP_ADDRESS_PATTERN.sub(self._redact_address_match, redacted)
+
+    def _redact_ipv4_range_match(self, match: re.Match[str]) -> str:
+        start_text = match.group("start")
+        end_text = match.group("end")
+        try:
+            start = ip_address(start_text)
+            end = ip_address(end_text)
+        except ValueError:
+            return match.group(0)
+        if start.version != 4 or end.version != 4 or int(start) == 0 or int(end) == 0:
+            return match.group(0)
+        return f"{self._mask_ipv4(start_text)}-{self._mask_ipv4(end_text)}"
 
     def _redact_address_match(self, match: re.Match[str]) -> str:
         value = match.group("ip")
@@ -780,7 +797,10 @@ class SnapshotRedactor:
         label, separator, remainder = value.partition(":")
         if (
             separator and re.fullmatch(r"[A-Za-z_][A-Za-z_-]*", label)
-            and re.search(r"[^a-fA-F]", label)
+            and (
+                re.search(r"[^a-fA-F]", label)
+                or re.fullmatch(rf"{IPV4_ADDRESS_BODY}\.*", remainder)
+            )
         ):
             prefix = label + separator
             value = remainder
@@ -789,7 +809,7 @@ class SnapshotRedactor:
         suffix = value[len(address_text):]
         if (
             address_text.endswith(":") and not address_text.endswith("::")
-            and re.match(r"\s+[A-Za-z]", match.string[match.end():])
+            and re.match(r"\s+[A-Za-z0-9]", match.string[match.end():])
         ):
             address_text = address_text[:-1]
             suffix = ":" + suffix

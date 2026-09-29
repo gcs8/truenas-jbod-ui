@@ -926,6 +926,8 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         endpoints = {
             "192.0.2.173": "x.x.x.173",
             "192.0.2.173.": "x.x.x.173.",
+            "Request to 192.0.2.173... retrying": "Request to x.x.x.173... retrying",
+            "192.0.2.10-192.0.2.20": "x.x.x.10-x.x.x.20",
             "2001:DB8::A7.": "x:x:DB8:A7.",
             "192.0.2.173:9443": "x.x.x.173:9443",
             "https://192.0.2.173:9443/api": "https://x.x.x.173:9443/api",
@@ -956,8 +958,12 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_colon_adjacent_endpoints_across_rendered_export_payloads(self) -> None:
         endpoints = {
             "peer:198.51.100.219": "peer:x.x.x.219",
+            "face:198.51.100.219": "face:x.x.x.219",
+            "bad:198.51.100.219": "bad:x.x.x.219",
             "peer:2001:db8:91::ab:cd": "peer:x:x:ab:cd",
             "2001:db8:91::ab:cd: unavailable": "x:x:ab:cd: unavailable",
+            "2001:db8::1: 404": "x:x:db8:1: 404",
+            "2001:db8::1: 2 failures": "x:x:db8:1: 2 failures",
             "peer:198.51.100.219:8443": "peer:x.x.x.219:8443",
             "peer:2001:db8:91::ab:cd: unavailable": "peer:x:x:ab:cd: unavailable",
             "peer:::ab:cd": "peer:x:x:ab:cd",
