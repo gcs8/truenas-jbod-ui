@@ -24,6 +24,7 @@ import stat
 import threading
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.config_errors import ConfigurationError
 from app.logging_config import configure_service_logging
@@ -53,6 +54,21 @@ def _app_gid() -> int:
     if not raw.isdigit() or int(raw) <= 0:
         raise ConfigurationError(["APP_GID in the environment must be a positive whole number."])
     return int(raw)
+
+
+def _local_tz() -> ZoneInfo | None:
+    """The TZ zone for the full schedule, so it follows DST; None keeps the current offset."""
+
+    name = (os.getenv("TZ") or "").strip()
+    if not name:
+        return None
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError):
+        logger.warning(
+            "TZ=%r is not a known time zone; the full backup schedule uses the current UTC offset.", name
+        )
+        return None
 
 
 def build_scheduler(policy: BackupPolicy) -> Any:
@@ -118,6 +134,7 @@ def build_scheduler(policy: BackupPolicy) -> Any:
         config_groups=config_group_keys(DEFAULT_BACKUP_GROUP_KEYS, HISTORY_DB_KEY),
         full_groups=list(DEFAULT_BACKUP_GROUP_KEYS),
         snapshot_config=lambda: snapshot_config_files(hashed),
+        local_tz=_local_tz(),
     )
 
 

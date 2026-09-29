@@ -135,12 +135,14 @@ def _finding_fingerprint(category: str, values: Counter[str]) -> str:
 # Exact pre-filters for the whole-text patterns. Each pattern below can only
 # match when the text contains one of these literals (PRIVATE_POSIX_PATH needs
 # a `/home/`-style prefix, LOCAL_WINDOWS_PATH a drive separator, and
-# INTERNAL_HOST_SUFFIX one of its suffixes), so skipping a text without them
-# changes nothing about the findings, only the time spent. The tracked corpus
-# is over 10 MB and the regex passes dominated this suite's time.
+# INTERNAL_HOST_SUFFIX one of its suffixes, found with the pattern's own
+# case-insensitive rule so look-alikes such as a dotless i still pass), so
+# skipping a text without them changes nothing about the findings, only the
+# time spent. The tracked corpus is over 10 MB and the regex passes dominated
+# this suite's time.
 _PRIVATE_POSIX_PATH_LITERALS = ("/home/", "/Users/", "/mnt/", "/media/", "/Volumes/")
 _LOCAL_WINDOWS_PATH_LITERALS = (":/", ":\\")
-_INTERNAL_HOST_SUFFIX_LITERALS = (".local", ".lan", ".internal")
+_INTERNAL_HOST_SUFFIX_PREFILTER = re.compile(r"(?i)\.(?:local|lan|internal)")
 
 
 def _may_match(text: str, literals: tuple[str, ...]) -> bool:
@@ -153,14 +155,13 @@ def _scan_text(text: str) -> Counter[tuple[str, str]]:
     def add(category: str, value: str) -> None:
         values_by_category.setdefault(category, Counter())[value] += 1
 
-    lowered = text.lower()
     for match in IPV4_CANDIDATE.finditer(text):
         if _is_rfc1918(match.group()):
             add("rfc1918_ipv4", match.group())
     for category, pattern, applicable in (
         ("private_posix_host_path", PRIVATE_POSIX_PATH, _may_match(text, _PRIVATE_POSIX_PATH_LITERALS)),
         ("local_windows_drive_path", LOCAL_WINDOWS_PATH, _may_match(text, _LOCAL_WINDOWS_PATH_LITERALS)),
-        ("internal_hostname", INTERNAL_HOST_SUFFIX, _may_match(lowered, _INTERNAL_HOST_SUFFIX_LITERALS)),
+        ("internal_hostname", INTERNAL_HOST_SUFFIX, _INTERNAL_HOST_SUFFIX_PREFILTER.search(text) is not None),
         ("compact_lab_host_id", COMPACT_LAB_HOST_ID, True),
         ("sas_wwn_identifier", SAS_WWN_IDENTIFIER, True),
     ):
@@ -303,6 +304,13 @@ class PublicDocPrivacyTests(unittest.TestCase):
         replacement = _scan_text("host: 10.23.45.68\n")
 
         self.assertNotEqual(first, replacement)
+
+    def test_internal_hostname_prefilter_keeps_non_ascii_look_alikes(self) -> None:
+        # Dotted capital I and dotless i both case-fold to the pattern's "i".
+        for text in ("storage.\u0130nternal\n", "storage.\u0131nternal\n"):
+            with self.subTest(text=ascii(text)):
+                categories = {category for category, _ in _scan_text(text)}
+                self.assertIn("internal_hostname", categories)
 
     def test_fabric_host_label_exception_matches_exact_source_findings(self) -> None:
         # YAML-shaped JavaScript object keys are still scanned, not bypassed.
