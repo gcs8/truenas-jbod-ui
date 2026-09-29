@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import yaml
 
@@ -376,6 +379,68 @@ class CloneSourceWithoutSshPreservationTests(_DialectConfigMixin, unittest.TestC
         saved = self._saved_truenas("saved-jsonrpc")
         self.assertEqual(saved.get("api_dialect"), "jsonrpc")
         self.assertEqual(saved.get("api_version"), "v25.10.0")
+
+
+@unittest.skipIf(os.name == "nt", "POSIX file modes")
+class ConfigFileModeTests(_DialectConfigMixin, unittest.TestCase):
+    """A System Setup save must not widen the mode of a config that holds credentials."""
+
+    def _save_new_system(self) -> None:
+        self.service.save_system(self._request(system_id="other-scale", endpoint="https://other.example.test"))
+
+    def test_directory_failures_report_uncertain_replacement(self) -> None:
+        import errno
+        from app.secret_files import write_text_atomically
+
+        for operation in ("open", "fsync"):
+            with self.subTest(operation=operation):
+                self.config_path.write_text("old", encoding="utf-8")
+                real_open, real_fsync = os.open, os.fsync
+                def fail_open(path, flags, *args, **kwargs):
+                    if Path(path) == self.config_path.parent:
+                        raise OSError(errno.EIO, "synthetic directory failure")
+                    return real_open(path, flags, *args, **kwargs)
+                def fail_sync(fd):
+                    if stat.S_ISDIR(os.fstat(fd).st_mode):
+                        raise OSError(errno.EIO, "synthetic directory failure")
+                    return real_fsync(fd)
+                target = "os.open" if operation == "open" else "os.fsync"
+                with mock.patch(target, side_effect=fail_open if operation == "open" else fail_sync):
+                    with self.assertRaisesRegex(OSError, "replaced.*durability.*uncertain") as caught:
+                        write_text_atomically(self.config_path, "new")
+                self.assertEqual(caught.exception.errno, errno.EIO)
+                self.assertEqual(self.config_path.read_text(), "new")
+                self.assertFalse(self.config_path.with_suffix(".tmp").exists())
+
+    def test_a_new_config_file_is_owner_only(self) -> None:
+        self.config_path.unlink()
+        self.service = SystemSetupService(str(self.config_path))
+        self._save_new_system()
+
+        self.assertEqual(stat.S_IMODE(self.config_path.stat().st_mode), 0o600)
+
+    def test_a_saved_config_keeps_its_mode(self) -> None:
+        self.config_path.chmod(0o640)
+        real_open = os.open
+        parent_descriptors: list[int] = []
+
+        def recording_open(path, flags, *args, **kwargs):
+            descriptor = real_open(path, flags, *args, **kwargs)
+            if os.fspath(path) == os.fspath(self.config_path.parent):
+                parent_descriptors.append(descriptor)
+            return descriptor
+
+        with (
+            mock.patch("os.open", side_effect=recording_open),
+            mock.patch("os.fsync", wraps=os.fsync) as fsync,
+        ):
+            self._save_new_system()
+
+        self.assertEqual(stat.S_IMODE(self.config_path.stat().st_mode), 0o640)
+        # The rename is made durable by fsyncing the parent directory.
+        self.assertEqual(len(parent_descriptors), 1)
+        fsync.assert_any_call(parent_descriptors[0])
+        self.assertEqual(self._saved_truenas("other-scale").get("host"), "https://other.example.test")
 
 
 if __name__ == "__main__":

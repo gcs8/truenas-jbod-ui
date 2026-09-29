@@ -216,21 +216,25 @@ class ServiceAccountBootstrapService:
             raise ValueError(detail)
 
         details = self._parse_output(result.stdout)
+        sudo_verified = details.get("sudo_rules_installed") == "1"
+        policy_unverified = payload.install_sudo_rules and not sudo_verified
         return {
-            "ok": True,
+            "ok": not policy_unverified,
             "host": payload.host,
             "platform": payload.platform,
             "bootstrap_user": payload.bootstrap_user,
             "service_user": details.get("service_user") or payload.service_user,
             "service_home": details.get("service_home"),
             "authorized_keys_path": details.get("authorized_keys_path"),
-            "sudo_rules_installed": bool(payload.install_sudo_rules),
+            "sudo_rules_installed": payload.install_sudo_rules and sudo_verified,
             "sudoers_path": details.get("sudoers_path"),
             "permission_target": details.get("permission_target") or details.get("sudoers_path"),
             "key_source": key_source,
             "detail": (
                 f"Provisioned {payload.service_user} on {payload.host} using one-time setup credentials. "
                 "Those bootstrap credentials were used only for this action and were not written to config.yaml."
+                if not policy_unverified else
+                "The requested sudo policy installation could not be verified. Account setup may have completed."
             ),
             "stdout": result.stdout.strip(),
         }
@@ -366,28 +370,7 @@ class ServiceAccountBootstrapService:
         else:
             script_lines.extend(
                 [
-            "  sudoers_dir=",
-            f"  for candidate in {' '.join(SUDOERS_DIR_CANDIDATES)}; do",
-            "    if [ -d \"$candidate\" ] || mkdir -p \"$candidate\" 2>/dev/null; then",
-            "      sudoers_dir=\"$candidate\"",
-            "      break",
-            "    fi",
-            "  done",
-            "  if [ -z \"$sudoers_dir\" ]; then",
-            "    echo \"Unable to locate a sudoers.d directory on the remote host.\" >&2",
-            "    exit 1",
-            "  fi",
-            f"  sudoers_path=\"$sudoers_dir/{self._sudoers_filename(service_user)}\"",
-            "  temp_sudoers_path=\"$sudoers_path.tmp\"",
-            "  cat > \"$temp_sudoers_path\" <<'EOF_SUDOERS'",
-            sudoers_content,
-            "EOF_SUDOERS",
-            "  chmod 440 \"$temp_sudoers_path\"",
-            "  if command -v visudo >/dev/null 2>&1; then",
-            "    visudo -cf \"$temp_sudoers_path\" >/dev/null",
-            "  fi",
-            "  mv \"$temp_sudoers_path\" \"$sudoers_path\"",
-            "  permission_target=\"$sudoers_path\"",
+                    *self._linux_sudo_policy_script(service_user, sudoers_content).splitlines(),
                 ]
             )
         script_lines.extend(
@@ -398,9 +381,69 @@ class ServiceAccountBootstrapService:
             "printf 'BOOTSTRAP_AUTHORIZED_KEYS_PATH=%s\\n' \"$authorized_keys_path\"",
             "printf 'BOOTSTRAP_SUDOERS_PATH=%s\\n' \"$sudoers_path\"",
             "printf 'BOOTSTRAP_PERMISSION_TARGET=%s\\n' \"$permission_target\"",
+            "printf 'BOOTSTRAP_SUDO_RULES_INSTALLED=%s\\n' \"$install_sudo\"",
             ]
         )
         return "\n".join(script_lines)
+
+
+    @classmethod
+    def _linux_sudo_policy_script(cls, service_user: str, sudoers_content: str) -> str:
+        # Support only direct, unquoted includedir directives in the conventional
+        # Linux root policy, not arbitrary include graphs. The default visudo
+        # report must confirm the root and final file, not just fragment syntax.
+        return "\n".join([
+            "  sudoers_dir=",
+            "  export LC_ALL=C",
+            "  policy_error() { echo \"Unable to verify sudo policy: $*\" >&2; exit 1; }",
+            "  command -v visudo >/dev/null 2>&1 || policy_error 'visudo is required.'",
+            "  command -v timeout >/dev/null 2>&1 || policy_error 'timeout is required.'",
+            "  [ -f /etc/sudoers ] && [ -r /etc/sudoers ] || policy_error 'root policy is unavailable.'",
+            "  policy=$(head -c 65537 /etc/sudoers && printf '.') || policy_error 'root policy read failed.'",
+            "  policy=${policy%.}",
+            "  [ ${#policy} -le 65536 ] || policy_error 'root policy exceeds 64 KiB.'",
+            "  included_dirs=$(printf '%s\\n' \"$policy\" | awk '",
+            r"    /\\$/ { bad=1 }",
+            "    $1 ~ /^[@#]include/ {",
+            "      if (($1 != \"#includedir\" && $1 != \"@includedir\") ||",
+            "          ($2 != \"/etc/sudoers.d\" && $2 != \"/usr/local/etc/sudoers.d\") ||",
+            "          (NF > 2 && $3 !~ /^#/)) bad=1; else dirs[$2]=1",
+            "    }",
+            "    END { if (bad) exit 1; for (dir in dirs) print dir }",
+            "  ') || policy_error 'unsupported include syntax or continued policy lines.'",
+            f"  for candidate in {' '.join(SUDOERS_DIR_CANDIDATES)}; do",
+            "    if printf '%s\\n' \"$included_dirs\" | grep -Fxq \"$candidate\"; then",
+            "      sudoers_dir=$candidate; break",
+            "    fi",
+            "  done",
+            "  [ -n \"$sudoers_dir\" ] || policy_error 'no supported active includedir was found.'",
+            "  mkdir -p \"$sudoers_dir\" || policy_error 'includedir is not writable.'",
+            f'  sudoers_path="$sudoers_dir/{cls._sudoers_filename(service_user)}"',
+            '  temp_sudoers_path="$sudoers_path.tmp"',
+            '  policy_check=$(mktemp "$sudoers_dir/.jbod-policy.XXXXXX")',
+            "  trap 'rm -f \"$policy_check\" \"$temp_sudoers_path\"' 0",
+            "  check_sudo_policy() {",
+            "    if ! (ulimit -f 128 && timeout 10 visudo -c > \"$policy_check\" 2>&1); then",
+            "      policy_error 'default policy validation failed or exceeded its bounds.'",
+            "    fi",
+            "    grep -Fxq '/etc/sudoers: parsed OK' \"$policy_check\" ||",
+            "      policy_error 'the default policy root is unsupported.'",
+            "  }",
+            "  check_sudo_policy",
+            "  cat > \"$temp_sudoers_path\" <<'EOF_SUDOERS'",
+            sudoers_content,
+            "EOF_SUDOERS",
+            '  chmod 440 "$temp_sudoers_path"',
+            '  timeout 10 visudo -cf "$temp_sudoers_path" >/dev/null 2>&1 ||',
+            "    policy_error 'the requested fragment failed validation.'",
+            '  mv "$temp_sudoers_path" "$sudoers_path"',
+            "  check_sudo_policy",
+            '  grep -Fxq "$sudoers_path: parsed OK" "$policy_check" ||',
+            "    policy_error 'the installed file is not confirmed in the default policy; inspect it manually.'",
+            '  rm -f "$policy_check"',
+            "  trap - 0",
+            '  permission_target="$sudoers_path"',
+        ])
 
     @staticmethod
     def _sudoers_filename(service_user: str) -> str:
@@ -474,8 +517,9 @@ class ServiceAccountBootstrapService:
             "filename": filename,
             "path_candidates": path_candidates,
             "detail": (
-                "Bootstrap writes this exact file content after choosing the first writable sudoers.d "
-                "directory on the remote host."
+                "Bootstrap writes this file only to a directly included sudoers.d directory, "
+                "then requires bounded visudo validation of the default policy and installed file. "
+                "Unsupported include layouts fail verification."
             ),
             "content": cls._build_sudoers_content(service_user, platform, requested_commands),
         }
@@ -661,6 +705,8 @@ class ServiceAccountBootstrapService:
                 parsed["authorized_keys_path"] = line.split("=", 1)[1].strip()
             elif line.startswith("BOOTSTRAP_SUDOERS_PATH="):
                 parsed["sudoers_path"] = line.split("=", 1)[1].strip()
+            elif line.startswith("BOOTSTRAP_SUDO_RULES_INSTALLED="):
+                parsed["sudo_rules_installed"] = line.split("=", 1)[1].strip()
             elif line.startswith("BOOTSTRAP_PERMISSION_TARGET="):
                 parsed["permission_target"] = line.split("=", 1)[1].strip()
         return parsed

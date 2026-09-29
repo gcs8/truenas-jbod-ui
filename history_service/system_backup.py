@@ -22,10 +22,13 @@ import time
 import uuid
 import zipfile
 import zlib
+from collections.abc import Mapping
 from contextlib import closing, nullcontext
+from copy import copy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from types import MappingProxyType
 from typing import Any, Callable, Literal
 from urllib.parse import urlsplit, urlunsplit
 
@@ -49,6 +52,7 @@ from app.config import (
     _derive_runtime_layout_paths,
     _normalize_systems,
     get_settings,
+    load_settings,
 )
 from app.models.domain import ManualMapping, SasFabricAlias
 from app.services.profile_registry import ProfileRegistry
@@ -2015,6 +2019,19 @@ class SystemBackupService:
     def __init__(self, history_settings: HistorySettings, store: HistoryStore) -> None:
         self.history_settings = history_settings
         self.store = store
+        self._captured_config_files: Mapping[Path, bytes | None] = {}
+
+    def with_captured_config_files(self, files: Mapping[Path, bytes | None]) -> SystemBackupService:
+        """Use one scheduler capture without changing the shared export service.
+
+        Only the hashed documents are pinned; unselected groups and unhashed
+        caches retain the normal collection and validation behavior. ``None``
+        pins an absent document even if it appears before archive construction.
+        """
+
+        captured = copy(self)
+        captured._captured_config_files = MappingProxyType(dict(files))
+        return captured
 
     def validate_scheduled_backup_scope(self, included_paths: list[str]) -> None:
         selected_groups = self._resolve_selected_groups(
@@ -3555,6 +3572,10 @@ class SystemBackupService:
         }
 
     def _load_app_settings(self) -> Settings:
+        if self._captured_config_files:
+            # Resolving paths from live config could bypass the captured bytes.
+            # Keep the normal loader/normalizers, without changing shared settings.
+            return load_settings(captured_files=self._captured_config_files)
         get_settings.cache_clear()
         return get_settings()
 
@@ -4380,14 +4401,19 @@ class SystemBackupService:
                 [],
             )
 
-        if source_path.exists() and source_path.is_file():
+        captured_path = source_path.absolute()
+        if captured_path in self._captured_config_files:
+            content = self._captured_config_files[captured_path]
+        else:
+            content = source_path.read_bytes() if source_path.exists() and source_path.is_file() else None
+        if content is not None:
             member = BundleMember(
                 key=group_key,
                 group_key=group_key,
                 archive_path=metadata["archive_root"],
                 source_path=str(source_path),
                 present=True,
-                content=source_path.read_bytes(),
+                content=content,
             )
             return (
                 BundleGroup(

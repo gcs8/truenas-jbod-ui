@@ -17,6 +17,7 @@ from history_service.backup_archive.catalog import (
     CatalogError,
 )
 from history_service.backup_archive.lifecycle import (
+    ApplyResult,
     GroomingPlan,
     LifecycleManager,
     LocalBackupDirectory,
@@ -399,6 +400,78 @@ class LifecycleApplyTests(CatalogCase):
         self.assertIsNotNone(self.catalog.get(failing.artifact_id))
         for item in result.not_attempted:
             self.assertIsNotNone(self.catalog.get(item.record.artifact_id))
+
+    def test_unreachable_location_skips_only_its_own_items(self) -> None:
+        plan = self.manager.plan(NOW)
+        local_items = tuple(i for i in plan.items if i.record.location == "local")
+        remote_items = tuple(i for i in plan.items if i.record.location == "nas-1")
+        # A remote item sorts before later local items, so a stop-the-run would strand them.
+        self.assertLess(plan.items.index(remote_items[0]), plan.items.index(local_items[-1]))
+
+        def resolver(location: str):
+            if location == "nas-1":
+                raise OSError("synthetic connection refused")
+            return self.resolver(location)
+
+        result = self.manager.apply(plan, resolver)
+        self.assertEqual(result.deleted, local_items)
+        self.assertEqual(dict(result.failed_locations), {"nas-1": "OSError: synthetic connection refused"})
+        self.assertEqual(result.failed, remote_items[0])
+        self.assertIn("OSError", result.error)
+        self.assertEqual(result.not_attempted, remote_items[1:])
+        self.assertFalse(result.complete)
+        self.assertEqual(self.remote.deleted, [])
+        for item in remote_items:
+            self.assertIsNotNone(self.catalog.get(item.record.artifact_id))
+
+    def test_delete_connection_failure_skips_only_its_own_location(self) -> None:
+        plan = self.manager.plan(NOW)
+        local_items = tuple(i for i in plan.items if i.record.location == "local")
+        remote_items = tuple(i for i in plan.items if i.record.location == "nas-1")
+        self.assertLess(plan.items.index(remote_items[0]), plan.items.index(local_items[-1]))
+
+        class LazyUnavailableTarget(FakeTarget):
+            def delete(self, name: str) -> None:
+                raise ConnectionRefusedError("synthetic lazy connection refused")
+
+        unavailable = LazyUnavailableTarget({r.name: r.size for r in self.remote_records})
+        resolver = local_target_resolver(self.backup_dir, remote={"nas-1": unavailable}.__getitem__)
+        result = self.manager.apply(plan, resolver)
+
+        self.assertEqual(result.deleted, local_items)
+        self.assertEqual(
+            dict(result.failed_locations),
+            {"nas-1": "ConnectionRefusedError: synthetic lazy connection refused"},
+        )
+        self.assertEqual(result.failed, remote_items[0])
+        self.assertEqual(result.not_attempted, remote_items[1:])
+        self.assertFalse(result.location_complete("nas-1"))
+        self.assertTrue(result.location_complete("local"))
+        for item in remote_items:
+            self.assertIsNotNone(self.catalog.get(item.record.artifact_id))
+
+    def test_location_complete_is_false_only_for_the_failed_location(self) -> None:
+        plan = self.manager.plan(NOW)
+        local_items = tuple(i for i in plan.items if i.record.location == "local")
+        remote_items = tuple(i for i in plan.items if i.record.location == "nas-1")
+        unreachable = ApplyResult(
+            deleted=local_items,
+            already_missing=(),
+            failed=remote_items[0],
+            error="OSError: synthetic connection refused",
+            not_attempted=remote_items[1:],
+            failed_locations={"nas-1": "OSError: synthetic connection refused"},
+        )
+        self.assertTrue(unreachable.location_complete("local"))
+        self.assertFalse(unreachable.location_complete("nas-1"))
+        stopped = ApplyResult(deleted=(), already_missing=(), failed=remote_items[0], error="RuntimeError: boom")
+        self.assertFalse(stopped.location_complete("nas-1"))
+        self.assertTrue(stopped.location_complete("local"))
+        stranded = ApplyResult(
+            deleted=(), already_missing=(), failed=remote_items[0], error="RuntimeError: boom", not_attempted=local_items
+        )
+        self.assertFalse(stranded.location_complete("local"))
+        self.assertTrue(ApplyResult(deleted=local_items, already_missing=()).location_complete("local"))
 
     def test_apply_refuses_item_pinned_after_planning(self) -> None:
         plan = self.manager.plan(NOW)
