@@ -390,3 +390,224 @@ test("late LED completion cannot replace a newer shelf or its draft", async ({pa
  await expect(page.locator('#mapping-form [name="notes"]')).toHaveValue("New shelf draft");
  expect(errors).toEqual([]);
 });
+
+// The browser runs the complete current app asset and submits its real form.
+// Only the HTTP boundary is synthetic: captured writes go through MappingStore
+// in a disposable directory, not through a replacement CAS implementation.
+function mappingStoreFixture(directory, operation, values = {}) {
+  const result = spawnSync(process.env.PYTHON || "python3", ["-B", "-c", `
+import hashlib
+import json
+from pathlib import Path
+import sys
+from app.models.domain import ManualMapping
+from app.services.mapping_store import MappingStore, MappingRevisionConflict
+root = Path(sys.argv[1])
+request = json.load(sys.stdin)
+store = MappingStore(str(root / "mappings.json"))
+scope = ("synthetic-system", "enc-a", 0)
+def identity():
+    return {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in root.rglob("*") if p.is_file()}
+before = identity()
+conflict = False
+if request["operation"] == "save":
+    payload = request["values"]
+    mapping = ManualMapping(system_id=scope[0], enclosure_id=scope[1], slot=scope[2],
+                            **{key: payload.get(key) for key in
+                               ("serial", "device_name", "gptid", "notes")})
+    try:
+        store.save_mapping(mapping, expected_revision=payload["expected_revision"])
+    except MappingRevisionConflict:
+        conflict = True
+unchanged = identity() == before
+store = MappingStore(str(root / "mappings.json"))
+mapping = store.get_mapping(*scope)
+print(json.dumps({"conflict": conflict, "unchanged": unchanged,
+                  "revision": store.save_revision(*scope),
+                  "mapping": mapping.model_dump(mode="json") if mapping else None}))
+`, directory], {
+    cwd: repoRoot, encoding: "utf8", input: JSON.stringify({operation, values}),
+    env: {...process.env, BACKUP_CONFIG_ENABLED: "false", APP_CONFIG_PATH: path.join(directory, "absent.yaml")},
+  });
+  expect(result.status, result.stderr).toBe(0);
+  return JSON.parse(result.stdout);
+}
+
+async function openMappingFixture(page) {
+  const directory = fs.mkdtempSync(path.join(fixture.tempDir, "mapping-store-"));
+  const empty = mappingStoreFixture(directory, "read");
+  const original = mappingStoreFixture(directory, "save", {
+    expected_revision: empty.revision, serial: "SANITIZED-MAPPING-OLD",
+    device_name: "sdx", gptid: "synthetic-mapping-old", notes: "Original notes",
+  });
+  await page.addInitScript(original => {
+    Object.defineProperty(window, "APP_BOOTSTRAP", {configurable: true, set(value) {
+      value.writePolicy = {enabled: true, mode: "network", reason: "Synthetic fixture write policy"};
+      Object.assign(value.snapshot.slots[0], original.mapping, {mapping_revision: original.revision});
+      value.snapshot.enclosures.push({...value.snapshot.enclosures[0], id: "enc-b", label: "Second Shelf"});
+      Object.defineProperty(window, "APP_BOOTSTRAP", {value, writable: true, configurable: true});
+    }});
+  }, original);
+  const unexpected = [];
+  await page.route("**/*", route => { unexpected.push(route.request().url()); return route.abort(); });
+  const errors = await openFixture(page);
+  expect(await page.evaluate(async () => (await fetch("/static/app.js")).text())).toBe(appSource);
+  const snapshot = await page.evaluate(() => structuredClone(window.APP_BOOTSTRAP.snapshot));
+  const field = name => page.locator(`#mapping-form [name="${name}"]`);
+  await expect(field("serial")).toHaveValue(original.mapping.serial);
+  // These tests drive permitted manual refresh, not polling of dirty drafts.
+  await page.locator("#auto-refresh-toggle").uncheck();
+  return {directory, original, snapshot, field, errors, unexpected};
+}
+
+function mappingSnapshot(snapshot, record) {
+  const next = structuredClone(snapshot);
+  Object.assign(next.slots[0], record.mapping, {mapping_revision: record.revision});
+  return next;
+}
+
+async function refreshMappingFixture(page, snapshot, dirty = false) {
+  await page.route("**/api/inventory?**", route => route.fulfill({
+    contentType: "application/json", body: JSON.stringify(snapshot),
+  }));
+  if (dirty) page.once("dialog", dialog => dialog.accept());
+  await page.locator("#refresh-button").click();
+  await expect(page.locator("#status-text")).toHaveText("Up to date.");
+}
+
+for (const dirty of [false, true]) {
+  test(`mapping generation ${dirty ? "dirty manual refresh retains original CAS" : "clean notes-only save cannot restore departed serial"}`, async ({page}) => {
+    const h = await openMappingFixture(page);
+    if (dirty) await h.field("notes").fill("Synthetic notes-only edit");
+    const replacement = mappingStoreFixture(h.directory, "save", {
+      expected_revision: h.original.revision, notes: "Authoritative empty bay",
+    });
+    expect(replacement.revision).not.toBe(h.original.revision);
+    const next = mappingSnapshot(h.snapshot, replacement);
+    await refreshMappingFixture(page, next, dirty);
+    if (!dirty) await h.field("notes").fill("Synthetic notes-only edit");
+    const writes = [];
+    await page.route("**/api/slots/0/mapping?**", async route => {
+      const payload = route.request().postDataJSON();
+      const result = mappingStoreFixture(h.directory, "save", payload);
+      writes.push({payload, result, url: route.request().url()});
+      await route.fulfill({status: result.conflict ? 409 : 200, contentType: "application/json",
+        body: JSON.stringify(result.conflict ? {detail: "Mapping scope revision changed before this write."}
+          : {snapshot: mappingSnapshot(next, result)})});
+    });
+    await page.locator('#mapping-form button[type="submit"]').click();
+    await expect.poll(() => writes.length).toBe(1);
+    const {payload, result, url} = writes[0];
+    expect(new URL(url).searchParams.get("system_id")).toBe("synthetic-system");
+    expect(new URL(url).searchParams.get("enclosure_id")).toBe("enc-a");
+    expect.soft(payload).toEqual({
+      expected_revision: dirty ? h.original.revision : replacement.revision,
+      serial: dirty ? h.original.mapping.serial : null,
+      device_name: dirty ? h.original.mapping.device_name : null,
+      gptid: dirty ? h.original.mapping.gptid : null,
+      notes: "Synthetic notes-only edit", clear_identify_after_save: true,
+    });
+    expect.soft(result.conflict).toBe(dirty);
+    expect.soft(result.unchanged).toBe(dirty);
+    expect.soft(result.mapping.serial).toBeNull();
+    expect.soft(result.mapping.notes).toBe(dirty ? "Authoritative empty bay" : "Synthetic notes-only edit");
+    if (dirty) {
+      await expect(page.locator("#status-text")).toContainText("Save mapping failed");
+      await expect(h.field("notes")).toHaveValue("Synthetic notes-only edit");
+    } else {
+      await expect(page.locator("#status-text")).toContainText("Saved mapping");
+      await expect(h.field("serial")).toHaveValue("");
+    }
+    expect(h.errors).toEqual([]);
+    expect(h.unexpected).toEqual([]);
+  });
+}
+
+test("mapping generation unchanged clean render does not rewrite fields or selection", async ({page}) => {
+  const h = await openMappingFixture(page);
+  await h.field("notes").focus();
+  await h.field("notes").evaluate(node => {
+    node.setSelectionRange(2, 6);
+    window.__mappingValueWrites = 0;
+    for (const input of document.querySelectorAll('#mapping-form input[type="text"], #mapping-form textarea')) {
+      const descriptor = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(input), "value");
+      Object.defineProperty(input, "value", {
+        get() { return descriptor.get.call(this); },
+        set(value) { window.__mappingValueWrites++; descriptor.set.call(this, value); },
+      });
+    }
+  });
+  await refreshMappingFixture(page, h.snapshot);
+  expect(await page.evaluate(() => window.__mappingValueWrites)).toBe(0);
+  expect(await h.field("notes").evaluate(node => [node.selectionStart, node.selectionEnd])).toEqual([2, 6]);
+  expect(h.errors).toEqual([]);
+  expect(h.unexpected).toEqual([]);
+});
+
+test("mapping generation out-of-order refresh cannot replace newer values or CAS", async ({page}) => {
+  const h = await openMappingFixture(page);
+  const pending = [];
+  await page.route("**/api/inventory?**", route => { pending.push(route); });
+  await page.locator("#refresh-button").click();
+  await expect.poll(() => pending.length).toBe(1);
+  await page.locator("#refresh-button").click();
+  await expect.poll(() => pending.length).toBe(2);
+  const replacement = mappingStoreFixture(h.directory, "save", {
+    expected_revision: h.original.revision, serial: "SANITIZED-MAPPING-NEW", notes: "New generation",
+  });
+  await pending[1].fulfill({contentType: "application/json", body: JSON.stringify(mappingSnapshot(h.snapshot, replacement))});
+  await expect(page.locator("#status-text")).toHaveText("Up to date.");
+  await pending[0].fulfill({contentType: "application/json", body: JSON.stringify(h.snapshot)});
+  await expect(h.field("serial")).toHaveValue(replacement.mapping.serial);
+  await h.field("notes").fill("Newest draft");
+  let payload;
+  await page.route("**/api/slots/0/mapping?**", route => {
+    payload = route.request().postDataJSON();
+    return route.fulfill({status: 409, contentType: "application/json", body: '{"detail":"Synthetic refusal"}'});
+  });
+  await page.locator('#mapping-form button[type="submit"]').click();
+  await expect.poll(() => payload?.expected_revision).toBe(replacement.revision);
+  expect(payload.serial).toBe(replacement.mapping.serial);
+  expect(h.errors).toEqual([]);
+  expect(h.unexpected).toEqual([]);
+});
+
+test("mapping generation navigation fences pending refresh and discards old draft authority", async ({page}) => {
+  const h = await openMappingFixture(page);
+  await h.field("notes").fill("Old shelf draft");
+  const pending = [];
+  await page.route("**/api/inventory?**", route => { pending.push(route); });
+  page.once("dialog", dialog => dialog.accept());
+  await page.locator("#refresh-button").click();
+  await expect.poll(() => pending.length).toBe(1);
+  page.once("dialog", dialog => dialog.accept());
+  await page.locator("#enclosure-select").selectOption("enclosure:enc-b");
+  await expect.poll(() => pending.length).toBe(2);
+  let writes = 0;
+  await page.route("**/api/slots/*/mapping?**", route => { writes++; return route.abort(); });
+  await page.locator("#mapping-form").dispatchEvent("submit");
+  expect(writes).toBe(0);
+  const next = structuredClone(h.snapshot);
+  next.selected_enclosure_id = "enc-b";
+  next.selected_enclosure_label = "Second Shelf";
+  Object.assign(next.slots[0], {enclosure_id: "enc-b", serial: "SANITIZED-SECOND-SHELF", notes: "Second shelf notes", mapping_revision: "second-shelf-revision"});
+  await pending[1].fulfill({contentType: "application/json", body: JSON.stringify(next)});
+  await expect(page.locator("#inventory-scope-note")).toBeHidden();
+  await page.locator('#slot-grid [data-slot="0"]').click();
+  await pending[0].fulfill({contentType: "application/json", body: JSON.stringify(h.snapshot)});
+  await expect(h.field("serial")).toHaveValue("SANITIZED-SECOND-SHELF");
+  await expect(h.field("notes")).toHaveValue("Second shelf notes");
+  await h.field("notes").fill("Second shelf draft");
+  let payload;
+  await page.route("**/api/slots/0/mapping?**", route => {
+    expect(new URL(route.request().url()).searchParams.get("enclosure_id")).toBe("enc-b");
+    payload = route.request().postDataJSON();
+    return route.fulfill({status: 409, contentType: "application/json", body: '{"detail":"Synthetic refusal"}'});
+  });
+  await page.locator('#mapping-form button[type="submit"]').click();
+  await expect.poll(() => payload?.expected_revision).toBe("second-shelf-revision");
+  expect(payload.serial).toBe("SANITIZED-SECOND-SHELF");
+  expect(h.errors).toEqual([]);
+  expect(h.unexpected).toEqual([]);
+});

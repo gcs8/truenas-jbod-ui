@@ -240,3 +240,13 @@ test("SMART completion refreshes heatmap overlays without rebuilding tiles", () 
     "storage-view tile labels are refreshed in place once SMART arrives",
   );
 });
+
+test("SMART requests rely on the backend operation bounds", () => {
+  for (const name of ["requestSmartBatchForSlots", "ensureSmartSummary", "ensureStorageViewSmartSummary"]) {
+    assert.doesNotMatch(
+      functionSource(APP_SOURCE, name),
+      /AbortSignal\.timeout/,
+      `${name} must not abort before the bounded backend operation finishes`,
+    );
+  }
+});
