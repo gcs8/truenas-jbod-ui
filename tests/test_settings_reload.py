@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import stat
 import tempfile
 import threading
 import unittest
@@ -668,6 +669,108 @@ class MainAppWiringTests(ConfigReloadTestCase):
         self.assertEqual(route_support.health_status_code(payload), 200)
         self.assertTrue(str(payload["summary"]).startswith("Config change not applied:"))
 
+    def test_invalid_log_level_keeps_inventory_usable_through_real_asgi(self) -> None:
+        import logging
+
+        # Keep the real settings, middleware, logging builder and routes. Only
+        # appliance inventory is synthetic; no lifespan or outbound I/O runs.
+        root_logger = logging.getLogger()
+        previous_level = root_logger.level
+        previous_handlers = tuple(root_logger.handlers)
+
+        def restore_logging() -> None:
+            root_logger.setLevel(previous_level)
+            for handler in tuple(root_logger.handlers):
+                if handler not in previous_handlers:
+                    root_logger.removeHandler(handler)
+                    handler.close()
+
+        self.addCleanup(restore_logging)
+        _main, application = self._app()
+        reloader = application.state.config_reloader
+        runtime = reloader.runtime
+        built: list[Any] = []
+
+        class SyntheticRegistry:
+            def __init__(self, settings: Settings, **_: Any) -> None:
+                self.settings = settings
+                self.system = settings.systems[0]
+                built.append(self)
+
+            def get_service(self, _system_id: Any) -> Any:
+                return self
+
+            async def get_snapshot(self, **_: Any) -> InventorySnapshot:
+                return InventorySnapshot(slots=[], refresh_interval_seconds=self.settings.app.refresh_interval_seconds)
+
+            def peek_cached_snapshot(self) -> None:
+                return None
+
+        async def get(path: str) -> tuple[int, dict[str, Any]]:
+            messages: list[dict[str, Any]] = []
+
+            async def receive() -> dict[str, Any]:
+                return {"type": "http.request", "body": b"", "more_body": False}
+
+            async def send(message: dict[str, Any]) -> None:
+                messages.append(message)
+
+            scope = {
+                "type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"},
+                "http_version": "1.1", "method": "GET", "scheme": "http",
+                "path": path, "raw_path": path.encode(), "query_string": b"",
+                "headers": [(b"host", b"ui.example.test")], "root_path": "",
+                "client": ("192.0.2.1", 1234), "server": ("ui.example.test", 80),
+            }
+            try:
+                await application(scope, receive, send)
+            except Exception:
+                # Starlette sends the 500 then re-raises to its ASGI server.
+                if not any(item.get("status") == 500 for item in messages):
+                    raise
+            status = next(item["status"] for item in messages if item["type"] == "http.response.start")
+            body = b"".join(item.get("body", b"") for item in messages if item["type"] == "http.response.body")
+            return status, json.loads(body)
+
+        async def run() -> None:
+            status, inventory = await get("/api/inventory")
+            self.assertEqual(status, 200)
+            self.assertEqual(inventory["refresh_interval_seconds"], 30)
+            original = runtime.current()
+            registry = route_support.get_inventory_registry()
+            self.config["app"] = {"log_level": "unsupported-synthetic-level", "refresh_interval_seconds": 55}
+            self._write_config()
+            self.clock.now += 5
+            status, inventory = await get("/api/inventory")
+            self.assertEqual(status, 200)
+            self.assertIs(runtime.current(), original)
+            self.assertIs(route_support.get_inventory_registry(), registry)
+            self.assertEqual(inventory["refresh_interval_seconds"], 30)
+            self.assertEqual(inventory["warnings"], [PUBLIC_RELOAD_FAILURE])
+            status, health = await get("/healthz")
+            self.assertEqual(status, 200)
+            self.assertEqual(health["status"], "degraded")
+            self.assertEqual(health["problems"], [PUBLIC_RELOAD_FAILURE])
+            self.assertEqual((await get("/livez"))[0], 200)
+            self.assertEqual(len(built), 1)
+            # The same rejected signature does not create warnings repeatedly.
+            self.clock.now += 5
+            self.assertEqual((await get("/api/inventory"))[1]["warnings"], [PUBLIC_RELOAD_FAILURE])
+            self.config["app"] = {"log_level": "info", "refresh_interval_seconds": 55}
+            self._write_config()
+            self.clock.now += 5
+            status, inventory = await get("/api/inventory")
+            self.assertEqual(status, 200)
+            self.assertEqual(inventory["refresh_interval_seconds"], 55)
+            self.assertEqual(inventory["warnings"], [])
+            self.assertEqual(runtime.current().number, original.number + 1)
+            self.assertEqual(len(built), 2)
+
+        with patch.object(route_support, "InventoryRegistry", SyntheticRegistry), patch(
+            "app.routes.history_service_problem", return_value=None,
+        ), patch("app.routes.backup_archive_problems", return_value=[]):
+            asyncio.run(run())
+
     def test_restart_notice_is_a_page_warning_not_a_health_problem(self) -> None:
         app_main, application = self._app()
         self.config["app"] = {"public_origin": "https://ui.example.test"}
@@ -709,6 +812,440 @@ class MainAppWiringTests(ConfigReloadTestCase):
         warnings = json.loads(response.body)["warnings"]
         self.assertTrue(warnings[0].startswith("Config change not applied:"))
         self.assertEqual(warnings[1], "existing")
+
+
+class RuntimeOverrideOwnershipTests(ConfigReloadTestCase):
+    @staticmethod
+    def _field(payload: dict[str, Any], key: str) -> dict[str, Any]:
+        return next(field for field in payload["fields"] if field["key"] == key)
+
+    def _custom_path(self) -> Path:
+        custom = self.root / "custom" / "timing.yaml"
+        custom.parent.mkdir()
+        custom.write_text("app:\n  smart_cache_ttl_seconds: 901\n", encoding="utf-8")
+        self.config["paths"] = {"runtime_overrides_file": str(custom)}
+        self._write_config()
+        get_settings.cache_clear()
+        return custom
+
+    def test_custom_path_load_save_status_and_reload_agree(self) -> None:
+        custom = self._custom_path()
+        settings = get_settings()
+        self.assertEqual(settings.app.smart_cache_ttl_seconds, 901)
+        self.assertEqual(app_config.config_watch_paths(settings)[1], custom)
+        response = app_config.save_runtime_behavior_overrides(settings, {"smart_cache_ttl_seconds": 902})
+        for payload in (response, app_config.runtime_behavior_settings_payload()):
+            self.assertEqual(payload["override_file"], str(custom))
+            field = self._field(payload, "smart_cache_ttl_seconds")
+            self.assertEqual(field["value"], 902)
+            self.assertEqual(field["owner"], "admin")
+            self.assertEqual(field["source"], "runtime-overrides.yaml")
+            self.assertTrue(field["writable"])
+        get_settings.cache_clear()
+        self.assertEqual(get_settings().app.smart_cache_ttl_seconds, 902)
+        self.assertEqual(yaml.safe_load(custom.read_text())["app"]["smart_cache_ttl_seconds"], 902)
+        self.assertFalse(self.overrides_path.exists())
+        self.reloader.prime()
+        custom.write_text("app:\n  smart_cache_ttl_seconds: 903\n", encoding="utf-8")
+        self.assertTrue(self._check())
+        self.assertEqual(self.runtime.current().settings.app.smart_cache_ttl_seconds, 903)
+
+    def test_pending_custom_path_uses_running_content_until_restart(self) -> None:
+        custom = self._custom_path()
+        self.reloader.prime()
+        pending = self.root / "pending.yaml"
+        pending.write_text("app:\n  smart_cache_ttl_seconds: 999\n", encoding="utf-8")
+        self.overrides_path.write_text("app:\n  smart_cache_ttl_seconds: 401\n", encoding="utf-8")
+        self.config["paths"]["runtime_overrides_file"] = str(pending)
+        self._write_config()
+        custom.write_text("app:\n  smart_cache_ttl_seconds: 903\n", encoding="utf-8")
+        self.assertTrue(self._check())
+        current = self.runtime.current().settings
+        self.assertEqual(current.paths.runtime_overrides_file, str(custom))
+        self.assertEqual(current.app.smart_cache_ttl_seconds, 903)
+        self.assertEqual(self.reloader.restart_pending, ("paths",))
+        self.assertEqual(app_config.config_watch_paths(current)[1], custom)
+        self.assertEqual(self._field(app_config.runtime_behavior_settings_payload(current), "smart_cache_ttl_seconds")["value"], 903)
+        self.assertEqual(app_config.load_settings().app.smart_cache_ttl_seconds, 999)
+        self.assertEqual(app_config.load_settings().paths.runtime_overrides_file, str(pending))
+
+    def test_pending_custom_path_is_validated_before_restart(self) -> None:
+        from app.config_errors import ConfigurationError
+
+        self._custom_path()
+        running = get_settings()
+        pending = self.root / "pending-invalid.yaml"
+        pending.write_text("app:\n  smart_cache_ttl_seconds: invalid\n", encoding="utf-8")
+        self.config["paths"]["runtime_overrides_file"] = str(pending)
+        self._write_config()
+
+        with self.assertRaises(ConfigurationError):
+            app_config.load_settings(running_restart_only=running)
+
+    def test_malformed_paths_report_configuration_error(self) -> None:
+        from app.config_errors import ConfigurationError
+
+        for paths in (None, [], {"runtime_overrides_file": []}):
+            with self.subTest(paths=paths):
+                self.config["paths"] = paths
+                self._write_config()
+                with self.assertRaises(ConfigurationError):
+                    app_config.load_settings()
+
+    def test_lock_key_survives_symlink_replacement(self) -> None:
+        target = self.root / "target-overrides.yaml"
+        target.write_text("{}\n", encoding="utf-8")
+        link = self.root / "linked-overrides.yaml"
+        link.symlink_to(target)
+        before = app_config._runtime_override_lock_key(link)
+
+        link.unlink()
+        link.write_text("{}\n", encoding="utf-8")
+
+        self.assertEqual(app_config._runtime_override_lock_key(link), before)
+
+    def test_save_with_pending_path_returns_the_written_running_file(self) -> None:
+        custom = self._custom_path()
+        running = get_settings()
+        pending = self.root / "pending.yaml"
+        pending.write_text("app:\n  smart_cache_ttl_seconds: 999\n", encoding="utf-8")
+        before = pending.read_bytes()
+        self.config["paths"]["runtime_overrides_file"] = str(pending)
+        self._write_config()
+        response = app_config.save_runtime_behavior_overrides(running, {"smart_cache_ttl_seconds": 904})
+        self.assertEqual(response["override_file"], str(custom))
+        self.assertEqual(self._field(response, "smart_cache_ttl_seconds")["value"], 904)
+        self.assertEqual(pending.read_bytes(), before)
+        self.assertEqual(yaml.safe_load(custom.read_text())["app"]["smart_cache_ttl_seconds"], 904)
+        self.assertEqual(get_settings().paths.runtime_overrides_file, str(custom))
+
+    def test_custom_path_environment_ownership_and_legacy_precedence(self) -> None:
+        custom = self._custom_path()
+        custom.write_text("app:\n  smart_cache_ttl_seconds: 901\n  source_bundle_cache_ttl_seconds: 120\n", encoding="utf-8")
+        before = custom.read_bytes()
+        with patch.dict(os.environ, {"APP_SMART_CACHE_TTL_SECONDS": "777", "APP_CACHE_TTL": "15"}):
+            get_settings.cache_clear()
+            settings = get_settings()
+            payload = app_config.runtime_behavior_settings_payload(settings)
+            field = self._field(payload, "smart_cache_ttl_seconds")
+            self.assertEqual(field["value"], 777)
+            self.assertEqual(field["owner"], ".env")
+            self.assertFalse(field["writable"])
+            with self.assertRaisesRegex(ValueError, "owned by .env"):
+                app_config.save_runtime_behavior_overrides(settings, {"smart_cache_ttl_seconds": 902})
+            self.assertEqual(custom.read_bytes(), before)
+            self.assertEqual(settings.app.source_bundle_cache_ttl_seconds, 120)
+            self.assertEqual(settings.app.snapshot_cache_ttl_seconds, 15)
+            self.assertEqual(self._field(payload, "source_bundle_cache_ttl_seconds")["owner"], "admin")
+
+    def test_default_flat_and_legacy_layouts_still_load_overrides(self) -> None:
+        for layout in ("flat", "config"):
+            for explicit in (False, True):
+                with self.subTest(layout=layout, legacy=explicit):
+                    base = self.root / f"{layout}-{explicit}"
+                    config_path = base / "config.yaml" if layout == "flat" else base / "config" / "config.yaml"
+                    config_path.parent.mkdir(parents=True)
+                    config_path.write_text(
+                        "paths:\n  runtime_overrides_file: /app/config/runtime-overrides.yaml\n" if explicit else "{}\n",
+                        encoding="utf-8",
+                    )
+                    override = config_path.with_name("runtime-overrides.yaml")
+                    override.write_text("app:\n  smart_cache_ttl_seconds: 901\n", encoding="utf-8")
+                    with patch.dict(os.environ, {"APP_CONFIG_PATH": str(config_path)}):
+                        settings = app_config.load_settings()
+                        self.assertEqual(settings.paths.runtime_overrides_file, str(override))
+                        self.assertEqual(settings.app.smart_cache_ttl_seconds, 901)
+
+
+class RuntimeOverrideTransactionTests(ConfigReloadTestCase):
+    def test_partial_writers_serialize_reads_through_response(self) -> None:
+        # Gate the first writer after its real read, then separately while it
+        # builds its response. The second must not read in either interval.
+        for phase in ("read", "response"):
+            with self.subTest(phase=phase):
+                self.overrides_path.write_text("app:\n  refresh_interval_seconds: 30\n", encoding="utf-8")
+                settings = app_config.load_settings()
+                entered = threading.Event()
+                release = threading.Event()
+                second_started = threading.Event()
+                second_read = threading.Event()
+                results: dict[str, Any] = {}
+                errors: list[BaseException] = []
+                real_load = app_config._load_runtime_overrides_config
+                real_payload = app_config.runtime_behavior_settings_payload
+
+                def load(path: Path, *args: Any) -> dict[str, Any]:
+                    result = real_load(path, *args)
+                    if threading.current_thread().name == "second":
+                        second_read.set()
+                    if phase == "read" and threading.current_thread().name == "first" and not entered.is_set():
+                        entered.set()
+                        if not release.wait(5):
+                            raise AssertionError("first writer was not released")
+                    return result
+
+                def payload(*args: Any, **kwargs: Any) -> dict[str, Any]:
+                    if phase == "response" and threading.current_thread().name == "first":
+                        entered.set()
+                        if not release.wait(5):
+                            raise AssertionError("first response was not released")
+                    return real_payload(*args, **kwargs)
+
+                def writer(name: str, values: dict[str, int]) -> None:
+                    try:
+                        if name == "second":
+                            second_started.set()
+                        results[name] = app_config.save_runtime_behavior_overrides(settings, values)
+                    except BaseException as exc:
+                        errors.append(exc)
+
+                first = threading.Thread(target=writer, name="first", args=("first", {"smart_cache_ttl_seconds": 777}))
+                second = threading.Thread(target=writer, name="second", args=("second", {"refresh_interval_seconds": 55}))
+                with patch.object(app_config, "_load_runtime_overrides_config", side_effect=load), patch.object(
+                    app_config, "runtime_behavior_settings_payload", side_effect=payload,
+                ):
+                    first.start()
+                    try:
+                        self.assertTrue(entered.wait(5))
+                        second.start()
+                        self.assertTrue(second_started.wait(5))
+                        self.assertFalse(second_read.wait(0.2), "second writer read before the first transaction finished")
+                    finally:
+                        release.set()
+                        first.join(5)
+                        if second.ident is not None:
+                            second.join(5)
+                    self.assertFalse(first.is_alive())
+                    self.assertFalse(second.is_alive())
+                self.assertEqual(errors, [])
+                self.assertTrue(second_read.is_set())
+                self.assertEqual(yaml.safe_load(self.overrides_path.read_text())["app"], {
+                    "refresh_interval_seconds": 55, "smart_cache_ttl_seconds": 777,
+                })
+                first_fields = {item["key"]: item["value"] for item in results["first"]["fields"]}
+                second_fields = {item["key"]: item["value"] for item in results["second"]["fields"]}
+                self.assertEqual((first_fields["smart_cache_ttl_seconds"], first_fields["refresh_interval_seconds"]), (777, 30))
+                self.assertEqual((second_fields["smart_cache_ttl_seconds"], second_fields["refresh_interval_seconds"]), (777, 55))
+
+    def test_each_writer_owns_a_unique_stage_and_leaves_other_files_alone(self) -> None:
+        sibling = self.overrides_path.with_suffix(".tmp")
+        sibling.write_text("another writer's stage", encoding="utf-8")
+        stages: list[Path] = []
+        real_replace = Path.replace
+
+        def replace(source: Path, target: Path) -> Path:
+            if Path(target) == self.overrides_path:
+                stages.append(source)
+                self.assertEqual(source.parent, self.overrides_path.parent)
+            return real_replace(source, target)
+
+        with patch.object(Path, "replace", replace):
+            for value in (777, 778):
+                app_config.save_runtime_behavior_overrides(get_settings(), {"smart_cache_ttl_seconds": value})
+        self.assertTrue(sibling.exists(), "save consumed an unowned staging file")
+        self.assertEqual(sibling.read_text(), "another writer's stage")
+        self.assertEqual(len(set(stages)), 2)
+        self.assertTrue(all(not stage.exists() for stage in stages))
+
+    def test_failed_serialization_and_replace_clean_only_the_owned_stage(self) -> None:
+        for failure in ("serialize", "replace"):
+            with self.subTest(failure=failure):
+                self.overrides_path.write_text("app:\n  smart_cache_ttl_seconds: 300\n", encoding="utf-8")
+                settings = app_config.load_settings()
+                before = self.overrides_path.read_bytes()
+                sibling = self.overrides_path.with_suffix(".tmp")
+                sibling.write_text("unowned", encoding="utf-8")
+                inventory = set(self.overrides_path.parent.iterdir())
+
+                def fail_dump(_data: Any, handle: Any, **_: Any) -> None:
+                    handle.write("partial stage")
+                    raise OSError("synthetic serialization failure")
+
+                target = patch.object(yaml, "safe_dump", side_effect=fail_dump) if failure == "serialize" else patch.object(
+                    Path, "replace", side_effect=OSError("synthetic replace failure"),
+                )
+                with target, self.assertRaises(OSError):
+                    app_config.save_runtime_behavior_overrides(settings, {"smart_cache_ttl_seconds": 777})
+                self.assertEqual(self.overrides_path.read_bytes(), before)
+                self.assertEqual(sibling.read_text(), "unowned")
+                self.assertEqual(set(self.overrides_path.parent.iterdir()), inventory)
+                # A failed writer releases ownership; the next public save works.
+                response = app_config.save_runtime_behavior_overrides(settings, {"smart_cache_ttl_seconds": 778})
+                self.assertEqual(RuntimeOverrideOwnershipTests._field(response, "smart_cache_ttl_seconds")["value"], 778)
+
+
+@unittest.skipUnless(os.name == "posix", "POSIX runtime-overrides reader permissions")
+class RuntimeOverridePermissionTests(ConfigReloadTestCase):
+    def test_new_file_keeps_stage_private_until_complete_then_publishes_readable(self) -> None:
+        real_dump = yaml.safe_dump
+        real_replace = Path.replace
+        stages: list[Path] = []
+
+        def dump(data: Any, handle: Any, **kwargs: Any) -> None:
+            stages.append(Path(handle.name))
+            self.assertEqual(stat.S_IMODE(os.fstat(handle.fileno()).st_mode), 0o600)
+            self.assertFalse(self.overrides_path.exists())
+            real_dump(data, handle, **kwargs)
+            self.assertEqual(stat.S_IMODE(os.fstat(handle.fileno()).st_mode), 0o600)
+
+        def replace(source: Path, target: Path) -> Path:
+            if target == self.overrides_path:
+                self.assertEqual(stat.S_IMODE(source.stat().st_mode), 0o600)
+                self.assertEqual(yaml.safe_load(source.read_text())["app"]["smart_cache_ttl_seconds"], 777)
+            return real_replace(source, target)
+
+        # No process-wide umask change is needed in production. The publication
+        # Owner-only mode is explicit, even when the writer's inherited umask is private.
+        previous = os.umask(0o077)
+        try:
+            with patch.object(yaml, "safe_dump", side_effect=dump), patch.object(Path, "replace", replace):
+                response = app_config.save_runtime_behavior_overrides(get_settings(), {"smart_cache_ttl_seconds": 777})
+        finally:
+            os.umask(previous)
+        metadata = self.overrides_path.stat()
+        self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
+        self.assertEqual(metadata.st_uid, os.geteuid())
+        self.assertEqual(metadata.st_gid, os.getegid())
+        self.assertEqual(len(stages), 1)
+        self.assertFalse(stages[0].exists())
+        self.assertEqual(RuntimeOverrideOwnershipTests._field(response, "smart_cache_ttl_seconds")["value"], 777)
+        self.assertEqual(app_config.load_settings().app.smart_cache_ttl_seconds, 777)
+
+    def test_existing_file_retains_owner_and_read_write_bits_without_special_bits(self) -> None:
+        for mode in (0o644, 0o640, 0o660, 0o600, 0o400, 0o6755, 0o2770):
+            with self.subTest(mode=oct(mode)):
+                self.overrides_path.unlink(missing_ok=True)
+                self.overrides_path.write_text("app:\n  smart_cache_ttl_seconds: 300\n")
+                self.overrides_path.chmod(mode)
+                before = self.overrides_path.stat()
+                app_config.save_runtime_behavior_overrides(get_settings(), {"smart_cache_ttl_seconds": 777})
+                after = self.overrides_path.stat()
+                self.assertEqual(stat.S_IMODE(after.st_mode), mode & 0o666)
+                self.assertEqual((after.st_uid, after.st_gid), (before.st_uid, before.st_gid))
+                self.assertEqual(app_config.load_settings().app.smart_cache_ttl_seconds, 777)
+
+    def test_existing_shared_group_is_preserved_on_real_replacement(self) -> None:
+        groups = sorted(set(os.getgroups()) - {os.getegid()})
+        if not groups:
+            self.skipTest("no supplementary group available for owned-fixture chgrp")
+        self.overrides_path.write_text("app:\n  smart_cache_ttl_seconds: 300\n")
+        # Only this test-owned file changes group, and only to an existing
+        # membership. No root, setuid, or changes to the process identity.
+        os.chown(self.overrides_path, -1, groups[0])
+        self.overrides_path.chmod(0o640)
+        before = self.overrides_path.stat()
+        with patch.object(os, "fchown", wraps=os.fchown) as chown:
+            app_config.save_runtime_behavior_overrides(get_settings(), {"smart_cache_ttl_seconds": 777})
+        self.assertEqual(chown.call_count, 1)
+        self.assertEqual(chown.call_args.args[1:], (before.st_uid, before.st_gid))
+        after = self.overrides_path.stat()
+        self.assertEqual((after.st_uid, after.st_gid), (before.st_uid, before.st_gid))
+        self.assertEqual(stat.S_IMODE(after.st_mode), 0o640)
+
+    def test_new_file_inherits_shared_group_from_setgid_parent(self) -> None:
+        groups = sorted(set(os.getgroups()) - {os.getegid()})
+        if not groups:
+            self.skipTest("no supplementary group available for owned-fixture chgrp")
+        parent = self.overrides_path.parent
+        os.chown(parent, -1, groups[0])
+        parent.chmod(0o2770)
+        before = parent.stat()
+        app_config.save_runtime_behavior_overrides(get_settings(), {"smart_cache_ttl_seconds": 777})
+        metadata = self.overrides_path.stat()
+        self.assertEqual(metadata.st_uid, os.geteuid())
+        self.assertEqual(metadata.st_gid, groups[0])
+        self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
+        after = parent.stat()
+        self.assertEqual((after.st_uid, after.st_gid, after.st_mode), (before.st_uid, before.st_gid, before.st_mode))
+
+    def test_declared_reader_identities_preserve_existing_owner_before_mode(self) -> None:
+        services = yaml.safe_load((Path(__file__).resolve().parents[1] / "docker-compose.nonroot.yml").read_text())["services"]
+        self.assertEqual(services["enclosure-admin"]["user"], "0:${APP_GID:-10001}")
+        self.assertEqual(services["enclosure-ui"]["user"], "${APP_UID:-10001}:${APP_GID:-10001}")
+        # UID ownership transfer is modeled, not a live different-UID open.
+        # Real modes, descriptor, serialization and replace still execute.
+        for uid, mode in ((0, 0o640), (10001, 0o600)):
+            with self.subTest(uid=uid, mode=oct(mode)):
+                self.overrides_path.write_text("app:\n  smart_cache_ttl_seconds: 300\n")
+                self.overrides_path.chmod(mode)
+                real_stat = Path.stat
+                real_chmod = os.fchmod
+                events: list[str] = []
+
+                def target_stat(path: Path, *args: Any, **kwargs: Any) -> os.stat_result:
+                    metadata = real_stat(path, *args, **kwargs)
+                    if path == self.overrides_path:
+                        fields = list(metadata)
+                        fields[4:6] = [uid, 10001]
+                        return os.stat_result(fields)
+                    return metadata
+
+                def chown(fd: int, owner: int, group: int) -> None:
+                    self.assertEqual((owner, group), (uid, 10001))
+                    self.assertEqual(stat.S_IMODE(os.fstat(fd).st_mode), 0o600)
+                    events.append("owner")
+
+                def chmod(fd: int, published_mode: int) -> None:
+                    self.assertEqual(events, ["owner"])
+                    self.assertEqual(published_mode, mode)
+                    events.append("mode")
+                    real_chmod(fd, published_mode)
+
+                with patch.object(Path, "stat", target_stat), patch.object(os, "fchown", side_effect=chown), patch.object(
+                    os, "fchmod", side_effect=chmod,
+                ):
+                    app_config.save_runtime_behavior_overrides(get_settings(), {"smart_cache_ttl_seconds": 777})
+                self.assertEqual(events, ["owner", "mode"])
+
+    def test_metadata_failure_preserves_canonical_and_unowned_files_then_recovers(self) -> None:
+        for phase in ("stat", "owner", "mode"):
+            with self.subTest(phase=phase):
+                self.overrides_path.write_text("app:\n  smart_cache_ttl_seconds: 300\n")
+                self.overrides_path.chmod(0o640)
+                settings = app_config.load_settings()
+                sibling = self.overrides_path.with_suffix(".tmp")
+                sibling.write_text("unowned")
+                paths = list(self.overrides_path.parent.iterdir())
+                before = {path: (path.read_bytes(), path.stat()) for path in paths}
+                real_stat = Path.stat
+                real_fstat = os.fstat
+
+                def target_stat(path: Path, *args: Any, **kwargs: Any) -> os.stat_result:
+                    if path == self.overrides_path:
+                        raise PermissionError("synthetic metadata refusal")
+                    return real_stat(path, *args, **kwargs)
+
+                def stage_stat(fd: int) -> os.stat_result:
+                    fields = list(real_fstat(fd))
+                    fields[4] += 1  # force ownership restoration without host chown
+                    return os.stat_result(fields)
+
+                target = patch.object(Path, "stat", target_stat) if phase == "stat" else patch.object(
+                    os, "fchown" if phase == "owner" else "fchmod", side_effect=PermissionError("synthetic metadata refusal"),
+                )
+                with target, patch.object(os, "fstat", side_effect=stage_stat if phase == "owner" else real_fstat), patch.object(
+                    Path, "replace", autospec=True, side_effect=Path.replace,
+                ) as replace:
+                    with self.assertRaises(PermissionError):
+                        app_config.save_runtime_behavior_overrides(settings, {"smart_cache_ttl_seconds": 777})
+                    replace.assert_not_called()
+                self.assertEqual(set(self.overrides_path.parent.iterdir()), set(paths))
+                for path, (data, metadata) in before.items():
+                    self.assertEqual(path.read_bytes(), data)
+                    self.assertEqual(path.stat(), metadata)
+                response = app_config.save_runtime_behavior_overrides(settings, {"smart_cache_ttl_seconds": 778})
+                self.assertEqual(RuntimeOverrideOwnershipTests._field(response, "smart_cache_ttl_seconds")["value"], 778)
+
+    def test_new_file_permission_failure_cleans_stage_without_publication(self) -> None:
+        sibling = self.overrides_path.with_suffix(".tmp")
+        sibling.write_text("unowned")
+        before = set(self.overrides_path.parent.iterdir())
+        with patch.object(os, "fchmod", side_effect=PermissionError("synthetic mode refusal")):
+            with self.assertRaises(PermissionError):
+                app_config.save_runtime_behavior_overrides(get_settings(), {"smart_cache_ttl_seconds": 777})
+        self.assertFalse(self.overrides_path.exists())
+        self.assertEqual(set(self.overrides_path.parent.iterdir()), before)
+        self.assertEqual(sibling.read_text(), "unowned")
 
 
 class ModuleCacheCompatibilityTests(unittest.TestCase):

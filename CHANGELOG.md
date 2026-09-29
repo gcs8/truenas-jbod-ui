@@ -262,6 +262,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Validate log levels before settings reload, use the configured runtime-overrides
+  file consistently, and serialize partial updates while preserving reader permissions. (#811)
 - Preserved newer admin drafts when older saves complete, and kept discovered
   storage-view candidates bound to the selected system and HA target. (#842)
 - Skipped excluded debug-export sources before reading or parsing them while
